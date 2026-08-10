@@ -4,16 +4,71 @@
  * Manages SQLite-backed KV stores for the StoreModule.
  * Uses a single SQLite database with multiple tables (one per logical store).
  *
- * Storage naming convention:
- *   {prefix}{schema}_{table}              - Data store (row data)
- *   {prefix}{schema}_{table}_idx_{name}   - Index store (secondary indexes)
- *   {prefix}__stats__                     - Unified stats store (row counts for all tables)
- *   {prefix}__catalog__                   - Catalog store (DDL metadata)
+ * Storage naming convention. Every logical store name comes from the shared builders
+ * (`buildDataStoreName` / `buildIndexStoreName`), then {@link encodeSqliteName} escapes it
+ * into a legal bare SQLite identifier:
+ *
+ *   {prefix}{encoded {schema}.{table}}             - Data store (row data)
+ *   {prefix}{encoded {schema}.{table}_idx_{name}}  - Index store (secondary indexes)
+ *   {prefix}__stats__                              - Unified stats store (row counts)
+ *   {prefix}__catalog__                            - Catalog store (DDL metadata)
+ *
+ * e.g. table `users` in schema `main` → `quereus_main_2Eusers`.
+ *
+ * The two reserved stores are NOT run through the encoder, and that is exactly what keeps
+ * them in a namespace no table can reach — see {@link encodeSqliteName}.
+ *
+ * HARD CUTOVER: an earlier version derived its own table names (`{prefix}{schema}_{table}`,
+ * with every character outside `[a-zA-Z0-9_]` folded to `_`). Those tables are NOT read
+ * here and databases written by it must be re-created; there is no on-disk migration. The
+ * old scheme was many-to-one, so two differently-named tables could share one SQLite table
+ * and interleave their rows.
  */
 
 import type { KVStore, KVStoreProvider } from '@quereus/store';
-import { STORE_SUFFIX, STATS_STORE_NAME } from '@quereus/store';
+import { buildDataStoreName, buildIndexStoreName, CATALOG_STORE_NAME, STATS_STORE_NAME } from '@quereus/store';
 import { SQLiteStore, type SQLiteDatabase } from './store.js';
+
+const textEncoder = new TextEncoder();
+
+/**
+ * Escape a logical store name into a legal bare SQLite identifier.
+ *
+ * Bytes `0`-`9` and `a`-`z` pass through; every other byte becomes `_XX` (uppercase hex of
+ * the UTF-8 byte). `_` is therefore ALWAYS an escape introducer and never a literal, which
+ * is what makes the mapping injective: the output can be parsed back unambiguously, so two
+ * different store names can never produce the same identifier. That matters because
+ * `StoreModule.assertStoreNameFree` compares LOGICAL names and only stands in for a
+ * physical collision check while this mapping is one-to-one.
+ *
+ * Percent-escaping (what `@quereus/plugin-leveldb` uses) is deliberately not reused here:
+ * `%` is illegal in a bare SQLite identifier, and `SQLiteStore` interpolates the table name
+ * straight into its SQL unquoted — so escaping into `[a-z0-9_]` keeps every produced name a
+ * legal bare identifier and adds no quoting/injection surface.
+ *
+ * Two properties the callers rely on:
+ *
+ *   - Injective under SQLite's ASCII-case-insensitive identifier comparison too. The input
+ *     is already lowercased by the shared builders, so no ASCII uppercase survives to be
+ *     escaped and the escape hex is the only uppercase in the output; case-folding it back
+ *     to `_2e` still decodes to the same byte.
+ *   - Disjoint from the reserved store names. `{prefix}__stats__` and `{prefix}__catalog__`
+ *     are used UNESCAPED; an encoded name can never contain a bare `_` followed by a
+ *     non-hex character, so no table name can produce `__stats__` (its second `_` is not a
+ *     hex digit) and no table can spoof a reserved store. Do not run the reserved names
+ *     through this function.
+ */
+function encodeSqliteName(name: string): string {
+	let out = '';
+	for (const byte of textEncoder.encode(name)) {
+		const isDigit = byte >= 0x30 && byte <= 0x39;
+		const isLower = byte >= 0x61 && byte <= 0x7a;
+		out += (isDigit || isLower)
+			? String.fromCharCode(byte)
+			: '_' + byte.toString(16).toUpperCase().padStart(2, '0');
+	}
+	return out;
+}
 
 /**
  * Options for creating a SQLite provider.
@@ -50,31 +105,12 @@ export class SQLiteProvider implements KVStoreProvider {
 		this.tablePrefix = options.tablePrefix ?? 'quereus_';
 	}
 
-	/**
-	 * Get the table name for a store.
-	 * Sanitizes schema/table names to valid SQLite identifiers.
-	 */
-	private getTableName(schemaName: string, tableName: string): string {
-		const sanitized = `${schemaName}_${tableName}`.replace(/[^a-zA-Z0-9_]/g, '_');
-		return `${this.tablePrefix}${sanitized}`;
-	}
-
-	/**
-	 * Get the key for the store cache.
-	 */
-	private getStoreKey(schemaName: string, tableName: string): string {
-		return `${schemaName}.${tableName}`.toLowerCase();
-	}
-
 	async getStore(schemaName: string, tableName: string, _options?: Record<string, unknown>): Promise<KVStore> {
-		const key = this.getStoreKey(schemaName, tableName);
-		return this.getOrCreateStore(key, this.getTableName(schemaName, tableName));
+		return this.getOrCreateStore(buildDataStoreName(schemaName, tableName));
 	}
 
 	async getIndexStore(schemaName: string, tableName: string, indexName: string): Promise<KVStore> {
-		const key = `${this.getStoreKey(schemaName, tableName)}${STORE_SUFFIX.INDEX}${indexName}`;
-		const sqliteTableName = `${this.getTableName(schemaName, tableName)}${STORE_SUFFIX.INDEX}${indexName}`.replace(/[^a-zA-Z0-9_]/g, '_');
-		return this.getOrCreateStore(key, sqliteTableName);
+		return this.getOrCreateStore(buildIndexStoreName(schemaName, tableName, indexName));
 	}
 
 	async getStatsStore(_schemaName: string, _tableName: string): Promise<KVStore> {
@@ -87,19 +123,17 @@ export class SQLiteProvider implements KVStoreProvider {
 
 	async getCatalogStore(): Promise<KVStore> {
 		if (!this.catalogStore) {
-			this.catalogStore = SQLiteStore.create(this.db, `${this.tablePrefix}__catalog__`);
+			this.catalogStore = SQLiteStore.create(this.db, `${this.tablePrefix}${CATALOG_STORE_NAME}`);
 		}
 		return this.catalogStore;
 	}
 
 	async closeStore(schemaName: string, tableName: string): Promise<void> {
-		const key = this.getStoreKey(schemaName, tableName);
-		await this.closeStoreByKey(key);
+		await this.closeStoreByName(buildDataStoreName(schemaName, tableName));
 	}
 
 	async closeIndexStore(schemaName: string, tableName: string, indexName: string): Promise<void> {
-		const key = `${this.getStoreKey(schemaName, tableName)}${STORE_SUFFIX.INDEX}${indexName}`;
-		await this.closeStoreByKey(key);
+		await this.closeStoreByName(buildIndexStoreName(schemaName, tableName, indexName));
 	}
 
 	async closeAll(): Promise<void> {
@@ -123,15 +157,13 @@ export class SQLiteProvider implements KVStoreProvider {
 	}
 
 	async deleteIndexStore(schemaName: string, tableName: string, indexName: string): Promise<void> {
-		const key = `${this.getStoreKey(schemaName, tableName)}${STORE_SUFFIX.INDEX}${indexName}`;
-		await this.closeStoreByKey(key);
+		await this.closeStoreByName(buildIndexStoreName(schemaName, tableName, indexName));
 		// Note: SQLite doesn't need explicit store deletion - table is dropped when closed
 	}
 
 	async deleteTableStores(schemaName: string, tableName: string, indexNames: readonly string[]): Promise<void> {
 		// Close data store
-		const dataKey = this.getStoreKey(schemaName, tableName);
-		await this.closeStoreByKey(dataKey);
+		await this.closeStoreByName(buildDataStoreName(schemaName, tableName));
 
 		// Stats are in the unified __stats__ store, so no need to close a separate store
 		// The individual stats entry will be removed by the calling code if needed
@@ -140,26 +172,32 @@ export class SQLiteProvider implements KVStoreProvider {
 		// the `{table}_idx_` prefix — that prefix also matches a sibling table
 		// literally named `{table}_idx_<x>`.
 		for (const indexName of indexNames) {
-			await this.closeStoreByKey(`${dataKey}${STORE_SUFFIX.INDEX}${indexName}`);
+			await this.closeStoreByName(buildIndexStoreName(schemaName, tableName, indexName));
 		}
 	}
 
-	private getOrCreateStore(key: string, sqliteTableName: string): SQLiteStore {
-		let store = this.stores.get(key);
+	/**
+	 * Get or open the store for a logical store name, caching by that CANONICAL name —
+	 * the same string the shared builders produce and `StoreModule` reasons about. Keying
+	 * the cache by anything else (a separately-derived spelling) risks two cache entries
+	 * for one physical table, or one entry shared by two.
+	 */
+	private getOrCreateStore(storeName: string): SQLiteStore {
+		let store = this.stores.get(storeName);
 
 		if (!store) {
-			store = SQLiteStore.create(this.db, sqliteTableName);
-			this.stores.set(key, store);
+			store = SQLiteStore.create(this.db, `${this.tablePrefix}${encodeSqliteName(storeName)}`);
+			this.stores.set(storeName, store);
 		}
 
 		return store;
 	}
 
-	private async closeStoreByKey(key: string): Promise<void> {
-		const store = this.stores.get(key);
+	private async closeStoreByName(storeName: string): Promise<void> {
+		const store = this.stores.get(storeName);
 		if (store) {
 			await store.close();
-			this.stores.delete(key);
+			this.stores.delete(storeName);
 		}
 	}
 }

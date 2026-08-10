@@ -9,13 +9,19 @@
  * object store within a per-test database; `reopen` drops the manager/handle WITHOUT
  * deleting the database and re-opens it, so persisted data survives — driving the
  * persistence tier.
+ *
+ * Also runs the shared store-name distinctness battery over `IndexedDBProvider`. This
+ * provider is one of the two reference implementations of that property (it uses the
+ * built store name verbatim as the object-store name), so a failure there means the
+ * battery is wrong rather than the plugin.
  */
 
 import 'fake-indexeddb/auto';
-import type { KVStore } from '@quereus/store';
-import { runKVStoreConformance } from '@quereus/store/testing';
+import type { KVStore, KVStoreProvider } from '@quereus/store';
+import { runKVStoreConformance, runStoreNameDistinctness } from '@quereus/store/testing';
 import { IndexedDBStore } from '../src/store.js';
 import { IndexedDBManager } from '../src/manager.js';
+import { createIndexedDBProvider, type IndexedDBProvider } from '../src/provider.js';
 
 const STORE_NAME = 'conformance-store';
 
@@ -127,6 +133,32 @@ runKVStoreConformance('IndexedDBStore', () => {
 			// NOTE: if `readBatch` changes again, re-measure by temporarily setting this to
 			// 1 and reading the failure message, rather than reasoning about it.
 			maxReadAhead: BATCH + 1,
+		},
+	};
+});
+
+runStoreNameDistinctness('IndexedDBProvider store names', () => {
+	const dbName = `quereus-kv-naming-idb-${seq++}`;
+	let provider: IndexedDBProvider | undefined;
+
+	return {
+		async open(): Promise<KVStoreProvider> {
+			provider = createIndexedDBProvider({ databaseName: dbName });
+			return provider;
+		},
+		async teardown(): Promise<void> {
+			if (provider) {
+				try {
+					await provider.closeAll();
+				} catch (e) {
+					// An unopened (or already closed) provider is fine to skip; anything else
+					// is worth seeing rather than swallowing.
+					console.warn(`closeAll during teardown: ${String(e)}`);
+				}
+			}
+			provider = undefined;
+			IndexedDBManager.resetInstance(dbName);
+			await deleteDatabase(dbName);
 		},
 	};
 });

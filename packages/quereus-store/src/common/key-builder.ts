@@ -61,11 +61,14 @@ function assertKeyableIdentifiers(...names: string[]): void {
  * Refusing the identifier here is also what lets `StoreModule.assertStoreNameFree` stand in
  * for a PHYSICAL store collision check: that guard compares names as JS strings, before any
  * provider encoding, so distinct logical names imply distinct physical stores only where the
- * provider's encoding is injective. With unpaired surrogates refused it is — for LevelDB
- * (percent-escaped UTF-8) and IndexedDB (verbatim `DOMString`). It is NOT for
- * `@quereus/plugin-nativescript-sqlite`, whose `getTableName` folds every character outside
- * `[a-zA-Z0-9_]` to `_`; that is a lossy mapping this guard neither causes nor repairs. See
- * `tickets/backlog/bug-mobile-provider-physical-store-name-collisions.md`.
+ * provider's encoding is injective. With unpaired surrogates refused, every shipped
+ * provider's encoding is: LevelDB percent-escapes the UTF-8 bytes, IndexedDB uses the name
+ * verbatim as a `DOMString`, NativeScript SQLite escapes to `[a-z0-9_]` with `_` as the
+ * introducer, and React Native LevelDB percent-escapes into a filename-safe set. That is a
+ * property of each provider rather than of this module, so it is pinned behaviorally by the
+ * shared `runStoreNameDistinctness` battery (`@quereus/store/testing`), which every plugin's
+ * `test/conformance.spec.ts` registers — a new provider that re-derives its own names fails
+ * there instead of silently merging two tables' rows.
  */
 // NOTE: composes with a literal '.' delimiter, so the schema/table boundary is
 // not recoverable from the physical name. A lone dotted identifier round-trips
@@ -86,8 +89,16 @@ export function buildDataStoreName(schemaName: string, tableName: string): strin
  *
  * Identifier-guarded for the same reason as {@link buildDataStoreName} — see its docstring
  * for why refusing an unpaired surrogate is what keeps distinct logical names on distinct
- * physical stores, and for the one provider whose encoding that still does not hold for.
+ * physical stores.
  */
+// NOTE: `_idx_` is a legal substring of an ordinary identifier, so — exactly like the '.'
+// delimiter in buildDataStoreName — this join is not boundary-safe: index `x` on table `t`
+// and a sibling table literally named `t_idx_x` both compose to `{schema}.t_idx_x`. That
+// collision is real but is caught above every provider by
+// `StoreModuleBase.assertStoreNameFree`, which rejects whichever of the two is created
+// second (see `collectOccupiedStoreNames`). No provider can distinguish them, so
+// `runStoreNameDistinctness` deliberately excludes the pair from its corpus. If the guard
+// ever has to go, switch to a boundary-safe encoding here rather than widening the guard.
 export function buildIndexStoreName(
 	schemaName: string,
 	tableName: string,

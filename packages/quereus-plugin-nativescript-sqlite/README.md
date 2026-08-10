@@ -15,6 +15,37 @@ SQLite storage plugin for Quereus on NativeScript. Provides persistent storage f
 - **ACID transactions**: SQLite transactions for atomic batch writes
 - **WITHOUT ROWID**: Optimized key-value table structure
 
+## Table naming
+
+Each logical store — a table's row data, or one of its secondary indexes — gets its own
+SQLite table. The name comes from `@quereus/store`'s shared builders and is then escaped
+into a legal bare SQLite identifier: digits and `a`-`z` pass through, every other byte
+becomes `_XX` (uppercase hex of the UTF-8 byte). `_` is therefore always an escape
+introducer and never a literal, which is what makes the escape reversible in principle — so
+two differently-named tables can never land on one SQLite table.
+
+| Logical store | SQLite table |
+| --- | --- |
+| table `t` in schema `main` | `quereus_main_2Et` |
+| table `a-b` in schema `main` | `quereus_main_2Ea_2Db` |
+| table `a b` in schema `main` | `quereus_main_2Ea_20b` |
+| index `x` on table `t` | `quereus_main_2Et_5Fidx_5Fx` |
+| table `café` in schema `main` | `quereus_main_2Ecaf_C3_A9` |
+| unified stats | `quereus___stats__` |
+| catalog (DDL) | `quereus___catalog__` |
+
+The two reserved tables are deliberately **not** escaped, which is what keeps them
+unreachable from any user table: an escaped name can never contain a bare `_` followed by a
+non-hex character, so no table name can produce `__stats__` or `__catalog__`. The
+`quereus_` part is the configurable `tablePrefix`.
+
+> **Hard cutover (no on-disk migration).** An earlier version named its tables
+> `{prefix}{schema}_{table}` with every character outside `[a-zA-Z0-9_]` folded to `_`.
+> That mapping was many-to-one — tables `a-b` and `a b` shared one SQLite table and
+> interleaved their rows — so it has been replaced outright. Databases written by the older
+> version are **not** read by this version and must be re-created. Pre-1.0 dev data is
+> expected to be thrown away; there is no migration importer.
+
 ## Installation
 
 ```bash
@@ -134,7 +165,8 @@ import { createSQLiteProvider } from '@quereus/plugin-nativescript-sqlite';
 const sqliteDb = openOrCreate('quereus.db');
 const provider = createSQLiteProvider({ db: sqliteDb });
 
-// Each store gets its own table: quereus_main_users, quereus_main_orders, etc.
+// Each store gets its own table: quereus_main_2Eusers, quereus_main_2Eorders, etc.
+// (see "Table naming" above for how the name is escaped)
 const userStore = await provider.getStore('main', 'users');
 const orderStore = await provider.getStore('main', 'orders');
 const catalogStore = await provider.getCatalogStore();
@@ -171,7 +203,7 @@ Keys and values are stored as BLOBs (binary). SQLite compares BLOBs using `memcm
 Each store creates a table with this schema:
 
 ```sql
-create table quereus_main_users (
+create table quereus_main_2Eusers (
   key blob primary key,
   value blob
 ) without rowid

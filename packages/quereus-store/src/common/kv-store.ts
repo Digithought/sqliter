@@ -245,8 +245,23 @@ export interface KVStoreOptions {
  *   {prefix}.__stats__            - Unified stats store (row counts for all tables)
  *   __catalog__                   - Catalog store (DDL metadata)
  *
- * Implementations should manage store lifecycle and caching.
+ * An implementation MUST build those names with `buildDataStoreName` /
+ * `buildIndexStoreName` rather than composing its own. It may prefix or escape the result
+ * to reach a legal native name, but that escaping must be INJECTIVE (decodable in
+ * principle) — two distinct logical names must never produce one native name. A native
+ * namespace that genuinely cannot represent a name must REJECT it, never fold it onto
+ * another. `runStoreNameDistinctness` (`@quereus/store/testing`) enforces this behaviorally.
+ *
+ * Implementations should manage store lifecycle and caching. Cache by the BUILT store name,
+ * so two spellings of one logical store cannot produce two cached handles.
  */
+// NOTE: this interface hands providers the raw `(schemaName, tableName[, indexName])`
+// identifiers and trusts each one to call the shared builders. Taking an already-built
+// store name instead would make the whole "provider re-derives its own names" defect class
+// unrepresentable, rather than merely tested for — but it touches five packages and every
+// StoreModule call site, so the shared battery was judged the better trade. If a provider is
+// ever again found re-deriving names, or a sixth provider lands, revisit and change these
+// signatures to take the built name.
 export interface KVStoreProvider {
 	/**
 	 * Get or create a KVStore for a table's row data.

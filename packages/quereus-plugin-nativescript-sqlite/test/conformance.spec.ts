@@ -12,14 +12,20 @@
  *
  * `SQLiteStore.close()` deliberately leaves the underlying database open (it may be
  * shared), so teardown closes the database itself and removes the file.
+ *
+ * Also runs the shared store-name distinctness battery over `SQLiteProvider` — the check
+ * that `encodeSqliteName` never folds two logical stores onto one SQLite table. Driven
+ * against real SQLite (better-sqlite3), so it also proves every produced identifier is a
+ * legal bare identifier: an illegal one fails at `create table`, not as a silent share.
  */
 
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import type { KVStore } from '@quereus/store';
-import { runKVStoreConformance } from '@quereus/store/testing';
+import type { KVStore, KVStoreProvider } from '@quereus/store';
+import { runKVStoreConformance, runStoreNameDistinctness } from '@quereus/store/testing';
 import { SQLiteStore, ITERATE_BATCH_SIZE, type SQLiteDatabase } from '../src/store.js';
+import { createSQLiteProvider, type SQLiteProvider } from '../src/provider.js';
 import { createTestDatabase } from './better-sqlite3-adapter.js';
 
 // A per-test unique file name. A counter (not Date.now/random) keeps names stable and
@@ -87,6 +93,28 @@ runKVStoreConformance('SQLiteStore', () => {
       // 512 entries reads exactly 512 (re-measure by temporarily setting this to 0 and
       // reading the failure message, rather than reasoning about it).
       maxReadAhead: ITERATE_BATCH_SIZE,
+    },
+  };
+});
+
+runStoreNameDistinctness('SQLiteProvider store names', () => {
+  const file = path.join(os.tmpdir(), `quereus-kv-naming-ns-sqlite-${process.pid}-${seq++}.db`);
+  let provider: SQLiteProvider | undefined;
+
+  return {
+    async open(): Promise<KVStoreProvider> {
+      provider = createSQLiteProvider({ db: createTestDatabase(file) });
+      return provider;
+    },
+    async teardown(): Promise<void> {
+      // `SQLiteProvider.closeAll` also closes the underlying database — required before
+      // removing the file on Windows, which refuses to unlink an open handle.
+      if (provider) await provider.closeAll();
+      provider = undefined;
+      // -wal/-shm exist only if the file was ever in WAL mode; force makes that moot.
+      for (const suffix of ['', '-wal', '-shm']) {
+        fs.rmSync(`${file}${suffix}`, { force: true });
+      }
     },
   };
 });

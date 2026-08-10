@@ -16,6 +16,40 @@ LevelDB storage plugin for Quereus on React Native. Provides fast, persistent st
 - **Persistent**: Data survives app restarts
 - **Atomic batch writes**: Uses native LevelDB WriteBatch for atomic multi-key operations
 
+## Database naming
+
+Each logical store — a table's row data, or one of its secondary indexes — is its own
+on-device LevelDB database. The name comes from `@quereus/store`'s shared builders, is
+percent-escaped into a filename-safe form, and is prefixed with the configurable
+`databaseName` (default `quereus`):
+
+| Logical store | LevelDB database |
+| --- | --- |
+| table `t` in schema `main` | `quereus.main.t` |
+| index `x` on table `t` | `quereus.main.t_idx_x` |
+| table `a b` in schema `main` | `quereus.main.a%20b` |
+| table `a/b` in schema `main` | `quereus.main.a%2Fb` |
+| unified stats | `quereus.__stats__` |
+| catalog (DDL) | `quereus.__catalog__` |
+
+rn-leveldb resolves the name it is given as a path under the app's documents directory, so
+the escape covers every byte that is hostile in a filename: the path separators `/` and
+`\`, `:`, the Windows-illegal `* ? " < > |`, `%` itself (the escape introducer), and every
+control, space and non-ASCII byte. Because the separators can never appear literally, the
+whole name is always a single path component. The escape is reversible in principle, which
+is what guarantees two differently-named tables never share one database.
+
+The two reserved databases are deliberately **not** escaped, which is what keeps them
+unreachable from any user table: every logical store name contains a `.` (it is built as
+`{schema}.{table}`) and neither `__stats__` nor `__catalog__` does.
+
+> **Hard cutover (no on-disk migration).** An earlier version derived its own names and
+> lowercased only part of them — an index store was named with the index name's original
+> case, so one logical index could occupy two on-device databases depending on how the SQL
+> spelled it. Databases written by the older version are **not** read by this version and
+> must be re-created. Pre-1.0 dev data is expected to be thrown away; there is no migration
+> importer.
+
 ## Installation
 
 ```bash

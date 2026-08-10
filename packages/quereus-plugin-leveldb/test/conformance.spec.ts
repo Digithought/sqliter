@@ -11,15 +11,21 @@
  * can see how many entries the store pulls from LevelDB. There is no other injection
  * point: `LevelDBStore.open` constructs its own ClassicLevel internally. That factory
  * keeps its own coverage in `standalone-open.spec.ts`.
+ *
+ * Also runs the shared store-name distinctness battery over `LevelDBProvider`. This
+ * provider is one of the two reference implementations of that property (its
+ * `encodeSublevelName` percent-escapes, so the mapping is injective), so a failure there
+ * means the battery is wrong rather than the plugin.
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { ClassicLevel } from 'classic-level';
-import type { KVStore } from '@quereus/store';
-import { runKVStoreConformance } from '@quereus/store/testing';
+import type { KVStore, KVStoreProvider } from '@quereus/store';
+import { runKVStoreConformance, runStoreNameDistinctness } from '@quereus/store/testing';
 import { LevelDBStore, type ViewLevel } from '../src/store.js';
+import { createLevelDBProvider, type LevelDBProvider } from '../src/provider.js';
 
 // A per-test unique directory. A counter (not Date.now/random) keeps names stable and
 // collision-free across the suite's many tests within one process.
@@ -99,6 +105,32 @@ runKVStoreConformance('LevelDBStore', () => {
 			entriesRead: () => reads,
 			// abstract-level yields one entry per awaited next() — no read-ahead above it.
 			maxReadAhead: 1,
+		},
+	};
+});
+
+runStoreNameDistinctness('LevelDBProvider store names', () => {
+	const dir = path.join(os.tmpdir(), `quereus-kv-naming-lvl-${process.pid}-${seq++}`);
+	let provider: LevelDBProvider | undefined;
+
+	return {
+		async open(): Promise<KVStoreProvider> {
+			fs.mkdirSync(dir, { recursive: true });
+			provider = createLevelDBProvider({ basePath: dir });
+			return provider;
+		},
+		async teardown(): Promise<void> {
+			if (provider) {
+				try {
+					await provider.closeAll();
+				} catch (e) {
+					// A provider whose root never opened is fine to skip; anything else is
+					// worth seeing rather than swallowing.
+					console.warn(`closeAll during teardown: ${String(e)}`);
+				}
+			}
+			provider = undefined;
+			fs.rmSync(dir, { recursive: true, force: true });
 		},
 	};
 });
