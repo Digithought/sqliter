@@ -840,11 +840,15 @@ async function runAddColumn(
 	// `dropConstraint` before the column itself goes (see {@link revertAddColumn}).
 	const installedConstraintNames: string[] = [];
 	let finalTableSchema: TableSchema;
+	// One resolver for every re-analysis this ALTER runs, so no two of them can disagree
+	// about what an inner FROM source exposes. It reads the LIVE catalog per call, so
+	// sharing it across the rounds below does not freeze the answers between them.
+	const resolveColumnInSource = buildColumnSourceResolver(rctx.db);
 	try {
 		// Recompute the generated-column dependency graph. If the added column is generated
 		// and its expression references an unknown column, or any new generated-column edges
 		// form a cycle, this throws — and the revert below undoes the materialization.
-		const columnOnlySchema = withGeneratedColumnGraph(updatedTableSchema, buildColumnSourceResolver(rctx.db));
+		const columnOnlySchema = withGeneratedColumnGraph(updatedTableSchema, resolveColumnInSource);
 
 		// Register the COLUMN-ONLY schema before installing any inline constraint. Two
 		// properties depend on this ordering, and both are easy to break:
@@ -918,7 +922,7 @@ async function runAddColumn(
 				type: 'addConstraint',
 				constraint,
 			});
-			current = withGeneratedColumnGraph(withConstraint, buildColumnSourceResolver(rctx.db));
+			current = withGeneratedColumnGraph(withConstraint, resolveColumnInSource);
 			if (installedName !== undefined) installedConstraintNames.push(installedName);
 		}
 

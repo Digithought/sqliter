@@ -7,11 +7,15 @@ import type { ResolveColumnInSource, ResolveObjectRef } from './rename-rewriter.
  * schema-object expression consults to tell an unqualified reference that binds to an
  * inner FROM source from one that binds to the table under consideration.
  *
- * Four callers, one definition, so no two of them can disagree about what a name
- * resolves to: `runRenameColumn`'s pre-flight probe and its real propagation, the
- * DROP COLUMN guards (`runtime/emit/drop-column-guards.ts` and
- * `schema/expression-dependents.ts`), and the constraint planner's self-qualifier
- * strip (`planner/building/constraint-builder.ts`).
+ * One definition for every such walk, so no two of them can disagree about what a
+ * name resolves to: `runRenameColumn`'s pre-flight probe and its real propagation,
+ * the DROP COLUMN guards (`runtime/emit/drop-column-guards.ts` and
+ * `schema/expression-dependents.ts`), the constraint planner's self-qualifier strip
+ * (`planner/building/constraint-builder.ts`), the generated-column reference
+ * analysis at CREATE TABLE (`schema/manager.ts`) and at ALTER TABLE
+ * (`planner/building/alter-table.ts`, `runtime/emit/alter-table.ts`), and the
+ * modules' own ALTER re-analysis hooks (`vtab/memory/layer/manager.ts`,
+ * `@quereus/store`'s `store-module-alter.ts`).
  *
  * A source may be a TABLE (a maintained table included — its backing columns are
  * real) or a VIEW. A view exposes a column when its explicit column list names it,

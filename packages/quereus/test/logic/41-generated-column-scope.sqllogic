@@ -164,7 +164,50 @@ alter table sqm drop column a;
 drop table sqm;
 
 -- ===================================
--- 9. Negative arms — genuine mistakes still raise the original messages.
+-- 9. The name a subquery's FROM binds is a reference to THAT table, so the
+--    cross-table column guards see it: dropping the referenced column is refused,
+--    and renaming it rewrites the generated body (the value still computes).
+-- ===================================
+
+create table dref (k integer primary key, v integer);
+insert into dref values (1, 42);
+create table tref (id integer primary key, g integer generated always as ((select v from dref where dref.k = id limit 1)));
+
+alter table dref drop column v;
+-- error: Cannot drop column 'v' from 'dref': it is referenced by the GENERATED expression of column 'g' on table 'tref'
+
+alter table dref rename column v to v2;
+-- run
+
+insert into tref (id) values (1);
+select id, g from tref;
+→ [{"id":1,"g":42}]
+
+drop table tref;
+drop table dref;
+
+-- ===================================
+-- 10. An inner name that ALSO names a column of the table being defined belongs to
+--     the subquery's source — analysis and evaluation agree on that reading.
+-- ===================================
+
+create table dsh (k integer primary key, id integer);
+insert into dsh values (1, 99);
+
+create table tsh (id integer primary key);
+insert into tsh values (1);
+alter table tsh add column h integer generated always as ((select id from dsh where dsh.k = 1 limit 1));
+-- run
+
+insert into tsh (id) values (7);
+select id, h from tsh order by id;
+→ [{"id":1,"h":99},{"id":7,"h":99}]
+
+drop table tsh;
+drop table dsh;
+
+-- ===================================
+-- 11. Negative arms — genuine mistakes still raise the original messages.
 -- ===================================
 
 create table n1 (id integer primary key, g integer generated always as (nosuch + 1));
@@ -187,3 +230,9 @@ create table n3 (
 	b integer generated always as (a + 1)
 );
 -- error: Cyclic dependency in generated columns
+
+-- An unrebound `new.` names the row being computed, so an unknown name behind it is a
+-- typo like any other. (Behavior change: this was accepted at DDL time before the
+-- scope-aware analysis and only failed at the first write.)
+create table n4 (id integer primary key, g integer generated always as (new.nosuch + 1));
+-- error: Column 'nosuch' referenced by generated column 'g' not found in table 'n4'
