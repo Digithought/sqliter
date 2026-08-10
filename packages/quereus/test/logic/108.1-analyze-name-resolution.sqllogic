@@ -3,8 +3,6 @@
 -- rows (through both the emitter's table lookup and the schema-only lookup).
 -- It now resolves the target at build time, the same way every other
 -- name-taking statement does, and errors when the name does not exist.
--- Covers every row of the before/after table in
--- tickets/implement/3-analyze-unresolvable-name-is-silent.md.
 
 create table t (id integer primary key, v integer);
 insert into t values (1, 10), (2, 20);
@@ -28,23 +26,23 @@ analyze t;
 -- ===================================
 
 analyze nosuchtable;
--- error: not found
+-- error: Table 'nosuchtable' not found in schema path: main
 
 analyze main.nosuchtable;
--- error: not found
+-- error: Table not found: main.nosuchtable
 
 analyze nosuchschema.t;
--- error: not found
+-- error: Table not found: nosuchschema.t
 
 analyze nosuchschema.*;
--- error: schema not found
+-- error: Schema not found: nosuchschema
 
 -- ===================================
 -- A plain view has no stored rows to collect statistics from
 -- ===================================
 
 analyze v_t;
--- error: view
+-- error: Cannot ANALYZE view 'main.v_t': a view has no stored rows to collect statistics from.
 
 -- ===================================
 -- `temp.` now parses as a schema qualifier (was a parse error before this fix)
@@ -55,6 +53,34 @@ analyze temp.tt;
 
 analyze temp.*;
 → [{"table":"tt","rows":1}]
+
+-- ===================================
+-- An unqualified name follows the session search path, the way it does for
+-- every other statement — the emitter's old lookup hardcoded `main`.
+-- ===================================
+
+analyze tt;
+-- error: Table 'tt' not found in schema path: main
+
+PRAGMA schema_path = 'main,temp';
+-- run
+
+analyze tt;
+→ [{"table":"tt","rows":1}]
+
+PRAGMA schema_path = 'main';
+-- run
+
+-- ===================================
+-- The `committed` pseudo-schema resolves through the search path, so both the
+-- table arm and the view rejection see the same name a plain reference would.
+-- ===================================
+
+analyze committed.t;
+→ [{"table":"t","rows":2}]
+
+analyze committed.v_t;
+-- error: Cannot ANALYZE view 'main.v_t': a view has no stored rows to collect statistics from.
 
 -- ===================================
 -- Materialized view: real backing table, unchanged

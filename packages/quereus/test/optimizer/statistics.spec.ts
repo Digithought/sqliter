@@ -491,11 +491,32 @@ describe('ANALYZE command', () => {
 
 	it('ANALYZE on a nonexistent table throws instead of silently producing no output', async () => {
 		await setupTable();
+		let caught: Error | undefined;
 		try {
 			for await (const _ of db.eval('ANALYZE nonexistent_table')) { /* consume */ }
-			expect.fail('ANALYZE on a missing table must throw');
 		} catch (e) {
-			expect((e as Error).message).to.match(/not found/i);
+			caught = e as Error;
+		}
+		expect(caught, 'ANALYZE on a missing table must throw').to.be.instanceOf(Error);
+		expect(caught!.message).to.include("Table 'nonexistent_table' not found in schema path");
+	});
+
+	it('re-runs a prepared ANALYZE after it invalidated its own cached plan', async () => {
+		// ANALYZE resolves its target at build time (recording a table dependency)
+		// and then writes statistics back onto that same table, firing
+		// `table_modified` — which nulls this statement's own cached plan. The
+		// second execution must rebuild cleanly rather than reuse a nulled plan.
+		await setupTable();
+		const stmt = db.prepare('ANALYZE products');
+		try {
+			for (let i = 0; i < 2; i++) {
+				const rows: any[] = [];
+				for await (const r of stmt.all()) rows.push(r);
+				expect(rows, `run ${i}`).to.have.lengthOf(1);
+				expect(rows[0]).to.have.property('rows', 100);
+			}
+		} finally {
+			await stmt.finalize();
 		}
 	});
 
