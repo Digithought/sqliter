@@ -1,5 +1,5 @@
 import type { Database } from '../../../core/database.js';
-import { type TableSchema, type IndexSchema, type UniqueConstraintSchema, buildColumnIndexMap, columnDefToSchema, resolvePkDefaultConflict, resolveNamedConstraintClass, shiftSchemaIndicesForDrop, rekeySchemaPrimaryKey } from '../../../schema/table.js';
+import { type TableSchema, type IndexSchema, type UniqueConstraintSchema, buildColumnIndexMap, collectTableConstraintNames, columnDefToSchema, resolvePkDefaultConflict, resolveNamedConstraintClass, shiftSchemaIndicesForDrop, rekeySchemaPrimaryKey } from '../../../schema/table.js';
 import { keyParts, type BTreeKeyForPrimary } from '../types.js';
 import { BTree } from 'inheritree';
 import { createValueSet } from '../../../util/value-set.js';
@@ -3110,7 +3110,11 @@ export class MemoryTableManager {
 	 * scaffolding as the other arms (via {@link addConstraint}).
 	 */
 	private addCheckConstraint(constraint: ASTTableConstraint): void {
-		const check = buildCheckConstraintSchema(constraint, this.tableSchema.checkConstraints.length);
+		const check = buildCheckConstraintSchema(
+			constraint,
+			this.tableSchema.checkConstraints.length,
+			collectTableConstraintNames(this.tableSchema),
+		);
 		const newSchema: TableSchema = Object.freeze({
 			...this.tableSchema,
 			checkConstraints: Object.freeze([...this.tableSchema.checkConstraints, check]),
@@ -3219,6 +3223,7 @@ export class MemoryTableManager {
 			this.tableSchema.columnIndexMap,
 			this._tableName,
 			this.schemaName,
+			collectTableConstraintNames(this.tableSchema),
 		);
 		const newSchema: TableSchema = Object.freeze({
 			...this.tableSchema,

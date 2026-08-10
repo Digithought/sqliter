@@ -902,8 +902,16 @@ async function runAddColumn(
 				// reaches the module's persistence side effects — mirroring
 				// `runAddConstraintViaModule`. Built with the same builder and columnIndexMap
 				// the module uses, so the name and column indices are identical to its own.
+				//
+				// The taken-set comes from `current` — the module's OWN latest schema, which
+				// already carries any inline constraint installed earlier in this loop — not
+				// from `columnOnlySchema`. The module disambiguates against exactly that set,
+				// so sourcing it anywhere else lets `installedName` drift from the name the
+				// module actually stored, and the revert path below would then drop by a name
+				// that was never installed, leaving the real FK behind.
 				const fk = buildForeignKeyConstraintSchema(
-					constraint, columnOnlySchema.columnIndexMap, tableSchema.name, tableSchema.schemaName);
+					constraint, columnOnlySchema.columnIndexMap, tableSchema.name, tableSchema.schemaName,
+					collectTableConstraintNames(current));
 				validateForeignKeyCollations(rctx.db, columnOnlySchema, fk);
 				installedName = fk.name;
 			} else if (constraint.type === 'check') {

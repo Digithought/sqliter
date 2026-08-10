@@ -62,11 +62,15 @@ export function buildUniqueConstraintSchema(
  * `SchemaManager.extractForeignKeys` (table-level arm), including the
  * child/parent column-count mismatch error.
  *
- * `takenNames` is the CREATE TABLE path's statement-wide taken-set: when
- * provided, an unnamed FK's `_fk_<table>_<cols>` mint is disambiguated against —
- * and registered into — it (see `disambiguateAutoConstraintName`), so two
- * colliding mints in one declaration get distinct names. ALTER callers omit it
- * and keep the historical mint byte-identical.
+ * `takenNames` is the mint disambiguation set: an unnamed FK's
+ * `_fk_<table>_<cols>` mint is disambiguated against — and registered into — it
+ * (see `disambiguateAutoConstraintName`), so it can never repeat a name already
+ * in use. CREATE TABLE seeds it with the statement's user-written names; every
+ * ALTER path seeds it from the table's existing constraint names
+ * (`collectTableConstraintNames`). Omitting it is supported only for a caller
+ * that genuinely has no table to disambiguate against — an omitted set means an
+ * unnamed FK re-added over an existing `_fk_<table>_<cols>` mints that name a
+ * SECOND time, and one `DROP CONSTRAINT` then removes both.
  */
 export function buildForeignKeyConstraintSchema(
 	con: AST.TableConstraint,
@@ -119,24 +123,51 @@ export function buildForeignKeyConstraintSchema(
  * (memory + store) so a CHECK added via ALTER lands in the *module-cached*
  * schema, in lock-step with the catalog — the same place inline-CREATE CHECKs
  * live and where `DROP/RENAME CONSTRAINT` later resolve the constraint class. An
- * unnamed CHECK is auto-named `check_<existingCount>`, preserving the engine's
- * prior in-emitter naming (`existingCount` = the number of CHECKs already on the
- * table). Determinism is intentionally NOT validated here — a CHECK may reference
- * `new.*`/`old.*`, which is checked at INSERT/UPDATE plan time.
+ * unnamed CHECK is auto-named `check_<n>` — see {@link mintCheckConstraintName}
+ * for how `n` is chosen. Determinism is intentionally NOT validated here — a
+ * CHECK may reference `new.*`/`old.*`, which is checked at INSERT/UPDATE plan time.
  */
 export function buildCheckConstraintSchema(
 	con: AST.TableConstraint,
 	existingCount: number,
+	takenNames: ReadonlySet<string>,
 ): RowConstraintSchema {
 	if (con.type !== 'check' || !con.expr) {
 		throw new QuereusError('CHECK constraint requires an expression', StatusCode.ERROR);
 	}
 	return {
-		name: con.name || `check_${existingCount}`,
+		name: con.name || mintCheckConstraintName(existingCount, takenNames),
 		expr: con.expr,
 		operations: opsToMask(con.operations),
 		tags: con.tags && Object.keys(con.tags).length > 0 ? Object.freeze({ ...con.tags }) : undefined,
 	};
+}
+
+/**
+ * The auto-name for an unnamed table-level CHECK: `check_<n>`, where `n` starts at
+ * `existingCount` (the number of CHECKs already on the table — the engine's
+ * historical spelling) and is bumped upward until the name is free on that table.
+ *
+ * `takenNames` is the table's existing constraint names, case-folded, spanning
+ * CHECK / UNIQUE / FOREIGN KEY as one namespace (`collectTableConstraintNames`) —
+ * the same namespace `namedConstraintExists` and `disambiguateAutoConstraintName`
+ * use. Without the probe, `DROP CONSTRAINT check_0` followed by another unnamed
+ * add re-mints a LIVE name (the count shrank), leaving two constraints one name
+ * addresses and one `DROP` removes both of.
+ *
+ * NOT `disambiguateAutoConstraintName`: that appends a `_<N>` collision suffix,
+ * which on this base would read `check_1_2`. Bumping the index instead keeps the
+ * documented `check_<n>` shape. Seeding at `existingCount` rather than scanning
+ * from 0 is what keeps every non-colliding name byte-identical to the historical
+ * mint — a table whose two CHECKs are USER-named has `existingCount` 2, so the
+ * next unnamed add stays `check_2` instead of shifting to a now-free `check_0`.
+ */
+function mintCheckConstraintName(existingCount: number, takenNames: ReadonlySet<string>): string {
+	// `check_<n>` is already lower-case, and `takenNames` is case-folded, so no
+	// further folding is needed on either side of the membership test.
+	let n = existingCount;
+	while (takenNames.has(`check_${n}`)) n++;
+	return `check_${n}`;
 }
 
 /* ──────────────── ALTER TABLE ADD COLUMN inline constraints ────────────────

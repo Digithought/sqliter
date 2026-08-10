@@ -7,8 +7,8 @@ import { SqlValue, StatusCode } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
 import type { RowConstraintSchema, TableSchema } from '../../schema/table.js';
 import type { Schema } from '../../schema/schema.js';
-import { assertConstraintNameFree, opsToMask, requireVtabModule, resolveReferencedColumnsForEnforcement } from '../../schema/table.js';
-import { buildForeignKeyConstraintSchema, validateForeignKeyCollations } from '../../schema/constraint-builder.js';
+import { assertConstraintNameFree, collectTableConstraintNames, requireVtabModule, resolveReferencedColumnsForEnforcement } from '../../schema/table.js';
+import { buildCheckConstraintSchema, buildForeignKeyConstraintSchema, validateForeignKeyCollations } from '../../schema/constraint-builder.js';
 import { assertUniqueConstraintIndexNameFree, assertUniqueConstraintNotDuplicated } from '../../schema/catalog.js';
 import { assertDdlTransactionPolicy } from './ddl-transaction-policy.js';
 import { emitAlterSchemaEvent, withStatementScopedSchemaEvents } from './alter-schema-event.js';
@@ -87,21 +87,19 @@ async function runAddCheckEngineSide(
 	constraint: AddConstraintNode['constraint'],
 	sql: string,
 ): Promise<SqlValue> {
-	if (!constraint.expr) {
-		throw new QuereusError(
-			'CHECK constraint requires an expression',
-			StatusCode.ERROR
-		);
-	}
-
+	// Through the shared builder (which raises the same expression-less error) so this
+	// arm inherits one auto-naming rule with the module-routed backends rather than
+	// carrying a second copy: the mint is disambiguated against the names already on
+	// the table, so a drop-then-re-add cannot re-mint a live `check_<n>`.
+	//
 	// Note: We don't validate determinism here because constraints may reference NEW/OLD
 	// which require special scoping. Determinism is validated at INSERT/UPDATE plan time
 	// in constraint-builder.ts when the constraint is actually checked.
-	const constraintSchema: RowConstraintSchema = {
-		name: constraint.name || `check_${tableSchema.checkConstraints.length}`,
-		expr: constraint.expr,
-		operations: opsToMask(constraint.operations),
-	};
+	const constraintSchema: RowConstraintSchema = buildCheckConstraintSchema(
+		constraint,
+		tableSchema.checkConstraints.length,
+		collectTableConstraintNames(tableSchema),
+	);
 
 	const updatedConstraints = [...tableSchema.checkConstraints, constraintSchema];
 	const updatedTableSchema: TableSchema = {
@@ -161,9 +159,12 @@ async function runAddConstraintViaModule(
 	// inside alterTable; a post-call throw would leave the conflicting FK on disk, only to
 	// rehydrate on the next reopen). The FK's child columns already exist on the prior
 	// `tableSchema`, so resolution against it is well-defined — and we build the FK via the
-	// same `buildForeignKeyConstraintSchema` + `columnIndexMap` the module uses, so the
-	// pre-built FK's column indices are identical to the module-returned FK's. Only FK ADD
-	// CONSTRAINT has a collation pairing (UNIQUE has none), so gate on the type. The
+	// same `buildForeignKeyConstraintSchema` + `columnIndexMap` + taken-set the module uses,
+	// so the pre-built FK's NAME and column indices are identical to the module-returned
+	// FK's. (The name matters beyond diagnostics on the ADD COLUMN path, which drops by it
+	// on revert — see `runAddColumn`; keeping the two builds in lock-step here keeps that
+	// one rule.) Only FK ADD CONSTRAINT has a collation pairing (UNIQUE has none), so gate
+	// on the type. The
 	// module-side `validateForeignKeyOverExistingRows` stays where it is — it needs a row
 	// scan, this is a pure schema check. (The `foreign_keys` pragma does NOT gate this:
 	// a conflicting-collation declaration is malformed regardless of enforcement.)
@@ -173,6 +174,7 @@ async function runAddConstraintViaModule(
 			tableSchema.columnIndexMap,
 			tableSchema.name,
 			tableSchema.schemaName,
+			collectTableConstraintNames(tableSchema),
 		);
 		validateForeignKeyCollations(rctx.db, tableSchema, fk);
 

@@ -208,7 +208,12 @@ export type { ImportCatalogOptions } from './schema/manager.js';
 // owning table through it rather than re-scanning the schema itself.
 export type { IndexLookupScope, IndexOwnerMatch } from './schema/manager.js';
 export type { SchemaChangeEvent, SchemaChangeListener, TableModifiedEvent, ViewAddedEvent, ViewRemovedEvent } from './schema/change-events.js';
-export { buildColumnIndexMap, columnDefToSchema, resolveNamedConstraintClass, namedConstraintExists, validateCollationForType, resolveDefaultCollation, appendIndexToTableSchema, shiftSchemaIndicesForDrop, rekeySchemaPrimaryKey } from './schema/table.js';
+// `collectTableConstraintNames` + `disambiguateAutoConstraintName` are the two halves of
+// the auto-constraint-name mint rule (build the table's case-folded taken-set, then pick a
+// free spelling). Exported for out-of-tree vtab modules that mint their own constraint
+// names on an ALTER path — a parallel implementation is exactly the drift the differential
+// tests exist to catch.
+export { buildColumnIndexMap, collectTableConstraintNames, columnDefToSchema, disambiguateAutoConstraintName, resolveNamedConstraintClass, namedConstraintExists, validateCollationForType, resolveDefaultCollation, appendIndexToTableSchema, shiftSchemaIndicesForDrop, rekeySchemaPrimaryKey } from './schema/table.js';
 export { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, validateForeignKeyCollations, maintainedTableUniqueViolationError, formatKeyValue } from './schema/constraint-builder.js';
 export type { TableSchema, IndexSchema as TableIndexSchema, UniqueConstraintSchema, ForeignKeyConstraintSchema, NamedConstraintClass } from './schema/table.js';
 // Per-column UNIQUE-enforcement collation resolver, plus the per-column comparators

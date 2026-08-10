@@ -28,6 +28,7 @@ import {
 	buildColumnSourceResolver,
 	buildObjectRefResolver,
 	buildUniqueConstraintSchema,
+	collectTableConstraintNames,
 	columnDefToSchema,
 	foldDefaultToType,
 	objectRefKey,
@@ -574,7 +575,13 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 				uniqueConstraints: Object.freeze([...(oldSchema.uniqueConstraints ?? []), uc]),
 			};
 		} else if (constraint.type === 'foreignKey') {
-			const fk = buildForeignKeyConstraintSchema(constraint, oldSchema.columnIndexMap, oldSchema.name, oldSchema.schemaName);
+			const fk = buildForeignKeyConstraintSchema(
+				constraint,
+				oldSchema.columnIndexMap,
+				oldSchema.name,
+				oldSchema.schemaName,
+				collectTableConstraintNames(oldSchema),
+			);
 			updatedSchema = {
 				...oldSchema,
 				foreignKeys: Object.freeze([...(oldSchema.foreignKeys ?? []), fk]),
@@ -586,7 +593,11 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 			// engine's prior in-emitter behavior) no existing-row scan. Routing it
 			// here — rather than catalog-only — keeps the persisted DDL and the
 			// connected-table schema in lock-step so DROP/RENAME CONSTRAINT resolve it.
-			const check = buildCheckConstraintSchema(constraint, oldSchema.checkConstraints.length);
+			const check = buildCheckConstraintSchema(
+				constraint,
+				oldSchema.checkConstraints.length,
+				collectTableConstraintNames(oldSchema),
+			);
 			updatedSchema = {
 				...oldSchema,
 				checkConstraints: Object.freeze([...oldSchema.checkConstraints, check]),
