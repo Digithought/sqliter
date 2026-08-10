@@ -13,7 +13,7 @@ import { TableReferenceNode } from '../nodes/reference.js';
 import * as AST from '../../parser/ast.js';
 import { validateDeterministicConstraint } from '../validation/determinism-validator.js';
 import { columnSchemaToScalarType } from '../type-utils.js';
-import { stripSelfQualifierInCheckExpression } from '../../schema/rename-rewriter.js';
+import { stripSelfQualifierInSchemaExpression } from '../../schema/rename-rewriter.js';
 import { buildColumnSourceResolver } from '../../schema/column-source-resolver.js';
 import { cloneExpr } from '../mutation/scope-transform.js';
 import { mutationContextVarNames, registerMutationContextSymbols, type MutationContextAttribute } from './mutation-context.js';
@@ -172,7 +172,7 @@ export function buildConstraintChecks(
       // peers' parent-chain fallback.
       let constraintExpr = constraint.expr;
       const stripped = cloneExpr(constraint.expr);
-      if (stripSelfQualifierInCheckExpression(stripped, tableSchema.name, tableSchema.schemaName, resolveColumnInSource)) {
+      if (stripSelfQualifierInSchemaExpression(stripped, tableSchema.name, tableSchema.schemaName, resolveColumnInSource)) {
         constraintExpr = stripped;
       }
 

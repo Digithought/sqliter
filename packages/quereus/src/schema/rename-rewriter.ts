@@ -2,8 +2,9 @@
  * In-place, scope-aware AST rewriters over schema-object expressions: the
  * rename walkers propagate ALTER TABLE RENAME operations into dependent
  * objects (CHECK expressions, view SELECT bodies, etc.), and the
- * self-qualifier strip folds a CHECK's table-qualified self-references so
- * the constraint planner's row-context scope can resolve them.
+ * self-qualifier strip folds a schema-authored row expression's
+ * table-qualified self-references (a CHECK's or a GENERATED ALWAYS AS body's)
+ * so the row-context scope it is compiled against can resolve them.
  *
  * The three walkers live in `rename/`, split along their seams — table
  * rename (`rename/table-rename.ts`), column rename
@@ -36,4 +37,4 @@ export {
 	bodyExposesRenamedColumn,
 	bodyPublishesColumnNamed,
 } from './rename/column-rename.js';
-export { stripSelfQualifierInCheckExpression } from './rename/self-qualifier-strip.js';
+export { stripSelfQualifierInSchemaExpression } from './rename/self-qualifier-strip.js';

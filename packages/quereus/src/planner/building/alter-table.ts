@@ -9,7 +9,8 @@ import { PlanNode, type VoidNode, type ScalarPlanNode, type Attribute, type RowD
 import type { TableReferenceNode } from '../nodes/reference.js';
 import { buildExpression } from './expression.js';
 import { buildRowDefaultScope } from './default-scope.js';
-import { validateDeterministicDefault, validateDeterministicGenerated } from '../validation/determinism-validator.js';
+import { validateDeterministicDefault } from '../validation/determinism-validator.js';
+import { buildGeneratedColumnExpr } from './generated-column-scope.js';
 import { tryFoldLiteral } from '../../parser/utils.js';
 import { inferType } from '../../types/registry.js';
 import { columnSchemaToScalarType } from '../type-utils.js';
@@ -308,24 +309,29 @@ function buildAddColumnBackfill(
     type: columnSchemaToScalarType(column),
     sourceRelation: 'add-column-backfill',
   }));
-  const rowScope = buildRowDefaultScope(ctx.scope, tableSchema.columns, rowAttrs);
-  // Schema-authored SQL, wrapped exactly as the three DML builders wrap theirs, so the
-  // backfill expression resolves bare relation names against the altered table's own
-  // schema — not whatever path the ALTER runs on. The CTE half of the wrapper is inert
-  // here (ALTER is not an `AST.QueryExpr`, so it can neither be a CTE body nor carry a
-  // `with` clause of its own); the schema-path half is the load-bearing part.
-  const node = buildExpression(
-    { ...schemaAuthoredContext(ctx, tableSchema.schemaName), scope: rowScope },
-    sourceExpr,
-  ) as ScalarPlanNode;
+  let node: ScalarPlanNode;
+  if (generatedExpr) {
+    // The generated arm goes through the builder every write-path site shares, so a
+    // GENERATED ALWAYS AS declaration this ALTER accepts is one every subsequent
+    // INSERT / UPDATE / upsert recompute accepts — same accepted spellings, same
+    // `schemaAuthoredContext` wrapper, same determinism validation.
+    node = buildGeneratedColumnExpr(ctx, tableSchema, columnDef.name, generatedExpr, rowAttrs);
+  } else {
+    const rowScope = buildRowDefaultScope(ctx.scope, tableSchema.columns, rowAttrs);
+    // Schema-authored SQL, wrapped exactly as the three DML builders wrap theirs, so the
+    // backfill expression resolves bare relation names against the altered table's own
+    // schema — not whatever path the ALTER runs on. The CTE half of the wrapper is inert
+    // here (ALTER is not an `AST.QueryExpr`, so it can neither be a CTE body nor carry a
+    // `with` clause of its own); the schema-path half is the load-bearing part.
+    node = buildExpression(
+      { ...schemaAuthoredContext(ctx, tableSchema.schemaName), scope: rowScope },
+      sourceExpr,
+    ) as ScalarPlanNode;
 
-  // Same validator each arm's write-path build site uses, so an ALTER accepts exactly
-  // what the equivalent CREATE TABLE + INSERT accepts. Both honour
-  // `nondeterministic_schema`, so the escape hatch is unchanged.
-  if (!ctx.db.options.getBooleanOption('nondeterministic_schema')) {
-    if (generatedExpr) {
-      validateDeterministicGenerated(node, columnDef.name, tableSchema.name);
-    } else {
+    // Same validator the DEFAULT's write-path build site uses, so an ALTER accepts
+    // exactly what the equivalent CREATE TABLE + INSERT accepts. It honours
+    // `nondeterministic_schema`, so the escape hatch is unchanged.
+    if (!ctx.db.options.getBooleanOption('nondeterministic_schema')) {
       validateDeterministicDefault(node, columnDef.name, tableSchema.name);
     }
   }

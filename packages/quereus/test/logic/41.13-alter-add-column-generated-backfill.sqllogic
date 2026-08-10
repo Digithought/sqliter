@@ -424,3 +424,114 @@ select id, v, g from t_after order by id;
 
 drop table t_after;
 -- run
+
+-- ============================================================
+-- 14. Every accepted spelling backfills AND stays writable afterwards
+--
+-- The declaration this ALTER accepts must be one every subsequent INSERT accepts:
+-- the backfill and the write path compile the same stored body, through the same
+-- builder (`planner/building/generated-column-scope.ts`). `new.<col>` is the arm
+-- that used to break — the ALTER accepted it and backfilled correctly, and then
+-- every INSERT afterwards failed with `new.<col> isn't a column`, leaving a table
+-- that could never gain another row.
+--
+-- Each arm: backfill an existing row, insert a new one, update the source column.
+-- All three must agree. The CREATE TABLE side of the same matrix lives in
+-- 41-generated-columns.sqllogic.
+-- ============================================================
+
+create table t_sp_bare (id integer primary key, a integer);
+insert into t_sp_bare values (1, 3);
+-- run
+
+alter table t_sp_bare add column g integer generated always as (a + 1);
+-- run
+
+insert into t_sp_bare (id, a) values (2, 5);
+update t_sp_bare set a = 10 where id = 1;
+-- run
+
+select id, a, g from t_sp_bare order by id;
+→ [{"id":1,"a":10,"g":11},{"id":2,"a":5,"g":6}]
+
+drop table t_sp_bare;
+-- run
+
+create table t_sp_tbl (id integer primary key, a integer);
+insert into t_sp_tbl values (1, 3);
+-- run
+
+alter table t_sp_tbl add column g integer generated always as (t_sp_tbl.a + 1);
+-- run
+
+insert into t_sp_tbl (id, a) values (2, 5);
+update t_sp_tbl set a = 10 where id = 1;
+-- run
+
+select id, a, g from t_sp_tbl order by id;
+→ [{"id":1,"a":10,"g":11},{"id":2,"a":5,"g":6}]
+
+drop table t_sp_tbl;
+-- run
+
+create table t_sp_sch (id integer primary key, a integer);
+insert into t_sp_sch values (1, 3);
+-- run
+
+alter table t_sp_sch add column g integer generated always as (main.t_sp_sch.a + 1);
+-- run
+
+insert into t_sp_sch (id, a) values (2, 5);
+update t_sp_sch set a = 10 where id = 1;
+-- run
+
+select id, a, g from t_sp_sch order by id;
+→ [{"id":1,"a":10,"g":11},{"id":2,"a":5,"g":6}]
+
+drop table t_sp_sch;
+-- run
+
+create table t_sp_new (id integer primary key, a integer);
+insert into t_sp_new values (1, 3);
+-- run
+
+alter table t_sp_new add column g integer generated always as (new.a + 1);
+-- run
+
+insert into t_sp_new (id, a) values (2, 5);
+update t_sp_new set a = 10 where id = 1;
+-- run
+
+select id, a, g from t_sp_new order by id;
+→ [{"id":1,"a":10,"g":11},{"id":2,"a":5,"g":6}]
+
+drop table t_sp_new;
+-- run
+
+-- ============================================================
+-- 15. A second ADD COLUMN reading the first added generated column
+--
+-- `new.g1` names the freshly computed g1, exactly as a bare `g1` does — at
+-- backfill time and on every write afterwards.
+-- ============================================================
+
+create table t_sp_chain (id integer primary key, a integer);
+insert into t_sp_chain values (1, 5);
+-- run
+
+alter table t_sp_chain add column g1 integer generated always as (a * 2);
+alter table t_sp_chain add column g2 integer generated always as (new.g1 + 1);
+-- run
+
+select id, a, g1, g2 from t_sp_chain order by id;
+→ [{"id":1,"a":5,"g1":10,"g2":11}]
+
+insert into t_sp_chain (id, a) values (2, 7);
+update t_sp_chain set a = 10 where id = 1;
+-- run
+
+select id, a, g1, g2 from t_sp_chain order by id;
+→ [{"id":1,"a":10,"g1":20,"g2":21},{"id":2,"a":7,"g1":14,"g2":15}]
+
+drop table t_sp_chain;
+-- run

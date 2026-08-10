@@ -36,7 +36,12 @@ insert into temp.sp_def (id) values (1);
 select id, w from temp.sp_def order by id;
 → [{"id":1,"w":3}]
 
--- ===== Generated column, INSERT path =====
+-- ===== Generated column, all four write sites =====
+-- One stored body, four statements that compile it (the INSERT row expansion, the
+-- `on conflict do update` recompute, the UPDATE recompute, and the ADD COLUMN
+-- backfill), one shared builder (`planner/building/generated-column-scope.ts`) that
+-- wraps every one of them in `schemaAuthoredContext`. All four must read `temp.c`
+-- (3 rows, beside the table), never the decoy `main.c` on the writer's path.
 
 create table temp.sp_gen (id integer primary key, v integer, g integer generated always as ((select count(*) from c)));
 -- run
@@ -46,14 +51,34 @@ insert into temp.sp_gen (id, v) values (1, 1);
 select id, v, g from temp.sp_gen order by id;
 → [{"id":1,"v":1,"g":3}]
 
+update temp.sp_gen set v = 2 where id = 1;
+
+select id, v, g from temp.sp_gen order by id;
+→ [{"id":1,"v":2,"g":3}]
+
+insert into temp.sp_gen (id, v) values (1, 5) on conflict (id) do update set v = 5;
+
+select id, v, g from temp.sp_gen order by id;
+→ [{"id":1,"v":5,"g":3}]
+
+-- the ADD COLUMN backfill, and a write through the ordinary path afterwards
+create table temp.sp_gen_alter (id integer primary key, v integer);
+insert into temp.sp_gen_alter values (1, 1);
+-- run
+
+alter table temp.sp_gen_alter add column g integer generated always as ((select count(*) from c));
+-- run
+
+insert into temp.sp_gen_alter (id, v) values (2, 2);
+
+select id, v, g from temp.sp_gen_alter order by id;
+→ [{"id":1,"v":1,"g":3},{"id":2,"v":2,"g":3}]
+
 -- ===== UPDATE-path schema-authored build (`building/update.ts`) =====
 -- `building/update.ts` narrows on its own context (`schemaAuthoredUpdateCtx`), shared by
--- the generated-column recompute, the CHECK build and the NOT NULL defaults. A CHECK is
--- what pins it here: the generated-column-on-UPDATE arm cannot be written yet, because a
--- subquery-bearing generated column recomputed on UPDATE currently stores the unresolved
--- promise itself (tracked separately as `bug-update-generated-column-subquery-not-awaited`
--- — an un-awaited evaluator in `runtime/emit/update.ts`, unrelated to schema paths). Add
--- that arm here once that lands.
+-- the CHECK build and the NOT NULL defaults. (The generated-column recompute no longer
+-- rides on that context — it narrows inside the shared generated-expression builder,
+-- pinned by the arm above.)
 
 create table temp.sp_cku (id integer primary key, v integer, check ((select count(*) from c) = 3));
 insert into temp.sp_cku values (1, 1);
@@ -372,6 +397,7 @@ drop table temp.sp_cku;
 drop table temp.sp_ws;
 drop table temp.sp_nnd;
 drop table temp.sp_gen;
+drop table temp.sp_gen_alter;
 drop table temp.sp_def;
 -- sp_acbf's added CHECK reads `c` through a subquery (resolving, from temp, to temp.c),
 -- so it has to go before it: dropping a table a stored expression still names is refused

@@ -189,3 +189,143 @@ SELECT doubled FROM t_gen_default_mode WHERE id = 1;
 
 DROP TABLE t_gen_default_mode;
 DROP TABLE t_gen_virtual;
+
+-- ============================================================
+-- === Row-scope spellings: one meaning at every write site ===
+--
+-- A `generated always as (...)` body is compiled by four different statements —
+-- the INSERT row expansion, the `on conflict do update` recompute, the UPDATE
+-- recompute, and the `alter table ... add column` backfill. All four go through
+-- one builder (`planner/building/generated-column-scope.ts`), so a declaration
+-- the engine accepts is one every subsequent write accepts.
+--
+-- Accepted: bare `col`, `table.col`, `schema.table.col`, `new.col`.
+-- Rejected: `old.col` (see 41-generated-column-errors.sqllogic) and any other
+-- qualifier. The ALTER arms live in
+-- 41.13-alter-add-column-generated-backfill.sqllogic.
+-- ============================================================
+
+-- --- bare `col` ---
+
+create table t_spell_bare (id integer primary key, a integer,
+	g integer generated always as (a * 2) stored);
+insert into t_spell_bare (id, a) values (1, 1);
+select id, a, g from t_spell_bare order by id;
+→ [{"id":1,"a":1,"g":2}]
+
+update t_spell_bare set a = 5 where id = 1;
+select id, a, g from t_spell_bare order by id;
+→ [{"id":1,"a":5,"g":10}]
+
+insert into t_spell_bare (id, a) values (1, 9) on conflict (id) do update set a = 9;
+select id, a, g from t_spell_bare order by id;
+→ [{"id":1,"a":9,"g":18}]
+
+drop table t_spell_bare;
+
+-- --- `table.col` — the body qualifies its own table ---
+
+create table t_spell_tbl (id integer primary key, a integer,
+	g integer generated always as (t_spell_tbl.a * 2) stored);
+insert into t_spell_tbl (id, a) values (1, 1);
+select id, a, g from t_spell_tbl order by id;
+→ [{"id":1,"a":1,"g":2}]
+
+update t_spell_tbl set a = 5 where id = 1;
+select id, a, g from t_spell_tbl order by id;
+→ [{"id":1,"a":5,"g":10}]
+
+insert into t_spell_tbl (id, a) values (1, 9) on conflict (id) do update set a = 9;
+select id, a, g from t_spell_tbl order by id;
+→ [{"id":1,"a":9,"g":18}]
+
+drop table t_spell_tbl;
+
+-- --- `schema.table.col` — the body qualifies its own schema and table ---
+
+create table t_spell_sch (id integer primary key, a integer,
+	g integer generated always as (main.t_spell_sch.a * 2) stored);
+insert into t_spell_sch (id, a) values (1, 1);
+select id, a, g from t_spell_sch order by id;
+→ [{"id":1,"a":1,"g":2}]
+
+update t_spell_sch set a = 5 where id = 1;
+select id, a, g from t_spell_sch order by id;
+→ [{"id":1,"a":5,"g":10}]
+
+insert into t_spell_sch (id, a) values (1, 9) on conflict (id) do update set a = 9;
+select id, a, g from t_spell_sch order by id;
+→ [{"id":1,"a":9,"g":18}]
+
+drop table t_spell_sch;
+
+-- --- `new.col` — an exact alias for the bare form ---
+
+create table t_spell_new (id integer primary key, a integer,
+	g integer generated always as (new.a * 2) stored);
+insert into t_spell_new (id, a) values (1, 1);
+select id, a, g from t_spell_new order by id;
+→ [{"id":1,"a":1,"g":2}]
+
+update t_spell_new set a = 5 where id = 1;
+select id, a, g from t_spell_new order by id;
+→ [{"id":1,"a":5,"g":10}]
+
+insert into t_spell_new (id, a) values (1, 9) on conflict (id) do update set a = 9;
+select id, a, g from t_spell_new order by id;
+→ [{"id":1,"a":9,"g":18}]
+
+drop table t_spell_new;
+
+-- --- `new.<other generated column>` sees the freshly computed value ---
+-- The generated columns are computed in dependency order, so g2 reads g1's new
+-- value, not the NULL placeholder the row expansion starts from.
+
+create table t_spell_chain (id integer primary key, a integer,
+	g1 integer generated always as (a * 2) stored,
+	g2 integer generated always as (new.g1 + 1) stored);
+insert into t_spell_chain (id, a) values (1, 5);
+select id, a, g1, g2 from t_spell_chain order by id;
+→ [{"id":1,"a":5,"g1":10,"g2":11}]
+
+update t_spell_chain set a = 10 where id = 1;
+select id, a, g1, g2 from t_spell_chain order by id;
+→ [{"id":1,"a":10,"g1":20,"g2":21}]
+
+insert into t_spell_chain (id, a) values (1, 3) on conflict (id) do update set a = 3;
+select id, a, g1, g2 from t_spell_chain order by id;
+→ [{"id":1,"a":3,"g1":6,"g2":7}]
+
+drop table t_spell_chain;
+
+-- --- a real table named `new` is still reachable from a generated body ---
+-- `new` is not a reserved word. The row scope is an ANCESTOR of every subquery
+-- planned inside the body, so the subquery's own FROM binds the name first and
+-- `"new".a` reads the table, not the row being written.
+
+create table "new" (a integer primary key);
+insert into "new" values (7);
+
+create table t_spell_newtbl (id integer primary key,
+	g integer generated always as ((select max("new".a) from "new")) stored);
+insert into t_spell_newtbl (id) values (1);
+select id, g from t_spell_newtbl order by id;
+→ [{"id":1,"g":7}]
+
+drop table t_spell_newtbl;
+drop table "new";
+
+-- --- a mutation-context variable does NOT shadow a column here ---
+-- In a CHECK or a column DEFAULT a `with context` variable claims the bare name.
+-- A generated body is different on purpose: its value is a pure function of the
+-- row being written and must compute identically at all four sites, and the
+-- `alter table ... add column` backfill has no context envelope to read. So the
+-- bare name always means the column. `g` below is a + 1 = 4, NOT ctx + 1 = 101.
+
+create table t_spell_ctx (id integer primary key, a integer,
+	g integer generated always as (a + 1) stored) with context (a integer);
+insert into t_spell_ctx (id, a) values (1, 3) with context a = 100;
+select id, a, g from t_spell_ctx order by id;
+→ [{"id":1,"a":3,"g":4}]
+
+drop table t_spell_ctx;

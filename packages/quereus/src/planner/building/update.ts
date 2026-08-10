@@ -21,7 +21,7 @@ import { buildConstraintChecks, buildNotNullDefaults } from './constraint-builde
 import { columnSchemaToScalarType } from '../type-utils.js';
 import { buildChildSideFKChecks, buildParentSideFKChecks, getBatchableRestrictFks } from './foreign-key-builder.js';
 import { isCommittedSchemaRef } from './schema-resolution.js';
-import { validateDeterministicGenerated } from '../validation/determinism-validator.js';
+import { buildGeneratedColumnExpr } from './generated-column-scope.js';
 import { buildViewMutation } from './view-mutation-builder.js';
 import { isMaintainedTable, maintainedTableViewLike } from '../../schema/derivation.js';
 import { isViewSchema } from '../../schema/view.js';
@@ -209,14 +209,19 @@ export function buildUpdateStmt(
   // that a generated column referencing another generated column sees the
   // freshly-computed value when the runtime evaluates each in turn against
   // the in-place updated row.
+  //
+  // Built through the shared generated-expression builder — NOT on the statement's
+  // table scope — so the body accepts exactly the spellings an INSERT, an upsert
+  // recompute and an ADD COLUMN backfill accept. Parenting on the plain statement
+  // scope also keeps the statement's own correlation name (`update t as x …`) out of
+  // reach of schema-authored SQL: a self-qualified `t.<col>` is folded by the builder,
+  // while `x.<col>` resolves nowhere, as it does at the other three sites.
   const genTopoOrder = tableReference.tableSchema.generatedColumnTopoOrder ?? [];
   for (const colIdx of genTopoOrder) {
     const col = tableReference.tableSchema.columns[colIdx];
     if (!col.generated || !col.generatedExpr) continue;
-    const genNode = buildExpression(schemaAuthoredUpdateCtx, col.generatedExpr) as ScalarPlanNode;
-    if (!ctx.db.options.getBooleanOption('nondeterministic_schema')) {
-      validateDeterministicGenerated(genNode, col.name, tableReference.tableSchema.name);
-    }
+    const genNode = buildGeneratedColumnExpr(
+      ctx, tableReference.tableSchema, col.name, col.generatedExpr, sourceAttributes);
     const targetColumn: AST.ColumnExpr = { type: 'column', name: col.name, table: stmt.table.name, schema: stmt.table.schema };
     assignments.push({ targetColumn, value: genNode, isGenerated: true });
   }

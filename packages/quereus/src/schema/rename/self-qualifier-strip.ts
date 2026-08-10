@@ -3,7 +3,7 @@ import { eq, type ResolveColumnInSource } from './shared.js';
 import { buildScopeFrame, emptyScopeFrame, opaqueScopeFrame, withScopeFrame, type ScopeFrame } from './scope-frame.js';
 
 // ──────────────────────────────────────────────────────────────────────
-// Self-qualifier strip (CHECK expressions)
+// Self-qualifier strip (schema-authored row expressions)
 // ──────────────────────────────────────────────────────────────────────
 
 interface StripState {
@@ -18,14 +18,17 @@ interface StripState {
 }
 
 /**
- * Strip table-qualified self-references in a CHECK expression down to the
+ * Strip table-qualified self-references in a schema-authored ROW expression —
+ * a `CHECK` constraint or a `GENERATED ALWAYS AS` body — down to the
  * unqualified form: `check (t.qty > 0)` (or `main.t.qty`) becomes
- * `check (qty > 0)` so the constraint planner's row-context scope — which
- * registers bare / `NEW.` / `OLD.` column names only — can resolve it.
+ * `check (qty > 0)` so the row-context scope those expressions are compiled
+ * against — which registers bare / `NEW.` (/ `OLD.` for a CHECK) column names
+ * only — can resolve it. Callers: `planner/building/constraint-builder.ts` and
+ * `planner/building/generated-column-scope.ts`.
  *
- * Deliberately NOT done by seeding `<table>.<col>` keys into the constraint
- * scope: that scope is an ancestor of every subquery planned inside the
- * CHECK, and a join peer's parent-chain fallback (`MultiScope` first-match
+ * Deliberately NOT done by seeding `<table>.<col>` keys into that row scope:
+ * the scope is an ancestor of every subquery planned inside the expression,
+ * and a join peer's parent-chain fallback (`MultiScope` first-match
  * on qualified names) would resolve an inner relation's qualified columns
  * against the outer row context (observed with lens view expansions).
  *
@@ -37,14 +40,14 @@ interface StripState {
  * function / CTE sources are unanalyzable and conservatively block the
  * strip (the ref then stays qualified and fails to resolve exactly as it
  * did before this rewrite existed). CTE and derived-table bodies cannot
- * correlate to the constraint row, so stripping is suppressed inside them.
+ * correlate to the written row, so stripping is suppressed inside them.
  * The frame model lives in `./scope-frame.ts`, shared with the
  * generated-column reference collector.
  *
- * Mutates `expr` in place (callers pass a clone of the stored constraint
- * AST) and returns whether anything was rewritten.
+ * Mutates `expr` in place (callers pass a clone of the stored expression,
+ * never the schema's own AST) and returns whether anything was rewritten.
  */
-export function stripSelfQualifierInCheckExpression(
+export function stripSelfQualifierInSchemaExpression(
 	expr: AST.AstNode | undefined,
 	tableName: string,
 	defaultSchemaName: string,
@@ -194,9 +197,9 @@ function stripColumnQualifier(col: AST.ColumnExpr, state: StripState): void {
 	}
 	if (qualifier !== state.tableName) return;
 	// A qualified self-reference must name the OWNING table's schema exactly —
-	// `defaultSchema` here is the CHECK's owning schema (the caller passes
+	// `defaultSchema` here is the expression's owning schema (the caller passes
 	// `tableSchema.schemaName`), so no path resolution applies: `main.t.qty` in
-	// a CHECK on `temp.t` is not a self-reference.
+	// an expression on `temp.t` is not a self-reference.
 	if (!(col.schema === undefined || eq(col.schema, state.defaultSchema))) return;
 	// Strip only when no intervening frame could capture the unqualified name.
 	const colLower = col.name.toLowerCase();

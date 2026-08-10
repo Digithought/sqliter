@@ -16,6 +16,7 @@ import type { ColumnDef } from '../../common/datatype.js';
 import { RegisteredScope } from '../scopes/registered.js';
 import type { Scope } from '../scopes/scope.js';
 import { buildRowDefaultScope } from './default-scope.js';
+import { buildGeneratedColumnExpr } from './generated-column-scope.js';
 import { ColumnReferenceNode, TableReferenceNode } from '../nodes/reference.js';
 import { SinkNode } from '../nodes/sink-node.js';
 import { ConstraintCheckNode } from '../nodes/constraint-check-node.js';
@@ -29,7 +30,7 @@ import { DmlExecutorNode, type UpsertClausePlan, type UpsertUpdateValidation } f
 import { buildConstraintChecks, buildNotNullDefaults } from './constraint-builder.js';
 import { buildChildSideFKChecks, buildParentSideFKChecks, getBatchableRestrictFks } from './foreign-key-builder.js';
 import { schemaAuthoredContext } from './schema-authored-context.js';
-import { validateDeterministicDefault, validateDeterministicGenerated } from '../validation/determinism-validator.js';
+import { validateDeterministicDefault } from '../validation/determinism-validator.js';
 import { validateReturningQualifiers } from '../validation/returning-qualifier-validator.js';
 import { isCommittedSchemaRef } from './schema-resolution.js';
 import { buildViewMutation } from './view-mutation-builder.js';
@@ -217,27 +218,15 @@ function createGeneratedColumnProjection(
 		const genColumn = tableSchema.columns[genColIdx];
 		if (!genColumn.generated || !genColumn.generatedExpr) continue;
 
+		// The row this iteration computes from is the CURRENT node's output, not the
+		// table reference's: generated columns processed in earlier iterations carry
+		// their freshly-computed value there. Do not collapse the chain.
 		const inputAttributes = currentNode.getAttributes();
-
-		// Scope: every column resolves to the corresponding attribute in the
-		// current source. This includes generated columns processed in earlier
-		// iterations — their attribute carries the freshly-computed value.
-		const genScope = new RegisteredScope(ctx.scope);
-		tableSchema.columns.forEach((col, colIndex) => {
-			const attr = inputAttributes[colIndex];
-			genScope.registerSymbol(col.name.toLowerCase(), (exp, s) =>
-				new ColumnReferenceNode(s, exp as AST.ColumnExpr, attr.type, attr.id, colIndex)
-			);
-		});
-
-		const genCtx = { ...ctx, scope: genScope };
 
 		const genProjections: Projection[] = tableSchema.columns.map((col, colIdx) => {
 			if (colIdx === genColIdx) {
-				const genNode = buildExpression(genCtx, genColumn.generatedExpr!) as ScalarPlanNode;
-				if (!ctx.db.options.getBooleanOption('nondeterministic_schema')) {
-					validateDeterministicGenerated(genNode, genColumn.name, tableSchema.name);
-				}
+				const genNode = buildGeneratedColumnExpr(
+					ctx, tableSchema, genColumn.name, genColumn.generatedExpr!, inputAttributes);
 				return { node: genNode, alias: col.name };
 			}
 			const attr = inputAttributes[colIdx];
@@ -339,10 +328,12 @@ function registerExistingRowColumns(
  *
  * The expressions get their OWN scope over the existing-row attributes rather than
  * reusing the SET scope: schema-authored SQL must not be able to bind the
- * statement's `new.` / `excluded.` symbols. Wrapped in `schemaAuthoredContext` for
- * the same reason `building/update.ts` wraps its recompute — the table's own DDL
- * resolves bare relation names in its own schema and cannot see the writing
- * statement's CTEs.
+ * statement's `new.` / `excluded.` symbols. That scope — and the
+ * `schemaAuthoredContext` wrapper — come from {@link buildGeneratedColumnExpr}, the
+ * one builder all four generated-expression sites share, so this recompute accepts
+ * exactly the spellings an INSERT, an UPDATE and an ADD COLUMN backfill accept.
+ * Only the generated arm routes through it: the DO UPDATE SET scope keeps its own
+ * `<table>.<col>` registration, which serves user-written SQL, not a stored body.
  */
 function appendGeneratedRecomputes(
 	ctx: PlanningContext,
@@ -350,20 +341,12 @@ function appendGeneratedRecomputes(
 	existingAttributes: readonly Attribute[],
 	assignments: Map<number, ScalarPlanNode>,
 ): number[] {
-	const generatedCtx = schemaAuthoredContext(
-		{ ...ctx, scope: registerExistingRowColumns(new RegisteredScope(ctx.scope), tableSchema, existingAttributes) },
-		tableSchema.schemaName,
-	);
-
 	const generatedAssignmentColumns: number[] = [];
 	for (const colIndex of tableSchema.generatedColumnTopoOrder ?? []) {
 		const col = tableSchema.columns[colIndex];
 		if (!col.generated || !col.generatedExpr) continue;
-		const genNode = buildExpression(generatedCtx, col.generatedExpr) as ScalarPlanNode;
-		if (!ctx.db.options.getBooleanOption('nondeterministic_schema')) {
-			validateDeterministicGenerated(genNode, col.name, tableSchema.name);
-		}
-		assignments.set(colIndex, genNode);
+		assignments.set(colIndex, buildGeneratedColumnExpr(
+			ctx, tableSchema, col.name, col.generatedExpr, existingAttributes));
 		generatedAssignmentColumns.push(colIndex);
 	}
 	return generatedAssignmentColumns;
