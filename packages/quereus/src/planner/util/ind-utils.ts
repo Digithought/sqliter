@@ -26,6 +26,7 @@
 
 import type { TableSchema, ForeignKeyConstraintSchema } from '../../schema/table.js';
 import { resolveReferencedColumns } from '../../schema/table.js';
+import type { CapabilityProvider } from '../../vtab/capabilities.js';
 import type { InclusionDependency, RelationalPlanNode } from '../nodes/plan-node.js';
 import { TableReferenceNode } from '../nodes/reference.js';
 import { RetrieveNode } from '../nodes/retrieve-node.js';
@@ -43,6 +44,19 @@ import { ProjectNode } from '../nodes/project-node.js';
 export interface CoveringFKMatch {
 	fk: ForeignKeyConstraintSchema;
 	nullable: boolean;
+}
+
+/**
+ * True when `module` declares `permitsOrphanedForeignKeyRows` — the shared
+ * predicate behind both FK-existence producers in this file (invariant
+ * OPT-059). An orphan-permitting backend can hold a child row whose FK value
+ * matches no parent row, so a declared FK on (or into) such a module is not an
+ * inclusion dependency and must not produce the ≥1-match existence claim.
+ * Undefined module (logical lens-slot tables) ⇒ not gated, same as the CHECK
+ * precedent in `analysis/check-extraction.ts`.
+ */
+function permitsOrphans(module: CapabilityProvider | undefined): boolean {
+	return module?.getCapabilities?.().permitsOrphanedForeignKeyRows === true;
 }
 
 /**
@@ -67,13 +81,24 @@ export interface CoveringFKMatch {
  * covered by the FK and must not fold. A defensive cross-check additionally
  * requires every `fk.referencedColumns[i]` to be a PK column so a malformed FK
  * referencing non-PK columns never produces an IND on the PK.
+ *
+ * **Capability gate (OPT-059).** Returns `undefined` when either side's owning
+ * module declares `permitsOrphanedForeignKeyRows`: an orphan-permitting child
+ * backend can hold rows the parent never matched, and an orphan-permitting
+ * *parent* backend can delete a parent row through a path the engine never
+ * sees (e.g. replication), orphaning the child either way. The module
+ * parameters default to each schema's own `vtabModule`; pass explicitly only
+ * at sites that resolve the module independently of the schema.
  */
 export function lookupCoveringFK(
 	childSchema: TableSchema,
 	parentSchema: TableSchema,
 	childEquiCols: ReadonlyArray<number>,
 	parentEquiCols: ReadonlyArray<number>,
+	childModule: CapabilityProvider | undefined = childSchema.vtabModule,
+	parentModule: CapabilityProvider | undefined = parentSchema.vtabModule,
 ): CoveringFKMatch | undefined {
+	if (permitsOrphans(childModule) || permitsOrphans(parentModule)) return undefined;
 	if (!childSchema.foreignKeys) return undefined;
 	if (childEquiCols.length !== parentEquiCols.length) return undefined;
 	if (childEquiCols.length === 0) return undefined;
@@ -158,19 +183,29 @@ export function fkChildNullable(
  * `fkChildNullable` bit. Parent schemas are resolved through `findParent`; an FK
  * whose parent cannot be resolved, has no PK, or has a mismatched PK seeds
  * nothing.
+ *
+ * **Capability gate (OPT-059).** Seeds nothing when the child's owning module
+ * declares `permitsOrphanedForeignKeyRows` (whole-function short-circuit), and
+ * skips any FK whose *resolved parent's* module declares it (per-FK) — same
+ * both-sides rationale as `lookupCoveringFK`. `childModule` defaults to the
+ * schema's own `vtabModule`; `TableReferenceNode` passes its
+ * construction-resolved module explicitly.
  */
 export function seedTableForeignKeyInds(
 	childSchema: TableSchema,
 	findParent: (tableName: string, schemaName: string) => TableSchema | undefined,
+	childModule: CapabilityProvider | undefined = childSchema.vtabModule,
 ): InclusionDependency[] {
 	const fks = childSchema.foreignKeys;
 	if (!fks || fks.length === 0) return [];
+	if (permitsOrphans(childModule)) return [];
 
 	const inds: InclusionDependency[] = [];
 	for (const fk of fks) {
 		const parentSchemaName = fk.referencedSchema ?? childSchema.schemaName;
 		const parent = findParent(fk.referencedTable, parentSchemaName);
 		if (!parent) continue;
+		if (permitsOrphans(parent.vtabModule)) continue;
 
 		const pkDef = parent.primaryKeyDefinition;
 		if (pkDef.length === 0) continue;

@@ -194,10 +194,18 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 		// indices here, so the FK child columns are used verbatim as `cols`. Needs
 		// the schema manager to resolve parent tables; when absent (isolated test
 		// construction) no INDs are seeded.
+		//
+		// Skipped wholesale when the owning vtab module declares the
+		// `permitsOrphanedForeignKeyRows` capability (and per-FK when a resolved
+		// parent's module does): an orphan-permitting backend can hold child rows
+		// no parent matches, so a declared FK is not an inclusion dependency there
+		// (invariant OPT-059). The gate lives centrally in `seedTableForeignKeyInds`;
+		// the node's own module reference is passed explicitly (it is resolved at
+		// construction, independent of the schema — same as the CHECK gate above).
 		let inds: ReadonlyArray<InclusionDependency> = [];
 		if (this.schemaManager !== undefined) {
 			const sm = this.schemaManager;
-			inds = seedTableForeignKeyInds(this.tableSchema, (t, s) => sm.findTable(t, s));
+			inds = seedTableForeignKeyInds(this.tableSchema, (t, s) => sm.findTable(t, s), this.vtabModule);
 		}
 
 		const out: Partial<PhysicalProperties> = {};

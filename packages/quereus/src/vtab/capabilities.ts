@@ -40,8 +40,9 @@ export interface ModuleCapabilities {
 	// path. They are asserted only in tests, and the isolation layer augments
 	// `isolation` / `savepoints` for its own bookkeeping — nothing reads them as a
 	// gate. Toggling one changes no engine behavior. Only `delegatesNotNullBackfill`,
-	// `permitsGrandfatheredCheckViolators`, and `ddlTransactionality` (below) are
-	// live capability gates. See docs/module-capabilities.md § "Surface inventory".
+	// `permitsGrandfatheredCheckViolators`, `permitsOrphanedForeignKeyRows`, and
+	// `ddlTransactionality` (below) are live capability gates. See
+	// docs/module-capabilities.md § "Surface inventory".
 
 	/** Advisory: module provides transaction isolation (read-your-own-writes, snapshot reads). Not engine-consulted. */
 	isolation?: boolean;
@@ -106,10 +107,36 @@ export interface ModuleCapabilities {
 	permitsGrandfatheredCheckViolators?: boolean;
 
 	/**
-	 * Declares how this module's DDL behaves inside a transaction — the third LIVE
-	 * capability gate alongside `delegatesNotNullBackfill` and
-	 * `permitsGrandfatheredCheckViolators`. See {@link DdlTransactionality} for the
-	 * three tiers.
+	 * Module may carry a row whose declared foreign-key value matches no row in
+	 * the referenced parent table (an "orphan"). Typical sources: `ALTER TABLE …
+	 * ADD CONSTRAINT … FOREIGN KEY` succeeding against non-conforming rows and
+	 * grandfathering them, or a replicated backend deleting a parent row through
+	 * a path the engine never sees.
+	 *
+	 * Default/absent ⇒ the planner treats every declared FK as a hard inclusion
+	 * dependency (`child.fk ⊆ parent.pk`): `lookupCoveringFK` and
+	 * `seedTableForeignKeyInds` (`planner/util/ind-utils.ts`) produce the
+	 * existence claim consumed by INNER join elimination, semi/anti-join FK
+	 * folds, the fan-out lookup join's `atMostOne-inner` mode, and the coverage
+	 * prover's no-row-loss obligation.
+	 *
+	 * When true, both producers return the empty answer whenever this module owns
+	 * the child OR the parent side of the FK, so no consumer can conclude
+	 * existence (≥1 parent match) from the declaration. The at-most-one claim
+	 * (`checkFkPkAlignment`) is unaffected — it follows from the parent's key
+	 * being unique, not from inclusion — so LEFT/RIGHT join elimination,
+	 * `atMostOne-left` fan-out, and key-preservation FDs survive. Write-time FK
+	 * enforcement is likewise unchanged. Native modules (memory, store) leave
+	 * this off, so their behavior — and Quereus's own conformance suite — is
+	 * unchanged. See invariant OPT-059.
+	 */
+	permitsOrphanedForeignKeyRows?: boolean;
+
+	/**
+	 * Declares how this module's DDL behaves inside a transaction — the fourth LIVE
+	 * capability gate alongside `delegatesNotNullBackfill`,
+	 * `permitsGrandfatheredCheckViolators`, and `permitsOrphanedForeignKeyRows`.
+	 * See {@link DdlTransactionality} for the three tiers.
 	 *
 	 * Default/absent ⇒ `'non-transactional'`. A module must EXPLICITLY claim
 	 * `'transactional'`; assuming the clean semantics by default would let every
@@ -121,6 +148,16 @@ export interface ModuleCapabilities {
 	 * flag is not consulted and behavior is unchanged.
 	 */
 	ddlTransactionality?: DdlTransactionality;
+}
+
+/**
+ * The slice of a vtab module a planner-side capability gate consults.
+ * Structural, so planner/analysis modules needn't depend on `vtab/module.ts` —
+ * shared by `planner/analysis/check-extraction.ts` and
+ * `planner/util/ind-utils.ts`.
+ */
+export interface CapabilityProvider {
+	getCapabilities?(): ModuleCapabilities;
 }
 
 /**

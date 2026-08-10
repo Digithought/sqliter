@@ -458,9 +458,8 @@ function recognizeSubqueryBranch(
  *
  *   - **at-most-one** (`atMostOne-left` / `atMostOne-inner`) — the lookup is
  *     FK→PK aligned, so each outer row matches ≤1 lookup row. INNER additionally
- *     requires a covering NOT-NULL FK + a row-preserving path (else it would
- *     drop or duplicate rows the cluster cannot account for — bail to preserve
- *     the nested-loop join).
+ *     requires a covering NOT-NULL FK + a row-preserving path (else the branch
+ *     falls through to `cross` below).
  *
  *   - **cross** / **cross-left** — a clean parameterized equi-lookup whose
  *     FK→PK alignment is *absent* (no FK, or FK→non-unique), so the
@@ -470,10 +469,15 @@ function recognizeSubqueryBranch(
  *     nullable-widened branch outputs). The unbounded Cartesian product is gated
  *     by the caller's row/product guards in both cases.
  *
- * Aligned-but-not-at-most-one INNER lookups (nullable FK, non-row-preserving
- * path) are *not* reclassified as `cross`: FK→PK is still ≤1 match, so the issue
- * is inner-drop semantics, not cardinality. They bail (return null) exactly as
- * before, so the chain falls back to a nested-loop join.
+ * Aligned INNER lookups that fail the at-most-one *existence* proof (nullable
+ * FK, non-row-preserving path, or a covering FK suppressed by the
+ * `permitsOrphanedForeignKeyRows` capability gate — see OPT-059) fall through
+ * to the `cross` path rather than bailing: `cross` is sound for an inner join
+ * (inner-drop on an empty branch is exactly inner-join semantics), so only the
+ * at-most-one cardinality claim is lost, and `crossGuardsPass` still gates the
+ * fan-out. Bailing here would abort the WHOLE cluster
+ * (`ruleFanOutLookupJoin` treats a null branch as non-clusterable) — a cliff
+ * strictly worse than clustering at data-driven cardinality.
  */
 function recognizeBranch(
 	join: JoinNode,
@@ -542,9 +546,13 @@ function recognizeBranch(
 		}
 		if (join.joinType === 'inner') {
 			const match = lookupCoveringFK(outerSchema, rightSchema, outerTableCols, rightTableCols);
-			if (!match || match.nullable) return null;
-			if (!isRowPreservingPathToTable(join.right)) return null;
-			return { lookup: join.right, mode: 'atMostOne-inner', condition: join.condition };
+			if (match && !match.nullable && isRowPreservingPathToTable(join.right)) {
+				return { lookup: join.right, mode: 'atMostOne-inner', condition: join.condition };
+			}
+			// Fall through to the cross path — `cross` is sound for an inner join;
+			// only the at-most-one cardinality claim is lost (nullable FK,
+			// non-row-preserving path, or capability-gated FK — OPT-059), and
+			// `crossGuardsPass` still gates the fan-out.
 		}
 		// An aligned `cross` join type (unusual: a cross join carrying an
 		// equi-condition) falls through to the cross treatment below.

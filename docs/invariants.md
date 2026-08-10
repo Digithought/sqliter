@@ -546,6 +546,24 @@ empty key on one or more columns must back it with the singleton FD. The reverse
 hold: a Filter over a covered key, a `LIMIT 1`, or a scalar aggregate adds the FD without
 rewriting its inherited logical keys.
 
+### OPT-059 — FK-derived existence is capability-gated
+
+- code: `packages/quereus/src/planner/util/ind-utils.ts` — `lookupCoveringFK`
+- code: `packages/quereus/src/planner/util/ind-utils.ts` — `seedTableForeignKeyInds`
+- guard: `packages/quereus/test/optimizer/fk-trust-gated-by-capability.spec.ts` — `cap on: join survives and the orphan is dropped`
+- doc: [Functional Dependencies § Inclusion Dependency Tracking](optimizer-fd.md#inclusion-dependency-tracking)
+
+A declared foreign key is treated as an inclusion dependency only when neither the child's
+nor the parent's owning module declares `permitsOrphanedForeignKeyRows`
+(`vtab/capabilities.ts`). Both producers — `lookupCoveringFK` and `seedTableForeignKeyInds`
+— return the empty answer under the cap, so no consumer (INNER join elimination, the
+semi/anti-join FK folds, `atMostOne-inner` fan-out, the coverage prover's no-row-loss
+obligation) can conclude existence from a foreign key the backend does not enforce
+retroactively. The at-most-one claim (`checkFkPkAlignment`) is unaffected: it follows from
+the parent's key being unique, not from inclusion — so LEFT/RIGHT join elimination and
+`atMostOne-left` fan-out survive the cap. Write-time FK enforcement is likewise untouched;
+the gate governs *retroactive trust*, not forward enforcement.
+
 ## MV — Materialized views
 
 The read-side rewrite and the coverage prover are optimizer concerns, not MV ones: a view no

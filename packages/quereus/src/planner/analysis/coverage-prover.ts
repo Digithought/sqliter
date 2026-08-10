@@ -82,13 +82,17 @@
  *
  * **Referential-integrity soundness (load-bearing).** Obligation (2) is sound
  * only because Quereus *enforces* referential integrity: `pragma foreign_keys`
- * defaults on, and the optimizer treats every declared FK as a hard inclusion
- * dependency (`child.fk ⊆ parent.pk` — see `util/ind-utils.ts`). The INNER
- * branch of `rule-join-elimination` already relies on exactly this invariant to
- * drop an FK→PK join, so admitting the same shape here introduces no *new*
- * assumption. If FKs were advisory — or RI is disabled and orphan child rows are
- * inserted — both this admit path *and* inner join elimination would be unsound
- * together; that is a global optimizer assumption, not one this prover owns.
+ * defaults on, and the optimizer treats a declared FK as a hard inclusion
+ * dependency (`child.fk ⊆ parent.pk` — see `util/ind-utils.ts`) — unless either
+ * side's owning vtab module declares the `permitsOrphanedForeignKeyRows`
+ * capability (invariant OPT-059), in which case both FK-existence producers
+ * (`lookupCoveringFK` and `seedTableForeignKeyInds`) return the empty answer
+ * and this prover's IND-derived and structural paths both decline. The INNER
+ * branch of `rule-join-elimination` relies on exactly the same gated invariant
+ * to drop an FK→PK join, so admitting the same shape here introduces no *new*
+ * assumption; the residual exposure — orphans inserted with `pragma
+ * foreign_keys` off on a non-declaring backend — remains a global optimizer
+ * assumption, not one this prover owns.
  *
  * **NOT the `extractBindings` `'row'` classification.** A tempting-but-wrong
  * signal is the binding extractor's `'row'` class (`binding-extractor.ts`,

@@ -225,14 +225,17 @@ describe('ruleFanOutLookupJoin', () => {
 		}
 	});
 
-	it('does NOT cluster INNER branch with nullable FK', async () => {
-		// Lookup is high-latency, but FK is nullable → individual branch fails
-		// the same nullability guard `ruleJoinElimination` uses.
+	it('clusters an INNER branch with nullable FK as `cross` (fallthrough, not bail)', async () => {
+		// Lookup is high-latency, but one FK is nullable → that branch fails the
+		// at-most-one *existence* proof (the same nullability guard
+		// `ruleJoinElimination` uses). It used to bail — aborting the WHOLE
+		// cluster — but `cross` is sound for an inner join (inner-drop on an
+		// empty branch is inner-join semantics), so recognizeBranch now falls
+		// through and only the cardinality claim is lost. The two NOT-NULL
+		// branches keep their `atMostOne-inner` mode.
 		await db.exec(`create table cust (id integer primary key, name text) using hi_lat_memory`);
 		await db.exec(`create table prod (id integer primary key, sku text) using hi_lat_memory`);
 		await db.exec(`create table region (id integer primary key, label text) using hi_lat_memory`);
-		// Two FKs are NOT NULL, one is nullable. Use INNER joins so nullability
-		// matters; the nullable-FK branch must fail recognition.
 		await db.exec(`create table orders (
 			order_id integer primary key,
 			customer_id integer not null references cust(id),
@@ -246,8 +249,9 @@ describe('ruleFanOutLookupJoin', () => {
 		           inner join prod p on o.product_id = p.id
 		           inner join region r on o.region_id = r.id`;
 		const plan = await planRows(db, q);
-		// The nullable-region branch breaks the chain → rule must abort.
-		expect(hasFanOut(plan), `ops=${plan.map(r => r.op).join(',')}`).to.equal(false);
+		expect(hasFanOut(plan), `ops=${plan.map(r => r.op).join(',')}`).to.equal(true);
+		expect(joinCount(plan), `ops=${plan.map(r => r.op).join(',')}`).to.equal(0);
+		expect(fanOutBranchModes(plan)).to.deep.equal(['atMostOne-inner', 'atMostOne-inner', 'cross']);
 	});
 
 	forkExecTest('preserves output rows across rewrite (execution equivalence)', async () => {

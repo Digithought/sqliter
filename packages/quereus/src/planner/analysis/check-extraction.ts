@@ -13,7 +13,7 @@
 import type { ConstantBinding, DomainConstraint, FunctionalDependency, GuardClause, GuardPredicate } from '../nodes/plan-node.js';
 import type { RowConstraintSchema, TableSchema } from '../../schema/table.js';
 import { RowOpFlag } from '../../schema/table.js';
-import type { ModuleCapabilities } from '../../vtab/capabilities.js';
+import type { CapabilityProvider } from '../../vtab/capabilities.js';
 import type * as AST from '../../parser/ast.js';
 import type { SqlValue } from '../../common/types.js';
 import { columnIndexFromExpr, literalValue, collectColumnNames, flattenDisjunction, flipComparison, walkAstNodes } from './predicate-shape.js';
@@ -71,12 +71,6 @@ export const EMPTY_CHECK_EXTRACTION: CheckExtraction = {
 	constantBindings: [],
 	domainConstraints: [],
 };
-
-/** The slice of a vtab module the capability gate consults (structural, so this
- *  analysis module needn't depend on `vtab/module.ts`). */
-interface CapabilityProvider {
-	getCapabilities?(): ModuleCapabilities;
-}
 
 /**
  * Capability-gated accessor over {@link getCheckExtraction}: returns

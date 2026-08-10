@@ -886,6 +886,12 @@ function compileDecompositionBody(
  * + `MAX_INDS_PER_NODE` for dedup/cap consistency with the Wave-1 FK seeding;
  * multiple mandatory members produce distinct INDs (same `cols` = anchor key,
  * different `target.relationId`), so dedup is unaffected.
+ *
+ * NOT gated by `permitsOrphanedForeignKeyRows` (OPT-059): these INDs assert
+ * `anchor.key ⊆ member.key` from the mapping advertisement's
+ * `presence: 'mandatory'` declaration — a different promise from a different
+ * declarant than a declared SQL foreign key, so the FK-trust capability gate
+ * deliberately does not apply here.
  */
 function computeExistenceAnchorInds(
 	advertisement: MappingAdvertisement,
