@@ -737,6 +737,20 @@ invoked while the calling connection has uncommitted writes. Two obligations fol
     the table schema per transaction must refresh that snapshot, or the statement after the
     DDL is checked against a schema that does not yet know the constraint exists.
 
+A third obligation is independent of open transactions: **a refused DDL call must leave
+nothing behind, because the engine unwinds nothing.** `SchemaManager` registers (or
+deregisters) the object in its own catalog only *after* `createIndex` / `dropIndex` /
+`alterTable` returns, and re-wraps a throw without any cleanup. Everything the module already
+did therefore outlives the refused statement — a physical structure it built, a catalog entry
+it wrote, and above all a cached `VirtualTable.tableSchema` it swapped, which leaves the
+module one schema ahead of the engine: it keeps maintaining a structure the engine never
+registered, or stops maintaining one the engine still plans seeks against. Validate before
+creating any physical artifact where the check allows it; where a later step can still throw,
+undo the earlier ones. `StoreModuleIndex.unwindFailedIndexDdl` is the store module's shared
+undo for both index arms — it records how far the statement got and runs the exact inverse,
+newest step first. A cleanup step that throws must be logged and swallowed, never allowed to
+replace the error the caller has to see.
+
 Neither module makes DDL itself transactional: the catalog entry and any physical structure
 are written outside the transaction coordinator, so a `ROLLBACK` discards the rows but leaves
 the index behind. That is safe only because both re-validate an index entry against the live

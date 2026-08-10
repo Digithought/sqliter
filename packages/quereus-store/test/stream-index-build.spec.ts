@@ -214,6 +214,11 @@ describe('StoreModule bounded-memory index builds', () => {
 	 * decoded DDL text. Entry counts (not values) for the data/index stores keep this
 	 * cheap while still catching a half-built index; the catalog is compared as TEXT
 	 * because the residue there is a changed bundle, not a changed entry count.
+	 *
+	 * NOTE: counts, not values — this would miss a refused statement that rewrote an
+	 * existing entry's value in place outside the catalog, leaving the count unchanged. No
+	 * arm has that shape today (every one either adds/removes entries or rewrites the
+	 * catalog); if one appears, hash the values here rather than adding a bespoke check.
 	 */
 	async function snapshotResidue(p: ReturnType<typeof createProvider>): Promise<string> {
 		const lines = [...p.stores.keys()].sort().map(k => `${k}=${p.stores.get(k)!.size}`);
@@ -503,6 +508,81 @@ describe('StoreModule bounded-memory index builds', () => {
 			expect(String(e)).to.match(/unique|constraint/i);
 		}
 		expect(threw, 'UNIQUE still enforced after the refused CREATE UNIQUE INDEX').to.be.true;
+	});
+
+	it('a DROP INDEX refused while the index realizes a plain UNIQUE keeps that UNIQUE enforced', async () => {
+		// The mirror of the case above, and the one the drop arm's unwind is for. While
+		// `uq_email` exists it REALIZES the plain UNIQUE on `email`, so no `_uc_email` store
+		// exists. The refused drop's cached-schema swap re-materializes `_uc_email` — a
+		// structure with no physical store — and enforcement by seek against an absent store
+		// reports no conflict, so every duplicate would be waved through until the session
+		// ends. Restoring the swap is what closes that.
+		provider = createProvider();
+		const db = open(provider);
+		await db.exec(`create table t (id integer primary key, email text unique) using store`);
+		await db.exec(`create unique index uq_email on t (email)`);
+		await db.exec(`insert into t values (1, 'a@x.com'), (2, 'b@x.com')`);
+		expect(indexStoreSize(provider, 't', 'uq_email'), 'the explicit index carries both rows').to.equal(2);
+		expect(provider.stores.has('main.t_idx__uc_email'), 'no implicit store while the index realizes the UNIQUE')
+			.to.equal(false);
+
+		provider.catalogFailure.fail = true;
+		try {
+			await expectRefusedDdlLeavesNoResidue(
+				provider,
+				db,
+				`drop index uq_email`,
+				/injected catalog-store write failure/,
+			);
+		} finally {
+			provider.catalogFailure.fail = false;
+		}
+
+		let threw = false;
+		try {
+			await db.exec(`insert into t values (3, 'a@x.com')`);
+		} catch (e) {
+			threw = true;
+			expect(String(e)).to.match(/unique|constraint/i);
+		}
+		expect(threw, 'the duplicate is still rejected after the refused DROP INDEX').to.be.true;
+
+		// A distinct row still lands, and still lands in the index the engine is planning against.
+		await db.exec(`insert into t values (4, 'c@x.com')`);
+		expect(indexStoreSize(provider, 't', 'uq_email'), 'index still maintained after the refused drop').to.equal(3);
+		expect(provider.stores.has('main.t_idx__uc_email'), 'no ghost implicit store left by the refused drop')
+			.to.equal(false);
+	});
+
+	it('an unwind step that itself fails is logged, and the original error still reaches the caller', async () => {
+		// Both the catalog write and the teardown of the fresh index store fail. The teardown
+		// is best-effort: `guardedUnwindStep` must log it and swallow it so the caller sees
+		// what actually refused the statement, not what went wrong cleaning up after it.
+		provider = createProvider({ failDeleteIndex: 'ix' });
+		const db = open(provider);
+		await db.exec(`create table t (id integer primary key, v text) using store`);
+		await db.exec(`insert into t values (1, 'a'), (2, 'b')`);
+
+		const warnings: string[] = [];
+		const origWarn = console.warn;
+		console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+		provider.catalogFailure.fail = true;
+		try {
+			await expectRefusedDdlLeavesNoResidue(
+				provider,
+				db,
+				`create index ix on t (v)`,
+				/injected catalog-store write failure/,
+			);
+		} finally {
+			provider.catalogFailure.fail = false;
+			console.warn = origWarn;
+		}
+
+		expect(
+			warnings.filter(w => /tear down the index store.*ix.*injected index-store delete failure/s.test(w)),
+			'the swallowed teardown failure was logged, naming the index and the cause',
+		).to.have.lengthOf(1);
 	});
 
 	it('ALTER COLUMN SET COLLATE on a text PK rebuilds the secondary index identically, across chunks', async () => {

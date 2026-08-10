@@ -233,6 +233,12 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 			);
 			// The index store this arm created: torn down on every failure, including the
 			// build's own. Mirrors dropIndex's teardown.
+			// NOTE: no `ddlCommitPendingOps()` before this one (unlike dropIndex's, and unlike
+			// the reconcile's), because `buildIndexEntries` writes the index store through its
+			// own batches OUTSIDE the coordinator and nothing else can have queued ops against
+			// a store created moments ago in this same statement — so there is nothing to
+			// replay into the closed store. If the build is ever routed through the
+			// coordinator, this teardown needs the flush the other two take.
 			await this.guardedUnwindStep('tear down the index store', subject, () =>
 				this.tearDownIndexStore(schemaName, tableName, table, indexSchema.name));
 			throw createError;
@@ -386,7 +392,10 @@ export abstract class StoreModuleIndex extends StoreModuleSchemaSync {
 		rebuildImplicitUniqueStores?: (failedSchema: TableSchema) => Promise<void>,
 	): Promise<void> {
 		if (progress.schemaSwapped) {
-			await this.guardedUnwindStep('restore the cached schema', subject, async () => {
+			// One step, not two: the rebuild is only meaningful with the restored schema
+			// already live, so a failed restore must skip it rather than run it against the
+			// schema the failed statement installed.
+			await this.guardedUnwindStep('restore the cached schema and its implicit unique stores', subject, async () => {
 				const failedSchema = table.getSchema();
 				table.updateSchema(originalSchema);
 				await rebuildImplicitUniqueStores?.(failedSchema);
