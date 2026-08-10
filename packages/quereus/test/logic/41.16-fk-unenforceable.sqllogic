@@ -227,6 +227,100 @@ drop table mm_c;
 drop table mm_p;
 
 -- ===================================
+-- B4. `pragma foreign_keys = off` silences arm B too — enforcement off means off on
+--     BOTH sides. The parent side is the one at risk: the runtime DML executor calls
+--     the batchability gate unconditionally (the pragma is re-checked at flush), so
+--     the gate must not raise while enforcement is off.
+-- ===================================
+
+pragma foreign_keys = false;
+
+create table offmm_p (a integer not null, b integer not null, primary key (a, b));
+create table offmm_c (id integer primary key, x integer null references offmm_p);
+
+insert into offmm_p values (1, 2);
+insert into offmm_c values (1, 1);
+
+-- child side: no checks are built at all
+select id, x from offmm_c order by id;
+→ [{"id":1,"x":1}]
+
+-- parent side, both ops: neither the plan gate nor the runtime gate may raise
+delete from offmm_p where a = 1;
+
+select count(*) as n from offmm_p;
+→ [{"n":0}]
+
+insert into offmm_p values (3, 4);
+update offmm_p set b = 5 where a = 3;
+
+select a, b from offmm_p order by a;
+→ [{"a":3,"b":5}]
+
+pragma foreign_keys = true;
+
+drop table offmm_c;
+drop table offmm_p;
+
+-- ===================================
+-- B5. arm B on the propagating actions — the CASCADE / SET NULL dispatch sites resolve
+--     the referenced columns separately from the RESTRICT pre-check, so a mismatched
+--     key must raise there too rather than cascading nowhere.
+-- ===================================
+
+create table cas_p (a integer not null, b integer not null, primary key (a, b));
+create table cas_c (id integer primary key, x integer null references cas_p on delete cascade);
+
+insert into cas_p values (1, 2);
+
+delete from cas_p where a = 1;
+-- error: Foreign key '_fk_cas_c_x' on table 'main.cas_c': 1 column(s) reference the primary key of 'main.cas_p', which has 2 column(s).
+
+select count(*) as n from cas_p;
+→ [{"n":1}]
+
+drop table cas_c;
+drop table cas_p;
+
+create table sn_p (a integer not null, b integer not null, primary key (a, b));
+create table sn_c (id integer primary key, x integer null references sn_p on update set null);
+
+insert into sn_p values (1, 2);
+
+update sn_p set b = 3 where a = 1;
+-- error: Foreign key '_fk_sn_c_x' on table 'main.sn_c': 1 column(s) reference the primary key of 'main.sn_p', which has 2 column(s).
+
+select a, b from sn_p order by a;
+→ [{"a":1,"b":2}]
+
+drop table sn_c;
+drop table sn_p;
+
+-- ===================================
+-- B6. `alter table … add constraint` reaches the same wording. The existing-row scan
+--     resolves the parent key itself, so it is a separate seam from the DML builders
+--     and used to phrase the mismatch its own way.
+-- ===================================
+
+create table alt_p (a integer not null, b integer not null, primary key (a, b));
+create table alt_c (id integer primary key, x integer null, y integer null);
+
+insert into alt_p values (1, 2);
+insert into alt_c values (1, 1, 2);
+
+alter table alt_c add constraint fk_alt foreign key (x) references alt_p;
+-- error: Foreign key 'fk_alt' on table 'main.alt_c': 1 column(s) reference the primary key of 'main.alt_p', which has 2 column(s).
+
+-- the refusal left nothing behind — the correctly-shaped ADD over the same rows works
+alter table alt_c add constraint fk_alt2 foreign key (x, y) references alt_p;
+
+insert into alt_c values (2, 9, 9);
+-- error: CHECK constraint failed: fk_alt2
+
+drop table alt_c;
+drop table alt_p;
+
+-- ===================================
 -- B3. the correctly-shaped composite case still works end to end, so B1/B2 are not
 --     rejecting every defaulted `references <parent>`
 -- ===================================

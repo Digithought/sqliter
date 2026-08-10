@@ -1340,7 +1340,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		// end-of-statement boundary. The plan side made the same gate decision
 		// and skipped the per-row NOT EXISTS checks.
 		const batchableFks = getBatchableRestrictFks(
-			ctx.db.schemaManager, tableSchema, 'update', plan.onConflict, plan.lensRouted);
+			ctx.db, tableSchema, 'update', plan.onConflict, plan.lensRouted);
 		const fkRestrictBatch = batchableFks ? createParentRestrictBatch(batchableFks) : undefined;
 
 		// Physical Halloween avoidance: unless the target module guarantees per-scan
@@ -1524,7 +1524,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		// runUpdate (per-execution state; one chunked probe per FK at the
 		// end-of-statement boundary when the gate admits the statement).
 		const batchableFks = getBatchableRestrictFks(
-			ctx.db.schemaManager, tableSchema, 'delete', plan.onConflict, plan.lensRouted);
+			ctx.db, tableSchema, 'delete', plan.onConflict, plan.lensRouted);
 		const fkRestrictBatch = batchableFks ? createParentRestrictBatch(batchableFks) : undefined;
 
 		// Physical Halloween avoidance — see the matching note in runUpdate. Unless

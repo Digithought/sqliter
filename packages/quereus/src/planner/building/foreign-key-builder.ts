@@ -1,7 +1,7 @@
 import type { PlanningContext } from '../planning-context.js';
 import type { TableSchema, ForeignKeyConstraintSchema, RowConstraintSchema } from '../../schema/table.js';
 import { RowOpFlag, type RowOpMask, resolveReferencedColumnsForEnforcement } from '../../schema/table.js';
-import type { SchemaManager } from '../../schema/manager.js';
+import type { Database } from '../../core/database.js';
 import { ConflictResolution } from '../../common/constants.js';
 import type { Attribute, ScalarPlanNode } from '../nodes/plan-node.js';
 import type { ConstraintCheck } from '../nodes/constraint-check-node.js';
@@ -490,17 +490,27 @@ export interface BatchableRestrictFk {
  * An inbound FK whose referenced-column resolution is malformed (column-count
  * mismatch) RAISES here, matching the per-row builders — the batch replaces
  * both per-row probes, so skipping it would leave the FK unenforced on this
- * route only. The `foreign_keys` pragma is NOT part of the gate; callers check
- * it (the plan side already gates the build, the runtime flush re-checks at
- * execution).
+ * route only. That raise is why the `foreign_keys` pragma is checked HERE rather
+ * than left to callers: with enforcement off nothing is checked on either route,
+ * so a malformed inbound FK must not fail the statement either. Taking `db`
+ * (not a bare `SchemaManager`) is what makes that unforgettable — the runtime
+ * DML executor calls this gate on every DELETE/UPDATE and has no other pragma
+ * check before it.
+ *
+ * NOTE: the trust-the-origin RESTRICT suppression (`db._isFkRestrictSuppressed()`,
+ * re-checked in `flushParentRestrictBatch`) is deliberately NOT part of the gate —
+ * suppression means the origin already enforced this FK, and a malformed FK is a
+ * malformed declaration on both ends. If an apply-path write ever needs to survive
+ * a receiver-only malformed FK, this is the site to widen.
  */
 export function getBatchableRestrictFks(
-	schemaManager: SchemaManager,
+	db: Database,
 	tableSchema: TableSchema,
 	operation: 'delete' | 'update',
 	onConflict: ConflictResolution | undefined,
 	lensRouted: boolean,
 ): BatchableRestrictFk[] | undefined {
+	if (!db.options.getBooleanOption('foreign_keys')) return undefined;
 	if (lensRouted) return undefined;
 	if (onConflict !== undefined
 		&& onConflict !== ConflictResolution.ABORT
@@ -509,7 +519,7 @@ export function getBatchableRestrictFks(
 	}
 
 	const batchable: BatchableRestrictFk[] = [];
-	for (const { childTable, fk } of schemaManager.getReferencingForeignKeys(tableSchema.schemaName, tableSchema.name)) {
+	for (const { childTable, fk } of db.schemaManager.getReferencingForeignKeys(tableSchema.schemaName, tableSchema.name)) {
 		const action = operation === 'delete' ? fk.onDelete : fk.onUpdate;
 		if (action !== 'restrict') return undefined;
 		if (childTable.schemaName.toLowerCase() === tableSchema.schemaName.toLowerCase()

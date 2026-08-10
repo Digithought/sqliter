@@ -824,6 +824,8 @@ Constraints written **without** a name are auto-named — `_check_<column>`, `_f
 
 The primary key constraint uniquely identifies each record in a table.
 
+A table declared with **no** primary key gets one covering **every** column, in declaration order — Quereus has no rowid, so whole-row identity is the fallback. The synthesized key does not force its columns `not null`. This matters wherever the primary key is referenced implicitly: `references <parent>` with no column list resolves to it (see [§ 7.6](#76-foreign-key-constraint)).
+
 **Syntax - Column Constraint:**
 ```sql
 column_name data_type primary key [asc|desc] [conflict_clause] [autoincrement]
@@ -1042,7 +1044,6 @@ to a same-schema FK). All reference actions (RESTRICT / CASCADE / SET NULL /
 SET DEFAULT) and `foreign_key_info()`'s `referenced_schema` column work the same
 across schemas.
 
-<a id="unqualified-parent-binding"></a>
 Because an unqualified parent binds to the **child's own schema**, a table in one
 schema that names a parent living in another resolves to a table that is not
 there — the foreign key is declared but can never be satisfied. The remedy is to
@@ -1079,7 +1080,7 @@ Cascade cycle detection prevents infinite recursion when cascading actions chain
 
 Parent resolution happens **per plan**, not once at `CREATE TABLE` — that is what makes forward references (§ *Order Independence*) work, and it means a key can become unenforceable long after it was declared. Two cases, and what each reports:
 
-- **The parent table does not exist** (never created, dropped since, or — see the note under *Syntax* above — named without a qualifier from a child in another schema). MATCH SIMPLE still applies: a row with any NULL FK column is accepted. Every other row is rejected with
+- **The parent table does not exist** (never created, dropped since, or — see the note on unqualified parents under *Syntax* above — named without a qualifier from a child in another schema). MATCH SIMPLE still applies: a row with any NULL FK column is accepted. Every other row is rejected with
 
   ```
   CHECK constraint failed: <fk name> — referenced table '<schema>.<parent>' does not exist
@@ -1095,7 +1096,9 @@ Parent resolution happens **per plan**, not once at `CREATE TABLE` — that is w
 
   Both the child-side existence check and every parent-side path (RESTRICT, CASCADE / SET NULL / SET DEFAULT) raise it, so an unenforceable key never looks enforced. Read queries and `foreign_key_info()` are unaffected.
 
-Neither case fires while `pragma foreign_keys = off` — no checks are built at all.
+  Watch for this on a parent declared with **no** `primary key`: Quereus gives such a table an all-columns primary key ([§ 7.1](#71-primary-key-constraint)), so `references p` against a three-column PK-less parent is a three-column reference, and a single-column child FK is a mismatch. Declare the parent's key, or write the parent column list explicitly.
+
+Neither case fires while `pragma foreign_keys = off` — no checks are built at all, on either side of the key.
 
 **Examples:**
 ```sql

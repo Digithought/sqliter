@@ -428,7 +428,7 @@ function buildUpsertUpdateValidation(
 		// cascaded ones). `runInsert` owns no ParentRestrictBatch, so unlike `runUpdate`
 		// the admitted case is enforced by that per-row pre-walk rather than one
 		// end-of-statement probe — same verdict, same message, no batching.
-		if (getBatchableRestrictFks(ctx.schemaManager, tableSchema, 'update', undefined, lensRouted) === undefined) {
+		if (getBatchableRestrictFks(ctx.db, tableSchema, 'update', undefined, lensRouted) === undefined) {
 			checks.push(...buildParentSideFKChecks(
 				schemaAuthoredCtx, tableSchema, RowOpFlag.UPDATE,
 				oldAttributes, newAttributes, contextAttributes

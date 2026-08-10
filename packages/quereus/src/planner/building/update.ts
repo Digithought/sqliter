@@ -279,7 +279,7 @@ export function buildUpdateStmt(
     // correlated NOT EXISTS per row (see getBatchableRestrictFks). UPDATE has
     // no statement-level OR clause, so the effective conflict resolution is the
     // ABORT default (matching the `undefined` onConflict on the DmlExecutorNode).
-    if (getBatchableRestrictFks(ctx.schemaManager, tableReference.tableSchema, 'update', undefined, lensRouted) === undefined) {
+    if (getBatchableRestrictFks(ctx.db, tableReference.tableSchema, 'update', undefined, lensRouted) === undefined) {
       const parentFKChecks = buildParentSideFKChecks(
         schemaAuthoredCtx, tableReference.tableSchema, RowOpFlag.UPDATE,
         oldAttributes, newAttributes, contextAttributes

@@ -219,7 +219,7 @@ export function buildDeleteStmt(
   // statement-level OR clause, so the effective conflict resolution is the
   // ABORT default (matching the `undefined` onConflict on the DmlExecutorNode).
   if (ctx.db.options.getBooleanOption('foreign_keys')
-    && getBatchableRestrictFks(ctx.schemaManager, tableReference.tableSchema, 'delete', undefined, lensRouted) === undefined) {
+    && getBatchableRestrictFks(ctx.db, tableReference.tableSchema, 'delete', undefined, lensRouted) === undefined) {
     const parentFKChecks = buildParentSideFKChecks(
       schemaAuthoredCtx, tableReference.tableSchema, RowOpFlag.DELETE,
       oldAttributes, newAttributes, contextAttributes
