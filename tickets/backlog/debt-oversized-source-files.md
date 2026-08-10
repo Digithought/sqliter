@@ -1,5 +1,6 @@
 description: Nine source and test files across the repo have grown well past the size at which this project has previously split a file, and nothing stops the next one from growing the same way; add an automated size limit and work through the backlog of files already over it.
 files:
+  - packages/quereus/src/schema/manager.ts                   # 3,633 lines (`wc -l`, 2026-08-10)
   - packages/quereus/src/vtab/memory/layer/manager.ts        # 3,589 lines
   - packages/quereus/src/runtime/emit/materialized-view-helpers.ts   # 3,107 lines
   - packages/quereus/src/schema/schema-differ.ts             # 3,013 lines (`wc -l`, 2026-08-07; 2,725 when this ticket was filed) (spec: 1,186)
@@ -45,6 +46,20 @@ per-package, and whether test files get a higher one (the largest offender here 
 ## The backlog it drains
 
 Measurements below are as recorded on each absorbed ticket; re-measure before splitting.
+
+### `packages/quereus/src/schema/manager.ts` — 3,633 lines
+
+Measured with `wc -l` on 2026-08-10 while reviewing the generated-column determinism gate;
+currently the largest non-test source file in the repo, and not previously listed here.
+`SchemaManager`, one class, covering: schema registry and name resolution (main / temp /
+attached, canonicalization); the `CREATE TABLE` build-and-register pipeline
+(`buildTableSchemaFromAST` plus roughly a dozen declaration-time guards stacked in
+`createTable`); the DEFAULT / CHECK / GENERATED declaration validators; index, view and
+materialized-view registration; constraint and tag mutation; and the catalog
+import/rehydrate path (`importCatalog` / `importDDL` / `importTable`). The
+build-vs-register split is already load-bearing in the comments — several guards carry a
+note explaining that they sit in `createTable` rather than in the shared builder precisely
+so catalog reload does not run them — which reads as the natural seam.
 
 ### `packages/quereus/src/vtab/memory/layer/manager.ts` — 3,589 lines
 

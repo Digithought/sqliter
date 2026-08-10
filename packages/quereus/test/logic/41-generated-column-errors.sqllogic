@@ -145,7 +145,39 @@ create table t_nondet (id integer primary key,
 drop table t_nondet;
 -- error: not found in schema
 
--- 5b. The `nondeterministic_schema` escape hatch lifts the rejection, same
+-- 5b. The call is found wherever it sits, not only as the whole body: nested
+--     in a larger expression, on a VIRTUAL column, and inside a subquery the
+--     body selects from.
+create table t_nondet_nested (id integer primary key, a integer,
+	x integer generated always as (a + random()) stored);
+-- error: Non-deterministic expression not allowed in GENERATED ALWAYS AS
+
+create table t_nondet_virtual (id integer primary key,
+	x integer generated always as (abs(random())) virtual);
+-- error: Non-deterministic expression not allowed in GENERATED ALWAYS AS
+
+create table t_nondet_subq (id integer primary key,
+	x integer generated always as ((select random())) stored);
+-- error: Non-deterministic expression not allowed in GENERATED ALWAYS AS
+
+-- Non-`random()` members of the non-deterministic set are caught the same way;
+-- the message names the offending function, not the whole body.
+create table t_nondet_clock (id integer primary key,
+	x text generated always as (date('now')) stored);
+-- error: Function 'date' is not deterministic
+
+-- Control: a deterministic body over the table's own columns still builds.
+create table t_det_ok (id integer primary key, a integer,
+	x integer generated always as (abs(a) + 1) stored);
+
+insert into t_det_ok (id, a) values (1, -5);
+
+select id, x from t_det_ok;
+→ [{"id":1,"x":6}]
+
+drop table t_det_ok;
+
+-- 5c. The `nondeterministic_schema` escape hatch lifts the rejection, same
 --     as it does for DEFAULT / CHECK.
 pragma nondeterministic_schema = true;
 

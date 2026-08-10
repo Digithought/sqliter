@@ -156,10 +156,12 @@ determinism checks).
 - `GENERATED ALWAYS AS` expressions are walked the same way CHECK constraints
   are — an AST pass over function calls, not a build through the full
   expression pipeline, since a generated body is written in terms of the
-  table's own columns and cannot be resolved against a scope this early. This
-  runs on every path that produces a table schema (`CREATE TABLE`, and
-  catalog reload of a persisted schema alike), not only on the user-authored
-  `CREATE TABLE` statement.
+  table's own columns and cannot be resolved against a scope this early.
+- All three gates run on the **authoring** statement only, never on catalog
+  reload. `nondeterministic_schema` is a session option, so a table declared
+  while it was on must still open in a session that has it off; validating on
+  reload would fail the whole catalog open instead of the one write that
+  cannot be satisfied.
 
 `ALTER TABLE … ALTER COLUMN … SET DEFAULT` routes the new default through the
 **same** validator (`SchemaManager.validateAlterColumnDefault`): bind

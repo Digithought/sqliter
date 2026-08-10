@@ -211,6 +211,22 @@ type TagMutation =
 type TagCompute = (current: Readonly<Record<string, SqlValue>> | undefined) => Readonly<Record<string, SqlValue>> | undefined;
 
 /**
+ * Shared rejection for a non-deterministic call found in a schema-level expression
+ * at declaration time — one wording across the CHECK and GENERATED gates, so the
+ * two surfaces cannot drift apart in how they explain the same rule.
+ *
+ * @param site Where the call was found, e.g. `CHECK constraint 'c' on table 't'`.
+ */
+function nonDeterministicDeclarationError(site: string, offendingExpr: AST.FunctionExpr): QuereusError {
+	return new QuereusError(
+		`Non-deterministic expression not allowed in ${site}. ` +
+		`Function '${offendingExpr.name}' is not deterministic. ` +
+		`Use mutation context to pass non-deterministic values (e.g., WITH CONTEXT (timestamp = datetime('now'))).`,
+		StatusCode.ERROR
+	);
+}
+
+/**
  * Manages all schemas associated with a database connection (main, temp, attached).
  * Handles lookup resolution according to SQLite's rules.
  */
@@ -1937,11 +1953,6 @@ export class SchemaManager {
 			))
 			: undefined;
 
-		// Same escape hatch as the CHECK / DEFAULT determinism gates: read live so
-		// a session that has lifted the guard can reload a catalog that needed it.
-		const allowNonDeterministicGenerated = this.db.options.getBooleanOption('nondeterministic_schema');
-		this.validateGeneratedColumnDeterminism(columns, tableName, allowNonDeterministicGenerated);
-
 		return {
 			name: tableName,
 			schemaName: targetSchemaName,
@@ -2329,27 +2340,11 @@ export class SchemaManager {
 
 			if (allowNonDeterministic) continue;
 
-			let offendingExpr: AST.FunctionExpr | undefined;
-			traverseAst(cc.expr as AST.AstNode, {
-				enterNode: (node: AST.AstNode) => {
-					if (offendingExpr) return false;
-					if (node.type !== 'function') return;
-					const fnNode = node as AST.FunctionExpr;
-					const argCount = fnNode.args?.length ?? 0;
-					const funcSchema = this.findFunction(fnNode.name, argCount)
-						?? this.findFunction(fnNode.name, -1);
-					if (funcSchema && (funcSchema.flags & FunctionFlags.DETERMINISTIC) === 0) {
-						offendingExpr = fnNode;
-						return false;
-					}
-				},
-			});
+			const offendingExpr = this.findNonDeterministicCall(cc.expr as AST.AstNode);
 			if (offendingExpr) {
-				throw new QuereusError(
-					`Non-deterministic expression not allowed in CHECK constraint '${constraintName}' on table '${tableName}'. ` +
-					`Function '${offendingExpr.name}' is not deterministic. ` +
-					`Use mutation context to pass non-deterministic values (e.g., WITH CONTEXT (timestamp = datetime('now'))).`,
-					StatusCode.ERROR
+				throw nonDeterministicDeclarationError(
+					`CHECK constraint '${constraintName}' on table '${tableName}'`,
+					offendingExpr,
 				);
 			}
 		}
@@ -2357,15 +2352,24 @@ export class SchemaManager {
 
 	/**
 	 * Validates that `GENERATED ALWAYS AS` expressions don't call non-deterministic
-	 * functions. Same AST-walk shape as {@link validateCheckConstraintDeterminism} —
-	 * a generated body is written in terms of the table's own columns (and may embed
-	 * a subquery that forward-references the table being created, or another table not
-	 * yet imported during a schema reload), so it cannot be built through
-	 * `buildExpression` here the way {@link validateDefaultDeterminism} builds a
-	 * DEFAULT. An AST-level function-flag walk has no catalog dependency and no
-	 * ordering hazard, so it is safe on every path through `buildTableSchemaFromAST`
-	 * (`createTable` and `importTable` alike) — called from there rather than from
-	 * `createTable` alone, unlike the CHECK / DEFAULT validators.
+	 * functions, so a declaration no write could ever satisfy is refused where it is
+	 * written rather than at every later INSERT/UPDATE.
+	 *
+	 * Called from {@link createTable} beside the CHECK / DEFAULT gates rather than from
+	 * the shared {@link buildTableSchemaFromAST}, and for the same reason those two are:
+	 * the import/rehydrate path shares that builder, and `nondeterministic_schema` is a
+	 * *session* option — a table legitimately declared while the pragma was on must still
+	 * reload into a session that has it off, instead of failing the whole catalog open.
+	 * `ALTER TABLE ADD COLUMN` runs its own equivalent gate (see
+	 * `planner/building/alter-table.ts`), so both authoring surfaces agree.
+	 *
+	 * NOTE: the sibling generated-column gate — `unboundQualifierError` in `./table.ts`,
+	 * reached from the builder — deliberately DOES fire on reload, and the two are not
+	 * meant to converge. A body naming something nothing binds is unwritable in every
+	 * session, so no reload of it can be legitimate; a non-deterministic body is
+	 * legitimately writable whenever the pragma is on, so rejecting it on reload would
+	 * close a database this same build opened. Revisit both together if reload ever
+	 * gains a general "refuse schemas no write can satisfy" pass.
 	 */
 	private validateGeneratedColumnDeterminism(
 		columns: ReadonlyArray<ColumnSchema>,
@@ -2377,30 +2381,44 @@ export class SchemaManager {
 		for (const col of columns) {
 			if (!col.generated || !col.generatedExpr) continue;
 
-			let offendingExpr: AST.FunctionExpr | undefined;
-			traverseAst(col.generatedExpr as AST.AstNode, {
-				enterNode: (node: AST.AstNode) => {
-					if (offendingExpr) return false;
-					if (node.type !== 'function') return;
-					const fnNode = node as AST.FunctionExpr;
-					const argCount = fnNode.args?.length ?? 0;
-					const funcSchema = this.findFunction(fnNode.name, argCount)
-						?? this.findFunction(fnNode.name, -1);
-					if (funcSchema && (funcSchema.flags & FunctionFlags.DETERMINISTIC) === 0) {
-						offendingExpr = fnNode;
-						return false;
-					}
-				},
-			});
+			const offendingExpr = this.findNonDeterministicCall(col.generatedExpr as AST.AstNode);
 			if (offendingExpr) {
-				throw new QuereusError(
-					`Non-deterministic expression not allowed in GENERATED ALWAYS AS for column '${col.name}' in table '${tableName}'. ` +
-					`Function '${offendingExpr.name}' is not deterministic. ` +
-					`Use mutation context to pass non-deterministic values (e.g., WITH CONTEXT (timestamp = datetime('now'))).`,
-					StatusCode.ERROR
+				throw nonDeterministicDeclarationError(
+					`GENERATED ALWAYS AS for column '${col.name}' in table '${tableName}'`,
+					offendingExpr,
 				);
 			}
 		}
+	}
+
+	/**
+	 * The first function call under `expr` whose registry entry lacks
+	 * `FunctionFlags.DETERMINISTIC`, or undefined if every call is deterministic.
+	 * A name the registry cannot resolve is skipped — an unknown function still
+	 * surfaces at write time, not here.
+	 *
+	 * Shared by the CHECK and GENERATED declaration-time gates. Both walk the raw
+	 * AST rather than building the expression the way {@link validateDefaultDeterminism}
+	 * does: their bodies name the table's own columns, whose scope does not exist
+	 * yet at declaration time.
+	 */
+	private findNonDeterministicCall(expr: AST.AstNode): AST.FunctionExpr | undefined {
+		let offendingExpr: AST.FunctionExpr | undefined;
+		traverseAst(expr, {
+			enterNode: (node: AST.AstNode) => {
+				if (offendingExpr) return false;
+				if (node.type !== 'function') return;
+				const fnNode = node as AST.FunctionExpr;
+				const argCount = fnNode.args?.length ?? 0;
+				const funcSchema = this.findFunction(fnNode.name, argCount)
+					?? this.findFunction(fnNode.name, -1);
+				if (funcSchema && (funcSchema.flags & FunctionFlags.DETERMINISTIC) === 0) {
+					offendingExpr = fnNode;
+					return false;
+				}
+			},
+		});
+		return offendingExpr;
 	}
 
 	/**
@@ -2880,6 +2898,7 @@ export class SchemaManager {
 		const allowNonDet = this.db.options.getBooleanOption('nondeterministic_schema');
 		this.validateDefaultDeterminism(baseTableSchema.columns, tableName, hasMutationContext, allowNonDet);
 		this.validateCheckConstraintDeterminism(baseTableSchema.checkConstraints, tableName, allowNonDet);
+		this.validateGeneratedColumnDeterminism(baseTableSchema.columns, tableName, allowNonDet);
 
 		// A literal DEFAULT must be convertible to its own column's declared type — the same
 		// check ADD COLUMN and SET NOT NULL backfill already run — so an unconvertible one is
