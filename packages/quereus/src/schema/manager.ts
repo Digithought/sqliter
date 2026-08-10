@@ -1937,6 +1937,11 @@ export class SchemaManager {
 			))
 			: undefined;
 
+		// Same escape hatch as the CHECK / DEFAULT determinism gates: read live so
+		// a session that has lifted the guard can reload a catalog that needed it.
+		const allowNonDeterministicGenerated = this.db.options.getBooleanOption('nondeterministic_schema');
+		this.validateGeneratedColumnDeterminism(columns, tableName, allowNonDeterministicGenerated);
+
 		return {
 			name: tableName,
 			schemaName: targetSchemaName,
@@ -2342,6 +2347,54 @@ export class SchemaManager {
 			if (offendingExpr) {
 				throw new QuereusError(
 					`Non-deterministic expression not allowed in CHECK constraint '${constraintName}' on table '${tableName}'. ` +
+					`Function '${offendingExpr.name}' is not deterministic. ` +
+					`Use mutation context to pass non-deterministic values (e.g., WITH CONTEXT (timestamp = datetime('now'))).`,
+					StatusCode.ERROR
+				);
+			}
+		}
+	}
+
+	/**
+	 * Validates that `GENERATED ALWAYS AS` expressions don't call non-deterministic
+	 * functions. Same AST-walk shape as {@link validateCheckConstraintDeterminism} —
+	 * a generated body is written in terms of the table's own columns (and may embed
+	 * a subquery that forward-references the table being created, or another table not
+	 * yet imported during a schema reload), so it cannot be built through
+	 * `buildExpression` here the way {@link validateDefaultDeterminism} builds a
+	 * DEFAULT. An AST-level function-flag walk has no catalog dependency and no
+	 * ordering hazard, so it is safe on every path through `buildTableSchemaFromAST`
+	 * (`createTable` and `importTable` alike) — called from there rather than from
+	 * `createTable` alone, unlike the CHECK / DEFAULT validators.
+	 */
+	private validateGeneratedColumnDeterminism(
+		columns: ReadonlyArray<ColumnSchema>,
+		tableName: string,
+		allowNonDeterministic: boolean = false
+	): void {
+		if (allowNonDeterministic) return;
+
+		for (const col of columns) {
+			if (!col.generated || !col.generatedExpr) continue;
+
+			let offendingExpr: AST.FunctionExpr | undefined;
+			traverseAst(col.generatedExpr as AST.AstNode, {
+				enterNode: (node: AST.AstNode) => {
+					if (offendingExpr) return false;
+					if (node.type !== 'function') return;
+					const fnNode = node as AST.FunctionExpr;
+					const argCount = fnNode.args?.length ?? 0;
+					const funcSchema = this.findFunction(fnNode.name, argCount)
+						?? this.findFunction(fnNode.name, -1);
+					if (funcSchema && (funcSchema.flags & FunctionFlags.DETERMINISTIC) === 0) {
+						offendingExpr = fnNode;
+						return false;
+					}
+				},
+			});
+			if (offendingExpr) {
+				throw new QuereusError(
+					`Non-deterministic expression not allowed in GENERATED ALWAYS AS for column '${col.name}' in table '${tableName}'. ` +
 					`Function '${offendingExpr.name}' is not deterministic. ` +
 					`Use mutation context to pass non-deterministic values (e.g., WITH CONTEXT (timestamp = datetime('now'))).`,
 					StatusCode.ERROR

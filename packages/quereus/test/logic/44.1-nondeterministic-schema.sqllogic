@@ -28,18 +28,17 @@ CREATE TABLE strict_check (
 );
 -- error: Non-deterministic expression not allowed in CHECK
 
--- GENERATED column determinism is validated at DML build time (the expression
--- is built into a plan node when the row is expanded), not at CREATE TABLE.
+-- GENERATED column determinism is validated at CREATE TABLE time, same as
+-- DEFAULT and CHECK — the table is never created.
 CREATE TABLE strict_generated (
     id INTEGER PRIMARY KEY,
     v INTEGER,
     g INTEGER GENERATED ALWAYS AS (random()) STORED
 );
-
-INSERT INTO strict_generated (id, v) VALUES (1, 10);
--- error: Non-deterministic expression not allowed
+-- error: Non-deterministic expression not allowed in GENERATED ALWAYS AS
 
 DROP TABLE strict_generated;
+-- error: not found in schema
 
 -- ===================================
 -- Flip the gate and read it back

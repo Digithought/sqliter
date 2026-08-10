@@ -153,6 +153,13 @@ determinism checks).
   unless the registry marks it `DETERMINISTIC`, and bind parameters
   (`?`, `:name`) are rejected too. Column references inside CHECK predicates
   are validated at INSERT/UPDATE time, when the row scope exists.
+- `GENERATED ALWAYS AS` expressions are walked the same way CHECK constraints
+  are — an AST pass over function calls, not a build through the full
+  expression pipeline, since a generated body is written in terms of the
+  table's own columns and cannot be resolved against a scope this early. This
+  runs on every path that produces a table schema (`CREATE TABLE`, and
+  catalog reload of a persisted schema alike), not only on the user-authored
+  `CREATE TABLE` statement.
 
 `ALTER TABLE … ALTER COLUMN … SET DEFAULT` routes the new default through the
 **same** validator (`SchemaManager.validateAlterColumnDefault`): bind
