@@ -18,7 +18,7 @@ import type { ResolveColumnInSource, ResolveObjectRef, TableRenameTarget } from 
 import { snapshotObjectRefResolvers, tableRenameTargetsFor, type ObjectRefResolvers } from '../../schema/object-ref-resolver.js';
 import type { ColumnSchema } from '../../schema/column.js';
 import { assertCatalogObjectPersistable, assertRenameDependentsPersistable } from '../../schema/catalog-persistability.js';
-import { assertUniqueConstraintIndexNameFree, assertUniqueConstraintNotDuplicated, assertUniqueConstraintBackingNamesDistinct, uniqueConstraintColumnSetKey } from '../../schema/catalog.js';
+import { assertUniqueConstraintIndexNameFree, assertUniqueConstraintNotDuplicated, assertUniqueConstraintBackingNamesDistinct, uniqueConstraintColumnSetKey, type DeclaredUniqueConstraint } from '../../schema/catalog.js';
 import type { Schema } from '../../schema/schema.js';
 import type { Database } from '../../core/database.js';
 import { isTruthy } from '../../util/comparison.js';
@@ -700,14 +700,15 @@ async function runAddColumn(
 	// `runAddConstraintViaModule`. `declaredColumnSets` carries the unnamed sets claimed by
 	// earlier inline constraints in THIS statement (`add column c … unique unique`); none
 	// of them is on `tableSchema` yet, so the guard cannot see them any other way.
+	const inlineUniques: DeclaredUniqueConstraint[] = inlineConstraints
+		.filter(c => c.type === 'unique')
+		.map(c => ({ name: c.name, columnNames: (c.columns ?? []).map(col => col.name) }));
 	const declaredColumnSets = new Set<string>();
-	for (const constraint of inlineConstraints) {
-		if (constraint.type !== 'unique') continue;
-		const columnNames = (constraint.columns ?? []).map(c => c.name);
-		const operation = `add ${constraint.name ? `constraint '${constraint.name}'` : 'UNIQUE'} column '${columnDef.name}' to table '${tableSchema.name}'`;
-		assertUniqueConstraintNotDuplicated(tableSchema, constraint.name, columnNames, operation, declaredColumnSets);
-		assertUniqueConstraintIndexNameFree(tableSchema, constraint.name, columnNames, operation);
-		if (constraint.name === undefined) declaredColumnSets.add(uniqueConstraintColumnSetKey(columnNames));
+	for (const uc of inlineUniques) {
+		const operation = `add ${uc.name ? `constraint '${uc.name}'` : 'UNIQUE'} column '${columnDef.name}' to table '${tableSchema.name}'`;
+		assertUniqueConstraintNotDuplicated(tableSchema, uc.name, uc.columnNames, operation, declaredColumnSets);
+		assertUniqueConstraintIndexNameFree(tableSchema, uc.name, uc.columnNames, operation);
+		if (uc.name === undefined) declaredColumnSets.add(uniqueConstraintColumnSetKey(uc.columnNames));
 	}
 
 	// Two inline `unique` constraints on the SAME new column can also derive one backing
@@ -716,9 +717,7 @@ async function runAddColumn(
 	// yet, so the per-constraint guard above cannot see the pair; this compares them against
 	// each other. After the loop, so a plain duplicate still reports as a duplicate.
 	assertUniqueConstraintBackingNamesDistinct(
-		inlineConstraints
-			.filter(c => c.type === 'unique')
-			.map(c => ({ name: c.name, columnNames: (c.columns ?? []).map(col => col.name) })),
+		inlineUniques,
 		`add column '${columnDef.name}' to table '${tableSchema.name}'`,
 	);
 

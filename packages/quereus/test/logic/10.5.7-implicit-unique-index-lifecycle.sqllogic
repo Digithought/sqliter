@@ -878,6 +878,16 @@ create table cn_ct (id integer primary key, cn_c integer, cn_b integer,
     constraint _UC_CN_C unique (cn_b), unique (cn_c));
 -- error: both derive backing structure name
 
+-- Two inline `unique` constraints on ONE column, the written name coinciding with the
+-- auto-name the other derives. The CREATE TABLE twin of the ADD COLUMN case in 11d —
+-- neither constraint can be seen on a table, so only comparing the declaration against
+-- itself catches it.
+create table cn_ct (id integer primary key, cn_c integer constraint _uc_cn_c unique unique);
+-- error: both derive backing structure name '_uc_cn_c'
+
+select count(*) as c from schema() where type = 'table' and name = 'cn_ct';
+→ [{"c":0}]
+
 -- 11b. CREATE TABLE — ordinary column names, no reserved prefix anywhere
 -- The auto-name joins the covered column names with `_`, so the single column `cnq_cnr`
 -- derives exactly what the pair `(cnq, cnr)` derives.

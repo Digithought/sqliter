@@ -291,11 +291,16 @@ export class MemoryTableManager {
 			// a second time: two entries under one name is the state `importDDL` warns about
 			// (see `SchemaManager.importCatalog`) — `index_info()` then reports neither,
 			// `DROP INDEX` answers `no such index`, and a predicate over the covered column
-			// stops filtering. No write path can produce a duplicate unnamed UNIQUE any more
-			// (`assertNoDuplicateUniqueConstraints` / `assertUniqueConstraintNotDuplicated`
-			// refuse it at every declaration site), so this arm is defence in depth for a
-			// catalog written before those guards: it degrades to one shared structure and
-			// double enforcement rather than to a corrupt index list.
+			// stops filtering. No write path can reach either producer of a held name any more
+			// — a duplicate unnamed UNIQUE (`assertNoDuplicateUniqueConstraints` /
+			// `assertUniqueConstraintNotDuplicated`) or two DIFFERENT UNIQUEs deriving one
+			// structure name (`assertNoDuplicateUniqueConstraintBackingNames` /
+			// `assertUniqueConstraintIndexNameFree`), refused at every declaration site — so
+			// this arm is defence in depth for a catalog written before those guards: it
+			// degrades to one shared structure rather than to a corrupt index list. For the
+			// duplicate that means double enforcement of the same rule; for the derived-name
+			// collision it means the adopting constraint is enforced by a structure keyed on
+			// the OTHER constraint's columns, which is the defect those guards now prevent.
 			const wantedName = uc.name ?? this.implicitIndexNameFor(uc);
 			const claimedIndex = newIndexes.find(idx => idx.name.toLowerCase() === wantedName.toLowerCase());
 

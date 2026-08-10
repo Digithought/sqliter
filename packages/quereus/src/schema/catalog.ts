@@ -445,10 +445,11 @@ function uniqueConstraintColumnNames(
  * column names — an `ADD COLUMN`'s column does not even exist on the table yet — so
  * they cannot go through the schema-resolved form.
  *
- * Keep this the ONLY spelling of the `_uc_<cols>` rule in this package.
- * `quereus-store`'s `implicitUniqueIndexName` and
- * `MemoryTableManager.implicitIndexNameFor` mirror it for their own backends and
- * must stay equal to it.
+ * Keep this the ONLY spelling of the `_uc_<cols>` rule in this package. Three
+ * out-of-package mirrors must stay equal to it: `quereus-store`'s
+ * `implicitUniqueIndexName`, `MemoryTableManager.implicitIndexNameFor`, and
+ * `quereus-isolation`'s `installOverlayUniqueConstraint` (which names the overlay's
+ * narrowed unique index by the same rule so DROP / RENAME CONSTRAINT forwards resolve).
  */
 function implicitIndexNameForColumns(constraintName: string | undefined, columnNames: ReadonlyArray<string>): string {
 	return constraintName ?? `_uc_${columnNames.join('_')}`;
@@ -574,7 +575,8 @@ export function assertUniqueConstraintIndexNameFree(
 		);
 		throw new QuereusError(
 			`Cannot ${operation}: its backing structure '${backingName}' would collide with the backing structure `
-				+ `of the UNIQUE constraint ${siblingDescription} on the same table. Rename the constraint.`,
+				+ `of the UNIQUE constraint ${siblingDescription} on the same table. Name or rename one of the two `
+				+ `constraints — an unnamed one derives its structure name from the columns it covers.`,
 			StatusCode.CONSTRAINT,
 		);
 	}
@@ -586,6 +588,17 @@ export function assertUniqueConstraintIndexNameFree(
 			+ `on the same table. Rename the constraint or the index.`,
 		StatusCode.CONSTRAINT,
 	);
+}
+
+/**
+ * A UNIQUE constraint as its declaration spells it — the name the user wrote (absent
+ * when unnamed) and the names of the columns it covers. Enough to derive its backing
+ * structure name and to describe it back in a message, and available before the
+ * constraint (or, for `ADD COLUMN`, its column) exists on any schema.
+ */
+export interface DeclaredUniqueConstraint {
+	readonly name?: string;
+	readonly columnNames: ReadonlyArray<string>;
 }
 
 /**
@@ -601,15 +614,16 @@ export function assertUniqueConstraintIndexNameFree(
  * and — for `CREATE TABLE` — before `module.create`, so a refusal leaves no storage
  * behind.
  *
- * Takes `{ name, columnNames }` pairs rather than built {@link UniqueConstraintSchema}s
- * so the ADD COLUMN caller, whose column does not exist on any schema yet, can use it;
+ * Takes {@link DeclaredUniqueConstraint}s rather than built
+ * {@link UniqueConstraintSchema}s so the ADD COLUMN caller, whose column does not exist
+ * on any schema yet, can use it;
  * {@link assertNoDuplicateUniqueConstraintBackingNames} is the built-constraint wrapper.
  */
 export function assertUniqueConstraintBackingNamesDistinct(
-	declared: ReadonlyArray<{ name?: string; columnNames: ReadonlyArray<string> }>,
+	declared: ReadonlyArray<DeclaredUniqueConstraint>,
 	operation: string,
 ): void {
-	const seen = new Map<string, { name?: string; columnNames: ReadonlyArray<string> }>();
+	const seen = new Map<string, DeclaredUniqueConstraint>();
 	for (const uc of declared) {
 		const backingName = implicitIndexNameForColumns(uc.name, uc.columnNames);
 		const lower = backingName.toLowerCase();
@@ -618,7 +632,8 @@ export function assertUniqueConstraintBackingNamesDistinct(
 			throw new QuereusError(
 				`Cannot ${operation}: the UNIQUE constraint ${describeUniqueConstraint(held.name, held.columnNames)} and `
 					+ `the UNIQUE constraint ${describeUniqueConstraint(uc.name, uc.columnNames)} both derive backing `
-					+ `structure name '${backingName}'. Rename one of them.`,
+					+ `structure name '${backingName}'. Name or rename one of them — an unnamed one derives its `
+					+ `structure name from the columns it covers.`,
 				StatusCode.CONSTRAINT,
 			);
 		}

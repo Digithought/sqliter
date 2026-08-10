@@ -1106,6 +1106,22 @@ fallback — generic rebuild, schema-only rename, engine-side logical enforcemen
 a clean user error. A silent no-op leaves the catalog and the physical state diverged with the
 engine none the wiser, and stays invisible until a later read returns wrong rows.
 
+### SCH-005 — One table, one backing structure name
+
+- code: `packages/quereus/src/schema/catalog.ts` — `assertUniqueConstraintIndexNameFree`, `assertUniqueConstraintBackingNamesDistinct`
+- code: `packages/quereus/src/schema/manager.ts` — `createTable`
+- guard: `packages/quereus/test/index-ddl-roundtrip.spec.ts` — `CREATE TABLE refuses two UNIQUE constraints that derive one structure name`
+- doc: [SQL DDL § 6.3 Indexes on Virtual Tables](sql-ddl.md#63-indexes-on-virtual-tables)
+
+A UNIQUE constraint's implicit backing structure is named after the constraint, or
+`_uc_<covered columns joined by _>` when unnamed. Within one table that name is held by at
+most one object: no write path may leave two UNIQUE constraints, or a UNIQUE constraint and
+an index, deriving it. Every declaring and renaming path refuses ahead of the module, so the
+answer is identical on every backend and a refusal persists nothing. The comparison reads
+`uniqueConstraints` and `.indexes` — both backend-independent — never a materialized
+structure. Sharing a name makes one constraint enforce under a structure keyed on the other's
+columns, silently accepting duplicates. Import/rehydrate is unguarded so older catalogs open.
+
 ## SYNC — Sync
 
 ### SYNC-001 — All DDL in a sync batch applies before any DML
