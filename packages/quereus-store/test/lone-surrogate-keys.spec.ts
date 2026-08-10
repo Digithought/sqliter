@@ -310,10 +310,13 @@ describe('Lone surrogates are refused by the store and accepted in memory', () =
 		//
 		// Two rejection MECHANISMS live here, and both fire at `CREATE`, before anything is
 		// registered:
-		//   - A bad TABLE / INDEX NAME is refused by the identifier guard in
-		//     `buildDataStoreName` / `buildIndexStoreName` — the PHYSICAL store name is
-		//     built before the statement's first side effect, so the create is a clean
-		//     no-op (`bug-store-physical-store-name-lone-surrogate-collision`).
+		//   - A bad INDEX NAME is refused by the identifier guard in `buildIndexStoreName`
+		//     — the PHYSICAL store name is built before the statement's first side effect,
+		//     so the create is a clean no-op
+		//     (`bug-store-physical-store-name-lone-surrogate-collision`). `buildDataStoreName`
+		//     is the same guard for a bad TABLE name, but a table name now trips the
+		//     pre-flight below first (its catalog KEY is unencodable), which runs ahead of
+		//     `module.create`; either way the create is refused before any side effect.
 		//   - A bad identifier or literal that only shows up in the persisted DDL TEXT (a
 		//     column name, a `default` string, a `check` literal) leaves the table's own
 		//     name clean, so the store-name guard never sees it. `CREATE TABLE` asks every
@@ -395,6 +398,39 @@ describe('Lone surrogates are refused by the store and accepted in memory', () =
 
 			const mod = new StoreModule(provider);
 			expect(await mod.loadAllDDL(), 'nothing was silently written to the catalog').to.deep.equal([]);
+		});
+
+		it('refuses a MAINTAINED table before any backing store is built', async () => {
+			// `create table … maintained as` routes through the same `SchemaManager.createTable`
+			// with `preferBacking`, so the veto must fire ahead of `createBacking` — otherwise a
+			// maintained table gets a durable basis store it can never have a catalog entry for.
+			await db.exec(`create table base (id integer primary key, v integer) using store`);
+			await db.exec(`insert into base values (1, 10)`);
+			await rejects(
+				db,
+				`create table mt (id integer primary key, "${LONE_HIGH}" integer) using store maintained as select id, v as "${LONE_HIGH}" from base`,
+			);
+			expect(db.schemaManager.getTable('main', 'mt'), 'no backing table may survive').to.be.undefined;
+
+			const mod = new StoreModule(provider);
+			expect(await mod.loadAllDDL(), 'only the base table is in the catalog')
+				.to.deep.equal(['CREATE TABLE "main"."base" ("id" INTEGER NOT NULL PRIMARY KEY, "v" INTEGER NOT NULL) USING store']);
+		});
+
+		it('an isolation-wrapped store still vetoes a CREATE TABLE — the wrapper forwards the hook', async () => {
+			// `allModules()` yields the REGISTERED module, which here is the `IsolationModule`
+			// wrapper, not the store inside it. Without its forward every isolated deployment
+			// keeps the silent-drop bug on the CREATE TABLE path too.
+			const isoProvider = createInMemoryProvider();
+			const iso = new Database();
+			iso.registerModule('store', createIsolatedStoreModule({ provider: isoProvider }));
+			try {
+				await rejects(iso, `create table t (id integer primary key, v text default '${LONE_HIGH}') using store`);
+				expect(iso.schemaManager.getTable('main', 't'), 'the table must not be registered').to.be.undefined;
+			} finally {
+				await isoProvider.closeAll();
+				await iso.close();
+			}
 		});
 	});
 

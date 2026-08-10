@@ -256,10 +256,12 @@ export abstract class StoreModuleCatalog extends StoreModuleBase {
 	 * is chained onto `persistQueue` behind a `SchemaChangeNotifier` listener, and both
 	 * layers swallow.
 	 *
-	 * The `'table'` kind arrives only from the RENAME pre-flight scan, which offers EVERY
-	 * table in every schema whose record the propagation would rewrite — most of them not
-	 * ours. {@link ownsTableCatalogEntry} is the synchronous self-filter that keeps a
-	 * memory-backed dependent from being refused on our behalf.
+	 * The `'table'` kind arrives from `SchemaManager.createTable` (the table about to be
+	 * created, before `module.create`) and from the RENAME pre-flight scan, which offers
+	 * EVERY table in every schema whose record the propagation would rewrite — most of them
+	 * not ours. {@link ownsTableCatalogEntry} is the synchronous self-filter that keeps a
+	 * memory-backed table (a `using memory` create, a dependent of a rename) from being
+	 * refused on our behalf.
 	 *
 	 * Gated on `subscribedDb === db`: this module persists a view/MV only while subscribed
 	 * to that `Database`'s change notifier. Since `StoreModule.onRegister` subscribes at
@@ -269,8 +271,8 @@ export abstract class StoreModuleCatalog extends StoreModuleBase {
 	 * one-instance-one-database posture `ensureSchemaSubscription` documents). That case
 	 * writes nothing, so vetoing there would reject a definition that loses nothing.
 	 */
-	// NOTE: regenerates the object's full DDL text on every CREATE VIEW / CREATE MATERIALIZED
-	// VIEW / view-or-MV SET TAGS, and the persist that follows regenerates it again. DDL is
+	// NOTE: regenerates the object's full DDL text on every CREATE TABLE / CREATE VIEW / CREATE
+	// MATERIALIZED VIEW / view-or-MV SET TAGS, and the persist that follows regenerates it again. DDL is
 	// rare and the text is small, so the duplicate render is not worth caching today; if a
 	// schema-heavy workload (a large `apply schema` deploying many views) ever shows up hot
 	// here, thread the already-built CatalogEntry from the veto through to the write.

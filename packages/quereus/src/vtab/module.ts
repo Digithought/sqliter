@@ -622,7 +622,7 @@ export interface VirtualTableModule<
 	/**
 	 * Optional pre-flight veto: throw when this module would be UNABLE to durably
 	 * persist the catalog entry for `object`. Consulted over every registered module
-	 * by the CREATE VIEW / CREATE MATERIALIZED VIEW / ALTER … SET TAGS paths BEFORE
+	 * by the CREATE TABLE / CREATE VIEW / CREATE MATERIALIZED VIEW / ALTER … SET TAGS paths BEFORE
 	 * the object is registered (or, for a materialized view, inside `materializeView`'s
 	 * existing rollback arm), so a rejection leaves the statement a clean no-op.
 	 *
@@ -642,7 +642,8 @@ export interface VirtualTableModule<
 	 * already holds in memory, not by reading its catalog. Omit ⇒ never consulted (today's
 	 * behavior).
 	 *
-	 * Call sites, each ahead of its statement's first side effect: `emitCreateView`
+	 * Call sites, each ahead of its statement's first side effect: `SchemaManager.createTable`
+	 * (before `module.create`, so a refusal leaves no storage behind); `emitCreateView`
 	 * (before `schema.addView`); `materializeView` (inside its existing rollback arm — an
 	 * MV's DDL text does not exist until the derivation is attached); the two view/MV SET
 	 * TAGS paths in `SchemaManager` (tags ride the persisted DDL); and both ALTER RENAME
@@ -653,8 +654,12 @@ export interface VirtualTableModule<
 	 * rewrites a rename propagates into other tables), plus, for a renamed materialized
 	 * view, its own prospective record under the new name.
 	 *
-	 * `'table'` is a RENAME-propagation kind only: `create table` is not gated here, since
-	 * it goes through `module.create`, whose failure already reaches the statement.
+	 * `create table` is gated here too — `module.create`'s own failure reaches the statement,
+	 * but that hook does not see the persisted DDL text. The import / rehydrate path
+	 * (`buildTableSchemaFromAST` via `importTable` / `importCatalog`) deliberately is NOT
+	 * gated: a catalog written before this guard existed must still open. Neither is
+	 * `CREATE INDEX`, whose catalog write is awaited inside `module.createIndex` and so
+	 * already fails the statement.
 	 *
 	 * Not covered: a `select *` materialized view's persisted backing COLUMN LIST shifts
 	 * under a column rename with no AST change and no persist event, so nothing asks here
@@ -671,9 +676,10 @@ export interface VirtualTableModule<
  * The catalog object classes {@link VirtualTableModule.assertCatalogObjectPersistable}
  * arbitrates. `'view'` carries a {@link ViewSchema}; `'materializedView'` carries the
  * maintained {@link TableSchema} (the unified MV record); `'table'` carries an ordinary
- * {@link TableSchema} — a table whose own catalog entry a RENAME propagation would
- * rewrite (its FKs, CHECK expressions or partial-index predicates name the renamed
- * object). A maintained table is offered under BOTH kinds: a store-hosted materialized
+ * {@link TableSchema} — either a table being created (`CREATE TABLE`, pre-`module.create`)
+ * or one whose own catalog entry a RENAME propagation would rewrite (its FKs, CHECK
+ * expressions or partial-index predicates name the renamed object). A maintained table is
+ * offered under BOTH kinds: a store-hosted materialized
  * view persists an ordinary table bundle alongside its MV entry.
  */
 export type CatalogObjectKind = 'view' | 'materializedView' | 'table';
