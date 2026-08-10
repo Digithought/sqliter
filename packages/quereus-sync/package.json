@@ -1,6 +1,6 @@
 {
   "name": "@quereus/sync",
-  "version": "3.3.0",
+  "version": "4.11.0",
   "type": "module",
   "description": "Fully opaque CRDT sync for Quereus - write normal SQL, get automatic multi-master replication with conflict resolution",
   "keywords": [
@@ -41,7 +41,8 @@
   "scripts": {
     "clean": "rimraf dist",
     "build": "tsc",
-    "typecheck": "tsc --noEmit",
+    "lint": "echo 'No lint configured'",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json --noEmit",
     "test": "cd ../.. && node --import ./packages/quereus-sync/register.mjs node_modules/mocha/bin/mocha.js \"packages/quereus-sync/test/**/*.spec.ts\" --reporter min --colors",
     "test:single": "cd ../.. && node --import ./packages/quereus-sync/register.mjs node_modules/mocha/bin/mocha.js --bail"
   },
@@ -56,10 +57,10 @@
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",
-    "@types/node": "^25.0.9",
+    "@types/node": "^25.9.3",
     "chai": "^6.2.2",
-    "mocha": "^11.7.5",
-    "rimraf": "^6.1.2",
+    "mocha": "^11.7.6",
+    "rimraf": "^6.1.3",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
   },

@@ -1,6 +1,7 @@
 import type { AsyncGatherNode } from '../../planner/nodes/async-gather-node.js';
 import type { EmissionContext } from '../emission-context.js';
-import type { Instruction, InstructionRun, RuntimeContext } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import type { Row } from '../../common/types.js';
 import { emitCallFromPlan } from '../emitters.js';
 import { ParallelDriver } from '../parallel-driver.js';
@@ -244,7 +245,7 @@ export function emitAsyncGather(plan: AsyncGatherNode, ctx: EmissionContext): In
 		}
 		return {
 			params: childInstructions,
-			run: run as InstructionRun,
+			run: asRun(run),
 			note: `async_gather(unionAll, N=${branchCount}, cap=${concurrencyCap})`,
 		};
 	}
@@ -268,7 +269,7 @@ export function emitAsyncGather(plan: AsyncGatherNode, ctx: EmissionContext): In
 		}
 		return {
 			params: childInstructions,
-			run: run as InstructionRun,
+			run: asRun(run),
 			note: `async_gather(zipByKey, N=${branchCount}, cap=${concurrencyCap})`,
 		};
 	}
@@ -281,7 +282,7 @@ export function emitAsyncGather(plan: AsyncGatherNode, ctx: EmissionContext): In
 	}
 	return {
 		params: childInstructions,
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `async_gather(crossProduct, N=${branchCount}, cap=${concurrencyCap})`,
 	};
 }

@@ -1,0 +1,72 @@
+-- 10.1.5-create-index-lifecycle.sqllogic — CREATE INDEX lifecycle and DDL error paths.
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Carved out of 10.1-ddl-lifecycle: that file's subject is the generic DDL lifecycle
+-- (create → insert → verify → drop, IF NOT EXISTS / IF EXISTS, ALTER, schema-vs-
+-- transaction interaction, multi-table sequences) and its remaining error cases are
+-- all table-shaped. Only these sections need standalone index DDL, so they move here.
+--
+-- Subject: creating, re-creating (IF NOT EXISTS), listing and dropping indexes, plus
+-- the DDL rejections — unknown table, unknown column, duplicate index name.
+
+-- ===================================
+-- 1. CREATE INDEX Lifecycle
+-- ===================================
+
+create table idx_lifecycle (id integer primary key, name text, score integer);
+
+insert into idx_lifecycle values
+	(1, 'Alice', 90),
+	(2, 'Bob', 80),
+	(3, 'Charlie', 95);
+
+-- Create an index
+create index idx_lc_score on idx_lifecycle (score);
+
+-- Queries should still work with the index present
+select name from idx_lifecycle where score > 85 order by name;
+→ [{"name": "Alice"}, {"name": "Charlie"}]
+
+-- CREATE INDEX IF NOT EXISTS on existing index is a no-op
+create index if not exists idx_lc_score on idx_lifecycle (score);
+
+-- Create a second index on a different column
+create index idx_lc_name on idx_lifecycle (name);
+
+select name from idx_lifecycle where name = 'Bob';
+→ [{"name": "Bob"}]
+
+-- Verify indexes are visible in schema()
+select name from schema() where type = 'index' and tbl_name = 'idx_lifecycle' order by name;
+→ [{"name": "idx_lc_name"}, {"name": "idx_lc_score"}]
+
+-- Clean up
+drop table idx_lifecycle;
+
+-- ===================================
+-- 2. CREATE INDEX error cases
+-- ===================================
+-- (the table-shaped rejections — unknown table, duplicate column name, dropping a
+--  missing table — stay in 10.1-ddl-lifecycle § 5)
+
+-- 2a. CREATE INDEX on non-existent table
+create index idx_bad on no_such_table (col);
+-- error: no such table
+
+-- 2b. CREATE INDEX on non-existent column
+create table idx_err (id integer primary key, name text);
+
+create index idx_bad_col on idx_err (missing_col);
+-- error: not found
+
+drop table idx_err;
+
+-- 2c. Duplicate index name without IF NOT EXISTS
+create table idx_dup_test (id integer primary key, val integer);
+create index idx_dup on idx_dup_test (val);
+
+create index idx_dup on idx_dup_test (val);
+-- error: already exists
+
+drop table idx_dup_test;

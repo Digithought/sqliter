@@ -1,0 +1,47 @@
+-- 110.1-scan-emitter-index-scan-kills.sqllogic — Mutation-killing tests for the IndexScan path in runtime/emit/scan.ts
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Carved out of 110-scan-emitter-mutation-kills: that file's SeqScan and IndexSeek
+-- sections reach their access paths through PRIMARY KEY declarations alone. These
+-- two IndexScan sections use `create index` only to route the plan onto the
+-- secondary-index shape, so they move here and leave the rest of the emitter
+-- coverage runnable on a backend without first-class CREATE INDEX.
+--
+-- Subject: ordered access and range access driven by a secondary index.
+
+-- =============================================================================
+-- IndexScan — ordered access via index
+-- =============================================================================
+
+create table scan_idx (id integer primary key, score integer);
+create index idx_score on scan_idx(score);
+insert into scan_idx values (1, 30), (2, 10), (3, 20);
+
+-- Index scan with ordering by indexed column
+select id, score from scan_idx order by score;
+→ [{"id":2,"score":10},{"id":3,"score":20},{"id":1,"score":30}]
+
+-- Descending index scan
+select id, score from scan_idx order by score desc;
+→ [{"id":1,"score":30},{"id":3,"score":20},{"id":2,"score":10}]
+
+drop table scan_idx;
+
+-- =============================================================================
+-- IndexScan — secondary index with range
+-- =============================================================================
+
+create table scan_range (id integer primary key, v integer);
+create index idx_v on scan_range(v);
+insert into scan_range values (1, 100), (2, 200), (3, 300), (4, 400), (5, 500);
+
+-- Range scan on indexed column
+select id from scan_range where v >= 200 and v <= 400 order by v;
+→ [{"id":2},{"id":3},{"id":4}]
+
+-- Range scan with single bound
+select id from scan_range where v > 300 order by v;
+→ [{"id":4},{"id":5}]
+
+drop table scan_range;

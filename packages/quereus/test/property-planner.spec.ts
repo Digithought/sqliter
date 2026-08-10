@@ -156,7 +156,15 @@ function skewedDataArb(spec: TableSpec, count: number): fc.Arbitrary<SqlValue[][
 // Tests
 // ---------------------------------------------------------------------------
 
-describe('Property-Based Planner/Optimizer Tests', () => {
+describe('Property-Based Planner/Optimizer Tests', function () {
+
+	// These are fast-check-heavy suites: each `it` drives dozens of property
+	// runs that each spin up a Database, load rows, and plan/run queries. In
+	// isolation individual cases run well under a second, but under the default
+	// 2000ms mocha timeout they can slip past the budget when the host is under
+	// CPU contention (e.g. the full-monorepo test run). Give the whole suite a
+	// generous per-test budget; the stress sub-suite below overrides it higher.
+	this.timeout(30_000);
 
 	// -----------------------------------------------------------------------
 	// Property 1: Semantic equivalence under optimizer rules
@@ -178,17 +186,26 @@ describe('Property-Based Planner/Optimizer Tests', () => {
 			specArb: fc.Arbitrary<TableSpec[]>;
 			queryFn: (specs: TableSpec[]) => string;
 			dataArb: (specs: TableSpec[]) => fc.Arbitrary<Map<string, SqlValue[][]>>;
+			/**
+			 * Optional extra DDL run after the tables are created and loaded, before
+			 * the query is planned — e.g. a CREATE VIEW the query references. Used by
+			 * projection-pruning, whose Project-on-Project firing shape only forms
+			 * through view expansion (a FROM-subquery interposes an AliasNode that
+			 * blocks the rule).
+			 */
+			setup?: (db: Database, specs: TableSpec[]) => Promise<void>;
 		}
 
 		const singleTableRules: RuleDef[] = [
 			{
 				id: 'predicate-pushdown',
 				specArb: singleTableSpec.map(s => [s]),
-				queryFn: (specs) => {
-					const cols = specs[0].columns.filter(c => c.name !== 'id');
-					const c1 = cols[0]?.name ?? 'a';
-					return `SELECT * FROM t1 WHERE ${c1} IS NOT NULL AND id > 0`;
-				},
+				// Interpose a Distinct the rule must visibly move the Filter across.
+				// A bare `WHERE ... AND id > 0` on t1 lands in the Retrieve pipeline
+				// during building (grow-retrieve), so enabled/disabled plans match and
+				// the rule never fires. The inner DISTINCT survives to the rule's pass;
+				// enabled pushes the Filter below it, disabled keeps it above → plans differ.
+				queryFn: () => `SELECT * FROM (SELECT DISTINCT a, b FROM t1) sub WHERE a IS NOT NULL`,
 				dataArb: (specs) => singleTableDataArb(specs[0]).map(rows => new Map([['t1', rows]]))
 			},
 			{
@@ -210,12 +227,20 @@ describe('Property-Based Planner/Optimizer Tests', () => {
 			{
 				id: 'projection-pruning',
 				specArb: singleTableSpec.map(s => [s]),
-				queryFn: (specs) => {
-					const cols = specs[0].columns.filter(c => c.name !== 'id');
-					const c1 = cols[0]?.name ?? 'a';
-					const c2 = cols[1]?.name ?? cols[0]?.name ?? 'a';
-					return `SELECT ${c1} FROM (SELECT ${c1}, ${c2} FROM t1) sub`;
-				},
+				// The rule fires only when a ProjectNode's source is also a ProjectNode
+				// and the outer references a strict subset of the inner's outputs. Two
+				// obstacles: (1) a pass-through `SELECT a, b` inner projection gets
+				// absorbed into the Retrieve during building, leaving no inner
+				// ProjectNode — defeated by a *computed* column (`id + 1`), which cannot
+				// be absorbed into a scan; (2) a FROM-subquery interposes an AliasNode
+				// between the two projections (Project→Alias→Project), which the rule
+				// does not look through — defeated by using a VIEW, whose expansion
+				// yields Project→Project directly. So: view v = {a, e=id+1}; the outer
+				// selects only `a`, so the computed `e` is pruned from the inner Project.
+				// Use `id` (always INTEGER) so the computed column never depends on a
+				// randomly-typed extra column.
+				setup: async (db) => { await db.exec(`CREATE VIEW v AS SELECT a, id + 1 AS e FROM t1`); },
+				queryFn: () => `SELECT a FROM v`,
 				dataArb: (specs) => singleTableDataArb(specs[0]).map(rows => new Map([['t1', rows]]))
 			},
 			{
@@ -233,43 +258,42 @@ describe('Property-Based Planner/Optimizer Tests', () => {
 			}
 		];
 
+		// Two rules are deliberately absent from this fire-coverage set: a swap /
+		// diagnostic pass they perform is invisible to the plan-diff signal (op +
+		// node_type, ORDER BY id), so enabling vs. disabling them yields an identical
+		// op/node_type stream. ruleFireCount can never exceed 0 for them, so the
+		// assertion below would fail no matter the generated shape:
+		//
+		//   - 'join-key-inference' is diagnostic-only: it `return null`s
+		//     unconditionally and only logs FK->PK detection. Its real effect flows
+		//     through computePhysical / CatalogStatsProvider.joinSelectivity (cost +
+		//     key propagation), not the plan tree. Covered by
+		//     test/optimizer/keys-propagation.spec.ts.
+		//
+		//   - 'join-greedy-commute' swaps an inner join's two children when the right
+		//     is the smaller nested-loop driver. Both join inputs here are a bare
+		//     IndexScan -> TableReference, so swapping them leaves the op/node_type
+		//     sequence unchanged — the swap is not plan-observable through this diff
+		//     (and PostOptimization physical-join selection re-canonicalizes
+		//     build/probe order regardless). Its correctness — inner-join
+		//     commutativity — is covered by the 'Join commutativity' suite below.
+		//     (Verified by dumping enabled/disabled query_plan for the asymmetric-data
+		//     shape: the op/node_type streams were byte-identical.)
+		//
+		// NOTE: neither removed rule has a "disabling it leaves the result set
+		// unchanged" check here. If that specific coverage is ever wanted, a plan
+		// diff can't provide it (see above) — assert on a cost / among-plans signal
+		// or on child order exposed some other way, not on op/node_type.
 		const twoTableRules: RuleDef[] = [
-			{
-				id: 'join-key-inference',
-				specArb: twoTableSpecs.map(([s1, s2]) => [s1, s2]),
-				queryFn: (specs) => {
-					const cols2 = specs[1].columns.filter(c => c.name !== 'id');
-					const joinCol = cols2[0]?.name ?? 'a';
-					return `SELECT * FROM t1 JOIN t2 ON t1.id = t2.${joinCol}`;
-				},
-				dataArb: (specs) => fc.tuple(
-					singleTableDataArb(specs[0]),
-					singleTableDataArb(specs[1])
-				).map(([r1, r2]) => new Map([['t1', r1], ['t2', r2]]))
-			},
-			{
-				id: 'join-greedy-commute',
-				specArb: twoTableSpecs.map(([s1, s2]) => [s1, s2]),
-				queryFn: (specs) => {
-					const cols2 = specs[1].columns.filter(c => c.name !== 'id');
-					const joinCol = cols2[0]?.name ?? 'a';
-					return `SELECT * FROM t1 JOIN t2 ON t1.id = t2.${joinCol}`;
-				},
-				dataArb: (specs) => fc.tuple(
-					singleTableDataArb(specs[0]),
-					singleTableDataArb(specs[1])
-				).map(([r1, r2]) => new Map([['t1', r1], ['t2', r2]]))
-			},
 			{
 				id: 'subquery-decorrelation',
 				specArb: twoTableSpecs.map(([s1, s2]) => [s1, s2]),
-				queryFn: (specs) => {
-					const cols1 = specs[0].columns.filter(c => c.name !== 'id');
-					const cols2 = specs[1].columns.filter(c => c.name !== 'id');
-					const c1 = cols1[0]?.name ?? 'a';
-					const c2 = cols2[0]?.name ?? 'a';
-					return `SELECT * FROM t1 WHERE ${c1} IN (SELECT ${c2} FROM t2)`;
-				},
+				// A *correlated* EXISTS: the rule anchors on a FilterNode whose
+				// predicate has a correlated EXISTS/IN and rewrites it into a
+				// semi-join. The old `a IN (SELECT b FROM t2)` was uncorrelated, so
+				// isCorrelatedSubquery was false and the rule bailed. `t2.a = t1.a`
+				// correlates it; both tables always have `a` (extra-col min is 2).
+				queryFn: () => `SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a)`,
 				dataArb: (specs) => fc.tuple(
 					singleTableDataArb(specs[0]),
 					singleTableDataArb(specs[1])
@@ -290,6 +314,7 @@ describe('Property-Based Planner/Optimizer Tests', () => {
 						const db = new Database();
 						try {
 							await setupSchema(db, specs, data);
+							if (ruleDef.setup) await ruleDef.setup(db, specs);
 							const query = ruleDef.queryFn(specs);
 
 							// Run with all rules enabled
@@ -318,10 +343,18 @@ describe('Property-Based Planner/Optimizer Tests', () => {
 					}
 				), { numRuns });
 
-				// Warn if the rule never fired across all runs — the test isn't exercising it
-				if (ruleFireCount === 0) {
-					console.warn(`[property-planner] Rule '${ruleDef.id}' never fired across ${numRuns} runs`);
-				}
+				// Hard-fail if the rule never fired across all runs: a rule whose
+				// enabled/disabled plans are always identical gets no coverage from the
+				// equivalence assertion above (it passes vacuously). Every rule left in
+				// the two rule arrays is plan-observable, so this is uniform — no
+				// per-rule special-casing. The two rules whose effect is invisible to
+				// the op/node_type plan diff (join-key-inference, join-greedy-commute)
+				// are *removed* (see the note on twoTableRules), not merely un-asserted
+				// here.
+				expect(ruleFireCount,
+					`Rule '${ruleDef.id}' never fired across ${numRuns} runs — ` +
+					`the disabled-rule equivalence check is vacuous for it`
+				).to.be.greaterThan(0);
 			});
 		}
 	});

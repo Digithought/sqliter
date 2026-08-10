@@ -1,0 +1,828 @@
+{
+  "children": [
+    {
+      "children": [
+        {
+          "children": [
+            {
+              "children": [
+                {
+                  "children": [
+                    {
+                      "children": [
+                        {
+                          "children": [],
+                          "detail": "main.users",
+                          "logical": {
+                            "columns": [
+                              "id",
+                              "name",
+                              "age",
+                              "dept_id"
+                            ],
+                            "estimates": {
+                              "rows": 0
+                            },
+                            "schema": "main",
+                            "table": "users"
+                          },
+                          "nodeType": "TableReference",
+                          "op": "TABLEREFERENCE",
+                          "physical": {
+                            "concurrencySafe": true,
+                            "constant": false,
+                            "deterministic": true,
+                            "fds": [
+                              {
+                                "dependents": [
+                                  1,
+                                  2,
+                                  3
+                                ],
+                                "determinants": [
+                                  0
+                                ],
+                                "kind": "unique"
+                              }
+                            ],
+                            "idempotent": true,
+                            "readonly": true,
+                            "updateLineage": {
+                              "$map": [
+                                [
+                                  "0",
+                                  {
+                                    "kind": "base",
+                                    "table": 4,
+                                    "baseColumn": "id"
+                                  }
+                                ],
+                                [
+                                  "1",
+                                  {
+                                    "kind": "base",
+                                    "table": 4,
+                                    "baseColumn": "name"
+                                  }
+                                ],
+                                [
+                                  "2",
+                                  {
+                                    "kind": "base",
+                                    "table": 4,
+                                    "baseColumn": "age"
+                                  }
+                                ],
+                                [
+                                  "3",
+                                  {
+                                    "kind": "base",
+                                    "table": 4,
+                                    "baseColumn": "dept_id"
+                                  }
+                                ]
+                              ],
+                              "size": 4
+                            }
+                          }
+                        }
+                      ],
+                      "detail": "INDEX SCAN users USING _primary_ ORDER BY 0",
+                      "logical": {
+                        "accessMethod": "index-scan",
+                        "filterInfo": {
+                          "estimatedCost": 1000.01,
+                          "estimatedRows": 1000,
+                          "matchedClauses": 0,
+                          "usableIndex": "idx=_primary_(0);plan=0"
+                        },
+                        "indexName": "_primary_",
+                        "providesOrdering": [
+                          {
+                            "column": 0,
+                            "desc": false
+                          }
+                        ],
+                        "schema": "main",
+                        "table": "users"
+                      },
+                      "nodeType": "IndexScan",
+                      "op": "INDEXSCAN",
+                      "physical": {
+                        "accessCapabilities": {
+                          "asofRight": true
+                        },
+                        "concurrencySafe": true,
+                        "deterministic": true,
+                        "estimatedRows": 0,
+                        "expectedLatencyMs": 0,
+                        "fds": [
+                          {
+                            "dependents": [
+                              1,
+                              2,
+                              3
+                            ],
+                            "determinants": [
+                              0
+                            ],
+                            "kind": "unique"
+                          }
+                        ],
+                        "idempotent": true,
+                        "monotonicOn": [
+                          {
+                            "attrId": 0,
+                            "direction": "asc",
+                            "strict": true
+                          }
+                        ],
+                        "ordering": [
+                          {
+                            "column": 0,
+                            "desc": false
+                          }
+                        ],
+                        "readonly": true,
+                        "updateLineage": {
+                          "$map": [
+                            [
+                              "0",
+                              {
+                                "kind": "base",
+                                "table": 4,
+                                "baseColumn": "id"
+                              }
+                            ],
+                            [
+                              "1",
+                              {
+                                "kind": "base",
+                                "table": 4,
+                                "baseColumn": "name"
+                              }
+                            ],
+                            [
+                              "2",
+                              {
+                                "kind": "base",
+                                "table": 4,
+                                "baseColumn": "age"
+                              }
+                            ],
+                            [
+                              "3",
+                              {
+                                "kind": "base",
+                                "table": 4,
+                                "baseColumn": "dept_id"
+                              }
+                            ]
+                          ],
+                          "size": 4
+                        }
+                      }
+                    },
+                    {
+                      "children": [
+                        {
+                          "children": [],
+                          "detail": "age",
+                          "logical": {
+                            "attributeId": 2,
+                            "column": "age",
+                            "resultType": "INTEGER"
+                          },
+                          "nodeType": "ColumnReference",
+                          "op": "COLUMNREFERENCE",
+                          "physical": {
+                            "constant": false,
+                            "deterministic": true,
+                            "idempotent": true,
+                            "readonly": true
+                          }
+                        },
+                        {
+                          "children": [],
+                          "detail": "30",
+                          "logical": {
+                            "resultType": "REAL",
+                            "value": 30
+                          },
+                          "nodeType": "Literal",
+                          "op": "LITERAL",
+                          "physical": {
+                            "constant": true,
+                            "deterministic": true,
+                            "idempotent": true,
+                            "readonly": true
+                          }
+                        }
+                      ],
+                      "detail": "u.age > 30",
+                      "logical": {
+                        "left": "u.age",
+                        "operator": ">",
+                        "resultType": "BOOLEAN",
+                        "right": "30"
+                      },
+                      "nodeType": "BinaryOp",
+                      "op": "BINARYOP",
+                      "physical": {
+                        "concurrencySafe": true,
+                        "deterministic": true,
+                        "expectedLatencyMs": 0,
+                        "idempotent": true,
+                        "readonly": true
+                      }
+                    }
+                  ],
+                  "detail": "WHERE u.age > 30",
+                  "logical": {
+                    "predicate": "u.age > 30"
+                  },
+                  "nodeType": "Filter",
+                  "op": "FILTER",
+                  "physical": {
+                    "concurrencySafe": true,
+                    "deterministic": true,
+                    "estimatedRows": 0,
+                    "expectedLatencyMs": 0,
+                    "fds": [
+                      {
+                        "dependents": [
+                          1,
+                          2,
+                          3
+                        ],
+                        "determinants": [
+                          0
+                        ],
+                        "kind": "unique"
+                      }
+                    ],
+                    "idempotent": true,
+                    "monotonicOn": [
+                      {
+                        "attrId": 0,
+                        "direction": "asc",
+                        "strict": true
+                      }
+                    ],
+                    "ordering": [
+                      {
+                        "column": 0,
+                        "desc": false
+                      }
+                    ],
+                    "readonly": true,
+                    "updateLineage": {
+                      "$map": [
+                        [
+                          "0",
+                          {
+                            "kind": "base",
+                            "table": 4,
+                            "baseColumn": "id"
+                          }
+                        ],
+                        [
+                          "1",
+                          {
+                            "kind": "base",
+                            "table": 4,
+                            "baseColumn": "name"
+                          }
+                        ],
+                        [
+                          "2",
+                          {
+                            "kind": "base",
+                            "table": 4,
+                            "baseColumn": "age"
+                          }
+                        ],
+                        [
+                          "3",
+                          {
+                            "kind": "base",
+                            "table": 4,
+                            "baseColumn": "dept_id"
+                          }
+                        ]
+                      ],
+                      "size": 4
+                    }
+                  }
+                }
+              ],
+              "detail": "ALIAS u",
+              "logical": {
+                "alias": "u"
+              },
+              "nodeType": "Alias",
+              "op": "ALIAS",
+              "physical": {
+                "concurrencySafe": true,
+                "deterministic": true,
+                "estimatedRows": 0,
+                "expectedLatencyMs": 0,
+                "fds": [
+                  {
+                    "dependents": [
+                      1,
+                      2,
+                      3
+                    ],
+                    "determinants": [
+                      0
+                    ],
+                    "kind": "unique"
+                  }
+                ],
+                "idempotent": true,
+                "monotonicOn": [
+                  {
+                    "attrId": 0,
+                    "direction": "asc",
+                    "strict": true
+                  }
+                ],
+                "ordering": [
+                  {
+                    "column": 0,
+                    "desc": false
+                  }
+                ],
+                "readonly": true,
+                "updateLineage": {
+                  "$map": [
+                    [
+                      "0",
+                      {
+                        "kind": "base",
+                        "table": 4,
+                        "baseColumn": "id"
+                      }
+                    ],
+                    [
+                      "1",
+                      {
+                        "kind": "base",
+                        "table": 4,
+                        "baseColumn": "name"
+                      }
+                    ],
+                    [
+                      "2",
+                      {
+                        "kind": "base",
+                        "table": 4,
+                        "baseColumn": "age"
+                      }
+                    ],
+                    [
+                      "3",
+                      {
+                        "kind": "base",
+                        "table": 4,
+                        "baseColumn": "dept_id"
+                      }
+                    ]
+                  ],
+                  "size": 4
+                }
+              }
+            },
+            {
+              "children": [
+                {
+                  "children": [
+                    {
+                      "children": [],
+                      "detail": "main.departments",
+                      "logical": {
+                        "columns": [
+                          "id",
+                          "name",
+                          "budget"
+                        ],
+                        "estimates": {
+                          "rows": 0
+                        },
+                        "schema": "main",
+                        "table": "departments"
+                      },
+                      "nodeType": "TableReference",
+                      "op": "TABLEREFERENCE",
+                      "physical": {
+                        "concurrencySafe": true,
+                        "constant": false,
+                        "deterministic": true,
+                        "fds": [
+                          {
+                            "dependents": [
+                              1,
+                              2
+                            ],
+                            "determinants": [
+                              0
+                            ],
+                            "kind": "unique"
+                          }
+                        ],
+                        "idempotent": true,
+                        "readonly": true,
+                        "updateLineage": {
+                          "$map": [
+                            [
+                              "4",
+                              {
+                                "kind": "base",
+                                "table": 7,
+                                "baseColumn": "id"
+                              }
+                            ],
+                            [
+                              "5",
+                              {
+                                "kind": "base",
+                                "table": 7,
+                                "baseColumn": "name"
+                              }
+                            ],
+                            [
+                              "6",
+                              {
+                                "kind": "base",
+                                "table": 7,
+                                "baseColumn": "budget"
+                              }
+                            ]
+                          ],
+                          "size": 3
+                        }
+                      }
+                    }
+                  ],
+                  "detail": "INDEX SCAN departments USING _primary_ ORDER BY 0",
+                  "logical": {
+                    "accessMethod": "index-scan",
+                    "filterInfo": {
+                      "estimatedCost": 1000,
+                      "estimatedRows": 1000,
+                      "matchedClauses": 0,
+                      "usableIndex": "idx=_primary_(0);plan=0"
+                    },
+                    "indexName": "_primary_",
+                    "providesOrdering": [
+                      {
+                        "column": 0,
+                        "desc": false
+                      }
+                    ],
+                    "schema": "main",
+                    "table": "departments"
+                  },
+                  "nodeType": "IndexScan",
+                  "op": "INDEXSCAN",
+                  "physical": {
+                    "accessCapabilities": {
+                      "asofRight": true
+                    },
+                    "concurrencySafe": true,
+                    "deterministic": true,
+                    "estimatedRows": 0,
+                    "expectedLatencyMs": 0,
+                    "fds": [
+                      {
+                        "dependents": [
+                          1,
+                          2
+                        ],
+                        "determinants": [
+                          0
+                        ],
+                        "kind": "unique"
+                      }
+                    ],
+                    "idempotent": true,
+                    "monotonicOn": [
+                      {
+                        "attrId": 4,
+                        "direction": "asc",
+                        "strict": true
+                      }
+                    ],
+                    "ordering": [
+                      {
+                        "column": 0,
+                        "desc": false
+                      }
+                    ],
+                    "readonly": true,
+                    "updateLineage": {
+                      "$map": [
+                        [
+                          "4",
+                          {
+                            "kind": "base",
+                            "table": 7,
+                            "baseColumn": "id"
+                          }
+                        ],
+                        [
+                          "5",
+                          {
+                            "kind": "base",
+                            "table": 7,
+                            "baseColumn": "name"
+                          }
+                        ],
+                        [
+                          "6",
+                          {
+                            "kind": "base",
+                            "table": 7,
+                            "baseColumn": "budget"
+                          }
+                        ]
+                      ],
+                      "size": 3
+                    }
+                  }
+                }
+              ],
+              "detail": "ALIAS d",
+              "logical": {
+                "alias": "d"
+              },
+              "nodeType": "Alias",
+              "op": "ALIAS",
+              "physical": {
+                "concurrencySafe": true,
+                "deterministic": true,
+                "estimatedRows": 0,
+                "expectedLatencyMs": 0,
+                "fds": [
+                  {
+                    "dependents": [
+                      1,
+                      2
+                    ],
+                    "determinants": [
+                      0
+                    ],
+                    "kind": "unique"
+                  }
+                ],
+                "idempotent": true,
+                "monotonicOn": [
+                  {
+                    "attrId": 4,
+                    "direction": "asc",
+                    "strict": true
+                  }
+                ],
+                "ordering": [
+                  {
+                    "column": 0,
+                    "desc": false
+                  }
+                ],
+                "readonly": true,
+                "updateLineage": {
+                  "$map": [
+                    [
+                      "4",
+                      {
+                        "kind": "base",
+                        "table": 7,
+                        "baseColumn": "id"
+                      }
+                    ],
+                    [
+                      "5",
+                      {
+                        "kind": "base",
+                        "table": 7,
+                        "baseColumn": "name"
+                      }
+                    ],
+                    [
+                      "6",
+                      {
+                        "kind": "base",
+                        "table": 7,
+                        "baseColumn": "budget"
+                      }
+                    ]
+                  ],
+                  "size": 3
+                }
+              }
+            }
+          ],
+          "detail": "INNER HASH JOIN on [3=4]",
+          "logical": {
+            "algorithm": "bloom",
+            "equiPairs": [
+              {
+                "left": 3,
+                "right": 4
+              }
+            ],
+            "hasResidual": false,
+            "joinType": "inner"
+          },
+          "nodeType": "HashJoin",
+          "op": "HASHJOIN",
+          "physical": {
+            "concurrencySafe": true,
+            "deterministic": true,
+            "equivClasses": [
+              [
+                3,
+                4
+              ]
+            ],
+            "estimatedRows": 0,
+            "expectedLatencyMs": 0,
+            "fds": [
+              {
+                "dependents": [
+                  5,
+                  6
+                ],
+                "determinants": [
+                  4
+                ],
+                "kind": "determination"
+              },
+              {
+                "dependents": [
+                  4
+                ],
+                "determinants": [
+                  3
+                ],
+                "kind": "determination"
+              },
+              {
+                "dependents": [
+                  3
+                ],
+                "determinants": [
+                  4
+                ],
+                "kind": "determination"
+              },
+              {
+                "dependents": [
+                  1,
+                  2,
+                  3,
+                  4,
+                  5,
+                  6
+                ],
+                "determinants": [
+                  0
+                ],
+                "kind": "unique"
+              }
+            ],
+            "idempotent": true,
+            "readonly": true
+          }
+        },
+        {
+          "children": [],
+          "detail": "name",
+          "logical": {
+            "attributeId": 1,
+            "column": "name",
+            "resultType": "TEXT"
+          },
+          "nodeType": "ColumnReference",
+          "op": "COLUMNREFERENCE",
+          "physical": {
+            "constant": false,
+            "deterministic": true,
+            "idempotent": true,
+            "readonly": true
+          }
+        },
+        {
+          "children": [],
+          "detail": "name",
+          "logical": {
+            "attributeId": 5,
+            "column": "name",
+            "resultType": "TEXT"
+          },
+          "nodeType": "ColumnReference",
+          "op": "COLUMNREFERENCE",
+          "physical": {
+            "constant": false,
+            "deterministic": true,
+            "idempotent": true,
+            "readonly": true
+          }
+        }
+      ],
+      "detail": "SELECT u.name, d.name AS dept_name",
+      "logical": {
+        "projectionCount": 2,
+        "projections": [
+          {
+            "expression": "u.name"
+          },
+          {
+            "alias": "dept_name",
+            "expression": "d.name"
+          }
+        ],
+        "uniqueKeys": []
+      },
+      "nodeType": "Project",
+      "op": "PROJECT",
+      "physical": {
+        "concurrencySafe": true,
+        "deterministic": true,
+        "estimatedRows": 0,
+        "expectedLatencyMs": 0,
+        "idempotent": true,
+        "readonly": true,
+        "updateLineage": {
+          "$map": [
+            [
+              "1",
+              {
+                "kind": "computed",
+                "expr": {
+                  "type": "column",
+                  "name": "name",
+                  "table": "u",
+                  "loc": {
+                    "start": {
+                      "line": 1,
+                      "column": 8,
+                      "offset": 7
+                    },
+                    "end": {
+                      "line": 1,
+                      "column": 13,
+                      "offset": 13
+                    }
+                  }
+                }
+              }
+            ],
+            [
+              "5",
+              {
+                "kind": "computed",
+                "expr": {
+                  "type": "column",
+                  "name": "name",
+                  "table": "d",
+                  "loc": {
+                    "start": {
+                      "line": 1,
+                      "column": 16,
+                      "offset": 15
+                    },
+                    "end": {
+                      "line": 1,
+                      "column": 21,
+                      "offset": 21
+                    }
+                  }
+                }
+              }
+            ]
+          ],
+          "size": 2
+        }
+      }
+    }
+  ],
+  "detail": "1 statements",
+  "logical": {
+    "numStatements": 1,
+    "parameters": [],
+    "statementTypes": [
+      "Project"
+    ]
+  },
+  "nodeType": "Block",
+  "op": "BLOCK",
+  "physical": {
+    "concurrencySafe": true,
+    "deterministic": true,
+    "expectedLatencyMs": 0,
+    "idempotent": true,
+    "readonly": true
+  }
+}

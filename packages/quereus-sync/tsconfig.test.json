@@ -13,6 +13,7 @@
     "esm": true,
     "experimentalSpecifierResolution": "node"
   },
-  "include": ["test/**/*", "src/**/*"]
+  "include": ["test/**/*", "src/**/*"],
+  "exclude": ["node_modules", "dist"]
 }
 

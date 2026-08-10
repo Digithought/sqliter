@@ -1,0 +1,150 @@
+-- 03.9-is-bool-predicate.sqllogic — `expr IS [NOT] TRUE/FALSE` boolean tests.
+--
+-- These four postfix unary predicates are SQLite-compatible and TOTAL: they
+-- never return NULL. Operand truthiness routes through the engine's isTruthy
+-- (same as FilterNode / NOT / logical ops), so non-boolean operands behave
+-- consistently. The defining feature vs `= true/false` is the NULL row:
+--   x = true  on NULL  ⇒ NULL        x IS TRUE on NULL ⇒ false
+-- The 4×3 matrix below pins NULL totality; the non-boolean block pins that
+-- truthiness goes through isTruthy (NOT JS truthiness).
+
+-- ===========================================================================
+-- Totality matrix: {IS TRUE, IS NOT TRUE, IS FALSE, IS NOT FALSE} × {true,
+-- false, null}. Scalar form (aliased) so results are unambiguous booleans.
+-- ===========================================================================
+
+-- IS TRUE: true→true, false→false, null→false.
+select (true is true) as r;
+→ [{"r":true}]
+
+select (false is true) as r;
+→ [{"r":false}]
+
+select (null is true) as r;
+→ [{"r":false}]
+
+-- IS NOT TRUE (≡ NOT (x IS TRUE)): true→false, false→true, null→true.
+select (true is not true) as r;
+→ [{"r":false}]
+
+select (false is not true) as r;
+→ [{"r":true}]
+
+select (null is not true) as r;
+→ [{"r":true}]
+
+-- IS FALSE: true→false, false→true, null→false.
+select (true is false) as r;
+→ [{"r":false}]
+
+select (false is false) as r;
+→ [{"r":true}]
+
+select (null is false) as r;
+→ [{"r":false}]
+
+-- IS NOT FALSE (≡ NOT (x IS FALSE)): true→true, false→false, null→true.
+select (true is not false) as r;
+→ [{"r":true}]
+
+select (false is not false) as r;
+→ [{"r":false}]
+
+select (null is not false) as r;
+→ [{"r":true}]
+
+-- ===========================================================================
+-- Non-boolean operands must route through isTruthy, NOT JS truthiness.
+-- A regression to JS truthiness would make '0' IS TRUE → true and
+-- 'abc' IS TRUE → true; both must be false here.
+-- ===========================================================================
+
+-- Text: numeric-string conversion ('1'→1 truthy, '0'→0 falsey).
+select ('1' is true) as r;
+→ [{"r":true}]
+
+select ('0' is true) as r;
+→ [{"r":false}]
+
+-- Non-numeric text converts to 0 (falsey) — a JS-truthiness regression catcher.
+select ('abc' is true) as r;
+→ [{"r":false}]
+
+select ('abc' is false) as r;
+→ [{"r":true}]
+
+-- Numeric: 0 falsey, non-zero truthy.
+select (2 is true) as r;
+→ [{"r":true}]
+
+select (0 is false) as r;
+→ [{"r":true}]
+
+select (2 is not false) as r;
+→ [{"r":true}]
+
+-- ===========================================================================
+-- Column-reference path over a boolean column with a NULL row.
+-- ===========================================================================
+
+create table feat (id integer primary key, name text, flag any null);
+insert into feat values (1, 'alpha', true);
+insert into feat values (2, 'beta', false);
+insert into feat values (3, 'gamma', null);
+insert into feat values (4, 'delta', true);
+
+-- IS TRUE keeps only the true rows.
+select id from feat where flag is true order by id;
+→ [{"id":1},{"id":4}]
+
+-- IS NOT TRUE keeps false + null rows (totality: null flips into the NOT bucket).
+select id from feat where flag is not true order by id;
+→ [{"id":2},{"id":3}]
+
+-- IS FALSE keeps only the false row (null excluded — never returns true).
+select id from feat where flag is false order by id;
+→ [{"id":2}]
+
+-- IS NOT FALSE keeps true + null rows.
+select id from feat where flag is not false order by id;
+→ [{"id":1},{"id":3},{"id":4}]
+
+-- ===========================================================================
+-- Precedence: prefix NOT binds ABOVE the IS predicate, so
+-- `not flag is true` parses as `NOT (flag IS TRUE)` — identical to the
+-- explicit-parenthesis form and to `flag IS NOT TRUE` (double negation).
+-- A precedence inversion to `(not flag) is true` would diverge here.
+-- ===========================================================================
+
+select id from feat where not flag is true order by id;
+→ [{"id":2},{"id":3}]
+
+select id from feat where not (flag is true) order by id;
+→ [{"id":2},{"id":3}]
+
+-- The partial-index compilation smoke test for these four operators lives in
+-- 03.9.1-is-bool-predicate-partial-index (it needs standalone CREATE INDEX).
+
+drop table feat;
+
+-- ===========================================================================
+-- CHECK constraint using a boolean-test predicate. check-extraction /
+-- assertion-classifier don't special-case these operators (they fall through
+-- to "residual / not specially analyzed"); the constraint is still enforced by
+-- general expression evaluation, and no analysis path throws on the new
+-- operator string. `c IS NOT FALSE` admits true + null, rejects false.
+-- ===========================================================================
+
+create table chk (id integer primary key, c any null, check (c is not false));
+
+insert into chk values (1, true);
+insert into chk values (2, null);
+
+select id from chk order by id;
+→ [{"id":1},{"id":2}]
+
+-- false → `c is not false` is false → violates the CHECK.
+insert into chk values (3, false);
+-- error: CHECK constraint failed
+
+drop table chk;

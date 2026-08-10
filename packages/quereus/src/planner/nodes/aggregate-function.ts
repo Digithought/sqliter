@@ -9,13 +9,15 @@ import { formatExpressionList, formatScalarType } from '../../util/plan-formatte
 import { NULL_TYPE } from '../../types/builtin-types.js';
 import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
+import type { AggregateFunctionCapable } from '../framework/characteristics.js';
 
 /**
  * Represents an aggregate function call within a SQL query.
  * This is specifically for aggregate functions (COUNT, SUM, AVG, etc.)
  */
-export class AggregateFunctionCallNode extends PlanNode implements ScalarPlanNode {
+export class AggregateFunctionCallNode extends PlanNode implements ScalarPlanNode, AggregateFunctionCapable {
 	readonly nodeType = PlanNodeType.ScalarFunctionCall; // Using same type as scalar functions
+	readonly isAggregateFunctionCapable = true as const;
 	private readonly _inferredType?: ScalarType;
 
 	constructor(

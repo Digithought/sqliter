@@ -1,0 +1,114 @@
+-- 41.7.2.1-alter-column-collate-unique-index-store.sqllogic
+--
+-- requires-capability: standalone-index-ddl
+--
+-- ALTER COLUMN ... SET COLLATE re-validation where the UNIQUE comes from a standalone
+-- `create unique index`.
+--
+-- CROSS-MODULE (NOT in MEMORY_ONLY_FILES): runs in both memory and store modes, for the
+-- same reason as its parent — the constrained column is row DATA keyed by the integer PK,
+-- so the store's fixed-table-collation KEY encoding is irrelevant.
+--
+-- Carved out of 41.7.2-alter-column-collate-unique-store: sections 1, 2, 5, 7, 8 and 9
+-- there make the same re-validation points (reject on collision, honor when distinct,
+-- composite members, NULLs, no-op guard, PK re-key) with inline / table-level UNIQUE and
+-- need no index DDL. These sections need an explicit index — §1/§2 below because the
+-- constraint is index-derived rather than declared, §3 because a PARTIAL unique
+-- constraint has no declarative spelling in this engine.
+--
+-- Subject: an index-derived UNIQUE (including a partial one) is re-validated by the same
+-- existing-row scan on SET COLLATE, and afterwards enforces under the resulting collation.
+
+-- ===================================
+-- 1. EXPLICIT `create unique index` (not an inline UNIQUE) is re-validated by the
+--    same existing-row scan. A value set distinct under BINARY but colliding under
+--    NOCASE rejects the ALTER and rolls back; the table stays writable and the index
+--    keeps enforcing under the original collation.
+-- ===================================
+create table xi (id integer primary key, email text);
+create unique index xi_email on xi(email);
+insert into xi values (1, 'a@x'), (2, 'A@x');
+-- run
+
+alter table xi alter column email set collate nocase;
+-- error: UNIQUE constraint failed
+
+-- rollback: both rows survive, column still BINARY
+select id, email from xi order by id;
+→ [{"id":1,"email":"a@x"},{"id":2,"email":"A@x"}]
+
+select name, collation from table_info('xi') order by cid;
+→ [{"name":"id","collation":"BINARY"},{"name":"email","collation":"BINARY"}]
+
+-- the explicit unique index still enforces (under the original BINARY collation):
+-- a case-distinct value is still allowed, an exact duplicate is rejected.
+insert into xi values (3, 'B@x');
+select count(*) as n from xi;
+→ [{"n":3}]
+
+insert into xi values (4, 'a@x');
+-- error: UNIQUE constraint failed
+
+drop table xi;
+
+-- ===================================
+-- 2. EXPLICIT `create unique index`, distinct under BOTH collations → ALTER
+--    succeeds and the index then enforces under the NEW collation.
+-- ===================================
+
+create table xj (id integer primary key, email text);
+create unique index xj_email on xj(email);
+insert into xj values (1, 'a@x'), (2, 'b@x');
+
+alter table xj alter column email set collate nocase;
+-- run
+
+-- the index now enforces under NOCASE: a case-only duplicate collides
+insert into xj values (3, 'A@X');
+-- error: UNIQUE constraint failed
+
+select id, email from xj order by id;
+→ [{"id":1,"email":"a@x"},{"id":2,"email":"b@x"}]
+
+drop table xj;
+
+-- ===================================
+-- 3. PARTIAL unique index — only rows the predicate accepts are re-validated. A
+--    case-collision among EXCLUDED rows must NOT block the ALTER; a collision among
+--    INCLUDED rows must.
+-- ===================================
+
+-- 3a. the colliding pair is excluded by the predicate → ALTER succeeds.
+create table pp (id integer primary key, code text, active integer);
+create unique index pp_code on pp(code) where active = 1;
+insert into pp values (1, 'a', 0), (2, 'A', 0);
+-- run
+
+alter table pp alter column code set collate nocase;
+-- run
+
+-- the change took effect and the partial index now enforces NOCASE for active rows
+select name, collation from table_info('pp') where name = 'code';
+→ [{"name":"code","collation":"NOCASE"}]
+
+insert into pp values (3, 'a', 1);
+insert into pp values (4, 'A', 1);
+-- error: UNIQUE constraint failed
+
+drop table pp;
+
+-- 3b. the colliding pair is INCLUDED by the predicate → ALTER rejected, rollback.
+create table pq (id integer primary key, code text, active integer);
+create unique index pq_code on pq(code) where active = 1;
+insert into pq values (1, 'a', 1), (2, 'A', 1);
+-- run
+
+alter table pq alter column code set collate nocase;
+-- error: UNIQUE constraint failed
+
+select name, collation from table_info('pq') where name = 'code';
+→ [{"name":"code","collation":"BINARY"}]
+
+drop table pq;
+
+-- ===================================

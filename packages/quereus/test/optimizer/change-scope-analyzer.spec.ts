@@ -7,6 +7,7 @@ import { BuildTimeDependencyTracker, type PlanningContext } from '../../src/plan
 import { buildBlock } from '../../src/planner/building/block.js';
 import {
 	analyzeChangeScope,
+	buildSourceUnionScope,
 	unionScopes,
 	intersectScopes,
 	bindParameters,
@@ -90,6 +91,25 @@ describe('analyzeChangeScope', () => {
 			const r = w.scope as Extract<WatchScope, { kind: 'rows' }>;
 			expect(r.values).to.deep.equal([[42]]);
 			expect(scope.unboundParameters).to.deep.equal([]);
+		});
+
+		it('single-PK equality on a NON-lowercase table name still yields a rows scope', async () => {
+			// Regression for the relation-key casing bug: every relation-key
+			// builder in the change-scope pipeline lowercases EXCEPT the one in
+			// `createTableInfoFromNode`, which left the key un-lowercased. For a
+			// table whose name isn't already lowercase (`Entity`), the classifier
+			// key (`...Entity#id`) no longer matched the binding-extractor /
+			// analyzer keys (`...entity#id`), so `analyzeRowSpecific` and
+			// `extractConstraintsForTable` both missed and the watch silently
+			// widened to whole-table (or dropped entirely). Asserting on a
+			// capitalized name pins the fix; a lowercase name passes either way.
+			await db.exec('CREATE TABLE Entity (id INTEGER PRIMARY KEY, name TEXT) USING memory');
+			const scope = scopeFor(db, 'select name from Entity where id = ?', [200]);
+			const w = findWatch(scope, 'main', 'entity');
+			expect(w.scope.kind).to.equal('rows');
+			const r = w.scope as Extract<WatchScope, { kind: 'rows' }>;
+			expect(r.key).to.deep.equal(['id']);
+			expect(r.values).to.deep.equal([[200]]);
 		});
 
 		it('row binding whose values cannot be decoded falls back to full (soundness)', async () => {
@@ -198,6 +218,62 @@ describe('analyzeChangeScope', () => {
 			expect(w.scope.kind).to.equal('full');
 			expect(w.columns).to.not.equal('all');
 			expect([...(w.columns as ReadonlySet<string>)]).to.deep.equal(['v']);
+		});
+
+		it('select * from Entity where id = ? (whole-row PK read) → rows scope with columns = "all"', async () => {
+			// A `select *` is elided to a passthrough that forwards the base table's
+			// OWN attribute ids to the output with no ColumnReferenceNode, so the
+			// ColumnReferenceNode scan records only the WHERE-predicate column (`id`).
+			// The whole-row-forwarded detection must pin `columns` to 'all' (→ a
+			// row-level dep downstream), not a cell dep on `id`.
+			await db.exec('CREATE TABLE Entity (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER) USING memory');
+			const scope = scopeFor(db, 'select * from Entity where id = ?', [200]);
+			const w = findWatch(scope, 'main', 'entity');
+			expect(w.scope.kind).to.equal('rows');
+			expect(w.columns).to.equal('all');
+		});
+
+		it('select * from Entity where id = 200 (literal) → columns = "all"', async () => {
+			await db.exec('CREATE TABLE Entity (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER) USING memory');
+			const scope = scopeFor(db, 'select * from Entity where id = 200');
+			const w = findWatch(scope, 'main', 'entity');
+			expect(w.columns).to.equal('all');
+		});
+
+		it('select name from Entity where id = ? → columns = {"id","name"} (explicit projection NOT widened to all)', async () => {
+			// Guards against spuriously widening an explicit projection: a Project
+			// node narrows the output to a SUBSET of the table's attrs, so the
+			// whole-row detection must NOT fire here.
+			await db.exec('CREATE TABLE Entity (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER) USING memory');
+			const scope = scopeFor(db, 'select name from Entity where id = ?', [200]);
+			const w = findWatch(scope, 'main', 'entity');
+			expect(w.columns).to.not.equal('all');
+			expect([...(w.columns as ReadonlySet<string>)].sort()).to.deep.equal(['id', 'name']);
+		});
+
+		it('select * from A join B (whole-row join) → BOTH sides widened to "all"', async () => {
+			// A join forwards both inputs' attribute ids to the output relation
+			// (buildJoinAttributes preserves them), so a `select *` over a join
+			// serves BOTH base rows whole — neither side may under-report. This is
+			// the multi-table case the single-table tests above do not exercise.
+			await db.exec('CREATE TABLE A (id INTEGER PRIMARY KEY, av TEXT) USING memory');
+			await db.exec('CREATE TABLE B (id INTEGER PRIMARY KEY, bv TEXT) USING memory');
+			const scope = scopeFor(db, 'select * from A join B on A.id = B.id where A.id = ?', [200]);
+			expect(findWatch(scope, 'main', 'a').columns).to.equal('all');
+			expect(findWatch(scope, 'main', 'b').columns).to.equal('all');
+		});
+
+		it('select A.* from A join B → only the starred side widens; the other stays enumerated', async () => {
+			// `A.*` forwards A's whole attribute set but only B's join-key column
+			// reaches the plan (via the ON ColumnReferenceNode), so the whole-row
+			// detection fires for A alone — B keeps its enumerated read set.
+			await db.exec('CREATE TABLE A (id INTEGER PRIMARY KEY, av TEXT) USING memory');
+			await db.exec('CREATE TABLE B (id INTEGER PRIMARY KEY, bv TEXT) USING memory');
+			const scope = scopeFor(db, 'select A.* from A join B on A.id = B.id where A.id = ?', [200]);
+			expect(findWatch(scope, 'main', 'a').columns).to.equal('all');
+			const bCols = findWatch(scope, 'main', 'b').columns;
+			expect(bCols).to.not.equal('all');
+			expect([...(bCols as ReadonlySet<string>)]).to.deep.equal(['id']);
 		});
 	});
 
@@ -358,5 +434,34 @@ describe('Predicates', () => {
 		} finally {
 			await db.close();
 		}
+	});
+});
+
+describe('buildSourceUnionScope', () => {
+	const tableNames = (s: ChangeScope) => s.watches.map(w => `${w.table.schema}.${w.table.table}`);
+
+	it('builds one full/all watch per qualified source', () => {
+		const scope = buildSourceUnionScope(['main.a', 'main.b']);
+		expect(tableNames(scope)).to.deep.equal(['main.a', 'main.b']);
+		for (const w of scope.watches) {
+			expect(w.columns).to.equal('all');
+			expect(w.scope).to.deep.equal({ kind: 'full' });
+		}
+		expect(scope.nonDeterministicSources).to.deep.equal([]);
+		expect(scope.unboundParameters).to.deep.equal([]);
+	});
+
+	it('honors a non-main source schema across multiple sources', () => {
+		// N-source path is currently unreachable via SQL (join bodies are
+		// incremental-ineligible) but the helper must stay correct for when it widens.
+		// Input is always a deduped `Set`-derived list (collectSourceTables), so the
+		// helper does not itself dedup — same-table folding happens in unionScopes.
+		const scope = buildSourceUnionScope(['other.a', 'main.b']);
+		expect(tableNames(scope)).to.deep.equal(['main.b', 'other.a']);
+	});
+
+	it('falls back to the main schema for an unqualified source name', () => {
+		const scope = buildSourceUnionScope(['lonely']);
+		expect(scope.watches[0].table).to.deep.equal({ schema: 'main', table: 'lonely' });
 	});
 });

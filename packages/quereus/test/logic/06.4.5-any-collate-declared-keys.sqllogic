@@ -1,0 +1,92 @@
+-- 06.4.5-any-collate-declared-keys.sqllogic
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Subject: a declared COLLATE on an `any` column is honored by declared-key
+-- structures (the PK BTree, secondary indexes) exactly as the generic comparison
+-- path honors it (ticket any-type-compare-honors-collation): `ANY_TYPE.compare`
+-- applies the collation it is handed, so creating an index never changes a
+-- query's answer, and PK/UNIQUE enforcement agrees with the identity that
+-- DISTINCT / GROUP BY / IN already use. Each section pins the before-index
+-- answer as the oracle and asserts the after-index answer equals it.
+
+-- Case 1: equality and range answers must not move when an index appears.
+create table t1 (id integer primary key, v any collate nocase);
+insert into t1 values (1, 'Bob'), (2, 'zed');
+select id from t1 where v = 'BOB';
+→ [{"id":1}]
+select id from t1 where v > 'a' order by id;
+→ [{"id":1},{"id":2}]
+create index ix1 on t1 (v);
+select id from t1 where v = 'BOB';
+→ [{"id":1}]
+select id from t1 where v > 'a' order by id;
+→ [{"id":1},{"id":2}]
+drop table t1;
+
+-- Case 2: an index that supplies ORDER BY must reproduce the NOCASE order
+-- (A, b, C), not BINARY byte order (A, C, b).
+create table t2 (id integer primary key, v any collate nocase);
+insert into t2 values (1, 'b'), (2, 'A'), (3, 'C');
+select id from t2 order by v;
+→ [{"id":2},{"id":1},{"id":3}]
+create index ix2 on t2 (v);
+select id from t2 order by v;
+→ [{"id":2},{"id":1},{"id":3}]
+drop table t2;
+
+-- Case 3: an index COLLATE over an undecorated `any` column must be keyed under
+-- that collation — the cover analysis serves the NOCASE demand from it.
+create table t3 (id integer primary key, v any);
+insert into t3 values (1, 'Bob'), (2, 'zed');
+select id from t3 where v = 'BOB' collate nocase;
+→ [{"id":1}]
+create index ix3 on t3 (v collate nocase);
+select id from t3 where v = 'BOB' collate nocase;
+→ [{"id":1}]
+-- The column itself still compares BINARY when no collation is demanded.
+select id from t3 where v = 'BOB';
+→ []
+drop table t3;
+
+-- Case 4: PK and UNIQUE enforce under the declared collation — the same
+-- identity DISTINCT already collapses (a dup DISTINCT merges must not be
+-- admitted by UNIQUE).
+create table pk4 (k any collate nocase primary key, n integer);
+insert into pk4 values ('Bob', 1);
+insert into pk4 values ('BOB', 2);
+-- error: UNIQUE constraint failed
+select n from pk4 where k = 'BOB';
+→ [{"n":1}]
+drop table pk4;
+
+create table u4 (id integer primary key, v any collate nocase, unique (v));
+insert into u4 values (1, 'Bob');
+insert into u4 values (2, 'BOB');
+-- error: UNIQUE constraint failed
+select count(*) as cnt from u4;
+→ [{"cnt":1}]
+insert into u4 values (3, 'zed');
+select count(distinct v) as dv from u4;
+→ [{"dv":2}]
+drop table u4;
+
+-- Case 5: the identity paths — row DISTINCT, GROUP BY, aggregate DISTINCT, min/max
+-- — all collapse case variants of an `any collate nocase` column, and an index does
+-- not move any of those answers either.
+create table t5 (id integer primary key, v any collate nocase);
+insert into t5 values (1, 'Bob'), (2, 'BOB'), (3, 'zed');
+select distinct v from t5 order by v;
+→ [{"v":"Bob"},{"v":"zed"}]
+select v, count(*) as n from t5 group by v order by v;
+→ [{"v":"Bob","n":2},{"v":"zed","n":1}]
+select count(distinct v) as dv, min(v) as lo, max(v) as hi from t5;
+→ [{"dv":2,"lo":"Bob","hi":"zed"}]
+create index ix5 on t5 (v);
+select distinct v from t5 order by v;
+→ [{"v":"Bob"},{"v":"zed"}]
+select v, count(*) as n from t5 group by v order by v;
+→ [{"v":"Bob","n":2},{"v":"zed","n":1}]
+select count(distinct v) as dv, min(v) as lo, max(v) as hi from t5;
+→ [{"dv":2,"lo":"Bob","hi":"zed"}]
+drop table t5;

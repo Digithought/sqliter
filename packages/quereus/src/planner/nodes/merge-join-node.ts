@@ -8,7 +8,8 @@ import { quereusError } from '../../common/errors.js';
 import type { JoinCapable, PredicateSourceCapable } from '../framework/characteristics.js';
 import { mergeJoinCost } from '../cost/index.js';
 import type { JoinType } from './join-node.js';
-import { buildJoinAttributes, buildJoinRelationType, estimateJoinRows, propagateJoinMonotonicOn, propagateJoinFds, type EquiJoinPair } from './join-utils.js';
+import { buildJoinAttributes, buildJoinRelationType, describeEquiPairs, estimateJoinRows, joinPhysicalRows, propagateJoinMonotonicOn, propagateJoinFds, propagateJoinInds, valueFactPairs, type EquiJoinPair } from './join-utils.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 import { analyzeJoinKeyCoverage, combineJoinKeys } from '../util/key-utils.js';
 
 /**
@@ -23,6 +24,8 @@ import { analyzeJoinKeyCoverage, combineJoinKeys } from '../util/key-utils.js';
  */
 export class MergeJoinNode extends PlanNode implements BinaryRelationalNode, JoinCapable, PredicateSourceCapable {
 	override readonly nodeType = PlanNodeType.MergeJoin;
+	readonly isJoinCapable = true as const;
+	readonly isPredicateSourceCapable = true as const;
 	private attributesCache: Cached<Attribute[]>;
 
 	constructor(
@@ -42,7 +45,10 @@ export class MergeJoinNode extends PlanNode implements BinaryRelationalNode, Joi
 		const leftRows = left.estimatedRows ?? 100;
 		const rightRows = right.estimatedRows ?? 100;
 		// Merge cost only (no sort cost here — SortNodes are inserted upstream if needed)
-		const cost = left.getTotalCost() + right.getTotalCost() + mergeJoinCost(leftRows, rightRows, false, false);
+		// Self-cost only: children (left, right, residualCondition) flow in via
+		// getTotalCost(). Self is the merge cost (no sort cost — SortNodes are
+		// inserted upstream if needed).
+		const cost = mergeJoinCost(leftRows, rightRows, false, false);
 		super(scope, cost);
 
 		this.attributesCache = new Cached(() => this.buildAttributes());
@@ -59,12 +65,17 @@ export class MergeJoinNode extends PlanNode implements BinaryRelationalNode, Joi
 		return this.attributesCache.value;
 	}
 
+	/** Pairs this join may mint value-level facts from — see {@link valueFactPairs}. */
+	private factPairs(): readonly EquiJoinPair[] {
+		return valueFactPairs(this.equiPairs);
+	}
+
 	getType(): RelationType {
 		const leftType = this.left.getType();
 		const rightType = this.right.getType();
 		const leftIndex = this.left.getAttributeIndex();
 		const rightIndex = this.right.getAttributeIndex();
-		const indexPairs = this.equiPairs.map(p => ({
+		const indexPairs = this.factPairs().map(p => ({
 			left: leftIndex.get(p.leftAttrId) ?? -1,
 			right: rightIndex.get(p.rightAttrId) ?? -1,
 		})).filter(p => p.left >= 0 && p.right >= 0);
@@ -79,16 +90,23 @@ export class MergeJoinNode extends PlanNode implements BinaryRelationalNode, Joi
 		const leftIndex = this.left.getAttributeIndex();
 		const rightIndex = this.right.getAttributeIndex();
 
-		// Map attribute-ID-based equi-pairs to column-index-based pairs
-		const indexPairs = this.equiPairs.map(p => ({
+		// Map attribute-ID-based equi-pairs to column-index-based pairs.
+		// Value-fact consumers only — see `factPairs`.
+		const factPairs = this.factPairs();
+		const indexPairs = factPairs.map(p => ({
 			left: leftIndex.get(p.leftAttrId) ?? -1,
 			right: rightIndex.get(p.rightAttrId) ?? -1,
 		}));
 
+		// PHYSICAL child cardinalities — the logical getters read `undefined`
+		// through a physical access node (see `physicalSourceRows`).
+		const leftRows = physicalSourceRows(leftPhys, this.left);
+		const rightRows = physicalSourceRows(rightPhys, this.right);
+
 		const result = analyzeJoinKeyCoverage(
 			this.joinType, leftPhys, rightPhys,
 			this.left.getType(), this.right.getType(),
-			indexPairs, this.left.estimatedRows, this.right.estimatedRows,
+			indexPairs, leftRows, rightRows,
 			leftAttrs.length,
 		);
 
@@ -105,14 +123,17 @@ export class MergeJoinNode extends PlanNode implements BinaryRelationalNode, Joi
 
 		return {
 			ordering,
-			estimatedRows: result.estimatedRows,
+			estimatedRows: joinPhysicalRows(this.joinType, result.estimatedRows, leftRows, rightRows),
 			// MergeJoin physically guarantees monotonicOn on equi-pair attrIds when both
 			// inputs were monotonic on their respective X (the merge join's whole point).
-			monotonicOn: propagateJoinMonotonicOn(this.joinType, leftPhys, rightPhys, this.equiPairs),
+			// Value-discriminating pairs only: a NOCASE run collapses value-distinct
+			// rows into one key run, so per-side value monotonicity is not preserved.
+			monotonicOn: propagateJoinMonotonicOn(this.joinType, leftPhys, rightPhys, factPairs),
 			fds: fdResult.fds,
 			equivClasses: fdResult.equivClasses,
 			constantBindings: fdResult.constantBindings,
 			domainConstraints: fdResult.domainConstraints,
+			inds: propagateJoinInds(this.joinType, leftPhys, rightPhys, leftAttrs.length),
 		};
 	}
 
@@ -182,7 +203,7 @@ export class MergeJoinNode extends PlanNode implements BinaryRelationalNode, Joi
 		return {
 			joinType: this.joinType,
 			algorithm: 'merge',
-			equiPairs: this.equiPairs.map(p => ({ left: p.leftAttrId, right: p.rightAttrId })),
+			equiPairs: describeEquiPairs(this.equiPairs),
 			hasResidual: !!this.residualCondition,
 			leftRows: this.left.estimatedRows,
 			rightRows: this.right.estimatedRows,

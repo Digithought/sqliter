@@ -11,17 +11,27 @@ let connectionCounter = 0;
 
 /**
  * Connection to a KVStore-backed table.
- * All connections share a TransactionCoordinator for multi-table atomicity.
+ *
+ * All connections of one storage module share its single TransactionCoordinator
+ * for cross-table atomicity (see {@link TransactionCoordinator}). Because the
+ * coordinator is no longer per-table, coordinator identity can no longer pin a
+ * connection to one backing-table incarnation; {@link owner} carries that pin
+ * instead — set to the owning StoreTable ONLY for connections the backing host
+ * creates (see `StoreBackingHost.connect` / `ownsConnection`). Ordinary DML
+ * connections leave it `undefined`.
  */
 export class StoreConnection implements VirtualTableConnection {
   public readonly connectionId: string;
   public readonly tableName: string;
+  /** The owning StoreTable instance, for backing-host incarnation pinning (host connections only). */
+  public readonly owner?: object;
   private coordinator: TransactionCoordinator;
 
-  constructor(tableName: string, coordinator: TransactionCoordinator) {
+  constructor(tableName: string, coordinator: TransactionCoordinator, owner?: object) {
     this.connectionId = `store-${tableName}-${++connectionCounter}`;
     this.tableName = tableName;
     this.coordinator = coordinator;
+    this.owner = owner;
   }
 
   /** Begin a transaction. */
@@ -59,11 +69,6 @@ export class StoreConnection implements VirtualTableConnection {
     if (this.coordinator.isInTransaction()) {
       this.coordinator.rollback();
     }
-  }
-
-  /** Get the coordinator for mutation operations. */
-  getCoordinator(): TransactionCoordinator {
-    return this.coordinator;
   }
 }
 

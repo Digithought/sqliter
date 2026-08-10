@@ -1,5 +1,6 @@
 import type { SequencingNode } from '../../planner/nodes/sequencing-node.js';
-import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import { emitPlanNode } from '../emitters.js';
 import type { Row } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
@@ -18,7 +19,7 @@ export function emitSequencing(plan: SequencingNode, ctx: EmissionContext): Inst
 
 	return {
 		params: [sourceInstruction],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `sequencing(${plan.sequenceColumnName})`
 	};
 }

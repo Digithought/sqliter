@@ -4,7 +4,7 @@ import type { BTree, Path } from 'inheritree';
  * A mutation-safe iterator for BTree that automatically handles tree mutations
  * by storing the current key and reopening the path when needed.
  */
-export async function* safeIterate<TKey, TValue>(tree: BTree<TKey, TValue>, isAscending: boolean, startKey?: { value: TKey }): AsyncIterable<TValue> {
+export function* safeIterate<TKey, TValue>(tree: BTree<TKey, TValue>, isAscending: boolean, startKey: { value: TKey } | undefined, keyFromEntry: (entry: TValue) => TKey): Iterable<TValue> {
 	let currentKey: TKey | undefined;
 
 	// Start iteration
@@ -14,7 +14,7 @@ export async function* safeIterate<TKey, TValue>(tree: BTree<TKey, TValue>, isAs
 	while (path.on) {
 		const entry = tree.at(path);
 		// Store the current key for potential path recovery
-		currentKey = tree.keyFromEntry(entry!);
+		currentKey = keyFromEntry(entry!);
 		yield entry!;
 
 		// Check if path is still valid before advancing

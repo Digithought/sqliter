@@ -1,0 +1,60 @@
+-- View updateability — OR-clause conflict resolution under view-mediated insert.
+-- The view's projection-filter body routes the OR clause to the base op verbatim.
+
+-- ===================================
+-- OR IGNORE: the violating op drops its row; siblings continue.
+-- ===================================
+create table ki (id integer primary key, val integer);
+insert into ki values (1, 10);
+create view kvi as select id, val from ki where val >= 0;
+
+insert or ignore into kvi values (1, 99), (2, 20);
+select * from ki order by id;
+→ [{"id":1,"val":10},{"id":2,"val":20}]
+
+-- ===================================
+-- OR REPLACE: the conflicting row is replaced.
+-- ===================================
+create table kr (id integer primary key, val integer);
+insert into kr values (1, 10);
+create view kvr as select id, val from kr where val >= 0;
+
+insert or replace into kvr values (1, 50);
+select * from kr order by id;
+→ [{"id":1,"val":50}]
+
+-- ===================================
+-- OR FAIL: abort at first violation; already-succeeded prior rows remain.
+-- ===================================
+create table kf (id integer primary key, val integer);
+insert into kf values (2, 10);
+create view kvf as select id, val from kf where val >= 0;
+
+insert or fail into kvf values (1, 1), (2, 2), (3, 3);
+-- error:
+select * from kf order by id;
+→ [{"id":1,"val":1},{"id":2,"val":10}]
+
+-- ===================================
+-- OR ABORT (default): abort and undo prior rows in the same statement.
+-- ===================================
+create table ka (id integer primary key, val integer);
+insert into ka values (2, 10);
+create view kva as select id, val from ka where val >= 0;
+
+insert into kva values (1, 1), (2, 2), (3, 3);
+-- error:
+select * from ka order by id;
+→ [{"id":2,"val":10}]
+
+-- ===================================
+-- OR ROLLBACK: abort the enclosing transaction.
+-- ===================================
+create table ko (id integer primary key, val integer);
+insert into ko values (2, 10);
+create view kvo as select id, val from ko where val >= 0;
+
+insert or rollback into kvo values (1, 1), (2, 2);
+-- error:
+select * from ko order by id;
+→ [{"id":2,"val":10}]

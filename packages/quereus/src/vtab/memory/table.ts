@@ -1,5 +1,5 @@
 import { VirtualTable } from '../table.js';
-import type { AnyVirtualTableModule, SchemaChangeInfo } from '../module.js';
+import type { AnyVirtualTableModule, EffectiveRowSource, SchemaChangeInfo } from '../module.js';
 import type { Database } from '../../core/database.js';
 import type { Row, SqlValue, CompareFn, UpdateResult } from '../../common/types.js';
 import { type IndexSchema, type TableSchema } from '../../schema/table.js';
@@ -16,7 +16,9 @@ import type { VirtualTableConnection } from '../connection.js';
 import { MemoryVirtualTableConnection } from './connection.js';
 
 import type { VTableEventEmitter } from '../events.js';
-import { compareSqlValues, resolveCollation, createTypedComparator } from '../../util/comparison.js';
+import { createTypedComparator } from '../../util/comparison.js';
+import { createPrimaryKeyFunctions } from './utils/primary-key.js';
+import type { BTreeKeyForPrimary } from './types.js';
 import type { TableStatistics, ColumnStatistics } from '../../planner/stats/catalog-stats.js';
 import { buildHistogram } from '../../planner/stats/histogram.js';
 
@@ -36,6 +38,8 @@ export class MemoryTable extends VirtualTable {
 	private cachedVtabConnection: MemoryVirtualTableConnection | null = null;
 	/** @internal When true, reads from committed (pre-transaction) state only */
 	private readonly readCommitted: boolean;
+	/** @internal Memoized native PK comparator; see {@link getPrimaryKeyComparator} */
+	private pkComparatorCache?: { schema: TableSchema; arity: number; compare: (a: BTreeKeyForPrimary, b: BTreeKeyForPrimary) => number };
 
 	/**
 	 * @internal - Use MemoryTableModule.connect or create
@@ -98,9 +102,12 @@ export class MemoryTable extends VirtualTable {
 					// Skip the reset during an active transaction: readLayer may be
 					// a savepoint snapshot (eager-swap) holding in-transaction writes
 					// that aren't yet in currentCommittedLayer; resetting would lose
-					// those writes. Schema changes can't happen during a transaction
-					// (ensureSchemaChangeSafety throws on active transactions), so
-					// staleness is not a concern here.
+					// those writes. An in-transaction schema change (e.g. ALTER TABLE
+					// ADD COLUMN, which IS permitted inside an explicit transaction)
+					// is not a staleness concern here: ensureSchemaChangeSafety
+					// re-points every registered connection — including a detached one
+					// reused on this path — at the post-change base layer, so by the
+					// time reuse reaches this branch the readLayer is already current.
 					if (!this.connection.explicitTransaction
 						&& !this.connection.pendingTransactionLayer) {
 						this.connection.readLayer = this.manager.currentCommittedLayer;
@@ -125,6 +132,23 @@ export class MemoryTable extends VirtualTable {
 	setConnection(memoryConnection: MemoryTableConnection): void {
 		logger.debugLog(`Setting connection ${memoryConnection.connectionId} for table ${this.tableName}`);
 		this.connection = memoryConnection;
+	}
+
+	/**
+	 * Adopts an already-registered connection offered by the runtime, reusing it instead of
+	 * opening a fresh one. Rejects connections created by another module (instanceof guard)
+	 * and connections whose manager no longer matches this instance (a stale connection from
+	 * a dropped-then-recreated table). Ownership stays with the registry; safe to call twice.
+	 */
+	adoptConnection(connection: VirtualTableConnection): void {
+		if (!(connection instanceof MemoryVirtualTableConnection)) return;
+		const existingMemConn = connection.getMemoryConnection();
+		if (existingMemConn.tableManager === this.manager) {
+			this.setConnection(existingMemConn);
+			logger.debugLog(`Adopted existing connection into VirtualTable for table ${this.tableName}`);
+		} else {
+			logger.debugLog(`Skipped stale connection adoption for table ${this.tableName} (manager mismatch)`);
+		}
 	}
 
 	/** Creates a new VirtualTableConnection for transaction support */
@@ -242,10 +266,12 @@ export class MemoryTable extends VirtualTable {
 		const startLayer = this.readCommitted ? conn.readLayer : (conn.pendingTransactionLayer ?? conn.readLayer);
 		logger.debugLog(`query reading from layer ${startLayer.getLayerId()}`);
 
-		// Delegate scanning to the manager, which handles layer recursion
-		for await (const row of this.manager.scanLayer(startLayer, plan)) {
-			yield row;
-		}
+		// Delegate scanning to the manager, which handles layer recursion.
+		// `scanLayerSync` is synchronous (the backing BTree and all per-row filter
+		// logic are sync); `query` is already async solely for the awaited
+		// `ensureConnection` above, so this is the sole sync→async boundary on the
+		// memory-scan hot path — no extra per-layer promise round-trips.
+		yield* this.manager.scanLayerSync(startLayer, plan);
 	}
 
 	// Note: getBestAccessPlan is handled by the MemoryTableModule, not the table instance.
@@ -258,7 +284,7 @@ export class MemoryTable extends VirtualTable {
 		const conn = await this.ensureConnection();
 		// Delegate mutation to the manager.
 		// Note: mutationStatement is ignored by memory table (could be logged if needed)
-		return this.manager.performMutation(conn, args.operation, args.values, args.oldKeyValues, args.onConflict);
+		return this.manager.performMutation(conn, args.operation, args.values, args.oldKeyValues, args.onConflict, args.preCoerced);
 	}
 
 	/** Begins a transaction for this connection */
@@ -316,12 +342,26 @@ export class MemoryTable extends VirtualTable {
 
 
 	/** Handles schema changes via the manager */
-	async alterSchema(changeInfo: SchemaChangeInfo): Promise<void> {
+	async alterSchema(changeInfo: SchemaChangeInfo, validateOnly = false): Promise<void> {
+		// Validate-only dry run (see VirtualTable.alterSchema): supported for exactly the
+		// change types whose manager arms implement it. `alterColumn` has the live caller —
+		// the isolation layer pre-flights a `set collate` PK re-key against a per-connection
+		// overlay before the shared underlying mutates irreversibly; `alterPrimaryKey` is
+		// offered because `MemoryTableManager.alterPrimaryKey` honors the same dry-run
+		// contract, though no wrapper drives it today (the isolation layer never forwards
+		// `alter primary key` to an overlay). Refuse the rest rather than silently
+		// validating nothing.
+		if (validateOnly && changeInfo.type !== 'alterColumn' && changeInfo.type !== 'alterPrimaryKey') {
+			throw new QuereusError(
+				`MemoryTable.alterSchema: validate-only is supported for 'alterColumn' and 'alterPrimaryKey' changes, not '${changeInfo.type}'`,
+				StatusCode.UNSUPPORTED,
+			);
+		}
 		const originalManagerSchema = this.manager.tableSchema; // For potential error recovery
 		try {
 			switch (changeInfo.type) {
 				case 'addColumn':
-					await this.manager.addColumn(changeInfo.columnDef);
+					await this.manager.addColumn(changeInfo.columnDef, changeInfo.backfillEvaluator, changeInfo.insertAtIndex);
 					break;
 				case 'dropColumn':
 					await this.manager.dropColumn(changeInfo.columnName);
@@ -333,22 +373,25 @@ export class MemoryTable extends VirtualTable {
 					await this.manager.renameColumn(changeInfo.oldName, changeInfo.newColumnDefAst as ASTColumnDef);
 					break;
 				case 'alterPrimaryKey':
-					throw new QuereusError(
-						'MemoryTable does not support in-place primary key alteration',
-						StatusCode.UNSUPPORTED,
-					);
+					await this.manager.alterPrimaryKey(changeInfo.newPkColumns, undefined, validateOnly);
+					break;
 				case 'addConstraint':
-					throw new QuereusError(
-						`MemoryTable does not support ADD CONSTRAINT ${changeInfo.constraint.type}`,
-						StatusCode.UNSUPPORTED,
-					);
+					await this.manager.addConstraint(changeInfo.constraint);
+					break;
+				case 'dropConstraint':
+					await this.manager.dropConstraint(changeInfo.constraintName);
+					break;
+				case 'renameConstraint':
+					await this.manager.renameConstraint(changeInfo.oldName, changeInfo.newName);
+					break;
 				case 'alterColumn':
 					await this.manager.alterColumn({
 						columnName: changeInfo.columnName,
 						setNotNull: changeInfo.setNotNull,
 						setDataType: changeInfo.setDataType,
 						setDefault: changeInfo.setDefault,
-					});
+						setCollation: changeInfo.setCollation,
+					}, undefined, validateOnly);
 					break;
 				default: {
 					const exhaustiveCheck: never = changeInfo;
@@ -369,7 +412,18 @@ export class MemoryTable extends VirtualTable {
 		}
 	}
 
-	/** Disconnects this connection instance from the manager */
+	/**
+	 * Disconnects this connection instance from the manager.
+	 *
+	 * NOTE: for a `_readCommitted` instance this releases the pinned read layer's
+	 * protection — `MemoryTableManager.isLayerInUse` only sees connections still in
+	 * the manager's map, so once dropped, a layer collapse may `clearBase()` the
+	 * layer chain the snapshot was reading. Safe today because every caller
+	 * disconnects only after its `query()` iterator is exhausted or closed. If a
+	 * caller ever disconnects while an iterator is still live (a cancelled
+	 * concurrent read that tears down its scan connection eagerly, say), pin the
+	 * layer for the iterator's lifetime instead of relying on the connection.
+	 */
 	async disconnect(): Promise<void> {
 		if (this.connection) {
 			// Manager handles cleanup and potential layer collapse trigger
@@ -385,9 +439,9 @@ export class MemoryTable extends VirtualTable {
 	}
 
 	// --- Index DDL methods delegate to the manager ---
-	async createIndex(indexSchema: IndexSchema): Promise<void> {
+	async createIndex(indexSchema: IndexSchema, rows?: EffectiveRowSource): Promise<void> {
 		logger.operation('Create Index', this.tableName, { indexName: indexSchema.name });
-		await this.manager.createIndex(indexSchema);
+		await this.manager.createIndex(indexSchema, undefined, rows);
 		this.tableSchema = this.manager.tableSchema; // Refresh local schema ref
 	}
 
@@ -411,16 +465,41 @@ export class MemoryTable extends VirtualTable {
 	}
 
 	/**
-	 * Compare two rows by their primary key values.
-	 * Uses compareSqlValues for each PK column in order.
+	 * Compare two rows by their primary key values under this table's NATIVE key
+	 * ordering — the exact comparator its layer BTrees are keyed by, so DESC
+	 * direction, per-column logical-type semantics, and each column's declared
+	 * collation (resolved against THIS database's registry) all apply.
+	 *
+	 * The isolation layer adopts this comparator for its overlay/underlying merge
+	 * (`IsolatedTable.getComparePK`). Any disagreement with the table's own scan
+	 * order leaves an overlay row failing to shadow the base row it replaces, so
+	 * both surface in a scan — hence the delegation rather than a local loop.
+	 *
 	 * @returns negative if a < b, 0 if equal, positive if a > b
 	 */
 	comparePrimaryKey(a: SqlValue[], b: SqlValue[]): number {
-		for (let i = 0; i < a.length; i++) {
-			const cmp = compareSqlValues(a[i], b[i]);
-			if (cmp !== 0) return cmp;
+		const { arity, compare } = this.getPrimaryKeyComparator();
+		return arity === 1 ? compare(a[0], b[0]) : compare(a, b);
+	}
+
+	/**
+	 * The layer BTrees' primary-key comparator, memoized on the `TableSchema` object
+	 * identity (an `alter table` installs a fresh frozen schema, invalidating the
+	 * entry). `arity` travels with it because a single-column key is a bare
+	 * `SqlValue`, not a one-element array (see `BTreeKeyForPrimary`).
+	 *
+	 * Collation resolution is not retroactive: a `registerCollation` that replaces a
+	 * collation after the comparator was built is not picked up, matching the
+	 * contract `Database.registerCollation` documents engine-wide.
+	 */
+	private getPrimaryKeyComparator(): { arity: number; compare: (a: BTreeKeyForPrimary, b: BTreeKeyForPrimary) => number } {
+		const schema = this.tableSchema;
+		if (!schema) return { arity: 0, compare: () => 0 };
+		if (this.pkComparatorCache?.schema !== schema) {
+			const { compare } = createPrimaryKeyFunctions(schema, this.db.getCollationResolver());
+			this.pkComparatorCache = { schema, arity: schema.primaryKeyDefinition.length, compare };
 		}
-		return 0;
+		return this.pkComparatorCache;
 	}
 
 	/**
@@ -444,9 +523,10 @@ export class MemoryTable extends VirtualTable {
 		const index = schema.indexes?.find(idx => idx.name.toLowerCase() === indexName.toLowerCase());
 		if (!index) return undefined;
 
+		const collationResolver = this.db.getCollationResolver();
 		return index.columns.map(col => {
 			const columnSchema = schema.columns[col.index];
-			const collationFunc = col.collation ? resolveCollation(col.collation) : undefined;
+			const collationFunc = col.collation ? collationResolver(col.collation) : undefined;
 			const typedComparator = createTypedComparator(columnSchema.logicalType, collationFunc);
 
 			if (col.desc) {

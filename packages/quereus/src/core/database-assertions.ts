@@ -15,7 +15,6 @@
 
 import { QuereusError } from '../common/errors.js';
 import { StatusCode, type SqlValue } from '../common/types.js';
-import type { ScalarType } from '../common/datatype.js';
 import { createLogger } from '../common/logger.js';
 import { Parser } from '../parser/parser.js';
 import * as AST from '../parser/ast.js';
@@ -24,21 +23,59 @@ import { Scheduler } from '../runtime/scheduler.js';
 import type { RuntimeContext, Instruction } from '../runtime/types.js';
 import { createStrictRowContextMap, wrapTableContextsStrict } from '../runtime/strict-fork.js';
 import { BlockNode } from '../planner/nodes/block.js';
-import { PlanNode, type RelationalPlanNode, type ScalarPlanNode } from '../planner/nodes/plan-node.js';
-import { FilterNode } from '../planner/nodes/filter.js';
-import { BinaryOpNode, UnaryOpNode } from '../planner/nodes/scalar.js';
-import { ParameterReferenceNode, ColumnReferenceNode, TableReferenceNode } from '../planner/nodes/reference.js';
 import { EmissionContext } from '../runtime/emission-context.js';
 import { isAsyncIterable } from '../runtime/utils.js';
 import { extractBindings, type BindingMode, type PlanBindings } from '../planner/analysis/binding-extractor.js';
+import { injectKeyFilter } from '../planner/analysis/key-filter.js';
 import { DeltaExecutor, type DeltaApplyInput, type DeltaExecutorContext, type DeltaSubscription } from '../runtime/delta-executor.js';
 import type { Database } from './database.js';
 import type { SchemaChangeEvent } from '../schema/change-events.js';
+import { splitBaseKey } from '../util/qualified-name.js';
 
 const log = createLogger('core:assertions');
 
 /** Maximum number of violating rows to include in error messages */
 const MAX_VIOLATION_SAMPLES = 5;
+
+/** The identity slice of {@link IntegrityAssertionSchema} the evaluator needs. */
+interface AssertionIdentity {
+	name: string;
+	schemaName: string;
+	violationSql: string;
+}
+
+/** Cache key for an assertion: schema-qualified so two same-named assertions
+ *  in different schemas never evict each other's compiled plan. */
+function assertionCacheKey(assertion: { name: string; schemaName: string }): string {
+	return `${assertion.schemaName.toLowerCase()}.${assertion.name.toLowerCase()}`;
+}
+
+/** How an assertion names itself in a violation error / report-mode record.
+ *  Qualified outside `main`, where a bare name is ambiguous (names are only
+ *  unique per schema); bare in `main`, matching the rest of the DDL surface
+ *  (see `applyAssertionSchemaDefault`, `assertionSchemaToCatalog`). */
+function assertionDisplayName(assertion: { name: string; schemaName: string }): string {
+	return assertion.schemaName.toLowerCase() === 'main'
+		? assertion.name
+		: `${assertion.schemaName}.${assertion.name}`;
+}
+
+/**
+ * A single commit-time global-assertion violation, collected (rather than
+ * thrown) when {@link AssertionEvaluator.runGlobalAssertions} is driven in
+ * report mode. Surfaced to the external-row ingestion seam's caller so a
+ * trust-the-origin inbound merge can land its data and still be notified of
+ * the broken invariant. See `docs/mv-ingestion.md` § Trust boundary.
+ */
+export interface AssertionViolation {
+	/** Name of the violated assertion. */
+	readonly assertion: string;
+	/** Up to {@link MAX_VIOLATION_SAMPLES} sample rows. For a full-violation
+	 *  query these are the query's output rows; for per-tuple residual dispatch
+	 *  the single binding-key tuple. Diagnostic only — the assertion SELECT's
+	 *  output shape, not full table rows. */
+	readonly samples: SqlValue[][];
+}
 
 /**
  * Interface for accessing Database internals needed by the assertion evaluator.
@@ -49,8 +86,9 @@ export interface AssertionEvaluatorContext {
 	readonly optimizer: Database['optimizer'];
 	readonly options: Database['options'];
 
-	_buildPlan(statements: AST.Statement[]): import('./database.js').BuildPlanResult;
+	_buildPlan(statements: AST.Statement[], paramsOrTypes?: undefined, schemaPathOverride?: string[]): import('./database.js').BuildPlanResult;
 	_findTable(tableName: string, schemaName?: string): ReturnType<Database['_findTable']>;
+	_homeSchemaPath(schemaName: string): string[];
 	prepare(sql: string): ReturnType<Database['prepare']>;
 	getInstructionTracer(): ReturnType<Database['getInstructionTracer']>;
 
@@ -113,7 +151,7 @@ interface CachedAssertionPlan {
  * changes to avoid re-parsing/re-planning on every commit.
  */
 export class AssertionEvaluator {
-	/** Cached compiled plans keyed by assertion name (lowercase) */
+	/** Cached compiled plans keyed by lowercase `schema.name` (see {@link assertionCacheKey}) */
 	private cache = new Map<string, CachedAssertionPlan>();
 	/** Monotonic generation counter; incremented on schema changes that may affect assertions */
 	private schemaGeneration = 0;
@@ -121,13 +159,18 @@ export class AssertionEvaluator {
 	private unsubscribeSchemaChanges: (() => void) | null = null;
 	/** The shared delta dispatcher */
 	private readonly executor: DeltaExecutor;
+	/** Transient violation sink for a single `runGlobalAssertions` pass. When
+	 *  non-null (report mode), violations are pushed here and execution
+	 *  continues; when null (default) violations throw. Set/restored by
+	 *  `runGlobalAssertions`. */
+	private violationSink: AssertionViolation[] | null = null;
 
 	constructor(private readonly ctx: AssertionEvaluatorContext) {
 		const executorCtx: DeltaExecutorContext = {
 			getChangedBaseTables: () => ctx.getChangedBaseTables(),
 			getChangedTuples: (base, cols, pk) => ctx.getChangedTuples(base, cols, pk),
 			getRowCount: (base) => {
-				const [schemaName, tableName] = base.split('.');
+				const [schemaName, tableName] = splitBaseKey(base);
 				const table = ctx._findTable(tableName, schemaName);
 				return table?.estimatedRows;
 			},
@@ -137,6 +180,15 @@ export class AssertionEvaluator {
 		this.subscribeToSchemaChanges();
 	}
 
+	// NOTE: `assertion_modified` deliberately does NOT bump the generation — the only
+	// producer today is the `ALTER TABLE … RENAME` body rewrite
+	// (`runtime/emit/assertion-rename-helpers.ts`), and that statement already fires
+	// `table_modified` for the renamed table before it rewrites any body, so the
+	// cached plan is invalidated either way. `CREATE ASSERTION` over an existing name
+	// is refused, so no in-place redefine reaches here. If a redefine path is ever
+	// added (`create or replace assertion`, a catalog-import reconstruction), add
+	// `assertion_modified` to this gate — without it the evaluator keeps serving a
+	// plan compiled from the previous `violationSql`.
 	private subscribeToSchemaChanges(): void {
 		const notifier = this.ctx.schemaManager.getChangeNotifier();
 		this.unsubscribeSchemaChanges = notifier.addListener((event: SchemaChangeEvent) => {
@@ -148,8 +200,8 @@ export class AssertionEvaluator {
 	}
 
 	/** Remove an assertion from the plan cache (called on DROP ASSERTION) */
-	invalidateAssertion(name: string): void {
-		const key = name.toLowerCase();
+	invalidateAssertion(schemaName: string, name: string): void {
+		const key = assertionCacheKey({ name, schemaName });
 		const cached = this.cache.get(key);
 		if (cached) {
 			this.releaseCached(cached);
@@ -181,38 +233,59 @@ export class AssertionEvaluator {
 	 * The DeltaExecutor walks all live subscriptions; assertion subscriptions
 	 * dispatch their own residual scheduler per binding tuple.
 	 *
-	 * @throws QuereusError with CONSTRAINT status if any assertion is violated.
+	 * In the default (throw) mode the first violation throws a CONSTRAINT
+	 * `QuereusError`. When `sink` is supplied (report mode), violations are
+	 * **collected** into it and execution continues — so EVERY live assertion is
+	 * walked and ALL violations across the batch are gathered, not just the
+	 * first. Report mode is used by the external-row ingestion seam so a
+	 * trusted inbound merge can land its data and still surface the broken
+	 * invariant (see `docs/mv-ingestion.md` § Trust boundary).
+	 *
+	 * @param sink When provided, collect violations here instead of throwing.
+	 * @throws QuereusError with CONSTRAINT status if any assertion is violated
+	 *   and no `sink` is supplied.
 	 */
-	async runGlobalAssertions(): Promise<void> {
+	async runGlobalAssertions(sink?: AssertionViolation[]): Promise<void> {
 		const assertions = this.ctx.schemaManager.getAllAssertions();
 		if (assertions.length === 0) return;
 
 		const changedBases = this.ctx.getChangedBaseTables();
 		if (changedBases.size === 0) return;
 
-		// Ensure every assertion is compiled (registers its subscription on first
-		// touch). Subsequent commits reuse the cached subscription unless schema
-		// has changed.
-		for (const assertion of assertions) {
-			this.getOrCompilePlan(assertion);
-		}
-
-		// Assertions with no table dependencies (e.g. CHECK (1 = 0)) must run on
-		// every commit regardless of what changed — the kernel skips them because
-		// it dispatches on dependency overlap. Handle them directly here.
-		for (const assertion of assertions) {
-			const cached = this.cache.get(assertion.name.toLowerCase());
-			if (cached && cached.baseTablesInPlan.size === 0) {
-				await this.executeViolationOnce(assertion.name, assertion.violationSql);
+		// Install the sink for the duration of this pass; restore null after so a
+		// subsequent ordinary commit throws as usual (try/finally guards a throw
+		// from the no-dependency loop or the kernel walk in throw mode).
+		this.violationSink = sink ?? null;
+		try {
+			// Ensure every assertion is compiled (registers its subscription on
+			// first touch). Subsequent commits reuse the cached subscription unless
+			// schema has changed.
+			for (const assertion of assertions) {
+				this.getOrCompilePlan(assertion);
 			}
-		}
 
-		// Kernel walks all live subscriptions; assertions throw on violation.
-		await this.executor.runAll();
+			// Assertions with no table dependencies (e.g. CHECK (1 = 0)) must run on
+			// every commit regardless of what changed — the kernel skips them because
+			// it dispatches on dependency overlap. Handle them directly here. In
+			// report mode these collect (do not throw), so all are evaluated.
+			for (const assertion of assertions) {
+				const cached = this.cache.get(assertionCacheKey(assertion));
+				if (cached && cached.baseTablesInPlan.size === 0) {
+					await this.executeViolationOnce(assertion);
+				}
+			}
+
+			// Kernel walks all live subscriptions. In throw mode the first violation
+			// aborts the walk; in report mode every subscription runs and all
+			// violations are collected.
+			await this.executor.runAll();
+		} finally {
+			this.violationSink = null;
+		}
 	}
 
-	private getOrCompilePlan(assertion: { name: string; violationSql: string }): CachedAssertionPlan {
-		const key = assertion.name.toLowerCase();
+	private getOrCompilePlan(assertion: AssertionIdentity): CachedAssertionPlan {
+		const key = assertionCacheKey(assertion);
 		const existing = this.cache.get(key);
 		if (existing && existing.schemaGeneration === this.schemaGeneration) {
 			return existing;
@@ -245,11 +318,14 @@ export class AssertionEvaluator {
 	}
 
 	private compileUnderSuppression(
-		assertion: { name: string; violationSql: string },
+		assertion: AssertionIdentity,
 		ast: AST.Statement,
 		key: string,
 	): CachedAssertionPlan {
-		const { plan } = this.ctx._buildPlan([ast]);
+		// Plan under the assertion's home-schema path so unqualified table names in
+		// the stored body resolve against the assertion's own schema first,
+		// independent of the session's search path (see Database._homeSchemaPath).
+		const { plan } = this.ctx._buildPlan([ast], undefined, this.ctx._homeSchemaPath(assertion.schemaName));
 		const analyzed = this.ctx.optimizer.optimizeForAnalysis(plan, this.ctx as unknown as Database) as BlockNode;
 
 		const bindings = extractBindings(analyzed);
@@ -260,7 +336,7 @@ export class AssertionEvaluator {
 		for (const base of bindings.relationToBase.values()) {
 			baseTablesInPlan.add(base);
 			if (!pkIndicesByBase.has(base)) {
-				const [schemaName, tableName] = base.split('.');
+				const [schemaName, tableName] = splitBaseKey(base);
 				const table = this.ctx._findTable(tableName, schemaName);
 				if (table) {
 					pkIndicesByBase.set(base, table.primaryKeyDefinition.map(d => d.index));
@@ -308,7 +384,7 @@ export class AssertionEvaluator {
 			if (mode.kind === 'global') continue;
 			const bindCols = mode.kind === 'row' ? mode.keyColumns : mode.groupColumns;
 			const paramPrefix: 'pk' | 'gk' = mode.kind === 'row' ? 'pk' : 'gk';
-			const rewritten = this.injectKeyFilter(analyzed, relKey, bindCols, paramPrefix);
+			const rewritten = injectKeyFilter(analyzed, relKey, bindCols, paramPrefix);
 			const optimizedPlan = this.ctx.optimizer.optimize(rewritten, this.ctx as unknown as Database) as BlockNode;
 			const emissionContext = new EmissionContext(this.ctx as unknown as Database);
 			const instruction = emitPlanNode(optimizedPlan, emissionContext);
@@ -340,10 +416,10 @@ export class AssertionEvaluator {
 	}
 
 	private buildSubscription(
-		assertion: { name: string; violationSql: string },
+		assertion: AssertionIdentity,
 		cached: CachedAssertionPlan,
 	): DeltaSubscription {
-		const id = `assertion:${assertion.name}`;
+		const id = `assertion:${assertionCacheKey(assertion)}`;
 		const bindingsForExecutor = new Map<string, BindingMode>(cached.bindings.perRelation);
 		const relationToBase = new Map<string, string>(cached.bindings.relationToBase);
 		const pkIndicesByBase = new Map<string, readonly number[]>(cached.pkIndicesByBase);
@@ -355,16 +431,16 @@ export class AssertionEvaluator {
 				if (!residual) {
 					// Defensive: no residual compiled — run the full violation
 					// query once to maintain correctness.
-					await this.executeViolationOnce(assertion.name, assertion.violationSql);
+					await this.executeViolationOnce(assertion);
 					return;
 				}
-				await this.executeResidualPerTuple(assertion.name, residual, tuples);
+				await this.executeResidualPerTuple(assertionDisplayName(assertion), residual, tuples);
 			}
 
 			// Global re-evaluation: run once if any relation needs it. (Multiple
 			// 'global' relations for one assertion still only need one run.)
 			if (input.globalRelations.size > 0) {
-				await this.executeViolationOnce(assertion.name, assertion.violationSql);
+				await this.executeViolationOnce(assertion);
 			}
 		};
 
@@ -379,11 +455,15 @@ export class AssertionEvaluator {
 		};
 	}
 
-	private async executeViolationOnce(assertionName: string, sql: string): Promise<void> {
+	private async executeViolationOnce(assertion: AssertionIdentity): Promise<void> {
+		const assertionName = assertionDisplayName(assertion);
 		// `prepare()` defers planning; force compile under hoist-suppression so
 		// the optimizer can't fold this assertion's own violation query to
-		// empty. See `getOrCompilePlan`.
-		const stmt = this.ctx.prepare(sql);
+		// empty. See `getOrCompilePlan`. The home-schema path override makes the
+		// stored body resolve unqualified names against the assertion's own
+		// schema (compile is deferred, so setting it here is race-free).
+		const stmt = this.ctx.prepare(assertion.violationSql);
+		stmt._schemaPathOverride = this.ctx._homeSchemaPath(assertion.schemaName);
 		this.ctx.schemaManager.withSuppressedAssertionHoist(() => { stmt.compile(); });
 		try {
 			const violatingRows: SqlValue[][] = [];
@@ -394,7 +474,7 @@ export class AssertionEvaluator {
 				if (violatingRows.length >= MAX_VIOLATION_SAMPLES) break;
 			}
 			if (violatingRows.length > 0) {
-				throw this.buildViolationError(assertionName, violatingRows);
+				this.raiseViolation(assertionName, violatingRows);
 			}
 		} finally {
 			await stmt.finalize();
@@ -429,10 +509,25 @@ export class AssertionEvaluator {
 			const result = await scheduler.run(runtimeCtx);
 			if (isAsyncIterable(result)) {
 				for await (const _ of result as AsyncIterable<unknown>) {
-					throw this.buildViolationError(assertionName, [tuple as SqlValue[]]);
+					// First violating tuple for this binding: throw (default) or
+					// collect-and-stop (report mode mirrors the throw's method exit).
+					this.raiseViolation(assertionName, [tuple as SqlValue[]]);
+					return;
 				}
 			}
 		}
+	}
+
+	/**
+	 * Raise one violation: throw a CONSTRAINT error in the default mode, or push
+	 * to {@link violationSink} (report mode) and let the caller continue/return.
+	 */
+	private raiseViolation(assertionName: string, samples: SqlValue[][]): void {
+		if (this.violationSink) {
+			this.violationSink.push({ assertion: assertionName, samples });
+			return;
+		}
+		throw this.buildViolationError(assertionName, samples);
 	}
 
 	private buildViolationError(assertionName: string, samples: SqlValue[][]): QuereusError {
@@ -442,122 +537,5 @@ export class AssertionEvaluator {
 			message += ` [${formatted.join(', ')}]`;
 		}
 		return new QuereusError(message, StatusCode.CONSTRAINT);
-	}
-
-	/**
-	 * Inject a key-equality filter onto the `TableReferenceNode` matching
-	 * `targetRelationKey`. Used for both `'row'` (with PK columns + 'pk' prefix)
-	 * and `'group'` (with group-key columns + 'gk' prefix).
-	 */
-	private injectKeyFilter(
-		block: BlockNode,
-		targetRelationKey: string,
-		keyColumns: readonly number[],
-		paramPrefix: 'pk' | 'gk',
-	): BlockNode {
-		const newStatements = block.getChildren().map(stmt =>
-			this.rewriteForKeyFilter(stmt, targetRelationKey, keyColumns, paramPrefix)
-		);
-		if (newStatements.every((s, i) => s === block.getChildren()[i])) return block;
-		return new BlockNode(block.scope, newStatements, block.parameters);
-	}
-
-	private rewriteForKeyFilter(
-		node: PlanNode,
-		targetRelationKey: string,
-		keyColumns: readonly number[],
-		paramPrefix: 'pk' | 'gk',
-	): PlanNode {
-		const maybe = this.tryWrapTableReference(node, targetRelationKey, keyColumns, paramPrefix);
-		if (maybe) return maybe;
-
-		const originalChildren = node.getChildren();
-		if (!originalChildren || originalChildren.length === 0) return node;
-
-		const rewrittenChildren = originalChildren.map(child =>
-			this.rewriteForKeyFilter(child, targetRelationKey, keyColumns, paramPrefix)
-		);
-		const changed = rewrittenChildren.some((c, i) => c !== originalChildren[i]);
-		return changed ? node.withChildren(rewrittenChildren) : node;
-	}
-
-	private tryWrapTableReference(
-		node: PlanNode,
-		targetRelationKey: string,
-		keyColumns: readonly number[],
-		paramPrefix: 'pk' | 'gk',
-	): PlanNode | null {
-		if (!(node instanceof TableReferenceNode)) return null;
-
-		const tableSchema = node.tableSchema;
-		const schemaName = tableSchema.schemaName;
-		const tableName = tableSchema.name;
-		const relName = `${schemaName}.${tableName}`.toLowerCase();
-		const relKey = `${relName}#${node.id ?? 'unknown'}`;
-
-		if (relKey !== targetRelationKey) return null;
-
-		const relational = node as RelationalPlanNode;
-		const scope = relational.scope;
-		const attributes = relational.getAttributes();
-
-		const makeColumnRef = (colIndex: number): ScalarPlanNode => {
-			const attr = attributes[colIndex];
-			const expr: AST.ColumnExpr = { type: 'column', name: attr.name, table: tableName, schema: schemaName };
-			return new ColumnReferenceNode(scope, expr, attr.type, attr.id, colIndex);
-		};
-
-		const makeParamRef = (i: number, type: ScalarType): ScalarPlanNode => {
-			const name = `${paramPrefix}${i}`;
-			const pexpr: AST.ParameterExpr = { type: 'parameter', name };
-			return new ParameterReferenceNode(scope, pexpr, name, type);
-		};
-
-		// Per-column NULL safety: `col = :param` evaluates UNKNOWN when either
-		// side is NULL, so a residual built from plain equalities would silently
-		// skip change tuples whose key columns are NULL and miss real violations.
-		// For each nullable key column emit the NULL-safe form:
-		//   (col IS NULL AND :prefix_i IS NULL) OR col = :prefix_i
-		// For NOT NULL columns (typically PK columns on the 'row' path) keep
-		// the simpler `col = :prefix_i` form to avoid disjunctive predicates
-		// that could regress index-driven access.
-		let predicate: ScalarPlanNode | null = null;
-		for (let i = 0; i < keyColumns.length; i++) {
-			const colIdx = keyColumns[i];
-			const colNullable = attributes[colIdx].type.nullable === true;
-			const left = makeColumnRef(colIdx);
-			const right = makeParamRef(i, attributes[colIdx].type);
-			const eqAst: AST.BinaryExpr = { type: 'binary', operator: '=', left: left.expression, right: right.expression };
-			const eqNode = new BinaryOpNode(scope, eqAst, left, right);
-			let conjunct: ScalarPlanNode = eqNode;
-			if (colNullable) {
-				const leftForNullCheck = makeColumnRef(colIdx);
-				const rightForNullCheck = makeParamRef(i, attributes[colIdx].type);
-				const leftIsNullAst: AST.UnaryExpr = { type: 'unary', operator: 'IS NULL', expr: leftForNullCheck.expression };
-				const rightIsNullAst: AST.UnaryExpr = { type: 'unary', operator: 'IS NULL', expr: rightForNullCheck.expression };
-				const leftIsNull = new UnaryOpNode(scope, leftIsNullAst, leftForNullCheck);
-				const rightIsNull = new UnaryOpNode(scope, rightIsNullAst, rightForNullCheck);
-				const bothNullAst: AST.BinaryExpr = { type: 'binary', operator: 'AND', left: leftIsNull.expression, right: rightIsNull.expression };
-				const bothNull = new BinaryOpNode(scope, bothNullAst, leftIsNull, rightIsNull);
-				const orAst: AST.BinaryExpr = { type: 'binary', operator: 'OR', left: bothNull.expression, right: eqNode.expression };
-				conjunct = new BinaryOpNode(scope, orAst, bothNull, eqNode);
-			}
-			predicate = predicate
-				? new BinaryOpNode(
-					scope,
-					{ type: 'binary', operator: 'AND', left: predicate.expression, right: conjunct.expression },
-					predicate,
-					conjunct
-				)
-				: conjunct;
-		}
-
-		// No predicate built ⇒ `keyColumns` was empty (a ≤1-row 'row' binding).
-		// Leave the TableReferenceNode unwrapped: scanning the ≤1-row table whole
-		// is exactly the seek. (The delta executor also demotes such bindings to a
-		// global re-evaluation, so this residual is normally never dispatched.)
-		if (!predicate) return null;
-
-		return new FilterNode(scope, relational, predicate);
 	}
 }

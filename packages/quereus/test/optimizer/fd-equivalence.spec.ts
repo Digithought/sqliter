@@ -268,19 +268,19 @@ describe('ConstantBinding propagation per operator', () => {
 	it('Inner JOIN: one-sided literal binding closes over the equi-pair EC', async () => {
 		await db.exec("CREATE TABLE jl (id INTEGER PRIMARY KEY, k INTEGER) USING memory");
 		await db.exec("CREATE TABLE jr (rid INTEGER PRIMARY KEY, k INTEGER) USING memory");
-		// Use WHERE so the binding lives on the Filter above the join — it must
-		// be visible together with the equi-pair EC.
+		// The WHERE conjunct is pushed onto the `jl` branch by
+		// `rule-join-predicate-pushdown`, so the join node itself is the first frame
+		// that holds both k columns — and where the branch's binding must close over
+		// the equi-pair EC. (Any surviving FILTER is a branch filter with only one
+		// side's columns in frame, so it cannot answer this question.)
 		const rows = await planRows(db,
 			'SELECT * FROM jl INNER JOIN jr ON jl.k = jr.k WHERE jl.k = 5'
 		);
-		// Look at any node above the join that exposes the binding+EC together.
-		const filterProps = physicalOf(rows, r => r.op === 'FILTER');
-		const joinProps =
+		const props =
 			physicalOf(rows, r => r.op === 'HASHJOIN') ??
 			physicalOf(rows, r => r.op === 'MERGEJOIN') ??
 			physicalOf(rows, r => r.op === 'JOIN');
-		const props = filterProps ?? joinProps;
-		expect(props, 'expected physical props on filter-over-join').to.not.equal(undefined);
+		expect(props, 'expected physical props on the join').to.not.equal(undefined);
 		// Output columns: jl has 2 cols (id=0, k=1); jr starts at col 2 (rid=2, k=3).
 		// The binding for jl.k = 5 should close over the EC {1, 3} and cover BOTH 1 and 3.
 		const binding = props!.constantBindings?.find(b => b.attrs.includes(1) && b.attrs.includes(3));
@@ -294,8 +294,9 @@ describe('ConstantBinding propagation per operator', () => {
 		const rows = await planRows(db,
 			'SELECT * FROM jl INNER JOIN jr ON jl.k = jr.k WHERE jl.k = ?'
 		);
-		const props = physicalOf(rows, r => r.op === 'FILTER') ??
-			physicalOf(rows, r => r.op === 'HASHJOIN') ??
+		// Read at the join, for the same reason as the literal case above.
+		const props = physicalOf(rows, r => r.op === 'HASHJOIN') ??
+			physicalOf(rows, r => r.op === 'MERGEJOIN') ??
 			physicalOf(rows, r => r.op === 'JOIN');
 		expect(props).to.not.equal(undefined);
 		const binding = props!.constantBindings?.find(b => b.attrs.includes(1) && b.attrs.includes(3));

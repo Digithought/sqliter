@@ -7,29 +7,76 @@
 
 import type { SqlValue } from '@quereus/quereus';
 import type { KVStore, WriteBatch } from '@quereus/store';
-import { type HLC, serializeHLC, deserializeHLC, compareHLC } from '../clock/hlc.js';
-import { buildColumnVersionKey, buildColumnVersionScanBounds } from './keys.js';
+import { type HLC, type SerializedHLC, serializeHLC, deserializeHLC, compareHLC, hlcToJson, hlcFromJson } from '../clock/hlc.js';
+import { buildColumnVersionKey, buildColumnVersionScanBounds, encodePkIdentity, parseColumnVersionKey } from './keys.js';
+import type { PkKeyingResolver } from './pk-identity.js';
 
 /**
  * Column version record stored in the KV store.
+ *
+ * `pk` is the row's ADDRESS — the raw primary-key values, one spelling from the
+ * row's equivalence class. It lives in the VALUE because the record's KEY files
+ * under the derived, lossy pk IDENTITY (see `keys.ts`) which cannot be decoded
+ * back to values.
+ *
+ * NOTE: this repeats the pk in EVERY cell record of a row, so metadata size grows
+ * with (pk width × column count). Fine at current scale; if sync metadata volume
+ * ever becomes a concern for wide tables with long pks, add one per-row
+ * identity→pk record and drop `pk` from the cell records.
+ *
+ * `priorHlc`/`priorValue` are an optional per-cell before-image: the cell version
+ * this one replaced (its replica-local lineage). They are written together (both
+ * present or both absent) and are absent on the first write of a cell and on
+ * snapshot-reconstructed cells (a snapshot is a fresh basis with no history).
  */
 export interface ColumnVersion {
   hlc: HLC;
   value: SqlValue;
+  pk: SqlValue[];        // raw pk (the row's address; the key holds only the identity)
+  priorHlc?: HLC;        // hlc of the version this one replaced
+  priorValue?: SqlValue; // value of the version this one replaced
+}
+
+/**
+ * Write-side shape: everything but the pk, which the store methods take as
+ * their own parameter (they need it for the key identity anyway) and embed.
+ */
+export type ColumnVersionData = Omit<ColumnVersion, 'pk'>;
+
+/**
+ * Self-describing JSON payload for the value portion of a serialized column
+ * version. `v` is the current value; `k` is the raw pk; `pv`/`ph` are the
+ * optional before-image (value + HLC), present together or not at all. All
+ * values go through `encodeSqlValue` so `Uint8Array`/`bigint` round-trip.
+ */
+interface SerializedColumnVersionPayload {
+  v: unknown;          // encodeSqlValue(value)
+  k: unknown[];        // encodeSqlValue per raw pk cell
+  pv?: unknown;        // encodeSqlValue(priorValue) — present iff prior exists
+  ph?: SerializedHLC;  // hlcToJson(priorHlc) — present iff prior exists
 }
 
 /**
  * Serialize a column version for storage.
- * Format: 26 bytes HLC + JSON value
+ * Format: 30 bytes HLC + JSON payload `{ v, k, pv?, ph? }`.
  *
- * Uint8Array values are encoded as `{"__bin":"<base64>"}` so they survive
- * the JSON round-trip (plain JSON.stringify turns Uint8Array into an object
- * with numeric keys, which loses type information).
+ * Uint8Array values are encoded as `{"__bin":"<base64>"}` (bigint as
+ * `{"__bigint":"..."}`) so they survive the JSON round-trip; the same encoding
+ * covers the pk cells and the before-image (`pv`). The before-image fields are
+ * omitted entirely when the version has no prior, keeping first-writes and
+ * snapshot cells compact.
  */
 export function serializeColumnVersion(cv: ColumnVersion): Uint8Array {
   const hlcBytes = serializeHLC(cv.hlc);
-  const valueJson = JSON.stringify(encodeSqlValue(cv.value));
-  const valueBytes = new TextEncoder().encode(valueJson);
+  const payload: SerializedColumnVersionPayload = {
+    v: encodeSqlValue(cv.value),
+    k: cv.pk.map(encodeSqlValue),
+  };
+  if (cv.priorHlc !== undefined) {
+    payload.ph = hlcToJson(cv.priorHlc);
+    payload.pv = encodeSqlValue(cv.priorValue ?? null);
+  }
+  const valueBytes = new TextEncoder().encode(JSON.stringify(payload));
 
   const result = new Uint8Array(hlcBytes.length + valueBytes.length);
   result.set(hlcBytes, 0);
@@ -38,13 +85,18 @@ export function serializeColumnVersion(cv: ColumnVersion): Uint8Array {
 }
 
 /**
- * Deserialize a column version from storage.
+ * Deserialize a column version from storage. Tolerant of the before-image being
+ * absent (first-writes and snapshot-reconstructed cells carry none).
  */
 export function deserializeColumnVersion(buffer: Uint8Array): ColumnVersion {
-  const hlc = deserializeHLC(buffer.slice(0, 26));
-  const valueJson = new TextDecoder().decode(buffer.slice(26));
-  const value = decodeSqlValue(JSON.parse(valueJson));
-  return { hlc, value };
+  const hlc = deserializeHLC(buffer.slice(0, 30));
+  const payload = JSON.parse(new TextDecoder().decode(buffer.slice(30))) as SerializedColumnVersionPayload;
+  const cv: ColumnVersion = { hlc, value: decodeSqlValue(payload.v), pk: payload.k.map(decodeSqlValue) };
+  if (payload.ph !== undefined) {
+    cv.priorHlc = hlcFromJson(payload.ph);
+    cv.priorValue = decodeSqlValue(payload.pv);
+  }
+  return cv;
 }
 
 // ============================================================================
@@ -105,9 +157,20 @@ export function decodeSqlValue(v: unknown): SqlValue {
 
 /**
  * Column version store operations.
+ *
+ * Every pk-taking method derives the record key's pk IDENTITY through the
+ * per-table {@link PkKeyingResolver} passed at construction, so callers keep
+ * addressing rows by raw pk while the storage keys collapse spellings.
  */
 export class ColumnVersionStore {
-  constructor(private readonly kv: KVStore) {}
+  constructor(
+    private readonly kv: KVStore,
+    private readonly keying: PkKeyingResolver,
+  ) {}
+
+  private identity(schemaName: string, tableName: string, pk: SqlValue[]): string {
+    return encodePkIdentity(pk, this.keying(schemaName, tableName));
+  }
 
   /**
    * Get the version of a specific column.
@@ -118,7 +181,20 @@ export class ColumnVersionStore {
     pk: SqlValue[],
     column: string
   ): Promise<ColumnVersion | undefined> {
-    const key = buildColumnVersionKey(schemaName, tableName, pk, column);
+    return this.getColumnVersionByIdentity(schemaName, tableName, this.identity(schemaName, tableName, pk), column);
+  }
+
+  /**
+   * Get the version of a specific column by pk IDENTITY (as recovered from a
+   * parsed `cv:`/`cl:` key — no raw pk needed).
+   */
+  async getColumnVersionByIdentity(
+    schemaName: string,
+    tableName: string,
+    identity: string,
+    column: string
+  ): Promise<ColumnVersion | undefined> {
+    const key = buildColumnVersionKey(schemaName, tableName, identity, column);
     const data = await this.kv.get(key);
     if (!data) return undefined;
     return deserializeColumnVersion(data);
@@ -132,14 +208,18 @@ export class ColumnVersionStore {
     tableName: string,
     pk: SqlValue[],
     column: string,
-    version: ColumnVersion
+    version: ColumnVersionData
   ): Promise<void> {
-    const key = buildColumnVersionKey(schemaName, tableName, pk, column);
-    await this.kv.put(key, serializeColumnVersion(version));
+    const key = buildColumnVersionKey(schemaName, tableName, this.identity(schemaName, tableName, pk), column);
+    await this.kv.put(key, serializeColumnVersion({ ...version, pk }));
   }
 
   /**
-   * Set column version in a batch.
+   * Set column version in a batch. The key's pk IDENTITY is always derived
+   * locally through this store's keying resolver — there is deliberately no
+   * caller-supplied-identity variant (a snapshot receiver trusting a sender's
+   * identity was the bug fixed by deriving on ingress; see docs/sync.md
+   * § Row identity vs. address).
    */
   setColumnVersionBatch(
     batch: WriteBatch,
@@ -147,10 +227,10 @@ export class ColumnVersionStore {
     tableName: string,
     pk: SqlValue[],
     column: string,
-    version: ColumnVersion
+    version: ColumnVersionData
   ): void {
-    const key = buildColumnVersionKey(schemaName, tableName, pk, column);
-    batch.put(key, serializeColumnVersion(version));
+    const key = buildColumnVersionKey(schemaName, tableName, this.identity(schemaName, tableName, pk), column);
+    batch.put(key, serializeColumnVersion({ ...version, pk }));
   }
 
   /**
@@ -161,37 +241,72 @@ export class ColumnVersionStore {
     tableName: string,
     pk: SqlValue[]
   ): Promise<Map<string, ColumnVersion>> {
-    const bounds = buildColumnVersionScanBounds(schemaName, tableName, pk);
+    const identity = this.identity(schemaName, tableName, pk);
+    const bounds = buildColumnVersionScanBounds(schemaName, tableName, identity);
     const versions = new Map<string, ColumnVersion>();
 
     for await (const entry of this.kv.iterate(bounds)) {
-      // Extract column name from key
-      const keyStr = new TextDecoder().decode(entry.key);
-      const lastColon = keyStr.lastIndexOf(':');
-      const column = keyStr.slice(lastColon + 1);
+      // Every key component is length-prefixed, so the column name comes back
+      // verbatim even when it (or the table name, or the identity) contains
+      // `:` or `.` — see `metadata/keys.ts`.
+      const parsed = parseColumnVersionKey(entry.key);
+      if (!parsed) continue;
 
-      versions.set(column, deserializeColumnVersion(entry.value));
+      versions.set(parsed.column, deserializeColumnVersion(entry.value));
     }
 
     return versions;
   }
 
   /**
-   * Delete all column versions for a row.
+   * Queue deletion of ONE column's cell record into `batch`, whether or not a
+   * committed record exists — the caller may be removing a record that is only
+   * STAGED in this same batch (the local-capture delete cleanup; see
+   * `deleteRowVersionsAndLogEntries`).
    */
-  async deleteRowVersions(
+  deleteColumnVersionBatch(
+    batch: WriteBatch,
     schemaName: string,
     tableName: string,
-    pk: SqlValue[]
-  ): Promise<void> {
-    const bounds = buildColumnVersionScanBounds(schemaName, tableName, pk);
-    const batch = this.kv.batch();
+    pk: SqlValue[],
+    column: string
+  ): void {
+    batch.delete(buildColumnVersionKey(schemaName, tableName, this.identity(schemaName, tableName, pk), column));
+  }
 
-    for await (const entry of this.kv.iterate(bounds)) {
-      batch.delete(entry.key);
+  /**
+   * Queue deletion of every column version of a row into `batch`, returning the
+   * versions that were removed (column → version). A column in `keepColumns` is
+   * skipped entirely — neither staged for deletion nor included in the returned
+   * map (its paired `cl:` entry must survive too; see
+   * `deleteRowVersionsAndLogEntries`).
+   *
+   * The returned map is what lets a caller drop the paired `cl:` change-log
+   * entries in the SAME batch — each entry's key embeds the version's HLC, which
+   * is only recoverable from the record being deleted.
+   *
+   * NOTE: this fully deserializes each cell (a JSON parse of the value) when the
+   * change-log caller only needs the 30-byte HLC prefix. If deleting wide rows or
+   * rows with large blob cells ever shows up as slow, read just the HLC prefix
+   * here instead of reusing `getRowVersions`.
+   */
+  async deleteRowVersionsBatch(
+    batch: WriteBatch,
+    schemaName: string,
+    tableName: string,
+    pk: SqlValue[],
+    keepColumns?: ReadonlySet<string>
+  ): Promise<Map<string, ColumnVersion>> {
+    const identity = this.identity(schemaName, tableName, pk);
+    const versions = await this.getRowVersions(schemaName, tableName, pk);
+    for (const column of [...versions.keys()]) {
+      if (keepColumns?.has(column)) {
+        versions.delete(column);
+        continue;
+      }
+      batch.delete(buildColumnVersionKey(schemaName, tableName, identity, column));
     }
-
-    await batch.write();
+    return versions;
   }
 
   /**

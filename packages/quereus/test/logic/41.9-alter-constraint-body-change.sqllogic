@@ -1,0 +1,180 @@
+-- 41.9-alter-constraint-body-change.sqllogic
+-- Declarative differ: a named constraint whose NAME is unchanged but whose BODY
+-- changed is realized as DROP CONSTRAINT + ADD CONSTRAINT (drop+recreate). The
+-- re-add re-validates existing rows for UNIQUE / FOREIGN KEY (fails atomically on
+-- a violation); CHECK is forward-enforcing only (its ADD does not re-validate
+-- existing rows — a pre-existing limitation of the CHECK add path). Behavioral
+-- assertions through `apply schema`, so this passes under both `yarn test`
+-- (memory) and `yarn test:store`.
+
+pragma foreign_keys = true;
+-- run
+
+-- ============================================================
+-- 1. CHECK body change → drop+recreate; new predicate enforced forward
+-- ============================================================
+declare schema main {
+	table tc { id integer primary key, qty integer, constraint chk check (qty > 0) }
+}
+apply schema main;
+insert into tc values (1, 5);
+-- run
+
+-- old body (qty > 0): qty = 0 rejected
+insert into tc values (2, 0);
+-- error: check
+
+-- widen the body to qty >= 0 (same constraint name)
+declare schema main {
+	table tc { id integer primary key, qty integer, constraint chk check (qty >= 0) }
+}
+apply schema main;
+-- run
+
+-- new body enforced: qty = 0 now accepted
+insert into tc values (2, 0);
+select count(*) as n from tc;
+→ [{"n":2}]
+
+-- new body still rejects qty < 0
+insert into tc values (3, -1);
+-- error: check
+
+-- re-applying the identical declaration is a no-op (canonical bodies match)
+diff schema main;
+→ []
+
+drop table tc;
+-- run
+
+-- ============================================================
+-- 2. UNIQUE body change (column set widened) → drop+recreate; converges
+-- ============================================================
+declare schema main {
+	table tu { id integer primary key, a integer, b integer, constraint uq unique (a) }
+}
+apply schema main;
+insert into tu values (1, 10, 100);
+-- run
+
+-- old body unique(a): duplicate a rejected
+insert into tu values (2, 10, 200);
+-- error: unique
+
+-- widen to unique(a, b)
+declare schema main {
+	table tu { id integer primary key, a integer, b integer, constraint uq unique (a, b) }
+}
+apply schema main;
+-- run
+
+-- new body unique(a,b): duplicate a with distinct b now accepted
+insert into tu values (2, 10, 200);
+select count(*) as n from tu;
+→ [{"n":2}]
+
+-- full (a,b) duplicate still rejected
+insert into tu values (3, 10, 100);
+-- error: unique
+
+diff schema main;
+→ []
+
+drop table tu;
+-- run
+
+-- ============================================================
+-- 3. UNIQUE body change the existing data VIOLATES → the re-add aborts the apply
+-- ============================================================
+-- NOTE: a body change is DROP + ADD (two statements). A multi-statement migration
+-- is not atomic for schema mutations on the memory backend, so a failed re-add can
+-- leave the old constraint dropped — we assert only that the apply aborts and the
+-- data remains queryable, not that the prior constraint is restored.
+declare schema main {
+	table tv { id integer primary key, a integer, b integer, constraint uq unique (a, b) }
+}
+apply schema main;
+-- distinct on (a,b), duplicated on a alone
+insert into tv values (1, 10, 100), (2, 10, 200);
+-- run
+
+-- narrow to unique(a): existing a=10 twice → re-validation fails on the re-add
+declare schema main {
+	table tv { id integer primary key, a integer, b integer, constraint uq unique (a) }
+}
+-- run
+
+apply schema main;
+-- error:
+
+-- the existing rows survive and a new distinct-on-(a,b) row is accepted
+insert into tv values (3, 10, 300);
+select count(*) as n from tv;
+→ [{"n":3}]
+
+drop table tv;
+-- run
+
+-- ============================================================
+-- 4. FOREIGN KEY body change (ON DELETE action) → drop+recreate; behavior changes
+-- ============================================================
+declare schema main {
+	table fkp { pid integer primary key }
+	table fkc { id integer primary key, pa integer, constraint fk foreign key (pa) references fkp(pid) on delete restrict }
+}
+apply schema main;
+insert into fkp values (1);
+insert into fkc values (10, 1);
+-- run
+
+-- old body (on delete restrict): deleting a referenced parent is blocked
+delete from fkp where pid = 1;
+-- error:
+
+-- change the action to ON DELETE CASCADE
+declare schema main {
+	table fkp { pid integer primary key }
+	table fkc { id integer primary key, pa integer, constraint fk foreign key (pa) references fkp(pid) on delete cascade }
+}
+apply schema main;
+-- run
+
+-- new body (on delete cascade): deleting the parent removes the child too
+delete from fkp where pid = 1;
+select count(*) as n from fkc;
+→ [{"n":0}]
+
+diff schema main;
+→ []
+
+drop table fkc;
+drop table fkp;
+-- run
+
+-- ============================================================
+-- 5. Disambiguation — a tag-only change takes SET TAGS, NOT a drop+recreate
+-- ============================================================
+declare schema main {
+	table tt { id integer primary key, a integer, constraint uq unique (a) with tags (msg = 'orig') }
+}
+apply schema main;
+-- run
+
+-- change only the constraint's tags (body identical)
+declare schema main {
+	table tt { id integer primary key, a integer, constraint uq unique (a) with tags (msg = 'updated') }
+}
+-- run
+
+-- the diff is a single in-place SET TAGS — no DROP/ADD CONSTRAINT
+diff schema main;
+→ [{"ddl": "ALTER TABLE tt ALTER CONSTRAINT uq SET TAGS (msg = 'updated')"}]
+
+apply schema main;
+-- run
+
+diff schema main;
+→ []
+
+drop table tt;
+-- run

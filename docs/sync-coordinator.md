@@ -1,5 +1,7 @@
 # Sync Coordinator - Standalone Backend for Quereus Sync
 
+> **Stability: Experimental** — see [Stability Tiers](stability.md#tiers).
+
 The **sync-coordinator** package provides a production-ready, standalone backend server for the Quereus Sync protocol. It serves as both a reference implementation and a deployable service for multi-master CRDT replication.
 
 ## Design Goals
@@ -204,31 +206,46 @@ WebSocket connections provide real-time bidirectional sync.
 ### Connection Handshake
 
 1. Client connects to `/sync/ws`
-2. Client sends `{ type: "handshake", siteId: "...", token?: "..." }`
-3. Server authenticates and responds `{ type: "handshake_ack", serverSiteId: "..." }`
+2. Client sends `{ type: "handshake", siteId: "...", token?: "...", protocolVersion: <int> }`
+3. Server checks `protocolVersion` **before authenticating**. If it is absent or
+   not equal to the server's `PROTOCOL_VERSION`, the server replies
+   `{ type: "error", code: "PROTOCOL_VERSION_MISMATCH", fatal: true }` and closes
+   the socket with code `4003` — the store is never touched. Otherwise it
+   authenticates and responds
+   `{ type: "handshake_ack", serverSiteId: "...", protocolVersion: <int> }`.
 4. Connection is established; client is added to session registry
+
+The version check is **strict integer equality**: a peer that predates versioning
+(sends no `protocolVersion`) is treated as incompatible, not silently accepted.
+See [`sync-protocol.md` § Protocol version](sync-protocol.md#protocol-version) for the rationale.
 
 ### Message Types
 
 **Client → Server:**
 ```typescript
-| { type: "handshake"; siteId: string; token?: string }
+| { type: "handshake"; siteId: string; token?: string; protocolVersion: number }
 | { type: "get_changes"; sinceHLC?: HLC }
 | { type: "apply_changes"; changes: ChangeSet[] }
 | { type: "get_snapshot" }
-| { type: "resume_snapshot"; checkpoint: SnapshotCheckpoint }
+| { type: "resume_snapshot"; checkpoint: SerializedSnapshotCheckpoint }
 | { type: "ping" }
 ```
 
+`SerializedSnapshotCheckpoint` is the JSON-safe form of `SnapshotCheckpoint`
+(base64 `siteId` and `hlc`); the raw checkpoint holds a `Uint8Array` and a
+`bigint`, which `JSON.stringify` cannot emit. Senders build it with
+`serializeSnapshotCheckpoint`; the coordinator decodes it with
+`deserializeSnapshotCheckpoint` before handing it to the service.
+
 **Server → Client:**
 ```typescript
-| { type: "handshake_ack"; serverSiteId: string }
+| { type: "handshake_ack"; serverSiteId: string; protocolVersion: number }
 | { type: "changes"; changeSets: ChangeSet[] }
 | { type: "apply_result"; result: ApplyResult }
 | { type: "snapshot_chunk"; chunk: SnapshotChunk }
 | { type: "snapshot_complete" }                        // Signals successful end of snapshot stream
 | { type: "push_changes"; changeSets: ChangeSet[] }   // Server pushes new changes
-| { type: "error"; code: string; message: string }
+| { type: "error"; code: string; message: string; fatal?: boolean }
 | { type: "pong" }
 ```
 
@@ -276,7 +293,7 @@ interface CoordinatorConfig {
 
   // Sync settings (passed to SyncManager)
   sync: {
-    tombstoneTTL: number;          // Default: 30 days (ms)
+    retentionHorizonMs: number;    // Default: 30 days (ms)
     batchSize: number;             // Default: 1000
   };
 
@@ -298,6 +315,8 @@ interface CoordinatorConfig {
 | `SYNC_CORS_ORIGIN` | CORS origin(s), comma-separated |
 | `SYNC_AUTH_MODE` | Authentication mode |
 | `SYNC_AUTH_TOKENS` | Comma-separated token whitelist |
+| `SYNC_RETENTION_HORIZON_MS` | Retention horizon in ms (changes older than this are not guaranteed deliverable; default 30 days) |
+| `SYNC_BATCH_SIZE` | Maximum changes per sync batch |
 | `DEBUG` | Debug logging namespaces |
 
 ### CLI Usage

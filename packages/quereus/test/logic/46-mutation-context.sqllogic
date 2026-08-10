@@ -207,3 +207,389 @@ COMMIT;
 SELECT stock FROM deferred_test WHERE id = 1
 → [{"stock":15}]
 
+-- Test 11: new.<column> reads a supplied sibling alongside a context variable
+CREATE TABLE invoice (
+	id INTEGER PRIMARY KEY,
+	subtotal INTEGER,
+	total INTEGER DEFAULT (new.subtotal + tax)
+) USING memory
+WITH CONTEXT (
+	tax INTEGER
+);
+
+INSERT INTO invoice (id, subtotal)
+WITH CONTEXT tax = 7
+VALUES (1, 100);
+
+SELECT total FROM invoice WHERE id = 1
+→ [{"total":107}]
+
+-- Test 12: bare-vs-new precedence when the colliding column IS supplied.
+-- A context variable and a column share the name `amount`. When `amount` is
+-- supplied by the INSERT, a bare `amount` reference still resolves to the
+-- context variable (context shadows the column), while `new.amount` resolves to
+-- the supplied column value. No "symbol already exists" collision is raised.
+CREATE TABLE collide (
+	id INTEGER PRIMARY KEY,
+	amount INTEGER NULL,
+	bare_label INTEGER DEFAULT amount,
+	qual_label INTEGER DEFAULT (new.amount)
+) USING memory
+WITH CONTEXT (
+	amount INTEGER
+);
+
+INSERT INTO collide (id, amount)
+WITH CONTEXT amount = 999
+VALUES (1, 100);
+
+SELECT bare_label, qual_label FROM collide WHERE id = 1
+→ [{"bare_label":999,"qual_label":100}]
+
+-- Test 13: ALTER COLUMN SET DEFAULT coexists with a context variable. The default
+-- is installed via ALTER (not CREATE) yet resolves `new.<col>` (a supplied sibling)
+-- alongside a context variable at INSERT time — mirroring Test 11.
+CREATE TABLE invoice_alt (
+	id INTEGER PRIMARY KEY,
+	subtotal INTEGER,
+	total INTEGER
+) USING memory
+WITH CONTEXT (
+	tax INTEGER
+);
+
+ALTER TABLE invoice_alt ALTER COLUMN total SET DEFAULT (new.subtotal + tax);
+
+INSERT INTO invoice_alt (id, subtotal)
+WITH CONTEXT tax = 7
+VALUES (1, 100);
+
+SELECT total FROM invoice_alt WHERE id = 1
+→ [{"total":107}]
+
+-- Test 14: through the shared-surrogate envelope — a member-table column default
+-- reads a supplied sibling via `new.<col>` alongside a per-statement context
+-- variable. The shared key is minted once from the anchor's allocator default; the
+-- member's `total` default combines `new.amount` (supplied) with `tax` (context).
+CREATE TABLE ec_core (
+	rid INTEGER PRIMARY KEY DEFAULT (coalesce((SELECT max(rid) FROM ec_core), 0) + mutation_ordinal()),
+	name TEXT
+) USING memory;
+CREATE TABLE ec_line (
+	rid INTEGER PRIMARY KEY,
+	amount INTEGER,
+	total INTEGER DEFAULT (new.amount + tax)
+) USING memory
+WITH CONTEXT (
+	tax INTEGER
+);
+CREATE VIEW ec_v AS SELECT c.name AS name, l.amount AS amount
+	FROM ec_core c JOIN ec_line l ON l.rid = c.rid;
+
+INSERT INTO ec_v WITH CONTEXT tax = 5 VALUES ('Ada', 100), ('Lin', 200);
+
+SELECT rid, amount, total FROM ec_line ORDER BY rid
+→ [{"rid":1,"amount":100,"total":105},{"rid":2,"amount":200,"total":205}]
+
+-- Test 15: a subquery as a WITH CONTEXT value (optimizer must see it as a child).
+-- `DmlExecutorNode` and `ConstraintCheckNode` both expose their mutation-context
+-- value expressions as getChildren() so a subquery there gets rewritten like any
+-- other plan node. See bug-dml-side-expressions-invisible-to-optimizer.
+
+CREATE TABLE ctx_src (id INTEGER PRIMARY KEY, v TEXT);
+INSERT INTO ctx_src VALUES (1, 'a'), (2, 'b'), (3, 'c');
+
+-- Each op's context value feeds a CHECK constraint, mirroring Tests 2/4/5 above
+-- but with a subquery in place of a literal — proving the rewritten value reaches
+-- `ConstraintCheckNode` (not just the DML executor) for INSERT, UPDATE and DELETE.
+
+CREATE TABLE ctx_insert (
+	id INTEGER PRIMARY KEY,
+	CONSTRAINT gate_check CHECK (NEW.id <= who)
+) USING memory
+WITH CONTEXT (
+	who INTEGER
+);
+
+-- passes: subquery count is 3, id is 1
+INSERT INTO ctx_insert (id)
+WITH CONTEXT who = (SELECT COUNT(*) FROM ctx_src)
+VALUES (1);
+
+SELECT id FROM ctx_insert
+→ [{"id":1}]
+
+-- fails: subquery count is 1, id is 2
+INSERT INTO ctx_insert (id)
+WITH CONTEXT who = (SELECT COUNT(*) FROM ctx_src WHERE id = 1)
+VALUES (2);
+-- error: CHECK constraint failed
+
+DROP TABLE ctx_insert;
+
+CREATE TABLE ctx_update (
+	id INTEGER PRIMARY KEY,
+	val INTEGER,
+	CONSTRAINT gate_check CHECK (NEW.val <= who)
+) USING memory
+WITH CONTEXT (
+	who INTEGER
+);
+
+INSERT INTO ctx_update WITH CONTEXT who = 999 VALUES (1, 0);
+
+-- passes: subquery count is 3, val is 2
+UPDATE ctx_update
+WITH CONTEXT who = (SELECT COUNT(*) FROM ctx_src)
+SET val = 2
+WHERE id = 1;
+
+SELECT val FROM ctx_update WHERE id = 1
+→ [{"val":2}]
+
+-- fails: subquery count is 1, val is 2
+UPDATE ctx_update
+WITH CONTEXT who = (SELECT COUNT(*) FROM ctx_src WHERE id = 1)
+SET val = 2
+WHERE id = 1;
+-- error: CHECK constraint failed
+
+DROP TABLE ctx_update;
+
+CREATE TABLE ctx_delete (
+	id INTEGER PRIMARY KEY,
+	CONSTRAINT delete_check CHECK ON DELETE (who >= 3)
+) USING memory
+WITH CONTEXT (
+	who INTEGER
+);
+
+INSERT INTO ctx_delete WITH CONTEXT who = 999 VALUES (1), (2);
+
+-- fails: subquery count is 1
+DELETE FROM ctx_delete
+WITH CONTEXT who = (SELECT COUNT(*) FROM ctx_src WHERE id = 1)
+WHERE id = 1;
+-- error: CHECK constraint failed
+
+-- passes: subquery count is 3
+DELETE FROM ctx_delete
+WITH CONTEXT who = (SELECT COUNT(*) FROM ctx_src)
+WHERE id = 1;
+
+SELECT id FROM ctx_delete
+→ [{"id":2}]
+
+DROP TABLE ctx_delete;
+DROP TABLE ctx_src;
+
+-- Test 16: omitting the envelope on a table whose CHECK reads a NOT NULL context
+-- variable reports the missing STATEMENT argument, naming both table and variable —
+-- not "context.<var> isn't a column", which pointed the reader at the schema.
+CREATE TABLE revocation (
+	stamp_id TEXT PRIMARY KEY,
+	reissued_at INTEGER NULL,
+	CONSTRAINT authorized_reissue CHECK (context.owner_key = 'k')
+) USING memory
+WITH CONTEXT (
+	owner_key TEXT,
+	signature TEXT NULL
+);
+
+INSERT INTO revocation (stamp_id) VALUES ('a');
+-- error: table 'main.revocation' requires mutation context variable 'owner_key'
+
+-- Test 17: supplying an envelope that omits one NOT NULL variable is the same
+-- diagnosis, not an internal error.
+INSERT INTO revocation (stamp_id) WITH CONTEXT signature = 'x' VALUES ('a');
+-- error: table 'main.revocation' requires mutation context variable 'owner_key'
+
+UPDATE revocation WITH CONTEXT signature = 'x' SET reissued_at = 1;
+-- error: table 'main.revocation' requires mutation context variable 'owner_key'
+
+-- The NULL-marked `signature` may be omitted entirely.
+INSERT INTO revocation (stamp_id) WITH CONTEXT owner_key = 'k' VALUES ('a');
+
+SELECT stamp_id, reissued_at FROM revocation
+→ [{"stamp_id":"a","reissued_at":null}]
+
+-- Test 18: a name the table does not declare is ignored, not rejected. View
+-- decomposition forwards one envelope verbatim to every member statement, so a member
+-- routinely receives values for variables it never declared.
+INSERT INTO revocation (stamp_id) WITH CONTEXT owner_key = 'k', bogus = 1 VALUES ('b');
+
+SELECT stamp_id FROM revocation ORDER BY stamp_id
+→ [{"stamp_id":"a"},{"stamp_id":"b"}]
+
+-- Test 19: an omitted NULL-marked variable reads as NULL rather than erroring, so a
+-- CHECK comparing against it behaves like any NULL comparison (unknown ⇒ passes),
+-- and one written to reject NULL fails as a CHECK — never as a missing argument.
+CREATE TABLE floor_guard (
+	id INTEGER PRIMARY KEY,
+	v INTEGER NULL,
+	CONSTRAINT unknown_passes CHECK (v >= floor_v)
+) USING memory
+WITH CONTEXT (
+	floor_v INTEGER NULL
+);
+
+INSERT INTO floor_guard (id, v) VALUES (1, 5);
+
+SELECT id, v FROM floor_guard
+→ [{"id":1,"v":5}]
+
+CREATE TABLE floor_strict (
+	id INTEGER PRIMARY KEY,
+	v INTEGER NULL,
+	CONSTRAINT null_rejected CHECK (coalesce(v >= floor_v, 0))
+) USING memory
+WITH CONTEXT (
+	floor_v INTEGER NULL
+);
+
+INSERT INTO floor_strict (id, v) VALUES (1, 5);
+-- error: CHECK constraint failed
+
+INSERT INTO floor_strict (id, v) WITH CONTEXT floor_v = 1 VALUES (1, 5);
+
+SELECT id, v FROM floor_strict
+→ [{"id":1,"v":5}]
+
+-- Test 20: a declared variable that no default or constraint reads never makes the
+-- envelope mandatory — the error is raised where the variable is REFERENCED, not
+-- where the symbols are registered. Regression guard for envelope-less writes.
+CREATE TABLE unread_ctx (
+	id INTEGER PRIMARY KEY
+) USING memory
+WITH CONTEXT (
+	never_read TEXT
+);
+
+INSERT INTO unread_ctx VALUES (1);
+
+SELECT id FROM unread_ctx
+→ [{"id":1}]
+
+-- Likewise for an op the constraint does not cover: `revocation`'s CHECK is
+-- INSERT/UPDATE-scoped, so a DELETE reads no context variable and needs no envelope.
+DELETE FROM revocation WHERE stamp_id = 'b';
+
+SELECT stamp_id FROM revocation
+→ [{"stamp_id":"a"}]
+
+-- Test 21: a write mediated by a view reports the MEMBER table that declares the
+-- variable, not the view the statement named.
+CREATE TABLE mv_core (
+	rid INTEGER PRIMARY KEY DEFAULT (coalesce((SELECT max(rid) FROM mv_core), 0) + mutation_ordinal()),
+	name TEXT
+) USING memory;
+CREATE TABLE mv_line (
+	rid INTEGER PRIMARY KEY,
+	amount INTEGER,
+	CONSTRAINT cap_check CHECK (amount <= cap)
+) USING memory
+WITH CONTEXT (
+	cap INTEGER
+);
+CREATE VIEW mv_v AS SELECT c.name AS name, l.amount AS amount
+	FROM mv_core c JOIN mv_line l ON l.rid = c.rid;
+
+INSERT INTO mv_v VALUES ('Ada', 10);
+-- error: table 'main.mv_line' requires mutation context variable 'cap'
+
+INSERT INTO mv_v WITH CONTEXT cap = 100 VALUES ('Lin', 10);
+
+SELECT rid, amount FROM mv_line
+→ [{"rid":1,"amount":10}]
+
+-- Test 22: BEHAVIOR CHANGE — context variables are now registered for a write that
+-- supplies no envelope, so a bare reference that collides with a column name resolves
+-- to the (unsupplied, hence NULL) context variable, where it used to resolve to the
+-- column. Precedence is the documented one; only the envelope-less case moved.
+CREATE TABLE shadow_null (
+	id INTEGER PRIMARY KEY,
+	value TEXT NULL,
+	bare_label TEXT NULL DEFAULT value,
+	qual_label TEXT NULL DEFAULT (new.value)
+) USING memory
+WITH CONTEXT (
+	value TEXT NULL
+);
+
+INSERT INTO shadow_null (id, value) VALUES (1, 'col');
+INSERT INTO shadow_null (id, value) WITH CONTEXT value = 'ctx' VALUES (2, 'col');
+
+SELECT id, bare_label, qual_label FROM shadow_null ORDER BY id
+→ [{"id":1,"bare_label":null,"qual_label":"col"},{"id":2,"bare_label":"ctx","qual_label":"col"}]
+
+-- Test 23: a deferred CHECK captures context at write time and evaluates at COMMIT;
+-- an omitted NULL-marked variable must survive that capture AS NULL, not vanish (which
+-- would misalign the captured context row against its descriptor).
+CREATE TABLE deferred_null_ctx (
+	id INTEGER PRIMARY KEY,
+	stock INTEGER,
+	CONSTRAINT stock_check CHECK (
+		coalesce(stock >= min_stock, 1) AND
+		EXISTS (SELECT 1 FROM deferred_null_ctx WHERE id = NEW.id)
+	)
+) USING memory
+WITH CONTEXT (
+	min_stock INTEGER NULL
+);
+
+BEGIN;
+
+INSERT INTO deferred_null_ctx (id, stock) VALUES (1, 15);
+
+COMMIT;
+
+SELECT stock FROM deferred_null_ctx WHERE id = 1
+→ [{"stock":15}]
+
+-- The same deferred constraint still sees a supplied value.
+BEGIN;
+
+INSERT INTO deferred_null_ctx (id, stock) WITH CONTEXT min_stock = 99 VALUES (2, 15);
+
+COMMIT;
+-- error: CHECK constraint failed
+
+-- Test 24: a NOT NULL column whose DEFAULT reads an omitted NULL-marked variable
+-- yields NULL and then hits the ordinary NOT NULL column check — not a context error.
+CREATE TABLE stamped (
+	id INTEGER PRIMARY KEY,
+	who TEXT NOT NULL DEFAULT stamp
+) USING memory
+WITH CONTEXT (
+	stamp TEXT NULL
+);
+
+INSERT INTO stamped (id) VALUES (1);
+-- error: NOT NULL constraint failed: stamped.who
+
+INSERT INTO stamped (id) WITH CONTEXT stamp = 'me' VALUES (2);
+
+SELECT id, who FROM stamped
+→ [{"id":2,"who":"me"}]
+
+-- Test 25: the UPSERT `do update` arm re-plans the table's UPDATE-scoped constraints,
+-- so the same rules hold there.
+CREATE TABLE upsert_ctx (
+	id INTEGER PRIMARY KEY,
+	v INTEGER,
+	CONSTRAINT cap_check CHECK (v <= cap)
+) USING memory
+WITH CONTEXT (
+	cap INTEGER
+);
+
+INSERT INTO upsert_ctx WITH CONTEXT cap = 100 VALUES (1, 1);
+
+INSERT INTO upsert_ctx VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET v = 2;
+-- error: table 'main.upsert_ctx' requires mutation context variable 'cap'
+
+INSERT INTO upsert_ctx WITH CONTEXT cap = 100 VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET v = 2;
+
+SELECT id, v FROM upsert_ctx
+→ [{"id":1,"v":2}]
+

@@ -1,0 +1,30 @@
+-- ===================================================================
+-- Memory-only: default collation of an undecorated text PRIMARY KEY
+-- ===================================================================
+--
+-- This file is registered in MEMORY_ONLY_FILES (test/logic.spec.ts) and is
+-- SKIPPED under store mode (QUEREUS_TEST_STORE) on purpose: the default key
+-- collation of an *undecorated* text PK is intentionally backend-divergent.
+--
+--   memory module → BINARY  ('a' and 'A' are distinct rows)
+--   store module  → NOCASE  ('a' and 'A' collide; the second insert raises UNIQUE)
+--
+-- The memory side honors the session default_collation (BINARY out of box) via
+-- resolveDefaultCollation (quereus/src/schema/table.ts); the store side applies
+-- its table-level key collation K (NOCASE by default) via reconcilePkCollations
+-- (quereus-store/store-module-schema-rewrite.ts). The store leg of this contract is covered by
+-- create-table-conformance.spec.ts. See docs/schema.md §"Per-column PK key
+-- collation" for the full cross-backend contrast.
+
+-- Undecorated text PK reports BINARY under the memory module.
+create table t_text_pk (x text primary key);
+select name, collation from table_info('t_text_pk');
+→ [{"name":"x","collation":"BINARY"}]
+
+-- BINARY PK: 'a' and 'A' are distinct rows (would collide under NOCASE).
+insert into t_text_pk values ('a');
+insert into t_text_pk values ('A');
+select count(*) as n from t_text_pk;
+→ [{"n":2}]
+
+drop table t_text_pk;

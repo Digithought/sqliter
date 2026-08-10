@@ -44,6 +44,42 @@ function wrapIterableForTracing<T>(
 	return wrapped;
 }
 
+/**
+ * Per-mode seam that parameterizes the two dispatch loops (a synchronous entry
+ * loop and its async continuation). Optimized mode supplies only
+ * `runInstruction`; tracing and metrics layer their extra behavior in through the
+ * optional hooks. The point of the seam is that the core dispatch — and, in the
+ * async loop, the sweep-on-throw that drains abandoned promises — lives in
+ * exactly one place instead of being copy-pasted per mode.
+ */
+interface RunHooks {
+	/** Runs once before the first instruction (metrics: initialize per-instruction stats). */
+	onStart?(): void;
+	/** Runs once on normal completion only — never on throw (metrics: log aggregate stats). */
+	onComplete?(): void;
+	/** Runs before each instruction, with its resolved args (tracing: trace input). */
+	onInput?(index: number, instruction: Instruction, args: RuntimeValue[]): void;
+	/** Runs the instruction. Metrics wraps timing/counting around the call here. */
+	runInstruction(instruction: Instruction, ctx: RuntimeContext, args: RuntimeValue[]): OutputValue;
+	/**
+	 * Post-processes a non-promise output in the synchronous entry loop (tracing:
+	 * wrap async iterables + trace); returns the value to park. Only ever called
+	 * with a non-promise `output` — the sync loop hands off to the async loop the
+	 * instant an instruction returns a promise.
+	 */
+	onSyncOutput?(index: number, instruction: Instruction, output: OutputValue): OutputValue;
+	/**
+	 * Post-processes an output in the async loop; returns the value to park (which
+	 * may still be a promise, for deferred awaiting at the destination). Tracing
+	 * awaits promise outputs eagerly so trace events are ordered by settlement, and
+	 * wraps async iterables; optimized/metrics omit this hook and defer awaiting to
+	 * the consuming instruction's `Promise.all`.
+	 */
+	onAsyncOutput?(index: number, instruction: Instruction, output: OutputValue): OutputValue | Promise<OutputValue>;
+	/** Runs when an instruction throws (tracing: trace error). The loop re-throws. */
+	onError?(index: number, instruction: Instruction, error: unknown): void;
+}
+
 export class Scheduler {
 	readonly instructions: Instruction[] = [];
 	/** Index of the instruction that consumes the output of each instruction. */
@@ -82,99 +118,74 @@ export class Scheduler {
 		let result: OutputValue;
 
 		if (ctx.enableMetrics) {
-			result = this.runWithMetrics(ctx);
+			result = this.runSyncLoop(ctx, this.metricsHooks());
 		} else if (!ctx.tracer) {
-			result = this.runOptimized(ctx);
+			result = this.runSyncLoop(ctx, this.optimizedHooks());
 		} else {
-			result = this.runWithTracing(ctx);
+			result = this.runSyncLoop(ctx, this.tracingHooks(ctx));
 		}
 
-		// Check for remaining contexts and warn rather than error
-		if (ctx.context.size > 0 || ctx.tableContexts.size > 0) {
-			contextLog('Context leak detected - remaining row contexts: %d, table contexts: %d', ctx.context.size, ctx.tableContexts.size);
-		}
-
-		if (ctx.contextTracker && ctx.contextTracker.hasRemainingContexts()) {
-			const remaining = ctx.contextTracker.getRemainingContexts();
-			contextLog('Context tracker recorded remaining contexts: %O', remaining.map(c => c.source));
+		// Context-leak diagnostic. A program's result is frequently an unconsumed
+		// Promise or AsyncIterable — row/table contexts are opened and closed *during*
+		// iteration (e.g. a scan's row slot closes in the generator's `finally`), so
+		// checking synchronously here fires before any leak could occur and reports
+		// false positives (or misses real leaks entirely). Defer the check to
+		// settlement, and only when the context logger is enabled so production runs
+		// pay nothing for a debug-only diagnostic.
+		if (contextLog.enabled) {
+			return this.checkContextLeaksOnSettle(ctx, result);
 		}
 
 		return result;
 	}
 
-	private runOptimized(ctx: RuntimeContext): OutputValue {
-		// Argument lists for each instruction.
-		const instrArgs = new Array(this.instructions.length).fill(null).map(() => [] as OutputValue[] | undefined);
-		// Running output
-		let output: OutputValue | undefined;
-
-		// Run synchronously until we hit a promise
-		for (let i = 0; i < this.instructions.length; ++i) {
-			const args = instrArgs[i]!;	// Guaranteed not to contain promises
-			instrArgs[i] = undefined; // Clear args as we go to minimize memory usage.
-
-			output = this.instructions[i].run(ctx, ...(args as RuntimeValue[]));
-
-			// If the instruction returned a promise, switch to async mode for rest of instructions
-			if (output instanceof Promise) {
-				return this.runAsync(ctx, instrArgs, i, output);
+	/**
+	 * Run the context-leak check once `result` has settled: after a Promise
+	 * resolves/rejects, or after an AsyncIterable is fully drained. A synchronous
+	 * result is checked immediately. Only invoked when `contextLog.enabled`.
+	 */
+	private checkContextLeaksOnSettle(ctx: RuntimeContext, result: OutputValue): OutputValue {
+		const check = (): void => {
+			if (ctx.context.size > 0 || ctx.tableContexts.size > 0) {
+				contextLog('Context leak detected - remaining row contexts: %d, table contexts: %d', ctx.context.size, ctx.tableContexts.size);
 			}
-
-			// Store synchronous output
-			const destination = this.destinations[i];
-			if (destination !== null) {
-				instrArgs[destination]!.push(output);
+			if (ctx.contextTracker && ctx.contextTracker.hasRemainingContexts()) {
+				const remaining = ctx.contextTracker.getRemainingContexts();
+				contextLog('Context tracker recorded remaining contexts: %O', remaining.map(c => c.source));
 			}
-		}
+		};
 
-		return output as OutputValue;
-	}
-
-	private async runAsync(
-		ctx: RuntimeContext,
-		instrArgs: (OutputValue[] | undefined)[],
-		startIndex: number,
-		pendingOutput: OutputValue
-	): Promise<RuntimeValue> {
-		// Instruction indexes that have promise arguments
-		const hasPromise: boolean[] = [];
-
-		let output: OutputValue | undefined = pendingOutput;
-
-		// Store the output from the transition instruction
-		const transitionDestination = this.destinations[startIndex];
-		if (transitionDestination !== null) {
-			instrArgs[transitionDestination]!.push(output);
-			hasPromise[transitionDestination] = true;
-		}
-
-		// Continue with remaining instructions asynchronously
-		for (let i = startIndex + 1; i < this.instructions.length; ++i) {
-			let args = instrArgs[i]!;
-			instrArgs[i] = undefined;
-
-			// Resolve any promise arguments
-			if (hasPromise[i]) {
-				args = await Promise.all(args);
-			}
-
-			// Run the instruction
-			output = this.instructions[i].run(ctx, ...(args as RuntimeValue[]));
-
-			// Store the output
-			const destination = this.destinations[i];
-			if (destination !== null) {
-				instrArgs[destination]!.push(output);
-				if (output instanceof Promise) {
-					hasPromise[destination] = true;
+		if (isAsyncIterable<Row>(result)) {
+			const iterable: AsyncIterable<Row> = result;
+			return (async function* (): AsyncIterable<Row> {
+				try {
+					for await (const row of iterable) {
+						yield row;
+					}
+				} finally {
+					check();
 				}
-			}
+			})();
 		}
 
-		return output as OutputValue;
+		if (result instanceof Promise) {
+			return result.finally(check);
+		}
+
+		check();
+		return result;
 	}
 
-	private runWithTracing(ctx: RuntimeContext): OutputValue {
+	/**
+	 * Synchronous entry loop, shared by all three modes via {@link RunHooks}. Runs
+	 * instructions in linearized order until one returns a promise, then hands the
+	 * remainder to {@link runAsyncLoop}. Because it bails to the async loop the
+	 * instant an output is a promise, `instrArgs` here never holds a promise — so
+	 * there is nothing to sweep on a throw, and none is done.
+	 */
+	private runSyncLoop(ctx: RuntimeContext, hooks: RunHooks): OutputValue {
+		hooks.onStart?.();
+
 		// Argument lists for each instruction.
 		const instrArgs = new Array(this.instructions.length).fill(null).map(() => [] as OutputValue[] | undefined);
 		// Running output
@@ -186,30 +197,22 @@ export class Scheduler {
 			const args = instrArgs[i]!;	// Guaranteed not to contain promises
 			instrArgs[i] = undefined; // Clear args as we go to minimize memory usage.
 
-			// Trace input
-			ctx.tracer!.traceInput(i, instruction, args as RuntimeValue[]);
+			hooks.onInput?.(i, instruction, args as RuntimeValue[]);
 
 			try {
-				output = instruction.run(ctx, ...(args as RuntimeValue[]));
+				output = hooks.runInstruction(instruction, ctx, args as RuntimeValue[]);
 
-				// If the instruction returned a promise, switch to async mode for rest of instructions
+				// If the instruction returned a promise, switch to async mode for the rest.
 				if (output instanceof Promise) {
-					return this.runAsyncWithTracing(ctx, instrArgs, i, output);
+					return this.runAsyncLoop(ctx, instrArgs, i, output, hooks);
 				}
 
-				// Wrap async iterables for row-level tracing
-				if (isAsyncIterable(output)) {
-					output = wrapIterableForTracing(output, ctx, i, instruction);
+				if (hooks.onSyncOutput) {
+					output = hooks.onSyncOutput(i, instruction, output);
 				}
-
-				// Trace output - handle promises properly
-				ctx.tracer!.traceOutput(i, instruction, output);
-
-				// Keep the original output (promise or value) for flow control
 			} catch (error) {
-				// Trace error
-				ctx.tracer!.traceError(i, instruction, error as Error);
-				throw error; // Re-throw the error
+				hooks.onError?.(i, instruction, error);
+				throw error;
 			}
 
 			// Store synchronous output
@@ -219,172 +222,205 @@ export class Scheduler {
 			}
 		}
 
+		hooks.onComplete?.();
+
 		return output as OutputValue;
 	}
 
-	private async runAsyncWithTracing(
+	/**
+	 * Async continuation loop, shared by all three modes. Instruction outputs feed
+	 * later instructions by parking in `instrArgs[destination]` until the
+	 * destination runs; while the query runs asynchronously, some parked args are
+	 * still-pending promises.
+	 *
+	 * The bug this guards against: if an instruction throws *before* the
+	 * destination that would await a parked promise runs, that promise would be
+	 * abandoned — never awaited, never handled — and under strict rejection
+	 * handling an ordinary query error escalates into a process-fatal unhandled
+	 * rejection. The outer try/catch sweeps every remaining parked promise on any
+	 * throw (see {@link sweepAbandonedPromises}) and re-throws the original error.
+	 */
+	private async runAsyncLoop(
 		ctx: RuntimeContext,
 		instrArgs: (OutputValue[] | undefined)[],
 		startIndex: number,
-		pendingOutput: OutputValue
+		pendingOutput: OutputValue,
+		hooks: RunHooks
 	): Promise<RuntimeValue> {
-		// Handle the initial pending output
-		let resolvedPendingOutput = await pendingOutput;
-		if (isAsyncIterable(resolvedPendingOutput)) {
-			resolvedPendingOutput = wrapIterableForTracing(resolvedPendingOutput, ctx, startIndex, this.instructions[startIndex]);
-		}
-		ctx.tracer!.traceOutput(startIndex, this.instructions[startIndex], resolvedPendingOutput);
-
 		// Instruction indexes that have promise arguments
 		const hasPromise: boolean[] = [];
 
-		let output: OutputValue | undefined = resolvedPendingOutput;
-
-		// Store the output from the transition instruction
-		const transitionDestination = this.destinations[startIndex];
-		if (transitionDestination !== null) {
-			instrArgs[transitionDestination]!.push(output);
-			hasPromise[transitionDestination] = true;
-		}
-
-		// Continue with remaining instructions asynchronously
-		for (let i = startIndex + 1; i < this.instructions.length; ++i) {
-			const instruction = this.instructions[i];
-			let args = instrArgs[i]!;
-			instrArgs[i] = undefined;
-
-			// Resolve any promise arguments
-			if (hasPromise[i]) {
-				args = await Promise.all(args);
-			}
-
-			// Trace input
-			ctx.tracer!.traceInput(i, instruction, args as RuntimeValue[]);
-
-			try {
-				output = instruction.run(ctx, ...(args as RuntimeValue[]));
-
-				// Resolve and wrap async output for tracing
-				let resolvedOutput = output instanceof Promise ? await output : output;
-				if (isAsyncIterable(resolvedOutput)) {
-					resolvedOutput = wrapIterableForTracing(resolvedOutput, ctx, i, instruction);
-					output = resolvedOutput; // Update output to the wrapped version
-				}
-
-				// Trace output
-				ctx.tracer!.traceOutput(i, instruction, resolvedOutput);
-
-				// Keep the original output (promise or value) for flow control
-			} catch (error) {
-				// Trace error
-				ctx.tracer!.traceError(i, instruction, error as Error);
-				throw error; // Re-throw the error
-			}
-
-			// Store the output
-			const destination = this.destinations[i];
-			if (destination !== null) {
-				instrArgs[destination]!.push(output);
-				if (output instanceof Promise) {
-					hasPromise[destination] = true;
-				}
-			}
-		}
-
-		return output as OutputValue;
-	}
-
-	private runWithMetrics(ctx: RuntimeContext): OutputValue {
-		// Initialize metrics for all instructions
-		for (const instruction of this.instructions) {
-			if (!instruction.runtimeStats) {
-				instruction.runtimeStats = {
-					in: 0,
-					out: 0,
-					elapsedNs: 0n,
-					executions: 0
-				};
-			}
-		}
-
-		// Argument lists for each instruction.
-		const instrArgs = new Array(this.instructions.length).fill(null).map(() => [] as OutputValue[] | undefined);
-		// Running output
 		let output: OutputValue | undefined;
 
-		// Run synchronously until we hit a promise
-		for (let i = 0; i < this.instructions.length; ++i) {
-			const instruction = this.instructions[i];
-			const args = instrArgs[i]!;
-			instrArgs[i] = undefined; // Clear args as we go to minimize memory usage.
+		try {
+			// Handle the transition instruction's output (always a promise here).
+			const startInstruction = this.instructions[startIndex];
+			output = hooks.onAsyncOutput
+				? await hooks.onAsyncOutput(startIndex, startInstruction, pendingOutput)
+				: pendingOutput;
 
-			// Run with metrics collection
-			output = this.runInstructionWithMetrics(instruction, ctx, args as RuntimeValue[]);
-
-			// If the instruction returned a promise, switch to async mode for rest of instructions
-			if (output instanceof Promise) {
-				return this.runAsyncWithMetrics(ctx, instrArgs, i, output);
+			// Store the output from the transition instruction. The transition output
+			// is always deferred to its destination (parked, then awaited via
+			// Promise.all), matching every pre-collapse async loop.
+			const transitionDestination = this.destinations[startIndex];
+			if (transitionDestination !== null) {
+				instrArgs[transitionDestination]!.push(output);
+				hasPromise[transitionDestination] = true;
 			}
 
-			// Store synchronous output
-			const destination = this.destinations[i];
-			if (destination !== null) {
-				instrArgs[destination]!.push(output);
+			// Continue with remaining instructions asynchronously
+			for (let i = startIndex + 1; i < this.instructions.length; ++i) {
+				const instruction = this.instructions[i];
+				let args = instrArgs[i]!;
+				instrArgs[i] = undefined;
+
+				// Resolve any promise arguments
+				if (hasPromise[i]) {
+					args = await Promise.all(args);
+				}
+
+				hooks.onInput?.(i, instruction, args as RuntimeValue[]);
+
+				try {
+					output = hooks.runInstruction(instruction, ctx, args as RuntimeValue[]);
+					if (hooks.onAsyncOutput) {
+						output = await hooks.onAsyncOutput(i, instruction, output);
+					}
+				} catch (error) {
+					hooks.onError?.(i, instruction, error);
+					throw error;
+				}
+
+				// Store the output
+				const destination = this.destinations[i];
+				if (destination !== null) {
+					instrArgs[destination]!.push(output);
+					if (output instanceof Promise) {
+						hasPromise[destination] = true;
+					}
+				}
 			}
+
+			hooks.onComplete?.();
+
+			return output as RuntimeValue;
+		} catch (error) {
+			// Drain any promises still parked in `instrArgs` whose destination will
+			// now never run, then re-throw the ORIGINAL error.
+			await this.sweepAbandonedPromises(instrArgs);
+			throw error;
 		}
-
-		// Log aggregate metrics if debugging is enabled
-		this.logAggregateMetrics();
-
-		return output as OutputValue;
 	}
 
-	private async runAsyncWithMetrics(
-		ctx: RuntimeContext,
-		instrArgs: (OutputValue[] | undefined)[],
-		startIndex: number,
-		pendingOutput: OutputValue
-	): Promise<RuntimeValue> {
-		// Instruction indexes that have promise arguments
-		const hasPromise: boolean[] = [];
-
-		let output: OutputValue | undefined = pendingOutput;
-
-		// Store the output from the transition instruction
-		const transitionDestination = this.destinations[startIndex];
-		if (transitionDestination !== null) {
-			instrArgs[transitionDestination]!.push(output);
-			hasPromise[transitionDestination] = true;
-		}
-
-		// Continue with remaining instructions asynchronously
-		for (let i = startIndex + 1; i < this.instructions.length; ++i) {
-			const instruction = this.instructions[i];
-			let args = instrArgs[i]!;
-			instrArgs[i] = undefined;
-
-			// Resolve any promise arguments
-			if (hasPromise[i]) {
-				args = await Promise.all(args);
-			}
-
-			// Run with metrics collection
-			output = await this.runInstructionWithMetricsAsync(instruction, ctx, args as RuntimeValue[]);
-
-			// Store the output
-			const destination = this.destinations[i];
-			if (destination !== null) {
-				instrArgs[destination]!.push(output);
-				if (output instanceof Promise) {
-					hasPromise[destination] = true;
+	/**
+	 * Drain any still-pending promises parked in `instrArgs` after an instruction
+	 * threw, so a promise that a now-unreachable destination would have awaited
+	 * cannot become an unhandled rejection (process-fatal under strict rejection
+	 * handling). Rejections are logged rather than swallowed silently; the caller
+	 * re-throws the ORIGINAL error, so swept results never replace it.
+	 */
+	private async sweepAbandonedPromises(instrArgs: (OutputValue[] | undefined)[]): Promise<void> {
+		const pending: Promise<unknown>[] = [];
+		for (const args of instrArgs) {
+			if (!args) continue;
+			for (const arg of args) {
+				if (arg instanceof Promise) {
+					pending.push(arg);
 				}
 			}
 		}
+		if (pending.length === 0) return;
 
-		// Log aggregate metrics if debugging is enabled
-		this.logAggregateMetrics();
+		const settled = await Promise.allSettled(pending);
+		for (const result of settled) {
+			if (result.status === 'rejected') {
+				log('Drained abandoned instruction promise that rejected during error unwind: %O', result.reason);
+			}
+		}
+	}
 
-		return output as OutputValue;
+	/** Optimized mode: plain dispatch, no tracing or metrics overhead. */
+	private optimizedHooks(): RunHooks {
+		return {
+			runInstruction: (instruction, ctx, args) => instruction.run(ctx, ...args),
+		};
+	}
+
+	/**
+	 * Tracing mode. `onSyncOutput`/`onAsyncOutput` diverge deliberately: the async
+	 * hook eagerly awaits each promise output before tracing so trace events are
+	 * ordered by settlement (the sync path never sees a promise). Both wrap async
+	 * iterables via {@link wrapIterableForTracing}. For a resolved-scalar promise
+	 * the async hook parks the ORIGINAL promise (deferring the await to the
+	 * destination), exactly as before the collapse.
+	 */
+	private tracingHooks(ctx: RuntimeContext): RunHooks {
+		const tracer = ctx.tracer!;
+		return {
+			onInput: (i, instruction, args) => tracer.traceInput(i, instruction, args),
+			runInstruction: (instruction, rctx, args) => instruction.run(rctx, ...args),
+			onSyncOutput: (i, instruction, output) => {
+				let traced = output;
+				if (isAsyncIterable(traced)) {
+					traced = wrapIterableForTracing(traced, ctx, i, instruction);
+				}
+				tracer.traceOutput(i, instruction, traced);
+				return traced;
+			},
+			onAsyncOutput: async (i, instruction, output) => {
+				let resolved = output instanceof Promise ? await output : output;
+				// Default: keep the original output for flow control (re-defers a
+				// resolved-scalar promise to its destination).
+				let parkValue: OutputValue = output;
+				if (isAsyncIterable(resolved)) {
+					resolved = wrapIterableForTracing(resolved, ctx, i, instruction);
+					parkValue = resolved;
+				}
+				tracer.traceOutput(i, instruction, resolved);
+				return parkValue;
+			},
+			onError: (i, instruction, error) => tracer.traceError(i, instruction, error as Error),
+		};
+	}
+
+	/**
+	 * Metrics mode. `runInstruction` wraps timing/counting (a sync value is timed
+	 * immediately; a promise result is timed on settle via `.then/.catch`). The
+	 * async loop parks that timing-wrapped promise and defers awaiting to the
+	 * destination — like optimized — so no separate async instruction runner is
+	 * needed. `onComplete` logs the aggregate on the normal-completion path only
+	 * (never on throw), matching the pre-collapse behavior.
+	 */
+	private metricsHooks(): RunHooks {
+		return {
+			onStart: () => {
+				// Reset (not create-if-absent): a cached scheduler is reused across
+				// executions, so stats must be zeroed each run to report per-execution
+				// numbers rather than accumulating across runs.
+				// NOTE: a sub-program scheduler (emitCall) reruns once per outer row in a
+				// correlated re-eval, so its stats reset per invocation, not per execution —
+				// its onComplete debug log reports the last invocation, not a cumulative sum.
+				// Fine today (debug telemetry only); revisit if sub-program metrics ever feed
+				// a decision that needs the per-execution total.
+				for (const instruction of this.instructions) {
+					if (instruction.runtimeStats) {
+						instruction.runtimeStats.in = 0;
+						instruction.runtimeStats.out = 0;
+						instruction.runtimeStats.elapsedNs = 0n;
+						instruction.runtimeStats.executions = 0;
+					} else {
+						instruction.runtimeStats = {
+							in: 0,
+							out: 0,
+							elapsedNs: 0n,
+							executions: 0
+						};
+					}
+				}
+			},
+			runInstruction: (instruction, ctx, args) => this.runInstructionWithMetrics(instruction, ctx, args),
+			onComplete: () => this.logAggregateMetrics(),
+		};
 	}
 
 	private runInstructionWithMetrics(instruction: Instruction, ctx: RuntimeContext, args: RuntimeValue[]): OutputValue {
@@ -412,24 +448,6 @@ export class Scheduler {
 			stats.out += this.countOutputs(result);
 			stats.elapsedNs += hrtimeNs() - start;
 
-			return result;
-		} catch (error) {
-			stats.elapsedNs += hrtimeNs() - start;
-			throw error;
-		}
-	}
-
-	private async runInstructionWithMetricsAsync(instruction: Instruction, ctx: RuntimeContext, args: RuntimeValue[]): Promise<OutputValue> {
-		const stats = instruction.runtimeStats!;
-		const start = hrtimeNs();
-
-		stats.executions++;
-		stats.in += this.countInputs(args);
-
-		try {
-			const result = await instruction.run(ctx, ...args);
-			stats.out += this.countOutputs(result);
-			stats.elapsedNs += hrtimeNs() - start;
 			return result;
 		} catch (error) {
 			stats.elapsedNs += hrtimeNs() - start;

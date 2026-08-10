@@ -48,6 +48,30 @@ export function buildWithClause(
 }
 
 /**
+ * True when `cte` is the recursive (self-referential) member of a WITH clause —
+ * the `recursive` keyword AND a compound (UNION / UNION ALL) SELECT body, which is
+ * the exact shape {@link buildCommonTableExpr} routes to {@link buildRecursiveCTE}.
+ * A `with recursive` clause whose member is a plain non-compound body is NOT itself
+ * recursive (a *sibling* member may carry the self-reference), so it stays on the
+ * ordinary CTE path — and remains a valid DML write target. The CTE-name DML target
+ * resolver reuses this to reject only a genuinely-recursive target with the
+ * structured `recursive-cte` diagnostic, never merely on the `recursive` keyword.
+ */
+export function isRecursiveCte(recursive: boolean, cte: AST.CommonTableExpr): boolean {
+	return recursive && cte.query.type === 'select' && !!cte.query.compound;
+}
+
+/**
+ * True when `cte`'s body writes rows — an `insert` / `update` / `delete` with a
+ * `RETURNING` clause (the parser requires one for a CTE body). Such a CTE is built
+ * with `materialize` already on; see the call site in {@link buildCommonTableExpr}.
+ */
+function isDataModifyingCte(cte: AST.CommonTableExpr): boolean {
+	const t = cte.query.type;
+	return t === 'insert' || t === 'update' || t === 'delete';
+}
+
+/**
  * Builds a plan node for a single Common Table Expression.
  */
 export function buildCommonTableExpr(
@@ -57,9 +81,17 @@ export function buildCommonTableExpr(
 	existingCTEs: Map<string, CTEScopeNode>,
 	options?: AST.WithClauseOptions
 ): CTEPlanNode {
+	// Definitions visible to THIS member: the enclosing statement's (ctx.cteNodes) with
+	// the earlier members of this clause layered on top (a same-named sibling shadows an
+	// outer one). Threaded onto the context so a member body that does NOT take an
+	// explicit parent-CTE argument — every DML body — still resolves them.
+	// Copied rather than aliased: `buildWithClause` keeps adding to `existingCTEs` after
+	// this member is built, and a member must not retain a map that grows behind it.
+	const visibleCTEs = new Map<string, CTEScopeNode>([...(ctx.cteNodes ?? []), ...existingCTEs]);
+
 	// Create a context that includes previously defined CTEs in scope
 	// This allows later CTEs to reference earlier ones
-	const cteContext = { ...ctx };
+	const cteContext = { ...ctx, cteNodes: visibleCTEs };
 
 	// Add existing CTEs to the scope for forward references
 	const cteScope = new RegisteredScope(ctx.scope);
@@ -79,8 +111,8 @@ export function buildCommonTableExpr(
 	// require a SELECT body with a compound (UNION / UNION ALL) leg — VALUES
 	// or DML bodies cannot be recursive and fall through to the normal path
 	// (which will report the right error for non-SELECT recursive bodies).
-	if (isRecursive && cte.query.type === 'select' && cte.query.compound) {
-		return buildRecursiveCTE(cteContext, cte, existingCTEs, options);
+	if (isRecursiveCte(isRecursive, cte)) {
+		return buildRecursiveCTE(cteContext, cte, visibleCTEs, options);
 	}
 
 	// For non-recursive CTEs or recursive CTEs without UNION structure.
@@ -90,7 +122,7 @@ export function buildCommonTableExpr(
 	let query: RelationalPlanNode;
 	switch (cte.query.type) {
 		case 'select':
-			query = buildSelectStmt(cteContext, cte.query, existingCTEs) as RelationalPlanNode;
+			query = buildSelectStmt(cteContext, cte.query, visibleCTEs) as RelationalPlanNode;
 			break;
 		case 'values':
 			query = buildValuesStmt(cteContext, cte.query);
@@ -117,21 +149,32 @@ export function buildCommonTableExpr(
 		}
 	}
 
-	// Determine materialization strategy
-	let materializationHint = cte.materializationHint;
-	if (!materializationHint) {
-		// Default strategy: materialize if CTE is likely to be reused
-		// For now, we'll default to not materialized for simplicity
-		materializationHint = 'not_materialized';
-	}
-
+	// Preserve the user's explicit hint (or its absence). An unhinted CTE stays
+	// `undefined` so the materialization-advisory pass may still decide to
+	// materialize it when it is referenced more than once; a synthesized
+	// 'not_materialized' default would read as an explicit user opt-out there.
+	//
+	// A data-modifying body is a different matter: its write must happen exactly ONCE
+	// per statement execution no matter how many times the CTE is named, so
+	// `materialize` is forced on here rather than left to the advisory pass, and the
+	// hint is overridden (NOT MATERIALIZED on a writing body would license a second
+	// write). Rationale and the reference-count undercount it works around are in
+	// docs/runtime-caching.md § Shared CTE materialization.
+	//
+	// NOTE: this also takes a data-modifying CTE off the streaming path, so its whole
+	// RETURNING set is held in memory for the statement even when referenced once and
+	// consumed under a LIMIT. Unavoidable for the multi-reference case, and today's
+	// RETURNING sets are small; if a bulk write's RETURNING ever needs to stream,
+	// buffering would have to become conditional on the reference count — which means
+	// first fixing that undercount, not relaxing this flag.
 	return new CTENode(
 		ctx.scope,
 		cte.name,
 		cte.columns,
 		query,
-		materializationHint,
-		isRecursive
+		cte.materializationHint,
+		isRecursive,
+		isDataModifyingCte(cte)
 	);
 }
 

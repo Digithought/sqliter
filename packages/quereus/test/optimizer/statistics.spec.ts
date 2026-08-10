@@ -2,11 +2,17 @@
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
+import { MemoryTableModule } from '../../src/vtab/memory/module.js';
 import { buildHistogram, selectivityFromHistogram } from '../../src/planner/stats/histogram.js';
 import { CatalogStatsProvider } from '../../src/planner/stats/catalog-stats.js';
 import type { TableStatistics, ColumnStatistics, EquiHeightHistogram } from '../../src/planner/stats/catalog-stats.js';
+import { catalogRowCount } from '../../src/planner/stats/table-cardinality.js';
 import type { TableSchema } from '../../src/schema/table.js';
+import { PlanNode } from '../../src/planner/nodes/plan-node.js';
 import type { ScalarPlanNode } from '../../src/planner/nodes/plan-node.js';
+import { PlanNodeType } from '../../src/planner/nodes/plan-node-type.js';
+import { FilterNode } from '../../src/planner/nodes/filter.js';
+import { TableReferenceNode } from '../../src/planner/nodes/reference.js';
 import type { SqlValue } from '../../src/common/types.js';
 
 // ── Histogram unit tests ───────────────────────────────────────────────────
@@ -373,6 +379,10 @@ describe('CatalogStatsProvider selectivity', () => {
 			foreignKeys: [{
 				columns: [0],
 				referencedTable: 'orders',
+				referencedColumns: [0],
+				onDelete: 'restrict',
+				onUpdate: 'restrict',
+				deferred: false,
 			}],
 		});
 
@@ -581,7 +591,7 @@ describe('VTab-supplied statistics', () => {
 		}
 
 		// ALTER TABLE ADD COLUMN produces a frozen TableSchema in the catalog
-		await db.exec('ALTER TABLE frozen_test ADD COLUMN extra TEXT DEFAULT null');
+		await db.exec('ALTER TABLE frozen_test ADD COLUMN extra TEXT NULL DEFAULT null');
 
 		// Verify the schema is frozen (the memory module freezes it)
 		const schemaBeforeAnalyze = db.schemaManager.findTable('frozen_test');
@@ -626,5 +636,236 @@ describe('VTab-supplied statistics', () => {
 			secondRows.push(r);
 		}
 		expect(secondRows[0].rows).to.equal(30);
+	});
+});
+
+// ── A module that can only report its SIZE ──────────────────────────────────
+// Not every backend can answer the whole statistics question cheaply. A
+// key-value backend maintains a running row count and keeps no value
+// distribution at all, so its getStatistics() reports a row count with an empty
+// columnStats. ANALYZE must read that as "I answered the size, collect the rest
+// yourself" and still scan — otherwise implementing getStatistics() would make
+// ANALYZE collect strictly LESS than it did before.
+
+/** A memory module whose tables report a row count and no column statistics. */
+class SizeOnlyStatsModule extends MemoryTableModule {
+	/** Row count the last size-only report handed back, so a test can tell them apart. */
+	public reportedRowCount: number | undefined;
+
+	override async connect(
+		db: Database, pAux: unknown, moduleName: string, schemaName: string, tableName: string,
+		options: any, tableSchema?: TableSchema,
+	): Promise<any> {
+		const table = await super.connect(db, pAux, moduleName, schemaName, tableName, options, tableSchema);
+		const rich = table.getStatistics();
+		this.reportedRowCount = rich.rowCount;
+		table.getStatistics = (): TableStatistics => ({
+			rowCount: rich.rowCount,
+			columnStats: new Map<string, ColumnStatistics>(),
+		});
+		return table;
+	}
+}
+
+describe('ANALYZE over a size-only getStatistics()', () => {
+	let db: Database;
+	let module: SizeOnlyStatsModule;
+
+	beforeEach(() => {
+		db = new Database();
+		module = new SizeOnlyStatsModule();
+		db.registerModule('size_only', module);
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	const seed = async (): Promise<void> => {
+		await db.exec(`create table so (id integer primary key, cat text) using size_only`);
+		for (let i = 1; i <= 24; i++) {
+			await db.exec(`insert into so values (${i}, 'c${i % 4}')`);
+		}
+	};
+
+	it('still collects per-column statistics from the scan', async () => {
+		await seed();
+		for await (const _ of db.eval('analyze so')) { /* consume */ }
+
+		const stats = db.schemaManager.findTable('so')?.statistics;
+		expect(module.reportedRowCount, 'the module did report a size').to.equal(24);
+		expect(stats, 'statistics cached on the schema entry').to.not.be.undefined;
+		expect(stats!.rowCount).to.equal(24);
+		expect([...stats!.columnStats.keys()].sort()).to.deep.equal(['cat', 'id']);
+		expect(stats!.columnStats.get('cat')!.distinctCount).to.equal(4);
+	});
+
+	it('prefers the scan count when the reported size has drifted', async () => {
+		await seed();
+		// A delta-tracked count that lost sight of reality; the scan is the reconciliation.
+		const inflate = (): TableStatistics => ({ rowCount: 9999, columnStats: new Map() });
+		const originalConnect = module.connect.bind(module);
+		module.connect = async (...args: Parameters<typeof originalConnect>) => {
+			const table = await originalConnect(...args);
+			table.getStatistics = inflate;
+			return table;
+		};
+
+		const yielded: any[] = [];
+		for await (const r of db.eval('analyze so')) yielded.push(r);
+		expect(yielded[0].rows).to.equal(24);
+		expect(db.schemaManager.findTable('so')!.statistics!.rowCount).to.equal(24);
+	});
+});
+
+// ── Base-table cardinality from catalog statistics ──────────────────────────
+// TableReferenceNode.estimatedRows (and every physical access node built on
+// top of it) must prefer ANALYZE-collected statistics over the static schema
+// estimate, which SchemaManager hardcodes to 0 at CREATE TABLE and never
+// updates. See docs/optimizer.md "Base-table row estimates".
+
+describe('base-table cardinality from catalog statistics', () => {
+	function walk(node: PlanNode, fn: (n: PlanNode) => void): void {
+		fn(node);
+		for (const child of node.getChildren()) walk(child as PlanNode, fn);
+	}
+
+	/** First physical table-access node (SeqScan / IndexScan / IndexSeek) in the plan. */
+	function findScanNode(root: PlanNode): PlanNode | undefined {
+		const accessTypes = new Set([PlanNodeType.SeqScan, PlanNodeType.IndexScan, PlanNodeType.IndexSeek]);
+		let found: PlanNode | undefined;
+		walk(root, (n) => { if (!found && accessTypes.has(n.nodeType)) found = n; });
+		return found;
+	}
+
+	function findFilter(root: PlanNode): FilterNode | undefined {
+		let found: FilterNode | undefined;
+		walk(root, (n) => { if (!found && n instanceof FilterNode) found = n; });
+		return found;
+	}
+
+	function findTableRef(root: PlanNode): TableReferenceNode | undefined {
+		let found: TableReferenceNode | undefined;
+		walk(root, (n) => { if (!found && n instanceof TableReferenceNode) found = n; });
+		return found;
+	}
+
+	// ── catalogRowCount unit cases ──────────────────────────────────────────
+
+	describe('catalogRowCount', () => {
+		function makeTableSchema(stats?: TableStatistics, estimatedRows?: number): TableSchema {
+			return { name: 't', statistics: stats, estimatedRows, columns: [] } as unknown as TableSchema;
+		}
+
+		it('statistics present: returns rowCount, ignoring the static estimate', () => {
+			const stats = { rowCount: 100, columnStats: new Map() } as TableStatistics;
+			expect(catalogRowCount(makeTableSchema(stats, 0))).to.equal(100);
+		});
+
+		it('statistics absent, static estimatedRows present: returns the static estimate', () => {
+			expect(catalogRowCount(makeTableSchema(undefined, 0))).to.equal(0);
+			expect(catalogRowCount(makeTableSchema(undefined, 42))).to.equal(42);
+		});
+
+		it('both absent: returns undefined', () => {
+			expect(catalogRowCount(makeTableSchema(undefined, undefined))).to.be.undefined;
+		});
+
+		it('rowCount: 0 is honoured, not treated as "unknown" (?? vs ||)', () => {
+			// If this used `||` instead of `??`, a 0-row analyzed table would fall
+			// through to the static estimate below and silently misreport.
+			const stats = { rowCount: 0, columnStats: new Map() } as TableStatistics;
+			expect(catalogRowCount(makeTableSchema(stats, 500))).to.equal(0);
+		});
+
+		// CatalogStatsProvider.tableRows is the other caller of the helper; it must agree
+		// with the node getter and still hand the fully-unknown case to NaiveStatsProvider.
+		it('CatalogStatsProvider.tableRows agrees with the helper, defaulting only when nothing is known', () => {
+			const provider = new CatalogStatsProvider();
+			const stats = { rowCount: 100, columnStats: new Map() } as TableStatistics;
+			expect(provider.tableRows(makeTableSchema(stats, 0))).to.equal(100);
+			expect(provider.tableRows(makeTableSchema(undefined, 0))).to.equal(0);
+			expect(provider.tableRows(makeTableSchema(undefined, 42))).to.equal(42);
+			// Neither source knows: NaiveStatsProvider's 1000 default, not 0 and not undefined.
+			expect(provider.tableRows(makeTableSchema(undefined, undefined))).to.equal(1000);
+		});
+	});
+
+	// ── End-to-end: scan cardinality after ANALYZE ──────────────────────────
+
+	describe('end-to-end scan and filter estimates', () => {
+		let db: Database;
+		beforeEach(async () => {
+			db = new Database();
+			await db.exec('create table m (id integer primary key, a integer, s text) using memory');
+		});
+		afterEach(async () => { await db.close(); });
+
+		async function seed(rows: number, startId: number = 1): Promise<void> {
+			for (let i = startId; i < startId + rows; i++) {
+				await db.exec(`insert into m values (${i}, ${i % 4}, 's${i}')`);
+			}
+		}
+
+		it('an analyzed, populated table reports its real row count on the scan (not 0)', async () => {
+			await seed(100);
+			for await (const _ of db.eval('analyze m')) { /* consume */ }
+			const ndv = db.schemaManager.findTable('m')?.statistics?.columnStats.get('a')?.distinctCount;
+			expect(ndv, 'ANALYZE should record a distinct count for a').to.be.a('number');
+
+			const plan = db.getPlan('select * from m where a = 1');
+			const scan = findScanNode(plan);
+			expect(scan, 'expected a physical access node').to.not.be.undefined;
+			expect(scan!.physical?.estimatedRows).to.equal(100);
+
+			const filter = findFilter(plan);
+			expect(filter, 'expected a residual Filter').to.not.be.undefined;
+			expect(filter!.physical?.estimatedRows).to.equal(Math.max(1, Math.floor(100 / (ndv as number))));
+			expect(filter!.physical?.estimatedRows).to.not.equal(0);
+
+			// EXPLAIN reads getLogicalAttributes; it must print the number the cost model used.
+			const tableRef = findTableRef(plan);
+			expect(tableRef, 'expected a TableReference').to.not.be.undefined;
+			const estimates = tableRef!.getLogicalAttributes().estimates as { rows?: number };
+			expect(estimates.rows).to.equal(100);
+		});
+
+		it('a populated but never-analyzed table keeps the static (0) estimate — the change is inert without ANALYZE', async () => {
+			await seed(100);
+			// No ANALYZE.
+			const schema = db.schemaManager.findTable('m');
+			expect(schema?.statistics, 'no ANALYZE means no statistics').to.be.undefined;
+			expect(schema?.estimatedRows, 'SchemaManager stamps a static 0 at CREATE TABLE').to.equal(0);
+
+			const plan = db.getPlan('select * from m where a = 1');
+			const scan = findScanNode(plan);
+			expect(scan, 'expected a physical access node').to.not.be.undefined;
+			expect(scan!.physical?.estimatedRows).to.equal(0);
+		});
+
+		it('ANALYZE on an empty table: scan and filter both report 0', async () => {
+			// No rows inserted.
+			for await (const _ of db.eval('analyze m')) { /* consume */ }
+			expect(db.schemaManager.findTable('m')?.statistics?.rowCount).to.equal(0);
+
+			const plan = db.getPlan('select * from m where a = 1');
+			const scan = findScanNode(plan);
+			expect(scan!.physical?.estimatedRows).to.equal(0);
+
+			const filter = findFilter(plan);
+			expect(filter!.physical?.estimatedRows).to.equal(0);
+		});
+
+		it('re-ANALYZE after further inserts: the scan estimate tracks the new count', async () => {
+			await seed(20);
+			for await (const _ of db.eval('analyze m')) { /* consume */ }
+			let plan = db.getPlan('select * from m where a = 1');
+			expect(findScanNode(plan)!.physical?.estimatedRows).to.equal(20);
+
+			await seed(30, 21); // ids 21..50, 30 more rows
+			for await (const _ of db.eval('analyze m')) { /* consume */ }
+			plan = db.getPlan('select * from m where a = 1');
+			expect(findScanNode(plan)!.physical?.estimatedRows).to.equal(50);
+		});
 	});
 });

@@ -8,7 +8,7 @@ This list reflects the current and upcoming work for Quereus. Completed items an
 - 🔄 **Phase 1.5 - Access Path Selection**: Seek/range scan infrastructure and optimization rules
 
 ### Upcoming Optimizer Work
-- 📋 **Subquery Optimization**: Transform correlated subqueries to joins
+- 📋 **Subquery Optimization**: Transform the *remaining* correlated subquery shapes to joins. Already shipped: correlated `EXISTS`/`IN` → semi/anti join (`subquery-decorrelation`) and correlated scalar-*aggregate* subqueries → grouped LEFT join, in the SELECT list (`scalar-agg-decorrelation`), inside an enclosing aggregate's arguments (`-aggregate`), and in WHERE/HAVING filter predicates (`-filter`). Still uncovered: correlated *non-aggregate* scalar subqueries (e.g. `... ORDER BY ... LIMIT 1`), and non-equi correlations (`c.pid < p.id`).
 - 📋 **Advanced Statistics**: VTab-supplied or ANALYZE-based statistics
 - ✅ **Join Algorithms**: Bloom joins and merge joins
 - 📋 **Aggregate Pushdown**: Push aggregations below joins when semantically valid
@@ -23,6 +23,13 @@ See `docs/design-isolation-layer.md`
 ## 🔄 Current Development Focus
 
 - [ ] Need to update the BNF in sql.md
+
+### Language roadmap (relocated from the SQL reference §11.4)
+
+Quereus is actively developed with plans to add:
+- Advanced window function features (navigation functions, window frames)
+- Enhanced recursive CTE capabilities
+- More query planning enhancements
 
 - [ ] Our constraint system can't enforce a certain class of constraints that require access to the before AND after state of the transaction (e.g. a certain row must have been removed).  Design a system to enable this.  Perhaps we have a new class of constrains that runs a query *before* the transaction changes anything, then makes that result set available to the constraint logic running *after*.
 
@@ -163,10 +170,12 @@ Database‑wide integrity assertions deferrable at COMMIT (auto-detected), with 
   - [ ] Extend classification with group-specific (GROUP BY / PARTITION BY) keys
   - [ ] Binding propagation across equi-joins to related tables
   - [ ] Residual construction helper to inject `= ?` filters on bound relation
-- [ ] Materialized Views (future)
-  - [ ] Register view definition and incrementalization strategy
-  - [ ] Compute ΔView on COMMIT and merge into storage
-  - [ ] `explain_view_delta(name)` diagnostics
+- [ ] Reactive signals / triggers (future kernel consumers)
+  - [ ] Register a reactive plan and act on per-binding deltas at COMMIT
+
+> Note: materialized views are **not** a kernel consumer — they are maintained
+> synchronously at the DML write boundary (row-time), off this post-commit kernel.
+> See [Materialized Views](materialized-views.md).
 
 ### Milestones (Implementation Outline)
 
@@ -271,6 +280,18 @@ The logical type system enables significant runtime performance improvements by 
 - [ ] **Computed Columns**: Columns with derived values
 - [ ] **ALTER TABLE**: More comprehensive ALTER TABLE operations
 - [ ] **Materialized Views**: Views with cached results
+- [ ] **Atomic store catalog rename**: fold the old-entry delete and every dependent
+  rewrite into one `provider.beginAtomicBatch` commit, removing the crash residues
+  documented in [`store.md` § Catalog persistence](store.md#catalog-persistence-bundled-index-ddl).
+  Needs an atomic provider and a larger engine↔module change.
+
+**Runtime — parallel and validation follow-ups**
+- [ ] **Per-branch equi-pair surface on `FanOutBranchSpec`**: would let
+  `FanOutLookupJoinNode.computePhysical` tighten its ordering/FD derivation without
+  changing the emitter (see [`runtime-parallel.md`](runtime-parallel.md#fanoutlookupjoinnode-per-row-fan-out-lookup-join)).
+- [ ] **Relax the connection lock for fully-reentrant modules**: once a module advertises
+  `'fully-reentrant'`, the optimizer predicate and the lock policy can refine in tandem
+  for that module (see [`runtime-parallel.md`](runtime-parallel.md#connection-lock-contract-under-impure-subtrees)).
 
 **Performance & Scalability (Medium-term)**
 - [ ] **Memory Pooling**: Reduce allocation overhead in hot paths
@@ -323,3 +344,118 @@ The logical type system enables significant runtime performance improvements by 
 - [ ] **Range Seeks**: Pass dynamic lower/upper bounds and extend Memory module scan/seek plan to use them
 - [ ] **IN-list strategy**: Choose between seek-union vs residual based on index coverage and list size
 
+**Phase 4 – Correlated push-down (`ApplyNode` proposal)**
+
+Correlated and lateral joins plan as `JoinNode` today; the nested-loop emitter re-executes
+the right subtree per outer row and a right-side `RetrieveNode` is re-assessed each time.
+(One shape is no longer among these: a correlated scalar-*aggregate* subquery is now
+decorrelated into a grouped LEFT join by `scalar-agg-decorrelation`, so it never reaches the
+per-row emitter — this proposal is scoped to the still-correlated shapes.)
+The proposal replaces that with an explicit `Apply(left, right, predicate, outer)` node —
+"execute `right` once per row of `left`, with correlation context threaded through" —
+mapping `CROSS`/`INNER`/`LEFT JOIN` onto the same shape and eliminating the per-join-type
+special cases. Its value is push-down, not execution: with the correlated operation named,
+the optimizer can hand the left row's correlation values to `module.supports()` as extra
+constraints, letting a module turn a correlated subquery into one index seek — or ship the
+whole correlated pipeline to a remote system. Non-correlated `Apply`s remain free to
+become bloom or merge joins in the Physical pass.
+
+- [ ] Introduce `ApplyNode` and build correlated / lateral joins onto it
+- [ ] Extend `supports()` with a correlation-constraint channel
+- [ ] Teach the memory module to answer a correlated seek through it
+- [ ] Retire the `JoinNode` special-casing for lateral once the above lands
+
+
+## Materialized views
+
+Everything below is unimplemented. The one-line pointers under
+[`materialized-views.md` § Current limitations](materialized-views.md#current-limitations)
+name each item; the design detail lives here.
+
+**Bounded-delta arms for floor-covered shapes.** A fanning (non-1:1) keyed join, an outer 1:1
+join, and a scalar (no-`GROUP BY`) aggregate are maintained correctly by the
+[full-rebuild floor](mv-maintenance.md#full-rebuild-floor) but have no *bounded-delta* arm.
+These are pure performance refinements — they shrink the rebuild fallback without changing
+coverage:
+
+- [ ] Delta-arithmetic aggregate arm (`sum` / `count`), with a rescan-on-retraction fallback for `min` / `max`
+- [ ] Null-extending reverse residual, giving outer 1:1 joins a bounded-delta arm
+- [ ] By-prefix fanning-join arm — the natural next consumer of the `'prefix-delete'` machinery
+- [ ] A possible **unified maintenance substrate** folding the row-time arms and the post-commit `DeltaExecutor` binding kernel under one abstraction; the arms above would retarget onto it if it lands
+
+**Statement-level op-coalescing for the incremental arms — LANDED** (the
+`mv-maintenance-statement-batching` ticket). The three residual arms now accumulate their
+affected binding keys per statement and recompute once per distinct key at the
+end-of-statement flush, with the per-statement `shouldDegradeToRebuild` demotion wired
+(see [`mv-maintenance.md` § Synchronous, transactional, per-statement](mv-maintenance.md#synchronous-transactional-per-statement)).
+The once-feared `lookupCoveringConflicts` buffer-unioning turned out never to be needed:
+`'inverse-projection'` — the only arm enforcement ever reads — stays per-row-immediate, so
+the deferral cut avoids the hazard entirely. No coalescing remains open for
+`'inverse-projection'` itself (its per-row delta is a cheap pure projection, and its
+per-row visibility is load-bearing for enforcement).
+
+**Bag (multiplicity-keyed) materialization.** A body with no provable unique key — and no
+[coarsened lineage key](materialized-views.md#coarsened-backing-keys) — is rejected at create
+today, because there is no row identity to materialize on. A Z-set-style backing (distinct
+rows plus a multiplicity count, expanded on read) would lift the restriction, at the cost of
+a hidden count column and a read-time expansion.
+
+- [ ] Z-set backing with a hidden multiplicity column
+- [ ] Read-time expansion, and its interaction with the covering-structure prover
+
+**Concurrent refresh.** Overlapping refreshes, and refresh-while-read beyond the current
+atomic base-layer swap.
+
+**MV-over-MV write-through.** DML against a materialized view whose body's source is itself a
+materialized view is rejected today; its rewrite would target the inner view's read-only
+maintained table. Routing one level down to the inner view's own write-through would lift it.
+
+**Non-binary covering-MV prefix scan.**
+
+- [ ] Thread per-column collation into `ScanPlan.equalityPrefix` matching (`plan-filter.ts` / `scan-layer.ts`) so a non-binary covering materialized view uses the prefix scan instead of the full-scan fallback
+
+**Precise change-scope projection.** `Database.watch` on a materialized view currently
+projects to a `full` watch per source. A per-source row/group scope, mirroring the maintenance
+projection the manager already derives, would narrow it.
+
+**Coarsened-key advisory surface.** `TableDerivation.coarsenedKey` is stamped at create but is
+programmatic-only — no SQL or introspection-TVF surface exposes it. If the lens deploy-report
+pipeline grows an advisory surface, the coarsened-key fact is a natural candidate to carry
+there. It must read the live record rather than persist; the stamp stays non-serialized. See
+[`materialized-views.md` § Coarsened backing keys](materialized-views.md#coarsened-backing-keys).
+
+**Backing-host stale-set portability.** The durable stale-MV set's soundness currently rests
+on write-ahead-log ordering: the source DDL is queued before the `sync: true` stale-set write
+on the same queue. Folding the two into one atomic `batch()` would remove the WAL-ordering
+dependency and make the adopt fast path portable to any backend. It requires reworking
+`alterTable`'s eager source-DDL persist across every alter kind. See
+[`mv-backing-host.md` § Cross-module atomicity](mv-backing-host.md#cross-module-atomicity).
+
+- [ ] Fold the stale-set write into the source DDL's atomic batch
+
+## Sync Engine Remaining Work
+
+Core sync is complete (see [`sync.md`](sync.md)); these are refinements and coverage gaps.
+
+**Transactional integrity**
+- [ ] Use `WriteBatch` for per-table atomicity when applying remote changes
+- [ ] Consider `TransactionCoordinator` in the store adapter for batched writes
+- [ ] Update the sync store adapter to use `UnifiedIndexedDBModule` for atomic sync writes
+- [ ] Leverage Store-level isolation (memory vtab's `TransactionLayer` pattern) for true ACID sync semantics
+
+**Storage cost**
+- [ ] Config flag to opt out of the tombstone row before-image (`priorRow`), whose cost is
+  bounded but non-trivial for wide rows (see [`sync-protocol.md`](sync-protocol.md#data-structures))
+
+**Testing**
+- [ ] Tombstone TTL expiration and fallback to snapshot
+- [ ] Large-dataset streaming-snapshot tests
+- [ ] Network interruption / resume tests
+- [ ] IndexedDB integration tests (browser environment)
+- [ ] Crash-recovery tests (idempotent re-apply after partial sync)
+
+**Transports & examples**
+- [ ] Example transports: WebSocket, HTTP polling, `applyToStore` callback
+- [ ] Performance benchmarks
+- [ ] HTTP-polling fallback for environments without WebSocket
+- [ ] Connection-quality metrics (latency, reconnect count)

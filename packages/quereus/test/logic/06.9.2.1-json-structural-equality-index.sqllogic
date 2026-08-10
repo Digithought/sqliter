@@ -1,0 +1,76 @@
+-- 06.9.2.1-json-structural-equality-index.sqllogic
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Carved out of 06.9.2-json-structural-equality: ten of that file's twelve sections
+-- compare a JSON column against SQL text with no index in sight (plan-time coercion,
+-- ordering, IN lists, cross-column joins, CSE fingerprints). These two sections put a
+-- standalone `create unique index` over the JSON column, so they move here and leave
+-- the coercion coverage runnable on a backend without first-class CREATE INDEX.
+--
+-- Subject: an INDEXED JSON column answers `=`, `in` and BETWEEN identically to the
+-- unindexed one, and the index enforces uniqueness by structure — including after a
+-- text column is retyped to JSON.
+-- No `using memory`, so store mode exercises the persisted byte-key path too.
+
+-- ===================================
+-- 1. The same set with a UNIQUE index on the JSON column
+-- ===================================
+-- Before the fix, an indexed JSON column raised `Unknown literal type object` at plan
+-- time for the forms that DID work unindexed (`= json(...)` / `= cast(... as json)`),
+-- because the seek key was rebuilt as a LiteralNode with no type.
+create table jse_ix (id integer primary key, v json);
+create unique index jse_ix_v on jse_ix (v);
+insert into jse_ix values (1, '{"a":1,"b":2}'), (2, '[1,2,3]');
+-- run
+
+select id from jse_ix where v = '{"a":1,"b":2}';
+→ [{"id":1}]
+
+select id from jse_ix where v = '{ "b" : 2 , "a" : 1 }';
+→ [{"id":1}]
+
+select id from jse_ix where v = json('{"b":2,"a":1}');
+→ [{"id":1}]
+
+select id from jse_ix where v = cast('{ "a" : 1 , "b" : 2 }' as json);
+→ [{"id":1}]
+
+select id from jse_ix where v in ('{"b":2,"a":1}', '[1,2,3]') order by id;
+→ [{"id":1},{"id":2}]
+
+-- A range over the index: the tree, `<`/`>` and BETWEEN all rank JSON documents by the
+-- same structural compare, so the indexed answer equals the unindexed one. Ranges over a
+-- corpus of every JSON kind (including array-valued documents) are covered in
+-- 06.9.3-json-index-range-seek.sqllogic.
+select id from jse_ix where v between '{"a":1,"b":1}' and '{"a":1,"b":3}';
+→ [{"id":1}]
+
+select id from jse_ix where v = 'not json';
+→ []
+
+-- The index still enforces uniqueness by structure, and `=` now agrees with it.
+insert into jse_ix values (3, '{ "b" : 2 , "a" : 1 }');
+-- error: UNIQUE constraint failed
+
+-- The seek returns the stored native document, not the literal's text.
+select v from jse_ix where v = '{"b":2,"a":1}';
+→ [{"v":{"a":1,"b":2}}]
+
+-- ===================================
+-- 2. A retyped TEXT → JSON column answers the same once indexed
+-- ===================================
+-- The unindexed half of this retype check lives in 06.9.2 § 8; here the same column
+-- is indexed after the retype, so the seek key is built from the NEW logical type.
+create table jse_re (id integer primary key, v text);
+insert into jse_re values (1, '{"a":1}');
+-- run
+
+alter table jse_re alter column v set data type json;
+-- run
+
+create unique index jse_re_v on jse_re (v);
+-- run
+
+select id from jse_re where v = '{ "a" : 1 }';
+→ [{"id":1}]

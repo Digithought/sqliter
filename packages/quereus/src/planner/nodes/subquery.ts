@@ -8,6 +8,8 @@ import { formatExpression, formatScalarType } from "../../util/plan-formatter.js
 import { quereusError } from "../../common/errors.js";
 import { BLOB_TYPE, BOOLEAN_TYPE } from "../../types/builtin-types.js";
 import { StatusCode } from "../../common/types.js";
+import { Cached } from "../../util/cached.js";
+import { collationConflictError, resolveInCollationForNode } from "../analysis/comparison-collation.js";
 
 export class ScalarSubqueryNode extends PlanNode implements ScalarPlanNode {
 	override readonly nodeType = PlanNodeType.ScalarSubquery;
@@ -84,6 +86,7 @@ export class ScalarSubqueryNode extends PlanNode implements ScalarPlanNode {
 
 export class InNode extends PlanNode implements ScalarPlanNode {
 	override readonly nodeType = PlanNodeType.In;
+	private cachedType: Cached<ScalarType>;
 
 	constructor(
 		readonly scope: Scope,
@@ -93,15 +96,29 @@ export class InNode extends PlanNode implements ScalarPlanNode {
 		readonly values?: ScalarPlanNode[],    // For IN value list
 	) {
 		super(scope);
+		this.cachedType = new Cached(this.generateType);
 	}
 
-	getType(): ScalarType {
+	generateType = (): ScalarType => {
+		// IN compares the condition against every RHS value under ONE collation
+		// (`emitIn` pre-resolves a single comparator for the membership test);
+		// validate the provenance lattice here so a same-rank explicit/declared
+		// conflict surfaces at plan time. Eagerly forced at build time — see
+		// building/expression.ts.
+		const resolution = resolveInCollationForNode(this);
+		if (resolution.kind === 'conflict') {
+			throw collationConflictError(resolution, this.expression);
+		}
 		return {
 			typeClass: 'scalar',
 			logicalType: BOOLEAN_TYPE,
 			nullable: true, // IN with NULLs follows three-valued logic
 			isReadOnly: true,
-		}
+		};
+	}
+
+	getType(): ScalarType {
+		return this.cachedType.value;
 	}
 
 	getChildren(): readonly PlanNode[] {

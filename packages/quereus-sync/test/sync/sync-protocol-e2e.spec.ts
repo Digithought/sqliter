@@ -15,12 +15,16 @@ import {
   type SchemaChangeToApply,
   type ApplyToStoreCallback,
   type SnapshotChunk,
+  type ChangeSet,
+  type ColumnChange,
+  type RowDeletion,
 } from '../../src/sync/protocol.js';
-import { StoreEventEmitter, InMemoryKVStore } from '@quereus/store';
+import { StoreEventEmitter, InMemoryKVStore, StoreModule, type KVStoreProvider } from '@quereus/store';
 import { generateSiteId } from '../../src/clock/site.js';
-import { compareHLC } from '../../src/clock/hlc.js';
+import { compareHLC, type HLC } from '../../src/clock/hlc.js';
 import type { SyncManager } from '../../src/sync/manager.js';
-import type { SqlValue } from '@quereus/quereus';
+import { Database, type SqlValue, type TableSchema } from '@quereus/quereus';
+import { FakeTransactionSource } from '../helpers/fake-transaction-source.js';
 
 // ============================================================================
 // Test Infrastructure
@@ -89,12 +93,36 @@ class MockDataStore {
   }
 }
 
+/**
+ * Minimal TableSchema stand-in for `main.test (id INTEGER PRIMARY KEY, value TEXT)`.
+ * Carries only the fields the sync manager's column-mapping paths actually
+ * read: identity, columns, `primaryKeyDefinition`, and `columnIndexMap`.
+ * (The store adapter itself no longer takes a schema lookup — it resolves
+ * tables through the StoreModule.) If a sync path starts reading more schema
+ * fields, extend this one factory.
+ */
+function makeTestTableSchema(): TableSchema {
+  return {
+    schemaName: 'main',
+    name: 'test',
+    columns: [
+      { name: 'id', logicalType: { isTextual: false } },
+      { name: 'value', logicalType: { isTextual: true } },
+    ],
+    primaryKeyDefinition: [{ index: 0, desc: false }],
+    columnIndexMap: new Map([
+      ['id', 0],
+      ['value', 1],
+    ]),
+  } as unknown as TableSchema;
+}
+
 /** Represents a sync replica (host or guest) */
 interface Replica {
   name: string;
   kv: InMemoryKVStore;
   dataStore: MockDataStore;
-  storeEvents: StoreEventEmitter;
+  storeEvents: FakeTransactionSource;
   syncEvents: SyncEventEmitterImpl;
   manager: SyncManager;
 }
@@ -103,7 +131,7 @@ interface Replica {
 async function createReplica(name: string, config: SyncConfig): Promise<Replica> {
   const kv = new InMemoryKVStore();
   const dataStore = new MockDataStore();
-  const storeEvents = new StoreEventEmitter();
+  const storeEvents = new FakeTransactionSource();
   const syncEvents = new SyncEventEmitterImpl();
   const applyToStore = dataStore.createApplyToStoreCallback();
 
@@ -156,7 +184,7 @@ function emitLocalInsert(
   pk: SqlValue[],
   row: SqlValue[]
 ): void {
-  replica.storeEvents.emitDataChange({
+  replica.storeEvents.commitData({
     type: 'insert',
     schemaName: schema,
     tableName: table,
@@ -174,7 +202,7 @@ function emitLocalUpdate(
   oldRow: SqlValue[],
   newRow: SqlValue[]
 ): void {
-  replica.storeEvents.emitDataChange({
+  replica.storeEvents.commitData({
     type: 'update',
     schemaName: schema,
     tableName: table,
@@ -192,7 +220,7 @@ function emitLocalDelete(
   pk: SqlValue[],
   oldRow: SqlValue[]
 ): void {
-  replica.storeEvents.emitDataChange({
+  replica.storeEvents.commitData({
     type: 'delete',
     schemaName: schema,
     tableName: table,
@@ -565,7 +593,7 @@ describe('Sync Protocol E2E', () => {
       const guest = await createReplica('guest', config);
 
       // Host creates a table
-      host.storeEvents.emitSchemaChange({
+      host.storeEvents.commitSchema({
         type: 'create',
         objectType: 'table',
         schemaName: 'main',
@@ -589,7 +617,7 @@ describe('Sync Protocol E2E', () => {
       const guest = await createReplica('guest', config);
 
       // Host creates table and inserts data
-      host.storeEvents.emitSchemaChange({
+      host.storeEvents.commitSchema({
         type: 'create',
         objectType: 'table',
         schemaName: 'main',
@@ -618,7 +646,7 @@ describe('Sync Protocol E2E', () => {
       const guest = await createReplica('guest', config);
 
       // Emit schema change with remote=true (simulating received remote change)
-      host.storeEvents.emitSchemaChange({
+      host.storeEvents.commitSchema({
         type: 'create',
         objectType: 'table',
         schemaName: 'main',
@@ -714,7 +742,7 @@ describe('Sync Protocol E2E', () => {
 
       const store = new InMemoryKVStore();
       const dataStore = new MockDataStore();
-      const storeEvents = new StoreEventEmitter();
+      const storeEvents = new FakeTransactionSource();
       const syncEvents = new SyncEventEmitterImpl();
 
       // Create manager with getTableSchema callback
@@ -728,7 +756,7 @@ describe('Sync Protocol E2E', () => {
       );
 
       // Emit a local insert
-      storeEvents.emitDataChange({
+      storeEvents.commitData({
         type: 'insert',
         schemaName: 'main',
         tableName: 'users',
@@ -780,7 +808,7 @@ describe('Sync Protocol E2E', () => {
 
       // Source replica with schema
       const sourceStore = new InMemoryKVStore();
-      const sourceEvents = new StoreEventEmitter();
+      const sourceEvents = new FakeTransactionSource();
       const sourceSyncEvents = new SyncEventEmitterImpl();
       const sourceDataStore = new MockDataStore();
 
@@ -795,7 +823,7 @@ describe('Sync Protocol E2E', () => {
 
       // Destination replica with same schema
       const destStore = new InMemoryKVStore();
-      const destEvents = new StoreEventEmitter();
+      const destEvents = new FakeTransactionSource();
       const destSyncEvents = new SyncEventEmitterImpl();
       const destDataStore = new MockDataStore();
 
@@ -809,7 +837,7 @@ describe('Sync Protocol E2E', () => {
       );
 
       // Source makes a local insert
-      sourceEvents.emitDataChange({
+      sourceEvents.commitData({
         type: 'insert',
         schemaName: 'main',
         tableName: 'users',
@@ -867,23 +895,11 @@ describe('Sync Protocol E2E', () => {
      */
     it('should sync data through coordinator (full flow simulation)', async function() {
       this.timeout(5000);
-      const tableSchema = {
-        schemaName: 'main',
-        name: 'test',
-        columns: [
-          { name: 'id' },
-          { name: 'value' },
-        ],
-        primaryKeyDefinition: [{ index: 0, desc: false }],
-        columnIndexMap: new Map([
-          ['id', 0],
-          ['value', 1],
-        ]),
-      };
+      const tableSchema = makeTestTableSchema();
 
       // Browser A (source)
       const browserAStore = new InMemoryKVStore();
-      const browserAEvents = new StoreEventEmitter();
+      const browserAEvents = new FakeTransactionSource();
       const browserASyncEvents = new SyncEventEmitterImpl();
       const browserADataStore = new MockDataStore();
       const browserA = await SyncManagerImpl.create(
@@ -892,12 +908,12 @@ describe('Sync Protocol E2E', () => {
         config,
         browserASyncEvents,
         browserADataStore.createApplyToStoreCallback(),
-        () => tableSchema as unknown as import('@quereus/quereus').TableSchema
+        () => tableSchema
       );
 
       // Coordinator (no schema, no applyToStore - just CRDT metadata)
       const coordStore = new InMemoryKVStore();
-      const coordEvents = new StoreEventEmitter();
+      const coordEvents = new FakeTransactionSource();
       const coordSyncEvents = new SyncEventEmitterImpl();
       const coordinator = await SyncManagerImpl.create(
         coordStore,
@@ -909,7 +925,7 @@ describe('Sync Protocol E2E', () => {
 
       // Browser B (destination)
       const browserBStore = new InMemoryKVStore();
-      const browserBEvents = new StoreEventEmitter();
+      const browserBEvents = new FakeTransactionSource();
       const browserBSyncEvents = new SyncEventEmitterImpl();
       const browserBDataStore = new MockDataStore();
       const browserB = await SyncManagerImpl.create(
@@ -918,11 +934,11 @@ describe('Sync Protocol E2E', () => {
         config,
         browserBSyncEvents,
         browserBDataStore.createApplyToStoreCallback(),
-        () => tableSchema as unknown as import('@quereus/quereus').TableSchema
+        () => tableSchema
       );
 
       // Step 1: Browser A creates table and inserts row
-      browserAEvents.emitSchemaChange({
+      browserAEvents.commitSchema({
         type: 'create',
         objectType: 'table',
         schemaName: 'main',
@@ -931,7 +947,7 @@ describe('Sync Protocol E2E', () => {
       });
       await new Promise(r => setTimeout(r, 10));
 
-      browserAEvents.emitDataChange({
+      browserAEvents.commitData({
         type: 'insert',
         schemaName: 'main',
         tableName: 'test',
@@ -982,23 +998,11 @@ describe('Sync Protocol E2E', () => {
     it('should sync data to late-joining browser via getChangesSince', async function() {
       this.timeout(5000);
 
-      const tableSchema = {
-        schemaName: 'main',
-        name: 'test',
-        columns: [
-          { name: 'id' },
-          { name: 'value' },
-        ],
-        primaryKeyDefinition: [{ index: 0, desc: false }],
-        columnIndexMap: new Map([
-          ['id', 0],
-          ['value', 1],
-        ]),
-      };
+      const tableSchema = makeTestTableSchema();
 
       // Browser A (source)
       const browserAStore = new InMemoryKVStore();
-      const browserAEvents = new StoreEventEmitter();
+      const browserAEvents = new FakeTransactionSource();
       const browserASyncEvents = new SyncEventEmitterImpl();
       const browserADataStore = new MockDataStore();
       const browserA = await SyncManagerImpl.create(
@@ -1007,12 +1011,12 @@ describe('Sync Protocol E2E', () => {
         config,
         browserASyncEvents,
         browserADataStore.createApplyToStoreCallback(),
-        () => tableSchema as unknown as import('@quereus/quereus').TableSchema
+        () => tableSchema
       );
 
       // Coordinator (no schema, no applyToStore - just CRDT metadata)
       const coordStore = new InMemoryKVStore();
-      const coordEvents = new StoreEventEmitter();
+      const coordEvents = new FakeTransactionSource();
       const coordSyncEvents = new SyncEventEmitterImpl();
       const coordinator = await SyncManagerImpl.create(
         coordStore,
@@ -1023,7 +1027,7 @@ describe('Sync Protocol E2E', () => {
       );
 
       // Step 1: Browser A creates table and inserts row
-      browserAEvents.emitSchemaChange({
+      browserAEvents.commitSchema({
         type: 'create',
         objectType: 'table',
         schemaName: 'main',
@@ -1032,7 +1036,7 @@ describe('Sync Protocol E2E', () => {
       });
       await new Promise(r => setTimeout(r, 10));
 
-      browserAEvents.emitDataChange({
+      browserAEvents.commitData({
         type: 'insert',
         schemaName: 'main',
         tableName: 'test',
@@ -1050,7 +1054,7 @@ describe('Sync Protocol E2E', () => {
 
       // Step 4: Browser B connects LATER and requests changes
       const browserBStore = new InMemoryKVStore();
-      const browserBEvents = new StoreEventEmitter();
+      const browserBEvents = new FakeTransactionSource();
       const browserBSyncEvents = new SyncEventEmitterImpl();
       const browserBDataStore = new MockDataStore();
       const browserB = await SyncManagerImpl.create(
@@ -1059,7 +1063,7 @@ describe('Sync Protocol E2E', () => {
         config,
         browserBSyncEvents,
         browserBDataStore.createApplyToStoreCallback(),
-        () => tableSchema as unknown as import('@quereus/quereus').TableSchema
+        () => tableSchema
       );
 
       // Browser B requests all changes from coordinator (no sinceHLC)
@@ -1096,58 +1100,61 @@ describe('Sync Protocol E2E', () => {
      * - The sync manager uses `quoomb_sync_meta` IndexedDB database for CRDT metadata
      * - Each table uses its own IndexedDB database like `quereus_main_test` for data
      *
-     * The fix: createStoreAdapter now takes a getKVStore function that returns
-     * the correct store for each table.
+     * The adapter resolves each table via `StoreModule.getTableForExternalWrite`,
+     * whose `StoreTable.ensureStore` opens the table's OWN data store through the
+     * module's provider — the per-table routing the deleted `getKVStore` option
+     * used to do by hand.
      */
     it('should write to the correct KV store for each table', async function() {
       this.timeout(5000);
 
       // This simulates the browser scenario where we have TWO different stores:
       // 1. syncMetaStore - where sync metadata lives (quoomb_sync_meta)
-      // 2. tableDataStore - where actual table data lives (quereus_main_test)
+      // 2. the per-table data stores the StoreModule resolves via its provider
       const syncMetaStore = new InMemoryKVStore();
-      const tableDataStore = new InMemoryKVStore();
 
-      const tableSchema = {
-        schemaName: 'main',
-        name: 'test',
-        columns: [
-          { name: 'id' },
-          { name: 'value' },
-        ],
-        primaryKeyDefinition: [{ index: 0, desc: false }],
-        columnIndexMap: new Map([
-          ['id', 0],
-          ['value', 1],
-        ]),
+      const dataStores = new Map<string, InMemoryKVStore>();
+      const getDataStore = (key: string): InMemoryKVStore => {
+        let store = dataStores.get(key);
+        if (!store) {
+          store = new InMemoryKVStore();
+          dataStores.set(key, store);
+        }
+        return store;
+      };
+      const provider: KVStoreProvider = {
+        async getStore(s, t) { return getDataStore(`${s}.${t}`); },
+        async getIndexStore(s, t, i) { return getDataStore(`${s}.${t}_idx_${i}`); },
+        async getStatsStore(s, t) { return getDataStore(`${s}.${t}.__stats__`); },
+        async getCatalogStore() { return getDataStore('__catalog__'); },
+        async closeStore() {},
+        async closeIndexStore() {},
+        async closeAll() {
+          for (const store of dataStores.values()) await store.close();
+          dataStores.clear();
+        },
       };
 
       const events = new StoreEventEmitter();
       const syncEvents = new SyncEventEmitterImpl();
 
-      // Create a store adapter with getKVStore that returns the TABLE's store
-      const { createStoreAdapter } = await import('../../src/sync/store-adapter.js');
-      const applyToStore = createStoreAdapter({
-        db: null as unknown as import('@quereus/quereus').Database, // Not needed for this test
-        getKVStore: async (schemaName: string, tableName: string) => {
-          // Return the table's store (not the sync metadata store)
-          if (schemaName === 'main' && tableName === 'test') {
-            return tableDataStore;
-          }
-          throw new Error(`Unknown table: ${schemaName}.${tableName}`);
-        },
-        events,
-        getTableSchema: () => tableSchema as unknown as import('@quereus/quereus').TableSchema,
-        collation: 'NOCASE',
-      });
+      const db = new Database();
+      const storeModule = new StoreModule(provider, events);
+      db.registerModule('store', storeModule);
+      await db.exec('create table test (id integer primary key, value text) using store');
 
+      const { createStoreAdapter } = await import('../../src/sync/store-adapter.js');
+      const applyToStore = createStoreAdapter({ db, storeModule, events });
+
+      // Local capture is sourced from the engine transaction boundary (the real
+      // Database); this test only applies remote changes, so nothing is captured.
       const syncManager = await SyncManagerImpl.create(
         syncMetaStore,  // Sync metadata goes here
-        events,
+        db,
         config,
         syncEvents,
         applyToStore,
-        () => tableSchema as unknown as import('@quereus/quereus').TableSchema
+        (schemaName, tableName) => db.schemaManager.getTable(schemaName, tableName)
       );
 
       // Simulate receiving remote changes
@@ -1193,21 +1200,26 @@ describe('Sync Protocol E2E', () => {
       }
 
       const tableDataKeys: string[] = [];
-      for await (const entry of tableDataStore.iterate()) {
+      for await (const entry of getDataStore('main.test').iterate()) {
         tableDataKeys.push(new TextDecoder().decode(entry.key));
       }
 
-      // FIXED: Data should now be in tableDataStore, NOT syncMetaStore
-      // Sync metadata keys start with specific prefixes (e.g., 'crdt:', 'hlc:', etc.)
-      // Table data keys are just encoded PKs (no prefix)
-      // We verify by checking that tableDataStore has entries and syncMetaStore has none of those
-      expect(tableDataKeys.length).to.be.greaterThan(0, 'Data should be in tableDataStore');
+      // Data lands in the TABLE's data store, NOT syncMetaStore.
+      expect(tableDataKeys.length).to.be.greaterThan(0, 'Data should be in the table data store');
       // Sync meta store should only have sync-related keys, not table data
-      // (The actual sync metadata format uses different prefixes)
       const tableDataInSyncMeta = syncMetaKeys.some(k =>
         tableDataKeys.includes(k)
       );
       expect(tableDataInSyncMeta).to.equal(false, 'Table data keys should not be in syncMetaStore');
+
+      // The applied row reads back through the engine (both column changes
+      // merged into one upsert against the table's own store).
+      const rows: Record<string, SqlValue>[] = [];
+      for await (const row of db.eval('select id, value from test')) rows.push(row);
+      expect(rows.map(r => ({ id: Number(r.id), value: r.value })))
+        .to.deep.equal([{ id: 1, value: 'hello' }]);
+
+      await db.close();
     });
   });
 
@@ -1311,9 +1323,12 @@ describe('Sync Protocol E2E', () => {
       const snapshot = await host.manager.getSnapshot();
       await guest.manager.applySnapshot(snapshot);
 
-      // Guest's data store should have the rows applied via callback
+      // Guest's data store should have the rows applied via callback. The
+      // non-streaming path emits one single-column update per CELL (2 rows ×
+      // 2 columns), HLC-ascending — no receiver keying is resolvable before the
+      // snapshot's own DDL runs, so cells cannot be grouped into rows here.
       const dataChanges = guest.dataStore.changeLog.filter(c => c.type === 'data');
-      expect(dataChanges.length).to.equal(2, 'Snapshot should apply row data to store');
+      expect(dataChanges.length).to.equal(4, 'Snapshot should apply per-cell row data to store');
 
       // Verify actual row data
       const row1 = guest.dataStore.getRow('main', 'users', [1]);
@@ -1353,7 +1368,7 @@ describe('Sync Protocol E2E', () => {
       const guest = await createReplica('guest', config);
 
       // Host creates a table (schema change)
-      host.storeEvents.emitSchemaChange({
+      host.storeEvents.commitSchema({
         type: 'create',
         objectType: 'table',
         schemaName: 'main',
@@ -1371,6 +1386,219 @@ describe('Sync Protocol E2E', () => {
       // Guest's data store should have the schema change applied via callback
       const schemaChanges = guest.dataStore.changeLog.filter(c => c.type === 'schema');
       expect(schemaChanges.length).to.be.at.least(1, 'Snapshot should apply schema migrations to store');
+    });
+  });
+
+  describe('Before-image (per-cell prior)', () => {
+    /** Flatten all column changes out of a list of ChangeSets. */
+    function columnChanges(changes: ChangeSet[]): ColumnChange[] {
+      return changes
+        .flatMap(cs => cs.changes)
+        .filter((c): c is ColumnChange => c.type === 'column');
+    }
+
+    it('omits prior on first insert and carries it on a later overwrite', async () => {
+      const host = await createReplica('host', config);
+      const freshPeer = generateSiteId();
+
+      // First write of each cell: no before-image anywhere.
+      emitLocalInsert(host, 'main', 'users', [1], [1, 'Original']);
+      await new Promise(r => setTimeout(r, 10));
+
+      const afterInsert = columnChanges(await host.manager.getChangesSince(freshPeer));
+      expect(afterInsert.length).to.be.greaterThan(0);
+      for (const c of afterInsert) {
+        expect(c).to.not.have.property('priorValue');
+        expect(c).to.not.have.property('priorHlc');
+      }
+      const insertedValueCol = afterInsert.find(c => c.column === 'col_1');
+      expect(insertedValueCol).to.exist;
+      const insertHlc = insertedValueCol!.hlc;
+
+      // Overwrite the value column in a separate transaction.
+      await new Promise(r => setTimeout(r, 5));
+      emitLocalUpdate(host, 'main', 'users', [1], [1, 'Original'], [1, 'Updated']);
+      await new Promise(r => setTimeout(r, 10));
+
+      const overwritten = columnChanges(await host.manager.getChangesSince(freshPeer))
+        .find(c => c.column === 'col_1');
+      expect(overwritten).to.exist;
+      expect(overwritten!.value).to.equal('Updated');
+      expect(overwritten!.priorValue).to.equal('Original');
+      expect(overwritten!.priorHlc).to.not.be.undefined;
+      // The before-image HLC is exactly the overwritten version's HLC.
+      expect(compareHLC(overwritten!.priorHlc!, insertHlc)).to.equal(0);
+    });
+
+    it('preserves the origin prior chain when relayed through a receiver', async () => {
+      const host = await createReplica('host', config);
+      const relay = await createReplica('relay', config);
+      const freshPeer = generateSiteId();
+
+      // Round 1: relay receives the insert (so relay holds the pre-overwrite version).
+      emitLocalInsert(host, 'main', 'users', [1], [1, 'Original']);
+      await new Promise(r => setTimeout(r, 10));
+      const r1 = await host.manager.getChangesSince(relay.manager.getSiteId());
+      await relay.manager.applyChanges(r1);
+      const insertHlc = columnChanges(r1).find(c => c.column === 'col_1')!.hlc;
+
+      // Round 2: relay receives the overwrite; its local lineage prior is the insert.
+      emitLocalUpdate(host, 'main', 'users', [1], [1, 'Original'], [1, 'Updated']);
+      await new Promise(r => setTimeout(r, 10));
+      const r2 = await host.manager.getChangesSince(relay.manager.getSiteId());
+      await relay.manager.applyChanges(r2);
+
+      // Relay re-emits the origin's prior (its stored before-image), not its own clock.
+      const relayed = columnChanges(await relay.manager.getChangesSince(freshPeer))
+        .find(c => c.column === 'col_1');
+      expect(relayed).to.exist;
+      expect(relayed!.value).to.equal('Updated');
+      expect(relayed!.priorValue).to.equal('Original');
+      expect(relayed!.priorHlc).to.not.be.undefined;
+      expect(compareHLC(relayed!.priorHlc!, insertHlc)).to.equal(0);
+    });
+
+    it('in-batch dedup keeps the pre-batch prior, not an in-batch loser', async () => {
+      const receiver = await createReplica('receiver', config);
+      const siteA = generateSiteId();
+      const freshPeer = generateSiteId();
+
+      const mk = (value: SqlValue, wallTime: bigint): ColumnChange => ({
+        type: 'column', schema: 'main', table: 'users', pk: [1], column: 'col_1', value,
+        hlc: { wallTime, counter: 0, siteId: siteA, opSeq: 0 } as HLC,
+      });
+      const cs = (transactionId: string, change: ColumnChange): ChangeSet => ({
+        siteId: siteA, transactionId, hlc: change.hlc, changes: [change], schemaMigrations: [],
+      });
+
+      // Pre-batch: receiver stores v0@1000 (first write here, no prior).
+      await receiver.manager.applyChanges([cs('tx0', mk('v0', 1000n))]);
+
+      // One applyChanges with two stacked versions of the same cell; BOTH Phase-1
+      // resolve against the pre-batch v0@1000, so the surviving winner's prior is
+      // v0@1000 — never the in-batch loser v1@2000.
+      await receiver.manager.applyChanges([
+        cs('tx1', mk('v1', 2000n)),
+        cs('tx2', mk('v2', 3000n)),
+      ]);
+
+      const stored = columnChanges(await receiver.manager.getChangesSince(freshPeer))
+        .find(c => c.column === 'col_1');
+      expect(stored).to.exist;
+      expect(stored!.value).to.equal('v2');
+      expect(stored!.priorValue).to.equal('v0');
+      expect(stored!.priorHlc).to.not.be.undefined;
+      expect(stored!.priorHlc!.wallTime).to.equal(1000n); // h0, not h1 (2000n)
+    });
+  });
+
+  describe('Row before-image (delete priorRow)', () => {
+    /** Flatten all deletions out of a list of ChangeSets. */
+    function deletions(changes: ChangeSet[]): RowDeletion[] {
+      return changes
+        .flatMap(cs => cs.changes)
+        .filter((c): c is RowDeletion => c.type === 'delete');
+    }
+
+    it('carries priorRow matching the pre-delete row image', async () => {
+      const host = await createReplica('host', config);
+      const freshPeer = generateSiteId();
+
+      // Insert then delete; the delete should carry the row's last-known image.
+      emitLocalInsert(host, 'main', 'users', [1], [1, 'Alice']);
+      await new Promise(r => setTimeout(r, 5));
+      emitLocalDelete(host, 'main', 'users', [1], [1, 'Alice']);
+      await new Promise(r => setTimeout(r, 10));
+
+      const dels = deletions(await host.manager.getChangesSince(freshPeer));
+      expect(dels).to.have.lengthOf(1);
+      expect(dels[0].priorRow).to.deep.equal([1, 'Alice']);
+    });
+
+    it('re-emits priorRow on the incremental (sinceHLC) relay path', async () => {
+      // The no-sinceHLC tests above drain via collectAllChanges; passing a sinceHLC
+      // forces the change-log replay path (collectChangesSince -> resolveLogEntry),
+      // which re-emits the stored image from a separate code site. A zero HLC sits
+      // before any real delete, so the delete is included.
+      const host = await createReplica('host', config);
+      const freshPeer = generateSiteId();
+      const zeroHLC: HLC = { wallTime: 0n, counter: 0, siteId: generateSiteId(), opSeq: 0 };
+
+      emitLocalInsert(host, 'main', 'users', [1], [1, 'Alice']);
+      await new Promise(r => setTimeout(r, 5));
+      emitLocalDelete(host, 'main', 'users', [1], [1, 'Alice']);
+      await new Promise(r => setTimeout(r, 10));
+
+      const dels = deletions(await host.manager.getChangesSince(freshPeer, zeroHLC));
+      expect(dels).to.have.lengthOf(1);
+      expect(dels[0].priorRow).to.deep.equal([1, 'Alice']);
+    });
+
+    it('omits priorRow when the delete event carried no oldRow', async () => {
+      const host = await createReplica('host', config);
+      const freshPeer = generateSiteId();
+
+      // A relayed/synthesized delete: pk present, but no oldRow on the event.
+      host.storeEvents.commitData({
+        type: 'delete',
+        schemaName: 'main',
+        tableName: 'users',
+        key: [7],
+      });
+      await new Promise(r => setTimeout(r, 10));
+
+      const dels = deletions(await host.manager.getChangesSince(freshPeer));
+      expect(dels).to.have.lengthOf(1);
+      expect(dels[0]).to.not.have.property('priorRow');
+    });
+
+    it('re-emits the latest row image after delete -> reinsert -> delete', async () => {
+      const host = await createReplica('host', config);
+      const freshPeer = generateSiteId();
+
+      emitLocalInsert(host, 'main', 'users', [1], [1, 'Alice']);
+      await new Promise(r => setTimeout(r, 5));
+      emitLocalDelete(host, 'main', 'users', [1], [1, 'Alice']);
+      await new Promise(r => setTimeout(r, 5));
+      // Reuse the same pk with a new value, then delete again. The tombstone dedup
+      // drops the prior delete entry, so exactly one delete survives — carrying the
+      // SECOND delete's row image, not the first.
+      emitLocalInsert(host, 'main', 'users', [1], [1, 'Alice v2']);
+      await new Promise(r => setTimeout(r, 5));
+      emitLocalDelete(host, 'main', 'users', [1], [1, 'Alice v2']);
+      await new Promise(r => setTimeout(r, 10));
+
+      const dels = deletions(await host.manager.getChangesSince(freshPeer));
+      expect(dels).to.have.lengthOf(1);
+      expect(dels[0].priorRow).to.deep.equal([1, 'Alice v2']);
+    });
+
+    it('in-batch delete dedup keeps the winning delete row image', async () => {
+      const receiver = await createReplica('receiver', config);
+      const siteA = generateSiteId();
+      const freshPeer = generateSiteId();
+
+      const mkDelete = (priorRow: SqlValue[], wallTime: bigint): RowDeletion => ({
+        type: 'delete', schema: 'main', table: 'users', pk: [1],
+        hlc: { wallTime, counter: 0, siteId: siteA, opSeq: 0 } as HLC,
+        priorRow,
+      });
+      const cs = (transactionId: string, change: RowDeletion): ChangeSet => ({
+        siteId: siteA, transactionId, hlc: change.hlc, changes: [change], schemaMigrations: [],
+      });
+
+      // One applyChanges with two stacked deletes of the same pk: both Phase-1
+      // resolve against the empty pre-batch state, so only the max-HLC winner's
+      // metadata (and priorRow) persists — never the in-batch loser's.
+      await receiver.manager.applyChanges([
+        cs('tx1', mkDelete([1, 'loser'], 2000n)),
+        cs('tx2', mkDelete([1, 'winner'], 3000n)),
+      ]);
+
+      const dels = deletions(await receiver.manager.getChangesSince(freshPeer));
+      expect(dels).to.have.lengthOf(1);
+      expect(dels[0].priorRow).to.deep.equal([1, 'winner']);
+      expect(dels[0].hlc.wallTime).to.equal(3000n);
     });
   });
 
@@ -1405,6 +1633,9 @@ describe('Sync Protocol E2E', () => {
       // Snapshot state should be identical
       const snapshot2 = await guest.manager.getSnapshot();
       expect(snapshot2.tables.length).to.equal(snapshot1.tables.length);
+
+      // Re-applying already-applied changes must not grow the change log
+      expect(guest.dataStore.changeLog.length).to.equal(changeLogAfterFirst);
     });
 
     it('should produce identical state when applying the same deletion twice', async () => {
@@ -1463,14 +1694,18 @@ describe('Sync Protocol E2E', () => {
       const snapshotB = await replicaB.manager.getSnapshot();
 
       expect(snapshotA.tables.length).to.equal(snapshotB.tables.length);
-      // Both should have exactly the same column versions
+      // Both should have exactly the same column versions (entries are flat
+      // per-cell records; match them up by raw pk + column).
+      const cellKey = (e: { pk: SqlValue[]; column: string }): string =>
+        `${JSON.stringify(e.pk)}:${e.column}`;
       for (let i = 0; i < snapshotA.tables.length; i++) {
-        expect(snapshotA.tables[i].columnVersions.size).to.equal(
-          snapshotB.tables[i].columnVersions.size
+        expect(snapshotA.tables[i].columnVersions.length).to.equal(
+          snapshotB.tables[i].columnVersions.length
         );
+        const byKeyB = new Map(snapshotB.tables[i].columnVersions.map(e => [cellKey(e), e]));
         // The winning value should be the same on both
-        for (const [key, entryA] of snapshotA.tables[i].columnVersions) {
-          const entryB = snapshotB.tables[i].columnVersions.get(key);
+        for (const entryA of snapshotA.tables[i].columnVersions) {
+          const entryB = byKeyB.get(cellKey(entryA));
           expect(entryB).to.exist;
           expect(entryA.value).to.equal(entryB!.value);
           expect(compareHLC(entryA.hlc, entryB!.hlc)).to.equal(0);
@@ -1480,9 +1715,13 @@ describe('Sync Protocol E2E', () => {
   });
 
   describe('Tombstone Pruning', () => {
+    it('DEFAULT_SYNC_CONFIG.retentionHorizonMs should be 30 days', () => {
+      expect(DEFAULT_SYNC_CONFIG.retentionHorizonMs).to.equal(30 * 24 * 60 * 60 * 1000);
+    });
+
     it('should prune expired tombstones', async () => {
-      // Use very short TTL for testing
-      const shortTTLConfig = { ...config, tombstoneTTL: 1 }; // 1ms TTL
+      // Use very short retention horizon for testing
+      const shortTTLConfig = { ...config, retentionHorizonMs: 1 }; // 1ms
       const replica = await createReplica('replica', shortTTLConfig);
 
       // Insert and delete a row (creates a tombstone)
@@ -1504,8 +1743,8 @@ describe('Sync Protocol E2E', () => {
     });
 
     it('should not prune non-expired tombstones', async () => {
-      // Use long TTL
-      const longTTLConfig = { ...config, tombstoneTTL: 60_000 };
+      // Use long retention horizon
+      const longTTLConfig = { ...config, retentionHorizonMs: 60_000 };
       const replica = await createReplica('replica', longTTLConfig);
 
       emitLocalInsert(replica, 'main', 'users', [1], [1, 'Alice']);
@@ -1552,6 +1791,55 @@ describe('Sync Protocol E2E', () => {
     });
   });
 
+  describe('Transaction Grouping (two replicas)', () => {
+    it('delta-syncs two multi-row transactions as two atomic ChangeSets, halting the watermark at the second commit boundary', async () => {
+      const host = await createReplica('host', config);
+      const guest = await createReplica('guest', config);
+
+      // Transaction 1: two rows committed together.
+      host.storeEvents.commit({
+        data: [
+          { type: 'insert', schemaName: 'main', tableName: 'users', key: [1], newRow: [1, 'Alice'] },
+          { type: 'insert', schemaName: 'main', tableName: 'users', key: [2], newRow: [2, 'Bob'] },
+        ],
+      });
+      await new Promise(r => setTimeout(r, 10));
+
+      // Transaction 2: two more rows committed together.
+      host.storeEvents.commit({
+        data: [
+          { type: 'insert', schemaName: 'main', tableName: 'users', key: [3], newRow: [3, 'Carol'] },
+          { type: 'insert', schemaName: 'main', tableName: 'users', key: [4], newRow: [4, 'Dave'] },
+        ],
+      });
+      await new Promise(r => setTimeout(r, 10));
+
+      const changeSets = await host.manager.getChangesSince(guest.manager.getSiteId());
+
+      // Exactly two transactions — never split, never merged.
+      expect(changeSets).to.have.lengthOf(2);
+      expect(changeSets[0].transactionId).to.not.equal(changeSets[1].transactionId);
+      expect(compareHLC(changeSets[0].hlc, changeSets[1].hlc)).to.be.lessThan(0);
+      // Each transaction carries both rows' column facts (2 rows × 2 columns).
+      expect(changeSets[0].changes).to.have.lengthOf(4);
+      expect(changeSets[1].changes).to.have.lengthOf(4);
+
+      // Guest applies both ChangeSets atomically.
+      const result = await guest.manager.applyChanges(changeSets);
+      expect(result.transactions).to.equal(2);
+      expect(result.applied).to.equal(8);
+
+      // Watermark lands on the SECOND transaction's HLC (a real commit boundary).
+      const watermark = changeSets[changeSets.length - 1].hlc;
+      await guest.manager.updatePeerSyncState(host.manager.getSiteId(), watermark);
+      expect(compareHLC(watermark, changeSets[0].hlc)).to.be.greaterThan(0);
+
+      // Re-fetch from the watermark: both transactions already consumed, nothing repeats.
+      const after = await host.manager.getChangesSince(guest.manager.getSiteId(), watermark);
+      expect(after).to.have.lengthOf(0);
+    });
+  });
+
   describe('Multiple Tables', () => {
     it('should sync data across multiple tables independently', async () => {
       const host = await createReplica('host', config);
@@ -1591,7 +1879,7 @@ describe('Sync Protocol E2E', () => {
       const remoteHLC = new HLCManager(remoteSiteId);
 
       // Apply a delete first with a later HLC
-      const deleteHlc = remoteHLC.tick();
+      remoteHLC.tick();
       await new Promise(r => setTimeout(r, 5));
       const laterDeleteHlc = remoteHLC.tick();
 

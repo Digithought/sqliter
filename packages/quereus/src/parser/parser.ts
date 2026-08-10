@@ -1,5 +1,5 @@
 import { createLogger } from '../common/logger.js'; // Import logger
-import { Lexer, type Token, TokenType } from './lexer.js';
+import { Lexer, type Token, TokenType, CONTEXTUAL_KEYWORDS } from './lexer.js';
 import * as AST from './ast.js';
 import { ConflictResolution } from '../common/constants.js';
 import type { RowOp, SqlValue } from '../common/types.js';
@@ -37,10 +37,25 @@ function _createLoc(startToken: Token, endToken: Token): AST.AstNode['loc'] {
 }
 
 /**
+ * Leading keywords of a `declare schema { … }` item. Items carry no required
+ * separator, so these are barred from the bare-alias slot while an item body is
+ * parsed (see {@link Parser.withAliasBarrier}). The reserved ones are already safe
+ * — they lex to their own TokenType — but listing them keeps the set readable as
+ * "the item keywords". `DOMAIN` / `COLLATION` / `IMPORT` are the ignored kinds.
+ */
+const DECLARE_ITEM_KEYWORDS: ReadonlySet<string> = new Set([
+	'TABLE', 'INDEX', 'UNIQUE', 'MATERIALIZED', 'VIEW', 'SEED', 'ASSERTION',
+	'DOMAIN', 'COLLATION', 'IMPORT',
+]);
+
+/** Leading keyword of a `declare lens { … }` override; same separator-less shape. */
+const LENS_OVERRIDE_KEYWORDS: ReadonlySet<string> = new Set(['VIEW']);
+
+/**
  * IMPORTANT: Any changes to parsed syntax must also be reflected in the corresponding emitters:
  *   - packages/quereus/src/emit/ast-stringify.ts          (AST-to-SQL string conversion)
- *   - packages/quereus/src/schema/catalog.ts              (DDL generation for catalog/hashing)
- *   - packages/quereus-store/src/common/ddl-generator.ts  (DDL generation for persistence)
+ *   - packages/quereus/src/schema/catalog.ts              (CREATE ASSERTION DDL for catalog/hashing)
+ *   - packages/quereus/src/schema/ddl-generator.ts        (canonical DDL generation for persistence)
  * If only the parser is updated, SQL round-trips and persisted schemas will silently lose the new syntax.
  */
 export class Parser {
@@ -50,6 +65,15 @@ export class Parser {
 	private parameterPosition = 1;
 	// Track opening parentheses for accurate error locations
 	private parenStack: Token[] = [];
+	/**
+	 * Bare (no-`as`) alias barrier. While a declaration-block item body is being
+	 * parsed, the leading keywords of a *sibling* item must not be absorbed as an
+	 * implicit alias — block items carry no required separator, so the alias slot
+	 * and the next item's first token compete for the same position. Scoped by a
+	 * stack so it never leaks into ordinary statements, and by the paren depth the
+	 * item started at, since a sibling item cannot begin inside an open `(`.
+	 */
+	private aliasBarriers: { words: ReadonlySet<string>; parenDepth: number }[] = [];
 
 	/**
 	 * Initialize the parser with tokens from a SQL string
@@ -62,6 +86,7 @@ export class Parser {
 		this.current = 0;
 		this.parameterPosition = 1; // Reset parameter counter
 		this.parenStack = [];
+		this.aliasBarriers = [];
 
 		// Check for errors from lexer
 		const errorToken = this.tokens.find(t => t.type === TokenType.ERROR);
@@ -105,7 +130,7 @@ export class Parser {
 
 			} catch (e) {
 				// error() method now throws QuereusError directly with location info
-				if (e instanceof Error && e.name === 'QuereusError') {
+				if (e instanceof QuereusError) {
 					throw e;
 				}
 
@@ -244,22 +269,33 @@ export class Parser {
 		const resolutionContext = innerWith ?? outerWithContext;
 
 		const startToken = this.peek();
-		const kw = startToken.lexeme.toUpperCase();
 		let stmt: AST.QueryExpr;
-		switch (kw) {
-			case 'SELECT': this.advance(); stmt = this.selectStatement(startToken, resolutionContext); break;
-			case 'VALUES': this.advance(); stmt = this.valuesStatementWithOptionalCompound(startToken, resolutionContext); break;
-			case 'INSERT': this.advance(); stmt = this.insertStatement(startToken, resolutionContext); break;
-			case 'UPDATE': this.advance(); stmt = this.updateStatement(startToken, resolutionContext); break;
-			case 'DELETE': this.advance(); stmt = this.deleteStatement(startToken, resolutionContext); break;
-			default:
-				throw this.error(startToken, "Expected SELECT, VALUES, INSERT, UPDATE, or DELETE in query expression.");
+		if (this.check(TokenType.LPAREN)) {
+			// A parenthesized query expression `( <query-expr> )` is a valid first
+			// operand (view body / CTE body / FROM-subquery / scalar subquery all
+			// funnel here). Read it, then run the shared left-associative tail so
+			// `(…) union …` chains. Pure grouping (no compound follows) returns the
+			// inner expression unchanged — `(select 1)` ≡ `select 1`.
+			const firstOperand = this.parseCompoundOperand(resolutionContext, requireReturning);
+			stmt = this.checkCompoundOperator()
+				? this.parseCompoundTail(firstOperand, resolutionContext, startToken)
+				: firstOperand;
+		} else {
+			const kw = startToken.lexeme.toUpperCase();
+			switch (kw) {
+				case 'SELECT': this.advance(); stmt = this.selectStatement(startToken, resolutionContext); break;
+				case 'VALUES': this.advance(); stmt = this.valuesStatementWithOptionalCompound(startToken, resolutionContext); break;
+				case 'INSERT': this.advance(); stmt = this.insertStatement(startToken, resolutionContext); break;
+				case 'UPDATE': this.advance(); stmt = this.updateStatement(startToken, resolutionContext); break;
+				case 'DELETE': this.advance(); stmt = this.deleteStatement(startToken, resolutionContext); break;
+				default:
+					throw this.error(startToken, "Expected SELECT, VALUES, INSERT, UPDATE, or DELETE in query expression.");
+			}
 		}
 
 		if (innerWith) {
 			if (this.statementSupportsWithClause(stmt)) {
-				// eslint-disable-next-line @typescript-eslint/no-explicit-any
-				(stmt as any).withClause = innerWith;
+				stmt.withClause = innerWith;
 				if (innerWith.loc && stmt.loc) {
 					stmt.loc.start = innerWith.loc.start;
 				}
@@ -282,7 +318,7 @@ export class Parser {
 	 */
 	private commonTableExpression(): AST.CommonTableExpr {
 		const startToken = this.peek(); // Peek before consuming name
-		const name = this.consumeIdentifier(['key', 'action', 'set', 'default', 'check', 'unique', 'like'], "Expected CTE name.");
+		const name = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected CTE name.");
 		let endToken = this.previous(); // End token initially is the name
 
 		let columns: string[] | undefined;
@@ -290,7 +326,7 @@ export class Parser {
 			columns = [];
 			if (!this.check(TokenType.RPAREN)) {
 				do {
-					columns.push(this.consumeIdentifier(['key', 'action', 'set', 'default', 'check', 'unique', 'like'], "Expected column name in CTE definition."));
+					columns.push(this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected column name in CTE definition."));
 				} while (this.match(TokenType.COMMA) && !this.check(TokenType.RPAREN));
 			}
 			endToken = this.consume(TokenType.RPAREN, "Expected ')' after CTE column list.");
@@ -331,15 +367,22 @@ export class Parser {
 		const currentKeyword = startToken.lexeme.toUpperCase();
 		let stmt: AST.AstNode;
 
-		switch (currentKeyword) {
+		// A leading `(` is a parenthesized query expression at top level
+		// (`(select 1) union (select 2);` — SQLite parity). `parseQueryExpr`
+		// reads the operand and any compound tail; the post-switch WITH-attach
+		// below still folds an outer `with … (select …) union …` in.
+		if (this.check(TokenType.LPAREN)) {
+			stmt = this.parseQueryExpr(withClause);
+		} else switch (currentKeyword) {
 			case 'SELECT': this.advance(); stmt = this.selectStatement(startToken, withClause); break;
 			case 'INSERT': this.advance(); stmt = this.insertStatement(startToken, withClause); break;
 			case 'UPDATE': this.advance(); stmt = this.updateStatement(startToken, withClause); break;
 			case 'DELETE': this.advance(); stmt = this.deleteStatement(startToken, withClause); break;
 			case 'VALUES': this.advance(); stmt = this.valuesStatementWithOptionalCompound(startToken, withClause); break;
 			case 'CREATE': this.advance(); stmt = this.createStatement(startToken, withClause); break;
+			case 'REFRESH': this.advance(); stmt = this.refreshStatement(startToken, withClause); break;
 			case 'DROP': this.advance(); stmt = this.dropStatement(startToken, withClause); break;
-			case 'ALTER': this.advance(); stmt = this.alterTableStatement(startToken, withClause); break;
+			case 'ALTER': this.advance(); stmt = this.alterStatement(startToken, withClause); break;
 			case 'BEGIN': this.advance(); stmt = this.beginStatement(startToken, withClause); break;
 			case 'COMMIT': this.advance(); stmt = this.commitStatement(startToken, withClause); break;
 			case 'ROLLBACK': this.advance(); stmt = this.rollbackStatement(startToken, withClause); break;
@@ -348,7 +391,15 @@ export class Parser {
 			// TODO: Replace pragmas with build-in functions
 			case 'PRAGMA': this.advance(); stmt = this.pragmaStatement(startToken, withClause); break;
 			case 'ANALYZE': this.advance(); stmt = this.analyzeStatement(startToken); break;
-			case 'DECLARE': this.advance(); stmt = this.declareSchemaStatement(startToken); break;
+			case 'DECLARE': {
+				this.advance();
+				// `declare lens …` is a sibling statement, not a `declare schema`
+				// variant: branch on the contextual LENS keyword.
+				stmt = this.peekKeyword('LENS')
+					? this.declareLensStatement(startToken)
+					: this.declareSchemaStatement(startToken);
+				break;
+			}
 			case 'DIFF': this.advance(); stmt = this.diffSchemaStatement(startToken); break;
 			case 'APPLY': this.advance(); stmt = this.applySchemaStatement(startToken); break;
 			case 'EXPLAIN': this.advance(); stmt = this.explainSchemaStatement(startToken); break;
@@ -360,8 +411,7 @@ export class Parser {
 
 		// Attach WITH clause if present and supported
 		if (withClause && this.statementSupportsWithClause(stmt)) {
-			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-			(stmt as any).withClause = withClause;
+			stmt.withClause = withClause;
 			if (withClause.loc && stmt.loc) {
 				stmt.loc.start = withClause.loc.start;
 			}
@@ -393,14 +443,13 @@ export class Parser {
 
 		// Parse the table reference
 		const table = this.tableIdentifier();
-		const contextualKeywords = ['key', 'action', 'set', 'default', 'check', 'unique', 'references', 'on', 'cascade', 'restrict', 'like'];
 
 		// Parse column list if provided
 		let columns: string[] | undefined;
 		if (this.match(TokenType.LPAREN)) {
 			columns = [];
 			do {
-				if (!this.checkIdentifierLike(contextualKeywords)) {
+				if (!this.checkIdentifierLike(CONTEXTUAL_KEYWORDS)) {
 					throw this.error(this.peek(), "Expected column name.");
 				}
 				columns.push(this.getIdentifierValue(this.advance()));
@@ -409,15 +458,20 @@ export class Parser {
 			this.consume(TokenType.RPAREN, "Expected ')' after column list.");
 		}
 
-		// Parse mutation context assignments if present (after column list, before VALUES/SELECT)
-		// Note: Can also appear after VALUES/SELECT via parseTrailingWithClauses
+		// Parse mutation context assignments and/or tags if present (after column
+		// list, before VALUES/SELECT). Either may also appear trailing (after
+		// VALUES/SELECT) via parseTrailingWithClauses.
 		let contextValues: AST.ContextAssignment[] | undefined;
-		if (this.matchKeyword('WITH')) {
+		let tags: Record<string, SqlValue> | undefined;
+		while (this.matchKeyword('WITH')) {
 			if (this.matchKeyword('CONTEXT')) {
 				contextValues = this.parseContextAssignments();
+			} else if (this.matchKeyword('TAGS')) {
+				tags = this.parseTags();
 			} else {
-				// Not a WITH CONTEXT clause, backtrack
+				// Not a WITH CONTEXT / WITH TAGS clause, backtrack
 				this.current--;
+				break;
 			}
 		}
 
@@ -470,6 +524,13 @@ export class Parser {
 			}
 			contextValues = trailingClauses.contextValues;
 		}
+		if (trailingClauses.tags) {
+			if (tags) {
+				throw this.error(this.previous(), "Duplicate WITH TAGS clause");
+			}
+			tags = trailingClauses.tags;
+			lastConsumedToken = this.previous(); // After tags
+		}
 		const schemaPath = trailingClauses.schemaPath;
 		if (schemaPath) {
 			lastConsumedToken = this.previous(); // After schema path
@@ -492,6 +553,7 @@ export class Parser {
 			returning,
 			contextValues,
 			schemaPath,
+			tags,
 			loc: _createLoc(startToken, lastConsumedToken),
 		};
 	}
@@ -567,29 +629,23 @@ export class Parser {
 	 */
 	selectStatement(startToken?: Token, withClause?: AST.WithClause, isCompoundSubquery: boolean = false): AST.SelectStmt {
 		const start = startToken ?? this.previous(); // Use provided or the keyword token
-		let lastConsumedToken = start; // Initialize lastConsumed
 
 		const distinct = this.matchKeyword('DISTINCT');
-		if (distinct) lastConsumedToken = this.previous();
 		const all = !distinct && this.matchKeyword('ALL');
-		if (all) lastConsumedToken = this.previous();
 
 		// Parse column list
 		const columns = this.columnList();
-		if (columns.length > 0) lastConsumedToken = this.previous(); // Update after last column element
 
 		// Parse FROM clause if present
 		let from: AST.FromClause[] | undefined;
 		if (this.match(TokenType.FROM)) {
 			from = this.tableSourceList(withClause);
-			if (from.length > 0) lastConsumedToken = this.previous(); // After last source/join
 		}
 
 		// Parse WHERE clause if present
 		let where: AST.Expression | undefined;
 		if (this.match(TokenType.WHERE)) {
 			where = this.expression();
-			lastConsumedToken = this.previous(); // After where expression
 		}
 
 		// Parse GROUP BY clause if present
@@ -599,81 +655,200 @@ export class Parser {
 			do {
 				groupBy.push(this.expression());
 			} while (this.match(TokenType.COMMA));
-			lastConsumedToken = this.previous(); // After last group by expression
 		}
 
 		// Parse HAVING clause if present
 		let having: AST.Expression | undefined;
 		if (this.match(TokenType.HAVING)) {
 			having = this.expression();
-			lastConsumedToken = this.previous(); // After having expression
 		}
 
-		// Parse WITH SCHEMA clause if present (must come before ORDER BY/LIMIT)
+		// Parse WITH SCHEMA clause if present (must come before compound / ORDER BY / LIMIT
+		// and is suppressed in compound-subquery position).
 		let schemaPath: string[] | undefined;
 		if (!isCompoundSubquery) {
 			schemaPath = this.parseSchemaPath();
-			if (schemaPath) {
-				lastConsumedToken = this.previous(); // After schema path
-			}
 		}
 
-		// Check for compound set operations (UNION / INTERSECT / EXCEPT) BEFORE ORDER BY/LIMIT
-		let compound: { op: 'union' | 'unionAll' | 'intersect' | 'except' | 'diff'; select: AST.QueryExpr } | undefined;
-		if (this.match(TokenType.UNION, TokenType.INTERSECT, TokenType.EXCEPT, TokenType.DIFF)) {
-			const tok = this.previous();
-			let op: 'union' | 'unionAll' | 'intersect' | 'except' | 'diff';
-			if (tok.type === TokenType.UNION) {
-				if (this.match(TokenType.ALL)) {
-					op = 'unionAll';
-				} else {
-					op = 'union';
-				}
-			} else if (tok.type === TokenType.INTERSECT) {
-				op = 'intersect';
-			} else if (tok.type === TokenType.EXCEPT) {
-				op = 'except';
-			} else {
-				op = 'diff';
-			}
+		const sel: AST.SelectStmt = {
+			type: 'select',
+			columns,
+			from,
+			where,
+			groupBy,
+			having,
+			distinct,
+			all,
+			schemaPath,
+			loc: _createLoc(start, this.previous()),
+		};
 
-			// Compound leg is any QueryExpr (SELECT/VALUES/DML w/ RETURNING).
-			// For SELECT/VALUES legs we suppress ORDER BY / LIMIT so they bind
-			// to the outer compound — same rule the legacy code applied for
-			// SELECT, and the VALUES leg recurses so further compound chains
-			// continue past a VALUES right leg.
-			const usedParen = this.match(TokenType.LPAREN);
-			const legStartToken = this.peek();
-			let rightSelect: AST.QueryExpr;
-			if (this.check(TokenType.SELECT)) {
-				this.advance();
-				rightSelect = this.selectStatement(legStartToken, withClause, /*isCompoundSubquery*/ true);
-			} else if (this.check(TokenType.VALUES)) {
-				this.advance();
-				rightSelect = this.valuesStatementWithOptionalCompound(legStartToken, withClause, /*isCompoundSubquery*/ true);
-			} else if (
-				this.check(TokenType.WITH)
-				|| this.check(TokenType.INSERT)
-				|| this.check(TokenType.UPDATE)
-				|| this.check(TokenType.DELETE)
-			) {
-				rightSelect = this.parseQueryExpr(undefined, /*requireReturning*/ true);
-			} else {
-				throw this.error(this.peek(), "Expected SELECT, VALUES, or DML statement after set operation keyword.");
-			}
-			if (usedParen) {
-				this.consume(TokenType.RPAREN, "Expected ')' after parenthesized set operation.");
-			}
+		// Compound set operations (UNION / INTERSECT / EXCEPT / DIFF) bind BEFORE
+		// ORDER BY / LIMIT — delegate to the shared left-associative tail parser.
+		const result = this.parseCompoundTail(sel, withClause, start);
 
-			lastConsumedToken = this.previous();
-			compound = { op, select: rightSelect };
+		// ORDER BY / LIMIT / OFFSET apply to the final compound result; suppressed
+		// for a compound subquery (they bind to the outer compound).
+		this.parseTrailingOrderLimit(result, isCompoundSubquery);
+
+		// Trailing `with defaults (col = expr, …)` — binds to the whole compound,
+		// after limit/offset and before any DDL-level `with tags`. Suppressed on a
+		// compound leg (it belongs to the outer compound, like trailing ORDER BY).
+		if (!isCompoundSubquery) {
+			const defaults = this.parseDefaultsClause();
+			if (defaults) result.defaults = defaults;
 		}
 
-		// Parse ORDER BY clause if present (applies to final result after compound operations)
-		// Skip if this is a compound subquery as ORDER BY belongs to the outer compound
-		let orderBy: AST.OrderByClause[] | undefined;
-		if (!isCompoundSubquery && this.match(TokenType.ORDER) && this.consume(TokenType.BY, "Expected 'BY' after 'ORDER'.")) {
-			orderBy = [];
+		result.loc = _createLoc(start, this.previous());
+		return result;
+	}
+
+	/** True when the next token is a compound set-operation keyword. */
+	private checkCompoundOperator(): boolean {
+		return this.check(TokenType.UNION)
+			|| this.check(TokenType.INTERSECT)
+			|| this.check(TokenType.EXCEPT)
+			|| this.check(TokenType.DIFF);
+	}
+
+	/**
+	 * Decode a compound set-operation operator the caller has just consumed
+	 * (via `match`), plus the optional `<setop> exists <branch> as <name>`
+	 * membership-column clause(s) that sit between the operator keyword and the
+	 * right leg. One-token lookahead (`exists` followed by `left`/`right`, never
+	 * `(`) distinguishes the membership clause from the `exists (<subquery>)`
+	 * predicate, which never legally begins a compound leg.
+	 */
+	private parseCompoundOperator(): {
+		op: 'union' | 'unionAll' | 'intersect' | 'except' | 'diff';
+		existence?: ReadonlyArray<AST.SetOpMembershipColumn>;
+	} {
+		const tok = this.previous();
+		let op: 'union' | 'unionAll' | 'intersect' | 'except' | 'diff';
+		if (tok.type === TokenType.UNION) {
+			op = this.match(TokenType.ALL) ? 'unionAll' : 'union';
+		} else if (tok.type === TokenType.INTERSECT) {
+			op = 'intersect';
+		} else if (tok.type === TokenType.EXCEPT) {
+			op = 'except';
+		} else {
+			op = 'diff';
+		}
+		const existence = this.setOpMembershipClauses(op);
+		return existence ? { op, existence } : { op };
+	}
+
+	/**
+	 * Reads a single `query-term` operand of a set operation: either a
+	 * parenthesized query expression `( <query-expr> )` (full recursion — WITH,
+	 * nested compound, and the inner's OWN trailing ORDER BY / LIMIT all bind
+	 * inside the parens) or a bare keyword-led operand (SELECT / VALUES / DML).
+	 *
+	 * Bare SELECT / VALUES legs parse with `isCompoundSubquery=true` so a
+	 * trailing ORDER BY / LIMIT binds to the OUTER compound, and a bare SELECT
+	 * leg greedily consumes the remaining unparenthesized chain (preserving the
+	 * historical right-leaning shape). `requireReturning` is propagated so a
+	 * DML operand without RETURNING in a leg position is rejected.
+	 */
+	private parseCompoundOperand(
+		withClause: AST.WithClause | undefined,
+		requireReturning: boolean,
+	): AST.QueryExpr {
+		if (this.check(TokenType.LPAREN)) {
+			this.advance();
+			const inner = this.parseQueryExpr(withClause, requireReturning);
+			this.consume(TokenType.RPAREN, "Expected ')' after parenthesized query expression.");
+			return inner;
+		}
+		const start = this.peek();
+		if (this.check(TokenType.SELECT)) {
+			this.advance();
+			return this.selectStatement(start, withClause, /*isCompoundSubquery*/ true);
+		}
+		if (this.check(TokenType.VALUES)) {
+			this.advance();
+			return this.valuesStatementWithOptionalCompound(start, withClause, /*isCompoundSubquery*/ true);
+		}
+		if (this.check(TokenType.WITH) || this.check(TokenType.INSERT) || this.check(TokenType.UPDATE) || this.check(TokenType.DELETE)) {
+			return this.parseQueryExpr(undefined, requireReturning);
+		}
+		throw this.error(this.peek(), "Expected SELECT, VALUES, a DML statement, or '(' to begin a query operand.");
+	}
+
+	/**
+	 * Wraps an arbitrary query expression as `select * from (<inner>) as
+	 * <synthetic alias>` so the SELECT-level `compound` / ORDER BY / LIMIT slots
+	 * apply to it. Generalized from the VALUES-compound wrapper; the synthetic
+	 * alias is collision-proof per the inner's start offset (nested wraps live in
+	 * distinct subquery scopes, so identical aliases never collide).
+	 */
+	private wrapAsSubquerySelect(inner: AST.QueryExpr, startToken: Token): AST.SelectStmt {
+		const syntheticAlias = `values_${startToken.startOffset}`;
+		return {
+			type: 'select',
+			columns: [{ type: 'all' }],
+			from: [{
+				type: 'subquerySource',
+				subquery: inner,
+				alias: syntheticAlias,
+				loc: inner.loc,
+			}],
+			loc: inner.loc,
+		};
+	}
+
+	/**
+	 * Left-associative tail parser shared by every compound site. Consumes a
+	 * chain of `compound-op [membership] query-term` after an already-parsed
+	 * left operand and returns the resulting SELECT.
+	 *
+	 * A parenthesized operand iterates the loop (left-associative), wrapping the
+	 * accumulator whenever it cannot host the new compound — either it is not a
+	 * plain SELECT (e.g. a parenthesized VALUES/DML/compound operand) or its
+	 * `compound` slot is already taken. The first BARE keyword operand greedily
+	 * consumes the rest of the chain itself (its own `selectStatement` /
+	 * `valuesStatementWithOptionalCompound` recursion), so an unparenthesized
+	 * chain keeps today's right-leaning shape byte-for-byte. The user's explicit
+	 * parentheses are the only escape hatch into left-grouping.
+	 */
+	private parseCompoundTail(
+		left: AST.QueryExpr,
+		withClause: AST.WithClause | undefined,
+		startToken: Token,
+	): AST.SelectStmt {
+		let acc: AST.QueryExpr = left;
+		while (this.match(TokenType.UNION, TokenType.INTERSECT, TokenType.EXCEPT, TokenType.DIFF)) {
+			const { op, existence } = this.parseCompoundOperator();
+			const parenthesized = this.check(TokenType.LPAREN);
+			const right = this.parseCompoundOperand(withClause, /*requireReturning*/ true);
+
+			if (acc.type !== 'select' || acc.compound) {
+				acc = this.wrapAsSubquerySelect(acc, startToken);
+			}
+			acc.compound = existence ? { op, select: right, existence } : { op, select: right };
+
+			if (!parenthesized) break; // a bare operand already consumed the remaining chain
+		}
+		// `left` is a SelectStmt at every call site that may take zero iterations
+		// (selectStatement / continueSelectAfterFrom); the parenthesized entry only
+		// delegates here once a compound operator follows, and any iteration leaves
+		// `acc` a SELECT — so the result is always a SelectStmt.
+		return acc as AST.SelectStmt;
+	}
+
+	/**
+	 * Parses the trailing ORDER BY / LIMIT / OFFSET clauses that apply to the
+	 * final result of a (possibly compound) SELECT, mutating `sel` in place.
+	 * Suppressed entirely when `isCompoundSubquery` is set — those clauses then
+	 * bind to the enclosing compound, not this leg. Shared by `selectStatement`
+	 * and `continueSelectAfterFrom`.
+	 */
+	private parseTrailingOrderLimit(sel: AST.SelectStmt, isCompoundSubquery: boolean): void {
+		if (isCompoundSubquery) return;
+
+		// ORDER BY applies to the final result after compound operations.
+		if (this.match(TokenType.ORDER) && this.consume(TokenType.BY, "Expected 'BY' after 'ORDER'.")) {
+			sel.orderBy = [];
 			do {
 				const expr = this.expression();
 				const direction = this.match(TokenType.DESC) ? 'desc' :
@@ -695,48 +870,24 @@ export class Parser {
 				if (nulls) {
 					orderClause.nulls = nulls;
 				}
-				orderBy.push(orderClause);
+				sel.orderBy.push(orderClause);
 			} while (this.match(TokenType.COMMA));
-			lastConsumedToken = this.previous(); // After last order by clause
 		}
 
-		// Parse LIMIT clause if present (applies to final result after compound operations)
-		// Skip if this is a compound subquery as LIMIT belongs to the outer compound
-		let limit: AST.Expression | undefined;
-		let offset: AST.Expression | undefined;
-		if (!isCompoundSubquery && this.match(TokenType.LIMIT)) {
-			limit = this.expression();
-			lastConsumedToken = this.previous(); // After limit expression
+		// LIMIT applies to the final result after compound operations.
+		if (this.match(TokenType.LIMIT)) {
+			sel.limit = this.expression();
 
 			// LIMIT x OFFSET y syntax
 			if (this.match(TokenType.OFFSET)) {
-				offset = this.expression();
-				lastConsumedToken = this.previous(); // After offset expression
+				sel.offset = this.expression();
 			}
 			// LIMIT x, y syntax (x is offset, y is limit)
 			else if (this.match(TokenType.COMMA)) {
-				offset = limit;
-				limit = this.expression();
-				lastConsumedToken = this.previous(); // After second limit expression
+				sel.offset = sel.limit;
+				sel.limit = this.expression();
 			}
 		}
-
-		return {
-			type: 'select',
-			columns,
-			from,
-			where,
-			groupBy,
-			having,
-			orderBy,
-			limit,
-			offset,
-			distinct,
-			all,
-			compound,
-			schemaPath,
-			loc: _createLoc(start, lastConsumedToken),
-		};
 	}
 
 	/**
@@ -744,20 +895,21 @@ export class Parser {
 	 */
 	private columnList(): AST.ResultColumn[] {
 		const columns: AST.ResultColumn[] = [];
-		const contextualKeywords = ['key', 'action', 'set', 'default', 'check', 'unique', 'references', 'on', 'cascade', 'restrict', 'like'];
 
 		do {
 			// Handle wildcard: * or table.*
 			if (this.match(TokenType.ASTERISK)) {
 				columns.push({ type: 'all' });
+				this.rejectInverseClauseOnStar();
 			}
 			// Handle table.* syntax
-			else if (this.checkIdentifierLike(contextualKeywords) && this.checkNext(1, TokenType.DOT) &&
+			else if (this.checkIdentifierLike(CONTEXTUAL_KEYWORDS) && this.checkNext(1, TokenType.DOT) &&
 				this.checkNext(2, TokenType.ASTERISK)) {
-				const table = this.consumeIdentifier(contextualKeywords, "Expected table name before '.*'.");
+				const table = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected table name before '.*'.");
 				this.advance(); // consume DOT
 				this.advance(); // consume ASTERISK
 				columns.push({ type: 'all', table });
+				this.rejectInverseClauseOnStar();
 			}
 			// Handle regular column expression
 			else {
@@ -766,11 +918,11 @@ export class Parser {
 
 				// Handle AS alias or just alias
 				if (this.match(TokenType.AS)) {
-					if (this.checkIdentifierLike(contextualKeywords) || this.check(TokenType.STRING)) {
+					if (this.checkIdentifierLike(CONTEXTUAL_KEYWORDS) || this.check(TokenType.STRING)) {
 						const aliasToken = this.advance();
 						// For STRING tokens, use literal; for identifiers, use getIdentifierValue
 						alias = aliasToken.type === TokenType.STRING
-							? aliasToken.literal
+							? aliasToken.literal as string
 							: this.getIdentifierValue(aliasToken);
 					} else {
 						throw this.error(this.peek(), "Expected identifier or string after 'AS'.");
@@ -780,13 +932,17 @@ export class Parser {
 				else if (this.checkIdentifierLike([]) &&
 					!this.checkNext(1, TokenType.LPAREN) &&
 					!this.checkNext(1, TokenType.DOT) &&
-					!this.checkNext(1, TokenType.COMMA) &&
-					!this.isEndOfClause()) {
+					!this.isEndOfClause() &&
+					!this.atAliasBarrier()) {
 					const aliasToken = this.advance();
 					alias = this.getIdentifierValue(aliasToken);
 				}
 
-				columns.push({ type: 'column', expr, alias });
+				// Optional trailing `with inverse (col = expr, …)` — authored
+				// write-back expressions (docs/vu-inverses.md § Authored inverses)
+				const inverse = this.parseInverseClause();
+
+				columns.push({ type: 'column', expr, alias, inverse });
 			}
 		} while (this.match(TokenType.COMMA));
 
@@ -801,7 +957,7 @@ export class Parser {
 		let schema: string | undefined;
 		let name: string;
 		let endToken = startToken;
-		const contextualKeywords = ['key', 'action', 'set', 'default', 'check', 'unique', 'references', 'on', 'cascade', 'restrict', 'like', 'temp', 'temporary'];
+		const contextualKeywords = [...CONTEXTUAL_KEYWORDS, 'temp', 'temporary'];
 
 		// Check for schema.table pattern
 		if (this.checkIdentifierLike(contextualKeywords) && this.checkNext(1, TokenType.DOT)) {
@@ -850,31 +1006,17 @@ export class Parser {
 	 */
 	private tableSource(withClause?: AST.WithClause): AST.FromClause {
 		const startToken = this.peek();
-		const contextualKeywords = ['key', 'action', 'set', 'default', 'check', 'unique', 'references', 'on', 'cascade', 'restrict', 'like'];
 
 		// Subquery: any QueryExpr in parens. Decision is made on the token
 		// immediately after `(`; all relation-producing forms (SELECT, VALUES,
 		// WITH …, INSERT|UPDATE|DELETE w/ RETURNING) flow through the same
 		// subquerySource path.
-		if (this.check(TokenType.LPAREN)) {
-			const lookahead = this.current + 1;
-			if (lookahead < this.tokens.length) {
-				const nextTokenType = this.tokens[lookahead].type;
-				if (
-					nextTokenType === TokenType.SELECT
-					|| nextTokenType === TokenType.VALUES
-					|| nextTokenType === TokenType.WITH
-					|| nextTokenType === TokenType.INSERT
-					|| nextTokenType === TokenType.UPDATE
-					|| nextTokenType === TokenType.DELETE
-				) {
-					return this.subquerySource(startToken, withClause);
-				}
-			}
+		if (this.startsParenSubquery()) {
+			return this.subquerySource(startToken, withClause);
 		}
 
 		// Check for function call syntax: IDENTIFIER (
-		if (this.checkIdentifierLike(contextualKeywords) && this.checkNext(1, TokenType.LPAREN)) {
+		if (this.checkIdentifierLike(CONTEXTUAL_KEYWORDS) && this.checkNext(1, TokenType.LPAREN)) {
 			return this.functionSource(startToken);
 		}
 		// Otherwise, assume it's a standard table source
@@ -890,8 +1032,13 @@ export class Parser {
 	 * INSERT/UPDATE/DELETE with RETURNING). The DML branch is enforced to
 	 * carry RETURNING because the outer FROM-clause position consumes a
 	 * relation, not a side-effect.
+	 *
+	 * `requireAlias` mandates an explicit user-written alias rather than synthesizing
+	 * a default — set for an inline-subquery DML *write target* (`update (select …) as
+	 * v set …`), whose `alias` is user-meaningful (the `where`/`set` reference it). A
+	 * FROM-clause subquery leaves it false and keeps the generated-alias fallback.
 	 */
-	private subquerySource(startToken: Token, withClause?: AST.WithClause): AST.SubquerySource {
+	private subquerySource(startToken: Token, withClause?: AST.WithClause, requireAlias = false): AST.SubquerySource {
 		this.consume(TokenType.LPAREN, "Expected '(' before subquery.");
 
 		const subquery = this.parseQueryExpr(withClause, /*requireReturning*/ true);
@@ -907,28 +1054,30 @@ export class Parser {
 				throw this.error(this.peek(), "Expected alias after 'AS'.");
 			}
 			alias = this.getIdentifierValue(this.advance());
-		} else if (this.checkIdentifierLike([]) &&
-			!this.checkNext(1, TokenType.DOT) &&
-			!this.checkNext(1, TokenType.COMMA) &&
-			!this.isJoinToken() &&
-			!this.isEndOfClause()) {
-			alias = this.getIdentifierValue(this.advance());
 		} else {
-			// Generate a default alias if none provided. Keep separate prefixes
-			// for read-only vs mutating bodies so generated aliases stay
-			// distinguishable when surfacing in diagnostics.
-			const isMutating = subquery.type === 'insert' || subquery.type === 'update' || subquery.type === 'delete';
-			alias = `${isMutating ? 'mutating_subquery' : 'subquery'}_${startToken.startOffset}`;
+			const aliasToken = this.matchBareSourceAlias();
+			if (aliasToken) {
+				alias = this.getIdentifierValue(aliasToken);
+			} else if (requireAlias) {
+				// A subquery write target's alias is mandatory and user-meaningful — never a
+				// generated default (the `where`/`set` reference it). Reject the bare form.
+				throw this.error(this.peek(), "a subquery UPDATE/DELETE write target requires an alias, e.g. (select …) as v");
+			} else {
+				// Generate a default alias if none provided. Keep separate prefixes
+				// for read-only vs mutating bodies so generated aliases stay
+				// distinguishable when surfacing in diagnostics.
+				const isMutating = subquery.type === 'insert' || subquery.type === 'update' || subquery.type === 'delete';
+				alias = `${isMutating ? 'mutating_subquery' : 'subquery'}_${startToken.startOffset}`;
+			}
 		}
 
 		// Parse optional column list after alias: AS alias(col1, col2, ...)
 		if (this.match(TokenType.LPAREN)) {
 			columns = [];
-			const contextualKeywords = ['key', 'action', 'set', 'default', 'check', 'unique', 'references', 'on', 'cascade', 'restrict', 'like'];
 
 			if (!this.check(TokenType.RPAREN)) {
 				do {
-					columns.push(this.consumeIdentifier(contextualKeywords, "Expected column name in alias column list."));
+					columns.push(this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected column name in alias column list."));
 				} while (this.match(TokenType.COMMA) && !this.check(TokenType.RPAREN));
 			}
 			this.consume(TokenType.RPAREN, "Expected ')' after alias column list.");
@@ -944,9 +1093,43 @@ export class Parser {
 		};
 	}
 
+	/**
+	 * Detect and parse a leading inline-subquery DML write target — `(<query>) as v` —
+	 * for `update`/`delete`, or `undefined` when the next tokens are not a `(` followed
+	 * by a relation-producing keyword (the SAME lookahead {@link tableSource} uses for a
+	 * FROM subquery). The alias is mandatory (`requireAlias`); the body re-uses the
+	 * shared {@link subquerySource} production, so it requires RETURNING on a DML body
+	 * (rejected as a write target downstream) and parses the `as v` / `v(a,b)` alias.
+	 */
+	private subqueryDmlTarget(withClause?: AST.WithClause): AST.SubquerySource | undefined {
+		if (!this.startsParenSubquery()) return undefined;
+		return this.subquerySource(this.peek(), withClause, /*requireAlias*/ true);
+	}
+
+	/**
+	 * True when the cursor is at `(` followed by a relation-producing keyword
+	 * (`SELECT` / `VALUES` / `WITH` / a DML keyword) — i.e. the start of a
+	 * parenthesized subquery source. Shared by the FROM-clause {@link tableSource}
+	 * and the inline-subquery DML target {@link subqueryDmlTarget} so the lookahead
+	 * set stays defined once.
+	 */
+	private startsParenSubquery(): boolean {
+		if (!this.check(TokenType.LPAREN)) return false;
+		const lookahead = this.current + 1;
+		if (lookahead >= this.tokens.length) return false;
+		const nextTokenType = this.tokens[lookahead].type;
+		return (
+			nextTokenType === TokenType.SELECT
+			|| nextTokenType === TokenType.VALUES
+			|| nextTokenType === TokenType.WITH
+			|| nextTokenType === TokenType.INSERT
+			|| nextTokenType === TokenType.UPDATE
+			|| nextTokenType === TokenType.DELETE
+		);
+	}
+
 	/** Parses a standard table source (schema.table or table) */
 	private standardTableSource(startToken: Token): AST.TableSource {
-		const contextualKeywords = ['key', 'action', 'set', 'default', 'check', 'unique', 'references', 'on', 'cascade', 'restrict', 'like'];
 
 		// Parse table name (potentially schema-qualified)
 		const table = this.tableIdentifier();
@@ -955,20 +1138,18 @@ export class Parser {
 		// Parse optional alias
 		let alias: string | undefined;
 		if (this.match(TokenType.AS)) {
-			if (!this.checkIdentifierLike(contextualKeywords)) {
+			if (!this.checkIdentifierLike(CONTEXTUAL_KEYWORDS)) {
 				throw this.error(this.peek(), "Expected alias after 'AS'.");
 			}
 			const aliasToken = this.advance();
 			alias = this.getIdentifierValue(aliasToken);
 			endToken = aliasToken;
-		} else if (this.checkIdentifierLike([]) &&
-			!this.checkNext(1, TokenType.DOT) &&
-			!this.checkNext(1, TokenType.COMMA) &&
-			!this.isJoinToken() &&
-			!this.isEndOfClause()) {
-			const aliasToken = this.advance();
-			alias = this.getIdentifierValue(aliasToken);
-			endToken = aliasToken;
+		} else {
+			const aliasToken = this.matchBareSourceAlias();
+			if (aliasToken) {
+				alias = this.getIdentifierValue(aliasToken);
+				endToken = aliasToken;
+			}
 		}
 
 		return {
@@ -981,7 +1162,6 @@ export class Parser {
 
 	/** Parses a table-valued function source: name(arg1, ...) [AS alias] */
 	private functionSource(startToken: Token): AST.FunctionSource {
-		const contextualKeywords = ['key', 'action', 'set', 'default', 'check', 'unique', 'references', 'on', 'cascade', 'restrict', 'like'];
 
 		const name = this.tableIdentifier(); // name has its own loc
 		let endToken = this.previous(); // Initialize endToken after parsing function identifier
@@ -1016,29 +1196,26 @@ export class Parser {
 		let alias: string | undefined;
 		let columns: string[] | undefined;
 		if (this.match(TokenType.AS)) {
-			if (!this.checkIdentifierLike(contextualKeywords)) {
+			if (!this.checkIdentifierLike(CONTEXTUAL_KEYWORDS)) {
 				throw this.error(this.peek(), "Expected alias after 'AS'.");
 			}
 			const aliasToken = this.advance();
 			alias = this.getIdentifierValue(aliasToken);
 			endToken = aliasToken;
-		} else if (this.checkIdentifierLike([]) &&
-			!this.checkNext(1, TokenType.DOT) &&
-			!this.checkNext(1, TokenType.COMMA) &&
-			!this.isJoinToken() &&
-			!this.isEndOfClause()) {
-			const aliasToken = this.advance();
-			alias = this.getIdentifierValue(aliasToken);
-			endToken = aliasToken;
+		} else {
+			const aliasToken = this.matchBareSourceAlias();
+			if (aliasToken) {
+				alias = this.getIdentifierValue(aliasToken);
+				endToken = aliasToken;
+			}
 		}
 
 		// Optional column list after alias: alias(col1, col2, ...)
 		if (alias && this.match(TokenType.LPAREN)) {
 			columns = [];
-			const colKeywords = ['key', 'action', 'set', 'default', 'check', 'unique', 'references', 'on', 'cascade', 'restrict', 'like'];
 			if (!this.check(TokenType.RPAREN)) {
 				do {
-					columns.push(this.consumeIdentifier(colKeywords, "Expected column name in alias column list."));
+					columns.push(this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected column name in alias column list."));
 				} while (this.match(TokenType.COMMA) && !this.check(TokenType.RPAREN));
 			}
 			endToken = this.consume(TokenType.RPAREN, "Expected ')' after alias column list.");
@@ -1097,16 +1274,23 @@ export class Parser {
 		} else if (this.match(TokenType.USING)) {
 			this.consume(TokenType.LPAREN, "Expected '(' after 'USING'.");
 			columns = [];
-			const contextualKeywords = ['key', 'action', 'set', 'default', 'check', 'unique', 'references', 'on', 'cascade', 'restrict', 'like'];
 
 			do {
-				columns.push(this.consumeIdentifier(contextualKeywords, "Expected column name."));
+				columns.push(this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected column name."));
 			} while (this.match(TokenType.COMMA));
 
 			endToken = this.consume(TokenType.RPAREN, "Expected ')' after columns.");
 		} else if (joinType !== 'cross') {
 			throw this.error(this.peek(), "Expected 'ON' or 'USING' after JOIN.");
 		}
+
+		// Optional `exists [left|right] as <name>` existence column clause(s), after a
+		// complete ON/USING predicate. One-token lookahead after `exists` (an `as` or
+		// side token, never `(`) distinguishes this from the `exists (<subquery>)`
+		// predicate; the comma form is recognised only when followed by another
+		// `exists`, so a genuine new FROM source comma is left for `tableSourceList`.
+		const existence = this.joinExistenceClauses(joinType);
+		if (existence) endToken = this.previous();
 
 		return {
 			type: 'join',
@@ -1116,8 +1300,118 @@ export class Parser {
 			condition,
 			columns,
 			isLateral: isLateral || undefined,
+			existence,
 			loc: _createLoc(joinStartToken, endToken),
 		};
+	}
+
+	/**
+	 * Parse the optional comma-separated `exists [left|right] as <name>` clauses
+	 * trailing a join. Returns `undefined` when none are present. Resolves and
+	 * validates the side against the join type (default = the unique non-preserved
+	 * side; explicit side required for `full`; `inner`/`cross` rejected — no
+	 * null-extension means the flag would be a meaningless constant `true`).
+	 */
+	private joinExistenceClauses(
+		joinType: 'inner' | 'left' | 'right' | 'full' | 'cross',
+	): ReadonlyArray<AST.JoinExistenceColumn> | undefined {
+		// `exists` here must be followed by `as` or a side token, never `(` (which
+		// would be the `exists (<subquery>)` predicate). Bail before consuming if the
+		// lookahead does not match the clause shape.
+		const atExistenceClause = (): boolean =>
+			this.check(TokenType.EXISTS) &&
+			(this.checkNext(1, TokenType.AS) || this.checkNext(1, TokenType.LEFT) || this.checkNext(1, TokenType.RIGHT));
+
+		if (!atExistenceClause()) return undefined;
+
+		const result: AST.JoinExistenceColumn[] = [];
+		do {
+			this.consume(TokenType.EXISTS, "Expected 'exists'.");
+			let explicitSide: 'left' | 'right' | undefined;
+			if (this.match(TokenType.LEFT)) explicitSide = 'left';
+			else if (this.match(TokenType.RIGHT)) explicitSide = 'right';
+			this.consume(TokenType.AS, "Expected 'as' after 'exists' join existence clause.");
+			const name = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected name after 'exists ... as'.");
+			result.push({ side: this.resolveExistenceSide(joinType, explicitSide), name });
+
+			// Continue only on `, exists ...`; a plain comma starts a new FROM source.
+		} while (this.check(TokenType.COMMA) && this.checkNext(1, TokenType.EXISTS) && this.advance());
+
+		return result;
+	}
+
+	/**
+	 * Resolve and validate the side of an `exists [<side>] as` join existence
+	 * clause. The flag must reference a null-extendable (non-preserved) side.
+	 */
+	private resolveExistenceSide(
+		joinType: 'inner' | 'left' | 'right' | 'full' | 'cross',
+		explicitSide: 'left' | 'right' | undefined,
+	): 'left' | 'right' {
+		// Non-preserved (null-extendable) sides per join type.
+		const nonPreserved: ('left' | 'right')[] =
+			joinType === 'left' ? ['right']
+			: joinType === 'right' ? ['left']
+			: joinType === 'full' ? ['left', 'right']
+			: []; // inner / cross: neither side null-extends
+
+		if (nonPreserved.length === 0) {
+			throw this.error(this.previous(),
+				`'exists ... as' is not valid on an ${joinType.toUpperCase()} join (no side is null-extended, so the flag would be a constant true)`);
+		}
+		if (explicitSide) {
+			if (!nonPreserved.includes(explicitSide)) {
+				throw this.error(this.previous(),
+					`'exists ${explicitSide} as' references the preserved side of a ${joinType.toUpperCase()} join; only the non-preserved side (${nonPreserved.join('/')}) has a meaningful match flag`);
+			}
+			return explicitSide;
+		}
+		if (nonPreserved.length > 1) {
+			throw this.error(this.previous(),
+				`'exists as' is ambiguous on a ${joinType.toUpperCase()} join — specify 'exists left as' or 'exists right as'`);
+		}
+		return nonPreserved[0];
+	}
+
+	/**
+	 * Parse the optional comma-separated `exists <branch> as <name>` membership
+	 * clauses that sit between a set-operation keyword and its right leg. Returns
+	 * `undefined` when none are present. The `branch` is mandatory (`left` = the leg
+	 * already parsed before the operator, `right` = the operand that follows) — there
+	 * is no elided form, so `exists` here is ALWAYS followed by `left`/`right`, never
+	 * `(`; that one-token lookahead distinguishes the clause from the
+	 * `exists (<subquery>)` predicate. Rejected on `diff` (symmetric difference
+	 * desugars to two `except`s, so membership is ambiguous).
+	 */
+	private setOpMembershipClauses(
+		op: 'union' | 'unionAll' | 'intersect' | 'except' | 'diff',
+	): ReadonlyArray<AST.SetOpMembershipColumn> | undefined {
+		const atMembershipClause = (): boolean =>
+			this.check(TokenType.EXISTS) &&
+			(this.checkNext(1, TokenType.LEFT) || this.checkNext(1, TokenType.RIGHT));
+
+		if (!atMembershipClause()) return undefined;
+
+		if (op === 'diff') {
+			throw this.error(this.peek(),
+				"'exists <branch> as' membership columns are not valid on DIFF — symmetric difference desugars to two EXCEPTs, so branch membership is ambiguous");
+		}
+
+		const result: AST.SetOpMembershipColumn[] = [];
+		do {
+			this.consume(TokenType.EXISTS, "Expected 'exists'.");
+			let branch: 'left' | 'right';
+			if (this.match(TokenType.LEFT)) branch = 'left';
+			else if (this.match(TokenType.RIGHT)) branch = 'right';
+			else throw this.error(this.peek(), "Expected 'left' or 'right' after 'exists' in a set-operation membership clause.");
+			this.consume(TokenType.AS, "Expected 'as' after 'exists <branch>' membership clause.");
+			const name = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected name after 'exists <branch> as'.");
+			result.push({ branch, name });
+
+			// Continue only on `, exists ...`; a plain comma starts the next leg / clause boundary.
+		} while (this.check(TokenType.COMMA) && this.checkNext(1, TokenType.EXISTS) && this.advance());
+
+		return result;
 	}
 
 	/**
@@ -1187,13 +1481,17 @@ export class Parser {
 			const right = this.notExpression();
 			return { type: 'unary', operator: 'NOT', expr: right, loc: _createLoc(operatorToken, this.previous()) };
 		}
-		return this.isNull();
+		return this.isPredicate();
 	}
 
 	/**
-	 * Parse IS NULL / IS NOT NULL expressions
+	 * Parse the postfix IS predicates, each a unary postfix operator on the
+	 * operand: `IS [NOT] NULL`, `IS [NOT] TRUE`, `IS [NOT] FALSE`. A general
+	 * `IS <expr>` (anything other than NULL/TRUE/FALSE) is unsupported — we
+	 * backtrack the consumed `IS [NOT]` so the caller surfaces the same error
+	 * as before.
 	 */
-	private isNull(): AST.Expression {
+	private isPredicate(): AST.Expression {
 		const startToken = this.peek();
 		const expr = this.equality();
 
@@ -1203,7 +1501,15 @@ export class Parser {
 				const operator = isNot ? 'IS NOT NULL' : 'IS NULL';
 				return { type: 'unary', operator, expr, loc: _createLoc(startToken, this.previous()) };
 			}
-			// IS [NOT] not followed by NULL — backtrack
+			if (this.match(TokenType.TRUE)) {
+				const operator = isNot ? 'IS NOT TRUE' : 'IS TRUE';
+				return { type: 'unary', operator, expr, loc: _createLoc(startToken, this.previous()) };
+			}
+			if (this.match(TokenType.FALSE)) {
+				const operator = isNot ? 'IS NOT FALSE' : 'IS FALSE';
+				return { type: 'unary', operator, expr, loc: _createLoc(startToken, this.previous()) };
+			}
+			// IS [NOT] not followed by NULL/TRUE/FALSE — backtrack the IS [NOT].
 			if (isNot) this.current--;
 			this.current--;
 		}
@@ -1480,7 +1786,9 @@ export class Parser {
 
 		if (this.matchKeyword('COLLATE')) {
 			const collationToken = this.consume(TokenType.IDENTIFIER, "Expected collation name after COLLATE.");
-			return { type: 'collate', expr, collation: collationToken.lexeme, loc: _createLoc(startToken, collationToken) };
+			// getIdentifierValue strips the quotes from a quoted collation name (e.g.
+			// `collate "select"`); using the raw lexeme would embed them in the value.
+			return { type: 'collate', expr, collation: this.getIdentifierValue(collationToken), loc: _createLoc(startToken, collationToken) };
 		}
 
 		return expr;
@@ -1641,8 +1949,8 @@ export class Parser {
 		}
 
 		// Function call (with optional window function support)
-		if (this.checkIdentifierLike(['key', 'action', 'set', 'default', 'check', 'unique', 'references', 'on', 'cascade', 'restrict', 'like', 'replace']) && this.checkNext(1, TokenType.LPAREN)) {
-			const name = this.consumeIdentifier(['key', 'action', 'set', 'default', 'check', 'unique', 'references', 'on', 'cascade', 'restrict', 'like', 'replace'], "Expected function name.");
+		if (this.checkIdentifierLike([...CONTEXTUAL_KEYWORDS, 'replace']) && this.checkNext(1, TokenType.LPAREN)) {
+			const name = this.consumeIdentifier([...CONTEXTUAL_KEYWORDS, 'replace'], "Expected function name.");
 
 			this.consume(TokenType.LPAREN, "Expected '(' after function name.");
 
@@ -1699,16 +2007,15 @@ export class Parser {
 		}
 
 		// Column/identifier expressions
-		const contextualKeywords = ['key', 'action', 'set', 'default', 'check', 'unique', 'references', 'on', 'cascade', 'restrict', 'like'];
-		if (this.checkIdentifierLike(contextualKeywords)) {
+		if (this.checkIdentifierLike(CONTEXTUAL_KEYWORDS)) {
 			// Schema.table.column
-			if (this.checkNext(1, TokenType.DOT) && this.checkIdentifierLikeAt(2, contextualKeywords) &&
-				this.checkNext(3, TokenType.DOT) && this.checkIdentifierLikeAt(4, contextualKeywords)) {
-				const schema = this.consumeIdentifier(contextualKeywords, "Expected schema name.");
+			if (this.checkNext(1, TokenType.DOT) && this.checkIdentifierLikeAt(2, CONTEXTUAL_KEYWORDS) &&
+				this.checkNext(3, TokenType.DOT) && this.checkIdentifierLikeAt(4, CONTEXTUAL_KEYWORDS)) {
+				const schema = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected schema name.");
 				this.advance(); // Consume DOT
-				const table = this.consumeIdentifier(contextualKeywords, "Expected table name.");
+				const table = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected table name.");
 				this.advance(); // Consume DOT
-				const name = this.consumeIdentifier(contextualKeywords, "Expected column name.");
+				const name = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected column name.");
 				const nameToken = this.previous();
 
 				return {
@@ -1720,10 +2027,10 @@ export class Parser {
 				};
 			}
 			// table.column
-			else if (this.checkNext(1, TokenType.DOT) && this.checkIdentifierLikeAt(2, contextualKeywords)) {
-				const table = this.consumeIdentifier(contextualKeywords, "Expected table name.");
+			else if (this.checkNext(1, TokenType.DOT) && this.checkIdentifierLikeAt(2, CONTEXTUAL_KEYWORDS)) {
+				const table = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected table name.");
 				this.advance(); // Consume DOT
-				const name = this.consumeIdentifier(contextualKeywords, "Expected column name.");
+				const name = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected column name.");
 				const nameToken = this.previous();
 
 				return {
@@ -1735,7 +2042,7 @@ export class Parser {
 			}
 			// just column
 			else {
-				const name = this.consumeIdentifier(contextualKeywords, "Expected column name.");
+				const name = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected column name.");
 				const nameToken = this.previous();
 
 				return {
@@ -1914,6 +2221,23 @@ export class Parser {
 		return this.tokens[this.current + n].type === type;
 	}
 
+	/**
+	 * Non-consuming lookahead for a trailing `with defaults` clause — `WITH`
+	 * followed by the contextual `DEFAULTS` keyword (an IDENTIFIER lexeme, since
+	 * DEFAULTS is not reserved). Used by the VALUES trailing-clause path to decide
+	 * whether to wrap `VALUES …` as `SELECT * FROM (VALUES …)` so the select spine's
+	 * {@link parseDefaultsClause} can consume the clause — exactly how a trailing
+	 * ORDER BY / LIMIT on VALUES already wraps. A trailing `WITH TAGS` (DDL-level)
+	 * never matches, so it stays with the outer DDL parser.
+	 */
+	private checkWithDefaults(): boolean {
+		if (!this.check(TokenType.WITH)) return false;
+		const next = this.tokens[this.current + 1];
+		return next !== undefined
+			&& next.type === TokenType.IDENTIFIER
+			&& next.lexeme.toUpperCase() === 'DEFAULTS';
+	}
+
 	private advance(): Token {
 		if (!this.isAtEnd()) this.current++;
 		const tok = this.previous();
@@ -1988,6 +2312,52 @@ export class Parser {
 	}
 
 	/**
+	 * Consumes and returns an implicit (no-`as`) alias for a FROM-clause source,
+	 * or undefined when the cursor isn't sitting on one. A trailing comma is fine —
+	 * it only ends the source list item (`from t a, u b`).
+	 */
+	private matchBareSourceAlias(): Token | undefined {
+		if (!this.checkIdentifierLike([]) ||
+			this.checkNext(1, TokenType.DOT) ||
+			this.isJoinToken() ||
+			this.isEndOfClause() ||
+			this.atAliasBarrier()) {
+			return undefined;
+		}
+		return this.advance();
+	}
+
+	/**
+	 * Runs `parse` with `words` (uppercase lexemes) barred from the bare-alias slot.
+	 * See {@link aliasBarriers}; nesting is supported and the barrier always pops.
+	 */
+	private withAliasBarrier<T>(words: ReadonlySet<string>, parse: () => T): T {
+		this.aliasBarriers.push({ words, parenDepth: this.parenStack.length });
+		try {
+			return parse();
+		} finally {
+			this.aliasBarriers.pop();
+		}
+	}
+
+	/**
+	 * True when the cursor sits on a bare identifier an active barrier reserves.
+	 * Only fires at the paren depth the barrier was pushed at: an alias inside an
+	 * open `(` — a subquery source, a scalar subquery — cannot be confused with the
+	 * start of a sibling item, so `from t2 materialized` keeps working there.
+	 */
+	private atAliasBarrier(): boolean {
+		if (this.aliasBarriers.length === 0) return false;
+		const token = this.peek();
+		// A quoted identifier carries `literal`; only bare words are ambiguous, so
+		// `"materialized"` stays usable as an alias.
+		if (token.type !== TokenType.IDENTIFIER || token.literal !== undefined) return false;
+		const upper = token.lexeme.toUpperCase();
+		const depth = this.parenStack.length;
+		return this.aliasBarriers.some(b => b.parenDepth === depth && b.words.has(upper));
+	}
+
+	/**
 	 * True when the current token starts a `QueryExpr` (SELECT, VALUES, WITH,
 	 * INSERT, UPDATE, DELETE). Used by callers that have already consumed an
 	 * `(` to decide between a subquery and a parenthesized scalar expression.
@@ -2001,6 +2371,12 @@ export class Parser {
 			|| this.check(TokenType.DELETE);
 	}
 
+	// NOTE: this is also the stop set for bare (no-`as`) aliases. Any new clause keyword
+	// that can follow a select item or table source must be added here, or it will be
+	// swallowed as an alias — unless it lexes to its own TokenType, which keeps it safe.
+	// A keyword that is only reserved *inside* an enclosing block (e.g. `materialized`
+	// between `declare schema` items) does not belong here — that is a different idea,
+	// handled by the scoped {@link atAliasBarrier} check at both bare-alias sites.
 	private isEndOfClause(): boolean {
 		const token = this.peek().type;
 		return token === TokenType.FROM ||
@@ -2017,24 +2393,36 @@ export class Parser {
 	// --- Statement Parsing Stubs ---
 
 	/** @internal */
-	private updateStatement(startToken: Token, _withClause?: AST.WithClause): AST.UpdateStmt {
-		const table = this.tableIdentifier();
+	private updateStatement(startToken: Token, withClause?: AST.WithClause): AST.UpdateStmt {
+		// Inline subquery target: `update (select …) as v set …`. When present, the
+		// alias is the target's correlation name; mirror it into a synthetic placeholder
+		// `table` (= the alias) so generic `stmt.table.name` reads stay total, and carry
+		// it on `alias`. Otherwise fall through to the ordinary named/CTE target.
+		const targetSource = this.subqueryDmlTarget(withClause);
+		const table: AST.IdentifierExpr = targetSource
+			? { type: 'identifier', name: targetSource.alias, loc: targetSource.loc }
+			: this.tableIdentifier();
 
-		// Parse mutation context assignments if present (can also appear after WHERE)
+		// Parse mutation context assignments and/or tags if present (either may also
+		// appear trailing, after WHERE, via parseTrailingWithClauses).
 		let contextValues: AST.ContextAssignment[] | undefined;
-		if (this.matchKeyword('WITH')) {
+		let tags: Record<string, SqlValue> | undefined;
+		while (this.matchKeyword('WITH')) {
 			if (this.matchKeyword('CONTEXT')) {
 				contextValues = this.parseContextAssignments();
+			} else if (this.matchKeyword('TAGS')) {
+				tags = this.parseTags();
 			} else {
-				// Not a WITH CONTEXT clause, backtrack
+				// Not a WITH CONTEXT / WITH TAGS clause, backtrack
 				this.current--;
+				break;
 			}
 		}
 
 		this.consume(TokenType.SET, "Expected 'SET' after table name in UPDATE.");
 		const assignments: { column: string; value: AST.Expression }[] = [];
 		do {
-			const column = this.consumeIdentifier(['key', 'action', 'set', 'default', 'check', 'unique', 'references', 'on', 'cascade', 'restrict', 'like'], "Expected column name in SET clause.");
+			const column = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected column name in SET clause.");
 			this.consume(TokenType.EQUAL, "Expected '=' after column name in SET clause.");
 			const value = this.expression();
 			assignments.push({ column, value });
@@ -2052,6 +2440,12 @@ export class Parser {
 			}
 			contextValues = trailingClauses.contextValues;
 		}
+		if (trailingClauses.tags) {
+			if (tags) {
+				throw this.error(this.previous(), "Duplicate WITH TAGS clause");
+			}
+			tags = trailingClauses.tags;
+		}
 		const schemaPath = trailingClauses.schemaPath;
 
 		// Parse RETURNING clause if present
@@ -2061,22 +2455,33 @@ export class Parser {
 		}
 
 		const endToken = this.previous();
-		return { type: 'update', table, assignments, where, returning, contextValues, schemaPath, loc: _createLoc(startToken, endToken) };
+		return { type: 'update', table, targetSource, alias: targetSource?.alias, assignments, where, returning, contextValues, schemaPath, tags, loc: _createLoc(startToken, endToken) };
 	}
 
 	/** @internal */
-	private deleteStatement(startToken: Token, _withClause?: AST.WithClause): AST.DeleteStmt {
+	private deleteStatement(startToken: Token, withClause?: AST.WithClause): AST.DeleteStmt {
+		// `delete` consumes an optional leading `FROM`; the inline-subquery target check
+		// runs AFTER it so `delete from (select …) as v` works (and `delete (select …) as
+		// v` too, matching the optional-FROM behavior). See updateStatement.
 		this.matchKeyword('FROM');
-		const table = this.tableIdentifier();
+		const targetSource = this.subqueryDmlTarget(withClause);
+		const table: AST.IdentifierExpr = targetSource
+			? { type: 'identifier', name: targetSource.alias, loc: targetSource.loc }
+			: this.tableIdentifier();
 
-		// Parse mutation context assignments if present (can also appear after WHERE)
+		// Parse mutation context assignments and/or tags if present (either may also
+		// appear trailing, after WHERE, via parseTrailingWithClauses).
 		let contextValues: AST.ContextAssignment[] | undefined;
-		if (this.matchKeyword('WITH')) {
+		let tags: Record<string, SqlValue> | undefined;
+		while (this.matchKeyword('WITH')) {
 			if (this.matchKeyword('CONTEXT')) {
 				contextValues = this.parseContextAssignments();
+			} else if (this.matchKeyword('TAGS')) {
+				tags = this.parseTags();
 			} else {
-				// Not a WITH CONTEXT clause, backtrack
+				// Not a WITH CONTEXT / WITH TAGS clause, backtrack
 				this.current--;
+				break;
 			}
 		}
 
@@ -2093,6 +2498,12 @@ export class Parser {
 			}
 			contextValues = trailingClauses.contextValues;
 		}
+		if (trailingClauses.tags) {
+			if (tags) {
+				throw this.error(this.previous(), "Duplicate WITH TAGS clause");
+			}
+			tags = trailingClauses.tags;
+		}
 		const schemaPath = trailingClauses.schemaPath;
 
 		// Parse RETURNING clause if present
@@ -2102,7 +2513,7 @@ export class Parser {
 		}
 
 		const endToken = this.previous();
-		return { type: 'delete', table, where, returning, contextValues, schemaPath, loc: _createLoc(startToken, endToken) };
+		return { type: 'delete', table, targetSource, alias: targetSource?.alias, where, returning, contextValues, schemaPath, tags, loc: _createLoc(startToken, endToken) };
 	}
 
 	/** @internal */
@@ -2147,129 +2558,65 @@ export class Parser {
 	 */
 	private valuesStatementWithOptionalCompound(startToken: Token, withClause?: AST.WithClause, isCompoundSubquery: boolean = false): AST.QueryExpr {
 		const values = this.valuesStatement(startToken);
-		const hasCompound = this.check(TokenType.UNION) || this.check(TokenType.INTERSECT) || this.check(TokenType.EXCEPT) || this.check(TokenType.DIFF);
-		const hasTrailing = !isCompoundSubquery && (this.check(TokenType.ORDER) || this.check(TokenType.LIMIT));
+		const hasCompound = this.checkCompoundOperator();
+		// A trailing `with defaults (…)` wraps just like ORDER BY / LIMIT so the
+		// select spine consumes it — a VALUES-bodied view's defaults are inert
+		// (the view is non-updateable), but the clause must still parse + store.
+		const hasTrailing = !isCompoundSubquery && (this.check(TokenType.ORDER) || this.check(TokenType.LIMIT) || this.checkWithDefaults());
 		if (!hasCompound && !hasTrailing) {
 			return values;
 		}
 		// Wrap as `SELECT * FROM (<values>) AS <synthetic alias>` and continue
 		// parsing as a SELECT so the trailing clauses fold in naturally.
-		const syntheticAlias = `values_${startToken.startOffset}`;
-		const wrapped: AST.SelectStmt = {
-			type: 'select',
-			columns: [{ type: 'all' }],
-			from: [{
-				type: 'subquerySource',
-				subquery: values,
-				alias: syntheticAlias,
-				loc: values.loc,
-			}],
-			loc: values.loc,
-		};
-		return this.continueSelectAfterFrom(wrapped, withClause, isCompoundSubquery);
+		const wrapped = this.wrapAsSubquerySelect(values, startToken);
+		return this.continueSelectAfterFrom(wrapped, withClause, startToken, isCompoundSubquery);
 	}
 
 	/**
-	 * Picks up an in-progress SELECT after its FROM clause is already
-	 * populated and parses any remaining trailing clauses
-	 * (compound/ORDER/LIMIT). Used by `valuesStatementWithOptionalCompound`
-	 * to graft compound chains and trailing clauses onto a synthesized
-	 * SELECT-from-VALUES wrapper. The synthesized wrapper never carries
-	 * its own WHERE / GROUP BY / HAVING — bare VALUES at top level does not
-	 * accept those clauses, so they fall through as a statement-boundary
-	 * parse error rather than being silently absorbed by the wrapper.
+	 * Picks up an in-progress SELECT after its FROM clause is already populated
+	 * and parses any remaining trailing clauses by delegating to the shared
+	 * compound-tail / ORDER-LIMIT parsers. Used by
+	 * `valuesStatementWithOptionalCompound` to graft a compound chain and
+	 * trailing clauses onto a synthesized SELECT-from-VALUES wrapper. The
+	 * synthesized wrapper never carries its own WHERE / GROUP BY / HAVING — bare
+	 * VALUES at top level does not accept those clauses, so they fall through as
+	 * a statement-boundary parse error rather than being silently absorbed.
 	 *
-	 * `isCompoundSubquery` suppresses ORDER BY / LIMIT consumption — those
-	 * belong to the outer compound when this wrapper is a right leg.
+	 * `startToken` seeds the synthetic alias of any further subquery wrapper the
+	 * tail parser mints; `isCompoundSubquery` suppresses ORDER BY / LIMIT
+	 * consumption — those belong to the outer compound when this wrapper is a
+	 * right leg.
 	 */
-	private continueSelectAfterFrom(sel: AST.SelectStmt, withClause?: AST.WithClause, isCompoundSubquery: boolean = false): AST.SelectStmt {
-		// Compound chain.
-		if (this.match(TokenType.UNION, TokenType.INTERSECT, TokenType.EXCEPT, TokenType.DIFF)) {
-			const tok = this.previous();
-			let op: 'union' | 'unionAll' | 'intersect' | 'except' | 'diff';
-			if (tok.type === TokenType.UNION) {
-				op = this.match(TokenType.ALL) ? 'unionAll' : 'union';
-			} else if (tok.type === TokenType.INTERSECT) {
-				op = 'intersect';
-			} else if (tok.type === TokenType.EXCEPT) {
-				op = 'except';
-			} else {
-				op = 'diff';
-			}
-			const usedParen = this.match(TokenType.LPAREN);
-			const legStartToken = this.peek();
-			let rightLeg: AST.QueryExpr;
-			if (this.check(TokenType.SELECT)) {
-				this.advance();
-				rightLeg = this.selectStatement(legStartToken, withClause, /*isCompoundSubquery*/ true);
-			} else if (this.check(TokenType.VALUES)) {
-				this.advance();
-				// Recurse so that further compound chains (`VALUES (1) UNION
-				// VALUES (2) UNION VALUES (3)`) wrap each VALUES leg and the
-				// chain continues. isCompoundSubquery=true suppresses
-				// trailing ORDER BY / LIMIT — those belong to the outermost
-				// compound result, not this leg.
-				rightLeg = this.valuesStatementWithOptionalCompound(legStartToken, withClause, /*isCompoundSubquery*/ true);
-			} else if (this.check(TokenType.WITH) || this.check(TokenType.INSERT) || this.check(TokenType.UPDATE) || this.check(TokenType.DELETE)) {
-				rightLeg = this.parseQueryExpr(undefined, /*requireReturning*/ true);
-			} else {
-				throw this.error(this.peek(), "Expected SELECT, VALUES, or DML statement after set operation keyword.");
-			}
-			if (usedParen) {
-				this.consume(TokenType.RPAREN, "Expected ')' after parenthesized set operation.");
-			}
-			sel.compound = { op, select: rightLeg };
+	private continueSelectAfterFrom(sel: AST.SelectStmt, withClause: AST.WithClause | undefined, startToken: Token, isCompoundSubquery: boolean = false): AST.SelectStmt {
+		// Compound chain (left-associative tail) binds before ORDER BY / LIMIT.
+		const result = this.parseCompoundTail(sel, withClause, startToken);
+		this.parseTrailingOrderLimit(result, isCompoundSubquery);
+		// Trailing `with defaults (…)` binds to the whole compound (see selectStatement).
+		if (!isCompoundSubquery) {
+			const defaults = this.parseDefaultsClause();
+			if (defaults) result.defaults = defaults;
 		}
-		if (isCompoundSubquery) {
-			return sel;
-		}
-		// ORDER BY / LIMIT apply to the final compound result.
-		if (this.match(TokenType.ORDER) && this.consume(TokenType.BY, "Expected 'BY' after 'ORDER'.")) {
-			sel.orderBy = [];
-			do {
-				const expr = this.expression();
-				const direction = this.match(TokenType.DESC) ? 'desc' : (this.match(TokenType.ASC) ? 'asc' : 'asc');
-				let nulls: 'first' | 'last' | undefined;
-				if (this.matchKeyword('NULLS')) {
-					if (this.matchKeyword('FIRST')) {
-						nulls = 'first';
-					} else if (this.matchKeyword('LAST')) {
-						nulls = 'last';
-					}
-				}
-				const ob: AST.OrderByClause = { expr, direction };
-				if (nulls) ob.nulls = nulls;
-				sel.orderBy.push(ob);
-			} while (this.match(TokenType.COMMA));
-		}
-		if (this.match(TokenType.LIMIT)) {
-			sel.limit = this.expression();
-			if (this.match(TokenType.OFFSET)) {
-				sel.offset = this.expression();
-			} else if (this.match(TokenType.COMMA)) {
-				sel.offset = sel.limit;
-				sel.limit = this.expression();
-			}
-		}
-		return sel;
+		return result;
 	}
 
 	/** @internal */
-	private createStatement(startToken: Token, withClause?: AST.WithClause): AST.CreateTableStmt | AST.CreateIndexStmt | AST.CreateViewStmt | AST.CreateAssertionStmt {
-		let isTemporary = false;
+	private createStatement(startToken: Token, withClause?: AST.WithClause): AST.CreateTableStmt | AST.CreateIndexStmt | AST.CreateViewStmt | AST.CreateMaterializedViewStmt | AST.CreateAssertionStmt {
+		// TEMP/TEMPORARY is not a Quereus concept — the schema is already transient
+		// and temp placement was never wired. Reject it rather than silently ignore.
 		if (this.peekKeyword('TEMP') || this.peekKeyword('TEMPORARY')) {
-			isTemporary = true;
-			this.advance();
+			throw this.error(this.peek(), "TEMP/TEMPORARY is not supported.");
 		}
 
 		if (this.peekKeyword('TABLE')) {
 			this.consumeKeyword('TABLE', "Expected 'TABLE' after CREATE.");
-			return this.createTableStatement(startToken, isTemporary, withClause);
+			return this.createTableStatement(startToken, withClause);
 		} else if (this.peekKeyword('VIEW')) {
 			this.consumeKeyword('VIEW', "Expected 'VIEW' after CREATE.");
-			return this.createViewStatement(startToken, isTemporary, withClause);
-		} else if (isTemporary) {
-			throw this.error(this.peek(), "Expected TABLE or VIEW after CREATE TEMP/TEMPORARY.");
+			return this.createViewStatement(startToken, withClause);
+		} else if (this.peekKeyword('MATERIALIZED')) {
+			this.consumeKeyword('MATERIALIZED', "Expected 'MATERIALIZED' after CREATE.");
+			this.consumeKeyword('VIEW', "Expected 'VIEW' after CREATE MATERIALIZED.");
+			return this.createMaterializedViewStatement(startToken, withClause);
 		} else if (this.peekKeyword('INDEX')) {
 			this.consumeKeyword('INDEX', "Expected 'INDEX' after CREATE.");
 			return this.createIndexStatement(startToken, false, withClause);
@@ -2281,14 +2628,14 @@ export class Parser {
 			this.consumeKeyword('INDEX', "Expected 'INDEX' after CREATE UNIQUE.");
 			return this.createIndexStatement(startToken, true, withClause);
 		}
-		throw this.error(this.peek(), "Expected TABLE, [UNIQUE] INDEX, VIEW, ASSERTION, or VIRTUAL after CREATE.");
+		throw this.error(this.peek(), "Expected TABLE, [UNIQUE] INDEX, VIEW, MATERIALIZED VIEW, ASSERTION, or VIRTUAL after CREATE.");
 	}
 
 	/**
 	 * Parse CREATE TABLE statement
 	 * @returns AST for CREATE TABLE
 	 */
-	private createTableStatement(startToken: Token, isTemporary: boolean, _withClause?: AST.WithClause): AST.CreateTableStmt {
+	private createTableStatement(startToken: Token, _withClause?: AST.WithClause): AST.CreateTableStmt {
 		let ifNotExists = false;
 		if (this.matchKeyword('IF')) {
 			this.consumeKeyword('NOT', "Expected 'NOT' after 'IF'.");
@@ -2315,8 +2662,7 @@ export class Parser {
 			// If we didn't see a comma and the next token looks like the start of another
 			// column or table constraint, provide a clearer error about a missing comma.
 			if (!this.check(TokenType.RPAREN)) {
-				const contextualKeywords = ['key', 'action', 'set', 'default', 'check', 'unique', 'references', 'on', 'cascade', 'restrict', 'like'];
-				const nextLooksLikeAnotherItem = this.peekKeyword('PRIMARY') || this.peekKeyword('UNIQUE') || this.peekKeyword('CHECK') || this.peekKeyword('FOREIGN') || this.peekKeyword('CONSTRAINT') || this.checkIdentifierLike(contextualKeywords);
+				const nextLooksLikeAnotherItem = this.peekKeyword('PRIMARY') || this.peekKeyword('UNIQUE') || this.peekKeyword('CHECK') || this.peekKeyword('FOREIGN') || this.peekKeyword('CONSTRAINT') || this.checkIdentifierLike(CONTEXTUAL_KEYWORDS);
 				if (nextLooksLikeAnotherItem) {
 					const next = this.peek();
 					throw this.error(next, `Expected ',' between table elements. Did you forget a comma before '${next.lexeme}'?`);
@@ -2349,7 +2695,7 @@ export class Parser {
 						if (this.check(TokenType.STRING) || this.check(TokenType.INTEGER) || this.check(TokenType.FLOAT)) {
 							// Positional argument
 							const token = this.advance();
-							moduleArgs[String(positionalIndex++)] = token.literal;
+							moduleArgs[String(positionalIndex++)] = this.tokenLiteralValue(token);
 						} else if (this.check(TokenType.IDENTIFIER)) {
 							// Could be named argument or identifier value
 							const nameValue = this.nameValueItem('module argument');
@@ -2364,6 +2710,12 @@ export class Parser {
                 this.consume(TokenType.RPAREN, "Expected ')' after module arguments.");
             }
 		}
+
+		// Optional `maintained as <body … with defaults (…)>` clause — the declared-shape
+		// maintained-table form. `maintained` is contextual (an IDENTIFIER lexeme match), and
+		// this position (after the column list / USING clause, before the WITH clauses) is
+		// unambiguous, so no look-ahead guard is needed.
+		const maintained = this.parseMaintainedClause();
 
 		// Parse trailing WITH clauses (CONTEXT, TAGS) in any order
 		let contextDefinitions: AST.MutationContextVar[] | undefined;
@@ -2392,13 +2744,56 @@ export class Parser {
 			ifNotExists,
 			columns,
 			constraints,
-			isTemporary,
 			moduleName,
 			moduleArgs,
 			contextDefinitions,
 			tags,
+			maintained,
 			loc: _createLoc(startToken, this.previous()),
 		};
+	}
+
+	/**
+	 * Parse the optional `maintained as <query-expr>` clause of a CREATE TABLE (or
+	 * a `declare schema` table item) — the declared-shape maintained-table form.
+	 * Any omitted-insert defaults ride inside the body select's trailing
+	 * `with defaults (…)` clause. Returns undefined when the clause is absent.
+	 */
+	private parseMaintainedClause(): AST.MaintainedClause | undefined {
+		if (!this.matchKeyword('MAINTAINED')) return undefined;
+		// Optional explicit output-column rename list before AS — the lossless
+		// table-form encoding of the MV-sugar `(a, b)` renames. Absent ⇒ implicit
+		// (the body follows its source shape on reopen). The required AS that
+		// follows keeps this unambiguous against a parenthesized body.
+		const columns = this.parseMaintainedColumnList();
+		this.consumeKeyword('AS', "Expected 'AS' after MAINTAINED.");
+		// Body is any QueryExpr — bare SELECT / VALUES / WITH … SELECT all qualify.
+		// DML bodies parse here but the planner rejects them. A trailing
+		// `with defaults (…)` is consumed by the select spine into `select.defaults`.
+		const select = this.parseQueryExpr(undefined, /*requireReturning*/ true);
+		return { columns, select };
+	}
+
+	/**
+	 * Parse the optional parenthesized output-column rename list that may precede the
+	 * `AS` of a maintained-table form — shared by `create table … maintained (cols) as`
+	 * and `alter table … set maintained (cols) as`. Returns undefined when absent
+	 * (the implicit form). An empty `()` is rejected: it could not round-trip
+	 * (`maintainedClauseToString` drops an empty list) and the clause's absence is
+	 * already the implicit signal, so require at least one column.
+	 */
+	private parseMaintainedColumnList(): string[] | undefined {
+		if (!this.check(TokenType.LPAREN)) return undefined;
+		this.consume(TokenType.LPAREN, "Expected '(' to start maintained column list.");
+		if (this.check(TokenType.RPAREN)) {
+			throw this.error(this.peek(), "Expected at least one column name in the maintained column list.");
+		}
+		const columns: string[] = [];
+		do {
+			columns.push(this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected column name in maintained column list."));
+		} while (this.match(TokenType.COMMA) && !this.check(TokenType.RPAREN));
+		this.consume(TokenType.RPAREN, "Expected ')' after maintained column list.");
+		return columns;
 	}
 
 	/**
@@ -2461,7 +2856,7 @@ export class Parser {
 	 * Parse CREATE VIEW statement
 	 * @returns AST for CREATE VIEW
 	 */
-	private createViewStatement(startToken: Token, isTemporary: boolean, withClause?: AST.WithClause): AST.CreateViewStmt {
+	private createViewStatement(startToken: Token, withClause?: AST.WithClause): AST.CreateViewStmt {
 		let ifNotExists = false;
 		if (this.matchKeyword('IF')) {
 			this.consumeKeyword('NOT', "Expected 'NOT' after 'IF'.");
@@ -2475,10 +2870,9 @@ export class Parser {
 		if (this.check(TokenType.LPAREN)) {
 			this.consume(TokenType.LPAREN, "Expected '(' to start view column list.");
 			columns = [];
-			const contextualKeywords = ['key', 'action', 'set', 'default', 'check', 'unique', 'references', 'on', 'cascade', 'restrict', 'like'];
 			if (!this.check(TokenType.RPAREN)) {
 				do {
-					columns.push(this.consumeIdentifier(contextualKeywords, "Expected column name in view column list."));
+					columns.push(this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected column name in view column list."));
 				} while (this.match(TokenType.COMMA) && !this.check(TokenType.RPAREN));
 			}
 			this.consume(TokenType.RPAREN, "Expected ')' after view column list.");
@@ -2490,6 +2884,9 @@ export class Parser {
 		// SELECT all qualify. DML bodies parse here but the planner rejects
 		// them (mutating views are out of scope for this milestone).
 		const select = this.parseQueryExpr(withClause, /*requireReturning*/ true);
+
+		// A trailing `with defaults (…)` rides inside the select body
+		// (`select.defaults`); only the DDL-level WITH TAGS is parsed here.
 
 		// Parse optional WITH TAGS
 		let tags: Record<string, SqlValue> | undefined;
@@ -2507,8 +2904,200 @@ export class Parser {
 			ifNotExists,
 			columns,
 			select,
-			isTemporary,
 			tags,
+			loc: _createLoc(startToken, this.previous()),
+		};
+	}
+
+	/**
+	 * Parse the optional trailing `with defaults ( col = expr , … )` clause of a
+	 * core select — per-column omitted-insert defaults for view write-through.
+	 * Modeled byte-for-byte on {@link parseInverseClause}: commits only once
+	 * DEFAULTS follows WITH, so a statement-trailing `with tags` / `with schema` /
+	 * `with context` stays with the outer parser (the rewound token is WITH, which
+	 * never touches the parenStack — so the bare cursor rewind is safe). Returns
+	 * undefined when the clause is absent. An empty assignment list is a parse error.
+	 */
+	private parseDefaultsClause(): AST.ViewInsertDefault[] | undefined {
+		if (!this.check(TokenType.WITH)) return undefined;
+		this.advance();
+		if (!this.peekKeyword('DEFAULTS')) {
+			// Not our clause — back up the WITH and stop. Bare cursor rewind is safe
+			// only because the rewound token is WITH: advance() has one non-cursor
+			// side effect (LPAREN/RPAREN parenStack maintenance), which WITH never hits.
+			this.current--;
+			return undefined;
+		}
+		this.advance();
+		this.consume(TokenType.LPAREN, "Expected '(' after WITH DEFAULTS.");
+		const defaults: AST.ViewInsertDefault[] = [];
+		const seen = new Set<string>();
+		do {
+			const columnToken = this.peek();
+			const column = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected column name in WITH DEFAULTS.");
+			if (seen.has(column.toLowerCase())) {
+				throw this.error(columnToken, `Duplicate column '${column}' in WITH DEFAULTS.`);
+			}
+			seen.add(column.toLowerCase());
+			this.consume(TokenType.EQUAL, `Expected '=' after WITH DEFAULTS column '${column}'.`);
+			const expr = this.expression();
+			defaults.push({ column, expr });
+		} while (this.match(TokenType.COMMA));
+		this.consume(TokenType.RPAREN, "Expected ')' after WITH DEFAULTS list.");
+		return defaults;
+	}
+
+	/**
+	 * Parse the optional `with inverse ( col = expr , … )` clause trailing an
+	 * expression result column — authored write-back expressions for view
+	 * write-through (inert metadata until the write path consumes it; validation
+	 * is build-time). Returns undefined when the clause is absent. `inverse` is
+	 * contextual: commits only once INVERSE follows WITH, so a statement-trailing
+	 * `with schema` / `with context` / `with tags` after the column list stays
+	 * with the outer parser. An empty assignment list is a parse error.
+	 */
+	private parseInverseClause(): AST.ResultColumnInverse[] | undefined {
+		if (!this.check(TokenType.WITH)) return undefined;
+		this.advance();
+		if (!this.peekKeyword('INVERSE')) {
+			// Not our clause — back up the WITH and stop. Bare cursor rewind is safe
+			// only because the rewound token is WITH: advance() has one non-cursor
+			// side effect (LPAREN/RPAREN parenStack maintenance), which WITH never hits.
+			this.current--;
+			return undefined;
+		}
+		this.advance();
+		this.consume(TokenType.LPAREN, "Expected '(' after WITH INVERSE.");
+		const assignments: AST.ResultColumnInverse[] = [];
+		const seen = new Set<string>();
+		do {
+			const columnToken = this.peek();
+			const column = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected column name in WITH INVERSE.");
+			if (seen.has(column.toLowerCase())) {
+				throw this.error(columnToken, `Duplicate column '${column}' in WITH INVERSE.`);
+			}
+			seen.add(column.toLowerCase());
+			this.consume(TokenType.EQUAL, `Expected '=' after WITH INVERSE column '${column}'.`);
+			const expr = this.expression();
+			assignments.push({ column, expr });
+		} while (this.match(TokenType.COMMA));
+		this.consume(TokenType.RPAREN, "Expected ')' after WITH INVERSE list.");
+		return assignments;
+	}
+
+	/**
+	 * A `*` / `t.*` result column cannot carry WITH INVERSE (it names no single
+	 * expression to invert). Name the clause in the diagnostic rather than letting
+	 * the leftover WITH garble into a downstream CTE/clause error. A trailing
+	 * `with schema` / `with tags` is untouched — parseInverseClause commits only
+	 * on WITH followed by INVERSE.
+	 */
+	private rejectInverseClauseOnStar(): void {
+		const withToken = this.peek();
+		if (this.parseInverseClause()) {
+			throw this.error(withToken, "WITH INVERSE cannot apply to a '*' result column.");
+		}
+	}
+
+	/**
+	 * Parse CREATE MATERIALIZED VIEW statement.
+	 *
+	 * Syntax: `create materialized view <name> [(cols)] [using <module>(args)] as <query-expr> [with tags ...]`.
+	 * The optional `using` clause is parsed before `as` to stay unambiguous with the query body;
+	 * v1 restricts the backing module to `memory` at build time (the AST keeps the slot forward-compatible).
+	 */
+	private createMaterializedViewStatement(startToken: Token, withClause?: AST.WithClause): AST.CreateMaterializedViewStmt {
+		let ifNotExists = false;
+		if (this.matchKeyword('IF')) {
+			this.consumeKeyword('NOT', "Expected 'NOT' after 'IF'.");
+			this.consumeKeyword('EXISTS', "Expected 'EXISTS' after 'IF NOT'.");
+			ifNotExists = true;
+		}
+
+		const view = this.tableIdentifier();
+
+		let columns: string[] | undefined;
+		if (this.check(TokenType.LPAREN)) {
+			this.consume(TokenType.LPAREN, "Expected '(' to start view column list.");
+			columns = [];
+			if (!this.check(TokenType.RPAREN)) {
+				do {
+					columns.push(this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected column name in view column list."));
+				} while (this.match(TokenType.COMMA) && !this.check(TokenType.RPAREN));
+			}
+			this.consume(TokenType.RPAREN, "Expected ')' after view column list.");
+		}
+
+		// Optional backing-module clause (`using mem(...)`) before the body.
+		let moduleName: string | undefined;
+		const moduleArgs: Record<string, SqlValue> = {};
+		if (this.matchKeyword('USING')) {
+			moduleName = this.consumeIdentifier("Expected module name after 'USING'.");
+			if (this.match(TokenType.LPAREN)) {
+				let positionalIndex = 0;
+				if (!this.check(TokenType.RPAREN)) {
+					do {
+						if (this.check(TokenType.STRING) || this.check(TokenType.INTEGER) || this.check(TokenType.FLOAT)) {
+							const token = this.advance();
+							moduleArgs[String(positionalIndex++)] = this.tokenLiteralValue(token);
+						} else if (this.check(TokenType.IDENTIFIER)) {
+							const nameValue = this.nameValueItem('module argument');
+							moduleArgs[nameValue.name] = nameValue.value && nameValue.value.type === 'literal'
+								? getSyncLiteral(nameValue.value)
+								: (nameValue.value && nameValue.value.type === 'identifier' ? nameValue.value.name : nameValue.name);
+						} else {
+							throw this.error(this.peek(), "Expected module argument (string, number, or name=value pair).");
+						}
+					} while (this.match(TokenType.COMMA));
+				}
+				this.consume(TokenType.RPAREN, "Expected ')' after module arguments.");
+			}
+		}
+
+		this.consumeKeyword('AS', "Expected 'AS' before view body in CREATE MATERIALIZED VIEW.");
+
+		// Body is any QueryExpr — bare SELECT / VALUES / WITH … SELECT all qualify.
+		// DML bodies parse here but the planner rejects them.
+		const select = this.parseQueryExpr(withClause, /*requireReturning*/ true);
+
+		// A trailing `with defaults (…)` rides inside the select body
+		// (`select.defaults`); only the DDL-level WITH TAGS is parsed here.
+
+		// Parse the trailing `with tags (...)` metadata clause.
+		let tags: Record<string, SqlValue> | undefined;
+		while (this.matchKeyword('WITH')) {
+			if (this.matchKeyword('TAGS')) {
+				tags = this.parseTags();
+			} else {
+				this.current--; // Not a clause we own — back up the WITH and stop.
+				break;
+			}
+		}
+
+		return {
+			type: 'createMaterializedView',
+			view,
+			ifNotExists,
+			columns,
+			select,
+			moduleName,
+			moduleArgs: moduleName && Object.keys(moduleArgs).length > 0 ? moduleArgs : undefined,
+			tags,
+			loc: _createLoc(startToken, this.previous()),
+		};
+	}
+
+	/**
+	 * Parse REFRESH MATERIALIZED VIEW statement.
+	 * Syntax: `refresh materialized view <name>`.
+	 */
+	private refreshStatement(startToken: Token, _withClause?: AST.WithClause): AST.RefreshMaterializedViewStmt {
+		this.consumeKeyword('MATERIALIZED', "Expected 'MATERIALIZED' after REFRESH.");
+		this.consumeKeyword('VIEW', "Expected 'VIEW' after REFRESH MATERIALIZED.");
+		const name = this.tableIdentifier();
+		return {
+			type: 'refreshMaterializedView',
+			name,
 			loc: _createLoc(startToken, this.previous()),
 		};
 	}
@@ -2518,7 +3107,7 @@ export class Parser {
 	 * @returns AST for CREATE ASSERTION
 	 */
 	private createAssertionStatement(startToken: Token, _withClause?: AST.WithClause): AST.CreateAssertionStmt {
-		const name = this.consumeIdentifier("Expected assertion name.");
+		const name = this.tableIdentifier();
 
 		this.consumeKeyword('CHECK', "Expected 'CHECK' after assertion name.");
 		this.consume(TokenType.LPAREN, "Expected '(' after CHECK.");
@@ -2540,11 +3129,15 @@ export class Parser {
 	 * @returns AST for DROP statement
 	 */
 	private dropStatement(startToken: Token, _withClause?: AST.WithClause): AST.DropStmt {
-		let objectType: 'table' | 'view' | 'index' | 'trigger' | 'assertion';
+		let objectType: 'table' | 'view' | 'materializedView' | 'index' | 'trigger' | 'assertion';
 
 		if (this.peekKeyword('TABLE')) {
 			this.consumeKeyword('TABLE', "Expected TABLE after DROP.");
 			objectType = 'table';
+		} else if (this.peekKeyword('MATERIALIZED')) {
+			this.consumeKeyword('MATERIALIZED', "Expected MATERIALIZED after DROP.");
+			this.consumeKeyword('VIEW', "Expected VIEW after DROP MATERIALIZED.");
+			objectType = 'materializedView';
 		} else if (this.peekKeyword('VIEW')) {
 			this.consumeKeyword('VIEW', "Expected VIEW after DROP.");
 			objectType = 'view';
@@ -2555,7 +3148,7 @@ export class Parser {
 			this.consumeKeyword('ASSERTION', "Expected ASSERTION after DROP.");
 			objectType = 'assertion';
 		} else {
-			throw this.error(this.peek(), "Expected TABLE, VIEW, INDEX, or ASSERTION after DROP.");
+			throw this.error(this.peek(), "Expected TABLE, VIEW, MATERIALIZED VIEW, INDEX, or ASSERTION after DROP.");
 		}
 
 		let ifExists = false;
@@ -2576,6 +3169,79 @@ export class Parser {
 	}
 
 	/**
+	 * Top-level ALTER dispatch. `ALTER` has already been consumed. Branches on the
+	 * object keyword: TABLE → the full ALTER TABLE grammar; VIEW / MATERIALIZED VIEW
+	 * / INDEX → the v1 `SET TAGS`-only metadata grammar. MATERIALIZED is checked
+	 * before VIEW so `MATERIALIZED VIEW` is not mis-parsed as a plain view.
+	 */
+	private alterStatement(startToken: Token, withClause?: AST.WithClause): AST.AstNode {
+		if (this.peekKeyword('TABLE')) {
+			return this.alterTableStatement(startToken, withClause);
+		}
+		if (this.peekKeyword('MATERIALIZED')) {
+			return this.alterMaterializedViewStatement(startToken);
+		}
+		if (this.peekKeyword('VIEW')) {
+			return this.alterViewStatement(startToken);
+		}
+		if (this.peekKeyword('INDEX')) {
+			return this.alterIndexStatement(startToken);
+		}
+		throw this.error(this.peek(), "Expected 'TABLE', 'VIEW', 'MATERIALIZED VIEW', or 'INDEX' after ALTER.");
+	}
+
+	/**
+	 * Parse the trailing `{SET|ADD|DROP} TAGS (...)` of an ALTER VIEW /
+	 * MATERIALIZED VIEW / INDEX statement (object name already consumed):
+	 *   SET TAGS  → whole-set replace (empty list clears),
+	 *   ADD TAGS  → per-key merge (empty list is a no-op),
+	 *   DROP TAGS → per-key delete (atomic; empty list is a no-op).
+	 * No `(` look-ahead guard is needed (unlike the ALTER TABLE table level):
+	 * after `ALTER VIEW <name>` the only legal grammar is a tag op, so the
+	 * leading keyword is unambiguous.
+	 */
+	private parseObjectTagsAction(): AST.AlterObjectTagsAction {
+		if (this.matchKeyword('SET')) {
+			this.consumeKeyword('TAGS', "Expected 'TAGS' after SET.");
+			return { type: 'setTags', mode: 'replace', tags: this.parseTags() };
+		}
+		if (this.matchKeyword('ADD')) {
+			this.consumeKeyword('TAGS', "Expected 'TAGS' after ADD.");
+			return { type: 'setTags', mode: 'merge', tags: this.parseTags() };
+		}
+		if (this.matchKeyword('DROP')) {
+			this.consumeKeyword('TAGS', "Expected 'TAGS' after DROP.");
+			return { type: 'dropTags', keys: this.parseTagKeys() };
+		}
+		throw this.error(this.peek(), "Expected SET, ADD, or DROP TAGS after object name.");
+	}
+
+	/** Parse `ALTER VIEW <name> {SET|ADD|DROP} TAGS (...)`. */
+	private alterViewStatement(startToken: Token): AST.AlterViewStmt {
+		this.consumeKeyword('VIEW', "Expected 'VIEW' after ALTER.");
+		const name = this.tableIdentifier();
+		const action = this.parseObjectTagsAction();
+		return { type: 'alterView', name, action, loc: _createLoc(startToken, this.previous()) };
+	}
+
+	/** Parse `ALTER MATERIALIZED VIEW <name> {SET|ADD|DROP} TAGS (...)`. */
+	private alterMaterializedViewStatement(startToken: Token): AST.AlterMaterializedViewStmt {
+		this.consumeKeyword('MATERIALIZED', "Expected 'MATERIALIZED' after ALTER.");
+		this.consumeKeyword('VIEW', "Expected 'VIEW' after MATERIALIZED.");
+		const name = this.tableIdentifier();
+		const action = this.parseObjectTagsAction();
+		return { type: 'alterMaterializedView', name, action, loc: _createLoc(startToken, this.previous()) };
+	}
+
+	/** Parse `ALTER INDEX <name> {SET|ADD|DROP} TAGS (...)`. */
+	private alterIndexStatement(startToken: Token): AST.AlterIndexStmt {
+		this.consumeKeyword('INDEX', "Expected 'INDEX' after ALTER.");
+		const name = this.tableIdentifier();
+		const action = this.parseObjectTagsAction();
+		return { type: 'alterIndex', name, action, loc: _createLoc(startToken, this.previous()) };
+	}
+
+	/**
 	 * Parse ALTER TABLE statement
 	 * @returns AST for ALTER TABLE statement
 	 */
@@ -2589,19 +3255,40 @@ export class Parser {
 		if (this.peekKeyword('RENAME')) {
 			this.consumeKeyword('RENAME', "Expected RENAME.");
 			if (this.matchKeyword('COLUMN')) {
-				const oldName = this.consumeIdentifier(['key', 'action', 'set', 'default', 'check', 'unique', 'references', 'on', 'cascade', 'restrict', 'like'], "Expected old column name after RENAME COLUMN.");
+				const oldName = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected old column name after RENAME COLUMN.");
 				this.consumeKeyword('TO', "Expected 'TO' after old column name.");
-				const newName = this.consumeIdentifier(['key', 'action', 'set', 'default', 'check', 'unique', 'references', 'on', 'cascade', 'restrict', 'like'], "Expected new column name after TO.");
+				const newName = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected new column name after TO.");
 				action = { type: 'renameColumn', oldName, newName };
+			} else if (this.matchKeyword('CONSTRAINT')) {
+				// RENAME CONSTRAINT <old> TO <new> — name-level rename of a named
+				// table-level constraint (CHECK / UNIQUE / FOREIGN KEY).
+				const oldName = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected old constraint name after RENAME CONSTRAINT.");
+				this.consumeKeyword('TO', "Expected 'TO' after old constraint name.");
+				const newName = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected new constraint name after TO.");
+				action = { type: 'renameConstraint', oldName, newName };
 			} else {
 				this.consumeKeyword('TO', "Expected 'TO' after RENAME.");
-				const newName = this.consumeIdentifier(['key', 'action', 'set', 'default', 'check', 'unique', 'references', 'on', 'cascade', 'restrict', 'like'], "Expected new table name after RENAME TO.");
+				const newName = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected new table name after RENAME TO.");
 				action = { type: 'renameTable', newName };
 			}
 		} else if (this.peekKeyword('ADD')) {
 			this.consumeKeyword('ADD', "Expected ADD.");
-			if (this.peekKeyword('CONSTRAINT')) {
-				// ADD CONSTRAINT ... - let tableConstraint parse everything including CONSTRAINT keyword
+			if (this.peekKeyword('TAGS') && this.checkNext(1, TokenType.LPAREN)) {
+				// ADD TAGS (...) — per-key merge of table tags. Gated on TAGS being
+				// immediately followed by '(' so a column literally named `tags`
+				// (e.g. `ADD tags integer` / `ADD COLUMN tags ...`) still parses as
+				// ADD COLUMN. `TAGS` is a contextual keyword (a plain identifier), so
+				// without the '(' guard it would shadow such columns.
+				this.consumeKeyword('TAGS', "Expected 'TAGS'.");
+				const tags = this.parseTags();
+				action = { type: 'setTags', target: { kind: 'table' }, mode: 'merge', tags };
+			} else if (this.peekKeyword('CONSTRAINT')
+				|| this.check(TokenType.UNIQUE)
+				|| this.check(TokenType.FOREIGN)
+				|| this.check(TokenType.CHECK)) {
+				// ADD CONSTRAINT <name> <body>, or the unnamed table-constraint forms
+				// ADD UNIQUE (...) / ADD FOREIGN KEY (...) / ADD CHECK (...).
+				// tableConstraint() consumes the optional CONSTRAINT <name> prefix.
 				const constraint = this.tableConstraint();
 				action = { type: 'addConstraint', constraint };
 			} else {
@@ -2612,22 +3299,79 @@ export class Parser {
 			}
 		} else if (this.peekKeyword('DROP')) {
 			this.consumeKeyword('DROP', "Expected DROP.");
-			this.matchKeyword('COLUMN');
-			const name = this.consumeIdentifier(['key', 'action', 'set', 'default', 'check', 'unique', 'references', 'on', 'cascade', 'restrict', 'like'], "Expected column name after DROP COLUMN.");
-			action = { type: 'dropColumn', name };
+			if (this.peekKeyword('TAGS') && this.checkNext(1, TokenType.LPAREN)) {
+				// DROP TAGS (...) — per-key delete of table tags. Same '(' guard as
+				// ADD TAGS so `DROP COLUMN tags` / `DROP tags` (a column named `tags`)
+				// still parse as DROP COLUMN.
+				this.consumeKeyword('TAGS', "Expected 'TAGS'.");
+				action = { type: 'dropTags', target: { kind: 'table' }, keys: this.parseTagKeys() };
+			} else if (this.peekKeyword('MAINTAINED')) {
+				// DROP MAINTAINED — detach the table's derivation. The verb wins over a
+				// column literally named `maintained`; use DROP COLUMN maintained for that.
+				this.consumeKeyword('MAINTAINED', "Expected 'MAINTAINED'.");
+				action = { type: 'dropMaintained' };
+			} else if (this.matchKeyword('CONSTRAINT')) {
+				// DROP CONSTRAINT <name> — drop a named table-level constraint
+				// (CHECK / UNIQUE / FOREIGN KEY).
+				const name = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected constraint name after DROP CONSTRAINT.");
+				action = { type: 'dropConstraint', name };
+			} else {
+				this.matchKeyword('COLUMN');
+				const name = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected column name after DROP COLUMN.");
+				action = { type: 'dropColumn', name };
+			}
+		} else if (this.peekKeyword('SET')) {
+			this.consumeKeyword('SET', "Expected SET.");
+			if (this.matchKeyword('MAINTAINED')) {
+				// SET MAINTAINED [(cols)] AS <body> — attach / re-attach a derivation.
+				// No `using` clause: the module is the table's identity. The optional
+				// `(cols)` is the explicit output-column rename list (the differ's
+				// lossless encoding of an MV-sugar `(a, c)` rename): present ⇒ positional
+				// rename + recorded explicit; absent ⇒ implicit (the body's natural
+				// names). The required AS keeps it unambiguous. A trailing
+				// `with defaults (…)` rides inside the body (`select.defaults`).
+				const columns = this.parseMaintainedColumnList();
+				this.consumeKeyword('AS', "Expected 'AS' after SET MAINTAINED.");
+				const select = this.parseQueryExpr(undefined, /*requireReturning*/ true);
+				action = { type: 'setMaintained', columns, select };
+			} else {
+				// Table-level `SET TAGS (...)` — whole-set tag replacement on the table.
+				this.consumeKeyword('TAGS', "Expected 'TAGS' or 'MAINTAINED' after SET.");
+				const tags = this.parseTags();
+				action = { type: 'setTags', target: { kind: 'table' }, mode: 'replace', tags };
+			}
 		} else if (this.peekKeyword('ALTER')) {
 			this.consumeKeyword('ALTER', "Expected ALTER.");
 			if (this.peekKeyword('COLUMN')) {
 				this.consumeKeyword('COLUMN', "Expected COLUMN.");
 				action = this.alterColumnAction();
+			} else if (this.peekKeyword('CONSTRAINT')) {
+				// ALTER CONSTRAINT <name> {SET|ADD|DROP} TAGS (...) — tag mutation on a
+				// named table-level constraint (only named constraints are addressable):
+				//   SET TAGS  → whole-set replace, ADD TAGS → per-key merge,
+				//   DROP TAGS → per-key delete.
+				this.consumeKeyword('CONSTRAINT', "Expected CONSTRAINT.");
+				const constraintName = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected constraint name after ALTER CONSTRAINT.");
+				if (this.matchKeyword('SET')) {
+					this.consumeKeyword('TAGS', "Expected 'TAGS' after SET.");
+					action = { type: 'setTags', target: { kind: 'constraint', constraintName }, mode: 'replace', tags: this.parseTags() };
+				} else if (this.matchKeyword('ADD')) {
+					this.consumeKeyword('TAGS', "Expected 'TAGS' after ADD.");
+					action = { type: 'setTags', target: { kind: 'constraint', constraintName }, mode: 'merge', tags: this.parseTags() };
+				} else if (this.matchKeyword('DROP')) {
+					this.consumeKeyword('TAGS', "Expected 'TAGS' after DROP.");
+					action = { type: 'dropTags', target: { kind: 'constraint', constraintName }, keys: this.parseTagKeys() };
+				} else {
+					throw this.error(this.peek(), `Expected SET, ADD, or DROP after ALTER CONSTRAINT ${constraintName}.`);
+				}
 			} else {
-				this.consumeKeyword('PRIMARY', "Expected 'PRIMARY' or 'COLUMN' after ALTER.");
+				this.consumeKeyword('PRIMARY', "Expected 'PRIMARY', 'COLUMN', or 'CONSTRAINT' after ALTER.");
 				this.consumeKeyword('KEY', "Expected 'KEY' after PRIMARY.");
 				this.consume(TokenType.LPAREN, "Expected '(' after PRIMARY KEY.");
 				const columns: Array<{ name: string; direction?: 'asc' | 'desc' }> = [];
 				if (!this.check(TokenType.RPAREN)) {
 					do {
-						const colName = this.consumeIdentifier(['key', 'action', 'set', 'default', 'check', 'unique', 'references', 'on', 'cascade', 'restrict', 'like'], "Expected column name in PRIMARY KEY definition.");
+						const colName = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected column name in PRIMARY KEY definition.");
 						let direction: 'asc' | 'desc' | undefined;
 						if (this.matchKeyword('ASC')) {
 							direction = 'asc';
@@ -2659,7 +3403,7 @@ export class Parser {
 	 */
 	private alterColumnAction(): AST.AlterTableAction {
 		const columnName = this.consumeIdentifier(
-			['key', 'action', 'set', 'default', 'check', 'unique', 'references', 'on', 'cascade', 'restrict', 'like'],
+			CONTEXTUAL_KEYWORDS,
 			"Expected column name after ALTER COLUMN.",
 		);
 
@@ -2677,7 +3421,30 @@ export class Parser {
 				const expr = this.expression();
 				return { type: 'alterColumn', columnName, setDefault: expr };
 			}
-			throw this.error(this.peek(), "Expected NOT NULL, DATA TYPE, or DEFAULT after SET.");
+			if (this.match(TokenType.COLLATE)) {
+				// ALTER COLUMN <name> SET COLLATE <name> — change the column's collation,
+				// re-sorting / re-validating any PK / UNIQUE / index that orders by it.
+				if (!this.check(TokenType.IDENTIFIER)) {
+					throw this.error(this.peek(), "Expected collation name after SET COLLATE.");
+				}
+				const collation = this.getIdentifierValue(this.advance());
+				return { type: 'alterColumn', columnName, setCollation: collation };
+			}
+			if (this.matchKeyword('TAGS')) {
+				// ALTER COLUMN <name> SET TAGS (...) — whole-set tag replacement on the column.
+				const tags = this.parseTags();
+				return { type: 'setTags', target: { kind: 'column', columnName }, mode: 'replace', tags };
+			}
+			throw this.error(this.peek(), "Expected NOT NULL, DATA TYPE, DEFAULT, COLLATE, or TAGS after SET.");
+		}
+
+		if (this.matchKeyword('ADD')) {
+			// ALTER COLUMN <name> ADD TAGS (...) — per-key merge on the column. TAGS is
+			// unambiguous here (the grammar after ALTER COLUMN <name> ADD is fixed), so
+			// no '(' look-ahead guard is needed as it is at the table level.
+			this.consumeKeyword('TAGS', "Expected 'TAGS' after ADD.");
+			const tags = this.parseTags();
+			return { type: 'setTags', target: { kind: 'column', columnName }, mode: 'merge', tags };
 		}
 
 		if (this.matchKeyword('DROP')) {
@@ -2688,10 +3455,14 @@ export class Parser {
 			if (this.matchKeyword('DEFAULT')) {
 				return { type: 'alterColumn', columnName, setDefault: null };
 			}
-			throw this.error(this.peek(), "Expected NOT NULL or DEFAULT after DROP.");
+			if (this.matchKeyword('TAGS')) {
+				// ALTER COLUMN <name> DROP TAGS (...) — per-key delete on the column.
+				return { type: 'dropTags', target: { kind: 'column', columnName }, keys: this.parseTagKeys() };
+			}
+			throw this.error(this.peek(), "Expected NOT NULL, DEFAULT, or TAGS after DROP.");
 		}
 
-		throw this.error(this.peek(), "Expected SET or DROP after ALTER COLUMN name.");
+		throw this.error(this.peek(), "Expected SET, ADD, or DROP after ALTER COLUMN name.");
 	}
 
 	/**
@@ -2811,6 +3582,8 @@ export class Parser {
 	// === Declarative schema parsing ===
 
 	private declareSchemaStatement(startToken: Token): AST.DeclareSchemaStmt {
+		// Optional contextual keyword: `declare logical schema X { ... }`.
+		const isLogical = this.matchKeyword('LOGICAL');
 		this.consumeKeyword('SCHEMA', "Expected 'SCHEMA' after DECLARE.");
 		const schemaName = this.consumeIdentifier(['temp', 'temporary'], "Expected schema name after DECLARE.");
 		let version: string | undefined;
@@ -2855,47 +3628,159 @@ export class Parser {
 
 		while (!this.check(TokenType.RBRACE)) {
 			if (this.isAtEnd()) break;
-			// table ...
-			if (this.peekKeyword('TABLE')) {
-				this.advance();
-				items.push(this.declareTableItem());
-			} else if (this.peekKeyword('INDEX')) {
-				this.advance();
-				items.push(this.declareIndexItem(false));
-			} else if (this.peekKeyword('UNIQUE')) {
-				this.advance();
-				this.consumeKeyword('INDEX', "Expected 'INDEX' after 'UNIQUE'.");
-				items.push(this.declareIndexItem(true));
-			} else if (this.peekKeyword('VIEW')) {
-				this.advance();
-				items.push(this.declareViewItem());
-			} else if (this.peekKeyword('SEED')) {
-				this.advance();
-				items.push(this.declareSeedItem());
-			} else if (this.peekKeyword('ASSERTION')) {
-				this.advance();
-				items.push(this.declareAssertionItem());
-			} else {
-				// Fallback: ignore unrecognized item (domain, collation, import)
-				const start = this.peek();
-				// consume until semicolon
-				while (!this.isAtEnd() && !this.check(TokenType.SEMICOLON) && !(this.check(TokenType.IDENTIFIER) && this.peek().lexeme === '}')) {
-					this.advance();
-				}
-				const endTok = this.previous();
-				items.push({ type: 'declareIgnored', kind: 'domain', text: this.sourceSlice(start.startOffset, endTok.endOffset) } as unknown as AST.DeclareIgnoredItem);
-			}
+			// A stray separator is not an item — otherwise it lands as an empty ignored one.
+			if (this.match(TokenType.SEMICOLON)) continue;
+			// Items need no separator, so a sibling item's leading keyword sits exactly
+			// where the previous body's bare alias would go. Bar those keywords from the
+			// alias slot for the duration of the item.
+			items.push(this.withAliasBarrier(DECLARE_ITEM_KEYWORDS, () => this.declareBlockItem()));
 			this.match(TokenType.SEMICOLON);
 		}
 
 		this.consume(TokenType.RBRACE, "Expected '}' to close schema declaration block.");
 
 		const endTok = this.previous();
-		return { type: 'declareSchema', schemaName, version, using, items, loc: _createLoc(startToken, endTok) };
+		return { type: 'declareSchema', schemaName, version, using, items, ...(isLogical ? { isLogical: true } : {}), loc: _createLoc(startToken, endTok) };
+	}
+
+	/** Parses one item of a `declare schema { … }` block, dispatched on its leading keyword. */
+	private declareBlockItem(): AST.DeclareItem {
+		if (this.peekKeyword('TABLE')) {
+			this.advance();
+			return this.declareTableItem();
+		}
+		if (this.peekKeyword('INDEX')) {
+			this.advance();
+			return this.declareIndexItem(false);
+		}
+		if (this.peekKeyword('UNIQUE')) {
+			this.advance();
+			this.consumeKeyword('INDEX', "Expected 'INDEX' after 'UNIQUE'.");
+			return this.declareIndexItem(true);
+		}
+		if (this.peekKeyword('MATERIALIZED')) {
+			this.advance();
+			this.consumeKeyword('VIEW', "Expected 'VIEW' after 'MATERIALIZED'.");
+			return this.declareMaterializedViewItem();
+		}
+		if (this.peekKeyword('VIEW')) {
+			this.advance();
+			return this.declareViewItem();
+		}
+		if (this.peekKeyword('SEED')) {
+			this.advance();
+			return this.declareSeedItem();
+		}
+		if (this.peekKeyword('ASSERTION')) {
+			this.advance();
+			return this.declareAssertionItem();
+		}
+		return this.declareIgnoredItem();
+	}
+
+	/**
+	 * Fallback for an item kind the parser doesn't model yet (domain, collation, import):
+	 * skip its tokens and keep a placeholder so the surrounding block still parses.
+	 *
+	 * NOTE: an unrecognized item is retained only as opaque text — a typo'd item keyword
+	 * is therefore accepted and silently ignored rather than diagnosed. Diagnosing it
+	 * needs a real grammar for these kinds, not a tighter skip.
+	 */
+	private declareIgnoredItem(): AST.DeclareIgnoredItem {
+		const start = this.peek();
+		this.skipToDeclareItemBoundary();
+		const endTok = this.previous();
+		return { type: 'declareIgnored', kind: 'domain', text: this.sourceSlice(start.startOffset, endTok.endOffset) };
+	}
+
+	/**
+	 * Advances past the current declaration-block item, stopping at nesting depth 0 on
+	 * a `;`, the block's closing `}`, or the leading keyword of the next item. Brace and
+	 * paren depth is tracked so a braced column list or a parenthesized payload inside
+	 * the item doesn't end the scan early.
+	 *
+	 * NOTE: stopping on an item keyword is a heuristic — these kinds have no grammar
+	 * here, so the word `table` inside an unmodeled item would cut the skip short.
+	 * Separating the items with `;` is exact; if domain/collation/import ever gain real
+	 * bodies, give them a grammar rather than widening this scan.
+	 */
+	private skipToDeclareItemBoundary(): void {
+		// The item's own leading word may itself be an item keyword (`domain`, …), so
+		// always consume one token before testing for the next item's start.
+		this.advance();
+		let depth = 0;
+		while (!this.isAtEnd()) {
+			const type = this.peek().type;
+			if (depth === 0) {
+				if (type === TokenType.SEMICOLON || type === TokenType.RBRACE) return;
+				if (this.atDeclareItemStart()) return;
+			}
+			if (type === TokenType.LBRACE || type === TokenType.LPAREN) {
+				depth++;
+			} else if (type === TokenType.RBRACE || type === TokenType.RPAREN) {
+				depth--;
+			}
+			this.advance();
+		}
+	}
+
+	/** True when the cursor sits on a keyword that can begin a declaration-block item. */
+	private atDeclareItemStart(): boolean {
+		for (const keyword of DECLARE_ITEM_KEYWORDS) {
+			if (this.peekKeyword(keyword)) return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Parses `declare lens for <X> over <Y> { ( view <T> as <select> ;? )* }`.
+	 * The DECLARE token is already consumed by {@link statement}. `lens` and `for`
+	 * are contextual keywords (matched via peekKeyword's IDENTIFIER fallback);
+	 * `over` is the existing window-function keyword.
+	 */
+	private declareLensStatement(startToken: Token): AST.DeclareLensStmt {
+		this.consumeKeyword('LENS', "Expected 'LENS' after DECLARE.");
+		this.consumeKeyword('FOR', "Expected 'FOR' after DECLARE LENS.");
+		const logicalSchema = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected logical schema name after 'FOR'.");
+		this.consumeKeyword('OVER', "Expected 'OVER' after the logical schema name.");
+		const basisSchema = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected basis schema name after 'OVER'.");
+
+		this.consume(TokenType.LBRACE, "Expected '{' to start the lens declaration block.");
+		const overrides: AST.LensOverride[] = [];
+		while (!this.check(TokenType.RBRACE)) {
+			if (this.isAtEnd()) break;
+			this.consumeKeyword('VIEW', "Expected 'view' to begin a lens override.");
+			const table = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected the logical table name after 'view'.");
+			this.consumeKeyword('AS', "Expected 'AS' after the logical table name.");
+			// Overrides need no separator either; bar `view` from the body's alias slot
+			// (harmless today — `view` is reserved — but the shape is the same hazard).
+			const body = this.withAliasBarrier(LENS_OVERRIDE_KEYWORDS, () => this.parseQueryExpr());
+			if (body.type !== 'select') {
+				throw this.error(this.previous(), `A lens override body must be a SELECT; got '${body.type}'.`);
+			}
+			// A compound set-operation parses as a single `select` node carrying a
+			// `compound` (or legacy `union`) pointer; the override merger composes
+			// only the top leg, so reject the shape rather than silently mis-map.
+			if (body.compound || body.union) {
+				throw this.error(this.previous(), `A lens override body must be a single SELECT; compound set-operations (union/intersect/except) are not supported in v1 lens overrides.`);
+			}
+
+			overrides.push({ table, select: body });
+			this.match(TokenType.SEMICOLON);
+		}
+		this.consume(TokenType.RBRACE, "Expected '}' to close the lens declaration block.");
+
+		return {
+			type: 'declareLens',
+			logicalSchema,
+			basisSchema,
+			overrides,
+			loc: _createLoc(startToken, this.previous()),
+		};
 	}
 
 	private declareTableItem(): AST.DeclaredTable {
-		const tableName = this.consumeIdentifier(['key', 'action', 'set', 'default', 'check', 'unique', 'references', 'on', 'cascade', 'restrict', 'like'], 'Expected table name in declaration.');
+		const tableName = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, 'Expected table name in declaration.');
 		let moduleName: string | undefined;
 		let moduleArgs: Record<string, SqlValue> | undefined;
 		const columns: AST.ColumnDef[] = [];
@@ -2915,7 +3800,7 @@ export class Parser {
 						if (this.check(TokenType.STRING) || this.check(TokenType.INTEGER) || this.check(TokenType.FLOAT)) {
 							// Positional argument
 							const token = this.advance();
-							moduleArgs[String(positionalIndex++)] = token.literal;
+							moduleArgs[String(positionalIndex++)] = this.tokenLiteralValue(token);
 						} else if (this.check(TokenType.IDENTIFIER)) {
 							// Could be named argument or identifier value
 							const nv = this.nameValueItem('module argument');
@@ -2954,6 +3839,11 @@ export class Parser {
 			this.consume(TokenType.RPAREN, "Expected ')' after table definition.");
 		}
 
+		// Optional `maintained as <body … with defaults (…)>` — the declared-shape
+		// maintained-table form, carried through the CreateTableStmt reuse. (Differ
+		// transition handling is a follow-up; the clause parses and round-trips.)
+		const maintained = this.parseMaintainedClause();
+
 		// Parse trailing WITH clauses (CONTEXT, TAGS) in any order
 		let contextDefinitions: AST.MutationContextVar[] | undefined;
 		let tags: Record<string, SqlValue> | undefined;
@@ -2981,11 +3871,11 @@ export class Parser {
 			ifNotExists: false,
 			columns,
 			constraints,
-			isTemporary: false,
 			moduleName,
 			moduleArgs,
 			contextDefinitions,
-			tags
+			tags,
+			maintained
 		};
 
 		return { type: 'declaredTable', tableStmt };
@@ -2998,6 +3888,12 @@ export class Parser {
 		this.consume(TokenType.LPAREN, "Expected '(' before index columns.");
 		const columns = this.indexedColumnList();
 		this.consume(TokenType.RPAREN, "Expected ')' after index columns.");
+
+		// Parse optional WHERE <predicate> (partial index), before WITH TAGS
+		let where: AST.Expression | undefined;
+		if (this.matchKeyword('WHERE')) {
+			where = this.expression();
+		}
 
 		// Parse optional WITH TAGS
 		let tags: Record<string, SqlValue> | undefined;
@@ -3015,6 +3911,7 @@ export class Parser {
 			table: { type: 'identifier', name: tableName },
 			ifNotExists: false,
 			columns,
+			where,
 			isUnique,
 			tags
 		};
@@ -3032,6 +3929,9 @@ export class Parser {
 		this.consumeKeyword('AS', "Expected AS before view body in view declaration.");
 		const select = this.parseQueryExpr(undefined, /*requireReturning*/ true);
 
+		// A trailing `with defaults (…)` rides inside the select body
+		// (`select.defaults`); only the DDL-level WITH TAGS is parsed here.
+
 		// Parse optional WITH TAGS
 		let tags: Record<string, SqlValue> | undefined;
 		if (this.matchKeyword('WITH')) {
@@ -3048,11 +3948,75 @@ export class Parser {
 			ifNotExists: false,
 			columns,
 			select,
-			isTemporary: false,
 			tags
 		};
 
 		return { type: 'declaredView', viewStmt };
+	}
+
+	private declareMaterializedViewItem(): AST.DeclaredMaterializedView {
+		const viewName = this.consumeIdentifier('Expected materialized view name.');
+		let columns: string[] | undefined;
+		if (this.match(TokenType.LPAREN)) {
+			columns = this.identifierList();
+			this.consume(TokenType.RPAREN, "Expected ')' after materialized view columns.");
+		}
+
+		// Optional backing-module clause (`using mem(...)`) before the body — same
+		// shape as the top-level CREATE MATERIALIZED VIEW form.
+		let moduleName: string | undefined;
+		const moduleArgs: Record<string, SqlValue> = {};
+		if (this.matchKeyword('USING')) {
+			moduleName = this.consumeIdentifier("Expected module name after 'USING'.");
+			if (this.match(TokenType.LPAREN)) {
+				let positionalIndex = 0;
+				if (!this.check(TokenType.RPAREN)) {
+					do {
+						if (this.check(TokenType.STRING) || this.check(TokenType.INTEGER) || this.check(TokenType.FLOAT)) {
+							const token = this.advance();
+							moduleArgs[String(positionalIndex++)] = this.tokenLiteralValue(token);
+						} else if (this.check(TokenType.IDENTIFIER)) {
+							const nameValue = this.nameValueItem('module argument');
+							moduleArgs[nameValue.name] = nameValue.value && nameValue.value.type === 'literal'
+								? getSyncLiteral(nameValue.value)
+								: (nameValue.value && nameValue.value.type === 'identifier' ? nameValue.value.name : nameValue.name);
+						} else {
+							throw this.error(this.peek(), "Expected module argument (string, number, or name=value pair).");
+						}
+					} while (this.match(TokenType.COMMA));
+				}
+				this.consume(TokenType.RPAREN, "Expected ')' after module arguments.");
+			}
+		}
+
+		this.consumeKeyword('AS', "Expected AS before view body in materialized view declaration.");
+		const select = this.parseQueryExpr(undefined, /*requireReturning*/ true);
+
+		// A trailing `with defaults (…)` rides inside the select body
+		// (`select.defaults`); only the DDL-level WITH TAGS is parsed here.
+
+		// Parse optional WITH TAGS
+		let tags: Record<string, SqlValue> | undefined;
+		if (this.matchKeyword('WITH')) {
+			if (this.matchKeyword('TAGS')) {
+				tags = this.parseTags();
+			} else {
+				this.current--;
+			}
+		}
+
+		const viewStmt: AST.CreateMaterializedViewStmt = {
+			type: 'createMaterializedView',
+			view: { type: 'identifier', name: viewName },
+			ifNotExists: false,
+			columns,
+			select,
+			moduleName,
+			moduleArgs: moduleName && Object.keys(moduleArgs).length > 0 ? moduleArgs : undefined,
+			tags
+		};
+
+		return { type: 'declaredMaterializedView', viewStmt };
 	}
 
 	private declareSeedItem(): AST.DeclaredSeed {
@@ -3211,13 +4175,13 @@ export class Parser {
 				} else if (token.type === TokenType.FALSE) {
 					literal_value = 0;
 				} else {
-					literal_value = token.literal;
+					literal_value = this.tokenLiteralValue(token);
 				}
 				value = { type: 'literal', value: literal_value };
 			} else if (this.match(TokenType.MINUS)) {
 				if (this.check(TokenType.INTEGER) || this.check(TokenType.FLOAT)) {
 					const token = this.advance();
-					value = { type: 'literal', value: -token.literal };
+					value = { type: 'literal', value: -(token.literal as number) };
 				} else {
 					throw this.error(this.peek(), "Expected number after '-'.");
 				}
@@ -3273,10 +4237,20 @@ export class Parser {
 		return token.literal !== undefined ? String(token.literal) : token.lexeme;
 	}
 
+	/**
+	 * @internal The literal payload of a value token (STRING / INTEGER / FLOAT / BLOB)
+	 * as a {@link SqlValue}. Those token types always carry a literal, so this only
+	 * coalesces the type-level `undefined` (never reached at runtime for value tokens)
+	 * to `null`. Use at sites that have already matched a value token type.
+	 */
+	private tokenLiteralValue(token: Token): SqlValue {
+		return token.literal ?? null;
+	}
+
 	/** @internal Helper to consume an IDENTIFIER token and return its lexeme */
 	private consumeIdentifier(errorMessage: string): string;
-	private consumeIdentifier(availableKeywords: string[], errorMessage: string): string;
-	private consumeIdentifier(errorMessageOrKeywords: string | string[], errorMessage?: string): string {
+	private consumeIdentifier(availableKeywords: readonly string[], errorMessage: string): string;
+	private consumeIdentifier(errorMessageOrKeywords: string | readonly string[], errorMessage?: string): string {
 		if (typeof errorMessageOrKeywords === 'string') {
 			// Single parameter version - no contextual keywords
 			return this.consumeIdentifierOrContextualKeyword([], errorMessageOrKeywords);
@@ -3292,7 +4266,7 @@ export class Parser {
 	 * @param errorMessage Error message if no valid token is found
 	 * @returns The identifier value (unquoted for quoted identifiers)
 	 */
-	private consumeIdentifierOrContextualKeyword(availableKeywords: string[], errorMessage: string): string {
+	private consumeIdentifierOrContextualKeyword(availableKeywords: readonly string[], errorMessage: string): string {
 		const token = this.peek();
 
 		// First check for regular identifier
@@ -3317,7 +4291,7 @@ export class Parser {
 	/**
 	 * @internal Helper to check if current token is an identifier or available contextual keyword
 	 */
-	private checkIdentifierLike(availableKeywords: string[] = []): boolean {
+	private checkIdentifierLike(availableKeywords: readonly string[] = []): boolean {
 		if (this.check(TokenType.IDENTIFIER)) {
 			return true;
 		}
@@ -3328,7 +4302,7 @@ export class Parser {
 	/**
 	 * @internal Helper to check if token at offset is an identifier or available contextual keyword
 	 */
-	private checkIdentifierLikeAt(offset: number, availableKeywords: string[] = []): boolean {
+	private checkIdentifierLikeAt(offset: number, availableKeywords: readonly string[] = []): boolean {
 		if (this.checkNext(offset, TokenType.IDENTIFIER)) {
 			return true;
 		}
@@ -3351,7 +4325,7 @@ export class Parser {
 	/**
 	 * @internal Helper to check if any of the specified contextual keywords are available at current position
 	 */
-	private isContextualKeywordAvailable(availableKeywords: string[]): boolean {
+	private isContextualKeywordAvailable(availableKeywords: readonly string[]): boolean {
 		const token = this.peek();
 
 		for (const keyword of availableKeywords) {
@@ -3370,7 +4344,7 @@ export class Parser {
 
 	/** @internal Parses a column definition */
 	private columnDefinition(): AST.ColumnDef {
-		const name = this.consumeIdentifier(['key', 'action', 'set', 'default', 'check', 'unique', 'references', 'on', 'cascade', 'restrict', 'like'], "Expected column name.");
+		const name = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected column name.");
 
 		let dataType: string | undefined;
 		if (this.check(TokenType.IDENTIFIER)) {
@@ -3542,6 +4516,25 @@ export class Parser {
 
 		this.consume(TokenType.RPAREN, "Expected ')' after tag list.");
 		return tags;
+	}
+
+	/**
+	 * @internal Parses a bare comma-list of tag keys — `(key [, key ...])` with no
+	 * `= value`, used by the DROP TAGS form. Mirrors {@link parseTags} but yields
+	 * just the keys. An empty list `()` yields `[]`.
+	 */
+	private parseTagKeys(): string[] {
+		this.consume(TokenType.LPAREN, "Expected '(' after TAGS.");
+		const keys: string[] = [];
+
+		if (!this.check(TokenType.RPAREN)) {
+			do {
+				keys.push(this.consumeIdentifier("Expected tag key identifier."));
+			} while (this.match(TokenType.COMMA));
+		}
+
+		this.consume(TokenType.RPAREN, "Expected ')' after tag key list.");
+		return keys;
 	}
 
 	/** @internal Parses a tag value: string, number, TRUE, FALSE, or NULL */
@@ -3770,7 +4763,18 @@ export class Parser {
 		if (this.check(TokenType.REFERENCES)) {
 			this.advance();
 		}
-		const table = this.consumeIdentifier("Expected foreign table name.");
+		// Optional `schema.` qualifier on the parent table (cross-schema FK),
+		// mirroring tableIdentifier() so a schema named `temp` parses.
+		const contextualKeywords = [...CONTEXTUAL_KEYWORDS, 'temp', 'temporary'];
+		let schema: string | undefined;
+		let table: string;
+		if (this.checkIdentifierLike(contextualKeywords) && this.checkNext(1, TokenType.DOT)) {
+			schema = this.consumeIdentifier(contextualKeywords, "Expected schema name.");
+			this.advance(); // Consume DOT
+			table = this.consumeIdentifier(contextualKeywords, "Expected foreign table name after schema.");
+		} else {
+			table = this.consumeIdentifier(contextualKeywords, "Expected foreign table name.");
+		}
 		let columns: string[] | undefined;
 		if (this.match(TokenType.LPAREN)) {
 			columns = this.identifierList();
@@ -3819,7 +4823,7 @@ export class Parser {
 			}
 		}
 
-		return { table, columns, onDelete, onUpdate, deferrable, initiallyDeferred };
+		return { table, schema, columns, onDelete, onUpdate, deferrable, initiallyDeferred };
 	}
 
 	/** @internal Parses the ON CONFLICT clause */
@@ -3857,7 +4861,7 @@ export class Parser {
 	private identifierList(): string[] {
 		const identifiers: string[] = [];
 		do {
-			identifiers.push(this.consumeIdentifier(['key', 'action', 'set', 'default', 'check', 'unique', 'references', 'on', 'cascade', 'restrict', 'like'], "Expected identifier in list."));
+			identifiers.push(this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected identifier in list."));
 		} while (this.match(TokenType.COMMA));
 		return identifiers;
 	}
@@ -3866,7 +4870,7 @@ export class Parser {
 	private identifierListWithDirection(): { name: string; direction?: 'asc' | 'desc' }[] {
 		const identifiers: { name: string; direction?: 'asc' | 'desc' }[] = [];
 		do {
-			const name = this.consumeIdentifier(['key', 'action', 'set', 'default', 'check', 'unique', 'references', 'on', 'cascade', 'restrict', 'like'], "Expected identifier in list.");
+			const name = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected identifier in list.");
 			const direction = this.match(TokenType.ASC) ? 'asc' : this.match(TokenType.DESC) ? 'desc' : undefined;
 			identifiers.push({ name, direction });
 		} while (this.match(TokenType.COMMA));
@@ -3986,7 +4990,9 @@ export class Parser {
 		return typeKeywords.includes(lexeme.toUpperCase());
 	}
 
-	private statementSupportsWithClause(statement: AST.AstNode): boolean {
+	private statementSupportsWithClause(
+		statement: AST.AstNode
+	): statement is AST.SelectStmt | AST.InsertStmt | AST.UpdateStmt | AST.DeleteStmt {
 		return statement.type === 'select' ||
 			statement.type === 'insert' ||
 			statement.type === 'update' ||

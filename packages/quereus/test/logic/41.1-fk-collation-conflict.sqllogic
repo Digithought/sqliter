@@ -1,0 +1,277 @@
+-- 41.1 FOREIGN KEY collation-conflict detection at declaration time.
+-- Ticket fk-collation-conflict-create-time-validation.
+--
+-- A FOREIGN KEY whose child column and parent key column declare same-rank
+-- conflicting collations — the exact conflict the synthesized
+-- `parent.k = NEW.ref` enforcement comparison raises at plan time — is rejected
+-- at DECLARATION time (CREATE TABLE / ALTER ADD CONSTRAINT / ALTER ADD COLUMN)
+-- through the SAME comparison-collation lattice, instead of being deferred to
+-- the first DML against the child. The check is UNCONDITIONAL: a contradictory
+-- declaration is malformed whether or not `pragma foreign_keys` is on.
+--
+-- Runs under both memory and store. The store cases pin the reconcile edge: an
+-- implicit-default text PK reconciles to the store's NOCASE without marking the
+-- column explicit (rank 1), so it must NOT falsely conflict with a defaulted or
+-- declared child column.
+
+-- =============================================================================
+-- 1. CREATE TABLE conflict is UNCONDITIONAL: declared NOCASE child vs declared
+--    RTRIM parent PK is rejected at CREATE even with foreign_keys OFF.
+-- =============================================================================
+
+pragma foreign_keys = false;
+
+create table p_rt (k text collate rtrim primary key);
+create table c_nc (id integer primary key, ref text collate nocase references p_rt(k));
+-- error: conflicting collations
+-- c_nc was never created; only the parent exists.
+drop table p_rt;
+
+-- =============================================================================
+-- 2. Declared BINARY (rank 2) vs declared NOCASE (rank 2) → conflict. A declared
+--    `collate binary` is a real preference, not the absence of one.
+-- =============================================================================
+
+create table p_bin (k text collate binary primary key);
+create table c_db (id integer primary key, ref text collate nocase references p_bin(k));
+-- error: conflicting collations
+drop table p_bin;
+
+-- =============================================================================
+-- 3. Matching declared collations resolve — no conflict; the FK is live.
+-- =============================================================================
+
+pragma foreign_keys = true;
+
+create table p_nc (k text collate nocase primary key);
+create table c_nc2 (id integer primary key, ref text collate nocase references p_nc(k));
+insert into p_nc values ('ABC');
+-- case-variant child satisfied under the shared NOCASE collation.
+insert into c_nc2 values (1, 'abc');
+select count(*) as cnt from c_nc2;
+→ [{"cnt":1}]
+-- a value with no case-folded parent is still rejected (FK enforced).
+insert into c_nc2 values (2, 'nope');
+-- error:
+drop table c_nc2;
+drop table p_nc;
+
+-- =============================================================================
+-- 4. One-sided declaration → no conflict. A declared NOCASE child vs an
+--    implicit-default parent PK: the parent contributes the engine floor
+--    (rank 1 — BINARY on memory, reconciled NOCASE on store), so the declared
+--    NOCASE wins and resolves. Both backends create cleanly.
+-- =============================================================================
+
+create table os_parent (k text primary key);
+create table os_child (id integer primary key, ref text collate nocase references os_parent(k));
+insert into os_parent values ('ABC');
+insert into os_child values (1, 'abc');
+select count(*) as cnt from os_child;
+→ [{"cnt":1}]
+drop table os_child;
+drop table os_parent;
+
+-- =============================================================================
+-- 5. Store reconcile edge: an implicit-default text PK (reconciled to NOCASE,
+--    rank 1, on store) must NOT falsely conflict with a DEFAULTED child column.
+--    On memory both sides are rank-1 BINARY; on store the parent is rank-1
+--    NOCASE and the child rank-1 BINARY — neither is a same-rank declared
+--    conflict, so CREATE succeeds on both.
+-- =============================================================================
+
+create table ri_parent (k text primary key);
+create table ri_child (id integer primary key, ref text references ri_parent(k));
+insert into ri_parent values ('x');
+insert into ri_child values (1, 'x');
+select count(*) as cnt from ri_child;
+→ [{"cnt":1}]
+drop table ri_child;
+drop table ri_parent;
+
+-- =============================================================================
+-- 6. Self-referencing FK: a child column referencing a PK column on the SAME
+--    table with a divergent declared collation is rejected at CREATE (the
+--    validator resolves the parent against the table being declared, before it
+--    is registered in the catalog).
+-- =============================================================================
+
+create table self_fk (
+    code text collate nocase primary key,
+    parent_code text collate rtrim references self_fk(code)
+);
+-- error: conflicting collations
+
+-- =============================================================================
+-- 7. Multi-column FK: a conflict on ANY one pair rejects, even when the other
+--    pairs agree.
+-- =============================================================================
+
+create table mp_parent (
+    a text collate nocase,
+    b text collate nocase,
+    primary key (a, b)
+);
+create table mp_child (
+    id integer primary key,
+    fa text collate nocase,
+    fb text collate rtrim,
+    foreign key (fa, fb) references mp_parent(a, b)
+);
+-- error: conflicting collations
+drop table mp_parent;
+
+-- =============================================================================
+-- 8. ALTER TABLE ADD CONSTRAINT: a conflicting FK added after the fact is
+--    rejected at ALTER time. The collation check now runs as a PRE-validation,
+--    BEFORE module.alterTable, so it is the single, authoritative rejection
+--    point — before any module persistence side effect (on the store backend
+--    alterTable's addConstraint arm saveTableDDL's the FK before returning, so a
+--    post-call throw would leave the rejected FK on disk; see the store-reopen
+--    spec fk-collation-conflict-reopen.spec.ts). The `foreign_keys` pragma is no
+--    longer load-bearing for THIS rejection — it fires whether enforcement is on
+--    or off — but we keep OFF here so the assertion isolates the pure
+--    declaration-time check from the module's enforcement-time existing-row scan.
+-- =============================================================================
+
+pragma foreign_keys = false;
+
+create table acp (k text collate rtrim primary key);
+create table acc (id integer primary key, ref text collate nocase);
+alter table acc add constraint fk_acc foreign key (ref) references acp(k);
+-- error: conflicting collations
+drop table acc;
+drop table acp;
+
+-- =============================================================================
+-- 8.1. ALTER TABLE ADD CONSTRAINT, matching collations: a text FK whose child
+--      and parent declare the SAME collation is NOT falsely rejected — the
+--      validator only fires on a same-rank conflict. Proves the ALTER-time
+--      check leaves valid declarations alone (regression guard for the
+--      reference-based new-FK selection) and the added FK is live/enforced.
+-- =============================================================================
+
+pragma foreign_keys = true;
+
+create table acp_ok (k text collate nocase primary key);
+create table acc_ok (id integer primary key, ref text collate nocase);
+alter table acc_ok add constraint fk_ok foreign key (ref) references acp_ok(k);
+insert into acp_ok values ('ABC');
+-- case-variant child satisfied under the shared NOCASE collation (FK enforced).
+insert into acc_ok values (1, 'abc');
+select count(*) as cnt from acc_ok;
+→ [{"cnt":1}]
+-- a value with no case-folded parent is still rejected.
+insert into acc_ok values (2, 'nope');
+-- error:
+drop table acc_ok;
+drop table acp_ok;
+
+-- =============================================================================
+-- 8.2. ALTER TABLE ADD CONSTRAINT with foreign_keys ON: the conflict is caught
+--      by the declaration-time PRE-validation (which runs BEFORE the module's
+--      existing-row scan), so it surfaces as `conflicting collations` regardless
+--      of the pragma state — NOT the enforcement-seam `ambiguous collation`
+--      error the FK-ON existing-row query plan would otherwise raise. Locks the
+--      cross-pragma message consistency the prevalidation reorder introduced
+--      (§ 8 already pins the FK-OFF message). Empty child, so the existing-row
+--      scan finds no orphan — the collation pre-check is the rejecting mechanism.
+-- =============================================================================
+
+pragma foreign_keys = true;
+
+create table acp_on (k text collate rtrim primary key);
+create table acc_on (id integer primary key, ref text collate nocase);
+alter table acc_on add constraint fk_on foreign key (ref) references acp_on(k);
+-- error: conflicting collations
+drop table acc_on;
+drop table acp_on;
+
+-- =============================================================================
+-- 8.3. Self-referencing ADD CONSTRAINT FK: a conflict against the SAME table's
+--      PK column is rejected at ALTER time (the validator resolves the parent
+--      against the already-registered table). Mirrors § 6 on the ADD CONSTRAINT
+--      path, where the table — unlike at CREATE — is already in the catalog.
+-- =============================================================================
+
+create table self_ac (
+    code text collate nocase primary key,
+    parent_code text collate rtrim
+);
+alter table self_ac add constraint fk_self foreign key (parent_code) references self_ac(code);
+-- error: conflicting collations
+drop table self_ac;
+
+-- =============================================================================
+-- 8.4. Multi-column ADD CONSTRAINT FK: a conflict on ANY one pair rejects, even
+--      when the other pairs agree. Mirrors § 7 on the ADD CONSTRAINT path.
+-- =============================================================================
+
+create table mpa_parent (
+    a text collate nocase,
+    b text collate nocase,
+    primary key (a, b)
+);
+create table mpa_child (
+    id integer primary key,
+    fa text collate nocase,
+    fb text collate rtrim
+);
+alter table mpa_child add constraint fk_multi foreign key (fa, fb) references mpa_parent(a, b);
+-- error: conflicting collations
+drop table mpa_child;
+drop table mpa_parent;
+
+pragma foreign_keys = false;
+
+-- =============================================================================
+-- 9. ALTER TABLE ADD COLUMN (column-level FK): a conflicting FK on the added
+--    column is rejected, and the column is NOT added — the validate-before-swap
+--    revert drops it, leaving the table untouched.
+-- =============================================================================
+
+create table alp (k text collate rtrim primary key);
+create table alc (id integer primary key);
+alter table alc add column ref text collate nocase references alp(k);
+-- error: conflicting collations
+-- The table is unchanged: only `id` remains (the rejected column was reverted).
+insert into alc (id) values (1);
+select * from alc;
+→ [{"id":1}]
+drop table alc;
+drop table alp;
+
+-- =============================================================================
+-- 9.1. ALTER TABLE ADD COLUMN, matching collations: a column-level FK whose
+--      added column matches the parent collation is NOT rejected — the column
+--      IS added (the validate-before-swap region only reverts on a conflict).
+-- =============================================================================
+
+create table alp_ok (k text collate nocase primary key);
+create table alc_ok (id integer primary key);
+alter table alc_ok add column ref text collate nocase null references alp_ok(k);
+-- The column was added: both `id` and `ref` are present.
+insert into alc_ok (id, ref) values (1, null);
+select * from alc_ok;
+→ [{"id":1,"ref":null}]
+drop table alc_ok;
+drop table alp_ok;
+
+-- =============================================================================
+-- 10. Forward-declared parent residual: when the parent does not yet exist at
+--     child-declare time, the validator cannot see the parent column types, so
+--     the CREATE succeeds and the conflict remains caught at the first DML
+--     (unchanged enforcement path). This is the one unavoidable residual.
+-- =============================================================================
+
+pragma foreign_keys = true;
+
+create table fwd_child (id integer primary key, ref text collate nocase references fwd_parent(k));
+create table fwd_parent (k text collate rtrim primary key);
+insert into fwd_parent values ('a');
+insert into fwd_child values (1, 'a');
+-- error: ambiguous collation
+drop table fwd_child;
+drop table fwd_parent;
+
+pragma foreign_keys = false;

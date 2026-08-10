@@ -2,7 +2,7 @@
  * Types for the WebSocket sync client.
  */
 
-import type { ApplyResult, ChangeSet, SyncManager, SyncEventEmitter } from '@quereus/sync';
+import type { ApplyResult, ChangeSet, SnapshotProgress, SyncManager, SyncEventEmitter } from '@quereus/sync';
 
 // ============================================================================
 // Connection Status
@@ -14,6 +14,13 @@ import type { ApplyResult, ChangeSet, SyncManager, SyncEventEmitter } from '@que
 export type SyncStatus =
   | { status: 'disconnected' }
   | { status: 'connecting' }
+  /**
+   * A snapshot bootstrap is streaming into the local store. The local database
+   * is PARTIAL until this ends — do not write to it (a concurrent local write
+   * is silently overwritten by the snapshot and never pushed).
+   */
+  | { status: 'bootstrapping'; tablesProcessed: number; totalTables: number;
+      entriesProcessed: number; totalEntries: number; currentTable?: string }
   | { status: 'syncing'; progress: number }
   | { status: 'synced'; lastSyncTime: number }
   | { status: 'error'; message: string };
@@ -115,135 +122,35 @@ export interface SyncClientOptions {
    * @default false
    */
   readOnly?: boolean;
+
+  /**
+   * Automatically request a full snapshot on the first connect to an EMPTY
+   * replica — one that has never synced with this server and holds no local
+   * change facts of its own. Disable to keep bootstrap purely explicit via
+   * {@link SyncClient.requestSnapshot}.
+   * @default true
+   */
+  bootstrapOnEmpty?: boolean;
+
+  /**
+   * Stall watchdog for a snapshot transfer: if no `snapshot_chunk` arrives
+   * within this window, the transfer is aborted and the socket closed so the
+   * normal reconnect path can resume from the saved checkpoint.
+   * @default 60000
+   */
+  snapshotChunkTimeoutMs?: number;
+
+  /**
+   * Fine-grained snapshot transfer progress (fires once per applied chunk).
+   * The coarser table-boundary progress also rides `onSyncEvent` and the
+   * `bootstrapping` status.
+   */
+  onSnapshotProgress?: (progress: SnapshotProgress) => void;
 }
 
-// ============================================================================
-// WebSocket Protocol Messages
-// ============================================================================
-
-/** Client → Server: Handshake */
-export interface HandshakeMessage {
-  type: 'handshake';
-  databaseId: string;   // Database ID for multi-tenant routing
-  siteId: string;       // Base64-encoded site ID
-  token?: string;       // Optional auth token
-}
-
-/** Client → Server: Request changes */
-export interface GetChangesMessage {
-  type: 'get_changes';
-  sinceHLC?: string;    // Base64-encoded HLC
-}
-
-/** Client → Server: Apply local changes */
-export interface ApplyChangesMessage {
-  type: 'apply_changes';
-  changes: SerializedChangeSet[];
-}
-
-/** Client → Server: Request snapshot */
-export interface GetSnapshotMessage {
-  type: 'get_snapshot';
-}
-
-/** Client → Server: Heartbeat */
-export interface PingMessage {
-  type: 'ping';
-}
-
-export type ClientMessage =
-  | HandshakeMessage
-  | GetChangesMessage
-  | ApplyChangesMessage
-  | GetSnapshotMessage
-  | PingMessage;
-
-/** Server → Client: Handshake acknowledgment */
-export interface HandshakeAckMessage {
-  type: 'handshake_ack';
-  serverSiteId: string;
-  connectionId?: string;
-}
-
-/** Server → Client: Changes response */
-export interface ChangesMessage {
-  type: 'changes';
-  changeSets: SerializedChangeSet[];
-}
-
-/** Server → Client: Pushed changes from another peer */
-export interface PushChangesMessage {
-  type: 'push_changes';
-  changeSets: SerializedChangeSet[];
-}
-
-/** Server → Client: Apply result */
-export interface ApplyResultMessage {
-  type: 'apply_result';
-  applied: number;
-  skipped: number;
-  conflicts: number;
-  transactions: number;
-  rejected?: Array<{
-    reason: string;
-    code?: string;
-    table?: string;
-    column?: string;
-  }>;
-}
-
-/** Server → Client: Error */
-export interface ErrorMessage {
-  type: 'error';
-  code: string;
-  message: string;
-}
-
-/** Server → Client: Heartbeat response */
-export interface PongMessage {
-  type: 'pong';
-}
-
-export type ServerMessage =
-  | HandshakeAckMessage
-  | ChangesMessage
-  | PushChangesMessage
-  | ApplyResultMessage
-  | ErrorMessage
-  | PongMessage;
-
-// ============================================================================
-// Serialized Types for JSON Transport
-// ============================================================================
-
-/**
- * A ChangeSet serialized for JSON transport.
- * SiteIds are base64url-encoded, HLCs are base64-encoded.
- */
-export interface SerializedChangeSet {
-  siteId: string;
-  transactionId: string;
-  hlc: string;
-  changes: SerializedChange[];
-  schemaMigrations: SerializedSchemaMigration[];
-}
-
-export interface SerializedChange {
-  type: 'column' | 'delete';
-  schema: string;
-  table: string;
-  pk: unknown[];
-  column?: string;
-  value?: unknown;
-  hlc: string;
-}
-
-export interface SerializedSchemaMigration {
-  type: string;
-  schema: string;
-  table: string;
-  ddl: string;
-  hlc: string;
-  schemaVersion: number;
-}
+// The WebSocket message unions (ClientMessage / ServerMessage and their
+// per-message interfaces) and the Serialized* JSON-transport types formerly
+// declared here now live in @quereus/sync (`sync/wire.ts`) — the single wire
+// definition shared with the coordinator. Import them from '@quereus/sync';
+// index.ts re-exports them so the client's public API is unchanged.
 

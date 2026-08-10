@@ -361,6 +361,86 @@ describe('ParallelDriver', () => {
 			expect(returns[2]).to.equal(true);
 		});
 
+		it('drains an in-flight next() before considering a source closed (hand-rolled AsyncIterator)', async () => {
+			// A hand-rolled AsyncIterator — deliberately NOT a native generator, so it
+			// makes none of the guarantees native generators do (it does not queue a
+			// return() behind an in-flight next()). Its next() parks until the test
+			// releases it, and it records both the return() count and whether return()
+			// arrived while its next() was still outstanding.
+			function makeTrackingSource() {
+				let releaseNext: (() => void) | null = null;
+				const state = {
+					nextCalls: 0,
+					nextOutstanding: false,
+					returnCalls: 0,
+					returnedWhileNextOutstanding: false,
+				};
+				const iterator: AsyncIterator<Row> = {
+					next(): Promise<IteratorResult<Row>> {
+						state.nextCalls++;
+						state.nextOutstanding = true;
+						return new Promise<IteratorResult<Row>>((resolve) => {
+							releaseNext = () => {
+								state.nextOutstanding = false;
+								resolve({ done: true, value: undefined as never });
+							};
+						});
+					},
+					return(): Promise<IteratorResult<Row>> {
+						state.returnCalls++;
+						if (state.nextOutstanding) state.returnedWhileNextOutstanding = true;
+						return Promise.resolve({ done: true, value: undefined as never });
+					},
+				};
+				return {
+					factory: (_ctx: RuntimeContext): AsyncIterable<Row> => ({
+						[Symbol.asyncIterator]: () => iterator,
+					}),
+					state,
+					releaseNext: (): void => { releaseNext?.(); },
+				};
+			}
+
+			const driver = new ParallelDriver();
+			const parent = makeRuntimeContext();
+			const forks = driver.fork(parent, 2);
+
+			// Branch 0 emits exactly one row so the consumer has an item to break on.
+			const emitter = gatedSource({ rows: 1 });
+			emitter.gates[0].resolve();
+			// Branch 1 is the hand-rolled source whose next() stays parked.
+			const tracked = makeTrackingSource();
+
+			const driven = driver.drive([emitter.factory, tracked.factory], forks);
+			const iter = driven[Symbol.asyncIterator]();
+
+			const first = await iter.next();
+			expect(first.done).to.equal(false, 'branch 0 emits its row');
+			expect(tracked.state.nextCalls).to.equal(1, 'branch 1 was pulled');
+			expect(tracked.state.nextOutstanding).to.equal(true, 'branch 1 next() is parked');
+
+			// Consumer breaks → generator.return() → closeAll on the live branches.
+			const closePromise = iter.return!();
+
+			// closeAll must NOT resolve while branch 1's next() is still in flight — it
+			// has to await the outstanding pull, not discard it. (Under the old code,
+			// which awaited only the return()s and dropped the pending pulls, this
+			// promise would already be settled here.)
+			let closed = false;
+			void closePromise.then(() => { closed = true; });
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(closed).to.equal(false, 'close must wait for the in-flight next() to settle');
+			expect(tracked.state.returnCalls).to.equal(1, 'return() signalled wind-down promptly');
+
+			// Release the parked next(); only now may close complete.
+			tracked.releaseNext();
+			await closePromise;
+
+			expect(tracked.state.nextOutstanding).to.equal(false, 'in-flight next() drained before close resolved');
+			expect(tracked.state.returnCalls).to.equal(1, 'return() called exactly once');
+		});
+
 		it('pre-aborted signal rejects without invoking any factory', async () => {
 			const driver = new ParallelDriver();
 			const parent = makeRuntimeContext();

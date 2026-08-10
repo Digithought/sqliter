@@ -160,6 +160,11 @@ select name from t_collate_order order by name collate nocase;
 
 drop table t_collate_order;
 
+-- 2e. Undecorated text PRIMARY KEY default collation is backend-divergent
+--     (memory → BINARY, store → NOCASE), so the assertion lives in the
+--     memory-only file 10.2.2-default-collation-memory.sqllogic. See
+--     docs/schema.md §"Per-column PK key collation" for the cross-backend contrast.
+
 -- ===================================
 -- 3. NOT NULL / NULL Behavior
 -- ===================================

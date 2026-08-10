@@ -1,0 +1,329 @@
+-- 53.1-materialized-view-write-through.sqllogic — DML targeting a materialized-view
+-- *name* is rewritten to target the MV's source table (write-through via view
+-- updateability) and re-planned through the ordinary base-table builder. The source
+-- write then fires the existing row-time maintenance hook, so the backing is brought
+-- into sync within the same statement/transaction: a subsequent read of the MV sees
+-- the write (reads-own-writes), and a rollback reverts source + backing in lockstep.
+--
+-- A write-through to an MV is observably identical to writing the source and reading
+-- the MV. Modeled on the plain-view 93.4-view-mutation.sqllogic; the per-column
+-- writeability rules (passthrough writeable, computed read-only) and RETURNING
+-- rejection are inherited verbatim from view updateability.
+
+-- ===================================
+-- 1. Round-trip (insert / update / delete) through a passthrough MV.
+-- ===================================
+
+create table t (id integer primary key, x integer);
+insert into t values (1, 10), (2, 20);
+create materialized view m as select id, x from t;
+
+select id, x from m order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20}]
+
+-- INSERT through the MV lands in the source and is reflected in the MV
+insert into m (id, x) values (3, 30);
+select id, x from m order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20},{"id":3,"x":30}]
+select id, x from t order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20},{"id":3,"x":30}]
+
+-- UPDATE through the MV (a projected column) routes to the source and re-keys the backing
+update m set x = 99 where id = 2;
+select id, x from m order by id;
+→ [{"id":1,"x":10},{"id":2,"x":99},{"id":3,"x":30}]
+
+-- DELETE through the MV removes the source row and its backing entry
+delete from m where id = 1;
+select id, x from m order by id;
+→ [{"id":2,"x":99},{"id":3,"x":30}]
+
+-- ===================================
+-- 2. Reads-own-writes + rollback in lockstep. A write through the MV inside an open
+--    transaction is visible to a later read of the MV before commit, and rollback
+--    discards BOTH the source write and the backing delta.
+-- ===================================
+
+begin;
+insert into m (id, x) values (4, 40);
+-- reads-own-writes: the write is visible through the MV mid-transaction
+select id, x from m order by id;
+→ [{"id":2,"x":99},{"id":3,"x":30},{"id":4,"x":40}]
+rollback;
+-- rollback reverts the source AND the backing together
+select id, x from m order by id;
+→ [{"id":2,"x":99},{"id":3,"x":30}]
+select id, x from t order by id;
+→ [{"id":2,"x":99},{"id":3,"x":30}]
+
+-- a committed write-through persists
+begin;
+insert into m (id, x) values (5, 50);
+commit;
+select id, x from m order by id;
+→ [{"id":2,"x":99},{"id":3,"x":30},{"id":5,"x":50}]
+
+-- ===================================
+-- 3. Rename / reorder projection — the rewrite maps each MV column to its base column.
+-- ===================================
+
+create table u (uid integer primary key, name text);
+insert into u values (1, 'Ann');
+create materialized view uv as select uid as user_id, name as full_name from u;
+select user_id, full_name from uv order by user_id;
+→ [{"user_id":1,"full_name":"Ann"}]
+
+insert into uv (user_id, full_name) values (2, 'Bo');
+update uv set full_name = 'Bob' where user_id = 2;
+select user_id, full_name from uv order by user_id;
+→ [{"user_id":1,"full_name":"Ann"},{"user_id":2,"full_name":"Bob"}]
+-- the writes landed on the base under the base column names
+select uid, name from u order by uid;
+→ [{"uid":1,"name":"Ann"},{"uid":2,"name":"Bob"}]
+
+-- ===================================
+-- 4. Filtered MV (equality predicate on a projected column): constant-FD default for
+--    an omitted predicate column, predicate-scope transition on update, and a
+--    plan-time predicate-contradiction rejection.
+-- ===================================
+
+create table task (id integer primary key, x integer, status text);
+insert into task values (1, 10, 'open'), (2, 20, 'open'), (3, 30, 'closed');
+create materialized view opentasks as select id, x, status from task where status = 'open';
+select id, x, status from opentasks order by id;
+→ [{"id":1,"x":10,"status":"open"},{"id":2,"x":20,"status":"open"}]
+
+-- INSERT omitting the predicate column: the selection predicate supplies status='open'
+-- on the base via the constant-FD path
+insert into opentasks (id, x) values (4, 40);
+select id, x, status from opentasks order by id;
+→ [{"id":1,"x":10,"status":"open"},{"id":2,"x":20,"status":"open"},{"id":4,"x":40,"status":"open"}]
+-- the base row carries the defaulted predicate value
+select id, status from task where id = 4;
+→ [{"id":4,"status":"open"}]
+
+-- INSERT that provably contradicts the selection predicate is rejected at plan time
+insert into opentasks (id, x, status) values (5, 50, 'closed');
+-- error: contradicts its selection predicate
+
+-- UPDATE carrying a row out of the WHERE scope removes it from the MV (maintenance
+-- predicate-scope transition: delete old image, no new image upserted); the base row
+-- survives with its new value
+update opentasks set status = 'closed' where id = 1;
+select id, x, status from opentasks order by id;
+→ [{"id":2,"x":20,"status":"open"},{"id":4,"x":40,"status":"open"}]
+select id, status from task where id = 1;
+→ [{"id":1,"status":"closed"}]
+
+-- ===================================
+-- 5. Delete identity by a non-PK projected column removes exactly the matching backing
+--    row(s). The projection includes the source PK, so the base delete is exact.
+-- ===================================
+
+create table d (id integer primary key, label text, x integer);
+insert into d values (1, 'a', 10), (2, 'b', 20), (3, 'a', 30);
+create materialized view dv as select id, label, x from d;
+delete from dv where label = 'a';
+select id, label, x from dv order by id;
+→ [{"id":2,"label":"b","x":20}]
+select id, label from d order by id;
+→ [{"id":2,"label":"b"}]
+
+-- ===================================
+-- 6. RETURNING through an MV is shipped (inherited from view updateability — an MV
+--    is a single-source projection, so the rewrite carries the RETURNING onto the
+--    base op). The deleted view-projected row is returned (`*` → all view columns,
+--    OLD image).
+-- ===================================
+
+create table r (id integer primary key, x integer);
+insert into r values (1, 10);
+create materialized view rv as select id, x from r;
+delete from rv where id = 1 returning *;
+→ [{"id":1,"x":10}]
+
+-- ===================================
+-- 7. Per-column lineage on the MV write-through spine (the single-source spine, so
+--    it consumes inverses exactly as a plain view does): an INVERSE-profile column
+--    (`y = x + 1`) is writable and stores the inverted base value, an OPAQUE column
+--    (`z = x * 2`) is read-only (computed/non-invertible diagnostic), reads are
+--    unaffected, and a write to the passthrough column still propagates. Every write
+--    re-derives the computed columns via maintenance (reads-own-writes).
+--    (Needs materialized-view-rowtime-expression-projections so the body is creatable.)
+-- ===================================
+
+create table e (id integer primary key, x integer);
+insert into e values (1, 10), (2, 20);
+create materialized view ev as select id, x, x + 1 as y, x * 2 as z from e;
+select id, x, y, z from ev order by id;
+→ [{"id":1,"x":10,"y":11,"z":20},{"id":2,"x":20,"y":21,"z":40}]
+
+-- a write to the OPAQUE column z is rejected (read-only / non-invertible)
+update ev set z = 99 where id = 1;
+-- error: non-invertible
+
+-- a write to the INVERSE-profile column y now propagates: it stores the inverted
+-- base value (y = 99 ⇒ x = 98) and the computed columns re-derive (z = 196).
+update ev set y = 99 where id = 1;
+select id, x, y, z from ev order by id;
+→ [{"id":1,"x":98,"y":99,"z":196},{"id":2,"x":20,"y":21,"z":40}]
+
+-- a write to the passthrough column still propagates; the computed columns re-derive
+update ev set x = 100 where id = 1;
+select id, x, y, z from ev order by id;
+→ [{"id":1,"x":100,"y":101,"z":200},{"id":2,"x":20,"y":21,"z":40}]
+
+-- insert specifying only the passthrough columns works; y/z are derived by maintenance
+insert into ev (id, x) values (3, 30);
+select id, x, y, z from ev order by id;
+→ [{"id":1,"x":100,"y":101,"z":200},{"id":2,"x":20,"y":21,"z":40},{"id":3,"x":30,"y":31,"z":60}]
+
+-- ===================================
+-- 8. Bulk multi-row write-through — an INSERT…SELECT source, a multi-row UPDATE, and a
+--    multi-row DELETE all produce correct backing contents under per-statement
+--    maintenance batching.
+-- ===================================
+
+create table b (id integer primary key, x integer);
+insert into b values (1, 1);
+create materialized view bv as select id, x from b;
+
+create table src (id integer primary key, x integer);
+insert into src values (10, 100), (11, 110), (12, 120);
+
+-- INSERT … SELECT through the MV
+insert into bv select id, x from src;
+select id, x from bv order by id;
+→ [{"id":1,"x":1},{"id":10,"x":100},{"id":11,"x":110},{"id":12,"x":120}]
+
+-- multi-row UPDATE through the MV
+update bv set x = x + 1000 where id >= 10;
+select id, x from bv order by id;
+→ [{"id":1,"x":1},{"id":10,"x":1100},{"id":11,"x":1110},{"id":12,"x":1120}]
+
+-- multi-row DELETE through the MV
+delete from bv where id >= 11;
+select id, x from bv order by id;
+→ [{"id":1,"x":1},{"id":10,"x":1100}]
+
+-- ===================================
+-- 9. MV-over-MV write-through. Write-through to a level-1 MV over a real table routes
+--    to the base AND cascades to the level-2 MV. Write-through to the level-2 MV
+--    itself (whose source is a materialized view) is rejected cleanly — its rewrite
+--    would target the inner MV's read-only backing table. (The source→backing
+--    maintenance cascade is the read/maintain direction and is unaffected.)
+-- ===================================
+
+create table base (id integer primary key, x integer);
+insert into base values (1, 10);
+create materialized view inner_mv as select id, x from base;
+create materialized view outer_mv as select id, x from inner_mv;
+
+-- write-through to the level-1 MV routes to base and cascades to the level-2 MV
+insert into inner_mv (id, x) values (2, 20);
+select id, x from outer_mv order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20}]
+
+-- write-through to the level-2 MV (source is a materialized view) is rejected
+insert into outer_mv (id, x) values (3, 30);
+-- error: reads a materialized view
+update outer_mv set x = 99 where id = 1;
+-- error: reads a materialized view
+delete from outer_mv where id = 1;
+-- error: reads a materialized view
+
+-- the rejected writes changed nothing; the chain is intact
+select id, x from outer_mv order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20}]
+
+-- ===================================
+-- 10. Plain view over a materialized view — the same guard's broader reach. A plain
+--     `view ... select ... from <mv>` resolves its body source to the MV's backing
+--     table at plan time, so a write-through would target that read-only backing.
+--     Write-through is rejected with the same diagnostic as the MV-over-MV case
+--     (this closes a pre-existing latent hole, not just the MV path). Reads through
+--     the plain view are unaffected.
+-- ===================================
+
+-- inner_mv from §9 still holds {1,10},{2,20}
+create view pv as select id, x from inner_mv;
+select id, x from pv order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20}]
+
+insert into pv (id, x) values (4, 40);
+-- error: reads a materialized view
+update pv set x = 99 where id = 1;
+-- error: reads a materialized view
+delete from pv where id = 1;
+-- error: reads a materialized view
+
+-- the rejected writes changed nothing
+select id, x from pv order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20}]
+
+-- ===================================
+-- 11. Aggregate (non-updatable) body. An aggregate-bodied MV is creatable and
+--     maintained (the residual-recompute arm), but its body is NOT row-decomposable
+--     for write-through, so user DML against the MV name is rejected at PLAN time.
+--     The diagnostic names the target as a *materialized view* (not a plain "view") —
+--     the body-shape reject threads the target's kind. The reject is plan-time, so
+--     the MV contents are untouched and the source stays directly writable + maintained.
+--     (Runs in both memory and store suites; the 'x'/'y' group keys carry no
+--     case-variant collision, so the store's NOCASE backing-key default is moot.)
+-- ===================================
+
+create table words (id integer primary key, w text);
+insert into words values (1, 'x'), (2, 'y'), (3, 'x');
+create materialized view wcount as select w, count(*) as n from words group by w;
+select w, n from wcount order by w;
+→ [{"w":"x","n":2},{"w":"y","n":1}]
+
+-- insert / update / delete against the aggregate MV are all rejected at plan time,
+-- naming it a materialized view
+insert into wcount (w, n) values ('z', 1);
+-- error: cannot write through materialized view
+update wcount set n = 99 where w = 'x';
+-- error: cannot write through materialized view
+delete from wcount where w = 'y';
+-- error: cannot write through materialized view
+
+-- the rejected writes changed nothing
+select w, n from wcount order by w;
+→ [{"w":"x","n":2},{"w":"y","n":1}]
+
+-- the source remains directly writable and the MV maintains incrementally
+insert into words values (4, 'y');
+select w, n from wcount order by w;
+→ [{"w":"x","n":2},{"w":"y","n":2}]
+
+-- ===================================
+-- 12. Subquery-in-FROM body. An MV whose body wraps its base in a derived-table
+--     subquery is creatable + maintained, but write-through rejects it at the
+--     single-base-source branch (the inner filters/projections live in the plan,
+--     not in the rewrite-driving selectAst). That branch — distinct from the
+--     aggregate (classifyViewBody) reject in § 11 — must ALSO name the target a
+--     *materialized view*, not a plain "view": every body-shape reject in
+--     analyzeView threads the target's kind, so a maintained table reaching this
+--     branch is not misnamed. Plan-time reject; MV contents untouched.
+-- ===================================
+
+create table nums (id integer primary key, v integer);
+insert into nums values (1, 10), (2, 20);
+create materialized view sqmv as select id, v from (select id, v from nums);
+select id, v from sqmv order by id;
+→ [{"id":1,"v":10},{"id":2,"v":20}]
+
+-- write-through is rejected at the single-base-source branch, naming it a materialized view
+insert into sqmv (id, v) values (3, 30);
+-- error: cannot write through materialized view
+update sqmv set v = 99 where id = 1;
+-- error: cannot write through materialized view
+delete from sqmv where id = 2;
+-- error: cannot write through materialized view
+
+-- the rejected writes changed nothing; the source stays writable + maintained
+select id, v from sqmv order by id;
+→ [{"id":1,"v":10},{"id":2,"v":20}]
+insert into nums values (3, 30);
+select id, v from sqmv order by id;
+→ [{"id":1,"v":10},{"id":2,"v":20},{"id":3,"v":30}]

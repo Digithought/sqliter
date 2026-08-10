@@ -88,4 +88,26 @@ export interface PluginRecord {
 	enabled: boolean;               // Whether to load at startup
 	manifest?: PluginManifest;      // Cached after first successful load
 	config: Record<string, SqlValue>; // User-configured values
+	/**
+	 * SHA-256 (lowercase hex) of the module bytes last fetched from `url`, when
+	 * the host fetched them over the network. Lets a host notice that remote
+	 * code served from a stable URL has changed since it was installed. Absent
+	 * for records installed before this was recorded, and for `file:` plugins.
+	 */
+	sha256?: string;
+	/**
+	 * When true, `sha256` is enforced *before* the module is imported: a host that
+	 * verifies remote plugins refuses the load on a mismatch instead of warning
+	 * after the code has already run. Absent or false keeps the warn-and-continue
+	 * default.
+	 *
+	 * A pinned record with no `sha256` is not a violation — it is a first
+	 * observation. The next successful load records a hash and enforcement starts
+	 * from there.
+	 *
+	 * Only meaningful for `https:` records in a host that installed the Node remote
+	 * resolver. Browsers import the URL directly with no verification step, and
+	 * `file:` URLs never reach the resolver at all.
+	 */
+	pinned?: boolean;
 }

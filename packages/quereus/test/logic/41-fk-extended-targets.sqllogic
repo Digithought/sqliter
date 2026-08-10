@@ -67,11 +67,12 @@ drop table c_gen;
 drop table p_gen;
 
 -- ===================================
--- 3. FK with COLLATE NOCASE on parent key — Quereus rejects NOCASE on TEXT
+-- 3. COLLATE NOCASE on a TEXT parent-key column is accepted at DDL (the lowercase
+--    `nocase` spelling normalizes to canonical NOCASE)
+--    — unique-collation-name-case-insensitive-normalization.
 -- ===================================
 
 create table p_nc (id integer primary key, code text collate nocase unique not null);
--- error: not supported
 
 drop table if exists p_nc;
 

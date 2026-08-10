@@ -1,5 +1,6 @@
 ---
 description: Core SQL feature enhancements (DELETE FROM, orthogonal expressions, etc.)
+difficulty: hard
 ---
 
 ## Architecture

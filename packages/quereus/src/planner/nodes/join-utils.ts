@@ -1,25 +1,104 @@
-import type { Attribute, ConstantBinding, DomainConstraint, FunctionalDependency, MonotonicOnInfo, PhysicalProperties } from './plan-node.js';
-import type { JoinType } from './join-node.js';
-import type { RelationType, ColRef } from '../../common/datatype.js';
+import type { Attribute, ConstantBinding, DomainConstraint, FunctionalDependency, InclusionDependency, MonotonicOnInfo, PhysicalProperties } from './plan-node.js';
+import type { JoinType, ExistenceColumnSpec } from './join-node.js';
+import { PlanNodeType } from './plan-node-type.js';
+import type { RelationType, ColRef, ColumnDef, ScalarType } from '../../common/datatype.js';
+import { BOOLEAN_TYPE } from '../../types/builtin-types.js';
 import {
 	addEquivalence, addFd,
 	closeConstantBindingsOverEcs,
 	mergeConstantBindings,
 	mergeDomainConstraints,
 	mergeEquivClasses, mergeFds,
+	mergeInds,
 	shiftConstantBindings,
 	shiftDomainConstraints,
 	shiftEquivClasses, shiftFds,
+	shiftInds,
 	superkeyToFd,
 } from '../util/fd-utils.js';
 
 /**
  * An equi-join pair: left attribute = right attribute.
  * Attribute IDs are stable across plan transformations.
+ *
+ * Both flags are REQUIRED at every construction site — an implicit `true`
+ * default would silently reproduce the over-claims they exist to prevent.
  */
 export interface EquiJoinPair {
 	leftAttrId: number;
 	rightAttrId: number;
+
+	/**
+	 * True when both sides declare the SAME collation (`operandCollation`
+	 * equality). Only merge join reads this: it requires both inputs physically
+	 * ordered under the key's comparison collation, and
+	 * `PhysicalProperties.ordering` is collation-blind (`{column, desc}` only) —
+	 * a matched declared collation is what makes each input's advertised order
+	 * equal the merge comparator's order. Hash/Bloom join does not care — its
+	 * emitter resolves the pair collation symmetrically
+	 * (`effectiveCollationOfTypes`) and normalizes both sides' keys under it.
+	 */
+	collationsMatch: boolean;
+
+	/**
+	 * True when rows this pair matches are genuinely value-equal
+	 * (`isValueDiscriminatingEquality`). False for any possibly-text pair whose
+	 * comparison collation is non-BINARY: such a comparison matches
+	 * value-DIFFERENT rows ('Bob' = 'bob' under NOCASE), so the pair must not
+	 * mint equivalence classes, determination FDs, key coverage, or
+	 * monotonicity claims. It remains a perfectly good *join condition* — the
+	 * runtime emitters key/compare under the resolved collation regardless.
+	 */
+	valueDiscriminating: boolean;
+}
+
+/**
+ * Binary (left/right/inner/cross/semi/anti) join node types a structural plan
+ * walk may descend through. These all implement `JoinCapable` (logical
+ * `JoinNode`, `BloomJoinNode` = `HashJoin`, `MergeJoinNode`), so
+ * `CapabilityDetectors.isJoin` exposes `getJoinType` / `getLeftSource` /
+ * `getRightSource`. `FanOutLookupJoin` and `AsofScan` are deliberately absent —
+ * they are not `JoinCapable` and must fall through to each walk's rejection.
+ * Shared by the coverage prover's `walkToConstrainedBase` and the
+ * coarsened-backing-key lineage walk so the admitted node set is defined once.
+ */
+export const BINARY_JOIN_TYPES: ReadonlySet<PlanNodeType> = new Set([
+	PlanNodeType.Join,
+	PlanNodeType.NestedLoopJoin,
+	PlanNodeType.HashJoin,
+	PlanNodeType.MergeJoin,
+]);
+
+/**
+ * The subset of `pairs` that may mint value-level facts (keys, FDs, equivalence
+ * classes, monotonicity). A non-`valueDiscriminating` pair still keys the hash
+ * build/probe and drives the merge comparator — the emitters read the full pair
+ * list — but its matched rows are not value-equal, so fact propagation must not
+ * see it. Mirrors the `isValueDiscriminatingEquality` gate on the logical
+ * JoinNode's `extractEquiPairsFromCondition`.
+ *
+ * NOTE: this is a deliberate under-claim for matched-NOCASE pairs whose covered
+ * key is itself NOCASE-enforced (there the coverage would be sound); if
+ * NOCASE-keyed join plans regress from the lost key coverage / row estimates,
+ * consider a collation-aware coverage check instead of this blanket filter.
+ */
+export function valueFactPairs(pairs: readonly EquiJoinPair[]): readonly EquiJoinPair[] {
+	return pairs.filter(p => p.valueDiscriminating);
+}
+
+/**
+ * Plan-dump rendering of a physical join's equi-pairs. The flags serialize only
+ * when non-default, so existing plan goldens stay byte-identical while a
+ * mismatched-collation pair (hash-joinable, merge-declined, no value facts) is
+ * visible in `query_plan()`.
+ */
+export function describeEquiPairs(pairs: readonly EquiJoinPair[]): Record<string, unknown>[] {
+	return pairs.map(p => ({
+		left: p.leftAttrId,
+		right: p.rightAttrId,
+		...(p.collationsMatch ? {} : { collationsMatch: false }),
+		...(p.valueDiscriminating ? {} : { valueDiscriminating: false }),
+	}));
 }
 
 /**
@@ -29,11 +108,24 @@ export interface EquiJoinPair {
  * logical JoinNode) the preserved set is returned directly.  Otherwise the
  * attributes are computed from the left/right inputs and the join type.
  */
+/**
+ * The scalar type of an existence (`exists … as`) match flag: a clean
+ * `{true,false}` boolean, genuinely NOT NULL (the null-extension test the column
+ * replaces), and read-only (derived at the combinator).
+ */
+export const EXISTENCE_FLAG_TYPE: ScalarType = {
+	typeClass: 'scalar',
+	logicalType: BOOLEAN_TYPE,
+	nullable: false,
+	isReadOnly: true,
+};
+
 export function buildJoinAttributes(
 	leftAttrs: readonly Attribute[],
 	rightAttrs: readonly Attribute[],
 	joinType: JoinType,
 	preserveAttributeIds?: readonly Attribute[],
+	existence?: readonly ExistenceColumnSpec[],
 ): Attribute[] {
 	if (preserveAttributeIds) return preserveAttributeIds.slice() as Attribute[];
 	if (joinType === 'semi' || joinType === 'anti') return leftAttrs.slice() as Attribute[];
@@ -46,6 +138,13 @@ export function buildJoinAttributes(
 	for (const attr of rightAttrs) {
 		const isNullable = joinType === 'left' || joinType === 'full';
 		attributes.push(isNullable ? { ...attr, type: { ...attr.type, nullable: true } } : attr);
+	}
+	// Existence flags are appended AFTER both sides — boolean NOT NULL, never
+	// marked nullable (the clean-boolean point), with their pre-minted stable ids.
+	if (existence) {
+		for (const spec of existence) {
+			attributes.push({ id: spec.attrId, name: spec.name, type: EXISTENCE_FLAG_TYPE });
+		}
 	}
 	return attributes;
 }
@@ -61,6 +160,7 @@ export function buildJoinRelationType(
 	rightType: RelationType,
 	joinType: JoinType,
 	keys?: ReadonlyArray<ReadonlyArray<ColRef>>,
+	existence?: readonly ExistenceColumnSpec[],
 ): RelationType {
 	if (joinType === 'semi' || joinType === 'anti') {
 		return {
@@ -73,6 +173,11 @@ export function buildJoinRelationType(
 		};
 	}
 
+	const existenceColumns: ColumnDef[] = (existence ?? []).map(spec => ({
+		name: spec.name,
+		type: EXISTENCE_FLAG_TYPE,
+	}));
+
 	const combinedColumns = [
 		...leftType.columns.map(col => {
 			const isNullable = joinType === 'right' || joinType === 'full';
@@ -82,6 +187,8 @@ export function buildJoinRelationType(
 			const isNullable = joinType === 'left' || joinType === 'full';
 			return isNullable ? { ...col, type: { ...col.type, nullable: true } } : col;
 		}),
+		// Existence flags appended after both sides; never part of any join key.
+		...existenceColumns,
 	];
 
 	const isSet = (joinType === 'inner' || joinType === 'cross') &&
@@ -149,6 +256,26 @@ export function propagateJoinMonotonicOn(
 }
 
 /**
+ * Downgrade a fanned-out side's `'unique'` FDs to `'determination'`. A fanning
+ * join duplicates that side's rows, destroying determinant row-uniqueness
+ * while every value claim survives unchanged. Applies to guarded FDs too: a
+ * guarded partial-unique FD crossing a fanning join is no longer row-unique
+ * even within its guard's scope (the duplicated rows still satisfy the guard).
+ * Preserves object identity for FDs that are already determinations.
+ *
+ * This downgrade fully replaces the former `dropSideKeyFds`: the value claims
+ * survive as determinations (feeding ORDER BY pruning / GROUP BY
+ * simplification downstream), and the kind-aware readers
+ * (`isUniqueDeterminant`) never read them as uniqueness claims (ticket
+ * fd-determination-reader-side-rule).
+ */
+function downgradeUniqueFds(
+	fds: ReadonlyArray<FunctionalDependency>,
+): ReadonlyArray<FunctionalDependency> {
+	return fds.map(fd => (fd.kind === 'unique' ? { ...fd, kind: 'determination' as const } : fd));
+}
+
+/**
  * Propagate functional dependencies and equivalence classes through a join.
  *
  * Rules:
@@ -160,7 +287,13 @@ export function propagateJoinMonotonicOn(
  * - right outer: mirror of left outer.
  * - full outer: drop both sides' FDs/ECs (conservative).
  * - semi / anti: left's FDs/ECs survive; no right contribution and no equi-pair
- *   FDs (right columns are not in the output).
+ *   FDs (right columns are not in the output). Left rows pass ≤1:1, so kinds
+ *   are preserved verbatim.
+ * - Fan-out kind downgrade (inner/cross/left/right): a side that is NOT
+ *   preserved (no preserved key lies within it) is fanned out — its surviving
+ *   FDs, guarded ones included, are downgraded `'unique'` → `'determination'`
+ *   via `downgradeUniqueFds` so the kind invariant holds before any reader
+ *   trusts it.
  */
 export function propagateJoinFds(
 	joinType: JoinType,
@@ -218,12 +351,29 @@ export function propagateJoinFds(
 	switch (joinType) {
 		case 'inner':
 		case 'cross': {
-			let fds: ReadonlyArray<FunctionalDependency> = mergeFds(leftFds, shiftFds(rightFds, leftColumnCount), opts);
+			// A fanning (non-1:1) join duplicates the rows of a side whose unique key is
+			// not preserved (no preserved key lies entirely within that side's columns).
+			// Such a side's FDs remain true as value claims but no longer encode
+			// uniqueness in the product — downgrade them (guarded FDs included) to
+			// 'determination'. The kind-aware readers (`isUniqueDeterminant`) are what
+			// keep a downstream projection from re-deriving a spurious key off them
+			// (ticket fd-determination-reader-side-rule, replacing `dropSideKeyFds`).
+			const leftPreserved = preservedKeys.some(k => k.every(i => i < leftColumnCount));
+			const rightPreserved = preservedKeys.some(k => k.every(i => i >= leftColumnCount));
+			const keptLeftFds = leftPreserved ? leftFds : downgradeUniqueFds(leftFds);
+			const keptRightFds = rightPreserved ? rightFds : downgradeUniqueFds(rightFds);
+			let fds: ReadonlyArray<FunctionalDependency> = mergeFds(keptLeftFds, shiftFds(keptRightFds, leftColumnCount), opts);
 			let equiv: ReadonlyArray<ReadonlyArray<number>> = mergeEquivClasses(leftEC, shiftEquivClasses(rightEC, leftColumnCount));
+			// An equi-pair `{L}↔{R'}` is a value-equality claim: emit both directions
+			// unconditionally as 'determination'. Uniqueness facts live exclusively on
+			// the preserved-key FDs layered below (`withKeyFds` mints 'unique'); a
+			// determination is never read as a uniqueness claim by the kind-aware
+			// readers, so no endpoint gate is needed. The EC merge stays unconditional
+			// too — value equality also carries constant propagation.
 			for (const p of equiPairs) {
 				const rShifted = p.right + leftColumnCount;
-				fds = addFd(fds, { determinants: [p.left], dependents: [rShifted] }, opts);
-				fds = addFd(fds, { determinants: [rShifted], dependents: [p.left] }, opts);
+				fds = addFd(fds, { determinants: [p.left], dependents: [rShifted], kind: 'determination' }, opts);
+				fds = addFd(fds, { determinants: [rShifted], dependents: [p.left], kind: 'determination' }, opts);
 				equiv = addEquivalence(equiv, p.left, rShifted);
 			}
 			fds = withKeyFds(fds);
@@ -242,13 +392,25 @@ export function propagateJoinFds(
 			return wrap(fds, equiv, bindings, domains);
 		}
 		case 'left': {
+			// A LEFT join fans out left rows when the equi-predicate does not cover a
+			// right-side key (one left row can match several right rows). When left's
+			// key is therefore NOT preserved, downgrade its FDs (guarded included) to
+			// 'determination' — mirrors the inner/cross arm; the kind-aware readers
+			// keep a downstream key-dropping projection from re-deriving the left key.
+			const leftPreserved = preservedKeys.some(k => k.every(i => i < leftColumnCount));
+			const keptLeftFds = leftPreserved ? leftFds : downgradeUniqueFds(leftFds);
 			// Left's bindings survive on left's columns; right's are dropped (the
 			// NULL-padding from unmatched left rows breaks any right-side pin).
-			const fds = withKeyFds(leftFds.slice());
+			const fds = withKeyFds(keptLeftFds.slice());
 			return wrap(fds, leftEC.map(c => c.slice()), leftBindings.map(b => ({ ...b })), leftDomains.slice());
 		}
 		case 'right': {
-			let fds: ReadonlyArray<FunctionalDependency> = shiftFds(rightFds, leftColumnCount);
+			// Mirror of LEFT: a RIGHT join fans out right rows when the equi-predicate
+			// does not cover a left-side key. Downgrade the right side's FDs when no
+			// preserved key lies within the right side.
+			const rightPreserved = preservedKeys.some(k => k.every(i => i >= leftColumnCount));
+			const keptRightFds = rightPreserved ? rightFds : downgradeUniqueFds(rightFds);
+			let fds: ReadonlyArray<FunctionalDependency> = shiftFds(keptRightFds, leftColumnCount);
 			fds = withKeyFds(fds);
 			const equiv = shiftEquivClasses(rightEC, leftColumnCount);
 			const bindings = shiftConstantBindings(rightBindings, leftColumnCount);
@@ -265,6 +427,82 @@ export function propagateJoinFds(
 		default:
 			return {};
 	}
+}
+
+/**
+ * Propagate inclusion dependencies through a join operator. The IND analogue of
+ * `propagateJoinFds` — it MUST stay consistent with that function and
+ * `analyzeJoinKeyCoverage`.
+ *
+ * INDs assert per-row existence in another relation, so a NULL-padded side can
+ * violate the claim and is dropped conservatively:
+ * - inner / cross: union of left INDs and `shiftInds(right, leftColumnCount)`.
+ * - left (preserved = left): keep left INDs; drop the right side's INDs (the
+ *   right columns are NULL-padded for unmatched left rows).
+ * - right (preserved = right): keep `shiftInds(right, leftColumnCount)`; drop left.
+ * - semi / anti: keep left INDs only (right columns are not in the output).
+ * - full: drop both (either side can be NULL-padded).
+ */
+export function propagateJoinInds(
+	joinType: JoinType,
+	leftPhys: PhysicalProperties | undefined,
+	rightPhys: PhysicalProperties | undefined,
+	leftColumnCount: number,
+): ReadonlyArray<InclusionDependency> | undefined {
+	const leftInds = leftPhys?.inds ?? [];
+	const rightInds = rightPhys?.inds ?? [];
+
+	let result: ReadonlyArray<InclusionDependency>;
+	switch (joinType) {
+		case 'inner':
+		case 'cross':
+			result = mergeInds(leftInds, shiftInds(rightInds, leftColumnCount));
+			break;
+		case 'left':
+		case 'semi':
+		case 'anti':
+			result = leftInds.slice();
+			break;
+		case 'right':
+			result = shiftInds(rightInds, leftColumnCount);
+			break;
+		case 'full':
+		default:
+			result = [];
+			break;
+	}
+	return result.length > 0 ? result : undefined;
+}
+
+/**
+ * The physical row count a join node should stamp in `computePhysical`.
+ *
+ * `analyzeJoinKeyCoverage` only produces a number in the cases where it can
+ * *prove* a cap — an equi-predicate covering a unique key on one side bounds the
+ * output at the other side's row count. Everywhere else (no key coverage, full
+ * outer, semi/anti) it returns `undefined`, which used to leave the join — and
+ * therefore every node above it — with no cardinality at all. Fall back to the
+ * same heuristic the logical `estimatedRows` getter uses, applied to the
+ * cardinalities actually arriving at this node.
+ *
+ * `leftRows` / `rightRows` must be the PHYSICAL child counts (see
+ * `physicalSourceRows`): after the Retrieve→access-node conversion the logical
+ * getters read `undefined` through a `SeqScan` / `IndexScan`.
+ *
+ * The result is floored so EXPLAIN reports whole rows — the inner-join heuristic
+ * multiplies by 0.1 and would otherwise print values like `12.100000000000001`.
+ * `estimateJoinRows` itself is left unrounded: it also backs the logical getters,
+ * which feed cost comparisons this change has no business perturbing.
+ */
+export function joinPhysicalRows(
+	joinType: JoinType,
+	coverageRows: number | undefined,
+	leftRows: number | undefined,
+	rightRows: number | undefined,
+): number | undefined {
+	if (coverageRows !== undefined) return coverageRows;
+	const estimate = estimateJoinRows(leftRows, rightRows, joinType);
+	return estimate === undefined ? undefined : Math.floor(estimate);
 }
 
 /**

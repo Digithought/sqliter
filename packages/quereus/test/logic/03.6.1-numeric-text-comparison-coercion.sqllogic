@@ -1,0 +1,242 @@
+-- 03.6.1-numeric-text-comparison-coercion.sqllogic
+-- Regression coverage for bug-numeric-text-coercion-skips-in-and-case:
+-- `insertCrossTypeCoercion` (planner/building/coercion.ts) casts the textual side
+-- of a numeric-vs-textual comparison so `int_col = '1'` reads as `int_col = 1`.
+-- That rule used to apply only at the `=`/BETWEEN build sites; `IN` value lists,
+-- simple CASE, nullif/greatest/least, the IN-subquery runtime path
+-- (`inMembershipKeys`, runtime/emit/subquery.ts) and both IN decorrelation
+-- rewrites (rule-subquery-decorrelation.ts) skipped it, so the SAME comparison
+-- answered differently depending on how it was spelled. This file pins every
+-- form agreeing with each other over an INTEGER column, a REAL column and a
+-- TEXT column.
+--
+-- Section 6 pins the follow-on rule from
+-- bug-comparison-coercion-corrupts-returned-value: the three builtins that RETURN
+-- one of their arguments convert only a copy for the comparison, so the value
+-- handed back is the argument as written.
+
+create table nn (id integer primary key, i integer, r real);
+insert into nn values (1, 1, 2.5);
+-- run
+
+create table tt (id integer primary key, t text);
+insert into tt values (1, '1');
+-- run
+
+-- ===================================
+-- 1. INTEGER column `i` (value 1) against textual operands — every form agrees
+-- ===================================
+select (i = '1') as v from nn;
+→ [{"v":true}]
+
+select (i between '0' and '2') as v from nn;
+→ [{"v":true}]
+
+select i in ('1') as v from nn;
+→ [{"v":true}]
+
+select i in (select t from tt) as v from nn;
+→ [{"v":true}]
+
+select case i when '1' then 'hit' else 'miss' end as v from nn;
+→ [{"v":"hit"}]
+
+select nullif(i, '1') as v from nn;
+→ [{"v":null}]
+
+-- `greatest`/`least`/`nullif` compare CONVERTED copies but return the ORIGINAL
+-- argument, so the winner here is the text '2' the user wrote, not the INTEGER 2
+-- the conversion produced. Section 6 pins that rule on its own; here the point is
+-- that the comparison still ranks '2' above the integer 1.
+select greatest(i, '2') as v from nn;
+→ [{"v":"2"}]
+
+-- `least` is unaffected here (1 is already the smaller value either way) — kept
+-- as a control that the coercion did not change an already-correct answer.
+select least(i, '2') as v from nn;
+→ [{"v":1}]
+
+-- The existing `=` semantics truncate on an INTEGER target (`cast('1.9' as
+-- integer)` is 1) — not something this fix introduced, but every form must now
+-- agree on it the same way they agree above.
+select (i = '1.9') as v from nn;
+→ [{"v":true}]
+
+select i in ('1.9') as v from nn;
+→ [{"v":true}]
+
+select case i when '1.9' then 'hit' else 'miss' end as v from nn;
+→ [{"v":"hit"}]
+
+-- ===================================
+-- 2. REAL column `r` (value 2.5) against textual operands
+-- ===================================
+select (r = '2.5') as v from nn;
+→ [{"v":true}]
+
+select (r between '2' and '3') as v from nn;
+→ [{"v":true}]
+
+select r in ('2.5') as v from nn;
+→ [{"v":true}]
+
+select case r when '2.5' then 'hit' else 'miss' end as v from nn;
+→ [{"v":"hit"}]
+
+-- ===================================
+-- 3. TEXT column `t` (value '1') against numeric operands — the reverse pairing
+-- ===================================
+select (t = 1) as v from tt;
+→ [{"v":true}]
+
+select (t between 0 and 2) as v from tt;
+→ [{"v":true}]
+
+select t in (1) as v from tt;
+→ [{"v":true}]
+
+select t in (select i from nn) as v from tt;
+→ [{"v":true}]
+
+select case t when 1 then 'hit' else 'miss' end as v from tt;
+→ [{"v":"hit"}]
+
+-- A NULL member does not defeat the hoisted probe cast (it is filtered out of the
+-- all-numeric test), and the three-valued result still holds: a hit is true, a
+-- miss over a list containing NULL is NULL rather than false.
+select t in (1, null) as v from tt;
+→ [{"v":true}]
+
+select t in (9, null) as v from tt;
+→ [{"v":null}]
+
+select t not in (0, 2) as v from tt;
+→ [{"v":true}]
+
+select t not in (1, 2) as v from tt;
+→ [{"v":false}]
+
+-- Mixed INTEGER/REAL member list widens the hoisted probe cast to NUMERIC rather
+-- than picking a lossy winner, so a textual '1' still matches the integer member.
+select t in (1, 2.5) as v from tt;
+→ [{"v":true}]
+
+-- ===================================
+-- 4. Negative controls — must NOT change, and are the things a future
+--    "simplification" of the coercion would most likely break
+-- ===================================
+
+-- A non-numeric textual value never matches, in any form.
+select i in ('abc') as v from nn;
+→ [{"v":false}]
+
+-- IN with a NULL member stays three-valued: NULL, not false.
+select i in (null) as v from nn;
+→ [{"v":null}]
+
+-- NOT IN is the plain complement over a NULL-free list.
+select i not in ('2') as v from nn;
+→ [{"v":true}]
+
+-- Mixed-WHEN simple CASE: `i` is numeric, so each WHEN casts independently —
+-- this is the per-value path, not the hoisted-probe one, and is not the gap
+-- below. (The parser requires a THEN per WHEN, so `when '1' when 2` is a
+-- syntax error, not a shape to test.)
+select case i when 'abc' then 'a' when '1' then 'b' else 'c' end as v from nn;
+→ [{"v":"b"}]
+
+-- ===================================
+-- 5. The one remaining known gap: a TEXTUAL probe against a value list mixing
+--    numeric and textual values. `coerceComparisonSet` deliberately declines to
+--    hoist a probe cast over a MIXED list — `cast('abc' as real)` is 0, so
+--    hoisting would make `s in (1, 'abc')` true for a stored '0'. The trade is a
+--    visible disagreement with the `=` disjunction on the numeric member; see
+--    the NOTE on `coerceComparisonSet` (planner/building/coercion.ts) and
+--    docs/types.md "Type Coercion in Comparisons" for why closing it needs a
+--    per-value probe that IN cannot express.
+-- ===================================
+create table nc_mix (id integer primary key, s text);
+insert into nc_mix values (1, '0'), (2, '1');
+-- run
+
+-- Stored '0': IN and the `=` disjunction agree (both false) — this one is fine.
+select s in (1, 'abc') as v from nc_mix where id = 1;
+→ [{"v":false}]
+
+select (s = 1 or s = 'abc') as v from nc_mix where id = 1;
+→ [{"v":false}]
+
+-- Stored '1': THIS is where the gap is visible. `s in (1, 'abc')` stays
+-- uncoerced (false), but `s = 1 or s = 'abc'` reconciles the pairwise `=` and
+-- matches (true). Pinned deliberately as a known, documented divergence —
+-- not a typo.
+select s in (1, 'abc') as v from nc_mix where id = 2;
+→ [{"v":false}]
+
+select (s = 1 or s = 'abc') as v from nc_mix where id = 2;
+→ [{"v":true}]
+
+-- ===================================
+-- 6. Comparison answers unchanged, RETURNED values original
+--    (bug-comparison-coercion-corrupts-returned-value)
+--
+--    `nullif`, `greatest` and `least` each return one of their arguments. The
+--    coercion above used to REPLACE that argument with its cast, so the cast's
+--    output was what came back: `greatest(t, 1)` handed back the integer 3 for the
+--    stored text '3', and `least('abc', 1)` handed back 0 — a value that was never
+--    an argument at all (`cast('abc' as integer)` is 0). Those three now coerce
+--    comparison KEYS at emit time (`makeComparisonGroup`,
+--    runtime/emit/operand-comparator.ts) and return the raw argument.
+-- ===================================
+
+create table t3 (id integer primary key, s text);
+insert into t3 values (1, '3');
+-- run
+
+-- The returned value is the argument as written, storage class included.
+select nullif('3', 1) as v, typeof(nullif('3', 1)) as t;
+→ [{"v":"3","t":"text"}]
+
+select nullif(s, 1) as v, typeof(nullif(s, 1)) as ty from t3;
+→ [{"v":"3","ty":"text"}]
+
+-- A non-numeric text argument: the comparison converts it to 0 and so does not
+-- match 1, but 0 must never be the RESULT.
+select nullif('abc', 1) as v;
+→ [{"v":"abc"}]
+
+-- Regression guard against over-correcting: the comparison itself must still
+-- coerce, so a matching numeric text still nulls out (and '1.9' still truncates
+-- to 1 on the INTEGER side, exactly as `i = '1.9'` does in section 1).
+select nullif(i, '1') as a, nullif(i, '1.9') as b from nn;
+→ [{"a":null,"b":null}]
+
+-- Both orientations of the mixed pair. Argument order decides which side carries
+-- the conversion (probe cast vs value cast), so both must be covered; either way
+-- the result is one of the arguments, never 0.
+select least('abc', 1) as v, typeof(least('abc', 1)) as t;
+→ [{"v":"abc","t":"text"}]
+
+select least(1, 'abc') as v, typeof(least(1, 'abc')) as t;
+→ [{"v":"abc","t":"text"}]
+
+-- The comparison still picks the numerically larger/smaller argument across the
+-- category boundary — it is only the returned spelling that changed.
+select greatest(1, '2') as g, typeof(greatest(1, '2')) as gt;
+→ [{"g":"2","gt":"text"}]
+
+select least(1, '2') as l, typeof(least(1, '2')) as lt;
+→ [{"l":1,"lt":"integer"}]
+
+-- A TEXT column on the probe side, the shape from the bug report.
+select greatest(s, 1) as g, typeof(greatest(s, 1)) as gt from t3;
+→ [{"g":"3","gt":"text"}]
+
+-- Control: `coalesce` picks by nullness, not by comparison, so it declares no
+-- comparison group and was never affected — it already returned its argument.
+select coalesce(s, 1) as v, typeof(coalesce(s, 1)) as ty from t3;
+→ [{"v":"3","ty":"text"}]
+
+-- Control: a same-category group still returns the plain winner.
+select greatest(1, 2) as g, least(1, 2) as l;
+→ [{"g":2,"l":1}]

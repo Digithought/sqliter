@@ -152,6 +152,41 @@ select id from bp where id in (?, ?) order by id;
 → [{"id":1},{"id":3}]
 
 -- ===================================
+-- Single-placeholder IN over the PK
+-- ===================================
+-- Regression: `col in (?)` with exactly one placeholder over an indexed/PK column
+-- reduced to a point-seek on Literal(undefined) and degraded to a full-index walk,
+-- so the predicate silently matched (and, for DELETE, wiped) every row. It must
+-- match exactly the bound row. See quereus-single-element-in-list-matches-all.
+
+-- params: [2]
+select id from bp where id in (?) order by id;
+→ [{"id":2}]
+
+-- Re-bound with a different value (the placeholder must not be constant-folded)
+-- params: [3]
+select id from bp where id in (?) order by id;
+→ [{"id":3}]
+
+-- One-, two-, three-placeholder IN and `= ?` agree on the bound rows
+-- params: [1]
+select id from bp where id = ? order by id;
+→ [{"id":1}]
+
+-- params: [1, 4]
+select id from bp where id in (?, ?) order by id;
+→ [{"id":1},{"id":4}]
+
+-- params: [1, 2, 4]
+select id from bp where id in (?, ?, ?) order by id;
+→ [{"id":1},{"id":2},{"id":4}]
+
+-- A non-matching single placeholder matches nothing (not everything)
+-- params: [99]
+select id from bp where id in (?) order by id;
+→ []
+
+-- ===================================
 -- Parameter in LIMIT / OFFSET
 -- ===================================
 

@@ -48,3 +48,31 @@ create table empty_var (id integer primary key, x real null);
 select var_pop(x) from empty_var;
 → [{"var_pop(x)":null}]
 drop table empty_var;
+
+-- declared return types for the json/string aggregate builtins, pinned via the
+-- maintained-table strict shape gate (declared column types must equal the
+-- body-derived ones: json_group_array/json_group_object → json null,
+-- string_concat → text null)
+create table agg_rt (id integer primary key, grp text not null, v text not null);
+insert into agg_rt values (1, 'a', 'x'), (2, 'a', 'y'), (3, 'b', 'z');
+-- the PK column pins `collate binary` so the declared collation matches the
+-- body-derived one under both suites (the store's key collation defaults to NOCASE)
+create table agg_rt_mt (grp text not null collate binary primary key, ja json null, jo json null, sc text null)
+	maintained as select grp, json_group_array(v) as ja, json_group_object(v, id) as jo, string_concat(v) as sc from agg_rt group by grp;
+select grp, ja, jo, sc from agg_rt_mt order by grp;
+→ [{"grp":"a","ja":["x","y"],"jo":{"x":1,"y":2},"sc":"x,y"},{"grp":"b","ja":["z"],"jo":{"z":3},"sc":"z"}]
+
+-- a declared REAL column for a json aggregate is now a shape error (the old
+-- implicit default derivation)
+create table agg_rt_bad (grp text not null collate binary primary key, ja real null)
+	maintained as select grp, json_group_array(v) as ja from agg_rt group by grp;
+-- error: body derives type
+
+-- maintenance keeps the json/text columns consistent (storage round-trip
+-- through the backing under the JSON type's hooks)
+insert into agg_rt values (4, 'b', 'w');
+select ja, jo, sc from agg_rt_mt where grp = 'b';
+→ [{"ja":["z","w"],"jo":{"z":3,"w":4},"sc":"z,w"}]
+
+drop table agg_rt_mt;
+drop table agg_rt;

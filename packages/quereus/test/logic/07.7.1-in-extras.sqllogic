@@ -61,4 +61,98 @@ select id, val from inx_dml order by id;
 drop table inx_dml;
 drop table inx_keep;
 
+-- =============================================================================
+-- Single-placeholder `col in (?)` over a PK must match exactly the bound row(s),
+-- never the whole table. Regression for the match-all defect: a one-element
+-- parameterized IN reduced to a point-seek on Literal(undefined) and degraded to
+-- a full-index walk, so `delete from T where pk in (?)` wiped every row.
+-- See quereus-single-element-in-list-matches-all.
+-- =============================================================================
+
+create table inp (id integer primary key, label text);
+insert into inp values (0, 'a'), (1, 'b'), (2, 'c'), (3, 'd');
+
+-- select with a single placeholder matches just the bound row
+-- params: [1]
+select id from inp where id in (?) order by id;
+→ [{"id":1}]
+
+-- a different bind value selects a different single row
+-- params: [2]
+select id from inp where id in (?) order by id;
+→ [{"id":2}]
+
+-- one-, two-, three-placeholder IN agree, and with `= ?`
+-- params: [1, 2]
+select id from inp where id in (?, ?) order by id;
+→ [{"id":1},{"id":2}]
+
+-- params: [0, 2, 3]
+select id from inp where id in (?, ?, ?) order by id;
+→ [{"id":0},{"id":2},{"id":3}]
+
+-- params: [3]
+select id from inp where id = ? order by id;
+→ [{"id":3}]
+
+-- Correlated single-element IN (`p.id in (outer.target)`) — the inner scalar
+-- subquery seeks inp's PK on a correlated outer column. Pre-fix this match-alled,
+-- so the scalar subquery would have seen every row instead of exactly one.
+create table inref (rid integer primary key, target integer);
+insert into inref values (10, 2), (11, 3);
+select o.rid, (select p.label from inp p where p.id in (o.target)) as label from inref o order by o.rid;
+→ [{"rid":10,"label":"c"},{"rid":11,"label":"d"}]
+
+-- Plan-mechanism guard: the single-placeholder IN must reduce to an index seek
+-- whose seek key is the bound ParameterReference — NOT a Literal(undefined). The
+-- defect emitted a Literal node (value undefined) as the seek key, which the scan
+-- layer read as "no constraint" and walked the whole index.
+select count(*) as params from query_plan('select id from inp where id in (?)') where node_type = 'ParameterReference';
+→ [{"params":1}]
+
+select count(*) as lits from query_plan('select id from inp where id in (?)') where node_type = 'Literal';
+→ [{"lits":0}]
+
+-- DESTRUCTIVE: delete with a single placeholder removes ONLY the bound row,
+-- not the whole table.
+-- params: [1]
+delete from inp where id in (?);
+→ []
+
+select id from inp order by id;
+→ [{"id":0},{"id":2},{"id":3}]
+
+-- Composite multi-column seek with a single-element dynamic IN component.
+-- A 2-column PK seek where one column carries a multi-value IN (`a in (1, 2)`)
+-- and the other a single-placeholder IN (`b in (?)`) takes the composite
+-- cross-product seek path. Pre-fix the single-element component was dropped to
+-- Literal(undefined) (match-all on b); it must instead seek on the bound param,
+-- so only the b = <param> rows match.
+create table cmp (a integer, b integer, label text, primary key (a, b));
+insert into cmp values (1, 5, 'a'), (1, 6, 'b'), (2, 5, 'c'), (2, 6, 'd');
+
+-- b bound to 5 selects exactly the b=5 rows across both a values
+-- params: [5]
+select label from cmp where a in (1, 2) and b in (?) order by label;
+→ [{"label":"a"},{"label":"c"}]
+
+-- a different bind picks the other pair (proves the param is not constant-folded)
+-- params: [6]
+select label from cmp where a in (1, 2) and b in (?) order by label;
+→ [{"label":"b"},{"label":"d"}]
+
+-- Plan-mechanism guard: the dynamic component survives into the composite seek as
+-- the bound ParameterReference, not a dropped Literal(undefined). Pre-fix the param
+-- was lost entirely (0 ParameterReference nodes). Asserted as a presence check
+-- rather than an exact count because the seek-key cardinality is module-specific
+-- (the memory module expands the literal `a in (1, 2)` cross-product, emitting the
+-- param once per tuple; the store module keeps a single seek with one param node).
+select case when count(*) >= 1 then 'present' else 'absent' end as param from query_plan('select label from cmp where a in (1, 2) and b in (?)') where node_type = 'ParameterReference';
+→ [{"param":"present"}]
+
+drop table cmp;
+
+drop table inref;
+drop table inp;
+
 drop table inx_t;

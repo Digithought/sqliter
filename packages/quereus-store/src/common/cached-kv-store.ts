@@ -6,7 +6,8 @@
  * Iteration always delegates to the underlying store (range consistency is hard).
  */
 
-import type { KVStore, KVEntry, WriteBatch, IterateOptions, BatchOp } from './kv-store.js';
+import { bytesToHex } from './bytes.js';
+import type { KVStore, KVEntry, WriteBatch, IterateOptions, BatchOp, WriteOptions } from './kv-store.js';
 
 /** Configuration options for the CachedKVStore. */
 export interface CacheOptions {
@@ -18,6 +19,21 @@ export interface CacheOptions {
 	enabled?: boolean;
 }
 
+/**
+ * Copy a value across the cache boundary.
+ *
+ * The cache must OWN every buffer it holds and must never hand one out: `get()`'s
+ * read-buffer contract says a caller mutating a returned value cannot corrupt stored
+ * data, and the same has to hold for a value the caller passed to `put()` and then
+ * scribbled on. Without this the cache aliases the caller's buffer in both directions
+ * and a later cache hit serves the scribbles. One allocation per cached read is the
+ * same cost every real backend already pays (LevelDB deserializes, IndexedDB
+ * structured-clones).
+ */
+function copyValue(value: Uint8Array | undefined): Uint8Array | undefined {
+	return value === undefined ? undefined : new Uint8Array(value);
+}
+
 /** Doubly-linked list node for LRU tracking. */
 interface LRUNode {
 	key: string;
@@ -25,15 +41,6 @@ interface LRUNode {
 	size: number;
 	prev: LRUNode | null;
 	next: LRUNode | null;
-}
-
-/** Convert a Uint8Array to a hex string for use as a Map key. */
-function toHex(arr: Uint8Array): string {
-	let hex = '';
-	for (let i = 0; i < arr.length; i++) {
-		hex += (arr[i] < 16 ? '0' : '') + arr[i].toString(16);
-	}
-	return hex;
 }
 
 /**
@@ -71,23 +78,24 @@ export class CachedKVStore implements KVStore {
 	async get(key: Uint8Array): Promise<Uint8Array | undefined> {
 		if (!this.enabled) return this.store.get(key);
 
-		const hex = toHex(key);
+		const hex = bytesToHex(key);
 		const node = this.map.get(hex);
 		if (node) {
 			this.moveToHead(node);
-			return node.value;
+			return copyValue(node.value);
 		}
 
-		// Cache miss — read from underlying
+		// Cache miss — read from underlying. The underlying hands back a fresh buffer per
+		// read, so the caller gets that one and the cache keeps its own copy.
 		const value = await this.store.get(key);
-		this.addEntry(hex, value, key.length + (value?.length ?? 0));
+		this.addEntry(hex, copyValue(value), key.length + (value?.length ?? 0));
 		return value;
 	}
 
 	async has(key: Uint8Array): Promise<boolean> {
 		if (!this.enabled) return this.store.has(key);
 
-		const hex = toHex(key);
+		const hex = bytesToHex(key);
 		const node = this.map.get(hex);
 		if (node) {
 			this.moveToHead(node);
@@ -96,33 +104,35 @@ export class CachedKVStore implements KVStore {
 
 		// Cache miss — delegate to underlying, then cache the result
 		const value = await this.store.get(key);
-		this.addEntry(hex, value, key.length + (value?.length ?? 0));
+		this.addEntry(hex, copyValue(value), key.length + (value?.length ?? 0));
 		return value !== undefined;
 	}
 
-	async put(key: Uint8Array, value: Uint8Array): Promise<void> {
-		await this.store.put(key, value);
+	async put(key: Uint8Array, value: Uint8Array, options?: WriteOptions): Promise<void> {
+		// Forward `options` so the durability hint reaches the real store even when a
+		// cached store happens to be marker-bearing.
+		await this.store.put(key, value, options);
 		if (!this.enabled) return;
 
-		const hex = toHex(key);
+		const hex = bytesToHex(key);
 		const existing = this.map.get(hex);
 		if (existing) {
 			this.totalBytes -= existing.size;
-			existing.value = value;
+			existing.value = new Uint8Array(value); // cache owns its buffer — see copyValue
 			existing.size = key.length + value.length;
 			this.totalBytes += existing.size;
 			this.moveToHead(existing);
 		} else {
-			this.addEntry(hex, value, key.length + value.length);
+			this.addEntry(hex, new Uint8Array(value), key.length + value.length);
 		}
 	}
 
-	async delete(key: Uint8Array): Promise<void> {
-		await this.store.delete(key);
+	async delete(key: Uint8Array, options?: WriteOptions): Promise<void> {
+		await this.store.delete(key, options);
 		if (!this.enabled) return;
 
 		// Insert negative cache entry (known absent)
-		const hex = toHex(key);
+		const hex = bytesToHex(key);
 		const existing = this.map.get(hex);
 		if (existing) {
 			this.totalBytes -= existing.size;
@@ -155,7 +165,7 @@ export class CachedKVStore implements KVStore {
 
 	/** Invalidate a single key from the cache. */
 	invalidate(key: Uint8Array): void {
-		const hex = toHex(key);
+		const hex = bytesToHex(key);
 		this.removeEntry(hex);
 	}
 
@@ -269,6 +279,10 @@ class CachedWriteBatch implements WriteBatch {
 		for (const op of this.ops) {
 			this.cache.invalidate(op.key);
 		}
+		// NOTE: `ops` is intentionally NOT cleared here — the inner batch clears its own
+		// queue, so a reuse only re-invalidates already-invalid keys (harmless). If a
+		// caller ever reuses one batch handle across many commits, this array grows
+		// unbounded; clear it here at that point.
 	}
 
 	clear(): void {

@@ -4,6 +4,7 @@ import { PlanNodeType } from './plan-node-type.js';
 import type { Scope } from '../scopes/scope.js';
 import { Cached } from '../../util/cached.js';
 import type { CTEScopeNode } from './cte-node.js';
+import type { RecursiveCTERefCapable } from '../framework/characteristics.js';
 
 /**
  * Plan node for internal recursive CTE references.
@@ -11,8 +12,9 @@ import type { CTEScopeNode } from './cte-node.js';
  * Unlike CTEReferenceNode, this doesn't materialize the CTE but looks up the working table
  * from the runtime table context.
  */
-export class InternalRecursiveCTERefNode extends ZeroAryRelationalBase implements CTEScopeNode {
+export class InternalRecursiveCTERefNode extends ZeroAryRelationalBase implements CTEScopeNode, RecursiveCTERefCapable {
 	readonly nodeType = PlanNodeType.InternalRecursiveCTERef;
+	readonly isRecursiveCTERefCapable = true as const;
 
 	private attributesCache: Cached<Attribute[]>;
 

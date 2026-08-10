@@ -1,0 +1,147 @@
+-- Lens foundation + default name-based aligner (docs/lens.md).
+-- A logical schema deploys against a name-equivalent basis with no explicit
+-- lens; the query processor then sees an ordinary view.
+
+-- ===================================
+-- 1. Logical schema over a name-equivalent basis reads basis rows
+-- ===================================
+
+declare schema ybasis {
+	table t {
+		id integer primary key,
+		name text
+	}
+}
+
+-- run
+
+apply schema ybasis;
+
+-- run
+
+insert into ybasis.t values (1, 'alpha'), (2, 'beta');
+
+-- run
+
+declare logical schema appx {
+	table t {
+		id integer primary key,
+		name text
+	}
+}
+
+-- run
+
+apply schema appx;
+
+-- run
+
+-- The default mapper compiled `select id, name from ybasis.t`; reads ride the
+-- ordinary view-resolution path.
+select * from appx.t order by id;
+→ [{"id": 1, "name": "alpha"}, {"id": 2, "name": "beta"}]
+
+select name from appx.t where id = 2;
+→ [{"name": "beta"}]
+
+-- ===================================
+-- 2. Physical constructs are rejected under a logical schema
+-- ===================================
+
+declare logical schema badidx {
+	table t {
+		id integer primary key,
+		name text
+	}
+	index ix on t (name)
+}
+
+-- run
+
+apply schema badidx;
+-- error: index 'ix' is not allowed in logical schema
+
+-- ===================================
+-- 3. A logical column with no basis backing errors at apply (name alignment)
+-- ===================================
+
+declare logical schema badcol {
+	table t {
+		id integer primary key,
+		name text,
+		missing text
+	}
+}
+
+-- run
+
+apply schema badcol;
+-- error: has no basis backing
+
+-- ===================================
+-- 4. n-way decomposition synthesis: a columnar split advertised via decomp tags
+--    reads correctly through the synthesized join (optional member outer-joined)
+-- ===================================
+
+-- Basis members in main, carrying quereus.lens.decomp.* tags the generic memory
+-- module turns into a primary-storage advertisement (anchor Car_core, optional
+-- Car_perf sharing logical key id).
+create table Car_core (id integer primary key, make text) with tags (
+	"quereus.lens.decomp.logical.d1" = 'Car',
+	"quereus.lens.decomp.role.d1" = 'primary-storage',
+	"quereus.lens.decomp.anchor.d1" = 'Car_core',
+	"quereus.lens.decomp.presence.d1" = 'mandatory',
+	"quereus.lens.decomp.keykind.d1" = 'logical-tuple',
+	"quereus.lens.decomp.key.d1" = 'id',
+	"quereus.lens.decomp.col.d1.id" = 'id',
+	"quereus.lens.decomp.col.d1.make" = 'make'
+);
+
+create table Car_perf (id integer primary key, speed integer) with tags (
+	"quereus.lens.decomp.logical.d1" = 'Car',
+	"quereus.lens.decomp.role.d1" = 'primary-storage',
+	"quereus.lens.decomp.anchor.d1" = 'Car_core',
+	"quereus.lens.decomp.presence.d1" = 'optional',
+	"quereus.lens.decomp.keykind.d1" = 'logical-tuple',
+	"quereus.lens.decomp.key.d1" = 'id',
+	"quereus.lens.decomp.col.d1.maxSpeed" = 'speed'
+);
+
+-- run
+
+insert into Car_core values (1, 'Honda'), (2, 'Mazda');
+insert into Car_perf values (1, 180);
+
+-- run
+
+declare logical schema appcar {
+	table Car {
+		id integer primary key,
+		make text,
+		-- Backed by the OPTIONAL Car_perf member: an unmatched row null-extends maxSpeed
+		-- (outer-joined), so the logical column must be nullable. (default_column_nullability
+		-- is `not_null`, so this needs the explicit `null`.)
+		maxSpeed integer null
+	}
+}
+
+-- run
+
+-- Pin the basis to main explicitly (ybasis also carries tables, so the default
+-- basis is ambiguous without the `over` binding).
+declare lens for appcar over main { }
+
+-- run
+
+apply schema appcar;
+
+-- run
+
+-- The default mapper synthesized `Car_core left join Car_perf on id`; car 2 has
+-- no perf row but survives with maxSpeed null (optional member outer-joined).
+select * from appcar.Car order by id;
+→ [{"id": 1, "make": "Honda", "maxSpeed": 180}, {"id": 2, "make": "Mazda", "maxSpeed": null}]
+
+-- The maxSpeed column attributes to the Car_perf member in the effective lens.
+select logical_column, advertised_member from quereus_effective_lens('appcar', 'Car') order by logical_column;
+→ [{"logical_column": "id", "advertised_member": "Car_core"}, {"logical_column": "make", "advertised_member": "Car_core"}, {"logical_column": "maxSpeed", "advertised_member": "Car_perf"}]

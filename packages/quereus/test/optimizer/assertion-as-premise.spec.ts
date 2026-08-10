@@ -1,5 +1,8 @@
 import { expect } from 'chai';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { Database } from '../../src/core/database.js';
+import { lineAt, readCode, relPosix, stripComments, tsFilesUnder } from '../util/source-scan.js';
 import { classifyAssertionForHoisting, negateAst } from '../../src/planner/analysis/assertion-classifier.js';
 import type { IntegrityAssertionSchema } from '../../src/schema/assertion.js';
 import type * as AST from '../../src/parser/ast.js';
@@ -57,6 +60,7 @@ function existsOnJoined(leftTable: string, rightTable: string): AST.ExistsExpr {
 function assertion(name: string, expr: AST.Expression): IntegrityAssertionSchema {
 	return {
 		name,
+		schemaName: 'main',
 		violationSql: 'select 1 where 0', // unused by classifier
 		deferrable: true,
 		initiallyDeferred: true,
@@ -107,6 +111,32 @@ describe('classifyAssertionForHoisting (unit)', () => {
 			notExistsOnTable('nonexistent_table', bin('<', col('qty'), lit(0))));
 		const c = classifyAssertionForHoisting(a, db.schemaManager);
 		expect(c).to.equal(undefined);
+	});
+
+	it('resolves an unqualified base against the assertion home schema first', async () => {
+		// Same table name in two schemas: the hoist must bind the one next to the
+		// assertion, matching how the evaluator plans the stored body. Binding
+		// main.orders here would fold a temp assertion's predicate onto main's plan.
+		await db.exec('create table temp.orders (id integer primary key, qty integer) using memory');
+		const a: IntegrityAssertionSchema = {
+			...assertion('temp_no_neg', notExistsOnTable('orders', bin('<', col('qty'), lit(0)))),
+			schemaName: 'temp',
+		};
+		const c = classifyAssertionForHoisting(a, db.schemaManager);
+		expect(c, 'expected hoist candidate').to.not.equal(undefined);
+		expect(c!.baseTableQualifiedName).to.equal('temp.orders');
+	});
+
+	it('falls back past an empty home schema to the default path', () => {
+		// `orders` exists only in main; an assertion homed elsewhere still binds it.
+		db.schemaManager.addSchema('other_home');
+		const a: IntegrityAssertionSchema = {
+			...assertion('elsewhere', notExistsOnTable('orders', bin('<', col('qty'), lit(0)))),
+			schemaName: 'other_home',
+		};
+		const c = classifyAssertionForHoisting(a, db.schemaManager);
+		expect(c, 'expected hoist candidate').to.not.equal(undefined);
+		expect(c!.baseTableQualifiedName).to.equal('main.orders');
 	});
 
 	it('exists(...) — non-negated existential is rejected', () => {
@@ -345,5 +375,64 @@ describe('Assertion-as-premise: end-to-end folding', () => {
 		// by structural-equality dedup keeping the first-merged entry).
 		expect(dom!.source, 'declared-check has no source tag; hoisted dup is discarded')
 			.to.equal(undefined);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// OPT-052 static guard
+// ---------------------------------------------------------------------------
+
+/**
+ * Every reference to `ConstraintProvenance` in `code`, as `<relPath>:<line>`.
+ *
+ * The check is written against the *type name*, not against reads of the `source`
+ * property: `.source` collides with `node.source` (a plan node's child pointer),
+ * which rules read all the time. Any rule that wants to branch on where a fact came
+ * from has to name the provenance type to do anything useful with the tag.
+ */
+function findProvenanceRefs(relPath: string, code: string): string[] {
+	return [...code.matchAll(/\bConstraintProvenance\b/g)].map(m => `${relPath}:${lineAt(code, m.index)}`);
+}
+
+describe('OPT-052 static guard: provenance is informational', () => {
+	// An FD, constant binding, or domain constraint may carry a `source` tag saying it
+	// came from a declared CHECK or from a hoisted assertion. The tag is for diagnostics
+	// only: `fdsEqual` ignores it, and no optimizer rule may branch on it. A rule that
+	// does still typechecks and still passes its own tests — the damage is that a fact's
+	// optimizer meaning starts depending on where it came from.
+	const rulesDir = join(dirname(fileURLToPath(import.meta.url)), '../../src/planner/rules');
+
+	it('no optimizer rule names ConstraintProvenance', () => {
+		const files = tsFilesUnder(rulesDir);
+		expect(files.length, 'found the rule sources').to.be.greaterThan(20);
+
+		const offenders = files.flatMap(file => findProvenanceRefs(relPosix(rulesDir, file), readCode(file)));
+		expect(
+			offenders,
+			`rules must not branch on fact provenance:\n${offenders.join('\n')}`,
+		).to.be.empty;
+	});
+
+	it('flags a hand-written violation but not a comment or a child-pointer read', () => {
+		const violating = stripComments(`
+			import type { ConstraintProvenance } from '../../nodes/plan-node.js';
+			function ruleBad(node) {
+				const prov: ConstraintProvenance | undefined = node.physical.fds[0].source;
+				return prov?.kind === 'assertion' ? null : node;
+			}
+		`);
+		expect(findProvenanceRefs('rules/fake/rule-bad.ts', violating)).to.deep.equal([
+			'rules/fake/rule-bad.ts:2',
+			'rules/fake/rule-bad.ts:4',
+		]);
+
+		const innocent = stripComments(`
+			// ConstraintProvenance is deliberately not consulted here.
+			function ruleFine(node) {
+				if (node.source === node.tableRef) return null;
+				return node;
+			}
+		`);
+		expect(findProvenanceRefs('rules/fake/rule-fine.ts', innocent)).to.be.empty;
 	});
 });

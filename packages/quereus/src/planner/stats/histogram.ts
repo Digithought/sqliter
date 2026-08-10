@@ -97,6 +97,10 @@ export function buildHistogram(
 		const distinct = new Set<string>();
 		for (let j = start; j <= upperIdx; j++) {
 			const val = sortedValues[j];
+			// NOTE: String(val) collapses every JSON object to 'object:[object Object]',
+			// so a JSON column's per-bucket NDV is undercounted. Harmless today — this is
+			// a cost-estimation statistic only, never a correctness key. If JSON-column
+			// cardinality ever drives a bad plan, key on canonicalJsonString here instead.
 			distinct.add(typeof val + ':' + String(val));
 		}
 

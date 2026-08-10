@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quereus Code &amp; Design Review — July 2026</title>
+<style>
+	:root {
+		--bg: #ffffff; --fg: #1a1a1a; --muted: #666;
+		--border: #d8d8d8; --card: #f7f7f8; --accent: #2557a7;
+		--high: #b3261e; --high-bg: #fdecea;
+		--med: #9a6700; --med-bg: #fff8e1;
+		--low: #2e6b30; --low-bg: #edf7ee;
+		--code-bg: #f0f0f2;
+	}
+	@media (prefers-color-scheme: dark) {
+		:root {
+			--bg: #14161a; --fg: #e4e6eb; --muted: #9aa0a8;
+			--border: #33373d; --card: #1d2025; --accent: #7ab0ff;
+			--high: #ff8a80; --high-bg: #3a1f1d;
+			--med: #ffd166; --med-bg: #3a3014;
+			--low: #9be09e; --low-bg: #1c3320;
+			--code-bg: #23262c;
+		}
+	}
+	* { box-sizing: border-box; }
+	body {
+		margin: 0; padding: 2rem 1rem 4rem;
+		background: var(--bg); color: var(--fg);
+		font: 16px/1.6 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+	}
+	main { max-width: 60rem; margin: 0 auto; }
+	h1 { font-size: 1.9rem; line-height: 1.2; margin: 0 0 .25rem; }
+	h2 { font-size: 1.4rem; margin: 2.5rem 0 .75rem; border-bottom: 1px solid var(--border); padding-bottom: .3rem; }
+	h3 { font-size: 1.1rem; margin: 1.75rem 0 .5rem; }
+	p.subtitle { color: var(--muted); margin: 0 0 2rem; }
+	code {
+		background: var(--code-bg); padding: .1em .35em; border-radius: 4px;
+		font: .85em/1.4 ui-monospace, "Cascadia Code", Consolas, monospace;
+		word-break: break-word;
+	}
+	table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .92rem; }
+	th, td { border: 1px solid var(--border); padding: .45rem .6rem; text-align: left; vertical-align: top; }
+	th { background: var(--card); }
+	.tablewrap { overflow-x: auto; }
+	.sev { display: inline-block; padding: .05rem .5rem; border-radius: 999px; font-size: .78rem; font-weight: 600; white-space: nowrap; }
+	.sev.high { color: var(--high); background: var(--high-bg); }
+	.sev.med  { color: var(--med);  background: var(--med-bg); }
+	.sev.low  { color: var(--low);  background: var(--low-bg); }
+	.finding { border: 1px solid var(--border); border-left: 4px solid var(--border); border-radius: 6px; padding: .75rem 1rem; margin: .75rem 0; background: var(--card); }
+	.finding.high { border-left-color: var(--high); }
+	.finding.med  { border-left-color: var(--med); }
+	.finding.low  { border-left-color: var(--low); }
+	.finding h4 { margin: 0 0 .3rem; font-size: 1rem; }
+	.finding .loc { color: var(--muted); font-size: .85rem; margin-bottom: .35rem; }
+	.finding p { margin: .35rem 0; }
+	.summary-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 1rem 1.25rem; margin: 1rem 0; }
+	ol.recs > li { margin: .6rem 0; }
+	a { color: var(--accent); }
+	.toc { columns: 2; column-gap: 2rem; font-size: .95rem; }
+	@media (max-width: 640px) { .toc { columns: 1; } }
+</style>
+</head>
+<body>
+<main>
+
+<h1>Quereus Code &amp; Design Review</h1>
+<p class="subtitle">Full-monorepo review — July 2026. Five parallel deep-dive passes: core/parser, planner/optimizer, runtime/vtab, satellite packages (store → isolation → sync), and architecture/test strategy. All findings verified against source; line numbers from <code>main</code> at time of review.</p>
+
+<h2 id="exec">Executive Summary</h2>
+<div class="summary-card">
+<p><strong>Verdict:</strong> Quereus is an unusually well-engineered engine with a coherent theoretical spine — FD tracking → view updateability → materialized views → lenses form one deliberate dependency chain, and the layered test strategy (soundness property nets, round-trip laws, seeded fuzz, deterministic concurrency tests) is well above typical for a project this size. The core design choices (VTab-centric federation, async core, attribute-based context, single PlanNode hierarchy) are sound and verified in code, not just in docs.</p>
+<p><strong>The biggest risks are not design errors.</strong> They are: <em>(a)</em> total absence of CI for a ~134K-line engine plus 15 satellite packages; <em>(b)</em> a handful of genuine correctness bugs in the persistence/sync chain (key-encoding sort order, sync watermark advancement) that silently produce wrong results or permanent data loss; <em>(c)</em> a systemic cost-model contract violation that distorts join ordering; and <em>(d)</em> a research-program-sized feature surface (lenses, migration, parallel runtime) maintained on single-committer bandwidth, with mega-docs (optimizer.md alone 281&nbsp;KB) already drifting from code.</p>
+<p><strong>Severity distribution:</strong> 18 high, ~25 medium, ~20 low across ~80 verified findings. The high-severity cluster concentrates in <code>quereus-store</code> key encoding, <code>quereus-isolation</code> transaction semantics, and the sync protocol seams — the layers that underpin persistence and replication.</p>
+</div>
+
+<h3>Top 10 — fix these first</h3>
+<div class="tablewrap">
+<table>
+<tr><th>#</th><th>Sev</th><th>What</th><th>Where</th></tr>
+<tr><td>1</td><td><span class="sev high">HIGH</span></td><td>Mixed INTEGER/REAL type prefixes break key sort order → silently wrong range results (under-fetch, filters marked handled)</td><td><code>quereus-store/src/common/encoding.ts:110</code></td></tr>
+<tr><td>2</td><td><span class="sev high">HIGH</span></td><td>Length-prefixed BLOB key encoding not memcmp-ordered → wrong pushed-range results on blob PKs</td><td><code>quereus-store/src/common/encoding.ts:271</code></td></tr>
+<tr><td>3</td><td><span class="sev high">HIGH</span></td><td>Client advances sync watermark on fire-and-forget broadcasts → a dropped broadcast loses changes permanently</td><td><code>sync-coordinator …/coordinator-service.ts:631</code> + <code>quereus-sync-client/src/sync-client.ts:319</code></td></tr>
+<tr><td>4</td><td><span class="sev high">HIGH</span></td><td>Unawaited commit handler (<code>void handleTransactionCommit</code>) can interleave two commits, violating the change-log invariant the code itself documents as load-bearing</td><td><code>quereus-sync/src/sync/sync-manager-impl.ts:255</code></td></tr>
+<tr><td>5</td><td><span class="sev high">HIGH</span></td><td>Cost model double-counts children exponentially by depth (nodes bake child total cost into "self" cost; <code>getTotalCost()</code> adds children again) — distorts QuickPick join enumeration</td><td><code>planner/nodes/*.ts</code> ~20 constructors; <code>plan-node.ts:707,776</code></td></tr>
+<tr><td>6</td><td><span class="sev high">HIGH</span></td><td>Isolation layer doesn't deliver its documented snapshot isolation (reads see live shared state; no write-write conflict detection) and multi-table commits are non-atomic (torn transactions)</td><td><code>quereus-isolation/src/isolated-table.ts:315,1325</code></td></tr>
+<tr><td>7</td><td><span class="sev high">HIGH</span></td><td><code>key-serializer</code> violates its own equality invariant (bigint vs number vs boolean tagged differently; all JSON objects collapse to <code>o:[object Object]</code>) — wrong grouping in PARTITION BY / hash joins; used by store UNIQUE re-validation</td><td><code>quereus/src/util/key-serializer.ts:46</code></td></tr>
+<tr><td>8</td><td><span class="sev high">HIGH</span></td><td><code>Statement.getBlockSql()</code> / reconstructed <code>originalSql</code> return <code>"[object Object]"</code> — the fix (<code>astToString</code>) already exists in-tree</td><td><code>quereus/src/core/statement.ts:79,133</code></td></tr>
+<tr><td>9</td><td><span class="sev high">HIGH</span></td><td><code>tee()</code>/<code>merge()</code> never close source iterators on early consumer break — vtab disconnect/row-slot cleanup in <code>finally</code> blocks never runs</td><td><code>quereus/src/runtime/async-util.ts:43,238</code></td></tr>
+<tr><td>10</td><td><span class="sev high">HIGH</span></td><td>No CI whatsoever — no <code>.github</code> directory; release safety is a 5-second <code>setTimeout</code> reminder. Everything else in the quality story assumes tests actually run.</td><td>repo root</td></tr>
+</table>
+</div>
+
+<h3>Strategic recommendations (ranked)</h3>
+<ol class="recs">
+<li><strong>Stand up CI now.</strong> One GitHub Actions workflow: <code>lint + build + test + test:store + test:fork-strict</code> on push. Highest-ROI item in the entire review; <code>test:store</code> and fork-strict are currently excluded from default <code>yarn test</code> and nothing guarantees they ever run.</li>
+<li><strong>Fix the persistence-layer key encodings before anything is stored durably at scale</strong> (findings 1, 2, 7 above). These silently return wrong query results and become data-migration problems the moment real data exists. Add a mixed int/real range test and a KVStore conformance suite run against LevelDB, IndexedDB, and memory stores.</li>
+<li><strong>Make the isolation layer honest.</strong> Either implement snapshot + write-write conflict detection (base-row fingerprints at first touch, fail the second committer) or fix the documentation in both packages to say "read-committed + read-your-own-writes". Coordinate multi-table flush into one underlying transaction.</li>
+<li><strong>Harden the sync watermark/ack protocol.</strong> Advance <code>lastSyncHLC</code> only from server-ordered responses; serialize commit handling through a promise chain; validate HLC drift <em>before</em> commit; stream tombstones in snapshots; only kill auto-reconnect on fatal (auth) errors. Extract one shared protocol module with a <code>protocolVersion</code> handshake — the client and coordinator codecs have already drifted.</li>
+<li><strong>Pick one cost-model convention and enforce it in the plan validator</strong> (self-cost only, or totals-everywhere). Then memoize <code>getTotalCost()</code> — plan construction is currently O(depth²).</li>
+<li><strong>Declare stability tiers.</strong> Core SQL + vtab + views: stable. Materialized views: beta. Lenses / migration / parallel runtime: experimental. Contains the blast radius of the research tracks; consider freezing the parallel track until a federated consumer pays its rent.</li>
+<li><strong>Mechanize the context-shadowing invariant.</strong> The runtime's shared mutable <code>RowContextMap</code> with last-set-wins semantics plus hand-applied per-emitter discipline is the engine's most likely source of silent wrong-row bugs. Add a debug-mode assertion analogous to <code>QUEREUS_FORK_STRICT</code>.</li>
+<li><strong>Delete the dead scaffolding.</strong> The dead global rule registry (which swallows exceptions, unlike the live path), <code>PredicateAnalysis</code>/<code>CapabilityRegistry</code>, SQLite-era config types, deprecated global collation registry, dead REPL methods. Half-dead parallel paths with divergent semantics are traps.</li>
+<li><strong>Shrink and true-up the mega-docs.</strong> Four concrete doc drifts verified (below); 281&nbsp;KB optimizer.md and 204&nbsp;KB materialized-views.md are past the point of being reviewable against code — extract normative invariants from narrative history.</li>
+</ol>
+
+<h2 id="toc">Contents</h2>
+<ul class="toc">
+<li><a href="#core">1. Core, Parser, Common, Util</a></li>
+<li><a href="#planner">2. Planner &amp; Optimizer</a></li>
+<li><a href="#runtime">3. Runtime, VTab, Schema, Types, Func</a></li>
+<li><a href="#satellite">4. Satellite Packages (store / isolation / sync / plugins / UI)</a></li>
+<li><a href="#design">5. Architecture &amp; Design Assessment</a></li>
+<li><a href="#tests">6. Test Strategy &amp; Tooling</a></li>
+<li><a href="#drift">7. Verified Doc Drift</a></li>
+</ul>
+
+<!-- ==================== 1. CORE ==================== -->
+<h2 id="core">1. Core, Parser, Common, Util</h2>
+<p><strong>Assessment.</strong> Unusually disciplined engine code. The error taxonomy (<code>QuereusError</code> subclasses with status codes, cause-chaining, <code>AbortError</code> interop) is thoughtful; <code>wrapAsyncIterator</code>'s commit/rollback separation is a genuinely clean solution to a hard iterator-lifecycle problem; <code>comparison.ts</code> hot paths show real perf awareness. Weak spots: drifted seams (two collation registries, two equality functions with divergent semantics), soft statement-lifecycle corners (inconsistent mutex, non-resetting <code>reset()</code>, leakable listeners), and TODO placeholders that quietly became user-visible behavior.</p>
+
+<div class="finding high"><h4>Broken <code>getBlockSql()</code> — <code>"[object Object]"</code></h4>
+<div class="loc"><code>core/statement.ts:79,133</code> · robustness</div>
+<p>AST statements have no <code>toString()</code>; public <code>getBlockSql()</code>, reconstructed <code>originalSql</code>, and the planning log all emit garbage. <code>astToString</code> in <code>emit/ast-stringify.ts</code> already exists — use it at both sites.</p></div>
+
+<div class="finding high"><h4>Parser error re-wrap strips subclass identity and location</h4>
+<div class="loc"><code>parser/parser.ts:106–119</code> · robustness</div>
+<p><code>parseAll</code> matches <code>e.name === 'QuereusError'</code>, but every subclass overrides <code>name</code> — a <code>ParseError</code> gets logged as unhandled and re-wrapped without location info. Fix: <code>if (e instanceof QuereusError) throw e;</code>.</p></div>
+
+<div class="finding high"><h4><code>key-serializer</code> equality invariant does not hold</h4>
+<div class="loc"><code>util/key-serializer.ts:46–59</code> · correctness</div>
+<p>Doc promises "equal values ⇔ identical keys", but <code>5n</code> vs <code>5</code> and <code>true</code> vs <code>1</code> get different tags, and every distinct JSON object serializes to <code>'o:[object Object]'</code> — wrongly merging unequal values in PARTITION BY / hash joins, wrongly splitting equal ones in store UNIQUE re-validation. Normalize numeric classes to one tag; <code>JSON.stringify</code> object values.</p></div>
+
+<div class="finding high"><h4>LIKE/GLOB compile a fresh RegExp per row</h4>
+<div class="loc"><code>util/patterns.ts:16–30</code>, callers in <code>runtime/emit/binary.ts</code>, <code>func/builtins/string.ts</code> · performance</div>
+<p>Two <code>.replace</code> passes + <code>new RegExp</code> per row scanned. Memoize compiled patterns (small LRU) and pre-compile in <code>emitLikeOp</code> when the pattern is a literal.</p></div>
+
+<div class="finding med"><h4>Statement lifecycle soft spots</h4>
+<div class="loc"><code>core/statement.ts:164–213, 390–421</code> · robustness</div>
+<p>(a) <code>iterateRows()</code> skips the exec mutex that <code>run()</code>/<code>get()</code>/<code>all()</code> acquire — concurrent statements can interleave with implicit-transaction lifecycle. (b) Schema-change listener leaks when a recompile yields no dependencies (unsubscribe is conditional). (c) <code>reset()</code> merely warns and clears <code>busy</code> while iteration may be in flight — second iteration can start concurrently. (d) <code>db.get()</code> binds parameters twice.</p></div>
+
+<div class="finding med"><h4>Dead SQLite-era config types mislead plugin authors</h4>
+<div class="loc"><code>common/types.ts:111–176</code> · dead code</div>
+<p><code>DatabaseInfo</code>/<code>DatabaseConfig</code> (WAL, journal mode, page size) have zero references and describe features Quereus doesn't have. Delete.</p></div>
+
+<div class="finding med"><h4>Two collation registries, silent BINARY fallback</h4>
+<div class="loc"><code>util/comparison.ts:14,67–100</code> vs <code>core/database.ts:376</code> · design</div>
+<p>Deprecated global registry is still the live fallback inside <code>compareSqlValues</code>; per-database registrations are invisible to util-layer resolvers (debug-log-only BINARY fallback). Needs a migration plan; at minimum surface the fallback once per name. Related: <code>sqlValuesEqual</code> duplicates <code>compareSqlValuesFast</code> with divergent semantics (<code>5n === 5</code> false via <code>===</code>) and a stale doc comment — delete it.</p></div>
+
+<div class="finding low"><h4>Smaller items</h4>
+<div class="loc">various · cleanliness/performance</div>
+<p><code>needsParens</code> rebuilds its precedence table per binary node (hot in canonical-DDL hashing) — hoist to module constants; table omits <code>&lt;&gt;</code>/<code>IS</code>. OBJECT comparison JSON.stringifies both sides per compare inside sorts. Lexer builds lexemes char-by-char (slice-to-terminator for the no-escape case) and carries a dead <code>parseInt</code> try/catch. <code>Token.literal?: any</code> and two <code>(stmt as any).withClause</code> casts violate the no-<code>any</code> rule. <code>Latches</code> is a process-global static keyed by string — shared across all Database instances, no timeout/diagnostics. <code>database-materialized-views.ts</code> at 3,462 lines needs the same decomposition its siblings got. <code>validateParameterTypes</code> named-param <code>??</code> fallback misfires on legitimate <code>null</code> bindings.</p></div>
+
+<!-- ==================== 2. PLANNER ==================== -->
+<h2 id="planner">2. Planner &amp; Optimizer</h2>
+<p><strong>Assessment.</strong> The pass framework is clean (iterative worklist traversals, depth + rules-fired budgets, per-pass memo cache); <code>sideEffectMode</code> audit discipline is enforced at registration with soundness rationales; FD/EC/IND propagation is unusually rigorous. Weaknesses: the cost-model contract violation below, a dead parallel rule-application path with <em>different error semantics</em>, a <code>priority</code> field that pretends to govern ordering but doesn't, and three competing type-discrimination idioms.</p>
+
+<div class="finding high"><h4>Cost model: children double-counted, exponentially by depth</h4>
+<div class="loc"><code>nodes/plan-node.ts:707,776</code>; ~20 node constructors (<code>filter.ts:29</code>, <code>join-node.ts:119</code>, <code>sort.ts:44</code>, …) · design/correctness</div>
+<p><code>estimatedCost</code> is documented as self-cost-excluding-children, but constructors bake in <code>source.getTotalCost()</code>; <code>getTotalCost()</code> then adds children again — a leaf under d operators is weighted 2<sup>d</sup>. QuickPick join enumeration (<code>rule-quickpick-enumeration.ts:109</code>) consumes this, so left-deep vs bushy comparisons are systematically distorted. Pick one convention; enforce with a validator check. Also: <code>getTotalCost()</code> is uncached recursion invoked in constructors → O(depth²) plan construction, re-paid on every <code>withChildren</code> re-mint across three passes. Memoize (nodes are immutable).</p></div>
+
+<div class="finding high"><h4>Dead parallel rule-application path with divergent semantics</h4>
+<div class="loc"><code>optimizer.ts:1059–1113</code>, <code>framework/registry.ts:261</code> · cleanliness/robustness</div>
+<p><code>optimizeNode</code>/<code>optimizeChildren</code> are never called; they're the sole consumers of the global <code>RuleRegistry</code> path — whose <code>applyRules</code> <em>swallows rule exceptions</em> while the live <code>PassManager</code> propagates. Two near-duplicate loops with different error and ordering semantics. Delete the dead path and registry class.</p></div>
+
+<div class="finding high"><h4>Materialization advisory: swallowed errors + double analysis, fired from 12 anchors</h4>
+<div class="loc"><code>rules/cache/rule-materialization-advisory.ts:43–76</code>; <code>optimizer.ts:967–1000</code> · robustness/performance</div>
+<p>Catch-all <code>return null</code> masks advisory bugs (violates no-silent-exceptions); the probe loop transforms per-child then throws results away and re-analyzes the whole tree. Registered on 12 node types in a bottom-up pass, each firing walks the full subtree — O(n²)-flavored plan time on statement-heavy plans. Run once at plan root; let unexpected errors propagate.</p></div>
+
+<div class="finding med"><h4><code>priority</code> is dead metadata on the live path</h4>
+<div class="loc"><code>framework/pass.ts:520</code>; <code>optimizer.ts:117,413</code> · design</div>
+<p>Live pass iterates rules in registration order; priority sorting exists only in the dead registry. Comments admit it. Either sort <code>pass.rules</code> by priority (making annotations real) or remove the field. Related: the ~900-line <code>registerRulesToPasses</code> should become a table-driven manifest with a startup assertion that priorities are non-decreasing.</p></div>
+
+<div class="finding med"><h4>Three competing type-discrimination idioms</h4>
+<div class="loc"><code>framework/characteristics.ts:323–443</code> and 40 planner files · cleanliness/robustness</div>
+<p><code>instanceof</code> (179 occurrences), <code>nodeType</code> string checks, and duck-typed <code>as any</code> detectors coexist. Concrete defects: <code>isColumnBindingProvider</code> tests <code>typeof method === 'string'</code> (dead branch — methods typeof to 'function'); <code>isAggregateFunction</code> keys off mere property presence, so any node growing a same-named member silently acquires the capability. Pick one canonical mechanism. Also dead: <code>PredicateAnalysis</code> (whose TODO stub returns <code>true</code> — the <em>unsafe</em> direction) and <code>CapabilityRegistry</code> (registered into, never queried).</p></div>
+
+<div class="finding med"><h4>Plan-time performance: declining rules retried, heavyweight recompute per re-mint, residual O(n) scans</h4>
+<div class="loc"><code>framework/pass.ts:508–544</code>; <code>nodes/filter.ts:59–165</code>; <code>physical-utils.ts:41</code>, <code>rule-async-gather-zip-by-key.ts:581</code> · performance</div>
+<p>(a) Only transforming rules are marked applied — one transform on a Filter re-runs its full ~9-rule battery including the 1300-line query-rewrite matcher. Track per-(node,rule) declines. (b) <code>FilterNode.computePhysical</code> re-runs constraint extraction (1457-line module) 3–4× per pass re-mint and hand-builds an attr index instead of the existing cache. (c) Several <code>findIndex</code>-in-loop attribute scans survive despite <code>getAttributeIndex()</code> existing precisely to kill them.</p></div>
+
+<div class="finding med"><h4>Recursive property computation undermines the iterative-traversal guarantee</h4>
+<div class="loc"><code>plan-node.ts:776,780,825</code>; <code>characteristics.ts:38</code> · robustness</div>
+<p>Pass traversal is deliberately iterative to avoid stack overflow, but <code>get physical()</code>, <code>getTotalCost()</code>, <code>visit()</code>, and <code>subtreeHasSideEffects</code> are unbounded recursion over the same trees — a plan deep enough to need the depth budget still overflows the first time a rule touches <code>.physical</code>.</p></div>
+
+<div class="finding med"><h4>Cross-rule protocol rides untyped <code>moduleCtx</code> with two drifting local types</h4>
+<div class="loc"><code>rules/retrieve/rule-grow-retrieve.ts:49</code> vs <code>rules/access/rule-select-access-path.ts:1000</code> · robustness</div>
+<p><code>IndexStyleContext</code> declared twice with divergent field types (<code>residualPredicate?: PlanNode</code> vs <code>ScalarPlanNode</code>); consumer forced into <code>as unknown as</code> casts. Move to one shared module with a type guard.</p></div>
+
+<div class="finding low"><h4>Selectivity hardcoded at 0.5 while a full stats layer sits unreachable</h4>
+<div class="loc"><code>nodes/filter.ts:50–57</code>; <code>stats/</code> · design</div>
+<p>Histograms and <code>OptContext.stats</code> exist, but node-level <code>computePhysical</code> has no context parameter, so filters can never use them. Route selectivity through a Physical-pass rule that has <code>OptContext</code> rather than widening <code>computePhysical</code>. Also low: convergence model silently prevents rules re-firing on their own output (filter-merge loops internally; undocumented contract for new rule authors); <code>planner/debug.ts</code> <code>any</code> usage; dead <code>OptimizationContext</code> surface.</p></div>
+
+<!-- ==================== 3. RUNTIME ==================== -->
+<h2 id="runtime">3. Runtime, VTab, Schema, Types, Func</h2>
+<p><strong>Assessment.</strong> Coherent, well-documented-in-code architecture: plan-time specialization in emitters, pre-resolved collations, O(1) attribute-indexed context, MVCC memory vtab with carefully reasoned Halloween protection, end-to-end cancellation, and the strict-fork harness is a genuinely good concurrency-contract enforcement idea. Weaknesses: pervasive per-row async overhead, inconsistent iterator cleanup, a scheduler in six near-identical copies, memory-vtab specifics leaked into generic runtime.</p>
+
+<div class="finding high"><h4>Unconditional <code>await</code> per row on scalar sub-programs</h4>
+<div class="loc"><code>runtime/emit/filter.ts:30</code>, <code>project.ts:39</code>, <code>join.ts:92</code> · performance</div>
+<p>Every row pays <code>await predicate(rctx)</code> — one per projection column — even when the sub-scheduler returned synchronously (the common case). k microtask hops per row for a k-column projection. Check <code>instanceof Promise</code> and only await then; shared <code>resolveMaybe</code> helper.</p></div>
+
+<div class="finding high"><h4>Memory scan path stacks 3–5 async generators per row</h4>
+<div class="loc"><code>vtab/memory/layer/safe-iterate.ts:7</code>, <code>scan-layer.ts:26</code>, <code>table.ts:249</code>, <code>runtime/emit/scan.ts:107</code> · performance</div>
+<p><code>safeIterate</code> is <code>async function*</code> over a fully synchronous BTree; <code>scanLayer</code> wraps it recursively; <code>query()</code> re-yields with <code>for await … yield</code> instead of <code>yield*</code>; <code>emitSeqScan</code> wraps again. Each layer is a promise round-trip per row. Make <code>safeIterate</code> sync, adapt at the boundary, <code>yield*</code> everywhere else.</p></div>
+
+<div class="finding high"><h4><code>tee()</code>/<code>merge()</code> leak source iterators</h4>
+<div class="loc"><code>runtime/async-util.ts:43–118, 238</code> · robustness</div>
+<p>Early consumer break never calls <code>srcIterator.return()</code> — the source's <code>finally</code> (row slots, vtab disconnect) never runs. <code>merge()</code> additionally re-wraps every pending promise per loop iteration (O(sources) allocations per row, unbounded handler chains). Refcount consumers in <code>tee</code>; index-tagged promises + <code>try/finally</code> closing live iterators in <code>merge</code>.</p></div>
+
+<div class="finding med"><h4>CHECK truthiness misses bigint/string zero</h4>
+<div class="loc"><code>runtime/emit/constraint-check.ts:368</code>, <code>deferred-constraint-queue.ts:104</code> · correctness</div>
+<p><code>result === false || result === 0</code> — a CHECK evaluating to <code>0n</code> or <code>'0'</code> passes, diverging from <code>FilterNode</code>/<code>isTruthy</code> semantics. Use <code>isTruthy</code> at both sites.</p></div>
+
+<div class="finding med"><h4>Per-execution and per-run overhead on prepared statements</h4>
+<div class="loc"><code>core/statement.ts:323</code>; <code>runtime/emitters.ts:170</code>; <code>runtime/emit/scan.ts:75</code> · performance</div>
+<p>(a) Plan is cached but <code>emitPlanNode</code> + <code>new Scheduler</code> rerun per execution — whole-tree closure allocation on every reuse. (b) <code>validateCapturedSchemaObjects</code> re-validates the entire schema snapshot on every validated-instruction run — O(instructions × snapshot), and re-fires per outer row inside un-cached NLJ inners, which also re-run <code>module.connect</code>/<code>disconnect</code> per outer row. Validate once per statement execution; cache the instruction tree keyed on the emission-context fingerprint.</p></div>
+
+<div class="finding med"><h4>Scheduler abandons in-flight promises on throw; six near-identical loops</h4>
+<div class="loc"><code>runtime/scheduler.ts:105–438</code> · robustness/cleanliness</div>
+<p>In <code>runAsync</code>, promises parked in <code>instrArgs</code> are never awaited if an earlier instruction throws → unhandled rejections (process-fatal under strict mode). And the fix must land six times: <code>runOptimized</code>/<code>runWithTracing</code>/<code>runWithMetrics</code> plus async twins duplicate the core loop. Sweep abandoned promises with <code>allSettled</code> on throw; collapse to one hook-parameterized loop.</p></div>
+
+<div class="finding med"><h4>Coordinated-commit sibling path is last-writer-wins</h4>
+<div class="loc"><code>vtab/memory/layer/manager.ts:453–479</code> · robustness</div>
+<p>When a sibling connection already committed a layer for the same table during coordinated commit, the pending layer overwrites it — sibling's changes vanish from the committed chain. Rebase onto the sibling head or throw BUSY.</p></div>
+
+<div class="finding med"><h4><code>ParallelDriver.closeAll()</code> violates the iterator protocol it polices</h4>
+<div class="loc"><code>runtime/parallel-driver.ts:228–249</code> · robustness</div>
+<p><code>it.return()</code> invoked while a <code>next()</code> is still pending — async generators queue this safely, but arbitrary vtab <code>AsyncIterator</code> implementations may not. Await the pending pull first, or document the generator requirement.</p></div>
+
+<div class="finding med"><h4>Memory-vtab specifics hardcoded in generic runtime</h4>
+<div class="loc"><code>runtime/utils.ts:141–153</code> · design</div>
+<p><code>getVTable</code> special-cases <code>vtabModuleName === 'memory'</code> and imports memory-vtab classes into module-agnostic runtime — third-party modules can't get connection injection. Add an optional <code>VirtualTable.adoptConnection()</code> hook.</p></div>
+
+<div class="finding low"><h4>Smaller items</h4>
+<div class="loc">various · cleanliness/design</div>
+<p>AND/OR can't short-circuit (eager param evaluation; expensive scalar subqueries always run — emit callback-style like CASE when non-trivial). File-wide <code>eslint-disable no-explicit-any</code> in <code>emitters.ts</code>/<code>utils.ts</code>; <code>run as InstructionRun</code> casts everywhere (generic <code>Instruction&lt;TArgs&gt;</code> would fix). Dead: <code>shadowName</code> ("UNWIRED / DEAD"), no-op <code>cleanupUnreferencedLayers</code> calling <code>global.gc()</code> in production path. Multi-seek dedup allocates a full BTree as a seen-set. Context-leak diagnostic checks before async execution completes — can never observe the leaks it exists for. Mixed tabs/spaces in <code>emit/scan.ts</code>; ~60 duplicated lines in <code>scan-layer.ts</code>.</p></div>
+
+<!-- ==================== 4. SATELLITE ==================== -->
+<h2 id="satellite">4. Satellite Packages</h2>
+<p><strong>Assessment.</strong> The store → isolation → sync chain contains the review's most dangerous findings: two key-encoding sort-order bugs at the foundation, an isolation layer overselling its guarantee, and a sync watermark protocol that permanently loses changes under ordinary packet loss. The CRDT core in <code>quereus-sync</code> (LWW column versions, tombstone blocking, three-phase admission, quarantine) is carefully reasoned; the failures are at the seams. <code>quereus-plugin-leveldb</code> is the strongest reviewed package; <code>quoomb-cli</code> the messiest.</p>
+
+<h3>Store (quereus-store)</h3>
+<div class="finding high"><h4>Key encoding: mixed INTEGER/REAL prefixes break sort order</h4>
+<div class="loc"><code>src/common/encoding.ts:110–115</code> · correctness</div>
+<p>Whole numbers (<code>3.0</code>) route to <code>TYPE_INTEGER</code> (0x01), fractional to <code>TYPE_REAL</code> (0x02), so in a REAL PK column every whole number sorts before every fractional one. <code>getBestAccessPlan</code> marks range filters <em>handled</em> — <code>WHERE x &gt;= 2.5</code> skips <code>x = 3</code>. Under-fetch: silently wrong results. Fix: single order-preserving numeric encoding (SQLite4-style) or encode by declared physical type; add a mixed int/real range test.</p></div>
+
+<div class="finding high"><h4>BLOB keys: varint length prefix is not memcmp-ordered</h4>
+<div class="loc"><code>src/common/encoding.ts:271–278</code> · correctness</div>
+<p><code>[0x01,0x02]</code> compares greater than <code>[0x03]</code> (length-first). Same handled-filter consequence: pushed blob-PK ranges return wrong rows. Escape-encode with terminator (reuse the TEXT 0x00/0x01 escaping).</p></div>
+
+<div class="finding high"><h4>UNIQUE enforcement full-scans the table per constraint per row; secondary indexes written but never read</h4>
+<div class="loc"><code>src/common/store-table.ts:1451,636</code>; <code>store-module.ts:1856</code> · performance/design</div>
+<p>Bulk inserts with UNIQUE constraints are O(n²) — while writers pay per-index delete+put maintenance and <code>query()</code> only supports PK scans. Implementing the index-scan read arm fixes both.</p></div>
+
+<div class="finding med"><h4>Codec and lifecycle drag</h4>
+<div class="loc"><code>serialization.ts:24–49</code>, <code>transaction.ts:215</code>, <code>store-module.ts:1061,1753,1973</code> · performance/robustness</div>
+<p>JSON row codec with per-call <code>new TextEncoder()</code>; triplicate slow <code>bytesToHex</code>. Failed commit fires neither onCommit nor onRollback (stats delta leaks into next txn); <code>renameTable</code> deletes stats; <code>tableKey.split('.')</code> mis-routes quoted identifiers containing dots. CREATE INDEX / ALTER PK buffer the entire table. 565-line <code>alterTable</code> in a 2,689-line file.</p></div>
+
+<h3>Isolation (quereus-isolation)</h3>
+<div class="finding high"><h4>Documented snapshot isolation not delivered; multi-table commits torn</h4>
+<div class="loc"><code>isolation-module.ts:106</code>, <code>isolated-table.ts:315,1325</code>, <code>isolated-connection.ts:49</code> · design/correctness</div>
+<p>Reads merge the overlay with the <em>live shared</em> underlying table — other connections' commits visible mid-transaction; no write-write conflict detection (last flusher wins). Each table flushes in its own underlying transaction — table B failure leaves table A durably committed. Either implement (fingerprints at first touch + coordinated flush) or fix the docs in both packages.</p></div>
+
+<div class="finding high"><h4>Modified-PK set: <code>JSON.stringify(pk)</code> throws on bigint, ignores collation; tombstone revival skips UNIQUE checks</h4>
+<div class="loc"><code>isolated-table.ts:391,716</code> · robustness</div>
+<p>Secondary-index scans with pending changes crash on bigint PKs; NOCASE PK case-change yields duplicate rows in the merge. INSERT reviving a same-transaction tombstone returns early without <code>checkMergedUniqueConstraints</code>, then flushes <code>trustedWrite: true</code> — UNIQUE collision surfaces as INTERNAL at commit or corrupts the store.</p></div>
+
+<div class="finding med"><h4>String-parses the store's private <code>idxStr</code> wire format</h4>
+<div class="loc"><code>isolated-table.ts:449,1022</code> · design</div>
+<p>Parsing <code>"idx=name(n);plan=2"</code> couples packages through an unversioned string; unrecognized formats silently degrade to full scans. The engine is missing a small public seam: a structured index descriptor on <code>FilterInfo</code>/<code>BestAccessPlanResult</code>. UNIQUE checks here also full-scan the underlying (push an equality FilterInfo instead). Only 4 test specs for an isolation layer — thin.</p></div>
+
+<h3>Sync (quereus-sync, sync-client, sync-coordinator)</h3>
+<div class="finding high"><h4>Watermark advanced on fire-and-forget broadcasts → permanent change loss</h4>
+<div class="loc"><code>sync-coordinator …/coordinator-service.ts:631–672</code> + <code>sync-client.ts:319–324</code> · robustness</div>
+<p>Coordinator broadcast failures are only logged; the client sets <code>lastSyncHLC = max(hlc)</code> for pushed batches too. Miss batch X (HLC 5), receive Y (HLC 6) → next <code>get_changes sinceHLC=6</code> skips X forever. Advance the watermark only from server-ordered <code>changes</code> responses.</p></div>
+
+<div class="finding high"><h4>Unawaited commit handler violates the documented change-log invariant</h4>
+<div class="loc"><code>quereus-sync/src/sync/sync-manager-impl.ts:255</code> · correctness</div>
+<p><code>void manager.handleTransactionCommit(batch)</code> — two rapid commits interleave; second's dedup reads can precede first's <code>kvBatch.write()</code>, violating the invariant <code>collectChangesSince</code> documents as load-bearing. Serialize through a promise chain.</p></div>
+
+<div class="finding high"><h4>Snapshots omit tombstones; drift check runs after commit</h4>
+<div class="loc"><code>snapshot-stream.ts:72,272</code>; <code>change-applicator.ts:513</code>, <code>hlc.ts:329</code> · robustness</div>
+<p>Snapshot bootstrap (including every S3 restore) clears receiver tombstones — straggler writes resurrect deleted rows, de-converging replicas. Clock-drift rejection executes after data + CRDT metadata commit — a peer 60s ahead durably lands unbeatable far-future LWW wins, then the batch "fails". Stream a tombstone chunk type; validate HLC wallTime in phase 1.</p></div>
+
+<div class="finding high"><h4>Client kills auto-reconnect on any server <code>error</code> message</h4>
+<div class="loc"><code>sync-client.ts:260–268</code> · robustness</div>
+<p>Coordinator sends <code>error</code> for transient per-request failures; the client sets <code>intentionalDisconnect = true</code> unconditionally — one flaky apply ends sync for the process lifetime. Related fragility: stale-socket handlers reject new connects, uncorrelated <code>apply_result</code> acks, silent <code>send()</code> drops, in-memory-only <code>lastSentHLC</code> (every restart re-sends full history).</p></div>
+
+<div class="finding med"><h4>Wire protocol duplicated, drifted, unversioned</h4>
+<div class="loc"><code>sync-client/src/serialization.ts</code> vs <code>sync-coordinator/src/common/serialization.ts</code> · design</div>
+<p>Codec copies already disagree (missing-<code>schemaMigrations</code> tolerance, typed vs <code>Record&lt;string,unknown&gt;</code>); message unions have diverged (<code>resume_snapshot</code>/<code>snapshot_chunk</code> on one side only); no protocol version anywhere. One shared protocol module in <code>@quereus/sync</code> + <code>protocolVersion</code> handshake. Also: change-log pruning never wired into production; store-manager close/acquire race hands out closed LevelDB handles; <code>resume_snapshot</code> trusts an unvalidated client checkpoint; auth token in WS query string; S3 snapshot fully stringified in memory despite a streaming comment; no socket backpressure.</p></div>
+
+<h3>Plugins &amp; UI</h3>
+<div class="finding med"><h4>IndexedDB plugin diverges from its LevelDB twin behind the same contract</h4>
+<div class="loc"><code>quereus-plugin-indexeddb/src/store.ts:156,263</code>, <code>manager.ts:79,191</code> · robustness</div>
+<p>Iterate materializes the full result set (LevelDB streams); batch not cleared after write (reuse double-applies); failed open cached forever; racy upgrade serialization → <code>VersionError</code>. These stores are meant to be interchangeable — build a shared KVStore conformance suite run against LevelDB, IndexedDB, and memory.</p></div>
+
+<div class="finding low"><h4>Smaller items</h4>
+<div class="loc">various · cleanliness</div>
+<p>plugin-loader: protocol allowlist sits beside rather than inside <code>dynamicLoadModule</code>; config channel flattens objects to JSON strings that IndexedDB plugin casts back as objects (user cache config silently ignored); web/CLI/loader each re-implement the plugin-load loop. quoomb-cli: ~70 lines of dead REPL methods, scaffold remnants, pervasive <code>any</code>, raw identifier interpolation into <code>PRAGMA table_info(${tableName})</code>, dead npm <code>readline</code> dep. quoomb-web: five copy-paste <code>fetch*</code> actions. shared-ui: exports a string constant — drop or implement.</p></div>
+
+<!-- ==================== 5. DESIGN ==================== -->
+<h2 id="design">5. Architecture &amp; Design Assessment</h2>
+
+<h3>What's sound</h3>
+<ul>
+<li><strong>VTab-centric federation</strong> — deeply integrated, not a bolt-on: join-elimination rationale, <code>getBestAccessPlan</code>, and the module concurrency contract are all real and verified. Hidden cost: every read pays the async-iterator protocol per row even for in-memory data, and the "generous" perf sentinels won't catch gradual per-row creep (see runtime findings).</li>
+<li><strong>FD tracking</strong> — "sound by construction, best-effort complete" is the correct asymmetry, and the Key Soundness property net directly checks the thing that matters. Exemplary. Residual risk: uniqueness truth lives on three surfaces reconciled by one utility pair; any consumer bypassing <code>fd-utils</code> reintroduces the inconsistency.</li>
+<li><strong>Single PlanNode hierarchy + 1:1 emitter mirror</strong> — simple, testable; <code>sideEffectMode</code> registration enforcement is real discipline.</li>
+<li><strong>Key-based addressing</strong> — clean Third-Manifesto position with known write-amplification consequences for keyless tables. No concerns.</li>
+</ul>
+
+<h3>What's fragile</h3>
+<ul>
+<li><strong>Attribute-based context is the strongest and most fragile part simultaneously.</strong> Stable attribute IDs are the right call, but the runtime rests on a shared mutable <code>RowContextMap</code> with last-set-wins semantics; the stale-parent-context shadowing footgun is documented in <code>runtime.md</code> and mitigated by hand-applied per-emitter discipline that differs per emitter. Every new streaming emitter is a chance to reintroduce a silent wrong-row bug. That the parallel track needed <code>QUEREUS_FORK_STRICT</code> plus a static allowlist of mutation sites confirms the tension between shared-mutable context and the parallelism ambitions. Recommendation: debug-mode runtime assertion for stale-context wins.</li>
+<li><strong>Scope.</strong> Load-bearing: vtab framework, planner, FD framework, view updateability (MVs, lenses, and migration all sit on it — the Round-Trip Laws suite is the right mitigation), declarative schema. Research-grade but real: lenses (implemented with prover, compiler, logic tests — publishable-research correctness surface relative to user base). Speculative: the parallel runtime track — well-built, deterministic tests are genuinely good, but its payoff exists only for high-latency federated vtabs while its cost (fork contract, connection locks) is imposed on the whole runtime. Clearest candidate for "pause until demand justifies".</li>
+<li><strong>Feature creep verdict:</strong> the core is not yet endangered — 249 sqllogic files and the property nets keep the SQL engine honest, and advanced features are additive layers. The endangered resource is <em>maintainer attention</em>: 800&nbsp;KB+ of topic docs already drifting, and every layer added to the FD→lens chain raises the cost of changing anything beneath it.</li>
+</ul>
+
+<!-- ==================== 6. TESTS ==================== -->
+<h2 id="tests">6. Test Strategy &amp; Tooling</h2>
+<p><strong>Strengths (verified):</strong> 249 logic-test files; property tests including Key Soundness (Tier 1 + per-node Tier 2) and View Round-Trip Laws; seeded reproducible fuzzing with optimizer differential testing; golden plans; perf sentinels; deterministic gate-driven (not wall-clock) concurrency tests; Stryker mutation-testing infra; store-backed re-run.</p>
+
+<div class="finding high"><h4>No CI</h4>
+<div class="loc">repo root · process</div>
+<p>No <code>.github</code> directory. Release safety is a 5-second <code>setTimeout</code> reminder in the root <code>release</code> script. <code>test:store</code> and <code>test:fork-strict</code> are excluded from default <code>yarn test</code>; without CI, nothing guarantees they run. Single largest risk in the project.</p></div>
+
+<div class="finding med"><h4>Coverage unevenness and tooling gaps</h4>
+<div class="loc">workspace · testing/tooling</div>
+<p>quereus-isolation: 4 specs — thin for an isolation layer (vs sync 26, store 35). <code>plugin-loader</code>: no test script. quoomb-web/cli/shared-ui: <code>vitest --passWithNoTests</code> — effectively untested. No end-to-end sync test through the coordinator; no browser-environment execution for the IndexedDB plugin; no cross-package version-skew testing. Root build is a sequential 16-script <code>cd</code>-chain — <code>composite: true</code> is set but <code>tsc -b</code> project references are unused. Root <code>yarn lint</code> covers only <code>@quereus/quereus</code> while five packages actually have lint scripts (AGENTS.md's "only quereus has lint" is itself stale) and store/isolation/sync/plugins/coordinator have none. Dependency hygiene is good (six small runtime deps, pinned resolutions).</p></div>
+
+<!-- ==================== 7. DRIFT ==================== -->
+<h2 id="drift">7. Verified Doc Drift</h2>
+<div class="tablewrap">
+<table>
+<tr><th>Doc claim</th><th>Reality</th></tr>
+<tr><td><code>architecture.md:87</code> — "register emitter in <code>emit/emitter.ts</code>"</td><td>File doesn't exist; registration lives in <code>src/runtime/register.ts</code> (runtime.md has it right).</td></tr>
+<tr><td><code>architecture.md:91</code> — "Register in <code>planner/framework/registry.ts</code>"</td><td>Live registration is in <code>src/planner/optimizer.ts</code>; registry.ts is only the mechanism (and its global path is dead — see planner findings).</td></tr>
+<tr><td><code>architecture.md:200</code> — FanOutLookupJoin "manual-construction only; recognition rule lands in ticket 4.5"</td><td>Rule has landed and is registered (<code>rules/join/rule-fanout-lookup-join.ts</code>, <code>optimizer.ts:492</code>).</td></tr>
+<tr><td><code>runtime.md</code> §Creating an Emitter template</td><td>Declares <code>const sourceInstruction = …</code> twice in the same example function — the canonical copy-from template wouldn't compile.</td></tr>
+</table>
+</div>
+<p>Claims that <em>did</em> verify: sideEffectMode registration rejection, memory-vtab <code>reentrant-reads</code> snapshot capture, <code>keysOf</code>/<code>isUnique</code> reconciliation in fd-utils, row-time MV maintenance wiring, lens implementation + logic tests 51–55.5.</p>
+
+<h2>Method note</h2>
+<p>Five independent review passes, each reading source directly (≈150 files total) and instructed to report only code-verified findings. Line numbers are best-effort anchors and may drift with subsequent commits; symbol names are the durable reference.</p>
+
+</main>
+</body>
+</html>

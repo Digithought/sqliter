@@ -47,7 +47,9 @@ select iif(1, 'yes', 'no'), iif(0, 'yes', 'no'), iif(null, 'yes', 'no');
 select typeof(random());
 → [{"typeof(random())":"integer"}]
 
--- NULL propagation for math (through table columns to avoid type validation)
+-- NULL propagation for math (through table columns, historically to avoid the plan-time
+-- argument-type gate — a NULL-typed literal now passes it, see
+-- 06.5.3-undeclared-return-type-comparison § 6)
 create table null_math (id integer primary key, v real null);
 insert into null_math values (1, null);
 select abs(v), round(v), sqrt(v), pow(v, 2), floor(v), ceil(v) from null_math;
@@ -62,11 +64,13 @@ select pow(5, 0), pow(0, 0);
 select floor(5), ceil(5);
 → [{"floor(5)":5,"ceil(5)":5}]
 
--- clamp with null (through table column)
+-- clamp with null (through table column). Propagates NULL like every other math function
+-- above; this asserted 0 until clamp got an explicit null short-circuit, because its three
+-- arguments reach Number() together and Number(null) is 0, which returned the lower bound.
 create table null_clamp (id integer primary key, v real null);
 insert into null_clamp values (1, null);
 select clamp(v, 0, 10) from null_clamp;
-→ [{"clamp(v, 0, 10)":0}]
+→ [{"clamp(v, 0, 10)":null}]
 drop table null_clamp;
 
 -- greatest/least with single argument

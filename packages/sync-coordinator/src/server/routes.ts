@@ -3,11 +3,11 @@
  */
 
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
-import { siteIdFromBase64, deserializeHLC, type HLC, type ChangeSet } from '@quereus/sync';
+import { siteIdFromBase64, deserializeHLC, type HLC, type ChangeSet, type SerializedChangeSet } from '@quereus/sync';
 import type { CoordinatorService } from '../service/coordinator-service.js';
 import type { AuthContext, ClientIdentity } from '../service/types.js';
 import { httpLog } from '../common/logger.js';
-import { serializeChangeSet, deserializeChangeSet, serializeSnapshotChunk } from '../common/serialization.js';
+import { serializeChangeSet, deserializeChangeSet, serializeSnapshotChunk } from '../common/index.js';
 
 /**
  * Register sync HTTP routes.
@@ -130,7 +130,15 @@ export function registerRoutes(
         return errorResponse(reply, 'INVALID_BODY', 'Request body must contain changes array');
       }
 
-      const changes: ChangeSet[] = body.changes.map(cs => deserializeChangeSet(cs));
+      // Untrusted HTTP JSON: cast to the wire shape at the codec boundary. The
+      // codec reads defensively, so malformed input degrades the same way it did
+      // before this codec was shared.
+      // NOTE: unlike the WebSocket path, these REST endpoints carry no
+      // protocolVersion and run no version gate — a purely-HTTP client on a
+      // drifted PROTOCOL_VERSION is not detected here. Fine while all first-party
+      // clients sync over WebSocket (which IS gated); if a REST-only client ever
+      // ships, add version negotiation to these routes (header or body field).
+      const changes: ChangeSet[] = body.changes.map(cs => deserializeChangeSet(cs as SerializedChangeSet));
 
       const result = await service.applyChanges(databaseId, client, changes);
       return reply.send({ ok: true, data: result });

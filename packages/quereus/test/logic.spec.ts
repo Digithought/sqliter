@@ -9,6 +9,13 @@ import { QuereusError } from '../src/common/errors.js';
 import { safeJsonStringify } from '../src/util/serialization.js';
 import { CollectingInstructionTracer } from '../src/runtime/types.js';
 import { formatPlanTree, formatPlanSummary, type PlanDisplayOptions } from '../src/planner/debug.js';
+import {
+	parseRequiredCapabilities,
+	missingCapability,
+	MEMORY_BACKEND_CAPABILITIES,
+	STORE_BACKEND_CAPABILITIES,
+	type SqllogicCapability,
+} from './logic-capabilities.js';
 
 config.truncateThreshold = 1000;
 config.includeStack = true;
@@ -35,15 +42,35 @@ const __dirname = path.dirname(__filename);
 // Store mode configuration
 const USE_STORE_MODULE = process.env.QUEREUS_TEST_STORE === 'true' || process.env.QUEREUS_TEST_STORE === '1';
 
-// Files that are explicitly memory-module-specific and should be skipped in store mode
+// What this backend accepts, for the `-- requires-capability:` directive in .sqllogic files
+// (see logic-capabilities.ts and test/README.md).
+const BACKEND_CAPABILITIES = USE_STORE_MODULE ? STORE_BACKEND_CAPABILITIES : MEMORY_BACKEND_CAPABILITIES;
+
+// Files that are explicitly memory-module-specific and should be skipped in store mode.
+//
+// Split rule vs the capability directive: capability-shaped divergence — the store deliberately
+// does not accept some whole class of SQL statement — belongs in a `-- requires-capability:`
+// line in the file itself, so every consumer of the shared corpus honours it. This set is for
+// everything else: memory-engine quirks, cost-model choices, harness-config assertions,
+// white-box internals, and tracked store bugs. None of the entries below is capability-shaped.
 const MEMORY_ONLY_FILES = new Set([
   '05-vtab_memory.sqllogic',  // Explicitly tests memory table indexing behavior
+  '05.0.1-vtab-memory-unique-index-collation.sqllogic',  // Split out of 05-vtab_memory (needs standalone index DDL); memory-only for the same reason as its parent
+  // '10.1.3.1-ddl-drop-savepoint-memory.sqllogic' was folded into 10.1.3-ddl-drop-in-transaction.sqllogic § 4. It was memory-only because the STORE leg diverged: store mode runs behind the isolation layer, which used to rebuild its staging overlay on index DDL and so lost rows staged before the savepoint. With that adopt now in place (bug-isolation-index-ddl-rebuild-drops-savepoint-writes) the store leg matches plain memory on the whole sequence — pre-savepoint rows kept, and the DROP not undone by `rollback to savepoint`
+  '10.2.2-default-collation-memory.sqllogic',  // Asserts the memory-side BINARY default for an undecorated text PK; the store applies NOCASE (see docs/schema.md §"Per-column PK key collation")
   // '40-constraints.sqllogic' was excluded here; now fixed by IsolatedConnection.isCovering tiebreak
   // '41-foreign-keys.sqllogic' was excluded here; now fixed by IsolatedTable surfacing replacedRow for OR REPLACE store-side displacements
+  // '41.7.1-alter-column-collate-unique.sqllogic' is now cross-module: the store keys the PK per-column (store-pk-collate-physical-rekey), so an explicit `collate binary` PK holds the 'a'/'A' pair and re-keys it under SET COLLATE just like memory
+  // '41.7.3-alter-column-retype-unique.sqllogic' is now cross-module: the store defers the ALTER COLUMN value rewrite until after the UNIQUE re-validation over converted values (bug-retype-unique-revalidation-store)
+  '41.2.1-alter-column-retype-deleted-row-memory.sqllogic',  // A retype whose only unconvertible value sits in a row the transaction has DELETED: memory accepts (effective-row rule), but the store's convert pre-pass scans its OWN effective rows and cannot see the wrapper overlay's tombstone (NOTE in StoreModule.alterColumnSetDataType), so the store leg rejects
+  // '41.7.5-alter-column-collate-pk-staged-delete-memory.sqllogic' is now cross-module: the file declares `collate binary` on the PK (the store defaults an undecorated text PK to NOCASE, see 10.2.2 above, which made the case-variant pairs collide at INSERT), and the store now runs the memory backend's two pre-mutation re-key probes (StoreTable.validateRekeyedPrimaryKey — bug-store-pk-collate-rejects-deleted-row-collision), so both legs agree on all four sections
+  // '41.7.3.1-alter-column-retype-staged-rows-memory.sqllogic' is now cross-module: the isolation overlay the store runs behind converts the transaction's staged rows on an accepted retype (bug-isolation-retype-leaves-staged-rows-unconverted)
+  // '41.7.4-alter-column-retype-semantic-memory.sqllogic' is now cross-module: the store gates its value rewrite on logical-type identity too (bug-retype-same-class-skips-value-validation), so the DATE/TIME/DATETIME half re-validates and rebuilds there as well — it no longer depends on the key-transform guard that covered only TIMESPAN/JSON  // Pins the memory module's same-storage-class retype contract (text ↔ timespan / json / date). The store covers the TIMESPAN and JSON halves via its own key-transform guard, but not the date half, which turns on comparator identity rather than a key transform
   '83-merge-join.sqllogic',  // Asserts planner picks MergeJoin for PK equi-join; store's cost model can validly prefer HashJoin
   // '101-transaction-edge-cases.sqllogic',  // ROLLBACK TO SAVEPOINT through overlay memory connection hits undefined schema in TransactionLayer
   '103-database-options-edge-cases.sqllogic',  // Asserts default_vtab_module='memory'; store-mode harness sets it to 'store'
   '105-vtab-memory-mutation-kills.sqllogic',  // White-box mutation tests targeting src/vtab/memory/ internals
+  '105.1-vtab-memory-index-mutation-kills.sqllogic',  // Split out of 105 (needs standalone index DDL); white-box for the same reason as its parent
 ]);
 
 // Determine project root - if we're in dist/test, go up two levels, otherwise just one
@@ -470,6 +497,30 @@ describe('SQL Logic Tests' + (USE_STORE_MODULE ? ' (Store Mode)' : ''), () => {
 	});
 
 	for (const file of files) {
+		const filePath = path.join(logicTestDir, file);
+		const content = fs.readFileSync(filePath, 'utf-8');
+
+		// A malformed directive must fail exactly one file, not abort suite registration.
+		let required: ReadonlySet<SqllogicCapability>;
+		try {
+			required = parseRequiredCapabilities(file, content);
+		} catch (parseError: unknown) {
+			const error = parseError instanceof Error ? parseError : new Error(String(parseError));
+			describe(`File: ${file}`, () => {
+				it('should declare valid capability directives', () => { throw error; });
+			});
+			continue;
+		}
+
+		// Capability skip is evaluated before MEMORY_ONLY_FILES so its more specific message wins.
+		const missing = missingCapability(required, BACKEND_CAPABILITIES);
+		if (missing) {
+			describe(`File: ${file}`, () => {
+				it.skip(`skipped: backend lacks capability "${missing}"`, () => {});
+			});
+			continue;
+		}
+
 		// Skip memory-only files in store mode
 		if (USE_STORE_MODULE && MEMORY_ONLY_FILES.has(file)) {
 			describe(`File: ${file}`, () => {
@@ -477,9 +528,6 @@ describe('SQL Logic Tests' + (USE_STORE_MODULE ? ' (Store Mode)' : ''), () => {
 			});
 			continue;
 		}
-
-		const filePath = path.join(logicTestDir, file);
-		const content = fs.readFileSync(filePath, 'utf-8');
 
 		describe(`File: ${file}`, () => {
 			let db: Database;
@@ -536,9 +584,12 @@ describe('SQL Logic Tests' + (USE_STORE_MODULE ? ' (Store Mode)' : ''), () => {
 			});
 
 			it('should execute statements and match results or expected errors', async function() {
-				if (USE_STORE_MODULE) {
-					this.timeout(30000); // Store tests may be slower
-				}
+				// Each .sqllogic file runs as a single test that executes the whole file
+				// (potentially thousands of statements), so mocha's 2000ms default is
+				// structurally too tight — the larger files sit right at the boundary and
+				// flake under full-suite GC/load. Give memory mode a generous explicit
+				// timeout; store mode is slower still.
+				this.timeout(USE_STORE_MODULE ? 30000 : 15000);
 
 				const lines = content.split(/\r?\n/);
 				let currentSql = '';

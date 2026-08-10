@@ -4,14 +4,14 @@ import type { PlanningContext } from '../planning-context.js';
 import type { Projection } from '../nodes/project-node.js';
 import { buildExpression } from './expression.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
-import { expressionToString } from '../../emit/ast-stringify.js';
+import { expressionToString, expressionToIdentityString } from '../../emit/ast-stringify.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { WindowFunctionCallNode } from '../nodes/window-function.js';
 import { type RelationalPlanNode } from '../nodes/plan-node.js';
 import type { Scope } from '../scopes/scope.js';
 import { CapabilityDetectors } from '../framework/characteristics.js';
-import { AggregateFunctionCallNode } from '../nodes/aggregate-function.js';
+import { validateAuthoredInverses, resultColumnOutputName } from '../analysis/authored-inverse.js';
 
 /**
  * Checks if an expression contains aggregate functions
@@ -107,13 +107,19 @@ function collectInnerAggregates(
 	aggregates: { expression: ScalarPlanNode; alias: string }[]
 ): void {
 	if (CapabilityDetectors.isAggregateFunction(node)) {
-		const funcNode = node as AggregateFunctionCallNode;
-		const key = expressionToString(funcNode.expression).toLowerCase();
-		// Deduplicate against existing entries
-		if (!aggregates.some(a => a.alias.toLowerCase() === key)) {
+		const key = expressionToIdentityString(node.expression);
+		// Deduplicate against existing entries by identity key rather than the alias
+		// text — the alias is the un-folded rendering, so comparing it case-blind
+		// would collapse two aggregates differing only in a quoted literal's case.
+		// The array may also hold non-aggregate entries, so the guard is a filter.
+		const alreadyPresent = aggregates.some(a =>
+			CapabilityDetectors.isAggregateFunction(a.expression) &&
+			expressionToIdentityString(a.expression.expression) === key
+		);
+		if (!alreadyPresent) {
 			aggregates.push({
-				expression: funcNode,
-				alias: expressionToString(funcNode.expression)
+				expression: node,
+				alias: expressionToString(node.expression)
 			});
 		}
 		return; // Don't recurse into aggregate arguments
@@ -127,25 +133,39 @@ function collectInnerAggregates(
 }
 
 /**
- * Analyzes SELECT columns and categorizes them into different types
+ * Analyzes SELECT columns and categorizes them into different types.
+ *
+ * `source` is the select's planned FROM relation (post-WHERE) — the namespace
+ * any `with inverse (col = expr, …)` clause is validated against
+ * ({@link validateAuthoredInverses}; position-independent, so a typo'd clause
+ * fails loud even on a select that is never a write target). The validated
+ * metadata is attached to the column's `Projection` for the lineage walk.
  */
 export function analyzeSelectColumns(
 	columns: AST.ResultColumn[],
-	selectContext: PlanningContext
+	selectContext: PlanningContext,
+	source: RelationalPlanNode
 ): {
-	projections: Projection[];
+	projectionsByColumn: Map<AST.ResultColumn, Projection>;
 	aggregates: { expression: ScalarPlanNode; alias: string }[];
 	windowFunctions: { func: WindowFunctionCallNode; alias?: string }[];
 	hasAggregates: boolean;
 	hasWindowFunctions: boolean;
 	hasWrappedAggregates: boolean;
 } {
-	const projections: Projection[] = [];
+	// Keyed by AST result column, not a flat list: the caller assembles the final
+	// projection list by walking `columns` itself so each star expands in written
+	// position (see buildSelectStmt).
+	const projectionsByColumn = new Map<AST.ResultColumn, Projection>();
 	const aggregates: { expression: ScalarPlanNode; alias: string }[] = [];
 	const windowFunctions: { func: WindowFunctionCallNode; alias?: string }[] = [];
 	let hasAggregates = false;
 	let hasWindowFunctions = false;
 	let hasWrappedAggregates = false;
+
+	// Eager, position-independent validation of any `with inverse` clauses; the
+	// returned per-column metadata rides the Projection into the lineage walk.
+	const authoredInverses = validateAuthoredInverses(columns, source);
 
 	for (const column of columns) {
 		if (column.type === 'all') {
@@ -153,15 +173,29 @@ export function analyzeSelectColumns(
 			continue;
 		} else if (column.type === 'column') {
 			const scalarNode = buildExpression(selectContext, column.expr, true);
+			const authoredInverse = authoredInverses.get(column);
 
 			if (isWindowExpression(scalarNode)) {
 				hasWindowFunctions = true;
 				collectWindowFunctions(scalarNode, column.alias, windowFunctions);
-				projections.push({
+				projectionsByColumn.set(column, {
 					node: scalarNode,
-					alias: column.alias
+					alias: column.alias,
+					...(authoredInverse ? { authoredInverse } : {})
 				});
 			} else if (isAggregateExpression(scalarNode)) {
+				if (authoredInverse) {
+					// An aggregate result column never reaches the projection lineage the
+					// clause rides (it is routed into the aggregate phase below), so the
+					// metadata would be dropped SILENTLY — fail loud instead, matching the
+					// clause's position-independent validation stance. Aggregate write
+					// propagation is reserved future work (docs/view-updateability.md
+					// § Current limitations).
+					throw new QuereusError(
+						`result column '${resultColumnOutputName(column)}': WITH INVERSE cannot apply to an aggregate result column (aggregate views are read-only)`,
+						StatusCode.ERROR, undefined, column.expr.loc?.start.line, column.expr.loc?.start.column,
+					);
+				}
 				hasAggregates = true;
 				if (CapabilityDetectors.isAggregateFunction(scalarNode)) {
 					// Direct aggregate — add as-is (existing behavior)
@@ -175,16 +209,17 @@ export function analyzeSelectColumns(
 					hasWrappedAggregates = true;
 				}
 			} else {
-				projections.push({
+				projectionsByColumn.set(column, {
 					node: scalarNode,
-					alias: column.alias
+					alias: column.alias,
+					...(authoredInverse ? { authoredInverse } : {})
 				});
 			}
 		}
 	}
 
 	return {
-		projections,
+		projectionsByColumn,
 		aggregates,
 		windowFunctions,
 		hasAggregates,

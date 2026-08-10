@@ -1,0 +1,443 @@
+-- ALTER TABLE column-shape changes (ADD / DROP / RENAME COLUMN) inside a transaction
+-- must not disturb the savepoint ledger of rows the transaction has already staged:
+-- rows staged BEFORE a savepoint survive `rollback to savepoint`, rows staged AFTER it
+-- are discarded. (DDL itself is not transactional — the rollback keeps the column
+-- change and only unwinds row writes.)
+--
+-- Cross-backend on purpose: under the memory module the pending rows live in its own
+-- transaction layers; under --store they live in the isolation wrapper's per-connection
+-- overlay, which every ALTER used to REBUILD (copy staged rows into a fresh staging
+-- table). The copy's first write lazily registered a fresh connection whose replayed
+-- savepoint stack sat ABOVE the copied rows, so the next `rollback to savepoint`
+-- discarded rows staged long before the savepoint (isolation-alter-forward-column-shape).
+
+-- ADD COLUMN: pre-savepoint row survives (backfilled), post-savepoint rows discarded.
+create table t1 (id integer primary key, v text);
+-- run
+
+begin;
+-- run
+insert into t1 values (1, 'a');
+-- run
+savepoint s;
+-- run
+insert into t1 values (2, 'b');
+-- run
+alter table t1 add column w text default 'z';
+-- run
+insert into t1 values (3, 'c', 'x');
+-- run
+rollback to savepoint s;
+-- run
+
+select id, v, w from t1 order by id;
+→ [{"id":1,"v":"a","w":"z"}]
+
+commit;
+-- run
+
+select id, v, w from t1 order by id;
+→ [{"id":1,"v":"a","w":"z"}]
+
+drop table t1;
+-- run
+
+-- DROP COLUMN (middle) with a committed row present: staged values realign under the
+-- narrower layout, and the savepoint ledger still splits pre/post rows correctly.
+create table t2 (id integer primary key, v text, x integer);
+-- run
+insert into t2 values (0, 'base', 100);
+-- run
+
+begin;
+-- run
+insert into t2 values (1, 'a', 10);
+-- run
+savepoint s;
+-- run
+insert into t2 values (2, 'b', 20);
+-- run
+alter table t2 drop column v;
+-- run
+rollback to savepoint s;
+-- run
+commit;
+-- run
+
+select id, x from t2 order by id;
+→ [{"id":0,"x":100},{"id":1,"x":10}]
+
+drop table t2;
+-- run
+
+-- RENAME COLUMN: the rename does not change the column set, but the open layers still
+-- have to ADOPT the renamed schema — an eager savepoint snapshot left holding its frozen
+-- pre-rename schema fails `commitTransaction`'s snapshot-wrap identity check and the
+-- transaction's staged rows are dropped at COMMIT.
+create table t3 (id integer primary key, v text);
+-- run
+
+begin;
+-- run
+insert into t3 values (1, 'a');
+-- run
+savepoint s;
+-- run
+insert into t3 values (2, 'b');
+-- run
+alter table t3 rename column v to vv;
+-- run
+insert into t3 values (3, 'c');
+-- run
+rollback to savepoint s;
+-- run
+
+select id, vv from t3 order by id;
+→ [{"id":1,"vv":"a"}]
+
+commit;
+-- run
+
+select id, vv from t3 order by id;
+→ [{"id":1,"vv":"a"}]
+
+drop table t3;
+-- run
+
+-- ...and the same rename with no rollback: every staged row survives COMMIT.
+create table t3b (id integer primary key, v text);
+-- run
+
+begin;
+-- run
+insert into t3b values (1, 'a');
+-- run
+savepoint s;
+-- run
+alter table t3b rename column v to vv;
+-- run
+commit;
+-- run
+
+select id, vv from t3b order by id;
+→ [{"id":1,"vv":"a"}]
+
+drop table t3b;
+-- run
+
+-- A staged tombstone (an in-transaction DELETE of a committed row) survives the ALTER
+-- under a savepoint and still applies at COMMIT.
+create table t4 (id integer primary key, v text);
+-- run
+insert into t4 values (1, 'a'), (2, 'b');
+-- run
+
+begin;
+-- run
+delete from t4 where id = 1;
+-- run
+savepoint s;
+-- run
+alter table t4 add column w text default 'z';
+-- run
+rollback to savepoint s;
+-- run
+commit;
+-- run
+
+select id, v, w from t4 order by id;
+→ [{"id":2,"v":"b","w":"z"}]
+
+drop table t4;
+-- run
+
+-- ALTER COLUMN SET NOT NULL that needs NO backfill: metadata-only, so it moves nothing an
+-- open layer derives — but the layers still have to ADOPT the new schema OBJECT, or the
+-- savepoint snapshot a `rollback to savepoint` swaps in keeps its frozen pre-ALTER schema,
+-- fails `commitTransaction`'s snapshot-wrap identity check, and the staged rows are dropped
+-- at COMMIT.
+create table t5 (id integer primary key, v text null);
+-- run
+
+begin;
+-- run
+insert into t5 values (1, 'a');
+-- run
+savepoint s;
+-- run
+insert into t5 values (2, 'b');
+-- run
+alter table t5 alter column v set not null;
+-- run
+insert into t5 values (3, 'c');
+-- run
+rollback to savepoint s;
+-- run
+
+select id, v from t5 order by id;
+→ [{"id":1,"v":"a"}]
+
+commit;
+-- run
+
+select id, v from t5 order by id;
+→ [{"id":1,"v":"a"}]
+
+drop table t5;
+-- run
+
+-- ALTER COLUMN SET NOT NULL, the DEFAULT-backfill flavor: a staged NULL is filled at the ALTER, and the
+-- filled row (staged before the later savepoint) survives that savepoint's rollback.
+create table t5b (id integer primary key, v text null default 'filled');
+-- run
+
+begin;
+-- run
+insert into t5b values (1, null);
+-- run
+alter table t5b alter column v set not null;
+-- run
+savepoint s;
+-- run
+insert into t5b values (2, 'b');
+-- run
+rollback to savepoint s;
+-- run
+commit;
+-- run
+
+select id, v from t5b order by id;
+→ [{"id":1,"v":"filled"}]
+
+drop table t5b;
+-- run
+
+-- ALTER COLUMN SET DATA TYPE: the pre-savepoint staged row survives the rollback with
+-- its value CONVERTED; the post-savepoint row is discarded.
+create table t6 (id integer primary key, v text);
+-- run
+
+begin;
+-- run
+insert into t6 values (1, '10');
+-- run
+savepoint s;
+-- run
+insert into t6 values (2, '20');
+-- run
+alter table t6 alter column v set data type integer;
+-- run
+insert into t6 values (3, 30);
+-- run
+rollback to savepoint s;
+-- run
+
+select id, v from t6 order by id;
+→ [{"id":1,"v":10}]
+
+commit;
+-- run
+
+select id, v from t6 order by id;
+→ [{"id":1,"v":10}]
+
+drop table t6;
+-- run
+
+-- ALTER COLUMN SET DEFAULT: metadata-only, but the staged rows and the savepoint
+-- ledger must still come through, and the new DEFAULT applies after the rollback.
+create table t7 (id integer primary key, v integer null);
+-- run
+
+begin;
+-- run
+insert into t7 values (1, 5);
+-- run
+savepoint s;
+-- run
+insert into t7 values (2, 6);
+-- run
+alter table t7 alter column v set default 99;
+-- run
+rollback to savepoint s;
+-- run
+insert into t7 (id) values (3);
+-- run
+commit;
+-- run
+
+select id, v from t7 order by id;
+→ [{"id":1,"v":5},{"id":3,"v":99}]
+
+drop table t7;
+-- run
+
+-- ADD CONSTRAINT UNIQUE: pre-savepoint staged row survives, post-savepoint rows are
+-- discarded, and the constraint (DDL) survives the rollback and enforces after COMMIT.
+create table t8 (id integer primary key, v text);
+-- run
+
+begin;
+-- run
+insert into t8 values (1, 'a');
+-- run
+savepoint s;
+-- run
+insert into t8 values (2, 'b');
+-- run
+alter table t8 add constraint u_v unique (v);
+-- run
+insert into t8 values (3, 'c');
+-- run
+rollback to savepoint s;
+-- run
+
+select id, v from t8 order by id;
+→ [{"id":1,"v":"a"}]
+
+commit;
+-- run
+
+select id, v from t8 order by id;
+→ [{"id":1,"v":"a"}]
+
+insert into t8 values (4, 'a');
+-- error: UNIQUE
+
+drop table t8;
+-- run
+
+-- DROP CONSTRAINT: the drop survives the rollback (DDL is not transactional), the
+-- pre-savepoint staged row survives, and a once-duplicate insert is accepted after COMMIT.
+create table t9 (id integer primary key, v text, constraint u_v unique (v));
+-- run
+insert into t9 values (0, 'dup');
+-- run
+
+begin;
+-- run
+insert into t9 values (1, 'a');
+-- run
+savepoint s;
+-- run
+alter table t9 drop constraint u_v;
+-- run
+insert into t9 values (2, 'dup');
+-- run
+rollback to savepoint s;
+-- run
+commit;
+-- run
+
+select id, v from t9 order by id;
+→ [{"id":0,"v":"dup"},{"id":1,"v":"a"}]
+
+insert into t9 values (3, 'dup');
+-- run
+
+select count(*) as c from t9 where v = 'dup';
+→ [{"c":2}]
+
+drop table t9;
+-- run
+
+-- RENAME CONSTRAINT: schema-only, but the renamed UNIQUE's implicit covering index moves
+-- under a new key in every open layer's index map, and the layers must re-freeze the new
+-- schema so a savepoint snapshot restored across the rename still commits its staged rows.
+create table t10s (id integer primary key, v text, constraint u_old unique (v));
+-- run
+
+begin;
+-- run
+insert into t10s values (1, 'a');
+-- run
+savepoint s;
+-- run
+insert into t10s values (2, 'b');
+-- run
+alter table t10s rename constraint u_old to u_new;
+-- run
+rollback to savepoint s;
+-- run
+commit;
+-- run
+
+select id, v from t10s order by id;
+→ [{"id":1,"v":"a"}]
+
+insert into t10s values (3, 'a');
+-- error: UNIQUE
+
+drop table t10s;
+-- run
+
+-- ...and the same rename with no savepoint across it:
+create table t10 (id integer primary key, v text, constraint u_old unique (v));
+-- run
+
+begin;
+-- run
+insert into t10 values (1, 'a');
+-- run
+alter table t10 rename constraint u_old to u_new;
+-- run
+commit;
+-- run
+
+select id, v from t10 order by id;
+→ [{"id":1,"v":"a"}]
+
+insert into t10 values (3, 'a');
+-- error: UNIQUE
+
+drop table t10;
+-- run
+
+-- ADD CONSTRAINT UNIQUE over a primary-key member with two in-transaction deletions:
+-- the two deletion markers share a = 1, and a naive uniqueness check over them would
+-- report a phantom duplicate. Deleted rows are not rows — the ALTER must succeed.
+create table t11 (a integer, b integer, primary key (a, b));
+-- run
+insert into t11 values (1, 1), (1, 2), (2, 1);
+-- run
+
+begin;
+-- run
+delete from t11 where a = 1;
+-- run
+alter table t11 add constraint u_a unique (a);
+-- run
+commit;
+-- run
+
+select a, b from t11 order by a, b;
+→ [{"a":2,"b":1}]
+
+insert into t11 values (3, 1);
+-- run
+insert into t11 values (3, 2);
+-- error: UNIQUE
+
+drop table t11;
+-- run
+
+-- A backfilling SET NOT NULL must not disturb an in-transaction deletion: the deleted
+-- row stays deleted (never resurrected carrying the DEFAULT) and the survivor is intact.
+create table t12 (id integer primary key, v text null default 'filled');
+-- run
+insert into t12 values (1, null), (2, 'b');
+-- run
+
+begin;
+-- run
+delete from t12 where id = 1;
+-- run
+alter table t12 alter column v set not null;
+-- run
+commit;
+-- run
+
+select id, v from t12 order by id;
+→ [{"id":2,"v":"b"}]
+
+drop table t12;

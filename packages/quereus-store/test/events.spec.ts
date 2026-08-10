@@ -129,28 +129,77 @@ describe('StoreEventEmitter', () => {
 		});
 	});
 
-	describe('remote event tracking', () => {
-		it('marks matching schema event as remote', () => {
+	describe('remote schema scopes', () => {
+		it('marks a matching schema event remote while the scope is open', () => {
 			const events: SchemaChangeEvent[] = [];
 			emitter.onSchemaChange(e => events.push(e));
-			emitter.expectRemoteSchemaEvent({ type: 'create', objectType: 'table', schemaName: 'main', objectName: 'users' });
+			emitter.beginRemoteSchemaScope('main', 'users');
 			emitter.emitSchemaChange({ type: 'create', objectType: 'table', schemaName: 'main', objectName: 'users' });
+			emitter.endRemoteSchemaScope('main', 'users');
 			expect(events[0].remote).to.be.true;
 		});
 
-		it('does not mark non-matching event as remote', () => {
+		it('does not mark an event naming a different object', () => {
 			const events: SchemaChangeEvent[] = [];
 			emitter.onSchemaChange(e => events.push(e));
-			emitter.expectRemoteSchemaEvent({ type: 'create', objectType: 'table', schemaName: 'main', objectName: 'other' });
+			emitter.beginRemoteSchemaScope('main', 'other');
+			emitter.emitSchemaChange({ type: 'create', objectType: 'table', schemaName: 'main', objectName: 'users' });
+			emitter.endRemoteSchemaScope('main', 'other');
+			expect(events[0].remote).to.be.undefined;
+		});
+
+		it('matches case-insensitively', () => {
+			const events: SchemaChangeEvent[] = [];
+			emitter.onSchemaChange(e => events.push(e));
+			emitter.beginRemoteSchemaScope('MAIN', 'Users');
+			emitter.emitSchemaChange({ type: 'alter', objectType: 'table', schemaName: 'main', objectName: 'users' });
+			emitter.endRemoteSchemaScope('MAIN', 'Users');
+			expect(events[0].remote).to.be.true;
+		});
+
+		it('covers several events inside one scope, and nothing after it closes', () => {
+			// A statement may emit more than one event; the scope must cover them ALL
+			// (the old one-for-one expectation registry marked exactly one and let the
+			// rest leak back onto the wire as phantom local changes).
+			const events: SchemaChangeEvent[] = [];
+			emitter.onSchemaChange(e => events.push(e));
+			emitter.beginRemoteSchemaScope('main', 'users');
+			emitter.emitSchemaChange({ type: 'drop', objectType: 'index', schemaName: 'main', objectName: 'users' });
+			emitter.emitSchemaChange({ type: 'drop', objectType: 'index', schemaName: 'main', objectName: 'users' });
+			emitter.emitSchemaChange({ type: 'drop', objectType: 'table', schemaName: 'main', objectName: 'users' });
+			emitter.endRemoteSchemaScope('main', 'users');
+			emitter.emitSchemaChange({ type: 'create', objectType: 'table', schemaName: 'main', objectName: 'users' });
+			expect(events.map(e => e.remote ?? false)).to.deep.equal([true, true, true, false]);
+		});
+
+		it('a scope that saw no events leaves no residue', () => {
+			// The zero-event case: the old registry's expectation lingered forever and
+			// swallowed the NEXT genuine local event of the same signature.
+			const events: SchemaChangeEvent[] = [];
+			emitter.onSchemaChange(e => events.push(e));
+			emitter.beginRemoteSchemaScope('main', 'users');
+			emitter.endRemoteSchemaScope('main', 'users');
 			emitter.emitSchemaChange({ type: 'create', objectType: 'table', schemaName: 'main', objectName: 'users' });
 			expect(events[0].remote).to.be.undefined;
 		});
 
-		it('clearExpectedRemoteSchemaEvent prevents remote marking', () => {
+		it('refcounts nested scopes over the same object', () => {
 			const events: SchemaChangeEvent[] = [];
 			emitter.onSchemaChange(e => events.push(e));
-			emitter.expectRemoteSchemaEvent({ type: 'create', objectType: 'table', schemaName: 'main', objectName: 'users' });
-			emitter.clearExpectedRemoteSchemaEvent({ type: 'create', objectType: 'table', schemaName: 'main', objectName: 'users' });
+			emitter.beginRemoteSchemaScope('main', 'users');
+			emitter.beginRemoteSchemaScope('main', 'users');
+			emitter.endRemoteSchemaScope('main', 'users');
+			// One of the two scopes is still open.
+			emitter.emitSchemaChange({ type: 'alter', objectType: 'table', schemaName: 'main', objectName: 'users' });
+			emitter.endRemoteSchemaScope('main', 'users');
+			emitter.emitSchemaChange({ type: 'alter', objectType: 'table', schemaName: 'main', objectName: 'users' });
+			expect(events.map(e => e.remote ?? false)).to.deep.equal([true, false]);
+		});
+
+		it('endRemoteSchemaScope with no open scope is a harmless no-op', () => {
+			const events: SchemaChangeEvent[] = [];
+			emitter.onSchemaChange(e => events.push(e));
+			emitter.endRemoteSchemaScope('main', 'users');
 			emitter.emitSchemaChange({ type: 'create', objectType: 'table', schemaName: 'main', objectName: 'users' });
 			expect(events[0].remote).to.be.undefined;
 		});

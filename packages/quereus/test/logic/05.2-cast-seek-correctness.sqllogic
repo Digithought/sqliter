@@ -1,0 +1,124 @@
+-- 05.2-cast-seek-correctness.sqllogic
+-- Regression: a comparison whose column operand is wrapped in a value-changing
+-- CAST must not contribute an index-seek constraint. The constraint extractor
+-- used to strip every CastNode, so `cast(x as integer) = 1` on a TEXT primary
+-- key was pushed down as a seek for the integer 1 against stored text — which
+-- matches nothing under storage-class ordering — and the conjunct was reported
+-- as fully consumed, so no residual filter survived to catch the mistake.
+--
+-- The last group matters most: `insertCrossTypeCoercion` wraps the textual
+-- operand of a numeric comparison in a synthetic cast, so a bare `x = 1` on a
+-- TEXT column hits the same path with no explicit CAST in the SQL.
+--
+-- Every query is paired with the identical predicate over a non-indexed column
+-- of the same declared type; indexed and non-indexed must agree. The TEXT group
+-- is followed by REAL and BLOB keys, whose converting casts (truncation, UTF-8
+-- decode) change the value without crossing into a text/number mismatch.
+--
+-- Plan shapes are pinned separately in `test/plan/cast-seek-blocking.spec.ts`.
+
+PRAGMA default_vtab_module='memory';
+
+-- x is the primary key → the optimizer will try to seek on it.
+CREATE TABLE t (x TEXT PRIMARY KEY);
+INSERT INTO t VALUES ('1'), ('1abc'), ('2');
+
+-- Same rows, but x is an ordinary column (control: was always correct).
+CREATE TABLE u (id INTEGER PRIMARY KEY, x TEXT);
+INSERT INTO u VALUES (1, '1'), (2, '1abc'), (3, '2');
+
+-- Equality through a converting cast, column on the left.
+SELECT x FROM t WHERE CAST(x AS INTEGER) = 1 ORDER BY x;
+→ [{"x":"1"},{"x":"1abc"}]
+
+SELECT x FROM u WHERE CAST(x AS INTEGER) = 1 ORDER BY x;
+→ [{"x":"1"},{"x":"1abc"}]
+
+-- Same, operands flipped.
+SELECT x FROM t WHERE 1 = CAST(x AS INTEGER) ORDER BY x;
+→ [{"x":"1"},{"x":"1abc"}]
+
+SELECT x FROM u WHERE 1 = CAST(x AS INTEGER) ORDER BY x;
+→ [{"x":"1"},{"x":"1abc"}]
+
+-- Degenerate range through a converting cast.
+SELECT x FROM t WHERE CAST(x AS INTEGER) BETWEEN 1 AND 1 ORDER BY x;
+→ [{"x":"1"},{"x":"1abc"}]
+
+SELECT x FROM u WHERE CAST(x AS INTEGER) BETWEEN 1 AND 1 ORDER BY x;
+→ [{"x":"1"},{"x":"1abc"}]
+
+-- IN over a cast condition was already correct (extractInConstraint requires a
+-- bare column reference); pinned so it stays that way.
+SELECT x FROM t WHERE CAST(x AS INTEGER) IN (1) ORDER BY x;
+→ [{"x":"1"},{"x":"1abc"}]
+
+SELECT x FROM u WHERE CAST(x AS INTEGER) IN (1) ORDER BY x;
+→ [{"x":"1"},{"x":"1abc"}]
+
+-- Two-branch OR: the collapse to an IN constraint must not see through the cast.
+SELECT x FROM t WHERE CAST(x AS INTEGER) = 1 OR CAST(x AS INTEGER) = 2 ORDER BY x;
+→ [{"x":"1"},{"x":"1abc"},{"x":"2"}]
+
+SELECT x FROM u WHERE CAST(x AS INTEGER) = 1 OR CAST(x AS INTEGER) = 2 ORDER BY x;
+→ [{"x":"1"},{"x":"1abc"},{"x":"2"}]
+
+-- Implicit coercion: no CAST written, but the planner inserts one over `x`.
+SELECT x FROM t WHERE x = 1 ORDER BY x;
+→ [{"x":"1"},{"x":"1abc"}]
+
+SELECT x FROM u WHERE x = 1 ORDER BY x;
+→ [{"x":"1"},{"x":"1abc"}]
+
+-- Control: a text-vs-text equality needs no coercion and still seeks.
+SELECT x FROM t WHERE x = '1' ORDER BY x;
+→ [{"x":"1"}]
+
+SELECT x FROM u WHERE x = '1' ORDER BY x;
+→ [{"x":"1"}]
+
+-- A no-op cast is value-preserving and must still fold away (seek preserved).
+SELECT x FROM t WHERE CAST(x AS TEXT) = '1' ORDER BY x;
+→ [{"x":"1"}]
+
+DROP TABLE t;
+DROP TABLE u;
+
+-- Same shape over a REAL primary key: `cast(v as integer)` truncates, so the
+-- seek key differs from the stored value even though both sides are numeric.
+CREATE TABLE r (v REAL PRIMARY KEY);
+INSERT INTO r VALUES (1.0), (1.5), (2.0);
+
+CREATE TABLE s (id INTEGER PRIMARY KEY, v REAL);
+INSERT INTO s VALUES (1, 1.0), (2, 1.5), (3, 2.0);
+
+SELECT v FROM r WHERE CAST(v AS INTEGER) = 1 ORDER BY v;
+→ [{"v":1},{"v":1.5}]
+
+SELECT v FROM s WHERE CAST(v AS INTEGER) = 1 ORDER BY v;
+→ [{"v":1},{"v":1.5}]
+
+-- A no-op cast on the REAL key still folds away.
+SELECT v FROM r WHERE CAST(v AS REAL) = 1.5 ORDER BY v;
+→ [{"v":1.5}]
+
+DROP TABLE r;
+DROP TABLE s;
+
+-- BLOB key: `cast(b as text)` decodes the bytes as UTF-8, so the cast's value is a
+-- string and never the stored blob — it must not become a seek key.
+-- `tag` names the row so the assertion needs no blob-formatting function.
+CREATE TABLE bt (b BLOB PRIMARY KEY, tag TEXT);
+INSERT INTO bt VALUES (x'31', 'one'), (x'32', 'two');
+
+CREATE TABLE bu (id INTEGER PRIMARY KEY, b BLOB, tag TEXT);
+INSERT INTO bu VALUES (1, x'31', 'one'), (2, x'32', 'two');
+
+SELECT tag FROM bt WHERE CAST(b AS TEXT) = '1' ORDER BY tag;
+→ [{"tag":"one"}]
+
+SELECT tag FROM bu WHERE CAST(b AS TEXT) = '1' ORDER BY tag;
+→ [{"tag":"one"}]
+
+DROP TABLE bt;
+DROP TABLE bu;

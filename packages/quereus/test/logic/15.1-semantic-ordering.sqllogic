@@ -1,0 +1,960 @@
+-- 15.1-semantic-ordering.sqllogic - Semantic ordering for TIMESPAN and JSON
+--
+-- The rule (docs/types.md "Semantic ordering"): wherever a value of a declared
+-- semantic-ordering logical type is ordered or compared — ORDER BY, comparison
+-- operators, BETWEEN, PK order and range scans, DISTINCT/GROUP BY/set-operation
+-- identity, window ordering/partitioning, join keys — the type's compare is the
+-- order. TIMESPAN orders by elapsed time; JSON by structural deep-compare.
+
+-- === TIMESPAN primary key: order, elision, range scan, point seek ===
+
+create table m (d timespan primary key);
+insert into m values ('PT2H'), ('PT90M');
+
+-- Elapsed-time order: 90 minutes < 2 hours, though the text 'PT2H' < 'PT90M'.
+-- (This ORDER BY may be satisfied by the PK order — elided sort — or by a real
+-- sort; both must produce elapsed-time order.)
+select d from m order by d;
+→ [{"d":"PT90M"},{"d":"PT2H"}]
+
+select d from m order by d desc;
+→ [{"d":"PT2H"},{"d":"PT90M"}]
+
+-- Range scan through the PK BTree: the bound filter must agree with the typed
+-- tree order (previously returned no rows — text-order filter over a
+-- elapsed-time-ordered tree produced an empty window).
+select d from m where d > 'PT90M';
+→ [{"d":"PT2H"}]
+
+select d from m where d < 'PT2H';
+→ [{"d":"PT90M"}]
+
+select d from m where d >= 'PT90M' order by d;
+→ [{"d":"PT90M"},{"d":"PT2H"}]
+
+-- Point seek with an equal-elapsed-time spelling: PT120M ≡ PT2H.
+select d from m where d = 'PT120M';
+→ [{"d":"PT2H"}]
+
+-- BETWEEN agrees with the desugared comparisons: [30m, 100m] contains 90m only.
+-- (Text order would exclude PT90M: 'PT90M' > 'PT100M' lexicographically.)
+select d from m where d between 'PT30M' and 'PT100M';
+→ [{"d":"PT90M"}]
+
+drop table m;
+
+-- === TIMESPAN non-key column: real Sort node, comparisons ===
+
+create table s (id integer primary key, d timespan);
+insert into s values (1, 'PT2H'), (2, 'PT90M');
+
+-- Real sort (no index on d) must match the elided PK-order result above.
+select d from s order by d;
+→ [{"d":"PT90M"},{"d":"PT2H"}]
+
+select d from s where d > 'PT90M';
+→ [{"d":"PT2H"}]
+
+select d from s where d between 'PT30M' and 'PT100M';
+→ [{"d":"PT90M"}]
+
+-- Window ordering ranks by elapsed time.
+select d, row_number() over (order by d) as rn from s order by rn;
+→ [{"d":"PT90M","rn":1},{"d":"PT2H","rn":2}]
+
+drop table s;
+
+-- NULL placement is ORDER BY's rule, never the type's: NULLs first by default in
+-- BOTH directions, and explicit NULLS FIRST/LAST is absolute.
+create table sn (id integer primary key, d timespan null);
+insert into sn values (1, 'PT2H'), (2, 'PT90M'), (3, null);
+
+select id from sn order by d;
+→ [{"id":3},{"id":2},{"id":1}]
+
+select id from sn order by d desc;
+→ [{"id":3},{"id":1},{"id":2}]
+
+select id from sn order by d nulls last;
+→ [{"id":2},{"id":1},{"id":3}]
+
+drop table sn;
+
+-- === Composite-key access paths over a TIMESPAN column ===
+-- (the secondary-index access path lives in 15.1.2-semantic-ordering-index —
+-- it needs standalone CREATE INDEX)
+
+-- Composite PK with a TIMESPAN trailing member: the equality prefix and the
+-- trailing range bound must both compare under the tree's order.
+create table cp (g integer, d timespan, primary key (g, d));
+insert into cp values (1, 'PT2H'), (1, 'PT90M'), (2, 'PT30M');
+
+select d from cp where g = 1 order by d;
+→ [{"d":"PT90M"},{"d":"PT2H"}]
+
+select d from cp where g = 1 and d > 'PT90M';
+→ [{"d":"PT2H"}]
+
+select d from cp where g = 1 and d = 'PT120M';
+→ [{"d":"PT2H"}]
+
+drop table cp;
+
+-- DESC primary key: the descending physical walk still yields elapsed-time order.
+create table dsc (d timespan, primary key (d desc));
+insert into dsc values ('PT2H'), ('PT90M');
+
+select d from dsc order by d;
+→ [{"d":"PT90M"},{"d":"PT2H"}]
+
+select d from dsc where d > 'PT90M';
+→ [{"d":"PT2H"}]
+
+drop table dsc;
+
+-- IN-list multi-seek: each probe seeks by elapsed time, not by text.
+create table il (d timespan primary key);
+insert into il values ('PT2H'), ('PT90M');
+
+select d from il where d in ('PT120M', 'PT30M');
+→ [{"d":"PT2H"}]
+
+select d from il where d not between 'PT30M' and 'PT100M';
+→ [{"d":"PT2H"}]
+
+drop table il;
+
+-- === TIMESPAN identity: 'PT1H' ≡ 'PT60M' (same elapsed time) ===
+
+create table dt (id integer primary key, d timespan);
+insert into dt values (1, 'PT1H'), (2, 'PT60M');
+
+-- Equality operator already says they are equal.
+select (timespan('PT1H') = timespan('PT60M')) as r;
+→ [{"r":true}]
+
+-- DISTINCT through a typed column collapses (representative unspecified — assert
+-- the count, not the surviving text).
+select count(*) as c from (select distinct d from dt) as q;
+→ [{"c":1}]
+
+-- GROUP BY groups them together (project the key through total-seconds so the
+-- expectation does not depend on which textual representative survives).
+select timespan_total_seconds(d) as s, count(*) as c from dt group by d;
+→ [{"s":3600,"c":2}]
+
+-- Set-operation identity (UNION dedup) collapses them.
+select count(*) as c from (
+	select d from dt where id = 1
+	union
+	select d from dt where id = 2
+) as q;
+→ [{"c":1}]
+
+-- EXCEPT and INTERSECT run over the same row-identity comparator as UNION, so a
+-- differing spelling of the same elapsed time subtracts / intersects as one value.
+select count(*) as c from (
+	select d from dt where id = 1
+	except
+	select d from dt where id = 2
+) as q;
+→ [{"c":0}]
+
+select count(*) as c from (
+	select d from dt where id = 1
+	intersect
+	select d from dt where id = 2
+) as q;
+→ [{"c":1}]
+
+-- Window PARTITION BY places both rows in one partition.
+select count(*) over (partition by d) as c from dt;
+→ [{"c":2},{"c":2}]
+
+-- IN membership must agree with the `=` it desugars to, on every emitIn path:
+-- a constant list, a non-constant list element, and a subquery source. `d` is not
+-- the primary key here, so the residual `In` node survives and the comparison is
+-- exercised directly rather than being turned into an index multi-seek.
+select id from dt where d in ('PT60M') order by id;
+→ [{"id":1},{"id":2}]
+
+select id from dt where d in ((select d from dt where id = 2)) order by id;
+→ [{"id":1},{"id":2}]
+
+select id from dt where d in (select d from dt where id = 2) order by id;
+→ [{"id":1},{"id":2}]
+
+-- Non-members still miss, and an unparseable list entry compares as text (no
+-- false match) instead of derailing the rest of the list.
+select id from dt where d in ('PT59M', 'not-a-duration') order by id;
+→ []
+
+-- A simple CASE compares its base against each WHEN through the same routing, so
+-- `case d when 'PT60M'` must agree with `d = 'PT60M'` and `d in ('PT60M')` above.
+-- Regression for `simple-case-comparison-collation-and-type` (previously the
+-- CASE match compared raw text and reported a miss).
+select id, case d when 'PT60M' then 'hit' else 'miss' end as r from dt order by id;
+→ [{"id":1,"r":"hit"},{"id":2,"r":"hit"}]
+
+-- Per-clause: a non-member spelling still misses, and a later matching clause wins.
+select id, case d when 'PT59M' then 'hit1' when 'PT3600S' then 'hit2' else 'miss' end as r
+  from dt order by id;
+→ [{"id":1,"r":"hit2"},{"id":2,"r":"hit2"}]
+
+-- Equi-join matches across spellings (any join algorithm must agree with `=`).
+create table jt2 (id integer primary key, d timespan);
+insert into jt2 values (10, 'PT60M');
+select dt.id as l, jt2.id as r from dt join jt2 on dt.d = jt2.d order by l;
+→ [{"l":1,"r":10},{"l":2,"r":10}]
+
+drop table jt2;
+drop table dt;
+
+-- === Mixed-type equi-join keys agree with `=` ===
+--
+-- A join key pairing a semantic-ordering column with a plain one is not a valid
+-- PHYSICAL key: hash/bloom serialize the raw text and merge co-walks two
+-- incompatible orders (elapsed time on one side, text on the other), so both drop
+-- matches that `=` makes. The equi-pair extractor declines such a pair, demoting it
+-- to the residual — or, for USING, sinking the whole extraction — so the generic
+-- join evaluates it with the `=` operator's own semantics. Every spelling below
+-- must therefore agree with the `where` form.
+-- Regression for `mixed-type-equi-join-key-drops-semantic-matches` (all the `on` /
+-- `using` / `exists` forms previously returned no rows).
+
+create table mxa (id integer primary key, d timespan);
+create table mxb (id integer primary key, s text);
+insert into mxa values (1, 'PT1H'), (2, 'PT30M');
+insert into mxb values (10, 'PT60M'), (20, 'PT45M');
+
+-- Baseline: the comparison in a `where` clause has always matched.
+select mxa.id as l, mxb.id as r from mxa cross join mxb where mxa.d = mxb.s;
+→ [{"l":1,"r":10}]
+
+-- The same comparison spelled as an ON condition must agree.
+select mxa.id as l, mxb.id as r from mxa join mxb on mxa.d = mxb.s;
+→ [{"l":1,"r":10}]
+
+-- Flipped operand order resolves to the same pair.
+select mxa.id as l, mxb.id as r from mxa join mxb on mxb.s = mxa.d;
+→ [{"l":1,"r":10}]
+
+-- Correlated EXISTS (planned as a semi-join over the same extraction).
+select id from mxa where exists (select 1 from mxb where mxb.s = mxa.d);
+→ [{"id":1}]
+
+-- LEFT JOIN + null test: the unmatched left row must be the one whose elapsed time
+-- has no counterpart, not both of them.
+select mxa.id as l from mxa left join mxb on mxa.d = mxb.s where mxb.id is not null;
+→ [{"l":1}]
+
+select mxa.id as l from mxa left join mxb on mxa.d = mxb.s where mxb.id is null;
+→ [{"l":2}]
+
+-- A further filter pinning one side to a constant must not leak into the other
+-- side via the join equality: the logical equi-pair extractor previously minted
+-- a value-level pairing fact even when the two sides disagreed on semantic
+-- ordering, and predicate-inference substituted the pin's constant across the
+-- pair, comparing it as text against the untyped side and dropping the match.
+-- Regression for `equality-fact-extraction-ignores-semantic-ordering`. Each
+-- `on … where` form below must agree with the `cross join … where` oracle.
+
+select mxa.id as l, mxb.id as r from mxa cross join mxb where mxa.d = mxb.s and mxa.d = 'PT1H';
+→ [{"l":1,"r":10}]
+
+select mxa.id as l, mxb.id as r from mxa join mxb on mxa.d = mxb.s where mxa.d = 'PT1H';
+→ [{"l":1,"r":10}]
+
+select mxa.id as l, mxb.id as r from mxa join mxb on mxb.s = mxa.d where mxa.d = 'PT1H';
+→ [{"l":1,"r":10}]
+
+select mxa.id as l, mxb.id as r from mxa cross join mxb where mxa.d = mxb.s and mxb.s = 'PT60M';
+→ [{"l":1,"r":10}]
+
+select mxa.id as l, mxb.id as r from mxa join mxb on mxa.d = mxb.s where mxb.s = 'PT60M';
+→ [{"l":1,"r":10}]
+
+select mxa.id as l, mxb.id as r from mxa join mxb on mxb.s = mxa.d where mxb.s = 'PT60M';
+→ [{"l":1,"r":10}]
+
+-- Pinning the TEXT side to a spelling that only matches under semantic-ordering
+-- comparison, not as plain text, correctly finds nothing — this asymmetry is
+-- intended, not a regression.
+select mxa.id as l, mxb.id as r from mxa cross join mxb where mxa.d = mxb.s and mxb.s = 'PT1H';
+→ []
+
+select mxa.id as l, mxb.id as r from mxa join mxb on mxa.d = mxb.s where mxb.s = 'PT1H';
+→ []
+
+drop table mxb;
+drop table mxa;
+
+-- === Filter-level cross-column equality facts ===
+--
+-- The join extractors above are gated on semantic ordering; `extractEqualityFds`
+-- (the FILTER-side extractor) was not, so `where d = s` over a single table minted
+-- mirror FDs and an equivalence class claiming the timespan column and the text
+-- column always hold the same value. They do not: 'PT1H' and 'PT60M' are one
+-- elapsed time but two distinct strings. The one rule that acts on such a class,
+-- predicate inference through equivalences, reads them off the Filter's SOURCE, and
+-- adjacent filters merge into one Filter before it runs — so no spelling below
+-- returned a wrong row even before the gate. These cases exist so the path stays
+-- closed if filter merging or CTE property propagation changes.
+-- Regression for `debt-filter-equality-facts-ignore-semantic-ordering`.
+
+create table fso (id integer primary key, d timespan, s text);
+insert into fso values (1, 'PT1H', 'PT60M'), (2, 'PT30M', 'PT45M');
+
+-- Baseline: one Filter, both conjuncts together.
+select id from fso where d = s and d = 'PT1H';
+→ [{"id":1}]
+
+-- Nested sub-select: the inner filter carries the cross-column conjunct, the outer
+-- one the constant pin, so they are two separate Filters.
+select id from (select id, d, s from fso where d = s) where d = 'PT1H';
+→ [{"id":1}]
+
+-- Same shape via a CTE.
+with paired as (select id, d, s from fso where d = s)
+select id from paired where d = 'PT1H';
+→ [{"id":1}]
+
+-- Pinning the TEXT side instead: the pin is compared as text, so only the stored
+-- spelling matches. Same intended asymmetry as the join cases above.
+select id from (select id, d, s from fso where d = s) where s = 'PT1H';
+→ []
+
+select id from (select id, d, s from fso where d = s) where s = 'PT60M';
+→ [{"id":1}]
+
+drop table fso;
+
+-- Same-type control: `timespan = timespan` keeps its mirror FDs and equivalence
+-- class (the gate must not over-decline), and the row still comes back carrying its
+-- own stored spelling — a canonicalizing "fix" would have rewritten these.
+create table fsc (id integer primary key, d timespan, e timespan);
+insert into fsc values (1, 'PT1H', 'PT60M'), (2, 'PT30M', 'PT45M');
+
+select id, d, e from fsc where d = e and d = 'PT1H';
+→ [{"id":1,"d":"PT1H","e":"PT60M"}]
+
+select id, d, e from (select id, d, e from fsc where d = e) where d = 'PT1H';
+→ [{"id":1,"d":"PT1H","e":"PT60M"}]
+
+with paired as (select id, d, e from fsc where d = e)
+select id, d, e from paired where e = 'PT60M';
+→ [{"id":1,"d":"PT1H","e":"PT60M"}]
+
+drop table fsc;
+
+-- === CHECK-derived cross-column equality facts ===
+--
+-- A declared `check (d = s)` used to mint the same mirror FDs and equivalence
+-- class ungated, onto the TABLE REFERENCE — where `rule-predicate-inference-
+-- equivalence` reads it directly, with nothing to make it dormant. The claim is
+-- false for a mixed pair: the CHECK compares `d` and `s` by elapsed time, so a
+-- row may legally store 'PT1H' in one column and 'PT60M' in the other.
+-- Regression for `check-derived-equivalence-ignores-semantic-ordering`.
+--
+-- Every query below returned NO rows before the gate landed, except the
+-- same-type control (which was and stays correct).
+
+create table ckm (id integer primary key, d timespan, s text, check (d = s));
+insert into ckm values (1, 'PT1H', 'PT60M');
+
+-- The CHECK accepts the row: 'PT1H' and 'PT60M' are one elapsed time.
+select id, d, s from ckm;
+→ [{"id":1,"d":"PT1H","s":"PT60M"}]
+
+select id from ckm where d = 'PT1H';
+→ [{"id":1}]
+
+drop table ckm;
+
+-- Operand order reversed in the CHECK — the gate must be symmetric.
+create table ckr (id integer primary key, d timespan, s text, check (s = d));
+insert into ckr values (1, 'PT1H', 'PT60M');
+
+select id from ckr where d = 'PT1H';
+→ [{"id":1}]
+
+drop table ckr;
+
+-- JSON against TEXT: '{"x":1}' and '{ "x" : 1 }' are one structure, two strings.
+create table ckj (id integer primary key, a json, b text, check (a = b));
+insert into ckj values (1, '{"x":1}', '{ "x" : 1 }');
+
+select id from ckj where a = '{"x":1}';
+→ [{"id":1}]
+
+drop table ckj;
+
+-- Same-type control: `check (d = e)` over two TIMESPAN columns keeps its mirror
+-- FDs and equivalence class (the gate must not over-decline), and the row comes
+-- back carrying its own stored spellings — a canonicalizing "fix" would have
+-- rewritten them.
+create table ckt (id integer primary key, d timespan, e timespan, check (d = e));
+insert into ckt values (1, 'PT1H', 'PT60M');
+
+select id, d, e from ckt where d = 'PT1H';
+→ [{"id":1,"d":"PT1H","e":"PT60M"}]
+
+select id, d, e from ckt where e = 'PT60M';
+→ [{"id":1,"d":"PT1H","e":"PT60M"}]
+
+drop table ckt;
+
+-- A partial UNIQUE index in play. Row 2 is outside the index's `where` scope, so
+-- both rows may carry v = 7. The false {d, s} class dropped row 2 by inferring
+-- `s = 'PT60M'` from the pin on `d`. (It also fed the guard-discharge route,
+-- where an equivalence peer pinned to a literal discharges the partial index's
+-- `where` clause and activates a uniqueness FD that does not hold; the two could
+-- not be isolated from each other and close together.)
+create table ckp (id integer primary key, d timespan, s text, v integer, check (d = s));
+create unique index ckp_v on ckp (v) where s = 'PT60M';
+insert into ckp values (1, 'PT60M', 'PT60M', 7);
+insert into ckp values (2, 'PT1H', 'PT1H', 7);
+
+-- No `order by` here on purpose: adding one changes the plan enough to hide the
+-- defect (it returned both rows even ungated), so the bare form is the case that
+-- discriminates.
+select id from ckp where d = 'PT60M' and v = 7;
+→ [{"id":1},{"id":2}]
+
+drop table ckp;
+
+-- The hoisted-assertion route reaches the same extractor: a per-table assertion
+-- `not exists (select 1 from t where d <> s)` is negated into a synthetic per-row
+-- `d = s` check, and its facts merge onto the same TableReferenceNode. Same gate,
+-- same outcome.
+create table cka (id integer primary key, d timespan, s text);
+create assertion cka_eq check (not exists (select 1 from cka where d <> s));
+insert into cka values (1, 'PT1H', 'PT60M');
+
+select id from cka where d = 'PT1H';
+→ [{"id":1}]
+
+drop assertion cka_eq;
+drop table cka;
+
+-- USING over a mixed pair: `using (d)` means `l.d = r.d`, so the generic join's
+-- USING comparison routes through the same comparator the operator does.
+create table uma (id integer primary key, d timespan);
+create table umb (d text, tag text, primary key (d, tag));
+insert into uma values (1, 'PT1H');
+insert into umb values ('PT60M', 'y'), ('PT45M', 'n');
+
+select tag from umb join uma using (d);
+→ [{"tag":"y"}]
+
+select tag from uma join umb using (d);
+→ [{"tag":"y"}]
+
+drop table umb;
+drop table uma;
+
+-- A declined mixed pair lands on the nested-loop USING emitter, whose comparator
+-- ranks NULL/NULL as EQUAL (it is an ordering function). Without the emitter's own
+-- NULL guard this join would report a match that neither `=` nor the hash-keyed
+-- path reports. The `on` form is the oracle.
+create table una (id integer primary key, d timespan null);
+create table unb (id integer primary key, d text null);
+insert into una values (1, null), (2, 'PT1H');
+insert into unb values (10, null), (20, 'PT60M');
+
+select una.id as l, unb.id as r from una join unb using (d);
+→ [{"l":2,"r":20}]
+
+select una.id as l, unb.id as r from una join unb on una.d = unb.d;
+→ [{"l":2,"r":20}]
+
+drop table unb;
+drop table una;
+
+-- Control: when BOTH sides declare TIMESPAN the pair IS admissible and keeps the
+-- physical (hash/merge) key path. These must stay green — a gate that
+-- over-declines would still answer correctly here but via nested loop, while a
+-- gate that broke the same-type path would drop the rows outright.
+create table sma (id integer primary key, d timespan);
+create table smb (id integer primary key, d timespan);
+insert into sma values (1, 'PT1H'), (2, 'PT30M');
+insert into smb values (10, 'PT60M'), (20, 'PT45M');
+
+select sma.id as l, smb.id as r from sma join smb on sma.d = smb.d;
+→ [{"l":1,"r":10}]
+
+select sma.id as l, smb.id as r from sma join smb using (d);
+→ [{"l":1,"r":10}]
+
+drop table smb;
+drop table sma;
+
+-- JSON ↔ TEXT counterpart. These already passed before the gate landed, for a
+-- structural reason worth pinning: `insertCrossTypeCoercion` wraps the text side in
+-- `cast(… as json)`, so the ON operand is a CastNode rather than a bare column
+-- reference and was never recognized as an equi-pair in the first place. If that
+-- coercion ever stops firing, the semantic-ordering gate is what must catch the
+-- pair instead — and these assertions are what notice.
+create table jma (id integer primary key, doc json);
+create table jmb (id integer primary key, s text);
+insert into jma values (1, '{"a":1}');
+insert into jmb values (10, '{ "a" : 1 }'), (20, '{"a":2}');
+
+select jma.id as l, jmb.id as r from jma cross join jmb where jma.doc = jmb.s;
+→ [{"l":1,"r":10}]
+
+select jma.id as l, jmb.id as r from jma join jmb on jma.doc = jmb.s;
+→ [{"l":1,"r":10}]
+
+-- No JSON ↔ TEXT `using` case here on purpose: USING skips cross-type coercion
+-- entirely, so the two sides still compare as OBJECT vs TEXT storage classes and
+-- match nothing. Tracked as `bug-using-join-skips-cross-type-coercion`.
+
+drop table jmb;
+drop table jma;
+
+-- === nullif / greatest / least route through declared semantic ordering ===
+--
+-- The three comparison builtins resolve their operand group's declared type and
+-- collation at plan/emit time, so they agree with `=` and ORDER BY on TIMESPAN
+-- and JSON columns. Regression for `nullif-greatest-least-comparison-seam`
+-- (previously they compared raw bytes/text).
+
+create table gnl (id integer primary key, d timespan, e timespan);
+insert into gnl values (1, 'PT2H', 'PT90M');
+
+-- nullif matches whenever `=` matches: PT120M ≡ PT2H by elapsed time.
+select (d = 'PT120M') as r from gnl;
+→ [{"r":true}]
+
+select nullif(d, 'PT120M') as r from gnl;
+→ [{"r":null}]
+
+-- A different elapsed time still comes through unchanged.
+select nullif(d, 'PT119M') as r from gnl;
+→ [{"r":"PT2H"}]
+
+-- greatest/least rank by elapsed time (text order says 'PT2H' < 'PT90M'). The
+-- durations are semantically distinct, so no tie-representative is pinned.
+select greatest(d, e) as g, least(d, e) as l from gnl;
+→ [{"g":"PT2H","l":"PT90M"}]
+
+-- A MIXED group — TIMESPAN column against a bare TEXT literal — still ranks by
+-- elapsed time: the group comparator falls through to the runtime duration
+-- check, the same route `d > 'PT30M'` takes. Plain text order says
+-- 'PT2H' < 'PT30M' and would flip both answers.
+select (d > 'PT30M') as r from gnl;
+→ [{"r":true}]
+
+select greatest(d, 'PT30M') as g, least(d, 'PT30M') as l from gnl;
+→ [{"g":"PT2H","l":"PT30M"}]
+
+-- Three-operand mixed group, so the fold takes the duration route repeatedly.
+select greatest(d, e, 'PT30M') as g, least(d, e, 'PT30M') as l from gnl;
+→ [{"g":"PT2H","l":"PT30M"}]
+
+-- NULL handling is the plain fold's, unchanged by the comparator swap: both
+-- greatest and least skip NULLs.
+select greatest(d, null) as g, least(d, null) as l, least(null, d) as l2 from gnl;
+→ [{"g":"PT2H","l":"PT2H","l2":"PT2H"}]
+
+select nullif(d, null) as a, nullif(null, d) as b from gnl;
+→ [{"a":"PT2H","b":null}]
+
+drop table gnl;
+
+-- JSON: a textual operand is converted to the JSON side for the COMPARISON (the
+-- same conversion `=`, IN and simple CASE apply through their synthetic cast), so
+-- the comparison is structural — whitespace and key order are insignificant.
+-- `nullif`/`greatest`/`least` return one of their arguments, so they convert only
+-- a copy: the value handed back is the argument as written, never the parsed
+-- document the comparison was run over.
+create table jnl (id integer primary key, doc json, doc2 json);
+insert into jnl values (1, '{"a":1}', '{ "a" : 1 }');
+
+select (doc = '{ "a" : 1 }') as r from jnl;
+→ [{"r":true}]
+
+-- Both sides JSON columns: structural before this ticket already.
+select nullif(doc, doc2) as r from jnl;
+→ [{"r":null}]
+
+-- One side a text literal: converting it for the comparison makes that structural
+-- too, so the whitespace-different spelling matches.
+select nullif(doc, '{ "a" : 1 }') as r from jnl;
+→ [{"r":null}]
+
+-- A structurally different document still comes through — as the column's own
+-- parsed value, since the column is the returned argument here.
+select nullif(doc, '{"a":2}') as r from jnl;
+→ [{"r":{"a":1}}]
+
+-- Flipped orientation: the TEXT literal is the group's probe, so it is the side
+-- that converts. The comparison stays structural (whitespace-insensitive), and a
+-- non-match returns the literal AS WRITTEN — the text, not the parsed document.
+select nullif('{ "a" : 1 }', doc) as r from jnl;
+→ [{"r":null}]
+
+select nullif('{ "a" : 2 }', doc) as r, typeof(nullif('{ "a" : 2 }', doc)) as t from jnl;
+→ [{"r":"{ \"a\" : 2 }","t":"text"}]
+
+-- greatest/least over a JSON group rank structurally, not by text spelling — and
+-- each returns its winning argument untouched: the text literal wins `greatest`
+-- and comes back as text, while the column wins `least` and comes back parsed.
+select greatest(doc, '{"a":2}') as g, least(doc, '{"a":2}') as l from jnl;
+→ [{"g":"{\"a\":2}","l":{"a":1}}]
+
+drop table jnl;
+
+-- Negative control: bare text literals declare TEXT, not TIMESPAN — text
+-- ordering is correct for them ('PT2H' vs 'PT120M' are two distinct strings,
+-- and 'PT90M' > 'PT2H' as text).
+select nullif('PT2H', 'PT120M') as r;
+→ [{"r":"PT2H"}]
+
+select greatest('PT2H', 'PT90M') as g, least('PT2H', 'PT90M') as l;
+→ [{"g":"PT90M","l":"PT2H"}]
+
+-- === TIMESPAN UNIQUE enforcement: identity, not spelling ===
+--
+-- A UNIQUE constraint over a semantic-ordering column compares candidates through
+-- the column's declared type, so an equal-elapsed re-spelling is a duplicate — the
+-- same identity `=`, DISTINCT and the PRIMARY KEY already use above. Runs under both
+-- the memory module (`yarn test`) and the store module (`yarn test:store`); both must
+-- agree. (Regression: memory's candidate lookup was typed but its re-validation
+-- compared raw text, so the duplicate was found and then discarded as unequal.)
+
+create table u (id integer primary key, d timespan unique);
+insert into u values (1, 'PT1H');
+
+insert into u values (2, 'PT60M');
+-- error: UNIQUE constraint failed
+
+-- `on conflict ignore` drops the duplicate spelling; the original row survives.
+insert or ignore into u values (3, 'PT60M');
+select id, timespan_total_seconds(d) as s from u;
+→ [{"id":1,"s":3600}]
+
+-- `on conflict replace` evicts the row the conflicting spelling names.
+insert or replace into u values (4, 'PT1H0S');
+select id, timespan_total_seconds(d) as s from u;
+→ [{"id":4,"s":3600}]
+
+drop table u;
+
+-- Composite UNIQUE: the TIMESPAN member collapses spellings, a differing leading
+-- column is still a distinct key.
+create table uc (id integer primary key, k integer, d timespan, unique (k, d));
+insert into uc values (1, 1, 'PT1H');
+
+insert into uc values (2, 1, 'PT60M');
+-- error: UNIQUE constraint failed
+
+insert into uc values (3, 2, 'PT60M');
+select count(*) as c from uc;
+→ [{"c":2}]
+
+drop table uc;
+
+-- The index-derived variant of the same write-time identity check lives in
+-- 15.1.2-semantic-ordering-index (it needs standalone CREATE UNIQUE INDEX).
+
+-- UPDATE: re-spelling a row's OWN value is not a self-conflict; moving a row onto
+-- ANOTHER row's identity is.
+create table uu (id integer primary key, d timespan unique);
+insert into uu values (1, 'PT1H'), (2, 'PT30M');
+
+update uu set d = 'PT60M' where id = 1;
+select id, timespan_total_seconds(d) as s from uu order by id;
+→ [{"id":1,"s":3600},{"id":2,"s":1800}]
+
+update uu set d = 'PT60M' where id = 2;
+-- error: UNIQUE constraint failed
+
+select count(*) as c from uu;
+→ [{"c":2}]
+
+drop table uu;
+
+-- Negative control: the SAME strings in a declared TEXT column stay two distinct
+-- values — only a declared semantic-ordering type changes UNIQUE identity.
+create table ut (id integer primary key, d text unique);
+insert into ut values (1, 'PT1H'), (2, 'PT60M');
+select count(*) as c from ut;
+→ [{"c":2}]
+
+drop table ut;
+
+-- An explicit `on conflict (<col>)` target routes on the SAME identity the
+-- constraint enforces: naming a semantic-ordering column does not narrow the match
+-- back to byte equality. (Regression: the executor decided which clause a violation
+-- belonged to by comparing the target columns under storage class + collation only,
+-- so 'PT1H' vs 'PT60M' matched no clause and the UNIQUE error was re-raised.)
+-- NOTE: these assert through timespan_total_seconds, like the rest of this file, so
+-- they pin the identity but not WHICH spelling of d survives a DO UPDATE (the
+-- existing row's, since d is unassigned). If a backend is ever changed to adopt the
+-- proposed row's key spelling, add a raw `select d` here to pin it.
+create table ux (id integer primary key, d timespan unique, n integer);
+insert into ux values (1, 'PT1H', 10);
+
+insert into ux values (2, 'PT60M', 20) on conflict (d) do update set n = 99;
+select id, timespan_total_seconds(d) as s, n from ux;
+→ [{"id":1,"s":3600,"n":99}]
+
+insert into ux values (4, 'PT60M', 40) on conflict (d) do nothing;
+select id, timespan_total_seconds(d) as s, n from ux;
+→ [{"id":1,"s":3600,"n":99}]
+
+-- The untargeted form matches any constraint and never compares values — unchanged.
+insert into ux values (5, 'PT3600S', 50) on conflict do update set n = 77;
+select id, timespan_total_seconds(d) as s, n from ux;
+→ [{"id":1,"s":3600,"n":77}]
+
+-- A conflict on a DIFFERENT constraint than the target still aborts: the target
+-- columns disagree, so no clause covers it.
+insert into ux values (1, 'PT5M', 60) on conflict (d) do update set n = 1;
+-- error: constraint failed
+
+drop table ux;
+
+-- Composite target with a TIMESPAN member: the re-spelled member still names the
+-- same key, a differing leading column is a distinct key (plain insert).
+create table uxc (id integer primary key, k integer, d timespan, n integer, unique (k, d));
+insert into uxc values (1, 1, 'PT1H', 10);
+
+insert into uxc values (2, 1, 'PT60M', 20) on conflict (k, d) do update set n = 99;
+insert into uxc values (3, 2, 'PT60M', 30) on conflict (k, d) do update set n = 88;
+select id, k, timespan_total_seconds(d) as s, n from uxc order by id;
+→ [{"id":1,"k":1,"s":3600,"n":99},{"id":3,"k":2,"s":3600,"n":30}]
+
+drop table uxc;
+
+-- A PRIMARY KEY target resolves its enforcement collation down the other branch
+-- (the PK column definition, not a UNIQUE constraint) — the semantic identity has
+-- to survive that branch too. `excluded.` values reach the assignment normally.
+create table uxp (d timespan primary key, n integer);
+insert into uxp values ('PT1H', 10);
+
+insert into uxp values ('PT60M', 20) on conflict (d) do update set n = excluded.n;
+select timespan_total_seconds(d) as s, n from uxp;
+→ [{"s":3600,"n":20}]
+
+insert into uxp values ('PT90M', 30) on conflict (d) do update set n = excluded.n;
+select timespan_total_seconds(d) as s, n from uxp order by s;
+→ [{"s":3600,"n":20},{"s":5400,"n":30}]
+
+drop table uxp;
+
+-- JSON is the other semantic-ordering type. Its values reach the executor already
+-- canonicalized, so both sides of the match were equal even before this fix; pinned
+-- so the routing stays correct whichever layer canonicalizes.
+create table uxj (id integer primary key, v json unique, n integer);
+insert into uxj values (1, json('{"a":1,"b":2}'), 10);
+
+insert into uxj values (2, json('{"b":2,"a":1}'), 20) on conflict (v) do update set n = 99;
+select id, n from uxj order by id;
+→ [{"id":1,"n":99}]
+
+drop table uxj;
+
+-- Negative control: a TEXT conflict target keeps text identity — a differently
+-- spelled duration is a new row, and the same spelling still routes to DO UPDATE.
+create table uxt (id integer primary key, d text unique, n integer);
+insert into uxt values (1, 'PT1H', 10);
+
+insert into uxt values (2, 'PT60M', 20) on conflict (d) do update set n = 99;
+insert into uxt values (3, 'PT1H', 30) on conflict (d) do update set n = 55;
+select id, d, n from uxt order by id;
+→ [{"id":1,"d":"PT1H","n":55},{"id":2,"d":"PT60M","n":20}]
+
+drop table uxt;
+
+-- === Untyped expressions keep storage-class/text ordering ===
+
+-- Text literals (no declared TIMESPAN type): DISTINCT keeps both spellings.
+select count(*) as c from (
+	select distinct d from (select 'PT1H' as d union all select 'PT60M' as d) as u
+) as q;
+→ [{"c":2}]
+
+-- ANY column holding duration-shaped strings orders as text ('PT2H' < 'PT90M').
+create table anyt (id integer primary key, v any);
+insert into anyt values (1, 'PT2H'), (2, 'PT90M');
+select id from anyt order by v;
+→ [{"id":1},{"id":2}]
+
+drop table anyt;
+
+-- A plain TEXT column holding duration-shaped text stays text-ordered, and BETWEEN
+-- must agree with the comparisons it desugars to. (Regression: a runtime duration
+-- probe applied unconditionally in BETWEEN made these two disagree — 'PT30M' passed
+-- the text comparisons but was rejected by BETWEEN.)
+create table txt (id integer primary key, v text);
+insert into txt values (1, 'PT30M'), (2, 'PT2H'), (3, 'PT90M');
+
+select id from txt where v between 'PT100M' and 'PT3H' order by id;
+→ [{"id":1},{"id":2}]
+
+select id from txt where v >= 'PT100M' and v <= 'PT3H' order by id;
+→ [{"id":1},{"id":2}]
+
+-- A simple CASE over the same plain TEXT column stays text-compared too: 'PT30M'
+-- and 'PT0.5H' are one elapsed time but two distinct strings, and only a declared
+-- semantic-ordering type changes that. Must agree with `=`.
+select id, (v = 'PT0.5H') as eq, case v when 'PT0.5H' then 'hit' else 'miss' end as c
+  from txt where id = 1;
+→ [{"id":1,"eq":false,"c":"miss"}]
+
+-- The exact spelling still matches under text comparison.
+select id from txt where case v when 'PT30M' then 1 else 0 end = 1;
+→ [{"id":1}]
+
+drop table txt;
+
+-- === JSON: structural ordering ===
+
+create table jv (id integer primary key, v json);
+insert into jv values (1, '{"a":10}'), (2, '{"a":2}');
+
+-- Structural order: {"a":2} < {"a":10} because 2 < 10 numerically (canonical-text
+-- order would sort '{"a":10}' first).
+select id from jv order by v;
+→ [{"id":2},{"id":1}]
+
+select id from jv order by v desc;
+→ [{"id":1},{"id":2}]
+
+-- Comparison operators use the structural order too.
+select (json('{"a":2}') < json('{"a":10}')) as r;
+→ [{"r":true}]
+
+-- JSON type-rank order: number < string < array < object.
+select (json('5') < json('"a"')) as r;
+→ [{"r":true}]
+
+select (json('[99]') < json('{"a":0}')) as r;
+→ [{"r":true}]
+
+-- Equality is unchanged: key order in objects is insignificant either way.
+select (json('{"a":1,"b":2}') = json('{"b":2,"a":1}')) as r;
+→ [{"r":true}]
+
+-- BETWEEN over a JSON column agrees with the structural comparisons it desugars to.
+select id from jv where v between json('{"a":1}') and json('{"a":5}');
+→ [{"id":2}]
+
+-- Simple CASE over a JSON column compares structurally (whitespace and key order
+-- are insignificant), unchanged by the collation/type routing rework: the plan-time
+-- cast the builder inserts on the WHEN operands already put both sides in JSON.
+select id, case v when '{ "a" : 2 }' then 'hit' else 'miss' end as r from jv order by id;
+→ [{"id":1,"r":"miss"},{"id":2,"r":"hit"}]
+
+-- JSON row identity: key order is insignificant, so two reordered spellings of one
+-- document are one value to DISTINCT, GROUP BY and set operations. (JSON needs no
+-- groupKey hook — its canonical text form is already identity-faithful — so these
+-- assert that the canonical form, not the stored insertion order, drives the key.)
+create table jd (id integer primary key, v json);
+insert into jd values (1, '{"a":1,"b":2}'), (2, '{"b":2,"a":1}');
+
+select count(*) as c from (select distinct v from jd) as q;
+→ [{"c":1}]
+
+select count(*) as c from (select v from jd group by v) as q;
+→ [{"c":1}]
+
+select count(*) as c from (
+	select v from jd where id = 1
+	union
+	select v from jd where id = 2
+) as q;
+→ [{"c":1}]
+
+-- Window PARTITION BY and an equi-join key collapse the same identity.
+select count(*) over (partition by v) as c from jd;
+→ [{"c":2},{"c":2}]
+
+create table jd2 (id integer primary key, v json);
+insert into jd2 values (10, '{"b":2,"a":1}');
+select jd.id as l, jd2.id as r from jd join jd2 on jd.v = jd2.v order by l;
+→ [{"l":1,"r":10},{"l":2,"r":10}]
+
+drop table jd2;
+drop table jd;
+
+drop table jv;
+
+-- === Window min()/max() follow the same rule as the aggregate ===
+--
+-- Window functions resolve through their own registry (schema/window-function.ts),
+-- so the emitter binds each call site's argument type + collation to the MIN/MAX
+-- step exactly as the aggregate does. `min(x) over (…)` must therefore equal
+-- `min(x)` over the same rows, and agree with `order by x limit 1`.
+
+create table wts (id integer primary key, dur timespan);
+insert into wts values (1,'PT30M'), (2,'PT1H'), (3,'PT2H'), (4,'P1D'), (5,'PT0S');
+
+-- Whole-partition frame: elapsed-time order. Text order would give mn=P1D, mx=PT30M.
+select distinct min(dur) over () as mn, max(dur) over () as mx from wts;
+→ [{"mn":"PT0S","mx":"P1D"}]
+
+-- The window form agrees with the aggregate form and with order by … limit 1.
+select distinct
+	(min(dur) over () = (select min(dur) from wts)) as min_eq_agg,
+	(min(dur) over () = (select dur from wts order by dur limit 1)) as min_eq_order,
+	(max(dur) over () = (select max(dur) from wts)) as max_eq_agg,
+	(max(dur) over () = (select dur from wts order by dur desc limit 1)) as max_eq_order
+from wts;
+→ [{"min_eq_agg":true,"min_eq_order":true,"max_eq_agg":true,"max_eq_order":true}]
+
+-- Running frame (unbounded preceding): tightens by elapsed time, so 'P1D' at id=4
+-- never becomes the minimum and 'PT0S' at id=5 does.
+select id, min(dur) over (order by id rows unbounded preceding) as rmn from wts order by id;
+→ [{"id":1,"rmn":"PT30M"},{"id":2,"rmn":"PT30M"},{"id":3,"rmn":"PT30M"},{"id":4,"rmn":"PT30M"},{"id":5,"rmn":"PT0S"}]
+
+-- Sliding frame (1 preceding .. 1 following): each window ranks independently.
+select id, min(dur) over (order by id rows between 1 preceding and 1 following) as mn,
+       max(dur) over (order by id rows between 1 preceding and 1 following) as mx
+from wts order by id;
+→ [{"id":1,"mn":"PT30M","mx":"PT1H"},{"id":2,"mn":"PT30M","mx":"PT2H"},{"id":3,"mn":"PT1H","mx":"P1D"},{"id":4,"mn":"PT0S","mx":"P1D"},{"id":5,"mn":"PT0S","mx":"P1D"}]
+
+drop table wts;
+
+-- Mixed storage classes in an ANY column. A raw JavaScript `<` never selects the
+-- number (both `5 < 'abc'` and `'abc' < 5` are false), so the window minimum used
+-- to be whichever non-null value arrived first.
+create table wany (id integer primary key, v any);
+insert into wany values (1,'abc'), (2,5), (3,'zz');
+
+select v from wany order by v;
+→ [{"v":5},{"v":"abc"},{"v":"zz"}]
+
+select distinct min(v) over () as mn, max(v) over () as mx from wany;
+→ [{"mn":5,"mx":"zz"}]
+
+drop table wany;
+
+-- Declared collation: NOCASE ranks 'a' below 'B'; BINARY would report mn=B, mx=a.
+create table wnc (id integer primary key, t text collate NOCASE);
+insert into wnc values (1,'B'), (2,'a'), (3,'c');
+
+select distinct min(t) over () as mn, max(t) over () as mx from wnc;
+→ [{"mn":"a","mx":"c"}]
+
+drop table wnc;
+
+-- Blobs compare bytewise, agreeing with the aggregate and with ORDER BY. Under a
+-- raw `<` two Uint8Arrays coerce to strings, which is neither byte order nor
+-- anything else meaningful.
+create table wbl (id integer primary key, b blob);
+insert into wbl values (1, x'ff00'), (2, x'0102'), (3, x'80');
+
+select id from wbl order by b;
+→ [{"id":2},{"id":3},{"id":1}]
+
+select distinct
+	(min(b) over () = (select min(b) from wbl)) as min_eq_agg,
+	(max(b) over () = (select max(b) from wbl)) as max_eq_agg
+from wbl;
+→ [{"min_eq_agg":true,"max_eq_agg":true}]
+
+drop table wbl;

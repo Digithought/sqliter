@@ -12,17 +12,17 @@
  *   __catalog__                   - Catalog store (DDL metadata)
  */
 
-import type { KVStore, KVStoreProvider } from '@quereus/store';
+import type { AtomicBatch, KVStore, KVStoreProvider } from '@quereus/store';
 import {
 	buildDataStoreName,
 	buildIndexStoreName,
 	CachedKVStore,
 	CATALOG_STORE_NAME,
 	STATS_STORE_NAME,
-	STORE_SUFFIX,
 	type CacheOptions,
 } from '@quereus/store';
-import { IndexedDBStore } from './store.js';
+import { QuereusError, StatusCode } from '@quereus/quereus';
+import { IndexedDBStore, MultiStoreWriteBatch } from './store.js';
 import { IndexedDBManager } from './manager.js';
 
 /**
@@ -52,6 +52,15 @@ export interface IndexedDBProviderOptions {
 export class IndexedDBProvider implements KVStoreProvider {
 	private databaseName: string;
 	private stores = new Map<string, KVStore>();
+	/**
+	 * Maps each table's data store name to the set of its own index store names.
+	 * Populated as index stores are opened via `getIndexStore`, this is the
+	 * authoritative per-table index list the provider would otherwise lack:
+	 * `invalidateCache` consults it to clear exactly a table's own caches rather
+	 * than prefix-scanning `{data}_idx_`, which also matches a sibling table
+	 * literally named `{table}_idx_<x>` (data store `{schema}.{table}_idx_<x>`).
+	 */
+	private indexStoresByTable = new Map<string, Set<string>>();
 	private catalogStore: IndexedDBStore | null = null;
 	private statsStore: IndexedDBStore | null = null;
 	private manager: IndexedDBManager;
@@ -63,6 +72,13 @@ export class IndexedDBProvider implements KVStoreProvider {
 		this.cacheOptions = options.cache;
 	}
 
+	// NOTE: the physical store name is used verbatim as an IndexedDB object-store name.
+	// Per spec those are `DOMString`s compared by code unit, so an unpaired surrogate
+	// SHOULD survive intact (unlike LevelDB, whose sublevel names go through UTF-8 and
+	// fold every unpaired surrogate to U+FFFD) — but that has not been verified against a
+	// real browser here. It does not affect correctness: `buildDataStoreName` /
+	// `buildIndexStoreName` reject such an identifier above every provider, so no name
+	// reaching here can carry one.
 	async getStore(schemaName: string, tableName: string, _options?: Record<string, unknown>): Promise<KVStore> {
 		const storeName = buildDataStoreName(schemaName, tableName);
 		return this.getOrCreateStore(storeName);
@@ -70,6 +86,7 @@ export class IndexedDBProvider implements KVStoreProvider {
 
 	async getIndexStore(schemaName: string, tableName: string, indexName: string): Promise<KVStore> {
 		const storeName = buildIndexStoreName(schemaName, tableName, indexName);
+		this.registerIndexStore(buildDataStoreName(schemaName, tableName), storeName);
 		return this.getOrCreateStore(storeName);
 	}
 
@@ -109,6 +126,7 @@ export class IndexedDBProvider implements KVStoreProvider {
 			await store.close();
 		}
 		this.stores.clear();
+		this.indexStoresByTable.clear();
 
 		if (this.catalogStore) {
 			await this.catalogStore.close();
@@ -128,9 +146,57 @@ export class IndexedDBProvider implements KVStoreProvider {
 		const storeName = buildIndexStoreName(schemaName, tableName, indexName);
 		await this.closeStoreByName(storeName);
 		await this.manager.deleteObjectStore(storeName);
+		// Drop the stale mapping so a sibling table that later reuses this physical
+		// name (allowed once the index is gone) is not mistaken for this table's index.
+		this.indexStoresByTable.get(buildDataStoreName(schemaName, tableName))?.delete(storeName);
 	}
 
-	async deleteTableStores(schemaName: string, tableName: string): Promise<void> {
+	async renameTableStores(schemaName: string, oldName: string, newName: string, indexNames: readonly string[]): Promise<void> {
+		const oldDataStoreName = buildDataStoreName(schemaName, oldName);
+		const newDataStoreName = buildDataStoreName(schemaName, newName);
+
+		// Up-front collision guard, mirroring LevelDB's "destination already exists".
+		if (this.manager.hasObjectStore(newDataStoreName)) {
+			throw new Error(`Cannot rename table '${oldName}' to '${newName}': data store '${newDataStoreName}' already exists`);
+		}
+
+		// Build the rename list from the data store (if it materialized) plus the
+		// table's authoritative index stores. We map each schema index name to its
+		// exact store name rather than prefix-scanning `{oldName}_idx_`, which would
+		// also catch a sibling table named `{oldName}_idx_<x>`.
+		const renameList: Array<{ from: string; to: string }> = [];
+		if (this.manager.hasObjectStore(oldDataStoreName)) {
+			renameList.push({ from: oldDataStoreName, to: newDataStoreName });
+		}
+
+		for (const indexName of indexNames) {
+			const from = buildIndexStoreName(schemaName, oldName, indexName);
+			// An index store may not have materialized yet; only move what exists.
+			if (!this.manager.hasObjectStore(from)) continue;
+			const to = buildIndexStoreName(schemaName, newName, indexName);
+			if (this.manager.hasObjectStore(to)) {
+				throw new Error(`Cannot rename table '${oldName}' to '${newName}': index store '${to}' already exists`);
+			}
+			renameList.push({ from, to });
+		}
+
+		// Evict cached handles for every source store BEFORE the relocation so no
+		// stale IndexedDBStore/CachedKVStore points at an object store that is about
+		// to be deleted. __stats__ is the unified stats store and is left untouched —
+		// StoreModule.renameTable relocates the stats key itself.
+		for (const { from } of renameList) {
+			await this.closeStoreByName(from);
+		}
+
+		await this.manager.renameObjectStores(renameList);
+
+		// The old table's index mapping is now stale (its stores were relocated and
+		// their handles evicted). Drop it; the renamed table re-registers its index
+		// stores on next access via `getIndexStore`.
+		this.indexStoresByTable.delete(oldDataStoreName);
+	}
+
+	async deleteTableStores(schemaName: string, tableName: string, indexNames: readonly string[]): Promise<void> {
 		const dataStoreName = buildDataStoreName(schemaName, tableName);
 
 		// Close and delete data store
@@ -142,15 +208,19 @@ export class IndexedDBProvider implements KVStoreProvider {
 		// Stats are in the unified __stats__ store, so no need to delete a separate store
 		// The individual stats entry will be removed by the calling code if needed
 
-		// Find and delete all index stores for this table
-		const indexPrefix = `${dataStoreName}${STORE_SUFFIX.INDEX}`;
-		const allStores = this.manager.getObjectStoreNames();
-		for (const name of allStores) {
-			if (name.startsWith(indexPrefix)) {
-				await this.closeStoreByName(name);
-				await this.manager.deleteObjectStore(name);
-			}
+		// Delete exactly the table's index stores (by name), not every object store
+		// matching the `{table}_idx_` prefix — that prefix also matches a sibling
+		// table literally named `{table}_idx_<x>`.
+		for (const indexName of indexNames) {
+			const storeName = buildIndexStoreName(schemaName, tableName, indexName);
+			if (!this.manager.hasObjectStore(storeName)) continue;
+			await this.closeStoreByName(storeName);
+			await this.manager.deleteObjectStore(storeName);
 		}
+
+		// The table is gone; forget its index mapping so a future table reusing this
+		// data store name does not inherit stale index store associations.
+		this.indexStoresByTable.delete(dataStoreName);
 	}
 
 	/**
@@ -161,17 +231,64 @@ export class IndexedDBProvider implements KVStoreProvider {
 	}
 
 	/**
+	 * Open an atomic batch across this provider's object stores.
+	 *
+	 * All of this provider's stores live in one IndexedDB database, so a single
+	 * `db.transaction(storeNames, 'readwrite')` (driven by {@link MultiStoreWriteBatch})
+	 * commits them atomically and durably. The transaction coordinator uses this
+	 * to commit a table's data + secondary-index stores in one physical batch.
+	 */
+	beginAtomicBatch(): AtomicBatch {
+		return new IndexedDBAtomicBatch(
+			this.manager,
+			(store) => this.resolveStoreName(store),
+			(storeName) => this.invalidateStore(storeName),
+		);
+	}
+
+	/**
+	 * Map a {@link KVStore} handle this provider handed out back to its object
+	 * store name. Handles are `CachedKVStore(IndexedDBStore)` (or a raw
+	 * `IndexedDBStore` when caching is disabled). A handle not produced by this
+	 * provider — wrong type, or an `IndexedDBStore` bound to a different manager —
+	 * is a programming error.
+	 */
+	private resolveStoreName(store: KVStore): string {
+		const raw = store instanceof CachedKVStore ? store.getUnderlying() : store;
+		if (!(raw instanceof IndexedDBStore) || raw.getManager() !== this.manager) {
+			throw new QuereusError(
+				'AtomicBatch received a KVStore handle not produced by this provider',
+				StatusCode.MISUSE,
+			);
+		}
+		return raw.getStoreName();
+	}
+
+	/**
 	 * Invalidate the read cache for a specific table's data and index stores.
 	 * Called by cross-tab sync when remote data changes are detected.
 	 */
 	invalidateCache(schemaName: string, tableName: string): void {
 		const dataStoreName = buildDataStoreName(schemaName, tableName);
-		const indexPrefix = `${dataStoreName}${STORE_SUFFIX.INDEX}`;
+		this.invalidateStore(dataStoreName);
 
-		for (const [name, store] of this.stores) {
-			if ((name === dataStoreName || name.startsWith(indexPrefix)) && store instanceof CachedKVStore) {
-				store.invalidateAll();
+		// Clear only this table's own index stores. We never prefix-scan
+		// `{data}_idx_`: that prefix also matches a sibling table literally named
+		// `{table}_idx_<x>` (data store `{schema}.{table}_idx_<x>`), and clearing it
+		// would needlessly drop an unrelated table's read cache.
+		const indexStores = this.indexStoresByTable.get(dataStoreName);
+		if (indexStores) {
+			for (const indexStoreName of indexStores) {
+				this.invalidateStore(indexStoreName);
 			}
+		}
+	}
+
+	/** Invalidate a single store's read cache, if that store is currently cached. */
+	private invalidateStore(storeName: string): void {
+		const store = this.stores.get(storeName);
+		if (store instanceof CachedKVStore) {
+			store.invalidateAll();
 		}
 	}
 
@@ -185,6 +302,16 @@ export class IndexedDBProvider implements KVStoreProvider {
 				store.invalidateAll();
 			}
 		}
+	}
+
+	/** Record that `indexStoreName` is an index store belonging to `dataStoreName`. */
+	private registerIndexStore(dataStoreName: string, indexStoreName: string): void {
+		let indexStores = this.indexStoresByTable.get(dataStoreName);
+		if (!indexStores) {
+			indexStores = new Set<string>();
+			this.indexStoresByTable.set(dataStoreName, indexStores);
+		}
+		indexStores.add(indexStoreName);
 	}
 
 	private async getOrCreateStore(storeName: string): Promise<KVStore> {
@@ -212,6 +339,50 @@ export class IndexedDBProvider implements KVStoreProvider {
 			await store.close();
 			this.stores.delete(storeName);
 		}
+	}
+}
+
+/**
+ * {@link AtomicBatch} over the unified IndexedDB database.
+ *
+ * Wraps {@link MultiStoreWriteBatch} (one `db.transaction(storeNames, 'readwrite')`
+ * = native IDB multi-store atomicity), translating each {@link KVStore} handle to
+ * its object store name via the provider's `resolveStoreName`. After a successful
+ * `write()` the atomic write has bypassed every `CachedKVStore` wrapper, so each
+ * touched store's read cache would be stale; the batch invalidates them via the
+ * provider's `invalidateStore` to preserve read-your-own-writes across the cache.
+ */
+class IndexedDBAtomicBatch implements AtomicBatch {
+	private readonly batch: MultiStoreWriteBatch;
+
+	constructor(
+		manager: IndexedDBManager,
+		private readonly resolveStoreName: (store: KVStore) => string,
+		private readonly invalidateStore: (storeName: string) => void,
+	) {
+		this.batch = new MultiStoreWriteBatch(manager);
+	}
+
+	put(store: KVStore, key: Uint8Array, value: Uint8Array): void {
+		this.batch.putToStore(this.resolveStoreName(store), key, value);
+	}
+
+	delete(store: KVStore, key: Uint8Array): void {
+		this.batch.deleteFromStore(this.resolveStoreName(store), key);
+	}
+
+	async write(): Promise<void> {
+		// Capture before write() — a successful write() clears the batch's ops and
+		// store names, so read the names up front for post-write cache invalidation.
+		const storeNames = this.batch.getStoreNames();
+		await this.batch.write();
+		for (const storeName of storeNames) {
+			this.invalidateStore(storeName);
+		}
+	}
+
+	clear(): void {
+		this.batch.clear();
 	}
 }
 

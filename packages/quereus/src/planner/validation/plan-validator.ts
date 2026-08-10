@@ -308,9 +308,54 @@ function isDDLNode(nodeType: PlanNodeType): boolean {
 		PlanNodeType.Pragma,
 		PlanNodeType.AddConstraint,
 		PlanNodeType.AlterTable,
+		PlanNodeType.SetObjectTags,
 	]);
 
 	return ddlTypes.has(nodeType);
+}
+
+/**
+ * Assert the cost model's additivity invariant over a constructed plan tree:
+ * for every node, `getTotalCost()` must equal its self-cost (`estimatedCost`)
+ * plus the sum of every child's total cost, and `estimatedCost` must be a finite,
+ * non-negative number.
+ *
+ * This guards the self-cost-only convention (`PlanNode.estimatedCost` stores only
+ * the node's own cost; `getTotalCost()` is the sole place children are summed).
+ * The additivity equality is tautological for the base `getTotalCost()`, so the
+ * real value is catching (a) a future `getTotalCost()` override that diverges from
+ * additivity, and (b) a self-cost that went NaN / negative / infinite.
+ *
+ * Debug- and test-callable; not on the hot path. Throws `QuereusError` on the
+ * first violation.
+ */
+export function validateCostAdditivity(root: PlanNode): void {
+	const stack: PlanNode[] = [root];
+	const seen = new Set<PlanNode>();
+	while (stack.length > 0) {
+		const node = stack.pop()!;
+		if (seen.has(node)) continue; // shared child (DAG) — cost is identical, check once
+		seen.add(node);
+
+		const self = node.estimatedCost;
+		if (typeof self !== 'number' || !Number.isFinite(self) || self < 0) {
+			throw new QuereusError(
+				`Node ${node.nodeType} [${node.id}] has invalid self-cost estimatedCost=${self} (must be finite and >= 0)`,
+				StatusCode.INTERNAL,
+			);
+		}
+
+		const children = node.getChildren();
+		const expectedTotal = self + children.reduce((acc, child) => acc + child.getTotalCost(), 0);
+		if (node.getTotalCost() !== expectedTotal) {
+			throw new QuereusError(
+				`Node ${node.nodeType} [${node.id}] violates cost additivity: getTotalCost()=${node.getTotalCost()} != estimatedCost + Σ child.getTotalCost()=${expectedTotal}`,
+				StatusCode.INTERNAL,
+			);
+		}
+
+		for (const child of children) stack.push(child);
+	}
 }
 
 /**

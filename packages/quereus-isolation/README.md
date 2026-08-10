@@ -1,15 +1,19 @@
 # @quereus/isolation
 
+> **Stability: Beta** — complete and tested, but the surface is still being shaped; a
+> breaking change may land in a minor release. See
+> [Stability Tiers](../../docs/stability.md#tiers).
+
 Generic transaction isolation layer for Quereus virtual table modules.
 
 ## Overview
 
-The `@quereus/isolation` package provides MVCC-style transaction isolation semantics for any Quereus virtual table module. It wraps existing modules to add:
+The `@quereus/isolation` package provides connection-level transaction isolation for any Quereus virtual table module. It wraps existing modules to add:
 
 - **Read-your-own-writes** — See uncommitted changes within your transaction
-- **Snapshot isolation** — Consistent reads throughout the transaction
+- **Read-committed reads of shared state** — Reads merge against the *live* underlying table, so another connection's committed writes can become visible mid-transaction. This is **not** snapshot isolation — reads are not a stable point-in-time view. A stable snapshot, if needed, is the job of whatever module is layered beneath this one (see [Isolation Level](#isolation-level) below).
 - **Savepoint support** — Nested transaction control
-- **ACID semantics** — Full transaction guarantees
+- **No write-write conflict detection** — Concurrent writers to the same row are not detected; the last connection to flush wins.
 
 This allows module authors to focus on storage concerns while getting isolation "for free."
 
@@ -80,11 +84,65 @@ The isolation layer operates at the **row level**, merging query results from tw
 └─────────────────────────────────────────────────────────┘
 ```
 
+### Reading a pushed index window
+
+When the underlying serves a read through an index seek, the overlay must be narrowed to
+the same window — otherwise a staged row outside it would leak into the answer. The
+overlay is full-scanned (it cannot resolve an index name the underlying minted for its own
+plan), and `IsolatedTable`'s constraint matcher re-applies the pushed window itself. Several
+equality constraints on the *same* column are read as an **IN set**, not as an AND: that is
+how an `IN`-list seek is encoded — one equality per seek value — so an AND reading would
+match nothing and silently drop every staged row.
+
+This holds for a set of values that only exists at run time (`where v in (select …)`,
+which the engine may materialize and push down as a seek) exactly as it does for a literal
+`in (1, 2, 3)`: the pushed window has the same shape either way, and this layer cannot —
+and need not — tell them apart.
+
+One ordering caveat. The **primary-key** merge walks both streams in the primary key's own
+declared order — ascending, or descending for a `primary key (… desc)`. The engine sorts a
+run-time key set into that same order before pushing it, so that path arrives in order. A
+**literal** list does not: `where pk in (3, 1, 2)` is visited in list order, and with rows
+staged in the transaction the merge mis-pairs them — a staged update can surface alongside
+the stale stored row, and a staged delete can reappear. That is tracked as
+`backlog/bug-isolation-multiseek-merge-order`; the secondary-index merge is unaffected
+(it sorts the overlay itself and excludes shadowed rows by primary key).
+
+## Isolation Level
+
+The guarantee this layer actually provides is closer to **read-committed with
+read-your-own-writes** than to snapshot isolation:
+
+- **Read-your-own-writes** — a connection always sees its own uncommitted overlay
+  changes.
+- **Live reads of shared state** — the merged read path queries the *live* underlying
+  table on every read, not a point-in-time copy taken at `BEGIN`. If another
+  connection commits mid-transaction, the next read in this transaction can observe
+  that write. Reads are **not** isolated from concurrent commits.
+- **No write-write conflict detection** — two connections that write the same row in
+  overlapping transactions are not detected as conflicting; whichever connection
+  flushes (commits) last overwrites the other.
+- **Snapshotting is delegated downward** — if a consumer needs a stable, point-in-time
+  view of the data, that guarantee must come from the module wrapped *beneath* this
+  layer (the `underlying` module), not from `IsolationModule` itself. A future
+  optional snapshotting pass-through module may be added below the isolation layer
+  for consumers that need this; it does not exist today.
+
 ### Key Features
 
 **Per-connection overlay** — Each database instance gets its own overlay storage, ensuring proper isolation between connections.
 
 **Lazy overlay creation** — No memory overhead until the first write in a transaction.
+
+**Transparent hook forwarding** — `IsolationModule` is a wrapper, so the engine/planner/lens machinery reaches *it* (the registered module) rather than the underlying. Optional `VirtualTableModule` hooks whose behavior is isolation-transparent are forwarded straight through to the underlying: `getMappingAdvertisements` (decomposition shape), `getBestAccessPlan` (index awareness), the `beginSchemaBatch` / `endSchemaBatch` APPLY SCHEMA batch hooks (single-substrate-commit batching of migration DDL), `onRegister` (the registration-time handoff of the `Database`, which a persisting underlying uses to subscribe to the schema-change notifier before any statement runs — which `Database` a module serves is isolation-transparent, and without the forward a wrapped store would fall back to subscribing at its first table hook and silently drop a view created ahead of that), `assertCatalogObjectPersistable` (the pre-flight veto that lets a persisting module refuse a view / materialized view — or a table a RENAME would rewrite — whose catalog entry it could not durably write; whether a definition is encodable is a property of the definition text, not of the overlay, and without the forward a wrapped store would silently keep dropping such views on reopen. The table arm also needs the underlying module to recognise its OWN tables through this wrapper, since a wrapped table's `vtabModule` is the `IsolationModule`: it does so by matching `underlying`), and `getBackingHost` (the materialized-view backing-host capability — assigned in the constructor only when the underlying implements it, so method *presence* mirrors the underlying; backing writes are privileged and bypass the per-connection overlay entirely, making the underlying host's pending state the right surface). Hooks whose underlying value would *misdescribe* the wrapped behavior are intentionally **not** forwarded: `getCapabilities` is augmented with `isolation`/`savepoints` rather than passed through verbatim; `supports` (full-query push-down) is suppressed so the overlay always sees every row to merge; and `concurrencyMode` / `expectedLatencyMs` are derived rather than passed through verbatim: `concurrencyMode` is the weaker of the underlying and overlay modes, capped at `reentrant-reads` (the wrapper's own write path mutates shared overlay-merge state non-atomically, so it is never `fully-reentrant`), while `expectedLatencyMs` forwards the underlying's hint (defaulting to `0` when the underlying declares none).
+
+**Atomic ALTER (issuer-faithful) + cross-connection poison** — DDL through Quereus is not transaction-scoped and the shared underlying base auto-commits its mutation immediately, so a half-applied ALTER cannot be rolled back. The blast radius is isolation-faithful — an ALTER never depends on another connection's uncommitted data:
+
+- **Issuer's own overlay** — `IsolationModule.alterTable` dry-run **validates the issuing connection's own affected overlay's backfill** (per-row `NOT NULL` checks — for a new `ADD COLUMN ... NOT NULL` and for tightening an existing column with `ALTER COLUMN ... SET NOT NULL` — and the tombstone-present guard) *before* mutating the underlying. A rejection fires while the underlying, the schema catalog, and every overlay are still untouched, so for the issuer the ALTER either fails clean or fully applies — base and catalog never diverge. (The issuer staged both the data and the DDL, so rejecting up front is the least-surprising behavior.)
+- **`ALTER TABLE ... ALTER COLUMN ... SET COLLATE` on a primary-key column** — the change re-keys the table, so two staged rows can land on one new key. A deletion marker sharing its new key with a staged live row is that row's before-image (delete `'A'`, insert `'a'`, then switch to `NOCASE`), so the marker is discarded and the ALTER succeeds; two staged **live** rows on one key are a real duplicate and are refused. A shape the re-keyed overlay cannot physically hold — a savepoint that could restore both a marker and its replacement at one key — is refused as retryable (`BUSY`), the same answer a plain non-isolated table gives. Every refusal is surfaced *before* the shared underlying is touched, so the transaction survives intact.
+- **`ALTER TABLE ... ALTER PRIMARY KEY`** — the one change no overlay can follow: an overlay's staged rows (and its deletion markers) are keyed by the *old* primary key. A connection that has uncommitted changes staged for the table is therefore rejected with `BUSY` (retryable — not `UNSUPPORTED`, which the engine would treat as "fall back to a shadow-table rebuild" and silently lose the staged writes) *before* the underlying is touched — commit or roll back first, then retry. Another connection's overlay holding staged rows is poisoned; one holding nothing is swapped for an empty overlay under the new key. (Both bundled underlyings — `MemoryTableModule` and the store — re-key in place, so these paths arise under either. The refusal above is about the *overlay's* representation, not the underlying's capability.)
+- **Another connection's overlay** — the shared underlying and the catalog change regardless of any *other* connection's uncommitted state. A foreign overlay that *can* migrate is carried forward as usual (a staged `NULL` is backfilled when a usable literal `DEFAULT` exists); one that *cannot* (its staged row can't satisfy the new or newly-`NOT NULL` column) is left in place and marked **poisoned**. Its owning connection then raises a `CONSTRAINT` error the next time it reads (merged), writes, or commits that table, and recovers by rolling back (which discards the overlay and its poison). A committed-snapshot (`committed.<table>`) read bypasses the overlay and keeps working. A layer-invariant violation (e.g. a missing tombstone column, `INTERNAL`) still rethrows loud for everyone rather than poisoning.
+- **`ALTER TABLE ... ADD COLUMN` position** — `SchemaChangeInfo`'s optional `insertAtIndex` names a slot instead of the end (there is no SQL syntax for it; only an in-process module wrapper can set one). A caller-named position is honored in the overlay too, for both the issuer's own overlay and every migrated foreign one; with none supplied, the new column lands ahead of the overlay's own deletion-marker column so that column stays last.
 
 **Configurable overlay module** — Use memory for fast transactions, or persistent storage for large transactions:
 

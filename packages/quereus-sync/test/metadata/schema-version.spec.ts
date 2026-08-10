@@ -19,7 +19,7 @@ describe('SchemaVersion', () => {
     it('should round-trip serialize/deserialize column type', () => {
       const siteId = generateSiteId();
       const version: SchemaVersion = {
-        hlc: { wallTime: BigInt(Date.now()), counter: 42, siteId },
+        hlc: { wallTime: BigInt(Date.now()), counter: 42, siteId, opSeq: 0 },
         type: 'column',
         affinity: 'TEXT',
         nullable: true,
@@ -40,7 +40,7 @@ describe('SchemaVersion', () => {
     it('should round-trip serialize/deserialize dropped type', () => {
       const siteId = generateSiteId();
       const version: SchemaVersion = {
-        hlc: { wallTime: BigInt(1234567890), counter: 0, siteId },
+        hlc: { wallTime: BigInt(1234567890), counter: 0, siteId, opSeq: 0 },
         type: 'dropped',
       };
 
@@ -53,7 +53,7 @@ describe('SchemaVersion', () => {
     it('should round-trip serialize/deserialize table type', () => {
       const siteId = generateSiteId();
       const version: SchemaVersion = {
-        hlc: { wallTime: BigInt(1234567890), counter: 0, siteId },
+        hlc: { wallTime: BigInt(1234567890), counter: 0, siteId, opSeq: 0 },
         type: 'table',
         ddl: 'CREATE TABLE users (id INTEGER PRIMARY KEY)',
       };
@@ -87,8 +87,8 @@ describe('SchemaVersion', () => {
   describe('shouldApplySchemaChangeByOperation', () => {
     const siteId1 = generateSiteId();
     const siteId2 = generateSiteId();
-    const earlierHLC: HLC = { wallTime: BigInt(1000), counter: 1, siteId: siteId1 };
-    const laterHLC: HLC = { wallTime: BigInt(2000), counter: 1, siteId: siteId2 };
+    const earlierHLC: HLC = { wallTime: BigInt(1000), counter: 1, siteId: siteId1, opSeq: 0 };
+    const laterHLC: HLC = { wallTime: BigInt(2000), counter: 1, siteId: siteId2, opSeq: 0 };
 
     it('should apply when no existing change', () => {
       expect(shouldApplySchemaChangeByOperation('add_column', earlierHLC)).to.be.true;

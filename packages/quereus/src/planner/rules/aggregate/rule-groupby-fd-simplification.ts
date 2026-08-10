@@ -25,10 +25,13 @@
  * `MIN(col)` recovers it. EC-derived FDs from `WHERE a = b` are sound because
  * every surviving row has equal values on the EC members.
  *
- * Rewrite preserves the output schema (positions may shift, attribute IDs do
- * not): kept GROUP BYs come first, then the picker MIN aggregates re-emitting
- * the dropped columns at their original attribute IDs (via
- * `preserveAttributeIds`), then the original aggregate expressions.
+ * The new aggregate's own layout is: kept GROUP BYs first, then the picker MIN
+ * aggregates re-emitting the dropped columns at their original attribute IDs
+ * (via `preserveAttributeIds`), then the original aggregate expressions. That
+ * layout may permute the original output positions, so whenever it does the
+ * rule caps the new aggregate with a `ProjectNode` that re-emits the same
+ * attribute IDs in their original order. The rewrite therefore preserves the
+ * full output schema — attribute IDs *and* positions.
  */
 
 import { createLogger } from '../../../common/logger.js';
@@ -36,9 +39,11 @@ import type { PlanNode, ScalarPlanNode, Attribute, FunctionalDependency } from '
 import type { OptContext } from '../../framework/context.js';
 import { AggregateNode, type AggregateExpression } from '../../nodes/aggregate-node.js';
 import { AggregateFunctionCallNode } from '../../nodes/aggregate-function.js';
+import { ProjectNode } from '../../nodes/project-node.js';
 import { ColumnReferenceNode } from '../../nodes/reference.js';
 import { expandEcsToFds, keysOf, minimalCover, superkeyToFd } from '../../util/fd-utils.js';
 import { isAggregateFunctionSchema } from '../../../schema/function.js';
+import type { Scope } from '../../scopes/scope.js';
 import type * as AST from '../../../parser/ast.js';
 
 const log = createLogger('optimizer:rule:groupby-fd-simplification');
@@ -124,6 +129,15 @@ export function ruleGroupByFdSimplification(node: PlanNode, context: OptContext)
 		}
 	}
 
+	// Never collapse a grouped aggregate to a scalar (empty-GROUP-BY) aggregate:
+	// that would emit one row over an empty input instead of zero. This happens
+	// when every grouping column is constant-pinned (e.g. `where a = 0 and k = 6`),
+	// so FD propagation gives each an empty-determinant FD (`{} → col`) and
+	// `minimalCover` satisfies them all from `{}`, draining the cover. Removing the
+	// last group key changes the query's cardinality contract, which is never sound.
+	// Keep at least one grouping column.
+	if (keptGroupBy.length === 0) return null;
+
 	// Synthesize picker MIN aggregates for each dropped column, in original order.
 	const minSchema = context.db._findFunction('min', 1);
 	if (!minSchema || !isAggregateFunctionSchema(minSchema)) {
@@ -175,7 +189,7 @@ export function ruleGroupByFdSimplification(node: PlanNode, context: OptContext)
 		pickerAggregates.length,
 	);
 
-	return new AggregateNode(
+	const newAgg = new AggregateNode(
 		node.scope,
 		node.source,
 		keptGroupBy,
@@ -183,5 +197,49 @@ export function ruleGroupByFdSimplification(node: PlanNode, context: OptContext)
 		undefined,
 		newAttrs,
 	);
+
+	return restoreOutputOrder(newAgg, aggAttrs, newAttrs, node.scope);
+}
+
+/**
+ * Re-emit `rewritten`'s columns in `originalAttrs` order when the rewrite permuted
+ * them, otherwise hand it back bare.
+ *
+ * Attribute IDs survive the rewrite, so every id-bound consumer is already fine —
+ * but the statement result binds by POSITION when the aggregate is the query root,
+ * so a permuting rewrite needs the cap. The drop is order-preserving (and the cap
+ * skipped) exactly when the dropped keys were already a suffix of the grouping list.
+ */
+function restoreOutputOrder(
+	rewritten: AggregateNode,
+	originalAttrs: readonly Attribute[],
+	newAttrs: readonly Attribute[],
+	scope: Scope,
+): PlanNode {
+	if (newAttrs.every((a, i) => a.id === originalAttrs[i].id)) return rewritten;
+
+	// NOTE: this stacks under the builder's own select-list projection, so a
+	// permuting rewrite costs one extra row copy. If grouped-plan row-copy overhead
+	// ever shows up in a profile, collapse a permutation-only Project over Project;
+	// the collapse needs no index rebinding because column references resolve by
+	// attribute id at runtime (see runtime/emit/column-reference.ts).
+	const newIndexById = new Map(newAttrs.map((a, i) => [a.id, i]));
+	const projections = originalAttrs.map(attr => ({
+		node: new ColumnReferenceNode(
+			scope,
+			{ type: 'column', name: attr.name } satisfies AST.ColumnExpr,
+			attr.type,
+			attr.id,
+			newIndexById.get(attr.id)!,
+		) as ScalarPlanNode,
+		alias: attr.name,
+		attributeId: attr.id,
+	}));
+
+	// `preserveInputColumns: true` is inert while `predefinedAttributes` is supplied,
+	// but it describes what this node does — every projection is a bare column
+	// reference republishing its source attribute id — so it stays correct if a later
+	// rebuild ever drops the predefined attributes (`false` would mint fresh ids).
+	return new ProjectNode(scope, rewritten, projections, undefined, originalAttrs.slice(), true);
 }
 

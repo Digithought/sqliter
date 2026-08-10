@@ -1,5 +1,6 @@
 import { PhysicalType, type LogicalType, compareNulls } from './logical-type.js';
 import { BINARY_COLLATION } from '../util/comparison.js';
+import { canonicalizeInteger } from '../util/numeric-canonical.js';
 import { Temporal } from 'temporal-polyfill';
 
 /**
@@ -210,6 +211,88 @@ export const DATETIME_TYPE: LogicalType = {
 };
 
 /**
+ * TIMESTAMP type - an integer instant (signed 64-bit epoch value).
+ *
+ * The stored value is an integer whose unit the engine does not reinterpret:
+ * an integer written to a TIMESTAMP column reads back exactly as written. Only
+ * the string→integer direction pins a unit — an ISO 8601 datetime string
+ * parses to epoch MILLISECONDS, matching the epoch-ms convention DATE and
+ * DATETIME already use for their numeric inputs
+ * (`Temporal.Instant.fromEpochMilliseconds`).
+ */
+export const TIMESTAMP_TYPE: LogicalType = {
+	name: 'TIMESTAMP',
+	physicalType: PhysicalType.INTEGER,
+	isTemporal: true,
+
+	validate: (v) => {
+		if (v === null) return true;
+		if (typeof v === 'bigint') return true;
+		if (typeof v === 'number') return Number.isInteger(v);
+		return false;
+	},
+
+	parse: (v) => {
+		if (v === null) return null;
+		// TIMESTAMP's value space is the integer domain (physicalType INTEGER), so its
+		// arms canonicalize exactly like INTEGER_TYPE.parse: a safe-range bigint narrows
+		// to number, a whole number past the boundary widens to an exact bigint (R1,
+		// util/numeric-canonical.ts).
+		if (typeof v === 'bigint') return canonicalizeInteger(v);
+		if (typeof v === 'number') {
+			if (!Number.isInteger(v)) {
+				throw new TypeError(`Cannot convert non-integer number '${v}' to TIMESTAMP`);
+			}
+			return canonicalizeInteger(v);
+		}
+		if (typeof v === 'string') {
+			const trimmed = v.trim();
+			if (trimmed === '') return null;
+			// Integer-shaped string → that integer verbatim (no unit interpretation).
+			// Past 2^53 rebuild from the digit string, not the rounded number — same
+			// safe-integer boundary as INTEGER_TYPE.parse.
+			if (/^[+-]?\d+$/.test(trimmed)) {
+				const parsed = Number(trimmed);
+				if (Number.isSafeInteger(parsed)) return parsed;
+				return canonicalizeInteger(BigInt(trimmed[0] === '+' ? trimmed.slice(1) : trimmed));
+			}
+			// ISO 8601 datetime string → epoch milliseconds. Bare datetimes are
+			// treated as UTC wall-clock; offset/zone-bearing inputs convert to UTC —
+			// same canonicalization DATE / DATETIME apply.
+			try {
+				return parseDateTimeStringToUtcPlain(trimmed).toZonedDateTime('UTC').epochMilliseconds;
+			} catch (e) {
+				throw new TypeError(`Cannot convert '${v}' to TIMESTAMP: ${e instanceof Error ? e.message : String(e)}`);
+			}
+		}
+		throw new TypeError(`Cannot convert ${typeof v} to TIMESTAMP`);
+	},
+
+	// NOTE: deliberately NOT `isNumeric`. TIMESTAMP is an instant, not a number —
+	// `abs(ts)` / `round(ts)` should not typecheck on it. The cost is that
+	// `sharesSeekKeySpace(TIMESTAMP, INTEGER)` is false, so a key-set seek or
+	// index-nested-loop join keyed by an INTEGER-typed expression against a
+	// TIMESTAMP column declines and falls back to a scan — conservative, never a
+	// wrong answer. If that decline ever shows up as a real plan regression, add
+	// TIMESTAMP to `isSeekKeySpaceNumeric` (its compare already ranks mixed
+	// number/bigint by exact value, which is the predicate's requirement) rather
+	// than flipping `isNumeric`.
+	//
+	// Integer storage order IS the semantic order (no semanticOrdering flag).
+	// Mixed number/bigint compares by exact mathematical value under JS
+	// relational operators; validate admits only integers, so NaN never arrives.
+	compare: (a, b) => {
+		const nullCmp = compareNulls(a, b);
+		if (nullCmp !== undefined) return nullCmp;
+		const av = a as number | bigint;
+		const bv = b as number | bigint;
+		return av < bv ? -1 : av > bv ? 1 : 0;
+	},
+
+	supportedCollations: [],
+};
+
+/**
  * Parse human-readable duration strings into Temporal.Duration
  * Supports formats like "1 hour", "30 minutes", "2 days 3 hours"
  */
@@ -262,6 +345,24 @@ function parseHumanReadableDuration(input: string): Temporal.Duration | null {
 }
 
 /**
+ * Total elapsed seconds of an ISO 8601 duration string, resolving calendar units
+ * (years/months/weeks) against a fixed reference date so the mapping is total and
+ * deterministic engine-wide. This single helper backs both `TIMESPAN_TYPE.compare`
+ * and `TIMESPAN_TYPE.groupKey`, so ordering and hash-grouping identity can never
+ * disagree on the reference date. Returns undefined for unparseable input.
+ */
+function timespanTotalSeconds(v: string): number | undefined {
+	try {
+		const duration = Temporal.Duration.from(v);
+		// Reference date resolves calendar units (months/years have no fixed length)
+		const referenceDate = Temporal.PlainDate.from('2024-01-01');
+		return duration.total({ unit: 'seconds', relativeTo: referenceDate });
+	} catch {
+		return undefined;
+	}
+}
+
+/**
  * TIMESPAN type - stores ISO 8601 duration strings
  * Uses Temporal.Duration for validation and parsing
  */
@@ -269,6 +370,9 @@ export const TIMESPAN_TYPE: LogicalType = {
 	name: 'TIMESPAN',
 	physicalType: PhysicalType.TEXT,
 	isTemporal: true,
+	// Ordered by elapsed time, not by duration text: 'PT90M' < 'PT2H' though the
+	// text sorts the other way. See LogicalType.semanticOrdering.
+	semanticOrdering: true,
 
 	validate: (v) => {
 		if (v === null) return true;
@@ -311,21 +415,21 @@ export const TIMESPAN_TYPE: LogicalType = {
 		const nullCmp = compareNulls(a, b);
 		if (nullCmp !== undefined) return nullCmp;
 
-		try {
-			const durationA = Temporal.Duration.from(a as string);
-			const durationB = Temporal.Duration.from(b as string);
-
-			// Use a reference date to resolve calendar units
-			// This ensures consistent comparison of durations with months/years
-			const referenceDate = Temporal.PlainDate.from('2024-01-01');
-			const totalA = durationA.total({ unit: 'seconds', relativeTo: referenceDate });
-			const totalB = durationB.total({ unit: 'seconds', relativeTo: referenceDate });
-
-			return totalA < totalB ? -1 : totalA > totalB ? 1 : 0;
-		} catch {
+		const totalA = timespanTotalSeconds(a as string);
+		const totalB = timespanTotalSeconds(b as string);
+		if (totalA === undefined || totalB === undefined) {
 			// If parsing fails, fall back to binary string comparison
 			return BINARY_COLLATION(a as string, b as string);
 		}
+		return totalA < totalB ? -1 : totalA > totalB ? 1 : 0;
+	},
+
+	// Hash-grouping identity representative: equal elapsed times ('PT1H' ≡ 'PT60M')
+	// must key alike, so group on the total seconds compare() ranks by. Unparseable
+	// values keep their raw text (compare falls back to text for those too).
+	groupKey: (v) => {
+		if (typeof v !== 'string') return v;
+		return timespanTotalSeconds(v) ?? v;
 	},
 
 	supportedCollations: [],

@@ -7,14 +7,26 @@
 
 import type { KVStore, WriteBatch } from '@quereus/store';
 import { type HLC, serializeHLC, deserializeHLC, compareHLC } from '../clock/hlc.js';
-import { buildSchemaMigrationKey, buildSchemaMigrationScanBounds } from './keys.js';
-import type { SchemaMigrationType } from '../sync/protocol.js';
+import {
+  buildAllSchemaMigrationsScanBounds,
+  buildSchemaMigrationKey,
+  buildSchemaMigrationScanBounds,
+  parseSchemaMigrationKey,
+} from './keys.js';
+import {
+  sortMigrationsByHLC,
+  type SchemaMigration,
+  type SchemaMigrationType,
+  type SchemaObjectKind,
+} from '../sync/protocol.js';
 
 /**
  * Stored schema migration record.
  */
 export interface StoredMigration {
   type: SchemaMigrationType;
+  /** `rename_table` only: the table name before the rename. */
+  fromTable?: string;
   ddl: string;
   hlc: HLC;
   schemaVersion: number;
@@ -22,20 +34,26 @@ export interface StoredMigration {
 
 /**
  * Serialize a migration for storage.
- * Format: 26 bytes HLC + 4 bytes version + 1 byte type length + type + ddl
+ * Format: 30 bytes HLC + 4 bytes version + 1 byte type length + type
+ *         + 2 bytes fromTable byte-length (big-endian; 0 = absent) + fromTable + ddl
+ *
+ * The `fromTable` slot sits BEFORE the ddl because the ddl is "rest of buffer" —
+ * nothing can be appended after it. Inserting the slot is an incompatible layout
+ * change, covered by the `fv:` gate (SYNC_METADATA_FORMAT_VERSION 5 in keys.ts).
  */
 export function serializeMigration(migration: StoredMigration): Uint8Array {
   const encoder = new TextEncoder();
   const typeBytes = encoder.encode(migration.type);
+  const fromBytes = encoder.encode(migration.fromTable ?? '');
   const ddlBytes = encoder.encode(migration.ddl);
   const hlcBytes = serializeHLC(migration.hlc);
 
-  const buffer = new Uint8Array(26 + 4 + 1 + typeBytes.length + ddlBytes.length);
+  const buffer = new Uint8Array(30 + 4 + 1 + typeBytes.length + 2 + fromBytes.length + ddlBytes.length);
   let offset = 0;
 
-  // HLC (26 bytes)
+  // HLC (30 bytes)
   buffer.set(hlcBytes, offset);
-  offset += 26;
+  offset += 30;
 
   // Schema version (4 bytes, big-endian)
   const view = new DataView(buffer.buffer);
@@ -47,6 +65,12 @@ export function serializeMigration(migration: StoredMigration): Uint8Array {
   offset += 1;
   buffer.set(typeBytes, offset);
   offset += typeBytes.length;
+
+  // fromTable byte-length (2 bytes, big-endian; 0 = absent) + fromTable
+  view.setUint16(offset, fromBytes.length, false);
+  offset += 2;
+  buffer.set(fromBytes, offset);
+  offset += fromBytes.length;
 
   // DDL (rest of buffer)
   buffer.set(ddlBytes, offset);
@@ -61,9 +85,9 @@ export function deserializeMigration(buffer: Uint8Array): StoredMigration {
   const decoder = new TextDecoder();
   let offset = 0;
 
-  // HLC (26 bytes)
-  const hlc = deserializeHLC(buffer.slice(0, 26));
-  offset += 26;
+  // HLC (30 bytes)
+  const hlc = deserializeHLC(buffer.slice(0, 30));
+  offset += 30;
 
   // Schema version (4 bytes)
   const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
@@ -76,14 +100,33 @@ export function deserializeMigration(buffer: Uint8Array): StoredMigration {
   const type = decoder.decode(buffer.slice(offset, offset + typeLength)) as SchemaMigrationType;
   offset += typeLength;
 
+  // fromTable (2-byte big-endian byte-length; 0 = absent)
+  const fromLength = view.getUint16(offset, false);
+  offset += 2;
+  const fromTable = fromLength > 0
+    ? decoder.decode(buffer.slice(offset, offset + fromLength))
+    : undefined;
+  offset += fromLength;
+
   // DDL
   const ddl = decoder.decode(buffer.slice(offset));
 
-  return { type, ddl, hlc, schemaVersion };
+  return {
+    type,
+    ...(fromTable !== undefined ? { fromTable } : {}),
+    ddl,
+    hlc,
+    schemaVersion,
+  };
 }
 
 /**
  * Schema migration store operations.
+ *
+ * Every method is keyed by `(schemaName, kind, objectName)`: the object name
+ * alone is ambiguous, since an index migration names an INDEX while every other
+ * migration type names a TABLE. Callers derive `kind` from the migration type
+ * with {@link import('../sync/protocol.js').migrationObjectKind}.
  */
 export class SchemaMigrationStore {
   constructor(private readonly kv: KVStore) {}
@@ -93,10 +136,11 @@ export class SchemaMigrationStore {
    */
   async getMigration(
     schemaName: string,
-    tableName: string,
+    kind: SchemaObjectKind,
+    objectName: string,
     version: number
   ): Promise<StoredMigration | undefined> {
-    const key = buildSchemaMigrationKey(schemaName, tableName, version);
+    const key = buildSchemaMigrationKey(schemaName, kind, objectName, version);
     const data = await this.kv.get(key);
     if (!data) return undefined;
     return deserializeMigration(data);
@@ -107,10 +151,11 @@ export class SchemaMigrationStore {
    */
   async recordMigration(
     schemaName: string,
-    tableName: string,
+    kind: SchemaObjectKind,
+    objectName: string,
     migration: StoredMigration
   ): Promise<void> {
-    const key = buildSchemaMigrationKey(schemaName, tableName, migration.schemaVersion);
+    const key = buildSchemaMigrationKey(schemaName, kind, objectName, migration.schemaVersion);
     await this.kv.put(key, serializeMigration(migration));
   }
 
@@ -120,18 +165,23 @@ export class SchemaMigrationStore {
   recordMigrationBatch(
     batch: WriteBatch,
     schemaName: string,
-    tableName: string,
+    kind: SchemaObjectKind,
+    objectName: string,
     migration: StoredMigration
   ): void {
-    const key = buildSchemaMigrationKey(schemaName, tableName, migration.schemaVersion);
+    const key = buildSchemaMigrationKey(schemaName, kind, objectName, migration.schemaVersion);
     batch.put(key, serializeMigration(migration));
   }
 
   /**
-   * Get the current schema version for a table.
+   * Get the current schema version for one object (a table's, or an index's).
    */
-  async getCurrentVersion(schemaName: string, tableName: string): Promise<number> {
-    const bounds = buildSchemaMigrationScanBounds(schemaName, tableName);
+  async getCurrentVersion(
+    schemaName: string,
+    kind: SchemaObjectKind,
+    objectName: string
+  ): Promise<number> {
+    const bounds = buildSchemaMigrationScanBounds(schemaName, kind, objectName);
     let maxVersion = 0;
 
     for await (const entry of this.kv.iterate({ ...bounds, reverse: true, limit: 1 })) {
@@ -143,17 +193,50 @@ export class SchemaMigrationStore {
   }
 
   /**
-   * Get all migrations for a table.
+   * Get all migrations for one object.
    */
   async *getAllMigrations(
     schemaName: string,
-    tableName: string
+    kind: SchemaObjectKind,
+    objectName: string
   ): AsyncIterable<StoredMigration> {
-    const bounds = buildSchemaMigrationScanBounds(schemaName, tableName);
+    const bounds = buildSchemaMigrationScanBounds(schemaName, kind, objectName);
 
     for await (const entry of this.kv.iterate(bounds)) {
       yield deserializeMigration(entry.value);
     }
+  }
+
+  /**
+   * Every migration on this replica as a wire record, in causal (HLC) order.
+   *
+   * The producers that ship DDL — both snapshot paths and the delta collector —
+   * all need the whole set, and all need it causally ordered: DDL replays in list
+   * order, so a `create index` ahead of its table's `create table` fails outright.
+   * `sm:` key order is (schema, object kind, object name), which puts every index
+   * migration ahead of every table migration in a schema, so the scan order can
+   * never be used directly.
+   */
+  async listAllMigrations(): Promise<SchemaMigration[]> {
+    const migrations: SchemaMigration[] = [];
+
+    for await (const entry of this.kv.iterate(buildAllSchemaMigrationsScanBounds())) {
+      const parsed = parseSchemaMigrationKey(entry.key);
+      if (!parsed) continue;
+
+      const stored = deserializeMigration(entry.value);
+      migrations.push({
+        type: stored.type,
+        schema: parsed.schema,
+        table: parsed.table,
+        ...(stored.fromTable !== undefined ? { fromTable: stored.fromTable } : {}),
+        ddl: stored.ddl,
+        hlc: stored.hlc,
+        schemaVersion: stored.schemaVersion,
+      });
+    }
+
+    return sortMigrationsByHLC(migrations);
   }
 
   /**
@@ -162,11 +245,12 @@ export class SchemaMigrationStore {
    */
   async checkConflict(
     schemaName: string,
-    tableName: string,
+    kind: SchemaObjectKind,
+    objectName: string,
     version: number,
     incomingHLC: HLC
   ): Promise<StoredMigration | undefined> {
-    const existing = await this.getMigration(schemaName, tableName, version);
+    const existing = await this.getMigration(schemaName, kind, objectName, version);
     if (!existing) return undefined;
 
     // First-writer-wins: if existing has lower HLC, it wins

@@ -7,7 +7,7 @@
 
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
-import { Database, asyncIterableToArray } from '@quereus/quereus';
+import { Database, asyncIterableToArray, type SchemaChangeInfo } from '@quereus/quereus';
 import {
 	StoreModule,
 	InMemoryKVStore,
@@ -58,7 +58,7 @@ function createInMemoryProvider(): KVStoreProvider {
 			}
 			stores.clear();
 		},
-		async renameTableStores(schemaName: string, oldName: string, newName: string) {
+		async renameTableStores(schemaName: string, oldName: string, newName: string, indexNames: readonly string[]) {
 			const oldKey = `${schemaName}.${oldName}`;
 			const newKey = `${schemaName}.${newName}`;
 			const dataStore = stores.get(oldKey);
@@ -66,14 +66,15 @@ function createInMemoryProvider(): KVStoreProvider {
 				stores.delete(oldKey);
 				stores.set(newKey, dataStore);
 			}
-			const oldIndexPrefix = `${schemaName}.${oldName}_idx_`;
-			const newIndexPrefix = `${schemaName}.${newName}_idx_`;
-			for (const key of Array.from(stores.keys())) {
-				if (key.startsWith(oldIndexPrefix)) {
-					const suffix = key.substring(oldIndexPrefix.length);
-					const store = stores.get(key)!;
-					stores.delete(key);
-					stores.set(newIndexPrefix + suffix, store);
+			// Relocate exactly the table's index stores (by name), matching real
+			// provider semantics — a `{oldName}_idx_` prefix sweep would also move a
+			// sibling table named `{oldName}_idx_<x>`.
+			for (const indexName of indexNames) {
+				const from = `${schemaName}.${oldName}_idx_${indexName}`;
+				const store = stores.get(from);
+				if (store) {
+					stores.delete(from);
+					stores.set(`${schemaName}.${newName}_idx_${indexName}`, store);
 				}
 			}
 		},
@@ -83,11 +84,12 @@ function createInMemoryProvider(): KVStoreProvider {
 describe('Store ALTER TABLE', () => {
 	let db: Database;
 	let provider: KVStoreProvider;
+	let storeModule: StoreModule;
 
 	beforeEach(async () => {
 		db = new Database();
 		provider = createInMemoryProvider();
-		const storeModule = new StoreModule(provider);
+		storeModule = new StoreModule(provider);
 		db.registerModule('store', storeModule);
 	});
 
@@ -96,6 +98,45 @@ describe('Store ALTER TABLE', () => {
 	});
 
 	describe('ADD COLUMN', () => {
+		// `SchemaChangeInfo.addColumn.insertAtIndex` lets an in-process module wrapper place a
+		// new column somewhere other than the end (the memory module honours it). The store
+		// always appends, so rather than silently ignoring a position it was handed, it must
+		// reject one it cannot honour. SQL never produces a position, so this is unreachable
+		// from `alter table … add column` — the change is applied to the module directly.
+		it('rejects ADD COLUMN at a non-append position instead of silently appending', async () => {
+			await db.exec(`
+				CREATE TABLE items (
+					id INTEGER PRIMARY KEY,
+					name TEXT
+				) USING store
+			`);
+			await db.exec(`INSERT INTO items VALUES (1, 'Widget')`);
+
+			const addPrice = (insertAtIndex: number): SchemaChangeInfo => ({
+				type: 'addColumn',
+				columnDef: { name: 'price', dataType: 'REAL', constraints: [{ type: 'null' }] },
+				insertAtIndex,
+			});
+
+			let error: unknown;
+			try {
+				await storeModule.alterTable!(db, 'main', 'items', addPrice(0));
+			} catch (e) {
+				error = e;
+			}
+			expect(error, 'a non-append position should have been rejected').to.be.instanceOf(Error);
+			expect(String(error)).to.match(/can only ADD COLUMN at the end/);
+
+			// The table is untouched by the rejection.
+			expect(await asyncIterableToArray(db.eval('select * from items'))).to.deep.equal([
+				{ id: 1, name: 'Widget' },
+			]);
+
+			// Naming the append position explicitly is accepted — it is what the store does anyway.
+			const updated = await storeModule.alterTable!(db, 'main', 'items', addPrice(2));
+			expect(updated.columns.map(c => c.name)).to.deep.equal(['id', 'name', 'price']);
+		});
+
 		it('adds a column to a populated table with null default', async () => {
 			await db.exec(`
 				CREATE TABLE items (
@@ -416,6 +457,56 @@ describe('Store ALTER TABLE', () => {
 			expect(ddlStatements[0].toLowerCase()).to.include('t_after');
 			expect(ddlStatements[0].toLowerCase()).to.not.include('t_before');
 		});
+
+		it('does not schema-qualify an own-table self-reference when another schema on the path holds the NEW name', async () => {
+			// The rewrite's post-condition asks how a rewritten bare reference resolves
+			// AFTER the rename. For the renamed table's OWN expressions the answer is
+			// always this schema (its own schema leads its home path), so no qualifier
+			// belongs in the persisted DDL — even with `temp` on `main`'s search path
+			// holding the new name. Answering that with the PRE-rename snapshot instead
+			// gets it wrong (`temp.t_q2` there), qualifying text the engine's in-memory
+			// pass leaves bare and diverging the persisted DDL from the catalog.
+			const storeModule = new StoreModule(provider);
+			db.registerModule('store_rename_qualify', storeModule);
+
+			await db.exec(`PRAGMA schema_path = 'main,temp'`);
+			await db.exec(`CREATE TABLE temp.t_q2 (id INTEGER PRIMARY KEY)`);
+			await db.exec(`
+				CREATE TABLE t_q (
+					id INTEGER PRIMARY KEY,
+					n INTEGER DEFAULT ((SELECT count(*) FROM t_q))
+				) USING store_rename_qualify
+			`);
+			await db.exec(`ALTER TABLE t_q RENAME TO t_q2`);
+
+			const ddlStatements = await storeModule.loadAllDDL();
+			expect(ddlStatements).to.have.lengthOf(1);
+			const ddl = ddlStatements[0].toLowerCase();
+			expect(ddl).to.include('from t_q2');
+			expect(ddl).to.not.include('main.t_q2');
+			expect(ddl).to.not.include('temp.t_q2');
+		});
+
+		it('rename inside a savepoint does not throw on rollback-to (DDL-commits posture)', async () => {
+			// renameTable commits the coordinator mid-transaction (DDL-commits posture),
+			// clearing the savepoint stack. The engine still broadcasts rollback-to-s1
+			// after the rename, which must warn-and-return rather than throw.
+			await db.exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT) USING store`);
+			await db.exec(`INSERT INTO t VALUES (1, 'a'), (2, 'b')`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`SAVEPOINT s1`);
+			await db.exec(`INSERT INTO t VALUES (3, 'c')`);
+			await db.exec(`ALTER TABLE t RENAME TO t2`); // DDL-commits: commits insert + clears stack
+			await db.exec(`ROLLBACK TO s1`);             // must not throw; warn-and-return
+			await db.exec(`COMMIT`);
+
+			// The rename persisted (DDL-commits semantics); data is accessible under the new name.
+			const result = await asyncIterableToArray(db.eval('select id, val from t2 order by id'));
+			expect(result.length).to.be.at.least(2);
+			expect(result[0]).to.deep.equal({ id: 1, val: 'a' });
+			expect(result[1]).to.deep.equal({ id: 2, val: 'b' });
+		});
 	});
 
 	describe('sequential ALTER TABLE operations', () => {
@@ -560,6 +651,141 @@ describe('Store ALTER TABLE', () => {
 			// Full row set still intact
 			const rows = await asyncIterableToArray(db.eval('select * from t_pk order by code'));
 			expect(rows).to.have.lengthOf(3);
+		});
+
+		it('leaves EVERY row at its original key when a re-key collides (no partial re-key)', async () => {
+			// The signatures-only pass 1 must reject the whole re-key before pass 2 writes
+			// anything: a collision on ONE new key cannot leave OTHER rows already moved to
+			// their new keys. Assert the full ordered row set is byte-for-byte what it was.
+			await db.exec(`
+				CREATE TABLE t_pk (
+					id INTEGER PRIMARY KEY,
+					category INTEGER NOT NULL,
+					name TEXT
+				) USING store
+			`);
+			await db.exec(`INSERT INTO t_pk VALUES
+				(1, 10, 'a'), (2, 20, 'b'), (3, 20, 'c'), (4, 30, 'd'), (5, 40, 'e')`);
+
+			const before = await asyncIterableToArray(db.eval('select * from t_pk order by id'));
+
+			let caught: unknown = null;
+			try {
+				await db.exec(`ALTER TABLE t_pk ALTER PRIMARY KEY (category)`);
+			} catch (e) {
+				caught = e;
+			}
+			expect(caught, 'the colliding re-key must throw').to.be.instanceOf(Error);
+
+			// Still keyed by the ORIGINAL PK (id) with every row unchanged — nothing re-keyed.
+			const after = await asyncIterableToArray(db.eval('select * from t_pk order by id'));
+			expect(after).to.deep.equal(before);
+			// And the pre-ALTER point lookup on id still resolves (proves keys untouched).
+			expect(await db.get('select category, name from t_pk where id = 3'))
+				.to.deep.equal({ category: 20, name: 'c' });
+		});
+	});
+
+	describe('ALTER COLUMN SET COLLATE on a PK member (physical re-key)', () => {
+		it('rejects all-or-nothing when the coarser collation collapses two distinct PKs', async () => {
+			// Two BINARY-distinct text PKs ('A' vs 'a') collide under NOCASE. The re-key
+			// must reject before any write and leave both rows present under the old BINARY
+			// keys — the same all-or-nothing guarantee as ALTER PRIMARY KEY.
+			await db.exec(`
+				CREATE TABLE t_col (
+					k TEXT COLLATE BINARY PRIMARY KEY,
+					v TEXT
+				) USING store
+			`);
+			await db.exec(`INSERT INTO t_col VALUES ('A', 'upper'), ('a', 'lower')`);
+
+			const before = await asyncIterableToArray(db.eval(`select k, v from t_col order by k`));
+
+			let caught: unknown = null;
+			try {
+				await db.exec(`ALTER TABLE t_col ALTER COLUMN k SET COLLATE NOCASE`);
+			} catch (e) {
+				caught = e;
+			}
+			expect(caught, 'the colliding SET COLLATE must throw').to.be.instanceOf(Error);
+
+			// Both case-distinct rows survive, unchanged.
+			expect(await db.get('select count(*) as cnt from t_col')).to.deep.equal({ cnt: 2 });
+			const after = await asyncIterableToArray(db.eval(`select k, v from t_col order by k`));
+			expect(after).to.deep.equal(before);
+			expect((await db.get(`select v from t_col where k = 'A'`))?.v).to.equal('upper');
+			expect((await db.get(`select v from t_col where k = 'a'`))?.v).to.equal('lower');
+		});
+
+		it('re-keys every row under the new collation when there is no collision', async () => {
+			// No two keys collapse, so the re-key succeeds: every row present under the new
+			// NOCASE key bytes, none lost or duplicated.
+			await db.exec(`
+				CREATE TABLE t_col (
+					k TEXT COLLATE BINARY PRIMARY KEY,
+					v TEXT
+				) USING store
+			`);
+			await db.exec(`INSERT INTO t_col VALUES ('Alpha', '1'), ('Beta', '2'), ('Gamma', '3')`);
+
+			await db.exec(`ALTER TABLE t_col ALTER COLUMN k SET COLLATE NOCASE`);
+
+			expect(await db.get('select count(*) as cnt from t_col')).to.deep.equal({ cnt: 3 });
+			// Case-insensitive lookup now resolves under the new collation.
+			expect((await db.get(`select v from t_col where k = 'beta'`))?.v).to.equal('2');
+			const rows = await asyncIterableToArray(db.eval(`select k, v from t_col order by k`));
+			expect(rows).to.have.lengthOf(3);
+		});
+	});
+
+	describe('ALTER COLUMN SET DATA TYPE onto a key-transform type', () => {
+		// TIMESPAN keys by elapsed time, so 'PT1H' and 'PT60M' — distinct TEXT — become one
+		// value the moment the column is retyped. The physical type is TEXT either way, so no
+		// value rewrite happens; only the key transform changes. That arm rebuilds every
+		// secondary index WITHOUT the in-pass duplicate check (the pre-mutation UNIQUE probe
+		// is the sole guard, so a wrapper's overlay-deleted row cannot spuriously reject), and
+		// these two tests pin both halves of that bargain: the probe still rejects a real
+		// collision, and the non-enforcing rebuild still produces an enforcing index.
+		it('rejects an equal-elapsed pair under a UNIQUE index, changing nothing', async () => {
+			await db.exec(`create table ts (id integer primary key, d text) using store`);
+			await db.exec(`create unique index ts_d on ts (d)`);
+			await db.exec(`insert into ts values (1, 'PT1H'), (2, 'PT60M')`);
+
+			let caught: unknown = null;
+			try {
+				await db.exec(`alter table ts alter column d set data type timespan`);
+			} catch (e) {
+				caught = e;
+			}
+			expect(String(caught)).to.match(/UNIQUE constraint failed/i);
+
+			// Values, declared type and writability all survive the rejection.
+			expect(await asyncIterableToArray(db.eval(`select id, d from ts order by id`)))
+				.to.deep.equal([{ id: 1, d: 'PT1H' }, { id: 2, d: 'PT60M' }]);
+			expect(await db.get(`select type from table_info('ts') where name = 'd'`))
+				.to.deep.equal({ type: 'TEXT' });
+			await db.exec(`insert into ts values (3, 'PT90M')`);
+			expect(await db.get(`select count(*) as cnt from ts`)).to.deep.equal({ cnt: 3 });
+		});
+
+		it('leaves an enforcing, seekable index behind when there is no collision', async () => {
+			await db.exec(`create table ts (id integer primary key, d text) using store`);
+			await db.exec(`create unique index ts_d on ts (d)`);
+			await db.exec(`insert into ts values (1, 'PT1H'), (2, 'PT30M')`);
+
+			await db.exec(`alter table ts alter column d set data type timespan`);
+
+			// The rebuilt index keys by elapsed time: an equal-elapsed spelling finds row 1.
+			expect(await db.get(`select id from ts where d = 'PT60M'`)).to.deep.equal({ id: 1 });
+			expect(await db.get(`select id from ts where d = 'PT1H'`)).to.deep.equal({ id: 1 });
+
+			let caught: unknown = null;
+			try {
+				await db.exec(`insert into ts values (3, 'PT60M')`);
+			} catch (e) {
+				caught = e;
+			}
+			expect(String(caught), 'the rebuilt index must still enforce').to.match(/UNIQUE constraint failed/i);
 		});
 	});
 

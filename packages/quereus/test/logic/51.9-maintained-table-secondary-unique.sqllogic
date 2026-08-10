@@ -1,0 +1,237 @@
+-- 51.9-maintained-table-secondary-unique.sqllogic — declared secondary
+-- (non-PK) UNIQUE constraints on a `create table … maintained as` table are
+-- enforced against the rows the DERIVATION writes: the create-fill, the
+-- attach/re-attach reconcile, steady-state row-time maintenance, and the
+-- full-rebuild flush. A collision throws a CONSTRAINT error attributed to the
+-- maintained table, naming the constraint and the colliding key values.
+-- Enforcement is post-batch against the final effective contents, so a
+-- maintenance batch that MOVES a unique value between primary keys (the
+-- reconcile diff applies its inserts before its deletes) never false-positives.
+
+-- ===================================
+-- 1. create-fill collision: two derived rows collide on the declared UNIQUE
+-- ===================================
+
+create table src (id integer primary key, tag text);
+insert into src values (1, 'x'), (2, 'x');
+
+create table mt (id integer primary key, tag text unique) maintained as select id, tag from src;
+-- error: row derived into maintained table 'main.mt' collides on its declared UNIQUE constraint
+
+-- the failed create left nothing behind: the name is free for a plain create
+create table mt (id integer primary key);
+drop table mt;
+
+-- ===================================
+-- 2. steady state: insert and update images collide against existing derived rows
+-- ===================================
+
+delete from src where id = 2;
+create table mt (id integer primary key, tag text unique) maintained as select id, tag from src;
+
+insert into src values (3, 'x');
+-- error: row derived into maintained table 'main.mt'
+
+-- the violating source statement rolled back whole
+select count(*) as n from src;
+→ [{"n":1}]
+select * from mt order by id;
+→ [{"id":1,"tag":"x"}]
+
+-- a multi-row statement: the second row collides with the first row's pending image
+insert into src values (5, 'q'), (6, 'q');
+-- error: row derived into maintained table 'main.mt'
+select count(*) as n from src;
+→ [{"n":1}]
+
+-- a derived UPDATE image collides too
+insert into src values (2, 'y');
+update src set tag = 'x' where id = 2;
+-- error: row derived into maintained table 'main.mt'
+select tag from mt where id = 2;
+→ [{"tag":"y"}]
+
+-- same-PK update of the unique column to a fresh value succeeds (a row never
+-- collides with itself)
+update src set tag = 'z' where id = 2;
+select * from mt order by id;
+→ [{"id":1,"tag":"x"},{"id":2,"tag":"z"}]
+
+-- moving the unique value to a different primary key in one statement succeeds
+-- (delete + upsert land in one maintenance batch; enforcement is post-batch)
+update src set id = 9 where id = 1;
+select * from mt order by id;
+→ [{"id":2,"tag":"z"},{"id":9,"tag":"x"}]
+
+-- ===================================
+-- 3. collation: case-only variants collide under a NOCASE UNIQUE column
+-- ===================================
+
+create table csrc (id integer primary key, code text collate nocase);
+insert into csrc values (1, 'Alpha');
+create table mc (id integer primary key, code text collate nocase unique) maintained as select id, code from csrc;
+
+insert into csrc values (2, 'ALPHA');
+-- error: row derived into maintained table 'main.mc'
+select count(*) as n from mc;
+→ [{"n":1}]
+
+-- a genuinely different value flows
+insert into csrc values (2, 'beta');
+select count(*) as n from mc;
+→ [{"n":2}]
+
+-- ===================================
+-- 4. NULLs are distinct: multiple derived NULL rows coexist
+-- ===================================
+
+create table nsrc (id integer primary key, tag text null);
+insert into nsrc values (1, null), (2, null);
+create table mn (id integer primary key, tag text null unique) maintained as select id, tag from nsrc;
+select count(*) as n from mn;
+→ [{"n":2}]
+insert into nsrc values (3, null);
+select count(*) as n from mn;
+→ [{"n":3}]
+
+-- ===================================
+-- 5. partial UNIQUE (unique index … where): only in-scope rows collide
+-- ===================================
+-- Lives in 51.9.1-maintained-table-partial-unique: a partial UNIQUE can only be
+-- spelled as `create unique index … where …`, so it needs standalone index DDL.
+
+-- ===================================
+-- 6. a declared per-constraint conflict default never masks a derivation
+-- collision: eviction would silently diverge the table from its derivation
+-- ===================================
+
+create table rsrc (id integer primary key, email text);
+insert into rsrc values (1, 'a@x');
+create table mre (id integer primary key, email text unique on conflict replace) maintained as select id, email from rsrc;
+
+insert into rsrc values (2, 'a@x');
+-- error: row derived into maintained table 'main.mre'
+select count(*) as n from mre;
+→ [{"n":1}]
+
+-- ===================================
+-- 7. attach / re-attach reconcile
+-- ===================================
+
+-- a reconcile that MOVES a unique value between primary keys succeeds (the
+-- replace-all diff inserts before it deletes; enforcement is post-batch)
+create table b1 (id integer primary key, tag text);
+insert into b1 values (2, 'x');
+create table tgt (id integer primary key, tag text unique);
+insert into tgt values (1, 'x');
+alter table tgt set maintained as select id, tag from b1;
+select * from tgt order by id;
+→ [{"id":2,"tag":"x"}]
+
+-- a derivation producing a colliding pair fails the attach; the table reverts
+-- to plain, rows intact
+alter table tgt drop maintained;
+create table b2 (id integer primary key, tag text);
+insert into b2 values (3, 'x'), (4, 'x');
+alter table tgt set maintained as select id, tag from b2;
+-- error: row derived into maintained table 'main.tgt'
+insert into tgt values (5, 'other');
+select count(*) as n from tgt;
+→ [{"n":2}]
+
+-- re-attach failure restores the PRIOR derivation (and its row-time plan)
+create table a1 (id integer primary key, tag text);
+insert into a1 values (1, 'p');
+create table a2 (id integer primary key, tag text);
+insert into a2 values (1, 'd'), (2, 'd');
+create table ma (id integer primary key, tag text unique) maintained as select id, tag from a1;
+alter table ma set maintained as select id, tag from a2;
+-- error: row derived into maintained table 'main.ma'
+select * from ma;
+→ [{"id":1,"tag":"p"}]
+insert into a1 values (2, 'r');
+select count(*) as n from ma;
+→ [{"n":2}]
+
+-- ===================================
+-- 8. MV-over-MV cascade: the consumer's own declared UNIQUE validates its
+-- cascaded deltas
+-- ===================================
+
+create table base (id integer primary key, v text);
+insert into base values (1, 'one');
+create table mt1 (id integer primary key, v text) maintained as select id, v from base;
+create table mt2 (id integer primary key, v text unique) maintained as select id, v from mt1;
+
+insert into base values (2, 'one');
+-- error: row derived into maintained table 'main.mt2'
+select count(*) as n from base;
+→ [{"n":1}]
+select count(*) as n from mt2;
+→ [{"n":1}]
+
+-- ===================================
+-- 9. full-rebuild floor: the rebuild diff is UNIQUE-checked once at the flush
+-- ===================================
+
+-- DISTINCT falls to the full-rebuild arm; the all-columns key is the declared
+-- (integer-only — store text PKs collate NOCASE) primary key, with a declared
+-- secondary UNIQUE on m
+create table fsrc (id integer primary key, n integer, m integer);
+insert into fsrc values (1, 10, 7);
+create table mfr (n integer, m integer, primary key (n, m), unique (m)) maintained as select distinct n, m from fsrc;
+
+insert into fsrc values (2, 20, 7);
+-- error: row derived into maintained table 'main.mfr'
+select count(*) as cnt from fsrc;
+→ [{"cnt":1}]
+
+-- a rebuild that moves the unique value between primary keys succeeds
+update fsrc set n = 30 where id = 1;
+select * from mfr;
+→ [{"n":30,"m":7}]
+
+-- ===================================
+-- 10. detach: every committed row already satisfies the UNIQUE, which becomes
+-- user-enforced — no stranded violators
+-- ===================================
+
+alter table mt drop maintained;
+insert into mt values (10, 'x');
+-- error: UNIQUE constraint failed
+insert into mt values (10, 'w');
+select count(*) as n from mt;
+→ [{"n":3}]
+
+-- ===================================
+-- 11. zero-overhead regression: maintained tables without a secondary UNIQUE
+-- and the MV sugar store duplicate non-key values exactly as before
+-- ===================================
+
+create table z (id integer primary key, v text);
+insert into z values (1, 'dup'), (2, 'dup');
+create table mz (id integer primary key, v text) maintained as select id, v from z;
+create materialized view vz as select id, v from z;
+insert into z values (3, 'dup');
+select count(*) as n from mz;
+→ [{"n":3}]
+select count(*) as n from vz;
+→ [{"n":3}]
+
+-- ===================================
+-- 12. intra-statement value swap: bounded-delta maintenance applies per source
+-- row, so a swap across two source rows aborts mid-statement exactly like the
+-- equivalent multi-row UPDATE on an ordinary table (docs/materialized-views.md
+-- § Declared secondary UNIQUE); the statement rolls back whole
+-- ===================================
+
+create table wsrc (id integer primary key, tag text);
+insert into wsrc values (1, 'a'), (2, 'b');
+create table mw (id integer primary key, tag text unique) maintained as select id, tag from wsrc;
+
+update wsrc set tag = case id when 1 then 'b' else 'a' end;
+-- error: row derived into maintained table 'main.mw'
+select * from mw order by id;
+→ [{"id":1,"tag":"a"},{"id":2,"tag":"b"}]
+select * from wsrc order by id;
+→ [{"id":1,"tag":"a"},{"id":2,"tag":"b"}]

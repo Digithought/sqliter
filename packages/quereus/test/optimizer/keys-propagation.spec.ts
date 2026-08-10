@@ -136,6 +136,69 @@ describe('Key propagation and estimatedRows reduction', () => {
 		expect(types).to.not.include('Distinct');
 	});
 
+	describe('Keyed product (cross/inner) composite key', () => {
+		type Fd = { determinants: number[]; dependents: number[] };
+
+		async function joinPhysicalAny(sql: string): Promise<{ fds?: Fd[] } | undefined> {
+			const rows: Array<{ op: string; physical: string | null }> = [];
+			for await (const r of db.eval('SELECT op, physical FROM query_plan(?)', [sql])) {
+				rows.push(r as unknown as { op: string; physical: string | null });
+			}
+			const row = rows.find(r => r.op.includes('JOIN'));
+			if (!row?.physical) return undefined;
+			return JSON.parse(row.physical);
+		}
+
+		/** True iff some FD encodes a key (determinant a strict subset whose closure spans all cols). */
+		function hasKeyFd(fds: Fd[] | undefined, totalCols: number): boolean {
+			if (!fds) return false;
+			return fds.some(fd => fd.determinants.length < totalCols && fd.determinants.length + fd.dependents.length >= totalCols);
+		}
+
+		async function nodeTypesOf(sql: string): Promise<string> {
+			const rows: Array<Record<string, unknown>> = [];
+			for await (const r of db.eval('SELECT json_group_array(node_type) AS types FROM query_plan(?)', [sql])) {
+				rows.push(r as Record<string, unknown>);
+			}
+			return String(rows[0].types as unknown as string);
+		}
+
+		it('CROSS JOIN of two keyed tables carries a composite key-encoding FD', async () => {
+			await db.exec("CREATE TABLE a (aid INTEGER PRIMARY KEY, av TEXT) USING memory");
+			await db.exec("INSERT INTO a VALUES (1,'x'),(2,'y')");
+			await db.exec("CREATE TABLE b (bid INTEGER PRIMARY KEY, bv TEXT) USING memory");
+			await db.exec("INSERT INTO b VALUES (10,'p'),(20,'q')");
+			// Neither side covered (no predicate), both keyed ⇒ the product is keyed
+			// by the composite (a.aid ∪ b.bid). On the 4-col output that is a key FD
+			// whose determinant is a strict subset of all columns, spanning both sides.
+			const phys = await joinPhysicalAny('SELECT * FROM a CROSS JOIN b');
+			expect(phys, 'expected join physical').to.not.equal(undefined);
+			expect(hasKeyFd(phys!.fds, 4), 'expected composite key-encoding FD').to.equal(true);
+		});
+
+		it('DISTINCT eliminated over a keyed CROSS JOIN (composite key ⇒ already a set)', async () => {
+			await db.exec("CREATE TABLE a (aid INTEGER PRIMARY KEY, av TEXT) USING memory");
+			await db.exec("INSERT INTO a VALUES (1,'x'),(2,'y')");
+			await db.exec("CREATE TABLE b (bid INTEGER PRIMARY KEY, bv TEXT) USING memory");
+			await db.exec("INSERT INTO b VALUES (10,'p'),(20,'q')");
+			const types = await nodeTypesOf('SELECT DISTINCT * FROM a CROSS JOIN b');
+			expect(types, 'DISTINCT over a keyed cross product must be eliminated').to.not.include('Distinct');
+		});
+
+		it('DISTINCT retained over a CROSS JOIN with a keyless (bag) side (negative control)', async () => {
+			await db.exec("CREATE TABLE a (aid INTEGER PRIMARY KEY, av TEXT) USING memory");
+			await db.exec("INSERT INTO a VALUES (1,'x'),(2,'y')");
+			// A base table always carries an implicit (all-columns) key, so to get a
+			// genuinely keyless side we project away the PK over a column that repeats:
+			// `(SELECT bv FROM bk)` is a bag (bv = 'p' twice). The product can then
+			// contain duplicate full rows, so it is NOT a set and DISTINCT must remain.
+			await db.exec("CREATE TABLE bk (bid INTEGER PRIMARY KEY, bv TEXT) USING memory");
+			await db.exec("INSERT INTO bk VALUES (1,'p'),(2,'p')");
+			const types = await nodeTypesOf('SELECT DISTINCT * FROM a CROSS JOIN (SELECT bv FROM bk) bag');
+			expect(types, 'DISTINCT over a product with a keyless (bag) side must be retained').to.include('Distinct');
+		});
+	});
+
 	describe('Outer-join key propagation', () => {
 		interface PlanRow { op: string; node_type: string; properties: string | null; physical: string | null; est_rows: number | null }
 
@@ -268,21 +331,77 @@ describe('Key propagation and estimatedRows reduction', () => {
 				expect(indices(out)).to.deep.equal([[0], [2]]);
 			});
 
-			it('INNER without coverage (equi-pair on a non-key column) → []', () => {
+			it('INNER covering only ONE side → survivor key only, NO composite (gate)', () => {
+				// Equi-pair {1,0} covers the RIGHT key {0} (so left's key survives) but
+				// NOT the left key {0} (right's key does not survive). Exactly one side
+				// is covered, so the product-key gate (`!leftSurvive && !rightSurvive`)
+				// stays OFF — emitting a composite here would double-count the fan-out
+				// the covered side already accounts for. Result is the survivor alone.
+				const leftKeys: ColRef[][] = [[{ index: 0 }]];
+				const rightKeys: ColRef[][] = [[{ index: 0 }]];
+				const out = combineJoinKeys(leftKeys, rightKeys, 'inner', 2, [{ left: 1, right: 0 }]);
+				expect(indices(out)).to.deep.equal([[0]]);
+			});
+
+			it('INNER without coverage (equi-pair on a non-key column) → composite product key', () => {
 				// Equi-pair binds left col 1 = right col 1, neither of which is the
-				// key (col 0). A left row can match many right rows and vice-versa, so
-				// neither side's key survives — an unconditional union would be unsound.
+				// key (col 0). Neither side's key is covered, so neither survives on
+				// its own — but the inner predicate only *removes* (leftRow, rightRow)
+				// pairs (it never duplicates one), so the pair (leftKey, rightKey)
+				// stays unique and the composite product key (left {0} ∪ right {0}
+				// shifted by 2) is sound.
 				const leftKeys: ColRef[][] = [[{ index: 0 }]];
 				const rightKeys: ColRef[][] = [[{ index: 0 }]];
 				const out = combineJoinKeys(leftKeys, rightKeys, 'inner', 2, [{ left: 1, right: 1 }]);
-				expect(out).to.deep.equal([]);
+				expect(indices(out)).to.deep.equal([[0, 2]]);
 			});
 
-			it('CROSS join (no equi-pairs) → [] (full-row set-ness carried by isSet)', () => {
+			it('CROSS join (no equi-pairs, both keyed) → composite product key [[0, leftColumnCount]]', () => {
+				// A bare cross join covers neither side's key, but both sides are
+				// keyed, so the product is keyed by the pair (leftKey, rightKey):
+				// the lex-min from each side, with right shifted by leftColumnCount
+				// (2). Full-row set-ness is *additionally* carried by RelationType.isSet.
 				const leftKeys: ColRef[][] = [[{ index: 0 }]];
 				const rightKeys: ColRef[][] = [[{ index: 0 }]];
 				const out = combineJoinKeys(leftKeys, rightKeys, 'cross', 2);
-				expect(out).to.deep.equal([]);
+				expect(indices(out)).to.deep.equal([[0, 2]]);
+			});
+
+			it('composite-PK left side, single-col right → picks the only keys, right shifted', () => {
+				// left composite PK {0,1}, right PK {0}, cross, leftColumnCount=3 ⇒
+				// the only key on each side is picked; right's col 0 shifts to 3.
+				const leftKeys: ColRef[][] = [[{ index: 0 }, { index: 1 }]];
+				const rightKeys: ColRef[][] = [[{ index: 0 }]];
+				const out = combineJoinKeys(leftKeys, rightKeys, 'cross', 3);
+				expect(indices(out)).to.deep.equal([[0, 1, 3]]);
+			});
+
+			it('lex-min tie-break: two single-col keys → lowest first-col index wins', () => {
+				// left carries {1} and {0} (both length 1) ⇒ tie broken by lowest
+				// first-column index ⇒ picks {0}; right {0} shifts to 2.
+				const leftKeys: ColRef[][] = [[{ index: 1 }], [{ index: 0 }]];
+				const rightKeys: ColRef[][] = [[{ index: 0 }]];
+				const out = combineJoinKeys(leftKeys, rightKeys, 'cross', 2);
+				expect(indices(out)).to.deep.equal([[0, 2]]);
+			});
+
+			it('lex-min picks the shorter key when lengths differ', () => {
+				// left carries {0,1} and {2} ⇒ the shorter {2} is picked; right {0}
+				// shifts to 3.
+				const leftKeys: ColRef[][] = [[{ index: 0 }, { index: 1 }], [{ index: 2 }]];
+				const rightKeys: ColRef[][] = [[{ index: 0 }]];
+				const out = combineJoinKeys(leftKeys, rightKeys, 'cross', 3);
+				expect(indices(out)).to.deep.equal([[2, 3]]);
+			});
+
+			it('≤1-row guard: empty key on one side → no product key (survivor branch fires)', () => {
+				// right is ≤1-row (empty key), so left's key survives on its own and
+				// NO composite product key is emitted — the result equals the existing
+				// survivor-branch output ([[0]]), not a composite.
+				const leftKeys: ColRef[][] = [[{ index: 0 }]];
+				const rightKeys: ColRef[][] = [[]];
+				const out = combineJoinKeys(leftKeys, rightKeys, 'cross', 2);
+				expect(indices(out)).to.deep.equal([[0]]);
 			});
 
 			it('SEMI returns left keys unchanged', () => {

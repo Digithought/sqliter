@@ -1,0 +1,65 @@
+-- json-canonical-key.sqllogic
+-- Hash/encoded keys must agree with the JSON value comparator (deepCompareJson):
+-- values that compare equal key alike, values that compare unequal key apart.
+-- No `using memory`, so store mode exercises the persisted byte-key path too.
+
+-- Distinct JSON objects form distinct groups. A PK on `id` leaves the scan ordered
+-- by id, so GROUP BY on the unsorted `j` picks HashAggregate (the serializeKey path).
+-- Before the canonical-key fix every object collapsed to one 'o:[object Object]' bucket.
+create table jc_t (id integer primary key, j json);
+insert into jc_t values (1, '{"a":1}'), (2, '{"a":2}'), (3, '{"b":9}');
+-- run
+
+select count(*) as groups from (select j from jc_t group by j);
+→ [{"groups":3}]
+
+-- Reorder-equal objects ({a:1,b:2} == {b:2,a:1}) group and de-dup together.
+create table jc_reorder (id integer primary key, j json);
+insert into jc_reorder values (1, '{"a":1,"b":2}'), (2, '{"b":2,"a":1}'), (3, '{"a":1,"b":2}');
+-- run
+
+select count(*) as groups from (select j from jc_reorder group by j);
+→ [{"groups":1}]
+
+select count(*) as c from (select distinct j from jc_reorder);
+→ [{"c":1}]
+
+-- Array element order stays significant — [1,2] and [2,1] are distinct groups.
+create table jc_arr (id integer primary key, j json);
+insert into jc_arr values (1, '[1,2]'), (2, '[2,1]'), (3, '[1,2]');
+-- run
+
+select count(*) as groups from (select j from jc_arr group by j);
+→ [{"groups":2}]
+
+-- Equality join on a JSON key matches reorder-equal values across the two sides.
+create table jc_left (id integer primary key, j json);
+create table jc_right (id integer primary key, j json, tag text);
+insert into jc_left values (1, '{"a":1,"b":2}');
+insert into jc_right values (1, '{"b":2,"a":1}', 'hit');
+-- run
+
+select l.id as lid, r.tag as tag from jc_left l join jc_right r on l.j = r.j;
+→ [{"lid":1,"tag":"hit"}]
+
+-- JSON primary key: a reorder-equal insert conflicts with the existing key, so
+-- `insert or replace` replaces the row rather than adding a second one.
+create table jc_pk (id json primary key, n integer);
+insert into jc_pk values ('{"a":1,"b":2}', 10);
+insert or replace into jc_pk values ('{"b":2,"a":1}', 20);
+-- run
+
+select count(*) as c from jc_pk;
+→ [{"c":1}]
+
+-- The replacing row wins; the stored/displayed JSON stays insertion-order (the
+-- canonical form is used only to derive the key, never for storage or display).
+select id, n from jc_pk;
+→ [{"id":{"b":2,"a":1},"n":20}]
+
+-- A genuinely different JSON PK is a distinct row (no over-merge).
+insert into jc_pk values ('{"a":1,"c":3}', 30);
+-- run
+
+select count(*) as c from jc_pk;
+→ [{"c":2}]

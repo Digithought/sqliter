@@ -1,0 +1,74 @@
+-- 06.3.3.1-introspection-tags-index.sqllogic - Index tags and index layout through introspection TVFs
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Carved out of 06.3.3-introspection-tags: that file exposes tags and rich metadata
+-- for tables, views, columns, foreign keys, CHECK constraints, non-index UNIQUE
+-- constraints and assertions, none of which needs index DDL. The index-shaped parts
+-- all do — an index is the only object they can be about — so they move here and the
+-- rest stays runnable on a backend without first-class CREATE INDEX.
+--
+-- Subject: schema() reports an index's tags (and null when untagged), index_info()
+-- reports the column-by-column layout with desc/unique/partial flags and tags, and a
+-- partial unique index synthesizes a partial UNIQUE constraint in
+-- unique_constraint_info().
+
+-- ===================================================================
+-- Setup
+-- ===================================================================
+
+CREATE TABLE Orders (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL
+) WITH TAGS (display_name = 'Customer Orders', audit = true);
+
+CREATE INDEX idx_orders_name ON Orders (name)
+    WITH TAGS (purpose = 'name lookup');
+
+CREATE INDEX idx_orders_plain ON Orders (id);
+
+-- ===================================================================
+-- schema() — tags on indexes; null for untagged
+-- ===================================================================
+
+SELECT name, json_extract(tags, '$.purpose') AS purpose
+    FROM schema() WHERE type = 'index' AND name = 'idx_orders_name';
+→ [{"name":"idx_orders_name","purpose":"name lookup"}]
+
+SELECT tags FROM schema() WHERE type = 'index' AND name = 'idx_orders_plain';
+→ [{"tags":null}]
+
+-- ===================================================================
+-- index_info() — column-by-column index layout, partial/unique/tags
+-- ===================================================================
+
+CREATE TABLE IdxTable (
+    id INTEGER PRIMARY KEY,
+    a TEXT,
+    b INTEGER,
+    status TEXT
+);
+
+CREATE INDEX idx_a_asc ON IdxTable (a) WITH TAGS (purpose = 'lookup');
+CREATE INDEX idx_b_desc ON IdxTable (b DESC);
+CREATE UNIQUE INDEX idx_a_unique ON IdxTable (a);
+CREATE INDEX idx_a_partial ON IdxTable (a) WHERE status = 'active';
+
+SELECT index_name, seq, column_name, "desc", "unique", partial,
+       json_extract(tags, '$.purpose') AS purpose
+    FROM index_info('IdxTable') ORDER BY index_name, seq;
+→ [{"index_name":"idx_a_asc","seq":0,"column_name":"a","desc":0,"unique":0,"partial":0,"purpose":"lookup"},{"index_name":"idx_a_partial","seq":0,"column_name":"a","desc":0,"unique":0,"partial":1,"purpose":null},{"index_name":"idx_a_unique","seq":0,"column_name":"a","desc":0,"unique":1,"partial":0,"purpose":null},{"index_name":"idx_b_desc","seq":0,"column_name":"b","desc":1,"unique":0,"partial":0,"purpose":null}]
+
+-- ===================================================================
+-- unique_constraint_info() — partial unique index synthesizes a partial constraint
+-- ===================================================================
+
+CREATE TABLE PuTable (
+    id INTEGER PRIMARY KEY,
+    code TEXT NOT NULL,
+    status TEXT NOT NULL
+);
+CREATE UNIQUE INDEX uq_pu_active ON PuTable (code) WHERE status = 'active';
+
+SELECT name, partial FROM unique_constraint_info('PuTable');
+→ [{"name":"uq_pu_active","partial":1}]

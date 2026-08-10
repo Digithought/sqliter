@@ -1,0 +1,25 @@
+-- Index-derived UNIQUE enforcement collation via ON CONFLICT upsert.
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Carved out of 47.3-upsert-conflict-target-collation: every other section of
+-- 47.3 enforces UNIQUE through a column- or table-level constraint, but this
+-- scenario derives its UNIQUE from a standalone `create unique index` whose key
+-- expression carries a per-column COLLATE. Backends that retire first-class
+-- CREATE [UNIQUE] INDEX cannot run it, so it lives in its own file to keep 47.3's
+-- collation-variant upsert-matching subject portable across backends.
+--
+-- Subject: the enforcement collation is the INDEX's NOCASE, not the column's
+-- declared BINARY — so proposed 'HELLO' matches stored 'Hello' and routes to the
+-- DO UPDATE arm. Sibling: unique-enforcement-collation.spec.ts covers the same
+-- index-derived-collation resolution directly.
+
+create table idx_coll (id integer primary key, tag text);
+create unique index idx_tag_nc on idx_coll (tag collate nocase);
+insert into idx_coll values (1, 'Hello');
+
+insert into idx_coll values (2, 'HELLO') on conflict (tag) do update set tag = 'seen';
+select id, tag from idx_coll order by id;
+→ [{"id":1,"tag":"seen"}]
+
+drop table idx_coll;

@@ -366,6 +366,28 @@ apply schema main;
 select * from user_summary order by user_id;
 → [{"user_id": 1, "full_name": "Alice", "contact": "alice@example.com"}, {"user_id": 2, "full_name": "Bob", "contact": "bob@example.com"}]
 
+-- Step 33.1: Declarative apply rejects a conflicting-collation FK. The differ emits
+-- CREATE TABLE in dependency order (parent before child), so the child's CREATE
+-- re-executes through the same declaration-time collation validation as a direct
+-- CREATE TABLE and the apply fails. Isolated in schema Test3 so `main` is
+-- untouched. Ticket fk-collation-conflict-create-time-validation.
+declare schema Test3 {
+	table cfk_parent {
+		k TEXT COLLATE RTRIM PRIMARY KEY
+	}
+
+	table cfk_child {
+		id INTEGER PRIMARY KEY,
+		ref TEXT COLLATE NOCASE,
+		constraint fk_bad foreign key (ref) references cfk_parent(k)
+	}
+}
+
+-- run
+
+apply schema Test3;
+-- error: conflicting collations
+
 -- Step 34: Test view removal
 declare schema main {
 	table users {
@@ -752,6 +774,179 @@ select * from assert_items;
 → [{"id": 1, "qty": 5, "price": 10}]
 
 -- ===================================================================
+-- Redeclaring an assertion's CHECK body must be visible to `diff` / `apply` —
+-- regression for bug-assertion-body-drift-invisible-to-diff. Uses its own
+-- schema so it does not disturb the assert_accounts / assert_items row
+-- counts asserted above.
+-- ===================================================================
+
+declare schema assert_drift {
+	table t (
+		x INTEGER PRIMARY KEY
+	)
+
+	assertion range_check check (not exists (select 1 from t where x < 0))
+}
+
+-- run
+
+apply schema assert_drift;
+
+-- run
+
+diff schema assert_drift;
+→ []
+
+-- Redeclare with a changed CHECK body (forbid x < 0 → forbid x < -100). The
+-- diff must show a drop+recreate pair for the drifted assertion, not [].
+declare schema assert_drift {
+	table t (
+		x INTEGER PRIMARY KEY
+	)
+
+	assertion range_check check (not exists (select 1 from t where x < -100))
+}
+
+-- run
+
+diff schema assert_drift;
+→ [{"ddl": "DROP ASSERTION IF EXISTS assert_drift.range_check"}, {"ddl": "create assertion assert_drift.range_check check (not exists (select 1 from t where x < -100))"}]
+
+apply schema assert_drift;
+
+-- run
+
+-- Idempotent: re-diff is empty.
+diff schema assert_drift;
+→ []
+
+-- A row illegal under the OLD rule (x < 0) but legal under the NEW rule
+-- (only x < -100 is forbidden) commits — the new rule is the one enforced.
+begin;
+insert into assert_drift.t values (-50);
+commit;
+
+-- run
+
+select * from assert_drift.t;
+→ [{"x": -50}]
+
+-- A row illegal under the NEW rule fails at commit.
+begin;
+insert into assert_drift.t values (-150);
+commit;
+-- error: Integrity assertion failed: assert_drift.range_check
+
+select count(*) as cnt from assert_drift.t;
+→ [{"cnt": 1}]
+
+-- ===================================================================
+-- Drift interacting with a same-apply ADD COLUMN: the recreated assertion names
+-- a column the same migration adds. `create assertion` plans its body at create
+-- time (same strictness as a view body), so the create MUST run after the
+-- table-alter block — assertion creates are emitted last, after every ADD COLUMN
+-- and maintained re-attach. Assertion DROPs still lead the whole migration.
+-- ===================================================================
+
+declare schema assert_addcol {
+	table t (
+		x INTEGER PRIMARY KEY
+	)
+
+	assertion range_check check (not exists (select 1 from t where x < 0))
+}
+
+-- run
+
+apply schema assert_addcol;
+
+-- run
+
+declare schema assert_addcol {
+	table t (
+		x INTEGER PRIMARY KEY,
+		y INTEGER
+	)
+
+	assertion range_check check (not exists (select 1 from t where y < 0))
+}
+
+-- run
+
+diff schema assert_addcol;
+→ [{"ddl": "DROP ASSERTION IF EXISTS assert_addcol.range_check"}, {"ddl": "ALTER TABLE assert_addcol.t ADD COLUMN y INTEGER"}, {"ddl": "create assertion assert_addcol.range_check check (not exists (select 1 from t where y < 0))"}]
+
+apply schema assert_addcol;
+
+-- run
+
+diff schema assert_addcol;
+→ []
+
+-- The recreated rule enforces against the freshly added column.
+begin;
+insert into assert_addcol.t values (1, -5);
+commit;
+-- error: Integrity assertion failed: assert_addcol.range_check
+
+begin;
+insert into assert_addcol.t values (2, 5);
+commit;
+
+-- run
+
+select * from assert_addcol.t;
+→ [{"x": 2, "y": 5}]
+
+-- ===================================================================
+-- Table rename in the same apply as an assertion whose body follows the new
+-- name. Assertion CHECK bodies are never rename-reconciled by the differ, so
+-- the unchanged-in-spirit assertion reads as drifted and churns a
+-- drop+recreate. That is correct-but-avoidable, and it must still APPLY
+-- cleanly: renames are emitted before assertion drops/creates.
+-- ===================================================================
+
+declare schema assert_rename {
+	table t (
+		x INTEGER PRIMARY KEY
+	)
+
+	assertion range_check check (not exists (select 1 from t where x < 0))
+}
+
+-- run
+
+apply schema assert_rename;
+
+-- run
+
+declare schema assert_rename {
+	table t2 (
+		x INTEGER PRIMARY KEY
+	) with tags ("quereus.previous_name" = 't')
+
+	assertion range_check check (not exists (select 1 from t2 where x < 0))
+}
+
+-- run
+
+diff schema assert_rename;
+→ [{"ddl": "ALTER TABLE assert_rename.t RENAME TO t2"}, {"ddl": "DROP ASSERTION IF EXISTS assert_rename.range_check"}, {"ddl": "create assertion assert_rename.range_check check (not exists (select 1 from t2 where x < 0))"}]
+
+apply schema assert_rename;
+
+-- run
+
+diff schema assert_rename;
+→ []
+
+-- The rebound assertion enforces against the renamed table.
+begin;
+insert into assert_rename.t2 values (-1);
+commit;
+-- error: Integrity assertion failed: assert_rename.range_check
+
+-- ===================================================================
 -- Declarative `unique index` — parser admits the UNIQUE qualifier and
 -- the diff stringifies it back as `create unique index` so that the
 -- apply path enforces uniqueness the same way a top-level
@@ -1010,3 +1205,872 @@ insert into decl_check_cmpd.Palette values ('z');
 -- error: CHECK constraint failed: InPalette
 
 drop table decl_check_cmpd.Palette;
+
+-- ===================================================================
+-- Exposed implicit covering index — a UNIQUE constraint tagged
+-- quereus.expose_implicit_index surfaces its secondary BTree for
+-- introspection (schema() / index_info()), but the differ must NOT
+-- manage it as a standalone index. A converged schema diffs EMPTY (no
+-- phantom DROP INDEX IF EXISTS uq_expo_vin) across both the memory and
+-- store backends (ticket
+-- declarative-differ-spurious-drop-exposed-implicit-index).
+-- ===================================================================
+
+declare schema decl_expo_idx
+{
+	table ExpoTbl (
+		id INTEGER PRIMARY KEY,
+		vin TEXT,
+		constraint uq_expo_vin unique (vin) with tags ("quereus.expose_implicit_index" = true)
+	);
+}
+
+-- run
+
+apply schema decl_expo_idx;
+
+-- run
+
+-- Converged: re-diff is empty — no spurious DROP INDEX for the exposed
+-- implicit covering index (was the bug this ticket fixes).
+diff schema decl_expo_idx;
+→ []
+
+-- UNIQUE enforcement still holds (the constraint, not the index, governs it).
+insert into decl_expo_idx.ExpoTbl values (1, 'VIN001');
+insert into decl_expo_idx.ExpoTbl values (2, 'VIN001');
+-- error: UNIQUE
+
+drop table decl_expo_idx.ExpoTbl;
+
+-- ===================================================================
+-- View `with defaults (col = expr, …)` survives the declare/diff/apply
+-- round-trip: the diff renders the clause in the create DDL, the apply
+-- re-parses that DDL, and an insert through the applied view supplies the
+-- defaulted column. Declared in `main` since declarative views in
+-- non-main schemas are emitted without a schema prefix (see the
+-- compound-tail blocks above). `main` is empty at this point in the file
+-- (the last `apply schema main` reconciled it down to a single view,
+-- since dropped), so the diff is exactly the two creates.
+-- ===================================================================
+
+declare schema main {
+	table decl_dfl (
+		id INTEGER PRIMARY KEY,
+		name TEXT,
+		created INTEGER NOT NULL
+	)
+
+	view decl_dfl_v as select id, name from decl_dfl with defaults (created = 424242)
+}
+
+-- run
+
+-- The rendered create DDL carries the clause in canonical form.
+diff schema main;
+→ [{"ddl": "create table decl_dfl (id INTEGER primary key, name TEXT, created INTEGER not null)"}, {"ddl": "create view decl_dfl_v as select id, name from decl_dfl with defaults (created = 424242)"}]
+
+apply schema main;
+
+-- run
+
+-- Write-through: the applied view supplies the omitted not-null column.
+insert into decl_dfl_v values (1, 'x');
+select * from decl_dfl order by id;
+→ [{"id":1,"name":"x","created":424242}]
+
+-- Converged: an identical re-declare diffs empty (declared and actual agree,
+-- clause included).
+diff schema main;
+→ []
+
+drop view decl_dfl_v;
+drop table decl_dfl;
+
+-- ===================================================================
+-- View definition drift on a NAME-MATCHED view (ticket
+-- view-insert-defaults-declarative-drift-undetected): a changed /
+-- removed / added `with defaults` clause and a changed body each
+-- diff as DROP VIEW + CREATE VIEW. Previously all four diffed EMPTY —
+-- a stale default survived apply silently. Tag-only drift still takes
+-- the in-place SET TAGS path (declarative-equivalence unit tests).
+-- `main` is empty again at this point in the file.
+-- ===================================================================
+
+create table vd_t (id integer primary key, name text, created integer not null);
+create view vd_v as select id, name from vd_t with defaults (created = 111);
+
+-- run
+
+-- Baseline: write-through uses the original default.
+insert into vd_v values (1, 'a');
+select created from vd_t where id = 1;
+→ [{"created": 111}]
+
+-- Clause changed (111 → 222) on the name-matched view.
+declare schema main {
+	table vd_t (
+		id integer primary key,
+		name text,
+		created integer not null
+	)
+
+	view vd_v as select id, name from vd_t with defaults (created = 222)
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "DROP VIEW IF EXISTS vd_v"}, {"ddl": "create view vd_v as select id, name from vd_t with defaults (created = 222)"}]
+
+apply schema main;
+
+-- run
+
+-- Write-through now uses the NEW default (it kept writing 111 before this fix).
+insert into vd_v values (2, 'b');
+select created from vd_t where id = 2;
+→ [{"created": 222}]
+
+-- Converged: re-diff is empty.
+diff schema main;
+→ []
+
+-- Clause removed: drift again → drop+recreate; an insert omitting the
+-- NOT NULL column now fails (nothing supplies it anymore).
+declare schema main {
+	table vd_t (
+		id integer primary key,
+		name text,
+		created integer not null
+	)
+
+	view vd_v as select id, name from vd_t
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "DROP VIEW IF EXISTS vd_v"}, {"ddl": "create view vd_v as select id, name from vd_t"}]
+
+apply schema main;
+
+-- run
+
+insert into vd_v values (3, 'c');
+-- error: NOT NULL constraint failed: vd_t.created
+
+diff schema main;
+→ []
+
+-- Clause added (the inverse migration): drift → drop+recreate; the
+-- defaulted write-through works again with the new value.
+declare schema main {
+	table vd_t (
+		id integer primary key,
+		name text,
+		created integer not null
+	)
+
+	view vd_v as select id, name from vd_t with defaults (created = 333)
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "DROP VIEW IF EXISTS vd_v"}, {"ddl": "create view vd_v as select id, name from vd_t with defaults (created = 333)"}]
+
+apply schema main;
+
+-- run
+
+insert into vd_v values (4, 'd');
+select created from vd_t where id = 4;
+→ [{"created": 333}]
+
+-- Body changed (added a predicate), same name and clause: drift → drop+recreate.
+declare schema main {
+	table vd_t (
+		id integer primary key,
+		name text,
+		created integer not null
+	)
+
+	view vd_v as select id, name from vd_t where id > 2 with defaults (created = 333)
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "DROP VIEW IF EXISTS vd_v"}, {"ddl": "create view vd_v as select id, name from vd_t where id > 2 with defaults (created = 333)"}]
+
+apply schema main;
+
+-- run
+
+-- The new body filters: rows 1 (id=1) and 2 (id=2) are excluded; row 3 errored.
+select id from vd_v order by id;
+→ [{"id": 4}]
+
+diff schema main;
+→ []
+
+drop view vd_v;
+drop table vd_t;
+
+-- ---------------------------------------------------------------------------
+-- Maintained-table re-attach convergence (explicit rename-list reshape).
+-- A rename-list change on an EXPLICIT maintained table re-attaches in place via
+-- the carried `set maintained (cols) as` op — the backing column is renamed, rows
+-- are relabeled (not rebuilt), and a re-diff converges. Ticket
+-- maintained-reattach-explicit-rename-list-reshape.
+-- ---------------------------------------------------------------------------
+declare schema main {
+	table mvr_t (id INTEGER PRIMARY KEY, x INTEGER NOT NULL)
+	materialized view mvr_mv (a, b) as select id, x from mvr_t
+}
+
+-- run
+
+apply schema main;
+
+-- run
+
+insert into mvr_t values (1, 10), (2, 20);
+select a, b from mvr_mv order by a;
+→ [{"a": 1, "b": 10}, {"a": 2, "b": 20}]
+
+-- Rename-list change b → c: an in-place re-attach carrying the declared list.
+declare schema main {
+	table mvr_t (id INTEGER PRIMARY KEY, x INTEGER NOT NULL)
+	materialized view mvr_mv (a, c) as select id, x from mvr_t
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "alter table mvr_mv set maintained (a, c) as select id, x from mvr_t"}]
+
+apply schema main;
+
+-- run
+
+-- The backing column is relabeled b → c with values intact (a rename, not a rebuild).
+select a, c from mvr_mv order by a;
+→ [{"a": 1, "c": 10}, {"a": 2, "c": 20}]
+
+-- Maintenance is live on the relabeled backing.
+insert into mvr_t values (3, 30);
+select c from mvr_mv where a = 3;
+→ [{"c": 30}]
+
+-- Converged: re-diff wants nothing further.
+diff schema main;
+→ []
+
+drop table mvr_mv;
+drop table mvr_t;
+
+-- ===================================================================
+-- Seed application is idempotent (ticket
+-- declarative-seed-reopen-pk-collision). Re-applying `apply schema …
+-- with seed` over a table that already holds its seed rows must not
+-- collide on the seed PKs.
+-- The store package covers the reopen-without-rehydrate crash directly;
+-- this memory-backed case pins the in-engine SEMANTICS: the second apply
+-- uses INSERT … ON CONFLICT (<pk>) DO NOTHING — existing rows (including
+-- user-edited seed rows) are left untouched, and non-seed rows survive
+-- (no full-reset DELETE).
+-- ===================================================================
+
+declare schema decl_seed_idem using (default_vtab_module = 'memory') {
+	table meta {
+		id INTEGER PRIMARY KEY,
+		name TEXT NOT NULL
+	}
+
+	seed meta (
+		(1, 'AllSite'),
+		(2, 'Other')
+	)
+}
+
+-- run
+
+-- First apply seeds the freshly-created table.
+apply schema decl_seed_idem with seed;
+
+-- run
+
+select id, name from decl_seed_idem.meta order by id;
+→ [{"id": 1, "name": "AllSite"}, {"id": 2, "name": "Other"}]
+
+-- A user adds a non-seed row and edits a seeded row.
+insert into decl_seed_idem.meta values (3, 'UserAdded');
+update decl_seed_idem.meta set name = 'Edited' where id = 2;
+select id, name from decl_seed_idem.meta order by id;
+→ [{"id": 1, "name": "AllSite"}, {"id": 2, "name": "Edited"}, {"id": 3, "name": "UserAdded"}]
+
+-- Re-apply the SAME schema with seed: no DDL diff, but the seed re-runs.
+-- ON CONFLICT (<pk>) DO NOTHING skips existing PKs, so user edits and
+-- non-seed rows survive unchanged.
+apply schema decl_seed_idem with seed;
+
+-- run
+
+select id, name from decl_seed_idem.meta order by id;
+→ [{"id": 1, "name": "AllSite"}, {"id": 2, "name": "Edited"}, {"id": 3, "name": "UserAdded"}]
+
+drop table decl_seed_idem.meta;
+
+-- ===================================================================
+-- Seed re-application must NOT fire ON DELETE CASCADE for an unchanged
+-- seed parent (ticket seed-reseed-or-replace-cascade-tradeoff). This is
+-- the headline reason the seed insert skips an existing PK (via ON
+-- CONFLICT (<pk>) DO NOTHING) rather than using OR REPLACE: OR REPLACE
+-- is delete-then-insert on a PK conflict, so a reseed of an
+-- already-seeded parent would delete the parent row, fire ON DELETE
+-- CASCADE, and destroy child rows — even when the replacement values are
+-- identical. DO NOTHING skips the existing parent entirely (no delete),
+-- so the cascade never fires and children survive.
+-- ===================================================================
+
+pragma foreign_keys = true;
+
+declare schema decl_seed_cascade using (default_vtab_module = 'memory') {
+	table parent {
+		id INTEGER PRIMARY KEY,
+		name TEXT
+	}
+
+	table child {
+		id INTEGER PRIMARY KEY,
+		parent_id INTEGER,
+		constraint fk_parent foreign key (parent_id) references parent(id) on delete cascade
+	}
+
+	seed parent (
+		(1, 'P1')
+	)
+}
+
+-- run
+
+apply schema decl_seed_cascade with seed;
+
+-- run
+
+-- A user adds a child referencing the seeded parent.
+insert into decl_seed_cascade.child values (10, 1);
+select id, parent_id from decl_seed_cascade.child order by id;
+→ [{"id": 10, "parent_id": 1}]
+
+-- Re-apply the seed: ON CONFLICT (<pk>) DO NOTHING skips the
+-- already-present parent (1) with no delete, so ON DELETE CASCADE never
+-- fires and the child survives.
+apply schema decl_seed_cascade with seed;
+
+-- run
+
+select id, parent_id from decl_seed_cascade.child order by id;
+→ [{"id": 10, "parent_id": 1}]
+
+-- The seed parent is still present and unchanged.
+select id, name from decl_seed_cascade.parent order by id;
+→ [{"id": 1, "name": "P1"}]
+
+drop table decl_seed_cascade.child;
+drop table decl_seed_cascade.parent;
+
+-- ===================================================================
+-- A malformed seed row aborts on first apply instead of vanishing
+-- (ticket seed-or-ignore-masks-malformed-rows). The seed insert uses
+-- `ON CONFLICT (<pk>) DO NOTHING`, which suppresses ONLY the seed-PK
+-- already-present conflict (the idempotency cases above). A row that
+-- violates a CHECK, a NOT NULL column, or a child-side FK is NOT a PK
+-- conflict, so it aborts with a clear error rather than being silently
+-- dropped the way `INSERT OR IGNORE` used to drop it.
+-- ===================================================================
+
+-- Positive control: valid seed rows on a CHECK-constrained table apply
+-- cleanly, and a re-apply stays idempotent (the PK-targeted conflict
+-- clause skips the already-present rows, it does not re-run the CHECK
+-- into an error).
+declare schema decl_seed_good_check using (default_vtab_module = 'memory') {
+	table t {
+		id INTEGER PRIMARY KEY,
+		n INTEGER,
+		constraint positive check (n > 0)
+	}
+
+	seed t (
+		(1, 5),
+		(2, 10)
+	)
+}
+
+-- run
+
+apply schema decl_seed_good_check with seed;
+
+-- run
+
+select id, n from decl_seed_good_check.t order by id;
+→ [{"id": 1, "n": 5}, {"id": 2, "n": 10}]
+
+-- Idempotent reseed: existing seed PKs are skipped, no CHECK re-fires.
+apply schema decl_seed_good_check with seed;
+
+-- run
+
+select id, n from decl_seed_good_check.t order by id;
+→ [{"id": 1, "n": 5}, {"id": 2, "n": 10}]
+
+drop table decl_seed_good_check.t;
+
+-- CHECK violation: a seed row failing `check (n < 10)` aborts the apply
+-- (was silently dropped under OR IGNORE). (Seed literals must be bare —
+-- the parser rejects unary-minus — so the violation uses an over-large
+-- positive value rather than a negative one.)
+declare schema decl_seed_bad_check using (default_vtab_module = 'memory') {
+	table t {
+		id INTEGER PRIMARY KEY,
+		n INTEGER,
+		constraint small check (n < 10)
+	}
+
+	seed t (
+		(1, 50)
+	)
+}
+
+-- run
+
+apply schema decl_seed_bad_check with seed;
+-- error: CHECK constraint failed
+
+-- NOT NULL violation: a seed row supplying NULL for a NOT NULL column
+-- aborts the apply.
+declare schema decl_seed_bad_nn using (default_vtab_module = 'memory') {
+	table t {
+		id INTEGER PRIMARY KEY,
+		name TEXT NOT NULL
+	}
+
+	seed t (
+		(1, NULL)
+	)
+}
+
+-- run
+
+apply schema decl_seed_bad_nn with seed;
+-- error: NOT NULL constraint failed
+
+-- Child-side FK violation: a seed child row referencing a missing parent
+-- aborts the apply (the FK existence check is synthesized as a CHECK).
+pragma foreign_keys = true;
+
+declare schema decl_seed_bad_fk using (default_vtab_module = 'memory') {
+	table parent {
+		id INTEGER PRIMARY KEY
+	}
+
+	table child {
+		id INTEGER PRIMARY KEY,
+		parent_id INTEGER NOT NULL,
+		constraint fk_parent foreign key (parent_id) references parent(id)
+	}
+
+	seed child (
+		(1, 999)
+	)
+}
+
+-- run
+
+apply schema decl_seed_bad_fk with seed;
+-- error: CHECK constraint failed
+
+-- Composite PRIMARY KEY: the conflict clause names every PK column
+-- (`on conflict (a, b) do nothing`). A reseed over an already-present
+-- composite key is skipped (idempotent), a user edit to a non-PK column
+-- survives, and a non-seed row is preserved — the multi-column analogue
+-- of decl_seed_idem.
+declare schema decl_seed_composite using (default_vtab_module = 'memory') {
+	table pair {
+		a INTEGER,
+		b INTEGER,
+		label TEXT,
+		primary key (a, b)
+	}
+
+	seed pair (
+		(1, 1, 'one-one'),
+		(1, 2, 'one-two')
+	)
+}
+
+-- run
+
+apply schema decl_seed_composite with seed;
+
+-- run
+
+select a, b, label from decl_seed_composite.pair order by a, b;
+→ [{"a": 1, "b": 1, "label": "one-one"}, {"a": 1, "b": 2, "label": "one-two"}]
+
+-- A user edits a non-PK column on a seeded row and adds a non-seed row.
+update decl_seed_composite.pair set label = 'edited' where a = 1 and b = 2;
+insert into decl_seed_composite.pair values (2, 1, 'user-added');
+
+-- Reseed: the composite-key conflict is skipped (no overwrite of the
+-- edit), and the non-seed row survives.
+apply schema decl_seed_composite with seed;
+
+-- run
+
+select a, b, label from decl_seed_composite.pair order by a, b;
+→ [{"a": 1, "b": 1, "label": "one-one"}, {"a": 1, "b": 2, "label": "edited"}, {"a": 2, "b": 1, "label": "user-added"}]
+
+drop table decl_seed_composite.pair;
+
+-- Secondary UNIQUE collision: two seed rows share a UNIQUE value but have
+-- distinct PKs (a typo in the seed data). The seed insert targets the PK
+-- with `ON CONFLICT (<pk>) DO NOTHING`, so the second row's conflict is on
+-- the `email` UNIQUE constraint, NOT the targeted PK — it must abort the
+-- apply rather than vanish silently (ticket
+-- seed-secondary-unique-silently-skipped). Previously the PK-targeted
+-- clause short-circuited and swallowed any unique conflict.
+declare schema decl_seed_dup_unique using (default_vtab_module = 'memory') {
+	table t {
+		id INTEGER PRIMARY KEY,
+		email TEXT,
+		constraint uq_email unique (email)
+	}
+
+	seed t (
+		(1, 'dup@x'),
+		(2, 'dup@x')
+	)
+}
+
+-- run
+
+apply schema decl_seed_dup_unique with seed;
+-- error: UNIQUE constraint failed
+
+-- Comparison-domain ALTER ordering. A column whose declared type AND collation both
+-- drift needs `SET DATA TYPE` and `SET COLLATE` in the order the engine accepts:
+-- `SET DATA TYPE` carries the column's CURRENT collation into the new type, and
+-- DATE / TIME / DATETIME / TIMESPAN / JSON accept BINARY only, so narrowing a
+-- `TEXT COLLATE NOCASE` column to `DATE` must emit `SET COLLATE BINARY` FIRST — the
+-- other order is rejected engine-side and aborts the whole migration
+-- (bug-retype-keeps-illegal-collation). Widening back keeps the opposite order: NOCASE
+-- can only land once the column is TEXT again.
+declare schema decl_collate_retype using (default_vtab_module = 'memory') {
+	table t {
+		id INTEGER PRIMARY KEY,
+		d TEXT COLLATE NOCASE
+	}
+}
+
+-- run
+
+apply schema decl_collate_retype;
+insert into decl_collate_retype.t values (1, '2024-01-01'), (2, '2024-02-01');
+
+-- run
+
+-- Narrowing: TEXT COLLATE NOCASE → DATE.
+declare schema decl_collate_retype using (default_vtab_module = 'memory') {
+	table t {
+		id INTEGER PRIMARY KEY,
+		d DATE
+	}
+}
+
+-- run
+
+diff schema decl_collate_retype;
+→ [{"ddl": "ALTER TABLE decl_collate_retype.t ALTER COLUMN d SET COLLATE BINARY"}, {"ddl": "ALTER TABLE decl_collate_retype.t ALTER COLUMN d SET DATA TYPE DATE"}]
+
+apply schema decl_collate_retype;
+
+-- run
+
+-- Converged (no residual drift) and the rows survived the retype.
+diff schema decl_collate_retype;
+→ []
+
+select id, d from decl_collate_retype.t order by d;
+→ [{"id": 1, "d": "2024-01-01"}, {"id": 2, "d": "2024-02-01"}]
+
+-- Widening back: DATE → TEXT COLLATE NOCASE, retype first this time.
+declare schema decl_collate_retype using (default_vtab_module = 'memory') {
+	table t {
+		id INTEGER PRIMARY KEY,
+		d TEXT COLLATE NOCASE
+	}
+}
+
+-- run
+
+diff schema decl_collate_retype;
+→ [{"ddl": "ALTER TABLE decl_collate_retype.t ALTER COLUMN d SET DATA TYPE TEXT"}, {"ddl": "ALTER TABLE decl_collate_retype.t ALTER COLUMN d SET COLLATE NOCASE"}]
+
+apply schema decl_collate_retype;
+
+-- run
+
+diff schema decl_collate_retype;
+→ []
+
+select id, d from decl_collate_retype.t order by id;
+→ [{"id": 1, "d": "2024-01-01"}, {"id": 2, "d": "2024-02-01"}]
+
+drop table decl_collate_retype.t;
+
+-- run
+
+-- ---------------------------------------------------------------------------
+-- Views and materialized views in a NON-main declared schema. The apply must
+-- land both in the declared schema, their bodies must resolve their unqualified
+-- source names against that schema (independent of the session's schema path),
+-- and a re-diff immediately after apply must be empty.
+-- Ticket `bug-declared-materialized-view-non-main-schema`.
+declare schema nm_view_pol using (default_vtab_module = 'memory') {
+	table nt {
+		id INTEGER PRIMARY KEY,
+		x INTEGER
+	}
+
+	view nv as select id, x from nt
+
+	materialized view nmv as select id, x from nt
+}
+
+-- run
+
+apply schema nm_view_pol;
+
+-- run
+
+-- Converged immediately: the stored (unqualified) bodies match the declared ones.
+diff schema nm_view_pol;
+→ []
+
+insert into nm_view_pol.nt values (1, 10), (2, 20);
+
+-- The view body resolves `nt` in its home schema even though the session path is
+-- the default (`main, temp`).
+select * from nm_view_pol.nv order by id;
+→ [{"id": 1, "x": 10}, {"id": 2, "x": 20}]
+
+-- The MV was filled at apply and row-time maintained through the insert above.
+select * from nm_view_pol.nmv order by id;
+→ [{"id": 1, "x": 10}, {"id": 2, "x": 20}]
+
+-- run
+
+-- Refresh re-plans the body — still against the MV's home schema.
+refresh materialized view nm_view_pol.nmv;
+
+select * from nm_view_pol.nmv order by id;
+→ [{"id": 1, "x": 10}, {"id": 2, "x": 20}]
+
+-- Still converged after use.
+diff schema nm_view_pol;
+→ []
+
+drop materialized view nm_view_pol.nmv;
+drop view nm_view_pol.nv;
+drop table nm_view_pol.nt;
+
+-- run
+
+-- ---------------------------------------------------------------------------
+-- Assertion in a NON-main declared schema. The apply must land the assertion in
+-- the declared schema (not main), its body must resolve the unqualified table
+-- name against that schema, a re-diff immediately after apply must be empty,
+-- and a write to an unrelated main-schema table must still commit.
+-- Ticket `bug-declared-assertion-ignores-target-schema`.
+declare schema nm_assert_pol using (default_vtab_module = 'memory') {
+	table at_t {
+		id INTEGER PRIMARY KEY,
+		x INTEGER NOT NULL
+	}
+
+	assertion a1 check (not exists (select 1 from at_t where x < 0))
+}
+
+-- run
+
+apply schema nm_assert_pol;
+
+-- run
+
+-- Converged immediately: the assertion landed in its declared schema.
+diff schema nm_assert_pol;
+→ []
+
+-- The assertion lives in the declared schema, not main.
+select schema_name, name from assertion_info() where name = 'a1';
+→ [{"schema_name": "nm_assert_pol", "name": "a1"}]
+
+-- A conforming row commits (the body's unqualified `at_t` resolves in the
+-- assertion's home schema even though the session path is `main, temp`).
+insert into nm_assert_pol.at_t values (1, 10);
+
+select id, x from nm_assert_pol.at_t order by id;
+→ [{"id": 1, "x": 10}]
+
+-- run
+
+-- A violating row fails at commit.
+begin;
+insert into nm_assert_pol.at_t values (2, -5);
+commit;
+-- error: Integrity assertion failed: nm_assert_pol.a1
+
+select count(*) as cnt from nm_assert_pol.at_t;
+→ [{"cnt": 1}]
+
+-- An unrelated main-schema write still commits: compiling the non-main
+-- assertion at commit time no longer fails against the session path.
+create table nm_unrelated (id integer primary key);
+insert into nm_unrelated values (1);
+
+select id from nm_unrelated;
+→ [{"id": 1}]
+
+-- run
+
+-- Redeclare the schema WITHOUT the assertion: the diff emits a schema-qualified
+-- drop, and applying it removes the assertion from its home schema.
+declare schema nm_assert_pol using (default_vtab_module = 'memory') {
+	table at_t {
+		id INTEGER PRIMARY KEY,
+		x INTEGER NOT NULL
+	}
+}
+
+-- run
+
+diff schema nm_assert_pol;
+→ [{"ddl": "DROP ASSERTION IF EXISTS nm_assert_pol.a1"}]
+
+apply schema nm_assert_pol;
+
+-- run
+
+select count(*) as cnt from assertion_info() where name = 'a1';
+→ [{"cnt": 0}]
+
+diff schema nm_assert_pol;
+→ []
+
+drop table nm_unrelated;
+drop table nm_assert_pol.at_t;
+
+-- ===================================================================
+-- Seed-apply against a quoted (non-bare) schema name (ticket
+-- bug-seed-schema-name-not-quoted). The generated seed INSERT used to
+-- splice schemaName/tableName into the target unquoted, so any schema
+-- name needing quoting broke the apply. Two distinct failure shapes:
+-- a colon in the name reaches the parser as a bare token and derails
+-- statement parsing, while a name whose leading run looks like a broken
+-- number (e.g. "4ee6...") is rejected by the LEXER as a truncated
+-- scientific-notation literal before the parser ever sees it. Both are
+-- fixed by quoting the whole name. A table name needing quoting takes
+-- the same path (third block).
+-- ===================================================================
+
+-- Symptom 1: colon in the schema name, no digit-e-nondigit run.
+declare schema "scope:alpha" using (default_vtab_module = 'memory') {
+	table meta {
+		id INTEGER PRIMARY KEY,
+		label TEXT NOT NULL
+	}
+
+	seed meta (
+		(1, 'first')
+	)
+}
+
+-- run
+
+apply schema "scope:alpha" with seed;
+
+-- run
+
+select id, label from "scope:alpha".meta order by id;
+→ [{"id": 1, "label": "first"}]
+
+-- Idempotent reseed stays a no-op on the existing PK.
+apply schema "scope:alpha" with seed;
+
+-- run
+
+select id, label from "scope:alpha".meta order by id;
+→ [{"id": 1, "label": "first"}]
+
+drop table "scope:alpha".meta;
+
+-- Symptom 2: no colon, but a leading digit-e-nondigit run the lexer
+-- misreads as a truncated scientific-notation number literal. The
+-- leading digit is what makes the name non-bare: an interior run
+-- (item4ee6) is a valid identifier and never needed quoting.
+declare schema "4ee6item" using (default_vtab_module = 'memory') {
+	table meta {
+		id INTEGER PRIMARY KEY,
+		label TEXT NOT NULL
+	}
+
+	seed meta (
+		(1, 'first')
+	)
+}
+
+-- run
+
+apply schema "4ee6item" with seed;
+
+-- run
+
+select id, label from "4ee6item".meta order by id;
+→ [{"id": 1, "label": "first"}]
+
+apply schema "4ee6item" with seed;
+
+-- run
+
+select id, label from "4ee6item".meta order by id;
+→ [{"id": 1, "label": "first"}]
+
+drop table "4ee6item".meta;
+
+-- Both symptoms in one name (the shape the original report hit: a UUID
+-- suffix after a colon), plus a table name that itself needs quoting —
+-- the seed INSERT target quotes both halves.
+declare schema "recording:1fec5b46-014d-4e77-9dc1-b44df5513e88" using (default_vtab_module = 'memory') {
+	table "row data" {
+		id INTEGER PRIMARY KEY,
+		label TEXT NOT NULL
+	}
+
+	seed "row data" (
+		(1, 'first')
+	)
+}
+
+-- run
+
+apply schema "recording:1fec5b46-014d-4e77-9dc1-b44df5513e88" with seed;
+
+-- run
+
+select id, label from "recording:1fec5b46-014d-4e77-9dc1-b44df5513e88"."row data" order by id;
+→ [{"id": 1, "label": "first"}]
+
+drop table "recording:1fec5b46-014d-4e77-9dc1-b44df5513e88"."row data";

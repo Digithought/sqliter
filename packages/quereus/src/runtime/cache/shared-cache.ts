@@ -23,6 +23,13 @@ export interface SharedCacheConfig {
 	strategy: CacheStrategy;
 	/** Optional identifier for logging */
 	name?: string;
+	/**
+	 * When true, fully drain + commit the buffer before yielding any row, so a
+	 * short-circuiting consumer (e.g. IN early-exit) cannot abort the build.
+	 * Defaults to the streaming-first behaviour (yield each row as it arrives,
+	 * commit only after the source drains to completion).
+	 */
+	eager?: boolean;
 }
 
 /**
@@ -78,7 +85,39 @@ export async function* streamWithCache(
 		return;
 	}
 
-	// First time - pipeline results while building cache
+	// First time, eager mode - drain the source fully, commit, THEN yield.
+	// A consumer that breaks on the first row (e.g. IN early-exit) still causes
+	// the whole drain + commit here, so every later evaluation replays from cache
+	// instead of re-opening the source. The build cannot be short-circuited.
+	if (config.eager) {
+		log('Building %s cache eagerly (full drain before yield) with threshold %d', name, threshold);
+		const buffer: Row[] = [];
+		for await (const row of sourceIterable) {
+			if (buffer.length < threshold) {
+				// Deep copy to avoid reference issues (same as streaming path)
+				buffer.push([...row] as Row);
+			} else {
+				// Over threshold - abandon caching and stream the remainder straight
+				// through. The memory bound wins; later evals stream fresh.
+				log('%s eager cache threshold %d exceeded, abandoning cache and streaming through',
+					name, threshold);
+				state.cacheAbandoned = true;
+				for (const buffered of buffer) yield buffered;
+				yield row;
+				yield* sourceIterable;
+				return;
+			}
+		}
+		// Drained fully within threshold - commit before yielding any row.
+		// (If the source threw mid-drain we never reach here: nothing is committed
+		//  and cacheAbandoned stays false, so the next eval retries fresh.)
+		log('%s eager cache built successfully with %d rows', name, buffer.length);
+		state.cachedResult = buffer;
+		for (const row of buffer) yield [...row] as Row;
+		return;
+	}
+
+	// First time (streaming-first) - pipeline results while building cache
 	log('Building %s cache with threshold %d while pipelining', name, threshold);
 	let cache: Row[] | undefined = [];
 

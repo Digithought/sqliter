@@ -1,0 +1,148 @@
+-- 55.1-eviction-restrict-fk.sqllogic — a secondary-UNIQUE REPLACE eviction must enforce
+-- FK ON DELETE RESTRICT / NO ACTION, matching how a plain DELETE of the same parent row
+-- fails. Companion to 55-internal-eviction-reporting (which covers the CASCADE/SET NULL
+-- ACTIONS); this file covers the RESTRICT/NO ACTION PRE-CHECK that processEvictions
+-- previously skipped.
+
+PRAGMA foreign_keys = true;
+
+-- ===================================
+-- 1. INSERT-OR-REPLACE eviction of a RESTRICT parent must fail and leave data unchanged.
+-- ===================================
+
+create table p (id integer primary key, email text not null, unique (email));
+create table c (cid integer primary key, pid integer not null,
+                foreign key (pid) references p(id) on delete restrict);
+insert into p values (1, 'a@x');
+insert into c values (10, 1);
+
+-- evicts p(id=1) via the UNIQUE(email) conflict at a different PK -> RESTRICT child blocks it
+insert or replace into p values (2, 'a@x');
+-- error: constraint failed
+
+-- data unchanged: parent still id=1, child still references it
+select id, email from p order by id;
+→ [{"id":1,"email":"a@x"}]
+select cid, pid from c order by cid;
+→ [{"cid":10,"pid":1}]
+
+-- ===================================
+-- 2. Default ON DELETE (NO ACTION -> RESTRICT) child blocks the eviction too.
+-- ===================================
+
+create table p2 (id integer primary key, email text not null, unique (email));
+create table c2 (cid integer primary key, pid integer not null,
+                 foreign key (pid) references p2(id));
+insert into p2 values (1, 'b@x');
+insert into c2 values (10, 1);
+
+insert or replace into p2 values (2, 'b@x');
+-- error: constraint failed
+
+select id, email from p2 order by id;
+→ [{"id":1,"email":"b@x"}]
+select cid, pid from c2 order by cid;
+→ [{"cid":10,"pid":1}]
+
+-- ===================================
+-- 3. UPDATE-with-REPLACE-default move onto an occupied secondary-UNIQUE evicts a RESTRICT
+--    parent — must also fail.
+-- ===================================
+
+create table p3 (id integer primary key, email text not null, unique (email) on conflict replace);
+create table c3 (cid integer primary key, pid integer not null,
+                 foreign key (pid) references p3(id) on delete restrict);
+insert into p3 values (1, 'm@x'), (2, 'n@x');
+insert into c3 values (20, 2);
+
+-- moving id=1 onto email='n@x' would evict id=2, whose RESTRICT child blocks it
+update p3 set email = 'n@x' where id = 1;
+-- error: constraint failed
+
+select id, email from p3 order by id;
+→ [{"id":1,"email":"m@x"},{"id":2,"email":"n@x"}]
+select cid, pid from c3 order by cid;
+→ [{"cid":20,"pid":2}]
+
+-- ===================================
+-- 4. POSITIVE: eviction of a row whose children CASCADE still succeeds (guard vs over-blocking).
+-- ===================================
+
+create table p4 (id integer primary key, email text not null, unique (email));
+create table c4 (cid integer primary key, pid integer not null,
+                 foreign key (pid) references p4(id) on delete cascade);
+insert into p4 values (1, 'q@x');
+insert into c4 values (30, 1);
+
+insert or replace into p4 values (2, 'q@x');
+select id, email from p4 order by id;
+→ [{"id":2,"email":"q@x"}]
+select cid, pid from c4 order by cid;
+→ []
+
+-- ===================================
+-- 5. TRANSITIVE depth-2: eviction's CASCADE child has its own RESTRICT grandchild.
+--    The post-eviction scan recurses through the (not-yet-cascaded) child and the
+--    grandchild's RESTRICT blocks the whole statement. Proves the transitive walk —
+--    not just the direct scan — fires for evictions.
+-- ===================================
+
+create table p5 (id integer primary key, email text not null, unique (email));
+create table c5 (cid integer primary key, pid integer not null,
+                 foreign key (pid) references p5(id) on delete cascade);
+create table g5 (gid integer primary key, cid integer not null,
+                 foreign key (cid) references c5(cid) on delete restrict);
+insert into p5 values (1, 'r@x');
+insert into c5 values (40, 1);
+insert into g5 values (400, 40);
+
+-- evicting p5(id=1) would CASCADE-delete c5(40), but g5(400) RESTRICTs that -> whole statement fails
+insert or replace into p5 values (2, 'r@x');
+-- error: constraint failed
+
+-- nothing changed at any depth
+select id, email from p5 order by id;
+→ [{"id":1,"email":"r@x"}]
+select cid, pid from c5 order by cid;
+→ [{"cid":40,"pid":1}]
+select gid, cid from g5 order by gid;
+→ [{"gid":400,"cid":40}]
+
+-- POSITIVE companion: when the grandchild also CASCADEs, the depth-2 eviction succeeds.
+create table p6 (id integer primary key, email text not null, unique (email));
+create table c6 (cid integer primary key, pid integer not null,
+                 foreign key (pid) references p6(id) on delete cascade);
+create table g6 (gid integer primary key, cid integer not null,
+                 foreign key (cid) references c6(cid) on delete cascade);
+insert into p6 values (1, 's@x');
+insert into c6 values (50, 1);
+insert into g6 values (500, 50);
+
+insert or replace into p6 values (2, 's@x');
+select id, email from p6 order by id;
+→ [{"id":2,"email":"s@x"}]
+select cid, pid from c6 order by cid;
+→ []
+select gid, cid from g6 order by gid;
+→ []
+
+-- ===================================
+-- 6. MULTI-ROW statement atomicity: a RESTRICT-violating eviction in a multi-row INSERT
+--    unwinds the WHOLE statement (the prior, otherwise-valid row too), matching SQLite.
+-- ===================================
+
+create table p7 (id integer primary key, email text not null, unique (email));
+create table c7 (cid integer primary key, pid integer not null,
+                 foreign key (pid) references p7(id) on delete restrict);
+insert into p7 values (1, 't@x');
+insert into c7 values (60, 1);
+
+-- row (3,'u@x') is fine; row (2,'t@x') evicts the RESTRICTed id=1 -> entire statement rolls back
+insert or replace into p7 values (3, 'u@x'), (2, 't@x');
+-- error: constraint failed
+
+-- id=3 must NOT have been inserted (statement-scope unwind, not just the failing row)
+select id, email from p7 order by id;
+→ [{"id":1,"email":"t@x"}]
+select cid, pid from c7 order by cid;
+→ [{"cid":60,"pid":1}]

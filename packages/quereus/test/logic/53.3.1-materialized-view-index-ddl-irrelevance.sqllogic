@@ -1,0 +1,29 @@
+-- 53.3.1-materialized-view-index-ddl-irrelevance.sqllogic
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Carved out of 53.3-materialized-view-constraint-only-ddl: that file classifies which
+-- source DDL events force a materialized view to recompile, and it makes the same point
+-- with DROP / RENAME / ADD CONSTRAINT, ANALYZE and tag-only ALTER — none of which need
+-- index DDL. CREATE/DROP INDEX is one more example event in that list, so it lives here.
+--
+-- Subject: CREATE INDEX and DROP INDEX on the source are body-irrelevant — each fires
+-- table_modified, neither stales the MV, and the MV keeps tracking source rows across
+-- both.
+
+create table g2 (id integer primary key, v integer not null);
+insert into g2 values (1, 1);
+create materialized view mvg2 as select id, v from g2;
+
+create index ig2 on g2 (v);
+insert into g2 values (2, 2);
+select * from mvg2 order by id;
+→ [{"id":1,"v":1},{"id":2,"v":2}]
+
+drop index ig2;
+insert into g2 values (3, 3);
+select * from mvg2 order by id;
+→ [{"id":1,"v":1},{"id":2,"v":2},{"id":3,"v":3}]
+
+drop materialized view mvg2;
+drop table g2;

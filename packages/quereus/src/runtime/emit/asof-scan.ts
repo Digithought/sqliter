@@ -1,14 +1,16 @@
 import type { AsofScanNode } from '../../planner/nodes/asof-scan-node.js';
-import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import { emitPlanNode } from '../emitters.js';
 import type { Row } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { createLogger } from '../../common/logger.js';
 import { buildRowDescriptor } from '../../util/row-descriptor.js';
 import { createRowSlot } from '../context-helpers.js';
-import { compareSqlValuesFast, BINARY_COLLATION } from '../../util/comparison.js';
+import { compareSqlValuesFast } from '../../util/comparison.js';
 import type { CollationFunction } from '../../util/comparison.js';
-import { resolveKeyNormalizer, serializeRowKey } from '../../util/key-serializer.js';
+import { serializeRowKey } from '../../util/key-serializer.js';
+import { effectiveCollationOfTypes, hashKeyCollationName } from '../../planner/analysis/comparison-collation.js';
 import { joinOutputRow } from './join-output.js';
 
 const log = createLogger('runtime:emit:asof-scan');
@@ -51,8 +53,27 @@ function resolveSetup(plan: AsofScanNode, ctx: EmissionContext): AsofScanSetup {
 	if (leftMatchIdx === -1 || rightMatchIdx === -1) {
 		throw new Error(`AsofScan: could not resolve match-attr ids ${plan.matchAttr.leftAttrId}/${plan.matchAttr.rightAttrId}`);
 	}
-	const matchCollationName = leftAttrs[leftMatchIdx].type.collationName ?? rightAttrs[rightMatchIdx].type.collationName;
-	const matchCollation: CollationFunction = matchCollationName ? ctx.resolveCollation(matchCollationName) : BINARY_COLLATION;
+	// Resolve the match column's comparison collation through the shared provenance
+	// lattice (explicit > declared > default > BINARY), so a declared NOCASE on
+	// either side governs the asof match regardless of which side spells it. Throws
+	// on an explicit/declared conflict — a loud backstop. LOCKSTEP (merge strategy):
+	// the asof co-stream needs both inputs ordered under THIS collation;
+	// `rule-asof-strategy-select` validates the (collation-blind) physical ordering,
+	// sound only while both match attrs share their declared sort collation — the
+	// same alignment `equi-pair-extractor` enforces for merge join.
+	const matchCollationName = effectiveCollationOfTypes(leftAttrs[leftMatchIdx].type, rightAttrs[rightMatchIdx].type);
+	const matchCollation: CollationFunction = ctx.resolveCollation(matchCollationName);
+	// NOTE: AS OF match/partition compares are storage-class + collation, not
+	// semantic-ordering-aware. Correct for the canonical AS OF column types
+	// (DATE/DATETIME — canonical ISO text order IS their semantic order). A TIMESPAN
+	// or JSON match column would order by text here, disagreeing with `<`/ORDER BY.
+	// The equi-join rule (docs/types-ordering.md § "Semantic ordering": a physical key pair is
+	// admissible only when both sides agree on semantic ordering, else it demotes to
+	// the residual) does NOT apply here — AS OF has no residual to demote into, so a
+	// declining gate would only make the query unplannable. Fixing this means
+	// resolving a typed comparator for a same-type pair and rejecting the plan for a
+	// mixed one; tracked as
+	// `tickets/backlog/bug-asof-match-column-ignores-semantic-ordering`.
 
 	const leftPartitionIndices: number[] = [];
 	const rightPartitionIndices: number[] = [];
@@ -66,9 +87,15 @@ function resolveSetup(plan: AsofScanNode, ctx: EmissionContext): AsofScanSetup {
 		}
 		leftPartitionIndices.push(leftIdx);
 		rightPartitionIndices.push(rightIdx);
-		const collationName = leftAttrs[leftIdx].type.collationName ?? rightAttrs[rightIdx].type.collationName;
-		partitionCollations.push(collationName ? ctx.resolveCollation(collationName) : BINARY_COLLATION);
-		keyNormalizers.push(resolveKeyNormalizer(collationName));
+		// Same provenance-lattice resolution as the match column: a partition column
+		// declared NOCASE on either side groups case-variant keys together regardless
+		// of which side declares it; the comparator and the hash-bucket normalizer
+		// both key off the one resolved name so they cannot disagree.
+		const leftType = leftAttrs[leftIdx].type;
+		const rightType = rightAttrs[rightIdx].type;
+		const collationName = effectiveCollationOfTypes(leftType, rightType);
+		partitionCollations.push(ctx.resolveCollation(collationName));
+		keyNormalizers.push(ctx.resolveKeyNormalizer(hashKeyCollationName(collationName, [leftType, rightType])));
 	}
 
 	const rightOutputColumnIndices = plan.getRightOutputColumnIndices();
@@ -156,8 +183,8 @@ function emitAsofScanHash(plan: AsofScanNode, ctx: EmissionContext): Instruction
 		log('Starting %s asof scan [hash]: direction=%s, %d partition keys, strict=%s',
 			plan.outer ? 'LEFT' : 'INNER', direction, plan.partitionAttrs.length, strict);
 
-		const leftSlot = createRowSlot(rctx, leftRowDescriptor);
-		const rightSlot = createRowSlot(rctx, rightRowDescriptor);
+		const leftSlot = createRowSlot(rctx, leftRowDescriptor, `AsofScan#${plan.id}:left`);
+		const rightSlot = createRowSlot(rctx, rightRowDescriptor, `AsofScan#${plan.id}:right`);
 
 		try {
 			// Bucket right rows by partition key. Right rows with NULL match are dropped;
@@ -258,7 +285,7 @@ function emitAsofScanHash(plan: AsofScanNode, ctx: EmissionContext): Instruction
 
 	return {
 		params: [leftInstruction, rightInstruction],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `${plan.outer ? 'left' : 'inner'} asof scan [hash]${strict ? ' strict' : ''}`,
 	};
 }
@@ -362,8 +389,8 @@ function emitAsofScanMerge(plan: AsofScanNode, ctx: EmissionContext): Instructio
 		log('Starting %s asof scan [merge]: direction=%s, %d partition keys, strict=%s',
 			plan.outer ? 'LEFT' : 'INNER', direction, partitionLen, strict);
 
-		const leftSlot = createRowSlot(rctx, leftRowDescriptor);
-		const rightSlot = createRowSlot(rctx, rightRowDescriptor);
+		const leftSlot = createRowSlot(rctx, leftRowDescriptor, `AsofScan#${plan.id}:left`);
+		const rightSlot = createRowSlot(rctx, rightRowDescriptor, `AsofScan#${plan.id}:right`);
 
 		const leftIter = peekableAsyncIterator(leftSource);
 		const rightIter = peekableAsyncIterator(rightSource);
@@ -494,7 +521,7 @@ function emitAsofScanMerge(plan: AsofScanNode, ctx: EmissionContext): Instructio
 
 	return {
 		params: [leftInstruction, rightInstruction],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `${plan.outer ? 'left' : 'inner'} asof scan [merge]${strict ? ' strict' : ''}`,
 	};
 }

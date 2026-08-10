@@ -1,11 +1,13 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import type { PlanNode } from './nodes/plan-node.js';
+import { isRelationalNode } from './nodes/plan-node.js';
 import { safeJsonStringify } from '../util/serialization.js';
 import { astToString } from '../emit/ast-stringify.js';
 import type { Instruction, InstructionTracer } from '../runtime/types.js';
+import type { Scheduler } from '../runtime/scheduler.js';
 import type * as AST from '../parser/ast.js';
 import { quereusError } from '../common/errors.js';
 import { StatusCode } from '../common/types.js';
+import type { BaseType } from '../common/datatype.js';
 
 /**
  * Detailed information about a PlanNode for debugging purposes.
@@ -13,13 +15,13 @@ import { StatusCode } from '../common/types.js';
 export interface PlanNodeDebugInfo {
   id: string;
   nodeType: string;
-  type: any; // The result of getType()
+  type: BaseType; // The result of getType()
   estimatedCost: number;
   estimatedRows?: number;
   totalCost: number;
   children: PlanNodeDebugInfo[];
   relations: PlanNodeDebugInfo[];
-  properties: Record<string, any>; // Node-specific properties
+  properties: Record<string, unknown>; // Node-specific properties
 }
 
 /**
@@ -47,14 +49,14 @@ export interface SubProgramDebugInfo {
 /**
  * Checks if a value is an AST node
  */
-function isAstNode(value: any): value is AST.AstNode {
-	return value && typeof value === 'object' && 'type' in value && typeof value.type === 'string';
+function isAstNode(value: unknown): value is AST.AstNode {
+	return !!value && typeof value === 'object' && 'type' in value && typeof (value as { type: unknown }).type === 'string';
 }
 
 /**
  * Recursively processes a value, converting AST nodes to SQL strings
  */
-function processValue(value: any): any {
+function processValue(value: unknown): unknown {
 	if (value === null || value === undefined) {
 		return value;
 	}
@@ -80,7 +82,7 @@ function processValue(value: any): any {
 			return '[COMPLEX_OBJECT]';
 		}
 
-		const processed: Record<string, any> = {};
+		const processed: Record<string, unknown> = {};
 		for (const [key, val] of Object.entries(value)) {
 			try {
 				processed[key] = processValue(val);
@@ -105,7 +107,7 @@ export function serializePlanTree(rootNode: PlanNode): string {
 	rootNode.visit((node) => {
 		if (!nodeMap.has(node)) {
 			// Get node-specific properties by examining the node object
-			const properties: Record<string, any> = {};
+			const properties: Record<string, unknown> = {};
 
 			// Extract interesting properties from the node (excluding functions and circular refs)
 			for (const [key, value] of Object.entries(node)) {
@@ -135,7 +137,7 @@ export function serializePlanTree(rootNode: PlanNode): string {
 				nodeType: node.nodeType,
 				type: node.getType(),
 				estimatedCost: node.estimatedCost,
-				estimatedRows: (node as any).estimatedRows,
+				estimatedRows: isRelationalNode(node) ? node.estimatedRows : undefined,
 				totalCost: node.getTotalCost(),
 				children: [], // Will be filled in second pass
 				relations: [], // Will be filled in second pass
@@ -174,7 +176,7 @@ export function generateInstructionProgram(
   lines.push('=== INSTRUCTION PROGRAM ===');
   lines.push('');
 
-  const subProgramMap = new Map<number, { scheduler: any; parentIndex: number }>();
+  const subProgramMap = new Map<number, { scheduler: Scheduler; parentIndex: number }>();
   let nextSubProgramId = 0;
 
   for (let i = 0; i < instructions.length; i++) {
@@ -338,6 +340,11 @@ export function formatPlanTree(rootNode: PlanNode, options: PlanDisplayOptions =
 	const lines: string[] = [];
 	const nodesSeen = new Set<PlanNode>();
 
+	// NOTE: recursive tree-walk (also formatPlanSummary/collectPath below). Unlike
+	// the read-time accessors (physical/getTotalCost/visit), this is diagnostic-only
+	// (EXPLAIN / plan display), so a deep plan is not on the query hot path. If plan
+	// formatting ever needs to run on arbitrarily deep plans, convert to an explicit
+	// worklist like PlanNode.computePostOrder / visit.
 	function formatNode(node: PlanNode, depth: number, isLast: boolean, prefix: string): void {
 		if (maxDepth !== undefined && depth > maxDepth) {
 			return;
@@ -373,14 +380,14 @@ export function formatPlanTree(rootNode: PlanNode, options: PlanDisplayOptions =
 		}
 
 		// Add physical properties if requested and available
-		if (showPhysical && (node as any).physical) {
-			const physical = (node as any).physical;
+		if (showPhysical && node.physical) {
+			const physical = node.physical;
 			const physicalInfo = [];
 			if (physical.estimatedRows !== undefined) {
 				physicalInfo.push(`rows: ${physical.estimatedRows}`);
 			}
 			if (physical.ordering && physical.ordering.length > 0) {
-				physicalInfo.push(`ordered: ${physical.ordering.map((o: any) => `${o.column}${o.desc ? ' desc' : ' asc'}`).join(',')}`);
+				physicalInfo.push(`ordered: ${physical.ordering.map(o => `${o.column}${o.desc ? ' desc' : ' asc'}`).join(',')}`);
 			}
 			if (physical.readonly !== undefined) {
 				physicalInfo.push(`readonly: ${physical.readonly}`);

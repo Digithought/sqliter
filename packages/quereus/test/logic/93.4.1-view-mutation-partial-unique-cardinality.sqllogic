@@ -1,0 +1,31 @@
+-- 93.4.1-view-mutation-partial-unique-cardinality.sqllogic
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Carved out of 93.4-view-mutation: that ~4400-line file is multi-source view
+-- write-through, and this was its only index DDL. A PARTIAL unique key has no
+-- declarative spelling in this engine — `create unique index … where …` is the only
+-- way to express one — so this adversarial case is the file's single dependency on
+-- standalone index DDL.
+--
+-- Subject: a cross-source `set` whose partner's only unique key on the join column is a
+-- PARTIAL unique index is REJECTED at plan time. A partial unique key bounds uniqueness
+-- only within its predicate scope, so it cannot prove the owner joins at most one
+-- partner. Here xs1pp_p has TWO rows with pcode=500 (one, pv=-5, outside the partial
+-- scope pv>0), so the child cid=1 genuinely joins both parents — the proof correctly
+-- fails and the write is rejected at plan time rather than failing at runtime with
+-- "more than one row". The non-partial (plain UNIQUE column) counterpart it contrasts
+-- with stays in 93.4.
+
+create table xs1pp_p (pid integer primary key, pcode integer, pv integer);
+create table xs1pp_c (cid integer primary key, cref integer, cv integer);
+create unique index xs1pp_ux on xs1pp_p(pcode) where pv > 0;
+insert into xs1pp_p values (10, 500, 100), (20, 500, -5);
+insert into xs1pp_c values (1, 500, 1);
+create view xs1pp_v as
+    select c.cid as cid, c.cv as cv, p.pv as pv
+    from xs1pp_c c join xs1pp_p p on p.pcode = c.cref;
+update xs1pp_v set cv = pv where cid = 1;
+-- error: assigned side joins more than one
+select cid, cv from xs1pp_c order by cid;
+→ [{"cid":1,"cv":1}]

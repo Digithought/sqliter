@@ -1,0 +1,115 @@
+-- 07.7.2-scalar-agg-decorrelation-nested.sqllogic
+-- Scalar-aggregate subqueries nested inside other aggregate subqueries
+-- (parent → child → grandchild JSON trees) are decorrelated level by level:
+-- the Project-site rule (scalar-agg-decorrelation) rewrites the outer level,
+-- and the aggregate-argument site (scalar-agg-decorrelation-aggregate) then
+-- rewrites the subquery that lands inside the new grouped aggregate's
+-- argument. These tests pin the observable semantics of the fully set-based
+-- shapes and of the shapes that must stay (partially) correlated.
+
+-- Setup: the 3-table hierarchy from the motivating perf report — log entries
+-- → items on an entry (via a join table) → per-(entry, item) quantifier
+-- values (joined to their quantifier definitions).
+CREATE TABLE e (id INTEGER PRIMARY KEY, name TEXT);
+CREATE TABLE lei (entry_id INTEGER, item_id INTEGER, PRIMARY KEY (entry_id, item_id));
+CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT);
+CREATE TABLE qv (entry_id INTEGER, item_id INTEGER, quantifier_id INTEGER, value REAL, PRIMARY KEY (entry_id, item_id, quantifier_id));
+CREATE TABLE q (id INTEGER PRIMARY KEY, name TEXT);
+
+INSERT INTO e VALUES (1,'a'),(2,'b'),(3,'empty');
+INSERT INTO items VALUES (10,'i10'),(11,'i11'),(12,'i12');
+-- entry 3 has no items; item 11 (on entry 1) has no quantifier values
+INSERT INTO lei VALUES (1,10),(1,11),(2,12);
+INSERT INTO q VALUES (100,'qa'),(101,'qb');
+INSERT INTO qv VALUES (1,10,100,1.5),(1,10,101,2.5),(2,12,100,9.0);
+
+-- The motivating 2-level query: json_group_array(json_object(...)) at both
+-- levels, level-2 correlation spanning two ancestor levels (e.id and i.id).
+-- An item with no quantifier values gets NULL (json_group_array over a
+-- zero-row scalar-subquery group — same as the correlated baseline); an entry
+-- with no items gets NULL at level 1 and level 2 never evaluates.
+select e.id,
+  (select json_group_array(json_object(
+     'itemId', i.id,
+     'quantifiers', (
+        select json_group_array(json_object('id', q.id, 'value', qv.value))
+        from qv join q on q.id = qv.quantifier_id
+        where qv.entry_id = e.id and qv.item_id = i.id)))
+   from lei join items i on i.id = lei.item_id
+   where lei.entry_id = e.id) as items
+from e order by e.id;
+→ [{"id":1,"items":[{"itemId":10,"quantifiers":[{"id":100,"value":1.5},{"id":101,"value":2.5}]},{"itemId":11,"quantifiers":null}]},{"id":2,"items":[{"itemId":12,"quantifiers":[{"id":100,"value":9}]}]},{"id":3,"items":null}]
+
+-- Nested count inside sum: non-NULL empty value (count → 0) at level 2 needs
+-- the join-miss CASE marker below the level-1 aggregate; entry 3 (no items)
+-- sums over zero rows → NULL.
+select e.id,
+  (select sum((select count(*) from qv where qv.entry_id = e.id and qv.item_id = i.id))
+   from lei join items i on i.id = lei.item_id
+   where lei.entry_id = e.id) as total
+from e order by e.id;
+→ [{"id":1,"total":2},{"id":2,"total":1},{"id":3,"total":null}]
+
+-- Three levels of nesting: the rewrite converges level by level.
+CREATE TABLE tags (quantifier_id INTEGER, tag TEXT, PRIMARY KEY (quantifier_id, tag));
+INSERT INTO tags VALUES (100,'t1'),(100,'t2');
+select e.id,
+  (select json_group_array(json_object(
+     'itemId', i.id,
+     'quantifiers', (
+        select json_group_array(json_object('qid', qv.quantifier_id,
+          'tags', (select json_group_array(t.tag) from tags t where t.quantifier_id = qv.quantifier_id)))
+        from qv
+        where qv.entry_id = e.id and qv.item_id = i.id)))
+   from lei join items i on i.id = lei.item_id
+   where lei.entry_id = e.id) as items
+from e order by e.id;
+→ [{"id":1,"items":[{"itemId":10,"quantifiers":[{"qid":100,"tags":["t1","t2"]},{"qid":101,"tags":null}]},{"itemId":11,"quantifiers":null}]},{"id":2,"items":[{"itemId":12,"quantifiers":[{"qid":100,"tags":["t1","t2"]}]}]},{"id":3,"items":null}]
+
+-- DISTINCT aggregate at level 2: the at-most-one join adds no duplicate rows,
+-- so the distinct set is unchanged.
+select e.id,
+  (select json_group_array((select count(distinct qv.quantifier_id) from qv where qv.entry_id = e.id and qv.item_id = i.id))
+   from lei join items i on i.id = lei.item_id
+   where lei.entry_id = e.id) as d
+from e order by e.id;
+→ [{"id":1,"d":[2,0]},{"id":2,"d":[1]},{"id":3,"d":null}]
+
+-- Sibling subqueries inside one aggregate argument: each gets its own join.
+select lei.entry_id, json_group_array(
+   (select count(*) from qv where qv.entry_id = lei.entry_id and qv.item_id = lei.item_id)
+ + (select total(qv.value) from qv where qv.entry_id = lei.entry_id and qv.item_id = lei.item_id)) as j
+from lei group by lei.entry_id order by lei.entry_id;
+→ [{"entry_id":1,"j":[6,0]},{"entry_id":2,"j":[10]}]
+
+-- The aggregate-argument site also fires on a top-level (user-written)
+-- GROUP BY aggregate — not only on nested subqueries.
+select lei.entry_id, json_group_array((select count(*) from qv where qv.entry_id = lei.entry_id and qv.item_id = lei.item_id)) as j
+from lei group by lei.entry_id order by lei.entry_id;
+→ [{"entry_id":1,"j":[2,0]},{"entry_id":2,"j":[1]}]
+
+-- HAVING evaluates against the (attribute-id-preserved) aggregate output and
+-- is undisturbed by the join inserted below the aggregate.
+select lei.entry_id, sum((select count(*) from qv where qv.entry_id = lei.entry_id and qv.item_id = lei.item_id)) as s
+from lei group by lei.entry_id having count(*) > 1 order by lei.entry_id;
+→ [{"entry_id":1,"s":2}]
+
+-- Correlated aggregate subquery as a GROUP BY expression (pathological but
+-- supported: group-by expressions are per-source-row scalar trees too).
+select (select count(*) from qv where qv.entry_id = lei.entry_id) as g, count(*) as n
+from lei group by 1 order by g;
+→ [{"g":1,"n":1},{"g":2,"n":2}]
+
+-- Remap-bailed level 1: the NOCASE correlation cannot justify remapping
+-- en.name (referenced in the aggregate argument) to ln.ename, so level 1
+-- stays correlated — and both levels stay correct.
+CREATE TABLE en (name TEXT PRIMARY KEY COLLATE NOCASE);
+CREATE TABLE ln (ename TEXT COLLATE NOCASE, item_id INTEGER, PRIMARY KEY (ename, item_id));
+INSERT INTO en VALUES ('A'),('b');
+INSERT INTO ln VALUES ('a',10),('A',11),('B',12);
+select en.name,
+  (select json_group_array(json_object('n', en.name, 'item', ln.item_id,
+     'cnt', (select count(*) from qv where qv.entry_id = 1 and qv.item_id = ln.item_id)))
+   from ln where ln.ename = en.name) as j
+from en order by en.name;
+→ [{"name":"A","j":[{"n":"A","item":10,"cnt":2},{"n":"A","item":11,"cnt":0}]},{"name":"b","j":[{"n":"b","item":12,"cnt":0}]}]

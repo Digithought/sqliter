@@ -1,0 +1,483 @@
+-- 53.2-materialized-view-rename-propagation.sqllogic — ALTER TABLE/COLUMN RENAME
+-- rewrites a dependent materialized view's body in place, exactly as it rewrites a
+-- plain view's ("MV ≡ faster view"): sourceTables/bodyHash/DDL are re-keyed,
+-- row-time maintenance re-registers against the renamed catalog, and the MV stays
+-- LIVE — writes to the renamed source keep propagating and REFRESH keeps working.
+-- A column rename additionally carries a shifted output name onto the backing
+-- table (bare passthrough projections expose the NEW name, plain-view parity).
+-- An MV the rename provably does NOT affect — an unreferenced column rename, a
+-- constraint-only rewrite of another source, a `select *` pure name shift — is
+-- restored after the statement rather than left silently stale (§10–§13).
+
+-- ===================================
+-- 1. RENAME TABLE: dependent MV stays live
+-- ===================================
+
+create table t (id integer primary key, v integer not null);
+insert into t values (1, 10);
+create materialized view mv1 as select id, v from t;
+
+select * from mv1 order by id;
+→ [{"id":1,"v":10}]
+
+alter table t rename to t2;
+
+-- the MV still reads (body re-keyed to t2, backing untouched)
+select * from mv1 order by id;
+→ [{"id":1,"v":10}]
+
+-- row-time maintenance re-registered under the NEW base: writes propagate
+insert into t2 values (2, 20);
+select * from mv1 order by id;
+→ [{"id":1,"v":10},{"id":2,"v":20}]
+
+update t2 set v = 21 where id = 2;
+select * from mv1 order by id;
+→ [{"id":1,"v":10},{"id":2,"v":21}]
+
+-- REFRESH resolves the new name (errored "Table 't' not found" before the fix)
+refresh materialized view mv1;
+select * from mv1 order by id;
+→ [{"id":1,"v":10},{"id":2,"v":21}]
+
+drop materialized view mv1;
+drop table t2;
+
+-- ===================================
+-- 2. RENAME COLUMN: MV stays live and exposes the NEW column name
+-- ===================================
+
+create table s (id integer primary key, v integer not null);
+insert into s values (1, 10);
+create materialized view mv2 as select id, v from s;
+
+alter table s rename column v to w;
+
+-- bare passthrough projection: the MV's exposed name follows the rename
+select id, w from mv2 order by id;
+→ [{"id":1,"w":10}]
+
+-- the old name is gone (plain-view parity)
+select v from mv2;
+-- error: column not found
+
+-- still live: writes maintain under the new name
+insert into s values (2, 20);
+select id, w from mv2 order by id;
+→ [{"id":1,"w":10},{"id":2,"w":20}]
+
+refresh materialized view mv2;
+select id, w from mv2 order by id;
+→ [{"id":1,"w":10},{"id":2,"w":20}]
+
+drop materialized view mv2;
+drop table s;
+
+-- ===================================
+-- 3. RENAME COLUMN behind an explicit column list: output names pinned
+-- ===================================
+
+create table e (id integer primary key, v integer not null);
+insert into e values (1, 1);
+create materialized view mv3 (a, b) as select id, v from e;
+
+alter table e rename column v to w;
+
+-- declared interface unchanged; MV still live
+select a, b from mv3 order by a;
+→ [{"a":1,"b":1}]
+
+insert into e values (2, 2);
+select a, b from mv3 order by a;
+→ [{"a":1,"b":1},{"a":2,"b":2}]
+
+drop materialized view mv3;
+drop table e;
+
+-- ===================================
+-- 4. RENAME COLUMN behind an expression alias: output name pinned
+-- ===================================
+
+create table f (id integer primary key, v integer not null);
+insert into f values (1, 5);
+create materialized view mv4 as select id, v * 2 as dbl from f;
+
+alter table f rename column v to w;
+
+select id, dbl from mv4 order by id;
+→ [{"id":1,"dbl":10}]
+
+insert into f values (2, 7);
+select id, dbl from mv4 order by id;
+→ [{"id":1,"dbl":10},{"id":2,"dbl":14}]
+
+drop materialized view mv4;
+drop table f;
+
+-- ===================================
+-- 5. MV-over-MV, base TABLE rename: both stay live, writes cascade
+-- ===================================
+
+create table b (id integer primary key, v integer not null);
+insert into b values (1, 10);
+create materialized view m1 as select id, v from b;
+create materialized view m2 as select id, v from m1;
+
+alter table b rename to b2;
+
+select * from m2 order by id;
+→ [{"id":1,"v":10}]
+
+-- write to the renamed base cascades m1 → m2 through the chain
+insert into b2 values (2, 20);
+select * from m1 order by id;
+→ [{"id":1,"v":10},{"id":2,"v":20}]
+select * from m2 order by id;
+→ [{"id":1,"v":10},{"id":2,"v":20}]
+
+drop materialized view m2;
+drop materialized view m1;
+drop table b2;
+
+-- ===================================
+-- 6. MV-over-MV, source COLUMN rename flowing into n1's exposed name:
+--    the rename CASCADES — n1's shifted output name re-runs the propagation
+--    with n1 as the target, so n2's body (which references the OLD output
+--    name) is rewritten in a second round and BOTH stay live. (Before the
+--    cascade n2 was left stale with the staleness diagnostic on read.)
+-- ===================================
+
+create table c (id integer primary key, v integer not null);
+insert into c values (1, 10);
+create materialized view n1 as select id, v from c;
+create materialized view n2 as select id, v from n1;
+
+alter table c rename column v to w;
+
+-- n1 stays live under the new name
+select id, w from n1 order by id;
+→ [{"id":1,"w":10}]
+insert into c values (2, 20);
+select id, w from n1 order by id;
+→ [{"id":1,"w":10},{"id":2,"w":20}]
+
+-- n2 followed the shifted name: live, maintained through the chain
+select id, w from n2 order by id;
+→ [{"id":1,"w":10},{"id":2,"w":20}]
+
+-- REFRESH re-plans the rewritten body against n1's renamed backing
+refresh materialized view n2;
+select id, w from n2 order by id;
+→ [{"id":1,"w":10},{"id":2,"w":20}]
+
+drop materialized view n2;
+drop materialized view n1;
+drop table c;
+
+-- ===================================
+-- 7. RENAME COLUMN rewrites an MV's `with defaults` clause (clause-only:
+--    the body does not project the defaulted column)
+-- ===================================
+-- Pre-fix the propagation `continue`d when the body AST didn't change, so the
+-- clause kept the old name and write-through errored
+-- "'with defaults (created = …)' names column 'created'".
+
+create table g (id integer primary key, name text, created integer not null);
+create materialized view mv7 as select id, name from g with defaults (created = 55);
+
+alter table g rename column created to created_at;
+
+-- write-through resolves the rewritten clause target
+insert into mv7 values (1, 'y');
+
+select id, name, created_at from g;
+→ [{"id":1,"name":"y","created_at":55}]
+
+-- the MV stayed live: the write landed in the backing too
+select id, name from mv7 order by id;
+→ [{"id":1,"name":"y"}]
+
+drop materialized view mv7;
+drop table g;
+
+-- ===================================
+-- 8. RENAME COLUMN hitting both an MV's body and its `with defaults` clause
+-- ===================================
+-- The defaulted column is also a bare passthrough projection: the rename
+-- shifts the backing output name (body change) AND rewrites the clause target.
+
+create table h (id integer primary key, v integer not null);
+create materialized view mv8 as select id, v from h with defaults (v = 9);
+
+alter table h rename column v to w;
+
+insert into mv8 (id) values (1);
+
+select id, w from h;
+→ [{"id":1,"w":9}]
+
+select id, w from mv8 order by id;
+→ [{"id":1,"w":9}]
+
+drop materialized view mv8;
+drop table h;
+
+-- ===================================
+-- 9. RENAME TO of a table referenced inside an MV's `with defaults` expr
+--    subquery (clause-only: the body reads a different table)
+-- ===================================
+
+create table aud (c integer primary key);
+insert into aud values (3);
+
+create table k (id integer primary key, ts integer not null);
+create materialized view mv9 as select id from k with defaults (ts = (select max(c) from aud));
+
+alter table aud rename to aud2;
+
+insert into mv9 values (4);
+
+select id, ts from k;
+→ [{"id":4,"ts":3}]
+
+select id from mv9 order by id;
+→ [{"id":4}]
+
+drop materialized view mv9;
+drop table k;
+drop table aud2;
+
+-- ===================================
+-- 10. RENAME COLUMN the MV body never references: provably unaffected — the MV
+--     is restored after the statement (writes keep propagating, REFRESH keeps
+--     working). Pre-fix it was left silently stale: reads served the
+--     unmaintained backing and the insert below never appeared.
+-- ===================================
+
+create table ru (id integer primary key, v integer not null, u integer not null);
+insert into ru values (1, 10, 100);
+create materialized view mv10 as select id, u from ru;
+
+alter table ru rename column v to w;
+
+-- still live: the write propagates
+insert into ru values (2, 20, 200);
+select id, u from mv10 order by id;
+→ [{"id":1,"u":100},{"id":2,"u":200}]
+
+-- REFRESH keeps working after the restore
+refresh materialized view mv10;
+select id, u from mv10 order by id;
+→ [{"id":1,"u":100},{"id":2,"u":200}]
+
+drop materialized view mv10;
+drop table ru;
+
+-- ===================================
+-- 11. RENAME TABLE whose only effect on another source is a constraint rewrite
+--     (FK `references` target): the other source's dependent MV is provably
+--     unaffected and is restored. Pre-fix the FK rewrite's table_modified marked
+--     it stale and the MV loop skipped it (AST unchanged, sourceTables lacks the
+--     renamed base) → silently stale.
+-- ===================================
+
+create table rp (id integer primary key);
+create table rc (id integer primary key, tid integer references rp (id));
+create materialized view mv11 as select id, tid from rc;
+
+alter table rp rename to rp2;
+
+insert into rp2 values (1);
+insert into rc values (2, 1);
+select id from mv11;
+→ [{"id":2}]
+
+refresh materialized view mv11;
+select id, tid from mv11 order by id;
+→ [{"id":2,"tid":1}]
+
+drop materialized view mv11;
+drop table rc;
+drop table rp2;
+
+-- ===================================
+-- 12. RENAME COLUMN under a `select *` body: the AST is unchanged but the body's
+--     output is a pure name shift — the restoration pass carries the new name
+--     onto the backing and the MV stays live. Pre-fix it was left silently stale
+--     under the OLD column name.
+-- ===================================
+
+create table rs (id integer primary key, v integer not null);
+insert into rs values (1, 10);
+create materialized view mv12 as select * from rs;
+
+alter table rs rename column v to w;
+
+-- the exposed name follows the rename
+select id, w from mv12 order by id;
+→ [{"id":1,"w":10}]
+
+-- the old name is gone (plain-view parity)
+select v from mv12;
+-- error: column not found
+
+-- still live: writes maintain under the new name
+insert into rs values (2, 20);
+select id, w from mv12 order by id;
+→ [{"id":1,"w":10},{"id":2,"w":20}]
+
+refresh materialized view mv12;
+select id, w from mv12 order by id;
+→ [{"id":1,"w":10},{"id":2,"w":20}]
+
+drop materialized view mv12;
+drop table rs;
+
+-- ===================================
+-- 13. Chained MVs under the restoration pass: the `select *` producer's restore
+--     renames its backing column, whose table_modified re-marks the consumer
+--     stale MID-pass; the consumer is examined after the producer (creation
+--     order) and — referencing only the unshifted column — is itself restored.
+--     The whole chain stays live.
+-- ===================================
+
+create table cs (id integer primary key, v integer not null);
+insert into cs values (1, 10);
+create materialized view mv13p as select * from cs;
+create materialized view mv13c as select id from mv13p;
+
+alter table cs rename column v to w;
+
+-- both live: a write to the base cascades producer → consumer
+insert into cs values (2, 20);
+select id, w from mv13p order by id;
+→ [{"id":1,"w":10},{"id":2,"w":20}]
+select id from mv13c order by id;
+→ [{"id":1},{"id":2}]
+
+refresh materialized view mv13c;
+select id from mv13c order by id;
+→ [{"id":1},{"id":2}]
+
+drop materialized view mv13c;
+drop materialized view mv13p;
+drop table cs;
+
+-- ===================================
+-- 14. A materialized view in ANOTHER schema follows the rename and stays LIVE
+-- ===================================
+-- The MV loop used to run only while iterating the renamed table's own schema,
+-- so an MV in `temp` over `main.t` was never re-keyed: its body kept naming the
+-- vanished table, its `sourceTables` kept the old base, and the rename's
+-- `table_modified` left it stale with row-time maintenance detached. Every
+-- schema is walked now.
+
+create table main.xsrc (id integer primary key, v integer not null);
+insert into main.xsrc values (1, 10);
+create materialized view temp.mv14 as select id, v from main.xsrc;
+
+alter table main.xsrc rename to xsrc2;
+
+-- Live, not stale: a write to the renamed base still cascades (a stale MV would
+-- serve the unmaintained backing and never see row 2).
+insert into main.xsrc2 values (2, 20);
+select id, v from temp.mv14 order by id;
+→ [{"id":1,"v":10},{"id":2,"v":20}]
+
+-- REFRESH re-plans the rewritten body against the renamed catalog.
+refresh materialized view temp.mv14;
+select id, v from temp.mv14 order by id;
+→ [{"id":1,"v":10},{"id":2,"v":20}]
+
+-- Column verb, same cross-schema MV.
+alter table main.xsrc2 rename column v to w;
+
+insert into main.xsrc2 values (3, 30);
+select id, w from temp.mv14 order by id;
+→ [{"id":1,"w":10},{"id":2,"w":20},{"id":3,"w":30}]
+
+refresh materialized view temp.mv14;
+select id, w from temp.mv14 order by id;
+→ [{"id":1,"w":10},{"id":2,"w":20},{"id":3,"w":30}]
+
+drop materialized view temp.mv14;
+drop table main.xsrc2;
+
+-- ===================================
+-- 15. The cascade reaches READERS of a materialized view whose names shifted
+-- ===================================
+-- A bare-passthrough MV republishes the renamed column under the new name
+-- (its backing columns follow the body's output names), so a plain view
+-- reading the MV is one level further out and must be rewritten too.
+
+create table t15 (id integer primary key, x integer);
+insert into t15 values (1, 4);
+create materialized view mv15 as select id, x from t15;
+create view v15 as select id, x from mv15;
+
+alter table t15 rename column x to y;
+
+select id, y from v15;
+→ [{"id":1,"y":4}]
+
+-- the MV is still live: writes keep maintaining, through to the outer view
+insert into t15 values (2, 6);
+select id, y from v15 order by id;
+→ [{"id":1,"y":4},{"id":2,"y":6}]
+
+refresh materialized view mv15;
+select id, y from v15 order by id;
+→ [{"id":1,"y":4},{"id":2,"y":6}]
+
+drop view v15;
+drop materialized view mv15;
+drop table t15;
+
+-- ===================================
+-- 16. An MV OVER a view whose published names shifted follows in round two
+-- ===================================
+-- Round 1 rewrites the plain view's body (x → y); the MV reads the VIEW, so
+-- only the second round — with the view as the rename target — reaches its
+-- body. Its backing column follows and it stays live.
+
+create table t16 (id integer primary key, x integer);
+insert into t16 values (1, 9);
+create view v16 as select id, x from t16;
+create materialized view mv16 as select id, x from v16;
+
+alter table t16 rename column x to y;
+
+select id, y from mv16;
+→ [{"id":1,"y":9}]
+
+insert into t16 values (2, 11);
+select id, y from mv16 order by id;
+→ [{"id":1,"y":9},{"id":2,"y":11}]
+
+refresh materialized view mv16;
+select id, y from mv16 order by id;
+→ [{"id":1,"y":9},{"id":2,"y":11}]
+
+drop materialized view mv16;
+drop view v16;
+drop table t16;
+
+-- ===================================
+-- 17. Published-name collision on an MV refuses the rename up front
+-- ===================================
+-- Mirror of the plain-view refusal: the MV republishes the renamed column
+-- bare AND already publishes its own `y`, so the rename is refused before any
+-- side effect and everything keeps reading under the old names.
+
+create table t17 (id integer primary key, x integer);
+insert into t17 values (1, 3);
+create materialized view mv17 as select id, x, id + 1 as y from t17;
+
+alter table t17 rename column x to y;
+-- error: already publishes a column named 'y'
+
+select id, x, y from mv17;
+→ [{"id":1,"x":3,"y":2}]
+
+drop materialized view mv17;
+drop table t17;

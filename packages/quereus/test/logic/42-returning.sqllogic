@@ -14,14 +14,14 @@ INSERT INTO test_returning (id, name) VALUES (101, 'first') RETURNING id, name, 
 → [{"id":101,"name":"first","value":100}]
 
 INSERT INTO test_returning (id, name, value) VALUES (102, 'second', 200) RETURNING *;
--- error: RETURNING * not yet supported
+→ [{"id":102,"name":"second","value":200}]
 
 INSERT INTO test_returning (id, name, value) VALUES (103, 'third', 300) RETURNING id, name;
 → [{"id":103,"name":"third"}]
 
--- Verify data was actually inserted
+-- Verify data was actually inserted (102 was inserted via RETURNING * above)
 SELECT * FROM test_returning ORDER BY id;
-→ [{"id":101,"name":"first","value":100},{"id":103,"name":"third","value":300}]
+→ [{"id":101,"name":"first","value":100},{"id":102,"name":"second","value":200},{"id":103,"name":"third","value":300}]
 
 -- UPDATE with RETURNING
 UPDATE test_returning SET value = value + 50 WHERE id = 101 RETURNING id, name, value;
@@ -29,19 +29,19 @@ UPDATE test_returning SET value = value + 50 WHERE id = 101 RETURNING id, name, 
 
 -- UPDATE multiple rows with RETURNING
 UPDATE test_returning SET name = name || '_updated' RETURNING id, name;
-→ [{"id":101,"name":"first_updated"},{"id":103,"name":"third_updated"}]
+→ [{"id":101,"name":"first_updated"},{"id":102,"name":"second_updated"},{"id":103,"name":"third_updated"}]
 
 -- Verify updates were applied
 SELECT * FROM test_returning ORDER BY id;
-→ [{"id":101,"name":"first_updated","value":150},{"id":103,"name":"third_updated","value":300}]
+→ [{"id":101,"name":"first_updated","value":150},{"id":102,"name":"second_updated","value":200},{"id":103,"name":"third_updated","value":300}]
 
 -- DELETE with RETURNING
 DELETE FROM test_returning WHERE id = 103 RETURNING id, name, value;
 → [{"id":103,"name":"third_updated","value":300}]
 
--- Verify deletion
-SELECT * FROM test_returning;
-→ [{"id":101,"name":"first_updated","value":150}]
+-- Verify deletion (102 remains; only 103 was deleted)
+SELECT * FROM test_returning ORDER BY id;
+→ [{"id":101,"name":"first_updated","value":150},{"id":102,"name":"second_updated","value":200}]
 
 -- === RETURNING with expressions ===
 

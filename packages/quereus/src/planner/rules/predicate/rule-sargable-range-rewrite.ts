@@ -127,7 +127,18 @@ function makeComparison(
 	return new BinaryOpNode(scope, ast, colRef, literal);
 }
 
-/** Strip a planner-inserted CastNode wrapper. */
+/**
+ * Strip a planner-inserted CastNode wrapper.
+ *
+ * NOTE: this strips a *converting* cast too, so `getLiteralValue` below would
+ * yield the pre-cast value for `cast(1 as text)` — the same defect fixed in
+ * `constraint-extractor.ts`'s `unwrapCast` (ticket
+ * `bug-cast-stripped-from-seek-constraints`). It is dormant here because
+ * constant folding collapses a cast over a literal before this rule runs, and
+ * because the column side never reaches this helper: the rule calls
+ * `candidateSide.rangeRewriteIn(...)`, which a CastNode declines. If either
+ * assumption stops holding, gate on `isNoOpCast` as that file does.
+ */
 function unwrapCast(node: ScalarPlanNode): ScalarPlanNode {
 	return node.nodeType === PlanNodeType.Cast ? (node as CastNode).operand : node;
 }

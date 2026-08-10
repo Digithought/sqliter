@@ -12,6 +12,8 @@ export interface SchemaChangeEvent {
   objectType: 'table' | 'index';
   schemaName: string;
   objectName: string;
+  /** `RENAME TO` only: the table name before the rename (`objectName` carries the new one). */
+  oldObjectName?: string;
   ddl?: string;
   /** True if this event originated from sync (remote replica) or cross-tab. */
   remote?: boolean;
@@ -19,12 +21,16 @@ export interface SchemaChangeEvent {
 
 /**
  * Data change event types.
+ *
+ * Producers owe the engine's key contract (`docs/usage.md` § Subscribing to Data Changes):
+ * `key` is projected from the event's own row image, and an `update` never moves a row — a
+ * relocating primary-key change is a `delete` at the old key then an `insert` at the new one.
  */
 export interface DataChangeEvent {
   type: 'insert' | 'update' | 'delete';
   schemaName: string;
   tableName: string;
-  /** Primary key values. Alias: pk */
+  /** Primary key projected from this event's own image: `newRow` for insert/update, `oldRow` for delete. Alias: pk */
   key?: SqlValue[];
   /** Primary key values. Alias: key */
   pk?: SqlValue[];
@@ -42,14 +48,9 @@ export interface DataChangeEvent {
 export type SchemaChangeListener = (event: SchemaChangeEvent) => void;
 export type DataChangeListener = (event: DataChangeEvent) => void;
 
-/**
- * Key for identifying a pending remote schema event.
- */
-interface PendingRemoteSchemaEvent {
-  type: 'create' | 'alter' | 'drop';
-  objectType: 'table' | 'index';
-  schemaName: string;
-  objectName: string;
+/** Case-insensitive `(schema, object)` scope key — identifiers are case-insensitive engine-wide. */
+function remoteScopeKey(schemaName: string, objectName: string): string {
+	return `${schemaName.toLowerCase()}:${objectName.toLowerCase()}`;
 }
 
 /**
@@ -62,10 +63,11 @@ export class StoreEventEmitter implements VTableEventEmitter {
 	private batchedDataEvents: DataChangeEvent[] = [];
 	private isBatching = false;
 	/**
-	 * Pending remote schema events that should be marked as remote when they arrive.
-	 * Uses a Map with stringified key for O(1) lookup.
+	 * Open remote-schema scopes, refcounted per `(schema, object)` key. While a
+	 * scope is open, every schema event naming that object is marked remote —
+	 * see {@link beginRemoteSchemaScope}.
 	 */
-	private pendingRemoteSchemaEvents: Map<string, number> = new Map();
+	private remoteSchemaScopes: Map<string, number> = new Map();
 
   /**
    * Subscribe to schema change events.
@@ -87,20 +89,11 @@ export class StoreEventEmitter implements VTableEventEmitter {
 
   /**
    * Emit a schema change event.
-   * If the event matches a pending remote event, it's automatically marked as remote.
+   * If a remote-schema scope is open for the named object, the event is marked remote.
    */
   emitSchemaChange(event: SchemaChangeEvent): void {
-    // Check if this event matches a pending remote event
-    const key = this.makeSchemaEventKey(event);
-    const pendingCount = this.pendingRemoteSchemaEvents.get(key);
-    if (pendingCount !== undefined && pendingCount > 0) {
-      // Mark as remote and decrement the pending count
+    if ((this.remoteSchemaScopes.get(remoteScopeKey(event.schemaName, event.objectName)) ?? 0) > 0) {
       event = { ...event, remote: true };
-      if (pendingCount === 1) {
-        this.pendingRemoteSchemaEvents.delete(key);
-      } else {
-        this.pendingRemoteSchemaEvents.set(key, pendingCount - 1);
-      }
     }
 
     for (const listener of this.schemaListeners) {
@@ -113,35 +106,38 @@ export class StoreEventEmitter implements VTableEventEmitter {
   }
 
   /**
-   * Create a unique key for a schema event signature.
+   * Open a remote-schema scope for `(schemaName, objectName)`: until the matching
+   * {@link endRemoteSchemaScope}, EVERY schema event naming that object is marked
+   * `remote: true` — whether the scoped statement emits zero, one, or several
+   * events. Matching never consumes the scope; only the caller's `finally` closes
+   * it, so a statement that emits nothing leaves nothing behind. Refcounted, so
+   * nested/concurrent scopes over the same object compose.
+   *
+   * Tradeoff of time-bounded (vs. the old signature-matched, consume-on-match)
+   * marking: a CONCURRENT local DDL on the same `(schema, object)`, issued while
+   * the scoped statement is in flight, would be mis-marked remote. `Database`
+   * serializes statements behind its execution mutex, so that requires a host
+   * issuing local DDL on the very table being replicated at that moment. The old
+   * scheme had the mirror-image hazard (a concurrent local DDL of the same
+   * signature consumed the marker) and additionally leaked or starved whenever a
+   * statement's event count was not exactly one.
    */
-  private makeSchemaEventKey(event: PendingRemoteSchemaEvent): string {
-    return `${event.type}:${event.objectType}:${event.schemaName.toLowerCase()}:${event.objectName.toLowerCase()}`;
+  beginRemoteSchemaScope(schemaName: string, objectName: string): void {
+    const key = remoteScopeKey(schemaName, objectName);
+    this.remoteSchemaScopes.set(key, (this.remoteSchemaScopes.get(key) ?? 0) + 1);
   }
 
   /**
-   * Register an expected remote schema event.
-   * When a matching event is emitted, it will be automatically marked as remote.
-   * Uses reference counting to handle concurrent applies of the same event type.
+   * Close a scope opened by {@link beginRemoteSchemaScope}. Call from a `finally`
+   * so a throwing statement cannot leave the scope open.
    */
-  expectRemoteSchemaEvent(event: PendingRemoteSchemaEvent): void {
-    const key = this.makeSchemaEventKey(event);
-    const current = this.pendingRemoteSchemaEvents.get(key) ?? 0;
-    this.pendingRemoteSchemaEvents.set(key, current + 1);
-  }
-
-  /**
-   * Clear an expected remote schema event (e.g., if the operation failed).
-   */
-  clearExpectedRemoteSchemaEvent(event: PendingRemoteSchemaEvent): void {
-    const key = this.makeSchemaEventKey(event);
-    const current = this.pendingRemoteSchemaEvents.get(key);
-    if (current !== undefined && current > 0) {
-      if (current === 1) {
-        this.pendingRemoteSchemaEvents.delete(key);
-      } else {
-        this.pendingRemoteSchemaEvents.set(key, current - 1);
-      }
+  endRemoteSchemaScope(schemaName: string, objectName: string): void {
+    const key = remoteScopeKey(schemaName, objectName);
+    const current = this.remoteSchemaScopes.get(key);
+    if (current === undefined || current <= 1) {
+      this.remoteSchemaScopes.delete(key);
+    } else {
+      this.remoteSchemaScopes.set(key, current - 1);
     }
   }
 

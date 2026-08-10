@@ -1,11 +1,15 @@
 # @quereus/plugin-nativescript-sqlite
 
+> **Stability: Beta** — complete and tested, but the surface is still being shaped; a
+> breaking change may land in a minor release. It rides `@quereus/store`'s on-disk key
+> encoding, which is not frozen. See [Stability Tiers](../../docs/stability.md#tiers).
+
 SQLite storage plugin for Quereus on NativeScript. Provides persistent storage for iOS and Android mobile apps using the [`@quereus/store`](../quereus-store/) module.
 
 ## Features
 
 - **Native SQLite**: Uses the device's built-in SQLite via `@nativescript-community/sqlite`
-- **Transaction isolation**: Read-your-own-writes and snapshot isolation by default
+- **Transaction isolation**: Read-committed + read-your-own-writes by default (no write-write conflict detection; not snapshot isolation)
 - **Order-preserving keys**: BLOB keys with `memcmp()` comparison ensure correct lexicographic byte ordering
 - **Single database file**: All stores share one SQLite database (separate tables)
 - **ACID transactions**: SQLite transactions for atomic batch writes

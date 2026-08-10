@@ -6,10 +6,10 @@
  * - Causality tracking across distributed nodes
  * - Bounded clock drift tolerance
  *
- * Ordering: (wallTime, counter, siteId) compared lexicographically
+ * Ordering: (wallTime, counter, siteId, opSeq) compared lexicographically
  */
 
-import type { SiteId } from './site.js';
+import { type SiteId, siteIdToBase64, siteIdFromBase64 } from './site.js';
 
 /**
  * Hybrid Logical Clock timestamp.
@@ -21,6 +21,15 @@ export interface HLC {
   readonly counter: number;
   /** 16-byte UUID identifying the replica */
   readonly siteId: SiteId;
+  /**
+   * Per-transaction sub-order, 0-based (uint32, 0–4294967295).
+   *
+   * Discriminates facts produced by the *same* site at the same
+   * `(wallTime, counter)` — i.e. the same transaction. It is the *last*
+   * tiebreak in the comparison key and is NOT a clock-monotonicity component:
+   * it resets every transaction and is never persisted in the `hc:` clock state.
+   */
+  readonly opSeq: number;
 }
 
 /**
@@ -29,10 +38,37 @@ export interface HLC {
 const MAX_COUNTER = 0xFFFF;
 
 /**
+ * Maximum `opSeq` value — a transaction may produce at most 2^32 facts.
+ *
+ * `opSeq` is serialized as a big-endian uint32 (see {@link serializeHLC}), so a
+ * fact count exceeding this would silently wrap. The write side asserts against
+ * this bound and throws rather than wrapping; the limit is practically
+ * unreachable (4 billion facts in one transaction).
+ */
+export const MAX_OPSEQ = 0xFFFFFFFF;
+
+/**
  * Maximum allowed clock drift in milliseconds (1 minute).
  * Rejects remote timestamps that are too far in the future.
  */
-const MAX_DRIFT_MS = 60_000n;
+export const MAX_DRIFT_MS = 60_000n;
+
+/**
+ * Assert a remote wall time is within the drift bound of `now`.
+ *
+ * Throws when `remoteWallTime` exceeds `now` by more than {@link MAX_DRIFT_MS}.
+ * Side-effect-free (no clock mutation), so the apply paths can validate a batch's
+ * clock BEFORE any data or CRDT metadata is written — rejecting a far-future peer
+ * up front rather than after its poison LWW winners have durably committed.
+ * {@link HLCManager.receive} delegates here so the bound has a single definition.
+ */
+export function assertWithinDrift(remoteWallTime: bigint, now: bigint): void {
+  if (remoteWallTime > now + MAX_DRIFT_MS) {
+    throw new Error(
+      `Remote clock too far in future: ${remoteWallTime - now}ms ahead (max ${MAX_DRIFT_MS}ms)`
+    );
+  }
+}
 
 /**
  * Compare two HLCs for ordering.
@@ -48,7 +84,13 @@ export function compareHLC(a: HLC, b: HLC): number {
   if (a.counter > b.counter) return 1;
 
   // Same counter: compare site ID lexicographically
-  return compareSiteIds(a.siteId, b.siteId);
+  const siteCmp = compareSiteIds(a.siteId, b.siteId);
+  if (siteCmp !== 0) return siteCmp;
+
+  // Same site (i.e. same transaction): compare per-transaction sub-order
+  if (a.opSeq < b.opSeq) return -1;
+  if (a.opSeq > b.opSeq) return 1;
+  return 0;
 }
 
 /**
@@ -71,18 +113,48 @@ export function hlcEquals(a: HLC, b: HLC): boolean {
 }
 
 /**
- * Create a new HLC with the given values.
+ * Return the maximum HLC from an iterable, or undefined when empty.
  */
-export function createHLC(wallTime: bigint, counter: number, siteId: SiteId): HLC {
-  return Object.freeze({ wallTime, counter, siteId });
+export function maxHLC(hlcs: Iterable<HLC>): HLC | undefined {
+  let max: HLC | undefined;
+  for (const hlc of hlcs) {
+    if (!max || compareHLC(hlc, max) > 0) max = hlc;
+  }
+  return max;
+}
+
+/**
+ * Create a new HLC with the given values.
+ *
+ * `opSeq` defaults to 0 to keep the many call sites that produce the first (or
+ * only) fact of a transaction terse — the field remains required on the
+ * interface.
+ */
+export function createHLC(wallTime: bigint, counter: number, siteId: SiteId, opSeq = 0): HLC {
+  return Object.freeze({ wallTime, counter, siteId, opSeq });
+}
+
+/**
+ * Derive a deterministic transaction id from a transaction's base HLC.
+ *
+ * The base HLC `(wallTime, counter, siteId)` is unique among a site's
+ * transactions (consecutive {@link HLCManager.tick}s always differ in counter or
+ * wallTime), so this id is stable and reproducible: every peer that replays the
+ * same transaction's facts derives the *same* id from their shared base, without
+ * persisting a separate transaction record. `opSeq` is intentionally excluded —
+ * all facts of one transaction share a single id.
+ */
+export function deterministicTxnId(base: HLC): string {
+  return `${base.wallTime.toString()}:${base.counter}:${siteIdToBase64(base.siteId)}`;
 }
 
 /**
  * Serialize HLC to a Uint8Array for storage.
- * Format: 8 bytes wallTime (BE) + 2 bytes counter (BE) + 16 bytes siteId = 26 bytes
+ * Format: 8 bytes wallTime (BE) + 2 bytes counter (BE) + 16 bytes siteId
+ *   + 4 bytes opSeq (BE) = 30 bytes
  */
 export function serializeHLC(hlc: HLC): Uint8Array {
-  const buffer = new Uint8Array(26);
+  const buffer = new Uint8Array(30);
   const view = new DataView(buffer.buffer);
 
   // Wall time as big-endian 64-bit
@@ -94,6 +166,9 @@ export function serializeHLC(hlc: HLC): Uint8Array {
   // Site ID (16 bytes)
   buffer.set(hlc.siteId, 10);
 
+  // Per-transaction sub-order as big-endian 32-bit
+  view.setUint32(26, hlc.opSeq, false);
+
   return buffer;
 }
 
@@ -101,8 +176,8 @@ export function serializeHLC(hlc: HLC): Uint8Array {
  * Deserialize HLC from a Uint8Array.
  */
 export function deserializeHLC(buffer: Uint8Array): HLC {
-  if (buffer.length !== 26) {
-    throw new Error(`Invalid HLC buffer length: ${buffer.length}, expected 26`);
+  if (buffer.length !== 30) {
+    throw new Error(`Invalid HLC buffer length: ${buffer.length}, expected 30`);
   }
 
   const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
@@ -110,8 +185,9 @@ export function deserializeHLC(buffer: Uint8Array): HLC {
   const wallTime = view.getBigUint64(0, false);
   const counter = view.getUint16(8, false);
   const siteId = new Uint8Array(buffer.slice(10, 26));
+  const opSeq = view.getUint32(26, false);
 
-  return createHLC(wallTime, counter, siteId);
+  return createHLC(wallTime, counter, siteId, opSeq);
 }
 
 // ============================================================================
@@ -129,6 +205,8 @@ export interface SerializedHLC {
   counter: number;
   /** Site ID as 22-character base64url string */
   siteId: string;
+  /** Per-transaction sub-order (0-based uint32) */
+  opSeq: number;
 }
 
 /**
@@ -139,7 +217,8 @@ export function hlcToJson(hlc: HLC): SerializedHLC {
   return {
     wallTime: hlc.wallTime.toString(),
     counter: hlc.counter,
-    siteId: siteIdToBase64Local(hlc.siteId),
+    siteId: siteIdToBase64(hlc.siteId),
+    opSeq: hlc.opSeq,
   };
 }
 
@@ -150,56 +229,9 @@ export function hlcFromJson(json: SerializedHLC): HLC {
   return createHLC(
     BigInt(json.wallTime),
     json.counter,
-    siteIdFromBase64Local(json.siteId)
+    siteIdFromBase64(json.siteId),
+    json.opSeq ?? 0
   );
-}
-
-// Base64url alphabet (RFC 4648 Section 5)
-const BASE64URL_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
-
-/**
- * Convert site ID to base64url string (local helper to avoid circular import).
- */
-function siteIdToBase64Local(siteId: SiteId): string {
-  let result = '';
-  for (let i = 0; i < siteId.length; i += 3) {
-    const byte1 = siteId[i];
-    const byte2 = i + 1 < siteId.length ? siteId[i + 1] : 0;
-    const byte3 = i + 2 < siteId.length ? siteId[i + 2] : 0;
-    const triplet = (byte1 << 16) | (byte2 << 8) | byte3;
-    result += BASE64URL_CHARS[(triplet >>> 18) & 0x3f];
-    result += BASE64URL_CHARS[(triplet >>> 12) & 0x3f];
-    if (i + 1 < siteId.length) result += BASE64URL_CHARS[(triplet >>> 6) & 0x3f];
-    if (i + 2 < siteId.length) result += BASE64URL_CHARS[triplet & 0x3f];
-  }
-  return result;
-}
-
-/**
- * Parse site ID from base64url string (local helper to avoid circular import).
- */
-function siteIdFromBase64Local(base64: string): SiteId {
-  if (base64.length !== 22) {
-    throw new Error(`Invalid site ID base64 length: ${base64.length}, expected 22`);
-  }
-  // Build reverse lookup table
-  const lookup: Record<string, number> = {};
-  for (let i = 0; i < BASE64URL_CHARS.length; i++) {
-    lookup[BASE64URL_CHARS[i]] = i;
-  }
-  const result = new Uint8Array(16);
-  let writePos = 0;
-  for (let i = 0; i < base64.length; i += 4) {
-    const c1 = lookup[base64[i]] ?? 0;
-    const c2 = lookup[base64[i + 1]] ?? 0;
-    const c3 = i + 2 < base64.length ? lookup[base64[i + 2]] ?? 0 : 0;
-    const c4 = i + 3 < base64.length ? lookup[base64[i + 3]] ?? 0 : 0;
-    const triplet = (c1 << 18) | (c2 << 12) | (c3 << 6) | c4;
-    if (writePos < 16) result[writePos++] = (triplet >>> 16) & 0xff;
-    if (writePos < 16) result[writePos++] = (triplet >>> 8) & 0xff;
-    if (writePos < 16) result[writePos++] = triplet & 0xff;
-  }
-  return result;
 }
 
 /**
@@ -262,12 +294,9 @@ export class HLCManager {
   receive(remote: HLC): HLC {
     const now = BigInt(Date.now());
 
-    // Check for excessive drift
-    if (remote.wallTime > now + MAX_DRIFT_MS) {
-      throw new Error(
-        `Remote clock too far in future: ${remote.wallTime - now}ms ahead (max ${MAX_DRIFT_MS}ms)`
-      );
-    }
+    // Check for excessive drift (single source of truth — kept here as a harmless
+    // last-line defense even though the apply paths now validate pre-commit).
+    assertWithinDrift(remote.wallTime, now);
 
     // Merge: take max of local, remote, and now
     const maxWall = now > this.wallTime

@@ -1,0 +1,38 @@
+-- 07.9.1-in-value-list-composite-index.sqllogic
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Carved out of 07.9-in-value-list: every other scenario there reaches the IN
+-- multi-seek path through an inline PRIMARY KEY or UNIQUE column (auto-indexed),
+-- so the file needs no index DDL. This one scenario builds a standalone composite
+-- `create index` to reach the two-column cross-product form of the same seek, and
+-- would otherwise have cost a backend without first-class CREATE INDEX the entire
+-- IN-value-list file.
+--
+-- Subject: the memory-vtab IN multi-seek over a COMPOSITE index — the a×b seek-key
+-- cross-product must drop NULL-bearing tuples and dedup by primary key, so duplicate
+-- list values never multiply matches.
+
+-- ===== Composite-index IN (cross-product) with a duplicate and a NULL =====
+
+create table c (id integer primary key, a integer, b integer);
+create index idx_ab on c(a, b);
+insert into c values (1, 1, 10), (2, 1, 20), (3, 2, 10), (4, 2, 20);
+
+-- Cross-product (a∈{1,1} × b∈{10,null}): the NULL-bearing tuples drop, the
+-- (1,10) duplicate collapses → a single row.
+select id from c where a in (1, 1) and b in (10, null) order by id;
+→ [{"id":1}]
+
+-- Duplicate values on both columns must not multiply matches.
+select id from c where a in (1, 2, 2) and b in (10, 20, 20) order by id;
+→ [{"id":1},{"id":2},{"id":3},{"id":4}]
+
+-- Duplicate + NULL collapsing to a two-row subset.
+select id from c where a in (1, 1, 2) and b in (10, null) order by id;
+→ [{"id":1},{"id":3}]
+
+select distinct id from c where a in (1, 1, 2) and b in (10, null) order by id;
+→ [{"id":1},{"id":3}]
+
+drop table c;

@@ -1,5 +1,6 @@
 import type { ReturningNode } from '../../planner/nodes/returning-node.js';
-import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import type { Row, OutputValue } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { emitPlanNode, emitCallFromPlan } from '../emitters.js';
@@ -31,7 +32,11 @@ export function emitReturning(plan: ReturningNode, ctx: EmissionContext): Instru
 				// serialize-project-subquery-evaluation for the canonical fix.
 				const outputs: OutputValue[] = [];
 				for (const func of projectionCallbacks) {
-					outputs.push(await func(rctx));
+					// Resolve each column without a per-column microtask hop: `await`
+					// only when the sub-program is genuinely a promise (rare). See
+					// resolveMaybe in runtime/async-util.ts for the rationale.
+					const value = func(rctx);
+					outputs.push(value instanceof Promise ? await value : value);
 				}
 				yield outputs as Row;
 			}
@@ -45,7 +50,7 @@ export function emitReturning(plan: ReturningNode, ctx: EmissionContext): Instru
 
 	return {
 		params: [executorInstruction, ...projectionEvaluators],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `returning(${plan.projections.length} cols)`
 	};
 }

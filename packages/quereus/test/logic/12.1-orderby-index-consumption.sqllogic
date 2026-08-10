@@ -1,0 +1,40 @@
+-- 12.1-orderby-index-consumption.sqllogic — ORDER BY consumed (or not) by a secondary index.
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Carved out of 12-join_padding_order: that file's subject is LEFT JOIN NULL
+-- padding through direct output, aggregates and window functions, none of which
+-- needs an index. This section builds an indexed table only so the planner can
+-- elide the Sort node, so it moves here rather than costing a backend without
+-- first-class CREATE INDEX the whole padding suite.
+--
+-- Subject: ORDER BY on the indexed column (ASC and DESC) is satisfied by the index
+-- ordering; ORDER BY on another column or on an expression is not, and must still
+-- return correctly sorted rows through a Sort.
+
+-- Setup Indexed Table for ORDER BY consumption test
+CREATE TABLE t_idx (id INTEGER PRIMARY KEY, name TEXT);
+CREATE INDEX t_idx_name ON t_idx (name);
+INSERT INTO t_idx VALUES (1, 'Xavier'), (2, 'Alice'), (3, 'Bob');
+
+-- Test: ORDER BY Consumed by Index (ASC)
+-- Expect query plan to use index on t_idx.name, no Sort operation needed
+SELECT name FROM t_idx ORDER BY name ASC;
+→ [{"name":"Alice"},{"name":"Bob"},{"name":"Xavier"}]
+
+-- Test: ORDER BY Consumed by Index (DESC)
+-- Expect query plan to use index on t_idx.name (backwards), no Sort operation needed
+SELECT name FROM t_idx ORDER BY name DESC;
+→ [{"name":"Xavier"},{"name":"Bob"},{"name":"Alice"}]
+
+-- Test: ORDER BY Not Consumed (Different Column)
+-- Expect query plan to use PK for scan, requires Sort operation
+SELECT name FROM t_idx ORDER BY id DESC;
+→ [{"name":"Bob"},{"name":"Alice"},{"name":"Xavier"}]
+
+-- Test: ORDER BY Not Consumed (Expression)
+-- Expect query plan to use PK for scan, requires Sort operation
+SELECT name FROM t_idx ORDER BY lower(name);
+→ [{"name":"Alice"},{"name":"Bob"},{"name":"Xavier"}]
+
+DROP TABLE t_idx;

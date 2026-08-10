@@ -1,4 +1,5 @@
 description: OR branches on different indexes → UNION ALL rewriting with per-branch index seeks
+difficulty: hard
 prereq: constraint-extractor, UnionAllNode, cost model
 files: packages/quereus/src/planner/analysis/constraint-extractor.ts, packages/quereus/src/planner/rules/access/rule-select-access-path.ts
 ----

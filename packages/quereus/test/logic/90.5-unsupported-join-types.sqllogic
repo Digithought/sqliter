@@ -1,6 +1,6 @@
 -- adapted from SQLite test/join.test, join7.test, joinB.test, joinH.test
--- Pin the current behavior for join types Quereus does not yet support:
--- RIGHT [OUTER] JOIN, FULL [OUTER] JOIN, NATURAL JOIN.
+-- RIGHT [OUTER] JOIN and FULL [OUTER] JOIN now execute in the nested-loop join
+-- emitter (read path). NATURAL JOIN remains unparsed and is pinned as an error.
 
 create table uj_l (id integer primary key, val text);
 create table uj_r (id integer primary key, val text);
@@ -9,27 +9,27 @@ insert into uj_l values (1, 'L1'), (2, 'L2');
 insert into uj_r values (1, 'R1'), (3, 'R3');
 -- run
 
--- RIGHT JOIN: parser accepts the syntax; runtime rejects.
-select uj_l.id, uj_r.id from uj_l right join uj_r on uj_l.id = uj_r.id;
--- error: RIGHT JOIN is not supported yet
+-- RIGHT JOIN: every right row appears; right id=3 has no left match → null-left.
+select uj_l.id as l, uj_r.id as r from uj_l right join uj_r on uj_l.id = uj_r.id order by uj_r.id;
+→ [{"l":1,"r":1},{"l":null,"r":3}]
 
--- RIGHT OUTER JOIN: same path.
-select uj_l.id, uj_r.id from uj_l right outer join uj_r on uj_l.id = uj_r.id;
--- error: RIGHT JOIN is not supported yet
+-- RIGHT OUTER JOIN: same path, same rows.
+select uj_l.id as l, uj_r.id as r from uj_l right outer join uj_r on uj_l.id = uj_r.id order by uj_r.id;
+→ [{"l":1,"r":1},{"l":null,"r":3}]
 
--- FULL OUTER JOIN: parser accepts; runtime rejects.
-select uj_l.id, uj_r.id from uj_l full outer join uj_r on uj_l.id = uj_r.id;
--- error: FULL JOIN is not supported yet
+-- FULL OUTER JOIN: matched (1,1), left id=2 unmatched (2,NULL), right id=3 unmatched (NULL,3).
+select uj_l.id as l, uj_r.id as r from uj_l full outer join uj_r on uj_l.id = uj_r.id order by coalesce(uj_l.id, uj_r.id);
+→ [{"l":1,"r":1},{"l":2,"r":null},{"l":null,"r":3}]
 
--- FULL JOIN (no OUTER keyword): same path.
-select uj_l.id, uj_r.id from uj_l full join uj_r on uj_l.id = uj_r.id;
--- error: FULL JOIN is not supported yet
+-- FULL JOIN (no OUTER keyword): same path, same rows.
+select uj_l.id as l, uj_r.id as r from uj_l full join uj_r on uj_l.id = uj_r.id order by coalesce(uj_l.id, uj_r.id);
+→ [{"l":1,"r":1},{"l":2,"r":null},{"l":null,"r":3}]
 
--- NATURAL JOIN: not currently parsed.
+-- NATURAL JOIN: still not parsed (out of scope for this ticket).
 select * from uj_l natural join uj_r;
 -- error: NATURAL
 
--- NATURAL LEFT JOIN: not currently parsed.
+-- NATURAL LEFT JOIN: still not parsed.
 select * from uj_l natural left join uj_r;
 -- error: NATURAL
 

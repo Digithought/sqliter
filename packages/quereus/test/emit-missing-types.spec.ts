@@ -1,7 +1,11 @@
 import { expect } from 'chai';
 import { astToString } from '../src/emit/ast-stringify.js';
+import { parse } from '../src/parser/index.js';
 import type {
 	AlterTableStmt,
+	AlterViewStmt,
+	AlterMaterializedViewStmt,
+	AlterIndexStmt,
 	AnalyzeStmt,
 	CreateAssertionStmt,
 	SubquerySource,
@@ -98,6 +102,52 @@ describe('Emit: missing statement types', () => {
 		});
 	});
 
+	describe('alterView / alterMaterializedView / alterIndex (SET TAGS)', () => {
+		it('should stringify ALTER VIEW ... SET TAGS', () => {
+			const node: AlterViewStmt = {
+				type: 'alterView',
+				name: ident('v'),
+				action: { type: 'setTags', mode: 'replace', tags: { cacheable: true } },
+			};
+			const result = astToString(node);
+			expect(result).to.equal(`alter view v set tags (cacheable = true)`);
+		});
+
+		it('should stringify ALTER MATERIALIZED VIEW ... SET TAGS', () => {
+			const node: AlterMaterializedViewStmt = {
+				type: 'alterMaterializedView',
+				name: ident('mv'),
+				action: { type: 'setTags', mode: 'replace', tags: { owner: 'analytics' } },
+			};
+			const result = astToString(node);
+			expect(result).to.equal(`alter materialized view mv set tags (owner = 'analytics')`);
+		});
+
+		it('should stringify ALTER INDEX ... SET TAGS with the clear-all form', () => {
+			const node: AlterIndexStmt = {
+				type: 'alterIndex',
+				name: ident('idx'),
+				action: { type: 'setTags', mode: 'replace', tags: {} },
+			};
+			const result = astToString(node);
+			expect(result).to.equal(`alter index idx set tags ()`);
+		});
+
+		it('should round-trip parse → stringify → parse for each kind (canonical SQL is stable)', () => {
+			const cases = [
+				`alter view v set tags (a = 1, b = 'x')`,
+				`alter materialized view mv set tags (owner = 'analytics')`,
+				`alter index idx set tags (purpose = 'search')`,
+				`alter index idx set tags ()`,
+			];
+			for (const sql of cases) {
+				const canonical = astToString(parse(sql));
+				const reCanonical = astToString(parse(canonical));
+				expect(reCanonical).to.equal(canonical, `round-trip mismatch for: ${sql}`);
+			}
+		});
+	});
+
 	describe('analyze', () => {
 		it('should stringify bare analyze', () => {
 			const node: AnalyzeStmt = { type: 'analyze' };
@@ -136,7 +186,7 @@ describe('Emit: missing statement types', () => {
 		it('should stringify create assertion', () => {
 			const node: CreateAssertionStmt = {
 				type: 'createAssertion',
-				name: 'positive_balance',
+				name: { type: 'identifier', name: 'positive_balance' },
 				check: {
 					type: 'binary',
 					operator: '>',

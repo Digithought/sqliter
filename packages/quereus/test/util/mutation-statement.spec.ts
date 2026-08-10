@@ -27,7 +27,6 @@ describe('mutation-statement', () => {
 			primaryKeyDefinition: Object.freeze(primaryKeyDefinition),
 			indexes: Object.freeze([]),
 			checkConstraints: Object.freeze([]),
-			isTemporary: false,
 			isView: false,
 			mutationContext,
 		} as TableSchema;

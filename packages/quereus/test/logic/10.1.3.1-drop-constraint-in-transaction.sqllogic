@@ -1,0 +1,45 @@
+-- Dropping a UNIQUE constraint inside an open transaction must stop enforcing it for the
+-- rest of that transaction.
+--
+-- Carved out of 10.1.3-ddl-drop-in-transaction, which is annotated
+-- `requires-capability: standalone-index-ddl` because most of it drops UNIQUE INDEXES.
+-- This section is the constraint-side twin of that file's § 1 and uses no index DDL, so a
+-- backend skipping 10.1.3 would have lost it for no reason.
+--
+-- A `TransactionLayer` freezes its schema at construction and enforces UNIQUE off that frozen
+-- schema, so an `alter table … drop constraint` that ran after the layer forked used to keep
+-- rejecting rows against a constraint that no longer exists. The manager now hands the
+-- post-drop schema to every open layer (`adoptSchemaOnOpenLayers` → `TransactionLayer.adoptSchema`),
+-- so enforcement stops immediately.
+--
+-- Runs against every backend (memory, store). Each statement is its own block so an expected
+-- failure is attributed to exactly one statement.
+
+-- ===================================
+-- alter table … drop constraint unique inside a transaction stops enforcing it
+-- ===================================
+
+create table drop_tx_b (id integer primary key, v text, constraint drop_tx_b_u unique (v));
+-- run
+begin;
+-- run
+insert into drop_tx_b values (1, 'a');
+-- run
+alter table drop_tx_b drop constraint drop_tx_b_u;
+-- run
+
+-- The unique constraint is gone, so a colliding row is now accepted mid-transaction.
+insert into drop_tx_b values (2, 'a');
+-- run
+commit;
+-- run
+
+select id, v from drop_tx_b order by id;
+→ [{ "id": 1, "v": "a" }, { "id": 2, "v": "a" }]
+
+-- After commit the constraint is genuinely gone: a fresh duplicate is still accepted.
+insert into drop_tx_b values (3, 'a');
+-- run
+
+select count(*) as cnt from drop_tx_b;
+→ [{ "cnt": 3 }]

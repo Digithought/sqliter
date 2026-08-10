@@ -1,0 +1,187 @@
+-- Dropping a UNIQUE index / constraint inside an open transaction must stop enforcing it
+-- for the rest of that transaction.
+--
+-- requires-capability: standalone-index-ddl
+--
+-- A `TransactionLayer` freezes its schema at construction and enforces UNIQUE off that frozen
+-- schema, so a `drop index` / `alter table … drop constraint` that ran after the layer forked
+-- used to keep rejecting rows against a constraint that no longer exists. The manager now hands
+-- the post-drop schema to every open layer (`adoptSchemaOnOpenLayers` → `TransactionLayer.adoptSchema`,
+-- which now also removes the dropped index), so enforcement stops immediately.
+--
+-- § 4 additionally pins the savepoint interaction, which is cross-backend on both counts: a
+-- `rollback to savepoint` keeps every row staged BEFORE the savepoint, and does NOT undo the
+-- DROP itself (DDL is not transactional on either backend).
+--
+-- Runs against every backend (memory, store). Each statement is its own block so an expected
+-- failure is attributed to exactly one statement.
+
+-- ===================================
+-- 1. drop index on a unique index inside a transaction stops enforcing it
+-- ===================================
+
+create table drop_tx_a (id integer primary key, v text);
+-- run
+create unique index drop_tx_a_ix on drop_tx_a (v);
+-- run
+begin;
+-- run
+insert into drop_tx_a values (1, 'a');
+-- run
+drop index drop_tx_a_ix;
+-- run
+
+-- The unique index is gone, so a colliding row is now accepted mid-transaction.
+insert into drop_tx_a values (2, 'a');
+-- run
+commit;
+-- run
+
+select id, v from drop_tx_a order by id;
+→ [{ "id": 1, "v": "a" }, { "id": 2, "v": "a" }]
+
+-- After commit the constraint is genuinely gone: a fresh duplicate is still accepted.
+insert into drop_tx_a values (3, 'a');
+-- run
+
+select count(*) as cnt from drop_tx_a;
+→ [{ "cnt": 3 }]
+
+-- ===================================
+-- 2. alter table … drop constraint unique inside a transaction stops enforcing it
+-- ===================================
+-- The constraint-side twin of § 1 needs no index DDL, so it lives in
+-- 10.1.3.1-drop-constraint-in-transaction and stays runnable on backends that skip
+-- this file.
+
+-- ===================================
+-- 3. Dropping one unique index leaves a sibling unique index still enforced
+-- ===================================
+
+create table drop_tx_c (id integer primary key, v text, w text);
+-- run
+create unique index drop_tx_c_v on drop_tx_c (v);
+-- run
+create unique index drop_tx_c_w on drop_tx_c (w);
+-- run
+begin;
+-- run
+insert into drop_tx_c values (1, 'a', 'x');
+-- run
+drop index drop_tx_c_v;
+-- run
+
+-- The dropped index no longer blocks a duplicate v.
+insert into drop_tx_c values (2, 'a', 'y');
+-- run
+
+-- The sibling index on w is untouched and still rejects a duplicate w.
+insert into drop_tx_c values (3, 'b', 'x');
+-- error: UNIQUE constraint failed
+commit;
+-- run
+
+select id, v, w from drop_tx_c order by id;
+→ [{ "id": 1, "v": "a", "w": "x" }, { "id": 2, "v": "a", "w": "y" }]
+
+-- ===================================
+-- 4. index DDL inside a savepoint must not discard writes staged BEFORE the savepoint
+-- ===================================
+-- `rollback to savepoint s` unwinds only what happened after `s`. The isolation layer used to
+-- throw its staging overlay away and copy the staged rows into a fresh one on CREATE/DROP INDEX;
+-- the copy's first write lazily registered a connection, which replays the active savepoint
+-- stack BEFORE the copy — so every copied row landed above `s` and was discarded here. Silent
+-- data loss (bug-isolation-index-ddl-rebuild-drops-savepoint-writes).
+
+create table drop_sp_a (id integer primary key, v text);
+-- run
+create unique index drop_sp_a_ix on drop_sp_a (v);
+-- run
+begin;
+-- run
+insert into drop_sp_a values (1, 'a');
+-- run
+savepoint s;
+-- run
+
+-- Staged AFTER the savepoint: these two must go.
+insert into drop_sp_a values (2, 'b');
+-- run
+drop index drop_sp_a_ix;
+-- run
+insert into drop_sp_a values (3, 'c');
+-- run
+rollback to savepoint s;
+-- run
+
+-- Pre-savepoint row kept, post-savepoint rows discarded — both directions.
+select id, v from drop_sp_a order by id;
+→ [{ "id": 1, "v": "a" }]
+
+-- DDL is not transactional on either backend, so `rollback to savepoint` does NOT undo the
+-- DROP: a would-be duplicate is still accepted. Making DDL reversible belongs to the larger
+-- feature `feat-ddl-transaction-capability`.
+insert into drop_sp_a values (4, 'a');
+-- run
+commit;
+-- run
+
+select id, v from drop_sp_a order by id;
+→ [{ "id": 1, "v": "a" }, { "id": 4, "v": "a" }]
+
+-- Same for the additive direction: CREATE INDEX under a savepoint.
+create table drop_sp_b (id integer primary key, v text);
+-- run
+begin;
+-- run
+insert into drop_sp_b values (1, 'a');
+-- run
+savepoint s2;
+-- run
+create unique index drop_sp_b_ix on drop_sp_b (v);
+-- run
+rollback to savepoint s2;
+-- run
+
+select id, v from drop_sp_b order by id;
+→ [{ "id": 1, "v": "a" }]
+commit;
+-- run
+
+select id, v from drop_sp_b order by id;
+→ [{ "id": 1, "v": "a" }]
+
+-- A tombstone staged before the savepoint survives the DDL too: the DELETE still lands.
+create table drop_sp_c (id integer primary key, v text);
+-- run
+insert into drop_sp_c values (1, 'a'), (2, 'b');
+-- run
+create unique index drop_sp_c_ix on drop_sp_c (v);
+-- run
+begin;
+-- run
+delete from drop_sp_c where id = 1;
+-- run
+savepoint s3;
+-- run
+drop index drop_sp_c_ix;
+-- run
+rollback to savepoint s3;
+-- run
+commit;
+-- run
+
+select id, v from drop_sp_c order by id;
+→ [{ "id": 2, "v": "b" }]
+
+-- Cleanup
+drop table drop_tx_a;
+-- run
+drop table drop_tx_c;
+-- run
+drop table drop_sp_a;
+-- run
+drop table drop_sp_b;
+-- run
+drop table drop_sp_c;
+-- run

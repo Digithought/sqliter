@@ -8,7 +8,8 @@ import type * as AST from '../../parser/ast.js';
 import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { ColumnReferenceNode } from './reference.js';
-import { isAssertedKey } from '../util/fd-utils.js';
+import { isUniqueDeterminant } from '../util/fd-utils.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 
 export interface WindowSpec {
 	partitionBy: AST.Expression[];
@@ -45,7 +46,7 @@ export type StreamingWindowFunctionMode =
 		/** Underlying aggregate / value function name (lower-case). */
 		name: 'sum' | 'count' | 'avg' | 'min' | 'max' | 'first_value' | 'last_value';
 		frameMode: 'rows' | 'range';
-		/** Non-negative integer literal for ROWS; non-negative numeric literal for RANGE. */
+		/** Non-negative integer literal, in both frame modes. `CURRENT ROW` is 0. */
 		preceding: number;
 		/** Same constraints as preceding. */
 		following: number;
@@ -262,7 +263,7 @@ export class WindowNode extends PlanNode implements UnaryRelationalNode {
 					const leadIdx = this.source.getAttributeIndex().get(leadAttrId) ?? -1;
 					if (leadIdx >= 0) {
 						const direction = this.windowSpec.orderBy[0]?.direction === 'desc' ? 'desc' : 'asc';
-						const strict = isAssertedKey(new Set([leadIdx]), sourcePhysical?.fds, sourceAttrs.length);
+						const strict = isUniqueDeterminant(new Set([leadIdx]), sourcePhysical?.fds, sourceAttrs.length, this.source.getType().isSet);
 						monotonicOn = [{ attrId: leadAttrId, direction, strict }];
 					}
 				}
@@ -270,7 +271,8 @@ export class WindowNode extends PlanNode implements UnaryRelationalNode {
 		}
 
 		return {
-			estimatedRows: this.estimatedRows,
+			// Window functions don't change the row count — relay the PHYSICAL one.
+			estimatedRows: physicalSourceRows(sourcePhysical, this.source),
 			ordering: sourcePhysical?.ordering,
 			monotonicOn,
 			// Window functions append columns but don't change the source row stream;

@@ -1,0 +1,119 @@
+description: The query planner writes down "how many rows do I expect here" as a plain number, with no way to say "I have no idea" — so a table nobody has gathered statistics for reports zero, and different parts of the planner read that zero as "empty", as "unknown", or as proof that a read can be deleted entirely.
+files:
+  - packages/quereus/src/planner/util/row-estimates.ts                     # physicalSourceRows — the shared helper; where a richer estimate type would live
+  - packages/quereus/src/planner/rules/cache/rule-cte-optimization.ts      # `sourceSize > 0` — reads unknown as empty
+  - packages/quereus/src/planner/cache/materialization-advisory.ts
+  - packages/quereus/src/planner/rules/access/rule-select-access-path.ts   # selectPhysicalNode — the fold that deletes a read on a zero estimate
+  - packages/quereus/src/vtab/best-access-plan.ts                          # the `rows` field's documented meaning
+  - packages/quereus/src/vtab/memory/module.ts                             # the one shipped module that makes the zero claim; also reads `request.estimatedRows || 1000`
+  - packages/quereus/src/planner/nodes/set-operation-node.ts               # no estimatedRows getter at all, and computePhysical never stamps one
+  - packages/quereus/src/planner/nodes/async-gather-node.ts
+  - packages/quereus/src/planner/nodes/cte-node.ts
+  - packages/quereus/src/planner/nodes/cte-reference-node.ts
+  - packages/quereus/src/planner/nodes/delete-node.ts
+  - packages/quereus/src/planner/nodes/dml-executor-node.ts
+  - packages/quereus/src/planner/nodes/returning-node.ts
+  - packages/quereus/src/planner/nodes/insert-node.ts
+  - packages/quereus/src/planner/nodes/remote-query-node.ts
+  - packages/quereus/src/schema/manager.ts                                 # hardcodes TableSchema.estimatedRows = 0 at table creation
+  - packages/quereus/test/optimizer/plan-shape-decisions.spec.ts           # "CTE referenced once is inlined (no CACHE node)"
+  - packages/quereus/test/plan/cte-materialization.spec.ts                 # "does not produce a CACHE node for single-use CTE"
+  - docs/module-authoring.md                                               # the contract, currently stated in prose only
+repro: verified
+severity: wrong-result
+likelihood: normal-use
+tradeoffs: Changing the estimate representation touches every plan node and every storage module that answers an access-plan request — a wide, mechanical, backwards-incompatible change whose payoff is mostly better plans rather than fixed answers, so a maintainer may prefer to patch the two consumers that misread zero today.
+----
+
+# One number is asked to mean three different things
+
+`estimatedRows` is a plain number on every plan node and on every access-plan answer a
+storage module returns. It is currently used to express three distinct claims:
+
+| claim | how it is spelled today |
+|---|---|
+| "I estimate about N rows" | `N` |
+| "I have no idea" | `0` (a table that has never been `ANALYZE`d) |
+| "I have proven nothing can match" | `0` (a module answering an access-plan request) |
+
+`SchemaManager` hardcodes `TableSchema.estimatedRows` to 0 when a table is created, and
+`vtab/memory/module.ts` reads the same field back as `request.estimatedRows || 1000`
+*precisely because* 0 means unknown there. So both readings are live in the codebase at
+once, and a fourth site treats 0 as a proof strong enough to delete a table read.
+
+## The invariant that retires the class
+
+Make the three claims separately representable, so a consumer cannot silently pick the
+wrong one — e.g. a `RowEstimate` that is `{kind: 'unknown'} | {kind: 'estimate', rows}`
+plus a distinct `provablyEmpty` flag on the access-plan answer, with the "no statistics"
+default spelled `unknown` rather than `0`. Every consumer then has to say what it does
+with `unknown`, and the compiler makes it say so.
+
+Once that lands, the three arms below stop being defects and become two-line decisions.
+
+## Arm 1 — the CTE caching gate reads "unknown" as "empty" (verified)
+
+`ruleCteOptimization` decides whether to keep a `with …` result in memory from a row
+estimate alone:
+
+```ts
+const sourceSize = PlanNodeCharacteristics.estimatesRows(source);
+const shouldCache = (
+    cteNode.materializationHint === 'materialized' ||
+    (sourceSize > 0 && sourceSize < context.tuning.cte.maxSizeForCaching)
+) && !isAlreadyCached;
+```
+
+`sourceSize > 0` is false for every un-analyzed database, so **whether the engine
+caches a CTE depends on whether a maintenance command has been run**, not on anything
+about the query.
+
+The gate also never looks at how many times the CTE name is used. Once a real estimate
+does arrive, it passes for *every* CTE in range, including single-use ones — which two
+existing specs say should be inlined (`plan-shape-decisions.spec.ts` "CTE referenced
+once is inlined (no CACHE node)" and `cte-materialization.spec.ts` "does not produce a
+CACHE node for single-use CTE"). Those specs pass today **only because the estimate
+happens to be 0**, so fixing the unknown-vs-zero reading without also adding a
+reference count turns them red.
+
+## Arm 2 — a zero estimate is read as proof of emptiness (static)
+
+When the planner asks a storage backend how it would read a table, a **zero** row count
+makes the planner conclude the read can produce nothing and replaces it with a static
+empty result — no storage access, ever. That conclusion is a *proof*, but the field it
+is read out of is documented as an *estimate*. A backend that rounds a very selective
+estimate down to zero, or that reports how big the table is right now, makes the strong
+claim without meaning to.
+
+The worst arm is already closed: the fold used to fire on a plan with **no filters at
+all**, because the guard restricting it to the proven-impossible case
+(`handledFilters.every(...)`) is vacuously true over an empty list — so a backend
+reporting an honest live size of zero for a plain full scan had its table read deleted,
+and planning precedes execution, so "empty now" was not "empty later". What remains is
+the representation problem: the interface still has no way to distinguish the two claims.
+
+## Arm 3 — estimates stop existing at set operations
+
+`SetOperationNode` has no `estimatedRows` getter at all and its `computePhysical` never
+stamps one, so a query whose results are combined with `union` / `union all` /
+`intersect` / `except` reports **no row count from the combine point upward**, in either
+the logical or the physical view. Everything above it — sorts, enclosing joins, cache
+sizing — falls back to a fixed default. `union all` is common, so this is the largest of
+the gaps.
+
+Three smaller groups have the same hole: `AsyncGatherNode` (has a logical getter that
+composes its branches, but no physical one — and a PostOptimization rule substitutes it
+for `union all` on high-latency plans), the CTE nodes (`cte-node.ts`,
+`cte-reference-node.ts`), and the DML family (`delete-node.ts`,
+`dml-executor-node.ts`, `returning-node.ts`, `insert-node.ts`, `remote-query-node.ts`).
+
+`debt-join-rows-from-physical-children` already moved the single-source operators and
+the join family onto `physicalSourceRows`; these four groups were left out.
+
+## Notes for whoever picks this up
+
+- Arm 3 is a *producer* gap and arms 1–2 are *consumer* gaps. Filling arm 3 without
+  fixing arm 1 makes the CTE caching behaviour change for every user at once — the
+  producer work should not land first.
+- `docs/module-authoring.md` states the access-plan `rows` contract in prose only; a
+  representation change is the chance to make it checkable.

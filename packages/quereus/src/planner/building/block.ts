@@ -8,6 +8,11 @@ import { buildCreateIndexStmt } from './ddl.js';
 import { buildDropTableStmt } from './drop-table.js';
 import { buildCreateViewStmt } from './create-view.js';
 import { buildDropViewStmt } from './drop-view.js';
+import {
+	buildCreateMaterializedViewStmt,
+	buildRefreshMaterializedViewStmt,
+	buildDropMaterializedViewStmt,
+} from './materialized-view.js';
 import { buildCreateAssertionStmt } from './create-assertion.js';
 import { buildDropAssertionStmt } from './drop-assertion.js';
 import { buildDropIndexStmt } from './drop-index.js';
@@ -15,13 +20,14 @@ import { buildInsertStmt } from './insert.js';
 import { buildUpdateStmt } from './update.js';
 import { buildDeleteStmt } from './delete.js';
 import { buildAlterTableStmt } from './alter-table.js';
+import { buildAlterViewStmt, buildAlterMaterializedViewStmt, buildAlterIndexStmt } from './set-object-tags.js';
 import { buildBeginStmt, buildCommitStmt, buildRollbackStmt, buildSavepointStmt, buildReleaseStmt } from './transaction.js';
 import { buildPragmaStmt } from './pragma.js';
 import { buildAnalyzeStmt } from './analyze.js';
 import { buildValuesStmt } from './select.js';
 import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
-import { buildDeclareSchemaStmt, buildDiffSchemaStmt, buildApplySchemaStmt, buildExplainSchemaStmt } from './declare-schema.js';
+import { buildDeclareSchemaStmt, buildDeclareLensStmt, buildDiffSchemaStmt, buildApplySchemaStmt, buildExplainSchemaStmt } from './declare-schema.js';
 
 export function buildBlock(ctx: PlanningContext, statements: AST.Statement[]): BlockNode {
 	const plannedStatements = statements.map((stmt) => {
@@ -35,6 +41,10 @@ export function buildBlock(ctx: PlanningContext, statements: AST.Statement[]): B
 				return buildCreateIndexStmt(ctx, stmt as AST.CreateIndexStmt);
 			case 'createView':
 				return buildCreateViewStmt(ctx, stmt as AST.CreateViewStmt);
+			case 'createMaterializedView':
+				return buildCreateMaterializedViewStmt(ctx, stmt as AST.CreateMaterializedViewStmt);
+			case 'refreshMaterializedView':
+				return buildRefreshMaterializedViewStmt(ctx, stmt as AST.RefreshMaterializedViewStmt);
 			case 'createAssertion':
 				return buildCreateAssertionStmt(ctx, stmt as AST.CreateAssertionStmt);
 			case 'drop': {
@@ -43,6 +53,8 @@ export function buildBlock(ctx: PlanningContext, statements: AST.Statement[]): B
 					return buildDropTableStmt(ctx, dropStmt);
 				} else if (dropStmt.objectType === 'view') {
 					return buildDropViewStmt(ctx, dropStmt);
+				} else if (dropStmt.objectType === 'materializedView') {
+					return buildDropMaterializedViewStmt(ctx, dropStmt);
 				} else if (dropStmt.objectType === 'assertion') {
 					return buildDropAssertionStmt(ctx, dropStmt);
 				} else if (dropStmt.objectType === 'index') {
@@ -79,10 +91,18 @@ export function buildBlock(ctx: PlanningContext, statements: AST.Statement[]): B
 				return buildAnalyzeStmt(ctx, stmt as AST.AnalyzeStmt);
 			case 'alterTable':
 				return buildAlterTableStmt(ctx, stmt as AST.AlterTableStmt);
+			case 'alterView':
+				return buildAlterViewStmt(ctx, stmt as AST.AlterViewStmt);
+			case 'alterMaterializedView':
+				return buildAlterMaterializedViewStmt(ctx, stmt as AST.AlterMaterializedViewStmt);
+			case 'alterIndex':
+				return buildAlterIndexStmt(ctx, stmt as AST.AlterIndexStmt);
 			case 'values':
 				return buildValuesStmt(ctx, stmt as AST.ValuesStmt);
 			case 'declareSchema':
 				return buildDeclareSchemaStmt(ctx, stmt);
+			case 'declareLens':
+				return buildDeclareLensStmt(ctx, stmt);
 			case 'diffSchema':
 				return buildDiffSchemaStmt(ctx, stmt);
 			case 'applySchema':

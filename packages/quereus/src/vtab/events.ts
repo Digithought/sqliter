@@ -24,6 +24,10 @@ export function tryGetEventEmitter(module: AnyVirtualTableModule): VTableEventEm
 
 /**
  * Data change event emitted when mutations are committed.
+ *
+ * Producers owe the key contract in `docs/usage.md` § Subscribing to Data Changes: `key` is
+ * projected from the event's own row image, and an `update` never moves a row (a relocating
+ * primary-key change is a `delete` at the old key then an `insert` at the new one).
  */
 export interface VTableDataChangeEvent {
 	/** The type of mutation operation */
@@ -32,7 +36,7 @@ export interface VTableDataChangeEvent {
 	schemaName: string;
 	/** Table name */
 	tableName: string;
-	/** Primary key values */
+	/** Primary key projected from this event's own image: `newRow` for insert/update, `oldRow` for delete */
 	key?: SqlValue[];
 	/** Previous row data (for update/delete) */
 	oldRow?: Row;
@@ -56,6 +60,9 @@ export interface VTableSchemaChangeEvent {
 	schemaName: string;
 	/** Object name (table name for table/column, index name for index) */
 	objectName: string;
+	/** Old object name — `RENAME TO` only: the table name before the rename
+	 *  (`objectName` carries the new one). Companion to `oldColumnName`. */
+	oldObjectName?: string;
 	/** Column name (for column operations) */
 	columnName?: string;
 	/** Old column name (for column rename) */

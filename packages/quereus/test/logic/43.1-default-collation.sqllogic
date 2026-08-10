@@ -1,0 +1,140 @@
+-- 43.1-default-collation.sqllogic - per-DB default_collation pragma.
+-- Sets the declared collation a column with NO explicit COLLATE resolves to.
+-- Defaults to BINARY (no behavior change). An explicit COLLATE always wins, and
+-- the default applies only to types that support the collation (text); non-text
+-- and empty-collation types (INTEGER/REAL/BLOB, JSON/temporal) fall back to BINARY.
+
+-- ===================================
+-- 0. Default is BINARY — out-of-box behavior unchanged.
+-- ===================================
+
+pragma default_collation;
+→ [{"name": "default_collation", "value": "BINARY"}]
+
+create table t_base (id integer primary key, name text);
+insert into t_base values (1, 'a');
+
+-- BINARY: a case-different literal does NOT match.
+select count(*) as n from t_base where name = 'A';
+→ [{"n":0}]
+
+select name, collation from table_info('t_base') order by cid;
+→ [{"name":"id","collation":"BINARY"},{"name":"name","collation":"BINARY"}]
+
+drop table t_base;
+
+-- ===================================
+-- 1. default_collation = NOCASE: an omitted-COLLATE text column resolves to NOCASE.
+-- ===================================
+
+pragma default_collation='nocase';
+pragma default_collation;
+→ [{"name": "default_collation", "value": "nocase"}]
+
+create table t_nc (id integer primary key, name text);
+insert into t_nc values (1, 'a');
+
+-- NOCASE: 'A' now matches the row inserted as 'a'.
+select count(*) as n from t_nc where name = 'A';
+→ [{"n":1}]
+
+-- table_info: id (INTEGER) falls back to BINARY; name (TEXT) is NOCASE.
+select name, collation from table_info('t_nc') order by cid;
+→ [{"name":"id","collation":"BINARY"},{"name":"name","collation":"NOCASE"}]
+
+drop table t_nc;
+
+-- ===================================
+-- 2. Non-text fallback: INTEGER / REAL / BLOB stay BINARY under a non-BINARY default.
+-- ===================================
+
+create table t_types (id integer primary key, amount real, payload blob, label text);
+select name, collation from table_info('t_types') order by cid;
+→ [{"name":"id","collation":"BINARY"},{"name":"amount","collation":"BINARY"},{"name":"payload","collation":"BINARY"},{"name":"label","collation":"NOCASE"}]
+
+drop table t_types;
+
+-- ===================================
+-- 3. Empty-collation types (JSON / temporal) stay BINARY under NOCASE.
+-- ===================================
+
+create table t_json (id integer primary key, doc json, created date);
+select name, collation from table_info('t_json') order by cid;
+→ [{"name":"id","collation":"BINARY"},{"name":"doc","collation":"BINARY"},{"name":"created","collation":"BINARY"}]
+
+drop table t_json;
+
+-- `any` declares no supported-collation list either, so it stays BINARY too.
+-- This matters since `ANY_TYPE.compare` began honoring its collation argument
+-- (ticket any-type-compare-honors-collation): an undecorated `any` column must
+-- keep comparing — and keying — BINARY, so only an explicit COLLATE moves it.
+create table t_any (id integer primary key, v any);
+select name, collation from table_info('t_any') order by cid;
+→ [{"name":"id","collation":"BINARY"},{"name":"v","collation":"BINARY"}]
+
+insert into t_any values (1, 'a');
+select count(*) as n from t_any where v = 'A';
+→ [{"n":0}]
+
+drop table t_any;
+
+-- ===================================
+-- 4. Explicit COLLATE always wins over the default.
+-- ===================================
+
+-- Explicit COLLATE BINARY under a NOCASE default stays BINARY (case-sensitive).
+create table t_expl (id integer primary key, name text collate binary);
+insert into t_expl values (1, 'a');
+select count(*) as n from t_expl where name = 'A';
+→ [{"n":0}]
+select name, collation from table_info('t_expl') order by cid;
+→ [{"name":"id","collation":"BINARY"},{"name":"name","collation":"BINARY"}]
+drop table t_expl;
+
+-- Explicit COLLATE RTRIM under a NOCASE default stays RTRIM.
+create table t_rt (id integer primary key, name text collate rtrim);
+select name, collation from table_info('t_rt') order by cid;
+→ [{"name":"id","collation":"BINARY"},{"name":"name","collation":"RTRIM"}]
+drop table t_rt;
+
+-- ===================================
+-- 5. ALTER TABLE ADD COLUMN honors default_collation (text → NOCASE, non-text → BINARY).
+-- ===================================
+-- Closes the CREATE-vs-ADD inconsistency: an ADD-COLUMN-ed text column gets NOCASE
+-- like a CREATE-d one, while a non-text added column falls back to BINARY
+-- (resolveDefaultCollation type-gate). Under test:store this also covers the store
+-- addColumn path and a persisted-DDL reopen round-trip.
+
+create table t_add (id integer primary key);
+alter table t_add add column name text;   -- text → NOCASE under the default
+alter table t_add add column qty integer; -- non-text → BINARY
+select name, collation from table_info('t_add') order by cid;
+→ [{"name":"id","collation":"BINARY"},{"name":"name","collation":"NOCASE"},{"name":"qty","collation":"BINARY"}]
+
+-- The added text column compares case-insensitively (NOCASE semantics).
+insert into t_add values (1, 'a', 10);
+select count(*) as n from t_add where name = 'A';
+→ [{"n":1}]
+
+drop table t_add;
+
+-- ===================================
+-- 6. Reset to BINARY restores out-of-box semantics.
+-- ===================================
+
+pragma default_collation='binary';
+pragma default_collation;
+→ [{"name": "default_collation", "value": "binary"}]
+
+create table t_reset (id integer primary key, name text);
+insert into t_reset values (1, 'a');
+select count(*) as n from t_reset where name = 'A';
+→ [{"n":0}]
+select name, collation from table_info('t_reset') order by cid;
+→ [{"name":"id","collation":"BINARY"},{"name":"name","collation":"BINARY"}]
+drop table t_reset;
+
+-- Note: rejection of an unknown default_collation (and value rollback) is covered by
+-- core-api-features.spec.ts — via the pragma path setOption errors are surfaced as the
+-- generic "Unknown pragma" (the real cause is chained), so the precise message is asserted
+-- at the API level instead.

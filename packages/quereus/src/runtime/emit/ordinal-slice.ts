@@ -1,6 +1,7 @@
 import type { OrdinalSliceNode } from '../../planner/nodes/ordinal-slice-node.js';
 import { SeqScanNode, IndexScanNode, IndexSeekNode } from '../../planner/nodes/table-access-nodes.js';
-import type { Instruction, InstructionRun, RuntimeContext } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import { emitCallFromPlan } from '../emitters.js';
 import { emitSeqScan } from './scan.js';
 import type { EmissionContext } from '../emission-context.js';
@@ -104,7 +105,7 @@ export function emitOrdinalSlice(plan: OrdinalSliceNode, ctx: EmissionContext): 
 
 	return {
 		params,
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `ordinal_slice(${plan.offsetExpr ? 'OFFSET' : ''}${plan.offsetExpr && plan.limitExpr ? ',' : ''}${plan.limitExpr ? 'LIMIT' : ''})`,
 	};
 }

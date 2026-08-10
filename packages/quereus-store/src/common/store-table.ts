@@ -8,66 +8,42 @@
  *   - Data store: {schema}.{table} - row data keyed by encoded PK
  *   - Index stores: {schema}.{table}_idx_{name} - one per secondary index
  *   - Stats store: __stats__ - unified store for all table statistics, keyed by {schema}.{table}
+ *
+ * The class is layered across four files, each adding one job to the one below:
+ *   `store-table-base.ts`        - state, store handles, stats, transaction lifecycle
+ *   `store-table-scan.ts`        - the read path (predicate -> byte window -> rows)
+ *   `store-table-constraints.ts` - secondary-index maintenance + UNIQUE enforcement
+ *   `store-table.ts`             - this file: the write path and bulk row maintenance
  */
 
 import {
-	VirtualTable,
-	IndexConstraintOp,
 	ConflictResolution,
 	QuereusError,
 	StatusCode,
-	compareSqlValues,
-	validateAndParse,
-	compilePredicate,
-	type Database,
-	type DatabaseInternal,
+	formatKeyValue,
+	rowsValueIdentical,
+	type ColumnSchema,
 	type TableSchema,
-	type UniqueConstraintSchema,
-	type CompiledPredicate,
 	type Row,
-	type FilterInfo,
 	type SqlValue,
-	type VirtualTableConnection,
 	type UpdateArgs,
-	type VirtualTableModule,
 	type UpdateResult,
+	type BackingRowChange,
 } from '@quereus/quereus';
 
-import type { KVStore } from './kv-store.js';
-import type { StoreEventEmitter } from './events.js';
-import type { TransactionCoordinator } from './transaction.js';
-import { StoreConnection } from './store-connection.js';
+import { bytesEqual, bytesToHex } from './bytes.js';
 import {
 	buildDataKey,
-	buildIndexKey,
 	buildFullScanBounds,
-	buildStatsKey,
 } from './key-builder.js';
 import {
 	serializeRow,
 	deserializeRow,
-	serializeStats,
-	deserializeStats,
-	type TableStats,
 } from './serialization.js';
-import type { EncodeOptions } from './encoding.js';
+import { resolvePkKeyCollations, resolvePkKeyTransforms } from './pk-key-resolution.js';
+import type { DataChangeEvent } from './events.js';
 
-/** Number of mutations before persisting statistics. */
-const STATS_FLUSH_INTERVAL = 100;
-
-/** Hex-encode a key for use as a Map/Set lookup. */
-function bytesToHex(key: Uint8Array): string {
-	return Array.from(key).map(b => b.toString(16).padStart(2, '0')).join('');
-}
-
-/** Byte-wise equality check for Uint8Arrays. */
-function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
-	if (a.length !== b.length) return false;
-	for (let i = 0; i < a.length; i++) {
-		if (a[i] !== b[i]) return false;
-	}
-	return true;
-}
+import { StoreTableConstraints } from './store-table-constraints.js';
 
 /**
  * Resolves the per-constraint default conflict action for PK conflicts.
@@ -89,31 +65,15 @@ function resolvePkDefaultConflict(schema: TableSchema): ConflictResolution | und
 }
 
 /**
- * Configuration for a store table.
+ * One externally-applied row op against a SOURCE table's committed storage,
+ * the input vocabulary of {@link StoreTable.applyExternalRowChanges}. An
+ * `upsert` carries the full table row in schema column order (its PK — and thus
+ * its data key — is derived from the row, so an upsert can never relocate a
+ * row); a `delete` carries the PK values in PK-definition order.
  */
-export interface StoreTableConfig {
-	/** Collation for text keys. Default: 'NOCASE'. */
-	collation?: 'BINARY' | 'NOCASE';
-	/** Additional platform-specific options. */
-	[key: string]: unknown;
-}
-
-/**
- * Interface for the store module that manages this table.
- * Provides access to stores and coordinators.
- */
-export interface StoreTableModule {
-	/** Get the data store for a table. */
-	getStore(tableKey: string, config: StoreTableConfig): Promise<KVStore>;
-	/** Get an index store for a table. */
-	getIndexStore(schemaName: string, tableName: string, indexName: string): Promise<KVStore>;
-	/** Get the stats store for a table. */
-	getStatsStore(schemaName: string, tableName: string): Promise<KVStore>;
-	/** Get a coordinator for a table. */
-	getCoordinator(tableKey: string, config: StoreTableConfig): Promise<TransactionCoordinator>;
-	/** Save table DDL to persistent storage. */
-	saveTableDDL(tableSchema: TableSchema): Promise<void>;
-}
+export type ExternalRowOp =
+	| { op: 'upsert'; row: Row }
+	| { op: 'delete'; pk: SqlValue[] };
 
 /**
  * Generic KVStore-backed virtual table.
@@ -122,105 +82,18 @@ export interface StoreTableModule {
  * storage backends. Platform-specific behavior is delegated to the
  * StoreTableModule.
  */
-export class StoreTable extends VirtualTable {
-	protected storeModule: StoreTableModule;
-	protected config: StoreTableConfig;
-	protected store: KVStore | null = null;
-	protected storeInitPromise: Promise<KVStore> | null = null;
-	protected indexStores: Map<string, KVStore> = new Map();
-	protected statsStore: KVStore | null = null;
-	protected coordinator: TransactionCoordinator | null = null;
-	protected connection: StoreConnection | null = null;
-	protected eventEmitter?: StoreEventEmitter;
-	protected encodeOptions: EncodeOptions;
-	protected pkDirections: boolean[];
-	protected ddlSaved = false;
-
-	// Statistics tracking
-	protected cachedStats: TableStats | null = null;
-	protected pendingStatsDelta = 0;
-	protected mutationCount = 0;
-	protected statsFlushPending = false;
-
-	// Lazy cache of compiled partial-UNIQUE predicates. Keyed on the
-	// UniqueConstraintSchema object identity — UC schemas are frozen and a
-	// new constraint object after CREATE/DROP INDEX produces a fresh compile;
-	// the WeakMap lets the GC reclaim entries for retired constraints.
-	private readonly predicateCache: WeakMap<UniqueConstraintSchema, CompiledPredicate> = new WeakMap();
-
-	constructor(
-		db: Database,
-		storeModule: StoreTableModule,
-		tableSchema: TableSchema,
-		config: StoreTableConfig,
-		eventEmitter?: StoreEventEmitter,
-		isConnected = false
-	) {
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		super(db, storeModule as unknown as VirtualTableModule<any, any>, tableSchema.schemaName, tableSchema.name);
-		this.storeModule = storeModule;
-		this.tableSchema = tableSchema;
-		this.config = config;
-		this.eventEmitter = eventEmitter;
-		this.encodeOptions = { collation: config.collation || 'NOCASE' };
-		this.pkDirections = tableSchema.primaryKeyDefinition.map(pk => !!pk.desc);
-		this.ddlSaved = isConnected;
-	}
-
-	/** Get the table configuration. */
-	getConfig(): StoreTableConfig {
-		return this.config;
-	}
-
-	/** Get the table schema. */
-	getSchema(): TableSchema {
-		return this.tableSchema!;
-	}
-
-	/** Update the table schema after an ALTER TABLE operation. */
-	updateSchema(newSchema: TableSchema): void {
-		this.tableSchema = newSchema;
-		this.pkDirections = newSchema.primaryKeyDefinition.map(pk => !!pk.desc);
-	}
-
-	/** Close and forget a cached index-store handle, if any. */
-	async releaseIndexStore(indexName: string): Promise<void> {
-		const cached = this.indexStores.get(indexName);
-		if (!cached) return;
-		this.indexStores.delete(indexName);
-		try { await cached.close(); } catch { /* close is best-effort */ }
-	}
-
-	/**
-	 * Returns true if the table has at least one stored row. Stops after the first hit.
-	 */
-	async hasAnyRows(): Promise<boolean> {
-		const store = await this.ensureStore();
-		const bounds = buildFullScanBounds();
-		for await (const _entry of store.iterate(bounds)) {
-			return true;
-		}
-		return false;
-	}
-
-	/**
-	 * Scan every row, checking whether the column at `colIndex` ever holds NULL.
-	 * Used by ALTER COLUMN SET NOT NULL to decide whether the tightening is safe.
-	 */
-	async rowsWithNullAtIndex(colIndex: number): Promise<number> {
-		const store = await this.ensureStore();
-		const bounds = buildFullScanBounds();
-		let count = 0;
-		for await (const entry of store.iterate(bounds)) {
-			const row = deserializeRow(entry.value);
-			if (row[colIndex] === null) count++;
-		}
-		return count;
-	}
-
+export class StoreTable extends StoreTableConstraints {
 	/**
 	 * Apply a per-row mapping function to every stored row, in place (re-writing
-	 * the same key). The mapper may throw QuereusError — propagated to the caller.
+	 * the same key). The mapper may throw QuereusError — propagated to the caller;
+	 * the batch is written only after every row maps, so a throw leaves the store
+	 * untouched.
+	 *
+	 * NOTE: reads and writes the COMMITTED store, outside the coordinator. Sound
+	 * only because every caller calls `StoreModule.ddlCommitPendingOps` first, so
+	 * "committed" is "everything live". A caller that skips that flush would leave
+	 * its transaction's pending rows unmapped, and they would replay unconverted
+	 * over the rewritten store at commit.
 	 */
 	async mapRowsAtIndex(
 		colIndex: number,
@@ -242,45 +115,197 @@ export class StoreTable extends VirtualTable {
 	}
 
 	/**
+	 * Closure computing a row's data key under a NEW primary-key definition and
+	 * column set — the exact bytes {@link rekeyRows} pass 2 writes. Shared by
+	 * `rekeyRows`' two passes and {@link validateRekeyedPrimaryKey}'s probes so a
+	 * collision judged by a probe is byte-identical to the key the re-key would
+	 * write. Deliberately NOT the `dedupeRowSignature` / `KeyNormalizerResolver`
+	 * path the UNIQUE validators use — the two disagree for at least an `any`-typed
+	 * PK member, whose key bytes pin BINARY regardless of its declared collation
+	 * (pinned by `any-json-pk-binary-key.spec.ts`).
+	 *
+	 * The transforms matter too: an ALTER PRIMARY KEY onto (or a SET DATA TYPE
+	 * creating) a semantic-ordering member must collapse equal spellings, so
+	 * 'PT1H'/'PT60M' land on one key and are judged as the duplicate they are.
+	 */
+	private rekeyedKeyComputer(
+		newPkDef: ReadonlyArray<{ index: number; desc?: boolean }>,
+		newColumns: ReadonlyArray<ColumnSchema>,
+	): (row: Row) => Uint8Array {
+		const newPkDirections = newPkDef.map(pk => !!pk.desc);
+		const newPkCollations = resolvePkKeyCollations(
+			newPkDef,
+			newColumns,
+			this.encodeOptions.collation ?? 'NOCASE',
+		);
+		const newPkTransforms = resolvePkKeyTransforms(newPkDef, newColumns);
+		return (row: Row): Uint8Array =>
+			buildDataKey(newPkDef.map(pk => row[pk.index]), this.encodeOptions, newPkDirections, newPkCollations, newPkTransforms);
+	}
+
+	/**
+	 * The store's counterpart of the memory backend's
+	 * `MemoryTableManager.validateRekeyedPrimaryKey`: the two throw-only questions a
+	 * PK re-key must answer, over two DIFFERENT row sets, BEFORE anything is flushed
+	 * or mutated (see docs/memory-table.md §"A collation change on a PRIMARY KEY
+	 * column obeys a stricter rule"):
+	 *
+	 *  1. **Is the change legal?** — over `effectiveRows`, the rows the DDL-issuing
+	 *     transaction can SEE (a wrapper's `EffectiveRowSource` when the isolation
+	 *     layer holds the transaction's staged rows outside this store, else this
+	 *     table's own effective stream). Two rows on one new key here is a duplicate
+	 *     a `select` in this transaction would return, so the change is invalid →
+	 *     `CONSTRAINT`, naming the colliding key.
+	 *  2. **Can the store carry it?** — over this store's COMMITTED rows, the set a
+	 *     `rollback` must be able to restore. The data store holds one row per key,
+	 *     so a committed pair collapsing onto one new key cannot be represented even
+	 *     when the transaction has deleted one of them → `BUSY`, with the memory
+	 *     module's "commit/rollback and retry" posture.
+	 *
+	 * Probe order is what makes the statuses right, with no backend sniffing: the
+	 * committed probe can only fire once the effective one passed, i.e. only when the
+	 * committed rows are NOT a subset of the effective ones — which happens exactly
+	 * when the transaction has DELETED a committed row (staged in a wrapper's overlay,
+	 * or buffered in this module's own coordinator). A collision among rows the
+	 * transaction can still see therefore always reports `CONSTRAINT`, never `BUSY`.
+	 *
+	 * The buffered-delete case makes the bare module stricter than it used to be: the
+	 * old post-flush pass committed the delete first and then re-keyed happily, quietly
+	 * spending the transaction's rollback. It now refuses with the same `BUSY` the
+	 * wrapped path gives, and `commit; <retry>` still lands the change.
+	 *
+	 * Both probes key through {@link rekeyedKeyComputer}, so they and the re-key agree
+	 * byte-for-byte.
+	 *
+	 * NOTE: these two probes put both re-keying arms — SET COLLATE on a PK member and
+	 * ALTER PRIMARY KEY — at four full table scans (two here, then {@link rekeyRows}'
+	 * pass 1 backstop and pass 2), each holding one hex
+	 * key signature per row. Fine for a statement this rare; if a huge table ever makes
+	 * it slow, drop pass 1 for callers that pre-validated — it cannot fire for them.
+	 */
+	async validateRekeyedPrimaryKey(
+		newPkDef: ReadonlyArray<{ index: number; desc?: boolean }>,
+		newColumns: ReadonlyArray<ColumnSchema>,
+		effectiveRows: AsyncIterable<Row>,
+	): Promise<void> {
+		const computeNewKey = this.rekeyedKeyComputer(newPkDef, newColumns);
+
+		const seenEffective = new Set<string>();
+		for await (const row of effectiveRows) {
+			const hex = bytesToHex(computeNewKey(row));
+			if (seenEffective.has(hex)) {
+				// Mirror the memory module's diagnostic, naming the key from the second
+				// (colliding) row's PK values — including its empty-key wording, since
+				// `alter primary key ()` leaves no components to name and "(key: )" reads
+				// as a bug (`MemoryTableManager.assertNoPrimaryKeyCollisionInRows`).
+				const parts = newPkDef.map(pk => formatKeyValue(row[pk.index]));
+				const keyDesc = parts.length > 0 ? `(key: ${parts.join(', ')})` : '(the empty key admits one row)';
+				throw new QuereusError(
+					`UNIQUE constraint failed: ${this.tableName} primary key collides under the new key definition ${keyDesc}`,
+					StatusCode.CONSTRAINT,
+				);
+			}
+			seenEffective.add(hex);
+		}
+
+		const store = await this.ensureStore();
+		const seenCommitted = new Set<string>();
+		for await (const entry of store.iterate(buildFullScanBounds())) {
+			const hex = bytesToHex(computeNewKey(deserializeRow(entry.value)));
+			if (seenCommitted.has(hex)) {
+				throw new QuereusError(
+					`Cannot re-key the primary key of table ${this.tableName}: `
+					+ `rows this transaction has removed still collide under the new key definition and must survive a rollback. `
+					+ `Commit/rollback and retry.`,
+					StatusCode.BUSY,
+				);
+			}
+			seenCommitted.add(hex);
+		}
+	}
+
+	/**
 	 * Re-key every stored row under a new primary-key definition.
 	 *
-	 * Two-pass: the first pass reads every row and computes the new data keys,
-	 * tracking duplicates. On collision we throw `CONSTRAINT` without touching
-	 * the store. The second pass batches deletes of displaced old keys and puts
-	 * of new (key, row) pairs. Rows whose new key matches the old key are no-ops.
+	 * Two-pass, signatures-only pass 1: the first pass computes each row's new data
+	 * key and retains only a `Set` of key SIGNATURES (hex of the key bytes) to detect
+	 * collisions — two distinct old keys collapsing to one new key under a coarser
+	 * collation or a narrower PK. On collision we throw `CONSTRAINT` without touching
+	 * the store. For `ALTER PRIMARY KEY` this pass is the gate; for `ALTER COLUMN …
+	 * SET COLLATE` on a PK member it is only a backstop — that arm has already run
+	 * {@link validateRekeyedPrimaryKey}'s two probes before the DDL flush, so a
+	 * refusal there leaves the enclosing transaction alive. The second pass RE-SCANS
+	 * the same committed store, recomputes each
+	 * new key, and batches deletes of displaced old keys + puts of new (key, row)
+	 * pairs into ONE atomic batch. Rows whose new key matches the old key are no-ops.
+	 *
+	 * Holding signatures instead of whole rows halves peak memory: the prior design
+	 * retained the entire table in a map AND again in the batch. The re-scan trades
+	 * O(rows) CPU (a second iterate + newKey recompute) for not buffering the table
+	 * twice. Pass 1 and pass 2 iterate the SAME bounds over the SAME committed store
+	 * and see identical rows: nothing writes between them — we are single-threaded
+	 * within the ALTER, outside the coordinator, and every caller ran
+	 * `StoreModule.ddlCommitPendingOps` first so "committed" is "everything live".
+	 *
+	 * The final single `batch.write()` is the ONLY thing making the re-key
+	 * all-or-nothing — do not chunk-flush it. Its residual peak (the batch still holds
+	 * every changed row) is irreducible without breaking atomicity; tracked separately
+	 * in `debt-store-atomic-batch-bounded-memory`.
 	 *
 	 * Only the data store is rewritten — secondary indexes are rebuilt by the
 	 * caller (the keys embed the PK suffix, so they must be rebuilt whenever
 	 * the PK changes).
+	 *
+	 * The new key for each row is encoded under `newColumns`'s per-column PK
+	 * collations, so this drives BOTH:
+	 *   - `ALTER PRIMARY KEY` — the PK *columns* change; `newColumns` defaults to the
+	 *     current column set (their collations are unchanged), and
+	 *   - `ALTER COLUMN … SET COLLATE` on a PK member — the PK columns stay the same
+	 *     but one column's collation changes; the caller passes the post-ALTER
+	 *     `updatedSchema.columns` so the new key bytes follow the new collation.
+	 * The OLD key is taken verbatim from the stored entry (never re-encoded), so the
+	 * old collation is implicit in the existing bytes and need not be supplied.
 	 */
 	async rekeyRows(
-		newPkDef: ReadonlyArray<{ index: number; desc: boolean }>,
+		newPkDef: ReadonlyArray<{ index: number; desc?: boolean }>,
+		newColumns: ReadonlyArray<ColumnSchema> = this.tableSchema!.columns,
 	): Promise<void> {
 		const store = await this.ensureStore();
 		const bounds = buildFullScanBounds();
 
-		interface Pending { newKey: Uint8Array; oldKey: Uint8Array; row: Row; }
-		const pending = new Map<string, Pending>();
+		// Both passes key rows through this one helper — shared with the SET COLLATE
+		// arm's pre-flush probes — so a collision judged anywhere is byte-identical to
+		// the key pass 2 writes.
+		const computeNewKey = this.rekeyedKeyComputer(newPkDef, newColumns);
 
-		const newPkDirections = newPkDef.map(pk => !!pk.desc);
+		// Pass 1 — collision detection only. Hold one hex signature per new key, never
+		// the row or old key. On a repeat, reject before any write; the store is
+		// untouched on rejection.
+		const seen = new Set<string>();
 		for await (const entry of store.iterate(bounds)) {
-			const row = deserializeRow(entry.value);
-			const newPkValues = newPkDef.map(pk => row[pk.index]);
-			const newKey = buildDataKey(newPkValues, this.encodeOptions, newPkDirections);
-			const hex = bytesToHex(newKey);
-			if (pending.has(hex)) {
+			const hex = bytesToHex(computeNewKey(deserializeRow(entry.value)));
+			if (seen.has(hex)) {
 				throw new QuereusError(
 					`UNIQUE constraint failed: duplicate primary key on rekey of '${this.schemaName}.${this.tableName}'`,
 					StatusCode.CONSTRAINT,
 				);
 			}
-			pending.set(hex, { newKey, oldKey: entry.key, row });
+			seen.add(hex);
 		}
 
+		// Pass 2 — re-scan and build the single atomic batch. Recompute each new key and
+		// only rewrite rows whose key actually moves (`newKey !== oldKey`).
 		const batch = store.batch();
-		for (const { newKey, oldKey, row } of pending.values()) {
-			if (!bytesEqual(oldKey, newKey)) {
-				batch.delete(oldKey);
+		for await (const entry of store.iterate(bounds)) {
+			const row = deserializeRow(entry.value);
+			const newKey = computeNewKey(row);
+			if (!bytesEqual(entry.key, newKey)) {
+				batch.delete(entry.key);
+				// NOTE: the row VALUE is unchanged, so `serializeRow(row)` reproduces
+				// `entry.value` byte-for-byte. We re-serialize rather than reuse
+				// `entry.value` to avoid retaining an iterator-owned buffer in the batch.
+				// If re-key CPU ever shows up hot, reuse `entry.value` where the backend
+				// guarantees the buffer is not reused across iteration.
 				batch.put(newKey, serializeRow(row));
 			}
 		}
@@ -291,326 +316,42 @@ export class StoreTable extends VirtualTable {
 	 * Migrate all stored rows from the old column layout to a new one.
 	 * The remap array maps newColumnIndex -> oldColumnIndex | -1.
 	 * -1 means the column is new (fill with defaultValue).
+	 *
+	 * `backfill`, when supplied (ADD COLUMN with a non-foldable DEFAULT such as
+	 * `new.<col>`), derives the new column's value from each existing row instead of the
+	 * single `defaultValue`, and rejects a NULL it produces for a NOT NULL column. The
+	 * batch is only written once every row migrates, so a throwing evaluator / NOT NULL
+	 * violation leaves the store untouched for the caller's rollback.
 	 */
-	async migrateRows(remap: number[], defaultValue: SqlValue): Promise<void> {
+	async migrateRows(
+		remap: number[],
+		defaultValue: SqlValue,
+		backfill?: { evaluator: (row: Row) => SqlValue | Promise<SqlValue>; notNull: boolean; columnName: string },
+	): Promise<void> {
 		const store = await this.ensureStore();
 		const bounds = buildFullScanBounds();
 		const batch = store.batch();
 
 		for await (const entry of store.iterate(bounds)) {
 			const oldRow = deserializeRow(entry.value);
+			let newColumnValue = defaultValue;
+			if (backfill) {
+				newColumnValue = await backfill.evaluator(oldRow);
+				if (backfill.notNull && newColumnValue === null) {
+					throw new QuereusError(
+						`NOT NULL constraint failed: backfilling column '${this.schemaName}.${this.tableName}.${backfill.columnName}' produced NULL for an existing row`,
+						StatusCode.CONSTRAINT,
+					);
+				}
+			}
 			const newRow: Row = new Array(remap.length);
 			for (let i = 0; i < remap.length; i++) {
-				newRow[i] = remap[i] === -1 ? defaultValue : oldRow[remap[i]];
+				newRow[i] = remap[i] === -1 ? newColumnValue : oldRow[remap[i]];
 			}
 			batch.put(entry.key, serializeRow(newRow));
 		}
 
 		await batch.write();
-	}
-
-	/**
-	 * Ensure the data store is open and DDL is persisted.
-	 * Uses a promise-based singleton pattern to prevent race conditions
-	 * when multiple concurrent queries access the same table.
-	 */
-	protected ensureStore(): Promise<KVStore> {
-		if (this.store) {
-			return Promise.resolve(this.store);
-		}
-
-		if (this.storeInitPromise) {
-			return this.storeInitPromise;
-		}
-
-		this.storeInitPromise = this.initializeStore();
-		return this.storeInitPromise;
-	}
-
-	/**
-	 * Internal method to actually initialize the store.
-	 * Only called once per table instance.
-	 */
-	private async initializeStore(): Promise<KVStore> {
-		const tableKey = `${this.schemaName}.${this.tableName}`.toLowerCase();
-
-		try {
-			this.store = await this.storeModule.getStore(tableKey, this.config);
-
-			if (!this.store) {
-				throw new Error(`getStore returned null/undefined for ${tableKey}`);
-			}
-
-			// Save DDL on first access (only for newly created tables)
-			if (!this.ddlSaved && this.tableSchema) {
-				await this.storeModule.saveTableDDL(this.tableSchema);
-				this.ddlSaved = true;
-			}
-
-			return this.store;
-		} catch (error) {
-			this.storeInitPromise = null;
-			throw error;
-		}
-	}
-
-	/**
-	 * Get or create an index store for the given index name.
-	 */
-	protected async ensureIndexStore(indexName: string): Promise<KVStore> {
-		let indexStore = this.indexStores.get(indexName);
-		if (!indexStore) {
-			indexStore = await this.storeModule.getIndexStore(this.schemaName, this.tableName, indexName);
-			this.indexStores.set(indexName, indexStore);
-		}
-		return indexStore;
-	}
-
-	/**
-	 * Get or create the stats store.
-	 */
-	protected async ensureStatsStore(): Promise<KVStore> {
-		if (!this.statsStore) {
-			this.statsStore = await this.storeModule.getStatsStore(this.schemaName, this.tableName);
-		}
-		return this.statsStore;
-	}
-
-	/**
-	 * Ensure the coordinator is available and connection is registered.
-	 */
-	protected async ensureCoordinator(): Promise<TransactionCoordinator> {
-		if (!this.coordinator) {
-			const tableKey = `${this.schemaName}.${this.tableName}`.toLowerCase();
-			this.coordinator = await this.storeModule.getCoordinator(tableKey, this.config);
-
-			this.coordinator.registerCallbacks({
-				onCommit: () => this.applyPendingStats(),
-				onRollback: () => this.discardPendingStats(),
-			});
-		}
-
-		if (!this.connection) {
-			this.connection = new StoreConnection(this.tableName, this.coordinator);
-			await (this.db as DatabaseInternal).registerConnection(this.connection);
-		}
-
-		return this.coordinator;
-	}
-
-	/** Apply pending stats on commit. */
-	protected applyPendingStats(): void {
-		if (this.pendingStatsDelta === 0) return;
-
-		if (!this.cachedStats) {
-			this.cachedStats = { rowCount: 0, updatedAt: Date.now() };
-		}
-		this.cachedStats.rowCount = Math.max(0, this.cachedStats.rowCount + this.pendingStatsDelta);
-		this.cachedStats.updatedAt = Date.now();
-		this.mutationCount += Math.abs(this.pendingStatsDelta);
-		this.pendingStatsDelta = 0;
-
-		if (this.mutationCount >= STATS_FLUSH_INTERVAL && !this.statsFlushPending) {
-			this.statsFlushPending = true;
-			queueMicrotask(() => this.flushStats());
-		}
-	}
-
-	/** Discard pending stats on rollback. */
-	protected discardPendingStats(): void {
-		this.pendingStatsDelta = 0;
-	}
-
-	/** Flush statistics to the stats store. */
-	protected async flushStats(): Promise<void> {
-		this.statsFlushPending = false;
-		this.mutationCount = 0;
-
-		if (!this.cachedStats) {
-			return;
-		}
-
-		const statsStore = await this.ensureStatsStore();
-		const statsKey = buildStatsKey(this.schemaName, this.tableName);
-		await statsStore.put(statsKey, serializeStats(this.cachedStats));
-	}
-
-	/** Create a new connection for transaction support. */
-	async createConnection(): Promise<VirtualTableConnection> {
-		await this.ensureCoordinator();
-		return this.connection!;
-	}
-
-	/** Get the current connection. */
-	getConnection(): VirtualTableConnection | undefined {
-		return this.connection ?? undefined;
-	}
-
-	/** Extract primary key values from a row. */
-	protected extractPK(row: Row): SqlValue[] {
-		const schema = this.tableSchema!;
-		return schema.primaryKeyDefinition.map(pk => row[pk.index]);
-	}
-
-	/**
-	 * Coerce each cell in `row` to its declared column logical type.
-	 * Mirrors the memory-table path (MemoryTableManager.performInsert/performUpdate)
-	 * so INTEGER/REAL affinity is applied and JSON columns are parsed into native
-	 * objects before PK extraction, serialization, and index-key construction.
-	 */
-	protected coerceRow(row: Row): Row {
-		const cols = this.tableSchema!.columns;
-		if (row.length > cols.length) {
-			throw new QuereusError(
-				`Too many values for ${this.schemaName}.${this.tableName}: expected ${cols.length}, got ${row.length}`,
-				StatusCode.ERROR,
-			);
-		}
-		return row.map((v, i) => validateAndParse(v, cols[i].logicalType, cols[i].name)) as Row;
-	}
-
-	/** Query the table with optional filters. */
-	async *query(filterInfo: FilterInfo): AsyncIterable<Row> {
-		const store = await this.ensureStore();
-
-		const pkAccess = this.analyzePKAccess(filterInfo);
-
-		if (pkAccess.type === 'point') {
-			const key = buildDataKey(pkAccess.values!, this.encodeOptions, this.pkDirections);
-			const value = await store.get(key);
-			if (value) {
-				const row = deserializeRow(value);
-				if (this.matchesFilters(row, filterInfo)) {
-					yield row;
-				}
-			}
-			return;
-		}
-
-		if (pkAccess.type === 'range') {
-			yield* this.scanPKRange(store, pkAccess, filterInfo);
-			return;
-		}
-
-		// Full table scan
-		const bounds = buildFullScanBounds();
-		for await (const entry of store.iterate(bounds)) {
-			const row = deserializeRow(entry.value);
-			if (this.matchesFilters(row, filterInfo)) {
-				yield row;
-			}
-		}
-	}
-
-	/** Analyze filter info to determine PK access pattern. */
-	protected analyzePKAccess(filterInfo: FilterInfo): PKAccessPattern {
-		const schema = this.tableSchema!;
-		const pkColumns = schema.primaryKeyDefinition.map(pk => pk.index);
-
-		if (pkColumns.length === 0) {
-			return { type: 'scan' };
-		}
-
-		// Check for equality on all PK columns
-		const eqValues: SqlValue[] = new Array(pkColumns.length);
-		let allEq = true;
-
-		for (let i = 0; i < pkColumns.length; i++) {
-			const pkColIdx = pkColumns[i];
-			const eqConstraintEntry = filterInfo.constraints?.find(
-				c => c.constraint.iColumn === pkColIdx && c.constraint.op === IndexConstraintOp.EQ
-			);
-			if (eqConstraintEntry && eqConstraintEntry.argvIndex > 0) {
-				eqValues[i] = filterInfo.args[eqConstraintEntry.argvIndex - 1];
-			} else {
-				allEq = false;
-				break;
-			}
-		}
-
-		if (allEq) {
-			return { type: 'point', values: eqValues };
-		}
-
-		// Check for range constraints on first PK column
-		const firstPkCol = pkColumns[0];
-		const rangeOps = [IndexConstraintOp.LT, IndexConstraintOp.LE, IndexConstraintOp.GT, IndexConstraintOp.GE];
-		const rangeConstraints = filterInfo.constraints?.filter(
-			c => c.constraint.iColumn === firstPkCol && rangeOps.includes(c.constraint.op)
-		) || [];
-
-		if (rangeConstraints.length > 0) {
-			return {
-				type: 'range',
-				columnIndex: firstPkCol,
-				constraints: rangeConstraints.map(c => ({
-					columnIndex: c.constraint.iColumn,
-					op: c.constraint.op,
-					value: c.argvIndex > 0 ? filterInfo.args[c.argvIndex - 1] : undefined,
-				})),
-			};
-		}
-
-		return { type: 'scan' };
-	}
-
-	/** Scan a range of PK values. */
-	protected async *scanPKRange(
-		store: KVStore,
-		_access: PKAccessPattern,
-		filterInfo: FilterInfo
-	): AsyncIterable<Row> {
-		const bounds = buildFullScanBounds();
-
-		// TODO: Refine bounds based on range constraints
-		for await (const entry of store.iterate(bounds)) {
-			const row = deserializeRow(entry.value);
-			if (this.matchesFilters(row, filterInfo)) {
-				yield row;
-			}
-		}
-	}
-
-	/** Check if a row matches the filter constraints. */
-	protected matchesFilters(row: Row, filterInfo: FilterInfo): boolean {
-		if (!filterInfo.constraints || filterInfo.constraints.length === 0) {
-			return true;
-		}
-
-		for (const constraintEntry of filterInfo.constraints) {
-			const { constraint, argvIndex } = constraintEntry;
-			if (constraint.iColumn < 0 || argvIndex <= 0) {
-				continue;
-			}
-
-			const rowValue = row[constraint.iColumn];
-			const filterValue = filterInfo.args[argvIndex - 1];
-
-			if (!this.compareValues(rowValue, constraint.op, filterValue)) {
-				return false;
-			}
-		}
-
-		return true;
-	}
-
-	/** Compare two values according to an operator. */
-	protected compareValues(a: SqlValue, op: IndexConstraintOp, b: SqlValue): boolean {
-		if (a === null || b === null) {
-			return op === IndexConstraintOp.EQ ? a === b : false;
-		}
-
-		switch (op) {
-			case IndexConstraintOp.EQ:
-				return a === b || (typeof a === 'string' && typeof b === 'string' &&
-					this.config.collation === 'NOCASE' && a.toLowerCase() === b.toLowerCase());
-			case IndexConstraintOp.NE: return a !== b;
-			case IndexConstraintOp.LT: return a < b;
-			case IndexConstraintOp.LE: return a <= b;
-			case IndexConstraintOp.GT: return a > b;
-			case IndexConstraintOp.GE: return a >= b;
-			default: return true;
-		}
 	}
 
 	/** Perform an update operation (INSERT, UPDATE, DELETE). */
@@ -626,18 +367,50 @@ export class StoreTable extends VirtualTable {
 				if (!values) throw new QuereusError('INSERT requires values', StatusCode.MISUSE);
 				const coerced = args.preCoerced ? values : this.coerceRow(values);
 				const pk = this.extractPK(coerced);
-				const key = buildDataKey(pk, this.encodeOptions, this.pkDirections);
+				const key = this.encodeDataKey(pk);
 
 				// Check for existing row (for conflict handling).
 				// Resolve PK-conflict action: statement OR > per-constraint default > ABORT.
 				const pkEffective = args.onConflict ?? resolvePkDefaultConflict(schema) ?? ConflictResolution.ABORT;
-				const existing = await store.get(key);
-				if (existing) {
+
+				// Trusted-flush safety analysis — why this arm diverges from the others.
+				// The insert arm's probe stays committed-only on the trusted-flush path,
+				// while the update/delete arms below read the effective
+				// (pending-over-committed) image UNCONDITIONALLY. That divergence is
+				// safe: `flushOverlayToUnderlying` (isolation, isolated-table.ts) wraps
+				// the flush in its own coordinator mini-transaction, the overlay holds
+				// at most ONE entry per PK, and tombstone deletes are ordered before
+				// inserts/updates — so when any flush write probes its own key, no
+				// pending op exists at that key yet in the mini-transaction and the
+				// effective read equals the committed read on every trusted probe. The
+				// committed-only read kept here is therefore NOT a read-correctness
+				// requirement but a pinned INTERNAL invariant: the flush routes existing
+				// PKs to update, so a row present here is an isolation-layer violation we
+				// must surface loudly (store-backing-host-substrate analysis).
+				let existingRow: Row | null;
+				if (args.trustedWrite) {
+					const committed = await store.get(key);
+					existingRow = committed ? deserializeRow(committed) : null;
+				} else {
+					existingRow = await this.readEffectiveRowByKey(key);
+				}
+				if (args.trustedWrite) {
+					// Trusted flush insert: the overlay flush routes existing PKs to
+					// update (via rowExistsInUnderlying), so a row already present here
+					// is an isolation-layer invariant violation. Fail loudly rather than
+					// silently overwrite — the flush try/catch rolls back and rethrows
+					// (isolation-merged-unique-stale-underlying-false-positive).
+					if (existingRow) {
+						throw new QuereusError(
+							`Trusted flush insert on '${this.tableName}' hit an existing PK; the overlay flush should route existing PKs to update. This indicates an isolation-layer invariant violation.`,
+							StatusCode.INTERNAL,
+						);
+					}
+				} else if (existingRow) {
 					if (pkEffective === ConflictResolution.IGNORE) {
 						return { status: 'ok', row: undefined };
 					}
 					if (pkEffective !== ConflictResolution.REPLACE) {
-						const existingRow = deserializeRow(existing);
 						return {
 							status: 'constraint',
 							constraint: 'unique',
@@ -649,78 +422,76 @@ export class StoreTable extends VirtualTable {
 
 				// Enforce non-PK UNIQUE constraints. Pass the original statement-level
 				// onConflict so checkUniqueConstraints can resolve each UC's own
-				// defaultConflict independently of the PK's default.
-				const ucResult = await this.checkUniqueConstraints(
-					inTransaction,
-					coerced,
-					[pk],
-					args.onConflict,
-				);
-				if (ucResult) return ucResult;
+				// defaultConflict independently of the PK's default. Secondary-UNIQUE
+				// REPLACE evictions accumulate in `evicted` for the executor pipeline.
+				// Skipped for trusted flush writes: the overlay already validated the
+				// final state and a value-swap cycle cannot pass a row-by-row re-check.
+				const evicted: Row[] = [];
+				if (!args.trustedWrite) {
+					const ucResult = await this.checkUniqueConstraints(
+						inTransaction,
+						coerced,
+						[pk],
+						args.onConflict,
+						evicted,
+					);
+					if (ucResult) return ucResult;
+				}
 
-				const oldRow = existing ? deserializeRow(existing) : null;
+				const oldRow = existingRow;
 				const serializedRow = serializeRow(coerced);
 				if (inTransaction) {
-					coordinator.put(key, serializedRow);
+					coordinator.put(key, serializedRow, store);
 				} else {
 					await store.put(key, serializedRow);
 				}
 
-				// Update secondary indexes
+				// Update secondary indexes. An effective `oldRow` (a pending row at the
+				// same PK, evicted under REPLACE) cancels the earlier pending index-put;
+				// a commit-batch delete of a never-committed index key is a harmless no-op.
 				await this.updateSecondaryIndexes(inTransaction, oldRow, coerced, pk);
 
 				// Track statistics (only count as new if not replacing)
-				if (!existing) {
+				if (!existingRow) {
 					this.trackMutation(+1, inTransaction);
 				}
 
-				// Queue or emit event
-				if (oldRow) {
-					// REPLACE — emit as update
-					const updateEvent = {
-						type: 'update' as const,
-						schemaName: schema.schemaName,
-						tableName: schema.name,
-						key: pk,
-						oldRow,
-						newRow: coerced,
-					};
-					if (inTransaction) {
-						coordinator.queueEvent(updateEvent);
-					} else {
-						this.eventEmitter?.emitDataChange(updateEvent);
-					}
-				} else {
-					const insertEvent = {
-						type: 'insert' as const,
-						schemaName: schema.schemaName,
-						tableName: schema.name,
-						key: pk,
-						newRow: coerced,
-					};
-					if (inTransaction) {
-						coordinator.queueEvent(insertEvent);
-					} else {
-						this.eventEmitter?.emitDataChange(insertEvent);
-					}
-				}
+				// Queue or emit event. A REPLACE at the SAME key is an in-place update, so
+				// it keeps the single `update` shape — the contract's split rule applies to
+				// a key change that MOVES the row, which this arm cannot produce.
+				const insertEventBase = { schemaName: schema.schemaName, tableName: schema.name, key: pk };
+				this.emitOrQueueDataChange(inTransaction, oldRow
+					? { ...insertEventBase, type: 'update', oldRow, newRow: coerced }
+					: { ...insertEventBase, type: 'insert', newRow: coerced });
 
-				return { status: 'ok', row: coerced, replacedRow: oldRow ?? undefined };
+				return { status: 'ok', row: coerced, replacedRow: oldRow ?? undefined, evictedRows: evicted.length > 0 ? evicted : undefined };
 			}
 
 			case 'update': {
 				if (!values || !oldKeyValues) throw new QuereusError('UPDATE requires values and oldKeyValues', StatusCode.MISUSE);
 				const coerced = args.preCoerced ? values : this.coerceRow(values);
-				const oldPk = this.extractPK(oldKeyValues);
+				const oldPk = this.pkFromKeyValues(oldKeyValues);
 				const newPk = this.extractPK(coerced);
-				const oldKey = buildDataKey(oldPk, this.encodeOptions, this.pkDirections);
-				const newKey = buildDataKey(newPk, this.encodeOptions, this.pkDirections);
+				const oldKey = this.encodeDataKey(oldPk);
+				const newKey = this.encodeDataKey(newPk);
 
-				// Get old row for index updates
-				const oldRowData = await store.get(oldKey);
-				const oldRow = oldRowData ? deserializeRow(oldRowData) : null;
+				// Get old row for index updates. Read the effective
+				// (pending-over-committed) image UNCONDITIONALLY — including the trusted
+				// flush path — so an old image written earlier in the same transaction is
+				// visible. This fixes index cleanup, the `uniqueColumnsChanged` gate, and
+				// the event's `oldRow`. Trusted is safe here (see the insert-arm comment):
+				// deletes-first ordering + one-entry-per-PK ⇒ effective ≡ committed on a
+				// flush write probing its own key.
+				const oldRow = await this.readEffectiveRowByKey(oldKey);
 
-				const pkChanged = !this.keysEqual(oldPk, newPk);
+				// A PK "change" only relocates the row when the ENCODED key differs.
+				// Under a non-binary PK collation (e.g. NOCASE) a case-only rewrite
+				// ('apple' → 'APPLE') keeps the same physical key, so it is an in-place
+				// update, not a relocation. Comparing raw values via keysEqual would
+				// mis-classify it as a move and then false-detect a PK conflict against
+				// the row's own existing entry at newKey (== oldKey). The encoded keys
+				// are the storage layer's source of truth (mirrors the rekey path above).
+				const pkChanged = !bytesEqual(oldKey, newKey);
 
 				// Resolve PK-conflict action: statement OR > per-constraint default > ABORT.
 				const pkEffective = args.onConflict ?? resolvePkDefaultConflict(schema) ?? ConflictResolution.ABORT;
@@ -728,12 +499,16 @@ export class StoreTable extends VirtualTable {
 				// PK-change UPDATE collides like an INSERT at the new key.
 				// Capture the evicted row so it can be reported via `replacedRow`
 				// (consumed by the executor for ON DELETE cascade/SET NULL of the
-				// row at the new PK). Read through the coordinator so an evictee
-				// written earlier in the same transaction is visible.
+				// row at the new PK). Read the effective (pending-over-committed) image
+				// so an evictee written earlier in the same transaction conflicts/evicts
+				// rather than being silently overwritten.
+				// Skipped for trusted flush writes — the overlay flush never changes a
+				// row's PK (oldKeyValues and the row's PK columns are the same overlay
+				// entry), so pkChanged is false there; the guard makes the intent explicit.
 				let replacedAtNewPk: Row | null = null;
-				if (pkChanged) {
-					const existingAtNew = await store.get(newKey);
-					if (existingAtNew) {
+				if (pkChanged && !args.trustedWrite) {
+					const existingAtNewRow = await this.readEffectiveRowByKey(newKey);
+					if (existingAtNewRow) {
 						if (pkEffective === ConflictResolution.IGNORE) {
 							return { status: 'ok', row: undefined };
 						}
@@ -742,10 +517,10 @@ export class StoreTable extends VirtualTable {
 								status: 'constraint',
 								constraint: 'unique',
 								message: `UNIQUE constraint failed: ${this.tableName} PK.`,
-								existingRow: deserializeRow(existingAtNew),
+								existingRow: existingAtNewRow,
 							};
 						}
-						replacedAtNewPk = deserializeRow(existingAtNew);
+						replacedAtNewPk = existingAtNewRow;
 					}
 				}
 
@@ -756,14 +531,21 @@ export class StoreTable extends VirtualTable {
 				// row we're moving. Pass the original statement-level onConflict so
 				// each UC's own defaultConflict can be resolved independently.
 				const selfPks: SqlValue[][] = pkChanged ? [oldPk, newPk] : [oldPk];
-				const shouldCheckUniques = pkChanged
-					|| (oldRow ? this.uniqueColumnsChanged(oldRow, coerced) : true);
+				// Skip the UNIQUE re-check for trusted flush writes: the overlay
+				// merged-view check already validated the final state, and a value-swap
+				// cycle cannot pass a row-by-row logical-UNIQUE re-check
+				// (isolation-merged-unique-stale-underlying-false-positive).
+				const shouldCheckUniques = !args.trustedWrite
+					&& (pkChanged || (oldRow ? this.uniqueColumnsChanged(oldRow, coerced) : true));
+				// Secondary-UNIQUE REPLACE evictions accumulate for the executor pipeline.
+				const evicted: Row[] = [];
 				if (shouldCheckUniques) {
 					const ucResult = await this.checkUniqueConstraints(
 						inTransaction,
 						coerced,
 						selfPks,
 						args.onConflict,
+						evicted,
 					);
 					if (ucResult) return ucResult;
 				}
@@ -780,7 +562,7 @@ export class StoreTable extends VirtualTable {
 				// Delete old key if PK changed
 				if (pkChanged) {
 					if (inTransaction) {
-						coordinator.delete(oldKey);
+						coordinator.delete(oldKey, store);
 					} else {
 						await store.delete(oldKey);
 					}
@@ -788,7 +570,7 @@ export class StoreTable extends VirtualTable {
 
 				const serializedRow = serializeRow(coerced);
 				if (inTransaction) {
-					coordinator.put(newKey, serializedRow);
+					coordinator.put(newKey, serializedRow, store);
 				} else {
 					await store.put(newKey, serializedRow);
 				}
@@ -798,35 +580,44 @@ export class StoreTable extends VirtualTable {
 				// both halves use the same key.
 				await this.updateSecondaryIndexes(inTransaction, oldRow, coerced, oldPk, newPk);
 
-				// Queue or emit event
-				const updateEvent = {
-					type: 'update' as const,
-					schemaName: schema.schemaName,
-					tableName: schema.name,
-					key: newPk,
-					oldRow: oldRow || undefined,
-					newRow: coerced,
-				};
-				if (inTransaction) {
-					coordinator.queueEvent(updateEvent);
+				// Queue or emit the event(s). An update that RELOCATED the row is delivered
+				// as a `delete` at the old key then an `insert` at the new one, never a single
+				// `update` — the event contract's split rule, which lets a listener retire the
+				// old identity without knowing which columns form the key (docs/usage.md
+				// § Subscribing to Data Changes). `pkChanged` is exactly the relocation test the
+				// contract names: encoded data keys fold each PK column's collation, so a NOCASE
+				// case-only rewrite stays one in-place `update`, keyed — like every
+				// non-relocating update — by the POST-image `newPk`. Any `replacedAtNewPk`
+				// eviction already emitted its own delete above (deleteRowAt), so the delivered
+				// order is evict-delete, move-delete, move-insert.
+				const eventBase = { schemaName: schema.schemaName, tableName: schema.name };
+				if (pkChanged) {
+					this.emitOrQueueDataChange(inTransaction, { ...eventBase, type: 'delete', key: oldPk, oldRow: oldRow || undefined });
+					this.emitOrQueueDataChange(inTransaction, { ...eventBase, type: 'insert', key: newPk, newRow: coerced });
 				} else {
-					this.eventEmitter?.emitDataChange(updateEvent);
+					this.emitOrQueueDataChange(inTransaction, { ...eventBase, type: 'update', key: newPk, oldRow: oldRow || undefined, newRow: coerced });
 				}
 
-				return { status: 'ok', row: coerced, replacedRow: replacedAtNewPk ?? undefined };
+				return { status: 'ok', row: coerced, replacedRow: replacedAtNewPk ?? undefined, evictedRows: evicted.length > 0 ? evicted : undefined };
 			}
 
 			case 'delete': {
 				if (!oldKeyValues) throw new QuereusError('DELETE requires oldKeyValues', StatusCode.MISUSE);
-				const pk = this.extractPK(oldKeyValues);
-				const key = buildDataKey(pk, this.encodeOptions, this.pkDirections);
+				const pk = this.pkFromKeyValues(oldKeyValues);
+				const key = this.encodeDataKey(pk);
 
-				// Get old row for index cleanup
-				const oldRowData = await store.get(key);
-				const oldRow = oldRowData ? deserializeRow(oldRowData) : null;
+				// Get old row for index cleanup. Read the effective
+				// (pending-over-committed) image so a row inserted earlier in the same
+				// transaction is seen: this fixes index cleanup, the `-1` stats delta
+				// (netting an insert+delete to zero), and the event's `oldRow`.
+				// `coordinator.delete(key)` cancels a pending put; a commit-batch delete
+				// of a never-committed key is a harmless no-op. The trusted flush delete
+				// arm does NOT pass `trustedWrite`, but deletes-first ordering +
+				// one-entry-per-PK keep effective ≡ committed there too (see insert arm).
+				const oldRow = await this.readEffectiveRowByKey(key);
 
 				if (inTransaction) {
-					coordinator.delete(key);
+					coordinator.delete(key, store);
 				} else {
 					await store.delete(key);
 				}
@@ -838,18 +629,13 @@ export class StoreTable extends VirtualTable {
 				}
 
 				// Queue or emit event
-				const deleteEvent = {
-					type: 'delete' as const,
+				this.emitOrQueueDataChange(inTransaction, {
+					type: 'delete',
 					schemaName: schema.schemaName,
 					tableName: schema.name,
 					key: pk,
 					oldRow: oldRow || undefined,
-				};
-				if (inTransaction) {
-					coordinator.queueEvent(deleteEvent);
-				} else {
-					this.eventEmitter?.emitDataChange(deleteEvent);
-				}
+				});
 
 				return { status: 'ok', row: oldRow || undefined };
 			}
@@ -860,350 +646,81 @@ export class StoreTable extends VirtualTable {
 	}
 
 	/**
-	 * Update secondary indexes after a row change.
+	 * Apply externally-originated row ops directly to this source table's
+	 * COMMITTED storage: table-owned data-key put/delete, secondary-index
+	 * maintenance, and stats tracking. The index-maintaining counterpart of
+	 * `StoreBackingHost.applyMaintenance` (which targets index-less MV backings),
+	 * built for trusted replication-style writes.
 	 *
-	 * For PK-change UPDATE, `oldPk` (where the existing entry lives) and `newPk`
-	 * (where the relocated entry will live) differ; using a single pk for both
-	 * sides leaks the old entry. Other paths pass the same pk for both.
+	 * Deliberately:
+	 *   - emits NO module {@link DataChangeEvent}s — the external writer owns
+	 *     emission and the `remote` flag;
+	 *   - opens NO coordinator transaction — writes land in committed state
+	 *     immediately (`store.put`/`store.delete`, never the coordinator);
+	 *   - runs NO constraint validation (PK/UNIQUE/CHECK/FK) — the origin is
+	 *     trusted, mirroring the backing-host posture.
+	 *
+	 * Returns the EFFECTIVE per-op {@link BackingRowChange}s with accurate
+	 * before-images (the shape `Database.ingestExternalRowChanges` consumes),
+	 * suppressing no-ops to match the normative upsert-suppression contract in
+	 * `vtab/backing-host.ts`: a delete of an absent key, and a value-identical
+	 * upsert (`rowsValueIdentical` — byte-faithful, collation-UNAWARE, against the
+	 * effective existing row) write nothing and report nothing. A collation-equal /
+	 * byte-different upsert (e.g. a case-only rewrite under a NOCASE PK) keeps the
+	 * SAME data key (key identity is collation-aware) but IS a real update that
+	 * replaces the stored bytes and reports `update`.
+	 *
+	 * Last-writer-wins against any concurrently pending local transaction on this
+	 * table: the external write commits to storage at once, and that transaction's
+	 * pending batch may overwrite these keys when it commits. This is the same
+	 * posture the prior raw-KV sync adapter took — not a regression, now stated.
 	 */
-	protected async updateSecondaryIndexes(
-		inTransaction: boolean,
-		oldRow: Row | null,
-		newRow: Row | null,
-		oldPk: SqlValue[],
-		newPk: SqlValue[] = oldPk,
-	): Promise<void> {
-		const schema = this.tableSchema!;
-		const indexes = schema.indexes || [];
+	async applyExternalRowChanges(ops: readonly ExternalRowOp[]): Promise<BackingRowChange[]> {
+		const changes: BackingRowChange[] = [];
+		if (ops.length === 0) return changes;
 
-		for (const index of indexes) {
-			const indexStore = await this.ensureIndexStore(index.name);
-			const indexCols = index.columns.map(c => c.index);
-			const indexDirections = index.columns.map(c => !!c.desc);
+		// Route through the lazy store-open path so the first external write to a
+		// freshly created table persists its DDL exactly like a first vtab write.
+		const store = await this.ensureStore();
 
-			// Remove old index entry
-			if (oldRow) {
-				const oldIndexValues = indexCols.map(i => oldRow[i]);
-				const oldIndexKey = buildIndexKey(
-					oldIndexValues,
-					oldPk,
-					this.encodeOptions,
-					indexDirections,
-					this.pkDirections,
-				);
-
-				if (inTransaction && this.coordinator) {
-					this.coordinator.delete(oldIndexKey, indexStore);
-				} else {
-					await indexStore.delete(oldIndexKey);
+		for (const op of ops) {
+			switch (op.op) {
+				case 'delete': {
+					const key = this.encodeDataKey(op.pk);
+					const existing = await this.readEffectiveRowByKey(key);
+					if (!existing) break; // absent key → no storage/index/stats op, nothing reported
+					await store.delete(key);
+					await this.updateSecondaryIndexes(false, existing, null, op.pk);
+					this.trackMutation(-1, false);
+					changes.push({ op: 'delete', oldRow: existing });
+					break;
 				}
-			}
-
-			// Add new index entry
-			if (newRow) {
-				const newIndexValues = indexCols.map(i => newRow[i]);
-				const newIndexKey = buildIndexKey(
-					newIndexValues,
-					newPk,
-					this.encodeOptions,
-					indexDirections,
-					this.pkDirections,
-				);
-				// Index value is empty - we just need the key for lookups
-				const emptyValue = new Uint8Array(0);
-
-				if (inTransaction && this.coordinator) {
-					this.coordinator.put(newIndexKey, emptyValue, indexStore);
-				} else {
-					await indexStore.put(newIndexKey, emptyValue);
-				}
-			}
-		}
-	}
-
-	/**
-	 * Returns the compiled predicate for a partial-UNIQUE constraint, or undefined
-	 * when the constraint covers the full table. Compilation is memoized per
-	 * UniqueConstraintSchema instance so the hot UNIQUE-check path doesn't recompile.
-	 */
-	private compileFor(uc: UniqueConstraintSchema): CompiledPredicate | undefined {
-		if (!uc.predicate) return undefined;
-		let compiled = this.predicateCache.get(uc);
-		if (!compiled) {
-			compiled = compilePredicate(uc.predicate, this.tableSchema!.columns);
-			this.predicateCache.set(uc, compiled);
-		}
-		return compiled;
-	}
-
-	/** Check if two PK arrays are equal. */
-	protected keysEqual(a: SqlValue[], b: SqlValue[]): boolean {
-		if (a.length !== b.length) return false;
-		for (let i = 0; i < a.length; i++) {
-			if (a[i] !== b[i]) return false;
-		}
-		return true;
-	}
-
-	/**
-	 * Returns true if any column covered by a UNIQUE constraint differs between
-	 * oldRow and newRow, or — for partial UNIQUE — any column referenced by the
-	 * partial predicate differs (which can transition the row across the
-	 * predicate scope and re-trigger the uniqueness check).
-	 */
-	protected uniqueColumnsChanged(oldRow: Row, newRow: Row): boolean {
-		const ucs = this.tableSchema?.uniqueConstraints;
-		if (!ucs || ucs.length === 0) return false;
-		for (const uc of ucs) {
-			for (const colIdx of uc.columns) {
-				if (compareSqlValues(oldRow[colIdx], newRow[colIdx]) !== 0) return true;
-			}
-			if (uc.predicate) {
-				const compiled = this.compileFor(uc);
-				if (compiled) {
-					for (const colIdx of compiled.referencedColumns) {
-						if (compareSqlValues(oldRow[colIdx], newRow[colIdx]) !== 0) return true;
+				case 'upsert': {
+					const pk = this.extractPK(op.row);
+					const key = this.encodeDataKey(pk);
+					const existing = await this.readEffectiveRowByKey(key);
+					if (existing && rowsValueIdentical(existing, op.row)) {
+						// Byte-identical to the effective row → a true no-op: no write, no
+						// index touch, no stats delta, nothing reported (echo-prevention seam).
+						break;
 					}
+					await store.put(key, serializeRow(op.row));
+					// PK derives from the row, so the key never relocates: oldPk == newPk.
+					await this.updateSecondaryIndexes(false, existing, op.row, pk);
+					if (!existing) this.trackMutation(+1, false);
+					changes.push(existing
+						? { op: 'update', oldRow: existing, newRow: op.row }
+						: { op: 'insert', newRow: op.row });
+					break;
+				}
+				default: {
+					// A new ExternalRowOp variant must extend this switch; never-assignment
+					// makes that a compile error rather than a silent no-op.
+					const exhaustiveCheck: never = op;
+					throw new QuereusError(`Unknown external row op: ${JSON.stringify(exhaustiveCheck)}`, StatusCode.INTERNAL);
 				}
 			}
 		}
-		return false;
+		return changes;
 	}
-
-	/**
-	 * Enforce table-level UNIQUE constraints against the prospective newRow.
-	 * Honors `onConflict`: IGNORE returns an ok-with-undefined-row; REPLACE
-	 * deletes the conflicting row(s) and continues; otherwise returns a
-	 * constraint result. Returns null when all constraints pass.
-	 *
-	 * Rows whose PK is in `selfPks` are skipped (the row being inserted/updated).
-	 * NULL in any covered column skips that constraint (multiple NULLs are allowed
-	 * per SQL standard).
-	 *
-	 * Reads through the transaction coordinator's pending writes when active so
-	 * intra-transaction duplicates are detected.
-	 */
-	protected async checkUniqueConstraints(
-		inTransaction: boolean,
-		newRow: Row,
-		selfPks: SqlValue[][],
-		onConflict?: ConflictResolution,
-	): Promise<UpdateResult | null> {
-		const schema = this.tableSchema!;
-		const uniqueConstraints = schema.uniqueConstraints;
-		if (!uniqueConstraints || uniqueConstraints.length === 0) return null;
-
-		for (const uc of uniqueConstraints) {
-			if (uc.columns.some(idx => newRow[idx] === null)) continue;
-
-			// Partial UNIQUE: a row whose predicate is not unambiguously TRUE is
-			// outside the index's scope and contributes nothing to uniqueness.
-			const predicate = this.compileFor(uc);
-			if (predicate && predicate.evaluate(newRow) !== true) continue;
-
-			const conflict = await this.findUniqueConflict(uc, predicate, newRow, selfPks);
-			if (!conflict) continue;
-
-			// Resolve action per-constraint: statement OR > per-UC default > ABORT.
-			const effective = onConflict ?? uc.defaultConflict ?? ConflictResolution.ABORT;
-			if (effective === ConflictResolution.IGNORE) {
-				return { status: 'ok', row: undefined };
-			}
-			if (effective === ConflictResolution.REPLACE) {
-				await this.deleteRowAt(inTransaction, conflict.pk, conflict.row);
-				continue;
-			}
-			const colNames = uc.columns.map(i => schema.columns[i].name).join(', ');
-			return {
-				status: 'constraint',
-				constraint: 'unique',
-				message: `UNIQUE constraint failed: ${schema.name} (${colNames})`,
-				existingRow: conflict.row,
-			};
-		}
-		return null;
-	}
-
-	/**
-	 * Scan committed + pending data rows for a row matching `newRow` on
-	 * `uc.columns` whose PK is not in `selfPks`. For partial UNIQUE, candidates
-	 * whose row does not satisfy the predicate are skipped. Returns the first
-	 * match or null.
-	 */
-	private async findUniqueConflict(
-		uc: UniqueConstraintSchema,
-		predicate: CompiledPredicate | undefined,
-		newRow: Row,
-		selfPks: SqlValue[][],
-	): Promise<{ pk: SqlValue[]; row: Row } | null> {
-		const store = await this.ensureStore();
-		const pending = this.coordinator?.isInTransaction()
-			? this.coordinator.getPendingOpsForStore(store)
-			: null;
-		const constrainedCols = uc.columns;
-
-		const matches = (candidate: Row): { pk: SqlValue[]; row: Row } | null => {
-			const pk = this.extractPK(candidate);
-			for (const skip of selfPks) {
-				if (this.keysEqual(pk, skip)) return null;
-			}
-			for (const idx of constrainedCols) {
-				if (compareSqlValues(newRow[idx], candidate[idx]) !== 0) return null;
-			}
-			// Partial UNIQUE: candidate must also be in the predicate's scope to conflict.
-			if (predicate && predicate.evaluate(candidate) !== true) return null;
-			return { pk, row: candidate };
-		};
-
-		const seen = new Set<string>();
-		const bounds = buildFullScanBounds();
-		for await (const entry of store.iterate(bounds)) {
-			const hex = bytesToHex(entry.key);
-			seen.add(hex);
-			if (pending?.deletes.has(hex)) continue;
-			const overlay = pending?.puts.get(hex);
-			const value = overlay ? overlay.value : entry.value;
-			const found = matches(deserializeRow(value));
-			if (found) return found;
-		}
-
-		if (pending) {
-			for (const [hex, op] of pending.puts) {
-				if (seen.has(hex)) continue;
-				const found = matches(deserializeRow(op.value));
-				if (found) return found;
-			}
-		}
-		return null;
-	}
-
-	/**
-	 * Fully delete the row at `pk` (data + secondary indexes + stats + delete event).
-	 * Used by REPLACE conflict resolution to evict a conflicting unique row before
-	 * the caller's insert/update proceeds.
-	 */
-	private async deleteRowAt(
-		inTransaction: boolean,
-		pk: SqlValue[],
-		oldRow: Row,
-	): Promise<void> {
-		const store = await this.ensureStore();
-		const key = buildDataKey(pk, this.encodeOptions, this.pkDirections);
-		if (inTransaction && this.coordinator) {
-			this.coordinator.delete(key);
-		} else {
-			await store.delete(key);
-		}
-		await this.updateSecondaryIndexes(inTransaction, oldRow, null, pk);
-		this.trackMutation(-1, inTransaction);
-
-		const schema = this.tableSchema!;
-		const deleteEvent = {
-			type: 'delete' as const,
-			schemaName: schema.schemaName,
-			tableName: schema.name,
-			key: pk,
-			oldRow,
-		};
-		if (inTransaction && this.coordinator) {
-			this.coordinator.queueEvent(deleteEvent);
-		} else {
-			this.eventEmitter?.emitDataChange(deleteEvent);
-		}
-	}
-
-	/**
-	 * Begin a table-scoped transaction by ensuring the coordinator is active.
-	 *
-	 * Used by the isolation layer's flush path, which treats the underlying
-	 * write as an independent mini-transaction. Idempotent: if the coordinator
-	 * is already in a transaction (e.g. started by a registered connection),
-	 * this is a no-op.
-	 */
-	async begin(): Promise<void> {
-		const coordinator = await this.ensureCoordinator();
-		coordinator.begin();
-	}
-
-	/**
-	 * Commits a table-scoped transaction, flushing any buffered writes to the KV store.
-	 * No-op if the coordinator is not currently in a transaction.
-	 */
-	async commit(): Promise<void> {
-		if (this.coordinator?.isInTransaction()) {
-			await this.coordinator.commit();
-		}
-	}
-
-	/**
-	 * Rolls back a table-scoped transaction, discarding any buffered writes.
-	 * No-op if the coordinator is not currently in a transaction.
-	 */
-	async rollback(): Promise<void> {
-		if (this.coordinator?.isInTransaction()) {
-			this.coordinator.rollback();
-		}
-	}
-
-	/** Disconnect from the store. */
-	async disconnect(): Promise<void> {
-		// Called by Quereus after each scan completes.
-		// Do NOT clear the store - it's shared across concurrent queries.
-		// Only flush pending stats if there are mutations.
-		if (this.mutationCount > 0 && this.store) {
-			await this.flushStats();
-		}
-		// Store remains available for subsequent queries.
-		// Use destroy() to fully clean up the table.
-	}
-
-	/** Get the current estimated row count. */
-	async getEstimatedRowCount(): Promise<number> {
-		if (this.cachedStats) {
-			return this.cachedStats.rowCount;
-		}
-
-		const statsStore = await this.ensureStatsStore();
-		const statsKey = buildStatsKey(this.schemaName, this.tableName);
-		const statsData = await statsStore.get(statsKey);
-
-		if (statsData) {
-			this.cachedStats = deserializeStats(statsData);
-			return this.cachedStats.rowCount;
-		}
-
-		// No stats yet, return 0
-		return 0;
-	}
-
-	/** Track a mutation and schedule lazy stats persistence. */
-	protected trackMutation(delta: number, inTransaction = false): void {
-		if (inTransaction) {
-			// Buffer during transaction - stats will be applied at commit
-			this.pendingStatsDelta += delta;
-			return;
-		}
-
-		if (!this.cachedStats) {
-			this.cachedStats = { rowCount: 0, updatedAt: Date.now() };
-		}
-
-		this.cachedStats.rowCount = Math.max(0, this.cachedStats.rowCount + delta);
-		this.cachedStats.updatedAt = Date.now();
-		this.mutationCount++;
-
-		// Schedule lazy flush after threshold
-		if (this.mutationCount >= STATS_FLUSH_INTERVAL && !this.statsFlushPending) {
-			this.statsFlushPending = true;
-			queueMicrotask(() => this.flushStats());
-		}
-	}
-}
-
-/** PK access pattern analysis result. */
-interface PKAccessPattern {
-	type: 'point' | 'range' | 'scan';
-	values?: SqlValue[];
-	columnIndex?: number;
-	constraints?: Array<{ columnIndex: number; op: IndexConstraintOp; value?: SqlValue }>;
 }

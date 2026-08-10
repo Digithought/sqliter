@@ -211,6 +211,79 @@ ORDER BY val DESC;
 → [{"val":"gamma"},{"val":"beta"},{"val":"alpha"}]
 
 -- ============================================================
+-- SET OPERATIONS: ORDER BY ordinal (positional) over a compound
+-- Regression: ticket compound-order-by-ordinal-reference. A bare
+-- positional ordinal must order by the compound's Nth OUTPUT column,
+-- not compile to a constant (a no-op).
+-- ============================================================
+
+-- Bare ordinal orders by output column 1 (was: input/union order — no-op)
+SELECT v FROM (VALUES (3), (1), (2)) AS a(v)
+UNION
+SELECT v FROM (VALUES (3), (1), (2)) AS b(v)
+ORDER BY 1;
+→ [{"v":1},{"v":2},{"v":3}]
+
+-- Descending ordinal over UNION ALL (bag preserves all rows)
+SELECT v FROM (VALUES (3), (1), (2)) AS a(v)
+UNION ALL
+SELECT v FROM (VALUES (3), (1), (2)) AS b(v)
+ORDER BY 1 DESC;
+→ [{"v":3},{"v":3},{"v":2},{"v":2},{"v":1},{"v":1}]
+
+-- Ordinal over INTERSECT
+SELECT v FROM (VALUES (3), (1), (2)) AS a(v)
+INTERSECT
+SELECT v FROM (VALUES (2), (3)) AS b(v)
+ORDER BY 1;
+→ [{"v":2},{"v":3}]
+
+-- Ordinal over EXCEPT
+SELECT v FROM (VALUES (3), (1), (2)) AS a(v)
+EXCEPT
+SELECT v FROM (VALUES (2)) AS b(v)
+ORDER BY 1;
+→ [{"v":1},{"v":3}]
+
+-- Ordinal over DIFF (symmetric difference: (A EXCEPT B) UNION (B EXCEPT A)).
+-- The ordinal resolves over the outer UNION's output column, so positional
+-- ordering works across the structural expansion.
+SELECT v FROM (VALUES (1), (2), (3)) AS a(v)
+DIFF
+SELECT v FROM (VALUES (2), (3), (4)) AS b(v)
+ORDER BY 1 DESC;
+→ [{"v":4},{"v":1}]
+
+-- Mixed ordinal + column-name keys in one ORDER BY
+SELECT a, b FROM (VALUES (2, 'x'), (1, 'y'), (1, 'a')) AS t(a, b)
+UNION
+SELECT a, b FROM (VALUES (2, 'x'), (1, 'y'), (1, 'a')) AS u(a, b)
+ORDER BY 1, b DESC;
+→ [{"a":1,"b":"y"},{"a":1,"b":"a"},{"a":2,"b":"x"}]
+
+-- Non-integer expression keeps expression semantics (NOT an ordinal):
+-- `1 + 0` is a constant, so the secondary key `v` decides the order.
+SELECT v FROM (VALUES (3), (1), (2)) AS a(v)
+UNION
+SELECT v FROM (VALUES (3), (1), (2)) AS b(v)
+ORDER BY 1 + 0, v;
+→ [{"v":1},{"v":2},{"v":3}]
+
+-- Out-of-range ordinal raises the standard prepare-time error
+SELECT v FROM (VALUES (1)) AS a(v)
+UNION
+SELECT v FROM (VALUES (2)) AS b(v)
+ORDER BY 2;
+-- error: ORDER BY position 2 is not in the SELECT list
+
+-- Zero ordinal raises the standard prepare-time error
+SELECT v FROM (VALUES (1)) AS a(v)
+UNION
+SELECT v FROM (VALUES (2)) AS b(v)
+ORDER BY 0;
+-- error: ORDER BY position 0 is not in the SELECT list
+
+-- ============================================================
 -- SET OPERATIONS: Type preservation
 -- ============================================================
 

@@ -1,0 +1,347 @@
+-- 06.3.5-column-info.sqllogic — column_info(name) per-column updateability surface.
+-- The column-granular companion to view_info(): docs/view-updateability.md
+-- § Information Schema Surface (information_schema.columns.is_updatable).
+-- Columns: schema, name, cid, column_name, is_updatable ('YES'/'NO'),
+-- base_table, base_column (both null for a read-only column). Resolves a base
+-- table, a plain view, or a maintained table (materialized view — derivation-body
+-- lineage, not plain base columns); throws not-found when neither matches.
+
+-- ===================================================================
+-- Base table, all columns updatable: every non-generated base column is a
+-- trivially-updatable base write target tracing to itself.
+-- ===================================================================
+
+create table t (id integer primary key, name text);
+
+select cid, column_name, is_updatable, base_table, base_column from column_info('t');
+→ [{"cid":0,"column_name":"id","is_updatable":"YES","base_table":"t","base_column":"id"},{"cid":1,"column_name":"name","is_updatable":"YES","base_table":"t","base_column":"name"}]
+
+select schema, name from column_info('t');
+→ [{"schema":"main","name":"t"},{"schema":"main","name":"t"}]
+
+-- Cardinality: one row per column.
+select count(*) as c from column_info('t');
+→ [{"c":2}]
+
+-- ===================================================================
+-- Base table with a generated column: the generated column is read-only
+-- (computed lineage) with null base trace; the rest are updatable.
+-- ===================================================================
+
+create table g (id integer primary key, a integer, b integer generated always as (a + 1));
+select cid, column_name, is_updatable, base_table, base_column from column_info('g');
+→ [{"cid":0,"column_name":"id","is_updatable":"YES","base_table":"g","base_column":"id"},{"cid":1,"column_name":"a","is_updatable":"YES","base_table":"g","base_column":"a"},{"cid":2,"column_name":"b","is_updatable":"NO","base_table":null,"base_column":null}]
+
+-- ===================================================================
+-- Identity view: both columns updatable, tracing to the base table.
+-- ===================================================================
+
+create view v_identity as select id, name from t;
+select cid, column_name, is_updatable, base_table, base_column from column_info('v_identity');
+→ [{"cid":0,"column_name":"id","is_updatable":"YES","base_table":"t","base_column":"id"},{"cid":1,"column_name":"name","is_updatable":"YES","base_table":"t","base_column":"name"}]
+
+select schema, name from column_info('v_identity');
+→ [{"schema":"main","name":"v_identity"},{"schema":"main","name":"v_identity"}]
+
+-- ===================================================================
+-- Rename view: the alias renames the OUTPUT column (column_name), the trace
+-- keeps the underlying base column (base_column).
+-- ===================================================================
+
+create view v_rename as select id as user_id, name as full_name from t;
+select cid, column_name, is_updatable, base_table, base_column from column_info('v_rename');
+→ [{"cid":0,"column_name":"user_id","is_updatable":"YES","base_table":"t","base_column":"id"},{"cid":1,"column_name":"full_name","is_updatable":"YES","base_table":"t","base_column":"name"}]
+
+-- ===================================================================
+-- Computed column among passthroughs: the passthrough column is updatable, the
+-- computed expression column is read-only with null trace.
+-- ===================================================================
+
+create view cv as select name, name || '!' as banner from t;
+select cid, column_name, is_updatable, base_table, base_column from column_info('cv');
+→ [{"cid":0,"column_name":"name","is_updatable":"YES","base_table":"t","base_column":"name"},{"cid":1,"column_name":"banner","is_updatable":"NO","base_table":null,"base_column":null}]
+
+-- ===================================================================
+-- Single-source INVERSE-profile column: `bp = b + 1` is a non-identity invertible
+-- projection of si.b. Its UpdateSite is `base` (si.b) WITH an inverse, which
+-- baseSiteOf resolves like any base site → is_updatable='YES' tracing to the base
+-- column. The opaque sibling `bo = b * 2` (multiplication has no inverse profile)
+-- stays read-only. The single-source UPDATE path now consumes the threaded inverse
+-- (a real write below stores the inverted base value), so static and dynamic agree.
+-- docs § Scalar Invertibility.
+-- ===================================================================
+
+create table si (id integer primary key, b integer null);
+create view si_v as select id, b + 1 as bp, b * 2 as bo from si;
+select cid, column_name, is_updatable, base_table, base_column from column_info('si_v');
+→ [{"cid":0,"column_name":"id","is_updatable":"YES","base_table":"si","base_column":"id"},{"cid":1,"column_name":"bp","is_updatable":"YES","base_table":"si","base_column":"b"},{"cid":2,"column_name":"bo","is_updatable":"NO","base_table":null,"base_column":null}]
+
+-- Dynamic agreement: writing the inverse column stores the inverted base value
+-- (bp = 9 ⇒ b = 8), and the view reads it back through the forward transform.
+insert into si values (1, 5);
+update si_v set bp = 9 where id = 1;
+select id, b from si;
+→ [{"id":1,"b":8}]
+select id, bp, bo from si_v;
+→ [{"id":1,"bp":9,"bo":16}]
+
+-- The opaque sibling stays read-only on the write path too.
+update si_v set bo = 99 where id = 1;
+-- error: read-only
+
+-- ===================================================================
+-- Single-source PASSTHROUGH-profile columns: `bc = b collate nocase` and
+-- `nc = cast(n as integer)` (no-op, same logical type) are identity-ON-VALUE
+-- transforms of one base column — their UpdateSite is `base` WITH NO inverse
+-- (passthrough), which baseSiteOf resolves like any base site → is_updatable='YES'
+-- tracing to the base column. The opaque sibling `bo = b || '!'` (concat has no
+-- inverse profile) stays read-only. The single-source UPDATE path now routes the
+-- FULL writable-base set (identity + passthrough + inverse), so a real write below
+-- stores the value VERBATIM (no inverse to apply) and the view reads it back —
+-- static and dynamic agree. docs § Scalar Invertibility.
+-- ===================================================================
+
+create table pt (id integer primary key, b text null, n integer null);
+create view pt_v as select id, b collate nocase as bc, cast(n as integer) as nc, b || '!' as bo from pt;
+select cid, column_name, is_updatable, base_table, base_column from column_info('pt_v');
+→ [{"cid":0,"column_name":"id","is_updatable":"YES","base_table":"pt","base_column":"id"},{"cid":1,"column_name":"bc","is_updatable":"YES","base_table":"pt","base_column":"b"},{"cid":2,"column_name":"nc","is_updatable":"YES","base_table":"pt","base_column":"n"},{"cid":3,"column_name":"bo","is_updatable":"NO","base_table":null,"base_column":null}]
+
+-- Dynamic agreement: a passthrough write stores the value VERBATIM (no inverse to
+-- apply), and the view reads it back through the value-preserving forward transform.
+insert into pt values (1, 'hi', 5);
+update pt_v set bc = 'yo' where id = 1;
+select id, b from pt;
+→ [{"id":1,"b":"yo"}]
+update pt_v set nc = 99 where id = 1;
+select id, n from pt;
+→ [{"id":1,"n":99}]
+select id, bc, nc from pt_v;
+→ [{"id":1,"bc":"yo","nc":99}]
+
+-- The opaque sibling stays read-only on the write path too.
+update pt_v set bo = 'X' where id = 1;
+-- error: read-only
+
+-- ===================================================================
+-- Multi-source inner join: each output column traces to its own source base
+-- table; all updatable. (cid/note from ms_child, label from ms_parent.)
+-- ===================================================================
+
+create table ms_parent (pid integer primary key, label text);
+create table ms_child (cid integer primary key, pref integer, note text,
+    foreign key (pref) references ms_parent(pid));
+create view ms_jv as
+    select c.cid as cid, c.note as note, p.label as label
+    from ms_child c join ms_parent p on p.pid = c.pref;
+select cid, column_name, is_updatable, base_table, base_column from column_info('ms_jv');
+→ [{"cid":0,"column_name":"cid","is_updatable":"YES","base_table":"ms_child","base_column":"cid"},{"cid":1,"column_name":"note","is_updatable":"YES","base_table":"ms_child","base_column":"note"},{"cid":2,"column_name":"label","is_updatable":"YES","base_table":"ms_parent","base_column":"label"}]
+
+-- ===================================================================
+-- Multi-source inner join with an INVERSE-profile column: `nv1 = c.nv + 1` is a
+-- non-identity invertible projection of iv_child.nv. Its UpdateSite is `base`
+-- (iv_child.nv) WITH an inverse, which baseSiteOf resolves like any base site, so
+-- it reports is_updatable='YES' tracing to the base column — consistent with the
+-- multi-source UPDATE path, which now consumes the threaded inverse (a real write
+-- below stores the inverted base value). docs § Scalar Invertibility, § Inner Join.
+-- ===================================================================
+
+create table iv_parent (pid integer primary key, label text);
+create table iv_child (cid integer primary key, pref integer, nv integer,
+    foreign key (pref) references iv_parent(pid));
+create view iv_jv as
+    select c.cid as cid, c.nv + 1 as nv1, p.label as label
+    from iv_child c join iv_parent p on p.pid = c.pref;
+select cid, column_name, is_updatable, base_table, base_column from column_info('iv_jv');
+→ [{"cid":0,"column_name":"cid","is_updatable":"YES","base_table":"iv_child","base_column":"cid"},{"cid":1,"column_name":"nv1","is_updatable":"YES","base_table":"iv_child","base_column":"nv"},{"cid":2,"column_name":"label","is_updatable":"YES","base_table":"iv_parent","base_column":"label"}]
+
+-- Dynamic agreement: writing the inverse column stores the inverted base value
+-- (nv1 = 9 ⇒ nv = 8), and the view reads it back through the forward transform.
+insert into iv_parent values (1, 'p1');
+insert into iv_child values (10, 1, 5);
+update iv_jv set nv1 = 9 where cid = 10;
+select cid, pref, nv from iv_child;
+→ [{"cid":10,"pref":1,"nv":8}]
+select cid, nv1, label from iv_jv;
+→ [{"cid":10,"nv1":9,"label":"p1"}]
+
+-- ===================================================================
+-- Wholly read-only bodies: every output column is_updatable='NO' with null
+-- trace. Unlike view_info's single conservative row, column_info still emits
+-- one row per output column.
+-- ===================================================================
+
+create view values_v as values (1, 2), (3, 4);
+select cid, is_updatable, base_table, base_column from column_info('values_v');
+→ [{"cid":0,"is_updatable":"NO","base_table":null,"base_column":null},{"cid":1,"is_updatable":"NO","base_table":null,"base_column":null}]
+
+create view agg_v as select count(*) as n from t;
+select cid, column_name, is_updatable, base_table, base_column from column_info('agg_v');
+→ [{"cid":0,"column_name":"n","is_updatable":"NO","base_table":null,"base_column":null}]
+
+-- ===================================================================
+-- Outer-join body: PER-SIDE updatability. A LEFT outer join is writable on every base
+-- column — the preserved side's columns (aid, av) report is_updatable='YES' with their
+-- base trace, and the non-preserved (`null-extended`) side's column (bv) ALSO reports
+-- 'YES' tracing to oj_b.bv: its UPDATE materializes per row (a matched row updates the
+-- non-preserved base row, a null-extended row inserts one keyed by the EC join key —
+-- `view-write-optional-member-transitions`), since the body has a preserved anchor.
+-- column_info reads the same per-column `null-extended` lineage `view_info` does, so
+-- the two surfaces agree with the dynamic truth.
+-- ===================================================================
+
+create table oj_a (aid integer primary key, av text);
+create table oj_b (bid integer primary key, bv text);
+insert into oj_a values (1, 'a1');
+create view oj_left as
+    select a.aid as aid, a.av as av, b.bv as bv
+    from oj_a a left join oj_b b on b.bid = a.aid;
+select cid, column_name, is_updatable, base_table, base_column from column_info('oj_left');
+→ [{"cid":0,"column_name":"aid","is_updatable":"YES","base_table":"oj_a","base_column":"aid"},{"cid":1,"column_name":"av","is_updatable":"YES","base_table":"oj_a","base_column":"av"},{"cid":2,"column_name":"bv","is_updatable":"YES","base_table":"oj_b","base_column":"bv"}]
+
+-- Surface agrees with propagate(): both a preserved-side and a non-preserved-side
+-- update are accepted — aid=1 has no oj_b match, so the bv update materializes
+-- oj_b(bid=1, bv='z') via the EC join key (bid = aid) and the row reads back joined.
+update oj_left set av = 'z' where aid = 1;
+update oj_left set bv = 'z' where aid = 1;
+select cid, column_name, is_updatable from column_info('oj_left');
+→ [{"cid":0,"column_name":"aid","is_updatable":"YES"},{"cid":1,"column_name":"av","is_updatable":"YES"},{"cid":2,"column_name":"bv","is_updatable":"YES"}]
+
+-- RIGHT outer join: the exact mirror of oj_left. oj_b is preserved (the right operand of
+-- a `right` join), oj_a is non-preserved. bid/bv (oj_b) report is_updatable='YES' with
+-- their base trace; the non-preserved av (oj_a) ALSO reports 'YES' tracing oj_a.av — the
+-- preserved oj_b anchor makes the non-preserved column updatable, exactly as oj_left's bv
+-- does. column_info reads the same per-column `null-extended` lineage view_info does.
+create view oj_right as
+    select a.av as av, b.bid as bid, b.bv as bv
+    from oj_a a right join oj_b b on b.bid = a.aid;
+select cid, column_name, is_updatable, base_table, base_column from column_info('oj_right');
+→ [{"cid":0,"column_name":"av","is_updatable":"YES","base_table":"oj_a","base_column":"av"},{"cid":1,"column_name":"bid","is_updatable":"YES","base_table":"oj_b","base_column":"bid"},{"cid":2,"column_name":"bv","is_updatable":"YES","base_table":"oj_b","base_column":"bv"}]
+
+-- Surface agrees with propagate(): both a preserved-side (bv) and a non-preserved-side
+-- (av) update are accepted. bid=2 has no oj_a match, so the av update materializes
+-- oj_a(aid=2, av='z2') via the EC join key (aid = bid).
+insert into oj_b values (2, 'b2');
+update oj_right set bv = 'z2' where bid = 2;
+update oj_right set av = 'z2' where bid = 2;
+select cid, column_name, is_updatable from column_info('oj_right');
+→ [{"cid":0,"column_name":"av","is_updatable":"YES"},{"cid":1,"column_name":"bid","is_updatable":"YES"},{"cid":2,"column_name":"bv","is_updatable":"YES"}]
+
+-- ===================================================================
+-- Non-inner join bodies (Divergence 3): a cross join never null-extends (only
+-- LEFT/RIGHT/FULL do — deriveJoinUpdateLineage), so it carries strict-`base`
+-- lineage and slips past the outer-join gate. propagate() rejects a cross join
+-- (collectInnerJoinSources requires an ON/USING predicate), so column_info must
+-- report every output column is_updatable='NO' with null trace, agreeing with
+-- view_info()'s conservative row.
+--
+-- n-way (≥2) inner equi-joins — composite-PK sides and self-joins included — are
+-- now DECOMPOSABLE (isDecomposableJoinBody accepts them), so column_info reports
+-- each base column updatable with its trace, agreeing with propagate() accepting
+-- the write (covered after the cross join).
+--
+-- Comma / implicit joins are NOT tested here: the SELECT builder rejects ANY
+-- multiple-FROM-source body ("SELECT with multiple FROM sources (joins) not
+-- supported"), so a comma-join view can never be created to reach column_info —
+-- there is no buildable case.
+-- ===================================================================
+
+create table ra (aid integer primary key, av text);
+create table rb (bid integer primary key, bv text);
+create table rc (cid integer primary key, cv text);
+
+-- Cross join (two-table, no ON): every column 'NO' / null.
+create view cross_v as select a.aid as aid, a.av as av, b.bv as bv
+    from ra a cross join rb b;
+select cid, column_name, is_updatable, base_table, base_column from column_info('cross_v');
+→ [{"cid":0,"column_name":"aid","is_updatable":"NO","base_table":null,"base_column":null},{"cid":1,"column_name":"av","is_updatable":"NO","base_table":null,"base_column":null},{"cid":2,"column_name":"bv","is_updatable":"NO","base_table":null,"base_column":null}]
+
+-- Surface agrees with propagate(): a mutation through the cross-join view is rejected.
+update cross_v set av = 'z' where aid = 1;
+-- error: cannot write through view
+
+-- 3-table inner join (> 2 base tables): now decomposable ⇒ each column traces to
+-- its owning base, updatable.
+create view three_v as select a.aid as aid, a.av as av, b.bv as bv, c.cv as cv
+    from ra a join rb b on b.bid = a.aid join rc c on c.cid = a.aid;
+select cid, column_name, is_updatable, base_table, base_column from column_info('three_v');
+→ [{"cid":0,"column_name":"aid","is_updatable":"YES","base_table":"ra","base_column":"aid"},{"cid":1,"column_name":"av","is_updatable":"YES","base_table":"ra","base_column":"av"},{"cid":2,"column_name":"bv","is_updatable":"YES","base_table":"rb","base_column":"bv"},{"cid":3,"column_name":"cv","is_updatable":"YES","base_table":"rc","base_column":"cv"}]
+
+-- Surface agrees with propagate(): a write through the 3-table-join view is accepted
+-- (empty bases ⇒ clean no-op).
+update three_v set av = 'z' where aid = 1;
+
+-- Self-join (one table under two alias-bound sites): now decomposable ⇒ each column
+-- traces to its owning alias's scan; both base_table values collapse to `ra`.
+create view self_v as select a.aid as aid, b.av as bv
+    from ra a join ra b on b.aid = a.aid;
+select cid, column_name, is_updatable, base_table, base_column from column_info('self_v');
+→ [{"cid":0,"column_name":"aid","is_updatable":"YES","base_table":"ra","base_column":"aid"},{"cid":1,"column_name":"bv","is_updatable":"YES","base_table":"ra","base_column":"av"}]
+
+-- Surface agrees with propagate(): a write through the self-join view is accepted
+-- (empty base ⇒ clean no-op).
+update self_v set bv = 'z' where aid = 1;
+
+-- ===================================================================
+-- Maintained table (materialized view): per-column lineage comes from the SAME
+-- derivation-body walk a plain view gets — NOT the trivially-all-updatable base
+-- branch — because write-through inherits the view-updateability rules
+-- (docs/materialized-views.md § Write boundary). A passthrough column (id) and a
+-- renamed column (label = name) report their SOURCE base column with
+-- is_updatable='YES'; an INVERSE-profile expression (vp = v + 1) stays 'YES'
+-- tracing to its base column (same as a plain view — the write stores the
+-- inverted value); a non-invertible expression (dbl = v * 2) is read-only with
+-- null trace ('no-inverse' on write).
+-- ===================================================================
+
+create table mt (id integer primary key, v integer, name text);
+insert into mt values (1, 5, 'a');
+create materialized view mt_mv as select id, name as label, v + 1 as vp, v * 2 as dbl from mt;
+
+select cid, column_name, is_updatable, base_table, base_column from column_info('mt_mv');
+→ [{"cid":0,"column_name":"id","is_updatable":"YES","base_table":"mt","base_column":"id"},{"cid":1,"column_name":"label","is_updatable":"YES","base_table":"mt","base_column":"name"},{"cid":2,"column_name":"vp","is_updatable":"YES","base_table":"mt","base_column":"v"},{"cid":3,"column_name":"dbl","is_updatable":"NO","base_table":null,"base_column":null}]
+
+-- The object identity columns name the maintained table itself, in its schema.
+select distinct schema, name from column_info('mt_mv');
+→ [{"schema":"main","name":"mt_mv"}]
+
+-- Dynamic agreement with the write-through rewrite: the renamed column routes to
+-- its base column; the inverse column stores the inverted base value (vp = 9 ⇒
+-- v = 8); the non-invertible expression column rejects the write.
+update mt_mv set label = 'z' where id = 1;
+select id, v, name from mt;
+→ [{"id":1,"v":5,"name":"z"}]
+update mt_mv set vp = 9 where id = 1;
+select id, v, name from mt;
+→ [{"id":1,"v":8,"name":"z"}]
+select id, label, vp, dbl from mt_mv;
+→ [{"id":1,"label":"z","vp":9,"dbl":16}]
+
+update mt_mv set dbl = 99 where id = 1;
+-- error: read-only
+
+-- view_info keeps excluding maintained tables (its surface stays plain-view-only;
+-- the per-column lineage story for an MV lives in column_info above).
+select count(*) as c from view_info('mt_mv');
+→ [{"c":0}]
+
+-- ===================================================================
+-- MV-sugar column-rename form: the registered output names (mv(pk, dv)) DIFFER
+-- from the body's attribute names (id, v). The maintained-table branch reports
+-- the table's REGISTERED columns as the authoritative output names (positional
+-- override) while the lineage trace still resolves to the SOURCE base column —
+-- exercising the columnNames override that the alias-only MV above cannot.
+-- ===================================================================
+
+create table mt2 (id integer primary key, v integer);
+insert into mt2 values (1, 5);
+create materialized view mt2_mv (pk, dv) as select id, v from mt2;
+
+select cid, column_name, is_updatable, base_table, base_column from column_info('mt2_mv');
+→ [{"cid":0,"column_name":"pk","is_updatable":"YES","base_table":"mt2","base_column":"id"},{"cid":1,"column_name":"dv","is_updatable":"YES","base_table":"mt2","base_column":"v"}]
+
+-- ===================================================================
+-- Unknown name throws (mirrors table_info's required-target posture).
+-- ===================================================================
+
+select * from column_info('nope');
+-- error: not found

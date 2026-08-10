@@ -12,9 +12,13 @@
 
 import type { ConstantBinding, DomainConstraint, FunctionalDependency, GuardClause, GuardPredicate } from '../nodes/plan-node.js';
 import type { RowConstraintSchema, TableSchema } from '../../schema/table.js';
+import { RowOpFlag } from '../../schema/table.js';
+import type { ModuleCapabilities } from '../../vtab/capabilities.js';
 import type * as AST from '../../parser/ast.js';
 import type { SqlValue } from '../../common/types.js';
-import { columnIndexFromExpr, literalValue, collectColumnNames, flattenDisjunction, flipComparison } from './predicate-shape.js';
+import { columnIndexFromExpr, literalValue, collectColumnNames, flattenDisjunction, flipComparison, walkAstNodes } from './predicate-shape.js';
+import { isValueDiscriminatingAstComparison, type DeclaredColumnInfo } from './comparison-collation.js';
+import { semanticOrderingsAgree } from '../../util/comparison.js';
 
 export interface CheckExtraction {
 	readonly fds: ReadonlyArray<FunctionalDependency>;
@@ -40,23 +44,76 @@ const cache = new WeakMap<TableSchema, CheckExtraction>();
 
 const allDeterministic = (): boolean => true;
 
-export function getCheckExtraction(tableSchema: TableSchema): CheckExtraction {
+/**
+ * Raw (capability-blind) CHECK extraction. **Module-internal**: every external
+ * consumer must go through {@link getTrustedCheckExtraction} so the
+ * `permitsGrandfatheredCheckViolators` gate cannot be forgotten. Not exported.
+ */
+function getCheckExtraction(tableSchema: TableSchema): CheckExtraction {
 	let cached = cache.get(tableSchema);
 	if (!cached) {
 		cached = extractCheckConstraints(
 			tableSchema.checkConstraints,
 			tableSchema.columnIndexMap,
 			allDeterministic,
+			tableSchema.columns,
 		);
 		cache.set(tableSchema, cached);
 	}
 	return cached;
 }
 
+/** Shared empty {@link CheckExtraction} returned when the capability gate in
+ *  {@link getTrustedCheckExtraction} suppresses the CHECK contribution lift. */
+export const EMPTY_CHECK_EXTRACTION: CheckExtraction = {
+	fds: [],
+	equivPairs: [],
+	constantBindings: [],
+	domainConstraints: [],
+};
+
+/** The slice of a vtab module the capability gate consults (structural, so this
+ *  analysis module needn't depend on `vtab/module.ts`). */
+interface CapabilityProvider {
+	getCapabilities?(): ModuleCapabilities;
+}
+
+/**
+ * Capability-gated accessor over {@link getCheckExtraction}: returns
+ * {@link EMPTY_CHECK_EXTRACTION} when the table's owning vtab module declares
+ * `permitsGrandfatheredCheckViolators` (see `vtab/capabilities.ts`). Under that
+ * contract `ALTER TABLE … ADD CHECK` against non-conforming rows succeeds and
+ * grandfathers the violators, so a declared CHECK is not a universal invariant
+ * over the current row set — any consumer that treats the extraction as a
+ * row-set fact (physical-property lift, lens-prover domain enumeration) must
+ * go through this accessor rather than `getCheckExtraction` directly.
+ *
+ * `vtabModule` defaults to the schema's own module reference. Logical tables
+ * (lens-slot specs) carry no module and are never gated. Pass the module
+ * explicitly at sites that resolve it independently of the schema (e.g.
+ * `TableReferenceNode`, which is constructed with its module).
+ */
+export function getTrustedCheckExtraction(
+	tableSchema: TableSchema,
+	vtabModule: CapabilityProvider | undefined = tableSchema.vtabModule,
+): CheckExtraction {
+	const permitsViolators = vtabModule?.getCapabilities?.().permitsGrandfatheredCheckViolators === true;
+	return permitsViolators ? EMPTY_CHECK_EXTRACTION : getCheckExtraction(tableSchema);
+}
+
+/**
+ * `columns` carries each column's declared collation + logical type (indexed
+ * by column position; `ColumnSchema` is assignable) for the value-discrimination
+ * gate: a value-level fact (FD / EC / binding / domain) is minted only when
+ * the enforcement comparison it derives from is value-discriminating
+ * ({@link isValueDiscriminatingAstComparison}) — non-BINARY collations over
+ * textual operands pass value-different rows, so their facts would over-claim.
+ */
 export function extractCheckConstraints(
 	checks: ReadonlyArray<RowConstraintSchema>,
 	columnIndexMap: ReadonlyMap<string, number>,
 	isDeterministic: (fnName: string, argc: number) => boolean,
+	columns: ReadonlyArray<DeclaredColumnInfo>,
 ): CheckExtraction {
 	const fds: FunctionalDependency[] = [];
 	const equivPairs: Array<readonly [number, number]> = [];
@@ -65,16 +122,79 @@ export function extractCheckConstraints(
 
 	for (const check of checks) {
 		if (!check.expr) continue;
+		if (!isRowInvariantCheck(check)) continue;
 		if (containsNonDeterministicCall(check.expr, isDeterministic)) continue;
-		walkConjunction(check.expr, columnIndexMap, fds, equivPairs, constantBindings, domainConstraints);
+		walkConjunction(check.expr, columnIndexMap, columns, fds, equivPairs, constantBindings, domainConstraints);
 	}
 
 	return { fds, equivPairs, constantBindings, domainConstraints };
 }
 
+/**
+ * Row-invariant gate: a CHECK only contributes value facts when every stored
+ * row image is guaranteed to satisfy it — i.e. it is enforced on every path a
+ * row can enter the table. Two check-level legs, both required (they describe
+ * when the whole check runs):
+ *
+ * 1. The operation mask covers both INSERT and UPDATE. Enforcement filters by
+ *    `shouldCheckConstraint(constraint, operation)` (constraint-builder.ts),
+ *    so e.g. a `check on insert (...)` never runs on UPDATE and an UPDATE can
+ *    legally store a violating row. DELETE membership is irrelevant — a
+ *    delete adds no row image. ALTER ADD CHECK backfill validation plus the
+ *    `permitsGrandfatheredCheckViolators` consumer gate cover the
+ *    pre-existing-rows path for qualifying checks.
+ *
+ * 2. Not deferred. A deferred check is enforced at commit, so
+ *    same-transaction reads can observe violating rows. No SQL today can set
+ *    these flags on a stored table CHECK (the parser rejects DEFERRABLE on
+ *    CHECK constraints); this leg is defensive against hand-built or future
+ *    schemas.
+ *
+ * The third leg — no `old.<col>` row-image reference — is screened
+ * per-AND-conjunct inside {@link walkConjunction} rather than here:
+ * `old.a = b` is a transition constraint over the previous row image, not a
+ * predicate on stored rows — and OLD is registered nullable / NULL on the
+ * INSERT path, so even a default-mask `check (old.a = b)` admits rows
+ * violating the same-row reading. But under SQL ternary logic `C1 AND C2` is
+ * FALSE whenever C2 is FALSE regardless of C1, so each `old.`-free conjunct
+ * independently holds over stored rows and may extract normally even when a
+ * sibling conjunct references OLD. The per-conjunct argument does NOT extend
+ * through OR — an `old.` ref anywhere inside a non-AND conjunct (e.g. one
+ * disjunct of an implication form) kills that whole conjunct.
+ * `new.<col>` stays allowed: NEW is the stored row image, so NEW-qualified
+ * references are same-row (see `columnIndexFromExpr`, whose bare-name
+ * resolution deliberately tolerates the qualifier).
+ */
+function isRowInvariantCheck(check: RowConstraintSchema): boolean {
+	const requiredOps = RowOpFlag.INSERT | RowOpFlag.UPDATE;
+	if ((check.operations & requiredOps) !== requiredOps) return false;
+	return !(check.deferrable || check.initiallyDeferred);
+}
+
+/**
+ * True when any node in `expr`'s subtree is a column reference qualified with
+ * the `old` row-image marker (`old.a` parses as
+ * `ColumnExpr { name: 'a', table: 'old' }`). `walkAstNodes` discovers children
+ * reflectively, so guard disjuncts, compound operands, between bounds, and
+ * in-lists are all covered — so an `old.` ref inside any non-AND structure
+ * (OR disjunct, BETWEEN bound, IN list, compound operand) screens out the
+ * entire conjunct it appears in. Conservative edge: a table literally named
+ * `old` using self-qualified `old.col` refs also matches — sound, since the
+ * enforcement scope keys `old.<col>` to the OLD image there too.
+ */
+function containsOldRowImageRef(expr: AST.Expression): boolean {
+	for (const node of walkAstNodes(expr)) {
+		if (node.type === 'column' && (node as AST.ColumnExpr).table?.toLowerCase() === 'old') {
+			return true;
+		}
+	}
+	return false;
+}
+
 function walkConjunction(
 	expr: AST.Expression,
 	columnIndexMap: ReadonlyMap<string, number>,
+	columns: ReadonlyArray<DeclaredColumnInfo>,
 	fds: FunctionalDependency[],
 	equivPairs: Array<readonly [number, number]>,
 	constantBindings: ConstantBinding[],
@@ -88,13 +208,18 @@ function walkConjunction(
 			stack.push(b.left, b.right);
 			continue;
 		}
-		recognize(cur, columnIndexMap, fds, equivPairs, constantBindings, domainConstraints);
+		// Per-conjunct `old.`-screen: a conjunct referencing the OLD row image is
+		// a transition constraint, not a stored-row invariant — skip it while
+		// letting sibling conjuncts extract (see isRowInvariantCheck doc).
+		if (containsOldRowImageRef(cur)) continue;
+		recognize(cur, columnIndexMap, columns, fds, equivPairs, constantBindings, domainConstraints);
 	}
 }
 
 function recognize(
 	expr: AST.Expression,
 	columnIndexMap: ReadonlyMap<string, number>,
+	columns: ReadonlyArray<DeclaredColumnInfo>,
 	fds: FunctionalDependency[],
 	equivPairs: Array<readonly [number, number]>,
 	constantBindings: ConstantBinding[],
@@ -105,18 +230,18 @@ function recognize(
 		switch (b.operator) {
 			case '=':
 			case '==': {
-				handleEquality(b.left, b.right, columnIndexMap, fds, equivPairs, constantBindings);
+				handleEquality(b.left, b.right, columnIndexMap, columns, fds, equivPairs, constantBindings);
 				return;
 			}
 			case '<':
 			case '<=':
 			case '>':
 			case '>=': {
-				handleInequality(b, columnIndexMap, domainConstraints);
+				handleInequality(b, columnIndexMap, columns, domainConstraints);
 				return;
 			}
 			case 'OR': {
-				handleImplication(b, columnIndexMap, fds);
+				handleImplication(b, columnIndexMap, columns, fds);
 				return;
 			}
 			default:
@@ -131,6 +256,9 @@ function recognize(
 		const lo = literalValue(bt.lower);
 		const hi = literalValue(bt.upper);
 		if (lo === undefined || hi === undefined) return;
+		// Per-bound gate, mirroring emitBetween's per-bound collation resolution.
+		if (!isValueDiscriminatingAstComparison(bt.expr, bt.lower, columnIndexMap, columns)
+			|| !isValueDiscriminatingAstComparison(bt.expr, bt.upper, columnIndexMap, columns)) return;
 		domainConstraints.push({
 			kind: 'range',
 			column: colIdx,
@@ -150,6 +278,10 @@ function recognize(
 		for (const v of inExpr.values) {
 			const lit = literalValue(v);
 			if (lit === undefined) return;
+			// Per-value gate (conservative: emitIn resolves the condition operand's
+			// collation, but textuality of each listed value participates in the
+			// non-textual escape).
+			if (!isValueDiscriminatingAstComparison(inExpr.expr, v, columnIndexMap, columns)) return;
 			values.push(lit);
 		}
 		if (values.length === 0) return;
@@ -158,21 +290,53 @@ function recognize(
 	}
 }
 
+/**
+ * Semantic-ordering gate for a **cross-column** CHECK-derived fact (invariant
+ * OPT-051): a mixed pair such as `d timespan` / `s text` shares no notion of
+ * "same value" — `check (d = s)` accepts a row holding 'PT1H' and 'PT60M', so
+ * mirror FDs, an equivalence pair, or a one-way determination between them are
+ * all false. Admits only "neither side semantic" or "both the SAME semantic
+ * type". An absent `logicalType` counts as non-semantic. Reasoning:
+ * `docs/optimizer-fd.md` § "Semantic-ordering gate on cross-column facts".
+ *
+ * Deliberately local rather than shared with the three plan-node call sites of
+ * {@link semanticOrderingsAgree} — those work on `ScalarPlanNode`, this one on
+ * declared column metadata, the same split the collation gate carries
+ * (`isValueDiscriminatingEquality` / `isValueDiscriminatingAstComparison`).
+ */
+function columnPairSemanticsAgree(
+	a: number,
+	b: number,
+	columns: ReadonlyArray<DeclaredColumnInfo>,
+): boolean {
+	return semanticOrderingsAgree(columns[a]?.logicalType, columns[b]?.logicalType);
+}
+
 function handleEquality(
 	left: AST.Expression,
 	right: AST.Expression,
 	columnIndexMap: ReadonlyMap<string, number>,
+	columns: ReadonlyArray<DeclaredColumnInfo>,
 	fds: FunctionalDependency[],
 	equivPairs: Array<readonly [number, number]>,
 	constantBindings: ConstantBinding[],
 ): void {
+	// Value-discrimination gate: all three recognized shapes (col=col mirror
+	// FDs + EC pair, col=lit pin + binding, single-column col=expr one-way FD)
+	// are value-level claims over the enforcement comparison.
+	if (!isValueDiscriminatingAstComparison(left, right, columnIndexMap, columns)) return;
+
 	const lIdx = columnIndexFromExpr(left, columnIndexMap);
 	const rIdx = columnIndexFromExpr(right, columnIndexMap);
 
+	// All CHECK-derived FDs are `kind: 'determination'` — a CHECK constrains
+	// values, never row counts, so it can never witness row-uniqueness.
 	if (lIdx !== undefined && rIdx !== undefined) {
 		if (lIdx === rIdx) return;
-		fds.push({ determinants: [lIdx], dependents: [rIdx] });
-		fds.push({ determinants: [rIdx], dependents: [lIdx] });
+		// Cross-column fact — gated on semantic ordering (OPT-051).
+		if (!columnPairSemanticsAgree(lIdx, rIdx, columns)) return;
+		fds.push({ determinants: [lIdx], dependents: [rIdx], kind: 'determination' });
+		fds.push({ determinants: [rIdx], dependents: [lIdx], kind: 'determination' });
 		equivPairs.push([lIdx, rIdx]);
 		return;
 	}
@@ -180,15 +344,18 @@ function handleEquality(
 	if (lIdx !== undefined) {
 		const lit = literalValue(right);
 		if (lit !== undefined) {
-			fds.push({ determinants: [], dependents: [lIdx] });
+			// Constant pin — deliberately UNGATED: it claims only that the column
+			// compares equal to the literal under its own comparison (OPT-051).
+			fds.push({ determinants: [], dependents: [lIdx], kind: 'determination' });
 			constantBindings.push({ attrs: [lIdx], value: { kind: 'literal', value: lit } });
 			return;
 		}
 		const cols = collectColumnNames(right, columnIndexMap);
 		if (cols.size === 1) {
 			const [singleCol] = cols;
-			if (singleCol !== lIdx) {
-				fds.push({ determinants: [singleCol], dependents: [lIdx] });
+			// Cross-column determination — same gate (OPT-051).
+			if (singleCol !== lIdx && columnPairSemanticsAgree(singleCol, lIdx, columns)) {
+				fds.push({ determinants: [singleCol], dependents: [lIdx], kind: 'determination' });
 			}
 		}
 		return;
@@ -197,15 +364,15 @@ function handleEquality(
 	if (rIdx !== undefined) {
 		const lit = literalValue(left);
 		if (lit !== undefined) {
-			fds.push({ determinants: [], dependents: [rIdx] });
+			fds.push({ determinants: [], dependents: [rIdx], kind: 'determination' });
 			constantBindings.push({ attrs: [rIdx], value: { kind: 'literal', value: lit } });
 			return;
 		}
 		const cols = collectColumnNames(left, columnIndexMap);
 		if (cols.size === 1) {
 			const [singleCol] = cols;
-			if (singleCol !== rIdx) {
-				fds.push({ determinants: [singleCol], dependents: [rIdx] });
+			if (singleCol !== rIdx && columnPairSemanticsAgree(singleCol, rIdx, columns)) {
+				fds.push({ determinants: [singleCol], dependents: [rIdx], kind: 'determination' });
 			}
 		}
 	}
@@ -214,8 +381,13 @@ function handleEquality(
 function handleInequality(
 	b: AST.BinaryExpr,
 	columnIndexMap: ReadonlyMap<string, number>,
+	columns: ReadonlyArray<DeclaredColumnInfo>,
 	domainConstraints: DomainConstraint[],
 ): void {
+	// A text-typed range under a non-BINARY enforcement collation over-claims
+	// (consumers compare domain bounds under BINARY) — same gate as equalities.
+	if (!isValueDiscriminatingAstComparison(b.left, b.right, columnIndexMap, columns)) return;
+
 	// Normalize so the column is on the left.
 	const lIdx = columnIndexFromExpr(b.left, columnIndexMap);
 	const rIdx = columnIndexFromExpr(b.right, columnIndexMap);
@@ -269,6 +441,7 @@ function handleInequality(
 function handleImplication(
 	root: AST.BinaryExpr,
 	columnIndexMap: ReadonlyMap<string, number>,
+	columns: ReadonlyArray<DeclaredColumnInfo>,
 	fds: FunctionalDependency[],
 ): void {
 	const disjuncts = flattenDisjunction(root);
@@ -284,7 +457,7 @@ function handleImplication(
 
 	const body = disjuncts[disjuncts.length - 1];
 	const guard: GuardPredicate = { clauses: guardClauses };
-	recognizeGuardedBody(body, guard, columnIndexMap, fds);
+	recognizeGuardedBody(body, guard, columnIndexMap, columns, fds);
 }
 
 /**
@@ -391,33 +564,58 @@ function recognizeGuardedBody(
 	body: AST.Expression,
 	guard: GuardPredicate,
 	columnIndexMap: ReadonlyMap<string, number>,
+	columns: ReadonlyArray<DeclaredColumnInfo>,
 	fds: FunctionalDependency[],
 ): void {
 	if (body.type !== 'binary') return;
 	const b = body as AST.BinaryExpr;
 	if (b.operator !== '=' && b.operator !== '==') return;
 
+	// Same value-discrimination gate as unconditional equalities — especially
+	// load-bearing for the `valueEquality: true` mirror tags, which the Filter
+	// guard-activation path lifts into ECs. Guard *scopes* (recognizeNegatedGuard)
+	// are deliberately ungated: enforcement evaluates them under declared
+	// collations (Part A of ticket check-extraction-collation-blind-fds), and
+	// the discharge gate in `buildPredicateFacts` keeps filter rows within the
+	// declared-collation guard scope.
+	if (!isValueDiscriminatingAstComparison(b.left, b.right, columnIndexMap, columns)) return;
+
 	const lIdx = columnIndexFromExpr(b.left, columnIndexMap);
 	const rIdx = columnIndexFromExpr(b.right, columnIndexMap);
 
+	// Guarded CHECK-derived FDs are `kind: 'determination'` like their
+	// unconditional twins — an implication-form CHECK still constrains values
+	// only, never row counts.
 	if (lIdx !== undefined && rIdx !== undefined) {
 		if (lIdx === rIdx) return;
-		fds.push({ determinants: [lIdx], dependents: [rIdx], guard });
-		fds.push({ determinants: [rIdx], dependents: [lIdx], guard });
+		// Cross-column fact — gated on semantic ordering (OPT-051). Load-bearing
+		// for the `valueEquality` tag below: `FilterNode.computePhysical` lifts a
+		// tagged mirror pair into an equivalence class once the guard discharges,
+		// and re-closes constant bindings over it, so a mixed pair would pin the
+		// text column to a spelling no row stores.
+		if (!columnPairSemanticsAgree(lIdx, rIdx, columns)) return;
+		// Tag the mirror pair as a genuine column value-equality so a downstream
+		// guard-activation (FilterNode) can soundly lift it as an EC — a one-way
+		// `col = expr` body (below) or an index-derived guarded mirror is NOT
+		// tagged and is never lifted (ticket fd-guarded-activation-key-bag-overclaim).
+		fds.push({ determinants: [lIdx], dependents: [rIdx], guard, valueEquality: true, kind: 'determination' });
+		fds.push({ determinants: [rIdx], dependents: [lIdx], guard, valueEquality: true, kind: 'determination' });
 		return;
 	}
 
 	if (lIdx !== undefined) {
 		const lit = literalValue(b.right);
 		if (lit !== undefined) {
-			fds.push({ determinants: [], dependents: [lIdx], guard });
+			// Guarded constant pin — ungated, same reason as its unconditional twin.
+			fds.push({ determinants: [], dependents: [lIdx], guard, kind: 'determination' });
 			return;
 		}
 		const cols = collectColumnNames(b.right, columnIndexMap);
 		if (cols.size === 1) {
 			const [singleCol] = cols;
-			if (singleCol !== lIdx) {
-				fds.push({ determinants: [singleCol], dependents: [lIdx], guard });
+			// Cross-column determination — same gate (OPT-051).
+			if (singleCol !== lIdx && columnPairSemanticsAgree(singleCol, lIdx, columns)) {
+				fds.push({ determinants: [singleCol], dependents: [lIdx], guard, kind: 'determination' });
 			}
 		}
 		return;
@@ -426,14 +624,14 @@ function recognizeGuardedBody(
 	if (rIdx !== undefined) {
 		const lit = literalValue(b.left);
 		if (lit !== undefined) {
-			fds.push({ determinants: [], dependents: [rIdx], guard });
+			fds.push({ determinants: [], dependents: [rIdx], guard, kind: 'determination' });
 			return;
 		}
 		const cols = collectColumnNames(b.left, columnIndexMap);
 		if (cols.size === 1) {
 			const [singleCol] = cols;
-			if (singleCol !== rIdx) {
-				fds.push({ determinants: [singleCol], dependents: [rIdx], guard });
+			if (singleCol !== rIdx && columnPairSemanticsAgree(singleCol, rIdx, columns)) {
+				fds.push({ determinants: [singleCol], dependents: [rIdx], guard, kind: 'determination' });
 			}
 		}
 	}
@@ -448,27 +646,12 @@ export function containsNonDeterministicCall(
 	expr: AST.Expression,
 	isDeterministic: (fnName: string, argc: number) => boolean,
 ): boolean {
-	const stack: AST.AstNode[] = [expr as AST.AstNode];
-	while (stack.length > 0) {
-		const node = stack.pop()!;
+	for (const node of walkAstNodes(expr)) {
 		if (node.type === 'subquery' || node.type === 'exists') return true;
 		if (node.type === 'function') {
 			const fn = node as AST.FunctionExpr;
 			const argc = fn.args?.length ?? 0;
 			if (!isDeterministic(fn.name, argc)) return true;
-		}
-		for (const key of Object.keys(node)) {
-			const v = (node as unknown as Record<string, unknown>)[key];
-			if (!v) continue;
-			if (Array.isArray(v)) {
-				for (const item of v) {
-					if (item && typeof item === 'object' && 'type' in item) {
-						stack.push(item as AST.AstNode);
-					}
-				}
-			} else if (typeof v === 'object' && 'type' in (v as object)) {
-				stack.push(v as AST.AstNode);
-			}
 		}
 	}
 	return false;

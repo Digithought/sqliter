@@ -89,7 +89,7 @@ async function loadSuites() {
 	for (const file of files) {
 		const mod = await import(pathToFileURL(join(suitesDir, file)).href);
 		const suiteName = basename(file, '.bench.mjs');
-		suites.push({ name: suiteName, benchmarks: mod.default ?? mod.benchmarks });
+		suites.push({ name: suiteName, benchmarks: mod.default ?? mod.benchmarks, ratioGuards: mod.ratioGuards ?? [] });
 	}
 	return suites;
 }
@@ -131,6 +131,44 @@ function printTable(benchmarks, baseline) {
 
 function fmt(ms) {
 	return ms < 1 ? `${(ms * 1000).toFixed(0)} µs` : `${ms.toFixed(2)} ms`;
+}
+
+// ── Within-run ratio guards ─────────────────────────────────────────────
+/**
+ * Evaluate each suite's `ratioGuards` against the collected medians. A guard
+ * `{ name, baseline, maxRatio }` fails when `median[suite/name] /
+ * median[suite/baseline]` exceeds `maxRatio`. Returns the number of failures
+ * (0 = all pass). A guard that names a benchmark not present in the run is a
+ * misconfiguration and counts as a failure — never a silent skip.
+ */
+function checkRatioGuards(suites, allBenchmarks) {
+	let failures = 0;
+	for (const suite of suites) {
+		for (const guard of suite.ratioGuards ?? []) {
+			const targetName = `${suite.name}/${guard.name}`;
+			const baseName = `${suite.name}/${guard.baseline}`;
+			const target = allBenchmarks[targetName];
+			const base = allBenchmarks[baseName];
+			if (!target || !base) {
+				const missing = !target ? targetName : baseName;
+				console.log(`\x1b[31mratio guard misconfigured: benchmark '${missing}' not found in this run\x1b[0m`);
+				failures++;
+				continue;
+			}
+			// Degenerate medians (sub-rounding-floor) collapse to a sane ratio
+			// rather than NaN/Infinity: both ~0 ⇒ 1, only the target ~0 ⇒ still 0.
+			const ratio = base.median_ms > 0
+				? target.median_ms / base.median_ms
+				: (target.median_ms > 0 ? Infinity : 1);
+			if (ratio > guard.maxRatio) {
+				console.log(`\x1b[31mratio guard FAILED: ${targetName} is ${ratio.toFixed(1)}× ${baseName} (max ${guard.maxRatio}×) — likely a plan-shape regression\x1b[0m`);
+				failures++;
+			} else {
+				console.log(`ratio guard ok: ${targetName} / ${baseName} = ${ratio.toFixed(2)}× (max ${guard.maxRatio}×)`);
+			}
+		}
+	}
+	return failures;
 }
 
 // ── Get git commit hash ─────────────────────────────────────────────────
@@ -189,6 +227,13 @@ async function main() {
 
 	await writeFile(outputPath, JSON.stringify(output, null, 2) + '\n');
 	console.log(`Results written to ${outputPath}`);
+
+	// Within-run ratio guards (shape-economy gates). Independent of --baseline:
+	// a single run of a query that is 26× slower than its hand-written twin
+	// otherwise prints a fine-looking number and passes.
+	if (checkRatioGuards(suites, allBenchmarks) > 0) {
+		process.exit(1);
+	}
 
 	// Check for regressions
 	if (baseline) {

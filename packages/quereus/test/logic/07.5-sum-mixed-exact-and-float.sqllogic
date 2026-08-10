@@ -1,0 +1,151 @@
+-- 07.5-sum-mixed-exact-and-float.sqllogic
+-- Regression: sum() over a column mixing exact integers with floating-point values.
+--
+-- sum() keeps TWO accumulator slots and never mixes the two number domains until
+-- finalize: a bigint or safe-integer number joins the exact part, everything else
+-- (fractions, whole numbers past the safe-integer boundary, non-finites) joins the
+-- floating-point part. Before that split, one slot decided per addition whether the
+-- running total was exact or float, which
+--   (a) silently dropped values (a fractional side made BigInt() throw and the step
+--       swallowed it),
+--   (b) turned a REAL column's total into an arbitrary-precision integer, and
+--   (c) made the answer depend on the order rows happened to be scanned.
+--
+-- Every fold-order pair below must agree — that equality, not just the literal
+-- expected value, is what this file is guarding.
+--
+-- NOTE: the two fold orders are forced with `order by id` inside a subquery, and
+-- nothing here asserts that the two scans genuinely ran in opposite orders. If the
+-- planner ever becomes free to discard an inner `order by` that no outer clause
+-- observes, these arms weaken to two identical scans and stop guarding anything —
+-- they would still pass. If that optimization lands, pin the orders some other way
+-- (an ordered plan assertion under test/plan/, or scan-order-sensitive data).
+
+-- ===========================================================================
+-- 1. Fraction + integer past the safe-integer boundary — both scan orders
+-- ===========================================================================
+
+create table sum_mixed (id integer primary key, v numeric);
+insert into sum_mixed values (1, 0.5), (2, 9007199254740993);
+-- run
+
+-- Ascending: the fraction arrives first. Used to return 0.5 (the large value vanished).
+select sum(v) as s, typeof(sum(v)) as ty from sum_mixed;
+→ [{"s":9007199254740992,"ty":"integer"}]
+
+-- Descending: the large value arrives first. Used to return 9007199254740993.
+select sum(v) as s from (select v from sum_mixed order by id desc);
+→ [{"s":9007199254740992}]
+
+-- Fold-order independence stated directly, not inferred from two literals matching.
+select (select sum(v) from (select v from sum_mixed order by id asc))
+     = (select sum(v) from (select v from sum_mixed order by id desc)) as same;
+→ [{"same":true}]
+
+-- Anchored to binary `+` over the same pair — the engine's rule for one mixed
+-- addition, which sum's routing now mirrors.
+select sum(v) = 9007199254740993 + 0.5 as matches_binary_plus from sum_mixed;
+→ [{"matches_binary_plus":true}]
+
+-- ===========================================================================
+-- 2. Three values: two fractions and one large integer
+-- ===========================================================================
+-- Used to return 0.75 — the large value dropped and both fractions survived.
+
+create table sum_three (id integer primary key, v numeric);
+insert into sum_three values (1, 0.5), (2, 0.25), (3, 9007199254740993);
+-- run
+
+select sum(v) as s from sum_three;
+→ [{"s":9007199254740992}]
+
+select sum(v) as s from (select v from sum_three order by id desc);
+→ [{"s":9007199254740992}]
+
+-- ===========================================================================
+-- 3. A whole `number` outside the safe-integer range is NOT exact
+-- ===========================================================================
+-- 1e308 is a legal `number` (R1 constrains which values may be bigint, not which
+-- numbers may be whole). Routing it to the exact part is what produced a 309-digit
+-- integer total for a REAL column — a bigint in a REAL result, violating R2.
+
+create table sum_real (id integer primary key, v real);
+insert into sum_real values (1, 1e308), (2, 0.5);
+-- run
+
+select sum(v) as s, typeof(sum(v)) as ty from sum_real;
+→ [{"s":1e308,"ty":"integer"}]
+
+select sum(v) as s from (select v from sum_real order by id desc);
+→ [{"s":1e308}]
+
+select sum(v) = 0.5 + 1e308 as matches_binary_plus from sum_real;
+→ [{"matches_binary_plus":true}]
+
+-- ===========================================================================
+-- 4. A REAL total that overflows to infinity
+-- ===========================================================================
+-- Used to return a 309-digit exact integer with typeof 'integer'. It now stays in
+-- the float domain and agrees with total(), the other float-summing aggregate.
+-- (Infinity has no JSON spelling, so this section asserts through text and equality.)
+
+create table sum_overflow (id integer primary key, v real);
+insert into sum_overflow values (1, 1e308), (2, 1e308);
+-- run
+
+select typeof(sum(v)) as ty, cast(sum(v) as text) as txt from sum_overflow;
+→ [{"ty":"real","txt":"Infinity"}]
+
+select sum(v) = total(v) as agrees_with_total from sum_overflow;
+→ [{"agrees_with_total":true}]
+
+-- ===========================================================================
+-- 5. Unchanged: all-integer and all-float folds
+-- ===========================================================================
+
+-- An all-integer fold still accumulates exactly, promoting and narrowing under R1.
+create table sum_ints (id integer primary key, v integer);
+insert into sum_ints values (1, 9007199254740991), (2, 5), (3, -6);
+-- run
+
+-- Promotes past 2^53−1 mid-fold, then retracts back inside it.
+select sum(v) as s, typeof(sum(v)) as ty from sum_ints;
+→ [{"s":9007199254740990,"ty":"integer"}]
+
+-- A total that stays outside the safe range remains exact.
+delete from sum_ints where id = 3;
+select sum(v) as s from sum_ints;
+→ [{"s":9007199254740996}]
+
+-- An all-float fold is bit-identical to plain left-to-right float addition.
+create table sum_floats (id integer primary key, v real);
+insert into sum_floats values (1, 0.1), (2, 0.2);
+-- run
+
+select sum(v) = 0.1 + 0.2 as same from sum_floats;
+→ [{"same":true}]
+
+-- Empty group and all-NULL group still finalize to NULL.
+create table sum_nulls (id integer primary key, v numeric null);
+insert into sum_nulls values (1, null), (2, null);
+-- run
+
+select sum(v) as s from sum_nulls;
+→ [{"s":null}]
+
+select sum(v) as s from sum_nulls where id > 99;
+→ [{"s":null}]
+
+-- ===========================================================================
+-- 6. GROUP BY keeps the split per group
+-- ===========================================================================
+
+create table sum_grouped (id integer primary key, g text, v numeric);
+insert into sum_grouped values
+  (1, 'exact', 9007199254740993), (2, 'exact', 5),
+  (3, 'mixed', 9007199254740993), (4, 'mixed', 0.5),
+  (5, 'float', 0.5), (6, 'float', 0.25);
+-- run
+
+select g, sum(v) as s, typeof(sum(v)) as ty from sum_grouped group by g order by g;
+→ [{"g":"exact","s":9007199254740998,"ty":"integer"},{"g":"float","s":0.75,"ty":"real"},{"g":"mixed","s":9007199254740992,"ty":"integer"}]

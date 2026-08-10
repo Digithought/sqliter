@@ -1,5 +1,6 @@
 ---
 description: Push aggregations below joins when semantically valid
+difficulty: hard
 prereq: Titan optimizer, aggregation planning
 
 ---

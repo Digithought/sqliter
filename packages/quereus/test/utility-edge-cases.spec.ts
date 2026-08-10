@@ -4,11 +4,12 @@ import {
 	compareSqlValuesFast,
 	isTruthy,
 	compareRows,
-	sqlValuesEqual,
+	sqlValueIdentical,
+	rowsValueIdentical,
 	BINARY_COLLATION,
 	NOCASE_COLLATION,
 	RTRIM_COLLATION,
-	compareWithOrderBy,
+	createOrderByComparatorFast,
 	getSqlDataTypeName,
 	compareTypedValues,
 	createTypedComparator,
@@ -421,28 +422,66 @@ describe('Utility Edge Cases', () => {
 		});
 	});
 
-	describe('sqlValuesEqual', () => {
+	describe('sqlValueIdentical', () => {
 		it('should treat null === null as true', () => {
-			expect(sqlValuesEqual(null, null)).to.be.true;
+			expect(sqlValueIdentical(null, null)).to.be.true;
 		});
 
 		it('should compare numbers', () => {
-			expect(sqlValuesEqual(1, 1)).to.be.true;
-			expect(sqlValuesEqual(1, 2)).to.be.false;
+			expect(sqlValueIdentical(1, 1)).to.be.true;
+			expect(sqlValueIdentical(1, 2)).to.be.false;
 		});
 
 		it('should compare strings', () => {
-			expect(sqlValuesEqual('a', 'a')).to.be.true;
+			expect(sqlValueIdentical('a', 'a')).to.be.true;
 		});
 
 		it('should compare blobs byte-wise', () => {
-			expect(sqlValuesEqual(new Uint8Array([1, 2]), new Uint8Array([1, 2]))).to.be.true;
-			expect(sqlValuesEqual(new Uint8Array([1, 2]), new Uint8Array([1, 3]))).to.be.false;
-			expect(sqlValuesEqual(new Uint8Array([1]), new Uint8Array([1, 2]))).to.be.false;
+			expect(sqlValueIdentical(new Uint8Array([1, 2]), new Uint8Array([1, 2]))).to.be.true;
+			expect(sqlValueIdentical(new Uint8Array([1, 2]), new Uint8Array([1, 3]))).to.be.false;
+			expect(sqlValueIdentical(new Uint8Array([1]), new Uint8Array([1, 2]))).to.be.false;
+		});
+
+		it('should treat cross-representation numeric-storage-class values as identical', () => {
+			expect(sqlValueIdentical(5n, 5)).to.be.true;
+			expect(sqlValueIdentical(true, 1)).to.be.true;
+			expect(sqlValueIdentical(false, 0)).to.be.true;
+		});
+
+		it('should not treat TEXT and NUMERIC storage classes as identical', () => {
+			expect(sqlValueIdentical('1', 1)).to.be.false;
+		});
+
+		it('should not treat NULL as identical to a non-NULL value', () => {
+			expect(sqlValueIdentical(null, 0)).to.be.false;
+			expect(sqlValueIdentical(null, '')).to.be.false;
+			expect(sqlValueIdentical(0, null)).to.be.false;
 		});
 	});
 
-	describe('compareWithOrderBy', () => {
+	describe('rowsValueIdentical', () => {
+		it('should inherit the per-value contract of sqlValueIdentical', () => {
+			expect(rowsValueIdentical([5n, true, 'a'], [5, 1, 'a'])).to.be.true;
+			expect(rowsValueIdentical(['1'], [1])).to.be.false;
+			expect(rowsValueIdentical([new Uint8Array([1])], [new Uint8Array([1])])).to.be.true;
+		});
+
+		it('should never treat rows of differing width as identical', () => {
+			expect(rowsValueIdentical([1], [1, 2])).to.be.false;
+			expect(rowsValueIdentical([], [null])).to.be.false;
+			expect(rowsValueIdentical([], [])).to.be.true;
+		});
+	});
+
+	describe('createOrderByComparatorFast', () => {
+		/** The ORDER BY comparator under BINARY, applied to a single pair. */
+		const compareWithOrderBy = (
+			a: SqlValue,
+			b: SqlValue,
+			direction: 'asc' | 'desc',
+			nullsOrdering?: 'first' | 'last',
+		): number => createOrderByComparatorFast(direction, nullsOrdering, BINARY_COLLATION)(a, b);
+
 		it('should sort ascending by default', () => {
 			expect(compareWithOrderBy(1, 2, 'asc')).to.be.lessThan(0);
 			expect(compareWithOrderBy(2, 1, 'asc')).to.be.greaterThan(0);
@@ -475,6 +514,12 @@ describe('Utility Edge Cases', () => {
 			expect(compareWithOrderBy(null, 1, 'asc')).to.be.lessThan(0);
 			// Default: nulls first for DESC too
 			expect(compareWithOrderBy(null, 1, 'desc')).to.be.lessThan(0);
+		});
+
+		it('should compare text through the supplied collation', () => {
+			const nocase = createOrderByComparatorFast('asc', undefined, NOCASE_COLLATION);
+			expect(nocase('a', 'A')).to.equal(0);
+			expect(createOrderByComparatorFast('asc', undefined, BINARY_COLLATION)('a', 'A')).to.be.greaterThan(0);
 		});
 	});
 

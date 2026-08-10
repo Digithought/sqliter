@@ -529,6 +529,52 @@ SELECT greatest(null, null) as result;
 SELECT greatest(null, 42) as result;
 → [{"result":42}]
 
+-- least skips NULLs, matching greatest, so the answer never depends on where
+-- a NULL sits in the argument list.
+SELECT least(1, null) as result;
+→ [{"result":1}]
+
+SELECT least(null, 1) as result;
+→ [{"result":1}]
+
+SELECT least(null, null) as result;
+→ [{"result":null}]
+
+SELECT least(3, null, 1) as result;
+→ [{"result":1}]
+
+SELECT least(1, null, 3) as result;
+→ [{"result":1}]
+
+-- Skipping is by argument, not by position: the same multiset of non-NULL
+-- arguments gives the same answer whatever order the NULLs arrive in.
+SELECT least(null, 3, null, 1, null) as result;
+→ [{"result":1}]
+
+SELECT greatest(3, null, 1) as result;
+→ [{"result":3}]
+
+-- A single non-NULL argument survives on its own, with no comparison to make.
+SELECT least(null, 7, null) as result, greatest(null, 7, null) as result2;
+→ [{"result":7,"result2":7}]
+
+-- Non-numeric comparison groups take the same path — TEXT ranks by collation,
+-- and the returned value is the raw argument (`returnsArg`), not a coerced key.
+SELECT least('b', null, 'a') as result, greatest('b', null, 'a') as result2;
+→ [{"result":"a","result2":"b"}]
+
+-- Mixed group: the fold ranks coerced keys ('abc' reads as 0) but still hands
+-- back the raw argument, and the NULL is skipped as in a single-type group.
+SELECT least('abc', null, 1) as result, greatest('abc', null, 1) as result2;
+→ [{"result":"abc","result2":1}]
+
+-- All-NULL and single-NULL calls answer NULL for both directions.
+SELECT least(null, null, null) as result, greatest(null, null, null) as result2;
+→ [{"result":null,"result2":null}]
+
+SELECT least(null) as result, greatest(null) as result2;
+→ [{"result":null,"result2":null}]
+
 -- ============================================================
 -- SCALAR: typeof edge cases
 -- ============================================================

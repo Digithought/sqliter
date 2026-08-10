@@ -1,10 +1,12 @@
 # Change-scope introspection
 
+> **Stability: Beta** — see [Stability Tiers](stability.md#tiers).
+
 The **change-scope** API exposes — as a small JSON-serializable data
 contract — what base-table state and external inputs a prepared
 `Statement` reads from. It is the external projection of the internal
 binding-key analysis used by assertions and incremental view
-maintenance (see [optimizer.md](optimizer.md) § "Binding-aware Delta
+maintenance (see [optimizer-assertions.md](optimizer-assertions.md) § "Binding-aware Delta
 Planning").
 
 A `ChangeScope` answers questions like:
@@ -75,8 +77,14 @@ For each `TableWatch.columns`:
 - A `ReadonlySet<string>` lists the lowercased column names actually
   read by the plan (output projection plus filter/group/order/aggregate
   inputs).
-- The sentinel `'all'` is used when the plan does not read any
-  column-specific data (e.g. `select count(*) from t`).
+- The sentinel `'all'` is used in two cases: when the plan does not read
+  any column-specific data (e.g. `select count(*) from t`), AND when the
+  plan serves a table's *whole row* to its output (a `select *`, which the
+  planner elides to a passthrough that forwards the base table's entire
+  attribute set with no per-column `ColumnReferenceNode`). In the latter
+  case pinning to `'all'` keeps the read set sound — a downstream host that
+  emits precise pk+column change events would otherwise miss changes to
+  every non-predicate column of the watched row.
 
 A `kind: 'full'` watch with `columns: {a, b}` is meaningful: the
 underlying query scans the table but only reads `a` and `b`. A future
@@ -155,7 +163,7 @@ scope mentions.
 
 1. Calls `extractBindings(plan)` from `binding-extractor.ts` to obtain
    a `BindingMode` per `TableReferenceNode` instance (see
-   [optimizer.md](optimizer.md)).
+   [optimizer-assertions.md](optimizer-assertions.md)).
 2. Walks the scalar-expression tree to collect, per
    `TableReferenceNode`, the set of column indices its
    `ColumnReferenceNode`s touch.
@@ -220,6 +228,46 @@ silently drop the nested DML subtree (that would also break the
 write-target propagation), and `physical.readonly` propagates as
 AND-of-children so `subtreeHasSideEffects` is reliable.
 
+### Materialized-view reference projection
+
+A `select` from a materialized view resolves to a `TableReference` on the
+maintained table itself (a materialized view *is* a table, registered under the
+name the user gave it), not a body expansion — so the analyzer would naively
+report that table as the watched one. A watcher usually wants the **sources**:
+the backing is maintained synchronously from them at the row-write boundary
+(row-time), and source-granularity is what the caller means by "watch this
+view".
+
+The analyzer therefore **projects** a maintained-table reference onto the MV's
+source tables. `Statement.getChangeScope()` passes `analyzeChangeScope` a
+`resolveMaterializedViewSource` resolver (backed by
+`SchemaManager.getMaintainedTable`); when a reference is a maintained table, its
+watch is replaced by that table's cached source-union scope
+(`TableDerivation.sourceScope`, built once at registration by
+`buildSourceUnionScope`). The projected scope is `unionScopes`-d
+into the result, so reading both the MV and a source directly reports the source
+once. v1's source-union is a `full` watch per source; a precise per-source
+row/group scope is a future refinement.
+
+Every materialized view is projected this way. See
+[materialized-views.md § Change-scope projection](materialized-views.md#change-scope-projection).
+
+**The projection is granularity-widening, not load-bearing.** A maintained table
+*does* appear in the transaction change log in its own right: row-time
+maintenance records each realized backing delta through the same
+`TransactionManager.recordInsert/Update/Delete` surface the DML boundary uses
+(`MaterializedViewManager.recordMaintenanceChanges` — see
+[incremental-maintenance.md § Recording changes](incremental-maintenance.md#recording-changes)).
+So a watch left on the backing table would fire, and a `create assertion` whose
+body names a materialized view is dispatched at COMMIT like one over any other
+table. Removing the projection would change *which* writes a watcher observes,
+which is why it stays.
+
+One consequence worth knowing: the projection is **one level deep** — it names
+the view's *direct* sources, not the transitive closure. For `mv2` over `mv1`
+over `w`, `scope(mv2)` is a watch on `main.mv1`. That fires only because `mv1` is
+itself change-logged by maintenance; the projection alone would not reach `w`.
+
 ## The two cases that look the same but are not
 
 Row-binding values come from two structurally similar SQL constructs;
@@ -260,6 +308,11 @@ describes more.
   that the analyzer cannot decode into a `ScopeValue`, the watch falls
   back to `{kind:'full'}` rather than emitting `{kind:'rows', values: []}`
   (which would describe "watch zero rows" and under-specify the scope).
+- **MV source projection is whole-table.** Reading a materialized view projects
+  to a `{kind:'full'}` watch per source table (see
+  [Materialized-view reference projection](#materialized-view-reference-projection)).
+  Even when the MV's body keys on a source PK or group key, the projected scope
+  does not yet narrow to those rows/groups — sound but coarse.
 
 ## Watcher
 
@@ -317,10 +370,14 @@ received over a network.
 | `groups`      | The distinct group-key tuples touched in this txn. |
 | `rowsByGroup` | The bound tuples from `values` that intersected the changes in this txn. |
 
-If the kernel falls back to a global re-evaluation (e.g. missing PK or
-the cost-based fallback fired) on a `rows` / `rowsByGroup` watch, the
-watcher surfaces every literal value the watch was registered for —
-"all of your watched keys may have changed."
+If the kernel falls back to a global re-evaluation (e.g. missing PK,
+the cost-based fallback fired, or the whole relation changed opaquely),
+the watcher still fires — coarsely — rather than miss the change:
+
+- `full` and `groups` watches fire with **empty** `hits` ("something
+  changed, re-query"); neither carries a narrower set to report.
+- `rows` / `rowsByGroup` watches surface every literal value the watch
+  was registered for — "all of your watched keys may have changed."
 
 ### Validation
 
@@ -362,6 +419,32 @@ logged with the `Subscription.id`. To continue watching, build a fresh
 `ChangeScope` against the new schema and re-subscribe. This is
 intentional v1 simplicity — auto-rebind is deferred.
 
+### External / out-of-band changes
+
+```ts
+notifyExternalChange(tableName: string, schemaName?: string): Promise<void>;
+```
+
+The post-commit path only fires for changes that flow through *this*
+`Database`'s change log. A table backed by a replicated/external store
+(e.g. an optimystic vtab) can learn of a **remote** write that never
+touched the local change log — its watchers would otherwise never fire.
+`notifyExternalChange` bridges that gap: it fires every active watcher
+whose scope includes `schema.table` as if the whole table changed,
+**without** a local commit. `schemaName` defaults to the current schema;
+matching is case-insensitive on the lowercased `schema.table` key.
+
+It is **coarse by design** — table-granular, no key narrowing. Each
+matching subscription is driven through the same global re-evaluation
+branch the commit-path fallback uses, so the `hits` follow the
+global-fallback rules above (`full`/`groups` → empty `hits`;
+`rows`/`rowsByGroup` → all registered literals). Over-firing only costs
+the consumer an extra re-query; it never misses a change. A no-op when no
+subscription matches; per-handler errors are logged and swallowed, never
+rejecting into the caller (same contract as the post-commit path).
+Handlers fire serially and are awaited. A future optional `changedKeys`
+argument could add a precise key-scoped variant without breaking callers.
+
 ### `Subscription.id` shape
 
 `watch:<base32-hash>:<nonce>` where the hash is a 6-character djb2
@@ -393,7 +476,7 @@ events.
 
 ## See also
 
-- [optimizer.md](optimizer.md) — § "Binding-aware Delta Planning" describes
+- [optimizer-assertions.md](optimizer-assertions.md) — § "Binding-aware Delta Planning" describes
   the internal `BindingMode` shape this API projects.
 - [incremental-maintenance.md](incremental-maintenance.md) — runtime
   surface for delta-driven consumers (assertions today, MVs and

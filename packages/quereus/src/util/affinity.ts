@@ -1,4 +1,14 @@
 import type { SqlValue } from '../common/types.js';
+import { valueToText } from './value-text.js';
+
+// NOTE: nothing in src/ imports this module today, and it is not re-exported from the
+// package index — the engine reaches type conversion through LogicalType.parse and
+// types/cast-semantics.ts instead, and these SQLite-affinity helpers are left over from
+// an earlier model. They are kept (and kept correct — applyTextAffinity shares the one
+// value-to-text rule) rather than deleted, because affinity is still the documented
+// SQLite behaviour a declared-type coercion path would need. If a release ever needs to
+// shrink the surface, deleting this module is a safe call; if a caller appears, the
+// blob-passthrough contract below is the part to preserve.
 
 /**
  * Attempts to parse a string as an integer according to SQLite rules.
@@ -129,17 +139,19 @@ export function applyNumericAffinity(value: SqlValue): SqlValue {
 
 /**
  * Applies SQLite TEXT affinity to a value.
- * Converts numbers to strings, leaves BLOBs unchanged.
+ * Converts every other storage class through the shared value-to-text rule,
+ * leaves BLOBs unchanged.
  */
 export function applyTextAffinity(value: SqlValue): SqlValue {
 	if (value === null || typeof value === 'string') return value;
-	if (typeof value === 'number' || typeof value === 'bigint') {
-		return String(value);
-	}
+	// SQLite's TEXT affinity does NOT convert a blob — it stays in the BLOB storage
+	// class. That is a different question from "render this value as text", so this
+	// early return must survive: folding it into valueToText would silently rewrite
+	// stored blobs in TEXT-affinity columns.
 	if (value instanceof Uint8Array) {
 		return value;
 	}
-	return String(value);
+	return valueToText(value);
 }
 
 /**

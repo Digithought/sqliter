@@ -38,6 +38,14 @@ describe('Emit: operator precedence round-trip', () => {
 			const result = roundTrip('(a != b) >= c');
 			expect(result).to.include('(');
 		});
+
+		it('should normalize `<>` to `!=` and keep a lower-prec RHS grouped', () => {
+			// `<>` is a source alias the lexer maps to the `!=` token, so it is stored and
+			// emitted as `!=`. `or` is lower precedence than the equality group, so the
+			// right operand must stay parenthesized to survive the round-trip.
+			const result = roundTrip('a <> (b or c)');
+			expect(result).to.equal('a != (b or c)');
+		});
 	});
 
 	describe('concatenation || operator', () => {

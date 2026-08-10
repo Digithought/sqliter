@@ -1,0 +1,354 @@
+-- 41.6-alter-drop-rename-constraint.sqllogic
+-- ALTER TABLE DROP CONSTRAINT / RENAME CONSTRAINT for named CHECK / UNIQUE /
+-- FOREIGN KEY constraints. Behavioral assertions only (enforcement on/off after
+-- the change + introspection via *_constraint_info TVFs), so this passes under
+-- both `yarn test` (memory) and `yarn test:store`. Memory-specific covering-index
+-- teardown is verified in alter-drop-rename-constraint.spec.ts.
+
+pragma foreign_keys = true;
+-- run
+
+-- ============================================================
+-- 1. DROP CONSTRAINT — named CHECK
+-- ============================================================
+create table c_chk (id integer primary key, qty integer, constraint chk_qty check (qty > 0));
+insert into c_chk values (1, 5);
+-- run
+
+-- enforcement active: non-positive qty rejected
+insert into c_chk values (2, -1);
+-- error: check
+
+-- introspection lists the named CHECK
+select name from check_constraint_info('c_chk') where name = 'chk_qty';
+→ [{"name":"chk_qty"}]
+
+alter table c_chk drop constraint chk_qty;
+-- run
+
+-- no longer listed
+select count(*) as c from check_constraint_info('c_chk') where name = 'chk_qty';
+→ [{"c":0}]
+
+-- enforcement gone: non-positive qty now accepted
+insert into c_chk values (2, -1);
+select qty from c_chk where id = 2;
+→ [{"qty":-1}]
+
+drop table c_chk;
+-- run
+
+-- ============================================================
+-- 2. DROP CONSTRAINT — named UNIQUE (covering structure released)
+-- ============================================================
+create table u_drop (id integer primary key, email text, constraint uq_email unique (email));
+insert into u_drop values (1, 'a@x'), (2, 'b@x');
+-- run
+
+-- enforcement active: duplicate rejected
+insert into u_drop values (3, 'a@x');
+-- error: unique
+
+alter table u_drop drop constraint uq_email;
+-- run
+
+-- constraint gone
+select count(*) as c from unique_constraint_info('u_drop') where name = 'uq_email';
+→ [{"c":0}]
+
+-- duplicate now accepted
+insert into u_drop values (3, 'a@x');
+select count(*) as c from u_drop;
+→ [{"c":3}]
+
+drop table u_drop;
+-- run
+
+-- ============================================================
+-- 3. DROP CONSTRAINT — named FOREIGN KEY (enforcement disabled)
+-- ============================================================
+create table fk_parent (pid integer primary key);
+insert into fk_parent values (1), (2);
+create table fk_child (id integer primary key, pid integer, constraint fk_p foreign key (pid) references fk_parent(pid));
+insert into fk_child values (1, 1);
+-- run
+
+-- enforcement active: orphan child rejected
+insert into fk_child values (2, 99);
+-- error:
+
+select name from foreign_key_info('fk_child') where name = 'fk_p';
+→ [{"name":"fk_p"}]
+
+alter table fk_child drop constraint fk_p;
+-- run
+
+select count(*) as c from foreign_key_info('fk_child') where name = 'fk_p';
+→ [{"c":0}]
+
+-- enforcement gone: orphan child now accepted
+insert into fk_child values (2, 99);
+select pid from fk_child where id = 2;
+→ [{"pid":99}]
+
+drop table fk_child;
+drop table fk_parent;
+-- run
+
+-- ============================================================
+-- 4. RENAME CONSTRAINT — named CHECK
+-- ============================================================
+create table r_chk (id integer primary key, n integer, constraint chk_n check (n >= 0));
+insert into r_chk values (1, 5);
+-- run
+
+alter table r_chk rename constraint chk_n to chk_nonneg;
+-- run
+
+-- old name gone, new name present
+select count(*) as c from check_constraint_info('r_chk') where name = 'chk_n';
+→ [{"c":0}]
+
+select name from check_constraint_info('r_chk') where name = 'chk_nonneg';
+→ [{"name":"chk_nonneg"}]
+
+-- still enforces under the new name
+insert into r_chk values (2, -1);
+-- error: check
+
+drop table r_chk;
+-- run
+
+-- ============================================================
+-- 5. RENAME CONSTRAINT — named UNIQUE
+-- ============================================================
+create table r_unq (id integer primary key, email text, constraint uq_e unique (email));
+insert into r_unq values (1, 'a');
+-- run
+
+alter table r_unq rename constraint uq_e to uq_email;
+-- run
+
+select name from unique_constraint_info('r_unq') where name = 'uq_email';
+→ [{"name":"uq_email"}]
+
+select count(*) as c from unique_constraint_info('r_unq') where name = 'uq_e';
+→ [{"c":0}]
+
+-- still enforces under the new name
+insert into r_unq values (2, 'a');
+-- error: unique
+
+drop table r_unq;
+-- run
+
+-- ============================================================
+-- 6. RENAME CONSTRAINT — named FOREIGN KEY
+-- ============================================================
+create table rfk_parent (pid integer primary key);
+insert into rfk_parent values (1);
+create table rfk_child (id integer primary key, pid integer, constraint fk_p foreign key (pid) references rfk_parent(pid));
+-- run
+
+alter table rfk_child rename constraint fk_p to fk_parent_ref;
+-- run
+
+select name from foreign_key_info('rfk_child') where name = 'fk_parent_ref';
+→ [{"name":"fk_parent_ref"}]
+
+-- still enforces under the new name
+insert into rfk_child values (1, 99);
+-- error:
+
+drop table rfk_child;
+drop table rfk_parent;
+-- run
+
+-- ============================================================
+-- 7. Error cases
+-- ============================================================
+
+-- NOTFOUND
+create table e_nf (id integer primary key, a integer, constraint c1 check (a > 0));
+-- run
+
+alter table e_nf drop constraint nope;
+-- error: not found
+
+alter table e_nf rename constraint nope to other;
+-- error: not found
+
+drop table e_nf;
+-- run
+
+-- Ambiguous: same name in two constraint classes. Formerly constructible right
+-- here — which was exactly the defect: `drop constraint dup` reported the pair
+-- ambiguous FOREVER, so neither could ever be removed. The state is now refused
+-- at CREATE TABLE (see 10.1.4-create-table-duplicate-constraint-names), so the
+-- resolver's ambiguity arm survives only as a defensive guard for catalogs
+-- persisted before the guard existed.
+create table e_amb (id integer primary key, a integer, constraint dup check (a > 0), constraint dup unique (a));
+-- error: duplicate constraint name 'dup'
+
+-- Collision: rename target already names a constraint
+create table e_coll (id integer primary key, a integer, b integer, constraint u1 unique (a), constraint u2 unique (b));
+-- run
+
+alter table e_coll rename constraint u1 to u2;
+-- error: already exists
+
+drop table e_coll;
+-- run
+
+-- The negative control for a UNIQUE derived from CREATE UNIQUE INDEX (DROP CONSTRAINT
+-- cannot target it) lives in 41.6.1-alter-drop-constraint-index-derived.
+
+-- ------------------------------------------------------------
+-- 7b. ADD CONSTRAINT refuses a name another constraint already uses.
+-- Same rule RENAME CONSTRAINT enforces, applied to the addition side. The refusal
+-- happens before the statement reaches the storage module, so memory and store agree
+-- and nothing is persisted — which is why these live here rather than in a spec.
+-- ------------------------------------------------------------
+
+-- CHECK onto CHECK
+create table a_chk (id integer primary key, a integer, b integer, constraint ck check (a > 0));
+-- run
+
+alter table a_chk add constraint ck check (b > 0);
+-- error: already exists
+
+-- refused ⇒ table untouched: still exactly one CHECK named ck
+select count(*) as c from check_constraint_info('a_chk') where name = 'ck';
+→ [{"c":1}]
+
+-- a different name is still accepted
+alter table a_chk add constraint ck2 check (b > 0);
+-- run
+
+select count(*) as c from check_constraint_info('a_chk') where name = 'ck2';
+→ [{"c":1}]
+
+-- case-insensitive, like every other constraint-name comparison
+alter table a_chk add constraint CK check (b > 1);
+-- error: already exists
+
+drop table a_chk;
+-- run
+
+-- UNIQUE onto UNIQUE
+create table a_unq (id integer primary key, a integer, b integer, constraint uq unique (a));
+-- run
+
+alter table a_unq add constraint uq unique (b);
+-- error: already exists
+
+select count(*) as c from unique_constraint_info('a_unq') where name = 'uq';
+→ [{"c":1}]
+
+-- negative control: an UNNAMED add has no user-supplied name to collide, so it succeeds
+alter table a_unq add unique (b);
+-- run
+
+insert into a_unq values (1, 1, 1);
+insert into a_unq values (2, 2, 1);
+-- error: unique
+
+drop table a_unq;
+-- run
+
+-- FOREIGN KEY onto FOREIGN KEY
+create table a_fk_parent (pid integer primary key);
+create table a_fk_child (id integer primary key, x integer, y integer, constraint fk foreign key (x) references a_fk_parent(pid));
+-- run
+
+alter table a_fk_child add constraint fk foreign key (y) references a_fk_parent(pid);
+-- error: already exists
+
+select count(*) as c from foreign_key_info('a_fk_child') where name = 'fk';
+→ [{"c":1}]
+
+drop table a_fk_child;
+drop table a_fk_parent;
+-- run
+
+-- Cross-class: a CHECK's name blocks a UNIQUE of the same name (and vice versa).
+-- Without this, the table ends up with a name no DROP/RENAME can ever address —
+-- both fail permanently with the ambiguity error from § 7 above.
+create table a_cross (id integer primary key, a integer, b integer, constraint dup check (a > 0));
+-- run
+
+alter table a_cross add constraint dup unique (b);
+-- error: already exists
+
+select count(*) as c from unique_constraint_info('a_cross') where name = 'dup';
+→ [{"c":0}]
+
+-- the name still resolves to exactly one constraint, so DROP works
+alter table a_cross drop constraint dup;
+-- run
+
+select count(*) as c from check_constraint_info('a_cross') where name = 'dup';
+→ [{"c":0}]
+
+drop table a_cross;
+-- run
+
+-- ADD COLUMN carrying an inline NAMED constraint is refused the same way
+create table a_col (id integer primary key, a integer, constraint ck check (a > 0));
+-- run
+
+alter table a_col add column b integer null constraint ck check (b > 0);
+-- error: already exists
+
+-- refused ⇒ no column added and no constraint installed
+select count(*) as c from table_info('a_col') where name = 'b';
+→ [{"c":0}]
+
+select count(*) as c from check_constraint_info('a_col') where name = 'ck';
+→ [{"c":1}]
+
+-- two inline constraints colliding with EACH OTHER on one ADD COLUMN (neither exists
+-- on the table yet, so only the within-statement accumulation catches it)
+alter table a_col add column c integer null constraint x check (c > 0) constraint x unique;
+-- error: already exists
+
+select count(*) as c from table_info('a_col') where name = 'c';
+→ [{"c":0}]
+
+-- a non-colliding inline name still works
+alter table a_col add column d integer null constraint ck_d check (d > 0);
+-- run
+
+select count(*) as c from check_constraint_info('a_col') where name = 'ck_d';
+→ [{"c":1}]
+
+drop table a_col;
+-- run
+
+-- ============================================================
+-- 8. DROP CONSTRAINT (CHECK) invalidates optimizer folding
+-- ============================================================
+-- A declared `check (x = 1)` lifts an FD/constant-binding onto the table that
+-- the filter-contradiction rule uses to fold `where x = 2` to EmptyRelation.
+-- Dropping the CHECK fires `table_modified`, which must invalidate that folding
+-- so a row that violates the dropped predicate is actually returned (regression
+-- guard for the cache-invalidation path on the constraint-drop case).
+create table fold_chk (id integer primary key, x integer, constraint chk check (x = 1));
+insert into fold_chk values (1, 1);
+-- run
+
+-- With the CHECK active, `where x = 2` is unsatisfiable (no such row can exist).
+select count(*) as c from fold_chk where x = 2;
+→ [{"c":0}]
+
+alter table fold_chk drop constraint chk;
+-- run
+
+-- A row that would have violated the dropped CHECK now inserts and must be found
+-- (folding no longer applies).
+insert into fold_chk values (2, 2);
+select count(*) as c from fold_chk where x = 2;
+→ [{"c":1}]
+
+drop table fold_chk;
+-- run

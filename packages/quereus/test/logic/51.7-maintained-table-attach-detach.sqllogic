@@ -1,0 +1,468 @@
+-- 51.7-maintained-table-attach-detach.sqllogic — the maintained-table lifecycle
+-- verbs: `create table … maintained as <body>` (declared-shape attach-to-empty),
+-- `alter table … set maintained as <body>` (attach / re-attach with
+-- verify-by-diff reconcile — derived content wins, identical content writes
+-- nothing), and `alter table … drop maintained` (detach — catalog-only, rows
+-- intact, table becomes ordinary and writable).
+
+-- ===================================
+-- 1. create table … maintained as — declared-shape form ≡ create-MV
+-- ===================================
+
+create table src (id integer primary key, v text);
+insert into src values (1, 'a'), (2, 'b');
+
+create table mt (id integer primary key, v text) maintained as select id, v from src;
+
+select * from mt order by id;
+→ [{"id":1,"v":"a"},{"id":2,"v":"b"}]
+
+-- row-time maintenance is live: source writes reflect immediately
+insert into src values (3, 'c');
+select * from mt order by id;
+→ [{"id":1,"v":"a"},{"id":2,"v":"b"},{"id":3,"v":"c"}]
+
+update src set v = 'B' where id = 2;
+select v from mt where id = 2;
+→ [{"v":"B"}]
+
+delete from src where id = 3;
+select count(*) as n from mt;
+→ [{"n":2}]
+
+-- write-through: DML against the maintained table routes to the source
+insert into mt values (9, 'z');
+select v from src where id = 9;
+→ [{"v":"z"}]
+delete from mt where id = 9;
+
+-- refresh works on a table-form maintained table
+refresh materialized view mt;
+select count(*) as n from mt;
+→ [{"n":2}]
+
+-- structural ALTER is rejected: the shape is body-defined
+alter table mt add column extra text;
+-- error: materialized view
+
+-- drop materialized view drops the one unified record
+drop materialized view mt;
+select count(*) as n from src;
+→ [{"n":2}]
+
+-- ===================================
+-- 2. Declared-shape mismatches error before any catalog registration
+-- ===================================
+
+create table src2 (id integer primary key, v text not null);
+insert into src2 values (1, 'a');
+
+-- arity (build-time gate)
+create table mt2 (id integer primary key, v text not null, extra integer) maintained as select id, v from src2;
+-- error: body produces 2 columns
+
+-- column name (strict: alias the body to the declared shape)
+create table mt2 (id integer primary key, vv text not null) maintained as select id, v from src2;
+-- error: alias the body output
+
+-- type
+create table mt2 (id integer primary key, v integer not null) maintained as select id, v from src2;
+-- error: body derives type
+
+-- not-null (strict in both directions; here the body derives not null but the
+-- declared column is explicitly nullable)
+create table mt2 (id integer primary key, v text null) maintained as select id, v from src2;
+-- error: nullable
+
+-- collation
+create table mt2 (id integer primary key, v text not null collate nocase) maintained as select id, v from src2;
+-- error: collation
+
+-- physical PK column
+create table mt2 (id integer not null, v text not null primary key) maintained as select id, v from src2;
+-- error: primary-key component
+
+-- physical PK direction
+create table mt2 (id integer primary key desc, v text not null) maintained as select id, v from src2;
+-- error: direction
+
+-- nothing registered by the failures: the name stayed free and a plain create works
+create table mt2 (id integer primary key, v text not null);
+insert into mt2 values (1, 'x');
+drop table mt2;
+
+-- if not exists interplay: an existing table skips ENTIRELY — never half-attaches
+create table keepme (id integer primary key, v text not null);
+insert into keepme values (1, 'orig');
+create table if not exists keepme (id integer primary key, v text not null) maintained as select id, v from src2;
+select * from keepme order by id;
+→ [{"id":1,"v":"orig"}]
+-- still plain (no derivation was attached) and still writable
+alter table keepme drop maintained;
+-- error: not a maintained table
+insert into keepme values (2, 'still writable');
+drop table keepme;
+
+-- ===================================
+-- 3. set maintained — fresh attach reconciles by diff (derived content wins)
+-- ===================================
+
+create table base (id integer primary key, v text not null);
+insert into base values (1, 'a'), (2, 'b'), (3, 'c');
+
+-- the upgrading-peer case: the target exists with drifted content —
+-- row 1 identical (no write), row 2 lagged (update), row 3 missing (insert),
+-- row 4 extra (delete)
+create table tgt (id integer primary key, v text not null);
+insert into tgt values (1, 'a'), (2, 'STALE'), (4, 'EXTRA');
+
+alter table tgt set maintained as select id, v from base;
+
+select * from tgt order by id;
+→ [{"id":1,"v":"a"},{"id":2,"v":"b"},{"id":3,"v":"c"}]
+
+-- maintenance resumed: source writes propagate
+insert into base values (5, 'e');
+select v from tgt where id = 5;
+→ [{"v":"e"}]
+
+-- the attached table is write-through, like any maintained table
+update tgt set v = 'A' where id = 1;
+select v from base where id = 1;
+→ [{"v":"A"}]
+
+-- structural ALTER now rejected
+alter table tgt add column x integer;
+-- error: materialized view
+
+-- ===================================
+-- 4. detach round-trip: detach → user writes → re-attach reconciles the drift
+-- ===================================
+
+alter table tgt drop maintained;
+
+-- rows intact
+select count(*) as n from tgt;
+→ [{"n":4}]
+
+-- maintenance stopped: a source write no longer propagates
+insert into base values (6, 'f');
+select count(*) as n from tgt where id = 6;
+→ [{"n":0}]
+
+-- ordinary and user-writable: a direct write stays local (no write-through).
+-- After detach the table carries no derivation, so the engine's READONLY backstop
+-- (runtime DML executor) sheds with it — a direct INSERT/UPDATE/DELETE succeeds and
+-- writes the table's own rows rather than routing to a source.
+insert into tgt values (7, 'local');
+select count(*) as n from base where id = 7;
+→ [{"n":0}]
+-- the local row is readable directly in the detached (now ordinary) table
+select v from tgt where id = 7;
+→ [{"v":"local"}]
+update tgt set v = 'LOCAL' where id = 7;
+select v from tgt where id = 7;
+→ [{"v":"LOCAL"}]
+delete from tgt where id = 7;
+select count(*) as n from tgt where id = 7;
+→ [{"n":0}]
+
+-- structural ALTER allowed again
+alter table tgt add column extra text null;
+alter table tgt drop column extra;
+
+-- re-attach reconciles exactly the user-written drift; maintenance resumes
+alter table tgt set maintained as select id, v from base;
+select * from tgt order by id;
+→ [{"id":1,"v":"A"},{"id":2,"v":"b"},{"id":3,"v":"c"},{"id":5,"v":"e"},{"id":6,"v":"f"}]
+insert into base values (8, 'h');
+select v from tgt where id = 8;
+→ [{"v":"h"}]
+
+-- ===================================
+-- 5. re-attach replaces the body atomically (the differ's body-change primitive)
+-- ===================================
+
+create table base2 (id integer primary key, v text not null);
+insert into base2 values (100, 'x');
+
+alter table tgt set maintained as select id, v from base2;
+select * from tgt order by id;
+→ [{"id":100,"v":"x"}]
+
+-- the old source no longer drives it
+insert into base values (9, 'i');
+select count(*) as n from tgt;
+→ [{"n":1}]
+
+-- the new source does
+insert into base2 values (101, 'y');
+select * from tgt order by id;
+→ [{"id":100,"v":"x"},{"id":101,"v":"y"}]
+
+alter table tgt drop maintained;
+drop table tgt;
+drop table base2;
+
+-- an aggregate body attaches too: the strict shape check holds over the
+-- derived aggregate types/key, and incremental maintenance runs post-attach.
+create table words (id integer primary key, w text not null);
+insert into words values (1, 'x'), (2, 'y'), (3, 'x');
+-- the PK column pins `collate binary` so the declared collation matches the
+-- body-derived one under both suites (the store's key collation defaults to NOCASE)
+create table counts (w text not null collate binary primary key, n integer not null);
+alter table counts set maintained as select w, count(*) as n from words group by w;
+select * from counts order by w;
+→ [{"w":"x","n":2},{"w":"y","n":1}]
+insert into words values (4, 'x');
+select n from counts where w = 'x';
+→ [{"n":3}]
+delete from words where id = 2;
+select count(*) as remaining from counts;
+→ [{"remaining":1}]
+drop materialized view counts;
+drop table words;
+
+-- ===================================
+-- 6. duplicate derived keys ⇒ loud reject, table and catalog untouched
+--    (the coarsened-key collision — the parallel-migration shape)
+-- ===================================
+
+-- the source PK is `collate binary` explicitly so the case-variant pair inserts
+-- under both suites (the store's table-level key collation defaults to NOCASE)
+create table contacts (handle text collate binary primary key, email text not null);
+insert into contacts values ('alice', 'a@x'), ('ALICE', 'A@X');
+
+-- create path: the loud reject rolls the whole record back
+create table contacts2 (handle text not null collate nocase primary key, email text not null)
+  maintained as select handle collate nocase as handle, email from contacts;
+-- error: duplicate rows for primary key
+
+-- the name stayed free
+create table contacts2 (handle text not null collate nocase primary key, email text not null);
+insert into contacts2 values ('z', 'z@x');
+
+-- attach path: same reject, table and catalog untouched
+alter table contacts2 set maintained as select handle collate nocase as handle, email from contacts;
+-- error: duplicate rows for primary key
+select * from contacts2 order by handle;
+→ [{"handle":"z","email":"z@x"}]
+insert into contacts2 values ('w', 'w@x');
+
+-- merge the collision in the source; the coarsened-key attach then succeeds
+-- (derived wins: the local rows are replaced by the derived contents)
+delete from contacts where handle = 'ALICE';
+alter table contacts2 set maintained as select handle collate nocase as handle, email from contacts;
+select * from contacts2 order by handle;
+→ [{"handle":"alice","email":"a@x"}]
+
+drop materialized view contacts2;
+drop table contacts;
+
+-- ===================================
+-- 7. self-reference and cycles via attach are rejected; the consumer cascade
+--    sees exactly the reconcile diff
+-- ===================================
+
+create table a1 (id integer primary key, v text not null);
+insert into a1 values (1, 'a');
+
+-- self-reference
+alter table a1 set maintained as select id, v from a1;
+-- error: derivation cycle
+
+-- two-table cycle: b1 maintained from a1, then a1 from b1 would close the loop
+create table b1 (id integer primary key, v text not null);
+alter table b1 set maintained as select id, v from a1;
+select * from b1 order by id;
+→ [{"id":1,"v":"a"}]
+alter table a1 set maintained as select id, v from b1;
+-- error: derivation cycle
+
+-- a non-cyclic body over the same table works (c1 → a1 → b1 chain), and the
+-- attach reconcile's changes cascade to the consumer
+create table c1 (id integer primary key, v text not null);
+insert into c1 values (5, 'c');
+alter table a1 set maintained as select id, v from c1;
+select * from a1 order by id;
+→ [{"id":5,"v":"c"}]
+select * from b1 order by id;
+→ [{"id":5,"v":"c"}]
+
+-- steady-state writes flow down the whole chain
+insert into c1 values (6, 'd');
+select * from b1 order by id;
+→ [{"id":5,"v":"c"},{"id":6,"v":"d"}]
+
+drop materialized view b1;
+drop materialized view a1;
+drop table c1;
+
+-- ===================================
+-- 8. verb errors
+-- ===================================
+
+create table plain1 (id integer primary key);
+
+alter table plain1 drop maintained;
+-- error: not a maintained table
+
+-- a DML body is rejected at build (and the mutation never executes)
+alter table plain1 set maintained as insert into base values (99, 'x') returning id;
+-- error: cannot be used as a view body
+select count(*) as n from base where id = 99;
+→ [{"n":0}]
+
+-- a shape-differing attach over a PLAIN table (the implicit form) RESHAPES the
+-- backing to follow the body — here a trailing append; the plain rows are
+-- discarded by the reconcile (derived content wins)
+alter table plain1 set maintained as select id, v from base;
+select count(*) as n from plain1;
+→ [{"n":7}]
+alter table plain1 drop maintained;
+
+-- an INEXPRESSIBLE reshape (a column reorder) is a sited error, table untouched
+alter table plain1 set maintained as select v, id from base;
+-- error: changed incompatibly
+select count(*) as n from plain1;
+→ [{"n":7}]
+
+-- a generated column is rejected on both authoring forms: the body supplies
+-- every column's value, so the generation expression would silently diverge
+create table gen1 (id integer primary key, v text not null generated always as ('x'));
+alter table gen1 set maintained as select id, v from base;
+-- error: generated
+drop table gen1;
+create table gen1 (id integer primary key, v text not null generated always as ('x')) maintained as select id, v from base;
+-- error: generated
+
+drop table plain1;
+drop table base;
+
+-- ===================================
+-- 9. detach of a STALE maintained table is allowed — the flag leaves with the
+--    derivation
+-- ===================================
+
+create table src3 (id integer primary key, v text not null);
+insert into src3 values (1, 'a');
+create table mt3 (id integer primary key, v text not null) maintained as select id, v from src3;
+
+-- an incompatible source change (dropping a referenced column) marks the
+-- consumer stale
+alter table src3 drop column v;
+select * from mt3;
+-- error: stale
+
+alter table mt3 drop maintained;
+
+-- plain again: readable and writable, staleness gone with the derivation
+select * from mt3 order by id;
+→ [{"id":1,"v":"a"}]
+insert into mt3 values (2, 'b');
+drop table mt3;
+drop table src3;
+
+-- ===================================
+-- 10. with defaults clause on the table form (write-through supplies the
+--     omitted column)
+-- ===================================
+
+create table src4 (id integer primary key, v text not null, created integer not null);
+create table mt4 (id integer primary key, v text not null, created integer not null)
+  maintained as select id, v, created from src4
+  with defaults (created = 42);
+
+insert into mt4 (id, v) values (1, 'a');
+select * from src4;
+→ [{"id":1,"v":"a","created":42}]
+select * from mt4;
+→ [{"id":1,"v":"a","created":42}]
+
+drop materialized view mt4;
+
+-- the clause also rides the attach verb
+create table mt5 (id integer primary key, v text not null, created integer not null);
+alter table mt5 set maintained as select id, v, created from src4
+  with defaults (created = 99);
+insert into mt5 (id, v) values (2, 'b');
+select * from src4 order by id;
+→ [{"id":1,"v":"a","created":42},{"id":2,"v":"b","created":99}]
+select created from mt5 where id = 2;
+→ [{"created":99}]
+
+drop materialized view mt5;
+drop table src4;
+
+-- ===================================
+-- 11. `maintained` stays contextual — usable as an identifier
+-- ===================================
+
+create table maintained (maintained integer primary key);
+insert into maintained values (1);
+select maintained from maintained;
+→ [{"maintained":1}]
+-- the bare DROP MAINTAINED verb wins over a column of that name…
+alter table maintained drop maintained;
+-- error: not a maintained table
+drop table maintained;
+
+-- ===================================
+-- 12. set maintained (cols) as — explicit rename-list re-attach + backing reshape
+-- ===================================
+
+create table rsrc (id integer primary key, x text not null, y text not null);
+insert into rsrc values (1, 'a', 'A'), (2, 'b', 'B');
+
+-- explicit attach with an authored rename list (a, b) over the body's (id, x)
+create table rmv (a integer primary key, b text not null) maintained (a, b) as select id, x from rsrc;
+select a, b from rmv order by a;
+→ [{"a":1,"b":"a"},{"a":2,"b":"b"}]
+
+-- rename-list change b → c (same body): the backing column is RENAMED in place,
+-- rows relabeled (not rebuilt); the derivation re-records (a, c)
+alter table rmv set maintained (a, c) as select id, x from rsrc;
+select a, c from rmv order by a;
+→ [{"a":1,"c":"a"},{"a":2,"c":"b"}]
+
+-- idempotent: re-running the same verb changes nothing
+alter table rmv set maintained (a, c) as select id, x from rsrc;
+select a, c from rmv order by a;
+→ [{"a":1,"c":"a"},{"a":2,"c":"b"}]
+
+-- maintenance is live on the renamed backing
+insert into rsrc values (3, 'c', 'C');
+select c from rmv where a = 3;
+→ [{"c":"c"}]
+
+-- body-only change with the list unchanged applies (a plain reconcile, no reshape)
+alter table rmv set maintained (a, c) as select id, y from rsrc;
+select a, c from rmv order by a;
+→ [{"a":1,"c":"A"},{"a":2,"c":"B"},{"a":3,"c":"C"}]
+
+-- a rename-list swap (a, c) → (c, a) is an inexpressible reorder, table untouched
+alter table rmv set maintained (c, a) as select id, y from rsrc;
+-- error: changed incompatibly
+select a, c from rmv order by a;
+→ [{"a":1,"c":"A"},{"a":2,"c":"B"},{"a":3,"c":"C"}]
+
+-- a list/body arity mismatch is a sited error before anything is recorded
+alter table rmv set maintained (a, c, d) as select id, y from rsrc;
+-- error: rename list declares 3 columns but the body produces 2
+
+-- a count drift (3-col list + body over the 2-col table) is the strict shape error
+alter table rmv set maintained (a, c, d) as select id, y, x from rsrc;
+-- error: body produces 3 columns but the table declares 2
+
+-- still intact after the rejected re-attaches
+select a, c from rmv order by a;
+→ [{"a":1,"c":"A"},{"a":2,"c":"B"},{"a":3,"c":"C"}]
+
+-- the bare verb over the explicit table goes implicit: the backing relabels to the
+-- body's natural names and the recorded list is abandoned (derivation.columns clears)
+alter table rmv set maintained as select id, x from rsrc;
+select id, x from rmv order by id;
+→ [{"id":1,"x":"a"},{"id":2,"x":"b"},{"id":3,"x":"c"}]
+
+drop materialized view rmv;
+drop table rsrc;

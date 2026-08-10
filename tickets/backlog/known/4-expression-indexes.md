@@ -1,5 +1,6 @@
 ---
 description: Support for indexes on computed expressions in MemoryTable
+difficulty: hard
 prereq: none
 ---
 

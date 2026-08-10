@@ -13,14 +13,14 @@ import { GetObjectCommand, ListObjectsV2Command, PutObjectCommand, type S3Client
 import { randomUUID } from 'node:crypto';
 import { createGunzip, createGzip } from 'node:zlib';
 import { serviceLog } from '../common/logger.js';
-import { serializeSnapshotChunk, deserializeSnapshotChunk } from '../common/serialization.js';
+import { serializeSnapshotChunk, deserializeSnapshotChunk } from '../common/index.js';
 import {
 	type S3StorageConfig,
 	type StoragePathResolver,
 	buildSnapshotKey,
 	defaultStoragePathResolver,
 } from './s3-config.js';
-import type { SyncManager, SnapshotChunk, SnapshotColumnVersionsChunk } from '@quereus/sync';
+import type { SyncManager, SnapshotChunk, SnapshotColumnVersionsChunk, SerializedSnapshotChunk } from '@quereus/sync';
 
 /**
  * Snapshot metadata stored alongside the snapshot.
@@ -318,7 +318,7 @@ export class S3SnapshotStore {
     const decompressed = await this.decompressData(Buffer.from(compressed));
     const data = JSON.parse(decompressed);
 
-    const chunks = (data.chunks as unknown[]).map(c => deserializeSnapshotChunk(c));
+    const chunks = (data.chunks as SerializedSnapshotChunk[]).map(c => deserializeSnapshotChunk(c));
 
     serviceLog('Downloaded snapshot for %s: %s (%d chunks)',
       databaseId, data.snapshotId, chunks.length);

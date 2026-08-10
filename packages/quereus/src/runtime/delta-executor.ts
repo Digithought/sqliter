@@ -43,6 +43,12 @@ export interface DeltaExecutorContext {
 	/** Heuristic row count for cost fallback. Optional — when omitted the
 	 *  kernel does not demote any bindings to global. */
 	getRowCount?(base: string): number | undefined;
+	/** Optional: report a base whose entire contents changed opaquely this pass
+	 *  (e.g. a wholesale rebuild whose per-row deltas weren't captured). When this
+	 *  returns true for a relation's base, the kernel flags that relation for
+	 *  global re-evaluation instead of fetching per-tuple deltas. Consumers that
+	 *  never rebuild opaquely (assertions, watchers) omit it. */
+	isGloballyChanged?(base: string): boolean;
 	/** Tuning parameter: ratio of changed-distinct-tuples to table row count
 	 *  above which the kernel demotes a 'row'/'group' binding to 'global'. */
 	readonly deltaPerRowFallbackRatio: number;
@@ -59,6 +65,25 @@ export interface DeltaApplyInput {
 	readonly perRelationTuples: ReadonlyMap<string, readonly SqlValue[][]>;
 	/** RelationKeys flagged for global re-evaluation. */
 	readonly globalRelations: ReadonlySet<string>;
+}
+
+/**
+ * Optional knobs for a single {@link DeltaExecutor.runAll} pass. Defaults keep
+ * the kernel consumer-neutral — assertions and watchers call `runAll()` with no
+ * options and behave exactly as before. The materialized-view manager uses both
+ * seams to converge cascading MV-over-MV chains in one post-commit pass: it
+ * reorders subscriptions into dependency-topological order and rescans the
+ * change source between subscriptions so a producer MV's backing-table write
+ * (exposed via the context overlay) is visible to its dependents.
+ */
+export interface RunAllOptions {
+	/** Reorder the subscription snapshot before dispatch. Receives a fresh array
+	 *  (safe to sort in place); the returned order is used. Default: insertion order. */
+	order?: (subs: DeltaSubscription[]) => DeltaSubscription[];
+	/** Recompute `ctx.getChangedBaseTables()` before each `runOne`, so an `apply`
+	 *  that grows the change source via the context (e.g. records a backing-table
+	 *  delta) is visible to later subscriptions in the same pass. Default: false. */
+	rescanPerSubscription?: boolean;
 }
 
 /**
@@ -116,18 +141,27 @@ export class DeltaExecutor {
 	 * Run all impacted subscriptions. Throws on the first subscription's
 	 * `apply` rejection — exceptions are surfaced unchanged so the COMMIT
 	 * path can roll back.
+	 *
+	 * With no options this is insertion-order, single-scan dispatch (the
+	 * assertion/watcher contract). {@link RunAllOptions} lets a consumer reorder
+	 * the snapshot and rescan the change source per subscription — see the
+	 * materialized-view manager's cascading-convergence pass.
 	 */
-	async runAll(): Promise<void> {
+	async runAll(opts?: RunAllOptions): Promise<void> {
 		if (this.subscriptions.size === 0) return;
-		const changedBases = this.ctx.getChangedBaseTables();
+		let changedBases = this.ctx.getChangedBaseTables();
 		if (changedBases.size === 0) return;
 
 		// Snapshot subscriptions before iterating: a handler that registers a
 		// new subscription mid-fire must not see the current commit, and one
 		// that unsubscribes a peer must still see in-flight apply complete.
-		const snapshot = [...this.subscriptions];
+		let snapshot = [...this.subscriptions];
+		if (opts?.order) snapshot = opts.order(snapshot);
 		for (const sub of snapshot) {
 			if (!this.subscriptions.has(sub)) continue;
+			// Rescan so a prior subscription's apply that grew the change source
+			// (e.g. a producer MV's backing-table delta) is visible here.
+			if (opts?.rescanPerSubscription) changedBases = this.ctx.getChangedBaseTables();
 			await this.runOne(sub, changedBases);
 		}
 	}
@@ -146,6 +180,14 @@ export class DeltaExecutor {
 		for (const [relKey, binding] of sub.bindings) {
 			const base = sub.relationToBase.get(relKey);
 			if (!base || !changedBases.has(base)) continue;
+
+			// The base's entire contents changed opaquely (e.g. a producer MV was
+			// rebuilt wholesale, so no per-row deltas were captured). The only
+			// correct response is to re-evaluate this relation globally.
+			if (this.ctx.isGloballyChanged?.(base)) {
+				globalRelations.add(relKey);
+				continue;
+			}
 
 			if (binding.kind === 'global') {
 				globalRelations.add(relKey);
@@ -434,8 +476,15 @@ export function subscriptionFromChangeScope(
 					break;
 				}
 				case 'groups': {
+					// A `groups` watch carries no literal values to surface, so on a
+					// global re-evaluation (kernel fell back to whole-relation, or an
+					// external/out-of-band change marked the relation global) we fire
+					// with empty hits — "some group changed, re-query" — exactly as the
+					// `full` case does. Without this, a `groups` watch would silently
+					// miss every global change (commit-path fallbacks and the entire
+					// external-change path), violating the never-miss-a-change contract.
 					hits = isGlobal ? [] : (kernelTuples ?? []);
-					observable = hits.length > 0;
+					observable = isGlobal || hits.length > 0;
 					break;
 				}
 				case 'rowsByGroup': {

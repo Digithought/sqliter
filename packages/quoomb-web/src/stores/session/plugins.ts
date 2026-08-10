@@ -1,6 +1,6 @@
 import type { SqlValue } from '@quereus/quereus';
 import type { PluginRecord } from '../../worker/types.js';
-import { validatePluginUrl, interpolateConfigEnvVars } from '@quereus/plugin-loader';
+import { validatePluginUrl, interpolateConfigEnvVars, toPluginSqlConfig } from '@quereus/plugin-loader';
 import { useSettingsStore } from '../settingsStore.js';
 import { useConfigStore } from '../configStore.js';
 import type { StoreSet, StoreGet } from './types.js';
@@ -183,21 +183,25 @@ export function createPluginActions(set: StoreSet, get: StoreGet) {
 			const configState = useConfigStore.getState();
 			if (configState.config && configState.config.plugins && configState.config.autoload !== false) {
 				const config = interpolateConfigEnvVars(configState.config);
+
+				// The browser imports `https:` URLs natively — there is no remote
+				// resolver here to hash the bytes against — so a config-declared
+				// `sha256` is inert. Say so: silence would leave a user believing the
+				// pin they wrote in the config file is being enforced.
+				const unverifiable = (config.plugins || []).filter(p => p.sha256).map(p => p.source);
+				if (unverifiable.length > 0) {
+					console.warn(
+						`quoomb.config.json declares sha256 for ${unverifiable.join(', ')}, but the browser ` +
+						'cannot verify plugin bytes before importing them; those hashes are not enforced here. ' +
+						'Load these plugins through the quoomb CLI for a checked load.'
+					);
+				}
+
 				for (const pluginConfig of config.plugins || []) {
 					try {
-						const sqlConfig: Record<string, SqlValue> = {};
-						if (pluginConfig.config) {
-							for (const [key, value] of Object.entries(pluginConfig.config)) {
-								if (value === null || value === undefined) {
-									sqlConfig[key] = null;
-								} else if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
-									sqlConfig[key] = value;
-								} else {
-									sqlConfig[key] = JSON.stringify(value);
-								}
-							}
-						}
-						await api.loadModule(pluginConfig.source, sqlConfig);
+						// Pass the config object through unflattened so structured settings
+						// (e.g. IndexedDB's `cache`) reach the plugin as objects, not JSON strings.
+						await api.loadModule(pluginConfig.source, toPluginSqlConfig(pluginConfig.config));
 					} catch (error) {
 						console.warn(`Failed to load plugin from config ${pluginConfig.source}:`, error);
 					}

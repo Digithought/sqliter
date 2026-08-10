@@ -1,5 +1,6 @@
 import type { DeleteNode } from '../../planner/nodes/delete-node.js';
-import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import { emitPlanNode } from '../emitters.js';
 import type { Row } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
@@ -29,7 +30,7 @@ export function emitDelete(plan: DeleteNode, ctx: EmissionContext): Instruction 
 
 	return {
 		params: [sourceInstruction],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `deletePrep(${plan.table.tableSchema.name})`
 	};
 }

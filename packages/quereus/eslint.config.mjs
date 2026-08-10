@@ -33,4 +33,15 @@ export default tseslint.config(
       '@typescript-eslint/no-unused-expressions': 'off',
     },
   },
+  {
+    // Canonical node-discrimination file. Its cross-class capability guards are
+    // brand-typed (never `as any`); a reintroduced duck-typed `as any` detector
+    // here is the exact regression this override guards against. Scope is this
+    // one file only — other planner files still carry legitimate `any` at `warn`.
+    // See docs/optimizer-conventions.md § Node discrimination.
+    files: ['src/planner/framework/characteristics.ts'],
+    rules: {
+      '@typescript-eslint/no-explicit-any': 'error',
+    },
+  },
 );

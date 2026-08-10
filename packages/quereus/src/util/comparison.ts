@@ -1,102 +1,148 @@
 import type { Row, SqlValue } from '../common/types.js';
-import { createLogger } from '../common/logger.js';
-import type { LogicalType, CollationFunction } from '../types/logical-type.js';
+import type { JSONValue } from '../common/json-types.js';
+import { canonicalJsonString } from './json-canonical.js';
+import type { LogicalType, CollationFunction, CollationResolver } from '../types/logical-type.js';
 import { StatusCode } from '../common/types.js';
 import { QuereusError } from '../common/errors.js';
 
 
-const log = createLogger('util:comparison');
-const warnLog = log.extend('warn');
-
 export type { CollationFunction };
 
-// Map to store registered collations
-const collations = new Map<string, CollationFunction>();
+/**
+ * True when the string holds a high surrogate (U+D800–U+DBFF) — the only code units
+ * for which JS `<`/`>` disagrees with code-point order. Everything else compares the
+ * same either way, so a string that fails this test can take the native fast path.
+ */
+const HAS_HIGH_SURROGATE = /[\uD800-\uDBFF]/;
+
+/**
+ * Compare two strings by Unicode code point — the order a `memcmp` of their UTF-8
+ * encodings produces, and the order SQLite's BINARY collation produces.
+ *
+ * JS `<`/`>` compares UTF-16 CODE UNITS, which differs above U+FFFF: an astral
+ * character is a surrogate pair whose leading unit lies in U+D800–U+DBFF, so `<` sorts
+ * it below every U+E000–U+FFFF character, while its UTF-8 encoding (`F0…`) sorts above
+ * theirs (`EE…`, `EF…`). The persistent store physically orders text keys by `memcmp`
+ * of their UTF-8 bytes, so a comparator stamped `orderPreserving` must agree with the
+ * code-point order, not the code-unit order.
+ *
+ * The scan needs no surrogate-pair decoding. At the FIRST differing code unit of two
+ * well-formed strings, either both units are low surrogates (U+DC00–U+DFFF) or neither
+ * is: a low surrogate at index `i` implies a matching high surrogate at `i-1`, which the
+ * shared prefix forces onto the other string, which therefore also carries a low
+ * surrogate at `i`. So the verdict is decided by ranking each unit with high surrogates
+ * lifted above U+FFFF (`u + 0x2800`, injective over the code-unit range) and comparing
+ * the ranks; equal-prefix strings fall back to shorter-first.
+ *
+ * Unpaired surrogates have no UTF-8 encoding (`TextEncoder` maps each to U+FFFD), so no
+ * comparator can be order-preserving over them. The persistent store therefore REFUSES
+ * to key them (`quereus-store`'s `encodeText` raises), which is what keeps the built-ins'
+ * `orderPreserving` stamp true over every value a store-backed table can hold. This
+ * function stays total and deterministic for them — memory tables accept them — it simply
+ * has no store bytes to agree with.
+ */
+export function compareCodePoints(a: string, b: string): number {
+	if (a === b) return 0;
+	// No high surrogate on either side ⇒ code-unit order IS code-point order, so keep V8's
+	// native string compare rather than a per-unit JS loop. BINARY is the engine's hottest
+	// comparator and the guard buys back most of its cost: dropping the fast path and always
+	// scanning measured ~6x slower on keys with a long common prefix, where the native
+	// compare memcmps but the JS loop pays per code unit.
+	//
+	// NOTE: the guard itself is O(length) — a full regex scan of BOTH operands, on V8's
+	// compiled-regex path (~15 ns for short keys). Measured only up to 40-char keys. If
+	// BINARY over long text columns (documents, blobs-as-text) ever shows up hot, narrow the
+	// guard: the two orders can only disagree when one operand holds a high surrogate AND the
+	// other holds a unit >= U+E000, so a cached per-string flag or a `lastIndexOf`-style
+	// early-out on the shorter operand would cut it.
+	if (!HAS_HIGH_SURROGATE.test(a) && !HAS_HIGH_SURROGATE.test(b)) {
+		return a < b ? -1 : 1;
+	}
+	return compareCodePointsBounded(a, a.length, b, b.length);
+}
+
+/**
+ * {@link compareCodePoints} restricted to the code-unit prefixes `a[0..lenA)` and
+ * `b[0..lenB)`. RTRIM uses this to compare the untrimmed strings up to their trimmed
+ * lengths without materializing the trimmed copies. Callers must not cut a bound
+ * through a surrogate pair (an ASCII-space trim never can).
+ */
+function compareCodePointsBounded(a: string, lenA: number, b: string, lenB: number): number {
+	const minLen = lenA < lenB ? lenA : lenB;
+	for (let i = 0; i < minLen; i++) {
+		const unitA = a.charCodeAt(i);
+		const unitB = b.charCodeAt(i);
+		if (unitA !== unitB) {
+			const rankA = unitA >= 0xD800 && unitA <= 0xDBFF ? unitA + 0x2800 : unitA;
+			const rankB = unitB >= 0xD800 && unitB <= 0xDBFF ? unitB + 0x2800 : unitB;
+			return rankA < rankB ? -1 : 1;
+		}
+	}
+	return lenA < lenB ? -1 : lenA > lenB ? 1 : 0;
+}
 
 /**
  * Binary (default) collation function.
- * Performs standard lexicographical comparison of strings.
+ * Orders strings by Unicode code point — see {@link compareCodePoints}.
  */
 export const BINARY_COLLATION: CollationFunction = (a, b) => {
-	return a < b ? -1 : a > b ? 1 : 0;
+	return compareCodePoints(a, b);
 };
 
 /**
  * Case-insensitive collation function.
- * Compares strings after converting them to lowercase.
+ * Compares strings by code point after converting them to lowercase.
+ * `toLowerCase()` maps surrogate pairs correctly (U+10400 → U+10428), so the lowercased
+ * forms are the same strings the key normalizer encodes.
  */
 export const NOCASE_COLLATION: CollationFunction = (a, b) => {
-	const lowerA = a.toLowerCase();
-	const lowerB = b.toLowerCase();
-	return lowerA < lowerB ? -1 : lowerA > lowerB ? 1 : 0;
+	return compareCodePoints(a.toLowerCase(), b.toLowerCase());
 };
 
 /**
  * Right-trim collation function.
- * Compares strings after removing trailing spaces.
+ * Compares strings by code point after removing trailing ASCII spaces.
  */
 export const RTRIM_COLLATION: CollationFunction = (a, b) => {
 	let lenA = a.length;
 	let lenB = b.length;
 
-	while (lenA > 0 && a[lenA - 1] === ' ') lenA--;
-	while (lenB > 0 && b[lenB - 1] === ' ') lenB--;
+	while (lenA > 0 && a.charCodeAt(lenA - 1) === 0x20) lenA--;
+	while (lenB > 0 && b.charCodeAt(lenB - 1) === 0x20) lenB--;
 
-	const minLen = Math.min(lenA, lenB);
-	for (let i = 0; i < minLen; i++) {
-		if (a[i] !== b[i]) {
-			return a[i] < b[i] ? -1 : 1;
-		}
-	}
-
-	return lenA - lenB;
+	return compareCodePointsBounded(a, lenA, b, lenB);
 };
 
-// Register built-in collations
-collations.set('BINARY', BINARY_COLLATION);
-collations.set('NOCASE', NOCASE_COLLATION);
-collations.set('RTRIM', RTRIM_COLLATION);
-
 /**
- * Registers a collation function in the global registry.
- * @deprecated Use `db.registerCollation(name, func)` for per-database collation registration.
- * This global registry is retained for standalone utility use and built-in collation fallback.
- * @param name The name of the collation (case-insensitive)
- * @param func The collation function to register
- */
-export function registerCollation(name: string, func: CollationFunction): void {
-    const upperName = name.toUpperCase();
-    if (collations.has(upperName)) {
-        warnLog(`Overwriting existing collation: %s`, upperName);
-    }
-    collations.set(upperName, func);
-}
-
-/**
- * Gets a collation function from the global registry.
- * @deprecated Use `db._getCollation(name)` or `EmissionContext.getCollation()` for per-database lookup.
+ * Resolves only the built-in collations (BINARY / NOCASE / RTRIM). For standalone
+ * utility code and tests that have no `Database`. Returns `undefined` for any other
+ * name — callers must decide whether that is an error or a reason to bail.
+ *
+ * There is no process-global collation registry: every custom collation lives on a
+ * `Database` (`db.registerCollation`) and resolves through `db.getCollationResolver()`.
+ * This switch is the built-ins-only floor, and it never observes a database's
+ * override of `NOCASE` / `RTRIM`.
  * @param name The collation name (case-insensitive)
- * @returns The collation function, or undefined if not found
  */
-export function getCollation(name: string): CollationFunction | undefined {
-	return collations.get(name.toUpperCase());
+export function builtinCollationResolver(name: string): CollationFunction | undefined {
+	switch (normalizeCollationName(name)) {
+		case 'BINARY': return BINARY_COLLATION;
+		case 'NOCASE': return NOCASE_COLLATION;
+		case 'RTRIM': return RTRIM_COLLATION;
+		default: return undefined;
+	}
 }
 
 /**
- * Resolves a collation name to its function from the global registry.
- * @deprecated Use `EmissionContext.resolveCollation()` for per-database resolution during emission.
- * This global version is retained for standalone comparison utilities and vtab internals.
- * @param collationName The collation name
- * @returns The collation function (defaults to BINARY if not found)
+ * Normalizes a collation name to its canonical form (trimmed, uppercase).
+ * SQLite treats collation names case-insensitively; the per-database registry and
+ * the resolvers all key on the uppercase name, so this yields the SQLite-canonical
+ * spelling used for DDL validation and downstream comparisons.
+ * @param name The collation name as written
+ * @returns The canonical (trimmed, uppercase) collation name
  */
-export function resolveCollation(collationName: string): CollationFunction {
-	if (collationName === 'BINARY') return BINARY_COLLATION; // Fast path for most common case
-	const func = collations.get(collationName.toUpperCase());
-	if (!func) {
-		warnLog(`Unknown collation requested: %s. Falling back to BINARY.`, collationName);
-		return BINARY_COLLATION;
-	}
-	return func;
+export function normalizeCollationName(name: string): string {
+	return name.trim().toUpperCase();
 }
 
 /** Represents SQLite storage classes for comparison purposes */
@@ -155,9 +201,58 @@ export function getSqlDataTypeName(v: SqlValue): 'null' | 'integer' | 'real' | '
  * @param a First number
  * @param b Second number
  * @returns -1 if a < b, 0 if a === b, 1 if a > b
+ *
+ * NOTE: a NaN operand makes both relational tests false, so this reports 0 —
+ * NaN compares "equal" to everything. Unreachable today: arithmetic maps
+ * non-finite results to NULL (`runtime/emit/binary.ts`) and the affinity /
+ * coercion paths reject NaN. If NaN ever becomes a storable value (e.g. a bound
+ * parameter that skips affinity), sort order and `sqlValueIdentical` both break
+ * here, not at the call sites.
  */
 function compareNumbers(a: number | bigint, b: number | bigint): number {
 	return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/**
+ * Canonical-string cache for OBJECT-class (JSON array/object) values.
+ *
+ * A sort of n OBJECT values would otherwise `JSON.stringify` the same value on the
+ * order of log n times each (O(n log n) serializations); caching the canonical
+ * string per value collapses that to one serialization per distinct value. A
+ * `WeakMap` keys on object identity, so cached strings evaporate with their values
+ * (no lifetime coupling / manual eviction).
+ *
+ * NOTE: keyed by JS object identity — two structurally-equal but distinct objects
+ * serialize independently (correct, just not shared). The canonical form is
+ * {@link canonicalJsonString} (recursive object-key sort), so OBJECT-class EQUALITY here
+ * agrees with `deepCompareJson` (`types/json-type.ts`) and with the runtime hash-key /
+ * persisted byte-key paths — reorder-equal objects compare equal.
+ *
+ * Their ORDERINGS are unrelated and always have been: this branch compares canonical JSON
+ * *syntax* (braces, quotes, commas included), while `deepCompareJson` ranks by JSON type,
+ * then key list, then values. This branch's order is what the store's `encodeObject`
+ * writes as UTF-8 and physically sorts by.
+ *
+ * This branch is reached only where an OBJECT value is ordered WITHOUT a declared JSON
+ * logical type to route it. A declared JSON column is compared through
+ * `createTypedComparator(JSON_TYPE, …)` everywhere it is ordered — the memory BTree's key
+ * comparator, `<`/`>`/BETWEEN at runtime, and ORDER BY — so an indexed JSON range seek
+ * walks exactly the window the operators evaluate.
+ *
+ * NOTE: assumes OBJECT-class values are treated as immutable — the string is cached on
+ * first serialization and never invalidated, so mutating a value in place after it has
+ * been compared/equated would return a stale canonical string. If OBJECT values ever
+ * become mutated in place, drop this cache (or key it on a version stamp).
+ */
+const objectCanonicalCache = new WeakMap<object, string>();
+
+function objectCanonicalString(v: object): string {
+	let s = objectCanonicalCache.get(v);
+	if (s === undefined) {
+		s = canonicalJsonString(v as JSONValue);
+		objectCanonicalCache.set(v, s);
+	}
+	return s;
 }
 
 /**
@@ -191,10 +286,14 @@ function compareSameType(a: SqlValue, b: SqlValue, storageClass: StorageClass, c
 			return blobA.length < blobB.length ? -1 : blobA.length > blobB.length ? 1 : 0;
 		}
 		case StorageClass.OBJECT: {
-			// Compare JSON objects by their stringified representation
-			const strA = JSON.stringify(a);
-			const strB = JSON.stringify(b);
-			return strA < strB ? -1 : strA > strB ? 1 : 0;
+			// Compare JSON objects by their canonical stringified representation, by code
+			// point — the store's `encodeObject` writes that same canonical string as UTF-8,
+			// so this must be the memcmp order of those bytes. Collation never applies to
+			// OBJECT-class values (only the TEXT/TEXT branch consults it), so an `any`
+			// primary key's object-valued members order identically under any collation.
+			const strA = objectCanonicalString(a as object);
+			const strB = objectCanonicalString(b as object);
+			return compareCodePoints(strA, strB);
 		}
 		default: {
 			return 0;
@@ -203,22 +302,99 @@ function compareSameType(a: SqlValue, b: SqlValue, storageClass: StorageClass, c
 }
 
 /**
- * Compares two SQLite values based on SQLite's comparison rules.
- * Follows SQLite's type ordering: NULL < Numeric < TEXT < BLOB
+ * Compares two SQLite values based on SQLite's comparison rules, under the BINARY
+ * collation. Follows SQLite's type ordering: NULL < Numeric < TEXT < BLOB.
+ *
+ * Deliberately takes no collation name: a name can only be resolved against the
+ * `Database` that owns it. Pass a resolved {@link CollationFunction} to
+ * {@link compareSqlValuesFast} instead — obtain it from `db.getCollationResolver()`
+ * (or {@link builtinCollationResolver} when there is no `Database` in scope).
  *
  * @param a First value
  * @param b Second value
- * @param collationName The collation to use for text comparison (defaults to BINARY)
  * @returns -1 if a < b, 0 if a === b, 1 if a > b
  */
-export function compareSqlValues(a: SqlValue, b: SqlValue, collationName: string = 'BINARY'): number {
-	const collationFunc = collationName === 'BINARY' ? BINARY_COLLATION : resolveCollation(collationName);
-	return compareSqlValuesFast(a, b, collationFunc);
+export function compareSqlValues(a: SqlValue, b: SqlValue): number {
+	return compareSqlValuesFast(a, b, BINARY_COLLATION);
+}
+
+/**
+ * Byte-faithful row value-identity: per-column {@link compareSqlValues} under the
+ * default BINARY collation — numeric-storage-class tolerant (a bigint `5n` equals a
+ * number `5`, so equal values of differing JS identity are not spuriously treated as
+ * changed) but byte-exact for text. Rows of differing width are never identical.
+ *
+ * This is the skip-identical comparison for value-identical maintenance-upsert
+ * suppression (the normative contract in `vtab/backing-host.ts`). It is deliberately
+ * collation-UNAWARE: a collation-equal / byte-different write (e.g. a case-only
+ * rewrite under a NOCASE column) is a real, observable change — `select` returns the
+ * stored bytes — that must replace the stored value and report an `update`, never be
+ * suppressed. Collation governs key *identity* (which row an upsert replaces); value
+ * *fidelity* is binary.
+ */
+export function rowsValueIdentical(a: readonly SqlValue[], b: readonly SqlValue[]): boolean {
+	if (a.length !== b.length) return false;
+	for (let i = 0; i < a.length; i++) {
+		if (!sqlValueIdentical(a[i], b[i])) return false;
+	}
+	return true;
+}
+
+/**
+ * Byte-faithful single-value identity: {@link compareSqlValuesFast} under
+ * BINARY. Numeric-storage-class tolerant (`5n` equals `5`), bytewise for blobs,
+ * canonical-JSON for object-class values, byte-exact for text. This is the
+ * scalar form of {@link rowsValueIdentical} and shares its contract.
+ */
+export function sqlValueIdentical(a: SqlValue, b: SqlValue): boolean {
+	return compareSqlValuesFast(a, b, BINARY_COLLATION) === 0;
+}
+
+/**
+ * Batch name→function resolution for a list of declared collation names, as
+ * produced by {@link uniqueEnforcementCollations} or a primary-key definition.
+ * An `undefined` entry means "no COLLATE was declared" and resolves to BINARY.
+ *
+ * Call this ONCE per comparator / per constraint check, above any row loop: the
+ * resolver throws on an unregistered name and is not inlinable, so a per-row
+ * call is pure overhead. Do not hold the returned functions across a
+ * `db.registerCollation` call — re-resolve instead.
+ */
+export function resolveCollationFunctions(
+	resolver: CollationResolver,
+	names: readonly (string | undefined)[],
+): CollationFunction[] {
+	return names.map(name => (name ? resolver(name) : BINARY_COLLATION));
 }
 
 /**
  * Optimized version of compareSqlValues that takes a pre-resolved collation function.
  * This avoids the collation lookup on every call.
+ *
+ * NOTE: accepted tradeoff — the per-call {@link getStorageClass} classification stays,
+ * even where the emitter statically knows both operand categories. The alternative
+ * (a `typeof`-guarded fast path that falls back here on a miss, the shape
+ * {@link createTypedComparator} already uses for storage-class drift) was prototyped and
+ * measured, and the payoff does not survive contact with the interpreter:
+ *   - guarded vs. this function, per comparison, isolated per-process microbench
+ *     (65536 pairs × 300 passes, median, node 24): text 25.5 → 23.0 ns; text with a
+ *     40-char shared prefix 26.5 → 25.9 ns; numeric 3.14 → 1.17 ns; text with 5% NULLs
+ *     23.0 → 19.8 ns (the fallback is not a cliff — guard misses stay cheap, so no
+ *     deopt/inline-cache machinery would be needed either).
+ *   - text can barely improve: a bare `BINARY_COLLATION(a, b)` call with no
+ *     classification at all measured 20.2 ns, so classification is ~5 ns of ~25 ns and
+ *     the guard itself costs ~3 ns of that back.
+ *   - end-to-end, one comparison expression costs ~210-226 ns/row (measured as the slope
+ *     of a 1→8-column projection ladder over 10k rows, isolated processes), against
+ *     143 ns/row for a bare column-reference instruction. Per-instruction scheduler
+ *     dispatch, not classification, is the cost. A ≤9 ns saving is ~4% of one comparison
+ *     expression and ~0.3% of a row — well inside the 20% bench regression gate.
+ * Sort/BTree comparators are no better a target: `order by` over 10k text rows runs
+ * ~n·log2(n) ≈ 133k comparisons ≈ 3 ms of comparator at the rates above, against a
+ * 260 ms benchmark median.
+ * Revisit if `runtime-scalar-expression-fusion` lands — fusion removes the per-instruction
+ * dispatch that swamps this, after which the guard is a double-digit percentage of what
+ * remains of a numeric comparison. Re-measure the ladder above before adding it.
  *
  * @param a First value
  * @param b Second value
@@ -244,6 +420,16 @@ export function compareSqlValuesFast(a: SqlValue, b: SqlValue, collationFunc: Co
 
 	// Different types: compare by storage class ordering
 	return classA - classB;
+}
+
+/**
+ * True when a {@link SqlValue} is a non-scalar JSON value — a JS array or plain
+ * object (StorageClass.OBJECT). BLOBs (`Uint8Array`) and `null` are scalars/NULL
+ * here, not object-class. Used by the bind-time array-valued-scalar-parameter
+ * guard ({@link import('../core/statement.js').Statement.validateParameterTypes}).
+ */
+export function isObjectClassValue(v: SqlValue): boolean {
+	return typeof v === 'object' && v !== null && !(v instanceof Uint8Array);
 }
 
 /**
@@ -281,81 +467,30 @@ export function compareWithOrderByFast(
 	nullsOrdering: NullsOrdering,
 	collationFunc: CollationFunction
 ): number {
-	let comparison: number;
-
 	// Fast path: both values are non-NULL (most common case)
 	if (a !== null && b !== null) {
-		comparison = compareSqlValuesFast(a, b, collationFunc);
-	} else if (a === null && b === null) {
-		comparison = 0;
-	} else if (a === null) {
-		// Explicit NULLS ordering is absolute — not affected by ASC/DESC
-		if (nullsOrdering === NullsOrdering.FIRST) return -1;
-		if (nullsOrdering === NullsOrdering.LAST) return 1;
-		// Default behavior: nulls always first (both ASC and DESC)
-		comparison = direction === SortDirection.DESC ? 1 : -1;
-	} else { // b === null
-		// Explicit NULLS ordering is absolute — not affected by ASC/DESC
-		if (nullsOrdering === NullsOrdering.FIRST) return 1;
-		if (nullsOrdering === NullsOrdering.LAST) return -1;
-		// Default behavior: nulls always first (both ASC and DESC)
-		comparison = direction === SortDirection.DESC ? -1 : 1;
+		const comparison = compareSqlValuesFast(a, b, collationFunc);
+		// Apply DESC direction (branchless when direction is ASC)
+		return direction === SortDirection.DESC ? -comparison : comparison;
 	}
-
-	// Apply DESC direction (branchless when direction is ASC)
-	return direction === SortDirection.DESC ? -comparison : comparison;
+	return orderByNullResult(a, b, nullsOrdering);
 }
 
 /**
- * Compares two SQL values with ORDER BY semantics including direction and NULL ordering.
- * This consolidates the comparison logic used by both sort and window operations.
- *
- * @param a First value
- * @param b Second value
- * @param direction Sort direction ('asc' or 'desc')
- * @param nullsOrdering Explicit NULLS ordering ('first', 'last', or undefined for default)
- * @param collationName The collation to use for text comparison (defaults to BINARY)
- * @returns -1 if a < b, 0 if a === b, 1 if a > b (after applying direction and null ordering)
+ * Final ORDER BY verdict for a pair with at least one NULL. NULL placement is
+ * absolute — never affected by ASC/DESC: explicit NULLS FIRST/LAST pin the ends,
+ * and the default places NULLs first for both directions (SQLite-compatible; the
+ * historical direction-conditioned form in {@link compareWithOrderByFast} negated
+ * itself back to the same result).
  */
-export function compareWithOrderBy(
-	a: SqlValue,
-	b: SqlValue,
-	direction: 'asc' | 'desc' = 'asc',
-	nullsOrdering?: 'first' | 'last',
-	collationName: string = 'BINARY'
-): number {
-	// Convert to optimized flags and use fast path
-	const directionFlag = direction === 'desc' ? SortDirection.DESC : SortDirection.ASC;
-	const nullsFlag = nullsOrdering === 'first'
-		? NullsOrdering.FIRST
-		: nullsOrdering === 'last'
-			? NullsOrdering.LAST
-			: NullsOrdering.DEFAULT;
-	const collationFunc = collationName === 'BINARY' ? BINARY_COLLATION : resolveCollation(collationName);
-
-	return compareWithOrderByFast(a, b, directionFlag, nullsFlag, collationFunc);
+function orderByNullResult(a: SqlValue, b: SqlValue, nullsOrdering: NullsOrdering): number {
+	if (a === null && b === null) return 0;
+	if (a === null) return nullsOrdering === NullsOrdering.LAST ? 1 : -1;
+	return nullsOrdering === NullsOrdering.LAST ? -1 : 1;
 }
 
 /**
- * Factory function to create optimized comparison functions for repeated use.
- * Pre-resolves collation and converts string flags to numeric for maximum performance.
- *
- * @param direction Sort direction ('asc' or 'desc')
- * @param nullsOrdering Explicit NULLS ordering ('first', 'last', or undefined for default)
- * @param collationName The collation to use for text comparison (defaults to BINARY)
- * @returns An optimized comparison function
- */
-export function createOrderByComparator(
-	direction: 'asc' | 'desc' = 'asc',
-	nullsOrdering?: 'first' | 'last',
-	collationName: string = 'BINARY'
-): (a: SqlValue, b: SqlValue) => number {
-	const collationFunc = collationName === 'BINARY' ? BINARY_COLLATION : resolveCollation(collationName);
-	return createOrderByComparatorFast(direction, nullsOrdering, collationFunc);
-}
-
-/**
- * Optimized factory function that takes a pre-resolved collation function.
+ * Factory function that takes a pre-resolved collation function.
  * This is the most efficient option when the collation function is already available.
  *
  * @param direction Sort direction ('asc' or 'desc')
@@ -378,6 +513,205 @@ export function createOrderByComparatorFast(
 	// Return a closure that captures the pre-resolved values
 	return (a: SqlValue, b: SqlValue): number => {
 		return compareWithOrderByFast(a, b, directionFlag, nullsFlag, collationFunc);
+	};
+}
+
+/**
+ * True when a logical type's `compare` defines an order that observably differs from
+ * storage-class + collation ordering (see {@link LogicalType.semanticOrdering}). This
+ * is the routing predicate for user-visible ordering/identity sites: ORDER BY,
+ * comparison operators, range-scan bound filters, and DISTINCT/GROUP BY identity use
+ * the type's `compare` exactly when this returns true.
+ */
+export function hasSemanticOrdering(type: LogicalType | undefined): type is LogicalType {
+	return type?.semanticOrdering === true && typeof type.compare === 'function';
+}
+
+/**
+ * True when a logical type's `compare` applies the collation function it is handed
+ * (see {@link LogicalType.collationAware} — TEXT and ANY). A declared-key structure
+ * (memory PK/index BTree, the store's key encoding, the isolation overlay's shadow
+ * keys) over a column of such a type must key under the column's declared collation;
+ * over a collation-blind type it must key under BINARY, or the key order/identity
+ * diverges from the comparator that actually orders the structure.
+ */
+export function isCollationAware(type: LogicalType | undefined): boolean {
+	return type?.collationAware === true;
+}
+
+/**
+ * True when two logical types order values differently — i.e. the comparators
+ * {@link createTypedComparator} builds for them are not interchangeable, so any structure
+ * keyed by one has to be re-sorted (and its uniqueness re-judged) to move to the other.
+ *
+ * `createTypedComparator(type, coll)` is fully determined by `type.compare`: present → the
+ * type's own `compare`; absent → `compareSqlValuesFast` under the collation. So comparing
+ * the two `compare` identities is exactly the question, and it catches more than a
+ * {@link hasSemanticOrdering} check would:
+ *
+ *  - TEXT ↔ TIMESPAN — TIMESPAN's `compare` ranks by elapsed time, so 'PT1H', 'PT60M' and
+ *    'PT3600S' are one value where text sees three.
+ *  - TEXT ↔ JSON — JSON's `compare` ranks by canonical structure, so '{"a":1}' and
+ *    '{ "a" : 1 }' are one value.
+ *  - TEXT ↔ DATE / TIME / DATETIME — these carry their own `compare` hard-wired to
+ *    BINARY_COLLATION, ignoring the column's declared collation, so `text collate nocase →
+ *    date` really does re-order even though both orderings are "textual".
+ *
+ * A retype that flattens to the SAME logical type object (`text → varchar(50)`,
+ * `integer → bigint`) shares one `compare` and is correctly reported as no change.
+ *
+ * NOTE: deliberately conservative — it answers "may the order move", not "does it". The
+ * DATE / TIME / DATETIME family compares exactly as BINARY text does, so under the only
+ * collation those types legally accept (BINARY — `supportedCollations: []`) a `text → date`
+ * retype re-sorts every structure into the order it was already in. `text ↔ any` is
+ * over-reported the same way: both types' `compare` honor the handed collation, so over
+ * all-text data a retype between them re-sorts into the same order. Harmless but O(rows);
+ * if a retype on a large table ever shows up as slow, narrow the predicate to a probe of the
+ * two comparators over a representative value set, or special-case the BINARY-equivalent
+ * comparators by identity.
+ */
+export function comparisonSemanticsDiffer(a: LogicalType, b: LogicalType): boolean {
+	return a.compare !== b.compare;
+}
+
+/**
+ * True when two declared logical types may share ONE physical equi-join key — i.e. when
+ * comparing their values with a single type-blind comparator (a serialized hash key, a
+ * merge co-walk) reproduces what `=` says about them.
+ *
+ * The admissible shapes are "neither side declares a semantic-ordering type" or "both
+ * declare the SAME one". A **mixed** pair (`timespan` ↔ `text`) is the defect this gates:
+ * `=` runs the generic comparison path, which applies a runtime duration check whenever
+ * either side is temporal, so 'PT1H' = 'PT60M'; a hash or merge join comparing raw text
+ * disagrees and silently drops the row. Merge join cannot be rescued by canonicalizing
+ * the key either — it needs both inputs physically sorted in its comparator's order, and
+ * a `timespan` side is sorted by elapsed time while a `text` side is sorted by text, so
+ * no single comparator merges the two. Declining is the only sound answer; the pair
+ * demotes to the residual / generic join, where `=`'s own semantics apply.
+ *
+ * NOT {@link comparisonSemanticsDiffer}, which asks a different question (may an ordered
+ * structure keyed under `a` be reused under `b`) by comparing `compare` identity. EVERY
+ * builtin type carries its own `compare`, so that predicate reports "differ" for an
+ * ordinary `integer` ↔ `real` join key and would cost a hash join for no correctness
+ * gain. This one keys on the `semanticOrdering` flag, which is exactly the set of types
+ * whose order is not reproducible from storage class + collation.
+ *
+ * See `docs/types.md` § "Semantic ordering".
+ */
+export function semanticOrderingsAgree(
+	a: LogicalType | undefined,
+	b: LogicalType | undefined,
+): boolean {
+	const semA = hasSemanticOrdering(a);
+	const semB = hasSemanticOrdering(b);
+	if (!semA && !semB) return true;
+	return semA && semB && a === b;
+}
+
+/**
+ * Canonical key-identity transform for a declared logical type, or undefined when raw
+ * values already key faithfully. Defined exactly when the type carries semantic ordering
+ * AND a `groupKey` hook (TIMESPAN — its stored text is not canonical for equality:
+ * 'PT1H' ≡ 'PT60M'); JSON has semantic ordering but its canonical text is already
+ * identity-faithful, so it takes no transform. Every hash-, set-, or byte-keyed identity
+ * site (GROUP BY, hash joins, IN membership, the persistent store's PK/index key encoding,
+ * the isolation overlay's shadowing keys) must run values through this before serializing, or two
+ * values the type's `compare` calls equal land on distinct keys.
+ */
+export function semanticKeyTransform(type: LogicalType | undefined): ((value: SqlValue) => SqlValue) | undefined {
+	return hasSemanticOrdering(type) && type.groupKey
+		? (value: SqlValue) => type.groupKey!(value)
+		: undefined;
+}
+
+/**
+ * ORDER BY comparator for one sort key of a declared logical type. When the type
+ * carries semantic ordering (see {@link hasSemanticOrdering}), non-NULL pairs are
+ * ranked by the type's `compare` (via {@link createTypedComparator}, which keeps the
+ * storage-class-mismatch fallback so a probe of a different storage class never
+ * falsely equals); otherwise this is exactly {@link createOrderByComparatorFast}.
+ *
+ * NULL placement is handled HERE, never delegated to `type.compare` — the type
+ * convention (NULL smallest, always) differs from ORDER BY's NULLS FIRST/LAST and
+ * default rules, which {@link orderByNullResult} implements.
+ */
+export function createTypedOrderByComparator(
+	type: LogicalType | undefined,
+	direction: 'asc' | 'desc' = 'asc',
+	nullsOrdering?: 'first' | 'last',
+	collationFunc: CollationFunction = BINARY_COLLATION
+): (a: SqlValue, b: SqlValue) => number {
+	if (!hasSemanticOrdering(type)) {
+		return createOrderByComparatorFast(direction, nullsOrdering, collationFunc);
+	}
+	const negate = direction === 'desc';
+	const nullsFlag = nullsOrdering === 'first'
+		? NullsOrdering.FIRST
+		: nullsOrdering === 'last'
+			? NullsOrdering.LAST
+			: NullsOrdering.DEFAULT;
+	const typedCompare = createTypedComparator(type, collationFunc);
+
+	return (a: SqlValue, b: SqlValue): number => {
+		if (a !== null && b !== null) {
+			const comparison = typedCompare(a, b);
+			return negate ? -comparison : comparison;
+		}
+		return orderByNullResult(a, b, nullsFlag);
+	};
+}
+
+/**
+ * The comparator an ordering site uses for a single value of `type` under
+ * `collation`: the type's own `compare` when it carries semantic ordering
+ * ({@link hasSemanticOrdering}), else storage-class + collation ordering. The
+ * scalar form of {@link createSemanticRowComparator}'s per-column routing — one
+ * copy of the routing rule, shared by row identity (DISTINCT/set operations) and
+ * the min/max aggregate binding (`bindArgs` in func/builtins/aggregate.ts).
+ *
+ * `type` may be undefined (untyped/ANY) — such values use the collation
+ * comparator, byte-identical to the historical BINARY default when no collation
+ * is passed. Safe for runtime type drift: the typed path's
+ * storage-class-mismatch guard (see {@link createTypedComparator}) falls back to
+ * storage-class ordering rather than mis-parsing.
+ */
+export function createSemanticValueComparator(
+	type: LogicalType | undefined,
+	collation: CollationFunction = BINARY_COLLATION,
+): (a: SqlValue, b: SqlValue) => number {
+	return hasSemanticOrdering(type)
+		? createTypedComparator(type, collation)
+		: (a: SqlValue, b: SqlValue) => compareSqlValuesFast(a, b, collation);
+}
+
+/**
+ * Row comparator for identity checks (DISTINCT, set operations) that routes each
+ * column through its declared logical type's `compare` when — and only when — that
+ * type carries semantic ordering ({@link hasSemanticOrdering}); all other columns
+ * keep the storage-class + collation comparison of
+ * {@link createCollationRowComparator}. This makes row identity agree with `=`
+ * (e.g. TIMESPAN 'PT1H' ≡ 'PT60M' collapses) without perturbing collation-aware
+ * text identity on ANY/TEXT columns: those types' `compare` now honors the handed
+ * collation (see {@link isCollationAware}) and is equivalent to the generic
+ * storage-class + collation path, so routing them through the cheaper generic
+ * comparator changes nothing.
+ *
+ * Per-column routing is {@link createSemanticValueComparator}.
+ */
+export function createSemanticRowComparator(
+	types: readonly (LogicalType | undefined)[],
+	collations: readonly CollationFunction[]
+): (a: Row, b: Row) => number {
+	const comparators = types.map((type, i) =>
+		createSemanticValueComparator(type, collations[i] ?? BINARY_COLLATION));
+	const len = comparators.length;
+
+	return (a: Row, b: Row): number => {
+		for (let i = 0; i < len; i++) {
+			const cmp = comparators[i](a[i], b[i]);
+			if (cmp !== 0) return cmp;
+		}
+		return 0;
 	};
 }
 
@@ -418,6 +752,17 @@ export function isTruthy(value: SqlValue): boolean {
 /**
  * Compares two rows for SQL DISTINCT semantics.
  * Returns -1, 0, or 1 for BTree ordering.
+ *
+ * Deliberately BINARY-only, and it takes no collation name because it has no `Database`
+ * to resolve one against. Its sole production caller is the recursive-CTE `union`
+ * (DISTINCT) dedup BTree in `runtime/emit/recursive-cte.ts`, which compares raw rows —
+ * matching SQLite, whose recursive queue table carries no `COLLATE`. Collation-aware row
+ * identity goes through {@link createCollationRowComparator} instead, with per-column
+ * functions pre-resolved from `db.getCollationResolver()` — that is what the `distinct`
+ * and `set-operation` emitters use.
+ *
+ * NOTE: if a future caller needs collation-aware row identity here, do not add a name
+ * parameter — take pre-resolved functions, as `createCollationRowComparator` does.
  */
 export function compareRows(a: Row, b: Row): number {
 	// Let's assume correct rows
@@ -432,26 +777,6 @@ export function compareRows(a: Row, b: Row): number {
 		}
 	}
 	return 0;
-}
-
-/**
- * Check two SQL values for equality, with proper handling of BLOBs (Uint8Array).
- * Unlike compareSqlValues, this performs byte-wise comparison for BLOBs.
- */
-export function sqlValuesEqual(a: SqlValue, b: SqlValue): boolean {
-	if (a instanceof Uint8Array && b instanceof Uint8Array) {
-		if (a.length !== b.length) return false;
-		for (let i = 0; i < a.length; i++) {
-			if (a[i] !== b[i]) return false;
-		}
-		return true;
-	}
-	// JSON object comparison by value
-	if (typeof a === 'object' && a !== null && !(a instanceof Uint8Array) &&
-		typeof b === 'object' && b !== null && !(b instanceof Uint8Array)) {
-		return JSON.stringify(a) === JSON.stringify(b);
-	}
-	return a === b;
 }
 
 /**

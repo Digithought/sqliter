@@ -1,3 +1,4 @@
+import type * as AST from '../parser/ast.js';
 import type { SqlParameters } from '../common/types.js';
 import type { Database } from '../core/database.js';
 import type { SchemaManager } from '../schema/manager.js';
@@ -26,7 +27,7 @@ export interface DebugOptions {
  * Used for plan invalidation when schema changes.
  */
 export interface SchemaDependency {
-	readonly type: 'table' | 'function' | 'vtab_module' | 'collation';
+	readonly type: 'table' | 'view' | 'function' | 'vtab_module' | 'collation';
 	readonly schemaName?: string; // undefined for functions, collations, and vtab modules
 	readonly objectName: string;
 	readonly objectVersion?: number; // For future versioning support
@@ -190,4 +191,29 @@ export interface PlanningContext {
    * Comes from the WITH SCHEMA clause on statements.
    */
   readonly schemaPath?: string[];
+
+  /**
+   * Set to `<schemaName>` by {@link import('./stored-body-context.js').storedBodyContext}
+   * when this context IS the home naming environment of that schema's stored body.
+   * Read only by `building/select.ts`, to decide whether a sub-select carrying a
+   * {@link import('../parser/ast.js').SelectStmt.storedBodyEnv} marker still needs
+   * the swap: while the body itself is being planned the context already is that
+   * environment, so re-swapping would clear the body's own CTE definitions.
+   */
+  readonly storedBodyOf?: string;
+
+  /**
+   * Per-lowering memo of the CTE definitions carried on a copied body fragment
+   * ({@link import('../parser/ast.js').StoredBodyEnv.withClause}), keyed by the body's
+   * `WITH` clause AST object. Created by `buildViewMutation` for a non-ephemeral target,
+   * so every fragment of ONE lowering shares one plan node per body-local CTE — two
+   * fragments referencing the same definition must not each build their own copy, or the
+   * runtime evaluates the definition twice (and a non-deterministic one disagrees between
+   * fragments). Sharing one `CTENode` across references is the shape the
+   * materialization-advisory pass already handles: it marks a multi-referenced CTE
+   * `materialize`, and `emitCTE` buffers it once per statement execution. Keyed on the
+   * clause OBJECT rather than the CTE name so a second lowering in the same statement
+   * (a different view) keeps its own definitions.
+   */
+  readonly storedBodyCTECache?: Map<AST.WithClause, Map<string, CTEScopeNode>>;
 }

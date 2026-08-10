@@ -1,6 +1,7 @@
 import { PhysicalType, type LogicalType, compareNulls } from './logical-type.js';
 import { safeJsonParse } from '../func/builtins/json-helpers.js';
 import type { JSONValue } from '../common/json-types.js';
+import { compareCodePoints } from '../util/comparison.js';
 
 /**
  * JSON type - stores JSON values as native JS objects/arrays/primitives.
@@ -10,6 +11,11 @@ import type { JSONValue } from '../common/json-types.js';
 export const JSON_TYPE: LogicalType = {
 	name: 'JSON',
 	physicalType: PhysicalType.OBJECT,
+	// Ordered by structural deep-compare (type rank, then element/key-wise recursion:
+	// {"a":2} < {"a":10}), not by canonical JSON text. Equality is unchanged —
+	// canonical-text equal iff structurally equal — so no groupKey hook is needed;
+	// only the ordering differs. See LogicalType.semanticOrdering.
+	semanticOrdering: true,
 
 	validate: (v) => {
 		if (v === null) return true;
@@ -52,21 +58,27 @@ export const JSON_TYPE: LogicalType = {
 		return v; // Already native
 	},
 
-	compare: (a, b) => {
+	compare: (a, b, collation) => {
 		const nullCmp = compareNulls(a, b);
 		if (nullCmp !== undefined) return nullCmp;
 
-		// Ensure both are in native form for comparison
-		const parsedA = typeof a === 'string' ? safeJsonParse(a) : a as JSONValue;
-		const parsedB = typeof b === 'string' ? safeJsonParse(b) : b as JSONValue;
-
-		if (parsedA === null || parsedB === null) {
-			const strA = typeof a === 'string' ? a : JSON.stringify(a);
-			const strB = typeof b === 'string' ? b : JSON.stringify(b);
-			return strA < strB ? -1 : strA > strB ? 1 : 0;
+		// A JS string reaching here is ALWAYS a JSON string scalar, never serialized
+		// object/array text: every caller reads values that have already been through
+		// `parse` above — the DML emitters convert writes at the top of the pipeline
+		// (buildRowCoercion), and the storage layer converts direct API writes
+		// (coerceRowToSchema). Nothing is re-parsed here, so the JSON string "9"
+		// stays distinct from the JSON number 9.
+		//
+		// Two string scalars compare as text — under the supplied collation, or
+		// BINARY (code-point order) when none is supplied. Code-point order agrees
+		// with deepCompareJson's string-leaf order and with the store's structural
+		// key bytes, so a comparator built without a collation (PK equality checks)
+		// still tells '9' and '9.0' apart.
+		if (typeof a === 'string' && typeof b === 'string') {
+			return collation ? collation(a, b) : compareCodePoints(a, b);
 		}
 
-		return deepCompareJson(parsedA, parsedB);
+		return deepCompareJson(a as JSONValue, b as JSONValue);
 	},
 
 	supportedCollations: [],
@@ -76,7 +88,16 @@ export const JSON_TYPE: LogicalType = {
 	isTemporal: false,
 };
 
-/** Ordering rank for JSON value types: null < boolean < number < string < array < object */
+/**
+ * Ordering rank for JSON value types: null < boolean < number < string < array < object
+ *
+ * NOTE: this must stay ordered compatibly with `StorageClass` in util/comparison.ts
+ * (NULL < NUMERIC < TEXT < BLOB < OBJECT). `createTypedComparator` short-circuits on a
+ * storage-class mismatch *before* reaching this compare, while `compareSqlValues` calls
+ * the type's compare directly — the two agree only because both orderings put numbers
+ * before strings and strings before containers. If either ranking is ever reordered,
+ * `j1 < j2` and `order by j` will start disagreeing.
+ */
 function jsonTypeOrder(v: JSONValue): number {
 	if (v === null) return 0;
 	switch (typeof v) {
@@ -90,6 +111,9 @@ function jsonTypeOrder(v: JSONValue): number {
 /**
  * Deep comparison of JSON values.
  * Returns -1, 0, or 1 for ordering.
+ *
+ * String leaves and object keys order by Unicode code point ({@link compareCodePoints}),
+ * matching `compareSameType`'s OBJECT-class branch and the store's UTF-8 key bytes.
  */
 function deepCompareJson(a: JSONValue, b: JSONValue): number {
 	if (a === b) return 0;
@@ -100,7 +124,11 @@ function deepCompareJson(a: JSONValue, b: JSONValue): number {
 
 	if (a === null) return 0;
 
-	if (typeof a === 'boolean' || typeof a === 'number' || typeof a === 'string') {
+	if (typeof a === 'string') {
+		return compareCodePoints(a, b as string);
+	}
+
+	if (typeof a === 'boolean' || typeof a === 'number') {
 		return a < (b as typeof a) ? -1 : a > (b as typeof a) ? 1 : 0;
 	}
 
@@ -116,13 +144,17 @@ function deepCompareJson(a: JSONValue, b: JSONValue): number {
 	if (typeof a === 'object' && typeof b === 'object' && !Array.isArray(a) && !Array.isArray(b)) {
 		const objA = a as Record<string, JSONValue>;
 		const objB = b as Record<string, JSONValue>;
-		const keysA = Object.keys(objA).sort();
-		const keysB = Object.keys(objB).sort();
+		// Sort with the SAME comparator the key sequences are then compared under —
+		// sorting by code unit and comparing by code point would not be a total order.
+		// Equality is unaffected by the choice: two objects with the same key set sort
+		// into the same sequence either way.
+		const keysA = Object.keys(objA).sort(compareCodePoints);
+		const keysB = Object.keys(objB).sort(compareCodePoints);
 
 		const minKeys = Math.min(keysA.length, keysB.length);
 		for (let i = 0; i < minKeys; i++) {
-			if (keysA[i] < keysB[i]) return -1;
-			if (keysA[i] > keysB[i]) return 1;
+			const keyCmp = compareCodePoints(keysA[i], keysB[i]);
+			if (keyCmp !== 0) return keyCmp;
 		}
 		if (keysA.length !== keysB.length) return keysA.length < keysB.length ? -1 : 1;
 

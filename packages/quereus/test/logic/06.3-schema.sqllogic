@@ -1,4 +1,6 @@
 -- schema-indexes.sqllogic - Testing schema() introspection for indexes
+--
+-- requires-capability: standalone-index-ddl
 
 CREATE TABLE products (
 	id INTEGER PRIMARY KEY,
@@ -41,16 +43,6 @@ CREATE INDEX idx_created_desc ON events(created_at DESC);
 SELECT sql FROM schema() WHERE type = 'index' AND name = 'idx_created_desc';
 → [{"sql":"CREATE INDEX \"idx_created_desc\" ON \"events\" (\"created_at\" COLLATE BINARY DESC)"}]
 
--- Test views appear in schema()
-CREATE VIEW active_products AS SELECT id, name FROM products WHERE category = 'active';
-
-SELECT type, name, tbl_name FROM schema() WHERE type = 'view';
-→ [{"type":"view","name":"active_products","tbl_name":"active_products"}]
-
--- Verify view sql is preserved
-SELECT sql FROM schema() WHERE name = 'active_products';
-→ [{"sql":"create view active_products as select id, name from products where category = 'active'"}]
-
--- Verify 'view' is now in the list of schema object types
-SELECT DISTINCT type FROM schema() ORDER BY type;
-→ [{"type":"function"},{"type":"index"},{"type":"table"},{"type":"view"}]
+-- The view-shaped schema() assertions (view row, view sql preserved, 'view' in the
+-- type list) need no index and live in 06.3.6-schema-views, so a backend that skips
+-- this file over its index DDL still runs them.

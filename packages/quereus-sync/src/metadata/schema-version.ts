@@ -5,7 +5,7 @@
  * "most destructive wins" conflict resolution for schema changes.
  *
  * Key format: sv:{schema}.{table}:{column}
- * Value: HLC (26 bytes) + 1 byte type + type-specific data
+ * Value: HLC (30 bytes) + 1 byte type + type-specific data
  *
  * Column types:
  * - 0x01: Regular column (type affinity, nullable, default)
@@ -96,11 +96,11 @@ export function serializeSchemaVersion(version: SchemaVersion): Uint8Array {
   if (version.ddl !== undefined) data.ddl = version.ddl;
 
   const dataBytes = encoder.encode(JSON.stringify(data));
-  const buffer = new Uint8Array(26 + 1 + dataBytes.length);
+  const buffer = new Uint8Array(30 + 1 + dataBytes.length);
 
   buffer.set(hlcBytes, 0);
-  buffer[26] = typeByte;
-  buffer.set(dataBytes, 27);
+  buffer[30] = typeByte;
+  buffer.set(dataBytes, 31);
 
   return buffer;
 }
@@ -109,11 +109,11 @@ export function serializeSchemaVersion(version: SchemaVersion): Uint8Array {
  * Deserialize a schema version from storage.
  */
 export function deserializeSchemaVersion(buffer: Uint8Array): SchemaVersion {
-  const hlc = deserializeHLC(buffer.slice(0, 26));
-  const typeByte = buffer[26];
+  const hlc = deserializeHLC(buffer.slice(0, 30));
+  const typeByte = buffer[30];
   const type: SchemaVersionType = typeByte === 0x01 ? 'column' : typeByte === 0x02 ? 'dropped' : 'table';
 
-  const dataJson = decoder.decode(buffer.slice(27));
+  const dataJson = decoder.decode(buffer.slice(31));
   const data = dataJson ? JSON.parse(dataJson) : {};
 
   return {

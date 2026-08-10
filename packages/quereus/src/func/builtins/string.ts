@@ -1,8 +1,12 @@
 import { createAggregateFunction, createScalarFunction, createTableValuedFunction } from '../registration.js';
 import type { Row, SqlValue, DeepReadonly } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
+import { QuereusError } from '../../common/errors.js';
+import { StatusCode } from '../../common/types.js';
 import { simpleLike, simpleGlob } from '../../util/patterns.js';
-import { INTEGER_TYPE, TEXT_TYPE } from '../../types/builtin-types.js';
+import { valueToText } from '../../util/value-text.js';
+import { INTEGER_TYPE, TEXT_TYPE, BLOB_TYPE } from '../../types/builtin-types.js';
+import { BOOLEAN_RETURN, BLOB_RETURN, TEXT_RETURN } from './return-types.js';
 import type { LogicalType } from '../../types/logical-type.js';
 
 const log = createLogger('func:builtins:scalar');
@@ -91,19 +95,23 @@ export const substringFunc = createScalarFunction(
 	substrImpl
 );
 
+// Nullable: `like(null, x)` and `like(p, null)` are NULL, not false.
+// Operands render through the one value-to-text rule (util/value-text.ts), the same
+// one `emitLikeOp` uses — `like('ab', x'6162')` and `x'6162' like 'ab'` are two
+// spellings of one operation and must not answer differently.
 export const likeFunc = createScalarFunction(
-	{ name: 'like', numArgs: 2, deterministic: true },
+	{ name: 'like', numArgs: 2, deterministic: true, returnType: BOOLEAN_RETURN },
 	(pattern: SqlValue, text: SqlValue): SqlValue => {
 		if (text === null || pattern === null) return null;
-		return simpleLike(String(pattern), String(text));
+		return simpleLike(valueToText(pattern), valueToText(text));
 	}
 );
 
 export const globFunc = createScalarFunction(
-	{ name: 'glob', numArgs: 2, deterministic: true },
+	{ name: 'glob', numArgs: 2, deterministic: true, returnType: BOOLEAN_RETURN },
 	(pattern: SqlValue, text: SqlValue): SqlValue => {
 		if (text === null || pattern === null) return null;
-		return simpleGlob(String(pattern), String(text));
+		return simpleGlob(valueToText(pattern), valueToText(text));
 	}
 );
 
@@ -256,7 +264,7 @@ export const splitStringFunc = createTableValuedFunction(
 
 // String concatenation aggregate (like GROUP_CONCAT but simpler)
 export const stringConcatFunc = createAggregateFunction(
-	{ name: 'string_concat', numArgs: 1, initialValue: [] },
+	{ name: 'string_concat', numArgs: 1, initialValue: [], returnType: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true } },
 	(acc: string[], value: SqlValue) => {
 		if (typeof value === 'string') {
 			acc.push(value);
@@ -279,5 +287,66 @@ export const upperFunc = createScalarFunction(
 	{ name: 'upper', numArgs: 1, deterministic: true, ...textReturnTypeInference },
 	(arg: SqlValue): SqlValue => {
 		return typeof arg === 'string' ? arg.toUpperCase() : null;
+	}
+);
+
+// --- hex(X) ---
+// A non-blob argument is converted to bytes the same way cast(X as blob) is,
+// via BLOB_TYPE.parse — so a JSON object/array argument throws rather than
+// returning NULL, matching blob()'s behavior instead of adding a second,
+// divergent conversion table here.
+// `TEXT_RETURN`, not the family's `textReturnTypeInference`: that helper declares
+// `nullable: false`, which is a lie for any function that maps NULL to NULL, and
+// the lens prover reads the flag to decide whether a NOT NULL logical column over
+// the expression is sound (`schema/lens-prover.ts` checkTypeAndNullability).
+// NOTE: @quereus/quereus cannot import `bytesToHex` from @quereus/quereus-store
+// (the dependency runs the other way), so this is a second byte→hex encoder in
+// the monorepo. They are not interchangeable: the store's must stay LOWERCASE —
+// `InMemoryKVStore` orders keys by string comparison and only `[0-9a-f]` matches
+// unsigned-byte order — while SQL `hex()` must be uppercase. If a third copy
+// appears, promote a case-parameterized one to a shared export rather than
+// unifying these two on one case.
+export const hexFunc = createScalarFunction(
+	{ name: 'hex', numArgs: 1, deterministic: true, returnType: TEXT_RETURN },
+	(arg: SqlValue): SqlValue => {
+		if (arg === null) return null;
+
+		let bytes: Uint8Array;
+		try {
+			bytes = BLOB_TYPE.parse!(arg) as Uint8Array;
+		} catch (e) {
+			throw new QuereusError(
+				`Cannot convert to BLOB for hex(): ${e instanceof Error ? e.message : String(e)}`,
+				StatusCode.MISMATCH
+			);
+		}
+
+		let out = '';
+		for (let i = 0; i < bytes.length; i++) {
+			out += bytes[i].toString(16).padStart(2, '0');
+		}
+		return out.toUpperCase();
+	}
+);
+
+/** A whole number of hex digit pairs — the only input `unhex` accepts. */
+const HEX_PAIRS = /^[0-9a-fA-F]*$/;
+
+// --- unhex(X) ---
+// Inverse of hex(): a hex-digit-pair string to bytes. Anything that is not a
+// whole number of hex digit pairs is NULL, not an error, matching SQLite. Text
+// only — a blob argument is NULL rather than being re-read as its own bytes, so
+// unhex() is the inverse of hex() only for hex()'s own output.
+export const unhexFunc = createScalarFunction(
+	{ name: 'unhex', numArgs: 1, deterministic: true, returnType: BLOB_RETURN },
+	(arg: SqlValue): SqlValue => {
+		if (typeof arg !== 'string') return null;
+		if (arg.length % 2 !== 0 || !HEX_PAIRS.test(arg)) return null;
+
+		const bytes = new Uint8Array(arg.length / 2);
+		for (let i = 0; i < arg.length; i += 2) {
+			bytes[i / 2] = parseInt(arg.slice(i, i + 2), 16);
+		}
+		return bytes;
 	}
 );

@@ -1,0 +1,72 @@
+-- 41.7.3.2-alter-column-retype-unique-index.sqllogic
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Carved out of 41.7.3-alter-column-retype-unique. That file proves that a
+-- value-REWRITING ALTER COLUMN (`set data type`, or `set not null` with a DEFAULT)
+-- re-validates uniqueness over the CONVERTED values before mutating anything; it makes
+-- every one of those points through inline / table-level `unique`, which needs no index
+-- DDL. The index-derived vehicle is a separate enforcement path (the parent's § 1 and § 2
+-- were deliberately the same collision seen through each), so it lives here.
+--
+-- Cross-module: the memory backend probes the converted rows before replacing its base
+-- tree, and the store backend defers its value rewrite (`mapRowsAtIndex`) until after the
+-- same probe.
+--
+-- Subject: a UNIQUE derived from `create unique index` is re-validated on retype exactly
+-- as a declared one is — rejecting on collision with nothing changed, and rebuilding over
+-- the converted values when it succeeds.
+
+-- ===================================
+-- 1. text → integer collision under an explicit `create unique index` → rejected,
+--    and the rejection changes nothing: values, type and writability all survive.
+-- ===================================
+
+create table ri (id integer primary key, v text);
+create unique index ri_v on ri (v);
+insert into ri values (1, '1'), (2, '01');
+-- run
+
+alter table ri alter column v set data type integer;
+-- error: UNIQUE constraint failed
+
+-- rolled back: both rows survive as their original TEXT values
+select id, v, typeof(v) from ri order by id;
+→ [{"id":1,"v":"1","typeof(v)":"text"},{"id":2,"v":"01","typeof(v)":"text"}]
+
+-- ...and the DECLARED type is unchanged too — a rejection must not leave rewritten values
+-- behind a stale catalog type, nor a changed catalog over old values
+select name, type from table_info('ri') where name = 'v';
+→ [{"name":"v","type":"TEXT"}]
+
+-- the table is still writable, and the index still enforces under the unchanged type
+insert into ri values (3, '001');
+select count(*) as n from ri;
+→ [{"n":3}]
+
+insert into ri values (4, '1');
+-- error: UNIQUE constraint failed
+
+drop table ri;
+
+-- ===================================
+-- 2. ACCEPTED: a non-colliding retype rebuilds the index over the CONVERTED values, so
+--    a later duplicate of a converted value is caught by the index.
+-- ===================================
+
+create table ok1 (id integer primary key, v text);
+create unique index ok1_v on ok1 (v);
+insert into ok1 values (1, '10'), (2, '9');
+-- run
+
+alter table ok1 alter column v set data type integer;
+-- run
+
+select id, v, typeof(v) from ok1 order by id;
+→ [{"id":1,"v":10,"typeof(v)":"integer"},{"id":2,"v":9,"typeof(v)":"integer"}]
+
+-- the rebuilt index enforces over the converted values
+insert into ok1 values (3, 10);
+-- error: UNIQUE constraint failed
+
+drop table ok1;

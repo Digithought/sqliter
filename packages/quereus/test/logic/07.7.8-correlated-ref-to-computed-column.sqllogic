@@ -1,0 +1,165 @@
+-- 07.7.8-correlated-ref-to-computed-column.sqllogic - a correlated sub-query may
+-- reference a column its enclosing query COMPUTES
+--
+-- Regression guard for `bug-correlated-subquery-cannot-read-outer-computed-column`.
+-- Two predicate-pushdown rules decide whether a Filter may slide below the node that
+-- computes a column, and both used to answer by walking the predicate's SCALAR tree
+-- only, stopping at any relational child. A correlated reference inside an `exists` /
+-- `in` / scalar-sub-query operand lives in exactly that relational subtree, so neither
+-- rule saw it: the dependency set came back empty, the push went ahead, and the
+-- reference landed BELOW the node defining the attribute it reads. The failure
+-- surfaced as "No row context found for column <c>".
+--
+-- Both rules now collect dependencies across sub-query operands as well (see
+-- src/planner/analysis/predicate-dependencies.ts), so the Filter stays put.
+--
+-- Sections:
+--   1. Filter vs a Project that computes the column (rule-predicate-pushdown)
+--   2. HAVING conjunct vs an aggregate (rule-aggregate-predicate-pushdown)
+-- Each section covers the shapes that used to fail AND the shapes that already
+-- worked — the fix must not degrade into a blanket refusal to push.
+--
+-- Plan-shape guards for the same statements live in
+-- test/optimizer/predicate-pushdown.spec.ts and
+-- test/optimizer/rule-aggregate-predicate-pushdown.spec.ts.
+
+-- =============================================================================
+-- 1. Correlated reference to a computed projection column.
+--
+-- `d` is minted by the sub-select's Project. `side` has exactly one row, so
+-- `exists (select 1 from side where <cond on d>)` is just `<cond on d>` evaluated
+-- once per outer row — the row set discriminates on the value of `d`.
+-- =============================================================================
+
+create table gt (id integer primary key, x integer);
+create table side (tag text primary key);
+insert into gt values (1, 10), (2, 20), (3, 0), (4, -5);
+insert into side values ('one');
+
+-- The original repro: EXISTS body reads the computed `d`.
+
+select id from (select id, x * 2 as d from gt) t where exists (select 1 from side where t.d > 0);
+→ [{"id":1},{"id":2}]
+
+select id from (select id, x * 2 as d from gt) t where exists (select 1 from side where t.d > 0) order by id desc;
+→ [{"id":2},{"id":1}]
+
+-- The scalar-sub-query form of the same thing: `max(t.d)` over `side`'s single row
+-- is `t.d` itself.
+
+select id from (select id, x * 2 as d from gt) t where (select max(t.d) from side) > 0;
+→ [{"id":1},{"id":2}]
+
+-- NOT EXISTS over the same shape — the complement, so a silently-empty or
+-- silently-full result set is caught too.
+
+select id from (select id, x * 2 as d from gt) t where not exists (select 1 from side where t.d > 0);
+→ [{"id":3},{"id":4}]
+
+-- The IN form: the correlated operand hangs off an `InNode`, which reports its own
+-- node type and exposes the relation only through `getChildren()`. The collector
+-- recognizes the relational child structurally, so no per-node-type list can rot.
+
+select id from (select id, x * 2 as d from gt) t where 1 in (select 1 from side where t.d > 0);
+→ [{"id":1},{"id":2}]
+
+-- Correlation buried two levels down: the operand's WHOLE subtree is scanned for
+-- outward references, not merely its top level.
+
+select id from (select id, x * 2 as d from gt) t
+	where exists (select 1 from side where exists (select 1 from side s2 where t.d > 0));
+→ [{"id":1},{"id":2}]
+
+-- Shapes that already worked and must keep working.
+
+select id from (select id, x from gt) t where exists (select 1 from side where t.x > 0);
+→ [{"id":1},{"id":2}]
+
+select id from (select id, x * 2 as d from gt) t where t.d in (select 20 union select 40);
+→ [{"id":1},{"id":2}]
+
+select id from (select id, x * 2 as d from gt) t where t.d > 0;
+→ [{"id":1},{"id":2}]
+
+-- The discriminating pair for "not a blanket refusal": the same Project computes
+-- `d` and passes `x` through. Correlating on `x` is still pushable (it exists below
+-- the Project); correlating on `d` is not. Both must return the same rows here.
+
+select id, d from (select id, x, x * 2 as d from gt) t where exists (select 1 from side where t.x > 0);
+→ [{"id":1,"d":20},{"id":2,"d":40}]
+
+select id, d from (select id, x, x * 2 as d from gt) t where exists (select 1 from side where t.d > 0);
+→ [{"id":1,"d":20},{"id":2,"d":40}]
+
+drop table gt;
+drop table side;
+
+-- =============================================================================
+-- 2. Correlated reference inside a HAVING conjunct.
+--
+-- `splitConjuncts` cannot break an `or` (or a `case`) apart, so one conjunct can
+-- mix a top-level reference to a pushable GROUP BY column with a correlated
+-- sub-query. Pushing it below the aggregate strands the correlated reference.
+--
+-- Groups: g=-1 (4 rows), g=0 (1 row), g=1 (2 rows), g=2 (1 row).
+-- `side` holds 1, 2, 3.
+-- =============================================================================
+
+create table t (id integer primary key, g integer, v integer);
+create table side (n integer primary key);
+insert into t values (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 0, 40),
+	(5, -1, 50), (6, -1, 60), (7, -1, 70), (8, -1, 80);
+insert into side values (1), (2), (3);
+
+-- Correlated on the GROUP BY column. g=-1 and g=0 fail both halves of the `or`.
+
+select g, count(*) as c from t group by g
+	having g > 1 or exists (select 1 from side where side.n = g) order by g;
+→ [{"g":1,"c":2},{"g":2,"c":1}]
+
+-- Correlated on the AGGREGATE output. g=-1 has 4 rows and 4 is not in `side`.
+
+select g, count(*) as c from t group by g
+	having g > 1 or exists (select 1 from side where side.n = count(*)) order by g;
+→ [{"g":0,"c":1},{"g":1,"c":2},{"g":2,"c":1}]
+
+-- The `case` form: one conjunct, correlation buried in a WHEN.
+
+select g, count(*) as c from t group by g
+	having (case when exists (select 1 from side where side.n = g) then g else 0 end) > 0 order by g;
+→ [{"g":1,"c":2},{"g":2,"c":1}]
+
+-- Shapes that already worked and must keep working.
+
+select g, count(*) as c from t group by g having g > 0 order by g;
+→ [{"g":1,"c":2},{"g":2,"c":1}]
+
+select g, count(*) as c from t group by g
+	having exists (select 1 from side where side.n = g) order by g;
+→ [{"g":1,"c":2},{"g":2,"c":1}]
+
+-- `and` splits into two conjuncts: `g > 0` pushes on its own and the correlated
+-- half stays above, where decorrelation turns it into a hash join.
+
+select g, count(*) as c from t group by g
+	having g > 0 and (select max(side.n) from side where side.n = g) is not null order by g;
+→ [{"g":1,"c":2},{"g":2,"c":1}]
+
+-- An UNCORRELATED sub-query alongside `g > 0`. `and` splits the two apart, so each
+-- half is judged on its own and the `g > 0` half still has to behave.
+
+select g, count(*) as c from t group by g
+	having g > 0 and exists (select 1 from side where side.n = 1) order by g;
+→ [{"g":1,"c":2},{"g":2,"c":1}]
+
+-- The same uncorrelated sub-query joined by `or`, so it CANNOT be split apart: one
+-- conjunct that both names a pushable GROUP BY column and carries a sub-query. The
+-- refusal above is about the correlation, not about carrying a sub-query, so this one
+-- must still push. `side` holds 1, so the `exists` is true and every group survives.
+
+select g, count(*) as c from t group by g
+	having g > 0 or exists (select 1 from side where side.n = 1) order by g;
+→ [{"g":-1,"c":4},{"g":0,"c":1},{"g":1,"c":2},{"g":2,"c":1}]
+
+drop table t;
+drop table side;

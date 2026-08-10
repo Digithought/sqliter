@@ -5,7 +5,10 @@
  * Keys and values are stored as binary ArrayBuffers.
  */
 
-import type { KVStore, KVEntry, WriteBatch, IterateOptions } from '@quereus/store';
+// `compareBytes` is the ordering oracle the KVStore contract and its conformance battery
+// are written against — the bound checks below must use that exact definition, not a
+// re-derived copy that could drift from it.
+import { compareBytes, type KVStore, type KVEntry, type WriteBatch, type IterateOptions } from '@quereus/store';
 
 /**
  * Type definition for rn-leveldb write batch.
@@ -197,17 +200,27 @@ export class ReactNativeLevelDBStore implements KVStore {
 
 		const iterator = this.db.newIterator();
 		try {
-			const entries = this.collectEntries(iterator, options);
-			for (const entry of entries) {
+			// rn-leveldb hands back a genuine streaming native cursor, so this walk yields
+			// each entry as it reaches it — peak is one entry, never the whole range.
+			for (const entry of this.walkEntries(iterator, options)) {
 				yield entry;
 			}
 		} finally {
+			// Covers natural exhaustion AND early termination: a consumer `break` or throw
+			// drives this generator's return()/throw(), which unwinds through here and
+			// releases the native iterator.
 			iterator.close();
 		}
 	}
 
-	private collectEntries(iterator: LevelDBIterator, options?: IterateOptions): KVEntry[] {
-		const entries: KVEntry[] = [];
+	/**
+	 * Walk the native iterator over the requested range, yielding each entry in place.
+	 *
+	 * Positioning, bound checks and the limit counter all live in this one loop, so no
+	 * intermediate array of the range is ever built.
+	 */
+	private *walkEntries(iterator: LevelDBIterator, options?: IterateOptions): Generator<KVEntry> {
+		let yielded = 0;
 		const limit = options?.limit;
 		const reverse = options?.reverse ?? false;
 
@@ -253,16 +266,16 @@ export class ReactNativeLevelDBStore implements KVStore {
 			}
 		}
 
-		// Collect entries
+		// Walk and yield
 		while (iterator.valid()) {
-			if (limit !== undefined && entries.length >= limit) {
+			if (limit !== undefined && yielded >= limit) {
 				break;
 			}
 
 			const key = toUint8Array(iterator.keyBuf());
-			const value = toUint8Array(iterator.valueBuf());
 
-			// Check bounds
+			// Check bounds before reading the value — the entry past the far edge ends the
+			// walk, so its value is never fetched.
 			if (!reverse) {
 				if (options?.lt && compareBytes(key, options.lt) >= 0) break;
 				if (options?.lte && compareBytes(key, options.lte) > 0) break;
@@ -271,7 +284,8 @@ export class ReactNativeLevelDBStore implements KVStore {
 				if (options?.gte && compareBytes(key, options.gte) < 0) break;
 			}
 
-			entries.push({ key, value });
+			yield { key, value: toUint8Array(iterator.valueBuf()) };
+			yielded++;
 
 			if (reverse) {
 				iterator.prev();
@@ -279,8 +293,6 @@ export class ReactNativeLevelDBStore implements KVStore {
 				iterator.next();
 			}
 		}
-
-		return entries;
 	}
 
 	batch(): WriteBatch {
@@ -375,19 +387,5 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
  */
 function toUint8Array(data: ArrayBuffer): Uint8Array {
 	return new Uint8Array(data);
-}
-
-/**
- * Compare two Uint8Arrays lexicographically.
- * @returns Negative if a < b, 0 if equal, positive if a > b.
- */
-function compareBytes(a: Uint8Array, b: Uint8Array): number {
-	const minLength = Math.min(a.length, b.length);
-	for (let i = 0; i < minLength; i++) {
-		if (a[i] !== b[i]) {
-			return a[i] - b[i];
-		}
-	}
-	return a.length - b.length;
 }
 

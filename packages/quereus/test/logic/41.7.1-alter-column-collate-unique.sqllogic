@@ -1,0 +1,45 @@
+-- ALTER COLUMN ... SET COLLATE — PRIMARY KEY re-key collision (cross-module).
+--
+-- CROSS-MODULE (NOT in MEMORY_ONLY_FILES): runs in both memory and store modes.
+-- Both modules enforce PRIMARY KEY uniqueness/ordering under a PER-COLUMN collation
+-- and re-key the primary structure on an ALTER COLUMN SET COLLATE of a PK member —
+-- memory re-keys its primary tree, the store physically re-encodes its data-store
+-- keys (and rebuilds dependent secondary indexes). So a PK pair distinct under
+-- BINARY but colliding under NOCASE rejects the ALTER with CONSTRAINT on both,
+-- leaving the table unchanged and still BINARY.
+--
+-- The PK column is declared `collate binary` EXPLICITLY: the store's table-level
+-- default key collation K is NOCASE, so an undecorated text PK would be keyed NOCASE
+-- and could not even hold the 'a'/'A' pair. The explicit BINARY declaration is
+-- honored natively by the store's per-column key encoding (ticket
+-- store-pk-collate-physical-rekey), which is what makes this fixture runnable
+-- cross-module. On memory `collate binary` matches its BINARY column default, so the
+-- declaration is a no-op there.
+--
+-- The non-PK UNIQUE / CREATE UNIQUE INDEX sections (identical across both modules)
+-- live in 41.7.2-alter-column-collate-unique-store.sqllogic, which also covers a
+-- divergent PK collation change that is HONORED (re-keyed, non-colliding). The
+-- cross-module query-layer behavior lives in 41.7-alter-column-collate.sqllogic.
+
+-- ===================================
+-- 1. PK column collation change re-keys the primary structure; a PK that is
+--    unique under BINARY but collides under NOCASE is rejected, all-or-nothing.
+-- ===================================
+
+create table pkc (k text collate binary primary key);
+insert into pkc values ('a'), ('A');
+-- run
+
+alter table pkc alter column k set collate nocase;
+-- error: UNIQUE constraint failed
+
+-- rollback: both rows survive, column still BINARY (BINARY order: A before a)
+select k from pkc order by k;
+→ [{"k":"A"},{"k":"a"}]
+
+-- the table is still writable after the failed ALTER
+insert into pkc values ('B');
+select count(*) as n from pkc;
+→ [{"n":3}]
+
+drop table pkc;

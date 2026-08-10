@@ -1,0 +1,106 @@
+-- ALTER COLUMN ... SET COLLATE on a PRIMARY KEY column, interleaved with rows the
+-- transaction deleted, re-inserted, or staged at a case-variant key.
+--
+-- Cross-module: both backends ask the same two questions before mutating anything
+-- (memory: MemoryTableManager.validateRekeyedPrimaryKey; store:
+-- StoreTable.validateRekeyedPrimaryKey) — a collision the transaction can SEE is
+-- CONSTRAINT, a collision confined to rows only a rollback could restore is BUSY, and
+-- either refusal leaves the transaction usable. The PK declares `collate binary`
+-- explicitly because the store defaults an undecorated text PK to NOCASE (see
+-- 10.2.2-default-collation-memory.sqllogic), which would make the case-variant pairs
+-- collide at INSERT before any ALTER runs. The isolation layer's own coverage of these
+-- sequences lives in packages/quereus-isolation/test/isolation-layer.spec.ts
+-- ("collapses overlay deletion markers").
+
+-- ===================================
+-- 1. Delete a row, re-insert a case-variant replacement, then re-key: the deleted row
+--    must not block the change, and the replacement survives the commit.
+-- ===================================
+
+create table t_rk (k text collate binary primary key, v text);
+insert into t_rk values ('A', 'x');
+
+begin;
+delete from t_rk where k = 'A';
+insert into t_rk values ('a', 'y');
+alter table t_rk alter column k set collate nocase;
+commit;
+
+select k, v from t_rk;
+→ [{"k":"a","v":"y"}]
+
+drop table t_rk;
+
+-- ===================================
+-- 2. Rows inserted AND deleted inside one transaction leave the case-colliding pair in the
+--    transaction's history; the re-key's conservative representability check refuses it as
+--    retryable (BUSY), the transaction's own work still commits, and the retry succeeds.
+-- ===================================
+
+create table t_rk2 (k text collate binary primary key, v text);
+-- run
+
+begin;
+insert into t_rk2 values ('A', 'x'), ('a', 'y');
+delete from t_rk2 where k in ('A', 'a');
+-- run
+
+alter table t_rk2 alter column k set collate nocase;
+-- error: still collide under the new key definition
+
+commit;
+select count(*) as n from t_rk2;
+→ [{"n":0}]
+
+alter table t_rk2 alter column k set collate nocase;
+select name, collation from table_info('t_rk2') order by cid;
+→ [{"name":"k","collation":"NOCASE"},{"name":"v","collation":"BINARY"}]
+
+drop table t_rk2;
+
+-- ===================================
+-- 3. A staged row colliding with a COMMITTED row under the new collation is a duplicate
+--    this transaction's own select would return: the change is invalid (CONSTRAINT), and
+--    the refusal leaves the transaction untouched and usable.
+-- ===================================
+
+create table t_rk3 (k text collate binary primary key, v text);
+insert into t_rk3 values ('A', 'x');
+-- run
+
+begin;
+insert into t_rk3 values ('a', 'y');
+-- run
+
+alter table t_rk3 alter column k set collate nocase;
+-- error: collides under the new key definition
+
+rollback;
+select k, v from t_rk3;
+→ [{"k":"A","v":"x"}]
+
+drop table t_rk3;
+
+-- ===================================
+-- 4. A committed collider DELETED in this transaction is invisible to the transaction's
+--    view but must survive a rollback, and a re-keyed structure cannot hold the pair:
+--    refused as retryable (BUSY), transaction still usable, retry after commit succeeds.
+-- ===================================
+
+create table t_rk4 (k text collate binary primary key, v text);
+insert into t_rk4 values ('A', 'x'), ('a', 'y');
+-- run
+
+begin;
+delete from t_rk4 where k = 'a';
+-- run
+
+alter table t_rk4 alter column k set collate nocase;
+-- error: still collide under the new key definition
+
+commit;
+alter table t_rk4 alter column k set collate nocase;
+select k, v from t_rk4;
+→ [{"k":"A","v":"x"}]
+
+drop table t_rk4;

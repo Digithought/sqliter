@@ -122,14 +122,42 @@ select wj_l.id as lid, wj_r.id as rid from wj_l left join wj_r on wj_l.k = wj_r.
 select wj_l.id as lid, wj_r.id as rid from wj_l left join wj_r on wj_r.tag = 1 and wj_r.k = wj_l.k order by lid, rid;
 → [{"lid":1,"rid":10},{"lid":2,"rid":30}]
 
--- Index presence on the ON columns must not change results
-create index wj_r_k_tag on wj_r(k, tag);
+-- The indexed variant of this equivalence (an index on the ON columns must not
+-- change the answer) lives in 100.1.1-where-join-on-order-indexed.
 
-select wj_l.id as lid, wj_r.id as rid from wj_l left join wj_r on wj_l.k = wj_r.k and wj_r.tag = 1 order by lid, rid;
-→ [{"lid":1,"rid":10},{"lid":2,"rid":30}]
-
-drop index wj_r_k_tag;
 drop table wj_l;
 drop table wj_r;
 
 drop table we;
+
+-- =============================================================================
+-- same-table column-column equality: must not crash (regression: seek crash)
+-- A col = same_col predicate is a per-row filter, never a seek key.
+-- =============================================================================
+
+create table samecolpk (b text primary key, c text);
+insert into samecolpk values ('u', 'u'), ('v', 'w'), ('x', 'x');
+
+-- simple PK: matching rows returned, no crash
+select b from samecolpk where b = c order by b;
+→ [{"b":"u"},{"b":"x"}]
+
+-- with inequality too
+select b from samecolpk where b = c and c != 'x';
+→ [{"b":"u"}]
+
+drop table samecolpk;
+
+-- composite PK: b=c with the other key column pinned must not crash
+create table samecolcomp (b text, c text, x integer, primary key (b, x));
+insert into samecolcomp values ('u','u',1), ('u','u',2), ('v','v',1), ('w','v',1);
+
+-- both pk columns specified but b=c is still a per-row filter
+select b, c, x from samecolcomp where b = c and x = 1 order by b;
+→ [{"b":"u","c":"u","x":1},{"b":"v","c":"v","x":1}]
+
+-- without x pin: b=c alone as filter
+select b, c, x from samecolcomp where b = c order by b, x;
+→ [{"b":"u","c":"u","x":1},{"b":"u","c":"u","x":2},{"b":"v","c":"v","x":1}]
+
+drop table samecolcomp;

@@ -21,7 +21,7 @@ select * from mb_v;
 drop view mb_v;
 
 -- ===================================
--- 2. Mutations through a view rejected (read-only by design)
+-- 2. Mutations through a single-source projection view (updateable)
 -- ===================================
 
 create table rom_base (id integer primary key, val integer);
@@ -29,13 +29,14 @@ insert into rom_base values (1, 10);
 create view rom_v as select id, val from rom_base;
 
 insert into rom_v values (2, 20);
--- error:
 
 update rom_v set val = 99 where id = 1;
--- error:
 
 delete from rom_v where id = 1;
--- error:
+
+-- View now reflects the base writes routed through it.
+select * from rom_v order by id;
+→ [{"id":2,"val":20}]
 
 drop view rom_v;
 drop table rom_base;

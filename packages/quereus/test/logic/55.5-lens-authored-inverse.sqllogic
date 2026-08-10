@@ -1,0 +1,1468 @@
+-- Authored inverses at the lens boundary (docs/lens.md § Computed and
+-- Generated Columns; docs/vu-inverses.md § Authored inverses;
+-- ticket `authored-inverse-lens-prover`).
+--
+-- Covers the prover's law treatment for `with inverse` columns through the full
+-- SQL pipeline: the acknowledgeable `lens.getput-lossy` advisory (+ ack and
+-- escalation governance), the `lens.putget-violation` hard error for an inverse
+-- the forward provably does not reproduce, the bijective-enumeration advisory
+-- suppression, the `inverse` disposition column on quereus_effective_lens, and
+-- writable-intent satisfaction by an authored inverse. (Fingerprint mechanics
+-- are unit-tested in test/lens-ack.spec.ts.)
+
+-- ===================================
+-- 1. Code-collapse lens: a non-injective forward with an authored inverse
+--    deploys with the lens.getput-lossy advisory; PutGet holds by enumeration;
+--    write-through normalizes the basis value (GetPut surrendered).
+-- ===================================
+
+declare schema ai1b {
+	table Item (
+		id integer primary key,
+		code text not null check (code in ('A1', 'A2', 'B1', 'B2', 'C1'))
+	)
+}
+
+-- run
+
+apply schema ai1b;
+
+-- run
+
+insert into ai1b.Item values (1, 'A2'), (2, 'B2');
+
+-- run
+
+declare logical schema ai1x {
+	table Item (
+		id integer primary key,
+		grp text null check (grp in ('A', 'B', 'C'))
+	)
+}
+
+-- run
+
+declare lens for ai1x over ai1b {
+	view Item as select id, substr(code, 1, 1) as grp
+		with inverse (code = new.grp || '1')
+	from ai1b.Item
+}
+
+-- run
+
+apply schema ai1x;
+
+-- run
+
+-- The advisory fires, sited at the authored column.
+select code, "column", status from quereus_lens_advisories('ai1x') where code = 'lens.getput-lossy';
+→ [{"code": "lens.getput-lossy", "column": "grp", "status": "active"}]
+
+-- Reads collapse the basis codes through the forward.
+select * from ai1x.Item order by id;
+→ [{"id": 1, "grp": "A"}, {"id": 2, "grp": "B"}]
+
+-- effective-lens reports the authored disposition.
+select logical_column, inverse from quereus_effective_lens('ai1x', 'Item') order by logical_column;
+→ [{"logical_column": "grp", "inverse": "authored"}, {"logical_column": "id", "inverse": "inferred"}]
+
+-- run
+
+-- UPDATE lowers through the authored put.
+update ai1x.Item set grp = 'C' where id = 1;
+select code from ai1b.Item where id = 1;
+→ [{"code": "C1"}]
+
+-- GetPut surrendered: writing the read value back normalizes B2 → B1 (the
+-- inverse's representative) — exactly what the advisory warns about.
+update ai1x.Item set grp = grp where id = 2;
+select code from ai1b.Item where id = 2;
+→ [{"code": "B1"}]
+
+-- INSERT evaluates the put per supplied row.
+insert into ai1x.Item (id, grp) values (3, 'A');
+select code from ai1b.Item where id = 3;
+→ [{"code": "A1"}]
+
+-- run
+
+-- The logical CHECK is enforced at the lens boundary over the written image.
+insert into ai1x.Item (id, grp) values (4, 'Z');
+-- error: check
+
+-- ===================================
+-- 2. An in-source ack suppresses the advisory (unconditional — no fingerprint)
+-- ===================================
+
+declare logical schema ai2x {
+	table Item (
+		id integer primary key,
+		grp text null check (grp in ('A', 'B', 'C'))
+	) with tags (
+		"quereus.lens.ack.getput-lossy:grp" = 'collapse to the 1-suffix representative is intentional'
+	)
+}
+
+-- run
+
+declare lens for ai2x over ai1b {
+	view Item as select id, substr(code, 1, 1) as grp
+		with inverse (code = new.grp || '1')
+	from ai1b.Item
+}
+
+-- run
+
+apply schema ai2x;
+
+-- run
+
+select code, status, rationale from quereus_lens_advisories('ai2x') where code = 'lens.getput-lossy';
+→ [{"code": "lens.getput-lossy", "status": "acknowledged-unconditional", "rationale": "collapse to the 1-suffix representative is intentional"}]
+
+-- ===================================
+-- 3. Escalation: require-ack makes the un-acknowledged advisory a deploy error
+-- ===================================
+
+declare logical schema ai3x {
+	table Item (
+		id integer primary key,
+		grp text null check (grp in ('A', 'B', 'C'))
+	) with tags (
+		"quereus.lens.policy.require-ack" = 'lens.getput-lossy'
+	)
+}
+
+-- run
+
+declare lens for ai3x over ai1b {
+	view Item as select id, substr(code, 1, 1) as grp
+		with inverse (code = new.grp || '1')
+	from ai1b.Item
+}
+
+-- run
+
+apply schema ai3x;
+-- error: lens.getput-lossy
+
+-- ===================================
+-- 4. Escalation: error-on is a hard error an ack cannot suppress
+-- ===================================
+
+declare logical schema ai4x {
+	table Item (
+		id integer primary key,
+		grp text null check (grp in ('A', 'B', 'C'))
+	) with tags (
+		"quereus.lens.policy.error-on" = 'lens.getput-lossy',
+		"quereus.lens.ack.getput-lossy:grp" = 'attempted suppression of a hard policy'
+	)
+}
+
+-- run
+
+declare lens for ai4x over ai1b {
+	view Item as select id, substr(code, 1, 1) as grp
+		with inverse (code = new.grp || '1')
+	from ai1b.Item
+}
+
+-- run
+
+apply schema ai4x;
+-- error: lens.getput-lossy
+
+-- ===================================
+-- 5. A deliberately wrong inverse reds lens.putget-violation at deploy:
+--    inverse('A') = 'B1' but forward('B1') = 'B' ≠ 'A'.
+-- ===================================
+
+declare logical schema ai5x {
+	table Item (
+		id integer primary key,
+		grp text null check (grp in ('A', 'B'))
+	)
+}
+
+-- run
+
+declare lens for ai5x over ai1b {
+	view Item as select id, substr(code, 1, 1) as grp
+		with inverse (code = case new.grp when 'A' then 'B1' else new.grp || '1' end)
+	from ai1b.Item
+}
+
+-- run
+
+apply schema ai5x;
+-- error: lens.putget-violation
+
+-- ===================================
+-- 6. A bijective enumerable mapping emits no advisory (forward proved injective
+--    over the basis CHECK domain, image inside the logical domain) — and GetPut
+--    operationally holds: write-back leaves the basis unchanged.
+-- ===================================
+
+declare schema ai6b {
+	table Item (
+		id integer primary key,
+		code text not null check (code in ('a', 'b', 'c'))
+	)
+}
+
+-- run
+
+apply schema ai6b;
+
+-- run
+
+insert into ai6b.Item values (1, 'b');
+
+-- run
+
+declare logical schema ai6x {
+	table Item (
+		id integer primary key,
+		grp text null check (grp in ('A', 'B', 'C'))
+	)
+}
+
+-- run
+
+declare lens for ai6x over ai6b {
+	view Item as select id, upper(code) as grp
+		with inverse (code = lower(new.grp))
+	from ai6b.Item
+}
+
+-- run
+
+apply schema ai6x;
+
+-- run
+
+select count(*) as n from quereus_lens_advisories('ai6x') where code = 'lens.getput-lossy';
+→ [{"n": 0}]
+
+-- GetPut: writing the read value back leaves the basis byte-identical.
+update ai6x.Item set grp = grp where id = 1;
+select code from ai6b.Item where id = 1;
+→ [{"code": "b"}]
+
+-- PutGet write-through.
+update ai6x.Item set grp = 'C' where id = 1;
+select code from ai6b.Item where id = 1;
+→ [{"code": "c"}]
+
+-- ===================================
+-- 7. effective-lens `inverse` dispositions across a mixed table:
+--    authored / inferred (covered + gap-filled) / none (computed, read-only).
+-- ===================================
+
+declare schema ai7b {
+	table T (
+		id integer primary key,
+		name text null,
+		code text not null check (code in ('a', 'b'))
+	)
+}
+
+-- run
+
+apply schema ai7b;
+
+-- run
+
+insert into ai7b.T values (1, 'ada', 'a');
+
+-- run
+
+declare logical schema ai7x {
+	table T (
+		id integer primary key,
+		name text null,
+		grp text null check (grp in ('A', 'B')),
+		shout text null
+	)
+}
+
+-- run
+
+-- `name` is gap-filled (identity ⇒ inferred); `shout` is computed with no
+-- inverse (none); `grp` carries the authored put (authored).
+declare lens for ai7x over ai7b {
+	view T as select id, upper(code) as grp
+		with inverse (code = lower(new.grp)),
+		upper(name) as shout
+	from ai7b.T
+}
+
+-- run
+
+apply schema ai7x;
+
+-- run
+
+select logical_column, source, inverse from quereus_effective_lens('ai7x', 'T') order by logical_column;
+→ [{"logical_column": "grp", "source": "override", "inverse": "authored"}, {"logical_column": "id", "source": "override", "inverse": "inferred"}, {"logical_column": "name", "source": "default", "inverse": "inferred"}, {"logical_column": "shout", "source": "override", "inverse": "none"}]
+
+-- run
+
+select * from ai7x.T;
+→ [{"id": 1, "name": "ada", "grp": "A", "shout": "ADA"}]
+
+-- ===================================
+-- 8. quereus.lens.writable = true is satisfied by an authored inverse — no
+--    lens.non-invertible (the column is writable through the supplied put).
+-- ===================================
+
+declare schema ai8b {
+	table Core (
+		id integer primary key,
+		speed integer not null
+	)
+}
+
+-- run
+
+apply schema ai8b;
+
+-- run
+
+insert into ai8b.Core values (1, 30);
+
+-- run
+
+declare logical schema ai8x {
+	table Car (
+		id integer primary key,
+		mph integer null with tags ("quereus.lens.writable" = true)
+	)
+}
+
+-- run
+
+declare lens for ai8x over ai8b {
+	view Car as select id, speed * 3 as mph
+		with inverse (speed = new.mph / 3)
+	from ai8b.Core
+}
+
+-- run
+
+apply schema ai8x;
+
+-- run
+
+select * from ai8x.Car;
+→ [{"id": 1, "mph": 90}]
+
+update ai8x.Car set mph = 120 where id = 1;
+select speed from ai8b.Core where id = 1;
+→ [{"speed": 40}]
+
+-- ===================================
+-- 9. Out-of-fragment body (join) + authored inverse + writable intent:
+--    degrade-to-safe holds — no branch fires (no lens.non-invertible, no
+--    advisory), the documented completeness gap is not regressed.
+-- ===================================
+
+declare schema ai9b {
+	table Core (
+		id integer primary key,
+		code text not null
+	)
+	table Aux (
+		id integer primary key,
+		tag text null
+	)
+}
+
+-- run
+
+apply schema ai9b;
+
+-- run
+
+insert into ai9b.Core values (1, 'x');
+insert into ai9b.Aux values (1, 't');
+
+-- run
+
+declare logical schema ai9x {
+	table V (
+		id integer primary key,
+		label text null with tags ("quereus.lens.writable" = true)
+	)
+}
+
+-- run
+
+declare lens for ai9x over ai9b {
+	view V as select Core.id as id, upper(Core.code) as label
+		with inverse (code = lower(new.label))
+	from ai9b.Core inner join ai9b.Aux on Core.id = Aux.id
+}
+
+-- run
+
+apply schema ai9x;
+
+-- run
+
+select count(*) as n from quereus_lens_advisories('ai9x') where code = 'lens.getput-lossy';
+→ [{"n": 0}]
+
+select * from ai9x.V;
+→ [{"id": 1, "label": "X"}]
+
+-- ===================================
+-- 10. A non-constant-foldable inverse (subquery) over an enumerable domain
+--     degrades to safe — deploys with the advisory, never a crash; the
+--     mutation-time lowering still consumes the subquery put.
+-- ===================================
+
+declare schema ai10b {
+	table Item (
+		id integer primary key,
+		code text not null
+	)
+	table Lk (
+		grp text primary key,
+		rep text not null
+	)
+}
+
+-- run
+
+apply schema ai10b;
+
+-- run
+
+insert into ai10b.Item values (1, 'A1');
+insert into ai10b.Lk values ('A', 'A1'), ('B', 'B1');
+
+-- run
+
+declare logical schema ai10x {
+	table Item (
+		id integer primary key,
+		grp text null check (grp in ('A', 'B'))
+	)
+}
+
+-- run
+
+declare lens for ai10x over ai10b {
+	view Item as select id, substr(code, 1, 1) as grp
+		with inverse (code = (select rep from ai10b.Lk where Lk.grp = new.grp))
+	from ai10b.Item
+}
+
+-- run
+
+apply schema ai10x;
+
+-- run
+
+-- Degrade-to-safe: the composition is not const-foldable, so PutGet is
+-- unverified (no error) and the advisory stands (not proved bijective).
+select code, status from quereus_lens_advisories('ai10x') where code = 'lens.getput-lossy';
+→ [{"code": "lens.getput-lossy", "status": "active"}]
+
+-- The mutation-time put still evaluates the subquery per write.
+update ai10x.Item set grp = 'B' where id = 1;
+select code from ai10b.Item where id = 1;
+→ [{"code": "B1"}]
+
+-- ===================================
+-- 11. Bijectivity suppression requires the inverse's images to land INSIDE the
+--     basis domain. Here PutGet holds ('z' hits the forward's else arm) and the
+--     forward alone is injective over the basis domain ('a'→'A', 'b'→'B'), but
+--     inverse('B') = 'z' escapes the basis CHECK — the pair is not a bijection
+--     (GetPut fails for stored 'b'), so the advisory must stand.
+-- ===================================
+
+declare schema ai11b {
+	table Item (
+		id integer primary key,
+		code text not null check (code in ('a', 'b'))
+	)
+}
+
+-- run
+
+apply schema ai11b;
+
+-- run
+
+insert into ai11b.Item values (1, 'b');
+
+-- run
+
+declare logical schema ai11x {
+	table Item (
+		id integer primary key,
+		grp text null check (grp in ('A', 'B'))
+	)
+}
+
+-- run
+
+declare lens for ai11x over ai11b {
+	view Item as select id, case code when 'a' then 'A' else 'B' end as grp
+		with inverse (code = case new.grp when 'A' then 'a' else 'z' end)
+	from ai11b.Item
+}
+
+-- run
+
+apply schema ai11x;
+
+-- run
+
+select code, "column", status from quereus_lens_advisories('ai11x') where code = 'lens.getput-lossy';
+→ [{"code": "lens.getput-lossy", "column": "grp", "status": "active"}]
+
+-- The surrendered GetPut is operationally visible: write-back of the read
+-- value puts 'z', which the basis CHECK rejects.
+update ai11x.Item set grp = grp where id = 1;
+-- error: check
+
+-- ===================================
+-- 12. A logical CHECK over an authored column on a join body reds
+--     lens.unrealizable-constraint at deploy: the forward substitution is
+--     row-local only on a single-source body. (Here the forward happens to read
+--     only the put member — a conservative over-block — but the slot AST cannot
+--     prove that, and a cross-side forward would otherwise deploy a CHECK that
+--     silently never enforces; see the next scenario's shape.)
+-- ===================================
+
+declare schema ai12b {
+	table Core (
+		id integer primary key,
+		code text not null
+	)
+	table Aux (
+		id integer primary key,
+		tag text null
+	)
+}
+
+-- run
+
+apply schema ai12b;
+
+-- run
+
+insert into ai12b.Core values (1, 'x');
+insert into ai12b.Aux values (1, 't');
+
+-- run
+
+declare logical schema ai12x {
+	table V (
+		id integer primary key,
+		label text null check (label in ('X', 'Y'))
+	)
+}
+
+-- run
+
+declare lens for ai12x over ai12b {
+	view V as select Core.id as id, upper(Core.code) as label
+		with inverse (code = lower(new.label))
+	from ai12b.Core inner join ai12b.Aux on Core.id = Aux.id
+}
+
+-- run
+
+apply schema ai12x;
+-- error: lens.unrealizable-constraint
+
+-- ===================================
+-- 13. Read-only gate: a NON-injective authored inverse as the logical PK keeps
+--     the table read-only. The reconstructibility verdict is now the bijection
+--     check, not the bare-column test: substr(code,1,1) collapses A1/A2 so the
+--     forward is not injective — the authored PK column is neither bare-
+--     reconstructible nor bijective-authored, so the PK is not reconstructible and
+--     the table deploys read-only (contrast scenario 18, where a *proven*
+--     bijection makes the authored PK reconstructible ⇒ writable). The lossy
+--     advisory is suppressed because the put never runs on a read-only table.
+-- ===================================
+
+declare schema ai13b {
+	table Item (
+		code text primary key check (code in ('A1', 'A2', 'B1'))
+	)
+}
+
+-- run
+
+apply schema ai13b;
+
+-- run
+
+declare logical schema ai13x {
+	table Item (
+		grp text primary key check (grp in ('A', 'B'))
+	)
+}
+
+-- run
+
+-- substr collapses A1/A2 — NOT injective over the basis domain, so absent the
+-- read-only gate the advisory would fire (scenario 1 pins exactly that).
+declare lens for ai13x over ai13b {
+	view Item as select substr(code, 1, 1) as grp
+		with inverse (code = new.grp || '1')
+	from ai13b.Item
+}
+
+-- run
+
+apply schema ai13x;
+
+-- run
+
+select count(*) as n from quereus_lens_advisories('ai13x') where code = 'lens.getput-lossy';
+→ [{"n": 0}]
+
+-- run
+
+insert into ai13x.Item values ('A');
+-- error: read-only
+
+-- ===================================
+-- 14. The PutGet error is NOT read-only-gated: the same read-only shape with a
+--     provably wrong inverse still blocks the deploy (a declared write path
+--     that loses the written value is an authoring error regardless).
+-- ===================================
+
+declare logical schema ai14x {
+	table Item (
+		grp text primary key check (grp in ('A', 'B'))
+	)
+}
+
+-- run
+
+declare lens for ai14x over ai13b {
+	view Item as select substr(code, 1, 1) as grp
+		with inverse (code = case new.grp when 'A' then 'B1' else new.grp || '1' end)
+	from ai13b.Item
+}
+
+-- run
+
+apply schema ai14x;
+-- error: lens.putget-violation
+
+-- ===================================
+-- 15. The motivating leak for the single-source gate above: a cross-side
+--     forward (reads Aux.tag, put writes Core.code). Were the CHECK admitted,
+--     the substituted NEW.tag would resolve NULL on the Core-member write and
+--     the CHECK would pass vacuously — an out-of-domain write would land
+--     silently. The deploy must reject instead.
+-- ===================================
+
+declare logical schema ai15x {
+	table V (
+		id integer primary key,
+		label text null check (label in ('Xt', 'Yt'))
+	)
+}
+
+-- run
+
+declare lens for ai15x over ai12b {
+	view V as select Core.id as id, upper(Core.code) || Aux.tag as label
+		with inverse (code = lower(substr(new.label, 1, 1)))
+	from ai12b.Core inner join ai12b.Aux on Core.id = Aux.id
+}
+
+-- run
+
+apply schema ai15x;
+-- error: lens.unrealizable-constraint
+
+-- ===================================
+-- 16. Without a logical CHECK on the authored column, the same join-body
+--     authored inverse still deploys and writes through (the single-source gate
+--     constrains only CHECK realizability, not the write path).
+-- ===================================
+
+declare logical schema ai16x {
+	table V (
+		id integer primary key,
+		label text null
+	)
+}
+
+-- run
+
+declare lens for ai16x over ai12b {
+	view V as select Core.id as id, upper(Core.code) as label
+		with inverse (code = lower(new.label))
+	from ai12b.Core inner join ai12b.Aux on Core.id = Aux.id
+}
+
+-- run
+
+apply schema ai16x;
+
+-- run
+
+update ai16x.V set label = 'Y' where id = 1;
+select code from ai12b.Core where id = 1;
+→ [{"code": "y"}]
+
+-- ===================================
+-- 17. The enumeration honors the column's full declared CHECK surface: a range
+--     CHECK narrows the in-list (3 is excluded), so an inverse that is only
+--     correct for the surviving values {1, 2} deploys clean — enumerating the
+--     excluded value would red a false lens.putget-violation. Integer domain.
+-- ===================================
+
+declare schema ai17b {
+	table Item (
+		id integer primary key,
+		k integer not null
+	)
+}
+
+-- run
+
+apply schema ai17b;
+
+-- run
+
+insert into ai17b.Item values (1, 0);
+
+-- run
+
+declare logical schema ai17x {
+	table Item (
+		id integer primary key,
+		n integer null check (n in (1, 2, 3)),
+		check (n < 3)
+	)
+}
+
+-- run
+
+-- inverse(3) would store 99 and read back 100 ≠ 3 — but 3 is outside the
+-- effective domain, so the composition is never evaluated for it.
+declare lens for ai17x over ai17b {
+	view Item as select id, k + 1 as n
+		with inverse (k = case when new.n < 3 then new.n - 1 else 99 end)
+	from ai17b.Item
+}
+
+-- run
+
+apply schema ai17x;
+
+-- run
+
+-- No basis-side CHECK domain ⇒ bijectivity unproven ⇒ the advisory stands.
+select code, "column", status from quereus_lens_advisories('ai17x') where code = 'lens.getput-lossy';
+→ [{"code": "lens.getput-lossy", "column": "n", "status": "active"}]
+
+-- run
+
+update ai17x.Item set n = 2 where id = 1;
+select k from ai17b.Item where id = 1;
+→ [{"k": 1}]
+
+-- Both declared CHECKs enforce over the written image (NEW.k + 1).
+update ai17x.Item set n = 3 where id = 1;
+-- error: check
+
+-- ===================================
+-- 18. PK over a PROVEN-BIJECTIVE authored inverse → WRITABLE. The logical PK is
+--     the authored column itself; the forward/inverse pair is proved a bijection
+--     between the basis and logical CHECK domains, AND the put-target basis column
+--     is a declared basis key, so the key is `proved` by bijection transport. The
+--     table deploys writable (no lens.pk-not-reconstructible), with zero runtime
+--     key enforcement (no lens.no-backing-index) and no lens.getput-lossy. Full
+--     keyed CRUD goes through the authored put: the forward in WHERE locates the
+--     row, the inverse in SET/VALUES writes the basis cell.
+--
+--     Integer keys (not text) so the behaviour is identical under the memory and
+--     LevelDB-store backends: the store assigns a single-column TEXT primary key
+--     NOCASE collation, under which a text CHECK in-list is not value-discriminating
+--     and so cannot witness a bijection — the integer-keyed shape proves cleanly on
+--     both. (The text upper/lower bijection is covered by scenario 6 and the unit
+--     specs.)
+-- ===================================
+
+declare schema bpk_b {
+	table Item (
+		k integer primary key check (k in (1, 2, 3))
+	)
+}
+
+-- run
+
+apply schema bpk_b;
+
+-- run
+
+insert into bpk_b.Item values (2);
+
+-- run
+
+declare logical schema bpk_x {
+	table Item (
+		n integer primary key check (n in (11, 12, 13))
+	)
+}
+
+-- run
+
+declare lens for bpk_x over bpk_b {
+	view Item as select k + 10 as n
+		with inverse (k = new.n - 10)
+	from bpk_b.Item
+}
+
+-- run
+
+apply schema bpk_x;
+
+-- run
+
+-- No advisories at all: bijective (no getput-lossy), reconstructible (no
+-- pk-not-reconstructible), proved by transport (no no-backing-index).
+select count(*) as n from quereus_lens_advisories('bpk_x');
+→ [{"n": 0}]
+
+-- Read transports the basis key through the forward.
+select * from bpk_x.Item;
+→ [{"n": 12}]
+
+-- run
+
+-- INSERT through the authored put: 11 stores k = 1.
+insert into bpk_x.Item values (11);
+select k from bpk_b.Item order by k;
+→ [{"k": 1}, {"k": 2}]
+
+-- run
+
+-- UPDATE by the authored key: forward in WHERE (k + 10 = 12), put in SET (k = 13 - 10).
+update bpk_x.Item set n = 13 where n = 12;
+select k from bpk_b.Item where k = 3;
+→ [{"k": 3}]
+
+-- run
+
+-- DELETE by the authored key.
+delete from bpk_x.Item where n = 11;
+select count(*) as cnt from bpk_b.Item where k = 1;
+→ [{"cnt": 0}]
+
+-- run
+
+-- GetPut still byte-stable (bijection): writing the read value back leaves the
+-- basis unchanged.
+update bpk_x.Item set n = n where n = 13;
+select k from bpk_b.Item where k = 3;
+→ [{"k": 3}]
+
+-- ===================================
+-- 19. A bijective authored inverse whose put-target basis column is NOT a basis
+--     key keeps the table writable (the bijection still proves, so the PK column
+--     is reconstructible — no lens.pk-not-reconstructible) but does NOT classify
+--     `proved`: two basis rows could share the value (`k` is NOT NULL + CHECK, but
+--     the basis PK is the unrelated `id`), so the logical key is not intrinsically
+--     unique. It enforces commit-time and emits lens.no-backing-index. The
+--     columnsFormDeclaredKey gate over the put target is load-bearing here.
+-- ===================================
+
+declare schema nbk_b {
+	table Item (
+		id integer primary key,
+		k integer not null check (k in (1, 2, 3))
+	)
+}
+
+-- run
+
+apply schema nbk_b;
+
+-- run
+
+declare logical schema nbk_x {
+	table Item (
+		n integer primary key check (n in (11, 12, 13))
+	)
+}
+
+-- run
+
+declare lens for nbk_x over nbk_b {
+	view Item as select k + 10 as n
+		with inverse (k = new.n - 10)
+	from nbk_b.Item
+}
+
+-- run
+
+apply schema nbk_x;
+
+-- run
+
+-- Writable (bijective ⇒ reconstructible): no read-only advisory.
+select count(*) as cnt from quereus_lens_advisories('nbk_x') where code = 'lens.pk-not-reconstructible';
+→ [{"cnt": 0}]
+
+-- Not proved (put-target is not a basis key): commit-time enforcement, so the
+-- no-backing-index advisory fires, sited at the primary key.
+select code, "constraint", "column" from quereus_lens_advisories('nbk_x') where code = 'lens.no-backing-index';
+→ [{"code": "lens.no-backing-index", "constraint": "primary key", "column": null}]
+
+-- Bijection still proved ⇒ no getput-lossy.
+select count(*) as cnt from quereus_lens_advisories('nbk_x') where code = 'lens.getput-lossy';
+→ [{"cnt": 0}]
+
+-- ===================================
+-- 20. A logical UNIQUE over a PROVEN-BIJECTIVE authored inverse is REALIZABLE.
+--     The authored column is not the PK (the table is keyed and writable via the
+--     real PK `id`), so the UNIQUE classifies on its own. The forward/inverse pair
+--     is proved a bijection, AND the put-target basis column `code` carries a
+--     declared basis UNIQUE — so the logical UNIQUE is `proved` by bijection
+--     transport: zero runtime enforcement, no lens.unrealizable-constraint, no
+--     lens.no-backing-index, no lens.getput-lossy. A duplicate is forbidden by the
+--     basis UNIQUE through the write-through (the proved key relies on it, exactly
+--     as the design intends). Integer +10 affine bijection (backend-agnostic, like
+--     scenario 18). The logical UNIQUE column is NOT NULL: the bijection-transport
+--     proof requires it (a nullable key would be conditionally unique and defers to
+--     commit-time per the prereq's transport guard).
+-- ===================================
+
+declare schema buprv_b {
+	table Item (
+		id integer primary key,
+		code integer not null unique check (code in (1, 2, 3))
+	)
+}
+
+-- run
+
+apply schema buprv_b;
+
+-- run
+
+insert into buprv_b.Item values (1, 1);
+
+-- run
+
+declare logical schema buprv_x {
+	table Item (
+		id integer primary key,
+		grp integer not null check (grp in (11, 12, 13)),
+		unique (grp)
+	)
+}
+
+-- run
+
+declare lens for buprv_x over buprv_b {
+	view Item as select id, code + 10 as grp
+		with inverse (code = new.grp - 10)
+	from buprv_b.Item
+}
+
+-- run
+
+apply schema buprv_x;
+
+-- run
+
+-- Clean deploy: proved by transport (no unrealizable, no no-backing-index, no
+-- getput-lossy), reconstructible PK (no pk-not-reconstructible).
+select count(*) as n from quereus_lens_advisories('buprv_x');
+→ [{"n": 0}]
+
+-- run
+
+-- Read transports the basis key through the forward.
+select * from buprv_x.Item order by id;
+→ [{"id": 1, "grp": 11}]
+
+-- run
+
+-- A second row whose grp maps to an existing code (grp 11 → code 1) is forbidden by
+-- the basis UNIQUE through the write-through — distinct id, so the basis PK does not
+-- catch it. The proved logical UNIQUE adds no runtime scan; the basis UNIQUE is the
+-- enforcer.
+insert into buprv_x.Item values (2, 11);
+-- error: unique
+
+-- run
+
+-- A distinct grp lands.
+insert into buprv_x.Item values (3, 12);
+select code from buprv_b.Item order by code;
+→ [{"code": 1}, {"code": 2}]
+
+-- ===================================
+-- 21. Commit-time fallback: the same bijective authored UNIQUE, but the put-target
+--     basis column has a CHECK + NOT NULL yet NO basis UNIQUE/PK over it — so the
+--     bijection-transport proof fails (no declared basis key) and findBasisCovering
+--     finds nothing (the authored projection has no bare basis column to map). The
+--     UNIQUE is still REALIZABLE: it enforces commit-time over the logical forward
+--     image, deploying with lens.no-backing-index (NOT lens.unrealizable-constraint).
+--     A logical-key duplicate ABORTs via the O(n) count scan.
+-- ===================================
+
+declare schema buct_b {
+	table Item (
+		id integer primary key,
+		code integer not null check (code in (1, 2, 3))
+	)
+}
+
+-- run
+
+apply schema buct_b;
+
+-- run
+
+insert into buct_b.Item values (1, 1);
+
+-- run
+
+declare logical schema buct_x {
+	table Item (
+		id integer primary key,
+		grp integer not null check (grp in (11, 12, 13)),
+		unique (grp)
+	)
+}
+
+-- run
+
+declare lens for buct_x over buct_b {
+	view Item as select id, code + 10 as grp
+		with inverse (code = new.grp - 10)
+	from buct_b.Item
+}
+
+-- run
+
+apply schema buct_x;
+
+-- run
+
+-- Realizable, not proved: exactly one active no-backing-index advisory, sited at the
+-- unique constraint (the put target is not a basis key).
+select code, "constraint", status from quereus_lens_advisories('buct_x') where code = 'lens.no-backing-index';
+→ [{"code": "lens.no-backing-index", "constraint": "unique", "status": "active"}]
+
+-- run
+
+-- Neither unrealizable nor lossy: the bijection still proves the round-trip.
+select count(*) as n from quereus_lens_advisories('buct_x') where code in ('lens.unrealizable-constraint', 'lens.getput-lossy');
+→ [{"n": 0}]
+
+-- run
+
+-- Read transports the basis key.
+select * from buct_x.Item order by id;
+→ [{"id": 1, "grp": 11}]
+
+-- run
+
+-- A logical-key duplicate (grp 11 → code 1, distinct id) ABORTs via the commit-time
+-- count scan — the basis has no UNIQUE on code, so only the logical scan catches it.
+insert into buct_x.Item values (2, 11);
+-- error: constraint
+
+-- run
+
+-- A distinct grp lands (grp 12 → code 2).
+insert into buct_x.Item values (3, 12);
+select code from buct_b.Item order by code;
+→ [{"code": 1}, {"code": 2}]
+
+-- run
+
+-- A key-changing UPDATE that creates a duplicate (grp 12 → 11, colliding with id 1)
+-- also ABORTs via the commit-time scan (the constraint fires on INSERT|UPDATE; the
+-- NEW side is the authored forward image NEW.code + 10). The row is unchanged.
+update buct_x.Item set grp = 11 where grp = 12;
+-- error: constraint
+
+-- run
+
+select grp from buct_x.Item order by grp;
+→ [{"grp": 11}, {"grp": 12}]
+
+-- ===================================
+-- 22. A NON-INJECTIVE (lossy) authored UNIQUE still reds lens.unrealizable-constraint
+--     — the motivating safety case. substr(code,1,1) collapses A1/A2 → A, so the
+--     forward is not injective and the authored column is NOT in the bijective set;
+--     uniqueness over a value with no proven write path is neither provable nor
+--     enforceable, so the gate stays closed for it.
+-- ===================================
+
+declare schema bunj_b {
+	table Item (
+		id integer primary key,
+		code text not null check (code in ('A1', 'A2', 'B1'))
+	)
+}
+
+-- run
+
+apply schema bunj_b;
+
+-- run
+
+declare logical schema bunj_x {
+	table Item (
+		id integer primary key,
+		grp text null check (grp in ('A', 'B')),
+		unique (grp)
+	)
+}
+
+-- run
+
+declare lens for bunj_x over bunj_b {
+	view Item as select id, substr(code, 1, 1) as grp
+		with inverse (code = new.grp || '1')
+	from bunj_b.Item
+}
+
+-- run
+
+apply schema bunj_x;
+-- error: lens.unrealizable-constraint
+
+-- ===================================
+-- 23. Conflict-action rejection: a bijective authored UNIQUE that classifies
+--     commit-time (no basis key over the put target) with `on conflict replace`
+--     still reds lens.unenforceable-conflict-action — the commit-time count scan can
+--     only ABORT, never REPLACE. The realizability gate is lifted, but the
+--     conflict-action gate downstream still fires.
+-- ===================================
+
+declare schema buca_b {
+	table Item (
+		id integer primary key,
+		code integer not null check (code in (1, 2, 3))
+	)
+}
+
+-- run
+
+apply schema buca_b;
+
+-- run
+
+declare logical schema buca_x {
+	table Item (
+		id integer primary key,
+		grp integer not null check (grp in (11, 12, 13)),
+		unique (grp) on conflict replace
+	)
+}
+
+-- run
+
+declare lens for buca_x over buca_b {
+	view Item as select id, code + 10 as grp
+		with inverse (code = new.grp - 10)
+	from buca_b.Item
+}
+
+-- run
+
+apply schema buca_x;
+-- error: lens.unenforceable-conflict-action
+
+-- ===================================
+-- 24. Multi-column commit-time UNIQUE mixing a bare-reconstructible column and a
+--     bijective authored column. unique(tag, grp): `tag` is a plain rename (bare,
+--     NEW.tag) and `grp` is the +10 affine bijection (authored, NEW.code + 10). No
+--     basis key over the put targets ⇒ commit-time. Exercises the per-column NEW-side
+--     synthesis: the count predicate must read `_u.tag = NEW.tag and _u.grp =
+--     NEW.code + 10` so a logical-domain tuple is compared to a logical-domain tuple.
+--     Distinct tuples land; a duplicate logical tuple ABORTs.
+-- ===================================
+
+declare schema bumix_b {
+	table Item (
+		id integer primary key,
+		tag text not null,
+		code integer not null check (code in (1, 2, 3))
+	)
+}
+
+-- run
+
+apply schema bumix_b;
+
+-- run
+
+declare logical schema bumix_x {
+	table Item (
+		id integer primary key,
+		tag text not null,
+		grp integer not null check (grp in (11, 12, 13)),
+		unique (tag, grp)
+	)
+}
+
+-- run
+
+declare lens for bumix_x over bumix_b {
+	view Item as select id, tag, code + 10 as grp
+		with inverse (code = new.grp - 10)
+	from bumix_b.Item
+}
+
+-- run
+
+apply schema bumix_x;
+
+-- run
+
+-- Commit-time (mixed bare + authored key): one no-backing-index, no unrealizable.
+select code, "constraint", status from quereus_lens_advisories('bumix_x') where code = 'lens.no-backing-index';
+→ [{"code": "lens.no-backing-index", "constraint": "unique", "status": "active"}]
+
+-- run
+
+-- Distinct logical tuples all land: (a,11), (a,12) differ in grp; (b,11) differs in tag.
+insert into bumix_x.Item values (1, 'a', 11), (2, 'a', 12), (3, 'b', 11);
+select id, tag, code from bumix_b.Item order by id;
+→ [{"id": 1, "tag": "a", "code": 1}, {"id": 2, "tag": "a", "code": 2}, {"id": 3, "tag": "b", "code": 1}]
+
+-- run
+
+-- A duplicate logical tuple (a, 11) → (tag a, code 1) ABORTs via the commit-time scan
+-- over the mixed NEW side (NEW.tag and NEW.code + 10).
+insert into bumix_x.Item values (4, 'a', 11);
+-- error: constraint
+
+-- ===================================
+-- 25. Conflict-action rejection on a PROVED-by-TRANSPORT key — the headline repro.
+--     A bare-reconstructible rename (`code as grp`) whose put-target basis column
+--     carries a declared basis UNIQUE classifies `proved` (a basis NOT-NULL UNIQUE is
+--     itself a relation key, so the body proves the logical key directly). But the
+--     basis UNIQUE — not the logical key — governs a write-through: a duplicate `grp`
+--     maps to a duplicate `code`, which the basis UNIQUE resolves by its OWN action
+--     (here ABORT). So a logical `unique (grp) on conflict replace` the basis UNIQUE
+--     does not carry would be silently dropped — it reds lens.unenforceable-conflict-
+--     action. (Before the fix this deployed clean, dropping the declared REPLACE.)
+-- ===================================
+
+declare schema tca25_b {
+	table t (
+		id integer primary key,
+		code integer not null unique check (code in (1, 2, 3))
+	)
+}
+
+-- run
+
+apply schema tca25_b;
+
+-- run
+
+declare logical schema tca25_x {
+	table t (
+		id integer primary key,
+		grp integer not null check (grp in (1, 2, 3)),
+		unique (grp) on conflict replace
+	)
+}
+
+-- run
+
+declare lens for tca25_x over tca25_b {
+	view t as select id, code as grp from tca25_b.t
+}
+
+-- run
+
+apply schema tca25_x;
+-- error: lens.unenforceable-conflict-action
+
+-- ===================================
+-- 26. The same rejection over an AUTHORED-bijective transport key (+10 affine), to
+--     pin the authored arm of the transport proof too (the body cannot prove a `code
+--     + 10` key, so this reaches the transport classification, not the body-proved
+--     one). Basis UNIQUE on the put target (ABORT), logical `unique (grp) on conflict
+--     replace` ⇒ red.
+-- ===================================
+
+declare schema tca26_b {
+	table t (
+		id integer primary key,
+		code integer not null unique check (code in (1, 2, 3))
+	)
+}
+
+-- run
+
+apply schema tca26_b;
+
+-- run
+
+declare logical schema tca26_x {
+	table t (
+		id integer primary key,
+		grp integer not null check (grp in (11, 12, 13)),
+		unique (grp) on conflict replace
+	)
+}
+
+-- run
+
+declare lens for tca26_x over tca26_b {
+	view t as select id, code + 10 as grp
+		with inverse (code = new.grp - 10)
+	from tca26_b.t
+}
+
+-- run
+
+apply schema tca26_x;
+-- error: lens.unenforceable-conflict-action
+
+-- ===================================
+-- 27. A MATCHING basis-UNIQUE action deploys clean and the write-through honors
+--     REPLACE for free — the positive case the rejecter must NOT block. Basis UNIQUE
+--     `on conflict replace`, logical `unique (grp) on conflict replace`: the actions
+--     agree, so the key stays `proved` with zero advisories, and a duplicate `code`
+--     REPLACES via the basis UNIQUE (not ABORT). This is the documented remediation.
+-- ===================================
+
+declare schema tca27_b {
+	table t (
+		id integer primary key,
+		code integer not null unique on conflict replace check (code in (1, 2, 3))
+	)
+}
+
+-- run
+
+apply schema tca27_b;
+
+-- run
+
+declare logical schema tca27_x {
+	table t (
+		id integer primary key,
+		grp integer not null check (grp in (1, 2, 3)),
+		unique (grp) on conflict replace
+	)
+}
+
+-- run
+
+declare lens for tca27_x over tca27_b {
+	view t as select id, code as grp from tca27_b.t
+}
+
+-- run
+
+apply schema tca27_x;
+
+-- run
+
+-- Clean deploy: matching actions ⇒ proved transport, no advisories.
+select count(*) as n from quereus_lens_advisories('tca27_x');
+→ [{"n": 0}]
+
+-- run
+
+-- The write honors REPLACE through the basis UNIQUE: (2, 1) replaces (1, 1) on the
+-- duplicate code, leaving one basis row (the later id) rather than ABORTing.
+insert into tca27_x.t (id, grp) values (1, 1);
+insert into tca27_x.t (id, grp) values (2, 1);
+select id, code from tca27_b.t order by id;
+→ [{"id": 2, "code": 1}]
+
+-- ===================================
+-- 28. PK transport variant. A logical PK over an authored-bijective column mapping to
+--     the basis PK is `proved` by transport — the basis PK governs a write-through.
+--     28a: a logical PK `on conflict replace` over a plain-ABORT basis PK reds.
+-- ===================================
+
+declare schema tca28a_b {
+	table t (
+		k integer primary key check (k in (1, 2, 3))
+	)
+}
+
+-- run
+
+apply schema tca28a_b;
+
+-- run
+
+declare logical schema tca28a_x {
+	table t (
+		n integer primary key on conflict replace check (n in (11, 12, 13))
+	)
+}
+
+-- run
+
+declare lens for tca28a_x over tca28a_b {
+	view t as select k + 10 as n
+		with inverse (k = new.n - 10)
+	from tca28a_b.t
+}
+
+-- run
+
+apply schema tca28a_x;
+-- error: lens.unenforceable-conflict-action
+
+-- ===================================
+-- 28b. A matching basis PK action deploys clean — confirms the PK arm's positive case.
+-- ===================================
+
+declare schema tca28b_b {
+	table t (
+		k integer primary key on conflict replace check (k in (1, 2, 3))
+	)
+}
+
+-- run
+
+apply schema tca28b_b;
+
+-- run
+
+declare logical schema tca28b_x {
+	table t (
+		n integer primary key on conflict replace check (n in (11, 12, 13))
+	)
+}
+
+-- run
+
+declare lens for tca28b_x over tca28b_b {
+	view t as select k + 10 as n
+		with inverse (k = new.n - 10)
+	from tca28b_b.t
+}
+
+-- run
+
+apply schema tca28b_x;
+
+-- run
+
+select count(*) as n from quereus_lens_advisories('tca28b_x');
+→ [{"n": 0}]

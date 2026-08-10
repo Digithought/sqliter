@@ -33,6 +33,31 @@ export function collectExternalReferences(subqueryNode: RelationalPlanNode): Set
 }
 
 /**
+ * Does `reader` reference a column produced anywhere inside `producer`'s subtree?
+ *
+ * The question a join's physical-algorithm rules must ask before replacing the
+ * nested-loop driver: hash and merge each drain one side before (or
+ * independently of) the other's rows exist, so a side reading its SIBLING's
+ * columns — a `JOIN LATERAL` subtree, or an index-nested-loop's own correlated
+ * seek — resolves against no row at runtime. Correlation to a scope OUTSIDE the
+ * join is a different question ({@link isCorrelatedSubquery}) and not a hazard:
+ * the enclosing driver installs that row slot before the whole join opens.
+ *
+ * `producer`'s whole subtree counts, not merely the attributes it exposes at its
+ * top, so the answer cannot hinge on which of them survived to its output list.
+ */
+export function readsColumnsOf(reader: RelationalPlanNode, producer: RelationalPlanNode): boolean {
+	const external = collectExternalReferences(reader);
+	if (external.size === 0) return false;
+	const produced = new Set<number>();
+	collectDefinedAttributes(producer, produced);
+	for (const attrId of external) {
+		if (produced.has(attrId)) return true;
+	}
+	return false;
+}
+
+/**
  * Recursively collect all attributes defined by relational nodes within a subtree
  */
 function collectDefinedAttributes(node: PlanNode, definedAttributes: Set<number>): void {

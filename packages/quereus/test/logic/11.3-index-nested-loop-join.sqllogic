@@ -1,0 +1,142 @@
+-- 11.3-index-nested-loop-join.sqllogic
+-- Result-equality coverage for the index-nested-loop join (rule-join-physical-selection
+-- + rules/join/index-nested-loop.ts): a small outer joined to a large indexed inner
+-- replaces the inner walk with one IndexSeek per outer row. Every assertion here is
+-- pure row equality, so it holds whichever physical join the optimizer picks — the
+-- plan-shape assertions (that these shapes DO pick the seek) live in
+-- test/optimizer/index-nested-loop.spec.ts.
+
+-- Small outer: one row with a NULL join key, one with a key matching nothing.
+CREATE TABLE inl_s (id INTEGER PRIMARY KEY, k INTEGER NULL);
+INSERT INTO inl_s VALUES (1, 5), (2, 7), (3, 500), (4, NULL);
+
+-- Large inner: v secondary-indexed; one row with a NULL v (must never match).
+CREATE TABLE inl_big (id INTEGER PRIMARY KEY, v INTEGER NULL, w INTEGER);
+CREATE INDEX inl_idx_v ON inl_big(v);
+INSERT INTO inl_big VALUES
+	(1, 1, 1), (2, 2, 2), (3, 3, 3), (4, 4, 4), (5, 5, 0), (6, 6, 1), (7, 7, 2), (8, 8, 3),
+	(9, 9, 4), (10, 10, 0), (11, 11, 1), (12, 12, 2), (13, 13, 3), (14, 14, 4), (15, 15, 0),
+	(16, 16, 1), (17, 17, 2), (18, 18, 3), (19, 19, 4), (20, 20, 0), (21, 21, 1), (22, 22, 2),
+	(23, 23, 3), (24, 24, 4), (25, 25, 0), (26, 26, 1), (27, 27, 2), (28, 28, 3), (29, 29, 4),
+	(30, 30, 0), (31, 31, 1), (32, 32, 2), (33, 33, 3), (34, 34, 4), (35, 35, 0), (36, 36, 1),
+	(37, 37, 2), (38, 38, 3), (39, 39, 4), (40, 40, 0), (41, NULL, 0);
+ANALYZE;
+
+-- INNER: only the two matching outer rows survive
+SELECT s.id, b.id AS bid FROM inl_s s JOIN inl_big b ON b.v = s.k ORDER BY s.id;
+→ [{"id":1,"bid":5},{"id":2,"bid":7}]
+
+-- LEFT: unmatched (k=500) and NULL-key outer rows null-pad — `NULL = v` is UNKNOWN
+SELECT s.id, b.id AS bid FROM inl_s s LEFT JOIN inl_big b ON b.v = s.k ORDER BY s.id;
+→ [{"id":1,"bid":5},{"id":2,"bid":7},{"id":3,"bid":null},{"id":4,"bid":null}]
+
+-- SEMI (EXISTS): first-match short-circuit; NULL key drops
+SELECT s.id FROM inl_s s WHERE EXISTS (SELECT 1 FROM inl_big b WHERE b.v = s.k) ORDER BY s.id;
+→ [{"id":1},{"id":2}]
+
+-- ANTI (NOT EXISTS): unmatched AND NULL-key outer rows are kept
+SELECT s.id FROM inl_s s WHERE NOT EXISTS (SELECT 1 FROM inl_big b WHERE b.v = s.k) ORDER BY s.id;
+→ [{"id":3},{"id":4}]
+
+-- The inner NULL-v row (id 41) matches nothing: NULL keys miss from BOTH sides
+SELECT count(*) AS n FROM inl_s s JOIN inl_big b ON b.v = s.k;
+→ [{"n":2}]
+
+-- `exists … as` flag joins keep the nested-loop driver, so they CAN take the seek
+-- path — the flag bit must survive and report per-row match truthfully
+SELECT s.id, has_b FROM inl_s s LEFT JOIN inl_big b ON b.v = s.k EXISTS RIGHT AS has_b ORDER BY s.id;
+→ [{"id":1,"has_b":true},{"id":2,"has_b":true},{"id":3,"has_b":false},{"id":4,"has_b":false}]
+
+-- Self-join: two access sites on the same table must not share a cursor (the
+-- outer walk and the per-row inner seek are distinct scan sites)
+SELECT a.id, b.id AS bid FROM inl_big a JOIN inl_big b ON b.v = a.w WHERE a.id <= 3 ORDER BY a.id;
+→ [{"id":1,"bid":1},{"id":2,"bid":2},{"id":3,"bid":3}]
+
+-- Three-way left-deep spine where the seek key comes from the INNER-MOST relation:
+-- at the final join the outer row is the composite [t1, t2] row and the t1
+-- attribute must still resolve inside the seek
+CREATE TABLE inl_t1 (id INTEGER PRIMARY KEY, k INTEGER);
+CREATE TABLE inl_t2 (id INTEGER PRIMARY KEY, t1_id INTEGER);
+INSERT INTO inl_t1 VALUES (1, 5), (2, 7);
+INSERT INTO inl_t2 VALUES (10, 1), (20, 2);
+ANALYZE;
+SELECT t1.id, t2.id AS t2id, b.id AS bid
+FROM inl_t1 t1 JOIN inl_t2 t2 ON t2.t1_id = t1.id JOIN inl_big b ON b.v = t1.k
+ORDER BY t1.id;
+→ [{"id":1,"t2id":10,"bid":5},{"id":2,"t2id":20,"bid":7}]
+
+-- ===== Composite and partial-composite keys =====
+
+CREATE TABLE inl_c (a INTEGER, b INTEGER, val TEXT, PRIMARY KEY (a, b));
+INSERT INTO inl_c VALUES
+	(1, 1, 'c1'), (2, 2, 'c2'), (3, 3, 'c3'), (4, 4, 'c4'), (0, 5, 'c5'),
+	(1, 6, 'c6'), (2, 7, 'c7'), (3, 8, 'c8'), (4, 9, 'c9'), (0, 10, 'c10'),
+	(1, 11, 'c11'), (2, 12, 'c12'), (3, 13, 'c13'), (4, 14, 'c14'), (0, 15, 'c15'),
+	(1, 16, 'c16'), (2, 17, 'c17'), (3, 18, 'c18'), (4, 19, 'c19'), (0, 20, 'c20'),
+	(1, 21, 'c21'), (2, 22, 'c22'), (3, 23, 'c23'), (4, 24, 'c24'), (0, 25, 'c25'),
+	(1, 26, 'c26'), (2, 27, 'c27'), (3, 28, 'c28'), (4, 29, 'c29'), (0, 30, 'c30');
+CREATE TABLE inl_s2 (id INTEGER PRIMARY KEY, x INTEGER NULL, y INTEGER NULL, name TEXT);
+INSERT INTO inl_s2 VALUES (1, 3, 3, 'c3'), (2, 2, 7, 'c12'), (3, 4, 999, 'zzz'), (4, NULL, 1, 'c1');
+ANALYZE;
+
+-- Both equi pairs covered by the composite PK: one composite seek per outer row
+SELECT s2.id, c.val FROM inl_s2 s2 JOIN inl_c c ON c.a = s2.x AND c.b = s2.y ORDER BY s2.id;
+→ [{"id":1,"val":"c3"},{"id":2,"val":"c7"}]
+
+-- Partial composite: the index covers only the `a = x` pair; `val = name` stays
+-- enforced by the retained condition (id 2: x=2 candidates are c2,c7,c12,… — only
+-- c12's val matches its name)
+SELECT s2.id, c.b AS cb FROM inl_s2 s2 JOIN inl_c c ON c.a = s2.x AND c.val = s2.name ORDER BY s2.id;
+→ [{"id":1,"cb":3},{"id":2,"cb":12}]
+
+-- ===== LATERAL with an ON equality (the sibling-reference guard) =====
+-- Before the guard in rule-join-physical-selection, a LATERAL right side reading
+-- the left side's columns with an equality ON was converted to a hash join,
+-- which drains the right side before any left row exists — "No row context
+-- found" at runtime. The guard keeps the nested-loop driver.
+
+CREATE TABLE inl_lt (k INTEGER PRIMARY KEY, v INTEGER);
+CREATE TABLE inl_lu (k INTEGER PRIMARY KEY, v INTEGER);
+INSERT INTO inl_lt VALUES (1, 10), (2, 20);
+INSERT INTO inl_lu VALUES (1, 10), (2, 99);
+
+SELECT t.k AS tk, x.k AS xk, x.v AS xv
+FROM inl_lt t JOIN LATERAL (SELECT * FROM inl_lu u WHERE u.k = t.k) x ON x.v = t.v;
+→ [{"tk":1,"xk":1,"xv":10}]
+
+SELECT t.k AS tk, x.k AS xk
+FROM inl_lt t LEFT JOIN LATERAL (SELECT * FROM inl_lu u WHERE u.k = t.k) x ON x.v = t.v
+ORDER BY tk;
+→ [{"tk":1,"xk":1},{"tk":2,"xk":null}]
+
+-- ===== Collation: both directions of a NOCASE / BINARY join =====
+
+-- Inner column declared NOCASE (its index inherits NOCASE); outer defaulted
+-- BINARY. Declared beats defaulted, so the join compares NOCASE and the index
+-- cover matches — the seek path is eligible, and 'n3' must match 'N3'.
+CREATE TABLE inl_cs (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE);
+CREATE INDEX inl_idx_cs ON inl_cs(name);
+INSERT INTO inl_cs VALUES
+	(1, 'N1'), (2, 'N2'), (3, 'N3'), (4, 'N4'), (5, 'N5'), (6, 'N6'), (7, 'N7'), (8, 'N8'),
+	(9, 'N9'), (10, 'N10'), (11, 'N11'), (12, 'N12'), (13, 'N13'), (14, 'N14'), (15, 'N15'),
+	(16, 'N16'), (17, 'N17'), (18, 'N18'), (19, 'N19'), (20, 'N20');
+CREATE TABLE inl_co (id INTEGER PRIMARY KEY, name TEXT);
+INSERT INTO inl_co VALUES (1, 'n3'), (2, 'N5'), (3, 'zzz');
+ANALYZE;
+SELECT o.id, i.id AS iid FROM inl_co o JOIN inl_cs i ON i.name = o.name ORDER BY o.id;
+→ [{"id":1,"iid":3},{"id":2,"iid":5}]
+
+-- Reverse direction: outer declared NOCASE, inner index BINARY — a raw seek
+-- would under-fetch, so the rule declines and the surviving hash join must
+-- return BOTH case variants of 'A1'.
+CREATE TABLE inl_bs (id INTEGER PRIMARY KEY, name TEXT);
+CREATE INDEX inl_idx_bs ON inl_bs(name);
+INSERT INTO inl_bs VALUES
+	(1, 'B1'), (2, 'B2'), (3, 'B3'), (4, 'B4'), (5, 'B5'), (6, 'B6'), (7, 'B7'), (8, 'B8'),
+	(9, 'B9'), (10, 'B10'), (11, 'B11'), (12, 'B12'), (13, 'B13'), (14, 'B14'), (15, 'B15'),
+	(16, 'B16'), (17, 'B17'), (18, 'B18'), (19, 'B19'), (20, 'B20'), (21, 'a1'), (22, 'A1');
+CREATE TABLE inl_no (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE);
+INSERT INTO inl_no VALUES (1, 'A1');
+ANALYZE;
+SELECT o.id, b.id AS bid FROM inl_no o JOIN inl_bs b ON b.name = o.name ORDER BY bid;
+→ [{"id":1,"bid":21},{"id":1,"bid":22}]

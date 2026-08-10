@@ -1,0 +1,39 @@
+-- 06.9.1.1-json-coerce-once-index.sqllogic
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Carved out of 06.9.1-json-coerce-once (ticket
+-- json-native-form-write-path-coverage): CREATE INDEX needs standalone index
+-- DDL, which not every backend implements, and the requires-capability
+-- directive is whole-file — putting this case into the parent file would make
+-- its much larger scenario set skippable too. Index DDL only; every other
+-- write path stays in the parent file.
+--
+-- Subject: index DDL on a JSON column rebuilds every existing row's index
+-- entry; the stored JSON text scalar must survive untouched (not re-parsed).
+
+create table jco_ix (id integer primary key, j json);
+insert into jco_ix values (1, '"9"'), (2, '"null"');
+create index jco_ix_j on jco_ix (j);
+-- run
+
+select id, json_quote(j) as jq from jco_ix order by id;
+→ [{"id":1,"jq":"\"9\""},{"id":2,"jq":"\"null\""}]
+
+-- CREATE UNIQUE INDEX additionally compares every existing row's key: a
+-- re-parse here would make the JSON text scalars "9" and "9.0" collide as the
+-- numbers 9 and 9.0, so a false UNIQUE violation is the failure shape.
+create table jco_ix_u (id integer primary key, j json);
+insert into jco_ix_u values (1, '"9"'), (2, '"9.0"');
+create unique index jco_ix_u_j on jco_ix_u (j);
+-- run
+
+select id, json_quote(j) as jq from jco_ix_u order by id;
+→ [{"id":1,"jq":"\"9\""},{"id":2,"jq":"\"9.0\""}]
+
+-- DROP INDEX rebuilds the table's schema; the stored values ride along.
+drop index jco_ix_u_j;
+-- run
+
+select id, json_quote(j) as jq from jco_ix_u order by id;
+→ [{"id":1,"jq":"\"9\""},{"id":2,"jq":"\"9.0\""}]

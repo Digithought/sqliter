@@ -2,6 +2,7 @@ import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
 import { collectSchemaCatalog, generateDeclaredDDL } from '../../src/schema/catalog.js';
 import { computeSchemaHash, computeShortSchemaHash } from '../../src/schema/schema-hasher.js';
+import { parse } from '../../src/parser/index.js';
 import type * as AST from '../../src/parser/ast.js';
 
 describe('Schema Catalog', () => {
@@ -37,6 +38,33 @@ describe('Schema Catalog', () => {
 			expect(table!.columns).to.have.length(2);
 			expect(table!.columns[0].name).to.equal('id');
 			expect(table!.columns[1].name).to.equal('name');
+		});
+
+		it('excludes an engine-managed table (quereus.engine_managed = true) from the catalog', async () => {
+			await db.exec('CREATE TABLE plain_t (id INTEGER PRIMARY KEY, name TEXT)');
+			await db.exec(
+				'CREATE TABLE managed_t (id INTEGER PRIMARY KEY, v INTEGER) WITH TAGS ("quereus.engine_managed" = true)',
+			);
+
+			const catalog = collectSchemaCatalog(db, 'main');
+			// The plain table is present; the engine-managed table is skipped entirely,
+			// so the declarative differ never sees it as an orphan to drop / an object to
+			// create, and export_schema omits it. (Motivating case: Lamina's per-column
+			// `(rowId, value)` basis member relations.)
+			expect(catalog.tables.find(t => t.name === 'plain_t'), 'plain table present').to.exist;
+			expect(catalog.tables.find(t => t.name === 'managed_t'), 'engine-managed table excluded').to.not.exist;
+			// Yet it stays fully resolvable in the live Schema for every other path.
+			expect(db.schemaManager.getSchema('main')!.getTable('managed_t'), 'still resolvable via getTable').to.exist;
+		});
+
+		it('keeps a table with engine_managed = false (or absent) in the catalog', async () => {
+			// The exclusion is strict `=== true`; a false / absent value is an ordinary
+			// differ-managed table.
+			await db.exec(
+				'CREATE TABLE not_managed_t (id INTEGER PRIMARY KEY) WITH TAGS ("quereus.engine_managed" = false)',
+			);
+			const catalog = collectSchemaCatalog(db, 'main');
+			expect(catalog.tables.find(t => t.name === 'not_managed_t'), 'engine_managed=false → present').to.exist;
 		});
 
 		it('should collect tables with composite primary keys', async () => {
@@ -97,6 +125,79 @@ describe('Schema Catalog', () => {
 			expect(table, 'settings table').to.exist;
 			expect(table!.ddl).to.include('PRIMARY KEY ()');
 			expect(table!.primaryKey).to.have.length(0);
+		});
+	});
+
+	// The differ compares a constraint's canonical body fragment (`definition`,
+	// name + tags excluded) to detect a name-unchanged-but-body-changed constraint.
+	// These pin the exact canonical form per class so the declared and actual sides
+	// stay byte-comparable (a drift here would churn spurious drop+recreates).
+	describe('namedConstraints definition canonicalization', () => {
+		async function definitionOf(createSql: string, table: string, constraintName: string): Promise<string> {
+			await db.exec(createSql);
+			const cat = collectSchemaCatalog(db, 'main');
+			const t = cat.tables.find(t => t.name === table)!;
+			const c = t.namedConstraints.find(c => c.name === constraintName)!;
+			expect(c, `constraint ${constraintName} surfaced`).to.exist;
+			return c.definition;
+		}
+
+		it('CHECK: default (insert+update) operation mask is elided', async () => {
+			const def = await definitionOf(
+				'CREATE TABLE t (id INTEGER PRIMARY KEY, qty INTEGER, CONSTRAINT chk_qty CHECK (qty > 0))',
+				't', 'chk_qty',
+			);
+			expect(def).to.equal('check (qty > 0)');
+		});
+
+		it('CHECK: a non-default operation mask is preserved', async () => {
+			const def = await definitionOf(
+				'CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, CONSTRAINT c1 CHECK ON DELETE (v > 0))',
+				't', 'c1',
+			);
+			expect(def).to.equal('check on delete (v > 0)');
+		});
+
+		it('UNIQUE: lists columns and elides the default ABORT conflict', async () => {
+			const def = await definitionOf(
+				'CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, CONSTRAINT uq UNIQUE (a, b))',
+				't', 'uq',
+			);
+			expect(def).to.equal('unique (a, b)');
+		});
+
+		it('UNIQUE: a non-default conflict action is preserved', async () => {
+			const def = await definitionOf(
+				'CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, CONSTRAINT uq UNIQUE (a) ON CONFLICT REPLACE)',
+				't', 'uq',
+			);
+			expect(def).to.equal('unique (a) on conflict replace');
+		});
+
+		it('FOREIGN KEY: elides default RESTRICT actions', async () => {
+			await db.exec('CREATE TABLE parent (pid INTEGER PRIMARY KEY)');
+			const def = await definitionOf(
+				'CREATE TABLE child (id INTEGER PRIMARY KEY, pa INTEGER, CONSTRAINT fk FOREIGN KEY (pa) REFERENCES parent(pid))',
+				'child', 'fk',
+			);
+			expect(def).to.equal('foreign key (pa) references parent(pid)');
+		});
+
+		it('FOREIGN KEY: a non-default ON DELETE action is preserved', async () => {
+			await db.exec('CREATE TABLE parent (pid INTEGER PRIMARY KEY)');
+			const def = await definitionOf(
+				'CREATE TABLE child (id INTEGER PRIMARY KEY, pa INTEGER, CONSTRAINT fk FOREIGN KEY (pa) REFERENCES parent(pid) ON DELETE CASCADE)',
+				'child', 'fk',
+			);
+			expect(def).to.equal('foreign key (pa) references parent(pid) on delete cascade');
+		});
+
+		it('definition excludes the constraint tags (tag-only change is not a body change)', async () => {
+			const def = await definitionOf(
+				"CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, CONSTRAINT uq UNIQUE (a) WITH TAGS (msg = 'hi'))",
+				't', 'uq',
+			);
+			expect(def, 'tags must not appear in the canonical body').to.equal('unique (a)');
 		});
 	});
 
@@ -198,6 +299,75 @@ describe('Schema Catalog', () => {
 			expect(after.tags).to.deep.equal(beforeTags);
 		});
 
+		it('roundtrips table-level CHECK / UNIQUE / FOREIGN KEY constraints', async () => {
+			// Regression: generateTableDDL historically emitted only columns + PK + USING
+			// + tags, silently dropping every table constraint on persistence round-trip.
+			// Build a table carrying one of each named constraint class plus an unnamed
+			// column-level CHECK (auto `_check_<col>`, exercising the verbose
+			// `check on insert, update (...)` re-parse), then assert the constraints
+			// survive both a raw parse() and a full drop+recreate.
+			await db.exec('CREATE TABLE rt_parent (pid INTEGER PRIMARY KEY) USING memory');
+			await db.exec(`CREATE TABLE rt_cons (
+				id INTEGER PRIMARY KEY,
+				email TEXT,
+				qty INTEGER,
+				pref INTEGER,
+				status INTEGER CHECK (status >= 0),
+				CONSTRAINT uq_email UNIQUE (email),
+				CONSTRAINT chk_qty CHECK (qty > 0),
+				CONSTRAINT fk_pref FOREIGN KEY (pref) REFERENCES rt_parent (pid)
+			) USING memory`);
+
+			const catalog = collectSchemaCatalog(db, 'main');
+			const entry = catalog.tables.find(t => t.name === 'rt_cons')!;
+			expect(entry, 'rt_cons catalog entry').to.exist;
+			// The emitted DDL must actually carry each constraint clause. Constraint
+			// bodies route through quoteIdentifier (bare for non-keywords), so column
+			// refs stay unquoted here even though column DEFS above are always quoted.
+			const lower = entry.ddl.toLowerCase();
+			expect(lower, entry.ddl).to.include('unique (email)');
+			expect(lower, entry.ddl).to.include('(qty > 0)');
+			expect(lower, entry.ddl).to.include('foreign key (pref) references rt_parent(pid)');
+			expect(lower, entry.ddl).to.include('constraint uq_email');
+			expect(lower, entry.ddl).to.include('constraint chk_qty');
+			expect(lower, entry.ddl).to.include('constraint fk_pref');
+
+			// (1) Raw parse-back: the emitted DDL must re-parse into the same constraint set.
+			const parsed = parse(entry.ddl);
+			expect(parsed.type).to.equal('createTable');
+			const parsedConstraints = (parsed as AST.CreateTableStmt).constraints;
+			const byType = (t: string) => parsedConstraints.filter(c => c.type === t);
+			expect(byType('unique').map(c => c.name)).to.deep.equal(['uq_email']);
+			expect(byType('unique')[0].columns!.map(c => c.name)).to.deep.equal(['email']);
+			// Two CHECKs: the named table-level chk_qty and the auto-named column check.
+			expect(byType('check').map(c => c.name).sort()).to.deep.equal(['_check_status', 'chk_qty']);
+			const fk = byType('foreignKey')[0];
+			expect(fk.name).to.equal('fk_pref');
+			expect(fk.columns!.map(c => c.name)).to.deep.equal(['pref']);
+			expect(fk.foreignKey!.table).to.equal('rt_parent');
+			expect(fk.foreignKey!.columns).to.deep.equal(['pid']);
+			expect(fk.foreignKey!.onDelete).to.equal('restrict');
+			expect(fk.foreignKey!.onUpdate).to.equal('restrict');
+
+			// (2) Full drop+recreate: the rebuilt schema's canonical constraint set must
+			// match the original. namedConstraints' `definition` is the canonical body
+			// (columns + FK actions + CHECK expr), so equality proves semantic fidelity.
+			const beforeNamed = [...entry.namedConstraints].sort((a, b) => a.name.localeCompare(b.name));
+			await db.exec('DROP TABLE rt_cons');
+			await db.exec(entry.ddl);
+
+			const after = db.schemaManager.getTable('main', 'rt_cons')!;
+			expect(after, 'rt_cons exists after roundtrip').to.exist;
+			expect((after.uniqueConstraints ?? []).map(c => c.name)).to.deep.equal(['uq_email']);
+			expect((after.foreignKeys ?? []).map(c => c.name)).to.deep.equal(['fk_pref']);
+			// Both CHECKs survive (named + auto-named column check).
+			expect((after.checkConstraints ?? []).map(c => c.name).sort()).to.deep.equal(['_check_status', 'chk_qty']);
+
+			const afterEntry = collectSchemaCatalog(db, 'main').tables.find(t => t.name === 'rt_cons')!;
+			const afterNamed = [...afterEntry.namedConstraints].sort((a, b) => a.name.localeCompare(b.name));
+			expect(afterNamed).to.deep.equal(beforeNamed);
+		});
+
 		it('honors default_column_nullability for emission and survives a roundtrip', async () => {
 			// Default is 'not_null': NOT NULL columns elide the annotation, nullable emits NULL.
 			await db.exec('CREATE TABLE rt_nn (id INTEGER PRIMARY KEY, note TEXT NULL) USING memory');
@@ -227,6 +397,34 @@ describe('Schema Catalog', () => {
 			const afterNullable = db.schemaManager.getTable('main', 'rt_nn')!;
 			expect(afterNullable.columns.find(c => c.name === 'id')!.notNull).to.equal(true);
 			expect(afterNullable.columns.find(c => c.name === 'note')!.notNull).to.equal(false);
+		});
+
+		it('emits explicit COLLATE under default_collation and survives a reset roundtrip', async () => {
+			// Under a non-BINARY default_collation, an omitted-COLLATE text column resolves
+			// to that collation AND the catalog DDL must carry it explicitly so the column
+			// round-trips identically regardless of the reopen session default.
+			db.setOption('default_collation', 'nocase');
+			await db.exec('CREATE TABLE rt_dc (id INTEGER PRIMARY KEY, name TEXT) USING memory');
+
+			const created = db.schemaManager.getTable('main', 'rt_dc')!;
+			expect(created.columns.find(c => c.name === 'name')!.collation).to.equal('NOCASE');
+			// INTEGER does not support NOCASE → falls back to BINARY.
+			expect(created.columns.find(c => c.name === 'id')!.collation).to.equal('BINARY');
+
+			const catalog = collectSchemaCatalog(db, 'main');
+			const entry = catalog.tables.find(t => t.name === 'rt_dc')!;
+			// Persisted DDL must name the non-BINARY collation explicitly (no session-default elision).
+			expect(entry.ddl).to.match(/"name"\s+TEXT[^,]*COLLATE\s+NOCASE/i);
+
+			await db.exec('DROP TABLE rt_dc');
+
+			// Re-exec the persisted DDL under a RESET-to-BINARY session: the explicit
+			// COLLATE in the DDL wins over the live default, so the column is still NOCASE.
+			db.setOption('default_collation', 'BINARY');
+			await db.exec(entry.ddl);
+			const reopened = db.schemaManager.getTable('main', 'rt_dc')!;
+			expect(reopened.columns.find(c => c.name === 'name')!.collation).to.equal('NOCASE');
+			expect(reopened.columns.find(c => c.name === 'id')!.collation).to.equal('BINARY');
 		});
 	});
 
@@ -360,7 +558,7 @@ describe('Schema Catalog', () => {
 						select: {
 							type: 'select',
 							columns: [{ type: 'all' }],
-							from: { type: 'table', table: { type: 'identifier', name: 'users' } },
+							from: [{ type: 'table', table: { type: 'identifier', name: 'users' } }],
 						},
 					},
 				}],
@@ -414,6 +612,28 @@ describe('Schema Catalog', () => {
 
 			const ddl = generateDeclaredDDL(schema);
 			expect(ddl).to.have.length(2);
+		});
+
+		it('should include declared assertions, qualified with a non-main target schema', () => {
+			const schema = parse(
+				'declare schema pol { table t (id integer, primary key (id)); assertion a1 check (not exists (select 1 from t where id < 0)) }'
+			) as AST.DeclareSchemaStmt;
+
+			const ddl = generateDeclaredDDL(schema, 'pol');
+			expect(ddl).to.have.length(2);
+			expect(ddl[1].toLowerCase()).to.include('create assertion');
+			expect(ddl[1]).to.include('pol.a1');
+		});
+
+		it('should not qualify a declared assertion for main', () => {
+			const schema = parse(
+				'declare schema main { assertion a1 check (1 = 1) }'
+			) as AST.DeclareSchemaStmt;
+
+			const ddl = generateDeclaredDDL(schema, 'main');
+			expect(ddl).to.have.length(1);
+			expect(ddl[0]).to.include('a1');
+			expect(ddl[0]).to.not.include('main.');
 		});
 	});
 });
@@ -498,6 +718,24 @@ describe('Schema Hasher', () => {
 		};
 
 		expect(computeSchemaHash(schema1)).to.not.equal(computeSchemaHash(schema2));
+	});
+
+	it('should change the hash when a declared assertion is added or its body changes', () => {
+		// Regression for ticket bug-declared-assertion-ignores-target-schema:
+		// generateDeclaredDDL had no assertion case, so these three all hashed alike.
+		const declare = (assertion: string | undefined): AST.DeclareSchemaStmt => parse(
+			'declare schema p { table t (x integer, primary key (x))'
+			+ (assertion ? `; assertion a1 check (${assertion})` : '')
+			+ ' }'
+		) as AST.DeclareSchemaStmt;
+
+		const without = computeSchemaHash(declare(undefined));
+		const bodyA = computeSchemaHash(declare('not exists (select 1 from t where x < 0)'));
+		const bodyB = computeSchemaHash(declare('not exists (select 1 from t where x < 100)'));
+
+		expect(bodyA).to.not.equal(without);
+		expect(bodyA).to.not.equal(bodyB);
+		expect(bodyB).to.not.equal(without);
 	});
 
 	it('should strip tags before hashing (tags do not affect hash)', () => {
@@ -594,7 +832,7 @@ describe('Schema Hasher', () => {
 					select: {
 						type: 'select',
 						columns: [{ type: 'all' }],
-						from: { type: 'table', table: { type: 'identifier', name: 't1' } },
+						from: [{ type: 'table', table: { type: 'identifier', name: 't1' } }],
 					},
 				},
 			}],
@@ -612,7 +850,7 @@ describe('Schema Hasher', () => {
 					select: {
 						type: 'select',
 						columns: [{ type: 'all' }],
-						from: { type: 'table', table: { type: 'identifier', name: 't1' } },
+						from: [{ type: 'table', table: { type: 'identifier', name: 't1' } }],
 					},
 					tags: { api: 'v2' },
 				},

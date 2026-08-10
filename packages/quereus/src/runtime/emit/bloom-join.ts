@@ -1,12 +1,13 @@
 import type { BloomJoinNode } from '../../planner/nodes/bloom-join-node.js';
-import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import { emitCallFromPlan, emitPlanNode } from '../emitters.js';
-import type { Row, OutputValue } from '../../common/types.js';
+import type { Row, SubProgram } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { createLogger } from '../../common/logger.js';
 import { buildRowDescriptor } from '../../util/row-descriptor.js';
 import { createRowSlot } from '../context-helpers.js';
-import { resolveKeyNormalizer, serializeRowKey } from '../../util/key-serializer.js';
+import { buildJoinKeyExtractor } from './join-key-extractor.js';
 import { joinOutputRow } from './join-output.js';
 
 const log = createLogger('runtime:emit:bloom-join');
@@ -25,10 +26,9 @@ export function emitBloomJoin(plan: BloomJoinNode, ctx: EmissionContext): Instru
 	const leftRowDescriptor = buildRowDescriptor(leftAttributes);
 	const rightRowDescriptor = buildRowDescriptor(rightAttributes);
 
-	// Pre-resolve equi-pair column indices and collation normalizers from attribute IDs
+	// Pre-resolve equi-pair column indices from attribute IDs
 	const leftIndices: number[] = [];
 	const rightIndices: number[] = [];
-	const keyNormalizers: ((s: string) => string)[] = [];
 	const leftIndex = plan.left.getAttributeIndex();
 	const rightIndex = plan.right.getAttributeIndex();
 	for (const pair of plan.equiPairs) {
@@ -39,19 +39,32 @@ export function emitBloomJoin(plan: BloomJoinNode, ctx: EmissionContext): Instru
 		}
 		leftIndices.push(li);
 		rightIndices.push(ri);
-		// Use the left attribute's collation (consistent with nested-loop join behavior)
-		const collationName = leftAttributes[li].type.collationName || rightAttributes[ri].type.collationName;
-		keyNormalizers.push(resolveKeyNormalizer(collationName));
 	}
+
+	// Collation normalizers + semantic-ordering canonicalizers, shared with the
+	// key-set semi join emitter — see join-key-extractor.ts for the resolution
+	// and LOCKSTEP notes.
+	const extractKey = buildJoinKeyExtractor(
+		plan.equiPairs.map((_pair, i) =>
+			[leftAttributes[leftIndices[i]].type, rightAttributes[rightIndices[i]].type] as const),
+		ctx,
+	);
 
 	const rightColCount = rightAttributes.length;
 
+	// The residual sub-program is a param only when `plan.residualCondition` is set,
+	// so `run` is called with two or three args. Declared as a trailing rest tuple
+	// rather than an optional param: `residual?: SubProgram` would type as
+	// `SubProgram | undefined`, and `undefined` is not a `RuntimeValue`, so the
+	// signature would not conform to `InstructionRun` (see `asRun`).
 	async function* run(
 		rctx: RuntimeContext,
 		leftSource: AsyncIterable<Row>,
 		rightSource: AsyncIterable<Row>,
-		residualCallback?: (ctx: RuntimeContext) => OutputValue
+		...residual: SubProgram[]
 	): AsyncIterable<Row> {
+		const residualCallback: SubProgram | undefined = residual[0];
+
 		log('Starting %s hash join: %d equi-pairs, %d left attrs, %d right attrs',
 			plan.joinType.toUpperCase(), plan.equiPairs.length, leftAttributes.length, rightAttributes.length);
 
@@ -72,7 +85,7 @@ export function emitBloomJoin(plan: BloomJoinNode, ctx: EmissionContext): Instru
 			// === Build phase: materialize right side into hash map ===
 			const hashMap = new Map<string, Row[]>();
 			for await (const rightRow of rightSource) {
-				const key = serializeRowKey(rightRow, rightIndices, keyNormalizers);
+				const key = extractKey(rightRow, rightIndices);
 				if (key === null) continue; // null keys can't match
 				const bucket = hashMap.get(key);
 				if (bucket) {
@@ -91,7 +104,7 @@ export function emitBloomJoin(plan: BloomJoinNode, ctx: EmissionContext): Instru
 				const leftRow = next.value;
 				leftSlot.set(leftRow);
 
-				const key = serializeRowKey(leftRow, leftIndices, keyNormalizers);
+				const key = extractKey(leftRow, leftIndices);
 				let matched = false;
 
 				if (key !== null) {
@@ -100,9 +113,12 @@ export function emitBloomJoin(plan: BloomJoinNode, ctx: EmissionContext): Instru
 						for (const rightRow of bucket) {
 							rightSlot.set(rightRow);
 
-							// Evaluate residual condition if present
+							// Evaluate residual condition if present. Resolve without a
+							// per-row microtask hop: `await` only when the sub-program is
+							// genuinely a promise. See resolveMaybe in runtime/async-util.ts.
 							if (residualCallback) {
-								const result = await residualCallback(rctx);
+								const raw = residualCallback(rctx);
+								const result = raw instanceof Promise ? await raw : raw;
 								if (!result) continue;
 							}
 
@@ -144,7 +160,7 @@ export function emitBloomJoin(plan: BloomJoinNode, ctx: EmissionContext): Instru
 
 	return {
 		params,
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `${plan.joinType} join (bloom/hash)`
 	};
 }

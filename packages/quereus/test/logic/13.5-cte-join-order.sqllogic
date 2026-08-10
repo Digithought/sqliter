@@ -1,0 +1,166 @@
+-- 13.5-cte-join-order.sqllogic - a WITH-clause reference must resolve the same
+-- whichever side of a join it appears on
+--
+-- Regression guard for `bug-cte-reference-as-second-join-source-fails-at-runtime`.
+--
+-- Every FROM source gets a scope mapping its column names to plan attribute ids, and
+-- a join combines the two peer scopes with MultiScope (first match wins). Each source
+-- scope used to be built with the *enclosing* query's scope as its fallback parent, so
+-- when MultiScope asked the LEFT peer about a name it did not own, the left peer did
+-- not answer "no" — it forwarded the question to the enclosing scope and answered from
+-- there. The right peer was never consulted.
+--
+-- `createCTEScope` registers a qualified `c.col` symbol for every WITH-clause column in
+-- the enclosing scope, bound to the CTE *body's* attribute ids (not the ids a
+-- CTEReferenceNode republishes). So `… from r join c on c.rid = r.id` resolved `c.rid`
+-- through `r`'s scope → miss → enclosing scope → the body's attribute id, which nothing
+-- below that point publishes, and the query died at runtime with
+-- "No row context found for column rid". The mirrored `from c join r on …` worked only
+-- because there the CTE reference is the left peer and answers first.
+--
+-- Fix: a FROM source's scope holds only its own columns (parented on EmptyScope); the
+-- enclosing-query fallback is composed once by the consumer (ShadowScope).
+--
+-- Invariant pinned here: for each shape, both join orders return the same rows, and the
+-- rows are the correct ones (row data, not just "did not crash").
+
+create table r (id integer primary key, qty integer, label text);
+insert into r values (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c');
+
+create table o (oid integer primary key, rid integer, cat text, qty integer);
+insert into o values (100, 1, 'x', 10), (101, 2, 'y', 20), (102, 2, 'z', 99), (103, 9, 'w', 5);
+
+create table s (k text primary key, note text);
+insert into s values ('x', 'X'), ('y', 'Y');
+
+-- =============================================================================
+-- The reported shape: WITH clause as the SECOND (right) join source. Before the
+-- fix this threw "No row context found for column rid"; the mirrored order below
+-- always worked, so the two must agree.
+-- =============================================================================
+
+with c as (select cat, qty, rid from o)
+select count(*) as n from r join c on c.rid = r.id;
+→ [{"n":3}]
+
+with c as (select cat, qty, rid from o)
+select count(*) as n from c join r on c.rid = r.id;
+→ [{"n":3}]
+
+-- Same shapes projecting real columns, so a wrong-rows regression is caught too.
+
+with c as (select cat, qty, rid from o)
+select r.id, c.cat from r join c on c.rid = r.id order by r.id, c.cat;
+→ [{"id":1,"cat":"x"},{"id":2,"cat":"y"},{"id":2,"cat":"z"}]
+
+with c as (select cat, qty, rid from o)
+select r.id, c.cat from c join r on c.rid = r.id order by r.id, c.cat;
+→ [{"id":1,"cat":"x"},{"id":2,"cat":"y"},{"id":2,"cat":"z"}]
+
+-- =============================================================================
+-- Operand-swapped ON condition — `c.rid` is looked up second rather than first.
+-- =============================================================================
+
+with c as (select cat, qty, rid from o)
+select r.id, c.cat from r join c on r.id = c.rid order by r.id, c.cat;
+→ [{"id":1,"cat":"x"},{"id":2,"cat":"y"},{"id":2,"cat":"z"}]
+
+-- =============================================================================
+-- Non-key join column: the join cannot be answered by a primary-key seek, so a
+-- different access path carries the same column reference.
+-- =============================================================================
+
+with c as (select cat, qty, rid from o)
+select r.id, c.cat from r join c on c.qty = r.qty order by r.id, c.cat;
+→ [{"id":1,"cat":"x"},{"id":2,"cat":"y"}]
+
+with c as (select cat, qty, rid from o)
+select r.id, c.cat from c join r on c.qty = r.qty order by r.id, c.cat;
+→ [{"id":1,"cat":"x"},{"id":2,"cat":"y"}]
+
+-- =============================================================================
+-- LEFT JOIN with the WITH clause second — the null-extended side is the CTE.
+-- =============================================================================
+
+with c as (select cat, qty, rid from o)
+select r.id, c.cat from r left join c on c.rid = r.id order by r.id, c.cat;
+→ [{"id":1,"cat":"x"},{"id":2,"cat":"y"},{"id":2,"cat":"z"},{"id":3,"cat":null}]
+
+-- =============================================================================
+-- Three-way join with the WITH clause in the MIDDLE: `(r join c) join s`. The
+-- left peer of the outer join is itself a join, so its scope is a nested
+-- MultiScope — the fall-through has to work through two levels.
+-- =============================================================================
+
+with c as (select cat, qty, rid from o)
+select count(*) as n from r join c on c.rid = r.id join s on s.k = c.cat;
+→ [{"n":2}]
+
+with c as (select cat, qty, rid from o)
+select r.id, c.cat, s.note from r join c on c.rid = r.id join s on s.k = c.cat
+order by r.id, c.cat;
+→ [{"id":1,"cat":"x","note":"X"},{"id":2,"cat":"y","note":"Y"}]
+
+-- =============================================================================
+-- The aliased spelling passed before the fix (the enclosing scope registers
+-- `c.rid`, not `x.rid`, so the leak had nothing to hand back). Pinned so the fix
+-- does not regress the shape that already worked.
+-- =============================================================================
+
+with c as (select cat, qty, rid from o)
+select r.id, x.cat from r join c as x on x.rid = r.id order by r.id, x.cat;
+→ [{"id":1,"cat":"x"},{"id":2,"cat":"y"},{"id":2,"cat":"z"}]
+
+-- =============================================================================
+-- Naming a WITH-clause column without the CTE in FROM is a plain unresolved-column
+-- error, not a confusing runtime row-context failure. (Before the fix, the stale
+-- `c.cat → CTE body attribute id` registration in the enclosing scope made this
+-- resolve to an id nothing publishes.)
+-- =============================================================================
+
+with c as (select cat, qty, rid from o)
+select c.cat from r;
+-- error: c.cat
+
+-- =============================================================================
+-- The shapes that ONLY the deleted registration could plausibly have served: a
+-- `cteName.column` reference from somewhere other than the CTE's own SELECT list.
+-- Each one names the CTE in a FROM, so it resolves through the reference's own
+-- republished attribute ids — the ids that actually reach the runtime.
+-- =============================================================================
+
+-- CTE column read from a nested subquery, with the CTE in the OUTER from.
+
+with c as (select rid, cat from o)
+select c.rid, (select count(*) from r where r.id = c.rid) as n from c order by c.rid, c.cat;
+→ [{"rid":1,"n":1},{"rid":2,"n":1},{"rid":2,"n":1},{"rid":9,"n":0}]
+
+-- CTE in an UPDATE's WHERE subquery.
+
+with c as (select rid from o where cat = 'x')
+update r set label = 'hit' where id in (select c.rid from c);
+select id, label from r order by id;
+→ [{"id":1,"label":"hit"},{"id":2,"label":"b"},{"id":3,"label":"c"}]
+
+-- CTE in an UPDATE's SET subquery, correlated to the update target.
+
+with c as (select rid, cat from o where cat <> 'z')
+update r set label = coalesce((select c.cat from c where c.rid = r.id), label);
+select id, label from r order by id;
+→ [{"id":1,"label":"x"},{"id":2,"label":"y"},{"id":3,"label":"c"}]
+
+-- CTE in a DELETE's WHERE subquery, with RETURNING.
+
+with c as (select rid from o where cat = 'y')
+delete from r where id in (select c.rid from c) returning id, label;
+→ [{"id":2,"label":"y"}]
+
+-- CTE read from an UPDATE's RETURNING clause.
+
+with c as (select rid from o)
+update r set qty = qty + 1 returning id, (select count(*) from c) as total;
+→ [{"id":1,"total":4},{"id":3,"total":4}]
+
+drop table s;
+drop table o;
+drop table r;

@@ -1,24 +1,63 @@
 import { PlanNodeType } from './plan-node-type.js';
 import { PlanNode, type RelationalPlanNode, type UnaryRelationalNode, type ScalarPlanNode, type Attribute, isRelationalNode } from './plan-node.js';
-import type { RelationType } from '../../common/datatype.js';
+import type { RelationType, ScalarType } from '../../common/datatype.js';
 import type { Scope } from '../scopes/scope.js';
 import { Cached } from '../../util/cached.js';
 import { deriveProjectionColumnMap, projectKeys } from '../util/key-utils.js';
-import { addFd, projectConstantBindings, projectDomainConstraints, projectFds, superkeyToFd } from '../util/fd-utils.js';
+import { addFd, projectConstantBindings, projectDomainConstraints, projectFds, projectInds, superkeyToFd } from '../util/fd-utils.js';
 import { expressionToString } from '../../emit/ast-stringify.js';
 import { formatProjection } from '../../util/plan-formatter.js';
 import { ColumnReferenceNode } from './reference.js';
 import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
-import { ProjectionCapable } from '../framework/characteristics.js';
-import type { PhysicalProperties } from './plan-node.js';
+import type { ProjectionCapable } from '../framework/characteristics.js';
+import type { PhysicalProperties, FunctionalDependency, AuthoredInverseMeta } from './plan-node.js';
 import { projectMonotonicOnByAttrId, projectOrdering } from '../framework/physical-utils.js';
+import { deriveProjectUpdateLineage } from '../analysis/update-lineage.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
+import { disambiguateColumnNames } from '../util/output-names.js';
 
 export interface Projection {
 	node: ScalarPlanNode;
 	alias?: string;
 	/** Optional predefined attribute ID to preserve during optimization */
 	attributeId?: number;
+	/**
+	 * Build-time-validated `with inverse (col = expr, …)` metadata (authored
+	 * write-back puts). `deriveProjectUpdateLineage` upgrades a projection carrying
+	 * this to a writable `authored` UpdateSite — overriding any registry-inferred
+	 * site (authored wins; docs/vu-inverses.md § Authored inverses). Inert
+	 * on the read path.
+	 */
+	authoredInverse?: AuthoredInverseMeta;
+}
+
+/**
+ * Resolves the effective output type for a projection expression.
+ *
+ * For a bare {@link ColumnReferenceNode}, honor the type the SOURCE relation
+ * publishes for that attribute id — `sourceTypeById` is built from
+ * `source.getAttributes()` — rather than the column-ref's own captured
+ * `columnType`. The captured type is stamped at *build* time from the base-table
+ * column scope, so over an outer join it is stale: it ignores the null-extension
+ * the join applied to the lookup side (`p.name` reads NOT NULL even though the
+ * left-join output attribute is nullable). Trusting the source attribute makes
+ * the projection's output nullability correct, which is what `deriveBackingShape`
+ * stamps onto a materialized-view backing column.
+ *
+ * Falls back to `projNode.getType()` when the attribute id is not present in the
+ * source (e.g. a correlated reference to an outer relation) or for any non
+ * column-reference expression (the helper is then a no-op, so it is safe to apply
+ * uniformly at every type-derivation site).
+ */
+function effectiveProjectionType(
+	projNode: ScalarPlanNode,
+	sourceTypeById: ReadonlyMap<number, ScalarType>,
+): ScalarType {
+	if (projNode instanceof ColumnReferenceNode) {
+		return sourceTypeById.get(projNode.attributeId) ?? projNode.getType();
+	}
+	return projNode.getType();
 }
 
 /**
@@ -27,6 +66,7 @@ export interface Projection {
  */
 export class ProjectNode extends PlanNode implements UnaryRelationalNode, ProjectionCapable {
 	override readonly nodeType = PlanNodeType.Project;
+	readonly isProjectionCapable = true as const;
 
 	private outputTypeCache: Cached<RelationType>;
 	private attributesCache: Cached<readonly Attribute[]>;
@@ -47,41 +87,25 @@ export class ProjectNode extends PlanNode implements UnaryRelationalNode, Projec
 
 		this.outputTypeCache = new Cached(() => {
 			// Build column names with proper duplicate handling
-			const columnNames: string[] = [];
-			const nameCount = new Map<string, number>();
-
-			const columns = this.projections.map((proj) => {
+			const columnNames = disambiguateColumnNames(this.projections.map(proj => {
 				// Determine base column name
-				let baseName: string;
-				if (proj.alias) {
-					baseName = proj.alias;
-				} else if (proj.node instanceof ColumnReferenceNode) {
-					// For column references, use the unqualified column name
-					baseName = proj.node.expression.name;
-				} else {
-					// For expressions, use the string representation
-					baseName = expressionToString(proj.node.expression);
-				}
+				if (proj.alias) return proj.alias;
+				// For column references, use the unqualified column name
+				if (proj.node instanceof ColumnReferenceNode) return proj.node.expression.name;
+				// For expressions, use the string representation
+				return expressionToString(proj.node.expression);
+			}));
 
-				// Handle duplicate names
-				let finalName: string;
-				const currentCount = nameCount.get(baseName) || 0;
-				if (currentCount === 0) {
-					// First occurrence - use the base name
-					finalName = baseName;
-				} else {
-					// Subsequent occurrences - add numbered suffix
-					finalName = `${baseName}:${currentCount}`;
-				}
-				nameCount.set(baseName, currentCount + 1);
-				columnNames.push(finalName);
+			// Source attribute types by id: a bare column-ref projection inherits the
+			// type the source publishes for its attribute id (the null-extended,
+			// nullable type over an outer join), not its own stale captured `columnType`.
+			const sourceTypeById = this.sourceTypeById();
 
-				return {
-					name: finalName,
-					type: proj.node.getType(),
-					generated: proj.node.nodeType !== PlanNodeType.ColumnReference,
-				};
-			});
+			const columns = this.projections.map((proj, index) => ({
+				name: columnNames[index],
+				type: effectiveProjectionType(proj.node, sourceTypeById),
+				generated: proj.node.nodeType !== PlanNodeType.ColumnReference,
+			}));
 
 			const { map } = deriveProjectionColumnMap(
 				this.source.getAttributes(),
@@ -124,12 +148,17 @@ export class ProjectNode extends PlanNode implements UnaryRelationalNode, Projec
 			// Get the computed column names from the type
 			const outputType = this.getType();
 
+			// Same source-attr type resolution as outputTypeCache: a bare column-ref
+			// attribute carries the source's (null-extended) type, not its stale
+			// captured `columnType`.
+			const sourceTypeById = this.sourceTypeById();
+
 			// If preserveInputColumns is false, only create attributes for projections
 			if (!this.preserveInputColumns) {
 				return this.projections.map((proj, index) => ({
 					id: proj.attributeId ?? PlanNode.nextAttrId(),
 					name: outputType.columns[index].name,
-					type: proj.node.getType(),
+					type: effectiveProjectionType(proj.node, sourceTypeById),
 					sourceRelation: `${this.nodeType}:${this.id}`,
 					relationName: 'projection'
 				}));
@@ -142,7 +171,7 @@ export class ProjectNode extends PlanNode implements UnaryRelationalNode, Projec
 					return {
 						id: proj.attributeId,
 						name: outputType.columns[index].name,
-						type: proj.node.getType(),
+						type: effectiveProjectionType(proj.node, sourceTypeById),
 						sourceRelation: `${this.nodeType}:${this.id}`,
 						relationName: 'projection'
 					};
@@ -155,7 +184,7 @@ export class ProjectNode extends PlanNode implements UnaryRelationalNode, Projec
 					return {
 						id: proj.node.attributeId,
 						name: outputType.columns[index].name,
-						type: proj.node.getType(),
+						type: effectiveProjectionType(proj.node, sourceTypeById),
 						sourceRelation: `${this.nodeType}:${this.id}`,
 						relationName: 'projection'
 					};
@@ -165,12 +194,24 @@ export class ProjectNode extends PlanNode implements UnaryRelationalNode, Projec
 				return {
 					id: PlanNode.nextAttrId(),
 					name: outputType.columns[index].name,
-					type: proj.node.getType(),
+					type: effectiveProjectionType(proj.node, sourceTypeById),
 					sourceRelation: `${this.nodeType}:${this.id}`,
 					relationName: 'projection'
 				};
 			});
 		});
+	}
+
+	/** Maps each source attribute id to the type the source publishes for it.
+	 *  Built from `source.getAttributes()` (collision-free — attribute ids are
+	 *  globally unique). Backs {@link effectiveProjectionType} so every
+	 *  type-derivation site agrees on a bare column-ref's effective type. */
+	private sourceTypeById(): Map<number, ScalarType> {
+		const map = new Map<number, ScalarType>();
+		for (const attr of this.source.getAttributes()) {
+			map.set(attr.id, attr.type);
+		}
+		return map;
 	}
 
 	computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
@@ -230,15 +271,30 @@ export class ProjectNode extends PlanNode implements UnaryRelationalNode, Projec
 		// augmented map carries through and which additionally emit a
 		// bi-directional FD when both the bare and derived columns are projected.
 		let fds = projectFds(sourcePhysical?.fds ?? [], map);
+		// Key FDs from the projected source keys — the projection's *real* keys
+		// (`kind: 'unique'` via superkeyToFd), independent of the injective
+		// determination FDs emitted below.
+		const projectedKeyFds: FunctionalDependency[] = [];
 		for (const key of projectedKeys) {
 			const keyFd = superkeyToFd(key, outputColCount);
-			if (keyFd) fds = addFd(fds, keyFd, { keyHints: projectedKeys });
+			if (keyFd) projectedKeyFds.push(keyFd);
 		}
+		for (const keyFd of projectedKeyFds) {
+			fds = addFd(fds, keyFd, { keyHints: projectedKeys });
+		}
+		// An injective projection emits the bi-directional FD `{bareOut}↔{outIdx}`
+		// (`SELECT id, id+1`) unconditionally as 'determination' — a value
+		// bijection, never a uniqueness claim. The kind-aware readers
+		// (`isUniqueDeterminant`) never derive a key from it on a bag, so no
+		// endpoint gate is needed; key-ness, when an endpoint is a key, is carried
+		// by the projected key FDs above (addFd's 'unique'-wins merge keeps it).
+		// (ticket fd-determination-reader-side-rule, replacing the
+		// fd-derived-key-bag-overclaim producer gate; mirrors returning-node.)
 		for (const [srcIdx, outIdx] of injectivePairs) {
 			const bareOut = map.get(srcIdx);
 			if (bareOut === undefined || bareOut === outIdx) continue;
-			fds = addFd(fds, { determinants: [bareOut], dependents: [outIdx] }, { keyHints: projectedKeys });
-			fds = addFd(fds, { determinants: [outIdx], dependents: [bareOut] }, { keyHints: projectedKeys });
+			fds = addFd(fds, { determinants: [bareOut], dependents: [outIdx], kind: 'determination' }, { keyHints: projectedKeys });
+			fds = addFd(fds, { determinants: [outIdx], dependents: [bareOut], kind: 'determination' }, { keyHints: projectedKeys });
 		}
 		const projectedEquiv: number[][] = [];
 		for (const cls of sourcePhysical?.equivClasses ?? []) {
@@ -251,15 +307,32 @@ export class ProjectNode extends PlanNode implements UnaryRelationalNode, Projec
 		}
 		const projectedBindings = projectConstantBindings(sourcePhysical?.constantBindings ?? [], map);
 		const projectedDomains = projectDomainConstraints(sourcePhysical?.domainConstraints ?? [], map);
+		// INDs project all-or-nothing through the same column map: an IND survives
+		// only when every witnessing column is still present in the output.
+		const projectedInds = projectInds(sourcePhysical?.inds ?? [], map);
+
+		// Backward update-lineage: thread each output column's UpdateSite from the
+		// child along the invertible-transform chain (`scalar-invertibility`),
+		// reading the child's lineage rather than re-deriving — the derived dual of
+		// the forward key/FD projection above.
+		const { updateLineage, attributeDefaults } = deriveProjectUpdateLineage(
+			this.projections,
+			this.getAttributes(),
+			sourcePhysical?.updateLineage,
+			sourcePhysical?.attributeDefaults,
+		);
 
 		return {
-			estimatedRows: this.source.estimatedRows,
+			estimatedRows: physicalSourceRows(sourcePhysical, this.source),
 			ordering: projectOrdering(sourcePhysical?.ordering, map),
 			monotonicOn: projectMonotonicOnByAttrId(sourcePhysical?.monotonicOn, preservedAttrIds),
 			fds: fds.length > 0 ? fds : undefined,
 			equivClasses: projectedEquiv.length > 0 ? projectedEquiv : undefined,
 			constantBindings: projectedBindings.length > 0 ? projectedBindings : undefined,
 			domainConstraints: projectedDomains.length > 0 ? projectedDomains : undefined,
+			inds: projectedInds.length > 0 ? projectedInds : undefined,
+			updateLineage,
+			attributeDefaults,
 		};
 	}
 
@@ -387,11 +460,15 @@ export class ProjectNode extends PlanNode implements UnaryRelationalNode, Projec
 			return this;
 		}
 
-		// Create predefined attributes from the new projections
+		// Create predefined attributes from the new projections. `this.source` is
+		// unchanged here, so the same source-attr type map applies — a bare column-ref
+		// keeps the source's (null-extended) type rather than its stale captured type,
+		// so an optimizer rebuild cannot re-introduce the wrong nullability.
+		const sourceTypeById = this.sourceTypeById();
 		const predefinedAttributes = projections.map(proj => ({
 			id: proj.attributeId,
 			name: proj.alias,
-			type: proj.node.getType(),
+			type: effectiveProjectionType(proj.node, sourceTypeById),
 			sourceRelation: `${this.nodeType}:${this.id}`,
 			relationName: 'projection'
 		}));

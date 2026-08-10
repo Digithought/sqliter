@@ -1,0 +1,208 @@
+-- ALTER COLUMN ... SET COLLATE — cross-module existing-row re-validation.
+--
+-- CROSS-MODULE (NOT in MEMORY_ONLY_FILES): runs in both memory and store modes.
+-- Sections 1-8: a per-column collation change is re-validated against existing rows
+-- for every non-PK UNIQUE constraint covering the altered column (inline / table-level
+-- here; the CREATE UNIQUE INDEX-derived cases are in
+-- 41.7.2.1-alter-column-collate-unique-index-store): a value set distinct under BINARY but colliding under
+-- NOCASE rejects the ALTER with CONSTRAINT (schema unchanged), and a distinct set
+-- succeeds and then enforces under the new collation. The store reaches end-to-end
+-- parity with memory here because the constrained column is row DATA keyed by the
+-- integer PK, so the store's fixed-table-collation KEY encoding is irrelevant — both
+-- modules behave identically.
+--
+-- Section 9: a PRIMARY KEY column's collation change runs cross-module. Both modules
+-- key the PK per-column and re-key the primary structure on SET COLLATE — memory
+-- re-keys its primary tree, the store physically re-encodes its data-store keys and
+-- rebuilds dependent secondary indexes (ticket store-pk-collate-physical-rekey). §9
+-- exercises a NON-colliding divergent change (NOCASE→BINARY) that is HONORED: a
+-- case-distinct PK that NOCASE collapsed now coexists, and ordering/uniqueness follow
+-- BINARY. The COLLIDING divergent case ('a'/'A' under BINARY→NOCASE rejects with
+-- CONSTRAINT, all-or-nothing) lives cross-module in
+-- 41.7.1-alter-column-collate-unique.sqllogic. The cross-module query-layer behavior
+-- lives in 41.7-alter-column-collate.sqllogic.
+
+-- ===================================
+-- 1. UNIQUE column, values distinct under BOTH collations → ALTER succeeds, and a
+--    subsequent NOCASE-colliding insert is then rejected under the new collation.
+-- ===================================
+
+create table us (id integer primary key, email text unique);
+insert into us values (1, 'a@x'), (2, 'b@x');
+
+alter table us alter column email set collate nocase;
+-- run
+
+-- the change took effect: a case-only duplicate now collides under NOCASE
+insert into us values (3, 'A@X');
+-- error: UNIQUE constraint failed
+
+select id, email from us order by id;
+→ [{"id":1,"email":"a@x"},{"id":2,"email":"b@x"}]
+
+-- a genuinely distinct value still inserts
+insert into us values (4, 'c@x');
+select id, email from us order by id;
+→ [{"id":1,"email":"a@x"},{"id":2,"email":"b@x"},{"id":4,"email":"c@x"}]
+
+drop table us;
+
+-- ===================================
+-- 2. UNIQUE column, values distinct under BINARY but COLLIDING under NOCASE →
+--    the ALTER is rejected with CONSTRAINT and the table is left unchanged.
+-- ===================================
+
+create table uc (id integer primary key, email text unique);
+insert into uc values (1, 'a@x'), (2, 'A@x');
+-- run
+
+alter table uc alter column email set collate nocase;
+-- error: UNIQUE constraint failed
+
+-- the rejected ALTER rolled back: both rows survive and the column is still BINARY,
+-- so the two case-distinct values remain valid
+select id, email from uc order by id;
+→ [{"id":1,"email":"a@x"},{"id":2,"email":"A@x"}]
+
+select name, collation from table_info('uc') order by cid;
+→ [{"name":"id","collation":"BINARY"},{"name":"email","collation":"BINARY"}]
+
+-- and the table is still writable after the failed ALTER
+insert into uc values (3, 'B@x');
+select count(*) as n from uc;
+→ [{"n":3}]
+
+drop table uc;
+
+-- ===================================
+-- 3-4. EXPLICIT `create unique index` (not an inline UNIQUE), re-validated by the
+--      same existing-row scan — rejecting on collision, honoring when distinct.
+-- ===================================
+-- Lives in 41.7.2.1-alter-column-collate-unique-index-store; needs standalone index DDL.
+
+-- ===================================
+-- 5. COMPOSITE UNIQUE (a, b) where only member `a`'s collation changes. Each member
+--    is normalized by its OWN column collation: after `a`→NOCASE, rows that differ
+--    only by the case of `a` collide; the still-BINARY `b` keeps distinguishing rows
+--    that differ in `b`'s case.
+-- ===================================
+
+-- 5a. distinct under BINARY (a: x vs X), colliding once `a` is NOCASE → ALTER rejected.
+create table cc (id integer primary key, a text, b text, unique (a, b));
+insert into cc values (1, 'x', 'y'), (2, 'X', 'y');
+-- run
+
+alter table cc alter column a set collate nocase;
+-- error: UNIQUE constraint failed
+
+-- rollback: both rows survive, `a` still BINARY
+select id, a, b from cc order by id;
+→ [{"id":1,"a":"x","b":"y"},{"id":2,"a":"X","b":"y"}]
+
+drop table cc;
+
+-- 5b. `a` differs only by case BUT `b` differs by case too → under (NOCASE a, BINARY b)
+--     the rows stay distinct (b is still BINARY) → ALTER succeeds, and the composite
+--     then enforces with `a` NOCASE / `b` BINARY.
+create table cd (id integer primary key, a text, b text, unique (a, b));
+insert into cd values (1, 'x', 'y'), (2, 'X', 'Y');
+
+alter table cd alter column a set collate nocase;
+-- run
+
+-- ('x','y') vs ('X','Y'): a collides under NOCASE, b ('y' vs 'Y') still distinguishes → OK
+select id, a, b from cd order by id;
+→ [{"id":1,"a":"x","b":"y"},{"id":2,"a":"X","b":"Y"}]
+
+-- now a NOCASE-on-a + exact-on-b duplicate collides
+insert into cd values (3, 'X', 'y');
+-- error: UNIQUE constraint failed
+
+-- but a row distinguished by b (still BINARY, value distinct from both rows) inserts fine
+insert into cd values (4, 'x', 'z');
+select count(*) as n from cd;
+→ [{"n":3}]
+
+drop table cd;
+
+-- ===================================
+-- 6. PARTIAL unique index — only rows the predicate accepts are re-validated.
+-- ===================================
+-- Lives in 41.7.2.1-alter-column-collate-unique-index-store: a partial UNIQUE can only
+-- be spelled as `create unique index … where …`, so it needs standalone index DDL.
+
+-- ===================================
+-- 7. NULL handling — SQL UNIQUE allows multiple NULLs, so existing NULL rows never
+--    count as collisions during the re-validation scan.
+-- ===================================
+
+create table nn (id integer primary key, email text null unique);
+insert into nn values (1, null), (2, null), (3, 'a@x');
+-- run
+
+alter table nn alter column email set collate nocase;
+-- run
+
+select name, collation from table_info('nn') where name = 'email';
+→ [{"name":"email","collation":"NOCASE"}]
+
+-- multiple NULLs still allowed after the change; a NOCASE duplicate still rejected
+insert into nn values (4, null);
+insert into nn values (5, 'A@X');
+-- error: UNIQUE constraint failed
+
+select count(*) as n from nn;
+→ [{"n":4}]
+
+drop table nn;
+
+-- ===================================
+-- 8. NO-OP guard — setting the collation to the value it already has is a no-op that
+--    neither scans nor rejects (re-applying NOCASE after it is already NOCASE), even
+--    when existing rows would collide under some OTHER collation.
+-- ===================================
+
+create table nopg (id integer primary key, email text collate nocase unique);
+-- two rows distinct under NOCASE
+insert into nopg values (1, 'a@x'), (2, 'b@x');
+-- run
+
+-- idempotent re-apply: already NOCASE → returns the existing schema, no scan
+alter table nopg alter column email set collate nocase;
+-- run
+
+select name, collation from table_info('nopg') where name = 'email';
+→ [{"name":"email","collation":"NOCASE"}]
+
+-- still enforcing NOCASE afterward
+insert into nopg values (3, 'A@X');
+-- error: UNIQUE constraint failed
+
+drop table nopg;
+
+-- ===================================
+-- 9. PRIMARY KEY column, DIVERGENT collation change (NOCASE → BINARY) is HONORED
+--    cross-module via a physical re-key. The column is declared `collate nocase`
+--    EXPLICITLY so both modules start NOCASE-keyed (the store honors the explicit
+--    NOCASE per-column; memory keys NOCASE too). After re-keying to BINARY a
+--    case-distinct PK that NOCASE collapsed now coexists, and ordering/uniqueness
+--    follow BINARY. (The store re-keys per-column instead of rejecting the divergent
+--    change — ticket store-pk-collate-physical-rekey.)
+-- ===================================
+
+create table pkb (k text collate nocase primary key);
+insert into pkb values ('alpha'), ('beta');
+
+alter table pkb alter column k set collate binary;
+-- run
+
+-- under BINARY a case-distinct value now coexists (it would collide under NOCASE)
+insert into pkb values ('ALPHA');
+select k from pkb order by k;
+→ [{"k":"ALPHA"},{"k":"alpha"},{"k":"beta"}]
+
+-- an exact-duplicate PK still collides under BINARY
+insert into pkb values ('beta');
+-- error: UNIQUE constraint failed
+
+drop table pkb;

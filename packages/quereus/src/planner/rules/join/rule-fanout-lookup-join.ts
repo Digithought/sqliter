@@ -41,6 +41,10 @@
  *   - AND-of-column-equalities ON-clause (any residual disqualifies the
  *     branch — leave it as a normal nested-loop join),
  *   - FK→PK alignment validated via `lookupCoveringFK` + `checkFkPkAlignment`,
+ *     on *base-table* column indices: each equi-pair's output positions are
+ *     first translated through `resolveTableColumnMapping`, since a sub-select
+ *     on either side renumbers columns. A join column with no base-table origin
+ *     degrades the branch to `cross` rather than bailing the cluster,
  *   - INNER branches additionally require NOT-NULL FK + row-preserving path
  *     to the PK table.
  *
@@ -74,13 +78,13 @@ import { JoinNode, extractEquiPairsFromCondition } from '../../nodes/join-node.j
 import { ScalarSubqueryNode } from '../../nodes/subquery.js';
 import { ColumnReferenceNode } from '../../nodes/reference.js';
 import { normalizePredicate } from '../../analysis/predicate-normalizer.js';
-import { checkFkPkAlignment, extractTableSchema } from '../../util/key-utils.js';
-import { lookupCoveringFK, isRowPreservingPathToTable } from '../../util/ind-utils.js';
+import { checkFkPkAlignment } from '../../util/key-utils.js';
+import { lookupCoveringFK, isRowPreservingPathToTable, mapColumnsToTable, resolveTableColumnMapping, type TableColumnMapping } from '../../util/ind-utils.js';
 import { collectExternalReferences } from '../../cache/correlation-detector.js';
+import { collectScalarSubqueries, substituteSubqueries } from '../../analysis/scalar-subqueries.js';
 import { CapabilityDetectors, PlanNodeCharacteristics } from '../../framework/characteristics.js';
 import { isAndOfColumnEqualities } from './rule-join-elimination.js';
 import { FanOutLookupJoinNode, isCrossBranchMode, isLeftBranchMode, type FanOutBranchSpec, type FanOutBranchMode } from '../../nodes/fanout-lookup-join-node.js';
-import type { TableSchema } from '../../../schema/table.js';
 
 const log = createLogger('optimizer:rule:fanout-lookup-join');
 
@@ -175,19 +179,22 @@ export function ruleFanOutLookupJoin(node: PlanNode, context: OptContext): PlanN
 	const outerAttrs = outerSubtree.getAttributes();
 
 	// Join-spine branches. FK→PK alignment is validated against the outer
-	// subtree's schema, so a spine requires the outer to resolve to a single
-	// table schema (mirrors `ruleJoinElimination`). `extractTableSchema` is
-	// needed ONLY here — pure-subquery clusters skip it.
+	// subtree's base table, so a spine requires the outer to resolve to a single
+	// table plus its output-column → table-column map (mirrors
+	// `ruleJoinElimination`). `resolveTableColumnMapping` is needed ONLY here —
+	// pure-subquery clusters skip it. The walker above descends `.left` until it
+	// stops being a JoinNode, so `outerSubtree` is never itself a join and a
+	// single mapping describes it.
 	//
 	// Bottom-up walk: joins[joins.length - 1] is the innermost (its .left ==
 	// outerSubtree), joins[0] is the outermost. Process bottom-up so the order
 	// of `spineBranches` reflects the natural wide-row layout.
 	const spineBranches: RecognizedBranch[] = [];
 	if (joins.length > 0) {
-		const outerSchema = extractTableSchema(outerSubtree);
-		if (!outerSchema) return null;
+		const outerMapping = resolveTableColumnMapping(outerSubtree);
+		if (!outerMapping) return null;
 		for (let i = joins.length - 1; i >= 0; i--) {
-			const recognized = recognizeBranch(joins[i], outerSchema, outerAttrs);
+			const recognized = recognizeBranch(joins[i], outerMapping, outerAttrs);
 			if (!recognized) {
 				// A non-eligible branch in the middle breaks the cluster — without
 				// a way to keep that branch in the original nested-loop position we
@@ -365,61 +372,6 @@ function columnExprFor(name: string): AST.ColumnExpr {
 }
 
 /**
- * Collect every `ScalarSubqueryNode` reachable in a projection's scalar
- * expression tree, in deterministic pre-order. A recognized subquery is a leaf
- * for this walk: we push it and do NOT descend into its relational body, so a
- * subquery nested *inside* another subquery's correlation predicate remains part
- * of its enclosing branch child rather than being clustered as its own branch.
- * (The relational body is filtered out by the `typeClass === 'scalar'` guard
- * regardless, but stopping early keeps the intent explicit.)
- */
-function collectScalarSubqueries(expr: ScalarPlanNode, out: ScalarSubqueryNode[]): void {
-	if (expr instanceof ScalarSubqueryNode) {
-		out.push(expr);
-		return;
-	}
-	for (const child of expr.getChildren()) {
-		if (child.getType().typeClass === 'scalar') {
-			collectScalarSubqueries(child as ScalarPlanNode, out);
-		}
-	}
-}
-
-/**
- * Rebuild a projection's scalar expression with each recognized
- * `ScalarSubqueryNode` replaced by its `ColumnReferenceNode` into the fan-out's
- * wide row, leaving the wrapping expression (`coalesce(<colref>, 0)`) intact.
- * For a bare-subquery projection the root itself is in the map and is returned
- * directly; for a wrapped subquery the tree is rebuilt via `withChildren` with
- * only the matched inner node substituted. Returns the input unchanged when no
- * descendant is a recognized subquery.
- */
-function substituteSubqueries(
-	expr: ScalarPlanNode,
-	replacements: ReadonlyMap<ScalarSubqueryNode, ColumnReferenceNode>,
-): ScalarPlanNode {
-	if (expr instanceof ScalarSubqueryNode) {
-		return replacements.get(expr) ?? expr;
-	}
-	const children = expr.getChildren();
-	if (children.length === 0) return expr;
-
-	const newChildren: PlanNode[] = [];
-	let changed = false;
-	for (const child of children) {
-		if (child.getType().typeClass === 'scalar') {
-			const replaced = substituteSubqueries(child as ScalarPlanNode, replacements);
-			newChildren.push(replaced);
-			if (replaced !== child) changed = true;
-		} else {
-			newChildren.push(child);
-		}
-	}
-	if (!changed) return expr;
-	return expr.withChildren(newChildren) as ScalarPlanNode;
-}
-
-/**
  * Recognize a correlated scalar-aggregate subquery as an `atMostOne-left`
  * fan-out branch. Returns null when the subquery is not correlated, correlates
  * to anything other than the outer subtree, is not aggregate-shaped with zero
@@ -486,11 +438,21 @@ function recognizeSubqueryBranch(
 /**
  * Decide whether `join`'s `right` side is a parameterized equi-lookup eligible
  * for branch clustering, and at what cardinality `mode`. The FK side is sourced
- * from `outerSchema` + `outerAttrs` — both the equi-pair's left attribute and
+ * from `outerMapping` + `outerAttrs` — both the equi-pair's left attribute and
  * its `outerAttrs` membership are checked, which is the safety net keeping
  * per-join alignment honest in the presence of intermediate joins in the chain
  * (the join's own `.left` resolves to a combined relation, so we cannot extract
  * a single schema from it).
+ *
+ * Both sides' equi-pair indices are *output* column positions and are translated
+ * to base-table column positions (via {@link resolveTableColumnMapping} /
+ * {@link mapColumnsToTable}) before being compared against the FK/PK
+ * declarations — a sub-select renames, reorders, and drops columns, so the two
+ * numbering schemes are not interchangeable. A join column with no base-table
+ * origin (a computed expression) is untranslatable and degrades the branch to
+ * `cross` rather than bailing the whole cluster: `cross` is always sound (it is
+ * the data-driven 1:n treatment, gated by the row/product guards), so failing to
+ * *prove* at-most-one should cost the proof, not the cluster.
  *
  * Two cardinality outcomes:
  *
@@ -515,10 +477,13 @@ function recognizeSubqueryBranch(
  */
 function recognizeBranch(
 	join: JoinNode,
-	outerSchema: TableSchema,
+	outerMapping: TableColumnMapping,
 	outerAttrs: readonly Attribute[],
 ): RecognizedBranch | null {
 	if (join.joinType !== 'left' && join.joinType !== 'inner' && join.joinType !== 'cross') return null;
+	// A join carrying `exists … as` match flags is not folded into a fan-out lookup
+	// shape (which would not carry the appended flag column); keep it nested-loop.
+	if (join.hasExistenceColumns) return null;
 	if (!join.condition) return null;
 
 	const leftAttrs = join.left.getAttributes();
@@ -548,16 +513,35 @@ function recognizeBranch(
 		rightCols.push(p.right);
 	}
 
-	const rightSchema = extractTableSchema(join.right);
-	if (!rightSchema) return null;
+	// NOTE: a lookup side that reads zero or several tables (a join, a union, a
+	// values list) bails the whole cluster, where an untranslatable *column*
+	// merely degrades the branch to `cross` below. The stricter treatment is
+	// sound but costs clusters; if multi-table lookup branches show up as a
+	// missed optimization, fall through to the cross path here too — `cross` never
+	// needed the schema.
+	const rightMapping = resolveTableColumnMapping(join.right);
+	if (!rightMapping) return null;
 
-	// At-most-one path: FK→PK alignment guarantees ≤1 match per outer row.
-	if (checkFkPkAlignment(outerSchema, rightSchema, outerCols, rightCols)) {
+	// Translate both sides' *output* column indices to base-table column indices
+	// before pairing them against the FK/PK declarations. A sub-select on either
+	// side renames, reorders, and drops columns, so an output index is not
+	// interchangeable with a table column index; a computed column has no table
+	// origin at all and `mapColumnsToTable` returns undefined for it.
+	const outerTableCols = mapColumnsToTable(outerCols, outerMapping);
+	const rightTableCols = mapColumnsToTable(rightCols, rightMapping);
+	const outerSchema = outerMapping.schema;
+	const rightSchema = rightMapping.schema;
+
+	// At-most-one path: FK→PK alignment guarantees ≤1 match per outer row. When
+	// the translation failed the branch cannot be *proven* at-most-one, so it
+	// falls through to the cross path rather than bailing the whole cluster.
+	if (outerTableCols && rightTableCols
+		&& checkFkPkAlignment(outerSchema, rightSchema, outerTableCols, rightTableCols)) {
 		if (join.joinType === 'left') {
 			return { lookup: join.right, mode: 'atMostOne-left', condition: join.condition };
 		}
 		if (join.joinType === 'inner') {
-			const match = lookupCoveringFK(outerSchema, rightSchema, outerCols, rightCols);
+			const match = lookupCoveringFK(outerSchema, rightSchema, outerTableCols, rightTableCols);
 			if (!match || match.nullable) return null;
 			if (!isRowPreservingPathToTable(join.right)) return null;
 			return { lookup: join.right, mode: 'atMostOne-inner', condition: join.condition };

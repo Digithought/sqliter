@@ -3,7 +3,8 @@ import {
 	type FanOutLookupJoinNode,
 	type FanOutBranchMode,
 } from '../../planner/nodes/fanout-lookup-join-node.js';
-import type { Instruction, InstructionRun, RuntimeContext } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import type { Row } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { emitCallFromPlan, emitPlanNode } from '../emitters.js';
@@ -588,7 +589,7 @@ export function emitFanOutLookupJoin(plan: FanOutLookupJoinNode, ctx: EmissionCo
 
 		return {
 			params: [outerInstruction, ...branchInstructions],
-			run: runBatched as InstructionRun,
+			run: asRun(runBatched),
 			note: `fanout_lookup_join_batched(N=${plan.branches.length}, globalCap=${globalCap}, readAhead<=${maxOuterReadAhead})`,
 		};
 	}
@@ -611,7 +612,7 @@ export function emitFanOutLookupJoin(plan: FanOutLookupJoinNode, ctx: EmissionCo
 
 	return {
 		params: [outerInstruction, ...branchInstructions],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `fanout_lookup_join(N=${plan.branches.length}, cap=${concurrencyCap})`,
 	};
 }

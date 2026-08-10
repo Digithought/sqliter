@@ -3,6 +3,7 @@ import { expect } from 'chai';
 import { PlanNodeType } from '../../src/planner/nodes/plan-node-type.js';
 import { PlanNode, type PhysicalProperties, type Attribute } from '../../src/planner/nodes/plan-node.js';
 import type { BaseType, ScalarType } from '../../src/common/datatype.js';
+import { INTEGER_TYPE } from '../../src/types/builtin-types.js';
 import type { Scope } from '../../src/planner/scopes/scope.js';
 import type { OptContext } from '../../src/planner/framework/context.js';
 import { DEFAULT_TUNING, type OptimizerTuning } from '../../src/planner/optimizer-tuning.js';
@@ -20,8 +21,12 @@ import {
 import {
 	PlanNodeCharacteristics,
 	CapabilityDetectors,
-	CapabilityRegistry,
 } from '../../src/planner/framework/characteristics.js';
+import { AggregateFunctionCallNode } from '../../src/planner/nodes/aggregate-function.js';
+import { ScalarFunctionCallNode } from '../../src/planner/nodes/function.js';
+import { FunctionFlags } from '../../src/common/constants.js';
+import type { AggregateFunctionSchema, ScalarFunctionSchema } from '../../src/schema/function.js';
+import type * as AST from '../../src/parser/ast.js';
 import {
 	extractOrderingFromSortKeys,
 	mergeOrderings,
@@ -110,7 +115,7 @@ function scalarNode(opts: {
 } = {}): MockPlanNode {
 	return new MockPlanNode({
 		...opts,
-		type: { typeClass: 'scalar', logicalType: 'integer', nullable: false, isReadOnly: false } as ScalarType,
+		type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: false } as ScalarType,
 	});
 }
 
@@ -127,8 +132,6 @@ function makeContext(overrides: Partial<OptimizerTuning> = {}): OptContext {
 		stats: {} as any,
 		tuning,
 		phase: 'rewrite',
-		depth: 0,
-		context: new Map(),
 		diagnostics: {},
 		db: {} as any,
 		visitedRules: new Map(),
@@ -141,9 +144,8 @@ function makeRule(
 	id: string,
 	nodeType: PlanNodeType,
 	fn: (node: PlanNode, ctx: OptContext) => PlanNode | null,
-	priority?: number,
 ): RuleHandle {
-	return { id, nodeType, phase: 'rewrite', fn, priority, sideEffectMode: 'safe' };
+	return { id, nodeType, phase: 'rewrite', fn, sideEffectMode: 'safe' };
 }
 
 // ---------------------------------------------------------------------------
@@ -360,13 +362,129 @@ describe('Planner Framework', () => {
 			expect(pass1Cached).to.equal(true);
 			expect(pass2Cached).to.equal(false);
 		});
+
+		// -------------------------------------------------------------------
+		// Decline tracking (ticket 3.5): a rule that declines on a node is not
+		// re-offered to that SAME (unchanged) node every fixpoint iteration, but
+		// IS re-offered once the node is transformed. Ephemeral per-node set, not
+		// inherited — so no plan output changes.
+		// -------------------------------------------------------------------
+
+		it('declining rule is not re-run on the same node across fixpoint iterations (the win)', () => {
+			const pass = createPass('decl', 'Decline', '', 10, TraversalOrder.BottomUp);
+			let declineCalls = 0;
+			let transformed = false;
+
+			// Transformer runs FIRST (mints N0→N1), decliner SECOND (declines on
+			// N1). The while loop iterates again to confirm fixpoint: the decliner
+			// is offered on the *same* N1 a second time. Pre-fix it re-ran (2
+			// calls); now the ephemeral decline set suppresses the redundant re-run.
+			const transformer = makeRule('transformer', PlanNodeType.Filter, () => {
+				if (transformed) return null;
+				transformed = true;
+				return relNode({ nodeType: PlanNodeType.Filter });
+			});
+			const decliner = makeRule('decliner', PlanNodeType.Filter, () => {
+				declineCalls++;
+				return null;
+			});
+			pass.rules.push(transformer, decliner);
+
+			const pm = new PassManager([pass]);
+			pm.execute(relNode({ nodeType: PlanNodeType.Filter }), makeContext());
+
+			// Offered exactly once on N1 — the redundant same-node re-run is cut.
+			expect(declineCalls).to.equal(1);
+		});
+
+		it('declining rule IS re-offered after a sibling transform changes the node (soundness)', () => {
+			const pass = createPass('reoffer', 'Reoffer', '', 10, TraversalOrder.BottomUp);
+			let declineCalls = 0;
+			let transformed = false;
+
+			// Decliner runs FIRST on N0 (declines), then the transformer mints
+			// N0→N1. The plan piece changed, so on the next iteration the decliner
+			// must be re-offered on N1 (it might now apply — this is exactly the
+			// pattern that inheriting declines would wrongly suppress, silently
+			// changing plans). Expect two calls: once on N0, once on N1.
+			const decliner = makeRule('decliner', PlanNodeType.Filter, () => {
+				declineCalls++;
+				return null;
+			});
+			const transformer = makeRule('transformer', PlanNodeType.Filter, () => {
+				if (transformed) return null;
+				transformed = true;
+				return relNode({ nodeType: PlanNodeType.Filter });
+			});
+			pass.rules.push(decliner, transformer);
+
+			const pm = new PassManager([pass]);
+			pm.execute(relNode({ nodeType: PlanNodeType.Filter }), makeContext());
+
+			expect(declineCalls).to.equal(2);
+		});
+
+		it('transform still offers previously-unoffered rules to the new node', () => {
+			const pass = createPass('freshRules', 'Fresh', '', 10, TraversalOrder.BottomUp);
+			let projectRuleCalls = 0;
+
+			// T rewrites Filter → Project. U only matches Project, so it was never
+			// offered to the original Filter and must fire on the transformed node —
+			// decline suppression must not touch genuinely-new rules.
+			const t = makeRule('filter-to-project', PlanNodeType.Filter, () =>
+				relNode({ nodeType: PlanNodeType.Project }));
+			const u = makeRule('project-rule', PlanNodeType.Project, () => {
+				projectRuleCalls++;
+				return null;
+			});
+			pass.rules.push(t, u);
+
+			const pm = new PassManager([pass]);
+			pm.execute(relNode({ nodeType: PlanNodeType.Filter }), makeContext());
+
+			expect(projectRuleCalls).to.equal(1);
+		});
+
+		it('same-node decline re-runs are cut across a fan of nodes (regression guard)', () => {
+			// Chain of three Filter nodes. Per node the transformer runs first
+			// (once), then the decliner declines on the transformed node; the
+			// fixpoint re-iteration must NOT re-run the decliner on that same node.
+			// New behavior: decliner offered once per node (3 total). Pre-fix: twice
+			// per node (6 total), the redundant same-node re-run.
+			const pass = createPass('scale', 'Scale', '', 10, TraversalOrder.BottomUp);
+			let declineCalls = 0;
+			const transformedIds = new Set<string>();
+
+			// Transform once per distinct node id (preserve children so the tree
+			// stays coherent). The applied-rule inheritance stops it re-firing on
+			// its own output; the guard keeps intent explicit.
+			const transformer = makeRule('transformer', PlanNodeType.Filter, (node) => {
+				if (transformedIds.has(node.id)) return null;
+				transformedIds.add(node.id);
+				return relNode({ nodeType: PlanNodeType.Filter, children: [...node.getChildren()] });
+			});
+			const decliner = makeRule('decliner', PlanNodeType.Filter, () => {
+				declineCalls++;
+				return null;
+			});
+			pass.rules.push(transformer, decliner);
+
+			const leaf = relNode({ nodeType: PlanNodeType.Filter });
+			const mid = relNode({ nodeType: PlanNodeType.Filter, children: [leaf] });
+			const root = relNode({ nodeType: PlanNodeType.Filter, children: [mid] });
+
+			const pm = new PassManager([pass]);
+			pm.execute(root, makeContext());
+
+			expect(declineCalls).to.equal(3);
+		});
 	});
 
 	// ---------------------------------------------------------------------------
-	// RuleRegistry (registry.ts) — tested through module-level helpers + OptContext
+	// Visited-rule tracking (registry.ts)
 	// ---------------------------------------------------------------------------
 
-	describe('RuleRegistry (visited rules)', () => {
+	describe('Visited-rule tracking', () => {
 
 		it('markRuleApplied / hasRuleBeenApplied round-trip', () => {
 			const ctx = makeContext();
@@ -488,7 +606,7 @@ describe('Planner Framework', () => {
 			];
 			const node = relNode({
 				attributes: attrs,
-				physical: { fds: [{ determinants: [0, 1], dependents: [2] }] },
+				physical: { fds: [{ determinants: [0, 1], dependents: [2], kind: 'unique' }] },
 			});
 			expect(PlanNodeCharacteristics.hasUniqueKeys(node)).to.equal(true);
 		});
@@ -520,61 +638,64 @@ describe('Planner Framework', () => {
 
 	describe('CapabilityDetectors', () => {
 
-		it('canPushDownPredicate detects getPredicate + withPredicate', () => {
+		// Post-branding, detection keys off a unique `is<X>Capable` brand — the method
+		// shape alone no longer qualifies a node. Each guard checks its own brand.
+
+		it('canPushDownPredicate detects the isPredicateCapable brand, not the method shape', () => {
 			const node = relNode();
 			expect(CapabilityDetectors.canPushDownPredicate(node)).to.equal(false);
 
-			// Add the capability
+			// Methods without the brand are NOT enough post-branding.
 			(node as any).getPredicate = () => null;
 			(node as any).withPredicate = () => node;
+			expect(CapabilityDetectors.canPushDownPredicate(node)).to.equal(false);
+
+			// The brand is the contract.
+			(node as any).isPredicateCapable = true;
 			expect(CapabilityDetectors.canPushDownPredicate(node)).to.equal(true);
 		});
 
-		it('isTableAccess detects relational node with tableSchema + getAccessMethod', () => {
+		it('isTableAccess detects the isTableAccessCapable brand', () => {
 			const node = relNode();
 			expect(CapabilityDetectors.isTableAccess(node)).to.equal(false);
 
-			(node as any).tableSchema = {};
-			(node as any).getAccessMethod = () => 'sequential';
+			(node as any).isTableAccessCapable = true;
 			expect(CapabilityDetectors.isTableAccess(node)).to.equal(true);
 		});
 
-		it('isSortable detects getSortKeys + withSortKeys', () => {
+		it('isSortable detects the isSortCapable brand', () => {
 			const node = relNode();
 			expect(CapabilityDetectors.isSortable(node)).to.equal(false);
 
-			(node as any).getSortKeys = () => [];
-			(node as any).withSortKeys = () => node;
+			(node as any).isSortCapable = true;
 			expect(CapabilityDetectors.isSortable(node)).to.equal(true);
 		});
 
-		it('isJoin detects relational node with join methods', () => {
+		it('isJoin detects the isJoinCapable brand', () => {
 			const node = relNode();
 			expect(CapabilityDetectors.isJoin(node)).to.equal(false);
 
-			(node as any).getJoinType = () => 'inner';
-			(node as any).getLeftSource = () => relNode();
-			(node as any).getRightSource = () => relNode();
+			(node as any).isJoinCapable = true;
 			expect(CapabilityDetectors.isJoin(node)).to.equal(true);
 		});
 
-		it('isCached detects getCacheStrategy', () => {
+		it('isCached detects the isCacheCapable brand', () => {
 			const node = relNode();
 			expect(CapabilityDetectors.isCached(node)).to.equal(false);
 
-			(node as any).getCacheStrategy = () => null;
+			(node as any).isCacheCapable = true;
 			expect(CapabilityDetectors.isCached(node)).to.equal(true);
 		});
 
-		it('isColumnReference requires scalar with attributeId + columnIndex + expression', () => {
+		it('isColumnReference detects the isColumnReferenceCapable brand', () => {
 			const node = scalarNode({ nodeType: PlanNodeType.ColumnReference });
-			(node as any).attributeId = 1;
-			(node as any).columnIndex = 0;
-			(node as any).expression = {};
+			expect(CapabilityDetectors.isColumnReference(node)).to.equal(false);
+
+			(node as any).isColumnReferenceCapable = true;
 			expect(CapabilityDetectors.isColumnReference(node)).to.equal(true);
 		});
 
-		it('isColumnReference rejects relational nodes', () => {
+		it('isColumnReference rejects a node that lacks the brand (even with look-alike fields)', () => {
 			const node = relNode();
 			(node as any).attributeId = 1;
 			(node as any).columnIndex = 0;
@@ -582,59 +703,68 @@ describe('Planner Framework', () => {
 			expect(CapabilityDetectors.isColumnReference(node)).to.equal(false);
 		});
 
-		it('isWindowFunction checks nodeType === WindowFunctionCall', () => {
+		it('isWindowFunction detects the isWindowFunctionCapable brand', () => {
 			const node = scalarNode({ nodeType: PlanNodeType.WindowFunctionCall });
-			(node as any).functionName = 'row_number';
-			(node as any).isDistinct = false;
+			expect(CapabilityDetectors.isWindowFunction(node)).to.equal(false);
+
+			(node as any).isWindowFunctionCapable = true;
 			expect(CapabilityDetectors.isWindowFunction(node)).to.equal(true);
 		});
 
-		it('isWindowFunction rejects non-window nodeType', () => {
+		it('isWindowFunction rejects a node without the window brand', () => {
+			// A scalar-function-shaped node (shared nodeType space) is not a window fn.
 			const node = scalarNode({ nodeType: PlanNodeType.ScalarFunctionCall });
 			(node as any).functionName = 'row_number';
 			(node as any).isDistinct = false;
 			expect(CapabilityDetectors.isWindowFunction(node)).to.equal(false);
 		});
-	});
 
-	// ---------------------------------------------------------------------------
-	// CapabilityRegistry
-	// ---------------------------------------------------------------------------
+		it('isColumnBindingProvider detects the isColumnBindingProviderCapable brand', () => {
+			const node = relNode();
+			expect(CapabilityDetectors.isColumnBindingProvider(node)).to.equal(false);
 
-	describe('CapabilityRegistry', () => {
-
-		afterEach(() => {
-			// Clean up custom test registrations
-			CapabilityRegistry.unregister('test-cap');
+			(node as any).isColumnBindingProviderCapable = true;
+			expect(CapabilityDetectors.isColumnBindingProvider(node)).to.equal(true);
 		});
 
-		it('register + hasCapability round-trip', () => {
-			CapabilityRegistry.register('test-cap', (n) => n.nodeType === PlanNodeType.Sort);
-			const sortNode = relNode({ nodeType: PlanNodeType.Sort });
-			const filterNode = relNode({ nodeType: PlanNodeType.Filter });
-
-			expect(CapabilityRegistry.hasCapability(sortNode, 'test-cap')).to.equal(true);
-			expect(CapabilityRegistry.hasCapability(filterNode, 'test-cap')).to.equal(false);
+		it('isColumnBindingProvider rejects a look-alike method without the brand', () => {
+			// A same-named member (function or string) must NOT be mistaken for the
+			// capability — only the brand qualifies.
+			const node = relNode();
+			(node as any).getBindingRelationName = () => 'my_table';
+			expect(CapabilityDetectors.isColumnBindingProvider(node)).to.equal(false);
 		});
 
-		it('getCapable filters nodes by capability', () => {
-			CapabilityRegistry.register('test-cap', (n) => n.nodeType === PlanNodeType.Sort);
-			const nodes = [
-				relNode({ nodeType: PlanNodeType.Sort }),
-				relNode({ nodeType: PlanNodeType.Filter }),
-				relNode({ nodeType: PlanNodeType.Sort }),
-			];
+		it('isAggregateFunction detects AggregateFunctionCallNode, rejects scalar + look-alikes', () => {
+			const scalarType = { typeClass: 'scalar' as const, logicalType: INTEGER_TYPE, nullable: true, isReadOnly: true };
+			const funcExpr = { type: 'function', name: 'count', args: [], distinct: false } as AST.FunctionExpr;
 
-			const capable = CapabilityRegistry.getCapable(nodes, 'test-cap');
-			expect(capable).to.have.length(2);
-		});
+			const aggSchema: AggregateFunctionSchema = {
+				name: 'count', numArgs: 0, flags: FunctionFlags.DETERMINISTIC, returnType: scalarType,
+				stepFunction: (acc: number) => acc + 1,
+				finalizeFunction: (acc: number) => acc,
+			};
+			const scalarSchema: ScalarFunctionSchema = {
+				name: 'abs', numArgs: 1, flags: FunctionFlags.DETERMINISTIC, returnType: scalarType,
+				implementation: (v: any) => v,
+			};
 
-		it('unregister removes capability', () => {
-			CapabilityRegistry.register('test-cap', () => true);
-			expect(CapabilityRegistry.hasCapability(relNode(), 'test-cap')).to.equal(true);
+			const aggNode = new AggregateFunctionCallNode(mockScope, funcExpr, 'count', aggSchema, [], false);
+			const scalarFnNode = new ScalarFunctionCallNode(mockScope, funcExpr, scalarSchema, []);
 
-			CapabilityRegistry.unregister('test-cap');
-			expect(CapabilityRegistry.hasCapability(relNode(), 'test-cap')).to.equal(false);
+			// Real aggregate schema → detected.
+			expect(CapabilityDetectors.isAggregateFunction(aggNode)).to.equal(true);
+			// Scalar function node (scalar schema) → not an aggregate.
+			expect(CapabilityDetectors.isAggregateFunction(scalarFnNode)).to.equal(false);
+
+			// Regression: a plain scalar node that merely wears the old duck-typed
+			// shape (functionName/isDistinct/args) but carries no aggregate schema
+			// must NOT be classified as an aggregate.
+			const lookAlike = scalarNode({ nodeType: PlanNodeType.ScalarFunctionCall });
+			(lookAlike as any).functionName = 'count';
+			(lookAlike as any).isDistinct = false;
+			(lookAlike as any).args = [];
+			expect(CapabilityDetectors.isAggregateFunction(lookAlike)).to.equal(false);
 		});
 	});
 

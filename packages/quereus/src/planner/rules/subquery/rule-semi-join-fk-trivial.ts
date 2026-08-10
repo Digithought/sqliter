@@ -8,7 +8,9 @@
  *   SemiJoin(L, R, p)
  *     where p is an AND-of-column-equalities,
  *     L's equi columns form a declared FK referencing R's PK, and
- *     R is a row-preserving path to its base table.
+ *     R is a row-preserving path to its base table (projections included — the
+ *     uncorrelated `IN` arm hands the join the subquery's SELECT list verbatim,
+ *     so R is typically `Project(parent)`).
  *
  * Rewrite:
  *   - FK columns all NOT NULL → replace the SemiJoin with L (every L row matches
@@ -32,7 +34,7 @@ import { FilterNode } from '../../nodes/filter.js';
 import { UnaryOpNode, BinaryOpNode } from '../../nodes/scalar.js';
 import { ColumnReferenceNode } from '../../nodes/reference.js';
 import { normalizePredicate } from '../../analysis/predicate-normalizer.js';
-import { lookupCoveringFK, isRowPreservingPathToTable, tableSchemaOf } from '../../util/ind-utils.js';
+import { lookupCoveringFK, isRowPreservingPathToTable, resolveTableColumnMapping, mapColumnsToTable } from '../../util/ind-utils.js';
 import { isAndOfColumnEqualities } from '../join/rule-join-elimination.js';
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 
@@ -51,17 +53,30 @@ export function ruleSemiJoinFkTrivial(node: PlanNode, _context: OptContext): Pla
 	const pairs = extractEquiPairsFromCondition(node.condition, leftAttrs, rightAttrs);
 	if (pairs.length === 0) return null;
 
-	const leftSchema = tableSchemaOf(node.left);
-	const rightSchema = tableSchemaOf(node.right);
-	if (!leftSchema || !rightSchema) return null;
+	// Equi-pairs index each side's OUTPUT columns; the FK lookup speaks base-table
+	// column indices. Translate before comparing — a projection on either side can
+	// rename, reorder, or drop columns, and a derived column has no table origin
+	// at all (mapColumnsToTable then declines).
+	const leftMapping = resolveTableColumnMapping(node.left);
+	const rightMapping = resolveTableColumnMapping(node.right);
+	if (!leftMapping || !rightMapping) return null;
 
-	const childEquiCols = pairs.map(p => p.left);
-	const parentEquiCols = pairs.map(p => p.right);
+	const childOutputCols = pairs.map(p => p.left);
+	const childEquiCols = mapColumnsToTable(childOutputCols, leftMapping);
+	const parentEquiCols = mapColumnsToTable(pairs.map(p => p.right), rightMapping);
+	if (!childEquiCols || !parentEquiCols) return null;
+
+	const leftSchema = leftMapping.schema;
+	const rightSchema = rightMapping.schema;
 	const match = lookupCoveringFK(leftSchema, rightSchema, childEquiCols, parentEquiCols);
 	if (!match) return null;
 
 	// The parent side must be the full table — if rows were filtered out, the
 	// IND inclusion doesn't preserve "every L row has a match" under filtering.
+	// A projection is peeled: `extractUncorrelatedIn` hands the join the IN
+	// subquery verbatim, so R is a `Project` over the parent table, and a
+	// projection never drops rows. Its column renaming is already accounted for
+	// by the mapping above.
 	if (!isRowPreservingPathToTable(node.right)) return null;
 
 	// Refuse to drop the R side when it carries a write — the rewrite replaces
@@ -78,8 +93,10 @@ export function ruleSemiJoinFkTrivial(node: PlanNode, _context: OptContext): Pla
 	}
 
 	// Nullable FK: rows with NULL in any FK column never match in the semi-join.
-	// Replace the join with `Filter(L, fk IS NOT NULL AND …)`.
-	const predicate = buildIsNotNullPredicate(node.scope, leftAttrs, childEquiCols);
+	// Replace the join with `Filter(L, fk IS NOT NULL AND …)`. The predicate is
+	// built over L's OUTPUT columns (`childOutputCols`), not the base-table
+	// indices the FK lookup consumed.
+	const predicate = buildIsNotNullPredicate(node.scope, leftAttrs, childOutputCols);
 	if (!predicate) return null;
 
 	log('Trivializing semi-join over nullable FK %s → %s to Filter(L, fk IS NOT NULL)',

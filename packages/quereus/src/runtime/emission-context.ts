@@ -7,6 +7,8 @@ import { createLogger } from '../common/logger.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode } from '../common/types.js';
 import { BINARY_COLLATION, type CollationFunction } from '../util/comparison.js';
+import { BUILTIN_NORMALIZERS } from '../util/key-serializer.js';
+import type { KeyNormalizer } from '../types/logical-type.js';
 
 const log = createLogger('runtime:emission-context');
 
@@ -102,14 +104,27 @@ export class EmissionContext {
 	/** Schema snapshot for table/view references during emission */
 	private readonly schemaSnapshot = new Map<string, SchemaObject>();
 	public readonly tracePlanStack: boolean;
+	/**
+	 * Whether `emitCallFromPlan` may compile pure synchronous scalar subtrees into
+	 * fused closures (runtime/scalar-fusion.ts) instead of per-row sub-programs.
+	 * Resolved once here: `trace_plan_stack` disables fusion because a fused subtree
+	 * bypasses the per-instruction tracing wrapper (its frames would silently vanish
+	 * from `ctx.planStack`), and `runtime_fuse_scalars` (default true) is the explicit
+	 * kill switch. The override forces a decision regardless of either option — used
+	 * by the debug-introspection surfaces (`scheduler_program()`, `execution_trace()`,
+	 * `Statement.getDebugProgram()`), which must report the unfused instruction graph.
+	 */
+	public readonly fuseScalars: boolean;
 
 	constructor(
 		public readonly db: Database,
+		options?: { fuseScalars?: boolean },
 	) {
-		const option = db.getOption('trace_plan_stack');
-		this.tracePlanStack = typeof option === 'object' && option !== null && 'value' in option
-			? Boolean((option as { value: unknown }).value)
-			: Boolean(option);
+		// Both options are registered `type: 'boolean'`, and `setOption` converts on the
+		// way in, so the stored value is always a boolean — read it as one.
+		this.tracePlanStack = db.options.getBooleanOption('trace_plan_stack');
+		this.fuseScalars = options?.fuseScalars
+			?? (!this.tracePlanStack && db.options.getBooleanOption('runtime_fuse_scalars'));
 		this.schemaManager = db.schemaManager;
 	}
 
@@ -172,6 +187,10 @@ export class EmissionContext {
 	 * Looks up a collation and records the dependency.
 	 * Also captures the collation reference for runtime use.
 	 */
+	// NOTE: the dependency is keyed on the name as written, so `collation:nocase` and
+	// `collation:NOCASE` are distinct keys for one collation. Harmless — validation
+	// re-resolves case-insensitively — but it can list the same collation twice in a
+	// plan fingerprint; normalize the key if fingerprint identity ever has to be exact.
 	getCollation(collationName: string): CollationFunction | undefined {
 		const collation = this.db._getCollation(collationName);
 		if (collation) {
@@ -187,18 +206,43 @@ export class EmissionContext {
 	}
 
 	/**
-	 * Resolves a collation name to its function, with BINARY fallback.
-	 * Records the dependency for plan invalidation.
-	 * Use this in emitters instead of the global resolveCollation().
+	 * Resolves a collation name to its function against this emission's database,
+	 * recording the dependency for plan invalidation. This is the only collation
+	 * lookup an emitter should use — a name has no meaning outside a `Database`.
+	 *
+	 * Throws `QuereusError` (`no such collation sequence: X`) on an unknown name — the
+	 * miss is delegated to {@link Database.getCollationResolver} so build-time and
+	 * emit-time resolution report the same error. There is deliberately no BINARY
+	 * fallback: it would silently produce wrong sort order, wrong UNIQUE enforcement,
+	 * and wrong index seeks. An unresolvable name here means the *producer* of the name
+	 * is wrong (DDL validates column collations at create time) — fix the producer.
 	 */
 	resolveCollation(collationName: string): CollationFunction {
 		if (collationName === 'BINARY') return BINARY_COLLATION; // Fast path
 		const func = this.getCollation(collationName);
-		if (!func) {
-			log('Unknown collation requested: %s. Falling back to BINARY.', collationName);
-			return BINARY_COLLATION;
-		}
+		if (!func) return this.db.getCollationResolver()(collationName);
 		return func;
+	}
+
+	/**
+	 * Resolves a collation name to its key normalizer against this emission's database,
+	 * recording the dependency for plan invalidation. This is the only normalizer lookup
+	 * an emitter should use: an operator that buckets rows by a text key must partition
+	 * them exactly as {@link resolveCollation}'s comparator would, or grouping and
+	 * comparison disagree on the same column in the same connection.
+	 *
+	 * Throws `QuereusError` on an unknown name, and on a comparator-only collation that
+	 * carries no normalizer — both delegated to {@link Database.getKeyNormalizerResolver}
+	 * so every caller reports the same error.
+	 *
+	 * Pass the name through `hashKeyCollationName()` first: a key whose operand types can
+	 * never hold text never consults its collation, so demanding a normalizer for it would
+	 * reject a valid query.
+	 */
+	resolveKeyNormalizer(collationName: string | undefined): KeyNormalizer {
+		if (!collationName || collationName === 'BINARY') return BUILTIN_NORMALIZERS.BINARY; // Fast path
+		this.getCollation(collationName); // Record the dependency; the resolver owns the miss
+		return this.db.getKeyNormalizerResolver()(collationName);
 	}
 
 	/**

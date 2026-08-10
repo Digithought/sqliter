@@ -24,7 +24,9 @@ export class RemoteQueryNode extends PlanNode implements UnaryRelationalNode {
 		/** Optional context data from the module's supports() assessment */
 		public readonly moduleCtx?: unknown
 	) {
-		super(scope, source.getTotalCost());
+		// Self-cost only: the source pipeline flows in via getChildren(). This node
+		// is just the remote-execution boundary marker — negligible self cost.
+		super(scope, 0.01);
 		this.typeCache = new Cached(() => this.source.getType());
 	}
 

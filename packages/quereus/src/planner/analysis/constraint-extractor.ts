@@ -4,6 +4,7 @@
  */
 
 import type { ScalarPlanNode, RelationalPlanNode, PlanNode, FunctionalDependency } from '../nodes/plan-node.js';
+import { isRelationalNode } from '../nodes/plan-node.js';
 import { PlanNodeType } from '../nodes/plan-node-type.js';
 import type { ColumnReferenceNode } from '../nodes/reference.js';
 import { BinaryOpNode, BetweenNode, CastNode, UnaryOpNode } from '../nodes/scalar.js';
@@ -17,6 +18,8 @@ import type { ConstraintOp, PredicateConstraint as VtabPredicateConstraint, Rang
 import { TableReferenceNode, ColumnReferenceNode as _ColumnRef } from '../nodes/reference.js';
 import { CapabilityDetectors } from '../framework/characteristics.js';
 import { computeClosure, expandEcsToFds, keysOf, type KeyRel } from '../util/fd-utils.js';
+import { effectiveBetweenBoundCollation, effectiveComparisonCollation, effectiveInCollation, operandCollation } from './comparison-collation.js';
+import { isNoOpCast } from './scalar-invertibility.js';
 
 const log = createLogger('planner:analysis:constraint-extractor');
 
@@ -373,6 +376,13 @@ function extractBinaryConstraint(
     finalOp = baseOp ? flipOperator(baseOp) : null;
 	}
 
+  // `col op NULL` is never true (3VL). A pushed range bound would instead apply
+  // key ordering — where NULL sorts below everything, so `> NULL` matches every
+  // row — so decline and leave the conjunct as a residual filter. Equality stays
+  // extractable: the access-path literal-NULL seek check (rule-select-access-path)
+  // emits an EmptyResult for it.
+  if (constant === null && finalOp !== '=') return null;
+
   if (!columnRef || !finalOp) {
 		log('No column-constant pattern found in binary expression');
 		return null;
@@ -410,13 +420,20 @@ function extractBinaryConstraint(
     const valueSide = (columnIsLeft ? rhs : lhs) as ScalarPlanNode;
     if (!isLiteralConstant(valueSide)) {
       result.valueExpr = valueSide;
-      const innerValue = unwrapCast(valueSide);
+      // Classification only — `valueExpr` above retains the cast, so a converting
+      // cast may be looked through here (see `unwrapCastForBindingKind`).
+      const innerValue = unwrapCastForBindingKind(valueSide);
       if (innerValue.nodeType === PlanNodeType.ParameterReference) {
         result.bindingKind = 'parameter';
       } else if (innerValue.nodeType === PlanNodeType.ColumnReference) {
         const rhsAttrId = (innerValue as unknown as ColumnReferenceNode).attributeId;
         const sameTable = tableInfo.columnIndexMap.has(rhsAttrId);
-        result.bindingKind = sameTable ? 'expression' : 'correlated';
+        if (sameTable) {
+          // Same-table column ref: value is unknown until the row is scanned —
+          // can never be a seek key. Decline; the predicate stays as residual.
+          return null;
+        }
+        result.bindingKind = 'correlated';
       } else {
         result.bindingKind = 'expression';
       }
@@ -461,6 +478,9 @@ function extractBetweenConstraints(
 
   const lowVal = getLiteralValue(low);
   const upVal = getLiteralValue(up);
+  // A NULL bound makes BETWEEN never true (3VL); leave as residual rather than
+  // pushing a seek bound that key ordering would satisfy.
+  if (lowVal === null || upVal === null) return null;
   return [
     {
       columnIndex,
@@ -600,6 +620,54 @@ function flattenOrDisjuncts(expr: ScalarPlanNode): ScalarPlanNode[] {
 }
 
 /**
+ * Collation gate for one branch constraint of an OR collapse (ticket
+ * `or-equality-collapse-collation-blind`).
+ *
+ * Both collapsed forms compare under the *column operand's own* collation —
+ * an OR_RANGE spec's bounds are interpreted in the index's declared-collation
+ * ordering — while each written disjunct compares under its own effective
+ * collation (the shared provenance lattice in `comparison-collation.ts`;
+ * constant folding keeps `'bob' COLLATE NOCASE` as a literal whose *type*
+ * carries NOCASE, so shape checks never see the wrapper). A collapse is
+ * sound only when those two collations are **equal** for the branch; both
+ * directions fail otherwise (under-match: a NOCASE disjunct over a BINARY
+ * column matches fewer rows after collapse; over-match: a BINARY disjunct over
+ * a NOCASE column matches more). Note `eff === 'BINARY'` alone is NOT
+ * sufficient here, unlike {@link equalityConstraintCollationOk}'s
+ * finer-than-enforcement rule — the over-match direction needs eff === the
+ * column's declared collation.
+ */
+function orBranchConstraintCollationOk(c: PredicateConstraint): boolean {
+	const src = c.sourceExpression;
+	if (src instanceof BinaryOpNode) {
+		const colSide = columnSideOf(src, c.attributeId);
+		if (colSide === undefined) return false;
+		return effectiveComparisonCollation(src.left, src.right) === operandCollation(colSide);
+	}
+	if (src instanceof InNode) {
+		// Minted only by `extractInConstraint`, whose condition is a bare
+		// ColumnReferenceNode. The lattice lets a collate-wrapped list element
+		// outrank the column's contribution, so the equality below is genuinely
+		// load-bearing (not just future-proofing).
+		return effectiveInCollation(src) === operandCollation(src.condition);
+	}
+	if (src instanceof BetweenNode) {
+		// A BETWEEN branch contributes two constraints sharing this source;
+		// `emitBetween` resolves each bound's collation independently (bound ??
+		// tested expression), so both must match the column operand.
+		const target = operandCollation(src.expr);
+		return effectiveBetweenBoundCollation(src.expr, src.lower) === target
+			&& effectiveBetweenBoundCollation(src.expr, src.upper) === target;
+	}
+	// Conservative: an unrecognized shape cannot prove its effective collation,
+	// so the whole OR stays residual. This is the *opposite* polarity of
+	// `equalityConstraintCollationOk`'s permissive fallback — there a wrong
+	// answer only loses a covered-key witness; here it would rewrite the
+	// comparison a consuming seek performs and produce wrong rows.
+	return false;
+}
+
+/**
  * Attempt to extract index-friendly constraints from an OR expression.
  *
  * Handles two cases:
@@ -642,6 +710,24 @@ function tryExtractOrBranches(
 		}
 	}
 	if (allRelations.size !== 1) return null;
+
+	// Collation pre-gate covering both collapse cases below (IN and OR_RANGE
+	// both compare under the column's own collation): every branch constraint's
+	// effective collation must equal it, else the whole OR stays residual —
+	// a completeness loss only, never a semantics change. Reviewer note:
+	// `effectivePredicateCollation` (rule-select-access-path) still resolves an
+	// OR `sourceExpression` to BINARY, but post-gate every surviving collapsed
+	// constraint's true collation equals the column's declared collation, so
+	// the cover analysis is at worst conservative (BINARY-vs-NOCASE-index →
+	// COARSER_SAFE keeps the semantically-correct OR residual; ranges decline).
+	// Carrying the resolved collation on the constraint would make it precise —
+	// an optional follow-up, not required for correctness.
+	for (const b of branches) {
+		if (!b.constraints.every(orBranchConstraintCollationOk)) {
+			log('OR collapse declined: branch effective collation does not match column collation');
+			return null;
+		}
+	}
 
 	// Case 1: All branches are single equality or IN on the same column → collapse to IN
 	const allEqOrIn = branches.every(b =>
@@ -819,14 +905,62 @@ function isOrExpression(expr: ScalarPlanNode): boolean {
 }
 
 /**
- * Check if node is a column reference
- */
-/**
- * Unwrap a CastNode inserted by the planner for cross-category coercion.
- * Returns the inner operand if node is a Cast, otherwise returns the node itself.
+ * Strip only *value-preserving* wrappers, exposing the underlying literal /
+ * column reference for shape matching. Every caller of this helper discards the
+ * wrapper, so anything it strips must leave the compared value unchanged.
+ *
+ * Only a no-op `CAST` (target logical type equal to the operand's — see
+ * {@link isNoOpCast}) qualifies, and chains of them are stripped. A **converting**
+ * `CAST` changes the compared value: `cast(x as integer) = 1` over a `text`
+ * column would be recognized as `x = 1` and pushed down as a seek key on the
+ * *stored* text, which under storage-class ordering matches nothing — and since
+ * the conjunct is reported as fully consumed, no residual `FILTER` survives to
+ * catch it. This is not exotic SQL: `insertCrossTypeCoercion`
+ * (`building/expression.ts`) synthesizes exactly that cast for a bare
+ * `where x = 1` against a `text` column. Symmetrically on the value side,
+ * `getLiteralValue` returns the *pre-cast* literal, so stripping
+ * `cast(1 as text)` would seek on the integer `1`.
+ *
+ * A `CollateNode` is never stripped either: a collate-wrapped literal or column
+ * changes the comparison's effective collation, so recognizing
+ * `b = 'x' collate nocase` as an ordinary `col = lit` constraint would mint a
+ * seek / covered-key witness under the column's declared collation while the
+ * runtime compares NOCASE — wrong rows from a seek, false ≤1-row claims from
+ * the covered-key path. Because only no-op casts are stripped, every recognized
+ * `col = lit` comparison's effective collation equals the column's declared
+ * collation (the key's enforcement collation), which is what keeps
+ * `FilterNode`'s covered-key detection sound.
+ *
+ * Pinned by seek-correctness tests (tickets
+ * `collation-blind-equality-fact-extraction` and
+ * `bug-cast-stripped-from-seek-constraints`); do not loosen without gating
+ * consumers on the wrapper. `sat-checker.ts`'s `unwrap()` and
+ * `coarsened-key.ts` carry the same rule.
+ *
+ * Classification-only callers that *retain* the wrapper use
+ * {@link unwrapCastForBindingKind} instead.
  */
 function unwrapCast(node: ScalarPlanNode): ScalarPlanNode {
-	return node.nodeType === PlanNodeType.Cast ? (node as CastNode).operand : node;
+	let cur = node;
+	while (cur instanceof CastNode && isNoOpCast(cur)) cur = cur.operand;
+	return cur;
+}
+
+/**
+ * Strip *any* `CastNode` chain — including converting casts — to classify the
+ * shape of a value-side expression.
+ *
+ * Sound only where the cast is retained in the emitted constraint: the two
+ * callers (`extractBinaryConstraint`'s `bindingKind` selection and
+ * {@link isDynamicValue}) keep the whole cast node in `valueExpr`, which is
+ * evaluated at runtime. That preserves parameter / correlated seek pushdown for
+ * `x = cast(:p as integer)`. Never use this where the wrapper is discarded —
+ * see {@link unwrapCast}.
+ */
+function unwrapCastForBindingKind(node: ScalarPlanNode): ScalarPlanNode {
+	let cur = node;
+	while (cur instanceof CastNode) cur = cur.operand;
+	return cur;
 }
 
 function isColumnReference(node: ScalarPlanNode): node is ColumnReferenceNode {
@@ -834,28 +968,32 @@ function isColumnReference(node: ScalarPlanNode): node is ColumnReferenceNode {
 }
 
 /**
- * Extract the underlying ColumnReferenceNode, unwrapping a planner-inserted
- * CastNode if present.
+ * Extract the underlying ColumnReferenceNode, unwrapping a value-preserving
+ * (no-op) CastNode if present.
  */
 function getColumnReference(node: ScalarPlanNode): ColumnReferenceNode {
 	return unwrapCast(node) as unknown as ColumnReferenceNode;
 }
 
 /**
- * Check if node is a literal constant (sees through planner-inserted CastNodes).
+ * Check if node is a literal constant (sees through value-preserving CastNodes).
  */
 function isLiteralConstant(node: ScalarPlanNode): node is LiteralNode {
 	return unwrapCast(node).nodeType === PlanNodeType.Literal;
 }
 
+/**
+ * True when the value side is a parameter or a column reference from any table
+ * (correlation handled later). Classification only — the caller keeps the cast
+ * in `valueExpr` and evaluates it at runtime, so a converting cast is fine here.
+ */
 function isDynamicValue(node: ScalarPlanNode): boolean {
-  const inner = unwrapCast(node);
-  // Parameter or column reference from any table (correlation handled later)
+  const inner = unwrapCastForBindingKind(node);
   return inner.nodeType === PlanNodeType.ParameterReference || inner.nodeType === PlanNodeType.ColumnReference;
 }
 
 /**
- * Get literal value from literal node (sees through planner-inserted CastNodes).
+ * Get literal value from literal node (sees through value-preserving CastNodes).
  */
 function getLiteralValue(node: ScalarPlanNode): SqlValue {
 	const literalNode = unwrapCast(node) as LiteralNode;
@@ -890,22 +1028,17 @@ export function extractConstraintsForTable(
 	targetTableRelationKey: string
 ): PredicateConstraint[] {
 	const constraints: PredicateConstraint[] = [];
+	const tableInfos = createTableInfosFromPlan(plan).filter(
+		info => info.relationKey === targetTableRelationKey
+	);
+	if (tableInfos.length === 0) return constraints;
 
-	// Walk the plan tree looking for filter predicates
-	walkPlanForPredicates(plan, (predicate, sourceNode) => {
-		// Create table info for the target table only
-		const tableInfos = createTableInfosFromPlan(plan).filter(
-			info => info.relationKey === targetTableRelationKey
-		);
-
-		if (tableInfos.length > 0) {
-			const result = extractConstraints(predicate, tableInfos);
-			const tableConstraints = result.constraintsByTable.get(targetTableRelationKey);
-			if (tableConstraints) {
-				constraints.push(...tableConstraints);
-				log('Found %d constraints for table %s from %s',
-					tableConstraints.length, targetTableRelationKey, sourceNode);
-			}
+	walkPredicatesConstraining(plan, targetTableRelationKey, predicate => {
+		const result = extractConstraints(predicate, tableInfos);
+		const tableConstraints = result.constraintsByTable.get(targetTableRelationKey);
+		if (tableConstraints) {
+			constraints.push(...tableConstraints);
+			log('Found %d constraints for table %s', tableConstraints.length, targetTableRelationKey);
 		}
 	});
 
@@ -913,31 +1046,63 @@ export function extractConstraintsForTable(
 }
 
 /**
- * Extract constraints and combined residual predicate for a specific table
+ * Visit every predicate in `plan` that can constrain the table instance
+ * `targetTableRelationKey` — i.e. every predicate whose own relational INPUT
+ * contains that table reference.
+ *
+ * A plain "walk everything" sweep is unsound here: a subquery body hangs off a
+ * scalar predicate, so `where exists (select 1 from t where t.s = a.i)` puts the
+ * inner `t.s = a.i` inside the outer Filter's subtree. Attributing it to `a`
+ * turns it into a constraint (and then a residual predicate) on `a`'s access
+ * path, which hoists a predicate reading column `s` over a relation that has no
+ * such column. The subquery's own scans stay reachable — an inner scan of the
+ * target legitimately collects its own correlated predicate — but a predicate is
+ * never attributed to a table outside its input.
+ *
+ * The target is matched on the instance-unique `#<nodeId>` suffix that
+ * {@link createTableInfoFromNode} appends, so callers that build the key with a
+ * bare table name and callers that schema-qualify it both work.
+ *
+ * @returns whether the target table reference sits in this node's relational input
  */
-export function extractConstraintsAndResidualForTable(
-    plan: RelationalPlanNode,
-    targetTableRelationKey: string
-): { constraints: PredicateConstraint[]; residualPredicate?: ScalarPlanNode } {
-    const constraints: PredicateConstraint[] = [];
-    const residuals: ScalarPlanNode[] = [];
+function walkPredicatesConstraining(
+	plan: PlanNode,
+	targetTableRelationKey: string,
+	callback: (predicate: ScalarPlanNode) => void,
+): boolean {
+	// NOTE: recursive over the native stack (as the sweep this replaced was). Plan depth is
+	// bounded by query nesting today; if a generated query ever overflows here, convert to the
+	// explicit-stack shape `PlanNode.computePostOrder` uses — the post-order return value
+	// (`inScope` bubbling up) is what makes the recursion convenient rather than necessary.
+	//
+	// NOTE: scope is followed through `getChildren()` only. Three nodes override
+	// `getRelations()` to expose a relation that is NOT a child — `InsertNode.table`,
+	// `AddConstraintNode.table`, `AlterTableNode.table` — so a target key naming one of those
+	// DML/DDL target references is unreachable here and yields no constraints. Harmless today:
+	// those references carry their own attribute ids, which no predicate in the plan mentions,
+	// so the old unguarded sweep found nothing for them either, and `binding-extractor` falls
+	// back to `{kind: 'global'}` on an empty covered-key set. If a caller ever needs
+	// constraints for a DML target reference, walk `getRelations()` here too.
+	const idSuffix = `#${plan.id ?? 'unknown'}`;
+	let inScope = plan instanceof TableReferenceNode && targetTableRelationKey.endsWith(idSuffix);
 
-    walkPlanForPredicates(plan, (predicate) => {
-        const tableInfos = createTableInfosFromPlan(plan).filter(
-            info => info.relationKey === targetTableRelationKey
-        );
-        if (tableInfos.length === 0) return;
-        const result = extractConstraints(predicate, tableInfos);
-        const tableConstraints = result.constraintsByTable.get(targetTableRelationKey);
-        if (tableConstraints && tableConstraints.length) {
-            constraints.push(...tableConstraints);
-        }
-        if (result.residualPredicate) {
-            residuals.push(result.residualPredicate);
-        }
-    });
+	// Only a RELATIONAL child of a RELATIONAL node feeds that node's input. A relational node
+	// reached through a scalar expression is a subquery body — a different scope — so what it
+	// contains must not put the target in scope here (its own predicates were already collected
+	// inside the recursion).
+	const planIsRelational = isRelationalNode(plan);
+	for (const child of plan.getChildren()) {
+		const foundBelow = walkPredicatesConstraining(child, targetTableRelationKey, callback);
+		if (foundBelow && planIsRelational && isRelationalNode(child)) inScope = true;
+	}
 
-    return { constraints, residualPredicate: combineResiduals(residuals) };
+	if (inScope && CapabilityDetectors.isPredicateSource(plan)) {
+		for (const predicate of plan.getPredicates() as ReadonlyArray<ScalarPlanNode>) {
+			callback(predicate);
+		}
+	}
+
+	return inScope;
 }
 
 /**
@@ -958,10 +1123,89 @@ export function extractCoveredKeysForTable(
 }
 
 /**
+ * Locate the (cast-unwrapped) column-reference side of a binary comparison
+ * matching `attributeId`. Used by {@link equalityConstraintCollationOk} to read
+ * the constrained column's declared collation off its reference type.
+ */
+function columnSideOf(src: BinaryOpNode, attributeId: number): ScalarPlanNode | undefined {
+	const l = unwrapCast(src.left);
+	if (l.nodeType === PlanNodeType.ColumnReference && (l as unknown as ColumnReferenceNode).attributeId === attributeId) return l;
+	const r = unwrapCast(src.right);
+	if (r.nodeType === PlanNodeType.ColumnReference && (r as unknown as ColumnReferenceNode).attributeId === attributeId) return r;
+	return undefined;
+}
+
+/**
+ * Collation gate for an equality constraint feeding covered-key detection.
+ *
+ * A covered key proves ≤1 row only when each pinned key column's comparison
+ * cannot conflate values the key's enforcement distinguishes — i.e. the
+ * comparison's effective collation is **at least as fine** as the enforcement
+ * collation (the column's declared collation: PK/UNIQUE enforcement compares
+ * under it — see the memory layer manager's uniqueness checks). The two
+ * decidable cases: effective collation BINARY (finest), or equal to the
+ * declared collation.
+ *
+ * The shape that needs this: constant folding collapses
+ * `'bob' COLLATE NOCASE` into a `LiteralNode` whose *type* keeps
+ * `collationName: 'NOCASE'` (const-pass preserves type metadata), so
+ * `b = 'bob' collate nocase` reaches extraction as an ordinary `col = lit`
+ * constraint that compares NOCASE at runtime over a BINARY-enforced key —
+ * counting it as covering produced a false ≤1-row claim (ticket
+ * `collation-blind-equality-fact-extraction`, repro 1). A `COLLATE` wrapper on
+ * the *column* side never folds and is already structurally rejected by
+ * `unwrapCast` being Cast-only.
+ *
+ * IN constraints are gated by {@link inConstraintCollationOk}: under the
+ * provenance lattice a collate-wrapped list element (folded to a literal whose
+ * type carries rank-3 NOCASE) can outrank the column condition, so listed
+ * values' collations are no longer inert.
+ */
+function equalityConstraintCollationOk(c: PredicateConstraint): boolean {
+	const src = c.sourceExpression;
+	if (src instanceof BinaryOpNode) {
+		const eff = effectiveComparisonCollation(src.left, src.right);
+		if (eff === 'BINARY') return true;
+		const colSide = columnSideOf(src, c.attributeId);
+		return colSide !== undefined && operandCollation(colSide) === eff;
+	}
+	// Every `op: '='` constraint today is minted by `extractBinaryConstraint`
+	// with the BinaryOpNode itself as `sourceExpression` (OR collapse emits
+	// only 'IN'/'OR_RANGE'), so this permissive fallback is unreachable for
+	// equalities. If a new producer mints '=' constraints from another shape,
+	// it must either carry the comparison or be gated here explicitly.
+	return true;
+}
+
+/**
+ * Collation gate for a (singleton) IN constraint feeding covered-key
+ * detection — the IN analogue of {@link equalityConstraintCollationOk}. The
+ * runtime membership test (`emitIn`) compares under the lattice-resolved
+ * collation over the condition AND every listed value, so a wrapped element
+ * like `b IN ('bob' collate nocase)` compares NOCASE over a BINARY-enforced
+ * key and must not count as covering. Sound cases mirror the equality gate:
+ * effective BINARY (finest), or equal to the column operand's own (declared)
+ * collation. OR-collapse-minted IN constraints carry the OR BinaryOpNode as
+ * `sourceExpression` and were already vetted per-branch by
+ * {@link orBranchConstraintCollationOk}.
+ */
+function inConstraintCollationOk(c: PredicateConstraint): boolean {
+	const src = c.sourceExpression;
+	if (src instanceof InNode) {
+		const eff = effectiveInCollation(src);
+		if (eff === 'BINARY') return true;
+		return operandCollation(src.condition) === eff;
+	}
+	return true;
+}
+
+/**
  * Given a set of constraints and a table's unique keys, compute which keys are fully covered by
  * equality (optionally using FDs and equivalence classes to expand the equality-covered column set
  * via closure). A key is covered if every column in it lies in the closure of equality-covered
- * columns under the supplied FDs + EC-derived FDs.
+ * columns under the supplied FDs + EC-derived FDs. Equality constraints whose
+ * comparison collation is coarser than the column's declared (enforcement)
+ * collation are skipped — see {@link equalityConstraintCollationOk}.
  */
 export function computeCoveredKeysForConstraints(
     constraints: readonly PredicateConstraint[],
@@ -993,10 +1237,10 @@ export function computeCoveredKeysForConstraints(
         // uniformly — see `bindingReferencesOuterTable`.
         if (c.correlated) continue;
         if (c.op === '=') {
-            eqCols.add(c.columnIndex);
+            if (equalityConstraintCollationOk(c)) eqCols.add(c.columnIndex);
         }
         if (c.op === 'IN' && Array.isArray(c.value) && (c.value as unknown[]).length === 1) {
-            eqCols.add(c.columnIndex);
+            if (inConstraintCollationOk(c)) eqCols.add(c.columnIndex);
         }
     }
 
@@ -1287,40 +1531,6 @@ function classifyForAggregate(
     classifyForIdentityBreakingNodes(aggNode.source as unknown as PlanNode, classifications, groupKeys, tableInfos);
 }
 
-function combineResiduals(predicates: ScalarPlanNode[]): ScalarPlanNode | undefined {
-    if (predicates.length === 0) return undefined;
-    if (predicates.length === 1) return predicates[0];
-    let acc = predicates[0];
-    for (let i = 1; i < predicates.length; i++) {
-        const right = predicates[i];
-        const ast: AST.BinaryExpr = { type: 'binary', operator: 'AND', left: acc.expression, right: right.expression };
-        acc = new BinaryOpNode(acc.scope, ast, acc, right);
-    }
-    return acc;
-}
-
-/**
- * Walk a plan tree and call callback for each predicate found
- */
-function walkPlanForPredicates(
-  plan: PlanNode,
-  callback: (predicate: ScalarPlanNode, sourceNode: string) => void
-): void {
-  if (!plan) return;
-  // If node exposes predicates via characteristic, collect them
-  if (CapabilityDetectors.isPredicateSource(plan)) {
-    const preds = plan.getPredicates() as ReadonlyArray<ScalarPlanNode>;
-    for (const p of preds) {
-      callback(p, 'PredicateSource');
-    }
-  }
-
-  // Recurse into all children (scalar and relational)
-  for (const child of plan.getChildren()) {
-    walkPlanForPredicates(child as unknown as PlanNode, callback);
-  }
-}
-
 /**
  * Create table information from a relational plan
  */
@@ -1390,7 +1600,16 @@ export function createTableInfoFromNode(node: RelationalPlanNode, relationName?:
 	const candidateKeys = keysOf(node as unknown as KeyRel).map(k => [...k]);
 
 	const relName = relationName || node.toString();
-	const relationKey = `${relName}#${node.id ?? 'unknown'}`;
+	// Canonicalize the instance key to lowercase. SQL identifiers are
+	// case-insensitive, and every other relation-key builder in the
+	// change-scope pipeline lowercases (`change-scope.ts` relKeyFor,
+	// `binding-extractor.ts` collectTableRefs, `collectRelationKeysBeneath`,
+	// `key-filter.ts`). Leaving this one un-lowercased meant a table whose
+	// name isn't already lowercase (e.g. `Entity`) produced a relationKey
+	// that no other site matched — so `analyzeRowSpecific`'s classification
+	// and `extractConstraintsForTable`'s filter both missed, silently
+	// widening every single-PK equality select to a whole-table scope.
+	const relationKey = `${relName.toLowerCase()}#${node.id ?? 'unknown'}`;
 
 	return {
 		relationName: relName,

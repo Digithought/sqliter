@@ -1,0 +1,143 @@
+-- Row-validating DDL inside an open transaction.
+--
+-- `create unique index` and `alter table ... add constraint ... unique` must see the
+-- rows the issuing transaction has written but not yet committed, and the constraint
+-- they declare must stay enforced for the rest of that transaction.
+--
+-- Runs against every backend (memory, store). Each statement is its own block so an
+-- expected failure is attributed to exactly one statement.
+--
+-- requires-capability: standalone-index-ddl
+--
+-- The `alter table ... add constraint ... unique` twins of §1 and §4 need no index DDL at all,
+-- so they live in 10.1.2.1-add-constraint-in-transaction and run on every backend. Everything
+-- left here builds the constraint through `create unique index`.
+
+-- ===================================
+-- 1. create unique index over rows the transaction just inserted
+-- ===================================
+
+create table ddl_tx_a (id integer primary key, v text);
+-- run
+begin;
+-- run
+insert into ddl_tx_a values (1, 'a');
+-- run
+insert into ddl_tx_a values (2, 'a');
+-- run
+create unique index ddl_tx_a_ix on ddl_tx_a (v);
+-- error: UNIQUE constraint failed
+rollback;
+-- run
+
+-- The rejected transaction left nothing behind.
+select count(*) as cnt from ddl_tx_a;
+→ [{ "cnt": 0 }]
+
+-- ===================================
+-- 2. create unique index over a pending row colliding with a committed one
+-- ===================================
+
+insert into ddl_tx_a values (1, 'a');
+-- run
+begin;
+-- run
+insert into ddl_tx_a values (2, 'a');
+-- run
+create unique index ddl_tx_a_ix on ddl_tx_a (v);
+-- error: UNIQUE constraint failed
+rollback;
+-- run
+
+select count(*) as cnt from ddl_tx_a;
+→ [{ "cnt": 1 }]
+
+-- ===================================
+-- 3. add constraint ... unique over rows the transaction just inserted
+-- ===================================
+-- Lives in 10.1.2.1-add-constraint-in-transaction § 1 (it needs no index DDL).
+
+-- ===================================
+-- 4. Accepted DDL enforces the new constraint for the rest of the transaction
+-- ===================================
+
+create table ddl_tx_c (id integer primary key, v text);
+-- run
+begin;
+-- run
+insert into ddl_tx_c values (1, 'a');
+-- run
+create unique index ddl_tx_c_ix on ddl_tx_c (v);
+-- run
+insert into ddl_tx_c values (2, 'a');
+-- error: UNIQUE constraint failed
+
+-- The transaction is still open; a non-colliding row is accepted and commits.
+insert into ddl_tx_c values (3, 'b');
+-- run
+commit;
+-- run
+
+select id, v from ddl_tx_c order by id;
+→ [{ "id": 1, "v": "a" }, { "id": 3, "v": "b" }]
+
+-- The committed index still enforces uniqueness.
+insert into ddl_tx_c values (4, 'b');
+-- error: UNIQUE constraint failed
+
+-- ===================================
+-- 5. Same, through add constraint ... unique
+-- ===================================
+-- Lives in 10.1.2.1-add-constraint-in-transaction § 2 (it needs no index DDL).
+
+-- ===================================
+-- 6. A pending DELETE removes a committed duplicate, so the build is legal
+-- ===================================
+
+create table ddl_tx_e (id integer primary key, v text);
+-- run
+insert into ddl_tx_e values (1, 'a');
+-- run
+insert into ddl_tx_e values (2, 'a');
+-- run
+begin;
+-- run
+delete from ddl_tx_e where id = 2;
+-- run
+create unique index ddl_tx_e_ix on ddl_tx_e (v);
+-- run
+commit;
+-- run
+
+select id, v from ddl_tx_e order by id;
+→ [{ "id": 1, "v": "a" }]
+
+-- ===================================
+-- 7. NULLs are distinct: multiple pending NULLs never block the build
+-- ===================================
+
+create table ddl_tx_f (id integer primary key, v text null);
+-- run
+begin;
+-- run
+insert into ddl_tx_f values (1, null);
+-- run
+insert into ddl_tx_f values (2, null);
+-- run
+create unique index ddl_tx_f_ix on ddl_tx_f (v);
+-- run
+commit;
+-- run
+
+select count(*) as cnt from ddl_tx_f;
+→ [{ "cnt": 2 }]
+
+-- Cleanup
+drop table ddl_tx_a;
+-- run
+drop table ddl_tx_c;
+-- run
+drop table ddl_tx_e;
+-- run
+drop table ddl_tx_f;
+-- run

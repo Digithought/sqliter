@@ -4,7 +4,7 @@ import { FunctionFlags } from '../common/constants.js';
 import type { Database } from '../core/database.js';
 import type { BaseType, ScalarType, RelationType, ColRef } from '../common/datatype.js';
 import type { AggValue } from '../func/registration.js';
-import type { LogicalType } from '../types/logical-type.js';
+import type { CollationFunction, LogicalType } from '../types/logical-type.js';
 import type { ScalarFunctionCallNode } from '../planner/nodes/function.js';
 import type { EmissionContext } from '../runtime/emission-context.js';
 import type { Instruction } from '../runtime/types.js';
@@ -48,6 +48,95 @@ export type AggregateReducer<T = any> = (accumulator: T, ...args: SqlValue[]) =>
 export type AggregateFinalizer<T = any> = (accumulator: T) => SqlValue;
 
 /**
+ * Optional algebraic structure over an aggregate's accumulator. Each field
+ * declares one property the engine may exploit for incremental maintenance of
+ * aggregate materialized views; an absent field means the property is not held
+ * (never "unknown"). Algebra functions are peers of `stepFunction`: they operate
+ * on the same accumulator representation and must use the same
+ * comparison/collation context the step uses. All algebra functions must be
+ * pure — no mutation of their inputs. `AggValue` is the opaque accumulator type.
+ *
+ * The author's contract (verified by the `assertAggregateAlgebraLaws` harness
+ * on the test surface; equivalence is finalize-then-byte-compare):
+ * 1. `merge` is associative and commutative; a clone of `initialValue` is its
+ *    identity.
+ * 2. Step/merge coherence: `step(a, x) ≡ merge(a, step(identity, x))`.
+ * 3. `merge(a, negate(a)) ≡ identity`.
+ * 4. Decode is observational: `finalize(merge(decode(finalize(a)), b)) ≡
+ *    finalize(merge(a, b))` for `b` built from *inserted* rows. When
+ *    `decodeExact` is declared, the same identity must additionally hold for
+ *    `b` containing retractions (`negate`d contributions) — decode fully
+ *    reconstructs the accumulator, not just an insert-observational witness.
+ * 5. `finalize(a) ≡ decompose.combine([finalize(p) …])` over the partial
+ *    accumulators induced by the same input rows.
+ */
+export interface AggregateAlgebra {
+	/** Commutative, associative combine of two accumulators; identity is a clone of
+	 *  initialValue (a commutative monoid). Enables partial aggregation. */
+	merge: (a: AggValue, b: AggValue) => AggValue;
+	/** Group inverse: merge(a, negate(a)) ≡ identity (lifts the monoid to an abelian
+	 *  group). Enables retraction. Retracting one source row x is
+	 *  merge(acc, negate(step(identity, x))). Absent ⇒ tighten-only. */
+	negate?: (a: AggValue) => AggValue;
+	/** Reconstruct a working accumulator from the STORED (finalized) output value.
+	 *  Required for backing-delta maintenance (the backing holds finalized values, not
+	 *  accumulators). Omit when finalize is identity-like (count → stored int IS the
+	 *  accumulator). IMPOSSIBLE for avg (the quotient forgets the count → declare
+	 *  `decompose` instead). */
+	decode?: (stored: SqlValue) => AggValue;
+	/** True when `decode` is a FULL inverse of finalize: `decode(finalize(a)) ≡ a`
+	 *  for every reachable accumulator, so a decoded accumulator stays observational
+	 *  under RETRACTIONS too (law 4's stronger form). Declarable when the stored value
+	 *  loses nothing (count → the stored int IS the accumulator). Absent ⇒ decode is
+	 *  only an insert-observational witness (sum → the stored sum forgets how many
+	 *  non-NULL rows contributed): the write-side delta arm must then prove the true
+	 *  contribution count stays positive (e.g. a NOT NULL argument column plus the
+	 *  count(*) multiplicity witness) before applying a retraction through decode,
+	 *  and otherwise re-derives the group from live source state. */
+	decodeExact?: boolean;
+	/** This aggregate's value is a scalar expression over OTHER (algebra-complete)
+	 *  sibling aggregates — e.g. avg(x) ≡ sum(x)/count(x). Lets a stored column be
+	 *  maintained by delta-maintaining its partials, and lets the read-side rollup
+	 *  recombine it. */
+	decompose?: AggregateDecomposition;
+}
+
+/** Resolved comparison context for ONE argument of an aggregate call site. */
+export interface AggregateArgBinding {
+	/** The argument's declared logical type; undefined when untyped / ANY. */
+	readonly logicalType?: LogicalType;
+	/** The argument's resolved collation; undefined ⇒ BINARY. */
+	readonly collation?: CollationFunction;
+}
+
+/** The pieces a bind may replace. Any field omitted keeps the declared default. */
+export interface AggregateFunctionBinding {
+	readonly stepFunction?: AggregateReducer;
+	readonly finalizeFunction?: AggregateFinalizer;
+	readonly algebra?: AggregateAlgebra;
+}
+
+/**
+ * A decomposition of one aggregate onto sibling partial aggregates. Kept one
+ * level deep: every named partial must itself be directly algebra-complete
+ * (a decompose-only partial is out of scope).
+ */
+export interface AggregateDecomposition {
+	/** The partials this aggregate is composed from. Each names a sibling aggregate by
+	 *  function name and how its argument relates to this aggregate's argument. */
+	readonly partials: ReadonlyArray<{
+		/** Sibling aggregate function name (e.g. 'sum', 'count'). */
+		readonly func: string;
+		/** 'same-arg' → f(thisArg); 'star' → count(*)-shaped (no argument). */
+		readonly arg: 'same-arg' | 'star';
+	}>;
+	/** Build the composed *finalized* value from the partials' finalized values, in
+	 *  `partials` order. Must reproduce this aggregate's finalize exactly (incl. the
+	 *  empty-group / divide-by-zero case → e.g. avg NULL/0 ⇒ NULL). */
+	readonly combine: (partialValues: readonly SqlValue[]) => SqlValue;
+}
+
+/**
  * Custom emitter hook for functions that need special emission logic.
  * This allows functions to cache compiled state in the EmissionContext,
  * optimize constant arguments, or perform other emission-time optimizations.
@@ -68,6 +157,19 @@ interface BaseFunctionSchema {
 	numArgs: number;
 	/** Combination of FunctionFlags */
 	flags: FunctionFlags;
+	/**
+	 * Stronger-than-deterministic class: when `true`, this function is asserted to
+	 * be **bit-identical across peers, platforms, and app versions** — not merely
+	 * deterministic within one database. This matters only for a function that is
+	 * already deterministic (the determinism gate handles non-determinism
+	 * independently), and is consulted at create when a backing host declares
+	 * {@link import('../vtab/backing-host.js').BackingHost.requiresReplicableDerivations}.
+	 * Built-in functions qualify automatically (Quereus implements its own
+	 * collation / case-folding / numeric formatting, so a deterministic builtin
+	 * cannot drift between peers' JS engines); a UDF opts in explicitly. Absent /
+	 * `false` ⇒ not asserted (the conservative default for a UDF).
+	 */
+	replicable?: boolean;
 	/** User data pointer passed during registration */
 	userData?: unknown;
 	/** Return type information */
@@ -79,6 +181,45 @@ interface BaseFunctionSchema {
 	 * emission context, and a reference to the default emitter.
 	 */
 	customEmitter?: CustomEmitterHook;
+	/**
+	 * When `true`, this function is omitted from the `schema()` catalog listing
+	 * but remains fully callable and visible to `function_info()`. Used by
+	 * hosts (e.g. Lamina) to hide synthesized internal helpers from the
+	 * user-facing schema catalog without preventing them from resolving.
+	 */
+	hidden?: boolean;
+	/** Argument positions this function compares against one another. `'all'` for a
+	 *  variadic function that ranks every argument. Drives plan-time cross-type
+	 *  coercion across the group (`planner/building/coercion.ts`
+	 *  `coerceComparisonGroup`), so a comparison-based builtin reconciles its
+	 *  operands exactly as the `=` operator does. A builtin that declares this must
+	 *  also supply a {@link BaseFunctionSchema.customEmitter} binding the matching
+	 *  comparator over the same positions (`emitNullif` / `emitExtremum` in
+	 *  `func/builtins/scalar.ts`) — the emitter is not derived from this field.
+	 *  A function that also declares {@link BaseFunctionSchema.returnsArg} skips the
+	 *  plan-time rewrite and coerces at emit time instead. */
+	readonly comparesArgs?: 'all' | readonly number[];
+	/**
+	 * When `true`, this function returns one of its arguments verbatim, so its
+	 * {@link BaseFunctionSchema.comparesArgs} group must NOT be rewritten with
+	 * plan-time casts — the cast's output would become the returned value
+	 * (`least('abc', 1)` returning `0`, a value that was never an argument). Such a
+	 * function's emitter compares *converted copies* of the argument values through
+	 * `makeComparisonGroup` (`runtime/emit/operand-comparator.ts`) and returns the
+	 * raw argument. Set by `nullif`, `greatest` and `least`.
+	 *
+	 * A function that returns a FRESH value computed from a compared group (a
+	 * hypothetical `same_value(a, b)` returning a boolean) leaves this unset and
+	 * keeps the plan-time rewrite. See `planner/building/coercion.ts`.
+	 *
+	 * NOTE: nothing validates that a schema setting this also supplies a
+	 * {@link BaseFunctionSchema.customEmitter} calling `makeComparisonGroup`. Setting
+	 * it without one turns the declared group OFF rather than moving it, since the
+	 * plan-time rewrite is skipped and no emit-time conversion replaces it. Harmless
+	 * while the three builtins are the only setters; if third-party registrations
+	 * start using it, reject the pairing in `Database.registerFunction`.
+	 */
+	readonly returnsArg?: boolean;
 	/**
 	 * Argument indices on which this function is injective when all other
 	 * arguments are held constant. Combines with operand-level recursion in
@@ -106,6 +247,21 @@ export interface ScalarFunctionSchema extends BaseFunctionSchema {
 	returnType: ScalarType;
 	/** Direct scalar function implementation */
 	implementation: ScalarFunc;
+	/**
+	 * When `true`, {@link ScalarFunctionSchema.implementation} may return a Promise.
+	 * Absent / `false` **declares the function synchronous**, which lets the engine
+	 * fuse its calls into a direct closure instead of running a per-row sub-program
+	 * (`runtime/scalar-fusion.ts`; see docs/runtime.md § Scalar fusion).
+	 *
+	 * A declared `async function` / `async` arrow is detected automatically and never
+	 * needs this flag. It exists for the implementation that returns a Promise WITHOUT
+	 * being declared `async` — a non-`async` function returning `somePromise`, or a
+	 * `.bind()` / wrapper around an async one — which is invisible to that detection.
+	 * Such a function that declares nothing fails loudly at its first fused call,
+	 * naming itself and this flag, rather than letting a Promise flow on as if it were
+	 * a value.
+	 */
+	isAsync?: boolean;
 	/**
 	 * Optional type inference function for polymorphic functions.
 	 * If provided, this function will be called at planning time to determine
@@ -231,6 +387,29 @@ export interface AggregateFunctionSchema extends BaseFunctionSchema {
 	/** Initial accumulator value for aggregates */
 	initialValue?: AggValue;
 	/**
+	 * Optional algebraic structure over the accumulator. Absent ⇒ no property
+	 * asserted; the aggregate stays residual-only (full recompute) for
+	 * materialized-view maintenance. Metadata only — never consulted during
+	 * function resolution or the `schema()` / `function_info()` listings.
+	 */
+	algebra?: AggregateAlgebra;
+	/**
+	 * Optional specialization to the call site's comparison context. Called once per
+	 * call site at emit / plan-build time — NEVER per row — with one binding per
+	 * declared argument (empty for a zero-arg call). Returns replacement closures, or
+	 * undefined to keep the declared defaults. Apply via `bindAggregateSchema`
+	 * (func/registration.ts); binding is idempotent, so a bound schema keeps this
+	 * hook and may be rebound freely.
+	 *
+	 * Author contract (an extension of the {@link AggregateAlgebra} contract): the
+	 * `algebra` returned here MUST use the same comparison as the returned
+	 * `stepFunction` — a `merge` that ranks differently from the step makes
+	 * materialized-view maintenance disagree with direct evaluation. It must also
+	 * declare the same algebra FIELDS as the unbound schema: delta/rollup
+	 * eligibility gates read field presence off the unbound declaration.
+	 */
+	readonly bindArgs?: (args: readonly AggregateArgBinding[]) => AggregateFunctionBinding | undefined;
+	/**
 	 * Optional type inference function for polymorphic aggregate functions.
 	 * If provided, this function will be called at planning time to determine
 	 * the return type based on the actual argument types.
@@ -254,13 +433,21 @@ export type FunctionSchema =
 
 /**
  * Type guards for function schema types.
+ *
+ * `returnType` is declared non-optional and `Database.registerFunction` normalizes
+ * it (see `normalizeFunctionSchema` in func/registration.ts), so an absent one
+ * should be unreachable. These guards answer `false` rather than throwing anyway:
+ * a schema that reaches the planner some other way (e.g. inserted straight into a
+ * Schema) then produces "Function f is not a scalar function" instead of an
+ * internal `undefined` read, and the `function_info()` catalog keeps listing
+ * instead of truncating at the first bad entry.
  */
 export function isScalarFunctionSchema(schema: FunctionSchema): schema is ScalarFunctionSchema {
-	return schema.returnType.typeClass === 'scalar' && 'implementation' in schema && typeof schema.implementation === 'function';
+	return schema.returnType?.typeClass === 'scalar' && 'implementation' in schema && typeof schema.implementation === 'function';
 }
 
 export function isTableValuedFunctionSchema(schema: FunctionSchema): schema is TableValuedFunctionSchema {
-	return schema.returnType.typeClass === 'relation';
+	return schema.returnType?.typeClass === 'relation';
 }
 
 export function isAggregateFunctionSchema(schema: FunctionSchema): schema is AggregateFunctionSchema {

@@ -1,5 +1,8 @@
 import { expect } from 'chai';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { Database } from '../../src/core/database.js';
+import { lineAt, readCode, relPosix, stripComments, tsFilesUnder } from '../util/source-scan.js';
 import {
 	addEquivalence,
 	addFd,
@@ -42,14 +45,18 @@ function physicalOf(rows: readonly PlanRow[], pred: (r: PlanRow) => boolean): Ph
 	return JSON.parse(row.physical) as PhysicalProps;
 }
 
-function fdHas(fds: FunctionalDependency[] | undefined, det: number[], dep: number[]): boolean {
-	if (!fds) return false;
+function fdFind(fds: FunctionalDependency[] | undefined, det: number[], dep: number[]): FunctionalDependency | undefined {
+	if (!fds) return undefined;
 	const detSet = new Set(det);
-	return fds.some(fd => {
+	return fds.find(fd => {
 		if (fd.determinants.length !== det.length) return false;
 		if (!fd.determinants.every(d => detSet.has(d))) return false;
 		return dep.every(d => fd.dependents.includes(d));
 	});
+}
+
+function fdHas(fds: FunctionalDependency[] | undefined, det: number[], dep: number[]): boolean {
+	return fdFind(fds, det, dep) !== undefined;
 }
 
 function classContains(classes: number[][] | undefined, members: number[]): boolean {
@@ -69,22 +76,22 @@ describe('fd-utils', () => {
 		});
 
 		it('applies a single FD', () => {
-			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2] }];
+			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2], kind: 'determination' }];
 			const c = computeClosure(new Set([1]), fds);
 			expect([...c].sort()).to.deep.equal([1, 2]);
 		});
 
 		it('iterates to fixpoint (a→b, b→c)', () => {
 			const fds: FunctionalDependency[] = [
-				{ determinants: [1], dependents: [2] },
-				{ determinants: [2], dependents: [3] },
+				{ determinants: [1], dependents: [2], kind: 'determination' },
+				{ determinants: [2], dependents: [3], kind: 'determination' },
 			];
 			const c = computeClosure(new Set([1]), fds);
 			expect([...c].sort()).to.deep.equal([1, 2, 3]);
 		});
 
 		it('handles constants (∅ → c)', () => {
-			const fds: FunctionalDependency[] = [{ determinants: [], dependents: [5] }];
+			const fds: FunctionalDependency[] = [{ determinants: [], dependents: [5], kind: 'determination' }];
 			const c = computeClosure(new Set([1]), fds);
 			expect([...c].sort()).to.deep.equal([1, 5]);
 		});
@@ -97,14 +104,14 @@ describe('fd-utils', () => {
 
 		it('transitive determination', () => {
 			const fds: FunctionalDependency[] = [
-				{ determinants: [1], dependents: [2] },
-				{ determinants: [2], dependents: [3] },
+				{ determinants: [1], dependents: [2], kind: 'determination' },
+				{ determinants: [2], dependents: [3], kind: 'determination' },
 			];
 			expect(determines(new Set([1]), new Set([3]), fds)).to.equal(true);
 		});
 
 		it('does not determine when no chain', () => {
-			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2] }];
+			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2], kind: 'determination' }];
 			expect(determines(new Set([1]), new Set([3]), fds)).to.equal(false);
 		});
 	});
@@ -112,7 +119,7 @@ describe('fd-utils', () => {
 	describe('minimalCover', () => {
 		it('removes redundant attributes', () => {
 			// {1,2} where 1→2, so {1} is the minimal cover that yields the same closure
-			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2] }];
+			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2], kind: 'determination' }];
 			const cover = minimalCover(new Set([1, 2]), fds);
 			expect([...cover].sort()).to.deep.equal([1]);
 		});
@@ -159,61 +166,93 @@ describe('fd-utils', () => {
 
 	describe('projectFds', () => {
 		it('drops FDs that lose a determinant column', () => {
-			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2] }];
+			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2], kind: 'determination' }];
 			const mapping = new Map<number, number>([[2, 0]]);
 			const out = projectFds(fds, mapping);
 			expect(out).to.deep.equal([]);
 		});
 
 		it('drops FDs that lose a dependent column', () => {
-			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2] }];
+			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2], kind: 'determination' }];
 			const mapping = new Map<number, number>([[1, 0]]);
 			const out = projectFds(fds, mapping);
 			expect(out).to.deep.equal([]);
 		});
 
 		it('remaps surviving FDs', () => {
-			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2] }];
+			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2], kind: 'determination' }];
 			const mapping = new Map<number, number>([[1, 10], [2, 20]]);
 			const out = projectFds(fds, mapping);
-			expect(out).to.deep.equal([{ determinants: [10], dependents: [20] }]);
+			expect(out).to.deep.equal([{ determinants: [10], dependents: [20], kind: 'determination' }]);
 		});
 	});
 
-	describe('addFd / mergeFds', () => {
+	describe('OPT-047: addFd dedupes by subsumption and evicts by key/kind preference', () => {
 		it('dedupes identical FDs', () => {
-			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2] }];
-			const out = addFd(fds, { determinants: [1], dependents: [2] });
+			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2], kind: 'determination' }];
+			const out = addFd(fds, { determinants: [1], dependents: [2], kind: 'determination' });
 			expect(out).to.have.length(1);
 		});
 
 		it('drops an existing FD when new one subsumes its dependents', () => {
-			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2] }];
-			const out = addFd(fds, { determinants: [1], dependents: [2, 3] });
+			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2], kind: 'determination' }];
+			const out = addFd(fds, { determinants: [1], dependents: [2, 3], kind: 'determination' });
 			expect(out).to.have.length(1);
 			expect(out[0].dependents.slice().sort()).to.deep.equal([2, 3]);
 		});
 
 		it('skips adding when an existing FD subsumes the new one', () => {
-			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2, 3] }];
-			const out = addFd(fds, { determinants: [1], dependents: [2] });
+			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2, 3], kind: 'determination' }];
+			const out = addFd(fds, { determinants: [1], dependents: [2], kind: 'determination' });
 			expect(out).to.have.length(1);
 			expect(out[0].dependents.slice().sort()).to.deep.equal([2, 3]);
 		});
 
 		it('mergeFds combines lists', () => {
-			const a: FunctionalDependency[] = [{ determinants: [1], dependents: [2] }];
-			const b: FunctionalDependency[] = [{ determinants: [3], dependents: [4] }];
+			const a: FunctionalDependency[] = [{ determinants: [1], dependents: [2], kind: 'determination' }];
+			const b: FunctionalDependency[] = [{ determinants: [3], dependents: [4], kind: 'determination' }];
 			const out = mergeFds(a, b);
 			expect(out).to.have.length(2);
+		});
+
+		it('cap eviction keeps FDs whose determinants lie inside a keyHints set, even over a unique', () => {
+			const fds: FunctionalDependency[] = [
+				{ determinants: [1], dependents: [9], kind: 'determination' },
+				{ determinants: [2], dependents: [9], kind: 'unique' },
+			];
+			const out = addFd(fds, { determinants: [3], dependents: [9], kind: 'unique' }, { cap: 1, keyHints: [[1]] });
+			expect(out).to.have.length(1);
+			expect(out[0].determinants).to.deep.equal([1]);
+		});
+
+		it('cap eviction prefers unique over determination within a partition', () => {
+			const fds: FunctionalDependency[] = [
+				{ determinants: [1], dependents: [9], kind: 'determination' },
+				{ determinants: [2], dependents: [9], kind: 'unique' },
+			];
+			const out = addFd(fds, { determinants: [3], dependents: [9], kind: 'determination' }, { cap: 2 });
+			expect(out).to.have.length(2);
+			expect(out[0].kind).to.equal('unique');
+			expect(out[0].determinants).to.deep.equal([2]);
+		});
+
+		it('cap eviction ranks key-hinted determinations ahead of non-hinted uniques', () => {
+			const fds: FunctionalDependency[] = [
+				{ determinants: [2], dependents: [9], kind: 'unique' },
+				{ determinants: [1], dependents: [9], kind: 'determination' },
+			];
+			const out = addFd(fds, { determinants: [3], dependents: [9], kind: 'unique' }, { cap: 2, keyHints: [[1]] });
+			expect(out).to.have.length(2);
+			expect(out[0].determinants).to.deep.equal([1]);
+			expect(out[1].kind).to.equal('unique');
 		});
 	});
 
 	describe('shiftFds / shiftEquivClasses', () => {
 		it('shifts all column indices', () => {
-			const fds: FunctionalDependency[] = [{ determinants: [0], dependents: [1] }];
+			const fds: FunctionalDependency[] = [{ determinants: [0], dependents: [1], kind: 'determination' }];
 			const shifted = shiftFds(fds, 5);
-			expect(shifted).to.deep.equal([{ determinants: [5], dependents: [6] }]);
+			expect(shifted).to.deep.equal([{ determinants: [5], dependents: [6], kind: 'determination' }]);
 			const classes = shiftEquivClasses([[0, 1]], 5);
 			expect(classes).to.deep.equal([[5, 6]]);
 		});
@@ -360,13 +399,19 @@ describe('FD propagation per operator', () => {
 		expect(fdHas(props!.fds, [], [1])).to.equal(true);
 	});
 
-	it('Filter: col1 = col2 yields bi-FDs and an equivalence class', async () => {
+	it('Filter: col1 = col2 over a keyless relation yields the EC and keeps the FDs as determinations', async () => {
 		await db.exec("CREATE TABLE g (a INTEGER, b INTEGER) USING memory");
 		const rows = await planRows(db, 'SELECT * FROM g WHERE a = b');
 		const props = physicalOf(rows, r => r.op === 'FILTER');
 		expect(props).to.not.equal(undefined);
-		expect(fdHas(props!.fds, [0], [1])).to.equal(true);
-		expect(fdHas(props!.fds, [1], [0])).to.equal(true);
+		// `g` has no key, so a/b are non-unique. The bi-directional `{a}↔{b}` is
+		// kept as `kind: 'determination'` — the kind-aware readers
+		// (`isUniqueDeterminant`) never read it as a uniqueness claim, so the
+		// old producer-side gate is gone and the value claim survives to feed
+		// ORDER BY pruning / GROUP BY simplification (ticket
+		// fd-determination-reader-side-rule). The EC survives as before.
+		expect(fdFind(props!.fds, [0], [1])?.kind).to.equal('determination');
+		expect(fdFind(props!.fds, [1], [0])?.kind).to.equal('determination');
 		expect(classContains(props!.equivClasses, [0, 1])).to.equal(true);
 	});
 
@@ -451,7 +496,7 @@ describe('FD propagation per operator', () => {
 		expect(aggProps!.fds === undefined || Array.isArray(aggProps!.fds)).to.equal(true);
 	});
 
-	it('Inner JOIN: equi-pair adds bi-directional FDs and merges equivalence classes', async () => {
+	it('Inner JOIN: a fanning equi-pair merges the EC and emits determination FDs', async () => {
 		await db.exec("CREATE TABLE jl (id INTEGER PRIMARY KEY, v TEXT) USING memory");
 		await db.exec("CREATE TABLE jr (rid INTEGER PRIMARY KEY, l_id INTEGER) USING memory");
 		const rows = await planRows(db, 'SELECT * FROM jl INNER JOIN jr ON jl.id = jr.l_id');
@@ -462,13 +507,18 @@ describe('FD propagation per operator', () => {
 			physicalOf(rows, r => r.op === 'JOIN');
 		expect(joinProps, 'expected join physical props').to.not.equal(undefined);
 		// Output column count: jl has 2 cols, so jr.rid is col 2 and jr.l_id is col 3.
-		// Equi-pair is (jl.id=0, jr.l_id=1+leftCols=3) ⇒ bi-FDs 0↔3 and EC {0,3}.
-		expect(fdHas(joinProps!.fds, [0], [3])).to.equal(true);
-		expect(fdHas(joinProps!.fds, [3], [0])).to.equal(true);
+		// Equi-pair is (jl.id=0, jr.l_id=1+leftCols=3). jl fans out (jr.l_id is
+		// non-unique), so the only preserved key is jr.rid (col 2). The equi-pair
+		// FDs are emitted unconditionally as `kind: 'determination'` — value
+		// equalities, never uniqueness claims; the kind-aware readers are what
+		// keep a downstream projection from deriving a phantom key off them
+		// (ticket fd-determination-reader-side-rule). The EC {0,3} merges as before.
+		expect(fdFind(joinProps!.fds, [0], [3])?.kind).to.equal('determination');
+		expect(fdFind(joinProps!.fds, [3], [0])?.kind).to.equal('determination');
 		expect(classContains(joinProps!.equivClasses, [0, 3])).to.equal(true);
 	});
 
-	it('LEFT outer JOIN: right FDs and equi-pair FDs are dropped', async () => {
+	it('LEFT outer JOIN: right FDs / equi-pair FDs dropped, and a FANNED left key FD downgrades to determination', async () => {
 		await db.exec("CREATE TABLE lo (id INTEGER PRIMARY KEY, v TEXT) USING memory");
 		await db.exec("CREATE TABLE ro (rid INTEGER PRIMARY KEY, l_id INTEGER) USING memory");
 		const rows = await planRows(db, 'SELECT * FROM lo LEFT JOIN ro ON lo.id = ro.l_id');
@@ -476,12 +526,31 @@ describe('FD propagation per operator', () => {
 			physicalOf(rows, r => r.op === 'HASHJOIN') ??
 			physicalOf(rows, r => r.op === 'JOIN');
 		expect(joinProps).to.not.equal(undefined);
-		// No equi-pair FD across left/right
+		// No equi-pair FD across left/right (the right side is NULL-padded)
 		expect(fdHas(joinProps!.fds, [0], [3])).to.equal(false);
 		// No equivalence class merging left and right
 		expect(classContains(joinProps!.equivClasses, [0, 3])).to.equal(false);
-		// Left's PK FD `id (0) → v (1)` survives — null-padding only affects right columns
-		expect(fdHas(joinProps!.fds, [0], [1])).to.equal(true);
+		// `ro.l_id` is non-unique, so a single `lo` row can match several `ro` rows —
+		// the LEFT join fans the left side out. `lo.id` is therefore NOT row-unique
+		// in the product: its key FD `{0} → {1}` survives as a value claim but is
+		// downgraded to `kind: 'determination'`, which the kind-aware readers never
+		// read as a key (ticket fd-determination-reader-side-rule, replacing the
+		// fd-derived-key-bag-overclaim drop).
+		expect(fdFind(joinProps!.fds, [0], [1])?.kind).to.equal('determination');
+	});
+
+	it('LEFT outer JOIN: a key-covered (non-fanning) left key FD survives as unique', async () => {
+		await db.exec("CREATE TABLE ln (id INTEGER PRIMARY KEY, v TEXT) USING memory");
+		await db.exec("CREATE TABLE rn (rid INTEGER PRIMARY KEY, w TEXT) USING memory");
+		// `ln.k = rn.rid` covers rn's PK ⇒ each ln row matches ≤1 rn row ⇒ no fan-out,
+		// so left's key survives and its key FD is retained with kind 'unique'.
+		const rows = await planRows(db, 'SELECT * FROM ln LEFT JOIN rn ON ln.id = rn.rid');
+		const joinProps =
+			physicalOf(rows, r => r.op === 'HASHJOIN') ??
+			physicalOf(rows, r => r.op === 'MERGEJOIN') ??
+			physicalOf(rows, r => r.op === 'JOIN');
+		expect(joinProps).to.not.equal(undefined);
+		expect(fdFind(joinProps!.fds, [0], [1])?.kind).to.equal('unique');
 	});
 
 	it('UNION ALL: no FDs', async () => {
@@ -501,5 +570,112 @@ describe('FD propagation per operator', () => {
 		expect(windowProps).to.not.equal(undefined);
 		// The PK FD from `w` (id → v) should survive — id stays as col 0 in the source.
 		expect(fdHas(windowProps!.fds, [0], [1])).to.equal(true);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// OPT-046 static guard
+// ---------------------------------------------------------------------------
+
+interface FdPush {
+	readonly key: string;
+	readonly where: string;
+}
+
+/**
+ * Every `<something>fds.push(...)` in `code`, keyed `<relPath>::<receiver>`. The
+ * receiver test is deliberately narrow: a name ending in `fd`/`fds` (any case),
+ * which is how every FD list in the planner is named.
+ */
+function findFdPushes(relPath: string, code: string): FdPush[] {
+	const out: FdPush[] = [];
+	for (const m of code.matchAll(/\b([A-Za-z_$][\w$]*)\.push\(/g)) {
+		const receiver = m[1];
+		if (!/fds?$/i.test(receiver)) continue;
+		out.push({ key: `${relPath}::${receiver}`, where: `${relPath}:${lineAt(code, m.index)} — ${receiver}.push(` });
+	}
+	return out;
+}
+
+/**
+ * Local candidate-list builds: an array assembled here, then handed to `addFd` /
+ * `mergeFds` by its consumer, or consumed as pure reasoning input that never reaches a
+ * node's FD set. Each entry must name that consumer — if it cannot, the push is a real
+ * violation, not an exception.
+ *
+ * NOTE: this guard pays for itself only while the list stays short. If it grows past
+ * a handful of entries the receiver-name heuristic has stopped discriminating, and
+ * the right move is to delete the guard rather than keep feeding it.
+ */
+const LOCAL_FD_BUILD_ALLOWLIST: ReadonlyMap<string, string> = new Map([
+	[
+		'nodes/project-node.ts::projectedKeyFds',
+		'candidate key FDs, each then folded through `addFd` in the loop immediately below',
+	],
+	[
+		'analysis/check-extraction.ts::fds',
+		'`extractCheckConstraints` returns a candidate list; `reference.ts` folds it through `addFd`',
+	],
+	[
+		'analysis/assertion-hoist-cache.ts::fds',
+		'`getAssertionHoistedConstraints` returns a candidate list; `reference.ts` folds it through `addFd`',
+	],
+	[
+		'rules/aggregate/rule-groupby-fd-simplification.ts::keyFds',
+		'candidate key FDs handed to `expandEcsToFds`/`minimalCover` as reasoning input; they never reach a node FD set',
+	],
+]);
+
+/** The sanctioned accumulation path itself — its pushes are the implementation of `addFd`. */
+const FD_UTILS = 'util/fd-utils.ts';
+
+describe('OPT-046 static guard: addFd is the only FD accumulation path', () => {
+	// FDs are accumulated through `addFd` / `mergeFds`, which apply subsumption and
+	// enforce MAX_FDS_PER_NODE. Pushing straight onto the array skips both, and shows
+	// up as a missing key or an over-long FD list rather than a crash. Scan the whole
+	// planner and flag any `.push(` onto an FD-named receiver that is not a known local
+	// candidate build.
+	const plannerDir = join(dirname(fileURLToPath(import.meta.url)), '../../src/planner');
+
+	function scanPushes(): FdPush[] {
+		return tsFilesUnder(plannerDir)
+			.map(file => relPosix(plannerDir, file))
+			.filter(rel => rel !== FD_UTILS)
+			.flatMap(rel => findFdPushes(rel, readCode(join(plannerDir, rel))));
+	}
+
+	it('no FD list is accumulated by a bare .push()', () => {
+		const pushes = scanPushes();
+		// Self-check: the known local builds must still be found, or the scanner has
+		// silently stopped matching and the guard would pass vacuously.
+		expect(pushes.length, 'scanner found the known FD pushes').to.be.greaterThan(0);
+
+		const offenders = pushes.filter(p => !LOCAL_FD_BUILD_ALLOWLIST.has(p.key)).map(p => p.where);
+		expect(
+			offenders,
+			`FD lists accumulated without addFd/mergeFds:\n${offenders.join('\n')}`,
+		).to.be.empty;
+	});
+
+	it('the allowlist has no stale entries', () => {
+		const seen = new Set(scanPushes().map(p => p.key));
+		for (const key of LOCAL_FD_BUILD_ALLOWLIST.keys()) {
+			expect(seen.has(key), `allowlisted FD push \`${key}\` no longer exists — drop it`).to.equal(true);
+		}
+	});
+
+	it('flags a hand-written violation and ignores non-FD receivers', () => {
+		const code = stripComments(`
+			function computePhysical(source) {
+				const fds = [...source.fds];
+				fds.push({ determinants: [0], dependents: [1], kind: 'unique' });
+				equivPairs.push([0, 1]);
+				constantBindings.push({ col: 2 });
+				return { fds };
+			}
+		`);
+		const found = findFdPushes('nodes/fake-node.ts', code);
+		expect(found.map(f => f.key)).to.deep.equal(['nodes/fake-node.ts::fds']);
+		expect(found[0].where).to.match(/^nodes\/fake-node\.ts:4 — fds\.push\($/);
 	});
 });

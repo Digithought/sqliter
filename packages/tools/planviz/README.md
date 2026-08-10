@@ -1,5 +1,10 @@
 # Quereus PlanViz
 
+> **Stability: Beta** — complete and tested, but the surface is still being shaped; a
+> breaking change may land in a minor release. The plan trees it prints are engine
+> internals with no compatibility promise at all, so the same query may render
+> differently after any upgrade. See [Stability Tiers](../../../docs/stability.md#tiers).
+
 Visual query plan inspection tool for Quereus SQL engine.
 
 ## Installation

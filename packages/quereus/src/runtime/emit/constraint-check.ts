@@ -1,67 +1,18 @@
-import type { ConstraintCheckNode, NotNullDefaultPlan, ConstraintCheck } from '../../planner/nodes/constraint-check-node.js';
-import type { Instruction, InstructionRun, RuntimeContext } from '../types.js';
+import type { ConstraintCheckNode, NotNullDefaultPlan } from '../../planner/nodes/constraint-check-node.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import type { Row } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { emitPlanNode, emitCallFromPlan } from '../emitters.js';
-import { ConstraintError, FailConflictError, RollbackConflictError } from '../../common/errors.js';
-import { type SqlValue, type OutputValue } from '../../common/types.js';
-import type { RowConstraintSchema, TableSchema } from '../../schema/table.js';
-import type { RowDescriptor } from '../../planner/nodes/plan-node.js';
-import { RowOpFlag } from '../../schema/table.js';
-import { ConflictResolution } from '../../common/constants.js';
+import { StatusCode, type SqlValue, type OutputValue } from '../../common/types.js';
+import { QuereusError } from '../../common/errors.js';
 import { withAsyncRowContext, createRowSlot } from '../context-helpers.js';
-import { expressionToString } from '../../emit/ast-stringify.js';
 import { composeCombinedDescriptor } from '../descriptor-helpers.js';
-import { sqlValuesEqual } from '../../util/comparison.js';
-import { validateAndParse } from '../../types/validation.js';
-
-interface ConstraintMetadataEntry {
-	schema: RowConstraintSchema;
-	flatRowDescriptor: RowDescriptor;
-	evaluator: (ctx: RuntimeContext) => OutputValue;
-	constraintName: string;
-	constraintExpr: string; // Stringified constraint expression
-	shouldDefer: boolean;
-	baseTable: string;
-	contextRow?: Row; // Mutation context row if present
-	contextDescriptor?: RowDescriptor; // Mutation context row descriptor
-	kind: 'check' | 'fk-child' | 'fk-parent';
-	/** For 'fk-parent' UPDATE checks: parent-table column indices the FK references. */
-	referencedColumnIndices?: ReadonlyArray<number>;
-}
-
-interface NotNullDefaultRuntime {
-	columnIndex: number;
-	evaluator: (ctx: RuntimeContext) => OutputValue;
-}
-
-/**
- * Resolve the effective conflict action for a single failure.
- *
- * Precedence: statement-level OR clause > per-constraint default > ABORT.
- */
-function pickAction(
-	stmtOR: ConflictResolution | undefined,
-	constraintDefault: ConflictResolution | undefined,
-): ConflictResolution {
-	return stmtOR ?? constraintDefault ?? ConflictResolution.ABORT;
-}
-
-/**
- * Throws an appropriate ConstraintError subclass based on the effective
- * conflict action. ABORT/REPLACE/IGNORE callers must not reach this — IGNORE
- * is handled by skipping the row, REPLACE by substitution / passthrough, and
- * ABORT throws a plain ConstraintError.
- */
-function throwForAction(action: ConflictResolution, message: string): never {
-	if (action === ConflictResolution.FAIL) {
-		throw new FailConflictError(message);
-	}
-	if (action === ConflictResolution.ROLLBACK) {
-		throw new RollbackConflictError(message);
-	}
-	throw new ConstraintError(message);
-}
+import {
+	buildConstraintMetadata,
+	evaluateRowConstraints,
+	type NotNullDefaultRuntime,
+} from '../row-constraints.js';
 
 export function emitConstraintCheck(plan: ConstraintCheckNode, ctx: EmissionContext): Instruction {
 	// Get the table schema to access constraints
@@ -81,9 +32,14 @@ export function emitConstraintCheck(plan: ConstraintCheckNode, ctx: EmissionCont
 	if (mutationContextValues && contextAttributes) {
 		for (const attr of contextAttributes) {
 			const valueExpr = mutationContextValues.get(attr.name);
-			if (valueExpr) {
-				contextEvaluatorInstructions.push(emitCallFromPlan(valueExpr, ctx));
+			if (!valueExpr) {
+				// Invariant: the DML builders fill every declared context slot (a supplied
+				// value expression, or a NULL literal for an omitted variable — see
+				// planner/building/mutation-context.ts). Skipping one would shift every
+				// later value out of alignment with contextDescriptor, so assert instead.
+				throw new QuereusError(`Internal: no mutation context evaluator for '${attr.name}'`, StatusCode.INTERNAL);
 			}
+			contextEvaluatorInstructions.push(emitCallFromPlan(valueExpr, ctx));
 		}
 	}
 
@@ -96,24 +52,22 @@ export function emitConstraintCheck(plan: ConstraintCheckNode, ctx: EmissionCont
 	const notNullDefaultPlans: ReadonlyArray<NotNullDefaultPlan> = plan.notNullDefaults ?? [];
 	const notNullDefaultInstructions = notNullDefaultPlans.map(d => emitCallFromPlan(d.defaultNode, ctx));
 
-	const constraintMetadata: ConstraintMetadataEntry[] = plan.constraintChecks.map((check: ConstraintCheck, idx) => {
-		const evaluatorInstruction = checkEvaluators[idx];
-		const constraintName = check.constraint.name ?? generateDefaultConstraintName(tableSchema, check.constraint);
-		const constraintExpr = expressionToString(check.constraint.expr);
-		return {
-			schema: check.constraint,
-			flatRowDescriptor: plan.flatRowDescriptor,
-			evaluator: evaluatorInstruction.run,
-			constraintName,
-			constraintExpr,
-			shouldDefer: Boolean(check.deferrable || check.initiallyDeferred || check.needsDeferred),
-			baseTable: `${tableSchema.schemaName}.${tableSchema.name}`,
-			contextRow: undefined,
-			contextDescriptor,
-			kind: check.kind ?? 'check',
-			referencedColumnIndices: check.referencedColumnIndices,
-		};
-	});
+	// Which substitutions need conversion — the emitters' static-type rule
+	// applied to the DEFAULT expression (see NotNullDefaultRuntime.coerceColumn).
+	const notNullDefaultCoercions = notNullDefaultPlans.map(d =>
+		d.defaultNode.getType().logicalType !== tableSchema.columns[d.columnIndex].logicalType
+			? tableSchema.columns[d.columnIndex]
+			: undefined);
+
+	const constraintMetadata = buildConstraintMetadata(
+		plan.constraintChecks,
+		tableSchema,
+		flatRowDescriptor,
+		contextDescriptor,
+		checkEvaluators.map(instruction => instruction.run),
+	);
+
+	const scope = { operation: plan.operation, hasNewSection: Boolean(plan.newRowDescriptor) };
 
 	async function* run(rctx: RuntimeContext, inputRows: AsyncIterable<Row>, ...evaluatorFunctions: Array<(ctx: RuntimeContext) => OutputValue>): AsyncIterable<Row> {
 		if (!inputRows) {
@@ -133,13 +87,12 @@ export function emitConstraintCheck(plan: ConstraintCheckNode, ctx: EmissionCont
 
 			contextRow = [];
 			for (const contextEvaluator of contextEvalFunctions) {
-				const value = await contextEvaluator(rctx) as SqlValue;
+				// Resolve without a per-row microtask hop: `await` only when the
+				// sub-program is genuinely a promise. See runtime/async-util.ts.
+				const raw = contextEvaluator(rctx);
+				const value = (raw instanceof Promise ? await raw : raw) as SqlValue;
 				contextRow.push(value);
 			}
-
-			constraintMetadata.forEach(meta => {
-				meta.contextRow = contextRow;
-			});
 
 			contextSlot = createRowSlot(rctx, contextDescriptor);
 			contextSlot.set(contextRow);
@@ -154,9 +107,18 @@ export function emitConstraintCheck(plan: ConstraintCheckNode, ctx: EmissionCont
 		const defaultsRuntime: NotNullDefaultRuntime[] = notNullDefaultPlans.map((d, i) => ({
 			columnIndex: d.columnIndex,
 			evaluator: defaultEvalFunctions[i],
+			coerceColumn: notNullDefaultCoercions[i],
 		}));
 
 		// Pre-compute the combined descriptor (constant across rows)
+		// NOTE: once `contextRow` exists, the row getter below concatenates it onto every
+		// visible row on each lookup. Mutation context attributes are now built from the
+		// TABLE's declaration rather than the statement's `with context` clause
+		// (planner/building/mutation-context.ts), so that concatenation applies to EVERY
+		// write to a context-declaring table, not only the ones carrying an envelope.
+		// Cheap at the declaration sizes seen so far; if a bulk envelope-less write into a
+		// context-declaring table ever shows up as slow, hoist the concatenation to one
+		// pre-sized array reused per row instead of spreading per lookup.
 		const combinedDescriptor = contextDescriptor && contextRow
 			? composeCombinedDescriptor(contextDescriptor, flatRowDescriptor)
 			: flatRowDescriptor;
@@ -165,18 +127,32 @@ export function emitConstraintCheck(plan: ConstraintCheckNode, ctx: EmissionCont
 			for await (const inputRow of inputRows) {
 				let flatRow = inputRow;
 
-				const evaluation = await withAsyncRowContext(rctx, combinedDescriptor, () => contextRow ? [...contextRow, ...flatRow] : flatRow, async () => {
-					return await checkConstraints(
+				// The row expressions see through `combinedDescriptor`. The getter is
+				// called lazily per lookup, so evaluateRowConstraints can swap it mid-row:
+				// after a REPLACE NOT NULL DEFAULT substitution, CHECK / FK must read
+				// the row AS SUBSTITUTED. The row arrives already converted to declared
+				// column types (the DML emitters convert the NEW section up front), so
+				// no separate coerced view exists — the substituted row IS what flows
+				// downstream.
+				let visibleRow: Row = flatRow;
+
+				const evaluation = await withAsyncRowContext(
+					rctx,
+					combinedDescriptor,
+					() => contextRow ? [...contextRow, ...visibleRow] : visibleRow,
+					() => evaluateRowConstraints(
 						rctx,
-						plan,
+						scope,
 						tableSchema,
 						flatRow,
 						constraintMetadata,
 						constraintEvalFunctions,
 						stmtOR,
 						defaultsRuntime,
-					);
-				});
+						contextRow,
+						row => { visibleRow = row; },
+					),
+				);
 
 				if (evaluation.skip) continue;
 				if (evaluation.replacedRow) {
@@ -197,219 +173,7 @@ export function emitConstraintCheck(plan: ConstraintCheckNode, ctx: EmissionCont
 
 	return {
 		params: [sourceInstruction, ...contextEvaluatorInstructions, ...checkEvaluators, ...notNullDefaultInstructions],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `constraintCheck(${plan.operation}, ${contextEvaluatorInstructions.length} ctx, ${plan.constraintChecks.length} checks, ${notNullDefaultInstructions.length} defaults)`
 	};
 }
-
-/**
- * Result of evaluating constraints for a single row.
- *
- * - skip=true → caller should drop this row (IGNORE resolution)
- * - replacedRow → caller should yield this row instead of the input (REPLACE
- *   substituted a DEFAULT for a NOT NULL violation)
- */
-interface ConstraintCheckResult {
-	skip: boolean;
-	replacedRow?: Row;
-}
-
-async function checkConstraints(
-	rctx: RuntimeContext,
-	plan: ConstraintCheckNode,
-	tableSchema: TableSchema,
-	row: Row,
-	constraintMetadata: ConstraintMetadataEntry[],
-	evaluatorFunctions: Array<(ctx: RuntimeContext) => OutputValue>,
-	stmtOR: ConflictResolution | undefined,
-	notNullDefaults: NotNullDefaultRuntime[],
-): Promise<ConstraintCheckResult> {
-	// NOT NULL constraints with possible REPLACE-DEFAULT substitution.
-	const nnResult = await checkNotNullConstraints(rctx, plan, tableSchema, row, stmtOR, notNullDefaults);
-	if (nnResult.skip) return { skip: true };
-	if (nnResult.replacedRow) row = nnResult.replacedRow;
-
-	// CHECK constraints (and synthetic FK existence checks built as RowConstraintSchema).
-	const ckResult = await checkCheckConstraints(rctx, plan, tableSchema, row, constraintMetadata, evaluatorFunctions, stmtOR);
-	if (ckResult.skip) return { skip: true };
-
-	return { skip: false, replacedRow: nnResult.replacedRow };
-}
-
-async function checkNotNullConstraints(
-	rctx: RuntimeContext,
-	plan: ConstraintCheckNode,
-	tableSchema: TableSchema,
-	flatRow: Row,
-	stmtOR: ConflictResolution | undefined,
-	notNullDefaults: NotNullDefaultRuntime[],
-): Promise<ConstraintCheckResult> {
-	if (plan.operation === RowOpFlag.DELETE) {
-		return { skip: false };
-	}
-
-	if (!plan.newRowDescriptor) {
-		return { skip: false };
-	}
-
-	const numCols = tableSchema.columns.length;
-	let mutableRow: Row | undefined;
-
-	for (let i = 0; i < numCols; i++) {
-		const column = tableSchema.columns[i];
-		if (!column.notNull) continue;
-
-		const newValueIndex = numCols + i; // NEW section: n..2n-1
-		const value = (mutableRow ?? flatRow)[newValueIndex];
-		if (value !== null && value !== undefined) continue;
-
-		const action = pickAction(stmtOR, column.defaultConflict);
-		const message = `NOT NULL constraint failed: ${tableSchema.name}.${column.name}`;
-
-		if (action === ConflictResolution.IGNORE) {
-			return { skip: true };
-		}
-
-		if (action === ConflictResolution.REPLACE) {
-			// Try to substitute the column's DEFAULT.
-			const defaultEntry = notNullDefaults.find(d => d.columnIndex === i);
-			if (!defaultEntry) {
-				// No DEFAULT available — REPLACE cannot recover.
-				throw new ConstraintError(message);
-			}
-			const defaultValue = await defaultEntry.evaluator(rctx) as SqlValue;
-			if (defaultValue === null || defaultValue === undefined) {
-				// DEFAULT itself is NULL — substitution does not satisfy NOT NULL.
-				throw new ConstraintError(message);
-			}
-			if (!mutableRow) mutableRow = [...flatRow] as Row;
-			mutableRow[newValueIndex] = defaultValue;
-			continue;
-		}
-
-		// ABORT / FAIL / ROLLBACK
-		throwForAction(action, message);
-	}
-
-	return { skip: false, replacedRow: mutableRow };
-}
-
-async function checkCheckConstraints(
-	rctx: RuntimeContext,
-	plan: ConstraintCheckNode,
-	tableSchema: TableSchema,
-	row: Row,
-	constraintMetadata: ConstraintMetadataEntry[],
-	evaluatorFunctions: Array<(ctx: RuntimeContext) => OutputValue>,
-	stmtOR: ConflictResolution | undefined,
-): Promise<ConstraintCheckResult> {
-	for (let i = 0; i < constraintMetadata.length; i++) {
-		const metadata = constraintMetadata[i];
-		const evaluator = evaluatorFunctions[i] ?? metadata.evaluator;
-
-		// Parent-side FK UPDATE: skip the NOT EXISTS subquery when none of the
-		// referenced parent columns actually changed.
-		if (
-			plan.operation === RowOpFlag.UPDATE &&
-			metadata.kind === 'fk-parent' &&
-			metadata.referencedColumnIndices
-		) {
-			const numCols = tableSchema.columns.length;
-			let anyChanged = false;
-			for (const colIdx of metadata.referencedColumnIndices) {
-				const oldVal = row[colIdx] as SqlValue;           // OLD section: 0..n-1
-				const newVal = row[numCols + colIdx] as SqlValue; // NEW section: n..2n-1
-				if (!sqlValuesEqual(oldVal, newVal)) {
-					anyChanged = true;
-					break;
-				}
-			}
-			if (!anyChanged) continue;
-		}
-
-		// Resolve effective action up front; non-default actions (IGNORE/REPLACE/FAIL/ROLLBACK)
-		// must be applied at row time, so we cannot let those defer to commit.
-		const effectiveAction = pickAction(stmtOR, metadata.schema.defaultConflict);
-		const mustEvaluateNow = effectiveAction !== ConflictResolution.ABORT;
-
-		if (metadata.shouldDefer && !mustEvaluateNow) {
-			const activeConnectionId = rctx.activeConnection?.connectionId;
-			rctx.db._queueDeferredConstraintRow(
-				metadata.baseTable,
-				metadata.constraintName,
-				coerceNewSection(row, tableSchema),
-				metadata.flatRowDescriptor,
-				evaluator,
-				activeConnectionId,
-				metadata.contextRow,
-				metadata.contextDescriptor
-			);
-			continue;
-		}
-
-		const result = await evaluator(rctx) as SqlValue;
-
-		// CHECK passes if truthy or NULL; fails on false / 0 (SQLite numeric boolean).
-		if (result === false || result === 0) {
-			const exprHint = metadata.constraintExpr.length <= 60
-				? ` (${metadata.constraintExpr})`
-				: '';
-			// Both engine-level CHECK and synthetic FK existence checks share the
-			// same "CHECK constraint failed" prefix for backward compatibility with
-			// existing assertions; downstream consumers identify FK by name.
-			const baseMessage = `CHECK constraint failed: ${metadata.constraintName}${exprHint}`;
-
-			if (effectiveAction === ConflictResolution.IGNORE) {
-				return { skip: true };
-			}
-
-			// REPLACE does NOT mask CHECK / FK violations — fall through to abort.
-			// (SQLite's OR REPLACE only relaxes UNIQUE/PK and NOT-NULL; CHECK still aborts.)
-			if (effectiveAction === ConflictResolution.REPLACE) {
-				throw new ConstraintError(baseMessage);
-			}
-
-			throwForAction(effectiveAction, baseMessage);
-		}
-	}
-	return { skip: false };
-}
-
-/**
- * Snapshot the flat OLD/NEW row for deferred evaluation, coercing the NEW
- * section (indices n..2n-1) to the declared column logical types.
- *
- * The insert pipeline defers type conversion to the storage layer's
- * validateAndParse, so the row reaching this node still holds raw NEW values.
- * Deferred CHECK subqueries compare these against already-coerced stored rows
- * in other tables, so we coerce NEW here to keep coerced-vs-coerced equality at
- * commit time (GitHub #25).
- *
- * OLD values (0..n-1) are NULL on INSERT or read from already-coerced stored
- * rows on UPDATE, so they are left untouched. A per-cell parse failure falls
- * back to the raw value, preserving the existing error semantics — the row's
- * own performInsert remains the authoritative place that throws MISMATCH.
- */
-function coerceNewSection(row: Row, tableSchema: TableSchema): Row {
-	const numCols = tableSchema.columns.length;
-	const snapshot = row.slice() as Row;
-	for (let i = 0; i < numCols; i++) {
-		const newIndex = numCols + i;
-		if (newIndex >= snapshot.length) break;
-		const column = tableSchema.columns[i];
-		const value = snapshot[newIndex] as SqlValue;
-		try {
-			snapshot[newIndex] = validateAndParse(value, column.logicalType, column.name);
-		} catch {
-			// Keep the raw value; downstream performInsert reports the error as today.
-		}
-	}
-	return snapshot;
-}
-
-function generateDefaultConstraintName(tableSchema: TableSchema, constraint: RowConstraintSchema): string {
-	// Find the index of this constraint in the original array to get the correct constraint number
-	const originalIndex = tableSchema.checkConstraints.findIndex((c: RowConstraintSchema) => c === constraint);
-	return `_check_${originalIndex >= 0 ? originalIndex : 'unknown'}`;
-}
-

@@ -13,6 +13,26 @@ import { StoreManager } from '../src/service/store-manager.js';
 const TEST_DATABASE_ID = 'test-db-1';
 const TEST_DATABASE_ID_2 = 'test-db-2';
 
+/**
+ * Poll `predicate` until it returns true or `timeoutMs` elapses.
+ *
+ * Used by the disk-eviction tests instead of a fixed sleep. Store close is
+ * async (awaits LevelDB `store.close()` before the store is registered as an
+ * eviction candidate), so under CPU/IO load the close can land well after a
+ * fixed wall-clock deadline — a fixed `setTimeout` then asserting the
+ * intermediate candidate count races that latency and flakes. Polling waits
+ * for the actual state to settle, with a generous timeout as the failure cap.
+ */
+async function waitFor(predicate: () => boolean, timeoutMs = 1000, intervalMs = 5): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) {
+      throw new Error(`waitFor: condition not met within ${timeoutMs}ms`);
+    }
+    await new Promise(resolve => setTimeout(resolve, intervalMs));
+  }
+}
+
 describe('StoreManager', () => {
   let manager: StoreManager;
   let testDataDir: string;
@@ -119,40 +139,62 @@ describe('StoreManager', () => {
   });
 
   describe('LRU eviction', () => {
+    let lruManager: StoreManager;
+    let lruDataDir: string;
+
+    beforeEach(() => {
+      lruDataDir = join(tmpdir(), `sync-lru-test-${randomUUID()}`);
+      lruManager = new StoreManager({
+        dataDir: lruDataDir,
+        maxOpenStores: 3,
+        idleTimeoutMs: 60_000,
+        cleanupIntervalMs: 60_000,
+      });
+      // Deliberately NOT started: no cleanup timer, so the ONLY close path is evictLRU.
+      // The shared manager's short idleTimeoutMs lets idle cleanup close a released store
+      // while later stores are still opening (LevelDB open + createSyncModule can exceed
+      // the timeout under load), which races the eviction behaviour under test.
+    });
+
+    afterEach(async () => {
+      await lruManager.shutdown();
+      await rm(lruDataDir, { recursive: true, force: true }).catch(() => {});
+    });
+
     it('should evict LRU store when maxOpenStores reached', async () => {
       // maxOpenStores is 3 - open 3 stores
-      await manager.acquire('db-a');
-      manager.release('db-a');
-      await manager.acquire('db-b');
-      manager.release('db-b');
-      await manager.acquire('db-c');
-      manager.release('db-c');
+      await lruManager.acquire('db-a');
+      lruManager.release('db-a');
+      await lruManager.acquire('db-b');
+      lruManager.release('db-b');
+      await lruManager.acquire('db-c');
+      lruManager.release('db-c');
 
-      expect(manager.openCount).to.equal(3);
+      expect(lruManager.openCount).to.equal(3);
 
       // Opening a 4th should evict the oldest (db-a)
-      await manager.acquire('db-d');
-      expect(manager.openCount).to.be.at.most(3);
-      expect(manager.isOpen('db-d')).to.be.true;
+      await lruManager.acquire('db-d');
+      expect(lruManager.openCount).to.be.at.most(3);
+      expect(lruManager.isOpen('db-d')).to.be.true;
     });
 
     it('should not evict a store that was re-acquired before close', async () => {
       // Fill to capacity and release all
-      await manager.acquire('db-a');
-      manager.release('db-a');
-      await manager.acquire('db-b');
-      manager.release('db-b');
-      await manager.acquire('db-c');
-      manager.release('db-c');
+      await lruManager.acquire('db-a');
+      lruManager.release('db-a');
+      await lruManager.acquire('db-b');
+      lruManager.release('db-b');
+      await lruManager.acquire('db-c');
+      lruManager.release('db-c');
 
       // Re-acquire db-a (the LRU candidate) so refCount > 0
-      await manager.acquire('db-a');
+      await lruManager.acquire('db-a');
 
       // Acquiring a 4th triggers eviction — db-a should be skipped
       // because its refCount is now 1
-      await manager.acquire('db-d');
-      expect(manager.isOpen('db-a')).to.be.true;
-      expect(manager.isOpen('db-d')).to.be.true;
+      await lruManager.acquire('db-d');
+      expect(lruManager.isOpen('db-a')).to.be.true;
+      expect(lruManager.isOpen('db-d')).to.be.true;
     });
   });
 
@@ -239,8 +281,8 @@ describe('StoreManager', () => {
       evictManager.release(TEST_DATABASE_ID);
       expect(evictManager.evictionCandidateCount).to.equal(0);
 
-      // Wait for idle close
-      await new Promise(resolve => setTimeout(resolve, 120));
+      // Wait for idle close to register the store as an eviction candidate.
+      await waitFor(() => evictManager.evictionCandidateCount === 1);
       expect(evictManager.isOpen(TEST_DATABASE_ID)).to.be.false;
       expect(evictManager.evictionCandidateCount).to.equal(1);
     });
@@ -284,7 +326,7 @@ describe('StoreManager', () => {
       evictManager.release(TEST_DATABASE_ID);
 
       // Wait for idle close (but not eviction threshold)
-      await new Promise(resolve => setTimeout(resolve, 120));
+      await waitFor(() => evictManager.evictionCandidateCount === 1);
       expect(evictManager.isOpen(TEST_DATABASE_ID)).to.be.false;
       expect(evictManager.evictionCandidateCount).to.equal(1);
 
@@ -314,8 +356,8 @@ describe('StoreManager', () => {
       await evictManager.acquire(TEST_DATABASE_ID);
       evictManager.release(TEST_DATABASE_ID);
 
-      // Wait for idle close
-      await new Promise(resolve => setTimeout(resolve, 120));
+      // Wait for idle close to register the eviction candidate.
+      await waitFor(() => evictManager.evictionCandidateCount === 1);
       expect(evictManager.evictionCandidateCount).to.equal(1);
 
       await evictManager.shutdown();
@@ -451,6 +493,114 @@ describe('StoreManager', () => {
       expect(entry2.databaseId).to.equal(TEST_DATABASE_ID_2);
       expect(entry1.store).to.not.equal(entry2.store);
       expect(manager.openCount).to.equal(2);
+    });
+  });
+
+  describe('close/acquire race', () => {
+    // Reproduces the bug where an acquire that lands while a store is mid-close
+    // (idle cleanup) receives the handle being torn down instead of a live one.
+    // Deterministic via a barrier that parks store.close() so the racing acquire
+    // is guaranteed to run during the close window.
+    it('acquire during an in-flight close returns a live handle, not the closing one', async () => {
+      const raceDataDir = join(tmpdir(), `sync-race-test-${randomUUID()}`);
+      const raceManager = new StoreManager({
+        dataDir: raceDataDir,
+        maxOpenStores: 10,
+        idleTimeoutMs: 0,      // eligible for close the moment refCount hits 0
+        cleanupIntervalMs: 20, // cleanup fires quickly
+      });
+      raceManager.start();
+
+      try {
+        const entry = await raceManager.acquire(TEST_DATABASE_ID);
+        raceManager.release(TEST_DATABASE_ID); // refCount → 0; cleanup will close it
+        // NOTE: no await between release and the close patch below — cleanup cannot
+        // interpose, so the store is always patched before its close() is invoked.
+
+        let releaseBarrier!: () => void;
+        const closeBarrier = new Promise<void>(resolve => { releaseBarrier = resolve; });
+        let signalCloseStarted!: () => void;
+        const closeStarted = new Promise<void>(resolve => { signalCloseStarted = resolve; });
+
+        const originalClose = entry.store.close.bind(entry.store);
+        entry.store.close = async () => {
+          signalCloseStarted();
+          await closeBarrier;   // park mid-close so an acquire can race
+          await originalClose();
+        };
+
+        // Wait until cleanup has entered close() and is parked on the barrier.
+        await closeStarted;
+
+        // Race an acquire against the in-flight close, then let the close finish.
+        const acquireP = raceManager.acquire(TEST_DATABASE_ID);
+        releaseBarrier();
+        const entry2 = await acquireP;
+
+        // The acquired handle must be live — not the one that was being closed.
+        expect(entry2.store.isClosed()).to.be.false;
+        // And usable: a read must not throw "LevelDBStore is closed".
+        await entry2.store.get(new Uint8Array([1]));
+
+        raceManager.release(TEST_DATABASE_ID);
+      } finally {
+        await raceManager.shutdown();
+        await rm(raceDataDir, { recursive: true, force: true }).catch(() => {});
+      }
+    });
+
+    // Sibling of the test above, but the close is driven by LRU eviction from INSIDE
+    // acquire() (not the cleanup timer). Same closeStore serialization must hold, so an
+    // acquire of the evicted key racing its eviction still gets a live handle.
+    it('acquire of an LRU-evicted key racing its eviction returns a live handle', async () => {
+      const raceDataDir = join(tmpdir(), `sync-race-evict-${randomUUID()}`);
+      const raceManager = new StoreManager({
+        dataDir: raceDataDir,
+        maxOpenStores: 1,        // opening a second store forces eviction of the first
+        idleTimeoutMs: 60_000,   // cleanup must never interpose — eviction is the only closer
+        cleanupIntervalMs: 60_000,
+      });
+      // Deliberately NOT started: no cleanup timer, so the ONLY close path is evictLRU.
+
+      try {
+        const victim = await raceManager.acquire(TEST_DATABASE_ID);
+        raceManager.release(TEST_DATABASE_ID); // refCount → 0; now LRU-evictable
+
+        let releaseBarrier!: () => void;
+        const closeBarrier = new Promise<void>(resolve => { releaseBarrier = resolve; });
+        let signalCloseStarted!: () => void;
+        const closeStarted = new Promise<void>(resolve => { signalCloseStarted = resolve; });
+
+        const originalClose = victim.store.close.bind(victim.store);
+        victim.store.close = async () => {
+          signalCloseStarted();
+          await closeBarrier;   // park mid-close so an acquire of the same key can race
+          await originalClose();
+        };
+
+        // Acquiring a second store trips maxOpenStores and evicts TEST_DATABASE_ID.
+        // This acquire parks on the barrier (evictLRU → closeStore → close), so we hold
+        // its promise rather than awaiting it here.
+        const acquireBP = raceManager.acquire(TEST_DATABASE_ID_2);
+
+        // Wait until eviction has entered close() and is parked on the barrier.
+        await closeStarted;
+
+        // Race an acquire of the evicted key against its in-flight eviction.
+        const acquireVictimP = raceManager.acquire(TEST_DATABASE_ID);
+        releaseBarrier();
+        const [reopened] = await Promise.all([acquireVictimP, acquireBP]);
+
+        // The re-acquired handle must be live — not the one eviction was tearing down.
+        expect(reopened.store.isClosed()).to.be.false;
+        await reopened.store.get(new Uint8Array([1]));
+
+        raceManager.release(TEST_DATABASE_ID);
+        raceManager.release(TEST_DATABASE_ID_2);
+      } finally {
+        await raceManager.shutdown();
+        await rm(raceDataDir, { recursive: true, force: true }).catch(() => {});
+      }
     });
   });
 });

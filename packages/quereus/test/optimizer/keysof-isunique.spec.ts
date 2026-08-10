@@ -50,7 +50,7 @@ describe('keysOf / isUnique (unified uniqueness surface)', () => {
 		// FD {0} → {1,2}: column 0 is a key on a 3-column relation.
 		const rel = makeRel({
 			columnCount: 3,
-			fds: [{ determinants: [0], dependents: [1, 2] }],
+			fds: [{ determinants: [0], dependents: [1, 2], kind: 'unique' }],
 		});
 		expect(keyStrings(rel)).to.deep.equal(['0']);
 		expect(isUnique([0], rel)).to.equal(true);
@@ -60,7 +60,7 @@ describe('keysOf / isUnique (unified uniqueness surface)', () => {
 	it('treats `∅ → all_cols` as the empty (≤1-row) key', () => {
 		const rel = makeRel({
 			columnCount: 2,
-			fds: [{ determinants: [], dependents: [0, 1] }],
+			fds: [{ determinants: [], dependents: [0, 1], kind: 'unique' }],
 		});
 		// The empty key subsumes everything.
 		expect(keyStrings(rel)).to.deep.equal(['']);
@@ -91,8 +91,8 @@ describe('keysOf / isUnique (unified uniqueness surface)', () => {
 		const rel = makeRel({
 			columnCount: 3,
 			fds: [
-				{ determinants: [0], dependents: [1] },
-				{ determinants: [1], dependents: [2] },
+				{ determinants: [0], dependents: [1], kind: 'unique' },
+				{ determinants: [1], dependents: [2], kind: 'determination' },
 			],
 		});
 		expect(isUnique([0], rel)).to.equal(true);
@@ -106,7 +106,7 @@ describe('keysOf / isUnique (unified uniqueness surface)', () => {
 		const rel = makeRel({
 			columnCount: 3,
 			keys: [[{ index: 0 }]],
-			fds: [{ determinants: [0], dependents: [1, 2] }],
+			fds: [{ determinants: [0], dependents: [1, 2], kind: 'unique' }],
 		});
 		expect(keyStrings(rel)).to.deep.equal(['0']);
 	});

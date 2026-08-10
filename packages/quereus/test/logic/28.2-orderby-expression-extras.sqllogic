@@ -81,3 +81,260 @@ select abs(x - 5) as dist from many order by 1;
 → [{"dist":0},{"dist":1},{"dist":1},{"dist":2},{"dist":2},{"dist":3},{"dist":3},{"dist":4},{"dist":4}]
 
 drop table many;
+
+-- =============================================================================
+-- ORDER BY / GROUP BY positional references bind to an OUTPUT POSITION, never
+-- to the name of the expression that produced it. Each case below is paired
+-- with a control query that must produce a DIFFERENT row order than a
+-- name-based resolution would, so a regression cannot pass by coincidence.
+-- =============================================================================
+
+create table nk (a text primary key, b text);
+insert into nk values ('x','1'), ('w','9');
+
+-- A SELECT-list alias shadows the column the ordinal points at.
+-- Position 2 is `z` (= nk.a), so the 'w' row sorts first. Resolving the ordinal
+-- through the name `a` would find the alias over nk.b and sort '1' before '9'.
+select b as a, a as z from nk order by 2;
+→ [{"a":"9","z":"w"},{"a":"1","z":"x"}]
+
+-- Control: the same sort spelled by alias
+select b as a, a as z from nk order by z;
+→ [{"a":"9","z":"w"},{"a":"1","z":"x"}]
+
+-- Discriminator: sorting by output position 1 gives the OPPOSITE order
+select b as a, a as z from nk order by 1;
+→ [{"a":"1","z":"x"},{"a":"9","z":"w"}]
+
+-- Same shadowing, with the target column arriving via a star
+select b as a, * from nk order by 2;
+→ [{"a":"9","a:1":"w","b":"9"},{"a":"1","a:1":"x","b":"1"}]
+
+-- Control: qualified name for the star-expanded column
+select b as a, * from nk order by nk.a;
+→ [{"a":"9","a:1":"w","b":"9"},{"a":"1","a:1":"x","b":"1"}]
+
+-- A pre-projection sort (second key is not a projected output column) keeps
+-- resolving the ordinal against the SELECT list, and still lands on `z`
+select b as a, a as z from nk order by 2, a;
+→ [{"a":"9","z":"w"},{"a":"1","z":"x"}]
+
+select b as a, a as z from nk order by z, a;
+→ [{"a":"9","z":"w"},{"a":"1","z":"x"}]
+
+-- Out-of-range ordinals still fail at prepare time
+select a from nk order by 3;
+-- error: ORDER BY position 3 is not in the SELECT list (1..1)
+
+drop table nk;
+
+-- -----------------------------------------------------------------------------
+-- Two joined tables expose the same column name under `*`
+-- -----------------------------------------------------------------------------
+
+create table ot1 (k integer primary key, v text);
+create table ot2 (k integer primary key, v text);
+insert into ot1 values (1,'a1'), (2,'b1');
+insert into ot2 values (1,'z2'), (2,'y2');
+
+-- Output column 4 is ot2.v, so the k=2 row ('y2') sorts first
+select * from ot1 join ot2 on ot1.k = ot2.k order by 4;
+→ [{"k":2,"v":"b1","k:1":2,"v:1":"y2"},{"k":1,"v":"a1","k:1":1,"v:1":"z2"}]
+
+-- Control: matches the qualified ot2.v spelling
+select * from ot1 join ot2 on ot1.k = ot2.k order by ot2.v;
+→ [{"k":2,"v":"b1","k:1":2,"v:1":"y2"},{"k":1,"v":"a1","k:1":1,"v:1":"z2"}]
+
+-- Discriminator: ot1.v produces the OPPOSITE order, so a name-based resolution
+-- (which picks the first `v` in scope) cannot pass the case above
+select * from ot1 join ot2 on ot1.k = ot2.k order by ot1.v;
+→ [{"k":1,"v":"a1","k:1":1,"v:1":"z2"},{"k":2,"v":"b1","k:1":2,"v:1":"y2"}]
+
+drop table ot2;
+drop table ot1;
+
+-- -----------------------------------------------------------------------------
+-- Ordinals pointing at computed output columns (window / aggregate)
+-- -----------------------------------------------------------------------------
+
+create table og (id integer primary key, a text, b text);
+insert into og values (1,'x','1'), (2,'w','9');
+
+-- DISTINCT takes the same path; position 2 is still `z`
+select distinct b as a, a as z from og order by 2;
+→ [{"a":"9","z":"w"},{"a":"1","z":"x"}]
+
+select distinct b as a, a as z from og order by z;
+→ [{"a":"9","z":"w"},{"a":"1","z":"x"}]
+
+-- The ordinal points at a window function: it must READ the computed column,
+-- not re-plan a fresh window expression inside the sort
+select b as a, row_number() over (order by a) as z from og order by 2;
+→ [{"a":"9","z":1},{"a":"1","z":2}]
+
+select b as a, row_number() over (order by a) as z from og order by z;
+→ [{"a":"9","z":1},{"a":"1","z":2}]
+
+-- The ordinal points at an aggregate in a query with no GROUP BY
+select count(*) as c from og order by 1;
+→ [{"c":2}]
+
+select count(*) as c from og order by count(*);
+→ [{"c":2}]
+
+select count(*) as c, max(a) as m from og order by 2;
+→ [{"c":2,"m":"x"}]
+
+-- GROUP BY ordinal binds to the aliased expression, not to the alias name
+select b as a, count(*) as c from og group by 1 order by 1;
+→ [{"a":"1","c":1},{"a":"9","c":1}]
+
+select b as a, count(*) as c from og group by b order by 1;
+→ [{"a":"1","c":1},{"a":"9","c":1}]
+
+-- Grouped query, ORDER BY ordinal on the aggregate output column
+select b as q, count(*) as c from og group by b order by 2 desc, 1;
+→ [{"q":"1","c":1},{"q":"9","c":1}]
+
+drop table og;
+
+-- -----------------------------------------------------------------------------
+-- GROUP BY ordinal onto a star-expanded column whose name is shared
+-- -----------------------------------------------------------------------------
+
+create table jt1 (id integer primary key, k integer, v text);
+create table jt2 (k integer primary key, v text);
+insert into jt1 values (1,1,'L'), (2,1,'L'), (3,2,'L');
+insert into jt2 values (1,'R1'), (2,'R2');
+
+-- Positions 1 and 2 are jt2.k / jt2.v (from `jt2.*`). Resolving them through
+-- the bare names `k` / `v` finds jt1's columns first, which leaves jt2.k and
+-- jt2.v ungrouped and fails the GROUP BY coverage check.
+select jt2.*, count(*) as n from jt1 join jt2 on jt1.k = jt2.k group by 1, 2 order by 1;
+→ [{"k":1,"v":"R1","n":2},{"k":2,"v":"R2","n":1}]
+
+select jt2.*, count(*) as n from jt1 join jt2 on jt1.k = jt2.k group by jt2.k, jt2.v order by 1;
+→ [{"k":1,"v":"R1","n":2},{"k":2,"v":"R2","n":1}]
+
+-- ORDER BY ordinal over that grouped output: position 3 is the count
+select jt2.*, count(*) as n from jt1 join jt2 on jt1.k = jt2.k group by 1, 2 order by 3 desc;
+→ [{"k":1,"v":"R1","n":2},{"k":2,"v":"R2","n":1}]
+
+-- ORDER BY that names an aggregate is applied BEFORE the grouped query's final
+-- projection exists, so a second ordinal key in the same clause has no output
+-- attributes to bind to and falls back to the select list. Position 2 is still
+-- jt2.v, not jt1's same-named column.
+select jt2.*, count(*) as n from jt1 join jt2 on jt1.k = jt2.k group by 1, 2 order by count(*) desc, 2;
+→ [{"k":1,"v":"R1","n":2},{"k":2,"v":"R2","n":1}]
+
+select jt2.*, count(*) as n from jt1 join jt2 on jt1.k = jt2.k group by jt2.k, jt2.v order by count(*) desc, jt2.v;
+→ [{"k":1,"v":"R1","n":2},{"k":2,"v":"R2","n":1}]
+
+drop table jt2;
+drop table jt1;
+
+-- -----------------------------------------------------------------------------
+-- Qualified stars from more than two sources
+-- -----------------------------------------------------------------------------
+
+create table os1 (k integer primary key, v text);
+create table os2 (k integer primary key, v text);
+create table os3 (k integer primary key, v text);
+insert into os1 values (1,'a1'), (2,'b1');
+insert into os2 values (1,'z2'), (2,'y2');
+insert into os3 values (1,'m3'), (2,'n3');
+
+-- All three sources expose a `v`; position 6 is os3.v and position 4 is os2.v,
+-- and the two produce OPPOSITE row orders, so neither can pass by coincidence.
+select os1.*, os2.*, os3.* from os1 join os2 on os1.k = os2.k join os3 on os1.k = os3.k order by 6;
+→ [{"k":1,"v":"a1","k:1":1,"v:1":"z2","k:2":1,"v:2":"m3"},{"k":2,"v":"b1","k:1":2,"v:1":"y2","k:2":2,"v:2":"n3"}]
+
+select os1.*, os2.*, os3.* from os1 join os2 on os1.k = os2.k join os3 on os1.k = os3.k order by os3.v;
+→ [{"k":1,"v":"a1","k:1":1,"v:1":"z2","k:2":1,"v:2":"m3"},{"k":2,"v":"b1","k:1":2,"v:1":"y2","k:2":2,"v:2":"n3"}]
+
+select os1.*, os2.*, os3.* from os1 join os2 on os1.k = os2.k join os3 on os1.k = os3.k order by 4;
+→ [{"k":2,"v":"b1","k:1":2,"v:1":"y2","k:2":2,"v:2":"n3"},{"k":1,"v":"a1","k:1":1,"v:1":"z2","k:2":1,"v:2":"m3"}]
+
+select os1.*, os2.*, os3.* from os1 join os2 on os1.k = os2.k join os3 on os1.k = os3.k order by os2.v;
+→ [{"k":2,"v":"b1","k:1":2,"v:1":"y2","k:2":2,"v:2":"n3"},{"k":1,"v":"a1","k:1":1,"v:1":"z2","k:2":1,"v:2":"m3"}]
+
+drop table os3;
+drop table os2;
+drop table os1;
+
+-- -----------------------------------------------------------------------------
+-- Ordinals through the remaining ORDER BY shapes
+-- -----------------------------------------------------------------------------
+
+create table ow (id integer primary key, a text, b text);
+insert into ow values (1,'x','p'), (2,'w','q'), (3,'v','q');
+
+-- Ordinals compose with the rest of the clause: direction, a second key,
+-- LIMIT, and NULLS placement all still apply to the bound output column.
+select b as z, id from ow order by 1, 2;
+→ [{"z":"p","id":1},{"z":"q","id":2},{"z":"q","id":3}]
+
+select b as z, id from ow order by 1 desc, 2;
+→ [{"z":"q","id":2},{"z":"q","id":3},{"z":"p","id":1}]
+
+select b as z, id from ow order by 1, 2 limit 2;
+→ [{"z":"p","id":1},{"z":"q","id":2}]
+
+-- A star select list under GROUP BY: the ordinals name the grouped columns
+select * from ow group by 1, 2, 3 order by 2;
+→ [{"id":3,"a":"v","b":"q"},{"id":2,"a":"w","b":"q"},{"id":1,"a":"x","b":"p"}]
+
+select * from ow group by id, a, b order by a;
+→ [{"id":3,"a":"v","b":"q"},{"id":2,"a":"w","b":"q"},{"id":1,"a":"x","b":"p"}]
+
+-- Through a CTE and through a derived table: the outer `select *` publishes the
+-- inner names, and position 2 is still the inner `z`
+with cw as (select b as a, a as z from ow) select * from cw order by 2;
+→ [{"a":"q","z":"v"},{"a":"q","z":"w"},{"a":"p","z":"x"}]
+
+select * from (select b as a, a as z from ow) order by 2;
+→ [{"a":"q","z":"v"},{"a":"q","z":"w"},{"a":"p","z":"x"}]
+
+-- Zero is out of range, like a negative or too-large position
+select a from ow order by 0;
+-- error: ORDER BY position 0 is not in the SELECT list (1..1)
+
+-- A window query containing `*` publishes one output attribute per SELECT-list
+-- column, stars expanded, so an ordinal binds the window column directly:
+-- position 4 is `w`, after the three star columns.
+select *, row_number() over (order by a) as w from ow order by 4;
+→ [{"id":3,"a":"v","b":"q","w":1},{"id":2,"a":"w","b":"q","w":2},{"id":1,"a":"x","b":"p","w":3}]
+
+select *, row_number() over (order by a) as w from ow order by 4 desc;
+→ [{"id":1,"a":"x","b":"p","w":3},{"id":2,"a":"w","b":"q","w":2},{"id":3,"a":"v","b":"q","w":1}]
+
+-- ...and position 5 is out of range: the select list has 4 entries.
+select *, row_number() over (order by a) as w from ow order by 5;
+-- error: ORDER BY position 5 is not in the SELECT list (1..4)
+
+drop table ow;
+
+-- NULLS FIRST / LAST apply to the bound output column
+create table onul (id integer primary key, v text null);
+insert into onul values (1, null), (2, 'a');
+
+select v as z, id from onul order by 1 nulls first;
+→ [{"z":null,"id":1},{"z":"a","id":2}]
+
+select v as z, id from onul order by 1 nulls last;
+→ [{"z":"a","id":2},{"z":null,"id":1}]
+
+drop table onul;
+
+-- The bound output column carries its declared collation, so an ordinal sorts
+-- identically to the name form
+create table ocol (id integer primary key, v text collate nocase);
+insert into ocol values (1,'B'), (2,'a');
+
+select v as z from ocol order by 1;
+→ [{"z":"a"},{"z":"B"}]
+
+select v as z from ocol order by z;
+→ [{"z":"a"},{"z":"B"}]
+
+drop table ocol;

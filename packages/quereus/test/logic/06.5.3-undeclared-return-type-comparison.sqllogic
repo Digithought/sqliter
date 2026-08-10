@@ -1,0 +1,244 @@
+-- undeclared-return-type-comparison.sqllogic
+-- A function registered without a declared `returnType` reports ANY (unknown), not REAL.
+-- While the default was REAL, the planner believed every such function returned a number,
+-- so `insertCrossTypeCoercion` cast the TEXT side of a comparison to REAL — the literal
+-- 'object' became 0 and `json_type(j) = 'object'` was FALSE. At the time, most builtins
+-- declared no return type (all of datetime.ts, nearly all of json.ts and string.ts), so
+-- the whole family was affected; ticket 1-scalar-function-default-return-type-any.
+--
+-- Those builtins now declare their real return types (ticket
+-- 2-builtin-scalar-function-declared-return-types), so most of the cases below reach the
+-- right answer by a shorter route than ANY. `json_extract` is the one builtin still
+-- deliberately ANY — genuinely polymorphic — so the ANY behavior stays exercised here.
+--
+-- The user-defined-function half of this (Database.createScalarFunction never passes a
+-- returnType) lives in test/core-api-features.spec.ts — a .sqllogic file cannot register
+-- one.
+--
+-- No `using memory`, so store mode exercises the persisted path too.
+
+create table urt (id integer primary key, j json, d text, n integer);
+insert into urt values (1, '{"a":"x"}', '2024-03-04', 5);
+-- run
+
+-- ===================================
+-- 1. The reproducing comparisons — every one of these was FALSE
+-- ===================================
+select json_type(j) = 'object' as r from urt;
+→ [{"r":true}]
+
+select json_extract(j, '$.a') = 'x' as r from urt;
+→ [{"r":true}]
+
+select strftime('%Y', d) = '2024' as r from urt;
+→ [{"r":true}]
+
+-- json_quote returns the JSON source as TEXT, so this compares two plain strings.
+select json_quote(j) = '{"a":"x"}' as r from urt;
+→ [{"r":true}]
+
+-- Literal on the LEFT is the same coercion, mirrored.
+select 'object' = json_type(j) as r from urt;
+→ [{"r":true}]
+
+-- The complement is honest too (it was TRUE for every row before).
+select json_type(j) <> 'object' as r from urt;
+→ [{"r":false}]
+
+-- Unequal text is still unequal — the fix is not "always true".
+select json_type(j) = 'array' as r from urt;
+→ [{"r":false}]
+
+-- WHERE position, not just the select list.
+select id from urt where json_type(j) = 'object';
+→ [{"id":1}]
+
+select id from urt where strftime('%Y', d) = '2024';
+→ [{"id":1}]
+
+-- ===================================
+-- 2. The other comparison sites agree with `=`
+-- ===================================
+select json_type(j) in ('object') as r from urt;
+→ [{"r":true}]
+
+select case json_type(j) when 'object' then 'yes' else 'no' end as r from urt;
+→ [{"r":"yes"}]
+
+select json_type(j) between 'a' and 'z' as r from urt;
+→ [{"r":true}]
+
+select json_type(j) like 'obj%' as r from urt;
+→ [{"r":true}]
+
+-- An ANY-typed value against a number is simply unequal, not an error.
+select json_type(j) = 3 as r from urt;
+→ [{"r":false}]
+
+-- ===================================
+-- 3. A non-JSON operand vs JSON still takes the object-physical arm of insertCrossTypeCoercion
+-- ===================================
+-- Neither ANY nor TEXT is NULL, so the arm is not skipped: the non-JSON side is cast to
+-- JSON. 'object' is not JSON source, so the lenient cast leaves it as the raw string,
+-- which does not equal the object {"a":"x"}. Pinned deliberately.
+select json_type(j) = j as r from urt;
+→ [{"r":false}]
+
+-- Same shape with a still-ANY operand (json_extract), so the ANY arm stays covered.
+select json_extract(j, '$.a') = j as r from urt;
+→ [{"r":false}]
+
+-- The JSON source text spelled by json_quote DOES parse, so it matches structurally.
+select json_quote(j) = j as r from urt;
+→ [{"r":true}]
+
+-- ===================================
+-- 4. json_type's value still works everywhere else it has always worked
+-- ===================================
+select json_type(j) || '!' as r from urt;
+→ [{"r":"object!"}]
+
+select length(json_type(j)) as r from urt;
+→ [{"r":6}]
+
+select coalesce(json_type(j), 'none') as r from urt;
+→ [{"r":"object"}]
+
+select nullif(json_type(j), 'object') as r from urt;
+→ [{"r":null}]
+
+select cast(json_type(j) as text) = 'object' as r from urt;
+→ [{"r":true}]
+
+select typeof(json_type(j)) as r from urt;
+→ [{"r":"text"}]
+
+-- Identity sites (ORDER BY / GROUP BY / DISTINCT / min / max) rank the value as text,
+-- as they always did.
+insert into urt values (2, '[1]', '2023-01-02', 7);
+-- run
+
+select json_type(j) as r from urt order by json_type(j);
+→ [{"r":"array"},{"r":"object"}]
+
+select min(json_type(j)) as mn, max(json_type(j)) as mx from urt;
+→ [{"mn":"array","mx":"object"}]
+
+select json_type(j) as g, count(*) as c from urt group by json_type(j) order by g;
+→ [{"g":"array","c":1},{"g":"object","c":1}]
+
+select count(*) as c from (select distinct json_type(j) from urt);
+→ [{"c":2}]
+
+-- ===================================
+-- 5. The numeric builtins accept an unclassifiable argument
+-- ===================================
+-- abs/round/sqrt/floor/ceil/clamp gate their argument at plan time on isNumeric. With an
+-- honest ANY default that gate has to mean "numeric, or not yet known"
+-- (isNumericOrUnknownType) or `abs(<undeclared function>)` becomes unusable.
+select abs(json_extract(j, '$.a')) as r from urt where id = 1;
+→ [{"r":null}]
+
+-- ===================================
+-- 6. NULL passes the same gate: abs(null) is null in SQL, not an error
+-- ===================================
+-- These all threw "Invalid argument types for function <name>" before, including at HEAD
+-- before the default changed.
+select abs(null) as r;
+→ [{"r":null}]
+
+select round(null) as r;
+→ [{"r":null}]
+
+select round(null, 1) as r;
+→ [{"r":null}]
+
+select sqrt(null) as r;
+→ [{"r":null}]
+
+select floor(null) as r;
+→ [{"r":null}]
+
+select ceil(null) as r;
+→ [{"r":null}]
+
+select ceiling(null) as r;
+→ [{"r":null}]
+
+-- clamp's implementation reaches Number() for all three arguments at once, so its null
+-- short-circuit is explicit — Number(null) is 0, which would return the lower bound.
+select clamp(null, 1, 2) as r;
+→ [{"r":null}]
+
+select clamp(5, null, 10) as r;
+→ [{"r":null}]
+
+select clamp(5, 1, null) as r;
+→ [{"r":null}]
+
+-- ===================================
+-- 7. A textual argument is still rejected at plan time
+-- ===================================
+-- Widening the gate to ANY and NULL must not widen it to TEXT.
+select abs('abc') as r;
+-- error: Invalid argument types for function abs
+
+select floor('abc') as r;
+-- error: Invalid argument types for function floor
+
+select clamp('a', 1, 2) as r;
+-- error: Invalid argument types for function clamp
+
+select abs(d) as r from urt;
+-- error: Invalid argument types for function abs
+
+-- ===================================
+-- 8. Arithmetic and aggregation over an ANY-typed value
+-- ===================================
+-- These were WRONG under the REAL default, not merely unspecialized: emitArithmeticOp
+-- took its numeric-fast path (`runtime/emit/binary.ts`), which trusts the declared type
+-- and applies the JS operator to the raw value. strftime returns the string '2024', so
+-- `'2024' + 1` concatenated to '20241', failed the Number.isFinite check and came back
+-- NULL. ANY routes to the generic path, which coerces first.
+select strftime('%Y', d) + 1 as r from urt where id = 1;
+→ [{"r":2025}]
+
+-- `abs(strftime(...))` was 2024 while strftime rode the ANY default: the numeric
+-- builtins' plan-time gate accepts "numeric OR unclassifiable", and ANY is
+-- unclassifiable. Ticket 2-builtin-scalar-function-declared-return-types declared
+-- strftime's real return type (TEXT), so the argument is now classifiable and the gate
+-- rejects it — the same rejection `abs(d)` gets in section 7, for the same reason.
+-- Write `abs(integer(strftime(...)))` to convert first.
+select abs(strftime('%Y', d)) as r from urt where id = 1;
+-- error: Invalid argument types for function abs
+
+select abs(integer(strftime('%Y', d))) as r from urt where id = 1;
+→ [{"r":2024}]
+
+-- Aggregates: an ANY-typed argument no longer skips coerceForAggregate
+-- (`computeAggregateSkipCoercion`, runtime/emit/aggregate-setup.ts).
+select sum(strftime('%Y', d)) as s, avg(strftime('%Y', d)) as a from urt;
+→ [{"s":4047,"a":2023.5}]
+
+-- ===================================
+-- 9. The deliberate loss: a numeric-looking STRING no longer coerces
+-- ===================================
+-- Not guessing REAL costs exactly this much. `json_extract(...) = '5'` was TRUE (the
+-- planner cast '5' to REAL 5); it is now FALSE, because an ANY operand gives the
+-- numeric↔textual arm of insertCrossTypeCoercion nothing to key on and the runtime
+-- compares an integer against text — different storage classes. Note this is NOT the gap
+-- bug-numeric-text-coercion-skips-in-and-case closed: that one was about the coercion
+-- being skipped at some comparison SITES; here every site applies it and there is simply
+-- no declared numeric type to key on.
+-- Pinned so the next change to the numeric↔text story is a deliberate one. json_extract
+-- is deliberately still ANY (its result shape depends on the data), so the loss is real
+-- here; every builtin that CAN name a type now does, which restores the coercion — see
+-- 06.5.4-declared-return-type-builtins.sqllogic.
+select json_extract('{"n":5}', '$.n') = '5' as r;
+→ [{"r":false}]
+
+-- Against an actual number it is true, as it always was.
+select json_extract('{"n":5}', '$.n') = 5 as r;
+→ [{"r":true}]
+
+drop table urt;

@@ -127,3 +127,106 @@ returning
 → [{"count":3,"sum":90}]
 
 drop table tr;
+
+-- ===================================
+-- 9. RETURNING * / table.* on a base-table INSERT / UPDATE / DELETE
+-- ===================================
+-- `*` expands to every target column in declaration order; the unqualified
+-- symbols bind the statement's default image (NEW for INSERT/UPDATE, OLD for
+-- DELETE). Output names are the bare column names regardless of qualifier.
+
+create table star_t (id integer primary key, name text, value integer default 100);
+
+-- INSERT ... RETURNING * → full row, declaration order; DEFAULT 100 surfaced.
+insert into star_t (id, name) values (1, 'a') returning *;
+→ [{"id":1,"name":"a","value":100}]
+
+-- INSERT ... RETURNING table.* (qualified by the target table name) → same as *.
+insert into star_t (id, name, value) values (2, 'b', 200) returning star_t.*;
+→ [{"id":2,"name":"b","value":200}]
+
+-- a wrong qualifier errors (not a generic crash, not a silent expand).
+insert into star_t (id, name) values (3, 'c') returning bogus.*;
+-- error: not found
+
+-- the rejected insert made no row (id=3 absent).
+select id from star_t order by id;
+→ [{"id":1},{"id":2}]
+
+-- UPDATE ... RETURNING * → the NEW (post-update) image, full row.
+update star_t set value = 101 where id = 1 returning *;
+→ [{"id":1,"name":"a","value":101}]
+
+-- mixed projection, trailing: * expands in place, the extra `name` keeps its
+-- position and is de-duplicated to `name:1`.
+update star_t set value = 102 where id = 1 returning *, name;
+→ [{"id":1,"name":"a","value":102,"name:1":"a"}]
+
+-- mixed projection, leading: a column before * keeps position (the star copy of
+-- `id` de-duplicates to `id:1`).
+update star_t set value = 103 where id = 1 returning id, *;
+→ [{"id":1,"id:1":1,"name":"a","value":103}]
+
+-- OLD-qualified expression composes with * (which is the NEW image).
+update star_t set value = 200 where id = 1 returning old.value, *;
+→ [{"old.value":103,"id":1,"name":"a","value":200}]
+
+-- DELETE ... RETURNING * → the OLD (deleted) image, full row.
+delete from star_t where id = 2 returning *;
+→ [{"id":2,"name":"b","value":200}]
+
+-- zero-row mutations with * yield an empty result set, not an error.
+update star_t set value = 0 where 1 = 0 returning *;
+→ []
+
+delete from star_t where 1 = 0 returning *;
+→ []
+
+-- relational orthogonality: RETURNING * makes the DML a relation usable in CTE
+-- position (a wider projection). Insert form:
+with ins as (insert into star_t (id, name, value) values (5, 'e', 50) returning *)
+select count(*) as c from ins;
+→ [{"c":1}]
+
+-- ...and delete form.
+with d as (delete from star_t where id = 5 returning *)
+select id, name, value from d;
+→ [{"id":5,"name":"e","value":50}]
+
+-- interaction: a multi-row INSERT ... RETURNING * emits one expanded row per
+-- inserted row (the star is the projection list; the executor supplies the rows).
+insert into star_t (id, name, value) values (10, 'j', 1), (11, 'k', 2) returning *;
+→ [{"id":10,"name":"j","value":1},{"id":11,"name":"k","value":2}]
+
+-- ...and a multi-row UPDATE ... RETURNING * emits one NEW image per updated row.
+update star_t set value = value + 100 where id in (10, 11) returning *;
+→ [{"id":10,"name":"j","value":101},{"id":11,"name":"k","value":102}]
+
+drop table star_t;
+
+-- ===================================
+-- 10. RETURNING * surfaces resolved DEFAULT and generated-column values
+-- ===================================
+
+create table gstar (id integer primary key, name text, qty integer default 7,
+    display text generated always as (upper(name)));
+
+insert into gstar (id, name) values (1, 'alice') returning *;
+→ [{"id":1,"name":"alice","qty":7,"display":"ALICE"}]
+
+drop table gstar;
+
+-- ===================================
+-- 11. RETURNING * over a collated column round-trips the stored value, and the
+--     column's declared collation still drives the WHERE match (the * column
+--     resolves through the same symbol a named column would).
+-- ===================================
+
+create table cstar (id integer primary key, name text collate nocase);
+insert into cstar values (1, 'Hello'), (2, 'WORLD');
+
+-- nocase WHERE matches 'hello' → 'Hello'; * returns the verbatim stored value.
+update cstar set name = name where name = 'hello' returning *;
+→ [{"id":1,"name":"Hello"}]
+
+drop table cstar;

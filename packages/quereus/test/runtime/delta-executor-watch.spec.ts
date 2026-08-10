@@ -225,6 +225,30 @@ describe('subscriptionFromChangeScope (unit)', () => {
 		expect(events[0].matched[0].hits).to.deep.equal([]);
 	});
 
+	it("apply: 'groups' watch fires with empty hits when relKey is in globalRelations", async () => {
+		const { ctx } = makeCtx({ tables });
+		const scope: ChangeScope = {
+			watches: [{
+				table: { schema: 'main', table: 't' },
+				columns: 'all',
+				scope: { kind: 'groups', groupBy: ['g'] },
+			}],
+			nonDeterministicSources: [],
+			unboundParameters: [],
+		};
+		const events: WatchEvent[] = [];
+		const { subscription } = subscriptionFromChangeScope(scope, e => { events.push(e); }, 'w-grp-global', ctx);
+		const relKey = [...subscription.relationToBase.keys()][0];
+		// A `groups` watch carries no literals; a global re-eval must still fire
+		// (whole-relation changed → re-query) — mirrors the `full` global case.
+		await subscription.apply({
+			perRelationTuples: new Map(),
+			globalRelations: new Set([relKey]),
+		});
+		expect(events).to.have.length(1);
+		expect(events[0].matched[0].hits).to.deep.equal([]);
+	});
+
 	it("apply: 'groups' watch reports kernel tuples directly as hits", async () => {
 		const { ctx } = makeCtx({ tables });
 		const scope: ChangeScope = {

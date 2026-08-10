@@ -1,0 +1,862 @@
+-- 93.6-set-op-flagless-write.sqllogic
+-- Flag-less predicate-honest set-op writes (`set-op-flagless-predicate-honest-writes`):
+-- a flag-less `union all` of literal-discriminator legs (`'red' as kind`) is writable via a
+-- plan-time σ + literal-discriminator branch oracle (`checkSatisfiability`). The literal
+-- discriminators are READ-ONLY; the plain base columns round-trip through the branch spine.
+-- See docs/vu-setops.md § Set-operation membership writes and docs/sql.md.
+
+-- ===================================================================
+-- Schema: a 4-leg flag-less union all. `kind` (red/large) and `src` (A/B) are literal
+-- discriminators; `id` / `x` are plain (writable) base columns.
+-- ===================================================================
+-- (`color` / `size` are nullable so a leg's omitted base column defaults to null when its
+-- sibling σ does not pin it — this engine defaults columns to NOT NULL.)
+create table items_a (id integer primary key, x integer, color text null, size text null);
+create table items_b (id integer primary key, x integer, color text null, size text null);
+insert into items_a values (1,10,'red','small'),(2,20,'blue','large');
+insert into items_b values (3,30,'red','small'),(4,40,'blue','large');
+
+create view U as
+  select id, x, 'red' as kind, 'A' as src from items_a where color = 'red'
+  union all
+  select id, x, 'red' as kind, 'B' as src from items_b where color = 'red'
+  union all
+  select id, x, 'large' as kind, 'A' as src from items_a where size = 'large'
+  union all
+  select id, x, 'large' as kind, 'B' as src from items_b where size = 'large';
+
+select * from U order by id;
+→ [{"id":1,"x":10,"kind":"red","src":"A"},{"id":2,"x":20,"kind":"large","src":"A"},{"id":3,"x":30,"kind":"red","src":"B"},{"id":4,"x":40,"kind":"large","src":"B"}]
+
+-- --- static surfaces: writable shape, discriminators read-only ---
+select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('U');
+→ [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES","effective_targets":"[\"items_a\",\"items_b\"]"}]
+
+select cid, column_name, is_updatable, base_table, base_column from column_info('U');
+→ [{"cid":0,"column_name":"id","is_updatable":"YES","base_table":null,"base_column":null},{"cid":1,"column_name":"x","is_updatable":"YES","base_table":null,"base_column":null},{"cid":2,"column_name":"kind","is_updatable":"NO","base_table":null,"base_column":null},{"cid":3,"column_name":"src","is_updatable":"NO","base_table":null,"base_column":null}]
+
+-- ===================================================================
+-- INSERT routing: the literal discriminators select exactly one leg; the other three are
+-- provably inconsistent (`unsat`) and skipped. Omitted base columns recover via the leg σ.
+-- ===================================================================
+-- (5,50,'red','B') → only the `items_b where color='red'` leg.
+insert into U (id, x, kind, src) values (5, 50, 'red', 'B');
+select id, x, color, size from items_b order by id;
+→ [{"id":3,"x":30,"color":"red","size":"small"},{"id":4,"x":40,"color":"blue","size":"large"},{"id":5,"x":50,"color":"red","size":null}]
+-- items_a untouched (the two `src='A'` / `kind='large'` legs were skipped).
+select id from items_a order by id;
+→ [{"id":1},{"id":2}]
+select * from U where id = 5;
+→ [{"id":5,"x":50,"kind":"red","src":"B"}]
+
+-- (6,60,'large','A') → only the `items_a where size='large'` leg; σ recovers `size='large'`.
+insert into U (id, x, kind, src) values (6, 60, 'large', 'A');
+select id, color, size from items_a where id = 6;
+→ [{"id":6,"color":null,"size":"large"}]
+select * from U where id = 6;
+→ [{"id":6,"x":60,"kind":"large","src":"A"}]
+
+-- ===================================================================
+-- DELETE fan-out: `kind='large'` fans to BOTH `size='large'` legs (items_a + items_b); the
+-- two `kind='red'` legs are provably inconsistent and skipped.
+-- ===================================================================
+delete from U where kind = 'large';
+select id from items_a order by id;
+→ [{"id":1}]
+select id from items_b order by id;
+→ [{"id":3},{"id":5}]
+
+-- ===================================================================
+-- data-UPDATE fan-out + discriminator read-only rejection (fresh tables).
+-- ===================================================================
+create table ua (id integer primary key, x integer, color text null, size text null);
+create table ub (id integer primary key, x integer, color text null, size text null);
+insert into ua values (1,10,'red','small'),(2,20,'blue','large');
+insert into ub values (3,30,'red','small'),(4,40,'blue','large');
+create view U4 as
+  select id, x, 'red' as kind, 'A' as src from ua where color = 'red'
+  union all
+  select id, x, 'red' as kind, 'B' as src from ub where color = 'red'
+  union all
+  select id, x, 'large' as kind, 'A' as src from ua where size = 'large'
+  union all
+  select id, x, 'large' as kind, 'B' as src from ub where size = 'large';
+
+-- `src='A'` fans to the two items_a-based legs (red + large) only.
+update U4 set x = x + 1 where src = 'A';
+select id, x from ua order by id;
+→ [{"id":1,"x":11},{"id":2,"x":21}]
+select id, x from ub order by id;
+→ [{"id":3,"x":30},{"id":4,"x":40}]
+
+-- A literal discriminator is read-only (no base inverse) — NOT silently routed.
+update U4 set kind = 'large' where id = 1;
+-- error: read-only
+
+update U4 set src = 'B' where id = 1;
+-- error: read-only
+
+-- An unknown column is a clean reject.
+update U4 set bogus = 1 where id = 1;
+-- error: not a column
+
+-- ===================================================================
+-- Rejected boundaries: SELECT-source insert (v1 VALUES only) + RETURNING.
+-- ===================================================================
+insert into U4 (id, x, kind, src) select id, x, 'red', 'A' from ua;
+-- error: VALUES source
+
+delete from U4 where id = 1 returning id;
+-- error: RETURNING
+
+-- ===================================================================
+-- σ-consistency oracle: a provably-inconsistent leg is skipped; the checker never emits a
+-- false `unsat`, so a real target leg is never dropped.
+-- ===================================================================
+create table sa (id integer primary key, x integer, color text null);
+create table sb (id integer primary key, x integer, color text null);
+insert into sa values (1,10,'red'),(2,20,'red');
+insert into sb values (3,30,'green'),(4,40,'green');
+create view U6 as
+  select id, x, 'lit' as tag from sa where color = 'red'
+  union all
+  select id, x, 'fn' as tag from sb where length(color) > 2;
+
+select * from U6 order by id;
+→ [{"id":1,"x":10,"tag":"lit"},{"id":2,"x":20,"tag":"lit"},{"id":3,"x":30,"tag":"fn"},{"id":4,"x":40,"tag":"fn"}]
+
+-- `tag='lit'` is provably inconsistent with the `'fn'` leg → that leg is skipped (sb intact),
+-- even though its σ (`length(color) > 2`) is undecidable to the checker.
+delete from U6 where tag = 'lit';
+select id from sa order by id;
+→ []
+select id from sb order by id;
+→ [{"id":3},{"id":4}]
+
+-- Honest fan-out: an UNDECIDABLE predicate (`tag like 'f%'`) is included on BOTH legs (no
+-- false `unsat`), and the member-exists correlation self-restricts the no-op leg — the `fn`
+-- leg's rows go, the `lit` leg's stay (its discriminator never matches the captured `fn` rows).
+create table la (id integer primary key, x integer, color text null);
+create table lb (id integer primary key, x integer, color text null);
+insert into la values (1,10,'red'),(2,20,'red');
+insert into lb values (3,30,'green'),(4,40,'green');
+create view U7 as
+  select id, x, 'lit' as tag from la where color = 'red'
+  union all
+  select id, x, 'fn' as tag from lb where length(color) > 2;
+delete from U7 where tag like 'f%';
+select id from la order by id;
+→ [{"id":1},{"id":2}]
+select id from lb order by id;
+→ []
+
+-- ===================================================================
+-- `intersect` semantics: insert fans to EVERY leg (a row must be in all to be visible);
+-- delete fans to every leg by default.
+-- ===================================================================
+create table ia (id integer primary key, v integer);
+create table ib (id integer primary key, v integer);
+insert into ia values (1,10),(2,20);
+insert into ib values (2,20),(3,30);
+create view IV as select id, v from ia intersect select id, v from ib;
+select * from IV order by id;
+→ [{"id":2,"v":20}]
+
+insert into IV (id, v) values (5, 50);
+select id from ia order by id;
+→ [{"id":1},{"id":2},{"id":5}]
+select id from ib order by id;
+→ [{"id":2},{"id":3},{"id":5}]
+select * from IV order by id;
+→ [{"id":2,"v":20},{"id":5,"v":50}]
+
+delete from IV where id = 2;
+select id from ia order by id;
+→ [{"id":1},{"id":5}]
+select id from ib order by id;
+→ [{"id":3},{"id":5}]
+
+-- ===================================================================
+-- `except` (A except B) semantics: insert into the LEFT operand only; delete from the LEFT
+-- operand only (so the row leaves the difference).
+-- ===================================================================
+create table ea (id integer primary key, v integer);
+create table eb (id integer primary key, v integer);
+insert into ea values (1,10),(2,20);
+insert into eb values (2,20);
+create view EV as select id, v from ea except select id, v from eb;
+select * from EV order by id;
+→ [{"id":1,"v":10}]
+
+insert into EV (id, v) values (3, 30);
+select id from ea order by id;
+→ [{"id":1},{"id":2},{"id":3}]
+select id from eb order by id;
+→ [{"id":2}]
+select * from EV order by id;
+→ [{"id":1,"v":10},{"id":3,"v":30}]
+
+delete from EV where id = 1;
+select id from ea order by id;
+→ [{"id":2},{"id":3}]
+select id from eb order by id;
+→ [{"id":2}]
+
+-- ===================================================================
+-- Rejected boundaries: the static surfaces must AGREE with the dynamic reject (no
+-- over-claim). A body the flag-less recognizer rejects falls through to the conservative
+-- all-`NO` row AND the dynamic write rejects.
+-- ===================================================================
+create table rp (id integer primary key, x integer);
+create table rq (id integer primary key, x integer);
+create table rr (id integer primary key, x integer);
+
+-- A discriminator-less `union all` is NOT writable (no literal discriminator to route an
+-- insert honestly — the phase-1 reject is preserved): all-`NO` static + dynamic reject.
+create view DLU as select id, x from rp union all select id, x from rq;
+select is_insertable_into, is_updatable, is_deletable from view_info('DLU');
+→ [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO"}]
+select cid, column_name, is_updatable from column_info('DLU');
+→ [{"cid":0,"column_name":"id","is_updatable":"NO"},{"cid":1,"column_name":"x","is_updatable":"NO"}]
+insert into DLU (id, x) values (1, 10);
+-- error:
+
+-- A deep / mixed `intersect` chain is not flattened (binary only) → conservative all-`NO`.
+create view DI as select id, x from rp intersect select id, x from rq intersect select id, x from rr;
+select is_insertable_into, is_updatable, is_deletable from view_info('DI');
+→ [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO"}]
+
+-- ===================================================================
+-- `union` (DISTINCT) of literal-discriminator legs is writable too (the recognizer admits
+-- both `union` and `union all`).
+-- ===================================================================
+create table da (id integer primary key, x integer, color text null);
+create table db (id integer primary key, x integer, color text null);
+insert into da values (1,10,'red'),(2,20,'blue');
+insert into db values (3,30,'red'),(4,40,'blue');
+create view DU as
+  select id, x, 'a' as src from da where color = 'red'
+  union
+  select id, x, 'b' as src from db where color = 'red';
+select is_insertable_into, is_updatable, is_deletable from view_info('DU');
+→ [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES"}]
+insert into DU (id, x, src) values (5, 50, 'a');
+select id, color from da order by id;
+→ [{"id":1,"color":"red"},{"id":2,"color":"blue"},{"id":5,"color":"red"}]
+
+-- ===================================================================
+-- Partial-discriminator insert ambiguity (the routing-ambiguity caveat): omitting a
+-- discriminator that distinguishes two legs of the SAME base table routes the row to BOTH,
+-- which surfaces as a clean PK conflict (not silent corruption).
+-- ===================================================================
+create table oa (id integer primary key, x integer, color text null, size text null);
+create view OU as
+  select id, x, 'red' as kind from oa where color = 'red'
+  union all
+  select id, x, 'large' as kind from oa where size = 'large';
+insert into OU (id, x) values (7, 70);
+-- error:
+
+-- ===================================================================
+-- Multi-source (INNER JOIN) leg compose (`set-op-write-multisource-leg-compose`): a flag-less
+-- set-op body one of whose legs is an INNER join is now writable for UPDATE / DELETE. The
+-- leg recognizer (`isWritableLeafLeg`) admits an inner-join leg, so the static surfaces report
+-- is_updatable / is_deletable = YES (and is_insertable_into = NO — join-leg insert is deferred to
+-- `set-op-write-multisource-leg-insert`). The fan composes the join leg via an inner per-leg
+-- base-PK capture (`__vmupd_keys$N`) chained off the outer set-op capture, so the join leg
+-- decomposes through the multi-source machinery without colliding with the outer capture (the
+-- internal `k.k0_0` error is gone). Both surfaces match the dynamic write exactly.
+-- ===================================================================
+create table jv1 (id integer primary key, x integer, color text null);
+create table jv2 (id integer primary key, y integer null);
+insert into jv1 values (1,10,'red'),(2,20,'blue');
+insert into jv2 values (1,100),(2,200);
+create view JV as
+  select jv1.id as id, jv1.x as x, 'a' as src from jv1 join jv2 on jv1.id = jv2.id where jv1.color = 'red'
+  union all
+  select id, x, 'b' as src from jv1 where color = 'blue';
+
+select * from JV order by id;
+→ [{"id":1,"x":10,"src":"a"},{"id":2,"x":20,"src":"b"}]
+
+-- static surfaces: update/delete YES (the join leg composes), insert YES (the join leg's shared key
+-- `id` is supplied, so its shared-surrogate envelope accepts the insert). The plain data columns
+-- report is_updatable = YES; the literal discriminator `src` is read-only (NO).
+select is_insertable_into, is_updatable, is_deletable from view_info('JV');
+→ [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES"}]
+select cid, column_name, is_updatable, base_table, base_column from column_info('JV');
+→ [{"cid":0,"column_name":"id","is_updatable":"YES","base_table":null,"base_column":null},{"cid":1,"column_name":"x","is_updatable":"YES","base_table":null,"base_column":null},{"cid":2,"column_name":"src","is_updatable":"NO","base_table":null,"base_column":null}]
+
+-- data UPDATE through the join leg ('a' leg): `x` maps to jv1.x, so only jv1 is updated; the
+-- discriminator σ routes the fan to the join leg ('b' leg is unsat with src='a' ⇒ skipped).
+update JV set x = x + 1 where src = 'a';
+select id, x from jv1 order by id;
+→ [{"id":1,"x":11},{"id":2,"x":20}]
+select id, y from jv2 order by id;
+→ [{"id":1,"y":100},{"id":2,"y":200}]
+
+-- DELETE through the join leg fans to both candidate sides of the inner join (ambiguous-delete
+-- default), so the joined row id=1 leaves both jv1 and jv2.
+delete from JV where src = 'a';
+select id, x from jv1 order by id;
+→ [{"id":2,"x":20}]
+select id, y from jv2 order by id;
+→ [{"id":2,"y":200}]
+
+-- INSERT through the join leg is now SHIPPED via the nested shared-surrogate envelope splice
+-- (`set-op-write-multisource-leg-insert`): the discriminator `src='a'` routes to the join leg, whose
+-- shared key `id` is supplied (jv1.id = jv2.id), so jv1 gets (5,50,'red') and jv2 gets (5,null). The
+-- 'b' plain leg is unsat with src='a' ⇒ untouched. The join leg's `where jv1.color='red'` IS now
+-- consulted on insert (multisource-insert-sigma-fd-defaulting): the σ equality constant is lifted as
+-- a per-side insert default, so the omitted, projected-away `color` is supplied 'red' on jv1 and the
+-- inserted row is VISIBLE through JV (matching the single-source σ-defaulting rule).
+insert into JV (id, x, src) values (5, 50, 'a');
+select id, x, color from jv1 order by id;
+→ [{"id":2,"x":20,"color":"blue"},{"id":5,"x":50,"color":"red"}]
+select id, y from jv2 order by id;
+→ [{"id":2,"y":200},{"id":5,"y":null}]
+-- the inserted (5,50,'a') row now appears THROUGH the view (jv1.color defaulted to 'red', so the
+-- 'a' join leg's `where color='red'` admits it).
+select * from JV order by id;
+→ [{"id":2,"x":20,"src":"b"},{"id":5,"x":50,"src":"a"}]
+
+-- NOTE on comma-join legs (`from a, b`): the engine rejects multiple FROM sources at build
+-- time ("SELECT with multiple FROM sources (joins) not supported"), so such a body cannot even
+-- be created/read — the `from.length > 1` arm of `isJoinBody` is unreachable for any readable
+-- view. The explicit-`join` form above is the live path.
+
+-- ===================================================================
+-- Join leg at chain depth > 1 (`set-op-write-multisource-leg-compose`, every-depth coverage):
+-- a flag-less union-all chain whose THIRD leg is a JOIN. The fan walks every flat leg, so a join
+-- at any depth composes its own inner capture and decomposes correctly.
+-- ===================================================================
+create table dv1 (id integer primary key, x integer, color text null);
+create table dv2 (id integer primary key, y integer null);
+insert into dv1 values (1,10,'red'),(2,20,'blue'),(3,30,'red');
+insert into dv2 values (1,100),(3,300);
+create view DV as
+  select id, x, 'a' as src from dv1 where color = 'red'
+  union all
+  select id, x, 'b' as src from dv1 where color = 'blue'
+  union all
+  select dv1.id as id, dv1.x as x, 'c' as src from dv1 join dv2 on dv1.id = dv2.id where dv1.color = 'red';
+select is_insertable_into, is_updatable, is_deletable from view_info('DV');
+→ [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES"}]
+select id, x, src from DV order by src, id;
+→ [{"id":1,"x":10,"src":"a"},{"id":3,"x":30,"src":"a"},{"id":2,"x":20,"src":"b"},{"id":1,"x":10,"src":"c"},{"id":3,"x":30,"src":"c"}]
+
+-- DELETE through the depth-3 join leg ('c'): the σ-router fans only to that leg (the 'a'/'b' legs
+-- are unsat with src='c'), and it deletes the joined rows (id 1,3) from both dv1 and dv2.
+delete from DV where src = 'c';
+select id, x from dv1 order by id;
+→ [{"id":2,"x":20}]
+select id, y from dv2 order by id;
+→ []
+
+-- INSERT through the deep (depth-3) join leg is now SHIPPED via the nested envelope splice: `src='c'`
+-- routes to the join leg, shared key `id` supplied, so dv1 gets (9,90,null) and dv2 gets (9,null).
+insert into DV (id, x, src) values (9, 90, 'c');
+select id, x from dv1 order by id;
+→ [{"id":2,"x":20},{"id":9,"x":90}]
+select id, y from dv2 order by id;
+→ [{"id":9,"y":null}]
+
+-- ===================================================================
+-- Composite-PK join leg (`set-op-write-multisource-leg-compose`): the inner per-leg capture
+-- projects one column per PK column per side (`k<side>_0, k<side>_1`), so a composite-key join
+-- leg decomposes through the multi-source machinery unchanged.
+-- ===================================================================
+create table cp1 (a integer, b integer, v integer, primary key (a, b));
+create table cp2 (a integer, b integer, w integer, primary key (a, b));
+insert into cp1 values (1,1,10),(1,2,20);
+insert into cp2 values (1,1,100),(1,2,200);
+create view CV as
+  select cp1.a as a, cp1.b as b, cp1.v as v, 'j' as src from cp1 join cp2 on cp1.a = cp2.a and cp1.b = cp2.b
+  union all
+  select a, b, v, 's' as src from cp1 where a = 9;
+select cid, column_name, is_updatable from column_info('CV');
+→ [{"cid":0,"column_name":"a","is_updatable":"YES"},{"cid":1,"column_name":"b","is_updatable":"YES"},{"cid":2,"column_name":"v","is_updatable":"YES"},{"cid":3,"column_name":"src","is_updatable":"NO"}]
+
+-- INSERT through the composite-PK join leg stays deferred (the shared-surrogate envelope threads a
+-- SINGLE shared key column): `is_insertable_into` reports NO (the probe sees the composite key), and
+-- the dynamic insert rejects cleanly with `unsupported-decomposition-key`. UPDATE / DELETE compose.
+select is_insertable_into, is_updatable, is_deletable from view_info('CV');
+→ [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"YES"}]
+insert into CV (a, b, v, src) values (9, 9, 90, 'j');
+-- error: composite shared key
+
+-- data UPDATE through the composite-PK join leg: `v` maps to cp1.v (identified by the composite key).
+update CV set v = v + 1 where a = 1 and b = 1 and src = 'j';
+select a, b, v from cp1 order by a, b;
+→ [{"a":1,"b":1,"v":11},{"a":1,"b":2,"v":20}]
+
+-- DELETE through the composite-PK join leg fans to both sides (composite identities captured per side).
+delete from CV where a = 1 and b = 2 and src = 'j';
+select a, b, v from cp1 order by a, b;
+→ [{"a":1,"b":1,"v":11}]
+select a, b, w from cp2 order by a, b;
+→ [{"a":1,"b":1,"w":100}]
+
+-- ===================================================================
+-- Self-join leg (`set-op-write-multisource-leg-compose`): one base table under two aliases. The
+-- inner capture routes by alias, so a data UPDATE through the self-join leg lands on the aliased
+-- owning side (`name` ⇒ `e.name`), not the manager alias.
+-- ===================================================================
+create table emp (id integer primary key, name text, mgr integer);
+insert into emp values (1,'a',1),(2,'b',1),(3,'c',2);
+create view SJ as
+  select e.id as id, e.name as name, m.name as mgrname, 'pair' as src from emp e join emp m on e.mgr = m.id
+  union all
+  select id, name, name as mgrname, 'solo' as src from emp where id = 99;
+select is_insertable_into, is_updatable, is_deletable from view_info('SJ');
+→ [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"YES"}]
+
+-- INSERT through the self-join leg stays deferred: the shared key `e.mgr` is neither supplied nor
+-- declares a DEFAULT, so the shared-surrogate envelope cannot mint it. The probe reports NO (above)
+-- and the dynamic insert rejects cleanly with `no-default`. UPDATE / DELETE compose.
+insert into SJ (id, name, mgrname, src) values (4, 'd', 'e', 'pair');
+-- error: neither supplied nor declares a default
+
+update SJ set name = 'X' where id = 2 and src = 'pair';
+select id, name from emp order by id;
+→ [{"id":1,"name":"a"},{"id":2,"name":"X"},{"id":3,"name":"c"}]
+
+-- ===================================================================
+-- Mixed body — one JOIN leg + one PLAIN leg both active on an INSERT (`set-op-write-multisource-leg-insert`):
+-- a union-all of a join leg ('j') and a plain leg ('p'). An INSERT that OMITS the discriminator is
+-- consistent with BOTH legs, so it routes to each: the join leg via a nested shared-surrogate envelope
+-- (mxj1+mxj2), the plain leg via the single-source spine (mxp). Both land in fan order.
+-- ===================================================================
+create table mxj1 (id integer primary key, x integer);
+create table mxj2 (id integer primary key);
+create table mxp (id integer primary key, x integer);
+insert into mxj1 values (1,10);
+insert into mxj2 values (1);
+insert into mxp values (1,10);
+create view MXV as
+  select mxj1.id as id, mxj1.x as x, 'j' as src from mxj1 join mxj2 on mxj1.id = mxj2.id
+  union all
+  select id, x, 'p' as src from mxp;
+
+select is_insertable_into, is_updatable, is_deletable from view_info('MXV');
+→ [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES"}]
+
+select id, x, src from MXV order by src, id;
+→ [{"id":1,"x":10,"src":"j"},{"id":1,"x":10,"src":"p"}]
+
+-- Omit `src`: the row (5,50) is consistent with BOTH legs, so it lands in the join leg's base tables
+-- (mxj1+mxj2 via one nested envelope) AND the plain leg's base table (mxp).
+insert into MXV (id, x) values (5, 50);
+select id, x from mxj1 order by id;
+→ [{"id":1,"x":10},{"id":5,"x":50}]
+select id from mxj2 order by id;
+→ [{"id":1},{"id":5}]
+select id, x from mxp order by id;
+→ [{"id":1,"x":10},{"id":5,"x":50}]
+
+-- `insert or ignore` through the join leg threads `onConflict` into the per-leg envelope insert:
+-- a row colliding on the existing join-leg PK (mxj1 id=5) is ignored (no error, no change), while a
+-- fresh non-colliding row still lands (`set-op-write-multisource-leg-insert`).
+insert or ignore into MXV (id, x, src) values (5, 999, 'j');
+select id, x from mxj1 order by id;
+→ [{"id":1,"x":10},{"id":5,"x":50}]
+insert or ignore into MXV (id, x, src) values (6, 60, 'j');
+select id, x from mxj1 order by id;
+→ [{"id":1,"x":10},{"id":5,"x":50},{"id":6,"x":60}]
+select id from mxj2 order by id;
+→ [{"id":1},{"id":5},{"id":6}]
+
+-- ===================================================================
+-- Uncovered NOT NULL non-key column on a join leg ⇒ NOT insertable (the probe-reject reason the
+-- `jv2.y integer null` fixture above sidesteps). `nn2.y` is a bare `integer` (NOT NULL, no default)
+-- not exposed as a view column, so the shared-surrogate envelope cannot supply it: `is_insertable_into`
+-- reports NO and the dynamic insert rejects cleanly. UPDATE / DELETE through the join leg stay YES.
+-- ===================================================================
+create table nn1 (id integer primary key, x integer, color text null);
+create table nn2 (id integer primary key, y integer);
+insert into nn1 values (1,10,'red');
+insert into nn2 values (1,100);
+create view NNV as
+  select nn1.id as id, nn1.x as x, 'a' as src from nn1 join nn2 on nn1.id = nn2.id
+  union all
+  select id, x, 'b' as src from nn1 where 0;
+
+select is_insertable_into, is_updatable, is_deletable from view_info('NNV');
+→ [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"YES"}]
+insert into NNV (id, x, src) values (5, 50, 'a');
+-- error: is NOT NULL with no default
+
+-- ===================================================================
+-- Halloween safety through a join leg (`set-op-write-multisource-leg-compose`): the inner capture
+-- is materialized BEFORE the leg's base ops, so an UPDATE that rewrites a column its own member
+-- filter ranged on still matches every captured row by identity (no row escapes mid-update).
+-- ===================================================================
+create table hk1 (id integer primary key, grp integer, x integer);
+create table hk2 (id integer primary key, y integer);
+insert into hk1 values (1,5,10),(2,5,20);
+insert into hk2 values (1,100),(2,200);
+create view HV as
+  select hk1.id as id, hk1.grp as grp, hk1.x as x, 'j' as src from hk1 join hk2 on hk1.id = hk2.id
+  union all
+  select id, grp, x, 's' as src from hk1 where grp = 9;
+update HV set grp = grp + 1 where grp = 5 and src = 'j';
+select id, grp, x from hk1 order by id;
+→ [{"id":1,"grp":6,"x":10},{"id":2,"grp":6,"x":20}]
+
+-- ===================================================================
+-- OUTER (left/right/full) join leg deferral (`set-op-write-multisource-leg-compose` ships INNER
+-- legs only): an outer-join leg drops the whole body out of the flag-less route (its
+-- `isWritableLeafLeg` is false), so the static surfaces report all-`NO` and the dynamic write
+-- falls to the single-source spine's clean reject — never the internal `k.k0_0` capture error.
+-- ===================================================================
+create table oj1 (id integer primary key, x integer, color text);
+create table oj2 (id integer primary key, y integer);
+insert into oj1 values (1,10,'red'),(2,20,'blue');
+insert into oj2 values (1,100);
+create view OJV as
+  select oj1.id as id, oj1.x as x, 'a' as src from oj1 left join oj2 on oj1.id = oj2.id where oj1.color = 'red'
+  union all
+  select id, x, 'b' as src from oj1 where color = 'blue';
+select is_insertable_into, is_updatable, is_deletable from view_info('OJV');
+→ [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO"}]
+update OJV set x = x + 1 where src = 'a';
+-- error: cannot write through view
+delete from OJV where src = 'a';
+-- error: cannot write through view
+-- base tables untouched.
+select id, x from oj1 order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20}]
+
+-- ===================================================================
+-- Missing-discriminator deferral (union-all body, non-equi INNER join leg, no literal
+-- discriminator): the body has no literal discriminator in either leg, so `flaglessShape`
+-- returns null — INSERT routing is ambiguous. The static surfaces report all-`NO` and the
+-- dynamic write rejects with `unsupported-set-op`.
+-- Note: the all-`NO` is NOT because the join is non-equi — `isWritableLeafLeg` admits a
+-- non-equi INNER join identically to an equi-join. The deferral is entirely due to the
+-- missing literal discriminator in a union-all body.
+-- ===================================================================
+create table ne1 (id integer primary key, x integer);
+create table ne2 (id integer primary key, lo integer, hi integer);
+insert into ne1 values (1,10),(2,20);
+insert into ne2 values (1,5,15),(2,5,15);
+create view NEV as
+  select ne1.id as id, ne1.x as x from ne1 join ne2 on ne1.x > ne2.lo and ne1.x < ne2.hi
+  union all
+  select id, x from ne1 where id = 99;
+select is_insertable_into, is_updatable, is_deletable from view_info('NEV');
+→ [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO"}]
+update NEV set x = x + 1 where id = 1;
+-- error: cannot write through view
+delete from NEV where id = 1;
+-- error: cannot write through view
+-- base tables untouched.
+select id, x from ne1 order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20}]
+
+-- ===================================================================
+-- Positive: non-equi INNER join leg WITH a literal discriminator (`set-op-flagless-write`).
+-- `isWritableLeafLeg` admits a non-equi INNER join (keys only on `joinType`), and the literal
+-- `tag` discriminator resolves the insert-routing ambiguity. So this body is writable for
+-- UPDATE / DELETE (is_updatable=YES, is_deletable=YES). INSERT is deferred precisely BECAUSE the
+-- join is non-equi: `setOpJoinLegsInsertable` probes the leg with `analyzeMultiSourceInsert`,
+-- which rejects a non-equi ON (`unsupported-join`) → is_insertable_into=NO. An equi-join leg with
+-- a qualifying shared key WOULD be insertable here (cf. the equi-join MXV body above, which is YES).
+-- Only id=1 is visible through the view (x=10 satisfies 5 < x < 15); id=2 (x=20) is not.
+-- ===================================================================
+create view NEVD as
+  select ne1.id as id, ne1.x as x, 'ne' as tag from ne1 join ne2 on ne1.x > ne2.lo and ne1.x < ne2.hi
+  union all
+  select id, x, 'plain' as tag from ne1 where id = 99;
+select is_insertable_into, is_updatable, is_deletable from view_info('NEVD');
+→ [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"YES"}]
+
+-- UPDATE through the non-equi join leg: id=1 is visible (x=10 is in range), update x.
+update NEVD set x = 11 where id = 1;
+select id, x from ne1 order by id;
+→ [{"id":1,"x":11},{"id":2,"x":20}]
+
+-- DELETE through the non-equi join leg: id=1 is now x=11 (still in range), delete it.
+delete from NEVD where id = 1;
+select id, x from ne1 order by id;
+→ [{"id":2,"x":20}]
+
+-- ===================================================================
+-- Range-σ write-branch oracle (`set-op-flagless-range-sigma-oracle`): a RANGE σ
+-- (`where x < 5`) on a *projected* column is now fed to the oracle as a conjunct, so a
+-- supplied value that provably violates it makes the leg `unsat` ⇒ skipped (no phantom base
+-- row). A literal discriminator (`bucket`) keeps the body writable; INSERTs OMIT it so the
+-- range σ — not the discriminator — drives the routing decision. See
+-- docs/vu-setops.md § Set-operation membership writes.
+-- ===================================================================
+create table rlo (id integer primary key, x integer);
+create table rhi (id integer primary key, x integer);
+insert into rlo values (1,1),(2,3);
+insert into rhi values (3,7),(4,9);
+create view RV as
+  select id, x, 'lo' as bucket from rlo where x < 5
+  union all
+  select id, x, 'hi' as bucket from rhi where x >= 5;
+
+select * from RV order by id;
+→ [{"id":1,"x":1,"bucket":"lo"},{"id":2,"x":3,"bucket":"lo"},{"id":3,"x":7,"bucket":"hi"},{"id":4,"x":9,"bucket":"hi"}]
+
+-- Out-of-range INSERT (the fix): x=100 provably violates the `lo` leg's `x < 5` → that leg
+-- is skipped (rlo gets NO phantom row); it is consistent with the `hi` leg's `x >= 5` → routes
+-- to rhi only. (Without the fix the range σ was invisible to the oracle and rlo got a phantom.)
+insert into RV (id, x) values (10, 100);
+select id, x from rlo order by id;
+→ [{"id":1,"x":1},{"id":2,"x":3}]
+select id, x from rhi order by id;
+→ [{"id":3,"x":7},{"id":4,"x":9},{"id":10,"x":100}]
+select * from RV where id = 10;
+→ [{"id":10,"x":100,"bucket":"hi"}]
+
+-- Complementary in-range INSERT: x=2 violates `x >= 5` (hi skipped) and satisfies `x < 5`
+-- (lo included) → routes to rlo only.
+insert into RV (id, x) values (11, 2);
+select id, x from rhi order by id;
+→ [{"id":3,"x":7},{"id":4,"x":9},{"id":10,"x":100}]
+select id, x from rlo order by id;
+→ [{"id":1,"x":1},{"id":2,"x":3},{"id":11,"x":2}]
+select * from RV where id = 11;
+→ [{"id":11,"x":2,"bucket":"lo"}]
+
+-- DELETE through a range σ: the WHERE `x < 3` is consistent with the `lo` leg but provably
+-- `unsat` with the `hi` leg (`x < 3 ∧ x >= 5`) → the fan NARROWS to rlo only, and the
+-- member-exists capture restricts the delete to the resident matching rows (rlo id 1 & 11).
+-- rhi is untouched; the observable result is exactly the resident rows.
+delete from RV where x < 3;
+select id, x from rlo order by id;
+→ [{"id":2,"x":3}]
+select id, x from rhi order by id;
+→ [{"id":3,"x":7},{"id":4,"x":9},{"id":10,"x":100}]
+
+-- UPDATE through a range σ (the delete-companion the ticket asked for): WHERE `x >= 9` is
+-- provably `unsat` with the `lo` leg (`x >= 9 ∧ x < 5`) → the fan NARROWS to rhi, and the
+-- member-exists capture restricts to the resident matching rows (rhi id 4 & 10). The SET
+-- target (`id`) does NOT touch the range column, so no Halloween reclassification. rlo is
+-- untouched (never even consulted — its leg is skipped at routing time).
+update RV set id = id + 100 where x >= 9;
+select id, x from rlo order by id;
+→ [{"id":2,"x":3}]
+select id, x from rhi order by id;
+→ [{"id":3,"x":7},{"id":104,"x":9},{"id":110,"x":100}]
+
+-- ===================================================================
+-- Gap-value INSERT: legs with a GAP (`x < 5` / `x >= 10`) reject a value that falls in the
+-- gap — both legs are provably `unsat`, so `baseOps` is empty and the honest
+-- `consistent with no writable leg` diagnostic fires (NOT a silent no-op). Base tables untouched.
+-- ===================================================================
+create table glo (id integer primary key, x integer);
+create table ghi (id integer primary key, x integer);
+insert into glo values (1,1);
+insert into ghi values (2,20);
+create view GV as
+  select id, x, 'lo' as bucket from glo where x < 5
+  union all
+  select id, x, 'hi' as bucket from ghi where x >= 10;
+
+select * from GV order by id;
+→ [{"id":1,"x":1,"bucket":"lo"},{"id":2,"x":20,"bucket":"hi"}]
+
+insert into GV (id, x) values (9, 7);
+-- error: consistent with no writable leg
+select id, x from glo order by id;
+→ [{"id":1,"x":1}]
+select id, x from ghi order by id;
+→ [{"id":2,"x":20}]
+
+-- ===================================================================
+-- BETWEEN-σ leg: `checkSatisfiability`'s positive-BETWEEN handling absorbs `x between 0 and 4`,
+-- so an out-of-band supplied value (`x = 50`) makes that leg `unsat` ⇒ skipped; an in-band
+-- value (`x = 3`) routes into it.
+-- ===================================================================
+create table btw (id integer primary key, x integer);
+create table oth (id integer primary key, x integer);
+insert into btw values (1,2);
+insert into oth values (2,50);
+create view BV as
+  select id, x, 'in' as bucket from btw where x between 0 and 4
+  union all
+  select id, x, 'out' as bucket from oth where x > 10;
+
+select * from BV order by id;
+→ [{"id":1,"x":2,"bucket":"in"},{"id":2,"x":50,"bucket":"out"}]
+
+-- x=50 is out of `[0,4]` → `in` leg skipped; consistent with `x > 10` → routes to oth.
+insert into BV (id, x) values (9, 50);
+select id, x from btw order by id;
+→ [{"id":1,"x":2}]
+select id, x from oth order by id;
+→ [{"id":2,"x":50},{"id":9,"x":50}]
+
+-- x=3 is within `[0,4]` → routes to btw; provably violates `x > 10` → oth skipped.
+insert into BV (id, x) values (8, 3);
+select id, x from btw order by id;
+→ [{"id":1,"x":2},{"id":8,"x":3}]
+select id, x from oth order by id;
+→ [{"id":2,"x":50},{"id":9,"x":50}]
+
+-- ===================================================================
+-- Product-coordinate addressing via projected-constant discriminators
+-- (`set-op-projected-constant-product-coordinate`): a body with MULTIPLE literal
+-- discriminator columns forms a discriminator grid — here `kind ∈ {red,large}` × `src ∈ {A,B}`,
+-- the `{inX,inY} × {inA,inB}` product grid the shelved product-coordinate model targeted. A write
+-- addresses a coordinate by filtering on those READ-ONLY discriminator columns:
+--   • both axes pinned (`kind='red' and src='A'`)  → writes the one co-satisfiable leg
+--   • one axis pinned (`kind='red'`)               → fans to every consistent leg
+--   • same-axis contradiction (`kind='red' and kind='large'`) / off-grid value → clean no-op
+-- This is the recommended surface for product-coordinate write-through — the product *use case*
+-- is served by the shipped flag-less write path, with no bespoke writable-membership build needed.
+-- (Fresh `pca`/`pcb` fixtures: the same two-axis grid as `U`/`U4`, self-contained so the matrix
+-- assertions do not depend on the mutated state of the views above.) See
+-- docs/vu-setops.md § Set-operation membership writes.
+-- ===================================================================
+create table pca (id integer primary key, x integer, color text null, size text null);
+create table pcb (id integer primary key, x integer, color text null, size text null);
+insert into pca values (1,10,'red','small'),(2,20,'blue','large');
+insert into pcb values (3,30,'red','small'),(4,40,'blue','large');
+create view PC as
+  select id, x, 'red' as kind, 'A' as src from pca where color = 'red'
+  union all
+  select id, x, 'red' as kind, 'B' as src from pcb where color = 'red'
+  union all
+  select id, x, 'large' as kind, 'A' as src from pca where size = 'large'
+  union all
+  select id, x, 'large' as kind, 'B' as src from pcb where size = 'large';
+
+select * from PC order by id;
+→ [{"id":1,"x":10,"kind":"red","src":"A"},{"id":2,"x":20,"kind":"large","src":"A"},{"id":3,"x":30,"kind":"red","src":"B"},{"id":4,"x":40,"kind":"large","src":"B"}]
+
+-- static surface: a view that CAN produce a zero-leg write at runtime is still statically writable
+-- (the no-op is a per-predicate runtime outcome, not a shape rejection). Plain columns YES;
+-- discriminators read-only (NO). (Must agree with U above — same grid shape.)
+select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('PC');
+→ [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES","effective_targets":"[\"pca\",\"pcb\"]"}]
+select cid, column_name, is_updatable, base_table, base_column from column_info('PC');
+→ [{"cid":0,"column_name":"id","is_updatable":"YES","base_table":null,"base_column":null},{"cid":1,"column_name":"x","is_updatable":"YES","base_table":null,"base_column":null},{"cid":2,"column_name":"kind","is_updatable":"NO","base_table":null,"base_column":null},{"cid":3,"column_name":"src","is_updatable":"NO","base_table":null,"base_column":null}]
+
+-- --- Cross-axis pin: both axes specified → the one co-satisfiable leg (pca red) only ---
+-- `kind='red' and src='A'` is sat ONLY with the `red,A` leg (`from pca where color='red'`); the
+-- other three legs each contradict one axis ⇒ unsat ⇒ skipped. So only pca id 1 (the red row) is
+-- touched; pca id 2 (large) and all of pcb are untouched.
+update PC set x = x + 100 where kind = 'red' and src = 'A';
+select id, x from pca order by id;
+→ [{"id":1,"x":110},{"id":2,"x":20}]
+select id, x from pcb order by id;
+→ [{"id":3,"x":30},{"id":4,"x":40}]
+
+-- --- Single-axis fan (UPDATE companion to the existing one-axis DELETE/UPDATE fans): `kind='red'`
+-- fans to BOTH red legs (red+A on pca, red+B on pcb); the two `large` legs are unsat ⇒ skipped. ---
+update PC set x = x + 1 where kind = 'red';
+select id, x from pca order by id;
+→ [{"id":1,"x":111},{"id":2,"x":20}]
+select id, x from pcb order by id;
+→ [{"id":3,"x":31},{"id":4,"x":40}]
+
+-- --- Same-axis contradiction → clean no-op (the bug fix: this threw `requires at least one base
+-- operation` before). `kind='red' and kind='large'` is provably unsat for EVERY leg (each leg pins
+-- one kind, the other conjunct contradicts it) ⇒ zero legs ⇒ 0 rows deleted, base tables unchanged. ---
+delete from PC where kind = 'red' and kind = 'large';
+select id, x from pca order by id;
+→ [{"id":1,"x":111},{"id":2,"x":20}]
+select id, x from pcb order by id;
+→ [{"id":3,"x":31},{"id":4,"x":40}]
+
+-- the symmetric same-axis contradiction on the other axis (`src='A' and src='B'`) is also a no-op.
+delete from PC where src = 'A' and src = 'B';
+select id, x from pca order by id;
+→ [{"id":1,"x":111},{"id":2,"x":20}]
+select id, x from pcb order by id;
+→ [{"id":3,"x":31},{"id":4,"x":40}]
+
+-- --- Off-grid value → clean no-op (also the bug fix). `kind='zzz'` matches no leg's kind
+-- discriminator ⇒ every leg unsat ⇒ zero-leg DELETE is 0 rows; the UPDATE form is the same. ---
+delete from PC where kind = 'zzz';
+select id, x from pca order by id;
+→ [{"id":1,"x":111},{"id":2,"x":20}]
+select id, x from pcb order by id;
+→ [{"id":3,"x":31},{"id":4,"x":40}]
+
+update PC set x = x + 1000 where src = 'zzz';
+select id, x from pca order by id;
+→ [{"id":1,"x":111},{"id":2,"x":20}]
+select id, x from pcb order by id;
+→ [{"id":3,"x":31},{"id":4,"x":40}]
+
+-- --- Positive write beside the no-ops (the no-op guard must NOT swallow a real write): a single-axis
+-- DELETE `kind='large'` still fans to both large legs and removes pca id 2 + pcb id 4. ---
+delete from PC where kind = 'large';
+select id, x from pca order by id;
+→ [{"id":1,"x":111}]
+select id, x from pcb order by id;
+→ [{"id":3,"x":31}]
+
+-- --- INSERT is the deliberate contrast to the no-op DELETE/UPDATE: an insert routing to no leg is a
+-- genuine "this row belongs to no branch" reject (NOT softened to a no-op) — the row would be
+-- invisible through every branch. The off-grid `kind='zzz'` makes every leg unsat. ---
+insert into PC (id, x, kind, src) values (8, 80, 'zzz', 'A');
+-- error: consistent with no writable leg
+-- base tables untouched by the rejected insert.
+select id, x from pca order by id;
+→ [{"id":1,"x":111}]
+select id, x from pcb order by id;
+→ [{"id":3,"x":31}]
+
+-- --- RETURNING is rejected up front regardless of leg count: a no-op-predicate DELETE that carries
+-- RETURNING still errors on RETURNING (the reject precedes the zero-leg short-circuit). ---
+delete from PC where kind = 'zzz' returning id;
+-- error: RETURNING
+
+-- ===================================================================
+-- Zero-leg no-op reaches the `intersect` / `except` fan paths too — a discriminator-less body has
+-- no literal axis, so the zero-leg case is driven by a contradictory base-column predicate
+-- (`id = 1 and id = 2`, provably unsat). `fanLegsForFanOut` returns [] (intersect: every leg unsat;
+-- except: the LEFT operand inconsistent), and the shared no-op guard covers both — never the
+-- internal `requires at least one base operation` error.
+-- ===================================================================
+create table zia (id integer primary key, v integer);
+create table zib (id integer primary key, v integer);
+insert into zia values (1,10),(2,20);
+insert into zib values (2,20),(3,30);
+create view ZIV as select id, v from zia intersect select id, v from zib;
+select * from ZIV order by id;
+→ [{"id":2,"v":20}]
+
+-- contradictory predicate → every intersect leg unsat → zero-leg no-op, base tables unchanged.
+delete from ZIV where id = 1 and id = 2;
+select id from zia order by id;
+→ [{"id":1},{"id":2}]
+select id from zib order by id;
+→ [{"id":2},{"id":3}]
+
+-- positive intersect delete beside it: id=2 is resident in both legs, so it leaves both bases.
+delete from ZIV where id = 2;
+select id from zia order by id;
+→ [{"id":1}]
+select id from zib order by id;
+→ [{"id":3}]
+
+create table zea (id integer primary key, v integer);
+create table zeb (id integer primary key, v integer);
+insert into zea values (1,10),(2,20);
+insert into zeb values (2,20);
+create view ZEV as select id, v from zea except select id, v from zeb;
+select * from ZEV order by id;
+→ [{"id":1,"v":10}]
+
+-- `except` fans the LEFT operand only; the contradictory predicate makes the left leg inconsistent,
+-- so the fan is empty → clean no-op, base tables unchanged.
+delete from ZEV where id = 1 and id = 2;
+select id from zea order by id;
+→ [{"id":1},{"id":2}]
+select id from zeb order by id;
+→ [{"id":2}]
+
+-- positive except delete beside it: id=1 is in the left (and not the right), so it leaves the difference.
+delete from ZEV where id = 1;
+select id from zea order by id;
+→ [{"id":2}]
+select id from zeb order by id;
+→ [{"id":2}]

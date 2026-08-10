@@ -87,9 +87,10 @@ export class BetterSQLiteAdapter implements SQLiteDatabase {
 }
 
 /**
- * Create an in-memory SQLite database for testing.
+ * Create a SQLite database for testing. Defaults to in-memory; pass a file path to get
+ * a database that survives close/reopen (what the conformance persistence tier needs).
  */
-export function createTestDatabase(): SQLiteDatabase {
-  return new BetterSQLiteAdapter(':memory:');
+export function createTestDatabase(path: string = ':memory:'): SQLiteDatabase {
+  return new BetterSQLiteAdapter(path);
 }
 

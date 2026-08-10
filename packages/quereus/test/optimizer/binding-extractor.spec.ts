@@ -89,13 +89,18 @@ describe('extractBindings: BindingMode per TableReference', () => {
 		expect((entry.mode as { kind: 'row'; keyColumns: number[] }).keyColumns).to.deep.equal([]);
 	});
 
-	it("emits 'row' on an FD-derived key and chooses the tighter (sub-PK) key", async () => {
-		// A no-PK table still has Quereus' implicit all-columns PK ({a,b}), so the
-		// classification was already 'row' before candidate-key sourcing. What the
-		// keysOf migration changes is the *chosen* key: CHECK (a = b) makes both
-		// {a} and {b} FD-derived (superkey) candidate keys, which subsume the
-		// implicit all-columns key. Equality on `a` then binds on the single
-		// column `[0]` instead of the full `[0, 1]` — a strictly tighter residual.
+	it("emits 'row' on the derived sub-key {a} for a CHECK (a=b) NON-keyed table", async () => {
+		// `t(a, b)` has no declared PK — only Quereus' implicit all-columns key
+		// {a,b} — so the classification is 'row' regardless. CHECK (a = b) folds the
+		// bi-directional determination FD {a}↔{b} unconditionally (the producer
+		// gate from fd-check-assertion-key-bag-overclaim is gone). At this node the
+		// relation IS a set (the implicit all-columns key), so the kind-aware reader
+		// (`isUniqueDeterminant`, ticket fd-determination-reader-side-rule) derives
+		// the tighter genuine key {a}: two rows agreeing on `a` would agree on `b`
+		// too — a duplicate, impossible in a set. The old projection-stripping
+		// hazard is closed on the reader side: a projection that drops the
+		// all-columns key yields a bag, where the same determination derives
+		// nothing. Equality on `a` therefore binds on [0].
 		await db.exec("CREATE TABLE t (a INTEGER, b INTEGER, CHECK (a = b)) USING memory");
 		const result = analyze(db, 'select * from t where a = 5');
 		const entry = findFor(result, 'main.t');

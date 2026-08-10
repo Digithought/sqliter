@@ -180,14 +180,17 @@ interface BushyTour {
 
 ### 1. **Registration in Optimizer**
 ```typescript
-// In optimizer.ts - add to Physical pass (bottom-up)
-this.passManager.addRuleToPass(PassId.Physical, {
+// In optimizer.ts - a RULE_MANIFEST entry in the Physical pass (bottom-up).
+// Manifest array order is execution order, so its position places this before
+// other join optimizations.
+{
+  pass: PassId.Physical,
   id: 'quickpick-join-enumeration',
   nodeType: PlanNodeType.Join,
   phase: 'impl',
   fn: ruleQuickPickJoinEnumeration,
-  priority: 5  // Run before other join optimizations
-});
+  sideEffectMode: 'aware',
+}
 ```
 
 ### 2. **Tuning Parameters**

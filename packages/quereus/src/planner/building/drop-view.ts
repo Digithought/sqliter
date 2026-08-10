@@ -6,8 +6,10 @@ import { DropViewNode } from '../nodes/drop-view-node.js';
  * Builds a plan node for DROP VIEW statements.
  */
 export function buildDropViewStmt(ctx: PlanningContext, stmt: AST.DropStmt): DropViewNode {
-	// Extract schema and view name
-	const schemaName = stmt.name.schema || 'main';
+	// Canonical schemaName, unqualified names landing in the current schema —
+	// symmetric with buildCreateViewStmt and the other DDL builders.
+	const sm = ctx.db.schemaManager;
+	const schemaName = stmt.name.schema ? sm.canonicalSchemaName(stmt.name.schema) : sm.getCurrentSchemaName();
 	const viewName = stmt.name.name;
 
 	return new DropViewNode(

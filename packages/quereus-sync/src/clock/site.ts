@@ -43,6 +43,9 @@ const BASE64URL_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
 /**
  * Convert a Uint8Array to base64url encoding (no padding).
  */
+// NOTE: @quereus/quereus has an identical encoder in src/util/hash.ts, but it is not part of that
+// package's public API. If a third copy appears, or the two ever need to agree on a change, promote
+// one to a shared export instead of copying again.
 export function toBase64Url(bytes: Uint8Array): string {
   let result = '';
   for (let i = 0; i < bytes.length; i += 3) {

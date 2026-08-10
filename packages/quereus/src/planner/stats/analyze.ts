@@ -7,7 +7,7 @@ import type { VirtualTable } from '../../vtab/table.js';
 import type { TableSchema } from '../../schema/table.js';
 import type { TableStatistics, ColumnStatistics } from './catalog-stats.js';
 import type { SqlValue } from '../../common/types.js';
-import type { FilterInfo } from '../../vtab/filter-info.js';
+import { makeFullScanFilterInfo, type FilterInfo } from '../../vtab/filter-info.js';
 import { buildHistogram } from './histogram.js';
 import { compareSqlValues } from '../../util/comparison.js';
 import { createLogger } from '../../common/logger.js';
@@ -42,26 +42,7 @@ export async function collectStatisticsFromScan(
 	const maxSample = 1000;
 
 	// Full scan with a minimal filter that returns all rows
-	const filterInfo: FilterInfo = {
-		idxNum: 0,
-		idxStr: null,
-		constraints: [],
-		args: [],
-		indexInfoOutput: {
-			nConstraint: 0,
-			aConstraint: [],
-			nOrderBy: 0,
-			aOrderBy: [],
-			colUsed: 0n,
-			aConstraintUsage: [],
-			idxNum: 0,
-			idxStr: null,
-			orderByConsumed: false,
-			estimatedCost: Infinity,
-			estimatedRows: BigInt(Number.MAX_SAFE_INTEGER),
-			idxFlags: 0,
-		},
-	};
+	const filterInfo: FilterInfo = makeFullScanFilterInfo(Infinity, Number.MAX_SAFE_INTEGER);
 
 	try {
 		for await (const row of vtab.query(filterInfo)) {

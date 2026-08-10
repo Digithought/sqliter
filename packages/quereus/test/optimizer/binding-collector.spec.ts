@@ -1,5 +1,6 @@
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
+import type { SqlParameters } from '../../src/common/types.js';
 
 describe('Binding collector (collectBindingsInExpr / collectBindingsInPlan)', () => {
 	let db: Database;
@@ -17,7 +18,7 @@ describe('Binding collector (collectBindingsInExpr / collectBindingsInPlan)', ()
 		await db.exec("INSERT INTO bc VALUES (1, 'Alice', 10), (2, 'Bob', 20), (3, 'Charlie', 30)");
 	}
 
-	async function collect(sql: string, params?: Record<string, unknown> | unknown[]): Promise<unknown[]> {
+	async function collect(sql: string, params?: SqlParameters): Promise<unknown[]> {
 		const rows: unknown[] = [];
 		for await (const r of db.eval(sql, params)) rows.push(r);
 		return rows;

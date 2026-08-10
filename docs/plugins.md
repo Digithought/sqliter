@@ -1,5 +1,7 @@
 # Quereus Plugin System (package.json–centric)
 
+> **Stability: Stable** — see [Stability Tiers](stability.md#tiers).
+
 Quereus plugins are standard ESM packages that declare their capabilities in `package.json` and expose a single runtime entry. At runtime, the module provides registrations for:
 
 - **Virtual Tables** — Custom data sources that appear as SQL tables
@@ -93,7 +95,7 @@ Virtual tables allow you to expose external data sources as SQL tables. Use the 
 
 **For comprehensive module authoring guidance**, including optimization integration, the Retrieve boundary architecture, and best practices, see the [Module Authoring Guide](module-authoring.md). This section covers plugin packaging; the authoring guide covers module implementation details.
 
-**For reactive patterns with mutation and schema change events**, see the [Module Authoring Guide](module-authoring.md#database-level-event-system).
+**For reactive patterns with mutation and schema change events**, see [Database-Level Event System](module-events.md).
 
 ### Basic Virtual Table
 
@@ -329,107 +331,190 @@ Notes:
 
 Functions extend SQL with custom computational logic. For the complete list of built-in functions (scalar, aggregate, window, JSON, date/time), see the [Built-in Functions Reference](functions.md).
 
+Build every function schema with one of the `create*` helpers (`createScalarFunction`, `createTableValuedFunction`, `createAggregateFunction`). They fill in the defaults and are type-checked against the schema the engine actually expects — see [Declaring return types](#declaring-return-types) for what a `returnType` must look like and what happens if it is wrong.
+
 ### Scalar Functions
 
 Return a single value:
 
 ```typescript
-import { Database, FunctionFlags, SqlValue } from 'quereus';
+import { createScalarFunction, FunctionFlags, TEXT_RETURN } from '@quereus/quereus';
+import type { Database, SqlValue } from '@quereus/quereus';
+
+const DETERMINISTIC_UTF8 = FunctionFlags.UTF8 | FunctionFlags.DETERMINISTIC;
 
 function reverse(text: SqlValue): SqlValue {
   if (text === null || text === undefined) return null;
   return String(text).split('').reverse().join('');
 }
 
-export default function register(db: Database, config: any) {
+export default function register(db: Database, config: Record<string, SqlValue> = {}) {
   return {
     functions: [
       {
-        schema: {
-          name: 'reverse',
-          numArgs: 1,
-          flags: FunctionFlags.UTF8,
-          returnType: { typeClass: 'scalar', sqlType: 'TEXT' },
-          implementation: reverse
-        }
+        schema: createScalarFunction(
+          { name: 'reverse', numArgs: 1, flags: DETERMINISTIC_UTF8, returnType: TEXT_RETURN },
+          reverse
+        )
       }
     ]
   };
 }
 ```
+
+#### Asynchronous scalar functions
+
+A scalar implementation may return a Promise. Write it as an ordinary `async` function
+and nothing else is required:
+
+```typescript
+createScalarFunction(
+  { name: 'fetch_label', numArgs: 1, returnType: TEXT_RETURN },
+  async (id: SqlValue) => (await lookup(id)) ?? null
+);
+```
+
+The engine compiles pure **synchronous** scalar expressions into a single fused closure
+instead of a per-row sub-program (see [runtime.md § Scalar
+fusion](./runtime.md#scalar-fusion-the-second-execution-tier)), so it has to know which
+implementations can hand back a Promise. A declared `async` function or arrow is
+detected automatically. What it cannot detect is a function that returns a Promise
+*without* being declared `async` — a plain function returning `somePromise`, or a
+`.bind()` / decorator wrapper around an async one. Declare those:
+
+```typescript
+createScalarFunction(
+  { name: 'fetch_label', numArgs: 1, returnType: TEXT_RETURN, isAsync: true },
+  wrapWithRetries(fetchLabel)   // returns a Promise, but is not itself `async`
+);
+```
+
+- **Omitting `isAsync` declares the function synchronous.** That is the right default,
+  and it is what lets calls to it fuse.
+- An undeclared function that returns a Promise anyway **throws on its first call**,
+  naming itself and this flag, rather than letting the Promise flow on as if it were a
+  value. Fixing it is a one-word registration change.
+- A function supplying a `customEmitter` is never fused and is unaffected either way.
 
 ### Table-Valued Functions
 
-Return multiple rows:
+Return multiple rows. The implementation is an **async generator** (its declared type is `(...args) => MaybePromise<AsyncIterable<Row>>`), and each row it yields is an **array of values in declared column order** — not an object keyed by column name:
 
-```javascript
-function* split_string(text, delimiter) {
+```typescript
+import { createTableValuedFunction, FunctionFlags, scalarReturn, INTEGER_TYPE, TEXT_TYPE } from '@quereus/quereus';
+import type { Database, Row, SqlValue } from '@quereus/quereus';
+
+const DETERMINISTIC_UTF8 = FunctionFlags.UTF8 | FunctionFlags.DETERMINISTIC;
+
+async function* splitString(text: SqlValue, delimiter: SqlValue): AsyncIterable<Row> {
   if (text === null || text === undefined) return;
-  
-  const parts = String(text).split(String(delimiter || ','));
+
+  const parts = String(text).split(String(delimiter ?? ','));
   for (let i = 0; i < parts.length; i++) {
-    yield { 
-      index: i + 1, 
-      value: parts[i].trim() 
-    };
+    yield [i + 1, parts[i].trim()];
   }
 }
 
-export default function register(db, config) {
+export default function register(db: Database, config: Record<string, SqlValue> = {}) {
   return {
     functions: [
       {
-        schema: {
-          name: 'split_string',
-          numArgs: 2,
-          flags: 1,
-          returnType: { 
-            typeClass: 'relation',
-            columns: [
-              { name: 'index', type: 'INTEGER' },
-              { name: 'value', type: 'TEXT' }
-            ]
+        schema: createTableValuedFunction(
+          {
+            name: 'split_string',
+            numArgs: 2,
+            flags: DETERMINISTIC_UTF8,
+            returnType: {
+              typeClass: 'relation',
+              isReadOnly: true,
+              isSet: false,
+              columns: [
+                { name: 'ordinal', type: scalarReturn(INTEGER_TYPE, false) },
+                { name: 'value', type: scalarReturn(TEXT_TYPE, false) }
+              ],
+              keys: [],
+              rowConstraints: []
+            }
           },
-          implementation: split_string
-        }
+          splitString
+        )
       }
     ]
   };
 }
 ```
+
+Declared columns are what makes `select ordinal, value from split_string(...)` and `... where value = 'b'` resolve; a table-valued function that declares none has no referenceable column names.
 
 ### Aggregate Functions
 
 Accumulate values across rows:
 
-```javascript
-function concatenateStep(accumulator, value) {
+```typescript
+import { createAggregateFunction, FunctionFlags, TEXT_RETURN } from '@quereus/quereus';
+import type { Database, SqlValue } from '@quereus/quereus';
+
+const DETERMINISTIC_UTF8 = FunctionFlags.UTF8 | FunctionFlags.DETERMINISTIC;
+
+function concatenateStep(accumulator: string, value: SqlValue): string {
   if (value === null || value === undefined) return accumulator;
   return accumulator + String(value);
 }
 
-function concatenateFinal(accumulator) {
+function concatenateFinal(accumulator: string): SqlValue {
   return accumulator;
 }
 
-export default function register(db, config) {
+export default function register(db: Database, config: Record<string, SqlValue> = {}) {
   return {
     functions: [
       {
-        schema: {
-          name: 'str_concat',
-          numArgs: 1,
-          flags: 1,
-          returnType: { typeClass: 'scalar', sqlType: 'TEXT' },
-          stepFunction: concatenateStep,
-          finalizeFunction: concatenateFinal,
-          initialValue: ''
-        }
+        schema: createAggregateFunction(
+          { name: 'str_concat', numArgs: 1, flags: DETERMINISTIC_UTF8, returnType: TEXT_RETURN, initialValue: '' },
+          concatenateStep,
+          concatenateFinal
+        )
       }
     ]
   };
 }
 ```
+
+### Declaring return types
+
+Every function schema carries a `returnType`, and there is exactly one contract for it — the same one whether you build the schema by hand or through a `create*` helper.
+
+A **scalar** return type names a *logical type object*, not a type-name string:
+
+```typescript
+import { scalarReturn, TEXT_TYPE } from '@quereus/quereus';
+
+scalarReturn(TEXT_TYPE)         // { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }
+scalarReturn(TEXT_TYPE, false)  // ...the same, declared NOT NULL
+```
+
+Ready-made constants cover the common cases: `TEXT_RETURN`, `INTEGER_RETURN`, `REAL_RETURN`, `BOOLEAN_RETURN`, `BLOB_RETURN`, `JSON_RETURN`, `ANY_RETURN`, plus `*_RETURN_NOT_NULL` variants for the ones that can never return NULL. A **relation** return type (table-valued functions) gives each column a `name` and a scalar type object as its `type` — again, not a type-name string. The shapes themselves are exported as types (`ScalarType`, `RelationType`, `ColumnDef`, `ColRef`) for plugins that build them outside a `create*` call.
+
+Rules:
+
+- **Omitting `returnType` is allowed** and means "unknown": it becomes a nullable scalar of type ANY. That is safe, but it forfeits plan-time typing, comparison specialization and cross-type coercion — declare the truth when you know it.
+- **A schema with an `implementation` and no `returnType` is taken to be scalar.** Nothing else distinguishes a scalar from a table-valued function, and a table-valued function with no declared columns is useless anyway. A table-valued function must therefore declare its columns, or be built with `createTableValuedFunction`.
+- **A relation's `isReadOnly`, `isSet`, `keys` and `rowConstraints` may be omitted**, and so may a scalar type's `nullable` (absent means nullable) — each has one obvious answer for a function that says nothing about it, and registration fills it in. Only `columns` carries meaning you have to supply.
+- **A relation's `keys` declare uniqueness the engine trusts.** Each entry is an array of `{ index }` references into the declared columns (`[]` inside `keys` is the *empty key* — the function returns at most one row; `keys: []` declares no key at all). A key the function does not actually enforce makes the planner drop a DISTINCT or under-count a join, so declare one only if every row really is unique on those columns.
+- **A malformed `returnType` is rejected at registration** with a `MisuseError` naming the function and the offending field. Registration does not quietly downgrade a typo to "unknown" — a wrong-shaped declaration that registers successfully only fails much later, at query planning time, with an error that names neither the function nor the problem. Malformed means: a `typeClass` that is missing or is neither `'scalar'` nor `'relation'`; a scalar whose `logicalType` is missing or is not a type object; a relation whose `columns` is not an array, or whose columns lack a `name` or carry a `type` that is not a scalar type object; a relation whose `rowConstraints` is present but is not an array; a relation whose `keys` is present but is not an array of arrays of `{ index }` references pointing at declared columns.
+
+Older documentation showed `returnType: { typeClass: 'scalar', sqlType: 'TEXT' }` and relation columns typed `{ name: 'v', type: 'INTEGER' }`. Neither shape has ever been read by the engine; both are now rejected at registration.
+
+#### Returning values in the right JavaScript form
+
+A declared `returnType` is a promise about the *value*, not only about the plan. The engine does not coerce what a function returns — coercing every call would cost on every row for no gain on a correct function — so an implementation must hand back the JavaScript form its declared type calls for. The rules are in [types.md § Physical representation](./types.md#physical-representation); the two that catch people out:
+
+- **One JavaScript form per whole number.** A whole number is a `number` while its magnitude stays inside the safe-integer range (|v| ≤ 2<sup>53</sup> − 1) and a `bigint` only outside it. Wrapping a small result in `BigInt(...)` is a violation even though the value is right — `canonicalizeInteger` and `canonicalizeSqlValue` (exported from the package) return the canonical form. A function declaring INTEGER may return either form under that rule; one declaring REAL must return a `number`.
+- **Most temporal types are physically text.** A DATE / TIME / DATETIME / TIMESPAN value is a `string`, not a `Temporal` object. TIMESTAMP is the exception: it is an integer instant and takes INTEGER's rule. A JSON *scalar* is likewise a plain `string` / `number` / `boolean`, not a wrapped object.
+
+`null` is always acceptable regardless of the declared type — nullability is a separate contract. Declaring no `returnType` (ANY) still binds you to the numeric rule, which holds for every value everywhere in the engine.
+
+Run your plugin's tests with `QUEREUS_REPR_STRICT=1` to check this: the engine then verifies every scalar function's returned value against its declared return type and throws naming the function and the offending form. Functions supplying a `customEmitter` build their own runtime path and are not covered by that check.
 
 ### Variable Arguments
 
@@ -541,11 +626,12 @@ SELECT filename FROM files ORDER BY filename COLLATE NUMERIC;
 SELECT * FROM files WHERE filename = 'file10.txt' COLLATE NUMERIC;
 ```
 
-> **Note** — to use a custom collation as the key for a compound index, supply
-> a `normalizer` alongside `func` (see [Key Normalizers and Index
-> Participation](#key-normalizers-and-index-participation) below). Comparator-only
-> registrations work for `ORDER BY` and standalone comparisons but index
-> creation referencing them is rejected.
+> **Note** — to use a custom collation as the key for a compound index, a
+> `GROUP BY` / `PARTITION BY` key, or a hash-join key, supply a `normalizer`
+> alongside `func` (see [Key Normalizers, Grouping, and Index
+> Participation](#key-normalizers-grouping-and-index-participation) below).
+> Comparator-only registrations work for `ORDER BY` and standalone comparisons;
+> index creation and grouping referencing them are rejected.
 
 ## Configuration
 
@@ -641,6 +727,7 @@ Here's a comprehensive plugin that demonstrates all three types. Note that metad
 
 **index.ts:**
 ```typescript
+import { createScalarFunction, FunctionFlags, TEXT_RETURN } from '@quereus/quereus';
 import type { Database, SqlValue, CollationFunction } from '@quereus/quereus';
 
 // Virtual table: simple key-value store
@@ -729,13 +816,10 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 
     functions: [
       {
-        schema: {
-          name: 'upper_reverse',
-          numArgs: 1,
-          flags: 1,
-          returnType: { typeClass: 'scalar', sqlType: 'TEXT' },
-          implementation: upperReverse
-        }
+        schema: createScalarFunction(
+          { name: 'upper_reverse', numArgs: 1, flags: FunctionFlags.UTF8 | FunctionFlags.DETERMINISTIC, returnType: TEXT_RETURN },
+          upperReverse
+        )
       }
     ],
 
@@ -756,6 +840,7 @@ Plugins are now best developed in TypeScript for full type safety and IDE suppor
 ### Full Type Safety
 
 ```typescript
+import { createScalarFunction, FunctionFlags, TEXT_RETURN } from '@quereus/quereus';
 import type { Database, SqlValue, CollationFunction } from '@quereus/quereus';
 
 // Compile-time checking of function implementations
@@ -774,13 +859,12 @@ const myCollation: CollationFunction = (a: string, b: string): number => {
 export default function register(db: Database, config: Record<string, SqlValue> = {}) {
   return {
     functions: [{
-      schema: {
-        name: 'my_function',
-        numArgs: 1,
-        flags: 1,
-        returnType: { typeClass: 'scalar', sqlType: 'TEXT' },
-        implementation: myFunction  // Type-checked at compile time
-      }
+      // createScalarFunction type-checks the whole schema — including the
+      // returnType shape — at compile time
+      schema: createScalarFunction(
+        { name: 'my_function', numArgs: 1, flags: FunctionFlags.UTF8 | FunctionFlags.DETERMINISTIC, returnType: TEXT_RETURN },
+        myFunction
+      )
     }],
     collations: [{
       name: 'MY_COLLATION',
@@ -878,14 +962,63 @@ const db = new Database();
 // 1) Load from npm package name (Node):
 await loadPlugin('npm:@acme/quereus-plugin-foo@^1', db, { api_key: '...' });
 
-// 2) Load from direct URL (Node or Browser):
+// 2a) Load from a direct https:// URL. Native in the browser; in Node this
+//     needs the remote resolver installed once at startup (see note below):
+import { installNodeRemoteModuleResolver } from '@quereus/plugin-loader/node';
+installNodeRemoteModuleResolver();
 await dynamicLoadModule('https://example.com/plugin.js', db, { timeout: 10000 });
+
+// 2b) Load from a direct file:// URL (Node):
+await dynamicLoadModule('file:///path/to/plugin.mjs', db, { timeout: 10000 });
 
 // 3) Browser npm via CDN (opt-in only):
 await loadPlugin('npm:@acme/quereus-plugin-foo@^1', db, { timeout: 8000 }, { allowCdn: true, cdn: 'jsdelivr' });
 ```
 
 Behavior:
+- Allowed module protocols are `https:` and `file:` — enforced inside `dynamicLoadModule`, so any other scheme is refused before an import is attempted.
+- **`https:` module loads need a resolver under Node.** Browsers `import('https://…')` natively. Node's ESM loader does not — it accepts only `file:` and `data:` URLs (network imports were experimental and have been removed) — so the loader delegates to a resolver the host installs:
+
+  ```typescript
+  import { installNodeRemoteModuleResolver } from '@quereus/plugin-loader/node';
+
+  installNodeRemoteModuleResolver({
+    // The SHA-256 this URL must serve, or undefined to leave it unpinned.
+    // Consulted on every fetch, and asked with the normalized URL.
+    expectedHash: url => myPluginRecords.get(url)?.sha256,
+    // Called after each fetch, before the module is imported. Awaited.
+    onFetched: ({ url, sha256, bytes }) => console.log(`Fetched ${url} (${bytes} B, sha256 ${sha256})`),
+    maxBytes: 5 * 1024 * 1024,   // default
+  });
+  ```
+
+  The resolver fetches the module, checks that redirects stayed on `https:`, enforces the size cap against both the declared `content-length` and the bytes actually received, SHA-256s them, verifies that digest against `expectedHash`, writes them to a temp file (`<tmpdir>/quereus-plugins-<pid>-<random>/<hash>-<n>.mjs`), and hands the loader that file's `file:` URL. The temp directory is removed when the process exits; files are kept until then so stack traces from inside the plugin still resolve.
+
+  It lives behind the `@quereus/plugin-loader/node` subpath, not the package index, so a browser or React Native bundle never pulls in `node:fs`. Any Node host wanting remote plugins installs it — the quoomb CLI does so at startup, and prints one line per fetch. Without it, a Node-side `https:` load fails with a message saying so, rather than `ERR_UNSUPPORTED_ESM_URL_SCHEME`.
+
+  There is no on-disk cache: a plugin saved by URL re-downloads and re-executes remote code on every host start. That is why `onFetched` exists — hosts are expected to surface the fetch rather than let it happen silently.
+
+- **Hash pinning gates the load, and is opt-in.** `expectedHash` returning `undefined` means "not pinned" and the load proceeds unchanged; returning a digest that the fetched bytes do not match aborts with a `PluginHashMismatchError` (exported from the package index) *before* the temp file is written, before `onFetched` fires, and before the import — the rejected code never evaluates. A returned value that is not 64 hex characters is a host bug and fails the load, rather than being read as "unpinned", so a typo cannot silently disarm the pin. `dynamicLoadModule` wraps every failure in `Failed to load plugin from <url>: …`, keeping the original on `error.cause`, so a caller distinguishes a mismatch with `error.cause instanceof PluginHashMismatchError`.
+
+  Scope: pinning is a property of the *Node resolver*. Browsers and workers install no resolver — they `import('https://…')` natively with no verification — and `file:` URLs never reach the resolver, so a pin on one is inert. `hashRemoteModule(url, { maxBytes, fetchImpl })` from the same subpath answers "what does this URL serve right now?" using the same transport checks and cap, writing nothing and importing nothing; it is a separate fetch from any load that follows, so bytes that change in between make the pinned load fail (closed, which is the right direction).
+
+  The CLI records each plugin's hash in `~/.quoomb/plugins.json` (`PluginRecord.sha256`) and, by default, warns when the module behind a URL has changed since it was installed. That comparison happens after the load, so the warning reports code that has already run — a change notice, not a gate.
+
+  Setting `PluginRecord.pinned` turns it into a gate: the CLI feeds every pinned record's `sha256` to `expectedHash`, so a mismatch is refused before the module is imported. It is opt-in per plugin (`.plugin install <url> --pin`, or `.plugin pin <name>`), and a pinned record with no recorded hash is a first observation rather than a violation — the next successful load records one and enforcement starts there. `.plugin trust <name> [hash]` records a new expected hash (fetching and digesting the URL without importing it when no hash is given), `.plugin unpin <name>` goes back to warning; both take effect in the same session. A pin that a startup load refuses does *not* disable the plugin — the code changed, the plugin is not broken — and the CLI prints those two remedies instead. `pinned` is meaningful only in a host that installed the Node resolver: quoomb-web keeps its own record type and imports `https:` URLs natively, with no verification step.
+
+  A plugin loaded from `quoomb.config.json` can declare its expected hash directly on the entry, instead of (or alongside) a `.plugin pin` on the installed record:
+
+  ```json
+  {
+    "plugins": [
+      { "source": "https://example.com/plugin.js", "sha256": "3f29b8...(64 hex chars)" }
+    ]
+  }
+  ```
+
+  Enforced the same way as a pinned record — refused before the module is imported — but `sha256` is only ever checked on an `https:` source, since only those reach the Node remote resolver. Declaring it on an `npm:` spec, a bare package name, or a `file:` source is a startup error naming the entry, not a silent no-op; so is a `sha256` that is not 64 hex characters, an empty one included, and so is listing one URL twice with two different hashes (one URL is one download; either choice would ignore what the other entry asked for). Every entry is checked and all the problems are reported together. A config file with any unusable `sha256` loads none of its plugins that run — but the entries that *did* validate still pin their URLs, which matters because the same URL can also be loaded from the saved records.
+
+  When the same URL is pinned by both the config file and a saved plugin record to different hashes, the config file's hash wins. The CLI warns once at startup, naming the URL and both values, and `.plugin pin`, `.plugin unpin` and `.plugin trust` each say so too when the record they just changed is outranked — otherwise they would report a hash that no load checks. For the same reason, a load refused by a config-declared hash points at the config file rather than at `.plugin trust`, which cannot lift it.
 - npm package resolution prefers the `exports['./plugin']` subpath. In Node, the package is loaded directly. In browsers, npm resolution is disabled by default; enabling it requires `{ allowCdn: true }` and maps to a CDN URL.
 - Version compatibility: if the package declares `engines.quereus` or a `peerDependency` on `@quereus/quereus`, hosts should throw when incompatible (error, not warning).
 
@@ -1100,6 +1233,10 @@ In Quoomb Web, the Plugin Manager accepts either:
 
 The UI reads `package.json.quereus.settings` to render configuration, and surfaces `quereus.provides` as capability badges. The manifest is automatically extracted from the plugin's `package.json` when loaded.
 
+### CLI
+
+The quoomb CLI installs plugins with `.plugin install <url>` and keeps them in `~/.quoomb/plugins.json` (see [`packages/quoomb-cli/README.md`](../packages/quoomb-cli/README.md) for the full subcommand list). Its other subcommands address a plugin by name, so a plugin whose `package.json` probe 404s — normal for a lone `.mjs` on a static host — still needs a name: the CLI derives one from the last path segment of the URL, and accepts the install URL as an identifier as well. The web UI has no such need, since it addresses plugins by the record `id` it assigns at install.
+
 
 
 ## Troubleshooting
@@ -1148,16 +1285,17 @@ Critical utilities for implementing virtual table modules and custom functions t
 ```typescript
 // Core comparison functions (match Quereus SQL semantics)
 import {
-  compareSqlValues,           // Compare two SQL values with collation support
-  compareSqlValuesFast,       // Optimized version with pre-resolved collation
-  compareRows,                // Compare entire rows for DISTINCT semantics
+  compareSqlValues,           // Compare two SQL values under BINARY
+  compareSqlValuesFast,       // Same, with a pre-resolved collation function
+  compareRows,                // Compare entire rows for DISTINCT semantics (BINARY)
   compareTypedValues,         // Type-aware comparison using LogicalType
   createTypedComparator,      // Factory for type-specific comparators
+  createTypedRowComparator,   // Factory for typed row comparators
+  createCollationRowComparator, // Factory for row comparators with per-column collations
 
   // ORDER BY comparison utilities
-  compareWithOrderBy,         // Compare with direction and NULL ordering
-  compareWithOrderByFast,     // Optimized version with numeric flags
-  createOrderByComparator,    // Factory for ORDER BY comparators
+  compareWithOrderByFast,     // Compare with direction, NULL ordering, and a collation function
+  createOrderByComparatorFast,// Factory for ORDER BY comparators
   SortDirection,              // Enum: ASC = 0, DESC = 1
   NullsOrdering,              // Enum: DEFAULT = 0, FIRST = 1, LAST = 2
 
@@ -1171,9 +1309,9 @@ import {
   BINARY_COLLATION,           // Standard lexicographical comparison
   NOCASE_COLLATION,           // Case-insensitive comparison
   RTRIM_COLLATION,            // Right-trim comparison
-  registerCollation,          // Register custom collation
-  getCollation,               // Get registered collation
-  resolveCollation,           // Resolve collation by name
+  builtinCollationResolver,   // Built-ins-only name lookup (no Database needed)
+  normalizeCollationName,     // Canonical (trimmed, uppercase) collation name
+  resolveCollationFunctions,  // Batch name→function resolution via a CollationResolver
 
   // Coercion utilities
   tryCoerceToNumber,          // Try to convert string to number
@@ -1438,18 +1576,52 @@ The function should return:
 - `0` if `a === b`
 - `1` if `a > b`
 
-### Key Normalizers and Index Participation
+### Key Normalizers, Grouping, and Index Participation
 
 A collation defines an equivalence relation on strings (the set of pairs where
-the comparator returns `0`). For a collation to back a compound index key, the
-engine needs a *normalizer* — a function whose output equality partitions
-strings into the same equivalence classes as the comparator. For example,
-`NOCASE`'s normalizer is `s => s.toLowerCase()`, and `RTRIM`'s strips only
-trailing ASCII spaces (matching its comparator — note that `s.trimEnd()` would
-*disagree* by also stripping tabs/NBSP).
+the comparator returns `0`). Anywhere the engine buckets rows by a key instead
+of comparing them pairwise, it needs a *normalizer* — a function whose output
+equality partitions strings into the same equivalence classes as the comparator.
+For example, `NOCASE`'s normalizer is `s => s.toLowerCase()`, and `RTRIM`'s
+strips only trailing ASCII spaces (matching its comparator — note that
+`s.trimEnd()` would *disagree* by also stripping tabs/NBSP).
+
+Supply a normalizer if the collation will be used, **over a text-typed key**, for
+any of:
+
+- a compound index key;
+- a `GROUP BY` key or a window `PARTITION BY` key;
+- a hash/bloom join key, or an `AS OF` partition key;
+- a `PRIMARY KEY` column of an isolation-wrapped table (`using isolated`), when a
+  transaction with pending writes on it is scanned through a secondary index;
+- a `PRIMARY KEY` column of a persistent-store table (`using store`, and the
+  LevelDB / IndexedDB plugins built on it), or that table's key collation `K`.
+
+A comparator-only registration still works for `ORDER BY` and standalone
+comparisons. Index creation naming it is rejected, and a query that groups or
+hash-joins a text key under it raises `collation <name> has no key normalizer` —
+the engine never guesses a built-in normalizer, because a normalizer that
+disagrees with the comparator produces confidently wrong groups rather than a
+visible error. A key whose type can never hold text (say `n integer collate
+mycoll`) needs no normalizer: the collation cannot affect how such values bucket,
+so the engine ignores it there rather than raising.
 
 Normalizer-and-comparator agreement is a hard contract. If they diverge, index
-lookups silently miss rows.
+lookups silently miss rows and groups split or merge wrongly.
+
+**Register store collations before opening the database.** A store table's physical
+key bytes come from its collation's normalizer, so the collation must be resolvable on
+every connection that reads the table — not only the one that created it. Reopening a
+persisted database from a connection that has not re-registered its custom collation now
+raises while rehydrating the catalog (`create table` from the stored DDL), naming the
+collation, rather than silently reading rows under a key layout it cannot reproduce.
+Call `db.registerCollation(...)` before the first statement that touches the store.
+
+A store collation should also declare whether its normalizer preserves **order**, not merely
+equality — `db.registerCollation(name, cmp, { normalizer, orderPreserving: true })`. Without
+that assertion the store still answers every query correctly, but falls back to a full scan
+where it could have seeked a byte range, and keeps a Sort it could have elided. See
+[store.md § Order preservation](./store.md#order-preservation).
 
 ### Built-in Collations
 
@@ -1459,12 +1631,25 @@ const BINARY_COLLATION: CollationFunction;    // Byte-by-byte comparison
 const NOCASE_COLLATION: CollationFunction;    // Case-insensitive comparison
 const RTRIM_COLLATION: CollationFunction;     // Right-trim before comparison
 
-// Collation management
-function registerCollation(
+// Collation management is per-database — there is no process-global registry.
+// Register on the connection that will run the query:
+db.registerCollation(
   name: string,
   func: CollationFunction,
-  normalizer?: (s: string) => string,
+  optionsOrNormalizer?:
+    | ((s: string) => string)
+    | { normalizer?: (s: string) => string; replicable?: boolean; orderPreserving?: boolean },
 ): void;
-function getCollation(name: string): CollationFunction | undefined;
-function resolveCollation(collationName: string): CollationFunction;
+
+// Resolve a name to its function. Throws `no such collation sequence: <name>` if unregistered.
+db.getCollationResolver(): CollationResolver;   // (name: string) => CollationFunction
+
+// Resolve a name to its key normalizer, for anything that buckets rows by key rather than
+// comparing them. `undefined` / `BINARY` → identity. Throws on an unregistered name, and on
+// a registered collation that carries no normalizer — it never guesses a built-in.
+db.getKeyNormalizerResolver(): KeyNormalizerResolver;   // (name: string | undefined) => (s: string) => string
+
+// Built-ins-only lookup, for standalone utility code that has no `Database`.
+// Returns `undefined` for any name outside BINARY / NOCASE / RTRIM.
+function builtinCollationResolver(name: string): CollationFunction | undefined;
 ```

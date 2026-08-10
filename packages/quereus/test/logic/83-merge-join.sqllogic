@@ -93,6 +93,44 @@ SELECT l.id, r.id FROM mj_nocase_l l JOIN mj_nocase_r r ON l.name = r.name ORDER
 SELECT l.id, l.name, r.id AS rid FROM mj_nocase_l l LEFT JOIN mj_nocase_r r ON l.name = r.name ORDER BY l.id;
 → [{"id":1,"name":"Alice","rid":10},{"id":2,"name":"Bob","rid":20},{"id":3,"name":"Charlie","rid":null}]
 
+-- Asymmetric collation (ticket join-key-collation-resolution-alignment): left
+-- defaults to BINARY, right declares NOCASE. equi-pair-extractor's matched-collation
+-- gate (deliberately kept conservative because the physical ordering property is
+-- collation-blind) demotes this asymmetric pair to the residual, so the join runs
+-- as a nested loop — but the comparison still resolves to NOCASE via the shared
+-- lattice (declared outranks defaulted BINARY), so the result is IDENTICAL to the
+-- symmetric NOCASE join above. The mirror spelling is the regression-prone case
+-- the old left-first emitter rules would have compared under BINARY.
+CREATE TABLE mj_mix_l (id INTEGER PRIMARY KEY, name TEXT);
+CREATE TABLE mj_mix_r (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE);
+INSERT INTO mj_mix_l VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
+INSERT INTO mj_mix_r VALUES (10, 'alice'), (20, 'BOB'), (30, 'Dave');
+
+SELECT l.id, r.id FROM mj_mix_l l JOIN mj_mix_r r ON l.name = r.name ORDER BY l.id;
+→ [{"id":1,"id:1":10},{"id":2,"id:1":20}]
+
+DROP TABLE mj_mix_l;
+DROP TABLE mj_mix_r;
+
+-- Real MergeJoin over NOCASE text PK keys: both sides are PK-ordered on a NOCASE
+-- column, so this is an actual MergeJoin (the mj_nocase ON-name join above is a
+-- hash join — name is not ordered there). Exercises the merge emitter's resolved
+-- comparator: the inputs are sorted under NOCASE and the key comparison resolves
+-- to NOCASE through the same lattice, so case-variant keys match in lockstep.
+CREATE TABLE mj_ci_pk_l (name TEXT COLLATE NOCASE PRIMARY KEY, v INTEGER);
+CREATE TABLE mj_ci_pk_r (name TEXT COLLATE NOCASE PRIMARY KEY, w INTEGER);
+INSERT INTO mj_ci_pk_l VALUES ('Alice', 1), ('Bob', 2), ('Carol', 3);
+INSERT INTO mj_ci_pk_r VALUES ('alice', 10), ('BOB', 20), ('dave', 30);
+
+SELECT node_type FROM query_plan('SELECT * FROM mj_ci_pk_l l JOIN mj_ci_pk_r r ON l.name = r.name') WHERE node_type LIKE '%Join%';
+→ [{"node_type":"MergeJoin"}]
+
+SELECT l.v, r.w FROM mj_ci_pk_l l JOIN mj_ci_pk_r r ON l.name = r.name ORDER BY l.v;
+→ [{"v":1,"w":10},{"v":2,"w":20}]
+
+DROP TABLE mj_ci_pk_l;
+DROP TABLE mj_ci_pk_r;
+
 -- ===== PK-equi-join tests (trigger MergeJoin via inherent PK ordering) =====
 
 -- Setup: single-column PK tables

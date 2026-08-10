@@ -1,6 +1,6 @@
 import { createLogger } from '../common/logger.js';
-import { type SqlValue, StatusCode, type Row, type SqlParameters, type DeepReadonly, isSqlValue, describeSqlValueViolation } from '../common/types.js';
-import { MisuseError, QuereusError } from '../common/errors.js';
+import { type SqlValue, StatusCode, type Row, type SqlParameters, type StatementOptions, type DeepReadonly, isSqlValue, describeSqlValueViolation } from '../common/types.js';
+import { MisuseError, QuereusError, throwIfAborted } from '../common/errors.js';
 import type { Database } from './database.js';
 import { isRelationType, type ColumnDef, type ScalarType } from '../common/datatype.js';
 import { Parser } from '../parser/parser.js';
@@ -10,8 +10,11 @@ import { emitPlanNode } from '../runtime/emitters.js';
 import { Scheduler } from '../runtime/scheduler.js';
 import type { InstructionTracer, RuntimeContext } from '../runtime/types.js';
 import { createStrictRowContextMap, wrapTableContextsStrict } from '../runtime/strict-fork.js';
+import { REPR_STRICT } from '../runtime/strict-flags.js';
+import { assertRowConforms, type DeclaredType } from '../runtime/strict-representation.js';
 import { Cached } from '../util/cached.js';
-import { isAsyncIterable } from '../runtime/utils.js';
+import { isAsyncIterable, disconnectVTable } from '../runtime/utils.js';
+import type { VirtualTable } from '../vtab/table.js';
 import { generateInstructionProgram, serializePlanTree } from '../planner/debug.js';
 import { EmissionContext } from '../runtime/emission-context.js';
 import type { SchemaDependency } from '../planner/planning-context.js';
@@ -19,11 +22,22 @@ import { getParameterTypes } from './param.js';
 import { rowToObject } from './utils.js';
 import { getPhysicalType, physicalTypeName, PhysicalType } from '../types/logical-type.js';
 import { wrapAsyncIterator } from '../util/async-iterator.js';
+import { combineAbortSignals } from '../util/abort-signal.js';
 import { analyzeChangeScope, type ChangeScope } from '../planner/analysis/change-scope.js';
+import { collectScalarRequiredParams } from '../planner/analysis/scalar-param-usage.js';
+import { isObjectClassValue } from '../util/comparison.js';
+import { canonicalizeSqlValue } from '../util/numeric-canonical.js';
+import { astToString } from '../emit/ast-stringify.js';
 
 const log = createLogger('core:statement');
 const errorLog = log.extend('error');
-const warnLog = log.extend('warn');
+
+/**
+ * The declared-type argument for a row check that has no declared types to check
+ * against — every position reads as `undefined` and takes `assertRowConforms`'s R1-only
+ * path. See {@link Statement._iterateWithSignal} for why statement egress is that case.
+ */
+const NO_DECLARED_TYPES: readonly (DeclaredType | undefined)[] = [];
 
 /**
  * Represents a prepared SQL statement.
@@ -38,13 +52,47 @@ export class Statement {
 	private boundArgs: Record<number | string, SqlValue> = {};
 	private plan: BlockNode | null = null;
 	private emissionContext: EmissionContext | null = null;
+	/**
+	 * Cached scheduler for the emitted instruction tree. Emit + schedule are
+	 * value-independent (emitters see only `(plan, EmissionContext)`, never bound
+	 * params), so this is built once and reused across executions. Its lifetime is
+	 * exactly the emission context's: nulled in lockstep with `this.emissionContext`
+	 * at every invalidation site, and rebuilt lazily in `_iterateRowsRawInternal`.
+	 */
+	private scheduler: Scheduler | null = null;
 	private needsCompile = true;
 	private columnDefCache = new Cached<DeepReadonly<ColumnDef>[]>(() => this.getColumnDefs());
 	private schemaChangeUnsubscriber: (() => void) | null = null;
 	/** Parameter types established at prepare time (either explicit or inferred from initial values) */
 	private parameterTypes: Map<string | number, ScalarType> | undefined = undefined;
+	/**
+	 * Parameter names/indices used directly as a comparand in a scalar comparison
+	 * (`= <> < <= > >=` / `IN` / `BETWEEN`) against a non-object scalar operand.
+	 * Binding any of these to a JS array / plain object can never match, so it is
+	 * rejected at bind time in {@link validateParameterTypes}. Recomputed on each
+	 * (re)compilation from the logical plan; see `analysis/scalar-param-usage.ts`.
+	 */
+	private scalarRequiredParams: Set<string | number> = new Set();
 	/** Debug options set via Database.prepareDebug(). @internal */
 	_debugOptions?: import('../planner/planning-context.js').DebugOptions;
+	/**
+	 * @internal Schema-path override applied when this statement plans (compile is
+	 * deferred, so setting this right after `db.prepare(...)` is race-free). Used by
+	 * the stored-body seams (materialized-view body re-plans) so an unqualified name
+	 * in the body resolves against the owning object's home schema, not the session
+	 * path — see {@link Database._homeSchemaPath}.
+	 */
+	_schemaPathOverride?: string[];
+	/**
+	 * @internal When true, this statement emits with scalar fusion disabled, so its
+	 * instruction graph is the full, faithful sub-program form. Set right after
+	 * `db.prepare(...)` by debug introspection (the `execution_trace()` TVF), which
+	 * joins trace events against `scheduler_program()` by instruction index — the two
+	 * must agree, and `scheduler_program()` reports the unfused graph. Compile is
+	 * deferred, so setting this before first iteration is race-free, exactly as
+	 * {@link _schemaPathOverride} documents.
+	 */
+	_emitUnfused?: boolean;
 
 	/**
 	 * @internal - Use db.prepare().
@@ -66,7 +114,7 @@ export class Statement {
 		} else {
 			this.astBatch = sqlOrAstBatch;
 			// Try to reconstruct originalSql if possible, or set a generic name
-			this.originalSql = this.astBatch.map(s => s.toString()).join('; '); // TODO: replace with better AST stringification
+			this.originalSql = this.astBatch.map(s => astToString(s)).join('; ');
 		}
 
 		// Handle explicit parameter types or initial values
@@ -76,13 +124,19 @@ export class Statement {
 		} else if (paramsOrTypes !== undefined) {
 			// Initial parameter values - infer types and bind them
 			this.parameterTypes = getParameterTypes(paramsOrTypes);
-			// Also bind the initial values
+			// Also bind the initial values. Values canonicalize as they enter boundArgs
+			// (a safe-range bigint narrows to number, R1 — util/numeric-canonical.ts):
+			// per-bind, not per-row, and shared by all three ingress sites (here,
+			// bind, bindAll). Type inference above saw the raw values, but it maps a
+			// safe-range bigint and its number form to INTEGER alike, so no drift.
 			if (Array.isArray(paramsOrTypes)) {
 				paramsOrTypes.forEach((value, index) => {
-					this.boundArgs[index + 1] = value;
+					this.boundArgs[index + 1] = canonicalizeSqlValue(value);
 				});
 			} else {
-				Object.assign(this.boundArgs, paramsOrTypes);
+				for (const [key, value] of Object.entries(paramsOrTypes)) {
+					this.boundArgs[key] = canonicalizeSqlValue(value);
+				}
 			}
 		}
 
@@ -106,6 +160,7 @@ export class Statement {
 			this.astBatchIndex++;
 			this.plan = null;
 			this.emissionContext = null;
+			this.scheduler = null;
 			this.needsCompile = true;
 			this.columnDefCache.clear();
 			this.parameterTypes = undefined;
@@ -120,7 +175,7 @@ export class Statement {
 		if (this.astBatchIndex < 0 || this.astBatchIndex >= this.astBatch.length) {
 			return "";
 		}
-		return this.getAstStatement().toString();	// TODO: replace with better AST stringification
+		return astToString(this.getAstStatement());
 	}
 
 	/** @internal Plans the current AST statement */
@@ -143,28 +198,46 @@ export class Statement {
 			}
 
 			// Pass parameter types directly to planning
-			const { plan: rawPlan, schemaDependencies: dependencies } = this.db._buildPlan([currentAst], this.parameterTypes);
+			const { plan: rawPlan, schemaDependencies: dependencies } = this.db._buildPlan([currentAst], this.parameterTypes, this._schemaPathOverride);
+			// Collect array-valued-scalar-param guard targets from the LOGICAL plan,
+			// before the access-path optimizer folds `col = ?` comparisons into index
+			// seeks (which erases the comparison node). See validateParameterTypes.
+			this.scalarRequiredParams = collectScalarRequiredParams(rawPlan);
 			plan = this.db.optimizer.optimize(rawPlan, this.db) as BlockNode;
 
-			// Set up schema change invalidation if we have dependencies
-			if (dependencies && dependencies.hasAnyDependencies()) {
-				// Remove any existing listener
-				if (this.schemaChangeUnsubscriber) {
-					this.schemaChangeUnsubscriber();
-				}
+			// Always drop the previous listener before (re)compiling, even when the new
+			// plan has no dependencies — otherwise a zero-dependency recompile leaks the
+			// old listener on the schema-change notifier.
+			if (this.schemaChangeUnsubscriber) {
+				this.schemaChangeUnsubscriber();
+				this.schemaChangeUnsubscriber = null;
+			}
 
+			// Set up schema change invalidation only when we have dependencies
+			if (dependencies && dependencies.hasAnyDependencies()) {
 				// Add new listener for schema changes that affect our dependencies
 				this.schemaChangeUnsubscriber = this.db.schemaManager.getChangeNotifier().addListener(event => {
-					// Map event type to dependency type
-					let dependencyType: string;
-					if (event.type.startsWith('table_')) {
-						dependencyType = 'table';
+					// Map event type to the dependency type(s) it can affect
+					let dependencyTypes: string[];
+					if (event.type === 'view_modified') {
+						dependencyTypes = ['view'];
+					} else if (event.type === 'materialized_view_added'
+						|| event.type === 'materialized_view_removed'
+						|| event.type === 'materialized_view_modified') {
+						// Unified model: a maintained table IS a table, so plans that read
+						// or write it record 'table' dependencies — an attach/detach/
+						// re-attach must invalidate them (a cached direct-write plan must
+						// not survive an attach, nor a write-through plan a detach).
+						// Legacy 'view' dependencies are still honored.
+						dependencyTypes = ['table', 'view'];
+					} else if (event.type.startsWith('table_')) {
+						dependencyTypes = ['table'];
 					} else if (event.type.startsWith('function_')) {
-						dependencyType = 'function';
+						dependencyTypes = ['function'];
 					} else if (event.type.startsWith('module_')) {
-						dependencyType = 'vtab_module';
+						dependencyTypes = ['vtab_module'];
 					} else if (event.type.startsWith('collation_')) {
-						dependencyType = 'collation';
+						dependencyTypes = ['collation'];
 					} else {
 						return; // Unknown event type
 					}
@@ -172,7 +245,7 @@ export class Statement {
 					// Check if this change affects any of our dependencies
 					const planDependencies = dependencies.getDependencies();
 					const affectedDependency = planDependencies.find((dep: SchemaDependency) =>
-						dep.type === dependencyType &&
+						dependencyTypes.includes(dep.type) &&
 						dep.objectName === event.objectName &&
 						(!dep.schemaName || dep.schemaName === event.schemaName)
 					);
@@ -182,6 +255,7 @@ export class Statement {
 						this.needsCompile = true;
 						this.plan = null;
 						this.emissionContext = null;
+						this.scheduler = null;
 						this.columnDefCache.clear();
 					}
 				});
@@ -203,7 +277,10 @@ export class Statement {
 	/** @internal Gets or creates the emission context for this statement */
 	private getEmissionContext(): EmissionContext {
 		if (!this.emissionContext) {
-			this.emissionContext = new EmissionContext(this.db);
+			this.emissionContext = new EmissionContext(
+				this.db,
+				this._emitUnfused ? { fuseScalars: false } : undefined,
+			);
 		}
 		return this.emissionContext;
 	}
@@ -219,9 +296,9 @@ export class Statement {
 		}
 		if (typeof key === 'number') {
 			if (key < 1) throw new RangeError(`Argument index ${key} out of range (must be >= 1)`);
-			this.boundArgs[key] = value;
+			this.boundArgs[key] = canonicalizeSqlValue(value);
 		} else if (typeof key === 'string') {
-			this.boundArgs[key] = value;
+			this.boundArgs[key] = canonicalizeSqlValue(value);
 		} else {
 			throw new MisuseError("Invalid argument key type");
 		}
@@ -241,15 +318,19 @@ export class Statement {
 				if (!isSqlValue(value)) {
 					throw new MisuseError(`bindAll: invalid value at index ${index}: expected SqlValue, got ${describeSqlValueViolation(value)}`);
 				}
-				this.boundArgs[index + 1] = value;
+				this.boundArgs[index + 1] = canonicalizeSqlValue(value);
 			});
 		} else if (typeof args === 'object' && args !== null) {
+			// Validate every entry before assigning any, so a rejected value leaves
+			// boundArgs empty rather than partially bound.
 			for (const [key, value] of Object.entries(args)) {
 				if (!isSqlValue(value)) {
 					throw new MisuseError(`bindAll: invalid value for key '${key}': expected SqlValue, got ${describeSqlValueViolation(value)}`);
 				}
 			}
-			Object.assign(this.boundArgs, args);
+			for (const [key, value] of Object.entries(args)) {
+				this.boundArgs[key] = canonicalizeSqlValue(value);
+			}
 		} else {
 			throw new MisuseError("Invalid parameters type for bindAll. Use array or object.");
 		}
@@ -275,10 +356,16 @@ export class Statement {
 		runtimeOverrides?: {
 			tracer?: InstructionTracer;
 			enableMetrics?: boolean;
+			signal?: AbortSignal;
+			/** Mutex-free committed read — see {@link RuntimeContext.readCommitted}. */
+			readCommitted?: boolean;
 		}
 	): AsyncIterable<Row> {
 		this.validateStatement("iterate rows for");
 		if (this.busy) throw new MisuseError("Statement busy, another iteration may be in progress or reset needed.");
+
+		// Pre-flight cancellation: reject immediately on an already-aborted signal.
+		throwIfAborted(runtimeOverrides?.signal);
 
 		if (params) this.bindAll(params);
 
@@ -286,16 +373,37 @@ export class Statement {
 		this.validateParameterTypes();
 
 		this.busy = true;
+		// Per-execution cache of connected inner-scan vtab instances (see
+		// runtime/emit/scan.ts). Declared out here so the teardown `finally` can
+		// disconnect every instance exactly once on all exit paths (normal completion,
+		// break, error, abort). `runtimeCtx` is likewise hoisted so `finally` can reach
+		// it after the try body assigns it.
+		const scanConnections = new Map<symbol, VirtualTable>();
+		let runtimeCtx: RuntimeContext | undefined;
 		try {
 			const blockPlanNode = this.compile();
 			if (!blockPlanNode.statements.length) return;
 
 			const emissionContext = this.getEmissionContext();
-			const rootInstruction = emitPlanNode(blockPlanNode, emissionContext);
-			const scheduler = new Scheduler(rootInstruction);
+			// Emit + schedule once and reuse across executions — the instruction tree is
+			// value-independent (bound params resolve from ctx.params at run time, not at
+			// emit time), and its validity is exactly the emission context's, which is
+			// nulled together with `this.scheduler` on any schema-dependency change.
+			// NOTE: the emission context (and thus this scheduler) is cached, so toggling
+			// the `trace_plan_stack` or `runtime_fuse_scalars` db options mid-life is
+			// ignored until the plan is recompiled — the tracing wrap and the fuse-or-not
+			// decision are both baked at emit time. Pre-existing behavior, unchanged here;
+			// caching the scheduler does not regress it (per-run tracer wrapping lives in
+			// the scheduler hooks, not baked). Recompile to pick up a toggle.
+			if (!this.scheduler) {
+				const rootInstruction = emitPlanNode(blockPlanNode, emissionContext);
+				this.scheduler = new Scheduler(rootInstruction);
+			}
+			const scheduler = this.scheduler;
 			const tracer = runtimeOverrides?.tracer ?? this.db.getInstructionTracer();
 			const enableMetrics = runtimeOverrides?.enableMetrics ?? Boolean(this.db.getOption('runtime_metrics'));
-			const runtimeCtx: RuntimeContext = {
+			const signal = runtimeOverrides?.signal;
+			runtimeCtx = {
 				db: this.db,
 				stmt: this,
 				params: this.boundArgs,
@@ -303,17 +411,28 @@ export class Statement {
 				tableContexts: wrapTableContextsStrict(new Map()),
 				tracer,
 				enableMetrics,
+				signal,
+				scanConnections,
+				readCommitted: runtimeOverrides?.readCommitted,
 			};
+
+			// Validate captured schema objects once per execution — hoisted out of every
+			// capturing instruction's run (see createValidatedInstruction). Runs after any
+			// schema-change listener would have fired; a defensive existence check for a
+			// schema change racing execution setup. Skip when nothing was captured.
+			if (emissionContext.getCapturedObjectCount() > 0) {
+				emissionContext.validateCapturedSchemaObjects();
+			}
 
 			const results = await scheduler.run(runtimeCtx);
 			if (results) {
 				if (Array.isArray(results) && results.length) {
 					const lastStatementOutput = results[results.length - 1];
 					if (isAsyncIterable(lastStatementOutput)) {
-						yield* lastStatementOutput as AsyncIterable<Row>;
+						yield* this._iterateWithSignal(lastStatementOutput as AsyncIterable<Row>, signal);
 					}
 				} else if (isAsyncIterable(results)) {
-					yield* results as AsyncIterable<Row>;
+					yield* this._iterateWithSignal(results as AsyncIterable<Row>, signal);
 				}
 			}
 		} catch (e) {
@@ -322,23 +441,155 @@ export class Statement {
 			const message = e instanceof Error ? e.message : String(e);
 			throw new QuereusError(`Execution error: ${message}`, StatusCode.ERROR, e instanceof Error ? e : undefined);
 		} finally {
+			// Disconnect every inner-scan instance connected during this execution,
+			// exactly once. This `finally` runs after the consumer finishes draining
+			// (normal completion, `break`, error, or abort — the async generator's
+			// teardown), so the cached instances stay live for the whole streaming
+			// window and are released here. `runtimeCtx` is undefined only on the
+			// no-statements early return, where the map is empty anyway.
+			if (runtimeCtx) {
+				for (const vtab of scanConnections.values()) {
+					await disconnectVTable(runtimeCtx, vtab);
+				}
+			}
+			scanConnections.clear();
 			this.busy = false;
 		}
 	}
 
+	/**
+	 * Re-yields a row stream while honoring a cancellation signal at every row
+	 * boundary. Covers output stages with no underlying table scan (e.g. `values`,
+	 * recursive CTEs) that the scan-leaf checkpoint cannot reach.
+	 * @internal
+	 */
+	private async *_iterateWithSignal(source: AsyncIterable<Row>, signal?: AbortSignal): AsyncIterable<Row> {
+		if (!signal && !REPR_STRICT) {
+			yield* source;
+			return;
+		}
+		// QUEREUS_REPR_STRICT backstop seam: rows yielded to the caller. This is the only
+		// one of the four seams that sees an EXPRESSION producing a non-canonical value
+		// (an arithmetic path that forgot to narrow) — the scan, write and UDF seams all
+		// sit upstream of it.
+		//
+		// R1 ONLY, deliberately — hence the empty declared-type array, which puts every
+		// cell on `assertRowConforms`'s untyped-position path. R2 is a rule about
+		// *declared* types — a column's DDL type — and a projection's `ScalarType` is not
+		// one: it is the planner's static INFERENCE, and the engine never coerces a
+		// projection's output to it. The two legitimately disagree all over the suite
+		// (`select ? as v` infers TEXT for an untyped parameter and yields a number; a
+		// comparison infers TEXT and yields a boolean; `sum(v)` infers REAL and yields a
+		// bigint past 2^53). Asserting R2 here would report the inference, not a
+		// representation defect. The declared-type checks live at the seams that actually
+		// have a declared type: the vtab scan and the DML write.
+		//
+		// NOTE: the inferred scalar type disagreeing with the runtime storage class is not
+		// only embedder-visible metadata — `emitInsert` builds its declared-type coercion
+		// from the source expression's static type and SKIPS a cell whose static type
+		// already equals the column's, so a disagreement there stores a non-conforming
+		// value. Tracked as `backlog/bug-inferred-scalar-type-disagrees-with-runtime-value`.
+		const reprNames = REPR_STRICT ? this.columnDefCache.value.map(col => col.name) : undefined;
+		for await (const row of source) {
+			if (signal) throwIfAborted(signal);
+			if (reprNames) assertRowConforms(row, NO_DECLARED_TYPES, 'the statement result row', reprNames);
+			yield row;
+		}
+	}
+
 	/** @internal Low-level row iteration without overrides. */
-	async *_iterateRowsRaw(params?: SqlParameters | SqlValue[]): AsyncIterable<Row> {
-		yield* this._iterateRowsRawInternal(params);
+	async *_iterateRowsRaw(params?: SqlParameters | SqlValue[], signal?: AbortSignal): AsyncIterable<Row> {
+		yield* this._iterateRowsRawInternal(params, { signal });
+	}
+
+	/**
+	 * @internal True when this execution should take the mutex-free committed-read
+	 * path: the caller opted in (`readConcurrency: 'committed'`) and the compiled
+	 * block passes {@link Database._isConcurrentReadEligible}. Compiles early
+	 * (synchronously) — the serialized path is untouched and still compiles
+	 * lazily inside the mutex when this returns false. Never throws: an
+	 * ineligible or uncompilable statement falls back to the serialized path,
+	 * where a compile error re-surfaces identically (compile failures are not
+	 * memoized).
+	 */
+	private tryRouteConcurrent(options?: StatementOptions): boolean {
+		if (options?.readConcurrency !== 'committed') return false;
+		try {
+			return this.db._isConcurrentReadEligible(this.compile());
+		} catch (e) {
+			log('committed-read routing declined (compile failed): %O', e);
+			return false;
+		}
+	}
+
+	/**
+	 * @internal Mutex-free committed-read execution. Runs WITHOUT the exec mutex
+	 * and MUST NOT touch the implicit-transaction lifecycle
+	 * (`_finalizeImplicitTransaction` / `_ensureTransaction` / autocommit
+	 * helpers) — any open implicit transaction belongs to the writer running
+	 * alongside, and finalizing it here would commit or roll back the WRITER's
+	 * transaction. Every table scan connects with `_readCommitted: true` (see
+	 * `RuntimeContext.readCommitted`), serving the last committed state.
+	 *
+	 * The {@link ConcurrentReadScope} is acquired lazily at first pull (not at
+	 * routing time) so an iterator that is never consumed holds no scope —
+	 * `Database.close()` awaits every live scope's teardown. The scope's signal
+	 * (fired by `close()`) is combined with the caller's; `scope.end()` runs in
+	 * this generator's `finally`, i.e. on every exit path.
+	 */
+	async *_iterateConcurrent(params?: SqlParameters | SqlValue[], options?: StatementOptions): AsyncGenerator<Row> {
+		throwIfAborted(options?.signal);
+		const scope = this.db._beginConcurrentRead();
+		const combined = combineAbortSignals(options?.signal, scope.signal);
+		try {
+			yield* this._iterateRowsRawInternal(params, { signal: combined.signal, readCommitted: true });
+		} finally {
+			combined.dispose();
+			scope.end();
+		}
 	}
 
 	/**
 	 * Iterates over result rows. Handles JIT transaction management - commits
 	 * implicit transactions on successful completion, rolls back on error.
+	 *
+	 * @param options Optional execution options (e.g. an `AbortSignal` for
+	 *   cooperative cancellation — checked on the first pull and at every row
+	 *   boundary so iteration can be interrupted on a request timeout).
 	 */
-	iterateRows(params?: SqlParameters | SqlValue[]): AsyncIterableIterator<Row> {
-		return wrapAsyncIterator(this._iterateRowsRaw(params), (commit, error) =>
+	iterateRows(params?: SqlParameters | SqlValue[], options?: StatementOptions): AsyncIterableIterator<Row> {
+		if (this.tryRouteConcurrent(options)) {
+			// Mutex-free committed read: no transaction to finalize here — the
+			// writer owns any open implicit transaction (see _iterateConcurrent).
+			return this._iterateConcurrent(params, options);
+		}
+		return wrapAsyncIterator(this._iterateRowsGenerator(params, options?.signal), (commit, error) =>
 			this.db._finalizeImplicitTransaction(commit, error)
 		);
+	}
+
+	/**
+	 * Internal generator for iterateRows() that holds the exec mutex for the whole
+	 * iteration, so two public iterations over the same db can't interleave the
+	 * implicit-transaction lifecycle. Mirrors {@link _allGenerator}, but yields raw
+	 * `Row` (no `rowToObject`). Transaction finalization is handled by the wrapper
+	 * returned by iterateRows().
+	 *
+	 * NOTE: on normal completion wrapAsyncIterator runs the transaction-finalize
+	 * cleanup after this generator's finally (mutex release), so the implicit-txn
+	 * commit lands just outside the mutex — same ordering as all()/`_allGenerator`.
+	 * @internal
+	 */
+	private async *_iterateRowsGenerator(params?: SqlParameters | SqlValue[], signal?: AbortSignal): AsyncGenerator<Row> {
+		// Pre-flight cancellation before acquiring the mutex, mirroring _allGenerator/eval().
+		throwIfAborted(signal);
+		const releaseMutex = await this.db._acquireExecMutex();
+
+		try {
+			yield* this._iterateRowsRaw(params, signal);
+		} finally {
+			releaseMutex();
+		}
 	}
 
 	/**
@@ -362,10 +613,11 @@ export class Statement {
 	 */
 	async reset(): Promise<void> {
 		this.validateStatement("reset");
-		if (this.busy) {
-			warnLog("Statement reset while busy. Iteration may not have completed.");
-		}
-		this.busy = false;
+		// Refuse while an iteration is in flight, matching bind/bindAll/clearBindings/
+		// nextStatement. Clearing `busy` here would let a second iteration slip past the
+		// guard in _iterateRowsRawInternal → two concurrent iterations over one statement.
+		// finalize() remains the escape hatch that force-clears `busy`.
+		if (this.busy) throw new MisuseError("Statement busy, cannot reset an in-flight iteration; complete or finalize it first.");
 	}
 
 	/**
@@ -390,6 +642,7 @@ export class Statement {
 		this.boundArgs = {};
 		this.plan = null;
 		this.emissionContext = null;
+		this.scheduler = null;
 		this.columnDefCache.clear();
 		this.astBatchIndex = -1;
 
@@ -409,15 +662,30 @@ export class Statement {
 	 *
 	 * The execution is serialized through the database mutex to prevent concurrent
 	 * transactions from interfering with each other.
+	 *
+	 * @param options Optional execution options (e.g. an `AbortSignal` for
+	 *   cooperative cancellation — checked before acquiring the mutex and at
+	 *   execution boundaries during the run).
 	 */
-	async run(params?: SqlParameters | SqlValue[]): Promise<void> {
+	async run(params?: SqlParameters | SqlValue[], options?: StatementOptions): Promise<void> {
 		this.validateStatement("run");
+		// Pre-flight cancellation: reject before acquiring the mutex / doing work.
+		throwIfAborted(options?.signal);
+
+		if (this.tryRouteConcurrent(options)) {
+			// Mutex-free committed read (eligibility guarantees read-only): drain
+			// without touching the implicit-transaction lifecycle.
+			for await (const _ of this._iterateConcurrent(params, options)) {
+				/* Consume all rows */
+			}
+			return;
+		}
 
 		await this.db._runWithMutex(async () => {
 			let success = false;
 			let runError: unknown;
 			try {
-				for await (const _ of this._iterateRowsRaw(params)) {
+				for await (const _ of this._iterateRowsRaw(params, options?.signal)) {
 					/* Consume all rows */
 				}
 				success = true;
@@ -433,9 +701,25 @@ export class Statement {
 	/**
 	 * Executes the prepared statement, binds parameters, and retrieves the first result row.
 	 * Transactions are started lazily (just-in-time) when needed.
+	 *
+	 * @param options Optional execution options (e.g. an `AbortSignal` for
+	 *   cooperative cancellation — checked before acquiring the mutex and at the
+	 *   row boundary while the first row is produced).
 	 */
-	async get(params?: SqlParameters | SqlValue[]): Promise<Record<string, SqlValue> | undefined> {
+	async get(params?: SqlParameters | SqlValue[], options?: StatementOptions): Promise<Record<string, SqlValue> | undefined> {
 		this.validateStatement("get first row for");
+		// Pre-flight cancellation: reject before acquiring the mutex / doing work.
+		throwIfAborted(options?.signal);
+
+		if (this.tryRouteConcurrent(options)) {
+			const names = this.getColumnNames();
+			// The early return triggers the generator's return() → its finally, so
+			// scan connections disconnect and the read scope ends.
+			for await (const row of this._iterateConcurrent(params, options)) {
+				return rowToObject(row, names);
+			}
+			return undefined;
+		}
 
 		return this.db._runWithMutex(async () => {
 			let result: Record<string, SqlValue> | undefined;
@@ -444,7 +728,7 @@ export class Statement {
 
 			try {
 				const names = this.getColumnNames();
-				for await (const row of this._iterateRowsRaw(params)) {
+				for await (const row of this._iterateRowsRaw(params, options?.signal)) {
 					result = rowToObject(row, names);
 					break; // Only need the first row
 				}
@@ -463,13 +747,33 @@ export class Statement {
 	 * Executes the prepared statement, binds parameters, and retrieves all result rows.
 	 * Transactions are started lazily (just-in-time) when needed.
 	 * The mutex is held for the entire iteration.
+	 *
+	 * @param options Optional execution options (e.g. an `AbortSignal` for
+	 *   cooperative cancellation — checked before acquiring the mutex and at every
+	 *   row boundary so streaming can be interrupted on a request timeout).
 	 */
-	all(params?: SqlParameters | SqlValue[]): AsyncIterableIterator<Record<string, SqlValue>> {
+	all(params?: SqlParameters | SqlValue[], options?: StatementOptions): AsyncIterableIterator<Record<string, SqlValue>> {
 		this.validateStatement("get all rows for");
 
-		return wrapAsyncIterator(this._allGenerator(params), (commit, error) =>
+		if (this.tryRouteConcurrent(options)) {
+			return this._allConcurrentGenerator(params, options);
+		}
+
+		return wrapAsyncIterator(this._allGenerator(params, options?.signal), (commit, error) =>
 			this.db._finalizeImplicitTransaction(commit, error)
 		);
+	}
+
+	/**
+	 * @internal Committed-read counterpart of {@link _allGenerator}: maps the
+	 * mutex-free row stream to objects. No transaction finalization — see
+	 * {@link _iterateConcurrent}.
+	 */
+	private async *_allConcurrentGenerator(params?: SqlParameters | SqlValue[], options?: StatementOptions): AsyncGenerator<Record<string, SqlValue>> {
+		const names = this.getColumnNames();
+		for await (const row of this._iterateConcurrent(params, options)) {
+			yield rowToObject(row, names);
+		}
 	}
 
 	/**
@@ -477,12 +781,14 @@ export class Statement {
 	 * Transaction finalization is handled by the wrapper returned by all().
 	 * @internal
 	 */
-	private async *_allGenerator(params?: SqlParameters | SqlValue[]): AsyncGenerator<Record<string, SqlValue>> {
+	private async *_allGenerator(params?: SqlParameters | SqlValue[], signal?: AbortSignal): AsyncGenerator<Record<string, SqlValue>> {
+		// Pre-flight cancellation before acquiring the mutex, mirroring eval().
+		throwIfAborted(signal);
 		const releaseMutex = await this.db._acquireExecMutex();
 
 		try {
 			const names = this.getColumnNames();
-			for await (const row of this._iterateRowsRaw(params)) {
+			for await (const row of this._iterateRowsRaw(params, signal)) {
 				yield rowToObject(row, names);
 			}
 		} finally {
@@ -558,6 +864,31 @@ export class Statement {
 	 * @throws QuereusError if parameter types don't match
 	 */
 	private validateParameterTypes(): void {
+		// Ensure the plan is compiled so `scalarRequiredParams` reflects the current
+		// statement (compile() is memoized — cheap when already planned).
+		this.compile();
+
+		// Reject an array/object value bound to a parameter that is used as a scalar
+		// comparand (`= <> < <= > >=` / `IN` / `BETWEEN` against a scalar operand).
+		// Such a binding can never match — the OBJECT storage class sorts above every
+		// scalar — so we diagnose it here at bind time rather than letting the query
+		// silently return no rows. The set is collected structurally at plan time
+		// (JSON-vs-JSON comparisons are excluded), so this never over-fires.
+		for (const key of this.scalarRequiredParams) {
+			// Presence check, not `??`: a parameter legitimately bound to `null` must
+			// use that binding, not fall through to the `:`-prefixed alternate key.
+			const value = typeof key === 'string'
+				? (Object.hasOwn(this.boundArgs, key) ? this.boundArgs[key] : this.boundArgs[`:${key}`])
+				: this.boundArgs[key];
+			if (value !== undefined && isObjectClassValue(value)) {
+				throw new QuereusError(
+					`parameter ${typeof key === 'number' ? `?${key}` : `:${key}`} ` +
+					`bound to an array/object value but used in a scalar comparison`,
+					StatusCode.MISMATCH
+				);
+			}
+		}
+
 		if (!this.parameterTypes) return; // No parameter types established yet
 
 		for (const [key, expectedType] of this.parameterTypes.entries()) {
@@ -612,7 +943,18 @@ export class Statement {
 		this.validateStatement("get change scope for");
 		const plan = this.getAnalysisPlan();
 		const effectiveParams = params ?? (Object.keys(this.boundArgs).length > 0 ? this.boundArgs : undefined);
-		return analyzeChangeScope(plan, effectiveParams !== undefined ? { params: effectiveParams } : undefined);
+		const sm = this.db.schemaManager;
+		return analyzeChangeScope(plan, {
+			...(effectiveParams !== undefined ? { params: effectiveParams } : {}),
+			// Project a maintained table's reference onto its cached source-union
+			// scope, widening the watch to the sources whose mutations drive its
+			// maintenance. (The table itself is change-logged too — maintenance
+			// records its realized deltas — so this is granularity, not a
+			// prerequisite.) Ordinary tables resolve to `undefined` and keep
+			// reporting themselves.
+			resolveMaterializedViewSource: (table) =>
+				sm.getMaintainedTable(table.schema, table.table)?.derivation.sourceScope,
+		});
 	}
 
 	/**
@@ -627,7 +969,7 @@ export class Statement {
 		if (this.parameterTypes === undefined) {
 			this.parameterTypes = getParameterTypes(this.boundArgs);
 		}
-		const { plan: rawPlan } = this.db._buildPlan([currentAst], this.parameterTypes);
+		const { plan: rawPlan } = this.db._buildPlan([currentAst], this.parameterTypes, this._schemaPathOverride);
 		return this.db.optimizer.optimizeForAnalysis(rawPlan, this.db) as BlockNode;
 	}
 
@@ -648,7 +990,11 @@ export class Statement {
 	getDebugProgram(): string {
 		this.validateStatement("get debug program for");
 		const plan = this.compile();
-		const emissionContext = this.getEmissionContext();
+		// A fresh unfused context, NOT the cached one: this dump exists to show the
+		// full instruction graph, and scalar fusion would dissolve scalar sub-programs
+		// into opaque fused(...) entries. Debug introspection reports the unfused
+		// graph; a normal execution still runs the (possibly fused) cached form.
+		const emissionContext = new EmissionContext(this.db, { fuseScalars: false });
 		const rootInstruction = emitPlanNode(plan, emissionContext);
 		const scheduler = new Scheduler(rootInstruction);
 

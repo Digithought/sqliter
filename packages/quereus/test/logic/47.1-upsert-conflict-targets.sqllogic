@@ -134,3 +134,36 @@ select id, name, count from multi order by id;
 → [{"id":1,"name":"first","count":100},{"id":2,"name":"second","count":20},{"id":3,"name":"third","count":30}]
 
 drop table multi;
+
+-- ===================================
+-- 8. ON CONFLICT (<target>) only suppresses conflicts on <target>
+-- A DO NOTHING clause must NOT swallow a conflict on a *different* unique
+-- constraint. With a PK plus a secondary UNIQUE, a clause targeting one of
+-- them aborts when the actual conflict is on the other.
+-- (ticket seed-secondary-unique-silently-skipped)
+-- ===================================
+
+create table scoped (id integer primary key, email text unique);
+insert into scoped values (1, 'a@x');
+
+-- Conflict is on the `email` UNIQUE (existing row has a different PK), but the
+-- clause targets `id` — so it must abort, not skip.
+insert into scoped values (2, 'a@x') on conflict (id) do nothing;
+-- error: UNIQUE constraint failed
+
+-- Symmetric: conflict is on the PK `id` (existing row has a different email),
+-- but the clause targets `email` — must abort, not skip.
+insert into scoped values (1, 'b@x') on conflict (email) do nothing;
+-- error: UNIQUE constraint failed
+
+-- The aborted inserts left no trace: still just the original row.
+select id, email from scoped order by id;
+→ [{"id":1,"email":"a@x"}]
+
+-- Idempotency control: a genuine PK conflict (same id, same email) targeting
+-- the PK is skipped silently — the value-comparison match still holds.
+insert into scoped values (1, 'a@x') on conflict (id) do nothing;
+select count(*) as cnt from scoped;
+→ [{"cnt":1}]
+
+drop table scoped;

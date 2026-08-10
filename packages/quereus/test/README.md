@@ -51,6 +51,7 @@ node --import ./packages/quereus/register.mjs node_modules/mocha/bin/mocha.js 'p
 
 - `→ [expected_json_results]` marks expected rows.
 - `-- error: <substring>` marks expected errors.
+- `-- requires-capability: <tokens>` declares database features the file needs; a backend that lacks one skips the whole file. See below.
 - Lowercase SQL keywords. Match the existing fixtures' style.
 - Inside a file, order scenarios **mundane → exotic** so the most general failure surfaces first.
 - File names carry a numeric prefix that places them in run order. The same mundane → exotic principle applies across files. Anchors:
@@ -61,6 +62,73 @@ node --import ./packages/quereus/register.mjs node_modules/mocha/bin/mocha.js 'p
   - `90–99`, `100+` — error paths, exotic edge cases, mutation kills.
 - Use a decimal sub-number to slot between adjacent files (`06.2.1-…` between `06.2-…` and `06.3-…`); don't renumber existing files.
 - Tests represent expected behavior when features are fully implemented. A failing test is a roadmap item, not a regression to silence.
+
+### `-- requires-capability:` directive
+
+`logic/*.sqllogic` is a **shared corpus** — other projects run the same files against their own storage
+engine. When a file's *subject* is a feature a backend deliberately does not implement, that file should
+skip there. Rather than have every consumer hand-maintain an O(corpus) list of file names, the file
+declares what it needs and each harness declares once what its backend has.
+
+**This section is the format spec, and the format is the cross-repo contract** — downstream harnesses
+reimplement the ~10-line parse against it. Quereus's own implementation is `test/logic-capabilities.ts`
+(quereus does not publish its test tree; `package.json` `files` excludes `dist/test`).
+
+Grammar — the directive lives in the file's **leading comment block**, before the first line that is
+neither blank nor a `--` comment:
+
+```
+-- Row-validating DDL inside an open transaction.
+-- requires-capability: standalone-index-ddl
+
+create table ddl_tx_a (id integer primary key, v text);
+```
+
+- Canonical line shape after trimming: `-- requires-capability: <tokens>`. The directive name matches
+  case-insensitively; tokens are lowercased before lookup.
+- `<tokens>` is one or more tokens separated by whitespace and/or commas.
+- The directive may appear on several lines; the declared sets **union**. Duplicate tokens are fine.
+- **No trailing comment on a directive line** — the whole remainder is read as tokens, so
+  `-- requires-capability: x -- why` errors on `--` and `why`.
+- Granularity is **whole file**; there is no section-scoped form. If only part of a file needs a
+  capability and the rest is worth running elsewhere, **split the file** (`10.5.2-…` style decimal
+  sub-numbering) rather than inventing a scoped directive.
+
+Each of these is a **hard error** that fails that one file's test — never a silent skip, never a silent pass:
+
+- an unknown capability token,
+- a directive with no tokens,
+- a canonical directive appearing after the file's first SQL line,
+- a **near-miss spelling** — `-- require-capability:`, `-- requires_capability:`, `-- requires capability:`.
+  This last one matters: the runner `continue`s past every unrecognized `--` line, so without the guard a
+  typo'd directive would vanish and the file would run with nobody the wiser.
+
+**Vocabulary** (closed set):
+
+| Token | Meaning |
+|---|---|
+| `standalone-index-ddl` | Backend accepts `create index`, `create unique index`, and `drop index` as standalone statements. |
+
+Adding a member is a deliberate quereus change: one entry in `SQLLOGIC_CAPABILITIES`, one row in this
+table, and at least one file annotated with it. The set being closed is the point — every consumer of the
+corpus agrees on what the tokens mean, so a downstream backend cannot mint private tokens. Group tokens
+by "a feature a backend would realistically choose to omit wholesale"; do **not** mint a capability per test.
+
+**What this is NOT.** Two adjacent concepts exist; keep them apart.
+
+- `ModuleCapabilities` (`src/vtab/capabilities.ts`) is a *runtime* interface a virtual-table module
+  advertises to the engine (`isolation`, `savepoints`, `secondaryIndexes`, `ddlTransactionality`, …). This
+  directive is a *test-harness* concept about whole SQL statements a backend accepts. One is not derived
+  from the other: `secondaryIndexes: true` means "supports secondary indexes", which a backend can satisfy
+  through declared schema or covering materialized views while still having no standalone `create index`
+  statement. Different question, different answer — hence the distinct type name `SqllogicCapability`.
+- `MEMORY_ONLY_FILES` (`logic.spec.ts`) is quereus's own store-mode exclusion list and stays as it is.
+  Split rule: capability-shaped divergence → file directive; memory-engine quirk, cost-model choice,
+  harness-config assertion, white-box internals, or known-bug divergence → that set.
+
+Both of quereus's backends ship standalone index DDL, so the mechanism produces **zero local skips** today.
+That is expected — the payoff is downstream. A file skipping locally means the capability sets or the
+directive are wrong.
 
 ## Test philosophy
 

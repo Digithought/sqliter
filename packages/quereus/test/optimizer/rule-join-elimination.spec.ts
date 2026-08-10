@@ -42,6 +42,20 @@ async function results(db: Database, sql: string): Promise<ResultRow[]> {
 	return rows;
 }
 
+/** Run `sql` with the aggregate-anchored elimination rule disabled (the baseline). */
+async function resultsNoAggElim(db: Database, sql: string): Promise<ResultRow[]> {
+	const base = db.optimizer.tuning;
+	db.optimizer.updateTuning({
+		...base,
+		disabledRules: new Set([...(base.disabledRules ?? []), 'join-elimination-aggregate']),
+	});
+	try {
+		return await results(db, sql);
+	} finally {
+		db.optimizer.updateTuning(base);
+	}
+}
+
 describe('ruleJoinElimination', () => {
 	let db: Database;
 
@@ -258,5 +272,347 @@ describe('ruleJoinElimination', () => {
 		expect(out.map(r => r.order_id)).to.deep.equal([10, 11, 12]);
 
 		await db.exec('DROP VIEW order_view');
+	});
+
+	// FK→PK alignment compares base-table column positions. A sub-select renames,
+	// reorders and drops columns, so the join condition's *output* positions are
+	// translated through `resolveTableColumnMapping` first. Without the
+	// translation an output index collides with an unrelated table column and the
+	// wrong column is accepted as the FK/PK column.
+	describe('derived-table column indices', () => {
+		async function setupDerived(): Promise<void> {
+			await db.exec('create table p (id integer primary key, other integer) using memory');
+			await db.exec(
+				'create table c (id integer primary key, p_id integer not null references p(id)) using memory',
+			);
+			await db.exec('insert into p values (7, 7), (2, 7)');
+			await db.exec('insert into c values (10, 7)');
+		}
+
+		it('keeps the LEFT join when the sub-select exposes a NON-FK-referenced column', async () => {
+			await setupDerived();
+			// `q.other` is output position 0 of the sub-select but column 1 of `p`.
+			// Position 0 of `p` is `id` — the column the FK references — so an
+			// untranslated comparison reports alignment and drops the join, losing a
+			// row (two `p` rows have other = 7).
+			const q = 'select c.id from c left join (select other from p) q on c.p_id = q.other';
+
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.be.greaterThan(0);
+
+			const out = await results(db, q);
+			expect(out.map(r => r.id)).to.deep.equal([10, 10]);
+		});
+
+		it('keeps the INNER join when the sub-select exposes a NON-FK column on the preserved side', async () => {
+			// The untranslated comparison also mis-fires on the FK (preserved) side,
+			// where an INNER join emits a row that has no parent at all.
+			await db.exec('create table p (id integer primary key) using memory');
+			await db.exec(
+				`create table c3 (
+					id integer primary key,
+					x integer,
+					p_id integer not null references p(id),
+					y integer
+				) using memory`,
+			);
+			await db.exec('insert into p values (1), (2)');
+			// y = 99 has NO parent row; p_id = 1 does.
+			await db.exec('insert into c3 values (10, 0, 1, 99)');
+
+			// `q.y` is output position 2, colliding with `c3.p_id` (table column 2),
+			// the real FK column.
+			const q = 'select q.id from (select id, x, y from c3) q join p on q.y = p.id';
+
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.be.greaterThan(0);
+
+			const out = await results(db, q);
+			expect(out).to.have.lengthOf(0);
+		});
+
+		it('still eliminates a LEFT join when a reordering sub-select IS FK-covered', async () => {
+			await setupDerived();
+			// `q.id` is output position 1 but table column 0 — the FK's referenced
+			// column. Translating (rather than refusing sub-selects outright) keeps
+			// this rewrite available.
+			const q = 'select c.id from c left join (select other, id from p) q on c.p_id = q.id';
+
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(0);
+
+			const out = await results(db, q);
+			expect(out.map(r => r.id)).to.deep.equal([10]);
+		});
+
+		it('still eliminates an INNER join when a reordering sub-select IS FK-covered', async () => {
+			await setupDerived();
+			// INNER additionally needs a row-preserving path to the PK table; a
+			// projection never drops rows, so it is peeled.
+			const q = 'select c.id from c join (select other, id from p) q on c.p_id = q.id';
+
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(0);
+
+			const out = await results(db, q);
+			expect(out.map(r => r.id)).to.deep.equal([10]);
+		});
+
+		it('declines when the join column is computed and has no base-table origin', async () => {
+			await setupDerived();
+			// `q.k` is an expression — `mapColumnsToTable` returns undefined, so the
+			// rewrite must decline rather than pair an unrelated index against `p`.
+			const q = 'select c.id from c left join (select id + 0 as k from p) q on c.p_id = q.k';
+
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.be.greaterThan(0);
+
+			const out = await results(db, q);
+			expect(out.map(r => r.id)).to.deep.equal([10]);
+		});
+
+		/**
+		 * Composite FK through a sub-select that swaps the parent's two PK columns.
+		 * Positional pairing is what makes a composite FK safe, and the swap makes
+		 * the two numbering schemes disagree in *both* directions: the pairing that
+		 * looks aligned by output position is the misaligned one, and vice versa.
+		 */
+		async function setupComposite(): Promise<void> {
+			await db.exec(
+				'create table pcomp (a integer not null, b integer not null, primary key (a, b)) using memory',
+			);
+			await db.exec(`create table ccomp (
+				id integer primary key,
+				fa integer not null,
+				fb integer not null,
+				foreign key (fa, fb) references pcomp(a, b)
+			) using memory`);
+			await db.exec('insert into pcomp values (1, 10), (2, 20)');
+			await db.exec('insert into ccomp values (100, 1, 10), (101, 2, 20)');
+		}
+
+		it('keeps the INNER join when a swapping sub-select permutes a composite FK', async () => {
+			await setupComposite();
+			// `(select b, a …)` puts `b` at output 0 and `a` at output 1, so pairing
+			// fa with q.b and fb with q.a reads as the FK's declared (a, b) order by
+			// output position while actually being the permuted pairing the FK does
+			// NOT cover. Eliminating would return ccomp's 2 rows; the truth is none.
+			const q = 'select c.id from ccomp c join (select b, a from pcomp) q on c.fa = q.b and c.fb = q.a';
+
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.be.greaterThan(0);
+
+			expect(await results(db, q)).to.have.lengthOf(0);
+		});
+
+		it('still eliminates the INNER join when a swapping sub-select keeps the composite FK pairing', async () => {
+			await setupComposite();
+			// The mirror: fa↔a and fb↔b is the FK's declared pairing, even though the
+			// sub-select hands them over in the opposite output order.
+			const q = 'select c.id from ccomp c join (select b, a from pcomp) q on c.fa = q.a and c.fb = q.b';
+
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(0);
+
+			const out = await results(db, q + ' order by c.id');
+			expect(out.map(r => r.id)).to.deep.equal([100, 101]);
+		});
+	});
+
+	// `ruleJoinEliminationUnderAggregate` (id `join-elimination-aggregate`): the
+	// Aggregate-anchored sibling of the Project entrypoint. A cardinality-only
+	// aggregate (`count(*)`) over an FK→PK LEFT/RIGHT/INNER join whose
+	// non-preserved side nothing reads collapses to zero join ops. The LEFT case
+	// holds *unconditionally* (`|L LEFT JOIN R| == |L|`) — needing neither a
+	// NOT-NULL FK nor a row-preserving R, the two checks the INNER case requires.
+	describe('aggregate-anchored elimination', () => {
+		it('eliminates the LEFT join under count(*) when no right-side columns are referenced', async () => {
+			await setupCustomersOrders();
+			const q =
+				'SELECT count(*) AS n FROM orders LEFT JOIN customers ON orders.customer_id = customers.id';
+
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(0);
+
+			const out = await results(db, q);
+			expect(out).to.deep.equal([{ n: 3 }]);
+			// Byte-equal to the rule-disabled baseline — elimination is a pure optimization.
+			expect(out).to.deep.equal(await resultsNoAggElim(db, q));
+		});
+
+		it('eliminates the LEFT join under count(*) even when the FK is nullable (unmatched rows still counted)', async () => {
+			// Distinct from the INNER nullable-FK case below, which KEEPS the join:
+			// LEFT preserves the unmatched (null-FK) row by null-padding it, so
+			// |L LEFT JOIN R| == |L| regardless of FK nullability.
+			await db.exec("CREATE TABLE cust2 (id INTEGER PRIMARY KEY, name TEXT) USING memory");
+			await db.exec(
+				"CREATE TABLE ord2 (order_id INTEGER PRIMARY KEY, customer_id INTEGER NULL REFERENCES cust2(id), total REAL) USING memory",
+			);
+			await db.exec("INSERT INTO cust2 VALUES (1, 'Acme')");
+			// Row 21 has a NULL FK — unmatched in the join, but LEFT keeps it.
+			await db.exec("INSERT INTO ord2 VALUES (20, 1, 99.0), (21, null, 49.5), (22, 1, 12.0)");
+
+			const q =
+				'SELECT count(*) AS n FROM ord2 LEFT JOIN cust2 ON ord2.customer_id = cust2.id';
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(0);
+
+			const out = await results(db, q);
+			expect(out).to.deep.equal([{ n: 3 }]);
+			expect(out).to.deep.equal(await resultsNoAggElim(db, q));
+		});
+
+		it('does NOT eliminate when an aggregate argument reads the non-preserved side', async () => {
+			await setupCustomersOrders();
+			const q =
+				'SELECT sum(length(customers.region)) AS s FROM orders LEFT JOIN customers ON orders.customer_id = customers.id';
+
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.be.greaterThan(0);
+
+			// regions EU(2)/US(2): orders 10,12 → EU, 11 → US ⇒ 2+2+2 = 6.
+			const out = await results(db, q);
+			expect(out).to.deep.equal([{ s: 6 }]);
+		});
+
+		it('does NOT eliminate when a GROUP BY key reads the non-preserved side', async () => {
+			await setupCustomersOrders();
+			const q =
+				'SELECT customers.region AS region, count(*) AS n FROM orders LEFT JOIN customers ' +
+				'ON orders.customer_id = customers.id GROUP BY customers.region ORDER BY region';
+
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.be.greaterThan(0);
+
+			const out = await results(db, q);
+			expect(out).to.deep.equal([
+				{ region: 'EU', n: 2 },
+				{ region: 'US', n: 1 },
+			]);
+		});
+
+		it('does NOT eliminate when a live existence flag is demanded (hasExistenceColumns guard)', async () => {
+			await setupCustomersOrders();
+			// The flag IS demanded (an aggregate arg), so join-existence-pruning keeps
+			// it; the flag's attr id is invisible to the usesRight scan, so the
+			// hasExistenceColumns guard must retain the join.
+			const q =
+				'SELECT sum(case when hasC then 1 else 0 end) AS s FROM orders ' +
+				'LEFT JOIN customers ON orders.customer_id = customers.id exists right as hasC';
+
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.be.greaterThan(0);
+
+			// FK NOT NULL ⇒ every order matches ⇒ hasC always true ⇒ sum = 3.
+			const out = await results(db, q);
+			expect(out).to.deep.equal([{ s: 3 }]);
+		});
+
+		it('eliminates the join under count(*) once an undemanded existence flag is pruned (cascade)', async () => {
+			await setupCustomersOrders();
+			// The flag is unreferenced: join-existence-pruning-aggregate
+			// strips it, then this rule eliminates the flag-free LEFT join — both in one
+			// applyRules pass. (Also covered in the existence-pruning spec.)
+			const q =
+				'SELECT count(*) AS n FROM orders LEFT JOIN customers ' +
+				'ON orders.customer_id = customers.id exists right as hasC';
+
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(0);
+
+			const out = await results(db, q);
+			expect(out).to.deep.equal([{ n: 3 }]);
+		});
+
+		it('eliminates the LEFT join under count(*) when a left-side predicate folds through the wrapper chain', async () => {
+			await setupCustomersOrders();
+			// A WHERE over a left-side column (orders.total) lands as a Filter between
+			// the Aggregate and the LEFT join. walkChain folds it into `demanded`; the
+			// referenced attr is left-side, so `usesRight` stays false and the join is
+			// still eliminated. Exercises the wrapper-chain path on the outer anchor
+			// (the bare Aggregate → Join shape is covered above).
+			const q =
+				'SELECT count(*) AS n FROM orders LEFT JOIN customers ' +
+				'ON orders.customer_id = customers.id WHERE orders.total > 20';
+
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(0);
+
+			// totals 99.0 / 49.5 / 12.0 ⇒ two rows above 20.
+			const out = await results(db, q);
+			expect(out).to.deep.equal([{ n: 2 }]);
+			expect(out).to.deep.equal(await resultsNoAggElim(db, q));
+		});
+
+		it('eliminates a RIGHT join under count(*) — matching the un-eliminated RIGHT execution', async () => {
+			await setupCustomersOrders();
+			// `customers RIGHT JOIN orders` preserves orders (right) and carries the
+			// FK on the preserved side (orders.customer_id → customers.id), so each
+			// preserved row matches ≤1 eliminated (customers) row: the sound mirror of
+			// the LEFT arm. RIGHT-JOIN execution is now implemented (the nested-loop
+			// emitter drives from the right side), so elimination is purely an
+			// optimization — the un-eliminated RIGHT join produces the same answer,
+			// which the contrast below asserts.
+			const q =
+				'SELECT count(*) AS n FROM customers RIGHT JOIN orders ON orders.customer_id = customers.id';
+
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(0);
+
+			const out = await results(db, q);
+			expect(out).to.deep.equal([{ n: 3 }]);
+
+			// With the rule disabled the RIGHT join survives to emit and runs — same result.
+			expect(await resultsNoAggElim(db, q)).to.deep.equal([{ n: 3 }]);
+		});
+
+		it('eliminates the LEFT join under count(*) for an aligned composite FK', async () => {
+			// Multi-column checkFkPkAlignment on the outer anchor: the misaligned
+			// composite abstain is covered for INNER (Project anchor); this confirms
+			// the aligned composite SUCCESS path eliminates under the aggregate-LEFT
+			// anchor too. Composite FK (fa, fb) REFERENCES pcomp(a, b), paired in
+			// declaration order, so checkFkPkAlignment reports alignment.
+			await db.exec(
+				"CREATE TABLE pcomp (a INTEGER NOT NULL, b INTEGER NOT NULL, label TEXT, PRIMARY KEY (a, b)) USING memory",
+			);
+			await db.exec(
+				"CREATE TABLE ccomp (id INTEGER PRIMARY KEY, fa INTEGER NOT NULL, fb INTEGER NOT NULL, FOREIGN KEY (fa, fb) REFERENCES pcomp(a, b)) USING memory",
+			);
+			await db.exec("INSERT INTO pcomp VALUES (1, 10, 'p1'), (2, 20, 'p2')");
+			await db.exec("INSERT INTO ccomp VALUES (100, 1, 10), (101, 2, 20)");
+
+			const q = 'SELECT count(*) AS n FROM ccomp c LEFT JOIN pcomp p ON p.a = c.fa AND p.b = c.fb';
+
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.equal(0);
+
+			const out = await results(db, q);
+			expect(out).to.deep.equal([{ n: 2 }]);
+			expect(out).to.deep.equal(await resultsNoAggElim(db, q));
+		});
+
+		it('keeps the LEFT join under count(*) when the sub-select exposes a NON-FK-referenced column', async () => {
+			// The aggregate anchor shares `tryEliminate` with the Project anchor, so
+			// the base-table translation covers it too — pinned here because the LEFT
+			// aggregate path skips both guards the INNER path relies on, leaving the
+			// alignment check as the only thing standing between a 1:n join and a
+			// wrong row count. `q.other` is output position 0 but column 1 of `p`.
+			await db.exec('create table p (id integer primary key, other integer) using memory');
+			await db.exec(
+				'create table c (id integer primary key, p_id integer not null references p(id)) using memory',
+			);
+			await db.exec('insert into p values (7, 7), (2, 7)');
+			await db.exec('insert into c values (10, 7)');
+
+			const q = 'select count(*) as n from c left join (select other from p) q on c.p_id = q.other';
+
+			const rows = await planRows(db, q);
+			expect(joinCount(rows), `plan ops=${rows.map(r => r.op).join(',')}`).to.be.greaterThan(0);
+
+			// Both `p` rows carry other = 7, so the single `c` row matches twice.
+			const out = await results(db, q);
+			expect(out).to.deep.equal([{ n: 2 }]);
+			expect(out).to.deep.equal(await resultsNoAggElim(db, q));
+		});
 	});
 });

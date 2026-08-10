@@ -1,0 +1,230 @@
+-- Set-operation cross-input collation merge. Ticket
+-- set-operation-cross-input-collation-merge. Each set-op output column resolves
+-- its dedup/compare collation across BOTH inputs through the same provenance-
+-- ranked comparison lattice (explicit > declared > default > BINARY, symmetric,
+-- plan-time error on same-rank explicit/declared conflicts) used by ordinary
+-- comparisons and join keys. The resolved collation is written into the node's
+-- output column/attribute types, so the dedup/membership comparator AND an
+-- enclosing ORDER BY both read it from there — lockstep is structural.
+--
+-- DISTINCT operators (UNION/INTERSECT/EXCEPT/DIFF) dedup, so a same-rank
+-- explicit/declared conflict is a prepare-time error; UNION ALL does no dedup,
+-- so it never errors (it propagates no collation, like `||` / CASE).
+-- See docs/types.md § Comparison collation resolution (set operations).
+
+create table cl (id integer primary key, n text collate nocase, p text, r text collate rtrim);
+create table cr (id integer primary key, n text collate nocase, p text, r text collate rtrim);
+insert into cl values (1, 'Apple', 'Apple', 'Apple'), (2, 'Banana', 'Banana', 'Banana');
+insert into cr values (1, 'apple', 'apple', 'apple'), (2, 'cherry', 'cherry', 'cherry');
+
+-- =============================================================================
+-- 1. Branch-order symmetry (the headline fix). A declared-NOCASE column on one
+--    side and a plain (defaulted-BINARY) column on the other resolves NOCASE
+--    from EITHER branch order, so the union dedups case-insensitively both ways
+--    ('Apple'/'apple' fold → 3 distinct, not 4). Previously the LEFT input's
+--    collation alone drove dedup, so swapping branches flipped NOCASE↔BINARY.
+-- =============================================================================
+
+select count(*) as c from (select n from cl union select p from cr);
+→ [{"c":3}]
+
+-- reversed: declared NOCASE now on the right; identical dedup (was BINARY → 4).
+select count(*) as c from (select p from cr union select n from cl);
+→ [{"c":3}]
+
+-- =============================================================================
+-- 2. Explicit COLLATE both sides. Same name resolves and dedups under it;
+--    different names are a rank-3 prepare-time conflict (both orders).
+-- =============================================================================
+
+select count(*) as c from (select n collate nocase from cl union select p collate nocase from cr);
+→ [{"c":3}]
+
+select n collate nocase from cl union select p collate rtrim from cr;
+-- error: conflicting COLLATE clauses
+
+select p collate rtrim from cr union select n collate nocase from cl;
+-- error: conflicting COLLATE clauses
+
+-- =============================================================================
+-- 3. Declared both sides. Same declared collation resolves; different declared
+--    collations are a rank-2 ambiguous-collation error (both orders). An
+--    explicit COLLATE on one side disambiguates.
+-- =============================================================================
+
+select count(*) as c from (select n from cl union select n from cr);
+→ [{"c":3}]
+
+select n from cl union select r from cr;
+-- error: ambiguous collation
+
+select r from cr union select n from cl;
+-- error: ambiguous collation
+
+-- explicit COLLATE outranks the conflicted declared pair (rank 3 > rank 2).
+select count(*) as c from (select n from cl union select r collate nocase from cr);
+→ [{"c":3}]
+
+-- =============================================================================
+-- 4. Default-vs-default conflict resolves to BINARY SILENTLY (no error) —
+--    defaults are preferences, not declarations. Tables created under different
+--    session default_collations. 'Bob'/'bob' fold only under NOCASE, 'bob '/'bob'
+--    only under RTRIM; under BINARY all three are distinct, so 3 proves BINARY.
+-- =============================================================================
+
+pragma default_collation='nocase';
+create table dn (id integer primary key, v text);
+pragma default_collation='rtrim';
+create table dr (id integer primary key, w text);
+pragma default_collation='binary';
+
+insert into dn values (1, 'Bob'), (2, 'bob ');
+insert into dr values (1, 'bob');
+
+select count(*) as c from (select v from dn union select w from dr);
+→ [{"c":3}]
+select count(*) as c from (select w from dr union select v from dn);
+→ [{"c":3}]
+
+drop table dn;
+drop table dr;
+
+-- =============================================================================
+-- 5. UNION ALL never errors. Two divergent EXPLICIT collations would be a hard
+--    conflict for any DISTINCT operator, but UNION ALL does no dedup, so the
+--    output column carries no collation and every input row passes through
+--    unchanged (bag: 2 + 2 = 4). This is the easiest place to wrongly throw.
+-- =============================================================================
+
+select count(*) as c from (select n collate nocase from cl union all select p collate rtrim from cr);
+→ [{"c":4}]
+
+-- divergent DECLARED collations under UNION ALL: also no error.
+select count(*) as c from (select n from cl union all select r from cr);
+→ [{"c":4}]
+
+-- =============================================================================
+-- 6. INTERSECT / EXCEPT membership follows the SAME resolved collation as UNION
+--    over the same inputs. Under NOCASE: 'Apple' ∩ {'apple','cherry'} matches
+--    (1 row); {'Apple','Banana'} − {'apple','cherry'} keeps only 'Banana' (1
+--    row). Under BINARY these would be 0 and 2.
+-- =============================================================================
+
+select count(*) as c from (select n from cl intersect select p from cr);
+→ [{"c":1}]
+select count(*) as c from (select n from cl except select p from cr);
+→ [{"c":1}]
+
+-- INTERSECT yields the LEFT row; it still reports the resolved collation.
+select n from cl intersect select p from cr;
+→ [{"n":"Apple"}]
+select n from cl except select p from cr;
+→ [{"n":"Banana"}]
+
+-- =============================================================================
+-- 7. Nested set operations / forward propagation. The inner union resolves to
+--    NOCASE at rank 2 (declared wins over the plain side), and that rank rides
+--    into the inner node's OUTPUT column collation. The outer union then sees
+--    NOCASE(2) vs declared RTRIM(2) → conflict. Were the inner rank demoted to
+--    1, RTRIM would silently win — so the error firing pins rank propagation.
+-- =============================================================================
+
+(select n from cl union select p from cr) union select r from cr;
+-- error: ambiguous collation
+
+-- inner resolves NOCASE, outer NOCASE vs declared NOCASE → resolves (no error).
+-- Deterministic union order (left-first, input order): Apple, Banana, cherry.
+(select n from cl union select p from cr) union select n from cr;
+→ [{"n":"Apple"},{"n":"Banana"},{"n":"cherry"}]
+
+-- =============================================================================
+-- 8. Multi-column alignment. Each column resolves independently; a conflict in
+--    ANY column errors the whole statement even when the others resolve. Here
+--    column 1 resolves (NOCASE both) but column 2 conflicts (NOCASE vs RTRIM).
+-- =============================================================================
+
+create table m1 (id integer primary key, a text collate nocase, b text collate nocase);
+create table m2 (id integer primary key, a text collate nocase, b text collate rtrim);
+insert into m1 values (1, 'x', 'y');
+insert into m2 values (1, 'x', 'y');
+
+select a, b from m1 union select a, b from m2;
+-- error: ambiguous collation
+
+drop table m1;
+drop table m2;
+
+-- =============================================================================
+-- 9. ORDER BY lockstep (end-to-end). The outer ORDER BY keys off the union's
+--    RESOLVED output-column collation (NOCASE), not the left input's raw type.
+--    'apple' < 'banana' < 'Cherry' under NOCASE; under BINARY 'Cherry' (C=67)
+--    would sort before the lowercase letters, so the order proves NOCASE.
+-- =============================================================================
+
+create table o1 (id integer primary key, n text collate nocase);
+create table o2 (id integer primary key, p text);
+insert into o1 values (1, 'banana');
+insert into o2 values (1, 'Cherry'), (2, 'apple');
+
+select n from o1 union select p from o2 order by n;
+→ [{"n":"apple"},{"n":"banana"},{"n":"Cherry"}]
+
+-- Ordinal form keys off the SAME resolved NOCASE output column (ticket
+-- compound-order-by-ordinal-reference): `order by 1` resolves to output column 1
+-- and inherits its resolved collation, so it sorts identically to the name form.
+select n from o1 union select p from o2 order by 1;
+→ [{"n":"apple"},{"n":"banana"},{"n":"Cherry"}]
+
+drop table o1;
+drop table o2;
+
+-- =============================================================================
+-- 10. Membership-flag set operations. Data columns resolve cross-input; the
+--     appended `exists … as` flag columns are never touched. The data column
+--     still dedups under the resolved NOCASE (3 distinct), and a divergent
+--     declared data-column collation still errors on the DATA column only.
+-- =============================================================================
+
+select count(*) as c from (select n from cl union exists left as inL select p from cr);
+→ [{"c":3}]
+
+select n from cl union exists left as inL select r from cr;
+-- error: ambiguous collation
+
+-- =============================================================================
+-- 11. DIFF (symmetric difference) expands to (A except B) union (B except A);
+--     each nested except is a DISTINCT operator, so divergent declared
+--     collations surface the conflict. A resolving DIFF folds under NOCASE:
+--     {'Banana'} ∪ {'cherry'} = 2 (BINARY would give 4).
+-- =============================================================================
+
+select n from cl diff select r from cr;
+-- error: ambiguous collation
+
+select count(*) as c from (select n from cl diff select p from cr);
+→ [{"c":2}]
+
+-- =============================================================================
+-- 12. Materialized view over a cross-collation UNION. The union's resolved
+--     output-column collation flows through `deriveBackingShape` into the
+--     backing column (its provenance — declared here — publishes an explicit
+--     backing collation), so the materialized result dedups under the SAME
+--     resolved NOCASE the plain view would (3, not 4), in BOTH branch orders.
+--     Locks in the implement handoff's highest-value gap (gap #3): an MV body's
+--     union persists the symmetric resolved collation, not the left input's.
+-- =============================================================================
+
+create materialized view mv_xc as select n from cl union select p from cr;
+select count(*) as c from mv_xc;
+→ [{"c":3}]
+
+-- reversed branch order persists the same NOCASE backing (was BINARY → 4).
+create materialized view mv_xc2 as select p from cr union select n from cl;
+select count(*) as c from mv_xc2;
+→ [{"c":3}]
+
+drop materialized view mv_xc;
+drop materialized view mv_xc2;
+
+drop table cl;
+drop table cr;

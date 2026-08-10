@@ -3,11 +3,23 @@ dist
 doc
 **/*.tsbuildinfo
 packages/sync-coordinator/.data
-.yarn
+.yarn/*
+!.yarn/patches
 .quereus
+
+.tmp
 
 # Task runner agent logs
 tasks/.logs/
+
+# Transient validation logs (agent `tee` output; must not be committed)
+*.log
+
+# Transient scheduled-tasks lock (per-session pid/lock; must not be committed)
+.claude/scheduled_tasks.lock
+
+# Pending release notes — curated during a cycle, consumed by `yarn gh-release`
+.release-notes.pending.md
 
 # Benchmark results
 packages/quereus/bench/results/
@@ -19,3 +31,5 @@ coverage/
 .stryker-tmp/
 packages/quereus/reports/mutation/
 packages/quereus/.stryker-tmp/
+packages/shared-ui/tsconfig.tsbuildinfo
+.pnp.*

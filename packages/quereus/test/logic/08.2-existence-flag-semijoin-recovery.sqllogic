@@ -1,0 +1,197 @@
+-- 08.2-existence-flag-semijoin-recovery.sqllogic
+-- A probe-only outer-join `exists … as` flag (`where flag` / `where not flag`)
+-- is recovered to an equivalent semi / anti join. Pure optimization — these
+-- assert end-to-end result correctness against real data.
+
+-- ===== No declared FK: probe-only flag recovers to a hash semi / anti join =====
+
+create table ec (cc integer primary key, pr integer null, cv integer);
+create table ep (pp integer primary key, pv integer);
+insert into ep values (1, 10), (2, 20);
+-- cc 1 (pr 1) matches; cc 2 (pr 9) no match; cc 3 (pr 2) matches; cc 4 (pr null) no match
+insert into ec values (1, 1, 100), (2, 9, 200), (3, 2, 300), (4, null, 400);
+
+-- semi: keep child rows WITH a matching parent
+select cc from ec c left join ep p on p.pp = c.pr exists right as hasP where hasP order by cc;
+→ [{"cc":1},{"cc":3}]
+
+-- anti: keep child rows with NO matching parent
+select cc from ec c left join ep p on p.pp = c.pr exists right as hasP where not hasP order by cc;
+→ [{"cc":2},{"cc":4}]
+
+-- double negation collapses to a semi probe
+select cc from ec c left join ep p on p.pp = c.pr exists right as hasP where not not hasP order by cc;
+→ [{"cc":1},{"cc":3}]
+
+-- literal probe forms: `= true` → semi, `= false` → anti
+select cc from ec c left join ep p on p.pp = c.pr exists right as hasP where hasP = true order by cc;
+→ [{"cc":1},{"cc":3}]
+
+select cc from ec c left join ep p on p.pp = c.pr exists right as hasP where hasP = false order by cc;
+→ [{"cc":2},{"cc":4}]
+
+-- IS [NOT] TRUE/FALSE probe forms over the non-null flag.
+--   `is true`      → semi  (rows WITH a match)
+--   `is not false` → semi  (≡ = true, exact because the flag is never null)
+--   `is false`     → anti  (rows with NO match)
+--   `is not true`  → anti  (≡ = false, exact because the flag is never null)
+select cc from ec c left join ep p on p.pp = c.pr exists right as hasP where hasP is true order by cc;
+→ [{"cc":1},{"cc":3}]
+
+select cc from ec c left join ep p on p.pp = c.pr exists right as hasP where hasP is not false order by cc;
+→ [{"cc":1},{"cc":3}]
+
+select cc from ec c left join ep p on p.pp = c.pr exists right as hasP where hasP is false order by cc;
+→ [{"cc":2},{"cc":4}]
+
+select cc from ec c left join ep p on p.pp = c.pr exists right as hasP where hasP is not true order by cc;
+→ [{"cc":2},{"cc":4}]
+
+-- `is not null` over the never-null flag is a constant TRUE — NOT a probe; the rule
+-- abstains and every left row survives (semi/anti recovery must not fire).
+select cc from ec c left join ep p on p.pp = c.pr exists right as hasP where hasP is not null order by cc;
+→ [{"cc":1},{"cc":2},{"cc":3},{"cc":4}]
+
+-- `is null` over the never-null flag is a constant FALSE — likewise not a probe; the
+-- rule abstains and the (always-false) filter keeps no rows.
+select cc from ec c left join ep p on p.pp = c.pr exists right as hasP where hasP is null order by cc;
+→ []
+
+-- residual AND-conjunct is retained above the semi join (cv > 150 keeps only cc 3)
+select cc from ec c left join ep p on p.pp = c.pr exists right as hasP where hasP and c.cv > 150 order by cc;
+→ [{"cc":3}]
+
+-- OR-probe: the flag's truth does not partition rows, so recovery abstains — still correct
+select cc from ec c left join ep p on p.pp = c.pr exists right as hasP where hasP or c.cv > 150 order by cc;
+→ [{"cc":1},{"cc":2},{"cc":3},{"cc":4}]
+
+-- flag also selected: retained (not a probe-only shape) and reads back correctly
+select cc, hasP from ec c left join ep p on p.pp = c.pr exists right as hasP where hasP order by cc;
+→ [{"cc":1,"hasP":true},{"cc":3,"hasP":true}]
+
+drop table ec;
+drop table ep;
+
+-- ===== Declared nullable FK (referential integrity holds): folding cascade =====
+
+create table par (pid integer primary key, pname text);
+create table chi (cid integer primary key, pref integer null references par(pid), cval integer);
+insert into par values (1, 'P1'), (2, 'P2');
+insert into chi values (10, 1, 100), (20, null, 200), (30, 2, 300), (40, null, 400);
+
+-- semi over a nullable FK folds to Filter(child, pref IS NOT NULL)
+select cid from chi left join par on par.pid = chi.pref exists right as hasP where hasP order by cid;
+→ [{"cid":10},{"cid":30}]
+
+-- anti over a nullable FK keeps the NULL-pref (unmatched) rows
+select cid from chi left join par on par.pid = chi.pref exists right as hasP where not hasP order by cid;
+→ [{"cid":20},{"cid":40}]
+
+drop table chi;
+drop table par;
+
+-- ===== Declared NOT NULL FK: semi folds to L, anti folds to Empty =====
+
+create table custs (id integer primary key, nm text);
+create table ords (oid integer primary key, cust integer not null references custs(id), amt real);
+insert into custs values (1, 'Acme'), (2, 'Beta');
+insert into ords values (10, 1, 99.0), (11, 2, 49.5), (12, 1, 12.0);
+
+-- every order has a matching customer → semi keeps all rows
+select oid from ords left join custs on ords.cust = custs.id exists right as hasC where hasC order by oid;
+→ [{"oid":10},{"oid":11},{"oid":12}]
+
+-- … so the anti is empty
+select oid from ords left join custs on ords.cust = custs.id exists right as hasC where not hasC order by oid;
+→ []
+
+drop table ords;
+drop table custs;
+
+-- ===== Fan-out guard: right side NOT unique on the join column =====
+-- A plain `left join … exists right as` yields one row per MATCHING right row,
+-- so `where flag` fans out (K rows per matched left row). Recovery to a semi
+-- join (1 row per left) would silently drop the duplicates — so the SEMI rule
+-- must abstain on the positive side. (The fanned-out positive cases are instead
+-- recovered to a fan-out-safe INNER join by `inner-join-existence-recovery`,
+-- which does NOT collapse K→1; see 08.3. Either way the rows below are identical,
+-- which is exactly what these assertions pin.) The anti side is immune (unmatched
+-- rows never fan out) and still recovers via the semi rule. These assert the
+-- fanned-out row counts directly.
+
+create table fc (cc integer primary key);
+create table fp (id integer primary key, pp integer);
+insert into fc values (1), (2);
+-- cc 1 matches THREE fp rows (pp=1); cc 2 matches none.
+insert into fp values (10, 1), (11, 1), (12, 1);
+
+-- semi probe over fan-out: SEMI rule abstains (would collapse to one); the inner
+-- fallback recovers an inner join that keeps all three fanned-out cc=1 rows.
+select cc from fc c left join fp p on p.pp = c.cc exists right as h where h order by cc;
+→ [{"cc":1},{"cc":1},{"cc":1}]
+
+-- `is true` is also a SEMI probe and rides the same fan-out guard — the semi rule
+-- abstains, the inner fallback recovers, keeping all three fanned-out cc=1 rows.
+select cc from fc c left join fp p on p.pp = c.cc exists right as h where h is true order by cc;
+→ [{"cc":1},{"cc":1},{"cc":1}]
+
+-- anti probe: one row per unmatched left row, fan-out irrelevant
+select cc from fc c left join fp p on p.pp = c.cc exists right as h where not h order by cc;
+→ [{"cc":2}]
+
+drop table fc;
+drop table fp;
+
+-- ===== Aggregate anchor: bare `count(*) … where flag` (no enclosing Project) =====
+-- A flag-bearing left join under a `count(*)` / `group by` with NO enclosing Project
+-- is recovered by the AggregateNode entrypoint (`semijoin-existence-recovery-aggregate`)
+-- exactly like the Project shape — the probe Filter sits between the Aggregate and the
+-- Join, so the same probe-detection + chain-rewrite machinery applies. These assert the
+-- end-to-end counts against real data.
+
+create table ac (cc integer primary key, pr integer null);
+create table ap (pp integer primary key, pv integer);
+insert into ap values (1, 10), (2, 20);
+-- cc 1 (pr 1) matches; cc 2 (pr 9) no match; cc 3 (pr 2) matches; cc 4 (pr null) no match
+insert into ac values (1, 1), (2, 9), (3, 2), (4, null);
+
+-- semi: count of child rows WITH a matching parent
+select count(*) as n from ac c left join ap p on p.pp = c.pr exists right as hasP where hasP;
+→ [{"n":2}]
+
+-- anti: count of child rows with NO matching parent
+select count(*) as n from ac c left join ap p on p.pp = c.pr exists right as hasP where not hasP;
+→ [{"n":2}]
+
+-- HAVING above the aggregate references only the count output — it does not block recovery
+select count(*) as n from ac c left join ap p on p.pp = c.pr exists right as hasP where hasP having count(*) >= 0;
+→ [{"n":2}]
+
+-- flag grouped on: retained (genuinely demanded), one group per flag value
+select hasP, count(*) as n from ac c left join ap p on p.pp = c.pr exists right as hasP group by hasP order by hasP;
+→ [{"hasP":false,"n":2},{"hasP":true,"n":2}]
+
+drop table ac;
+drop table ap;
+
+-- ===== Aggregate anchor fan-out: NO inner fallback, so count is the fanned-out value =====
+-- Unlike the Project anchor (which hands the fan-out positive probe to a fan-out-safe
+-- inner join), the aggregate anchor has no inner fallback: the SEMI rule abstains and the
+-- join stays a flag-bearing left join, so `count(*)` reflects the fanned-out rows.
+
+create table afc (cc integer primary key);
+create table afp (id integer primary key, pp integer);
+insert into afc values (1), (2);
+-- cc 1 matches THREE afp rows (pp=1); cc 2 matches none.
+insert into afp values (10, 1), (11, 1), (12, 1);
+
+-- positive probe over fan-out: stays left; count(*) is the fanned-out 3, NOT a collapsed 1
+select count(*) as n from afc c left join afp p on p.pp = c.cc exists right as h where h;
+→ [{"n":3}]
+
+-- anti probe: one row per unmatched left row — fan-out irrelevant, recovers an anti join
+select count(*) as n from afc c left join afp p on p.pp = c.cc exists right as h where not h;
+→ [{"n":1}]
+
+drop table afc;
+drop table afp;

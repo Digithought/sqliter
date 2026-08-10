@@ -1,6 +1,6 @@
 {
   "name": "@quereus/plugin-nativescript-sqlite",
-  "version": "3.3.0",
+  "version": "4.11.0",
   "type": "module",
   "description": "NativeScript SQLite storage plugin for Quereus - mobile persistent storage",
   "keywords": [
@@ -82,7 +82,8 @@
   "scripts": {
     "clean": "rimraf dist",
     "build": "tsc",
-    "typecheck": "tsc --noEmit",
+    "lint": "echo 'No lint configured'",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json --noEmit",
     "test": "cd ../.. && node --import ./packages/quereus-plugin-nativescript-sqlite/register.mjs node_modules/mocha/bin/mocha.js \"packages/quereus-plugin-nativescript-sqlite/test/**/*.spec.ts\" --reporter min --colors"
   },
   "dependencies": {
@@ -94,11 +95,11 @@
     "@types/better-sqlite3": "^7.6.13",
     "@types/chai": "^5.2.3",
     "@types/mocha": "^10.0.10",
-    "@types/node": "^25.0.9",
-    "better-sqlite3": "^12.6.0",
+    "@types/node": "^25.9.3",
+    "better-sqlite3": "^12.11.1",
     "chai": "^6.2.2",
-    "mocha": "^11.7.5",
-    "rimraf": "^6.1.2",
+    "mocha": "^11.7.6",
+    "rimraf": "^6.1.3",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
   }

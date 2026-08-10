@@ -128,7 +128,7 @@ export class SQLiteProvider implements KVStoreProvider {
 		// Note: SQLite doesn't need explicit store deletion - table is dropped when closed
 	}
 
-	async deleteTableStores(schemaName: string, tableName: string): Promise<void> {
+	async deleteTableStores(schemaName: string, tableName: string, indexNames: readonly string[]): Promise<void> {
 		// Close data store
 		const dataKey = this.getStoreKey(schemaName, tableName);
 		await this.closeStoreByKey(dataKey);
@@ -136,13 +136,11 @@ export class SQLiteProvider implements KVStoreProvider {
 		// Stats are in the unified __stats__ store, so no need to close a separate store
 		// The individual stats entry will be removed by the calling code if needed
 
-		// Close all index stores for this table
-		const indexPrefix = `${dataKey}${STORE_SUFFIX.INDEX}`;
-		for (const [key, store] of this.stores) {
-			if (key.startsWith(indexPrefix)) {
-				await store.close();
-				this.stores.delete(key);
-			}
+		// Close exactly the table's index stores (by name), not every store matching
+		// the `{table}_idx_` prefix — that prefix also matches a sibling table
+		// literally named `{table}_idx_<x>`.
+		for (const indexName of indexNames) {
+			await this.closeStoreByKey(`${dataKey}${STORE_SUFFIX.INDEX}${indexName}`);
 		}
 	}
 

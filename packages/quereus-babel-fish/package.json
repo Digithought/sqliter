@@ -19,8 +19,8 @@
 	},
 	"scripts": {
 		"clean": "rimraf dist",
-		"build": "yarn workspace @quereus/quereus build && tsc -p tsconfig.json",
-		"typecheck": "yarn workspace @quereus/quereus build && tsc --noEmit",
+		"build": "tsc",
+		"typecheck": "tsc --noEmit && tsc -p tsconfig.test.json --noEmit",
 		"test": "yarn build && node test-runner.mjs",
 		"test:single": "yarn build && node test-runner.mjs --bail"
 	},

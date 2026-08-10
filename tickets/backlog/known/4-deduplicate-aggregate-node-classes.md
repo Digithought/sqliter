@@ -1,4 +1,5 @@
 description: Extract shared logic from AggregateNode, HashAggregateNode, and StreamAggregateNode into a common base or utility
+difficulty: easy
 prereq: none
 files:
   packages/quereus/src/planner/nodes/aggregate-node.ts

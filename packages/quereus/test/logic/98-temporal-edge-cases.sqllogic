@@ -442,3 +442,74 @@ SELECT id, d, t FROM dt_offset ORDER BY id;
 → [{"id":1,"d":"2024-01-14","t":"23:30:00"},{"id":2,"d":"2024-01-15","t":"08:30:00"},{"id":3,"d":"2024-01-16","t":"04:30:00"}]
 
 DROP TABLE dt_offset;
+
+-- ============================================================
+-- DATETIME pushed-down filter: the comparison LITERAL is compared
+-- RAW (BINARY, no canonicalization) against the stored canonical
+-- value. Row 1 stores the bare form '2017-07-14T02:40:00' (see
+-- dt_canon above). A Z-suffixed or offset-bearing literal that
+-- denotes the SAME instant does NOT match the bare stored value.
+-- Pins the no-canonicalization contract against a future planner
+-- change that inserts a temporal cast or canonicalizes the seek key.
+-- ============================================================
+
+CREATE TABLE dt_filter (ts DATETIME PRIMARY KEY);
+INSERT INTO dt_filter VALUES ('2017-07-14T02:40:00Z');   -- stores bare '2017-07-14T02:40:00'
+INSERT INTO dt_filter VALUES ('2017-07-14T03:40:00');    -- a later canonical row, stored bare
+-- run
+
+-- Z-suffixed literal of the SAME instant as row 1: raw compare → no match.
+SELECT count(*) as c FROM dt_filter WHERE ts = '2017-07-14T02:40:00Z';
+→ [{"c":0}]
+
+-- +01:00-offset literal denoting the SAME instant as row 1
+-- ('2017-07-14T03:40:00+01:00' == 02:40:00Z): still raw, still no match — and
+-- note it does NOT match row 2 either, whose bare stored value shares the
+-- '2017-07-14T03:40:00' prefix but lacks the '+01:00' suffix.
+SELECT count(*) as c FROM dt_filter WHERE ts = '2017-07-14T03:40:00+01:00';
+→ [{"c":0}]
+
+-- The bare canonical literal matches exactly.
+SELECT count(*) as c FROM dt_filter WHERE ts = '2017-07-14T02:40:00';
+→ [{"c":1}]
+
+-- Range: raw lexicographic order places bare '...02:40:00' BELOW the
+-- Z-suffixed '...02:40:00Z' (the bare form is a proper prefix), so row 1
+-- is included by strict-less-than and row 2 ('...03:40:00') is not.
+SELECT ts FROM dt_filter WHERE ts < '2017-07-14T02:40:00Z';
+→ [{"ts":"2017-07-14T02:40:00"}]
+
+DROP TABLE dt_filter;
+
+-- ============================================================
+-- DATE / TIME pushed-down filter: same RAW-comparison contract.
+-- DATE and TIME share the identical isTemporal → BINARY compare
+-- path; a non-canonical literal denoting the same value must NOT
+-- match the bare stored canonical form.
+-- ============================================================
+
+CREATE TABLE d_filter (d DATE PRIMARY KEY);
+INSERT INTO d_filter VALUES ('2024-01-15T10:30:00Z');   -- stores bare '2024-01-15'
+INSERT INTO d_filter VALUES ('2024-01-20');
+-- run
+
+SELECT count(*) as c FROM d_filter WHERE d = '2024-01-15T10:30:00Z';
+→ [{"c":0}]
+
+SELECT count(*) as c FROM d_filter WHERE d = '2024-01-15';
+→ [{"c":1}]
+
+DROP TABLE d_filter;
+
+CREATE TABLE t_filter (t TIME PRIMARY KEY);
+INSERT INTO t_filter VALUES ('2024-01-15T10:30:00Z');   -- stores bare '10:30:00'
+INSERT INTO t_filter VALUES ('12:00:00');
+-- run
+
+SELECT count(*) as c FROM t_filter WHERE t = '2024-01-15T10:30:00Z';
+→ [{"c":0}]
+
+SELECT count(*) as c FROM t_filter WHERE t = '10:30:00';
+→ [{"c":1}]
+
+DROP TABLE t_filter;

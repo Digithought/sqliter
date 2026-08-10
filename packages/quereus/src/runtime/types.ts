@@ -3,10 +3,12 @@ import type { Database } from "../core/database.js";
 import type { Statement } from "../core/statement.js";
 import type { RowDescriptor, TableDescriptor, TableGetter } from "../planner/nodes/plan-node.js";
 import type { Scheduler } from "./scheduler.js";
-import type { EmissionContext } from "./emission-context.js";
 import type { VirtualTableConnection } from "../vtab/connection.js";
+import type { VirtualTable } from "../vtab/table.js";
 import type { PlanNode } from '../planner/nodes/plan-node.js';
 import type { RowContextMap } from './context-helpers.js';
+import type { CacheState } from './cache/shared-cache.js';
+import type { BTree } from 'inheritree';
 
 // Re-export types from common/types.js for convenience
 export type { OutputValue };
@@ -23,12 +25,119 @@ export type RuntimeContext = {
 	tracer?: InstructionTracer;
 	/** Active connection for the current transaction context */
 	activeConnection?: VirtualTableConnection;
+	/**
+	 * Lowercase `<schema>.<name>` as written at emit time → the name that table
+	 * carries NOW. Set only while the deferred-constraint queue evaluates an
+	 * evaluator frozen before an `ALTER TABLE ... RENAME TO`; undefined everywhere
+	 * else, so the scan leaf pays one `?.` on the hot path.
+	 */
+	tableNameRemap?: ReadonlyMap<string, string>;
 	/** Whether to collect runtime execution metrics */
 	enableMetrics: boolean;
+	/**
+	 * Cooperative cancellation signal for the current statement, if the caller
+	 * supplied one via `exec`/`eval` options. Honored at row and statement
+	 * boundaries (notably the table-scan leaf) so a long-running query can be
+	 * interrupted — e.g. on a request timeout. Undefined when no signal was given.
+	 */
+	signal?: AbortSignal;
+	/**
+	 * When true, this execution is a mutex-free committed read: every table scan
+	 * in this execution connects with `_readCommitted: true`, and no connection
+	 * may join (or create) a transaction — `getVTableConnection` asserts on this
+	 * flag. Set only by the concurrent committed-read path
+	 * (`core/statement.ts` `_iterateConcurrent`), which is gated on the plan
+	 * being read-only over `readCommittedSnapshot`-declaring modules
+	 * (`Database._isConcurrentReadEligible`).
+	 */
+	readCommitted?: boolean;
+	/**
+	 * The 1-based ordinal of the row currently being produced within the active
+	 * INSERT / mutation-context evaluation, or undefined outside one. Exposed to
+	 * the `mutation_ordinal()` builtin so a column `default` can author a per-row
+	 * surrogate (the shared-key-via-default case — docs/vu-mutation-context.md
+	 * § Mutation Context). Set per row by the INSERT DML executor and by the
+	 * shared-surrogate envelope (`runtime/emit/view-mutation.ts`), and saved/
+	 * restored around each scope so it never leaks past the statement.
+	 */
+	mutationOrdinal?: number;
 	/** Context tracking for debugging context leaks */
 	contextTracker?: ContextTracker;
 	/** Stack of currently executing plan nodes (only when tracing enabled) */
 	planStack?: PlanNode[];
+	/**
+	 * Per-execution memo for instructions that must fire exactly once per statement
+	 * execution — the impure (DML-bearing) scalar/`IN`/`EXISTS` subquery emitters
+	 * store their drained result here, keyed by a unique symbol minted at emit time.
+	 * Because a fresh RuntimeContext is built for each execution while the instruction
+	 * tree is cached and reused, tying the memo to the context (not the emit-time
+	 * closure) makes it reset between prepared-statement runs — so a re-executed
+	 * statement re-drives its inner DML, rather than replaying the first run's result.
+	 */
+	executionMemo?: Map<symbol, { value: SqlValue }>;
+	/**
+	 * Per-execution cache of connected inner-scan virtual-table instances, keyed by
+	 * a stable per-scan-node symbol minted in the {@link emitSeqScan} closure. A
+	 * nested-loop join re-scans its (un-cached) inner relation once per outer row;
+	 * without this, each re-scan would `module.connect(...)` + `disconnect(...)` the
+	 * inner table afresh. The scan connects once per scan-site per execution, reuses
+	 * the instance across every re-scan, and statement teardown disconnects each
+	 * cached instance exactly once (see core/statement.ts `_iterateRowsRawInternal`).
+	 *
+	 * Keyed by scan-node identity (not table name) so a self-join's two scan sites
+	 * over one table get distinct instances and never share a cursor — the re-scans
+	 * of one site are sequential (the NLJ drains each inner cursor before the next
+	 * outer row), so a single instance is never concurrently self-live. Absent on the
+	 * transient/analysis RuntimeContexts that don't set it — the scan then falls back
+	 * to connect-and-disconnect per invocation (correct, just no reuse).
+	 */
+	scanConnections?: Map<symbol, VirtualTable>;
+	/**
+	 * Per-execution materialized-row cache state for {@link emitCache}, keyed by a
+	 * stable symbol minted in that emitter's closure. A fresh RuntimeContext is
+	 * built for each execution while the instruction tree (and the emitter closure
+	 * that mints the key) is cached and reused on the prepared Statement, so tying
+	 * the cache to the context — not the closure — makes it reset between
+	 * prepared-statement runs: a re-executed statement re-drives its cached source
+	 * and observes current data instead of replaying the first run's rows. Within
+	 * one execution, the same key still resolves to the same {@link CacheState},
+	 * so the cache materializes once and replays across re-scans (e.g. per-outer-row
+	 * `IN`-subquery evaluation). Mirrors the {@link executionMemo}/{@link scanConnections}
+	 * pattern.
+	 */
+	cacheStates?: Map<symbol, CacheState>;
+	/**
+	 * Per-execution CTE materialization buffers, keyed by whatever stable identity
+	 * the emitter shares across the CTE's references, buffering the CTE's rows
+	 * exactly once per statement execution: the first reference to run stores the
+	 * buffer promise synchronously and drives the source; every other reference
+	 * awaits that same promise and never touches its own (separately-emitted)
+	 * source subtree. A fresh RuntimeContext per execution resets the map between
+	 * prepared-statement runs (no stale replay). Mirrors {@link cacheStates}.
+	 *
+	 * Both {@link emitCTE} and {@link emitRecursiveCTE} key by the CTE's
+	 * `TableDescriptor` — the identity object minted when the CTE is built and
+	 * threaded through every optimizer rebuild. The plan id would NOT do: the
+	 * optimizer may split one CTE node into several instances (a multi-referenced
+	 * recursive CTE is duplicated outright; a node reachable from two parents is
+	 * rebuilt once per path by the constant-folding pass), and per-id keying would
+	 * give each copy a private buffer and re-drive the source.
+	 */
+	cteMaterializations?: Map<TableDescriptor, Promise<Row[]>>;
+	/**
+	 * Per-execution materialized lookup sets for uncorrelated, functional
+	 * `x IN (subquery)` probes ({@link import('./emit/subquery.js').emitIn}), keyed
+	 * by a stable symbol minted in the emitter closure. The subquery source is
+	 * drained exactly once per statement execution into a `BTree` keyed under the
+	 * membership collation, then probed per outer row — O(K + N·log K) with zero
+	 * statistics, replacing the retired row-cache-plus-linear-scan mechanism. A
+	 * fresh RuntimeContext per execution resets the map between prepared-statement
+	 * runs, so a re-executed statement re-drains and observes current data.
+	 * `hasNull` records whether the inner produced any NULL — needed for
+	 * three-valued membership (a miss yields NULL when the inner had a NULL, else
+	 * false). Mirrors {@link executionMemo} / {@link cacheStates}.
+	 */
+	inSetProbes?: Map<symbol, { tree: BTree<SqlValue, SqlValue>; hasNull: boolean }>;
 };
 
 export type InstructionRun = (ctx: RuntimeContext, ...args: RuntimeValue[]) => OutputValue;
@@ -40,11 +149,49 @@ export type Instruction = {
 	note?: string;
 	/** Optional sub-programs used to execute this instruction - this is here for tracing purposes */
 	programs?: Scheduler[];
-	/** Optional emission context for schema validation */
-	emissionContext?: EmissionContext;
 	/** Optional runtime statistics collected during execution */
 	runtimeStats?: InstructionRuntimeStats;
 };
+
+/**
+ * Adapts an emitter's precisely-typed `run` (e.g.
+ * `(ctx, v1: SqlValue, v2: SqlValue) => SqlValue`) to the general
+ * {@link InstructionRun} that the scheduler drives every instruction through.
+ *
+ * A specific `run` is *not* structurally assignable to `InstructionRun`. The
+ * scheduler holds instructions generically and calls `run(ctx, ...args)` with
+ * every arg widened to `RuntimeValue`, so a function that declares narrower
+ * params (`SqlValue`, `AsyncIterable<Row>`, a fixed arity) is rejected by
+ * parameter contravariance under `strictFunctionTypes` — exactly as it would be
+ * if a caller passed more, fewer, or differently-typed args. Each emitter
+ * therefore has to assert the conversion. This helper is the single audited home
+ * for that assertion: emit sites write `run: asRun(run)` and the only
+ * `as`-to-`InstructionRun` in the runtime lives here.
+ *
+ * `TArgs` is inferred from the `run`'s own parameter tuple, so each emit site is
+ * still checked: every declared arg must be a {@link RuntimeValue} and the return
+ * must be an {@link OutputValue}. Only the arity/contravariance mismatch is
+ * waived. Two consequences for `run` authors:
+ * - An **optional** param (`cb?: SubProgram`) types as `SubProgram | undefined`, and
+ *   `undefined` is not a `RuntimeValue` — a `run` whose trailing params are
+ *   conditionally emitted must declare them as a rest tuple (`...cb: SubProgram[]`),
+ *   which is also the truthful description of its call sites.
+ * - `Promise<OutputValue>` is a promise-of-a-promise and is *not* an `OutputValue`.
+ *   An `async` `run` returns `Promise<RuntimeValue>`.
+ *
+ * NOTE: the per-arg checking is only as strong as `TArgs` inferring a real tuple. A
+ * `run` declared `(ctx, ...args: RuntimeValue[])` infers `TArgs = RuntimeValue[]` — the
+ * constraint itself — so that emit site is accepted unchecked. That is intentional for
+ * the genuinely variadic emitters (`emit/block.ts`, `emit/view-mutation.ts`), but it is
+ * also the escape hatch a future author reaches for to silence one of the two errors
+ * above. If you widen a `run`'s params to shut up `tsc`, you have opted that emitter
+ * out of checking, not fixed it.
+ */
+export function asRun<TArgs extends RuntimeValue[]>(
+	run: (ctx: RuntimeContext, ...args: TArgs) => OutputValue
+): InstructionRun {
+	return run as unknown as InstructionRun;
+}
 
 /**
  * Runtime statistics for instruction execution

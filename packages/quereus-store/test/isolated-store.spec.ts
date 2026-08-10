@@ -10,11 +10,13 @@
 
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
-import { Database, asyncIterableToArray } from '@quereus/quereus';
+import { Database, MemoryTableModule, asyncIterableToArray, installCommitStall, runCommittedReadConformance, settleMacrotasks, type DatabaseInternal, type VirtualTableConnection } from '@quereus/quereus';
+import { IsolationModule } from '@quereus/isolation';
 import {
 	createIsolatedStoreModule,
 	hasIsolation,
 	StoreModule,
+	StoreConnection,
 	InMemoryKVStore,
 	type KVStoreProvider,
 } from '../src/index.js';
@@ -65,6 +67,26 @@ function createInMemoryProvider(): KVStoreProvider {
 				await store.close();
 			}
 			stores.clear();
+		},
+		async renameTableStores(schemaName: string, oldName: string, newName: string, indexNames: readonly string[]) {
+			const oldKey = `${schemaName}.${oldName}`;
+			const newKey = `${schemaName}.${newName}`;
+			const dataStore = stores.get(oldKey);
+			if (dataStore) {
+				stores.delete(oldKey);
+				stores.set(newKey, dataStore);
+			}
+			// Relocate exactly the table's index stores (by name), matching real
+			// provider semantics — a `{oldName}_idx_` prefix sweep would also move a
+			// sibling table named `{oldName}_idx_<x>`.
+			for (const indexName of indexNames) {
+				const from = `${schemaName}.${oldName}_idx_${indexName}`;
+				const store = stores.get(from);
+				if (store) {
+					stores.delete(from);
+					stores.set(`${schemaName}.${newName}_idx_${indexName}`, store);
+				}
+			}
 		},
 	};
 }
@@ -146,10 +168,14 @@ describe('Isolated Store Module', () => {
 			const storeModule = new StoreModule(provider);
 			const caps = storeModule.getCapabilities();
 			expect(caps.isolation).to.be.false;
-			expect(caps.savepoints).to.be.false;
+			// Savepoints work without isolation: the coordinator's buffered op log
+			// supports create/release/rollback-to (see store-ryow.spec savepoint test).
+			expect(caps.savepoints).to.be.true;
 			expect(caps.persistent).to.be.true;
 			expect(caps.secondaryIndexes).to.be.true;
 			expect(caps.rangeScans).to.be.true;
+			// Worst-case DDL summary: the store force-commits on row-rewriting DDL.
+			expect(caps.ddlTransactionality).to.equal('auto-commit');
 		});
 
 		it('isolated store module reports isolation enabled', () => {
@@ -158,6 +184,72 @@ describe('Isolated Store Module', () => {
 			expect(caps.isolation).to.be.true;
 			expect(caps.savepoints).to.be.true;
 			expect(caps.persistent).to.be.true;
+			// The isolation wrapper forwards the underlying store's tier verbatim
+			// (never upgrades) — the overlay's DML would be left behind by an
+			// underlying DDL-commit, so the pessimistic value is the honest one.
+			expect(caps.ddlTransactionality).to.equal('auto-commit');
+		});
+
+		it('declines committed-snapshot reads, wrapped or not', () => {
+			// `connect` hands back a shared cached StoreTable per table key (so the
+			// `_readCommitted` option is dropped), and `StoreTable.query` merges the
+			// coordinator's pending ops over the committed store — a read taken during
+			// a commit flush would see a partially applied batch. The isolation wrapper no
+			// longer declines on its own account — it MIRRORS its underlying (a committed
+			// read gets a dedicated `_readCommitted` handle and bypasses the overlay) — but
+			// mirroring `false` is still `false`, and the first reason above is why: the
+			// "dedicated" handle over a store is the shared cached StoreTable. So the whole
+			// stack stays on the serialized read path. This is the assertion that keeps the
+			// mirror honest; see docs/module-authoring.md § "Committed-Snapshot Reads".
+			expect(new StoreModule(provider).readCommittedSnapshot).to.equal(false);
+			expect(createIsolatedStoreModule({ provider }).readCommittedSnapshot).to.equal(false);
+		});
+
+		it('the conformance harness refuses the store stack, naming the flag', async () => {
+			db.registerModule('store', createIsolatedStoreModule({ provider }));
+			await db.exec('CREATE TABLE conf (id INTEGER PRIMARY KEY, v TEXT) USING store');
+
+			let message = '';
+			try {
+				await runCommittedReadConformance({
+					db, table: 'conf', keyColumn: 'id', valueColumn: 'v', rowCount: 10,
+				});
+			} catch (e) {
+				message = e instanceof Error ? e.message : String(e);
+			}
+			expect(message).to.contain('readCommittedSnapshot');
+		});
+
+		/**
+		 * The engine half of the same fact. Because the stack declines the flag, an
+		 * opted-in read of a store-backed table is INELIGIBLE and silently falls back
+		 * to the serialized path. Both halves matter: the read must still return the
+		 * right rows, AND it must demonstrably wait for the parked writer. A future
+		 * change that wrongly qualifies the store stack breaks the second assertion
+		 * loudly instead of quietly serving a half-flushed batch.
+		 */
+		it('an opted-in read of a store-backed table falls back: correct rows, and it waits', async () => {
+			const stall = installCommitStall(db);
+			db.registerModule('store', createIsolatedStoreModule({ provider }));
+			await db.exec('CREATE TABLE fallback_t (id INTEGER PRIMARY KEY, v TEXT) USING store');
+			await db.exec(`INSERT INTO fallback_t VALUES (1, 'a')`);
+
+			const entered = stall.arm();
+			const writer = db.exec(`INSERT INTO fallback_t VALUES (2, 'b')`);
+			await entered; // the writer is now parked inside its commit
+
+			let settled = false;
+			const read = db.get('SELECT count(*) AS n FROM fallback_t', undefined, { readConcurrency: 'committed' })
+				.then(row => { settled = true; return row; }, err => { settled = true; throw err; });
+
+			await settleMacrotasks();
+			expect(settled, 'a store-backed read must NOT run mutex-free past a parked commit').to.equal(false);
+
+			stall.release();
+			await writer;
+			const row = await read;
+			// Serialized semantics: it waited, so it sees the writer's row.
+			expect(Number(row?.n)).to.equal(2);
 		});
 	});
 
@@ -176,6 +268,342 @@ describe('Isolated Store Module', () => {
 			// Table should exist
 			const result = await db.get(`SELECT name FROM schema() WHERE type = 'table' AND name = 'users'`);
 			expect(result?.name).to.equal('users');
+		});
+	});
+
+	/**
+	 * `IsolationModule.renameTable` evicts its cached underlying handle (StoreModule
+	 * disposes the `StoreTable` and re-opens the store during a rename, so the old
+	 * handle is dead) and re-keys any staged overlay onto the new name. It must then
+	 * re-connect an underlying under the new name, or the commit flush cannot resolve
+	 * the overlay. This pins the re-connect against a real `StoreModule`, where it has
+	 * to survive the dispose/re-open that the memory module never performs.
+	 *
+	 * `StoreModule.renameTable` must evict only the connections it created
+	 * (`StoreConnection`s), never every connection registered under the old qualified
+	 * name — the isolation layer registers its own connection there, and it is the only
+	 * thing that drives `commitConnectionOverlays` at COMMIT. Evicting it dropped the
+	 * transaction's writes while the abandoned overlay kept merging into the writing
+	 * connection's reads, masking the loss. Hence the assertions below read through
+	 * `committed.<table>` or a fresh Database, never a plain SELECT on the writer.
+	 */
+	describe('mid-transaction RENAME TO with staged writes', () => {
+		let isolatedModule: ReturnType<typeof createIsolatedStoreModule>;
+
+		beforeEach(async () => {
+			isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			await db.exec(`CREATE TABLE widget (id INTEGER PRIMARY KEY, name TEXT) USING store`);
+		});
+
+		it('re-resolves the underlying store table under the new name', async () => {
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO widget VALUES (1, 'a')`);
+			await db.exec(`ALTER TABLE widget RENAME TO gadget`);
+
+			// The staged overlay moved to `gadget`; an underlying must exist there too, or the
+			// commit flush has nothing to flush into. Re-connecting means calling
+			// StoreModule.connect() right after it disposed the old StoreTable.
+			expect(isolatedModule.getUnderlyingState('main', 'gadget'), 'underlying re-connected under the new name')
+				.to.not.be.undefined;
+			expect(isolatedModule.getUnderlyingState('main', 'widget'), 'stale handle evicted')
+				.to.be.undefined;
+
+			await db.exec('COMMIT');
+		});
+
+		it('leaves no underlying entry under the new name when nothing was staged', async () => {
+			// No overlay to carry across, so nothing must be flushed and the eviction alone is
+			// correct — the next connect() re-resolves lazily.
+			await db.exec(`ALTER TABLE widget RENAME TO gadget`);
+			expect(isolatedModule.getUnderlyingState('main', 'gadget')).to.be.undefined;
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT * FROM gadget`));
+			expect(rows).to.deep.equal([]);
+		});
+
+		it('flushes staged rows to the store on COMMIT', async () => {
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO widget VALUES (1, 'a')`);
+			await db.exec(`ALTER TABLE widget RENAME TO gadget`);
+			await db.exec('COMMIT');
+
+			// `committed.*` bypasses the overlay, so it sees only what actually reached storage.
+			const rows = await asyncIterableToArray(db.eval(`SELECT * FROM committed.gadget`));
+			expect(rows).to.deep.equal([{ id: 1, name: 'a' }]);
+		});
+
+		it('the committed row is physically stored, not just cached (fresh Database)', async () => {
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO widget VALUES (1, 'a')`);
+			await db.exec(`ALTER TABLE widget RENAME TO gadget`);
+			await db.exec('COMMIT');
+
+			const db2 = new Database();
+			const mod2 = new StoreModule(provider);
+			db2.registerModule('store', mod2);
+			await mod2.rehydrateCatalog(db2);
+
+			const rows = await asyncIterableToArray(db2.eval(`SELECT * FROM gadget`));
+			expect(rows).to.deep.equal([{ id: 1, name: 'a' }]);
+			await db2.close();
+		});
+
+		it('ROLLBACK after a mid-transaction rename discards the staged rows (no zombie overlay)', async () => {
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO widget VALUES (1, 'a')`);
+			await db.exec(`ALTER TABLE widget RENAME TO gadget`);
+			await db.exec('ROLLBACK');
+
+			expect(await asyncIterableToArray(db.eval(`SELECT * FROM committed.gadget`)),
+				'nothing reached storage').to.deep.equal([]);
+			expect(await asyncIterableToArray(db.eval(`SELECT * FROM gadget`)),
+				'the writing connection sees no abandoned overlay').to.deep.equal([]);
+		});
+
+		it('two renames in one transaction land every staged row under the final name', async () => {
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO widget VALUES (1, 'a')`);
+			await db.exec(`ALTER TABLE widget RENAME TO gizmo`);
+			await db.exec(`INSERT INTO gizmo VALUES (2, 'b')`);
+			await db.exec(`ALTER TABLE gizmo RENAME TO gadget`);
+			await db.exec('COMMIT');
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT * FROM committed.gadget ORDER BY id`));
+			expect(rows).to.deep.equal([{ id: 1, name: 'a' }, { id: 2, name: 'b' }]);
+		});
+
+		/**
+		 * The surviving `IsolatedConnection` keeps the OLD name, and it is `isCovering`, so
+		 * a table later created under that freed name finds it in the
+		 * `getConnectionsForTable` reuse lookup of `IsolatedTable.ensureRegisteredConnection`
+		 * and adopts it. That is only sound because the overlay/underlying maps are keyed by
+		 * name (not by connection), so both tables still resolve to their own state.
+		 */
+		it('a table recreated under the freed old name keeps its rows separate', async () => {
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO widget VALUES (1, 'a')`);
+			await db.exec(`ALTER TABLE widget RENAME TO gadget`);
+			await db.exec(`CREATE TABLE widget (id INTEGER PRIMARY KEY, name TEXT) USING store`);
+			await db.exec(`INSERT INTO widget VALUES (2, 'b')`);
+			await db.exec('COMMIT');
+
+			expect(await asyncIterableToArray(db.eval(`SELECT * FROM committed.gadget`))).to.deep.equal([{ id: 1, name: 'a' }]);
+			expect(await asyncIterableToArray(db.eval(`SELECT * FROM committed.widget`))).to.deep.equal([{ id: 2, name: 'b' }]);
+		});
+
+		it('ROLLBACK discards both tables when the old name was recreated', async () => {
+			await db.exec(`ALTER TABLE widget RENAME TO gadget`);
+			await db.exec(`CREATE TABLE widget (id INTEGER PRIMARY KEY, name TEXT) USING store`);
+
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO gadget VALUES (1, 'a')`);
+			await db.exec(`INSERT INTO widget VALUES (2, 'b')`);
+			await db.exec('ROLLBACK');
+
+			expect(await asyncIterableToArray(db.eval(`SELECT * FROM gadget`)), 'gadget rolled back').to.deep.equal([]);
+			expect(await asyncIterableToArray(db.eval(`SELECT * FROM widget`)), 'widget rolled back').to.deep.equal([]);
+		});
+
+		it('renaming a table that never registered a StoreConnection still commits later writes', async () => {
+			// Nothing wrote before the rename, so the eviction loop matches no StoreConnection
+			// at all and the underlying must still be re-resolved under the new name.
+			await db.exec('BEGIN');
+			await db.exec(`ALTER TABLE widget RENAME TO gadget`);
+			await db.exec(`INSERT INTO gadget VALUES (1, 'a')`);
+			await db.exec('COMMIT');
+			expect(await asyncIterableToArray(db.eval(`SELECT * FROM committed.gadget`))).to.deep.equal([{ id: 1, name: 'a' }]);
+		});
+
+		/** Guards the bound claimed by the `NOTE:` tripwire in `StoreModule.renameTable`. */
+		it('renaming back and forth does not grow the connection set without bound', async () => {
+			const count = () => (db as unknown as DatabaseInternal).getAllConnections().length;
+			await db.exec(`INSERT INTO widget VALUES (1, 'a')`);
+			await db.exec(`ALTER TABLE widget RENAME TO gadget`);
+			await db.exec(`ALTER TABLE gadget RENAME TO widget`);
+			const afterFirstRoundTrip = count();
+			await db.exec(`ALTER TABLE widget RENAME TO gadget`);
+			await db.exec(`ALTER TABLE gadget RENAME TO widget`);
+			expect(count(), 'a second round trip registers nothing new').to.equal(afterFirstRoundTrip);
+		});
+
+		it('evicts the store-owned connection for the old name', async () => {
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO widget VALUES (1, 'a')`);
+			await db.exec(`ALTER TABLE widget RENAME TO gadget`);
+
+			// The StoreConnection bound to `main.widget` is gone (its StoreTable is disposed);
+			// the isolation layer's connection under that name must NOT be, or the overlay
+			// never reaches storage.
+			const all: VirtualTableConnection[] = (db as unknown as DatabaseInternal).getAllConnections();
+			const conns = all.filter(c => c.tableName.toLowerCase() === 'main.widget');
+			expect(conns.filter((c: VirtualTableConnection) => c instanceof StoreConnection),
+				'no StoreConnection remains for the old name').to.deep.equal([]);
+			expect(conns.length, 'the isolation layer connection survives').to.be.greaterThan(0);
+
+			await db.exec('COMMIT');
+		});
+	});
+
+	/**
+	 * `ALTER COLUMN … SET NOT NULL` over rows staged in the isolation overlay, with the STORE as
+	 * the underlying. The reject-vs-backfill decision has to consult the isolation-supplied
+	 * effective rows, not just the committed store — a pending NULL lives in the overlay, so the
+	 * store's own `rowsWithNullAtIndex` count would miss it and wrongly accept the ALTER
+	 * (bug-set-not-null-ignores-uncommitted-rows). Drives engine → isolation → store end-to-end.
+	 */
+	describe('mid-transaction SET NOT NULL over staged overlay rows', () => {
+		beforeEach(() => {
+			db.registerModule('store', createIsolatedStoreModule({ provider }));
+		});
+
+		it('rejects a NULL that only exists in the overlay (no usable DEFAULT), leaving the txn usable', async () => {
+			await db.exec(`create table t (id integer primary key, v text null) using store`);
+			await db.exec('begin');
+			await db.exec(`insert into t values (1, null)`); // staged in the overlay, not the store
+
+			let err: unknown;
+			try { await db.exec(`alter table t alter column v set not null`); } catch (e) { err = e; }
+			expect(err, 'an overlay-only NULL must reject the tighten').to.not.be.undefined;
+			expect(String(err)).to.match(/contains NULL values/i);
+
+			// The transaction survives the rejection and keeps working; rollback leaves nothing.
+			await db.exec(`insert into t values (2, 'x')`);
+			await db.exec('rollback');
+			expect(await asyncIterableToArray(db.eval(`select id, v from t`))).to.deep.equal([]);
+		});
+
+		it('backfills an overlay NULL from a literal DEFAULT, leaving non-null rows untouched', async () => {
+			await db.exec(`create table t (id integer primary key, v text null default 'filled') using store`);
+			await db.exec('begin');
+			await db.exec(`insert into t values (1, null), (2, 'keep')`);
+			await db.exec(`alter table t alter column v set not null`);
+			await db.exec('commit');
+
+			// `committed.*` bypasses the overlay: only what actually reached the store, backfilled.
+			expect(await asyncIterableToArray(db.eval(`select id, v from committed.t order by id`)))
+				.to.deep.equal([{ id: 1, v: 'filled' }, { id: 2, v: 'keep' }]);
+		});
+
+		it('rejects a committed store NULL seen through the overlay', async () => {
+			await db.exec(`create table t (id integer primary key, v text null) using store`);
+			await db.exec(`insert into t values (1, null)`); // committed to the store
+			await db.exec('begin');
+			await db.exec(`insert into t values (2, 'x')`);  // pending, non-null
+
+			let err: unknown;
+			try { await db.exec(`alter table t alter column v set not null`); } catch (e) { err = e; }
+			expect(err, 'a committed NULL still blocks the tighten').to.not.be.undefined;
+			expect(String(err)).to.match(/contains NULL values/i);
+			await db.exec('rollback');
+		});
+	});
+
+	// Regression for `store-range-seek-collation-bounds` on the MERGED query path:
+	// with the store advertising `honorsCollatedRangeBounds`, a collation-matched
+	// NOCASE PK range is pushed down with NO residual Filter, so inside a
+	// transaction the overlay (memory) filter and the underlying (store) filter
+	// are each solely responsible for reproducing the NOCASE bound on their half
+	// of the merge.
+	describe('collated PK range under an open transaction', () => {
+		beforeEach(async () => {
+			const isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			await db.exec(`create table fruits (name text collate NOCASE primary key, n integer) using store`);
+			// Committed rows in the underlying store. 'CHERRY' is BINARY-less than
+			// the bound 'banana' (0x43 < 0x62) but NOCASE-greater.
+			await db.exec(`insert into fruits values ('apple', 1), ('CHERRY', 3)`);
+		});
+
+		it('merges overlay and underlying rows under the NOCASE range bound', async () => {
+			await db.exec('BEGIN');
+			// Uncommitted overlay rows: 'DATE' is BINARY-less than 'banana' but
+			// NOCASE-greater — a BINARY overlay bound filter would drop it.
+			await db.exec(`insert into fruits values ('Banana', 2), ('DATE', 4)`);
+
+			const rows = await asyncIterableToArray(
+				db.eval(`select n from fruits where name > 'banana' order by n`),
+			);
+			// NOCASE: 'CHERRY' (committed) and 'DATE' (uncommitted) qualify;
+			// 'Banana' is NOCASE-equal to the bound (excluded by >), 'apple' is below.
+			expect(rows.map(r => r.n)).to.deep.equal([3, 4]);
+
+			await db.exec('ROLLBACK');
+		});
+	});
+
+	// Secondary-index scan under isolation (store-index-scan-read-primitive): the
+	// underlying store's index scan MUST emit in index-key order (index-column bytes,
+	// then PK suffix) so the isolation overlay's `[indexKeyParts…, pkParts…]` merge is
+	// correct. This exercises overlay-pending inserts + deletes merged over a
+	// committed underlying index scan.
+	describe('secondary-index scan under an open transaction', () => {
+		beforeEach(async () => {
+			const isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			await db.exec(`create table t (id integer primary key, v integer) using store`);
+			await db.exec(`create index ix_v on t (v)`);
+			await db.exec(`insert into t values (1, 10), (2, 20), (3, 30)`);
+		});
+
+		it('merges overlay-pending inserts and deletes over the underlying index scan', async () => {
+			await db.exec('BEGIN');
+			// Overlay-pending: a new in-window row (v = 25) and a delete of a committed
+			// in-window row (v = 20).
+			await db.exec(`insert into t values (4, 25)`);
+			await db.exec(`delete from t where id = 2`);
+
+			const rows = await asyncIterableToArray(
+				db.eval(`select id from t where v >= 20 order by v`),
+			);
+			// Committed 30, overlay-inserted 25, minus overlay-deleted 20 → 25(id4), 30(id3).
+			expect(rows).to.deep.equal([{ id: 4 }, { id: 3 }]);
+
+			await db.exec('ROLLBACK');
+		});
+
+		it('an EQ index seek merges an overlay-pending row at the same value', async () => {
+			await db.exec('BEGIN');
+			await db.exec(`insert into t values (5, 30)`); // second row at v = 30 (overlay)
+			const rows = await asyncIterableToArray(
+				db.eval(`select id from t where v = 30 order by id`),
+			);
+			// Committed id 3 and overlay-pending id 5 both share v = 30.
+			expect(rows).to.deep.equal([{ id: 3 }, { id: 5 }]);
+			await db.exec('ROLLBACK');
+		});
+
+		it('an IN-list multi-seek interleaves overlay rows between its seek windows in index order', async () => {
+			// The store serves an IN list as one byte window per list value, scanned in
+			// ascending index-key order. The isolation layer merges that stream with its
+			// full-scanned overlay by (index key, PK), which is only sound if the
+			// underlying stream really is ascending across windows — so assert the RAW
+			// emission order (no ORDER BY, which would hide a misordered merge behind a
+			// Sort). Overlay values 20 and 40 fall BETWEEN committed windows 10/30/50.
+			await db.exec(`insert into t values (5, 50)`);
+			await db.exec('BEGIN');
+			await db.exec(`insert into t values (4, 40), (6, 15)`);
+			const rows = await asyncIterableToArray(
+				db.eval(`select id, v from t where v in (50, 10, 15, 40, 30)`),
+			);
+			expect(rows).to.deep.equal([
+				{ id: 1, v: 10 }, { id: 6, v: 15 }, { id: 3, v: 30 }, { id: 4, v: 40 }, { id: 5, v: 50 },
+			]);
+			await db.exec('ROLLBACK');
+		});
+
+		it('an IN-list multi-seek honours overlay updates and tombstones per seek window', async () => {
+			await db.exec('BEGIN');
+			await db.exec(`update t set v = 35 where id = 3`); // moves out of the v=30 window
+			await db.exec(`delete from t where id = 1`);       // removes the v=10 window's row
+			expect(await asyncIterableToArray(db.eval(`select id, v from t where v in (10, 20, 35)`)))
+				.to.deep.equal([{ id: 2, v: 20 }, { id: 3, v: 35 }]);
+			// The pre-update value must not resurface from the underlying index.
+			expect(await asyncIterableToArray(db.eval(`select id from t where v in (10, 30)`)))
+				.to.deep.equal([]);
+			await db.exec('ROLLBACK');
+			expect(await asyncIterableToArray(db.eval(`select id from t where v in (10, 30) order by id`)))
+				.to.deep.equal([{ id: 1 }, { id: 3 }]);
 		});
 	});
 
@@ -251,7 +679,10 @@ describe('Isolated Store Module', () => {
 
 			await db.exec('BEGIN');
 			await db.exec(`INSERT INTO t VALUES (1, 'Alice')`);
-			await db.exec(`ALTER TABLE t ADD COLUMN score INTEGER`);
+			// Explicit NULL: `default_column_nullability` ships as `not_null`, so a bare
+			// `score INTEGER` is mandatory and the NOT NULL backfill gate refuses it here
+			// (the overlay row has no value for it).
+			await db.exec(`ALTER TABLE t ADD COLUMN score INTEGER NULL`);
 
 			const row = await db.get('SELECT * FROM t WHERE id = 1');
 			expect(row?.id).to.equal(1);
@@ -294,6 +725,293 @@ describe('Isolated Store Module', () => {
 
 			await db.exec('ROLLBACK');
 		});
+
+		it('INSERT then ADD COLUMN with literal DEFAULT: staged row backfills the default (not NULL)', async () => {
+			// Regression: a staged overlay row must receive the column's DEFAULT, mirroring
+			// committed-row backfill. Pre-fix the overlay hardcoded NULL.
+			const isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			await db.exec(`CREATE TABLE t_lit (id INTEGER PRIMARY KEY, name TEXT) USING store`);
+
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO t_lit VALUES (1, 'Alice')`);
+			await db.exec(`ALTER TABLE t_lit ADD COLUMN score INTEGER DEFAULT 7`);
+
+			const inTxn = await db.get('SELECT * FROM t_lit WHERE id = 1');
+			expect(inTxn?.score).to.equal(7);
+
+			await db.exec('COMMIT');
+
+			const afterCommit = await db.get('SELECT score FROM t_lit WHERE id = 1');
+			expect(afterCommit?.score).to.equal(7);
+		});
+
+		it('INSERT then ADD COLUMN with signed-literal DEFAULT: staged row backfills the negative value', async () => {
+			// DEFAULT -5 is a UnaryExpr in the AST; tryFoldLiteral must recognize it so the
+			// staged row reads -5 rather than dropping it to NULL.
+			const isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			await db.exec(`CREATE TABLE t_neg (id INTEGER PRIMARY KEY, name TEXT) USING store`);
+
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO t_neg VALUES (1, 'Alice')`);
+			await db.exec(`ALTER TABLE t_neg ADD COLUMN delta INTEGER DEFAULT -5`);
+
+			const inTxn = await db.get('SELECT delta FROM t_neg WHERE id = 1');
+			expect(inTxn?.delta).to.equal(-5);
+
+			await db.exec('ROLLBACK');
+		});
+
+		it('INSERT then ADD COLUMN with per-row new.<col> DEFAULT: each staged row computes its own value', async () => {
+			// A non-foldable default (new.qty * 2) backfills each staged row from its own
+			// sibling value, so two rows with different qty get different qty2.
+			const isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			await db.exec(`CREATE TABLE t_pr (id INTEGER PRIMARY KEY, qty INTEGER) USING store`);
+
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO t_pr VALUES (1, 10), (2, 25)`);
+			await db.exec(`ALTER TABLE t_pr ADD COLUMN qty2 INTEGER DEFAULT (new.qty * 2)`);
+
+			const inTxn = await asyncIterableToArray(db.eval('SELECT id, qty2 FROM t_pr ORDER BY id'));
+			expect(inTxn.map((r: any) => [r.id, r.qty2])).to.deep.equal([[1, 20], [2, 50]]);
+
+			await db.exec('COMMIT');
+
+			const afterCommit = await asyncIterableToArray(db.eval('SELECT id, qty2 FROM t_pr ORDER BY id'));
+			expect(afterCommit.map((r: any) => [r.id, r.qty2])).to.deep.equal([[1, 20], [2, 50]]);
+		});
+
+		it('INSERT then ADD COLUMN NOT NULL with per-row default yielding NULL throws CONSTRAINT', async () => {
+			// Parallels committed-row behavior: a per-row default that produces NULL for a
+			// NOT NULL column on a staged row aborts the ALTER.
+			const isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			// `val` is explicitly nullable so the staged row can carry NULL (columns default
+			// to NOT NULL under the engine's Third-Manifesto default_column_nullability).
+			await db.exec(`CREATE TABLE t_nn (id INTEGER PRIMARY KEY, val INTEGER NULL) USING store`);
+
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO t_nn VALUES (1, NULL)`);
+
+			let err: Error | null = null;
+			try {
+				await db.exec(`ALTER TABLE t_nn ADD COLUMN c INTEGER NOT NULL DEFAULT (new.val)`);
+			} catch (e) { err = e as Error; }
+			expect(err, 'ALTER should throw for a NULL-yielding NOT NULL backfill').to.not.be.null;
+			expect(err!.message.toLowerCase()).to.include('not null');
+
+			await db.exec('ROLLBACK');
+		});
+
+		it('DELETE (tombstone) then ADD COLUMN with per-row NOT NULL DEFAULT: no spurious throw, row stays deleted', async () => {
+			// A staged tombstone's data columns are NULL placeholders; the evaluator must NOT
+			// run against it (it would trip the NOT NULL check), and the deleted row stays gone.
+			const isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			await db.exec(`CREATE TABLE t_ts (id INTEGER PRIMARY KEY, name TEXT) USING store`);
+			await db.exec(`INSERT INTO t_ts VALUES (1, 'Alice'), (2, 'Bob')`);
+
+			await db.exec('BEGIN');
+			await db.exec(`DELETE FROM t_ts WHERE id = 1`); // tombstones PK 1 in the overlay
+
+			// new.id is non-null for the surviving committed row (id=2); the tombstone for id=1
+			// must be skipped so the evaluator never sees its NULL placeholders.
+			await db.exec(`ALTER TABLE t_ts ADD COLUMN tag INTEGER NOT NULL DEFAULT (new.id)`);
+
+			const rows = await asyncIterableToArray(db.eval('SELECT id, tag FROM t_ts ORDER BY id'));
+			expect(rows.map((r: any) => [r.id, r.tag])).to.deep.equal([[2, 2]]);
+
+			await db.exec('ROLLBACK');
+		});
+
+		it('INSERT then ADD COLUMN with falsy literal DEFAULT 0: staged row reads 0, not NULL', async () => {
+			// Guards the `addColumnValue ?? null` / `tryFoldLiteral(...) ?? null` coalescing:
+			// it must coalesce only null/undefined, never a legitimate falsy 0.
+			const isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			await db.exec(`CREATE TABLE t_zero (id INTEGER PRIMARY KEY, name TEXT) USING store`);
+
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO t_zero VALUES (1, 'Alice')`);
+			await db.exec(`ALTER TABLE t_zero ADD COLUMN flag INTEGER DEFAULT 0`);
+
+			const inTxn = await db.get('SELECT flag FROM t_zero WHERE id = 1');
+			expect(inTxn?.flag).to.equal(0);
+
+			await db.exec('ROLLBACK');
+		});
+
+		it('UPDATE then ADD COLUMN with per-row new.<col> DEFAULT: evaluator sees the staged (updated) value', async () => {
+			// The per-row test above only stages INSERTs; an overlay UPDATE row holds the
+			// post-update image, so read-your-writes means new.qty must resolve to the
+			// updated value (100), not the committed one (10) → qty2 = 200.
+			const isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			await db.exec(`CREATE TABLE t_upd (id INTEGER PRIMARY KEY, qty INTEGER) USING store`);
+			await db.exec(`INSERT INTO t_upd VALUES (1, 10)`); // committed; underlying backfills 20
+
+			await db.exec('BEGIN');
+			await db.exec(`UPDATE t_upd SET qty = 100 WHERE id = 1`); // stages an overlay update
+			await db.exec(`ALTER TABLE t_upd ADD COLUMN qty2 INTEGER DEFAULT (new.qty * 2)`);
+
+			const inTxn = await db.get('SELECT qty, qty2 FROM t_upd WHERE id = 1');
+			expect([inTxn?.qty, inTxn?.qty2]).to.deep.equal([100, 200]);
+
+			await db.exec('COMMIT');
+
+			const afterCommit = await db.get('SELECT qty, qty2 FROM t_upd WHERE id = 1');
+			expect([afterCommit?.qty, afterCommit?.qty2]).to.deep.equal([100, 200]);
+		});
+
+		it('runtime ADD CONSTRAINT UNIQUE then duplicate INSERT is rejected (store underlying refresh)', async () => {
+			// isolation-runtime-constraint-propagation: a freshly-connected IsolatedTable's
+			// merged-view UNIQUE pre-check reads the cached underlying instance's tableSchema.
+			// The module-layer fix re-points that field to the schema alterTable returns; for
+			// StoreTable (which already refreshes its own tableSchema on alter) the write is a
+			// no-op. This arm proves that empirically — the memory ISOLATION_GAP_ARMS cover the
+			// path where the refresh actually matters.
+			const isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			await db.exec(`CREATE TABLE tau (id INTEGER PRIMARY KEY, email TEXT NOT NULL) USING store`);
+			await db.exec(`INSERT INTO tau VALUES (1, 'a@x'), (2, 'b@x')`);
+
+			await db.exec(`ALTER TABLE tau ADD CONSTRAINT u_email UNIQUE (email)`);
+
+			let err: Error | null = null;
+			try {
+				await db.exec(`INSERT INTO tau VALUES (3, 'a@x')`);
+			} catch (e) { err = e as Error; }
+			expect(err?.message.toLowerCase(), 'runtime-added UNIQUE must reject a duplicate').to.include('unique constraint');
+		});
+
+		it('runtime DROP CONSTRAINT UNIQUE then once-duplicate INSERT is accepted (store underlying refresh)', async () => {
+			// Inverse of the ADD arm: dropping the constraint must stop merged-view enforcement
+			// for a freshly-connected IsolatedTable, so a value that was a duplicate is now allowed.
+			const isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			await db.exec(`CREATE TABLE tdu (id INTEGER PRIMARY KEY, email TEXT NOT NULL, CONSTRAINT u_email UNIQUE (email)) USING store`);
+			await db.exec(`INSERT INTO tdu VALUES (1, 'a@x'), (2, 'b@x')`);
+
+			await db.exec(`ALTER TABLE tdu DROP CONSTRAINT u_email`);
+			await db.exec(`INSERT INTO tdu VALUES (3, 'a@x')`); // no longer a conflict
+
+			const dup = await asyncIterableToArray(db.eval(`SELECT count(*) AS c FROM tdu WHERE email = 'a@x'`));
+			expect(dup[0].c).to.equal(2);
+		});
+	});
+
+	/**
+	 * Row-validating DDL (`CREATE UNIQUE INDEX`, `ALTER TABLE … ADD CONSTRAINT … UNIQUE`)
+	 * must judge the rows the ISSUING connection can see — its own uncommitted writes
+	 * included — not the underlying store's committed rows. The end-to-end behavior is
+	 * covered by `test/logic/10.1.2-ddl-in-transaction.sqllogic`, which runs against both
+	 * backends; what only a white-box test can see is that a REJECTED DDL leaves the
+	 * overlay's staged rows intact.
+	 *
+	 * The bug these pin: the overlay rebuild ignored `MemoryTable.update`'s returned
+	 * `{ status: 'constraint' }`, so an accepted `ADD CONSTRAINT … UNIQUE` re-inserted the
+	 * first staged row, got a constraint back for the second, dropped it on the floor, and
+	 * committed a transaction missing a row. A test that only asserts the DDL raised cannot
+	 * tell that path from a correct one.
+	 */
+	describe('row-validating DDL over an open transaction', () => {
+		beforeEach(async () => {
+			db.registerModule('store', createIsolatedStoreModule({ provider }));
+			await db.exec(`CREATE TABLE ddl_tx (id INTEGER PRIMARY KEY, v TEXT) USING store`);
+		});
+
+		async function expectUniqueRejection(sql: string): Promise<void> {
+			try {
+				await db.exec(sql);
+			} catch (e) {
+				expect((e as Error).message).to.match(/UNIQUE constraint failed/);
+				return;
+			}
+			throw new Error(`expected [${sql}] to be rejected`);
+		}
+
+		it('ADD CONSTRAINT UNIQUE rejected over pending duplicates loses no staged row', async () => {
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO ddl_tx VALUES (1, 'a')`);
+			await db.exec(`INSERT INTO ddl_tx VALUES (2, 'a')`);
+
+			await expectUniqueRejection(`ALTER TABLE ddl_tx ADD CONSTRAINT ddl_tx_u UNIQUE (v)`);
+
+			// The rejected ALTER must leave the overlay exactly as it found it. Before the fix,
+			// the migration silently discarded row 2 and this returned only row 1.
+			const rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM ddl_tx ORDER BY id`));
+			expect(rows, 'both staged rows survive the rejected ALTER').to.deep.equal([
+				{ id: 1, v: 'a' },
+				{ id: 2, v: 'a' },
+			]);
+
+			// The transaction is still usable, and committing it lands both rows.
+			await db.exec('COMMIT');
+			const committed = await asyncIterableToArray(db.eval(`SELECT id, v FROM committed.ddl_tx ORDER BY id`));
+			expect(committed).to.deep.equal([{ id: 1, v: 'a' }, { id: 2, v: 'a' }]);
+		});
+
+		it('CREATE UNIQUE INDEX rejected over pending duplicates loses no staged row', async () => {
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO ddl_tx VALUES (1, 'a')`);
+			await db.exec(`INSERT INTO ddl_tx VALUES (2, 'a')`);
+
+			await expectUniqueRejection(`CREATE UNIQUE INDEX ddl_tx_ix ON ddl_tx (v)`);
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM ddl_tx ORDER BY id`));
+			expect(rows, 'both staged rows survive the rejected CREATE INDEX').to.deep.equal([
+				{ id: 1, v: 'a' },
+				{ id: 2, v: 'a' },
+			]);
+			await db.exec('ROLLBACK');
+		});
+
+		it('CREATE UNIQUE INDEX … COLLATE NOCASE over a JSON column is rejected for pending NOCASE-equal rows (wrapper dedupe)', async () => {
+			// bug-store-index-build-dedupe-skips-collation, wrapper-path arm: mid-transaction
+			// DDL routes the build through `validateUniqueIndexOverRows` (this module's
+			// `rows()` callback) instead of `buildIndexEntries`' own in-pass check, so the
+			// dedupe-signature fix must cover that call site too, not just the committed-row
+			// path pinned in unique-constraints.spec.ts.
+			await db.exec(`CREATE TABLE ddl_tx_j (id INTEGER PRIMARY KEY, d JSON) USING store`);
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO ddl_tx_j VALUES (1, '"a"')`);
+			await db.exec(`INSERT INTO ddl_tx_j VALUES (2, '"A"')`);
+
+			await expectUniqueRejection(`CREATE UNIQUE INDEX ddl_tx_j_ix ON ddl_tx_j (d COLLATE NOCASE)`);
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT id, d FROM ddl_tx_j ORDER BY id`));
+			expect(rows, 'both staged rows survive the rejected CREATE INDEX').to.deep.equal([
+				{ id: 1, d: 'a' },
+				{ id: 2, d: 'A' },
+			]);
+			await db.exec('ROLLBACK');
+		});
+
+		it('accepted CREATE UNIQUE INDEX rebuilds the overlay and preserves its rows and tombstones', async () => {
+			await db.exec(`INSERT INTO ddl_tx VALUES (1, 'a')`);
+			await db.exec(`INSERT INTO ddl_tx VALUES (2, 'a')`);
+
+			await db.exec('BEGIN');
+			await db.exec(`DELETE FROM ddl_tx WHERE id = 2`);      // stages a tombstone
+			await db.exec(`INSERT INTO ddl_tx VALUES (3, 'b')`);   // stages a live row
+
+			// The committed duplicate is gone from this transaction's view, so the build is legal.
+			await db.exec(`CREATE UNIQUE INDEX ddl_tx_ix ON ddl_tx (v)`);
+
+			// Both staged entries survived the rebuild: the tombstone still hides row 2, and the
+			// live row 3 is still there.
+			const rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM ddl_tx ORDER BY id`));
+			expect(rows).to.deep.equal([{ id: 1, v: 'a' }, { id: 3, v: 'b' }]);
+
+			// And the rebuilt overlay now enforces the new index against a further pending write.
+			await expectUniqueRejection(`INSERT INTO ddl_tx VALUES (4, 'b')`);
+
+			await db.exec('COMMIT');
+			const committed = await asyncIterableToArray(db.eval(`SELECT id, v FROM committed.ddl_tx ORDER BY id`));
+			expect(committed).to.deep.equal([{ id: 1, v: 'a' }, { id: 3, v: 'b' }]);
+		});
 	});
 
 	describe('cross-layer UNIQUE / PK conflict detection', () => {
@@ -306,6 +1024,160 @@ describe('Isolated Store Module', () => {
 
 		afterEach(async () => {
 			try { await isolatedModule.closeAll(); } catch { /* ignore */ }
+		});
+
+		it('UNIQUE-value swap across two rows within one txn commits (no stale-underlying false positive)', async () => {
+			// Regression: isolation-merged-unique-stale-underlying-false-positive.
+			await db.exec(`CREATE TABLE sw (id INTEGER PRIMARY KEY, email TEXT NOT NULL, UNIQUE (email)) USING store`);
+			await db.exec(`INSERT INTO sw VALUES (1, 'a'), (2, 'b')`);
+
+			await db.exec('BEGIN');
+			await db.exec(`UPDATE sw SET email = 'tmp' WHERE id = 1`); // frees 'a'
+			await db.exec(`UPDATE sw SET email = 'a'   WHERE id = 2`); // id=2 holds 'a', frees 'b'
+			await db.exec(`UPDATE sw SET email = 'b'   WHERE id = 1`); // 'b' free in merged view
+			await db.exec('COMMIT');
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT id, email FROM sw ORDER BY id`));
+			expect(rows.map(r => [r.id, r.email])).to.deep.equal([[1, 'b'], [2, 'a']]);
+		});
+
+		// store-index-collation-guard-collapse widened `IsolatedTable.canSeekForConstraint`
+		// past BINARY-only, so Phase 2 now answers a COLLATED index-derived UNIQUE through
+		// an index seek instead of a full underlying scan. The seek REPLACES the scan, so a
+		// window narrower than the enforcement-equal set silently loses a violation — these
+		// pin that the store's index bytes and the merged check agree on the collation.
+		it('a NOCASE index-derived UNIQUE catches a case-only committed collision through the seek', async () => {
+			await db.exec(`CREATE TABLE cu (id INTEGER PRIMARY KEY, email TEXT NOT NULL) USING store`);
+			await db.exec(`CREATE UNIQUE INDEX cu_email ON cu (email COLLATE NOCASE)`);
+			await db.exec(`INSERT INTO cu VALUES (1, 'b@x')`);
+
+			await db.exec('BEGIN');
+			let err: Error | null = null;
+			try { await db.exec(`INSERT INTO cu VALUES (2, 'B@X')`); } catch (e) { err = e as Error; }
+			await db.exec('ROLLBACK');
+			expect(err?.message ?? '', 'the NOCASE seek must find the committed case variant')
+				.to.match(/UNIQUE constraint failed/i);
+
+			// A genuinely distinct value still inserts — the seek is not just refusing everything.
+			await db.exec(`INSERT INTO cu VALUES (3, 'c@x')`);
+			const rows = await asyncIterableToArray(db.eval(`SELECT id FROM cu ORDER BY id`));
+			expect(rows.map(r => r.id)).to.deep.equal([1, 3]);
+		});
+
+		it('an ANY column with a declared COLLATE seeks and still catches the collision', async () => {
+			// `any` keys under its declared NOCASE now (any-type-compare-honors-collation
+			// made ANY_TYPE.compare honor the handed collation), which is also the
+			// collation the merged check enforces under — so `canSeekForConstraint`
+			// admits the seek, and the seek window must still hold the case variant.
+			await db.exec(`CREATE TABLE au (id INTEGER PRIMARY KEY, email ANY COLLATE NOCASE NOT NULL) USING store`);
+			await db.exec(`CREATE UNIQUE INDEX au_email ON au (email)`);
+			await db.exec(`INSERT INTO au VALUES (1, 'b@x')`);
+
+			await db.exec('BEGIN');
+			let err: Error | null = null;
+			try { await db.exec(`INSERT INTO au VALUES (2, 'B@X')`); } catch (e) { err = e as Error; }
+			await db.exec('ROLLBACK');
+			expect(err?.message ?? '', 'the seek must find the committed case variant')
+				.to.match(/UNIQUE constraint failed/i);
+		});
+
+		it('partial-UNIQUE value swap (both rows in predicate scope) commits within one txn', async () => {
+			// Exercises the merged-row predicate evaluation in findMergedUniqueConflict
+			// (isolation-merged-unique-stale-underlying-false-positive): the partial predicate
+			// must be evaluated against the overlay (merged) row, not the stale committed value.
+			await db.exec(`CREATE TABLE psw (id INTEGER PRIMARY KEY, email TEXT NOT NULL, active INTEGER NOT NULL) USING store`);
+			await db.exec(`CREATE UNIQUE INDEX psw_email_active ON psw (email) WHERE active = 1`);
+			await db.exec(`INSERT INTO psw VALUES (1, 'a', 1), (2, 'b', 1)`);
+
+			await db.exec('BEGIN');
+			await db.exec(`UPDATE psw SET email = 'tmp' WHERE id = 1`);
+			await db.exec(`UPDATE psw SET email = 'a'   WHERE id = 2`);
+			await db.exec(`UPDATE psw SET email = 'b'   WHERE id = 1`);
+			await db.exec('COMMIT');
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT id, email FROM psw ORDER BY id`));
+			expect(rows.map(r => [r.id, r.email])).to.deep.equal([[1, 'b'], [2, 'a']]);
+		});
+
+		it('PK-changing UPDATE reusing a PK tombstoned earlier in the same txn commits', async () => {
+			// Regression: isolation-overlay-pk-change-tombstone-reuse-conflict.
+			// Moving a row onto a PK that was vacated earlier in the SAME txn must
+			// overwrite the overlay tombstone there, not collide with it.
+			await db.exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL) USING store`);
+			await db.exec(`INSERT INTO t VALUES (1, 'a'), (2, 'b')`);
+
+			await db.exec('BEGIN');
+			await db.exec(`UPDATE t SET id = 9 WHERE id = 1`); // frees PK 1 (overlay tombstones PK 1)
+			await db.exec(`UPDATE t SET id = 1 WHERE id = 2`); // reuse freed PK 1
+			await db.exec('COMMIT');
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT id, name FROM t ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.name])).to.deep.equal([[1, 'b'], [9, 'a']]);
+		});
+
+		it('two-row PK swap via a temporary PK commits with names swapped', async () => {
+			// Regression: isolation-overlay-pk-change-tombstone-reuse-conflict.
+			await db.exec(`CREATE TABLE sw2 (id INTEGER PRIMARY KEY, name TEXT NOT NULL) USING store`);
+			await db.exec(`INSERT INTO sw2 VALUES (1, 'a'), (2, 'b')`);
+
+			await db.exec('BEGIN');
+			await db.exec(`UPDATE sw2 SET id = 99 WHERE id = 1`); // frees PK 1
+			await db.exec(`UPDATE sw2 SET id = 1  WHERE id = 2`); // reuse freed PK 1, frees PK 2
+			await db.exec(`UPDATE sw2 SET id = 2  WHERE id = 99`); // reuse freed PK 2
+			await db.exec('COMMIT');
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT id, name FROM sw2 ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.name])).to.deep.equal([[1, 'b'], [2, 'a']]);
+		});
+
+		it('PK-changing UPDATE onto a PK holding a LIVE overlay row still raises a constraint error', async () => {
+			// The tombstone special-case must not weaken genuine PK-conflict detection:
+			// a live overlay row at the destination PK is a real duplicate.
+			await db.exec(`CREATE TABLE tlive (id INTEGER PRIMARY KEY, name TEXT NOT NULL) USING store`);
+			await db.exec(`INSERT INTO tlive VALUES (1, 'a')`);
+
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO tlive VALUES (3, 'c')`); // live overlay row at PK 3
+
+			let err: Error | null = null;
+			try {
+				await db.exec(`UPDATE tlive SET id = 3 WHERE id = 1`); // collides with live PK 3
+			} catch (e) { err = e as Error; }
+			expect(err?.message.toLowerCase()).to.include('unique constraint');
+
+			await db.exec('ROLLBACK');
+		});
+
+		it('PK reuse combined with a freed secondary-UNIQUE value within one txn commits', async () => {
+			// A PK reuse where the relocated row also takes a UNIQUE value freed in the
+			// same txn must commit — exercises the merged-view UNIQUE check and the
+			// trusted-write flush together with the tombstone-reuse PK write.
+			await db.exec(`CREATE TABLE tu (id INTEGER PRIMARY KEY, email TEXT NOT NULL, UNIQUE (email)) USING store`);
+			await db.exec(`INSERT INTO tu VALUES (1, 'a'), (2, 'b')`);
+
+			await db.exec('BEGIN');
+			await db.exec(`UPDATE tu SET id = 9, email = 'tmp' WHERE id = 1`); // frees PK 1 and email 'a'
+			await db.exec(`UPDATE tu SET id = 1, email = 'a'   WHERE id = 2`); // reuse PK 1 and email 'a'
+			await db.exec('COMMIT');
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT id, email FROM tu ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.email])).to.deep.equal([[1, 'a'], [9, 'tmp']]);
+		});
+
+		it('PK-changing UPDATE reusing a PK freed by a DELETE earlier in the same txn commits', async () => {
+			// The reusable overlay tombstone can originate from an explicit DELETE, not just
+			// a PK-change. writeRelocatedRow keys off the tombstone flag regardless of origin,
+			// so relocating a row onto a deleted PK must overwrite that tombstone, not collide.
+			await db.exec(`CREATE TABLE td (id INTEGER PRIMARY KEY, name TEXT NOT NULL) USING store`);
+			await db.exec(`INSERT INTO td VALUES (1, 'a'), (3, 'c')`);
+
+			await db.exec('BEGIN');
+			await db.exec(`DELETE FROM td WHERE id = 3`);        // tombstones PK 3 in the overlay
+			await db.exec(`UPDATE td SET id = 3 WHERE id = 1`);  // relocate onto the freed PK 3
+			await db.exec('COMMIT');
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT id, name FROM td ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.name])).to.deep.equal([[3, 'a']]);
 		});
 
 		it('INSERT with PK that collides with underlying row throws constraint error', async () => {
@@ -422,6 +1294,64 @@ describe('Isolated Store Module', () => {
 
 			const row = await db.get(`SELECT val FROM t_upu WHERE id = 1`);
 			expect(row?.val).to.equal('updated');
+		});
+	});
+
+	describe('INSERT OR REPLACE co-occurrence: PK collision AND secondary-UNIQUE collision', () => {
+		// Regression for the isolation-layer commit-flush ordering bug
+		// (isolation-replace-pk-and-unique-cooccurrence): an INSERT OR REPLACE whose
+		// new row collides on the PRIMARY KEY with one underlying row AND on a secondary
+		// UNIQUE with a DIFFERENT underlying row. Pre-fix, flushOverlayToUnderlying
+		// applied the pk=5 update (which still collided on UNIQUE with the not-yet-deleted
+		// pk=9 row) before the pk=9 tombstone, and silently swallowed the underlying
+		// store's returned constraint result — so the new value was dropped and pk=5
+		// kept its OLD value. The flush now applies deletes before inserts/updates and
+		// throws on any swallowed constraint result. This path is store/isolation-only:
+		// the memory module short-circuits the secondary-UNIQUE check on a PK collision,
+		// so it never reaches the flush and would not evict pk=9 (a separate, documented
+		// gap) — which is why this lives here and not in the dual-mode 55 sqllogic file.
+		let isolatedModule: ReturnType<typeof createIsolatedStoreModule>;
+
+		beforeEach(async () => {
+			isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			db.setOption('default_vtab_module', 'store');
+			await db.exec(`PRAGMA foreign_keys = true`);
+		});
+
+		afterEach(async () => {
+			try { await isolatedModule.closeAll(); } catch { /* ignore */ }
+		});
+
+		it('keeps the new values at the PK slot and evicts the secondary-UNIQUE conflict', async () => {
+			await db.exec(`CREATE TABLE p5 (id INTEGER PRIMARY KEY, email TEXT NOT NULL, UNIQUE (email)) USING store`);
+			await db.exec(`INSERT INTO p5 VALUES (5, 'old'), (9, 'dup')`);
+
+			// pk=5 collides on PK with p5(5,'old'); 'dup' collides on UNIQUE(email) with p5(9,'dup').
+			await db.exec(`INSERT OR REPLACE INTO p5 VALUES (5, 'dup')`);
+
+			const rows = await asyncIterableToArray(db.eval('SELECT id, email FROM p5 ORDER BY id'));
+			// The PK slot takes the NEW value; the secondary-UNIQUE conflict (pk=9) is evicted.
+			expect(rows.map((r: any) => [r.id, r.email])).to.deep.equal([[5, 'dup']]);
+		});
+
+		it('cascades FK ON DELETE for BOTH the evicted secondary-UNIQUE row and the replaced PK row', async () => {
+			await db.exec(`CREATE TABLE p5 (id INTEGER PRIMARY KEY, email TEXT NOT NULL, UNIQUE (email)) USING store`);
+			await db.exec(`CREATE TABLE c5 (cid INTEGER PRIMARY KEY, pid INTEGER NOT NULL, FOREIGN KEY (pid) REFERENCES p5(id) ON DELETE CASCADE) USING store`);
+			await db.exec(`INSERT INTO p5 VALUES (5, 'old'), (9, 'dup')`);
+			await db.exec(`INSERT INTO c5 VALUES (50, 5), (90, 9)`);
+
+			await db.exec(`INSERT OR REPLACE INTO p5 VALUES (5, 'dup')`);
+
+			const parents = await asyncIterableToArray(db.eval('SELECT id, email FROM p5 ORDER BY id'));
+			expect(parents.map((r: any) => [r.id, r.email])).to.deep.equal([[5, 'dup']]);
+
+			// Both children cascade away: pk=9 via the secondary-UNIQUE eviction, and pk=5's
+			// child because INSERT OR REPLACE on a PK collision deletes the prior row
+			// (replacedRow) — the executor fires its FK ON DELETE actions, matching SQLite's
+			// "REPLACE = delete-then-insert" semantics.
+			const children = await asyncIterableToArray(db.eval('SELECT cid, pid FROM c5 ORDER BY cid'));
+			expect(children).to.deep.equal([]);
 		});
 	});
 
@@ -787,5 +1717,91 @@ describe('Isolated Store Module', () => {
 
 			await db.exec('COMMIT');
 		});
+	});
+});
+
+/**
+ * Catalog persistence THROUGH the isolation wrapper.
+ *
+ * `Database.registerModule` and the engine's schema-change notifier both see the
+ * REGISTERED module — the `IsolationModule` — so anything the store needs from the
+ * engine has to be forwarded. Two forwards are pinned here: `onRegister` (the store
+ * subscribes to the notifier at registration) and the ownership test the `table_added`
+ * catalog write self-filters on, which must recognize a table whose `vtabModule` is the
+ * wrapper exposing the store as `underlying`.
+ */
+describe('Isolated Store Module — catalog persistence across reopen', () => {
+	/**
+	 * A provider whose `closeAll` is a NO-OP, so a logical `StoreModule.closeAll()`
+	 * (which drains the catalog persist queue) survives and a fresh module can reopen
+	 * the same storage — the only way to express close → reopen against memory.
+	 */
+	function createPersistentProvider(): KVStoreProvider & { _hardClose: () => void } {
+		const stores = new Map<string, InMemoryKVStore>();
+		const getOrCreate = (key: string): InMemoryKVStore => {
+			let s = stores.get(key);
+			if (!s) {
+				s = new InMemoryKVStore();
+				stores.set(key, s);
+			}
+			return s;
+		};
+		return {
+			async getStore(schemaName: string, tableName: string) { return getOrCreate(`${schemaName}.${tableName}`); },
+			async getIndexStore(schemaName: string, tableName: string, indexName: string) {
+				return getOrCreate(`${schemaName}.${tableName}_idx_${indexName}`);
+			},
+			async getStatsStore(schemaName: string, tableName: string) { return getOrCreate(`${schemaName}.${tableName}.__stats__`); },
+			async getCatalogStore() { return getOrCreate('__catalog__'); },
+			async closeStore() { /* no-op: durable storage survives a logical close */ },
+			async closeIndexStore() { /* no-op */ },
+			async closeAll() { /* no-op: data survives module close, mirroring real disk */ },
+			_hardClose() {
+				for (const s of stores.values()) void s.close();
+				stores.clear();
+			},
+		};
+	}
+
+	let provider: ReturnType<typeof createPersistentProvider>;
+
+	beforeEach(() => { provider = createPersistentProvider(); });
+	afterEach(() => { provider._hardClose(); });
+
+	/** A fresh db whose `store` module is a StoreModule behind the isolation wrapper. */
+	function open(): { db: Database; store: StoreModule } {
+		const db = new Database();
+		const store = new StoreModule(provider);
+		db.registerModule('store', new IsolationModule({ underlying: store, overlay: new MemoryTableModule() }));
+		return { db, store };
+	}
+
+	it('an empty, never-touched store table behind the isolation wrapper survives reopen', async () => {
+		const { db, store } = open();
+		await db.exec(`CREATE TABLE lonely (id INTEGER PRIMARY KEY, v TEXT) USING store`);
+		// No read, no write — the table's storage is never opened.
+		await store.closeAll();
+
+		const { db: db2, store: store2 } = open();
+		const result = await store2.rehydrateCatalog(db2);
+		expect(result.errors, 'clean rehydrate').to.have.lengthOf(0);
+		expect(result.tables, 'the untouched wrapped table rehydrated').to.deep.equal(['main.lonely']);
+
+		const counted = await asyncIterableToArray(db2.eval('SELECT count(*) AS n FROM lonely'));
+		expect(counted[0].n).to.equal(0);
+	});
+
+	it('a view created as the FIRST statement behind the isolation wrapper survives reopen', async () => {
+		const { db, store } = open();
+		await db.exec(`CREATE VIEW early AS SELECT 1 AS x`);
+		await store.closeAll();
+
+		const { db: db2, store: store2 } = open();
+		const result = await store2.rehydrateCatalog(db2);
+		expect(result.errors, 'clean rehydrate').to.have.lengthOf(0);
+		expect(result.views, 'the early view persisted through the wrapper').to.deep.equal(['main.early']);
+
+		const got = await asyncIterableToArray(db2.eval('SELECT x FROM early'));
+		expect(got).to.deep.equal([{ x: 1 }]);
 	});
 });

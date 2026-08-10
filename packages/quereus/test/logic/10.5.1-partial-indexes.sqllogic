@@ -3,6 +3,8 @@
 -- Quereus's parser accepts partial indexes; this fixture pins the runtime semantics:
 -- only rows matching the WHERE clause participate in the index, but query results must
 -- remain correct regardless of which rows the index covers.
+--
+-- requires-capability: standalone-index-ddl
 
 -- =====================================================
 -- 1. Basic partial index — rows outside WHERE still queryable
@@ -407,3 +409,118 @@ select id, c, status from p7k order by id;
 → [{"id":1,"c":"A","status":"active"},{"id":2,"c":"B","status":"archived"},{"id":4,"c":"A","status":"active"}]
 
 drop table p7k;
+
+-- =====================================================
+-- 8. Bare-value predicate truthiness matches the engine (isTruthy).
+--    A bare-column WHERE uses numeric truthiness, so non-numeric text
+--    ('abc') is FALSE (out of scope) while numeric-nonzero text ('1')
+--    is TRUE (in scope) — the same rule the Filter / runtime path uses.
+--    A prior divergence treated any non-empty string as truthy; this
+--    pins the corrected, engine-aligned semantics.
+-- =====================================================
+create table p_bare (id integer primary key, flag text, code text);
+create unique index ix_p_bare on p_bare(code) where flag;
+
+-- 'abc' is non-numeric → predicate FALSE → row is OUT of the partial scope.
+insert into p_bare values (1, 'abc', 'X');
+-- Same code, also out of scope → allowed (would be a UNIQUE error under the old
+-- "any non-empty string is truthy" rule).
+insert into p_bare values (2, 'abc', 'X');
+
+-- '1' coerces to 1 → predicate TRUE → row is IN scope and claims code 'Y'.
+insert into p_bare values (3, '1', 'Y');
+-- Same code inside scope → rejected.
+insert into p_bare values (4, '1', 'Y');
+-- error: UNIQUE
+
+select id, code from p_bare order by id;
+→ [{"id":1,"code":"X"},{"id":2,"code":"X"},{"id":3,"code":"Y"}]
+
+drop table p_bare;
+
+-- =====================================================
+-- 9. Bare-value truthiness through the operator-nested predicateTruthy
+--    call sites (compileUnary NOT, compileBinary AND/OR) and the blob
+--    branch of isTruthy. § 8 pins the top-level bare-value path; these
+--    pin the same isTruthy delegation reached *inside* operators, plus
+--    the blobs-are-falsy rule. Each case is an observable partial-UNIQUE
+--    accept/reject, so a truthiness regression fails loudly.
+-- =====================================================
+
+-- 9a. NOT of a bare text column. `where not flag`:
+--   flag='abc' → isTruthy false → NOT true  → row IN scope
+--   flag='1'   → isTruthy true  → NOT false → row OUT of scope
+create table p_not (id integer primary key, flag text, code text);
+create unique index ix_p_not on p_not(code) where not flag;
+
+-- Two in-scope rows ('abc' is falsy → NOT true) sharing a code: second rejected.
+insert into p_not values (1, 'abc', 'X');
+insert into p_not values (2, 'abc', 'X');
+-- error: UNIQUE
+
+-- Two out-of-scope rows ('1' is truthy → NOT false) sharing a code: both allowed.
+insert into p_not values (3, '1', 'Y');
+insert into p_not values (4, '1', 'Y');
+
+select id, code from p_not order by id;
+→ [{"id":1,"code":"X"},{"id":3,"code":"Y"},{"id":4,"code":"Y"}]
+
+drop table p_not;
+
+-- 9b. Bare column as an AND operand. `where flag and othercol > 0`, with
+--     `othercol > 0` held TRUE so the bare-flag truthiness decides scope:
+--   flag='1'   (truthy) AND true → row IN scope
+--   flag='abc' (falsy)  AND true → row OUT of scope
+create table p_and (id integer primary key, flag text, othercol integer, code text);
+create unique index ix_p_and on p_and(code) where flag and othercol > 0;
+
+-- In scope (flag truthy): duplicate code rejected.
+insert into p_and values (1, '1', 5, 'X');
+insert into p_and values (2, '1', 5, 'X');
+-- error: UNIQUE
+
+-- Out of scope (flag falsy short-circuits the AND): duplicate code allowed.
+insert into p_and values (3, 'abc', 5, 'Y');
+insert into p_and values (4, 'abc', 5, 'Y');
+
+select id, code from p_and order by id;
+→ [{"id":1,"code":"X"},{"id":3,"code":"Y"},{"id":4,"code":"Y"}]
+
+drop table p_and;
+
+-- 9c. Bare column as an OR operand. `where flag or othercol > 0`, with
+--     `othercol > 0` held FALSE (othercol = 0) so the bare-flag truthiness
+--     decides scope:
+--   flag='1'   (truthy) OR false → row IN scope
+--   flag='abc' (falsy)  OR false → row OUT of scope
+create table p_or (id integer primary key, flag text, othercol integer, code text);
+create unique index ix_p_or on p_or(code) where flag or othercol > 0;
+
+-- In scope (flag truthy): duplicate code rejected.
+insert into p_or values (1, '1', 0, 'X');
+insert into p_or values (2, '1', 0, 'X');
+-- error: UNIQUE
+
+-- Out of scope (both disjuncts falsy): duplicate code allowed.
+insert into p_or values (3, 'abc', 0, 'Y');
+insert into p_or values (4, 'abc', 0, 'Y');
+
+select id, code from p_or order by id;
+→ [{"id":1,"code":"X"},{"id":3,"code":"Y"},{"id":4,"code":"Y"}]
+
+drop table p_or;
+
+-- 9d. Bare BLOB value. `where blobcol` with a non-null blob: isTruthy(blob)
+--     is FALSE (util/comparison.ts), so every row is OUT of scope and duplicate
+--     codes are allowed. Under a regression that treated blobs as truthy, these
+--     rows would be IN scope and the second insert would be a UNIQUE error.
+create table p_blob (id integer primary key, blobcol blob, code text);
+create unique index ix_p_blob on p_blob(code) where blobcol;
+
+insert into p_blob values (1, x'00', 'X');
+insert into p_blob values (2, x'01ff', 'X');
+
+select id, code from p_blob order by id;
+→ [{"id":1,"code":"X"},{"id":2,"code":"X"}]
+
+drop table p_blob;

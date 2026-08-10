@@ -1,0 +1,157 @@
+-- Read-path coverage for RIGHT / FULL outer joins in the nested-loop emitter
+-- (runtime/emit/join.ts). Companion to 90.5, which flips the basic RIGHT/FULL
+-- cases; this file pins column order, the empty-side matrix, no-match, many-to-many
+-- (fan-out), USING, and existence (`exists … as`) flag semantics.
+
+-- ===== select * column order: left columns first, then right columns =====
+-- `a right/full join b` returns `a.*` then `b.*` (the JoinNode attribute order),
+-- not the scan/drive order. Distinct column names avoid `:N` disambiguation so the
+-- per-name values directly confirm left attrs occupy the left positions.
+
+create table so_l (lid integer primary key, lval text);
+create table so_r (rid integer primary key, rval text);
+insert into so_l values (1, 'L1'), (2, 'L2');
+insert into so_r values (1, 'R1'), (3, 'R3');
+-- run
+
+-- RIGHT: matched (1) plus right id=3 null-extended on the left.
+select * from so_l right join so_r on so_l.lid = so_r.rid order by so_r.rid;
+→ [{"lid":1,"lval":"L1","rid":1,"rval":"R1"},{"lid":null,"lval":null,"rid":3,"rval":"R3"}]
+
+-- FULL: matched (1), left id=2 null-right, right id=3 null-left.
+select * from so_l full join so_r on so_l.lid = so_r.rid order by coalesce(so_l.lid, so_r.rid);
+→ [{"lid":1,"lval":"L1","rid":1,"rval":"R1"},{"lid":2,"lval":"L2","rid":null,"rval":null},{"lid":null,"lval":null,"rid":3,"rval":"R3"}]
+
+drop table so_l;
+drop table so_r;
+-- run
+
+-- ===== Empty-side matrix =====
+
+create table es_full (k integer primary key, v text);
+create table es_empty (k integer primary key, v text);
+create table es_empty2 (k integer primary key, v text);
+insert into es_full values (1, 'a'), (2, 'b');
+-- run
+
+-- left empty + RIGHT: every right row appears, null-extended on the left.
+select es_empty.k as lk, es_full.k as rk from es_empty right join es_full on es_empty.k = es_full.k order by es_full.k;
+→ [{"lk":null,"rk":1},{"lk":null,"rk":2}]
+
+-- right empty + RIGHT: no rows at all.
+select es_full.k as lk, es_empty.k as rk from es_full right join es_empty on es_full.k = es_empty.k order by es_empty.k;
+→ []
+
+-- both empty + FULL: no rows.
+select a.k as lk, b.k as rk from es_empty a full join es_empty2 b on a.k = b.k;
+→ []
+
+-- left non-empty + right empty + FULL: every left row null-extended on the right (trailing pass only).
+select es_full.k as lk, es_empty.k as rk from es_full full join es_empty on es_full.k = es_empty.k order by es_full.k;
+→ [{"lk":1,"rk":null},{"lk":2,"rk":null}]
+
+-- left empty + FULL: every right row null-extended on the left (no trailing rows).
+select es_empty.k as lk, es_full.k as rk from es_empty full join es_full on es_empty.k = es_full.k order by es_full.k;
+→ [{"lk":null,"rk":1},{"lk":null,"rk":2}]
+
+drop table es_full;
+drop table es_empty;
+drop table es_empty2;
+-- run
+
+-- ===== No match at all =====
+
+create table nm_l (id integer primary key);
+create table nm_r (id integer primary key);
+insert into nm_l values (1), (2);
+insert into nm_r values (3), (4);
+-- run
+
+-- RIGHT, predicate matches nothing: all right rows null-left.
+select nm_l.id as l, nm_r.id as r from nm_l right join nm_r on nm_l.id = nm_r.id order by nm_r.id;
+→ [{"l":null,"r":3},{"l":null,"r":4}]
+
+-- FULL, predicate matches nothing: all right null-left AND all left null-right.
+select nm_l.id as l, nm_r.id as r from nm_l full join nm_r on nm_l.id = nm_r.id order by coalesce(nm_l.id, nm_r.id);
+→ [{"l":1,"r":null},{"l":2,"r":null},{"l":null,"r":3},{"l":null,"r":4}]
+
+drop table nm_l;
+drop table nm_r;
+-- run
+
+-- ===== Many-to-many (duplicate join keys): one row per match, no spurious null-extension =====
+
+create table mm_l (id integer primary key, k integer);
+create table mm_r (id integer primary key, k integer);
+-- k=1 twice on each side; k=2 only on right; k=3 only on left.
+insert into mm_l values (1, 1), (2, 1), (3, 3);
+insert into mm_r values (10, 1), (11, 1), (12, 2);
+-- run
+
+-- RIGHT: right rows 10 & 11 (k=1) each match BOTH left k=1 rows (2 each); right row
+-- 12 (k=2) has no match → one null-left row. No matched right row is null-extended.
+select mm_l.id as lid, mm_r.id as rid from mm_l right join mm_r on mm_l.k = mm_r.k order by mm_r.id, mm_l.id;
+→ [{"lid":1,"rid":10},{"lid":2,"rid":10},{"lid":1,"rid":11},{"lid":2,"rid":11},{"lid":null,"rid":12}]
+
+-- FULL: the same matched/null-left rows, plus left row 3 (k=3) null-right exactly once.
+select mm_l.id as lid, mm_r.id as rid from mm_l full join mm_r on mm_l.k = mm_r.k order by coalesce(mm_r.id, 999), coalesce(mm_l.id, 999);
+→ [{"lid":1,"rid":10},{"lid":2,"rid":10},{"lid":1,"rid":11},{"lid":2,"rid":11},{"lid":null,"rid":12},{"lid":3,"rid":null}]
+
+drop table mm_l;
+drop table mm_r;
+-- run
+
+-- ===== USING join (order-agnostic equality in the right-driven loop) =====
+
+create table us_l (id integer primary key, val text);
+create table us_r (id integer primary key, val text);
+insert into us_l values (1, 'L1'), (2, 'L2');
+insert into us_r values (1, 'R1'), (3, 'R3');
+-- run
+
+-- right join … using (id): same shape as the ON form; right id=3 null-left.
+select us_l.id as l, us_r.id as r from us_l right join us_r using (id) order by us_r.id;
+→ [{"l":1,"r":1},{"l":null,"r":3}]
+
+-- full join … using (id): both unmatched sides surface.
+select us_l.id as l, us_r.id as r from us_l full join us_r using (id) order by coalesce(us_l.id, us_r.id);
+→ [{"l":1,"r":1},{"l":2,"r":null},{"l":null,"r":3}]
+
+drop table us_l;
+drop table us_r;
+-- run
+
+-- ===== Existence flags on RIGHT (non-preserved side = left) =====
+-- `exists as h` resolves to the only null-extendable side (left) of a RIGHT join.
+-- A matched row sets h=true; a left-null-extended row sets h=false.
+
+create table ex_l (id integer primary key, val text);
+create table ex_r (id integer primary key, val text);
+insert into ex_l values (1, 'L1');
+insert into ex_r values (1, 'R1'), (2, 'R2');
+-- run
+
+select ex_r.id as r, h from ex_l right join ex_r on ex_l.id = ex_r.id exists as h order by ex_r.id;
+→ [{"r":1,"h":true},{"r":2,"h":false}]
+
+drop table ex_l;
+drop table ex_r;
+-- run
+
+-- ===== Existence flags on FULL (both sides null-extendable) =====
+-- fl = "left present", fr = "right present". Matched → both true; right-only row →
+-- fl false, fr true; left-only row → fl true, fr false.
+
+create table fe_l (id integer primary key);
+create table fe_r (id integer primary key);
+insert into fe_l values (1), (2);
+insert into fe_r values (1), (3);
+-- run
+
+select fe_l.id as l, fe_r.id as r, fl, fr
+from fe_l full join fe_r on fe_l.id = fe_r.id exists left as fl, exists right as fr
+order by coalesce(fe_l.id, fe_r.id);
+→ [{"l":1,"r":1,"fl":true,"fr":true},{"l":2,"r":null,"fl":true,"fr":false},{"l":null,"r":3,"fl":false,"fr":true}]
+
+drop table fe_l;
+drop table fe_r;

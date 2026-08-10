@@ -1,5 +1,9 @@
 # @quereus/sync
 
+> **Stability: Experimental** — a research track; the API, the wire protocol, and the
+> stored bytes may change or disappear without notice, in any release including a patch.
+> See [Stability Tiers](../../docs/stability.md#tiers).
+
 CRDT-based multi-master sync framework for [Quereus](https://github.com/gotchoices/quereus). Enables offline-first applications with automatic conflict resolution.
 
 ## Features
@@ -27,10 +31,19 @@ import { createSyncModule, createStoreAdapter } from '@quereus/sync';
 const storeEvents = new StoreEventEmitter();
 const kv = await LevelDBStore.open({ path: './sync-metadata' });
 
-// Create sync module (tracks CRDT metadata, emits sync events)
-const { syncManager, syncEvents } = await createSyncModule(kv, storeEvents, {
-  applyToStore: createStoreAdapter({ db, getKVStore, events: storeEvents, getTableSchema }),
-  getTableSchema: (schema, table) => db.getTableSchema(schema, table),
+// Create sync module (tracks CRDT metadata, emits sync events).
+// `db` is the Quereus Database; `storeModule` is the StoreModule the synced
+// tables use — the adapter resolves each table through it, so inbound writes
+// get table-owned key encoding, secondary-index maintenance, and post-apply
+// reporting through the engine (materialized views, Database.watch).
+//
+// `transactionSource: db` wires local-change capture to the engine's
+// transaction-commit boundary: the HLC ticks once per committed transaction and
+// every fact of that transaction shares its base HLC (differing only by opSeq).
+const { syncManager, syncEvents } = await createSyncModule(kv, {
+  transactionSource: db,
+  applyToStore: createStoreAdapter({ db, storeModule, events: storeEvents }),
+  getTableSchema: (schema, table) => db.schemaManager.getTable(schema, table),
 });
 
 // Subscribe to sync events for UI
@@ -106,16 +119,29 @@ await syncManager.applySnapshot(snapshot);
 Streaming snapshots support checkpoint-based resumption:
 
 ```typescript
-// Save checkpoint during long snapshot transfers
-const checkpoint = await syncManager.getSnapshotCheckpoint(snapshotId);
+// After a restart the snapshotId is gone (it only ever arrived in the header
+// chunk), so discover any interrupted transfer instead. A non-empty list means
+// this replica's data is PARTIAL — an apply cleared local metadata and never
+// reached its footer.
+const [checkpoint] = await syncManager.listSnapshotCheckpoints();
 
-// Resume from where we left off
+// Or look one up directly, when the id is still in hand
+// const checkpoint = await syncManager.getSnapshotCheckpoint(snapshotId);
+
 if (checkpoint) {
+  // Resume from where we left off...
   for await (const chunk of syncManager.resumeSnapshotStream(checkpoint)) {
     sendToPeer(chunk);
   }
+  // ...or abandon a transfer that will not be resumed:
+  // await syncManager.clearSnapshotCheckpoint(checkpoint.snapshotId);
 }
 ```
+
+A `SnapshotCheckpoint` holds a `Uint8Array` site id and a `bigint` HLC wall time,
+so it is **not** JSON-safe as-is. To send one to a peer (e.g. in a
+`resume_snapshot` message), run it through `serializeSnapshotCheckpoint` and
+recover it on the far side with `deserializeSnapshotCheckpoint`.
 
 ## Events
 
@@ -154,10 +180,20 @@ This means concurrent updates to *different* columns of the same row both apply,
 
 ### Core Exports
 
-- `createSyncModule(kv, storeEvents, options?)` - Factory to create sync manager and event emitter
-- `createStoreAdapter(options)` - Creates an `ApplyToStoreCallback` for applying remote changes
+- `createSyncModule(kv, options?)` - Factory to create sync manager and event emitter. Pass `transactionSource` (the engine `Database`) to capture local changes at the transaction boundary; omit it for a relay-only deployment (e.g. a coordinator)
+- `createStoreAdapter({ db, storeModule, events, applyForeignKeyActions? })` - Creates an `ApplyToStoreCallback` for applying remote changes. Applies rows through `StoreTable.applyExternalRowChanges` (table-owned keying, secondary-index maintenance) and reports each invocation as one `Database.ingestExternalRowChanges` batch (materialized-view maintenance, `Database.watch` capture, commit-time assertions). `applyForeignKeyActions` (default `false`) opts inbound update/delete into parent-side FK actions — only enable when the replication stream does not already carry the origin's cascade effects; cascaded child writes are recorded as *local* changes and propagate outward. The callback is host-driven: never invoke it from within statement execution, and don't drive it while holding an open explicit transaction on `db`. Inbound **assertion** violations are *detect-and-notify*: a local commit-time global assertion the merged batch trips is reported via `onAssertionViolation` while the data and its derived effects (MV, `Database.watch`) converge on the first apply — no divergence, no throw, no retry (trust-the-origin: the data must land regardless). A genuine per-change **storage** failure still aborts: it is collected in `ApplyToStoreResult.errors`, the consumer leaves CRDT metadata uncommitted, and the next sync attempt re-resolves and converges (value-identical re-application is suppressed)
+- `registerBasisLifecycleTvf(db, syncManager)` - Opt-in: register the `quereus_basis_lifecycle()` introspection TVF against an engine `Database`, so a developer can list legacy / retirement-candidate basis tables from SQL (`select "table", state, "unmappedSince" from quereus_basis_lifecycle() where state = 'derivation-source-only'`). A pure read-only convenience over `SyncManager.getBasisTableLifecycle()`; call once after `createSyncModule(...)`
 - `SyncManager` - Main sync coordination interface
 - `SyncEventEmitter` / `SyncEventEmitterImpl` - Event subscription interface and implementation
+
+### Maintenance Exports
+
+The five housekeeping sweeps (`drainHeldChanges` / `pruneQuarantine` / `pruneTombstones` / `repairChangeLog` / `evictExpiredBasisTables`) are methods on `SyncManager`; this package deliberately schedules none of them — the host arms the timer. What it does ship is the *shape* of one pass, so every host runs the same semantics:
+
+- `runSyncMaintenancePass(target, log)` - Runs all five sweeps in drain-before-prune order. Each sweep is error-isolated (a throw is reported to `log` and the remaining sweeps still run); the pass never rejects
+- `createSyncMaintenanceTicker(getTarget, log)` - Wraps the pass with the single-flight and null-target guards a timer needs. The collapsed tick resolves immediately rather than joining the running pass — a host that must *await* the in-flight pass (to close stores at shutdown) should hold the pass promise itself
+- `SYNC_MAINTENANCE_INTERVAL_MS` - Suggested cadence (5 minutes), sized for the one latency-sensitive sweep (`drainHeldChanges`). A host where that sweep is inert — a relay with no `getTableSchema` oracle — is free to run slower
+- `SyncMaintenanceTarget` / `MaintenanceLogger` - The structural slice of `SyncManager` the pass calls, and the failure-reporting callback
 
 ### Clock Exports
 
@@ -171,9 +207,9 @@ This means concurrent updates to *different* columns of the same row both apply,
 - `ChangeSet` - Collection of changes from one transaction
 - `Change` (`ColumnChange | RowDeletion`) - Single column or row change
 - `SchemaMigration` - Schema change (CREATE/ALTER/DROP TABLE)
-- `SnapshotChunk` - Streaming snapshot data (header, table-start, column-versions, table-end, schema-migration, footer)
+- `SnapshotChunk` - Streaming snapshot data, in emission order: header, schema-migration, table-start, column-versions, table-end, tombstone, footer. All DDL precedes all table data — see docs/sync-protocol.md § Streaming Snapshot API
 - `ApplyResult` - Result of applying changes (applied, skipped, conflicts, transactions)
-- `SyncConfig` / `DEFAULT_SYNC_CONFIG` - Configuration (tombstoneTTL, allowResurrection, etc.)
+- `SyncConfig` / `DEFAULT_SYNC_CONFIG` - Configuration (retentionHorizonMs, allowResurrection, etc.)
 
 ## Related Packages
 

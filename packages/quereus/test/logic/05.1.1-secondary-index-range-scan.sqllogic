@@ -1,0 +1,56 @@
+-- 05.1.1-secondary-index-range-scan.sqllogic
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Carved out of 05.1-composite-pk-range-scan: that file's subject is leading-column
+-- range scans over composite (and DESC-leading composite) PRIMARY KEYS, which need
+-- no index DDL at all. These two scenarios build a standalone multi-column SECONDARY
+-- index purely as a comparison point for the same seek-key bug, so they lived only to
+-- cover the secondary branch — and would have made the whole PK file unrunnable on a
+-- backend without first-class CREATE INDEX.
+--
+-- Subject: a range scan bounded on the leading column of a multi-column SECONDARY
+-- index must return every matching row (ASC-leading and DESC-leading variants).
+
+PRAGMA default_vtab_module='memory';
+
+-- Multi-column SECONDARY index, leading-column range scan. The PK is a single
+-- scalar column so the primary path is unaffected; force the secondary index
+-- to drive the scan via a leading-column range on a composite index.
+CREATE TABLE idx_t (id INTEGER PRIMARY KEY, k INTEGER, name TEXT, v TEXT);
+CREATE INDEX idx_kn ON idx_t (k, name);
+INSERT INTO idx_t VALUES (1, 10, 'a', 'p'), (2, 20, 'b', 'q'), (3, 30, 'c', 'r');
+
+SELECT id FROM idx_t WHERE k >= 10 ORDER BY k;
+→ [{"id":1},{"id":2},{"id":3}]
+
+SELECT id FROM idx_t WHERE k >= 15 ORDER BY k;
+→ [{"id":2},{"id":3}]
+
+SELECT id FROM idx_t WHERE k >= 10 AND k < 30 ORDER BY k;
+→ [{"id":1},{"id":2}]
+
+DROP TABLE idx_t;
+
+-- Multi-column SECONDARY index with a DESC leading column. The secondary
+-- branch carries isDescFirstColumn handling (the lower-bound wrap is
+-- direction-independent), so a leading-column range still returns every row.
+-- (The primary branch lacks this handling — tracked separately.)
+CREATE TABLE idx_d (id INTEGER PRIMARY KEY, k INTEGER, name TEXT, v TEXT);
+CREATE INDEX idx_kn_d ON idx_d (k DESC, name);
+INSERT INTO idx_d VALUES (1, 10, 'a', 'p'), (2, 20, 'b', 'q'), (3, 30, 'c', 'r');
+
+SELECT id FROM idx_d WHERE k >= 15 ORDER BY k;
+→ [{"id":2},{"id":3}]
+
+-- Upper-bound range on the DESC-leading secondary index. An ascending physical
+-- walk over a DESC-leading composite index seeks from the upper bound; that
+-- scalar bound is wrapped in a single-element array so the comparator positions
+-- the seek at the bound rather than at a tree extreme. NOTE: the pre-wrap scalar
+-- form was inefficient (a bare scalar sorts to one tree end, forcing a full
+-- forward scan) but still correct here — it landed at the start of the walk, so
+-- this case is a result-correctness assertion, not a row-drop regression guard.
+SELECT id FROM idx_d WHERE k <= 25 ORDER BY k;
+→ [{"id":1},{"id":2}]
+
+DROP TABLE idx_d;

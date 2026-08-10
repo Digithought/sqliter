@@ -1,5 +1,7 @@
 # Titan Optimizer – Constant Folding & Constant-Dependency Resolution
 
+> **Stability: Internal** — see [Stability Tiers](stability.md#tiers).
+
 This document describes the design, data-flow, and implementation of constant folding in Titan. It assumes familiarity with `README.md` and `docs/runtime.md`.
 
 Implementation status: Implemented as a dedicated pre-optimization pass (Pass 0) in the optimizer’s multi-pass framework. Both scalar and relational constant folding are live. See “Pass 0: Constant Folding” in `docs/optimizer.md`.

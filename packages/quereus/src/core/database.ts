@@ -1,23 +1,25 @@
 import { createLogger } from '../common/logger.js';
-import { MisuseError, QuereusError, FailConflictError, RollbackConflictError } from '../common/errors.js';
-import { StatusCode, type SqlParameters, type SqlValue, type Row, type OutputValue } from '../common/types.js';
+import { MisuseError, QuereusError, FailConflictError, RollbackConflictError, throwIfAborted } from '../common/errors.js';
+import { StatusCode, type SqlParameters, type SqlValue, type Row, type OutputValue, type StatementOptions } from '../common/types.js';
 import type { ScalarType } from '../common/datatype.js';
 import type { AnyVirtualTableModule } from '../vtab/module.js';
 import { Statement } from './statement.js';
 import { SchemaManager } from '../schema/manager.js';
-import type { TableSchema } from '../schema/table.js';
+import type { TableSchema, UniqueConstraintSchema } from '../schema/table.js';
+import type { MaintainedTableSchema } from '../schema/derivation.js';
 import type { FunctionSchema } from '../schema/function.js';
 import { BUILTIN_FUNCTIONS } from '../func/builtins/index.js';
-import { createScalarFunction, createAggregateFunction } from '../func/registration.js';
+import { createScalarFunction, createAggregateFunction, normalizeFunctionSchema } from '../func/registration.js';
 import { FunctionFlags } from '../common/constants.js';
 import { MemoryTableModule } from '../vtab/memory/module.js';
 import type { VirtualTableConnection } from '../vtab/connection.js';
-import { BINARY_COLLATION, NOCASE_COLLATION, RTRIM_COLLATION, type CollationFunction } from '../util/comparison.js';
+import { BINARY_COLLATION, NOCASE_COLLATION, RTRIM_COLLATION, normalizeCollationName, type CollationFunction } from '../util/comparison.js';
 import { BUILTIN_NORMALIZERS } from '../util/key-serializer.js';
 import { Parser } from '../parser/parser.js';
 import * as AST from '../parser/ast.js';
 import { buildBlock } from '../planner/building/block.js';
 import { emitPlanNode } from '../runtime/emitters.js';
+import { refreshMaintainedTable } from '../runtime/emit/materialized-view.js';
 import { Scheduler } from '../runtime/scheduler.js';
 import type { RuntimeContext } from '../runtime/types.js';
 import { createStrictRowContextMap, wrapTableContextsStrict } from '../runtime/strict-fork.js';
@@ -27,7 +29,10 @@ import type { PlanningContext } from '../planner/planning-context.js';
 import { BuildTimeDependencyTracker } from '../planner/planning-context.js';
 import { ParameterScope } from '../planner/scopes/param.js';
 import { GlobalScope } from '../planner/scopes/global.js';
-import { PlanNode } from '../planner/nodes/plan-node.js';
+import { PlanNode, isRelationalNode } from '../planner/nodes/plan-node.js';
+import { TableReferenceNode } from '../planner/nodes/reference.js';
+import { PlanNodeType } from '../planner/nodes/plan-node-type.js';
+import { getModuleReadCommittedSnapshot } from '../vtab/concurrency.js';
 import { registerEmitters } from '../runtime/register.js';
 import { serializePlanTree, formatPlanTree } from '../planner/debug.js';
 import type { DebugOptions } from '../planner/planning-context.js';
@@ -36,24 +41,36 @@ import { Optimizer, DEFAULT_TUNING } from '../planner/optimizer.js';
 import type { OptimizerTuning } from '../planner/optimizer-tuning.js';
 import { registerBuiltinWindowFunctions } from '../func/builtins/builtin-window-functions.js';
 import { DatabaseOptionsManager } from './database-options.js';
+import { MAINTENANCE_REBUILD_ROW_THRESHOLD } from '../planner/cost/index.js';
 import type { InstructionTracer } from '../runtime/types.js';
 import { DeclaredSchemaManager } from '../schema/declared-schema-manager.js';
 import { DeferredConstraintQueue } from '../runtime/deferred-constraint-queue.js';
-import { type LogicalType } from '../types/logical-type.js';
+import { type LogicalType, type CollationResolver, type KeyNormalizer, type KeyNormalizerResolver } from '../types/logical-type.js';
 import { registerType as registerTypeInRegistry } from '../types/registry.js';
 import { getParameterTypes } from './param.js';
 import { rowToObject } from './utils.js';
+import { isAsyncIterable, disconnectVTable } from '../runtime/utils.js';
+import type { VirtualTable } from '../vtab/table.js';
 import { wrapAsyncIterator } from '../util/async-iterator.js';
+import { Latches } from '../util/latches.js';
+import { canonicalizeSqlValue } from '../util/numeric-canonical.js';
 import {
 	DatabaseEventEmitter,
 	type DatabaseDataChangeEvent,
 	type DatabaseSchemaChangeEvent,
+	type MaintenanceCollisionEvent,
+	type TransactionCommitBatch,
 	type DataChangeSubscriptionOptions,
 	type SchemaChangeSubscriptionOptions,
 } from './database-events.js';
 import { TransactionManager, type TransactionManagerContext } from './database-transaction.js';
-import { AssertionEvaluator, type AssertionEvaluatorContext } from './database-assertions.js';
+import { InternalStatementCache } from './internal-statement-cache.js';
+import { ingestExternalRowChangeBatch } from './database-external-changes.js';
+import type { ExternalRowChange, IngestExternalChangesOptions, IngestExternalChangesResult } from './database-internal.js';
+import { AssertionEvaluator, type AssertionEvaluatorContext, type AssertionViolation } from './database-assertions.js';
 import { WatcherManager, type WatcherManagerContext } from './database-watchers.js';
+import { MaterializedViewManager, type BackingConnectionCache, type ResidualKeyBatch } from './database-materialized-views.js';
+import type { BackingRowChange } from '../vtab/backing-host.js';
 import type { ChangeScope, Subscription, WatchHandler } from '../planner/analysis/change-scope.js';
 import { tryGetEventEmitter } from '../vtab/events.js';
 import { Table } from './table-handle.js';
@@ -65,6 +82,40 @@ const errorLog = log.extend('error');
 export interface BuildPlanResult {
 	plan: BlockNode;
 	schemaDependencies: BuildTimeDependencyTracker;
+}
+
+/**
+ * Live handle for one mutex-free committed read (see
+ * {@link import('../common/types.js').StatementOptions.readConcurrency}).
+ * Minted by {@link Database._beginConcurrentRead}; the read combines `signal`
+ * with the caller's own signal and MUST call `end()` on every exit path
+ * (completion, break, error, abort) — {@link Database.close} awaits `done`,
+ * so a leaked scope hangs close.
+ */
+export interface ConcurrentReadScope {
+	/** Fired by {@link Database.close} so an in-flight read unwinds (with an
+	 *  AbortError) at its next row boundary. */
+	readonly signal: AbortSignal;
+	/** Resolves once {@link end} has run — i.e. the read's teardown (scan
+	 *  connection disconnects included) is complete. */
+	readonly done: Promise<void>;
+	/** Marks the read finished. Idempotent. */
+	end(): void;
+}
+
+/** Options accepted by {@link Database.registerCollation}'s third argument. */
+export interface RegisterCollationOptions {
+	normalizer?: (s: string) => string;
+	replicable?: boolean;
+	orderPreserving?: boolean;
+}
+
+/** One entry in the per-database collation registry. */
+interface CollationEntry {
+	comparator: CollationFunction;
+	normalizer?: (s: string) => string;
+	replicable?: boolean;
+	orderPreserving?: boolean;
 }
 
 /** Parse a comma-separated schema path string into an array of trimmed, non-empty names. */
@@ -93,8 +144,29 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * Mutex for serializing statement execution.
 	 * This prevents concurrent statements from interfering with each other's
 	 * transaction state, matching SQLite's behavior of serializing writes.
+	 *
+	 * Not quite unconditional: a read-only statement executed with
+	 * `readConcurrency: 'committed'` (see {@link StatementOptions}) that passes
+	 * {@link _isConcurrentReadEligible} runs WITHOUT this mutex against each
+	 * table's last committed state, so it completes even while another statement
+	 * is blocked in its virtual-table commit. Everything else — every write, every
+	 * default read — still serializes here.
 	 */
 	private execMutex: Promise<void> = Promise.resolve();
+	/**
+	 * Depth of currently-held exec-mutex acquisitions. >0 while a statement
+	 * (`exec`/`eval`), an external-change ingest, or an MV-refresh sweep holds the
+	 * mutex. Read via {@link _isExecuting} so a re-entrant caller (e.g. a module
+	 * `notifyLensDeployment` listener that would itself re-enter the engine) can
+	 * detect it must defer rather than deadlock on the held mutex.
+	 */
+	private execMutexDepth = 0;
+	/**
+	 * Live mutex-free committed-read scopes → their abort controllers.
+	 * {@link close} aborts each and awaits its `done` before tearing down shared
+	 * state, so no read is left iterating a schema being cleared.
+	 */
+	private readonly concurrentReads = new Map<ConcurrentReadScope, AbortController>();
 	/** Database-level event emitter for unified reactivity */
 	private readonly eventEmitter = new DatabaseEventEmitter();
 	/** Transaction management */
@@ -103,15 +175,46 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	private readonly assertionEvaluator: AssertionEvaluator;
 	/** Post-commit watcher dispatch */
 	private readonly watcherManager: WatcherManager;
-	/** Per-database collation registry — comparator + optional key normalizer.
-	 *  The normalizer is required for index participation; comparator-only
-	 *  collations may still be used in ORDER BY but cannot back a compound index. */
-	private readonly collations = new Map<string, { comparator: CollationFunction; normalizer?: (s: string) => string }>();
+	/** Materialized-view schema-change staleness tracking */
+	private readonly materializedViewManager: MaterializedViewManager;
+	/** Per-database collation registry — comparator + optional key normalizer +
+	 *  optional REPLICABLE and ORDER-PRESERVING assertions. The normalizer is required
+	 *  for index participation; comparator-only collations may still be used in ORDER BY
+	 *  but cannot back a compound index. `replicable` (stamped `true` on the built-ins,
+	 *  opt-in for a custom collation) is consulted only by the materialized-view
+	 *  replicable-collation gate when the backing host demands it
+	 *  (see {@link _isCollationReplicable}). `orderPreserving` (same shape) is consulted
+	 *  by persistent stores before seeking a byte range or advertising byte order as
+	 *  collation order (see {@link _isCollationOrderPreserving}). */
+	private readonly collations = new Map<string, CollationEntry>();
+	/** Lazily-bound {@link getCollationResolver} closure — created once so callers can
+	 *  compare resolver identity, while still reading the live `collations` map. */
+	private collationResolver?: CollationResolver;
+	/** Lazily-bound {@link getKeyNormalizerResolver} closure — same identity/liveness
+	 *  contract as {@link collationResolver}. */
+	private keyNormalizerResolver?: KeyNormalizerResolver;
+	/**
+	 * Per-database latch registry — serializes commit / collapse / consolidate /
+	 * destroy / schema-change work by string key *within this database*. Scoped to
+	 * the `Database` instance (not process-global) so two databases never contend
+	 * on the same key. Memory-table managers reach it via `this.db.latches`.
+	 */
+	public readonly latches = new Latches();
+	/**
+	 * @internal Per-connection LRU pool of compiled internal statements for the FK
+	 * and DDL enforcement paths (RESTRICT probes, cascade DML, drop-referencing
+	 * check). Those sites otherwise re-`prepare` a tiny fixed-shape query per
+	 * affected row, paying a full parse + plan + emit each time (the engine has no
+	 * plan cache). Not a public statement-cache feature — see
+	 * {@link InternalStatementCache}. Drained by {@link close}.
+	 */
+	public readonly _internalStatementCache: InternalStatementCache;
 
 	constructor() {
 		this.schemaManager = new SchemaManager(this);
 		this.declaredSchemaManager = new DeclaredSchemaManager();
 		this.options = new DatabaseOptionsManager();
+		this._internalStatementCache = new InternalStatementCache(this);
 		log("Database instance created.");
 
 		// Register built-in functions
@@ -134,6 +237,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		this.transactionManager = new TransactionManager(this);
 		this.assertionEvaluator = new AssertionEvaluator(this);
 		this.watcherManager = new WatcherManager(this);
+		this.materializedViewManager = new MaterializedViewManager(this);
 
 		// Set up option change listeners
 		this.setupOptionListeners();
@@ -245,6 +349,35 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			}
 		});
 
+		this.options.registerOption('ddl_transaction_policy', {
+			type: 'string',
+			defaultValue: 'permissive',
+			description: 'Whether module-dispatching DDL (CREATE/DROP TABLE/INDEX, ALTER TABLE, CREATE/DROP/REFRESH MATERIALIZED VIEW) is allowed inside an explicit transaction: "permissive" (default; schema changes may escape the transaction, as today) or "strict" (refuse such DDL inside a transaction unless the module declares ddlTransactionality=transactional).',
+			onChange: (event) => {
+				const value = event.newValue as string;
+				if (value !== 'permissive' && value !== 'strict') {
+					throw new QuereusError(`Invalid ddl_transaction_policy value: ${value}. Must be "permissive" or "strict"`, StatusCode.ERROR);
+				}
+				log('DDL transaction policy changed to: %s', value);
+			}
+		});
+
+		this.options.registerOption('default_collation', {
+			type: 'string',
+			defaultValue: 'BINARY',
+			description: 'Default declared collation for columns with no explicit COLLATE (e.g. "BINARY", "NOCASE", "RTRIM", or any registered collation). Create-time authoring convenience only; the catalog stores concrete collations and persisted DDL always carries an explicit non-BINARY COLLATE.',
+			onChange: (event) => {
+				const value = event.newValue as string;
+				const normalized = normalizeCollationName(value);
+				// Validate at set time so a typo fails loudly, not at first comparison.
+				// The options framework rolls the value back when onChange throws.
+				if (this._getCollation(normalized) === undefined) {
+					throw new QuereusError(`Unknown collation '${value}' for default_collation`, StatusCode.ERROR);
+				}
+				log('Default collation changed to: %s', normalized);
+			}
+		});
+
 		this.options.registerOption('schema_path', {
 			type: 'string',
 			defaultValue: 'main',
@@ -260,6 +393,15 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			type: 'boolean',
 			defaultValue: false,
 			description: 'Enable plan stack tracing',
+		});
+
+		this.options.registerOption('runtime_fuse_scalars', {
+			type: 'boolean',
+			defaultValue: true,
+			description: 'Compile pure synchronous scalar expression subtrees into single fused closures ' +
+				'instead of per-row sub-programs (runtime/scalar-fusion.ts). Kill switch for bisecting a ' +
+				'suspected fusion bug; trace_plan_stack=true also disables fusion. Like trace_plan_stack, ' +
+				'the decision is baked into a prepared statement at emit time — recompile to pick up a toggle.',
 		});
 
 		this.options.registerOption('foreign_keys', {
@@ -280,14 +422,43 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 				log('nondeterministic_schema changed to: %s', event.newValue);
 			}
 		});
+
+		this.options.registerOption('materialized_view_rebuild_row_threshold', {
+			type: 'number',
+			defaultValue: MAINTENANCE_REBUILD_ROW_THRESHOLD,
+			description: 'Largest source-row count for which a materialized view whose only sound maintenance ' +
+				'strategy is a full body rebuild is accepted at create. A full-rebuild MV over a larger source ' +
+				'is rejected (every write would re-scan the whole source). Set to 0 to disable the size reject ' +
+				'(accept any size). The check uses the largest participating source for a multi-source body.',
+			onChange: (event) => {
+				// Validate at set time so a bad value fails loudly; the options framework
+				// rolls the value back when onChange throws.
+				const value = event.newValue as number;
+				if (!Number.isFinite(value) || value < 0) {
+					throw new QuereusError(
+						`Invalid materialized_view_rebuild_row_threshold ${event.newValue}: must be a non-negative number (0 disables the size reject)`,
+						StatusCode.ERROR,
+					);
+				}
+				log('materialized_view_rebuild_row_threshold changed to: %s', value);
+			}
+		});
 	}
 
 	/** @internal Registers default built-in SQL functions */
 	private registerBuiltinFunctions(): void {
 		const mainSchema = this.schemaManager.getMainSchema();
+		// Built-ins auto-qualify as REPLICABLE: Quereus implements its own collation,
+		// case-folding, and numeric formatting, so a deterministic builtin is
+		// bit-identical across peers' JS engines (see BaseFunctionSchema.replicable).
+		// This is the single seam that *knows* a schema is a builtin, so stamping here
+		// auto-qualifies all of them without editing ~100 definitions and without
+		// defaulting UDFs to replicable. Non-deterministic builtins (random, now, …) are
+		// stamped too — harmless, since the determinism gate rejects them first. Spread a
+		// COPY so the shared exported BUILTIN_FUNCTIONS constants are never mutated.
 		BUILTIN_FUNCTIONS.forEach(funcDef => {
 			try {
-				mainSchema.addFunction(funcDef);
+				mainSchema.addFunction({ ...funcDef, replicable: true });
 			} catch (e) {
 				errorLog(`Failed to register built-in function ${funcDef.name}/${funcDef.numArgs}: %O`, e);
 			}
@@ -298,10 +469,22 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	/** @internal Registers default collation sequences */
 	private registerDefaultCollations(): void {
 		// Register the built-in collations into per-instance registry, paired
-		// with their key normalizers so they can back compound indexes.
-		this.collations.set('BINARY', { comparator: BINARY_COLLATION, normalizer: BUILTIN_NORMALIZERS.BINARY });
-		this.collations.set('NOCASE', { comparator: NOCASE_COLLATION, normalizer: BUILTIN_NORMALIZERS.NOCASE });
-		this.collations.set('RTRIM',  { comparator: RTRIM_COLLATION,  normalizer: BUILTIN_NORMALIZERS.RTRIM  });
+		// with their key normalizers so they can back compound indexes. Stamped
+		// `replicable: true` — the built-ins are pure JS string operations (a code-point
+		// scan, locale-independent `toLowerCase()`, ASCII-space trim), so they are
+		// bit-identical across peers' JS engines, exactly parallel to why built-in
+		// functions auto-qualify (see registerBuiltinFunctions). This is the single
+		// seam that *knows* a collation is a builtin.
+		//
+		// Also stamped `orderPreserving: true`: each built-in comparator orders its
+		// operands' NORMALIZED forms by Unicode CODE POINT (BINARY's normalizer is the
+		// identity, NOCASE's is `toLowerCase()`, RTRIM's an ASCII-space right-trim), and
+		// code-point order IS the order a memcmp of those forms' UTF-8 bytes produces —
+		// see {@link import('../util/comparison.js').compareCodePoints} and
+		// {@link _isCollationOrderPreserving}.
+		this.collations.set('BINARY', { comparator: BINARY_COLLATION, normalizer: BUILTIN_NORMALIZERS.BINARY, replicable: true, orderPreserving: true });
+		this.collations.set('NOCASE', { comparator: NOCASE_COLLATION, normalizer: BUILTIN_NORMALIZERS.NOCASE, replicable: true, orderPreserving: true });
+		this.collations.set('RTRIM',  { comparator: RTRIM_COLLATION,  normalizer: BUILTIN_NORMALIZERS.RTRIM,  replicable: true, orderPreserving: true });
 		log("Default collations registered (BINARY, NOCASE, RTRIM)");
 	}
 
@@ -346,14 +529,23 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 *
 	 * @param sql The SQL query string to execute.
 	 * @param params Optional parameters to bind.
+	 * @param options Optional execution options (e.g. an `AbortSignal` for
+	 *   cooperative cancellation — checked before preparing and at the row
+	 *   boundary while the first row is produced; or `readConcurrency:
+	 *   'committed'` to run an eligible read-only query mutex-free against
+	 *   committed state — honored via `Statement.get`).
 	 * @returns A Promise resolving to the first result row as an object, or undefined if no rows.
-	 * @throws QuereusError on failure.
+	 * @throws QuereusError on failure (an `AbortError` if the signal fired).
 	 */
-	async get(sql: string, params?: SqlParameters | SqlValue[]): Promise<Record<string, SqlValue> | undefined> {
+	async get(sql: string, params?: SqlParameters | SqlValue[], options?: StatementOptions): Promise<Record<string, SqlValue> | undefined> {
 		this.checkOpen();
+		// Pre-flight cancellation before preparing/planning.
+		throwIfAborted(options?.signal);
 		const stmt = this.prepare(sql, params);
 		try {
-			return await stmt.get(params);
+			// Params were already bound (and their types inferred) by prepare();
+			// don't re-pass them or stmt.get() would rebind + re-validate every value.
+			return await stmt.get(undefined, options);
 		} finally {
 			await stmt.finalize();
 		}
@@ -377,7 +569,132 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			releaseMutex = resolve;
 		});
 		await previousMutex;
-		return releaseMutex!;
+		// Mark the mutex held from acquisition until the returned release runs, so a
+		// re-entrant caller can detect it (see _isExecuting). The wrapper decrements
+		// at most once even if release is invoked more than once.
+		this.execMutexDepth++;
+		let released = false;
+		return () => {
+			if (!released) {
+				released = true;
+				this.execMutexDepth--;
+			}
+			releaseMutex!();
+		};
+	}
+
+	/**
+	 * True while the exec mutex is held — i.e. a statement (`exec`/`eval`), an
+	 * external-change ingest, or an MV-refresh sweep is in flight. A caller that
+	 * would re-enter the engine (acquire the mutex again) from inside such a context
+	 * — e.g. a `notifyLensDeployment` module listener whose work calls
+	 * `ingestExternalRowChanges` — MUST check this and defer that work to run after
+	 * the current statement releases the mutex; re-entering synchronously deadlocks
+	 * on the chained mutex. Deliberately part of the consumable type surface (kept out
+	 * of the internal-only set) so a basis-backing host in another package can make
+	 * that defer-vs-await decision.
+	 */
+	_isExecuting(): boolean {
+		return this.execMutexDepth > 0;
+	}
+
+	/**
+	 * @internal True when this optimized block may run on the mutex-free
+	 * committed-read path. Pure predicate — no side effects, no awaits. All of
+	 * the following must hold, else the caller falls back to the serialized path
+	 * (falling back is always correct, so this never throws):
+	 *
+	 * - No EXPLICIT transaction is open. A read inside a user `BEGIN` must see
+	 *   the transaction's own writes, so it always serializes. An *implicit*
+	 *   transaction (another statement's in-flight autocommit wrapper — including
+	 *   one parked in its virtual-table commit, the motivating case) does NOT
+	 *   disqualify: the committed read never joins it and serves the last
+	 *   committed state.
+	 * - Every statement in the block is relational (row-producing). Transaction
+	 *   control and DDL lower to void nodes whose `physical.readonly` does not
+	 *   model their engine-level effects, so `readonly` alone is not a safe gate.
+	 * - No node in any statement's subtree has side effects.
+	 * - Every {@link TableReferenceNode} resolves to a module declaring
+	 *   `readCommittedSnapshot` (universal, not existential — one unqualified
+	 *   table makes the whole block serialize). Checked on the OPTIMIZED plan, so
+	 *   tables reached through views and materialized views are covered.
+	 * - No table-valued function is called. A TVF reaches its data outside the
+	 *   `TableReferenceNode` gate above, and `TableFunctionCallNode` reports
+	 *   `readonly: true` unconditionally, so neither of the other checks can see
+	 *   what it does — `execution_trace('insert ...')`, for one, prepares and
+	 *   runs arbitrary SQL. Fail closed, matching the module contract's
+	 *   opt-in-or-serialize discipline.
+	 *
+	 * Evaluated at routing time; a `BEGIN` landing after routing does not
+	 * invalidate an in-flight concurrent read — that read is already pinned to a
+	 * committed snapshot and simply does not see the new transaction's writes,
+	 * which is the documented semantics.
+	 *
+	 * NOTE: deliberately no plan-time schema gate. `Statement.compile()` is
+	 * synchronous (cannot observe half-applied multi-step DDL), captured schema
+	 * objects re-validate at execution start, and for the long window (the scan
+	 * itself) the `readCommittedSnapshot` obligation requires the module to keep
+	 * serving its pinned snapshot across concurrent DDL. A shared/exclusive gate
+	 * becomes necessary only if a module that cannot pin across DDL ever wants
+	 * onto this path — see backlog/debt-concurrent-reads-schema-gate.
+	 */
+	_isConcurrentReadEligible(block: BlockNode): boolean {
+		if (!this.isOpen) return false;
+		if (!this.transactionManager.getAutocommit() && !this.transactionManager.isImplicitTransaction()) {
+			return false;
+		}
+		if (block.statements.length === 0) return false;
+		return block.statements.every(stmt =>
+			isRelationalNode(stmt) && Database.isCommittedReadSafeSubtree(stmt));
+	}
+
+	/**
+	 * @internal Single walk over one optimized statement tree: rejects on any
+	 * side-effecting node, any table-valued function call, or any table whose
+	 * module does not declare `readCommittedSnapshot`. See
+	 * {@link _isConcurrentReadEligible} for why each is disqualifying.
+	 */
+	private static isCommittedReadSafeSubtree(root: PlanNode): boolean {
+		const stack: PlanNode[] = [root];
+		while (stack.length > 0) {
+			const node = stack.pop()!;
+			if (PlanNode.hasSideEffects(node.physical)) return false;
+			// NOTE: rejects every TVF, pure ones (`json_each`) included, because no
+			// declaration distinguishes them from `execution_trace`, which runs
+			// arbitrary SQL. If a pure TVF ever needs this path, add an explicit
+			// opt-in flag to the table-valued function schema and gate on it here.
+			if (node.nodeType === PlanNodeType.TableFunctionCall) return false;
+			if (node instanceof TableReferenceNode && !getModuleReadCommittedSnapshot(node.vtabModule)) {
+				return false;
+			}
+			for (const child of node.getChildren()) {
+				stack.push(child);
+			}
+		}
+		return true;
+	}
+
+	/**
+	 * @internal Registers a mutex-free committed read. The returned scope's
+	 * `signal` fires when {@link close} runs; the read must call `end()` on every
+	 * exit path or `close()` waits forever on `done`.
+	 */
+	_beginConcurrentRead(): ConcurrentReadScope {
+		this.checkOpen();
+		const controller = new AbortController();
+		let resolveDone!: () => void;
+		const done = new Promise<void>(resolve => {
+			resolveDone = resolve;
+		});
+		const scope: ConcurrentReadScope = {
+			signal: controller.signal,
+			done,
+			end: () => {
+				if (this.concurrentReads.delete(scope)) resolveDone();
+			},
+		};
+		this.concurrentReads.set(scope, controller);
+		return scope;
 	}
 
 	/**
@@ -497,7 +814,10 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * Executes a single AST statement. Does not manage mutex or transactions.
 	 * Used as the innermost execution primitive.
 	 */
-	private async _executeSingleStatement(statementAst: AST.Statement, params?: SqlParameters | SqlValue[]): Promise<void> {
+	private async _executeSingleStatement(statementAst: AST.Statement, params?: SqlParameters | SqlValue[], signal?: AbortSignal): Promise<void> {
+		// Pre-flight cancellation: reject before building/optimizing the plan.
+		throwIfAborted(signal);
+
 		const { plan } = this._buildPlan([statementAst], params);
 
 		if (plan.statements.length === 0) return; // No-op for this AST
@@ -507,14 +827,21 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		const rootInstruction = emitPlanNode(optimizedPlan, emissionContext);
 		const scheduler = new Scheduler(rootInstruction);
 
-		// Normalize array params to a record keyed by 1-based index, matching Statement.bindAll
-		let boundArgs: Record<number | string, SqlValue> = {};
+		// Normalize array params to a record keyed by 1-based index, matching Statement.bindAll —
+		// including its canonicalization: a safe-range bigint narrows to number as it enters the
+		// bound-args map (R1, util/numeric-canonical.ts). This is the fourth parameter ingress
+		// site alongside the three in Statement; without it `db.exec(sql, [5n])` would carry an
+		// uncanonicalized value all the way into a write.
+		const boundArgs: Record<number | string, SqlValue> = {};
 		if (Array.isArray(params)) {
-			params.forEach((value, index) => { boundArgs[index + 1] = value; });
+			params.forEach((value, index) => { boundArgs[index + 1] = canonicalizeSqlValue(value); });
 		} else if (params) {
-			boundArgs = { ...params };
+			for (const [key, value] of Object.entries(params)) {
+				boundArgs[key] = canonicalizeSqlValue(value);
+			}
 		}
 
+		const scanConnections = new Map<symbol, VirtualTable>();
 		const runtimeCtx: RuntimeContext = {
 			db: this,
 			stmt: undefined,
@@ -523,9 +850,26 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			tableContexts: wrapTableContextsStrict(new Map()),
 			tracer: this.instructionTracer,
 			enableMetrics: this.options.getBooleanOption('runtime_stats'),
+			signal,
+			scanConnections,
 		};
 
-		await scheduler.run(runtimeCtx);
+		try {
+			const result = await scheduler.run(runtimeCtx);
+			// A row-returning statement does its work only as its rows are pulled. `exec` wants
+			// none of them, but it does want the work — an un-drained stream means the statement
+			// never ran at all. Drain and discard, checking the abort signal at row boundaries the
+			// way Statement._iterateWithSignal does.
+			if (isAsyncIterable<Row>(result)) {
+				for await (const _row of result) {
+					throwIfAborted(signal);
+				}
+			}
+		} finally {
+			for (const vtab of scanConnections.values()) {
+				await disconnectVTable(runtimeCtx, vtab);
+			}
+		}
 	}
 
 	/**
@@ -562,14 +906,32 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * surrounding explicit transaction until the user issues `COMMIT` or
 	 * `ROLLBACK`.
 	 *
+	 * `options.readConcurrency` is IGNORED here: `exec` returns no rows, so a
+	 * concurrent committed read through it would have no consumer, and its
+	 * per-statement implicit-transaction loop is exactly the machinery the
+	 * mutex-free path must not touch. Use `get`/`eval` for concurrent reads.
+	 *
+	 * Every statement runs to completion, including row-returning ones (`select`,
+	 * `values`, `explain`, ...) — their rows are pulled and discarded so any side
+	 * effects and errors the query produces still happen. A caller passing a
+	 * row-returning query pays for the full scan and sees any error it raises,
+	 * but never sees the rows themselves; use `get`/`eval` to consume them.
+	 *
 	 * @param sql The SQL string(s) to execute.
 	 * @param params Optional parameters to bind.
+	 * @param options Optional execution options (e.g. an `AbortSignal` for
+	 *   cooperative cancellation — checked before each statement and at row
+	 *   boundaries during execution).
 	 * @returns A Promise resolving when execution completes.
-	 * @throws QuereusError on failure.
+	 * @throws QuereusError on failure (an `AbortError` if the signal fired).
 	 */
-	async exec(sql: string, params?: SqlParameters): Promise<void> {
+	async exec(sql: string, params?: SqlParameters, options?: StatementOptions): Promise<void> {
 		this.checkOpen();
 		log('Executing SQL block: %s', sql);
+
+		const signal = options?.signal;
+		// Pre-flight cancellation before acquiring the mutex / parsing.
+		throwIfAborted(signal);
 
 		const batch = this._parseSql(sql);
 		if (batch.length === 0) return;
@@ -583,7 +945,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			// statements that follow a mid-batch `BEGIN`.
 			for (const statementAst of batch) {
 				try {
-					await this._executeSingleStatement(statementAst, params);
+					await this._executeSingleStatement(statementAst, params, signal);
 					if (this.transactionManager.isImplicitTransaction()) {
 						await this._commitTransaction();
 					}
@@ -649,6 +1011,14 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 
 		// Check if the module has a getEventEmitter method and hook it up
 		this.hookModuleEvents(name, module);
+
+		// Hand the module this Database before any table hook can fire, so a module that
+		// must observe schema changes from the very first statement (a persistent-storage
+		// module persisting views, which never route through a table hook) can subscribe
+		// now. Deliberately LAST, and deliberately not guarded: a throw propagates to the
+		// caller, but the module is already registered and its events already hooked, so
+		// this is not an abort seam — see `VirtualTableModule.onRegister`.
+		module.onRegister?.(this, name);
 	}
 
 	/**
@@ -742,6 +1112,93 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	}
 
 	/**
+	 * @internal Whether the engine must generate/collect data-change events for
+	 * this statement — true when any `onDataChange` OR `onTransactionCommit`
+	 * listener is registered. The DML executor's auto-event gate consults this so a
+	 * consumer subscribed only to the grouped transaction-commit channel still gets
+	 * data events collected.
+	 */
+	_needsDataEvents(): boolean {
+		return this.eventEmitter.needsDataEvents();
+	}
+
+	/**
+	 * @internal Whether the engine must generate/collect schema-change events —
+	 * true when any `onSchemaChange` OR `onTransactionCommit` listener is
+	 * registered. Companion to {@link _needsDataEvents}; consulted by the schema
+	 * manager's auto-event gate.
+	 */
+	_needsSchemaEvents(): boolean {
+		return this.eventEmitter.needsSchemaEvents();
+	}
+
+	/**
+	 * Subscribe to materialized-view key-coarsening **collision** events — the
+	 * operational complement to the create-time key-coarsening warning. A
+	 * {@link MaintenanceCollisionEvent} fires whenever row-time maintenance
+	 * LWW-merges two distinct source-key tuples under one coarsened backing key K′
+	 * (`docs/materialized-views.md` § Coarsened backing keys). Events share the
+	 * transaction-batching discipline of the data/schema channels — delivered after
+	 * the commit that realized the merge, dropped on rollback.
+	 *
+	 * @param listener Callback invoked for each committed collision
+	 * @returns Unsubscribe function
+	 *
+	 * @example
+	 * ```typescript
+	 * const off = db.onMaintenanceCollision((e) => {
+	 *   console.warn(`coarsening collision on ${e.schemaName}.${e.tableName} ` +
+	 *     `at key ${JSON.stringify(e.key)} (columns: ${e.weakenedColumns.join(', ')})`);
+	 * });
+	 * ```
+	 */
+	onMaintenanceCollision(listener: (event: MaintenanceCollisionEvent) => void): () => void {
+		this.checkOpen();
+		return this.eventEmitter.onMaintenanceCollision(listener);
+	}
+
+	/**
+	 * Read-only snapshot of the cumulative committed key-coarsening collision
+	 * counter, keyed by lowercased qualified `schema.table` of the maintained
+	 * table. Reflects only collisions that committed (consistent with event
+	 * delivery) and is maintained whether or not a listener was ever subscribed.
+	 */
+	getMaterializedViewCollisionStats(): ReadonlyMap<string, number> {
+		this.checkOpen();
+		return this.eventEmitter.getMaterializedViewCollisionStats();
+	}
+
+	/**
+	 * Subscribe to grouped per-transaction commit batches — the authoritative
+	 * "one logical transaction = one group" boundary. A
+	 * {@link TransactionCommitBatch} fires **once** per committed transaction,
+	 * carrying every data and schema event of that transaction across **all**
+	 * tables, in flush order. Unlike the per-event {@link onDataChange} /
+	 * {@link onSchemaChange} channels (which this does not replace — it is purely
+	 * additive), a single subscription receives the whole transaction as one unit,
+	 * which is what a consumer grouping changes by transaction (e.g. assigning one
+	 * HLC per transaction) needs. Dropped on rollback; never fires for a
+	 * transaction that produced no data/schema events.
+	 *
+	 * @param listener Callback invoked once per committed transaction
+	 * @returns Unsubscribe function
+	 *
+	 * @example
+	 * ```typescript
+	 * const off = db.onTransactionCommit((batch) => {
+	 *   // All changes of one transaction, across all tables, in order.
+	 *   const local = batch.dataEvents.filter((e) => !e.remote);
+	 *   console.log(`committed ${local.length} local row changes, ` +
+	 *     `${batch.schemaEvents.length} schema changes`);
+	 * });
+	 * ```
+	 */
+	onTransactionCommit(listener: (batch: TransactionCommitBatch) => void): () => void {
+		this.checkOpen();
+		return this.eventEmitter.onTransactionCommit(listener);
+	}
+
+	/**
 	 * Get the internal event emitter for advanced use cases.
 	 * @internal
 	 */
@@ -800,8 +1257,24 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		log("Closing database...");
 		this.isOpen = false;
 
+		// Abort every live mutex-free committed read and wait for each to tear
+		// down (its scan connections disconnect in the read's own finally) before
+		// touching shared state. A read parked at a yield unwinds at the
+		// consumer's next pull/return — close() waits for that, so an abandoned,
+		// never-again-pulled iterator delays close (same discipline as any held
+		// iterator).
+		for (const controller of this.concurrentReads.values()) {
+			controller.abort();
+		}
+		await Promise.all(Array.from(this.concurrentReads.keys()).map(scope => scope.done));
+
 		// Disconnect all active connections first
 		await this.disconnectAllConnections();
+
+		// Drain the internal FK/DDL statement pool (finalizes its cached statements,
+		// which also deregisters them from `this.statements` below — double-finalize
+		// is a no-op, so the subsequent sweep is harmless).
+		await this._internalStatementCache.clear();
 
 		// Finalize all prepared statements
 		const finalizePromises = Array.from(this.statements).map(stmt => stmt.finalize());
@@ -813,6 +1286,9 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 
 		// Clean up watcher manager (dispose all subscriptions + schema listener)
 		this.watcherManager.dispose();
+
+		// Clean up materialized-view manager (unsubscribe schema listener)
+		this.materializedViewManager.dispose();
 
 		// Clear schemas, ensuring VTabs are potentially disconnected
 		// This will also call destroy on VTabs via SchemaManager.clearAll -> schema.clearTables -> schemaManager.dropTable
@@ -883,7 +1359,9 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		options: {
 			numArgs: number;
 			deterministic?: boolean;
+			replicable?: boolean;
 			flags?: number;
+			hidden?: boolean;
 		},
 		func: (...args: SqlValue[]) => SqlValue
 	): void {
@@ -893,7 +1371,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		const flags = options.flags ?? baseFlags;
 
 		const schema = createScalarFunction(
-			{ name, numArgs: options.numArgs, flags },
+			{ name, numArgs: options.numArgs, flags, replicable: options.replicable, hidden: options.hidden },
 			func
 		);
 
@@ -915,6 +1393,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		options: {
 			numArgs: number;
 			flags?: number;
+			replicable?: boolean;
 			initialState?: unknown;
 		},
 		stepFunc: (acc: unknown, ...args: SqlValue[]) => unknown,
@@ -925,7 +1404,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		const flags = options.flags ?? FunctionFlags.UTF8;
 
 		const schema = createAggregateFunction(
-			{ name, numArgs: options.numArgs, flags, initialValue: options.initialState },
+			{ name, numArgs: options.numArgs, flags, replicable: options.replicable, initialValue: options.initialState },
 			stepFunc,
 			finalFunc
 		);
@@ -937,7 +1416,13 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 
 	/**
 	 * Registers a function using a pre-defined FunctionSchema.
-	 * This is the lower-level registration method.
+	 * This is the lower-level registration method, and the path every plugin takes
+	 * (`registerPlugin` hands each entry's schema straight here).
+	 *
+	 * The schema's `returnType` is checked and normalized by
+	 * {@link normalizeFunctionSchema} — an absent one means "unknown" and becomes a
+	 * nullable scalar of ANY; a malformed one is rejected with a MisuseError rather
+	 * than surfacing later as an internal error at planning time.
 	 *
 	 * @param schema The FunctionSchema object describing the function.
 	 */
@@ -967,8 +1452,10 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		} else {
 			throw new MisuseError('registerFunction: schema must have implementation (scalar/TVF) or stepFunction+finalizeFunction (aggregate)');
 		}
-		this.registerFunctionWithErrorHandling('user', schema.name, schema.numArgs, () => {
-			this.schemaManager.getMainSchema().addFunction(schema);
+		// Return-type contract last, so the checks above keep firing on the field they name.
+		const normalized = normalizeFunctionSchema(schema);
+		this.registerFunctionWithErrorHandling('user', normalized.name, normalized.numArgs, () => {
+			this.schemaManager.getMainSchema().addFunction(normalized);
 		});
 	}
 
@@ -1059,13 +1546,31 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	}
 
 	/**
-	 * Registers a user-defined collation sequence.
+	 * Registers a user-defined collation sequence. `NOCASE` and `RTRIM` may be replaced;
+	 * `BINARY` may not (see {@link getCollationResolver}) and throws `MisuseError`.
 	 * @param name The name of the collation sequence (case-insensitive).
 	 * @param func The comparison function (a, b) => number (-1, 0, 1).
-	 * @param normalizer Optional key normalizer — a function whose output equality
-	 *   partitions strings into the same equivalence classes as `func` (modulo
-	 *   total ordering). Required to make this collation usable as the key for a
-	 *   compound index; ORDER BY / standalone comparisons work without it.
+	 * @param optionsOrNormalizer Either a bare key normalizer (the legacy positional
+	 *   form) or an options object `{ normalizer?, replicable?, orderPreserving? }`:
+	 *   - `normalizer` — a function whose output equality partitions strings into the
+	 *     same equivalence classes as `func` (modulo total ordering). Required to make
+	 *     this collation usable as the key for a compound index; ORDER BY / standalone
+	 *     comparisons work without it.
+	 *   - `replicable` — assert this collation is **bit-identical across peers,
+	 *     platforms, and app versions** (not merely deterministic). Consulted only by
+	 *     the materialized-view replicable-collation gate when a backing host declares
+	 *     `requiresReplicableDerivations`. Defaults to `false` — the conservative
+	 *     default for a custom collation (built-ins auto-qualify).
+	 *   - `orderPreserving` — assert the normalizer preserves ORDER, not merely
+	 *     equality: for all strings `x`, `y`,
+	 *     `sign(func(x, y)) === sign(memcmp(utf8(normalizer(x)), utf8(normalizer(y))))`.
+	 *     This is strictly stronger than the equality promise `normalizer` alone makes.
+	 *     Persistent stores physically order rows by the normalized key bytes, so they
+	 *     may only seek a byte range — or advertise byte order as collation order — for
+	 *     a collation carrying this assertion; without it they fall back to a full scan
+	 *     plus a comparator-accurate residual filter (correct, just slower). Defaults to
+	 *     `false` — correctness over speed for a custom collation (built-ins auto-qualify).
+	 *     See {@link _isCollationOrderPreserving}.
 	 * @example
 	 * // Example: Create a custom collation for phone numbers
 	 * db.registerCollation('PHONENUMBER', (a, b) => {
@@ -1075,11 +1580,39 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 *   return numA < numB ? -1 : numA > numB ? 1 : 0;
 	 * }, (s) => s.replace(/\D/g, ''));
 	 *
+	 * // A locale-independent custom collation a replicating backing can host:
+	 * db.registerCollation('CODEPOINT', cmp, { replicable: true });
+	 *
+	 * // A normalizer whose byte order matches its comparator, so store range seeks stay:
+	 * db.registerCollation('NOSPACE', cmp, { normalizer: s => s.replace(/ /g, ''), orderPreserving: true });
+	 *
 	 * // Then use it in SQL:
 	 * // SELECT * FROM contacts ORDER BY phone COLLATE PHONENUMBER;
 	 * // CREATE INDEX phone_idx ON contacts(phone COLLATE PHONENUMBER);
 	 */
-	registerCollation(name: string, func: CollationFunction, normalizer?: (s: string) => string): void {
+	// NOTE: registration is not retroactive. Comparators and key normalizers are
+	// resolved once, at comparator-construction time (index build, plan emission), so a
+	// collation registered — or re-registered with a different comparator/normalizer —
+	// after a structure was built does not rebuild it. A statement emitted *after* the
+	// re-registration does see the new one. Register collations before creating tables
+	// and indexes that name them. If retroactive re-registration ever needs to be
+	// supported, invalidate dependent indexes and cached plans here: the collation
+	// dependency `EmissionContext` records only drives an existence check before
+	// execution (`validateCapturedSchemaObjects`), which warns — it does not invalidate.
+	//
+	// NOTE: `orderPreserving` is stated against UTF-8 memcmp of the normalized forms, and the
+	// built-ins hold it for every WELL-FORMED string. It is unachievable for unpaired
+	// surrogates, which have no UTF-8 encoding at all (`TextEncoder` folds each to U+FFFD);
+	// the persistent store therefore REFUSES to key them (`quereus-store`'s `encodeText`
+	// raises), so no value a store-backed table can hold falls outside the assertion. Memory
+	// tables still accept them, which is why comparators must stay total there. A custom
+	// collation that compares with JS `<`/`>` orders by UTF-16 code unit and must NOT claim
+	// the assertion; use {@link import('../util/comparison.js').compareCodePoints}.
+	registerCollation(
+		name: string,
+		func: CollationFunction,
+		optionsOrNormalizer?: ((s: string) => string) | RegisterCollationOptions,
+	): void {
 		this.checkOpen();
 		if (typeof name !== 'string' || !name) {
 			throw new MisuseError('registerCollation: name must be a non-empty string');
@@ -1087,17 +1620,55 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		if (typeof func !== 'function') {
 			throw new MisuseError('registerCollation: func must be a function');
 		}
+		// A function-typed third arg is the legacy normalizer-only path (existing call
+		// sites unchanged, `replicable` and `orderPreserving` default to false); an object
+		// reads its fields; any other non-undefined third arg is a misused legacy normalizer.
+		let normalizer: ((s: string) => string) | undefined;
+		let replicable = false;
+		let orderPreserving = false;
+		if (typeof optionsOrNormalizer === 'function') {
+			normalizer = optionsOrNormalizer;
+		} else if (typeof optionsOrNormalizer === 'object' && optionsOrNormalizer !== null) {
+			normalizer = optionsOrNormalizer.normalizer;
+			replicable = optionsOrNormalizer.replicable === true;
+			orderPreserving = optionsOrNormalizer.orderPreserving === true;
+		} else if (optionsOrNormalizer !== undefined) {
+			throw new MisuseError('registerCollation: normalizer must be a function when supplied');
+		}
 		if (normalizer !== undefined && typeof normalizer !== 'function') {
 			throw new MisuseError('registerCollation: normalizer must be a function when supplied');
 		}
-		const upperName = name.toUpperCase();
+		const upperName = normalizeCollationName(name);
+		if (upperName === 'BINARY') {
+			// Resolvers fast-path BINARY to the built-in comparator, so an override could
+			// never take effect uniformly — reject rather than silently half-apply it.
+			throw new MisuseError('registerCollation: BINARY cannot be overridden');
+		}
 		if (this.collations.has(upperName)) {
 			log('Overwriting existing collation: %s', upperName);
 		}
-		this.collations.set(upperName, normalizer !== undefined
-			? { comparator: func, normalizer }
-			: { comparator: func });
-		log('Registered collation: %s%s', upperName, normalizer !== undefined ? ' (with normalizer)' : '');
+		const entry: CollationEntry = { comparator: func };
+		if (normalizer !== undefined) entry.normalizer = normalizer;
+		if (replicable) entry.replicable = true;
+		if (orderPreserving) entry.orderPreserving = true;
+		this.collations.set(upperName, entry);
+		log('Registered collation: %s%s%s%s', upperName,
+			normalizer !== undefined ? ' (with normalizer)' : '',
+			replicable ? ' (replicable)' : '',
+			orderPreserving ? ' (order-preserving)' : '');
+	}
+
+	/**
+	 * True iff `name` names a collation this connection can resolve — a built-in
+	 * (BINARY/NOCASE/RTRIM) or one registered via {@link registerCollation}. The
+	 * DDL-time counterpart of {@link getCollationResolver} that returns a boolean
+	 * instead of throwing; used to gate an explicit column COLLATE against the
+	 * connection's registry (see `validateCollationForType`). Names are normalized
+	 * (trim + uppercase) here and in {@link _getCollation}, so whitespace / case
+	 * variants resolve identically.
+	 */
+	isCollationRegistered(name: string): boolean {
+		return normalizeCollationName(name) === 'BINARY' || this._getCollation(name) !== undefined;
 	}
 
 	/**
@@ -1169,23 +1740,128 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		return this.instructionTracer;
 	}
 
-	/** @internal Gets a registered collation function */
-	_getCollation(name: string): CollationFunction | undefined {
-		return this.collations.get(name.toUpperCase())?.comparator;
+	/**
+	 * The canonical way to turn a collation name into a comparison function for this
+	 * database. Every comparator-construction site should route through this rather
+	 * than the deprecated process-global registry in `util/comparison.ts`, so a
+	 * collation registered with {@link registerCollation} is actually honored.
+	 *
+	 * The returned resolver:
+	 * - has stable identity across calls (bound once) and reads the live per-database
+	 *   registry, so a collation registered *after* the resolver was handed out is
+	 *   visible to later calls;
+	 * - resolves names case-insensitively (and tolerates surrounding whitespace);
+	 * - **throws** `QuereusError` (`no such collation sequence: X`) on an unknown name.
+	 *   An unresolvable collation is never downgraded to BINARY: byte-order results
+	 *   would be silently wrong for ORDER BY, UNIQUE, and index seeks alike;
+	 * - fast-paths the exact name `BINARY`. `BINARY` cannot be overridden — this is
+	 *   the fast path's correctness precondition, enforced by {@link registerCollation}
+	 *   rejecting it. Any other built-in — including `NOCASE` and `RTRIM` — can be
+	 *   overridden per database.
+	 *
+	 * It performs no `checkOpen()` check: it runs on hot comparator-construction paths,
+	 * and reading the registry of a closed database is harmless.
+	 */
+	getCollationResolver(): CollationResolver {
+		if (this.collationResolver === undefined) {
+			this.collationResolver = (collationName: string): CollationFunction => {
+				if (collationName === 'BINARY') return BINARY_COLLATION;
+				const func = this._getCollation(collationName);
+				if (!func) {
+					throw new QuereusError(`no such collation sequence: ${collationName}`, StatusCode.ERROR);
+				}
+				return func;
+			};
+		}
+		return this.collationResolver;
 	}
 
-	/** @internal Gets the registered key normalizer for a collation, falling back
-	 *  to the built-in normalizer for `BINARY` / `NOCASE` / `RTRIM` if the
-	 *  collation has no explicit normalizer registered. Returns `undefined` for
-	 *  comparator-only user-defined collations. */
-	_getCollationNormalizer(name: string): ((s: string) => string) | undefined {
-		const upper = name.toUpperCase();
-		const entry = this.collations.get(upper);
-		if (entry?.normalizer !== undefined) return entry.normalizer;
-		// Built-in fallback: even an entry that lost its normalizer (shouldn't
-		// happen for built-ins, but defends against external mutation) still
-		// resolves to the canonical built-in normalizer.
-		return BUILTIN_NORMALIZERS[upper];
+	/**
+	 * The canonical way to turn a collation name into a **key normalizer** for this
+	 * database — the hash-keyed counterpart of {@link getCollationResolver}. Every
+	 * operator that buckets rows by a text key (GROUP BY, window PARTITION BY, bloom /
+	 * hash join keys, AS OF partitioning) must resolve through this, so that grouping
+	 * and comparison agree on which rows are equal.
+	 *
+	 * Same contract as {@link getCollationResolver}: stable identity, reads the live
+	 * registry, no `checkOpen()`, and **no silent fallback**.
+	 *
+	 * - `undefined` or the exact name `BINARY` → the identity normalizer. `BINARY`
+	 *   cannot be overridden ({@link registerCollation} rejects it), which is this fast
+	 *   path's correctness precondition.
+	 * - A registered collation carrying a normalizer → that normalizer.
+	 * - A registered collation with **no** normalizer → throws. A comparator-only
+	 *   collation can order rows but cannot bucket them; guessing a normalizer would
+	 *   split or merge groups the comparator disagrees with.
+	 * - An unregistered name → throws `no such collation sequence: X`.
+	 */
+	getKeyNormalizerResolver(): KeyNormalizerResolver {
+		if (this.keyNormalizerResolver === undefined) {
+			this.keyNormalizerResolver = (collationName: string | undefined): KeyNormalizer => {
+				if (!collationName || collationName === 'BINARY') return BUILTIN_NORMALIZERS.BINARY;
+				const normalizer = this._getCollationNormalizer(collationName);
+				if (normalizer) return normalizer;
+				if (!this._getCollation(collationName)) {
+					throw new QuereusError(`no such collation sequence: ${collationName}`, StatusCode.ERROR);
+				}
+				throw new QuereusError(
+					`collation ${collationName} has no key normalizer; grouping and hash-join keys require one — pass { normalizer } to registerCollation`,
+					StatusCode.ERROR
+				);
+			};
+		}
+		return this.keyNormalizerResolver;
+	}
+
+	/** @internal Gets a registered collation function */
+	_getCollation(name: string): CollationFunction | undefined {
+		return this.collations.get(normalizeCollationName(name))?.comparator;
+	}
+
+	/** @internal Gets the registered key normalizer for a collation. Returns `undefined`
+	 *  both for an unregistered name and for a comparator-only collation — the two are
+	 *  distinguished, and turned into errors, by {@link getKeyNormalizerResolver}.
+	 *
+	 *  There is deliberately no built-in fallback: an embedder that re-registers `NOCASE`
+	 *  with a custom comparator and no normalizer must get a loud error, not the built-in
+	 *  lowercase normalizer, which would partition strings differently from their
+	 *  comparator. The built-ins are seeded *with* their normalizers in
+	 *  `registerDefaultCollations()`, so a fresh database loses nothing. */
+	_getCollationNormalizer(name: string): KeyNormalizer | undefined {
+		return this.collations.get(normalizeCollationName(name))?.normalizer;
+	}
+
+	/** @internal True iff the named collation is asserted REPLICABLE — bit-identical
+	 *  across peers/platforms/app-versions. Built-ins are stamped `replicable` at
+	 *  registration; a custom collation opts in with `replicable: true`. An unknown
+	 *  collation returns `false` defensively (an unknown collation in a derivation
+	 *  body errors earlier at create). Consumed only by the materialized-view
+	 *  replicable-collation gate when the backing host declares
+	 *  `requiresReplicableDerivations`. */
+	_isCollationReplicable(name: string): boolean {
+		return this.collations.get(normalizeCollationName(name))?.replicable === true;
+	}
+
+	/** @internal True iff the named collation is asserted ORDER-PRESERVING: for all strings
+	 *  `x`, `y`, `sign(comparator(x, y))` equals
+	 *  `sign(memcmp(utf8(normalizer(x)), utf8(normalizer(y))))`. Strictly stronger than the
+	 *  equality-partition promise a bare normalizer makes — a normalizer may agree with the
+	 *  comparator on equality while disagreeing on order.
+	 *
+	 *  Built-ins are stamped `orderPreserving` at registration; a custom collation opts in
+	 *  with `orderPreserving: true`. An unregistered name, or a comparator-only collation
+	 *  (no normalizer, hence no key bytes at all), returns `false` defensively.
+	 *
+	 *  Consumed by persistent stores, which physically order rows by normalized key bytes:
+	 *  a byte-range seek, or an advertisement that byte order *is* collation order, is sound
+	 *  only under this assertion. Without it the store full-scans and lets its
+	 *  comparator-accurate residual filter decide — slower, never wrong. */
+	_isCollationOrderPreserving(name: string): boolean {
+		const entry = this.collations.get(normalizeCollationName(name));
+		// The assertion is *about* the normalizer, so it is vacuous without one; a
+		// comparator-only collation cannot key a persisted structure anyway (the store
+		// rejects it at DDL time), and answering `true` here would be a trap.
+		return entry?.orderPreserving === true && entry.normalizer !== undefined;
 	}
 
 	public _queueDeferredConstraintRow(baseTable: string, constraintName: string, row: Row, descriptor: RowDescriptor, evaluator: (ctx: RuntimeContext) => OutputValue, connectionId?: string, contextRow?: Row, contextDescriptor?: RowDescriptor): void {
@@ -1323,10 +1999,13 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 *
 	 * @param sql The SQL query string to execute.
 	 * @param params Optional parameters to bind (array for positional, object for named).
+	 * @param options Optional execution options (e.g. an `AbortSignal` for
+	 *   cooperative cancellation — checked at row boundaries so iteration can be
+	 *   interrupted on a request timeout).
 	 * @yields Each result row as an object (`Record<string, SqlValue>`).
 	 * @returns An `AsyncIterableIterator` yielding result rows.
 	 * @throws MisuseError if the database is closed.
-	 * @throws QuereusError on prepare/bind/execution errors.
+	 * @throws QuereusError on prepare/bind/execution errors (an `AbortError` if the signal fired).
 	 *
 	 * @example
 	 * ```typescript
@@ -1339,10 +2018,63 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * }
 	 * ```
 	 */
-	eval(sql: string, params?: SqlParameters | SqlValue[]): AsyncIterableIterator<Record<string, SqlValue>> {
-		return wrapAsyncIterator(this._evalGenerator(sql, params), (commit, error) =>
+	eval(sql: string, params?: SqlParameters | SqlValue[], options?: StatementOptions): AsyncIterableIterator<Record<string, SqlValue>> {
+		if (options?.readConcurrency === 'committed') {
+			// Routing (parse + compile + eligibility) happens at first pull inside the
+			// delegating generator, so an unconsumed iterator holds no resources.
+			return this._evalRoutedGenerator(sql, params, options);
+		}
+		return wrapAsyncIterator(this._evalGenerator(sql, params, options?.signal), (commit, error) =>
 			this._finalizeImplicitTransaction(commit, error)
 		);
+	}
+
+	/**
+	 * @internal Committed-read routing for {@link eval}: a SINGLE-statement,
+	 * concurrent-read-eligible batch runs mutex-free against committed state
+	 * (never touching the implicit-transaction lifecycle — the writer owns any
+	 * open one); everything else — multi-statement batches included — delegates
+	 * to the serialized path with identical semantics. `yield*` forwards
+	 * `return()`/`throw()` into the wrapped serialized iterator, so its
+	 * transaction-finalize cleanup still runs on early exit.
+	 */
+	private async *_evalRoutedGenerator(sql: string, params?: SqlParameters | SqlValue[], options?: StatementOptions): AsyncGenerator<Record<string, SqlValue>> {
+		this.checkOpen();
+		throwIfAborted(options?.signal);
+
+		let stmt: Statement | null = null;
+		try {
+			const candidate = this.prepare(sql, params);
+			let eligible = false;
+			if (candidate.astBatch.length === 1) {
+				try {
+					// compile() is synchronous — no awaited DDL can interleave.
+					eligible = this._isConcurrentReadEligible(candidate.compile());
+				} catch (e) {
+					// A compile error re-surfaces identically on the serialized path
+					// below (compile failures are not memoized), so routing stays
+					// error-free. Logged for diagnosability, not swallowed.
+					log('eval committed-read routing declined (compile failed): %O', e);
+				}
+			}
+			if (!eligible) {
+				await candidate.finalize();
+				yield* wrapAsyncIterator(this._evalGenerator(sql, params, options?.signal), (commit, error) =>
+					this._finalizeImplicitTransaction(commit, error)
+				);
+				return;
+			}
+			stmt = candidate;
+			// Params were already bound by prepare(); passing them again would rebind.
+			const names = stmt.getColumnNames();
+			for await (const row of stmt._iterateConcurrent(undefined, options)) {
+				yield rowToObject(row, names);
+			}
+		} finally {
+			if (stmt) {
+				await stmt.finalize();
+			}
+		}
 	}
 
 	/**
@@ -1350,8 +2082,10 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * Transaction finalization is handled by the wrapper returned by eval().
 	 * @internal
 	 */
-	private async *_evalGenerator(sql: string, params?: SqlParameters | SqlValue[]): AsyncGenerator<Record<string, SqlValue>> {
+	private async *_evalGenerator(sql: string, params?: SqlParameters | SqlValue[], signal?: AbortSignal): AsyncGenerator<Record<string, SqlValue>> {
 		this.checkOpen();
+		// Pre-flight cancellation before acquiring the mutex / preparing.
+		throwIfAborted(signal);
 
 		const releaseMutex = await this._acquireExecMutex();
 		let stmt: Statement | null = null;
@@ -1367,14 +2101,14 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 				// Multi-statement batch: execute all but the last statement,
 				// then yield results from the last statement
 				for (let i = 0; i < stmt.astBatch.length - 1; i++) {
-					await this._executeSingleStatement(stmt.astBatch[i], params);
+					await this._executeSingleStatement(stmt.astBatch[i], params, signal);
 				}
 
 				const lastStmt = new Statement(this, [stmt.astBatch[stmt.astBatch.length - 1]]);
 				this.statements.add(lastStmt);
 				try {
 					const names = lastStmt.getColumnNames();
-					for await (const row of lastStmt._iterateRowsRaw(params)) {
+					for await (const row of lastStmt._iterateRowsRaw(params, signal)) {
 						yield rowToObject(row, names);
 					}
 				} finally {
@@ -1382,7 +2116,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 				}
 			} else {
 				const names = stmt.getColumnNames();
-				for await (const row of stmt._iterateRowsRaw(params)) {
+				for await (const row of stmt._iterateRowsRaw(params, signal)) {
 					yield rowToObject(row, names);
 				}
 			}
@@ -1392,7 +2126,15 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		}
 	}
 
-	getPlan(sqlOrAst: string | AST.AstNode): PlanNode {
+	/**
+	 * Builds and optimizes the plan for a statement.
+	 *
+	 * `schemaPath` (internal) overrides the session default search path for
+	 * unqualified-name resolution — used by the stored-body seams (view /
+	 * materialized-view bodies) to resolve against the owning object's home
+	 * schema instead of the caller's path. See {@link _homeSchemaPath}.
+	 */
+	getPlan(sqlOrAst: string | AST.AstNode, schemaPath?: string[]): PlanNode {
 		this.checkOpen();
 
 		let ast: AST.AstNode;
@@ -1412,7 +2154,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			ast = sqlOrAst;
 		}
 
-		const { plan } = this._buildPlan([ast as AST.Statement]);
+		const { plan } = this._buildPlan([ast as AST.Statement], undefined, schemaPath);
 
 		if (plan.statements.length === 0) return plan; // No-op for this AST
 
@@ -1517,8 +2259,15 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		return this.schemaManager.findFunction(funcName, nArg);
 	}
 
-	/** @internal */
-	_buildPlan(statements: AST.Statement[], paramsOrTypes?: SqlParameters | SqlValue[] | Map<string | number, ScalarType>): BuildPlanResult {
+	/**
+	 * @internal Build a fresh top-level {@link PlanningContext} (global → parameter scope,
+	 * default schema path, an empty dependency tracker). The shared seam {@link _buildPlan}
+	 * builds its planning context from, and a throwaway context the static updateability
+	 * surfaces (`func/builtins/schema.ts`) use to plan a view body / run an insertability
+	 * probe — whose `schemaDependencies` are discarded (the read TVF already discards the body
+	 * plan's), so a fresh tracker per call is correct.
+	 */
+	_buildProbeContext(paramsOrTypes?: SqlParameters | SqlValue[] | Map<string | number, ScalarType>, schemaPathOverride?: string[]): PlanningContext {
 		const globalScope = new GlobalScope(this.schemaManager);
 
 		// If we received parameter values, infer their types
@@ -1530,25 +2279,47 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		// This ParameterScope is for the entire batch. It has globalScope as its parent.
 		const parameterScope = new ParameterScope(globalScope, parameterTypes);
 
-		// Get default schema path from options
-		const schemaPath = parseSchemaPath(this.options.getStringOption('schema_path'));
+		// The caller's override (a stored body's home-schema path), else the
+		// session default from options
+		const schemaPath = schemaPathOverride ?? parseSchemaPath(this.options.getStringOption('schema_path'));
 
-		const schemaDependencies = new BuildTimeDependencyTracker();
-		const ctx: PlanningContext = {
+		return {
 			db: this,
 			schemaManager: this.schemaManager,
 			parameters: paramsOrTypes instanceof Map ? {} : (paramsOrTypes ?? {}),
 			scope: parameterScope,
 			cteNodes: new Map(),
-			schemaDependencies,
+			schemaDependencies: new BuildTimeDependencyTracker(),
 			schemaCache: new Map(),
 			cteReferenceCache: new Map(),
 			outputScopes: new Map(),
 			schemaPath
 		};
+	}
 
+	/** @internal `schemaPathOverride` — see {@link getPlan} / {@link _homeSchemaPath}. */
+	_buildPlan(statements: AST.Statement[], paramsOrTypes?: SqlParameters | SqlValue[] | Map<string | number, ScalarType>, schemaPathOverride?: string[]): BuildPlanResult {
+		const ctx = this._buildProbeContext(paramsOrTypes, schemaPathOverride);
 		const plan = buildBlock(ctx, statements);
-		return { plan, schemaDependencies };
+		return { plan, schemaDependencies: ctx.schemaDependencies };
+	}
+
+	/**
+	 * @internal Compose the schema path a stored object's body resolves under:
+	 * the owning object's schema first, then the session default path (deduped).
+	 * A view / materialized-view body written next to its tables must find them
+	 * regardless of the *reader's* path — the body is planned against this path
+	 * at create time, at reference/refresh/maintenance re-plan time, and by the
+	 * static updateability probes. The default path (not the calling statement's
+	 * `with schema` path) is the base so a caller's per-statement path never
+	 * leaks into a stored object's resolution.
+	 */
+	_homeSchemaPath(homeSchemaName: string): string[] {
+		// NOTE: re-parses the schema_path option on every body plan; if body
+		// re-plans ever show up hot, memoize on the option's change hook.
+		const defaultPath = parseSchemaPath(this.options.getStringOption('schema_path')) ?? ['main', 'temp'];
+		const lowerHome = homeSchemaName.toLowerCase();
+		return [homeSchemaName, ...defaultPath.filter(s => s.toLowerCase() !== lowerHome)];
 	}
 
 	/**
@@ -1633,6 +2404,19 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	}
 
 	/**
+	 * @internal Force-removes one connection by id.
+	 * Unlike unregisterConnection, this bypasses the implicit transaction deferral —
+	 * the caller has established that this specific connection is definitively stale.
+	 */
+	removeConnection(connectionId: string): void {
+		const connection = this.activeConnections.get(connectionId);
+		if (connection) {
+			this.activeConnections.delete(connectionId);
+			log(`Removed stale connection ${connectionId} for table ${connection.tableName}`);
+		}
+	}
+
+	/**
 	 * @internal Gets all active connections for a specific table.
 	 * @param tableName The name of the table
 	 * @returns Array of connections for the table
@@ -1679,8 +2463,68 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		if (!this.isOpen) throw new MisuseError("Database is closed");
 	}
 
-	public async runGlobalAssertions(): Promise<void> {
-		await this.assertionEvaluator.runGlobalAssertions();
+	public async runGlobalAssertions(sink?: AssertionViolation[]): Promise<void> {
+		await this.assertionEvaluator.runGlobalAssertions(sink);
+	}
+
+	/** @internal Install (or clear, with `null`) the report-mode sink the next
+	 *  commit's global-assertion pass collects into instead of throwing. Used by
+	 *  the external-row ingestion seam around its implicit commit; see
+	 *  {@link ingestExternalRowChanges} and `database-transaction.ts`. */
+	public _setPendingCommitAssertionSink(sink: AssertionViolation[] | null): void {
+		this.transactionManager.setPendingCommitAssertionSink(sink);
+	}
+
+	/** @internal Apply-mode RESTRICT suppression flag — see {@link _setFkRestrictSuppressed}. */
+	private _fkRestrictSuppressed = false;
+
+	/** @internal Apply-mode RESTRICT suppression. While set, the parent-side FK
+	 *  RESTRICT pre-checks ({@link assertTransitiveRestrictsForParentMutation} and its
+	 *  callees) early-return — the trust-the-origin external-row apply path: the origin
+	 *  already enforced RESTRICT at its own commit, so re-enforcing it on the receiver
+	 *  would wedge the sync stream. Cascade / set-null / set-default propagation is
+	 *  unaffected. Set for the duration of an apply batch (mutex held, so no concurrent
+	 *  statement observes it) and honored by every nested cascade DML and MV-maintenance
+	 *  FK pass. Returns the prior value so the caller restores it in a `finally`
+	 *  (supports nesting). */
+	public _setFkRestrictSuppressed(value: boolean): boolean {
+		const prior = this._fkRestrictSuppressed;
+		this._fkRestrictSuppressed = value;
+		return prior;
+	}
+
+	/** @internal Whether apply-mode RESTRICT suppression is active — see
+	 *  {@link _setFkRestrictSuppressed}. */
+	public _isFkRestrictSuppressed(): boolean {
+		return this._fkRestrictSuppressed;
+	}
+
+	/** @internal FK cascade re-entry flag — see {@link _setFkCascadeReentry}. */
+	private _fkCascadeReentry = false;
+
+	/** @internal Marks that the DML currently re-entering the executor is one of
+	 *  Quereus's own FK cascade child writes (cascade DELETE / UPDATE, SET NULL,
+	 *  SET DEFAULT — physical or lens), not a direct user DML on the child table.
+	 *  Set only for the duration of each cascade child write by
+	 *  `withFkCascadeReentry` in `runtime/foreign-key-actions.ts`, so a host vtab
+	 *  module can distinguish a cascade re-entry from a user write on the same
+	 *  child and suppress redundant child-side FK re-validation only for the
+	 *  former. Independent of {@link _setFkRestrictSuppressed} (a cascade path may
+	 *  legitimately have both semantics in play). Returns the prior value so the
+	 *  caller restores it in a `finally` — nesting-safe: an inner cascade restores
+	 *  to the outer's `true`, the outermost to `false`, and a thrown cascade cannot
+	 *  latch the flag on. Nothing inside Quereus reads it; it exposes the signal the
+	 *  host consumes. */
+	public _setFkCascadeReentry(value: boolean): boolean {
+		const prior = this._fkCascadeReentry;
+		this._fkCascadeReentry = value;
+		return prior;
+	}
+
+	/** @internal Whether the current DML re-entry is a Quereus FK cascade child
+	 *  write — see {@link _setFkCascadeReentry}. */
+	public _isFkCascadeReentry(): boolean {
+		return this._fkCascadeReentry;
 	}
 
 	/**
@@ -1715,9 +2559,253 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		await this.watcherManager.runPostCommit();
 	}
 
+	/**
+	 * Fire all active watchers whose scope includes `schema.table`, as if the
+	 * whole table changed, **without** a local commit. For hosts whose tables
+	 * are backed by an external/replicated store (e.g. the optimystic vtab) that
+	 * learns of remote writes out-of-band, so the change never touches this
+	 * `Database`'s commit change-log and the post-commit watcher path would
+	 * otherwise never fire.
+	 *
+	 * Coarse by design: handlers receive a global (whole-table) {@link WatchEvent}
+	 * — `full` watches fire with empty `hits`; `rows`/`rowsByGroup` watches
+	 * surface all their registered literal values as possibly-changed; `groups`
+	 * fire with empty hits. Over-firing only costs the consumer an extra
+	 * re-query; it never misses a change. A no-op when no subscription matches.
+	 * Async to mirror the post-commit watcher path (handlers may be async).
+	 *
+	 * When the host has the actual row images, prefer the precise,
+	 * in-transaction {@link ingestExternalRowChanges} seam instead: row-granular
+	 * watch hits at commit, plus MV maintenance, assertion evaluation, and
+	 * opt-in FK actions.
+	 *
+	 * @param tableName  The table whose watchers to fire.
+	 * @param schemaName Defaults to the current schema
+	 *   (`schemaManager.getCurrentSchemaName()`).
+	 */
+	public async notifyExternalChange(tableName: string, schemaName?: string): Promise<void> {
+		this.checkOpen();
+		const schema = schemaName ?? this.schemaManager.getCurrentSchemaName();
+		const fqName = `${schema}.${tableName}`.toLowerCase();
+		await this.watcherManager.notifyExternalTableChange(fqName);
+	}
+
+	/**
+	 * Batch ingestion seam for externally-applied row changes: drives the
+	 * post-write pipeline — change capture (`Database.watch` post-commit
+	 * dispatch + commit-time global assertions), batch-amortized row-time
+	 * materialized-view maintenance, and opt-in parent-side FK actions — for
+	 * writes the caller has already applied directly to module storage,
+	 * bypassing the DML executor. The precise, in-transaction alternative to
+	 * the coarse whole-table {@link notifyExternalChange}.
+	 *
+	 * `changes` is a flat ordered array; same-row changes must appear in event
+	 * order (each change's `oldRow` must be the true before-image of *that*
+	 * change — the prior change's `newRow`). The FK-actions facet re-reads
+	 * post-write merged storage and is order-independent for realistic batch
+	 * shapes (see `docs/sync.md` § Transactional Integrity During Sync for the
+	 * (E)/(F) exotic-topology caveats). The seam
+	 * trusts the origin — it re-validates NOTHING (no CHECK / NOT NULL /
+	 * UNIQUE / child-side FK existence), and it does NOT emit module data
+	 * events (the external writer owns those, including the `remote` flag).
+	 *
+	 * Transaction contract: runs inside the caller's active transaction when
+	 * one exists (the reported rows must already be visible to a vtab read
+	 * within it — the residual/full-rebuild maintenance arms re-read the
+	 * source); otherwise begins an implicit transaction it commits at batch
+	 * end. The batch's DERIVED effects are atomic via a batch savepoint; a
+	 * mid-batch error unwinds them all (the externally-applied storage rows
+	 * are NOT unwound by Quereus). Serialized via the exec mutex — do NOT call
+	 * from within statement execution or vtab callbacks (deadlock); the
+	 * two-arg `_maintainRowTimeCoveringStructures` is the seam for that
+	 * context. See `docs/mv-ingestion.md` § External row-change
+	 * ingestion for the full contract.
+	 *
+	 * Returns the collected commit-time global-assertion violations. With the
+	 * default `assertionFailureMode: 'throw'` a violation throws (and rolls the
+	 * batch's derived effects back) so the returned list is always empty; with
+	 * `'report'` — honored only for the seam-owned implicit transaction with
+	 * capture on — a violation is collected and the batch still commits (derived
+	 * effects land, watch dispatches), so the returned list names every violated
+	 * assertion. Empty in every other case.
+	 */
+	public async ingestExternalRowChanges(
+		changes: readonly ExternalRowChange[],
+		options?: IngestExternalChangesOptions,
+	): Promise<IngestExternalChangesResult> {
+		this.checkOpen();
+		return ingestExternalRowChangeBatch(this, changes, options);
+	}
+
+	/** @internal Compile + register an MV for row-time write-through maintenance.
+	 *  Throws on a body that is not row-time maintainable (the mandatory create-time gate). */
+	public registerMaterializedView(mv: MaintainedTableSchema): void {
+		this.materializedViewManager.registerMaterializedView(mv);
+	}
+
+	/** @internal Detach an MV's row-time maintenance plan (DROP path). */
+	public unregisterMaterializedView(schemaName: string, name: string): void {
+		this.materializedViewManager.unregisterMaterializedView(schemaName, name);
+	}
+
+	/** @internal Force-mark an MV stale: detach its row-time plan and invalidate cached
+	 *  backing reads so the next reference re-hits the build-time stale guard
+	 *  (ALTER … RENAME propagation failure path). */
+	public markMaterializedViewStale(mv: MaintainedTableSchema): void {
+		this.materializedViewManager.markMaterializedViewStale(mv);
+	}
+
+	/**
+	 * Refresh every maintained table (materialized view) in source-dependency
+	 * order, bringing each backing current with its sources. The convergence
+	 * point after a wholesale external load (e.g. a sync snapshot bootstrap) that
+	 * deferred row-time maintenance. Each MV is refreshed through the same
+	 * full-rebuild path as `refresh materialized view` (stale revalidation, shape
+	 * re-derivation/reshape, row-time re-registration, `stale` clear), so a
+	 * bounded-delta MV is full-rebuilt here too — convergence does not depend on
+	 * delta replay, and the full rebuild re-reads the complete source through the
+	 * vtab regardless of how its rows arrived (out-of-band direct-storage writes
+	 * included). MV-over-MV chains converge base-first: refresh is commit-first per
+	 * MV, so a base MV's backing is committed before a dependent's body re-reads it.
+	 *
+	 * NOT atomic across the sweep — the whole sweep is deliberately NOT wrapped in
+	 * one explicit transaction (refresh is commit-first per MV, so an enclosing
+	 * transaction would not make it atomic anyway). Each MV ensures/commits its own
+	 * implicit transaction exactly as the single-MV `refresh` does, so a failure
+	 * partway leaves earlier MVs converged; the caller (snapshot bootstrap) retries
+	 * the whole load idempotently.
+	 *
+	 * An engine convergence primitive, NOT a SQL statement: the
+	 * `ddl_transaction_policy = 'strict'` gate that refuses `refresh materialized
+	 * view` inside an explicit transaction does not apply here. A caller that opens
+	 * its own `begin` around the sweep still gets the commit-first behavior above.
+	 *
+	 * Serialized via the exec mutex like any statement — do NOT call from within
+	 * statement execution or a vtab callback (deadlock; same constraint as
+	 * `refresh materialized view` itself). Returns the refreshed MV identifiers
+	 * (for coarse watch notification); `[]` (no mutex, no transaction) when there
+	 * are no maintained tables. See `docs/mv-ingestion.md` § Converging all
+	 * materialized views.
+	 */
+	public async refreshAllMaterializedViews(): Promise<Array<{ schemaName: string; name: string }>> {
+		this.checkOpen();
+		// Build the order BEFORE the mutex: it only reads catalog/plan state, and an
+		// empty catalog must take no mutex and start no transaction.
+		const order = this.materializedViewManager.materializedViewRefreshOrder();
+		if (order.length === 0) return [];
+
+		const refreshed: Array<{ schemaName: string; name: string }> = [];
+		await this._withMutex(async () => {
+			// Per-MV implicit-transaction scope mirrors `exec`'s per-statement boundary:
+			// each refresh commits independently (commit-first), so a mid-sweep failure
+			// leaves the already-refreshed MVs converged rather than rolling them back.
+			for (const mv of order) {
+				try {
+					await this._ensureTransaction();
+					const live = await refreshMaintainedTable(this, mv);
+					if (this._isImplicitTransaction()) {
+						await this._commitTransaction();
+					}
+					refreshed.push({ schemaName: live.schemaName, name: live.name });
+				} catch (err) {
+					if (this._isImplicitTransaction()) {
+						await this._rollbackTransaction();
+					}
+					throw err;
+				}
+			}
+		});
+		return refreshed;
+	}
+
+	/** @internal Cheap synchronous guard for the per-row DML maintenance hook: true
+	 *  iff a `row-time` covering structure reads `sourceBase` (lowercased or raw
+	 *  `schema.table`). Lets a hot write path skip the maintenance call entirely when
+	 *  no row-time MV depends on the written table. */
+	public _hasRowTimeCoveringStructures(sourceBase: string): boolean {
+		return this.materializedViewManager.hasRowTimePlanFor(sourceBase);
+	}
+
+	/** @internal Synchronously maintain every `row-time` covering structure on
+	 *  `sourceBase` for one source row-write, before the writing statement observes
+	 *  its own effects. Drives a per-row backing delta through the backing table's
+	 *  coordinated transactional connection (reads-own-writes within the txn;
+	 *  committed/rolled-back in lockstep with the source write). See
+	 *  `database-materialized-views.ts` § row-time write-through.
+	 *
+	 *  `cache` is the optional per-statement {@link BackingConnectionCache} the DML
+	 *  generator threads in so the backing-connection resolution is amortized over the
+	 *  whole statement (one scan per backing, not one per source row). The cold
+	 *  eviction callers (memory `checkUniqueViaMaterializedView`, store-table-constraints.ts) omit
+	 *  it and re-resolve the same connection deterministically — the `DatabaseInternal`
+	 *  surface deliberately exposes only the two-arg form (a host reporting writes from
+	 *  OUTSIDE a statement uses the batch-amortized {@link ingestExternalRowChanges}
+	 *  seam instead).
+	 *
+	 *  `deferred` is the optional per-statement deferred-rebuild set (a `'full-rebuild'`
+	 *  plan is marked dirty in it, no per-row apply) and `residualBatch` the optional
+	 *  per-statement residual key batch (the residual arms accumulate their deduped
+	 *  affected binding keys into it, no per-row recompute); both drain once at the
+	 *  end-of-statement {@link _flushDeferredMaintenance}. The DML generator owns them;
+	 *  cold callers omit them (and only ever name inverse-projection MVs — the one
+	 *  per-row-immediate arm — so the inline per-change fallback is at worst a safe,
+	 *  unamortized apply). */
+	public async _maintainRowTimeCoveringStructures(
+		sourceBase: string,
+		change: BackingRowChange,
+		cache?: BackingConnectionCache,
+		deferred?: Set<string>,
+		residualBatch?: ResidualKeyBatch,
+	): Promise<void> {
+		await this.materializedViewManager.maintainRowTime(sourceBase, change, cache, deferred, residualBatch);
+	}
+
+	/** @internal Drain the per-statement deferred maintenance at the end-of-statement
+	 *  boundary: recompute every accumulated residual key once per distinct key, rebuild
+	 *  every dirtied full-rebuild covering MV exactly once, and cascade each delta onward
+	 *  (MV-over-MV). The DML generator calls this after the row loop and before releasing
+	 *  the statement-atomicity savepoint, so a failed recompute/rebuild rolls the whole
+	 *  statement back. `cache` is the same per-statement {@link BackingConnectionCache}
+	 *  the row loop used. See `database-materialized-views.ts` § flushDeferredMaintenance. */
+	public async _flushDeferredMaintenance(
+		deferred: Set<string>,
+		residualBatch: ResidualKeyBatch,
+		cache?: BackingConnectionCache,
+	): Promise<void> {
+		await this.materializedViewManager.flushDeferredMaintenance(deferred, residualBatch, cache);
+	}
+
+	/** @internal Resolve the linked, `row-time`, enforcement-ready covering MV for a
+	 *  UNIQUE constraint on `schema.table`, or `undefined`. Synchronous (a map lookup
+	 *  plus name/staleness checks) with an O(1) negative fast path, so the UNIQUE-check
+	 *  path can consult it without async overhead. When it returns an MV, conflict
+	 *  resolution routes through the covering MV's backing table (in preference to the
+	 *  auto-index) — see `docs/mv-constraints.md` § Covering structures. */
+	public _findRowTimeCoveringStructure(
+		schemaName: string,
+		tableName: string,
+		uc: UniqueConstraintSchema,
+	): MaintainedTableSchema | undefined {
+		return this.materializedViewManager.findRowTimeCoveringStructure(schemaName, tableName, uc);
+	}
+
+	/** @internal Point-look up a row-time covering MV's backing table for rows whose
+	 *  backing columns equal `newRow`'s UNIQUE values, returning the conflicting
+	 *  **source** PK(s) (excluding `newSourcePk`, the row being written). Reads-own-writes
+	 *  through the backing table's coordinated connection. The caller validates each
+	 *  candidate against its live source row and applies IGNORE/ABORT/REPLACE. */
+	public async _lookupCoveringConflicts(
+		mv: MaintainedTableSchema,
+		uc: UniqueConstraintSchema,
+		newRow: Row,
+		newSourcePk: readonly SqlValue[],
+	): Promise<Array<{ pk: SqlValue[]; row?: Row }>> {
+		return this.materializedViewManager.lookupCoveringConflicts(mv, uc, newRow, newSourcePk);
+	}
+
 	/** @internal Invalidate cached assertion plan (called on DROP ASSERTION) */
-	public invalidateAssertionCache(name: string): void {
-		this.assertionEvaluator.invalidateAssertion(name);
+	public invalidateAssertionCache(schemaName: string, name: string): void {
+		this.assertionEvaluator.invalidateAssertion(schemaName, name);
 	}
 }
 

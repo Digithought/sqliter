@@ -4,6 +4,7 @@ import type { EmissionContext } from '../emission-context.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode, type SqlValue } from '../../common/types.js';
 import type { ViewSchema } from '../../schema/view.js';
+import { assertCatalogObjectPersistable } from '../../schema/catalog-persistability.js';
 
 export function emitCreateView(plan: CreateViewNode, _ctx: EmissionContext): Instruction {
 	async function run(rctx: RuntimeContext): Promise<SqlValue> {
@@ -25,7 +26,8 @@ export function emitCreateView(plan: CreateViewNode, _ctx: EmissionContext): Ins
 			return null;
 		}
 
-		// Create the view schema
+		// Create the view schema. Any `with defaults (…)` rides inside
+		// plan.selectStmt (→ selectAst), so there is no separate field to thread.
 		const viewSchema: ViewSchema = {
 			name: plan.viewName,
 			schemaName: plan.schemaName,
@@ -44,7 +46,28 @@ export function emitCreateView(plan: CreateViewNode, _ctx: EmissionContext): Ins
 			);
 		}
 
+		// Refuse up front if a registered module could not durably persist this
+		// definition — the persistence itself is fire-and-forget (see
+		// assertCatalogObjectPersistable), so this is the only place the failure can
+		// reach the statement. Nothing has been mutated yet, so a throw is a clean no-op.
+		assertCatalogObjectPersistable(rctx.db, 'view', viewSchema);
+
 		schema.addView(viewSchema);
+
+		// Fire view_added so a store-backed catalog can persist this view. Fired
+		// here (not from Schema.addView) so only user/declarative DDL views are
+		// persisted; internal views (lens bodies, etc.) register via schema.addView
+		// directly and are deliberately excluded. Not reached on the IF NOT EXISTS
+		// no-op above.
+		rctx.db.schemaManager.getChangeNotifier().notifyChange({
+			type: 'view_added',
+			// Stored names of the registered ViewSchema — see
+			// SchemaManager.canonicalSchemaName for the emitter/stored-name invariant
+			// (plan.schemaName is already canonical via the builder, so they coincide).
+			schemaName: viewSchema.schemaName,
+			objectName: viewSchema.name,
+			newObject: viewSchema,
+		});
 		return null; // Explicitly return null for successful void operations
 	}
 

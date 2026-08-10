@@ -125,6 +125,17 @@ export class DatabaseOptionsManager {
 	}
 
 	/**
+	 * Get a number option value with type safety
+	 */
+	getNumberOption(key: string): number {
+		const value = this.getOption(key);
+		if (typeof value !== 'number') {
+			throw new QuereusError(`Option ${key} is not a number (got ${typeof value})`, StatusCode.INTERNAL);
+		}
+		return value;
+	}
+
+	/**
 	 * Get an object option value with type safety
 	 */
 	getObjectOption(key: string): Record<string, SqlValue> {

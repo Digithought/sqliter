@@ -3,7 +3,7 @@ import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, posix, relative, sep } from 'node:path';
 import { ParallelDriver } from '../../src/runtime/parallel-driver.js';
-import { createRowSlot } from '../../src/runtime/context-helpers.js';
+import { createRowSlot, resolveAttribute } from '../../src/runtime/context-helpers.js';
 import { createStrictRowContextMap, wrapTableContextsStrict } from '../../src/runtime/strict-fork.js';
 import type { RuntimeContext } from '../../src/runtime/types.js';
 import type { RowDescriptor } from '../../src/planner/nodes/plan-node.js';
@@ -39,15 +39,52 @@ const EXPECTED_FORK_POLICY = {
 	tableContexts: 'forked',
 	tracer: 'shared-sink',
 	activeConnection: 'shared-cooperative',
+	// Deferred-constraint table-name remap: set per entry by the queue on its own
+	// sequential commit-time context and only ever READ (by the scan leaf), so a fork
+	// shares it by reference and treats it as immutable.
+	tableNameRemap: 'shared-frozen',
 	enableMetrics: 'shared-frozen',
+	// Per-row INSERT/envelope ordinal: set+restored synchronously by the sequential
+	// insert path, never mutated inside a parallel fork — each child snapshots it.
+	mutationOrdinal: 'shared-frozen',
+	// Cooperative cancellation signal: shared by reference so every branch honors the
+	// same abort; the runtime only ever reads it (never mutates), so it is frozen.
+	signal: 'shared-frozen',
+	// Mutex-free committed-read marker: set once at execution start by the
+	// concurrent-read path and only ever READ (scan emitter connect options,
+	// getVTableConnection assertion), so a fork shares it by reference as immutable.
+	readCommitted: 'shared-frozen',
 	contextTracker: 'shared-sink',
 	planStack: 'shared-sink',
+	// Once-per-execution memo for impure subqueries: shared by reference so the
+	// run-once contract spans branches (matching the pre-cache single-closure memo).
+	// Mutation across branches is the impure-subquery contract's responsibility.
+	executionMemo: 'shared-cooperative',
+	// Once-per-execution inner-scan connection cache: shared by reference so the
+	// statement teardown disconnects every instance connected across branches exactly
+	// once. Mutation across branches is the scan lifecycle's responsibility.
+	scanConnections: 'shared-cooperative',
+	// Once-per-execution CacheNode row-cache map: shared by reference so a cache
+	// materialized in one branch is visible to a sibling branch re-driving the same
+	// cache site within the same execution. Mutation across branches is the
+	// CacheNode emitter's responsibility.
+	cacheStates: 'shared-cooperative',
+	// Once-per-execution shared CTE materialization buffer map: shared by reference
+	// so a CTE buffered in one branch replays in a sibling branch instead of
+	// re-driving the source. Mutation across branches is the emitCTE contract's
+	// responsibility.
+	cteMaterializations: 'shared-cooperative',
+	// Once-per-execution uncorrelated IN-subquery lookup-set map: shared by reference
+	// so a set materialized in one branch is visible to a sibling branch re-driving
+	// the same IN site within the same execution. Mutation across branches is the
+	// emitIn set-probe contract's responsibility.
+	inSetProbes: 'shared-cooperative',
 } as const satisfies Record<keyof RuntimeContext, ForkPolicy>;
 
 /**
  * Files allowed to call `tableContexts.set(` / `tableContexts.delete(` on a
  * RuntimeContext. Any new site must be added here deliberately after reading
- * docs/runtime.md § Parallel runtime fork contract — parent mutation while
+ * docs/runtime-parallel.md § Parallel runtime fork contract — parent mutation while
  * forks are alive is a contract violation.
  *
  * Excludes construction sites (`new Map()` / `new Map(rctx.tableContexts)`)
@@ -57,13 +94,18 @@ const EXPECTED_FORK_POLICY = {
  */
 const TABLE_CONTEXTS_MUTATION_ALLOWLIST = new Set<string>([
 	'src/runtime/emit/recursive-cte.ts',
+	// Multi-source view INSERT: stashes the shared-surrogate envelope rows under a
+	// unique descriptor before driving the base ops, deletes it in `finally`. Same
+	// working-table pattern as recursive-cte, and `tableContexts` is `forked` (each
+	// fork owns its copy), so the unique-key add/remove never perturbs a sibling.
+	'src/runtime/emit/view-mutation.ts',
 ]);
 
 /**
  * Files allowed to call `context.set(` / `context.delete(` on a RuntimeContext.
  * Other consumers should use `createRowSlot` / `withRowContext` / `withAsyncRowContext`.
  * The aggregate/window emitters mutate directly for performance and predate the
- * helpers — see runtime.md § Parallel runtime fork contract.
+ * helpers — see docs/runtime-parallel.md § Parallel runtime fork contract.
  */
 const ROW_CONTEXT_MUTATION_ALLOWLIST = new Set<string>([
 	'src/runtime/context-helpers.ts',
@@ -112,6 +154,9 @@ function makeRuntimeContext(): RuntimeContext {
 		context: createStrictRowContextMap(),
 		tableContexts: wrapTableContextsStrict(new Map()),
 		enableMetrics: false,
+		// Non-undefined sentinels so the 'shared-frozen' aliasing assertion is meaningful.
+		mutationOrdinal: 0,
+		readCommitted: false,
 	};
 }
 
@@ -131,7 +176,7 @@ describe('Fork contract (test harness)', () => {
 
 			expect(missing, `RuntimeContext fields without a declared fork policy: ${missing.join(', ')}. ` +
 				`Add to EXPECTED_FORK_POLICY in test/runtime/fork-contract.spec.ts after reading ` +
-				`docs/runtime.md § Parallel runtime fork contract.`).to.deep.equal([]);
+				`docs/runtime-parallel.md § Parallel runtime fork contract.`).to.deep.equal([]);
 			expect(extra, `EXPECTED_FORK_POLICY declares fields that no longer exist on RuntimeContext: ${extra.join(', ')}`)
 				.to.deep.equal([]);
 		});
@@ -162,8 +207,15 @@ describe('Fork contract (test harness)', () => {
 			parent.params = { 1: 99 };
 			parent.tracer = {} as unknown as RuntimeContext['tracer'];
 			parent.activeConnection = {} as unknown as RuntimeContext['activeConnection'];
+			parent.tableNameRemap = new Map([['main.t', 't2']]);
 			parent.contextTracker = {} as unknown as RuntimeContext['contextTracker'];
 			parent.planStack = [];
+			parent.signal = new AbortController().signal;
+			parent.executionMemo = new Map();
+			parent.scanConnections = new Map();
+			parent.cacheStates = new Map();
+			parent.cteMaterializations = new Map();
+			parent.inSetProbes = new Map();
 
 			const [fork] = driver.fork(parent, 1);
 
@@ -189,7 +241,7 @@ describe('Fork contract (test harness)', () => {
 			expect(unexpected,
 				`Files mutating RuntimeContext.tableContexts outside the allowlist: ${unexpected.join(', ')}. ` +
 				`If this is a legitimate emit site, add it to TABLE_CONTEXTS_MUTATION_ALLOWLIST ` +
-				`after reading docs/runtime.md § Parallel runtime fork contract — mutating the ` +
+				`after reading docs/runtime-parallel.md § Parallel runtime fork contract — mutating the ` +
 				`parent map while forks are alive is a contract violation.`,
 			).to.deep.equal([]);
 
@@ -218,8 +270,8 @@ describe('Fork contract (test harness)', () => {
 			expect(unexpected,
 				`Files mutating RuntimeContext.context outside the allowlist: ${unexpected.join(', ')}. ` +
 				`Prefer createRowSlot / withRowContext / withAsyncRowContext. If direct mutation ` +
-				`is required, add to ROW_CONTEXT_MUTATION_ALLOWLIST after reading docs/runtime.md ` +
-				`§ Parallel runtime fork contract.`,
+				`is required, add to ROW_CONTEXT_MUTATION_ALLOWLIST after reading ` +
+				`docs/runtime-parallel.md § Parallel runtime fork contract.`,
 			).to.deep.equal([]);
 
 			const dead = [...ROW_CONTEXT_MUTATION_ALLOWLIST].filter(f => !runtimeFound.has(f));
@@ -373,6 +425,125 @@ describe('Fork contract (test harness)', () => {
 					parent.tableContexts.set({} as never, () => undefined as never);
 				}).to.not.throw();
 			})();
+		});
+	});
+
+	describe('context-strict mode (QUEREUS_CONTEXT_STRICT)', () => {
+		const contextStrict = process.env.QUEREUS_CONTEXT_STRICT === '1' || process.env.QUEREUS_CONTEXT_STRICT === 'true';
+		const forkStrict = process.env.QUEREUS_FORK_STRICT === '1' || process.env.QUEREUS_FORK_STRICT === 'true';
+
+		it('createStrictRowContextMap returns a plain RowContextMap (no shadow hooks) when both strict flags are off', function () {
+			if (contextStrict || forkStrict) {
+				this.skip();
+				return;
+			}
+			const map = createStrictRowContextMap();
+			expect(map.assertNoShadow, 'base map must not carry the shadow hook when flags are off').to.equal(undefined);
+			expect(map.noteRowSet, 'base map must not carry noteRowSet when flags are off').to.equal(undefined);
+		});
+
+		it('throws context-strict on a deliberate stale-shadow (operator wins index, child sets a newer row)', function () {
+			if (!contextStrict) {
+				this.skip();
+				return;
+			}
+			const rctx = makeRuntimeContext();
+			const attrId = 700;
+			// Two distinct descriptors over the SAME attribute id (operator + child both
+			// project source attr 700 at column 0).
+			const opDesc: RowDescriptor = [];
+			opDesc[attrId] = 0;
+			const childDesc: RowDescriptor = [];
+			childDesc[attrId] = 0;
+
+			const opSlot = createRowSlot(rctx, opDesc, 'operator');
+			opSlot.set([111] as unknown as Row);
+			const childSlot = createRowSlot(rctx, childDesc, 'child-scan');
+			childSlot.set([222] as unknown as Row);
+
+			// Operator re-wins the attribute index for its stale row (as if it re-set its
+			// source-attr context) but then FORGETS to release it before the child advances.
+			opSlot.reactivate();
+			childSlot.set([333] as unknown as Row); // child's genuinely-newer row, index NOT reclaimed
+
+			// A read here would silently resolve to the operator's stale 111 instead of 333.
+			expect(() => resolveAttribute(rctx, attrId, 'x')).to.throw(/context-strict:/);
+		});
+
+		it('does NOT throw for correct tear-down (operator deletes its context before the child advances)', function () {
+			if (!contextStrict) {
+				this.skip();
+				return;
+			}
+			const rctx = makeRuntimeContext();
+			const attrId = 710;
+			const opDesc: RowDescriptor = [];
+			opDesc[attrId] = 0;
+			const childDesc: RowDescriptor = [];
+			childDesc[attrId] = 0;
+
+			const opSlot = createRowSlot(rctx, opDesc, 'operator');
+			opSlot.set([1] as unknown as Row);
+			const childSlot = createRowSlot(rctx, childDesc, 'child-scan');
+			childSlot.set([2] as unknown as Row);
+
+			// Correct discipline: operator releases its source-attr context (tear-down)
+			// BEFORE the child produces its next row. The index winner rebuilds to the child.
+			opSlot.close();
+			childSlot.set([3] as unknown as Row);
+
+			expect(() => resolveAttribute(rctx, attrId, 'y')).to.not.throw();
+			expect(resolveAttribute(rctx, attrId, 'y'), 'read resolves to the child current row').to.equal(3);
+		});
+
+		it('does NOT throw for correct reactivate (operator re-wins the index and stays newest)', function () {
+			if (!contextStrict) {
+				this.skip();
+				return;
+			}
+			const rctx = makeRuntimeContext();
+			const attrId = 720;
+			const opDesc: RowDescriptor = [];
+			opDesc[attrId] = 0;
+			const childDesc: RowDescriptor = [];
+			childDesc[attrId] = 0;
+
+			const opSlot = createRowSlot(rctx, opDesc, 'operator');
+			opSlot.set([10] as unknown as Row);
+			const childSlot = createRowSlot(rctx, childDesc, 'child-scan');
+			childSlot.set([20] as unknown as Row); // child's look-ahead cursor
+
+			// Correct reactivate-before-yield: operator re-wins the index AND is now newest.
+			opSlot.reactivate();
+
+			expect(() => resolveAttribute(rctx, attrId, 'z')).to.not.throw();
+			expect(resolveAttribute(rctx, attrId, 'z'), 'read resolves to the operator row').to.equal(10);
+		});
+
+		it('does NOT throw when two live descriptors share an attr but hold the SAME row object', function () {
+			if (!contextStrict) {
+				this.skip();
+				return;
+			}
+			const rctx = makeRuntimeContext();
+			const attrId = 730;
+			const opDesc: RowDescriptor = [];
+			opDesc[attrId] = 0;
+			const childDesc: RowDescriptor = [];
+			childDesc[attrId] = 0;
+
+			const sharedRow = [42] as unknown as Row;
+			const childSlot = createRowSlot(rctx, childDesc, 'child-scan');
+			childSlot.set(sharedRow);
+			const opSlot = createRowSlot(rctx, opDesc, 'operator');
+			opSlot.set(sharedRow); // operator wins the index (set last), holds the same peeked row
+
+			// Child re-touches the same object, bumping its epoch above the winner —
+			// but the row object is identical (asof-style left slot mirroring the peek).
+			childSlot.set(sharedRow);
+
+			// No observable wrong-row: both descriptors resolve to the identical array.
+			expect(() => resolveAttribute(rctx, attrId, 'w')).to.not.throw();
 		});
 	});
 });

@@ -56,8 +56,9 @@ describe('Runtime scheduler modes', () => {
 			const rows = await collectRows(stmt.iterateRowsWithTrace(undefined, tracer));
 			await stmt.finalize();
 
-			void expect(tracer.getTraceEvents().length).to.be.greaterThan(0);
-			return { rows, tickCalls };
+			const events = tracer.getTraceEvents();
+			void expect(events.length).to.be.greaterThan(0);
+			return { rows, tickCalls, events };
 		};
 
 		const runMetrics = async () => {
@@ -86,6 +87,22 @@ describe('Runtime scheduler modes', () => {
 		void expect(optimized.tickCalls).to.equal(5);
 		void expect(tracing.tickCalls).to.equal(5);
 		void expect(metrics.tickCalls).to.equal(5);
+
+		// Guard the two-loop collapse's tracing contract: after the six dispatch
+		// loops became one sync + one async loop, tracing still emits exactly one
+		// `output` per `input` (an instruction's input is paired with its output),
+		// with no stray `error` events on the happy path. The implementer verified
+		// this by hand with a scratch spec; assert it durably so a future change to
+		// the shared async loop can't silently break trace pairing.
+		const inputs = tracing.events.filter(e => e.type === 'input');
+		const outputs = tracing.events.filter(e => e.type === 'output');
+		const errors = tracing.events.filter(e => e.type === 'error');
+		void expect(errors.length).to.equal(0, 'no error events on the happy path');
+		void expect(inputs.length).to.be.greaterThan(0);
+		void expect(outputs.length).to.equal(inputs.length, 'every traced input must have exactly one matching output');
+		const inputIndexes = inputs.map(e => e.instructionIndex).sort((a, b) => a - b);
+		const outputIndexes = outputs.map(e => e.instructionIndex).sort((a, b) => a - b);
+		void expect(outputIndexes).to.deep.equal(inputIndexes, 'input and output events must cover the same instruction indexes');
 	});
 });
 

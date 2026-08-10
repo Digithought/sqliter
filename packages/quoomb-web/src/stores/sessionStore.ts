@@ -12,7 +12,40 @@ import { createSyncActions } from './session/sync.js';
 
 // Re-export types from the shared types module
 export type { QueryResult, Tab, SessionState } from './session/types.js';
-import type { QueryResult, Tab, SessionState } from './session/types.js';
+import type { QueryResult, Tab, SessionState, StoreSet, StoreGet } from './session/types.js';
+
+/**
+ * Shared body for the `fetch*` actions that lazily populate one field of the
+ * active query result (plan / program / trace / row-trace / plan-graph). Each
+ * differs only in the result field it writes, the worker API call it makes, and
+ * the label used in the error log — so they collapse to this one helper.
+ */
+async function fetchIntoActiveResult(
+	get: StoreGet,
+	set: StoreSet,
+	field: keyof QueryResult,
+	label: string,
+	run: (api: Comlink.Remote<QuereusWorkerAPI>) => Promise<unknown>,
+): Promise<void> {
+	const { api, isConnected, activeResultId } = get();
+	if (!api || !isConnected) throw new Error('Not connected to database');
+
+	try {
+		const value = await run(api);
+		if (activeResultId) {
+			const patch = { [field]: value } as Partial<QueryResult>;
+			set((state) => ({
+				...state,
+				queryHistory: state.queryHistory.map(r =>
+					r.id === activeResultId ? { ...r, ...patch } : r
+				),
+			}));
+		}
+	} catch (error) {
+		console.error(`Failed to fetch ${label}:`, error);
+		throw error;
+	}
+}
 
 export const useSessionStore = create<SessionState>()(
 	persist(
@@ -229,105 +262,20 @@ export const useSessionStore = create<SessionState>()(
 					}
 				},
 
-				fetchQueryPlan: async (sql) => {
-					const { api, isConnected, activeResultId } = get();
-					if (!api || !isConnected) throw new Error('Not connected to database');
+				fetchQueryPlan: (sql) =>
+					fetchIntoActiveResult(get, set, 'queryPlan', 'query plan', (api) => api.explainQuery(sql)),
 
-					try {
-						const plan = await api.explainQuery(sql);
-						if (activeResultId) {
-							set((state) => ({
-								...state,
-								queryHistory: state.queryHistory.map(r =>
-									r.id === activeResultId ? { ...r, queryPlan: plan } : r
-								),
-							}));
-						}
-					} catch (error) {
-						console.error('Failed to fetch query plan:', error);
-						throw error;
-					}
-				},
+				fetchProgram: (sql) =>
+					fetchIntoActiveResult(get, set, 'program', 'query program', (api) => api.explainProgram(sql)),
 
-				fetchProgram: async (sql) => {
-					const { api, isConnected, activeResultId } = get();
-					if (!api || !isConnected) throw new Error('Not connected to database');
+				fetchTrace: (sql) =>
+					fetchIntoActiveResult(get, set, 'trace', 'query trace', (api) => api.executionTrace(sql)),
 
-					try {
-						const program = await api.explainProgram(sql);
-						if (activeResultId) {
-							set((state) => ({
-								...state,
-								queryHistory: state.queryHistory.map(r =>
-									r.id === activeResultId ? { ...r, program } : r
-								),
-							}));
-						}
-					} catch (error) {
-						console.error('Failed to fetch query program:', error);
-						throw error;
-					}
-				},
+				fetchRowTrace: (sql) =>
+					fetchIntoActiveResult(get, set, 'rowTrace', 'query row trace', (api) => api.rowTrace(sql)),
 
-				fetchTrace: async (sql) => {
-					const { api, isConnected, activeResultId } = get();
-					if (!api || !isConnected) throw new Error('Not connected to database');
-
-					try {
-						const trace = await api.executionTrace(sql);
-						if (activeResultId) {
-							set((state) => ({
-								...state,
-								queryHistory: state.queryHistory.map(r =>
-									r.id === activeResultId ? { ...r, trace } : r
-								),
-							}));
-						}
-					} catch (error) {
-						console.error('Failed to fetch query trace:', error);
-						throw error;
-					}
-				},
-
-				fetchRowTrace: async (sql) => {
-					const { api, isConnected, activeResultId } = get();
-					if (!api || !isConnected) throw new Error('Not connected to database');
-
-					try {
-						const rowTrace = await api.rowTrace(sql);
-						if (activeResultId) {
-							set((state) => ({
-								...state,
-								queryHistory: state.queryHistory.map(r =>
-									r.id === activeResultId ? { ...r, rowTrace } : r
-								),
-							}));
-						}
-					} catch (error) {
-						console.error('Failed to fetch query row trace:', error);
-						throw error;
-					}
-				},
-
-				fetchPlanGraph: async (sql, withActual) => {
-					const { api, isConnected, activeResultId } = get();
-					if (!api || !isConnected) throw new Error('Not connected to database');
-
-					try {
-						const planGraph = await api.explainPlanGraph(sql, { withActual });
-						if (activeResultId) {
-							set((state) => ({
-								...state,
-								queryHistory: state.queryHistory.map(r =>
-									r.id === activeResultId ? { ...r, planGraph } : r
-								),
-							}));
-						}
-					} catch (error) {
-						console.error('Failed to fetch query plan graph:', error);
-						throw error;
-					}
-				},
+				fetchPlanGraph: (sql, withActual) =>
+					fetchIntoActiveResult(get, set, 'planGraph', 'query plan graph', (api) => api.explainPlanGraph(sql, { withActual })),
 
 				// --- UI state ---
 

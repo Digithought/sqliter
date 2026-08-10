@@ -19,6 +19,8 @@ export const SyncStatusIndicator: React.FC = () => {
         return <CloudOff size={12} className="text-gray-400" />;
       case 'connecting':
         return <Loader size={12} className="animate-spin text-yellow-500" />;
+      case 'bootstrapping':
+        return <Loader size={12} className="animate-spin text-blue-500" />;
       case 'syncing':
         return <Cloud size={12} className="text-blue-500 animate-pulse" />;
       case 'synced':
@@ -36,6 +38,8 @@ export const SyncStatusIndicator: React.FC = () => {
         return 'Sync: Disconnected';
       case 'connecting':
         return 'Sync: Connecting...';
+      case 'bootstrapping':
+        return `Sync: Downloading snapshot (${syncStatus.tablesProcessed}/${syncStatus.totalTables} tables)`;
       case 'syncing':
         return `Sync: Syncing (${syncStatus.progress}%)`;
       case 'synced':
@@ -54,6 +58,8 @@ export const SyncStatusIndicator: React.FC = () => {
         return 'text-gray-500 dark:text-gray-400';
       case 'connecting':
         return 'text-yellow-600 dark:text-yellow-400';
+      case 'bootstrapping':
+        return 'text-blue-600 dark:text-blue-400';
       case 'syncing':
         return 'text-blue-600 dark:text-blue-400';
       case 'synced':

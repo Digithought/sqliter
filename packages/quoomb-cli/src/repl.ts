@@ -1,10 +1,10 @@
-import * as readline from 'readline';
+import * as readline from 'node:readline';
 import { Database, formatErrorChain, unwrapError } from '@quereus/quereus';
-import { loadPluginsFromConfig, interpolateConfigEnvVars, validateConfig, type QuoombConfig } from '@quereus/plugin-loader';
+import { loadPluginsFromConfig, interpolateConfigEnvVars, type QuoombConfig } from '@quereus/plugin-loader';
 import chalk from 'chalk';
-import Table from 'cli-table3';
 import { DotCommands } from './commands/dot-commands.js';
-import { handleDotCommand, loadEnabledPlugins } from './commands/dot-commands.js';
+import { handleDotCommand, loadEnabledPlugins, syncSavedPluginPins } from './commands/dot-commands.js';
+import { seedConfigPluginPins } from './plugins/remote-resolver.js';
 
 interface REPLOptions {
   json?: boolean;
@@ -53,7 +53,11 @@ export class REPL {
     // Load plugins from config if provided and autoload is enabled
     if (this.options.config && this.options.autoload !== false) {
       try {
+        // A config-declared URL that a saved record pins is still pinned; this
+        // load does not go through the record path that would sync it.
+        await syncSavedPluginPins();
         const config = interpolateConfigEnvVars(this.options.config);
+        seedConfigPluginPins(config);
         if (config.autoload !== false) {
           await loadPluginsFromConfig(this.db, config);
         }
@@ -165,7 +169,6 @@ export class REPL {
         'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'DISTINCT'
       ];
 
-      const upperLine = line.toUpperCase();
       const lastWord = line.split(/\s+/).pop()?.toUpperCase() || '';
 
       for (const keyword of sqlKeywords) {
@@ -178,81 +181,11 @@ export class REPL {
     return [hits, line];
   }
 
-  private printResults(results: any[], executionTime: number): void {
-    if (results.length === 0) {
-      console.log(chalk.yellow('No rows returned'));
-      return;
-    }
-
-    if (this.options.json) {
-      console.log(JSON.stringify(results, null, 2));
-    } else {
-      this.printTable(results);
-    }
-
-    console.log(chalk.gray(`\n${results.length} row(s) (${executionTime}ms)`));
-  }
-
-  private printTable(results: any[]): void {
-    if (results.length === 0) return;
-
-    const columns = Object.keys(results[0]);
-    const table = new Table({
-      head: columns.map(col => this.options.color ? chalk.cyan(col) : col),
-      style: {
-        head: this.options.color ? ['cyan'] : []
-      }
-    });
-
-    for (const row of results) {
-      const values = columns.map(col => {
-        const value = row[col];
-        if (value === null) return this.options.color ? chalk.gray('NULL') : 'NULL';
-        if (typeof value === 'string') return value;
-        return String(value);
-      });
-      table.push(values);
-    }
-
-    console.log(table.toString());
-  }
-
-  private printError(error: any): void {
-    if (this.options.color) {
-      console.error(chalk.red('Error:'), error.message || error);
-    } else {
-      console.error('Error:', error.message || error);
-    }
-  }
-
-  private printHelp(): void {
-    const help = `
-Available commands:
-  .help                    Show this help message
-  .exit, .quit             Exit the REPL
-  .tables                  List all tables
-  .schema [table]          Show table schema
-  .import <file.csv>       Import CSV file as table
-  .export <sql> <file>     Export query results to file
-
-SQL commands:
-  Enter any SQL statement to execute it
-
-Examples:
-  CREATE TABLE users (id INTEGER, name TEXT);
-  INSERT INTO users VALUES (1, 'Alice');
-  SELECT * FROM users;
-  .import data.csv
-  .export "SELECT * FROM users" output.json
-`;
-    console.log(this.options.color ? chalk.yellow(help) : help);
-  }
-
   close(): void {
     this.rl.close();
   }
 
-  private printEnhancedError(error: any): void {
+  private printEnhancedError(error: unknown): void {
     if (this.options.color) {
       console.error(chalk.red('━'.repeat(60)));
       console.error(chalk.red.bold('SQL ERROR'));

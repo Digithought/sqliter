@@ -19,6 +19,8 @@ import { MemoryTableModule } from '../../src/vtab/memory/module.js';
 import { TableReferenceNode } from '../../src/planner/nodes/reference.js';
 import { GlobalScope } from '../../src/planner/scopes/global.js';
 import type { ModuleCapabilities } from '../../src/vtab/capabilities.js';
+import { getTrustedCheckExtraction } from '../../src/planner/analysis/check-extraction.js';
+import type { LensDeployReport } from '../../src/schema/lens-prover.js';
 
 describe('CHECK contribution gated by permitsGrandfatheredCheckViolators', () => {
 	let db: Database;
@@ -91,22 +93,104 @@ describe('CHECK contribution gated by permitsGrandfatheredCheckViolators', () =>
 		expect(hasBtoA, 'no b→a FD under cap').to.be.false;
 	});
 
-	it('default (cap absent): equality CHECK (a = b) DOES lift to FDs', async () => {
+	it('default (cap absent): equality CHECK (a = b) lifts the EC and the bi-FD as determinations', async () => {
 		await db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, b INTEGER NOT NULL, CHECK (a = b)) USING memory');
 		const ref = buildReference(new MemoryTableModule());
 		const phys = ref.computePhysical([]);
+		// Columns: id(0), a(1), b(2). The value-equality CHECK lifts the equivalence
+		// class {a, b} unconditionally — the EC merge is never gated (value-equality
+		// is always sound and ECs are not read by key derivation). The capability cap
+		// suppresses this (the paired "cap on" test asserts equivClasses undefined).
+		expect(phys.equivClasses, 'a≡b EC lifts without cap').to.deep.equal([[1, 2]]);
+		// The bi-directional FD {a}↔{b} folds unconditionally as
+		// `kind: 'determination'` — the kind-aware readers (`isUniqueDeterminant`,
+		// ticket fd-determination-reader-side-rule) never read a determination as
+		// a uniqueness claim, so `select a, b` cannot read {a} as a key over the
+		// duplicate (a=b) rows. (Replaces the producer-side gate from ticket
+		// fd-check-assertion-key-bag-overclaim, which dropped the pair here.)
 		const fds = phys.fds ?? [];
 		const aIdx = 1;
 		const bIdx = 2;
-		const hasAtoB = fds.some(fd =>
+		const aToB = fds.find(fd =>
 			fd.determinants.length === 1 && fd.determinants[0] === aIdx
 			&& fd.dependents.includes(bIdx),
 		);
-		const hasBtoA = fds.some(fd =>
+		const bToA = fds.find(fd =>
 			fd.determinants.length === 1 && fd.determinants[0] === bIdx
 			&& fd.dependents.includes(aIdx),
 		);
-		expect(hasAtoB, 'a→b FD without cap').to.be.true;
-		expect(hasBtoA, 'b→a FD without cap').to.be.true;
+		expect(aToB?.kind, 'a→b folds as a determination').to.equal('determination');
+		expect(bToA?.kind, 'b→a folds as a determination').to.equal('determination');
+	});
+});
+
+/** Test double: a memory module that grandfathers CHECK violators. */
+class GrandfatheringMemoryModule extends MemoryTableModule {
+	override getCapabilities(): ModuleCapabilities {
+		return { ...super.getCapabilities(), permitsGrandfatheredCheckViolators: true };
+	}
+}
+
+describe('getTrustedCheckExtraction: central capability gate (schema-resolved module)', () => {
+	let db: Database;
+
+	beforeEach(() => { db = new Database(); });
+	afterEach(async () => { await db.close(); });
+
+	it('default (cap absent): the extraction carries the CHECK-derived domain', async () => {
+		await db.exec("create table t (id integer primary key, v text not null check (v in ('a', 'b'))) using memory");
+		const table = db.schemaManager.findTable('t', 'main')!;
+		const ext = getTrustedCheckExtraction(table);
+		expect(ext.domainConstraints.length, 'enum domain extracted').to.be.greaterThan(0);
+	});
+
+	it('cap on: the schema-resolved module suppresses the extraction wholesale', async () => {
+		db.registerModule('gfmem', new GrandfatheringMemoryModule());
+		await db.exec("create table t (id integer primary key, v text not null check (v in ('a', 'b'))) using gfmem");
+		const table = db.schemaManager.findTable('t', 'main')!;
+		const ext = getTrustedCheckExtraction(table);
+		expect(ext.fds, 'no FDs under cap').to.deep.equal([]);
+		expect(ext.equivPairs, 'no ECs under cap').to.deep.equal([]);
+		expect(ext.constantBindings, 'no bindings under cap').to.deep.equal([]);
+		expect(ext.domainConstraints, 'no domains under cap').to.deep.equal([]);
+	});
+});
+
+describe('lens prover: basis CHECK domain gated by permitsGrandfatheredCheckViolators', () => {
+	let db: Database;
+
+	beforeEach(() => { db = new Database(); });
+	afterEach(async () => { await db.close(); });
+
+	/**
+	 * Deploys the bijective-enumeration shape from
+	 * test/logic/55.5-lens-authored-inverse.sqllogic § 6 over a basis table on
+	 * the given module: `upper(code)` forward, `lower(new.grp)` inverse —
+	 * bijective between the basis CHECK domain ('a','b','c') and the logical
+	 * CHECK domain ('A','B','C') whenever both domains are trusted.
+	 */
+	async function deployBijectiveLens(moduleName: string): Promise<LensDeployReport> {
+		await db.exec(`create table Item (id integer primary key, code text not null check (code in ('a', 'b', 'c'))) using ${moduleName}`);
+		await db.exec("declare logical schema x { table Item (id integer primary key, grp text null check (grp in ('A', 'B', 'C'))) }");
+		await db.exec('declare lens for x over main { view Item as select id, upper(code) as grp with inverse (code = lower(new.grp)) from main.Item }');
+		await db.exec('apply schema x');
+		const report = db.declaredSchemaManager.getDeployedLensReport('x');
+		expect(report, 'deploy report for x').to.not.be.undefined;
+		return report!;
+	}
+
+	it('control (cap absent): the bijective enumeration suppresses lens.getput-lossy', async () => {
+		const report = await deployBijectiveLens('memory');
+		expect(report.warnings.map(w => w.code), 'forward proved injective over the trusted basis domain').to.not.include('lens.getput-lossy');
+	});
+
+	it('cap on: the basis CHECK domain is untrusted — the injectivity proof must not certify, the advisory stands', async () => {
+		db.registerModule('gfmem', new GrandfatheringMemoryModule());
+		const report = await deployBijectiveLens('gfmem');
+		// Grandfathered basis rows may sit outside the declared CHECK domain, so
+		// the enumeration cannot witness the bijection: GetPut stays surrendered.
+		const lossy = report.warnings.filter(w => w.code === 'lens.getput-lossy');
+		expect(lossy.length, 'advisory stands under cap').to.equal(1);
+		expect(lossy[0].site.column, 'sited at the authored column').to.equal('grp');
 	});
 });

@@ -13,30 +13,30 @@ import type {
 } from '../src/schema/function.js';
 import { classifyFunction } from '../src/func/builtins/schema.js';
 import { registerWindowFunction, isWindowFunction } from '../src/schema/window-function.js';
-import { INTEGER_TYPE } from '../src/types/builtin-types.js';
+import { INTEGER_TYPE, REAL_TYPE, TEXT_TYPE } from '../src/types/builtin-types.js';
 
 describe('Function type guards', () => {
 	const scalarFunc: ScalarFunctionSchema = {
 		name: 'test_scalar',
 		numArgs: 1,
 		flags: FunctionFlags.DETERMINISTIC,
-		returnType: { typeClass: 'scalar', affinity: 'TEXT' },
+		returnType: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false },
 		implementation: (x) => x,
 	};
 
 	const tvfFunc: TableValuedFunctionSchema = {
 		name: 'test_tvf',
 		numArgs: 0,
-		flags: 0,
-		returnType: { typeClass: 'relation', columns: [] },
+		flags: FunctionFlags.UTF8,
+		returnType: { typeClass: 'relation', isReadOnly: false, isSet: false, columns: [], keys: [], rowConstraints: [] },
 		implementation: async function* () { /* empty */ },
 	};
 
 	const aggFunc: AggregateFunctionSchema = {
 		name: 'test_agg',
 		numArgs: 1,
-		flags: 0,
-		returnType: { typeClass: 'scalar', affinity: 'REAL' },
+		flags: FunctionFlags.UTF8,
+		returnType: { typeClass: 'scalar', logicalType: REAL_TYPE, nullable: false },
 		stepFunction: (acc, val) => acc + Number(val),
 		finalizeFunction: (acc) => acc,
 		initialValue: 0,
@@ -76,23 +76,23 @@ describe('classifyFunction', () => {
 		name: 'test_classify_scalar',
 		numArgs: 1,
 		flags: FunctionFlags.DETERMINISTIC,
-		returnType: { typeClass: 'scalar', affinity: 'TEXT' },
+		returnType: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false },
 		implementation: (x) => x,
 	};
 
 	const tvfFunc: TableValuedFunctionSchema = {
 		name: 'test_classify_tvf',
 		numArgs: 0,
-		flags: 0,
-		returnType: { typeClass: 'relation', columns: [] },
+		flags: FunctionFlags.UTF8,
+		returnType: { typeClass: 'relation', isReadOnly: false, isSet: false, columns: [], keys: [], rowConstraints: [] },
 		implementation: async function* () { /* empty */ },
 	};
 
 	const aggFunc: AggregateFunctionSchema = {
 		name: 'test_classify_agg',
 		numArgs: 1,
-		flags: 0,
-		returnType: { typeClass: 'scalar', affinity: 'REAL' },
+		flags: FunctionFlags.UTF8,
+		returnType: { typeClass: 'scalar', logicalType: REAL_TYPE, nullable: false },
 		stepFunction: (acc, val) => acc + Number(val),
 		finalizeFunction: (acc) => acc,
 		initialValue: 0,
@@ -126,8 +126,8 @@ describe('classifyFunction', () => {
 		const funcWithWindowName: ScalarFunctionSchema = {
 			name: windowName,
 			numArgs: 0,
-			flags: 0,
-			returnType: { typeClass: 'scalar', affinity: 'INTEGER' },
+			flags: FunctionFlags.UTF8,
+			returnType: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false },
 			implementation: () => 0,
 		};
 

@@ -115,9 +115,240 @@ SELECT COUNT(*) as count FROM myapp.products;
 INSERT INTO products (id, name) VALUES (3, 'Thingamajig') WITH SCHEMA myapp RETURNING id, name, status;
 → [{"id":3,"name":"Thingamajig","status":"active"}]
 
+-- Test 17a: a SUBQUERY inside RETURNING also resolves on the statement's schema path.
+-- INSERT used to build RETURNING against the bare context, so an unqualified name in a
+-- RETURNING subquery ignored WITH SCHEMA and reported "not found in schema path: main"
+-- (UPDATE and DELETE already resolved it). `lookup` exists only in myapp, and is not
+-- touched by the insert, so the count is stable.
+CREATE TABLE myapp.lookup (k INTEGER PRIMARY KEY);
+INSERT INTO myapp.lookup VALUES (1), (2), (3);
+
+INSERT INTO products (id, name) VALUES (5, 'Whatsit') WITH SCHEMA myapp
+  RETURNING id, (SELECT COUNT(*) FROM lookup) AS n;
+→ [{"id":5,"n":3}]
+
+DELETE FROM myapp.products WHERE id = 5;
+
+-- Test 17b: the ON CONFLICT arm resolves the schema path too, and now EXECUTEs a
+-- subquery in that position: `DmlExecutorNode` exposes its ON CONFLICT expressions as
+-- optimizer-visible children, so their subquery subtrees get rewritten. Fixed by
+-- `bug-dml-side-expressions-invisible-to-optimizer`.
+INSERT INTO products (id, name) VALUES (3, 'Dupe')
+  ON CONFLICT (id) DO UPDATE SET name = (SELECT COUNT(*) FROM lookup)
+  WITH SCHEMA myapp RETURNING name;
+→ [{"name":"3"}]
+
+DROP TABLE myapp.lookup;
+
+-- ===================================
+-- Non-default schema: write-through a view whose home schema is not on the path
+-- The stored body's unqualified `products` must resolve next to the VIEW (myapp),
+-- for the write exactly as for the read — the session path here is 'main'.
+-- ===================================
+
+-- Test 18: INSERT / UPDATE / DELETE through a view stored in myapp
+CREATE VIEW myapp.product_names AS SELECT id, name FROM products;
+
+INSERT INTO myapp.product_names (id, name) VALUES (4, 'Gizmo');
+
+SELECT id, name, status FROM myapp.products WHERE id = 4;
+→ [{"id":4,"name":"Gizmo","status":"active"}]
+
+UPDATE myapp.product_names SET name = 'Gizmo II' WHERE id = 4;
+
+SELECT id, name FROM myapp.products WHERE id = 4;
+→ [{"id":4,"name":"Gizmo II"}]
+
+DELETE FROM myapp.product_names WHERE id = 4;
+
+SELECT COUNT(*) as count FROM myapp.products WHERE id = 4;
+→ [{"count":0}]
+
+-- Test 19: on a name collision the view's home schema wins over the session path
+CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT);
+INSERT INTO products (id, name) VALUES (9, 'main-row');
+
+UPDATE myapp.product_names SET name = 'via-view' WHERE id = 3;
+
+SELECT id, name FROM myapp.products WHERE id = 3;
+→ [{"id":3,"name":"via-view"}]
+
+SELECT id, name FROM main.products;
+→ [{"id":9,"name":"main-row"}]
+
+DROP TABLE products;
+DROP VIEW myapp.product_names;
+
 -- Clean up custom schema
 DROP TABLE myapp.products;
 
 -- Clean up
 DROP TABLE users;
 DROP TABLE orders;
+
+-- ===================================
+-- Unqualified VIEW names resolve through the schema search path, exactly as
+-- unqualified table names do (bug-unqualified-view-name-ignores-schema-path).
+-- ===================================
+
+CREATE TABLE temp.rt (id INTEGER PRIMARY KEY, x INTEGER);
+INSERT INTO temp.rt VALUES (1, 10);
+CREATE VIEW temp.rv AS SELECT id, x FROM rt;
+
+-- Test 20: qualified reference (baseline, never depended on the path)
+SELECT * FROM temp.rv;
+→ [{"id":1,"x":10}]
+
+-- Test 21: with `temp` OFF the session path an unqualified view is not found —
+-- the same answer an unqualified table in `temp` gets, hint included
+PRAGMA schema_path = 'main';
+
+SELECT * FROM rv;
+-- error: Did you mean: temp.rv?
+
+SELECT * FROM rt;
+-- error: Did you mean: temp.rt?
+
+-- Test 22: with `temp` ON the path both resolve
+PRAGMA schema_path = 'temp,main';
+
+SELECT * FROM rv;
+→ [{"id":1,"x":10}]
+
+SELECT * FROM rt;
+→ [{"id":1,"x":10}]
+
+-- Test 23: a view composed over another view in the same non-main schema
+CREATE VIEW temp.rv2 AS SELECT id, x FROM rv;
+
+SELECT * FROM temp.rv2;
+→ [{"id":1,"x":10}]
+
+SELECT * FROM rv2;
+→ [{"id":1,"x":10}]
+
+-- Test 24: unqualified INSERT / UPDATE / DELETE through a non-main view
+INSERT INTO rv (id, x) VALUES (2, 20);
+
+SELECT id, x FROM temp.rt ORDER BY id;
+→ [{"id":1,"x":10},{"id":2,"x":20}]
+
+UPDATE rv SET x = 21 WHERE id = 2;
+
+SELECT id, x FROM temp.rt WHERE id = 2;
+→ [{"id":2,"x":21}]
+
+DELETE FROM rv WHERE id = 2;
+
+SELECT COUNT(*) as count FROM temp.rt;
+→ [{"count":1}]
+
+-- Test 25: statement-level WITH SCHEMA reaches the view too
+-- (`temp` is a keyword in the WITH SCHEMA position, hence the quoted form)
+PRAGMA schema_path = 'main';
+
+SELECT id, x FROM rv WITH SCHEMA "temp";
+→ [{"id":1,"x":10}]
+
+UPDATE rv SET x = 12 WHERE id = 1 WITH SCHEMA "temp";
+
+SELECT id, x FROM temp.rt WHERE id = 1;
+→ [{"id":1,"x":12}]
+
+UPDATE temp.rv SET x = 10 WHERE id = 1;
+
+DROP VIEW temp.rv2;
+DROP VIEW temp.rv;
+DROP TABLE temp.rt;
+
+-- Test 26: within-path ordering — a TABLE in an earlier entry beats a VIEW of
+-- the same name in a later one, and vice versa. (A table/view collision inside
+-- ONE schema is impossible; CREATE TABLE / CREATE VIEW reject it.)
+CREATE TABLE main.dual_name (id INTEGER PRIMARY KEY, tag TEXT);
+INSERT INTO main.dual_name VALUES (1, 'table-in-main');
+CREATE TABLE temp.dn_src (id INTEGER PRIMARY KEY, tag TEXT);
+INSERT INTO temp.dn_src VALUES (1, 'view-in-temp');
+CREATE VIEW temp.dual_name AS SELECT id, tag FROM dn_src;
+
+PRAGMA schema_path = 'main,temp';
+
+SELECT tag FROM dual_name;
+→ [{"tag":"table-in-main"}]
+
+PRAGMA schema_path = 'temp,main';
+
+SELECT tag FROM dual_name;
+→ [{"tag":"view-in-temp"}]
+
+-- a qualified reference is unaffected by the path either way
+SELECT tag FROM main.dual_name;
+→ [{"tag":"table-in-main"}]
+
+SELECT tag FROM temp.dual_name;
+→ [{"tag":"view-in-temp"}]
+
+-- Test 27: the same ordering governs a WRITE target, not just a read
+CREATE TABLE temp.dn_w_src (id INTEGER PRIMARY KEY, tag TEXT);
+INSERT INTO temp.dn_w_src VALUES (1, 'view-in-temp');
+CREATE VIEW temp.dn_w AS SELECT id, tag FROM dn_w_src;
+CREATE TABLE main.dn_w (id INTEGER PRIMARY KEY, tag TEXT);
+INSERT INTO main.dn_w VALUES (1, 'table-in-main');
+
+PRAGMA schema_path = 'main,temp';
+
+UPDATE dn_w SET tag = 'wrote-main' WHERE id = 1;
+
+SELECT tag FROM main.dn_w;
+→ [{"tag":"wrote-main"}]
+
+SELECT tag FROM temp.dn_w_src;
+→ [{"tag":"view-in-temp"}]
+
+PRAGMA schema_path = 'temp,main';
+
+UPDATE dn_w SET tag = 'wrote-temp-view' WHERE id = 1;
+
+SELECT tag FROM main.dn_w;
+→ [{"tag":"wrote-main"}]
+
+SELECT tag FROM temp.dn_w_src;
+→ [{"tag":"wrote-temp-view"}]
+
+PRAGMA schema_path = 'main';
+
+DROP VIEW temp.dn_w;
+DROP TABLE temp.dn_w_src;
+DROP TABLE main.dn_w;
+
+DROP VIEW temp.dual_name;
+DROP TABLE temp.dn_src;
+DROP TABLE main.dual_name;
+
+-- Test 28: a user-declared (non-`temp`) schema behaves identically — the `temp`
+-- coverage above must not be reading a temp-only special case.
+CREATE TABLE myapp.ut (id INTEGER PRIMARY KEY, x INTEGER);
+INSERT INTO myapp.ut VALUES (1, 10);
+CREATE VIEW myapp.uv AS SELECT id, x FROM ut;
+
+SELECT * FROM uv;
+-- error: Did you mean: myapp.uv?
+
+PRAGMA schema_path = 'myapp,main';
+
+SELECT * FROM uv;
+→ [{"id":1,"x":10}]
+
+INSERT INTO uv (id, x) VALUES (2, 20);
+
+SELECT id, x FROM myapp.ut ORDER BY id;
+→ [{"id":1,"x":10},{"id":2,"x":20}]
+
+DELETE FROM uv WHERE id = 2;
+
+PRAGMA schema_path = 'main';
+
+SELECT id, x FROM uv WITH SCHEMA myapp;
+→ [{"id":1,"x":10}]
+
+DROP VIEW myapp.uv;
+DROP TABLE myapp.ut;

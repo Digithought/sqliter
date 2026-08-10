@@ -123,3 +123,17 @@ SELECT grp, group_concat(distinct tag) AS tags FROM ha_gc GROUP BY grp ORDER BY 
 → [{"grp":"a","tags":"x,y"},{"grp":"b","tags":"z"}]
 
 DROP TABLE ha_gc;
+
+-- count(distinct blob_col) with GROUP BY — the DISTINCT tree's entry is the
+-- bare BLOB scalar (a Uint8Array), which inheritree's default freeze-on-insert
+-- could not store (bug-in-subquery-blob-values-crash). Exercises the shared
+-- distinct-tree factory used by hash-aggregate's grouped path.
+CREATE TABLE ha_blob_grp (id INTEGER PRIMARY KEY, grp TEXT, b BLOB NULL);
+INSERT INTO ha_blob_grp VALUES
+	(1, 'a', x'6162'), (2, 'a', x'6162'), (3, 'a', x'6164'),
+	(4, 'b', x'6162'), (5, 'b', null);
+
+SELECT grp, count(distinct b) AS cd FROM ha_blob_grp GROUP BY grp ORDER BY grp;
+→ [{"grp":"a","cd":2},{"grp":"b","cd":1}]
+
+DROP TABLE ha_blob_grp;

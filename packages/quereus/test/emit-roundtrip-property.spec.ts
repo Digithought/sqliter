@@ -79,6 +79,16 @@ const rowOpSubsetArb: fc.Arbitrary<RowOp[]> = fc.uniqueArray(rowOpArb, { minLeng
 const fkActionArb: fc.Arbitrary<AST.ForeignKeyAction> = fc.constantFrom('setNull', 'setDefault', 'cascade', 'restrict');
 
 /**
+ * Optional `with schema s1[, s2]` search path (`schemaPath` on SELECT and the
+ * three DML statements) — the stealth-drop net for the clause the stringifier
+ * once silently omitted (stringify-schema-path-clause).
+ */
+const schemaPathArb: fc.Arbitrary<string[] | undefined> = fc.option(
+	fc.uniqueArray(identArb, { minLength: 1, maxLength: 2 }),
+	{ nil: undefined },
+);
+
+/**
  * [NOT] DEFERRABLE [INITIALLY DEFERRED|IMMEDIATE] — produced as `deferrable` /
  * `initiallyDeferred` on `ForeignKeyClause`. `initiallyDeferred` is only set
  * inside a DEFERRABLE/NOT DEFERRABLE branch (the parser cannot reach it
@@ -127,6 +137,24 @@ const columnRefArb: fc.Arbitrary<AST.ColumnExpr> = identArb.map(name => ({
 /** Simple expression: literal or column reference. */
 const simpleExprArb: fc.Arbitrary<AST.Expression> = fc.oneof(literalArb, columnRefArb);
 
+/** `new.<col>` reference — the surface an authored inverse uses for the written view row. */
+const newQualifiedRefArb: fc.Arbitrary<AST.ColumnExpr> = identArb.map(name => ({
+	type: 'column' as const,
+	name,
+	table: 'new',
+}));
+
+/**
+ * `with inverse (col = expr, …)` assignment list on an expression result column
+ * (`ResultColumnExpr.inverse`) — distinct targets (a duplicate is a parse
+ * error), exprs spanning literals, bare refs, and `new.`-qualified refs.
+ */
+const inverseClauseArb: fc.Arbitrary<AST.ResultColumnInverse[]> = fc.uniqueArray(
+	fc.tuple(identArb, fc.oneof(simpleExprArb, newQualifiedRefArb))
+		.map(([column, expr]): AST.ResultColumnInverse => ({ column, expr })),
+	{ minLength: 1, maxLength: 3, selector: a => a.column },
+);
+
 /**
  * Comparison binary expression — `col > 0` etc. Restricted to one shape so
  * we don't have to model operator precedence in the arbitrary.
@@ -149,7 +177,7 @@ const checkExprArb: fc.Arbitrary<AST.BinaryExpr> = fc.tuple(
 const columnConstraintArb: fc.Arbitrary<AST.ColumnConstraint> = fc.oneof(
 	// PRIMARY KEY [ASC|DESC] [ON CONFLICT ...]
 	fc.record({
-		direction: fc.oneof<('asc' | 'desc' | undefined)[]>(fc.constant(undefined), fc.constant('asc'), fc.constant('desc')),
+		direction: fc.oneof<fc.Arbitrary<'asc' | 'desc' | undefined>[]>(fc.constant(undefined), fc.constant('asc'), fc.constant('desc')),
 		onConflict: conflictResArb,
 	}).map(({ direction, onConflict }): AST.ColumnConstraint => {
 		const c: AST.ColumnConstraint = { type: 'primaryKey' };
@@ -262,7 +290,7 @@ function makeTableConstraintArb(columnNames: string[]): fc.Arbitrary<AST.TableCo
 		// PRIMARY KEY (col [ASC|DESC], ...) [ON CONFLICT ...]
 		fc.record({
 			cols: multiCol(3),
-			directions: fc.array(fc.oneof<('asc' | 'desc' | undefined)[]>(fc.constant(undefined), fc.constant('asc'), fc.constant('desc')), { minLength: 0, maxLength: 3 }),
+			directions: fc.array(fc.oneof<fc.Arbitrary<'asc' | 'desc' | undefined>[]>(fc.constant(undefined), fc.constant('asc'), fc.constant('desc')), { minLength: 0, maxLength: 3 }),
 			onConflict: conflictResArb,
 		}).map(({ cols, directions, onConflict }): AST.TableConstraint => {
 			const c: AST.TableConstraint = {
@@ -332,17 +360,17 @@ const createTableArb: fc.Arbitrary<AST.CreateTableStmt> = fc.tuple(
 	identArb,                                  // table name
 	uniqueIdents(3),                            // column names (3 fixed so table constraints have something to reference)
 	fc.boolean(),                               // ifNotExists
-	fc.boolean(),                               // isTemporary
-).chain(([tableName, colNames, ifNotExists, isTemporary]) => {
-	const columnDefs = colNames.map(name => makeColumnDefArb(name));
+).chain(([tableName, colNames, ifNotExists]) => {
+	// Destructure into a fixed 3-tuple (colNames has exactly 3 entries) so fc.tuple
+	// infers positional element types instead of `ColumnDef | TableConstraint[]`.
+	const [col0, col1, col2] = colNames.map(name => makeColumnDefArb(name));
 	return fc.tuple(
-		...columnDefs,
+		col0, col1, col2,
 		fc.array(makeTableConstraintArb(colNames), { minLength: 0, maxLength: 2 }),
 	).map(([c0, c1, c2, constraints]): AST.CreateTableStmt => ({
 		type: 'createTable',
 		table: { type: 'identifier', name: tableName },
 		ifNotExists,
-		isTemporary,
 		columns: [c0, c1, c2],
 		constraints,
 	}));
@@ -352,9 +380,52 @@ const createTableArb: fc.Arbitrary<AST.CreateTableStmt> = fc.tuple(
 // CREATE VIEW (minimal)
 // ------------------------------------------------------------------------
 
-const simpleSelectArb: fc.Arbitrary<AST.SelectStmt> = fc.tuple(identArb, identArb).map(([col, table]): AST.SelectStmt => ({
+/**
+ * `select <col> [with inverse (…)] from <table> [with schema …]` — the result
+ * column sometimes carries an authored-inverse clause and the statement
+ * sometimes a schema path, so every QueryExpr-accepting site fed by this
+ * arbitrary (CTE body, view body, subquery source, compound leg, …) also
+ * probes clause survival in nested positions (a compound leg carrying a
+ * schema path must re-emit grouping parens — bare legs never parse one).
+ */
+const simpleSelectArb: fc.Arbitrary<AST.SelectStmt> = fc.tuple(
+	identArb,
+	identArb,
+	fc.option(inverseClauseArb, { nil: undefined }),
+	schemaPathArb,
+).map(([col, table, inverse, schemaPath]): AST.SelectStmt => ({
 	type: 'select',
-	columns: [{ type: 'column', expr: { type: 'column', name: col } }],
+	columns: [{ type: 'column', expr: { type: 'column', name: col }, ...(inverse ? { inverse } : {}) }],
+	from: [{ type: 'table', table: { type: 'identifier', name: table } }],
+	...(schemaPath ? { schemaPath } : {}),
+}));
+
+/**
+ * `select <col> [as alias] [with inverse (…)], … from t` — drives
+ * `ResultColumnExpr.inverse` directly across 1–3 result columns, each
+ * independently aliased and/or carrying the clause, so alias⨯inverse
+ * coexistence and the comma boundary between a clause and the next result
+ * column are probed structurally (the net for stealth field-drops in
+ * `resultColumnToString`).
+ */
+const selectWithInverseArb: fc.Arbitrary<AST.SelectStmt> = fc.tuple(
+	fc.array(
+		fc.tuple(
+			identArb,
+			fc.option(identArb, { nil: undefined }),
+			fc.option(inverseClauseArb, { nil: undefined }),
+		),
+		{ minLength: 1, maxLength: 3 },
+	),
+	identArb,
+).map(([cols, table]): AST.SelectStmt => ({
+	type: 'select',
+	columns: cols.map(([name, alias, inverse]): AST.ResultColumn => ({
+		type: 'column',
+		expr: { type: 'column', name },
+		...(alias ? { alias } : {}),
+		...(inverse ? { inverse } : {}),
+	})),
 	from: [{ type: 'table', table: { type: 'identifier', name: table } }],
 }));
 
@@ -457,11 +528,15 @@ const compoundSelectArb: fc.Arbitrary<AST.SelectStmt> = fc.tuple(
 	identArb, // left table name
 	compoundOpArb,
 	queryExprArb,
-).map(([col, table, op, rightLeg]): AST.SelectStmt => ({
+	// Statement-level schema path — binds BEFORE the compound operator, so the
+	// stringifier must emit it ahead of the op for re-parse to re-bind it here.
+	schemaPathArb,
+).map(([col, table, op, rightLeg, schemaPath]): AST.SelectStmt => ({
 	type: 'select',
 	columns: [{ type: 'column', expr: { type: 'column', name: col } }],
 	from: [{ type: 'table', table: { type: 'identifier', name: table } }],
 	compound: { op, select: rightLeg },
+	...(schemaPath ? { schemaPath } : {}),
 }));
 
 /**
@@ -484,30 +559,60 @@ const subquerySourceArb: fc.Arbitrary<AST.SelectStmt> = fc.tuple(
 	from: [{ type: 'subquerySource', subquery: query, alias }],
 }));
 
+/** [NOT] MATERIALIZED hint on a CTE — `undefined` ≡ no keyword emitted. */
+const materializationHintArb: fc.Arbitrary<AST.CommonTableExpr['materializationHint']> = fc.constantFrom(
+	undefined,
+	'materialized' as const,
+	'not_materialized' as const,
+);
+
 /**
- * `with <name> as (<query-expr>) select c from t` — drives
- * `CommonTableExpr.query`. The outer SELECT body is decoupled from the CTE
- * so the test is independent of CTE-reference resolution (parsing is
- * purely syntactic — name binding happens later). `materializationHint`
- * and the CTE column list are omitted: the former isn't emitted by today's
- * stringifier (a separate gap), and the latter would couple the column
- * arity to the QueryExpr's shape and conflict with VALUES bodies.
+ * `with <name> as [materialized|not materialized] (<query-expr>) select c from t`
+ * — drives `CommonTableExpr.query` and `materializationHint`. The outer SELECT
+ * body is decoupled from the CTE so the test is independent of CTE-reference
+ * resolution (parsing is purely syntactic — name binding happens later). The
+ * CTE column list is omitted because it would couple the column arity to the
+ * QueryExpr's shape and conflict with VALUES bodies.
  */
 const cteSelectArb: fc.Arbitrary<AST.SelectStmt> = fc.tuple(
 	identArb, // CTE name
 	queryExprArb,
+	materializationHintArb,
 	identArb, // outer column name
 	identArb, // outer table name
-).map(([cteName, query, col, table]): AST.SelectStmt => ({
-	type: 'select',
-	withClause: {
-		type: 'with',
-		recursive: false,
-		ctes: [{ type: 'commonTableExpr', name: cteName, query }],
-	},
-	columns: [{ type: 'column', expr: { type: 'column', name: col } }],
-	from: [{ type: 'table', table: { type: 'identifier', name: table } }],
-}));
+).map(([cteName, query, materializationHint, col, table]): AST.SelectStmt => {
+	const cte: AST.CommonTableExpr = { type: 'commonTableExpr', name: cteName, query };
+	if (materializationHint !== undefined) cte.materializationHint = materializationHint;
+	return {
+		type: 'select',
+		withClause: {
+			type: 'with',
+			recursive: false,
+			ctes: [cte],
+		},
+		columns: [{ type: 'column', expr: { type: 'column', name: col } }],
+		from: [{ type: 'table', table: { type: 'identifier', name: table } }],
+	};
+});
+
+/** `with defaults (col = expr, …)` entries — distinct columns, literal exprs.
+ *  The clause now rides inside the SELECT body (`SelectStmt.defaults`); attach
+ *  via {@link withDefaults} which is a no-op on a non-select body. */
+const defaultsArb: fc.Arbitrary<AST.ViewInsertDefault[] | undefined> = fc.option(
+	fc.uniqueArray(
+		fc.tuple(identArb, literalArb).map(([column, expr]): AST.ViewInsertDefault => ({ column, expr })),
+		{ minLength: 1, maxLength: 3, selector: d => d.column },
+	),
+	{ nil: undefined },
+);
+
+/** Attach a `with defaults (…)` clause to a body — only a SELECT body can carry it
+ *  ({@link AST.SelectStmt.defaults}); a VALUES body passes through unchanged (its
+ *  defaults would wrap to `SELECT * FROM (VALUES…)` and break AST round-trip). */
+function withDefaults(body: AST.QueryExpr, defaults: AST.ViewInsertDefault[] | undefined): AST.QueryExpr {
+	if (!defaults || body.type !== 'select') return body;
+	return { ...body, defaults };
+}
 
 /**
  * CREATE VIEW with either a SELECT or VALUES body. When the body is VALUES
@@ -520,14 +625,13 @@ const createViewArb: fc.Arbitrary<AST.CreateViewStmt> = fc.tuple(
 	fc.boolean(),
 	fc.option(uniqueIdents(1), { nil: undefined }),
 	queryExprArb,
-	fc.boolean(),
-).map(([name, ifNotExists, columns, body, isTemporary]): AST.CreateViewStmt => ({
+	defaultsArb,
+).map(([name, ifNotExists, columns, body, defaults]): AST.CreateViewStmt => ({
 	type: 'createView',
 	view: { type: 'identifier', name },
 	ifNotExists,
-	isTemporary,
 	columns: body.type === 'values' ? undefined : columns,
-	select: body,
+	select: withDefaults(body, defaults),
 }));
 
 // ------------------------------------------------------------------------
@@ -536,7 +640,7 @@ const createViewArb: fc.Arbitrary<AST.CreateViewStmt> = fc.tuple(
 
 const indexedColumnArb: fc.Arbitrary<AST.IndexedColumn> = fc.record({
 	name: identArb,
-	direction: fc.oneof<('asc' | 'desc' | undefined)[]>(fc.constant(undefined), fc.constant('asc'), fc.constant('desc')),
+	direction: fc.oneof<fc.Arbitrary<'asc' | 'desc' | undefined>[]>(fc.constant(undefined), fc.constant('asc'), fc.constant('desc')),
 }).map(({ name, direction }) => {
 	const c: AST.IndexedColumn = { name };
 	if (direction !== undefined) c.direction = direction;
@@ -566,10 +670,11 @@ const createIndexArb: fc.Arbitrary<AST.CreateIndexStmt> = fc.record({
 
 const createAssertionArb: fc.Arbitrary<AST.CreateAssertionStmt> = fc.record({
 	name: identArb,
+	schema: fc.option(identArb, { nil: undefined }),
 	check: checkExprArb,
-}).map(({ name, check }): AST.CreateAssertionStmt => ({
+}).map(({ name, schema, check }): AST.CreateAssertionStmt => ({
 	type: 'createAssertion',
-	name,
+	name: { type: 'identifier', name, schema },
 	check,
 }));
 
@@ -579,23 +684,23 @@ const createAssertionArb: fc.Arbitrary<AST.CreateAssertionStmt> = fc.record({
 
 /**
  * Declared-table inner CreateTableStmt. The declarative grammar forces
- * `ifNotExists`/`isTemporary` to false (no `IF NOT EXISTS` or `TEMP` keyword
- * at the item level), so we pin both to false here to keep generated trees
- * inside the parser's declared-form subset.
+ * `ifNotExists` to false (no `IF NOT EXISTS` at the item level), so we pin it
+ * to false here to keep generated trees inside the parser's declared-form subset.
  */
 const declaredTableInnerArb: fc.Arbitrary<AST.CreateTableStmt> = fc.tuple(
 	identArb,
 	uniqueIdents(3),
 ).chain(([tableName, colNames]) => {
-	const columnDefs = colNames.map(name => makeColumnDefArb(name));
+	// Destructure into a fixed 3-tuple (colNames has exactly 3 entries) so fc.tuple
+	// infers positional element types instead of `ColumnDef | TableConstraint[]`.
+	const [col0, col1, col2] = colNames.map(name => makeColumnDefArb(name));
 	return fc.tuple(
-		...columnDefs,
+		col0, col1, col2,
 		fc.array(makeTableConstraintArb(colNames), { minLength: 0, maxLength: 2 }),
 	).map(([c0, c1, c2, constraints]): AST.CreateTableStmt => ({
 		type: 'createTable',
 		table: { type: 'identifier', name: tableName },
 		ifNotExists: false,
-		isTemporary: false,
 		columns: [c0, c1, c2],
 		constraints,
 	}));
@@ -627,15 +732,15 @@ const declaredViewItemArb: fc.Arbitrary<AST.DeclaredView> = fc.record({
 	name: identArb,
 	cols: fc.option(uniqueIdents(1), { nil: undefined }),
 	select: simpleSelectArb,
-}).map(({ name, cols, select }): AST.DeclaredView => ({
+	defaults: defaultsArb,
+}).map(({ name, cols, select, defaults }): AST.DeclaredView => ({
 	type: 'declaredView',
 	viewStmt: {
 		type: 'createView',
 		view: { type: 'identifier', name },
 		ifNotExists: false,
-		isTemporary: false,
 		columns: cols,
-		select,
+		select: { ...select, defaults },
 	},
 }));
 
@@ -664,7 +769,7 @@ const declaredAssertionItemArb: fc.Arbitrary<AST.DeclaredAssertion> = fc.record(
 	check: checkExprArb,
 }).map(({ name, check }): AST.DeclaredAssertion => ({
 	type: 'declaredAssertion',
-	assertionStmt: { type: 'createAssertion', name, check },
+	assertionStmt: { type: 'createAssertion', name: { type: 'identifier', name }, check },
 }));
 
 const declareItemArb: fc.Arbitrary<AST.DeclareItem> = fc.oneof(
@@ -688,7 +793,7 @@ const declareSchemaArb: fc.Arbitrary<AST.DeclareSchemaStmt> = fc.array(declareIt
 
 const alterTableArb: fc.Arbitrary<AST.AlterTableStmt> = fc.tuple(
 	identArb, // table name
-	fc.oneof<AST.AlterTableAction[]>(
+	fc.oneof<fc.Arbitrary<AST.AlterTableAction>[]>(
 		// RENAME TO
 		identArb.map(newName => ({ type: 'renameTable', newName })),
 		// RENAME COLUMN
@@ -704,6 +809,14 @@ const alterTableArb: fc.Arbitrary<AST.AlterTableStmt> = fc.tuple(
 		})),
 		// DROP COLUMN
 		identArb.map(name => ({ type: 'dropColumn', name })),
+		// DROP CONSTRAINT <name>
+		identArb.map(name => ({ type: 'dropConstraint' as const, name })),
+		// RENAME CONSTRAINT <old> TO <new>
+		fc.tuple(identArb, identArb).map(([oldName, newName]) => ({
+			type: 'renameConstraint' as const,
+			oldName,
+			newName,
+		})),
 		// ADD CONSTRAINT — generate a NAMED constraint so the parser's `ADD CONSTRAINT`
 		// path is exercised (the unnamed table-constraint path requires the constraint
 		// keyword to be present anyway, so we always set a name).
@@ -714,7 +827,7 @@ const alterTableArb: fc.Arbitrary<AST.AlterTableStmt> = fc.tuple(
 			})),
 		),
 		// ALTER PRIMARY KEY (cols)
-		uniqueIdents(2).chain(cols => fc.array(fc.oneof<('asc' | 'desc' | undefined)[]>(
+		uniqueIdents(2).chain(cols => fc.array(fc.oneof<fc.Arbitrary<'asc' | 'desc' | undefined>[]>(
 			fc.constant(undefined),
 			fc.constant('asc'),
 			fc.constant('desc'),
@@ -812,12 +925,18 @@ const analyzeArb: fc.Arbitrary<AST.AnalyzeStmt> = fc.oneof(
 // DML smoke (kept tiny — string round-trip already covers most surface)
 // ------------------------------------------------------------------------
 
+// The INSERT source stays VALUES-shaped: a trailing schema path after a bare
+// SELECT source re-binds to the select on re-parse (the select's own
+// `parseSchemaPath` is greedy), so insert-level schemaPath ⨯ select-source is
+// only reachable with an intervening trailing clause — covered deterministically
+// in emit-roundtrip.spec.ts.
 const insertArb: fc.Arbitrary<AST.InsertStmt> = fc.tuple(
 	identArb,
 	uniqueIdents(2),
 	fc.array(literalArb, { minLength: 2, maxLength: 2 }),
 	conflictResArb,
-).map(([tbl, colNames, vals, onConflict]): AST.InsertStmt => {
+	schemaPathArb,
+).map(([tbl, colNames, vals, onConflict, schemaPath]): AST.InsertStmt => {
 	const stmt: AST.InsertStmt = {
 		type: 'insert',
 		table: { type: 'identifier', name: tbl },
@@ -828,6 +947,7 @@ const insertArb: fc.Arbitrary<AST.InsertStmt> = fc.tuple(
 		},
 	};
 	if (onConflict !== undefined) stmt.onConflict = onConflict;
+	if (schemaPath) stmt.schemaPath = schemaPath;
 	return stmt;
 });
 
@@ -836,26 +956,83 @@ const updateArb: fc.Arbitrary<AST.UpdateStmt> = fc.tuple(
 	identArb,
 	literalArb,
 	fc.option(checkExprArb, { nil: undefined }),
-).map(([tbl, col, val, wherePred]): AST.UpdateStmt => {
+	schemaPathArb,
+).map(([tbl, col, val, wherePred, schemaPath]): AST.UpdateStmt => {
 	const stmt: AST.UpdateStmt = {
 		type: 'update',
 		table: { type: 'identifier', name: tbl },
 		assignments: [{ column: col, value: val }],
 	};
 	if (wherePred) stmt.where = wherePred;
+	if (schemaPath) stmt.schemaPath = schemaPath;
 	return stmt;
 });
 
 const deleteArb: fc.Arbitrary<AST.DeleteStmt> = fc.tuple(
 	identArb,
 	fc.option(checkExprArb, { nil: undefined }),
-).map(([tbl, wherePred]): AST.DeleteStmt => {
+	schemaPathArb,
+).map(([tbl, wherePred, schemaPath]): AST.DeleteStmt => {
 	const stmt: AST.DeleteStmt = {
 		type: 'delete',
 		table: { type: 'identifier', name: tbl },
 	};
 	if (wherePred) stmt.where = wherePred;
+	if (schemaPath) stmt.schemaPath = schemaPath;
 	return stmt;
+});
+
+/**
+ * A minimal single-column-from-table SELECT body for an inline-subquery DML target
+ * (`(select <col> from <tbl>)`), shaped to match exactly what the parser yields for the
+ * same SQL so the round-trip compares equal.
+ */
+const subqueryBodyArb: fc.Arbitrary<AST.SelectStmt> = fc.tuple(identArb, identArb).map(
+	([col, tbl]): AST.SelectStmt => ({
+		type: 'select',
+		columns: [{ type: 'column', expr: { type: 'column', name: col } }],
+		from: [{ type: 'table', table: { type: 'identifier', name: tbl } }],
+	}),
+);
+
+/**
+ * Inline-subquery UPDATE target (`update (select …) as v [(cols)] set …`). Built to
+ * mirror parser output: `table` is the alias-named placeholder, `alias` carries the
+ * correlation name, and `targetSource` holds the body + optional rename list. Guards the
+ * stringifier against silently dropping `targetSource`.
+ */
+const subqueryTargetUpdateArb: fc.Arbitrary<AST.UpdateStmt> = fc.tuple(
+	subqueryBodyArb,
+	identArb,
+	identArb,
+	literalArb,
+	fc.option(fc.array(identArb, { minLength: 1, maxLength: 3 }), { nil: undefined }),
+).map(([subquery, alias, setCol, val, columns]): AST.UpdateStmt => {
+	const targetSource: AST.SubquerySource = { type: 'subquerySource', subquery, alias };
+	if (columns) targetSource.columns = columns;
+	return {
+		type: 'update',
+		table: { type: 'identifier', name: alias },
+		alias,
+		targetSource,
+		assignments: [{ column: setCol, value: val }],
+	};
+});
+
+/** Inline-subquery DELETE target (`delete from (select …) as v [(cols)] [where …]`). */
+const subqueryTargetDeleteArb: fc.Arbitrary<AST.DeleteStmt> = fc.tuple(
+	subqueryBodyArb,
+	identArb,
+	fc.option(fc.array(identArb, { minLength: 1, maxLength: 3 }), { nil: undefined }),
+).map(([subquery, alias, columns]): AST.DeleteStmt => {
+	const targetSource: AST.SubquerySource = { type: 'subquerySource', subquery, alias };
+	if (columns) targetSource.columns = columns;
+	return {
+		type: 'delete',
+		table: { type: 'identifier', name: alias },
+		alias,
+		targetSource,
+	};
 });
 
 // ------------------------------------------------------------------------
@@ -1025,6 +1202,10 @@ describe('AST round-trip property: QueryExpr at every accepting site', () => {
 	it('CommonTableExpr.query body round-trips structurally', () => {
 		fc.assert(fc.property(cteSelectArb, checkRoundTrip), { numRuns: 100 });
 	});
+
+	it('ResultColumnExpr.inverse (alias ⨯ clause ⨯ multi-column) round-trips structurally', () => {
+		fc.assert(fc.property(selectWithInverseArb, checkRoundTrip), { numRuns: 200 });
+	});
 });
 
 describe('AST round-trip property: transactional + misc', () => {
@@ -1072,5 +1253,13 @@ describe('AST round-trip property: DML smoke', () => {
 
 	it('DELETE round-trips structurally', () => {
 		fc.assert(fc.property(deleteArb, checkRoundTrip), { numRuns: 50 });
+	});
+
+	it('UPDATE with an inline-subquery target round-trips structurally', () => {
+		fc.assert(fc.property(subqueryTargetUpdateArb, checkRoundTrip), { numRuns: 50 });
+	});
+
+	it('DELETE with an inline-subquery target round-trips structurally', () => {
+		fc.assert(fc.property(subqueryTargetDeleteArb, checkRoundTrip), { numRuns: 50 });
 	});
 });

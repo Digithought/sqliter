@@ -5,8 +5,12 @@ import type { Expression } from '@quereus/quereus/parser';
 import { StoreEventEmitter, StoreModule, type KVStore } from '@quereus/store';
 import {
 	createStoreAdapter,
+	createSyncMaintenanceTicker,
 	createSyncModule,
+	SYNC_MAINTENANCE_INTERVAL_MS,
+	type BasisTableEvictedEvent,
 	type ConflictEvent,
+	type HeldChangesDrainedEvent,
 	type LocalChangeEvent,
 	type RemoteChangeEvent,
 	type SyncEventEmitter as SyncEventEmitterType,
@@ -16,6 +20,7 @@ import {
 import { SyncClient, type SyncEvent as SyncClientEvent, type SyncStatus as SyncClientStatus } from '@quereus/sync-client';
 import { IndexedDBProvider, IndexedDBStore } from '@quereus/plugin-indexeddb';
 import { dynamicLoadModule } from '@quereus/plugin-loader';
+import { createLocalCreateDrainListener } from './sync-local-create-drain.js';
 import Papa from 'papaparse';
 import type {
 	ColumnInfo,
@@ -52,6 +57,15 @@ class QuereusWorker implements QuereusWorkerAPI {
   private syncStatus: SyncStatus = { status: 'disconnected' };
   private syncEventHistory: SyncEvent[] = [];
   private syncEventSubscribers = new Map<string, (event: SyncEvent) => void>();
+
+  // Periodic sync-maintenance loop. The library is timer-free; this worker owns
+  // the cadence that drives drainHeldChanges + the prune/evict sweeps. The
+  // re-entrancy / null-target guards live inside the ticker closure.
+  private maintenanceTimer: ReturnType<typeof setInterval> | null = null;
+
+  // Eager scoped drain on local `create table` — registered in initializeSyncModule,
+  // torn down in close() (survives disconnectSync so offline re-creates still drain).
+  private syncDrainSchemaUnsub: (() => void) | null = null;
 
   // Database-level event subscribers (forwarded to UI via Comlink)
   private dataChangeSubscribers = new Map<string, DataChangeCallback>();
@@ -628,41 +642,77 @@ class QuereusWorker implements QuereusWorkerAPI {
     }
 
     // Create store adapter for applying remote changes
-    // This executes DDL/DML on the local database when remote changes arrive
+    // This executes DDL on the local database and applies row changes through
+    // the store module's external-write entry point (table-owned keying,
+    // secondary-index maintenance) + the engine's ingestion seam (MV
+    // maintenance, Database.watch capture).
     const db = this.db;
-    const storeModule = this.storeModule;
     const getTableSchema = (schemaName: string, tableName: string) => {
       return db.schemaManager.getTable(schemaName, tableName);
     };
 
-    // Get the correct KV store for each table
-    const getKVStore = async (schemaName: string, tableName: string) => {
-      const tableKey = `${schemaName}.${tableName}`.toLowerCase();
-      const config = { collation: 'NOCASE' as const };
-      return storeModule.getStore(tableKey, config);
-    };
-
     const applyToStore = createStoreAdapter({
       db: this.db,
-      getKVStore,
+      storeModule: this.storeModule,
       events: this.storeEvents,
-      getTableSchema,
-      collation: 'NOCASE',
     });
 
-    // Create sync module with the store adapter and schema lookup
-    // getTableSchema is needed for proper column name mapping in sync
+    // Reclaim-by-name callback for the basis-eviction sweep: a detached basis
+    // table's lingering local storage is dropped through the store module's
+    // reclaim-by-name helper (docs/migration.md § 4 Contract). The sweep
+    // (syncManager.evictExpiredBasisTables) is host-driven — like the tombstone /
+    // quarantine prunes, the library adds no timer.
+    const storeModule = this.storeModule;
+    const dropLocalTable = (schemaName: string, tableName: string, indexNames: readonly string[]) =>
+      storeModule.reclaimDetachedTable(schemaName, tableName, indexNames);
+
+    // Create sync module with the store adapter and schema lookup.
+    // getTableSchema maps column indices to names; transactionSource (the engine
+    // Database) drives local-change capture at the transaction boundary — one HLC
+    // per committed transaction.
     const { syncManager, syncEvents } = await createSyncModule(
       this.kvStore,
-      this.storeEvents,
-      { applyToStore, getTableSchema }
+      {
+        applyToStore,
+        getTableSchema,
+        dropLocalTable,
+        // Pk-identity keys must agree with the database's own row identity —
+        // resolve collation normalizers through the connection, not built-ins.
+        keyNormalizerResolver: db.getKeyNormalizerResolver(),
+        transactionSource: db,
+      }
     );
 
     this.syncManager = syncManager;
     this.syncEvents = syncEvents;
 
+    // Forward each logical `apply schema` lens deployment from the basis-backing
+    // store module to the sync layer's basis-table lifecycle bookkeeping. The
+    // store module guards this call (advisory; a bookkeeping failure never aborts
+    // a deploy), so we wire the recorder straight through.
+    this.storeModule.setLensDeploymentListener((listenerDb, logicalSchemaName, snapshot) =>
+      syncManager.recordLensDeployment(listenerDb, logicalSchemaName, snapshot),
+    );
+
     // Subscribe to sync events and forward to UI
     this.setupSyncEventListeners();
+
+    // Start the periodic maintenance loop. It lives with the sync *module* (not
+    // the connection): held changes drain even while offline, and the loop must
+    // survive disconnectSync() — so it is torn down only in close().
+    this.startSyncMaintenance();
+
+    // Eager scoped drain: fire drainHeldChanges immediately when the app locally
+    // re-creates a table, so held edits replay without waiting for the next
+    // maintenance interval. Torn down in close(), not disconnectSync(), for the
+    // same reason as the maintenance loop.
+    this.syncDrainSchemaUnsub = db.onSchemaChange(
+      createLocalCreateDrainListener(
+        () => this.syncManager,
+        (schema, table, error) =>
+          console.warn(`[quoomb-web] eager drain on local create ${schema}.${table} failed:`, error),
+      ),
+    );
   }
 
   private setupSyncEventListeners(): void {
@@ -715,6 +765,64 @@ class QuereusWorker implements QuereusWorkerAPI {
         message: `Sync state: ${state.status}`,
       });
     });
+
+    // Held out-of-basis changes replayed into a reappeared table by the
+    // maintenance loop's drainHeldChanges sweep (applied + skipped === drained).
+    this.syncEvents.onHeldChangesDrained((event: HeldChangesDrainedEvent) => {
+      this.addSyncEvent({
+        type: 'held-changes-drained',
+        timestamp: Date.now(),
+        message: `Drained ${event.drained} held change(s) into ${event.table} (applied ${event.applied}, skipped ${event.skipped})`,
+        details: {
+          table: event.table,
+          drained: event.drained,
+          applied: event.applied,
+          skipped: event.skipped,
+        },
+      });
+    });
+
+    // Detached basis table reclaimed by the maintenance loop's
+    // evictExpiredBasisTables sweep (now reachable because the loop runs it).
+    this.syncEvents.onBasisTableEvicted((event: BasisTableEvictedEvent) => {
+      this.addSyncEvent({
+        type: 'basis-evicted',
+        timestamp: Date.now(),
+        message: `Evicted detached basis table ${event.table}`,
+        details: {
+          table: event.table,
+        },
+      });
+    });
+  }
+
+  /**
+   * Arm the periodic sync-maintenance loop. Idempotent — a no-op if already
+   * armed (so a reconnect / re-init does not stack a second timer). Kicks off one
+   * immediate pass so held changes from a prior offline session drain on startup
+   * rather than waiting a full interval. The tick is fire-and-forget (errors are
+   * isolated inside the pass) and guarded against overlap + a null manager.
+   */
+  private startSyncMaintenance(): void {
+    if (this.maintenanceTimer) return; // already armed
+
+    const tick = createSyncMaintenanceTicker(
+      () => this.syncManager,
+      (step, error) => console.warn(`[quoomb-web] sync-maintenance step "${step}" failed:`, error),
+    );
+
+    this.maintenanceTimer = setInterval(() => void tick(), SYNC_MAINTENANCE_INTERVAL_MS);
+
+    // Immediate kick-off so a prior offline session's held changes drain now.
+    void tick();
+  }
+
+  /** Stop the periodic sync-maintenance loop. Idempotent. */
+  private stopSyncMaintenance(): void {
+    if (this.maintenanceTimer) {
+      clearInterval(this.maintenanceTimer);
+      this.maintenanceTimer = null;
+    }
   }
 
   private convertSyncState(state: SyncState): SyncStatus {
@@ -891,6 +999,16 @@ class QuereusWorker implements QuereusWorkerAPI {
   }
 
   async close(): Promise<void> {
+    // Stop the maintenance loop before nulling syncManager below, so a timer
+    // firing mid-teardown cannot race the manager out from under a sweep.
+    this.stopSyncMaintenance();
+
+    // Tear down the eager-drain schema listener.
+    if (this.syncDrainSchemaUnsub) {
+      this.syncDrainSchemaUnsub();
+      this.syncDrainSchemaUnsub = null;
+    }
+
     // Clean up sync connection
     if (this.syncClient) {
       await this.syncClient.disconnect();

@@ -18,6 +18,35 @@ SELECT NOT NOT 1;
 SELECT ~-1;
 → [{"~-1":0}]
 
+-- Unary operators over numeric-typed operands take a specialized emit-time path
+-- (see runtime/emit/unary.ts); these pin its results against the generic path.
+-- REAL operand: ~ truncates toward zero before complementing.
+SELECT ~5.7 AS a, ~(-5.7) AS b, -5.5 AS c, +5.5 AS d;
+→ [{"a":-6,"b":4,"c":-5.5,"d":5.5}]
+-- BIGINT operand: stays in the bigint domain, no float round-trip.
+SELECT -9223372036854775807 AS a, +9223372036854775807 AS b, ~9223372036854775807 AS c;
+→ [{"a":-9223372036854775807,"b":9223372036854775807,"c":-9223372036854775808}]
+-- NULL propagates through every unary arithmetic operator.
+SELECT -null AS a, +null AS b, ~null AS c;
+→ [{"a":null,"b":null,"c":null}]
+-- Column-sourced operands (INTEGER key, NUMERIC column) take the same path.
+SELECT -i AS a, +i AS b, ~i AS c, -n AS d, +n AS e FROM expr_t WHERE i = 2;
+→ [{"a":-2,"b":2,"c":-3,"d":5,"e":-5}]
+-- TEXT operand keeps the generic coerce-or-null path.
+SELECT -t AS a, +t AS b, ~t AS c FROM expr_t WHERE i = 1;
+→ [{"a":null,"b":null,"c":null}]
+-- ~ is -x-1 over the WHOLE integer domain, not a 32-bit complement: every operand
+-- below is past 2^31, where a ToInt32-based ~ silently wraps (~3000000000 would be
+-- 1294967295). The last two land on the safe-integer boundary from both sides —
+-- arithmetic narrowing (R1) hands ~ a number where it used to see a bigint.
+SELECT ~2147483647 AS a, ~2147483648 AS b, ~3000000000 AS c, ~(-3000000000) AS d;
+→ [{"a":-2147483648,"b":-2147483649,"c":-3000000001,"d":2999999999}]
+SELECT ~9007199254740990 AS a, ~(9007199254740993 - 3) AS b, ~9007199254740991 AS c;
+→ [{"a":-9007199254740991,"b":-9007199254740991,"c":-9007199254740992}]
+-- Generic (TEXT-operand) path agrees with the numeric-fast path past 2^31.
+SELECT ~'3000000000' AS a;
+→ [{"a":-3000000001}]
+
 -- String Concatenation
 SELECT t || ' ' || t FROM expr_t WHERE i = 1;
 → [{"t || ' ' || t":"hello hello"}]
@@ -64,6 +93,23 @@ SELECT CASE i WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END FROM expr_t O
 SELECT CASE WHEN n > 0 THEN 'pos' WHEN n < 0 THEN 'neg' ELSE 'zero' END FROM expr_t ORDER BY i;
 → [{"case when n > 0 then 'pos' when n < 0 then 'neg' else 'zero' end":"pos"},{"case when n > 0 then 'pos' when n < 0 then 'neg' else 'zero' end":"neg"},{"case when n > 0 then 'pos' when n < 0 then 'neg' else 'zero' end":"zero"}]
 
+-- CASE short-circuit semantics (only the selected branch is evaluated)
+-- Simple CASE, no ELSE, no match → NULL
+SELECT CASE i WHEN 99 THEN 'x' END FROM expr_t WHERE i = 1;
+→ [{"case i when 99 then 'x' end":null}]
+-- Searched CASE, no ELSE, no match → NULL
+SELECT CASE WHEN i = 99 THEN 'x' END FROM expr_t WHERE i = 1;
+→ [{"case when i = 99 then 'x' end":null}]
+-- Simple CASE with NULL base never matches any WHEN → falls to ELSE
+SELECT CASE null WHEN 1 THEN 'a' ELSE 'else' END AS r;
+→ [{"r":"else"}]
+-- Simple CASE with NULL WHEN value never matches → falls to ELSE
+SELECT CASE 1 WHEN null THEN 'a' ELSE 'else' END AS r;
+→ [{"r":"else"}]
+-- First match wins: later WHEN clauses are not consulted
+SELECT CASE WHEN 1 = 1 THEN 'first' WHEN 1 = 1 THEN 'second' END AS r;
+→ [{"r":"first"}]
+
 -- CAST expressions
 SELECT cast(i as TEXT), cast(n as INTEGER), cast(t as REAL) FROM expr_t WHERE i = 1;
 → [{"cast(i as text)":"1","cast(n as integer)":10,"cast(t as real)":0}]
@@ -94,9 +140,18 @@ SELECT 'B' COLLATE NOCASE BETWEEN 'a' AND 'c' AS yes2, 'B' BETWEEN 'a' AND 'c' A
 SELECT 'Hello' COLLATE NOCASE NOT BETWEEN 'a' AND 'z' AS no3, 'Hello' NOT BETWEEN 'a' AND 'z' AS yes3;
 → [{"no3":false,"yes3":true}]
 
--- COLLATE on lower bound propagates to BETWEEN
-SELECT 'hello' BETWEEN 'A' COLLATE NOCASE AND 'Z' AS yes4, 'hello' BETWEEN 'A' AND 'Z' AS no4;
-→ [{"yes4":true,"no4":false}]
+-- A COLLATE on a BETWEEN *bound* governs only that bound's comparison (per-bound,
+-- like `expr >= lo AND expr <= hi`), NOT the whole expression. The lower bound's NOCASE
+-- makes `'hello' >= 'A'` true, but the bare upper keeps `'hello' <= 'Z'` BINARY (false),
+-- so the whole BETWEEN is false — matching SQLite and the desugared two-comparison form.
+SELECT 'hello' BETWEEN 'A' COLLATE NOCASE AND 'Z' AS lo_collated, 'hello' BETWEEN 'A' AND 'Z' AS plain;
+→ [{"lo_collated":false,"plain":false}]
+
+-- A COLLATE on the *upper* bound likewise flips only that comparison: `'hello' <= 'Z'`
+-- under NOCASE is true ('hello' <= 'z'), and the bare lower `'hello' >= 'A'` is BINARY-true,
+-- so the BETWEEN is true.
+SELECT 'hello' BETWEEN 'A' AND 'Z' COLLATE NOCASE AS hi_collated;
+→ [{"hi_collated":true}]
 
 -- BETWEEN with NULL operands still returns NULL under COLLATE
 SELECT null COLLATE NOCASE BETWEEN 'a' AND 'z' AS r1, 'b' COLLATE NOCASE BETWEEN null AND 'z' AS r2;

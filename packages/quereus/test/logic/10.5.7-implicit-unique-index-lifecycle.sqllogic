@@ -1,0 +1,895 @@
+-- 10.5.7-implicit-unique-index-lifecycle.sqllogic
+--
+-- requires-capability: standalone-index-ddl
+--
+-- The implicit covering structure a declared UNIQUE constraint builds for
+-- enforcement is named after that constraint (or `_uc_<cols>` when unnamed), but
+-- it is NOT a user-addressable index: its lifecycle belongs to the constraint.
+-- `DROP INDEX <that name>` therefore raises `no such index` (IF EXISTS: no-op)
+-- and `CREATE INDEX <that name>` on the same table is refused as a duplicate.
+-- Removing the structure means dropping the constraint.
+--
+-- Runs on BOTH backends deliberately: memory materializes the structure as a
+-- real index entry, the store does not, and the guard reads `uniqueConstraints`
+-- (present on both) so the observable behavior must match.
+
+-- ============================================================
+-- 1. Named UNIQUE constraint — DROP INDEX refused, enforcement intact
+-- ============================================================
+create table iul_a (id integer primary key, email text, constraint uq_email unique (email));
+insert into iul_a values (1, 'a@x');
+-- run
+
+drop index uq_email;
+-- error: no such index
+
+drop index if exists uq_email;
+-- run
+
+-- Enforcement survives both attempts.
+insert into iul_a values (2, 'a@x');
+-- error: unique
+
+select count(*) as c from iul_a;
+→ [{"c":1}]
+
+-- The constraint is still registered.
+select count(*) as c from unique_constraint_info('iul_a') where name = 'uq_email';
+→ [{"c":1}]
+
+-- ============================================================
+-- 2. Named UNIQUE constraint — CREATE INDEX of the same name on the same table
+-- ============================================================
+create index uq_email on iul_a (email);
+-- error: already exists on table iul_a
+
+-- IF NOT EXISTS skips silently rather than erroring...
+create index if not exists uq_email on iul_a (email);
+-- run
+
+-- ...and adds nothing: the name is still only the constraint's backing structure.
+create index uq_email on iul_a (email);
+-- error: already exists on table iul_a
+
+-- ============================================================
+-- 3. Unnamed UNIQUE constraint — same rules under the auto-name `_uc_<cols>`
+-- ============================================================
+create table iul_u (id integer primary key, email text, unique (email));
+insert into iul_u values (1, 'u@x');
+-- run
+
+drop index _uc_email;
+-- error: no such index
+
+drop index if exists _uc_email;
+-- run
+
+create index _uc_email on iul_u (email);
+-- error: already exists on table iul_u
+
+insert into iul_u values (2, 'u@x');
+-- error: unique
+
+-- ============================================================
+-- 4. EXPOSED implicit structure — addressable for TAGS, still not for lifecycle
+-- ============================================================
+create table iul_e (id integer primary key, vin text,
+    constraint uq_vin unique (vin) with tags ("quereus.expose_implicit_index" = true));
+insert into iul_e values (1, 'VIN1');
+-- run
+
+-- Exposure makes it visible and tag-addressable...
+alter index uq_vin add tags (purpose = 'lookup');
+select json_extract(tags, '$.purpose') as purpose from schema() where type = 'index' and name = 'uq_vin';
+→ [{"purpose":"lookup"}]
+
+-- ...but its lifecycle still belongs to the constraint.
+drop index uq_vin;
+-- error: no such index
+
+drop index if exists uq_vin;
+-- run
+
+create index uq_vin on iul_e (vin);
+-- error: already exists on table iul_e
+
+insert into iul_e values (2, 'VIN1');
+-- error: unique
+
+-- Still exposed after the refused drops.
+select count(*) as c from schema() where type = 'index' and name = 'uq_vin';
+→ [{"c":1}]
+
+-- ============================================================
+-- 5. Mixed-case constraint name — the guards fold case like every index compare
+-- ============================================================
+create table iul_z (id integer primary key, email text, constraint UQ_Email unique (email));
+insert into iul_z values (1, 'z@x');
+-- run
+
+drop index UQ_Email;
+-- error: no such index
+
+drop index uq_email;
+-- error: no such index
+
+create index uq_email on iul_z (email);
+-- error: already exists on table iul_z
+
+insert into iul_z values (2, 'z@x');
+-- error: unique
+
+-- ============================================================
+-- 6. An implicit name on ANOTHER table is a real, droppable index
+-- ============================================================
+-- Constraint names are unique per TABLE, so `uq_shared` may be a constraint on
+-- iul_b and an ordinary index on iul_c at the same time. The owner scan must
+-- skip past iul_b's implicit match and keep going, not stop at it.
+create table iul_b (id integer primary key, email text, constraint uq_shared unique (email));
+create table iul_c (id integer primary key, email text);
+create index uq_shared on iul_c (email);
+insert into iul_b values (1, 'b@x');
+insert into iul_c values (1, 'c@x'), (2, 'c2@x');
+-- run
+
+select id from iul_c where email = 'c2@x';
+→ [{"id":2}]
+
+-- Resolves to iul_c's real index, not iul_b's backing structure.
+drop index uq_shared;
+-- run
+
+-- iul_b's constraint is untouched and still enforcing.
+select count(*) as c from unique_constraint_info('iul_b') where name = 'uq_shared';
+→ [{"c":1}]
+
+insert into iul_b values (2, 'b@x');
+-- error: unique
+
+-- iul_c's rows survive the index drop and are still readable by the column.
+select id from iul_c where email = 'c2@x';
+→ [{"id":2}]
+
+-- The name is free again on iul_c.
+create index uq_shared on iul_c (email);
+-- run
+
+drop index uq_shared;
+-- run
+
+-- ============================================================
+-- 6a. `schema()` / `index_info()` hide the backing structure on BOTH backends
+-- ============================================================
+-- Named constraint (iul_a's uq_email): absent from schema()...
+select count(*) as c from schema() where type = 'index' and name = 'uq_email' and tbl_name = 'iul_a';
+→ [{"c":0}]
+
+-- ...and from index_info().
+select count(*) as c from index_info('iul_a') where index_name = 'uq_email';
+→ [{"c":0}]
+
+-- Unnamed constraint's auto-name (iul_u's _uc_email): same.
+select count(*) as c from schema() where type = 'index' and name = '_uc_email' and tbl_name = 'iul_u';
+→ [{"c":0}]
+
+select count(*) as c from index_info('iul_u') where index_name = '_uc_email';
+→ [{"c":0}]
+
+-- Mixed-case constraint name (iul_z's UQ_Email): the predicate folds case.
+select count(*) as c from schema() where type = 'index' and lower(name) = 'uq_email' and tbl_name = 'iul_z';
+→ [{"c":0}]
+
+select count(*) as c from index_info('iul_z') where lower(index_name) = 'uq_email';
+→ [{"c":0}]
+
+-- The EXPOSED implicit structure (iul_e's uq_vin) keeps showing up, with tags,
+-- via index_info() too — it already does via schema() per section 4 above.
+select count(*) as c from index_info('iul_e') where index_name = 'uq_vin';
+→ [{"c":1}]
+
+select json_extract(tags, '$.purpose') as purpose from index_info('iul_e') where index_name = 'uq_vin';
+→ [{"purpose":"lookup"}]
+
+-- `create unique index` synthesizes a constraint for enforcement, but the index
+-- is the user's own object (not an implicit covering structure) and must keep
+-- showing up on both introspection surfaces.
+create table iul_d (id integer primary key, email text);
+insert into iul_d values (1, 'd@x');
+create unique index uq_d_email on iul_d (email);
+-- run
+
+select count(*) as c from schema() where type = 'index' and name = 'uq_d_email';
+→ [{"c":1}]
+
+select count(*) as c from index_info('iul_d') where index_name = 'uq_d_email';
+→ [{"c":1}]
+
+drop table iul_d;
+-- run
+
+-- ============================================================
+-- 7. DROP CONSTRAINT is the way to remove the structure
+-- ============================================================
+alter table iul_a drop constraint uq_email;
+-- run
+
+select count(*) as c from unique_constraint_info('iul_a') where name = 'uq_email';
+→ [{"c":0}]
+
+-- Duplicate accepted once the constraint (and its backing structure) is gone.
+insert into iul_a values (2, 'a@x');
+select count(*) as c from iul_a;
+→ [{"c":2}]
+
+-- ...and the name is now an ordinary one on that table.
+create index uq_email on iul_a (email);
+-- run
+
+drop index uq_email;
+-- run
+
+-- ============================================================
+-- 8. The strict-DDL-policy gate skips implicit structures the same way
+-- ============================================================
+-- `emitDropIndex` resolves the owning table before the `ddl_transaction_policy`
+-- gate fires, so its scan must apply the same skip. A name held ONLY by a
+-- constraint's structure has no droppable owner, so the statement fails with
+-- `no such index` and never reaches the gate; a real index of that name on
+-- another table IS found past the skip, so the gate does fire for it.
+
+pragma ddl_transaction_policy = 'strict';
+-- run
+
+-- Allowed in autocommit; iul_b still carries the `uq_shared` constraint.
+create index uq_shared on iul_c (email);
+-- run
+
+begin;
+-- run
+drop index uq_shared;
+-- error: ddl_transaction_policy = strict
+rollback;
+-- run
+
+begin;
+-- run
+drop index UQ_Email;
+-- error: no such index
+rollback;
+-- run
+
+pragma ddl_transaction_policy = 'permissive';
+-- run
+
+-- The gate refused rather than dropped: the index is still there.
+drop index uq_shared;
+-- run
+
+drop table iul_c;
+drop table iul_b;
+drop table iul_z;
+drop table iul_e;
+drop table iul_u;
+drop table iul_a;
+-- run
+
+-- ============================================================
+-- 9. The same rule from the CONSTRAINT side — declaring second is refused too
+-- ============================================================
+-- Sections 2/3/5 cover `CREATE INDEX` onto a name a UNIQUE constraint already
+-- holds. The mirror image — declaring a UNIQUE constraint onto a name an index on
+-- the SAME table already holds — is refused identically, on every authoring path.
+-- Left unguarded it silently reclassifies the user's index as a hidden backing
+-- structure: it disappears from schema() / index_info(), stops being droppable,
+-- and (store-backed) its CREATE INDEX line is dropped from the persisted catalog.
+
+create table iul_ac (id integer primary key, a text, b text);
+create index cs_named on iul_ac (b);
+insert into iul_ac values (1, 'x', 'p'), (2, 'y', 'q');
+-- run
+
+-- 9a. ALTER TABLE ADD CONSTRAINT
+alter table iul_ac add constraint cs_named unique (a);
+-- error: would collide with existing index 'cs_named'
+
+-- The index is untouched by the refusal: still visible, still resolving rows.
+select count(*) as c from schema() where type = 'index' and name = 'cs_named';
+→ [{"c":1}]
+
+select id from iul_ac where b = 'q';
+→ [{"id":2}]
+
+-- No duplicate index entry was left behind either.
+select count(*) as c from index_info('iul_ac') where index_name = 'cs_named';
+→ [{"c":1}]
+
+-- Case folds, like every other index-name compare.
+alter table iul_ac add constraint CS_Named unique (a);
+-- error: would collide with existing index 'cs_named'
+
+-- Rejected even when the index is over the SAME column, where the two structures
+-- would physically coincide: accepting it would silently hide the user's index.
+create index cs_same on iul_ac (a);
+-- run
+
+alter table iul_ac add constraint cs_same unique (a);
+-- error: would collide with existing index 'cs_same'
+
+-- A DIFFERENTLY-named constraint over an already-indexed column stays legal —
+-- reuse matches on columns, not on names.
+alter table iul_ac add constraint cs_other unique (a);
+-- run
+
+insert into iul_ac values (3, 'x', 'r');
+-- error: unique
+
+-- 9b. Unnamed UNIQUE — the auto-name `_uc_<cols>` is guarded the same way
+create table iul_au (id integer primary key, a text);
+create index _uc_a on iul_au (a);
+-- run
+
+alter table iul_au add unique (a);
+-- error: would collide with existing index '_uc_a'
+
+select count(*) as c from schema() where type = 'index' and name = '_uc_a';
+→ [{"c":1}]
+
+-- Multi-column: the auto-name joins the declared column names with `_`.
+create table iul_am (id integer primary key, a text, b text, c text);
+create index _uc_a_b on iul_am (c);
+-- run
+
+alter table iul_am add unique (a, b);
+-- error: would collide with existing index '_uc_a_b'
+
+select count(*) as c from schema() where type = 'index' and name = '_uc_a_b';
+→ [{"c":1}]
+
+-- A free multi-column auto-name still installs and enforces.
+alter table iul_am add unique (b, c);
+insert into iul_am values (1, 'p', 'q', 'r');
+-- run
+
+insert into iul_am values (2, 'z', 'q', 'r');
+-- error: unique
+
+-- 9c. ALTER TABLE RENAME CONSTRAINT
+create table iul_rc (id integer primary key, a text, b text);
+create index rc_taken on iul_rc (b);
+alter table iul_rc add constraint rc_uq unique (a);
+-- run
+
+alter table iul_rc rename constraint rc_uq to rc_taken;
+-- error: would collide with existing index 'rc_taken'
+
+-- Neither object moved: the constraint keeps its name and the index keeps its own.
+select count(*) as c from unique_constraint_info('iul_rc') where name = 'rc_uq';
+→ [{"c":1}]
+
+select count(*) as c from schema() where type = 'index' and name = 'rc_taken';
+→ [{"c":1}]
+
+-- A free name still renames, and a case-only rename is still a no-op (it must not
+-- trip over the constraint's OWN backing structure).
+alter table iul_rc rename constraint rc_uq to rc_moved;
+-- run
+
+alter table iul_rc rename constraint rc_moved to RC_Moved;
+-- run
+
+select count(*) as c from unique_constraint_info('iul_rc') where lower(name) = 'rc_moved';
+→ [{"c":1}]
+
+-- 9d. ALTER TABLE ADD COLUMN … unique
+create table iul_cc (id integer primary key, a text);
+create index _uc_c on iul_cc (a);
+create index cc_named on iul_cc (a);
+-- run
+
+-- Unnamed inline unique: auto-name comes from the not-yet-existing column's name.
+alter table iul_cc add column c text unique;
+-- error: would collide with existing index '_uc_c'
+
+-- Named inline unique.
+alter table iul_cc add column d text constraint cc_named unique;
+-- error: would collide with existing index 'cc_named'
+
+-- The refusals left the table exactly as it was — neither column was added.
+select count(*) as c from table_info('iul_cc') where name in ('c', 'd');
+→ [{"c":0}]
+
+-- A free name adds the column and its constraint normally.
+alter table iul_cc add column e text unique;
+insert into iul_cc values (1, 'p', 'q');
+-- run
+
+insert into iul_cc values (2, 'p2', 'q');
+-- error: unique
+
+-- A column declaring several inline `unique` constraints is checked per constraint,
+-- so the colliding one is refused whichever position it holds.
+create table iul_cm (id integer primary key, a text);
+create index _uc_m on iul_cm (a);
+-- run
+
+alter table iul_cm add column m text constraint cm_free unique unique;
+-- error: would collide with existing index '_uc_m'
+
+select count(*) as c from table_info('iul_cm') where name = 'm';
+→ [{"c":0}]
+
+-- 9e. `create unique index` still synthesizes its constraint beside its index
+-- (`derivedFromIndex`), which the guard must not mistake for a collision.
+create table iul_ui (id integer primary key, a text);
+create unique index ui_a on iul_ui (a);
+insert into iul_ui values (1, 'k');
+-- run
+
+select count(*) as c from schema() where type = 'index' and name = 'ui_a';
+→ [{"c":1}]
+
+insert into iul_ui values (2, 'k');
+-- error: unique
+
+-- 9f. ALTER TABLE RENAME COLUMN — the `_uc_<cols>` name MOVES with the column
+-- The auto-name is derived from the covered columns' CURRENT names and recorded
+-- nowhere, so renaming a covered column renames the backing structure. Two halves:
+-- the structure must follow (or it is orphaned under the old name — surfacing as a
+-- user index, droppable, and no longer recognized as the constraint's), and the
+-- statement must be refused when the post-rename name is already an index here.
+-- Column names are file-unique so a `drop index` below cannot resolve to some other
+-- table's index of the same name (see section 6).
+create table iul_rk (id integer primary key, rka text, rkb text, unique (rka));
+insert into iul_rk values (1, 'x', 'p'), (2, 'y', 'q');
+-- run
+
+alter table iul_rk rename column rka to rkz;
+-- run
+
+-- The structure followed the column: nothing surfaces under either name.
+select count(*) as c from schema() where type = 'index' and tbl_name = 'iul_rk';
+→ [{"c":0}]
+
+select count(*) as c from index_info('iul_rk');
+→ [{"c":0}]
+
+drop index _uc_rka;
+-- error: no such index
+
+drop index _uc_rkz;
+-- error: no such index
+
+-- ...and the constraint still enforces, now over the new column name.
+insert into iul_rk values (3, 'x', 'r');
+-- error: unique
+
+-- Multi-column: the auto-name joins the NEW column names.
+create table iul_rm (id integer primary key, rma text, rmb text, unique (rma, rmb));
+insert into iul_rm values (1, 'x', 'p');
+-- run
+
+alter table iul_rm rename column rma to rmz;
+-- run
+
+select count(*) as c from index_info('iul_rm');
+→ [{"c":0}]
+
+drop index _uc_rmz_rmb;
+-- error: no such index
+
+insert into iul_rm values (2, 'x', 'p');
+-- error: unique
+
+-- Collision: the post-rename name is already an index on this table.
+create table iul_rx (id integer primary key, rxa text, rxb text, unique (rxa));
+create index _uc_rxz on iul_rx (rxb);
+insert into iul_rx values (1, 'x', 'p'), (2, 'y', 'q');
+-- run
+
+alter table iul_rx rename column rxa to rxz;
+-- error: would collide with existing index '_uc_rxz'
+
+-- Nothing moved: the column keeps its old name...
+select count(*) as c from table_info('iul_rx') where name = 'rxa';
+→ [{"c":1}]
+
+select count(*) as c from table_info('iul_rx') where name = 'rxz';
+→ [{"c":0}]
+
+-- ...the user's index is still listed and still resolves rows...
+select count(*) as c from schema() where type = 'index' and name = '_uc_rxz';
+→ [{"c":1}]
+
+select id from iul_rx where rxb = 'q';
+→ [{"id":2}]
+
+-- ...the constraint still enforces over the old column name...
+insert into iul_rx values (3, 'x', 'r');
+-- error: unique
+
+-- ...and the index is still the user's to drop.
+drop index _uc_rxz;
+-- run
+
+-- A case-only rename derives a case-equal name, which must not be read as a
+-- collision with the constraint's OWN structure.
+create table iul_rf (id integer primary key, rfa text, unique (rfa));
+insert into iul_rf values (1, 'x');
+-- run
+
+alter table iul_rf rename column rfa to RFA;
+-- run
+
+select count(*) as c from index_info('iul_rf');
+→ [{"c":0}]
+
+insert into iul_rf values (2, 'x');
+-- error: unique
+
+-- An EXPOSED implicit structure follows the rename too — it stays visible, under the
+-- NEW derived name (exposure changes visibility, not who owns the name).
+create table iul_rp (id integer primary key, rpa text,
+    unique (rpa) with tags ("quereus.expose_implicit_index" = true));
+insert into iul_rp values (1, 'x');
+-- run
+
+alter table iul_rp rename column rpa to rpz;
+-- run
+
+select index_name from index_info('iul_rp');
+→ [{"index_name":"_uc_rpz"}]
+
+insert into iul_rp values (2, 'x');
+-- error: unique
+
+-- A NAMED UNIQUE's structure takes the CONSTRAINT's name, which no column rename
+-- moves — so neither arm applies to it.
+create table iul_rn (id integer primary key, rna text, rnb text, constraint rn_uq unique (rna));
+create index _uc_rnz on iul_rn (rnb);
+insert into iul_rn values (1, 'x', 'p');
+-- run
+
+alter table iul_rn rename column rna to rnz;
+-- run
+
+-- The index the unnamed case would have collided with is untouched...
+select count(*) as c from schema() where type = 'index' and name = '_uc_rnz' and tbl_name = 'iul_rn';
+→ [{"c":1}]
+
+-- ...and the constraint's own structure is still hidden and still enforcing.
+select count(*) as c from index_info('iul_rn') where index_name = 'rn_uq';
+→ [{"c":0}]
+
+insert into iul_rn values (2, 'x', 'q');
+-- error: unique
+
+-- The re-derived name is also the key DROP COLUMN tears the structure down by, so a
+-- rename followed by dropping a covered column must leave no orphan behind. Multi-column
+-- on purpose: a single-column structure collapses to zero key columns and is dropped by
+-- the shift helper regardless, so only this shape proves the key was re-derived.
+create table iul_rd (id integer primary key, rda text, rdb text, unique (rda, rdb));
+insert into iul_rd values (1, 'x', 'p');
+-- run
+
+alter table iul_rd rename column rda to rdz;
+-- run
+
+alter table iul_rd drop column rdz;
+-- run
+
+select count(*) as c from index_info('iul_rd');
+→ [{"c":0}]
+
+select count(*) as c from schema() where type = 'index' and tbl_name = 'iul_rd';
+→ [{"c":0}]
+
+-- The constraint covered the dropped column, so it went with it — the survivor is free.
+insert into iul_rd values (2, 'p');
+-- run
+
+select count(*) as c from iul_rd;
+→ [{"c":2}]
+
+-- Renaming INSIDE an open transaction that has already staged a row: the structure moves
+-- to its new name under the transaction's own layer too, so the staged row stays visible
+-- to it, enforcement never lapses, and the commit does not drop the staged write.
+create table iul_rs (id integer primary key, rsa text, unique (rsa));
+insert into iul_rs values (1, 'x');
+-- run
+
+begin;
+-- run
+insert into iul_rs values (2, 'y');
+-- run
+alter table iul_rs rename column rsa to rsz;
+-- run
+
+insert into iul_rs values (3, 'y');
+-- error: unique
+
+commit;
+-- run
+
+select id, rsz from iul_rs order by id;
+→ [{"id":1,"rsz":"x"},{"id":2,"rsz":"y"}]
+
+select count(*) as c from index_info('iul_rs');
+→ [{"c":0}]
+
+insert into iul_rs values (4, 'x');
+-- error: unique
+
+drop table iul_rs;
+drop table iul_rd;
+drop table iul_rn;
+drop table iul_rp;
+drop table iul_rf;
+drop table iul_rx;
+drop table iul_rm;
+drop table iul_rk;
+drop table iul_ui;
+drop table iul_cm;
+drop table iul_cc;
+drop table iul_rc;
+drop table iul_am;
+drop table iul_au;
+drop table iul_ac;
+-- run
+
+-- ============================================================
+-- 10. Duplicate UNIQUE constraints — one rule, every declaration site
+-- ============================================================
+-- An unnamed UNIQUE has no name to compare, so before this guard the only thing that
+-- ever noticed a repeat was the backing-structure name — which the memory backend
+-- materializes and the store backend does not, so one statement got three different
+-- answers. The test is the constraint's COLUMN SET, which both backends carry, and it
+-- runs ahead of the index-name check so the message names the constraint rather than
+-- an index the user never created.
+
+-- 10a. ALTER TABLE ADD CONSTRAINT
+create table dup_ac (id integer primary key, c integer, d integer);
+alter table dup_ac add unique (c);
+-- run
+
+alter table dup_ac add unique (c);
+-- error: an equivalent UNIQUE constraint on (c) already exists
+
+-- Case folds, like every other column-name compare.
+alter table dup_ac add unique (C);
+-- error: an equivalent UNIQUE constraint on (C) already exists
+
+-- Exactly one constraint survives the refusals, and it still enforces.
+select count(*) as c from unique_constraint_info('dup_ac');
+→ [{"c":1}]
+
+insert into dup_ac values (1, 5, 7);
+-- run
+
+insert into dup_ac values (2, 5, 8);
+-- error: unique
+
+-- Column ORDER is not identity: `unique (c, d)` and `unique (d, c)` are one rule, even
+-- though their derived structure names (`_uc_c_d` / `_uc_d_c`) differ.
+alter table dup_ac add unique (c, d);
+-- run
+
+alter table dup_ac add unique (d, c);
+-- error: an equivalent UNIQUE constraint on (d, c) already exists
+
+select count(distinct id) as c from unique_constraint_info('dup_ac');
+→ [{"c":2}]
+
+-- 10b. ALTER TABLE ADD COLUMN … unique, repeated within ONE statement
+create table dup_cc (id integer primary key, a text);
+-- run
+
+alter table dup_cc add column m text unique unique;
+-- error: an equivalent UNIQUE constraint on (m) already exists
+
+-- The refusal left the table exactly as it was — the column was never added.
+select count(*) as c from table_info('dup_cc') where name = 'm';
+→ [{"c":0}]
+
+-- A single inline `unique` still adds the column and enforces.
+alter table dup_cc add column n text unique;
+insert into dup_cc values (1, 'p', 'q');
+-- run
+
+insert into dup_cc values (2, 'p2', 'q');
+-- error: unique
+
+-- 10c. CREATE TABLE — refused before any storage is created
+create table dup_ct (id integer primary key, c integer, unique (c), unique (c));
+-- error: an equivalent UNIQUE constraint on (c) already exists
+
+select count(*) as c from schema() where type = 'table' and name = 'dup_ct';
+→ [{"c":0}]
+
+-- Column-level and table-level spellings of the same rule collide too.
+create table dup_ct (id integer primary key, c integer unique, unique (c));
+-- error: an equivalent UNIQUE constraint on (c) already exists
+
+-- ...as do two column-level ones on one column.
+create table dup_ct (id integer primary key, c integer unique unique);
+-- error: an equivalent UNIQUE constraint on (c) already exists
+
+-- Multi-column, declared in opposite orders — still one rule.
+create table dup_ct (id integer primary key, c integer, d integer, unique (c, d), unique (d, c));
+-- error: an equivalent UNIQUE constraint on (d, c) already exists
+
+-- The name is free the whole time: a single declaration creates normally.
+create table dup_ct (id integer primary key, c integer, d integer, unique (c), unique (d));
+insert into dup_ct values (1, 1, 1);
+-- run
+
+insert into dup_ct values (2, 1, 2);
+-- error: unique
+
+-- 10d. CARVE-OUT — a named UNIQUE beside an unnamed one over the same columns is legal
+-- Both are addressable and droppable by name, so the state is redundant, not broken.
+create table dup_nm (id integer primary key, c integer, unique (c));
+alter table dup_nm add constraint nm_u1 unique (c);
+-- run
+
+select count(distinct id) as c from unique_constraint_info('dup_nm');
+→ [{"c":2}]
+
+-- A SECOND named one is legal as well — a distinct name is a distinct identity.
+alter table dup_nm add constraint nm_u2 unique (c);
+-- run
+
+-- ...but a repeated NAME is still refused, by the name guard rather than this one.
+alter table dup_nm add constraint nm_u2 unique (c);
+-- error: a constraint with that name already exists
+
+-- The named ones drop by name, leaving the unnamed one enforcing.
+alter table dup_nm drop constraint nm_u1;
+alter table dup_nm drop constraint nm_u2;
+insert into dup_nm values (1, 3);
+-- run
+
+insert into dup_nm values (2, 3);
+-- error: unique
+
+select count(distinct id) as c from unique_constraint_info('dup_nm');
+→ [{"c":1}]
+
+-- 10e. CARVE-OUT — partial UNIQUEs over the same columns are different rules
+-- A partial UNIQUE only governs rows inside its predicate, so two with different
+-- predicates are genuinely different constraints, and neither duplicates a full one.
+create table dup_pt (id integer primary key, c integer, s text);
+create unique index dup_pt_pos on dup_pt (c) where s = 'pos';
+create unique index dup_pt_neg on dup_pt (c) where s = 'neg';
+-- run
+
+select count(distinct id) as c from unique_constraint_info('dup_pt') where partial = 1;
+→ [{"c":2}]
+
+-- A full UNIQUE over the same column is still accepted beside them, and builds its
+-- OWN backing structure rather than adopting either partial index — a partial index
+-- only covers rows inside its predicate, so it cannot back a rule that covers every row.
+alter table dup_pt add unique (c);
+-- run
+
+select count(distinct id) as c from unique_constraint_info('dup_pt');
+→ [{"c":3}]
+
+-- ...and it enforces across the WHOLE table, not just the rows either partial
+-- index's predicate admits.
+insert into dup_pt values (1, 5, 'a');
+-- run
+
+insert into dup_pt values (2, 5, 'b');
+-- error: unique
+
+-- ...and now it is the full one that refuses the repeat.
+alter table dup_pt add unique (c);
+-- error: an equivalent UNIQUE constraint on (c) already exists
+
+-- 10e-bis. The full UNIQUE keeps enforcing after the index it ADOPTED is dropped,
+-- and still refuses to fall back onto a same-column PARTIAL index.
+-- `add unique (c)` reuses `reuse_full` (unique, unfiltered, same collation) instead of
+-- building its own structure. Dropping that index leaves the constraint with no named
+-- structure, so enforcement resolves the covering index by column set — where a partial
+-- index over (c) is the only remaining candidate. It must be refused: with it adopted,
+-- both rows below sit outside `s = 'pos'` and the duplicate `c = 7` goes unnoticed.
+create table reuse_pt (id integer primary key, c integer, s text);
+create unique index reuse_part on reuse_pt (c) where s = 'pos';
+create unique index reuse_full on reuse_pt (c);
+alter table reuse_pt add unique (c);
+drop index reuse_full;
+-- run
+
+insert into reuse_pt values (1, 7, 'a');
+-- run
+
+insert into reuse_pt values (2, 7, 'b');
+-- error: unique
+
+select count(*) as c from reuse_pt;
+→ [{"c":1}]
+
+-- The partial index still enforces its own narrower rule alongside.
+insert into reuse_pt values (3, 8, 'pos');
+-- run
+
+insert into reuse_pt values (4, 8, 'pos');
+-- error: unique
+
+-- 10f. A column name is compared as a whole name, never as text spliced together
+-- A quoted identifier may contain anything, including whatever character the guard
+-- uses to concatenate a column set. `unique ("a,b")` covers ONE column and must not
+-- read as the pair `(a, b)`; refusing it would turn away a legal declaration.
+create table dup_sep (id integer primary key, "a,b" integer, a integer, b integer, unique (a, b));
+alter table dup_sep add unique ("a,b");
+-- run
+
+select count(distinct id) as c from unique_constraint_info('dup_sep');
+→ [{"c":2}]
+
+-- Both enforce, independently.
+insert into dup_sep values (1, 1, 1, 1);
+-- run
+
+insert into dup_sep values (2, 2, 1, 1);
+-- error: unique
+
+insert into dup_sep values (3, 1, 3, 3);
+-- error: unique
+
+-- ...and the repeat of the single-column one is still refused.
+alter table dup_sep add unique ("a,b");
+-- error: an equivalent UNIQUE constraint on (a,b) already exists
+
+drop table dup_sep;
+drop table dup_pt;
+drop table dup_nm;
+drop table dup_ct;
+drop table dup_cc;
+drop table dup_ac;
+-- run
+
+-- ============================================================
+-- 11. `apply schema` reaches the same guard
+-- ============================================================
+-- The differ emits `ALTER TABLE … ADD <constraint>` through the normal statement
+-- pipeline, so it inherits the ADD CONSTRAINT arm above rather than needing its
+-- own check. Runs last, against an otherwise-empty main schema, so the
+-- declaration below is the whole of main and the diff generates no drops.
+
+create table as_t (id integer primary key, a text, b text);
+create index as_foo on as_t (b);
+insert into as_t values (1, 'x', 'p'), (2, 'y', 'q');
+-- run
+
+declare schema main {
+	table as_t (id integer primary key, a text, b text, constraint as_foo unique (a))
+	index as_foo on as_t (b)
+}
+-- run
+
+apply schema main;
+-- error: would collide with existing index 'as_foo'
+
+-- The migration stopped at the offending statement; the index is intact.
+select count(*) as c from schema() where type = 'index' and name = 'as_foo';
+→ [{"c":1}]
+
+select id from as_t where b = 'q';
+→ [{"id":2}]
+
+drop table as_t;
+-- run
+
+-- The CREATE TABLE arm reaches its guard the same way: a declared table carrying the
+-- same plain UNIQUE twice is emitted as an ordinary CREATE TABLE and refused there.
+declare schema main {
+	table as_dup (id integer primary key, c integer, unique (c), unique (c))
+}
+-- run
+
+apply schema main;
+-- error: an equivalent UNIQUE constraint on (c) already exists
+
+select count(*) as c from schema() where type = 'table' and name = 'as_dup';
+→ [{"c":0}]

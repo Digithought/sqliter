@@ -5,10 +5,9 @@ This directory contains the core framework components for the Titan optimizer Ph
 ## Components
 
 ### Registry (`registry.ts`)
-- **RuleHandle**: Structured rule registration with ID, node type, phase, and priority
-- **Loop Detection**: Prevents infinite rule application using visited rule tracking
-- **Priority Ordering**: Rules execute in priority order (lower numbers first)
-- **Comprehensive Tracing**: Detailed logging and trace hooks for debugging
+- **RuleHandle**: Structured rule registration with ID, node type, and phase
+- **Loop Detection**: `hasRuleBeenApplied` / `markRuleApplied` prevent infinite rule application using per-node visited-rule tracking (consulted by `PassManager`). Records transforming applications only, inherited across a transform's re-mint. A rule that *declines* is tracked ephemerally per node id inside `PassManager.applyPassRules` so it is not re-run on the same unchanged node every fixpoint iteration; that decline suppression is dropped the moment the node is transformed (the plan piece changed), so no plan output changes
+- **`validateSideEffectMode`**: Rejects any rule handle missing its `sideEffectMode` declaration
 
 ### Trace Framework (`trace.ts`)
 - **TraceHook Interface**: Extensible hooks for rule and node processing events
@@ -19,9 +18,8 @@ This directory contains the core framework components for the Titan optimizer Ph
 
 ### Context (`context.ts`)
 - **OptContext**: Unified interface combining optimizer, stats provider, and tuning
-- **Depth Tracking**: Prevents infinite recursion in optimization rules
+- **Rule Visitation Tracking**: `visitedRules` / `optimizedNodes` prevent infinite rule re-application (see `hasRuleBeenApplied` / `markRuleApplied` in `registry.ts`)
 - **Phase Management**: Supports 'rewrite' (logical→logical) and 'impl' (logical→physical) phases
-- **Context Data**: Key-value store for rule communication and state
 
 ### Physical Utilities (`physical-utils.ts`)
 - **Property Inference**: Utilities for combining and propagating physical properties
@@ -32,29 +30,38 @@ This directory contains the core framework components for the Titan optimizer Ph
 ## Architecture Integration
 
 ### Rule Registration
+Rules are declared as ordered entries in `RULE_MANIFEST` (`src/planner/optimizer.ts`).
+`registerRulesToPasses()` walks the manifest in array order and registers each entry
+with its pass — so **array order is execution order** (there is no numeric priority).
 ```typescript
-import { registerRule, createRule } from '../framework/registry.js';
-
-registerRule(createRule(
-  'Aggregate→StreamAggregate',
-  PlanNodeType.Aggregate,
-  'impl',
-  ruleAggregateStreaming,
-  'safe', // sideEffectMode — see docs/optimizer.md § Audit discipline
-  10      // priority
-));
+// src/planner/optimizer.ts — an entry in RULE_MANIFEST
+{
+  pass: PassId.Physical,
+  id: 'Aggregate→StreamAggregate',
+  nodeType: PlanNodeType.Aggregate,
+  phase: 'impl',
+  fn: ruleAggregateStreaming,
+  sideEffectMode: 'safe', // see docs/optimizer.md § Audit discipline
+}
 ```
 
 ### Rule Implementation
+A rule leads with the discrimination check that matches its intent. When it targets a
+**specific class**, that check is `instanceof` — type-sound, natively narrowing, and the
+dominant idiom. When it targets **any node with a capability** (any join kind, any aggregate
+kind), use the `CapabilityDetectors` guard instead. See
+[docs/optimizer-conventions.md § Node discrimination](../../../../../docs/optimizer-conventions.md#node-discrimination-three-questions-three-mechanisms)
+for the full standard (`instanceof` vs capability brands vs `nodeType` vs physical
+characteristics).
 ```typescript
 import type { RuleFn } from '../framework/registry.js';
 
-const ruleAggregateStreaming: RuleFn = (node, optimizer) => {
+const ruleAggregateStreaming: RuleFn = (node, context) => {
+  // This rule needs AggregateNode's specific API → instanceof (concrete class identity).
   if (!(node instanceof AggregateNode)) return null;
-  
-  const context = optimizer.getContext();
-  const stats = optimizer.getStats();
-  
+
+  const stats = context.stats;
+
   // Rule logic here...
   return transformedNode;
 };

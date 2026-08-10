@@ -17,7 +17,11 @@ export interface IterateOptions {
 	lt?: Uint8Array;
 	/** Iterate in reverse order. */
 	reverse?: boolean;
-	/** Maximum number of entries to return. */
+	/**
+	 * Maximum number of entries to return. Omitted means unbounded and `0` means no
+	 * entries; a NEGATIVE limit is not a valid input — backends disagree on it
+	 * (`abstract-level` reads `-1` as unbounded, the in-memory store as zero).
+	 */
 	limit?: number;
 }
 
@@ -30,6 +34,26 @@ export interface KVEntry {
 }
 
 /**
+ * Per-write durability hint for the point-write surface (`put`/`delete`).
+ */
+export interface WriteOptions {
+	/**
+	 * Flush this write to stable storage before resolving. Default false.
+	 *
+	 * Backends without a durability knob (in-memory, and any backend that cannot
+	 * sync) silently ignore it — best-effort, never an error. IndexedDB is already
+	 * durable at transaction `oncomplete`; `sync` additionally requests
+	 * `durability: 'strict'` where the engine supports it.
+	 *
+	 * Used by the materialized-view clean-shutdown marker consume-delete to force
+	 * the delete durable before any of the session's data writes can become durable
+	 * (otherwise a power loss could resurrect a consumed marker — see
+	 * `docs/mv-backing-host.md` § Cross-module atomicity).
+	 */
+	sync?: boolean;
+}
+
+/**
  * Batch operation types.
  */
 export type BatchOp =
@@ -38,11 +62,16 @@ export type BatchOp =
 
 /**
  * Write batch for atomic operations.
+ *
+ * Queued operations apply in the order they were queued. When two operations
+ * target the same key, the later one wins: `put(k, a); delete(k)` leaves `k`
+ * absent, and `delete(k); put(k, a)` leaves `k` set to `a`. Ordering is only
+ * defined *within* one batch; `write()` remains all-or-nothing.
  */
 export interface WriteBatch {
-	/** Queue a put operation. */
+	/** Queue a put operation. On a key already queued in this batch, supersedes it. */
 	put(key: Uint8Array, value: Uint8Array): void;
-	/** Queue a delete operation. */
+	/** Queue a delete operation. On a key already queued in this batch, supersedes it. */
 	delete(key: Uint8Array): void;
 	/** Execute all queued operations atomically. */
 	write(): Promise<void>;
@@ -51,8 +80,54 @@ export interface WriteBatch {
 }
 
 /**
+ * An atomic batch spanning multiple stores of ONE provider. `write()` commits
+ * every queued op across every referenced store in a single durable,
+ * all-or-nothing physical commit. Obtained from
+ * {@link KVStoreProvider.beginAtomicBatch}; a provider exposes that method iff
+ * its stores share one atomic commit domain. All stores passed to `put`/`delete`
+ * must have been produced by the same provider.
+ *
+ * Stores are addressed by {@link KVStore} handle (matching how the transaction
+ * coordinator already tracks each op's target store), not by name — so it
+ * composes with the coordinator's per-store bucketing without a name lookup.
+ *
+ * Same-key ordering matches {@link WriteBatch}: queued ops apply in queue order,
+ * so for one (store, key) pair the later op wins. The coordinator replays its
+ * pending ops into one atomic batch without collapsing duplicates, so a
+ * transaction that writes then deletes the same row depends on this.
+ *
+ * SINGLE USE: a batch is spent once `write()` resolves — queue one commit's ops, write
+ * once, drop it (what the coordinator does). Reuse after `write()` is deliberately
+ * unspecified and backends differ: LevelDB's chained batch is closed by `write()` and
+ * throws on any later call, while IndexedDB's merely resets its op list and keeps working.
+ *
+ * NOTE: there is also no dispose — a batch that is built and then abandoned without
+ * `write()` (only reachable today if queueing throws MISUSE, i.e. a programming error)
+ * leaks whatever the backend holds until GC. If an abandoned-batch path ever becomes
+ * ordinary, give this interface a `close()` and make both behaviors conformance-tested.
+ */
+export interface AtomicBatch {
+	/** Queue a put against the given store. */
+	put(store: KVStore, key: Uint8Array, value: Uint8Array): void;
+	/** Queue a delete against the given store. */
+	delete(store: KVStore, key: Uint8Array): void;
+	/** Commit all queued ops across all referenced stores atomically + durably. */
+	write(): Promise<void>;
+	/** Discard all queued ops. */
+	clear(): void;
+}
+
+/**
  * Abstract key-value store interface.
  * Provides sorted key-value storage with range iteration support.
+ *
+ * BUFFER OWNERSHIP. Every buffer crossing this interface is independent of the store's
+ * internal state: `get` and `iterate` hand back buffers the caller may scribble on
+ * without corrupting stored data, and `put`/`delete` do not retain the caller's buffer,
+ * so mutating it afterwards changes nothing stored. A backend that deserializes per read
+ * (LevelDB, IndexedDB) gets this for free; one holding live buffers (the in-memory store,
+ * a cache wrapper) must copy at the boundary. Tiers 1 and 3 of
+ * `runKVStoreConformance` enforce it.
  */
 export interface KVStore {
 	/**
@@ -63,13 +138,15 @@ export interface KVStore {
 
 	/**
 	 * Put a key-value pair.
+	 * @param options - Optional per-write durability hint (see {@link WriteOptions}).
 	 */
-	put(key: Uint8Array, value: Uint8Array): Promise<void>;
+	put(key: Uint8Array, value: Uint8Array, options?: WriteOptions): Promise<void>;
 
 	/**
 	 * Delete a key.
+	 * @param options - Optional per-write durability hint (see {@link WriteOptions}).
 	 */
-	delete(key: Uint8Array): Promise<void>;
+	delete(key: Uint8Array, options?: WriteOptions): Promise<void>;
 
 	/**
 	 * Check if a key exists.
@@ -79,6 +156,46 @@ export interface KVStore {
 	/**
 	 * Iterate over key-value pairs in sorted order.
 	 * Keys are compared lexicographically by bytes.
+	 *
+	 * BOUNDED PEAK. Peak memory must be independent of how many entries the range
+	 * holds. An implementation may buffer a FIXED-SIZE batch — IndexedDB pages 256
+	 * entries at a time, `abstract-level` hands back one entry per `next()` — but it
+	 * must never read the whole range before yielding the first entry. Reason: a full
+	 * table scan calls `iterate(buildFullScanBounds())` with NO limit, and the mobile
+	 * backends that run this code have the least memory headroom of any of them.
+	 *
+	 * A backend whose dataset is already wholly resident in memory by construction
+	 * (`InMemoryKVStore`) satisfies this trivially — the requirement bounds reads from
+	 * BACKING STORAGE, and such a backend has none.
+	 *
+	 * EARLY TERMINATION IS CHEAP. A consumer that stops after k entries must cost
+	 * roughly k entries of work, not the size of the range: `limit: 10` over a million
+	 * rows must not read a million rows. Concretely, reads from backing storage must
+	 * stay within `k + (one batch)`, whatever the implementation's batch size is.
+	 *
+	 * TOTAL WORK IS LINEAR. Draining the whole range must read about one entry per
+	 * entry. A paged backend resumes from the LAST KEY SEEN — never by re-reading from
+	 * the start and discarding a growing prefix. `limit`/`offset` paging is O(n²) reads
+	 * yet still looks fine to a peak-memory check, so this is stated separately.
+	 *
+	 * EARLY TERMINATION RELEASES RESOURCES. When the consumer `break`s or throws, the
+	 * returned iterable's `return()`/`throw()` runs; the implementation must close its
+	 * cursor / transaction / statement there — a `try/finally` around the yield loop —
+	 * not only on natural exhaustion. After an abandoned iteration the store must still
+	 * serve `get`/`iterate` normally and `close()` must still resolve.
+	 *
+	 * NO SNAPSHOT PROMISE. Batching splits one logical read into several physical ones,
+	 * so a write committed mid-scan may become visible partway through a scan where a
+	 * single-shot read could not have shown it. `iterate` therefore does NOT promise a
+	 * point-in-time view and consumers must not assume one. This is honest about what
+	 * the stack already does: `StoreTable`'s scan merges the transaction coordinator's
+	 * pending ops over the committed range, and the store stack declares
+	 * `readCommittedSnapshot: false`. A real snapshot read is separate, future work.
+	 *
+	 * Backends without a streaming cursor (a SQL `select` hands back a whole result set)
+	 * should page with {@link pagedIterate} rather than re-deriving the resume edge.
+	 * `runKVStoreConformance`'s bounded-iteration tier enforces all of the above for any
+	 * backend whose adapter supplies a read meter.
 	 */
 	iterate(options?: IterateOptions): AsyncIterable<KVEntry>;
 
@@ -199,10 +316,19 @@ export interface KVStoreProvider {
 	/**
 	 * Delete all stores for a table (data, indexes, stats).
 	 * Called when dropping a table.
+	 *
+	 * `indexNames` is the authoritative list of the table's secondary-index names
+	 * (from `tableSchema.indexes`). Implementations MUST build exact index store
+	 * names from it via `buildIndexStoreName` rather than prefix-scanning the live
+	 * store list — `_idx_` is a legal substring of an ordinary identifier, so a
+	 * prefix scan over `{table}_idx_` also matches a sibling table literally named
+	 * `{table}_idx_<x>` and would destroy its data.
+	 *
 	 * @param schemaName - The schema name
 	 * @param tableName - The table name
+	 * @param indexNames - The table's secondary-index names (exact, from the schema)
 	 */
-	deleteTableStores?(schemaName: string, tableName: string): Promise<void>;
+	deleteTableStores?(schemaName: string, tableName: string, indexNames: readonly string[]): Promise<void>;
 
 	/**
 	 * Rename all stores for a table from `oldName` to `newName`. Implementations
@@ -210,10 +336,38 @@ export interface KVStoreProvider {
 	 * and drop all cached references to the old name so that subsequent
 	 * `getStore`/`getIndexStore` calls open the renamed storage.
 	 *
+	 * `indexNames` is the authoritative list of the table's secondary-index names
+	 * (from `tableSchema.indexes`). Implementations MUST relocate exactly those
+	 * index stores (built via `buildIndexStoreName`) rather than prefix-scanning —
+	 * a prefix scan over `{oldName}_idx_` also matches a sibling table literally
+	 * named `{oldName}_idx_<x>` and would silently move its data under `newName`.
+	 *
 	 * Called by StoreModule.renameTable during ALTER TABLE ... RENAME TO.
+	 *
+	 * Optional: when a provider omits this hook, StoreModule falls back to a generic
+	 * copy — read every entry via the required `getStore`/`getIndexStore` on the old
+	 * name and `put` it under the new name, then reclaim the old stores via
+	 * `deleteTableStores` if implemented. That fallback is correct on every provider
+	 * but does not stream at the backend's native speed and is O(table size) for a
+	 * single rename. Implement this hook for an efficient native move (e.g. a
+	 * directory/file rename) instead.
 	 * @param schemaName - The schema name
 	 * @param oldName - The current table name
 	 * @param newName - The desired table name
+	 * @param indexNames - The table's secondary-index names (exact, from the schema)
 	 */
-	renameTableStores?(schemaName: string, oldName: string, newName: string): Promise<void>;
+	renameTableStores?(schemaName: string, oldName: string, newName: string, indexNames: readonly string[]): Promise<void>;
+
+	/**
+	 * Open an atomic batch across this provider's stores, or return undefined
+	 * when the provider has no shared atomic commit domain (callers then fall
+	 * back to per-store {@link KVStore.batch}).
+	 *
+	 * A provider implements this iff all of its stores commit into one durable,
+	 * all-or-nothing physical domain (e.g. IndexedDB's single database with
+	 * multiple object stores). The transaction coordinator uses it to commit a
+	 * table's data + secondary-index stores in one batch, closing the crash
+	 * window where a per-store loop could leave them divergent.
+	 */
+	beginAtomicBatch?(): AtomicBatch | undefined;
 }

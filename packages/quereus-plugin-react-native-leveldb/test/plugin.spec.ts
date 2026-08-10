@@ -11,7 +11,6 @@ describe('React Native LevelDB Plugin', () => {
 		let originalStructuredClone: any;
 		let originalTextEncoder: any;
 		let originalTextDecoder: any;
-		let asyncIteratorWasDeleted = false;
 
 		before(() => {
 			// Save originals
@@ -27,7 +26,6 @@ describe('React Native LevelDB Plugin', () => {
 			(globalThis as any).TextDecoder = originalTextDecoder;
 			// Note: Symbol.asyncIterator is read-only in Node.js, so we can't restore it
 			// This is fine since we only delete it in tests and it's not actually removed
-			asyncIteratorWasDeleted = false;
 		});
 
 		it('should throw error when structuredClone is missing', () => {

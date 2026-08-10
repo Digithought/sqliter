@@ -13,7 +13,7 @@
  * the trailing key cannot reorder anything.
  *
  * Whole-Sort elimination (degenerate empty-key case): a source proven to hold
- * ≤1 row (the empty key `[]` present in `keysOf`, i.e. `isUnique([], source)`)
+ * ≤1 row (the empty key `[]` present in `keysOf`, i.e. `isAtMostOneRow(source)`)
  * is trivially totally ordered, so the *entire* ORDER BY is a no-op regardless
  * of how many keys it has — even a single-key sort. The rule drops the SortNode
  * outright (returns its source) before the trailing-key logic runs. This is the
@@ -45,7 +45,7 @@
  * members, so the trailing key is a no-op tiebreaker.
  *
  * Ordering with other rules: this is a Structural-pass rule. It must run
- * before `monotonic-limit-pushdown` (PostOptimization priority 8) so single-
+ * before `monotonic-limit-pushdown` (PostOptimization pass) so single-
  * key reductions can enable the pushdown. That ordering is automatic since
  * Structural runs before PostOptimization.
  */
@@ -55,7 +55,7 @@ import type { PlanNode } from '../../nodes/plan-node.js';
 import type { OptContext as _OptContext } from '../../framework/context.js';
 import { SortNode, type SortKey } from '../../nodes/sort.js';
 import { ColumnReferenceNode } from '../../nodes/reference.js';
-import { computeClosure, expandEcsToFds, isUnique, keysOf } from '../../util/fd-utils.js';
+import { computeClosure, expandEcsToFds, isAtMostOneRow, isUnique, keysOf } from '../../util/fd-utils.js';
 
 const log = createLogger('optimizer:rule:orderby-fd-pruning');
 
@@ -64,11 +64,11 @@ export function ruleOrderByFdPruning(node: PlanNode, _context: _OptContext): Pla
 
 	// Whole-Sort elimination: a provably ≤1-row source is trivially totally
 	// ordered, so the ORDER BY is a pure no-op no matter how many keys it lists.
-	// `isUnique([], source)` is true iff the empty key is present in the unified
+	// `isAtMostOneRow(source)` is true iff the empty key is present in the unified
 	// key surface (a `∅ → all_cols` singleton FD, a declared empty key, etc.).
 	// Drop the SortNode entirely — must run before the `< 2` guard so single-key
 	// sorts over a singleton source are eliminated too.
-	if (isUnique([], node.source)) {
+	if (isAtMostOneRow(node.source)) {
 		log('Eliminating ORDER BY over provably ≤1-row source');
 		return node.source;
 	}

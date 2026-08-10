@@ -1,13 +1,15 @@
 import type { CreateAssertionNode } from '../../planner/nodes/create-assertion-node.js';
-import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { QuereusError } from '../../common/errors.js';
 import { SqlValue, StatusCode } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
 import type { IntegrityAssertionSchema, AssertionDependentTable } from '../../schema/assertion.js';
-import { expressionToString } from '../../emit/ast-stringify.js';
+import { buildAssertionViolationSql } from '../../schema/assertion.js';
 
 const log = createLogger('runtime:emit:create-assertion');
+const warnLog = log.extend('warn');
 
 export function emitCreateAssertion(plan: CreateAssertionNode, _ctx: EmissionContext): Instruction {
 
@@ -15,13 +17,12 @@ export function emitCreateAssertion(plan: CreateAssertionNode, _ctx: EmissionCon
 		// Ensure we're in a transaction before DDL (lazy/JIT transaction start)
 		await rctx.db._ensureTransaction();
 
-		// Convert the CHECK expression to SQL text for storage
-		// The CHECK expression should be negated to become a violation query:
-		// check (condition) becomes "select 1 where not (condition)"
+		// Convert the CHECK expression to SQL text for storage. Shared with the
+		// `ALTER TABLE … RENAME` propagation, which regenerates this same text from
+		// the rewritten expression (see `buildAssertionViolationSql`).
 		let violationSql: string;
 		try {
-			const exprSql = expressionToString(plan.checkExpression);
-			violationSql = `select 1 where not (${exprSql})`;
+			violationSql = buildAssertionViolationSql(plan.checkExpression);
 		} catch (e) {
 			throw new QuereusError(
 				`Cannot create assertion '${plan.name}': failed to convert check expression to SQL`,
@@ -33,6 +34,7 @@ export function emitCreateAssertion(plan: CreateAssertionNode, _ctx: EmissionCon
 		// Create the assertion schema object
 		const assertionSchema: IntegrityAssertionSchema = {
 			name: plan.name,
+			schemaName: plan.schemaName,
 			violationSql,
 			deferrable: true, // Auto-deferred for multi-table constraints
 			initiallyDeferred: true,
@@ -40,9 +42,19 @@ export function emitCreateAssertion(plan: CreateAssertionNode, _ctx: EmissionCon
 			checkExpression: plan.checkExpression,
 		};
 
-		// Discover dependent base tables (best-effort; conservative if any failure)
+		// Discover dependent base tables (best-effort; conservative if any failure).
+		// Plan under the assertion's home-schema path so unqualified table names in
+		// the body resolve against the assertion's own schema first, and under
+		// hoist suppression so another assertion's hoisted premises can't fold a
+		// base reference out of the plan — the commit-time evaluator derives its
+		// own base set the same way (see AssertionEvaluator.getOrCompilePlan).
+		// The builder (`planAssertionBody`) already proved this same violation SQL
+		// builds against the live catalog, so a failure below is a discovery-only
+		// failure (optimizer-stage, or the plan-shape walk) — never "the body names
+		// something that doesn't exist".
 		try {
-			const planNode = rctx.db.getPlan(violationSql);
+			const planNode = rctx.db.schemaManager.withSuppressedAssertionHoist(
+				() => rctx.db.getPlan(violationSql, rctx.db._homeSchemaPath(plan.schemaName)));
 			const deps = new Map<string, AssertionDependentTable>();
 			(function collect(node: unknown) {
 				const candidate = node as {
@@ -62,14 +74,24 @@ export function emitCreateAssertion(plan: CreateAssertionNode, _ctx: EmissionCon
 			assertionSchema.dependentTables = Array.from(deps.values());
 			log('Assertion %s dependencies discovered: %o', plan.name, assertionSchema.dependentTables);
 		} catch (depErr) {
-			log('Dependency discovery failed for assertion %s: %O', plan.name, depErr);
+			// Enforcement does NOT read `dependentTables` — the evaluator recomputes
+			// its base set when it compiles the body. A failure here only blanks the
+			// `dependent_tables` column of `assertion_info()`, and usually means the
+			// body will fail to plan at commit time too. Warn rather than swallow.
+			warnLog(
+				'Dependency discovery failed for assertion %s.%s; assertion_info().dependent_tables will be empty: %O',
+				plan.schemaName, plan.name, depErr
+			);
 		}
 
-		// Add to schema
+		// Add to the assertion's home schema
 		const schemaManager = rctx.db.schemaManager;
-		const schema = schemaManager.getMainSchema(); // Store in main schema for now
+		const schema = schemaManager.getSchema(plan.schemaName);
+		if (!schema) {
+			throw new QuereusError(`Schema not found: ${plan.schemaName}`, StatusCode.ERROR);
+		}
 
-		// Check for existing assertion
+		// Check for existing assertion (names are unique per schema)
 		const existing = schema.getAssertion(plan.name);
 		if (existing) {
 			throw new QuereusError(
@@ -80,13 +102,13 @@ export function emitCreateAssertion(plan: CreateAssertionNode, _ctx: EmissionCon
 
 		schemaManager.addAssertion(schema.name, assertionSchema);
 
-		log('Created assertion %s with violationSql: %s', plan.name, violationSql);
+		log('Created assertion %s.%s with violationSql: %s', plan.schemaName, plan.name, violationSql);
 		return null;
 	}
 
 	return {
 		params: [],
-		run: run as InstructionRun,
-		note: `createAssertion(${plan.name})`
+		run: asRun(run),
+		note: `createAssertion(${plan.schemaName}.${plan.name})`
 	};
 }

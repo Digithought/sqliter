@@ -1,0 +1,275 @@
+-- 41.8-alter-add-constraint-unique-fk.sqllogic
+-- ALTER TABLE ADD CONSTRAINT for table-level UNIQUE / FOREIGN KEY. The module
+-- re-validates the existing rows and fails atomically with CONSTRAINT when the
+-- current data violates the new constraint; otherwise it installs forward
+-- enforcement. Behavioral assertions only (enforcement + introspection via the
+-- *_constraint_info / *_info TVFs), so this runs identically under `yarn test`
+-- (memory) and `yarn test:store`.
+
+pragma foreign_keys = true;
+-- run
+
+-- ============================================================
+-- 1. ADD UNIQUE over conforming data — enforces going forward
+-- ============================================================
+create table u_ok (id integer primary key, email text);
+insert into u_ok values (1, 'a@x'), (2, 'b@x');
+-- run
+
+alter table u_ok add constraint uq_email unique (email);
+-- run
+
+-- introspection lists the named UNIQUE
+select name from unique_constraint_info('u_ok') where name = 'uq_email';
+→ [{"name":"uq_email"}]
+
+-- forward enforcement: a duplicate is rejected
+insert into u_ok values (3, 'a@x');
+-- error: unique
+
+-- a fresh value still inserts
+insert into u_ok values (3, 'c@x');
+select count(*) as c from u_ok;
+→ [{"c":3}]
+
+drop table u_ok;
+-- run
+
+-- ============================================================
+-- 2. ADD UNIQUE over duplicated existing data — rejected atomically
+-- ============================================================
+create table u_dup (id integer primary key, email text);
+insert into u_dup values (1, 'a@x'), (2, 'a@x');
+-- run
+
+-- the add fails because existing rows already violate uniqueness
+alter table u_dup add constraint uq_email unique (email);
+-- error: unique
+
+-- constraint NOT installed: it is absent from introspection
+select count(*) as c from unique_constraint_info('u_dup') where name = 'uq_email';
+→ [{"c":0}]
+
+-- ...and enforcement is not active: another duplicate inserts freely
+insert into u_dup values (3, 'a@x');
+select count(*) as c from u_dup;
+→ [{"c":3}]
+
+-- retry after removing the offending rows ⇒ the same ADD now converges. (Exercises the
+-- DELETE-after-schema-change consolidation path: the base primary tree is replaced, not unioned,
+-- so the deleted duplicates do not resurface in the UNIQUE index build.)
+delete from u_dup where id in (2, 3);
+alter table u_dup add constraint uq_email unique (email);
+-- run
+
+select count(*) as c from unique_constraint_info('u_dup') where name = 'uq_email';
+→ [{"c":1}]
+
+-- forward enforcement is now active under the retried constraint
+insert into u_dup values (4, 'a@x');
+-- error: unique
+
+drop table u_dup;
+-- run
+
+-- ============================================================
+-- 3. ADD UNIQUE with existing NULLs — multiple NULLs allowed
+-- ============================================================
+create table u_null (id integer primary key, email text null);
+insert into u_null values (1, null), (2, null);
+-- run
+
+-- two existing NULLs are distinct under SQL UNIQUE — the add succeeds
+alter table u_null add constraint uq_email unique (email);
+-- run
+
+-- further NULLs remain allowed
+insert into u_null values (3, null);
+select count(*) as c from u_null where email is null;
+→ [{"c":3}]
+
+drop table u_null;
+-- run
+
+-- ============================================================
+-- 4. Unnamed ADD UNIQUE (...) form (auto-named)
+-- ============================================================
+create table u_anon (id integer primary key, email text);
+insert into u_anon values (1, 'a@x');
+-- run
+
+alter table u_anon add unique (email);
+-- run
+
+insert into u_anon values (2, 'a@x');
+-- error: unique
+
+drop table u_anon;
+-- run
+
+-- ============================================================
+-- 5. ADD FOREIGN KEY over satisfied data — enforces going forward
+-- ============================================================
+create table fk_parent (pid integer primary key);
+insert into fk_parent values (1), (2);
+create table fk_child (id integer primary key, pa integer);
+insert into fk_child values (1, 1), (2, 2);
+-- run
+
+alter table fk_child add constraint fk_pa foreign key (pa) references fk_parent(pid);
+-- run
+
+select name from foreign_key_info('fk_child') where name = 'fk_pa';
+→ [{"name":"fk_pa"}]
+
+-- forward enforcement: an orphan child is rejected
+insert into fk_child values (3, 99);
+-- error:
+
+-- a satisfied child still inserts
+insert into fk_child values (3, 2);
+select count(*) as c from fk_child;
+→ [{"c":3}]
+
+drop table fk_child;
+drop table fk_parent;
+-- run
+
+-- ============================================================
+-- 6. ADD FOREIGN KEY over an orphaned row — rejected atomically
+-- ============================================================
+create table fk_parent (pid integer primary key);
+insert into fk_parent values (1);
+create table fk_child (id integer primary key, pa integer);
+insert into fk_child values (1, 1), (2, 99);
+-- run
+
+-- existing row (2, 99) has no parent → the add fails
+alter table fk_child add constraint fk_pa foreign key (pa) references fk_parent(pid);
+-- error:
+
+-- constraint NOT installed: absent from introspection
+select count(*) as c from foreign_key_info('fk_child') where name = 'fk_pa';
+→ [{"c":0}]
+
+-- ...and not enforced: another orphan inserts freely
+insert into fk_child values (3, 77);
+select count(*) as c from fk_child;
+→ [{"c":3}]
+
+drop table fk_child;
+drop table fk_parent;
+-- run
+
+-- ============================================================
+-- 7. ADD FOREIGN KEY with a NULL FK child (MATCH SIMPLE)
+-- ============================================================
+create table fk_parent (pid integer primary key);
+insert into fk_parent values (1);
+create table fk_child (id integer primary key, pa integer null);
+insert into fk_child values (1, null), (2, 1);
+-- run
+
+-- a NULL FK row is exempt (MATCH SIMPLE) — the add succeeds
+alter table fk_child add constraint fk_pa foreign key (pa) references fk_parent(pid);
+-- run
+
+-- further NULL FK rows remain allowed
+insert into fk_child values (3, null);
+-- run
+
+-- but a non-NULL orphan is rejected
+insert into fk_child values (4, 99);
+-- error:
+
+drop table fk_child;
+drop table fk_parent;
+-- run
+
+-- ============================================================
+-- 8. ADD FOREIGN KEY with pragma foreign_keys = false — no validation
+-- ============================================================
+pragma foreign_keys = false;
+create table fk_parent (pid integer primary key);
+insert into fk_parent values (1);
+create table fk_child (id integer primary key, pa integer);
+insert into fk_child values (1, 99);
+-- run
+
+-- pragma off: the orphan is NOT validated, so the add succeeds
+alter table fk_child add constraint fk_pa foreign key (pa) references fk_parent(pid);
+-- run
+
+select count(*) as c from foreign_key_info('fk_child') where name = 'fk_pa';
+→ [{"c":1}]
+
+drop table fk_child;
+drop table fk_parent;
+pragma foreign_keys = true;
+-- run
+
+-- ============================================================
+-- 9. Unnamed ADD FOREIGN KEY (...) form (auto-named)
+-- ============================================================
+create table fk_parent (pid integer primary key);
+insert into fk_parent values (1);
+create table fk_child (id integer primary key, pa integer);
+insert into fk_child values (1, 1);
+-- run
+
+alter table fk_child add foreign key (pa) references fk_parent(pid);
+-- run
+
+-- forward enforcement is active under the auto-name
+insert into fk_child values (2, 99);
+-- error:
+
+drop table fk_child;
+drop table fk_parent;
+-- run
+
+-- ============================================================
+-- 10. Composite ADD FOREIGN KEY over existing rows — exercises the shared
+-- existing-row validator's `not exists` orphan test across MORE THAN ONE
+-- referenced column (the multi-column match chain in the correlated subquery;
+-- single-column cases above only argue the composite path in comments).
+-- ============================================================
+create table fk_cparent (a integer, b integer, primary key (a, b));
+insert into fk_cparent values (1, 10), (2, 20);
+
+-- 10a. Composite SATISFIED — every existing (ref_a, ref_b) pair has a parent row.
+create table fk_cchild (id integer primary key, ref_a integer, ref_b integer);
+insert into fk_cchild values (1, 1, 10), (2, 2, 20);
+-- run
+
+alter table fk_cchild add constraint fk_ab foreign key (ref_a, ref_b) references fk_cparent(a, b);
+-- run
+
+-- installed and enforced going forward; a matching prefix on only ONE column is still an orphan
+insert into fk_cchild values (3, 1, 20);
+-- error:
+
+insert into fk_cchild values (4, 2, 20);
+select count(*) as c from fk_cchild;
+→ [{"c":3}]
+
+drop table fk_cchild;
+-- run
+
+-- 10b. Composite ORPHAN — (2, 99) matches the parent on `a` only ⇒ no full
+-- match ⇒ the add is rejected (the first-parent-col null test must not be
+-- fooled by the partial `a` match).
+create table fk_cchild (id integer primary key, ref_a integer, ref_b integer);
+insert into fk_cchild values (1, 1, 10), (2, 2, 99);
+-- run
+
+alter table fk_cchild add constraint fk_ab foreign key (ref_a, ref_b) references fk_cparent(a, b);
+-- error:
+
+-- not installed, not enforced
+select count(*) as c from foreign_key_info('fk_cchild') where name = 'fk_ab';
+→ [{"c":0}]
+
+drop table fk_cchild;
+drop table fk_cparent;
+-- run

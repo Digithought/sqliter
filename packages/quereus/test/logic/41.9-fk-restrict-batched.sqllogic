@@ -1,0 +1,290 @@
+-- Batched parent-side RESTRICT enforcement (fk-restrict-statement-batch).
+-- A DELETE/UPDATE whose inbound FKs are all non-self-referential RESTRICT under
+-- default conflict resolution enforces them with ONE probe per FK at end of
+-- statement instead of per row. Final state + error class must be identical to
+-- per-row enforcement; these cases pin that equivalence plus the shapes the
+-- gate routes back to the per-row path.
+
+pragma foreign_keys = true;
+
+-- ===================================
+-- 1. Batchable multi-row DELETE with an existing child: error + full rollback
+-- ===================================
+
+create table bp (id integer primary key);
+create table bc (cid integer primary key, p_id integer,
+	foreign key (p_id) references bp(id) on delete restrict);
+
+insert into bp values (1), (2), (3), (4), (5);
+-- Only the LAST-scanned parent is referenced, so every earlier row deletes
+-- before the violation is detected — the statement must still undo them all.
+insert into bc values (10, 5);
+
+delete from bp;
+-- error: violates RESTRICT from 'bc'
+
+-- Atomic: all five parents survive.
+select count(*) as cnt from bp;
+→ [{"cnt":5}]
+
+-- ===================================
+-- 2. Batchable DELETE with zero referencing children succeeds
+-- ===================================
+
+delete from bc;
+delete from bp;
+select count(*) as cnt from bp;
+→ [{"cnt":0}]
+
+drop table bc;
+drop table bp;
+
+-- ===================================
+-- 3. UPDATE re-keying a referenced parent: violation at flush, atomic rollback
+-- ===================================
+
+create table up (id integer primary key, label text);
+create table uc (cid integer primary key, p_id integer,
+	foreign key (p_id) references up(id) on update restrict);
+
+insert into up values (1, 'a'), (2, 'b'), (3, 'c');
+insert into uc values (10, 2);
+
+-- Re-keys every parent; parent 2 is referenced -> whole statement rolls back.
+update up set id = id + 100;
+-- error: violates RESTRICT from 'uc'
+
+select id from up order by id;
+→ [{"id":1},{"id":2},{"id":3}]
+
+-- ===================================
+-- 4. UPDATE touching no referenced column contributes nothing to the batch
+-- ===================================
+
+update up set label = label || '!';
+select label from up order by id;
+→ [{"label":"a!"},{"label":"b!"},{"label":"c!"}]
+
+-- Re-keying only unreferenced parents succeeds (referenced key 2 unchanged).
+update up set id = id + 100 where id in (1, 3);
+select id from up order by id;
+→ [{"id":2},{"id":101},{"id":103}]
+
+drop table uc;
+drop table up;
+
+-- ===================================
+-- 5. Self-referential RESTRICT FK keeps per-row semantics (gate fallback)
+-- ===================================
+
+create table tree (id integer primary key, parent_id integer null,
+	foreign key (parent_id) references tree(id) on delete restrict);
+
+insert into tree values (1, null), (2, 1);
+
+-- Per-row: the check for row 1 sees row 2 still referencing it -> error.
+-- (A statement-end check over the post-delete state would wrongly pass.)
+delete from tree;
+-- error: constraint
+
+select count(*) as cnt from tree;
+→ [{"cnt":2}]
+
+-- Child-first order deletes cleanly row by row.
+delete from tree where id = 2;
+delete from tree where id = 1;
+select count(*) as cnt from tree;
+→ [{"cnt":0}]
+
+drop table tree;
+
+-- ===================================
+-- 6. Mixed inbound actions (restrict + cascade) fall back to per-row
+-- ===================================
+
+create table mp (id integer primary key);
+create table mc_r (cid integer primary key, p_id integer,
+	foreign key (p_id) references mp(id) on delete restrict);
+create table mc_c (cid integer primary key, p_id integer,
+	foreign key (p_id) references mp(id) on delete cascade);
+
+insert into mp values (1), (2);
+insert into mc_c values (20, 1);
+
+-- Only the cascade child references parent 1 -> delete cascades cleanly.
+delete from mp where id = 1;
+select count(*) as cnt from mc_c;
+→ [{"cnt":0}]
+
+insert into mc_r values (30, 2);
+delete from mp where id = 2;
+-- error: constraint
+
+select id from mp;
+→ [{"id":2}]
+
+drop table mc_c;
+drop table mc_r;
+drop table mp;
+
+-- ===================================
+-- 7. Composite (two-column) RESTRICT FK batches with OR-of-conjunctions probe
+-- ===================================
+
+create table kp (a integer not null, b integer not null, v text,
+	primary key (a, b));
+create table kc (cid integer primary key, ca integer, cb integer,
+	foreign key (ca, cb) references kp(a, b) on delete restrict);
+
+insert into kp values (1, 1, 'x'), (1, 2, 'y'), (2, 1, 'z');
+insert into kc values (10, 1, 2);
+
+delete from kp;
+-- error: violates RESTRICT from 'kc'
+
+select count(*) as cnt from kp;
+→ [{"cnt":3}]
+
+-- Deleting only unreferenced composite keys succeeds; (1,2) stays guarded.
+delete from kp where not (a = 1 and b = 2);
+select a, b from kp;
+→ [{"a":1,"b":2}]
+
+drop table kc;
+drop table kp;
+
+-- ===================================
+-- 8. NOCASE collation on the FK column: batched probe compares like per-row
+-- ===================================
+
+create table np (code text primary key collate nocase);
+create table nc (cid integer primary key, p_code text collate nocase,
+	foreign key (p_code) references np(code) on delete restrict);
+
+insert into np values ('ABC'), ('DEF');
+-- Case-variant reference: satisfies the child-side check under NOCASE.
+insert into nc values (10, 'abc');
+
+-- The batched IN probe rides the child column's NOCASE collation -> violation.
+delete from np where code = 'ABC';
+-- error: violates RESTRICT from 'nc'
+
+select code from np order by code;
+→ [{"code":"ABC"},{"code":"DEF"}]
+
+delete from np where code = 'def';
+select code from np;
+→ [{"code":"ABC"}]
+
+drop table nc;
+drop table np;
+
+-- ===================================
+-- 9. NULL referenced values are excluded (MATCH SIMPLE) — nothing to probe
+-- ===================================
+
+create table xp (id integer primary key, alt integer null unique);
+create table xc (cid integer primary key, p_alt integer null,
+	foreign key (p_alt) references xp(alt) on delete restrict);
+
+insert into xp (id, alt) values (1, null), (2, null), (3, 30);
+insert into xc values (10, 30);
+
+-- NULL alt values participate in no FK match: deletes succeed.
+delete from xp where alt is null;
+select id from xp;
+→ [{"id":3}]
+
+delete from xp where id = 3;
+-- error: violates RESTRICT from 'xc'
+
+drop table xc;
+drop table xp;
+
+-- ===================================
+-- 10. Multiple inbound RESTRICT FKs: each gets its own batch + probe
+-- ===================================
+
+create table zp (id integer primary key);
+create table zc1 (cid integer primary key, p_id integer,
+	foreign key (p_id) references zp(id) on delete restrict);
+create table zc2 (cid integer primary key, p_id integer,
+	foreign key (p_id) references zp(id) on delete restrict);
+
+insert into zp values (1), (2);
+-- Only the SECOND-declared child holds a reference.
+insert into zc2 values (20, 2);
+
+delete from zp where id = 1;
+select id from zp;
+→ [{"id":2}]
+
+delete from zp where id = 2;
+-- error: violates RESTRICT from 'zc2'
+
+drop table zc2;
+drop table zc1;
+drop table zp;
+
+-- ===================================
+-- 11. Referenced-column-change short-circuit coerces before comparing
+-- (regression for bug-fk-restrict-change-detection-uncoerced): a rewrite that
+-- spells the same stored value differently must not contribute a key to the
+-- batch, so accumulateParentRestrictKeys must not flush a spurious probe.
+-- ===================================
+
+create table crb_p (id integer primary key);
+create table crb_c (cid integer primary key, p_id integer,
+	foreign key (p_id) references crb_p(id) on update restrict);
+
+insert into crb_p values (1), (2);
+insert into crb_c values (10, 1);
+
+-- Integer key rewritten as text '1': same stored value, no batch entry.
+update crb_p set id = '1' where id = 1;
+select id from crb_p order by id;
+→ [{"id":1},{"id":2}]
+
+-- Genuine re-key of the referenced row still flushes a violating probe.
+update crb_p set id = 100 where id = 1;
+-- error: violates RESTRICT from 'crb_c'
+
+drop table crb_c;
+drop table crb_p;
+
+create table crbj_p (id json primary key, tag integer);
+create table crbj_c (cid integer primary key, p_id json,
+	foreign key (p_id) references crbj_p(id) on update restrict);
+
+insert into crbj_p values ('{"a":1,"b":2}', 1);
+insert into crbj_c values (10, '{"a":1,"b":2}');
+
+-- Reorder-equal JSON key: same stored value, no batch entry.
+update crbj_p set id = '{"b": 2, "a": 1}' where tag = 1;
+select id from crbj_p;
+→ [{"id":{"b":2,"a":1}}]
+
+-- Genuine JSON re-key still flushes a violating probe.
+update crbj_p set id = '{"a":9,"b":9}' where tag = 1;
+-- error: violates RESTRICT from 'crbj_c'
+
+drop table crbj_c;
+drop table crbj_p;
+
+-- The re-coercion compares BINARY on purpose: the column's collation says which
+-- values an equality test calls equal, not which value gets STORED. A case-only
+-- rewrite of a `collate nocase` key does change the stored value, so it must still
+-- count as a change and flush a violating probe.
+
+create table crbn_p (id text collate nocase primary key);
+create table crbn_c (cid integer primary key, p_id text,
+	foreign key (p_id) references crbn_p(id) on update restrict);
+
+insert into crbn_p values ('A');
+insert into crbn_c values (10, 'A');
+
+update crbn_p set id = 'a' where id = 'A';
+-- error: violates RESTRICT from 'crbn_c'
+
+drop table crbn_c;
+drop table crbn_p;

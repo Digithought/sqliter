@@ -1,5 +1,6 @@
 ---
 description: Phase 3 Advanced Push-down with full cost model
+difficulty: hard
 prereq: Titan optimizer phases 1-2, cost model
 
 ---

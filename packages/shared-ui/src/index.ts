@@ -1,10 +1,10 @@
-// Shared UI components for Quoomb applications
+// Shared UI components for Quoomb applications.
 // This package will contain reusable UI components like buttons, modals, etc.
+// Add exports here as components land, e.g.:
+//   export { Button } from './Button.js';
+//   export { Modal } from './Modal.js';
+//   export { Toast } from './Toast.js';
 
-// TODO: Implement and export UI components
-// export { Button } from './Button.js';
-// export { Modal } from './Modal.js';
-// export { Toast } from './Toast.js';
-
-// For now, export a placeholder
-export const placeholder = 'Shared UI components coming soon';
+// No components yet. `export {}` keeps this a valid ES module with no members
+// (the previous placeholder string constant was unused and has been dropped).
+export {};

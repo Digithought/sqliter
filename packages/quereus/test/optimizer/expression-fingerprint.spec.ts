@@ -42,7 +42,7 @@ function makeFunctionSchema(name: string, deterministic: boolean): ScalarFunctio
 	return {
 		name,
 		numArgs: -1,
-		flags: deterministic ? FunctionFlags.DETERMINISTIC : 0,
+		flags: FunctionFlags.UTF8 | (deterministic ? FunctionFlags.DETERMINISTIC : 0),
 		returnType: textType,
 		implementation: () => null,
 	};
@@ -482,6 +482,40 @@ describe('Expression fingerprinting', () => {
 			// Passing a Symbol or similar type that matches none of the type checks
 			const fp = fingerprintExpression(lit(Symbol('test')));
 			expect(fp).to.match(/^LI:\?/);
+		});
+
+		// JSON documents are the only OBJECT-class literal, and const-folding turns
+		// `json_col = '{"a":1}'` into one. `String(value)` renders every object as
+		// '[object Object]', which made CSE fold two DIFFERENT comparisons into one and
+		// silently drop a conjunct (`v = '{"a":1}' and v = '{"a":2}'` matched row 1).
+		describe('object (JSON) literals', () => {
+			it('structurally distinct documents fingerprint differently', () => {
+				expect(fingerprintExpression(lit({ a: 1 })))
+					.to.not.equal(fingerprintExpression(lit({ a: 2 })));
+				expect(fingerprintExpression(lit({ a: 1 })))
+					.to.not.equal(fingerprintExpression(lit({ b: 1 })));
+				expect(fingerprintExpression(lit([1, 2, 3])))
+					.to.not.equal(fingerprintExpression(lit([3, 2, 1])));
+			});
+
+			it('reorder-equal objects share a fingerprint (they are the same value)', () => {
+				expect(fingerprintExpression(lit({ a: 1, b: 2 })))
+					.to.equal(fingerprintExpression(lit({ b: 2, a: 1 })));
+			});
+
+			it('an object never collides with a same-looking string literal', () => {
+				expect(fingerprintExpression(lit({ a: 1 })))
+					.to.not.equal(fingerprintExpression(lit('{"a":1}')));
+			});
+
+			it('a non-serializable object falls back to a per-node fingerprint', () => {
+				const cyclic: Record<string, unknown> = {};
+				cyclic.self = cyclic;
+				const a = lit(cyclic);
+				const b = lit(cyclic);
+				expect(fingerprintExpression(a)).to.match(/^LI:\?/);
+				expect(fingerprintExpression(a)).to.not.equal(fingerprintExpression(b));
+			});
 		});
 	});
 

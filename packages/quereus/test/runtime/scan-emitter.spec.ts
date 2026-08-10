@@ -38,7 +38,6 @@ async function expectError(fn: () => Promise<unknown>): Promise<QuereusError> {
 // ---------------------------------------------------------------------------
 
 class StubTable extends VirtualTable {
-	private _queryFn: ((filterInfo: FilterInfo) => AsyncIterable<Row>) | undefined;
 	disconnected = false;
 
 	constructor(
@@ -50,7 +49,10 @@ class StubTable extends VirtualTable {
 		schema?: TableSchema,
 	) {
 		super(db, module, schemaName, tableName);
-		this._queryFn = queryFn;
+		// Expose query only if a queryFn was provided — allows testing vtab without query.
+		// Assign (rather than override the base optional method) so the no-query path
+		// leaves `query` genuinely undefined.
+		if (queryFn) this.query = queryFn;
 		if (schema) this.tableSchema = schema;
 	}
 
@@ -60,11 +62,6 @@ class StubTable extends VirtualTable {
 
 	async update(_args: UpdateArgs): Promise<{ status: 'ok'; row?: Row }> {
 		return { status: 'ok' };
-	}
-
-	// Expose query only if a queryFn was provided — allows testing vtab without query
-	get query(): ((filterInfo: FilterInfo) => AsyncIterable<Row>) | undefined {
-		return this._queryFn;
 	}
 }
 

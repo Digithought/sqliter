@@ -23,8 +23,9 @@ import {
 	BOOLEAN_TYPE,
 	NUMERIC_TYPE,
 	ANY_TYPE,
+	sharesSeekKeySpace,
 } from '../src/types/builtin-types.js';
-import { DATE_TYPE, TIME_TYPE } from '../src/types/temporal-types.js';
+import { DATE_TYPE, TIME_TYPE, DATETIME_TYPE, TIMESPAN_TYPE } from '../src/types/temporal-types.js';
 import { JSON_TYPE } from '../src/types/json-type.js';
 import { PhysicalType, getPhysicalType } from '../src/types/logical-type.js';
 import type { LogicalType } from '../src/types/logical-type.js';
@@ -32,9 +33,17 @@ import {
 	validateValue,
 	parseValue,
 	validateAndParse,
+	coerceRowToSchema,
+	foldDefaultToType,
+	planRetypeConversion,
 	isValidForType,
 	tryParse,
 } from '../src/types/validation.js';
+import type * as AST from '../src/parser/ast.js';
+import { createDefaultColumnSchema } from '../src/schema/column.js';
+import type { ColumnSchema } from '../src/schema/column.js';
+import { QuereusError } from '../src/common/errors.js';
+import { StatusCode } from '../src/common/types.js';
 
 describe('Type System', () => {
 
@@ -260,11 +269,20 @@ describe('Type System', () => {
 				expect(BLOB_TYPE.validate!('not a blob')).to.be.false;
 			});
 
-			it('should parse hex strings to blobs', () => {
+			it('should parse strings as literal UTF-8 bytes, not hex', () => {
 				const result = BLOB_TYPE.parse!('ff00') as Uint8Array;
 				expect(result).to.be.instanceOf(Uint8Array);
-				expect(result[0]).to.equal(0xff);
-				expect(result[1]).to.equal(0x00);
+				expect(Array.from(result)).to.deep.equal(Array.from(new TextEncoder().encode('ff00')));
+			});
+
+			it('parses every string the same way, whatever its length or alphabet', () => {
+				// The removed hex sniff branched on "even length AND all hex digits", so the
+				// bug it caused was invisible for odd-length or non-hex strings. Cover both
+				// sides of each old branch condition so no future sniff can slip back in.
+				for (const s of ['', 'a', 'ab', 'abc', 'f', 'ff00', '6162', 'DEAD', 'zz', 'héllo']) {
+					expect(Array.from(BLOB_TYPE.parse!(s) as Uint8Array), s)
+						.to.deep.equal(Array.from(new TextEncoder().encode(s)));
+				}
 			});
 		});
 
@@ -296,6 +314,46 @@ describe('Type System', () => {
 			it('should prefer integer when possible', () => {
 				expect(NUMERIC_TYPE.parse!('42')).to.equal(42);
 				expect(NUMERIC_TYPE.parse!('3.14')).to.equal(3.14);
+			});
+
+			it('should compare bigint magnitudes past 2^53 without precision loss', () => {
+				// A Number()-based comparator would round both operands to the same
+				// double and report 0; the true ordering differs by 1.
+				expect(NUMERIC_TYPE.compare!(9007199254740993n, 9007199254740992)).to.equal(1);
+				expect(NUMERIC_TYPE.compare!(9007199254740992, 9007199254740993n)).to.equal(-1);
+			});
+
+			it('should not throw on bigint operands', () => {
+				expect(() => NUMERIC_TYPE.compare!(9007199254740993n, 3)).to.not.throw();
+				expect(NUMERIC_TYPE.compare!(9007199254740993n, 3)).to.equal(1);
+			});
+
+			it('should place NaN smallest, matching REAL', () => {
+				expect(NUMERIC_TYPE.compare!(NaN, 1)).to.equal(-1);
+				expect(NUMERIC_TYPE.compare!(1, NaN)).to.equal(1);
+				expect(NUMERIC_TYPE.compare!(NaN, NaN)).to.equal(0);
+				// NaN vs a bigint must not throw either — the check is typeof-guarded
+				expect(NUMERIC_TYPE.compare!(NaN, 9007199254740993n)).to.equal(-1);
+				expect(NUMERIC_TYPE.compare!(9007199254740993n, NaN)).to.equal(1);
+			});
+
+			it('should order bigint pairs and negatives', () => {
+				expect(NUMERIC_TYPE.compare!(9007199254740993n, 9007199254740994n)).to.equal(-1);
+				expect(NUMERIC_TYPE.compare!(9007199254740993n, 9007199254740993n)).to.equal(0);
+				expect(NUMERIC_TYPE.compare!(-9007199254740993n, -9007199254740992)).to.equal(-1);
+				expect(NUMERIC_TYPE.compare!(-9007199254740993n, 3)).to.equal(-1);
+			});
+
+			it('should order a bigint against a fractional double exactly', () => {
+				expect(NUMERIC_TYPE.compare!(2n, 2.5)).to.equal(-1);
+				expect(NUMERIC_TYPE.compare!(3n, 2.5)).to.equal(1);
+				expect(NUMERIC_TYPE.compare!(2n, 2.0)).to.equal(0);
+			});
+
+			it('should sort NULL before any value, per the shared convention', () => {
+				expect(NUMERIC_TYPE.compare!(null, 9007199254740993n)).to.equal(-1);
+				expect(NUMERIC_TYPE.compare!(9007199254740993n, null)).to.equal(1);
+				expect(NUMERIC_TYPE.compare!(null, null)).to.equal(0);
 			});
 		});
 
@@ -395,6 +453,60 @@ describe('Type System', () => {
 				expect(JSON_TYPE.parse!('{"a":1}')).to.deep.equal({ a: 1 });
 				expect(JSON_TYPE.parse!(null)).to.equal(null);
 			});
+
+			it('should compare two string scalars as text, with or without a collation', () => {
+				// Regression for bug-json-pk-equality-drops-collation: with no collation the
+				// pair must still compare BINARY (code point), not re-parse as JSON numbers.
+				// A comparator built without a collation drives PK identity, so calling
+				// '9' and '9.0' equal there swallowed real UNIQUE violations.
+				expect(JSON_TYPE.compare!('9', '9.0')).to.be.lessThan(0);
+				expect(JSON_TYPE.compare!('9.0', '9')).to.be.greaterThan(0);
+				expect(JSON_TYPE.compare!('9', '9')).to.equal(0);
+				expect(JSON_TYPE.compare!('10', '9')).to.be.lessThan(0); // text order, not numeric
+
+				// An explicit collation still wins — a NOCASE pin must keep folding case.
+				const nocase = (a: string, b: string) =>
+					a.toLowerCase() < b.toLowerCase() ? -1 : a.toLowerCase() > b.toLowerCase() ? 1 : 0;
+				expect(JSON_TYPE.compare!('Bob', 'bob', nocase)).to.equal(0);
+				expect(JSON_TYPE.compare!('Bob', 'bob')).to.not.equal(0);
+			});
+
+			it('should treat a JS string as a JSON string scalar, never as serialized text', () => {
+				// Regression for bug-json-compare-string-ambiguity: `compare` used to
+				// re-parse a string that was paired with a non-string, so the JSON string
+				// "9" and the JSON number 9 came back equal — contradicting the type's own
+				// rank (number < string). Every caller now holds already-parsed values
+				// (DML rows via the emitters' buildRowCoercion pass, direct API writes
+				// via coerceRowToSchema), so nothing is re-parsed here.
+				expect(JSON_TYPE.compare!('9', 9)).to.equal(1);
+				expect(JSON_TYPE.compare!(9, '9')).to.equal(-1);
+
+				// Full rank: null < boolean < number < string < array < object.
+				expect(JSON_TYPE.compare!(true, 1)).to.equal(-1);
+				expect(JSON_TYPE.compare!(1, true)).to.equal(1);
+				expect(JSON_TYPE.compare!(null, false)).to.be.lessThan(0);
+				expect(JSON_TYPE.compare!('x', ['x'])).to.equal(-1);
+				expect(JSON_TYPE.compare!(['x'], 'x')).to.equal(1);
+
+				// A string paired with a container is likewise not re-parsed: '[1]' is the
+				// four-character JSON string, which ranks below any array.
+				expect(JSON_TYPE.compare!('[1]', [1])).to.equal(-1);
+				expect(JSON_TYPE.compare!('{"a":1}', { a: 1 })).to.equal(-1);
+
+				// A collation only applies string-to-string; it cannot reorder ranks.
+				const nocase = (a: string, b: string) =>
+					a.toLowerCase() < b.toLowerCase() ? -1 : a.toLowerCase() > b.toLowerCase() ? 1 : 0;
+				expect(JSON_TYPE.compare!('9', 9, nocase)).to.equal(1);
+			});
+
+			it('should order structurally, not by canonical text', () => {
+				// {"a":2} < {"a":10} — semanticOrdering, the reason this type exists.
+				expect(JSON_TYPE.compare!({ a: 2 }, { a: 10 })).to.be.lessThan(0);
+				expect(JSON_TYPE.compare!([2], [10])).to.be.lessThan(0);
+				// Type rank: null < boolean < number < string < array < object.
+				expect(JSON_TYPE.compare!(9, 'nine')).to.be.lessThan(0);
+				expect(JSON_TYPE.compare!(['x'], { x: 1 })).to.be.lessThan(0);
+			});
 		});
 	});
 
@@ -434,6 +546,118 @@ describe('Type System', () => {
 		});
 	});
 
+	// ──────────────────── Row-level coercion ────────────────────
+	describe('coerceRowToSchema', () => {
+		const columns = (...types: LogicalType[]): ColumnSchema[] =>
+			types.map((logicalType, i) => ({ ...createDefaultColumnSchema(`c${i}`), logicalType }));
+
+		it('should coerce each cell to its own column type', () => {
+			const row = coerceRowToSchema(['42', '1.5', 'text'], columns(INTEGER_TYPE, REAL_TYPE, TEXT_TYPE), 't');
+			expect([...row]).to.deep.equal([42, 1.5, 'text']);
+		});
+
+		it('should accept a short row, coercing only the cells present', () => {
+			const row = coerceRowToSchema(['42'], columns(INTEGER_TYPE, TEXT_TYPE, TEXT_TYPE), 't');
+			expect([...row]).to.deep.equal([42]);
+		});
+
+		it('should accept an empty row', () => {
+			expect([...coerceRowToSchema([], columns(INTEGER_TYPE), 't')]).to.deep.equal([]);
+		});
+
+		it('should throw with the caller-supplied label when the row is too long', () => {
+			expect(() => coerceRowToSchema([1, 2], columns(INTEGER_TYPE), 'INSERT into widgets'))
+				.to.throw(QuereusError, 'Too many values for INSERT into widgets: expected 1, got 2')
+				.with.property('code', StatusCode.ERROR);
+		});
+
+		it('should surface the offending column name when a cell fails validation', () => {
+			expect(() => coerceRowToSchema(['ok', 'abc'], columns(TEXT_TYPE, INTEGER_TYPE), 't'))
+				.to.throw(/c1/);
+		});
+	});
+
+	// ──────────────────── foldDefaultToType ────────────────────
+	// The shared fold+convert every ALTER backfill site uses, so a backfilled cell
+	// holds what a fresh INSERT under the same DEFAULT would store.
+	describe('foldDefaultToType', () => {
+		const lit = (value: AST.LiteralExpr['value']): AST.Expression => ({ type: 'literal', value });
+		const neg = (expr: AST.Expression): AST.Expression => ({ type: 'unary', operator: '-', expr });
+		const col = (name: string): AST.Expression => ({ type: 'column', name, table: 'new' });
+
+		it('should return undefined for a missing default', () => {
+			expect(foldDefaultToType(undefined, INTEGER_TYPE, 'n')).to.equal(undefined);
+			expect(foldDefaultToType(null, INTEGER_TYPE, 'n')).to.equal(undefined);
+		});
+
+		it('should return undefined for a non-foldable expression', () => {
+			// `new.<col>` — the caller's per-row evaluator path owns this case.
+			expect(foldDefaultToType(col('b'), INTEGER_TYPE, 'n')).to.equal(undefined);
+		});
+
+		it('should return null for a default that folds to NULL', () => {
+			expect(foldDefaultToType(lit(null), INTEGER_TYPE, 'n')).to.equal(null);
+		});
+
+		it('should convert a text literal to the column type', () => {
+			expect(foldDefaultToType(lit('7'), INTEGER_TYPE, 'n')).to.equal(7);
+		});
+
+		it('should parse a JSON source literal into its stored form', () => {
+			// The raw source text '"abc"' is NOT the stored form any write path produces.
+			expect(foldDefaultToType(lit('"abc"'), JSON_TYPE, 'n')).to.equal('abc');
+		});
+
+		it('should fold a signed numeric literal (a UnaryExpr, not a bare literal)', () => {
+			expect(foldDefaultToType(neg(lit(123.0)), REAL_TYPE, 'n')).to.equal(-123);
+		});
+
+		it('should throw MISMATCH naming the column when the literal cannot be converted', () => {
+			expect(() => foldDefaultToType(lit('abc'), INTEGER_TYPE, 'n'))
+				.to.throw(QuereusError, "Type conversion failed for column 'n'")
+				.with.property('code', StatusCode.MISMATCH);
+		});
+	});
+
+	// ──────────────────── ALTER COLUMN … SET DATA TYPE planning ────────────────────
+	describe('planRetypeConversion', () => {
+		it('should report no conversion for an alias retype (same logical type object)', () => {
+			const plan = planRetypeConversion('varchar(50)', TEXT_TYPE, 'c');
+			expect(plan.newLogicalType).to.equal(TEXT_TYPE);
+			expect(plan.convert).to.equal(null);
+		});
+
+		it('should report no conversion when the declared type is spelled differently but infers the same', () => {
+			expect(planRetypeConversion('bigint', INTEGER_TYPE, 'c').convert).to.equal(null);
+		});
+
+		it('should convert values when the storage class changes', () => {
+			const plan = planRetypeConversion('integer', TEXT_TYPE, 'c');
+			expect(plan.newLogicalType).to.equal(INTEGER_TYPE);
+			expect(plan.convert!('7')).to.equal(7);
+		});
+
+		it('should normalize values on a same-storage-class retype (text → date)', () => {
+			const plan = planRetypeConversion('date', TEXT_TYPE, 'c');
+			expect(plan.newLogicalType).to.equal(DATE_TYPE);
+			expect(plan.convert).to.not.equal(null);
+			expect(plan.convert!('2024-06-05T00:00:00Z')).to.equal('2024-06-05');
+		});
+
+		it('should throw MISMATCH naming the column and the declared type verbatim', () => {
+			const plan = planRetypeConversion('INTEGER', TEXT_TYPE, 'c');
+			expect(() => plan.convert!('hello'))
+				.to.throw(QuereusError, "Cannot convert value in 'c' to INTEGER")
+				.with.property('code', StatusCode.MISMATCH);
+		});
+
+		it('should infer an unknown type name by affinity rather than throwing', () => {
+			// `inferType` falls through SQLite-style affinity rules, so deriving a plan is
+			// always safe — call sites derive it BEFORE mutating anything.
+			expect(() => planRetypeConversion('wibble', TEXT_TYPE, 'c')).to.not.throw();
+		});
+	});
+
 	// ──────────────────── Custom type registration ────────────────────
 	describe('Custom Type Registration', () => {
 		it('should register and retrieve a custom type', () => {
@@ -449,6 +673,89 @@ describe('Type System', () => {
 			expect(getType('EMAIL')).to.equal(EMAIL_TYPE);
 			expect(getType('email')).to.equal(EMAIL_TYPE); // case-insensitive
 			expect(typeRegistry.hasType('EMAIL')).to.be.true;
+		});
+	});
+
+	// ──────────────────── Seek key space (sharesSeekKeySpace) ────────────────────
+	describe('sharesSeekKeySpace', () => {
+		// The plan-time gate both index-seek rewrites apply to a (target column type,
+		// seek key type) pair. True ⇒ a seek keyed by a value of one type cannot miss a
+		// row of the other, so the rewrite may fire. Plan-shape consequences live in
+		// test/optimizer/key-set-seek.spec.ts and test/optimizer/index-nested-loop.spec.ts.
+		const NUMERICS = [INTEGER_TYPE, REAL_TYPE, NUMERIC_TYPE];
+		const NON_NUMERICS = [TEXT_TYPE, BLOB_TYPE, JSON_TYPE, ANY_TYPE, BOOLEAN_TYPE,
+			DATE_TYPE, TIME_TYPE, DATETIME_TYPE, TIMESPAN_TYPE];
+
+		it('holds for all nine ordered pairs over INTEGER / REAL / NUMERIC', () => {
+			for (const a of NUMERICS) {
+				for (const b of NUMERICS) {
+					expect(sharesSeekKeySpace(a, b), `${a.name} vs ${b.name}`).to.equal(true);
+				}
+			}
+		});
+
+		it('fails for every numeric-vs-non-numeric pair, both directions', () => {
+			for (const a of NUMERICS) {
+				for (const b of NON_NUMERICS) {
+					expect(sharesSeekKeySpace(a, b), `${a.name} vs ${b.name}`).to.equal(false);
+					expect(sharesSeekKeySpace(b, a), `${b.name} vs ${a.name}`).to.equal(false);
+				}
+			}
+		});
+
+		it('holds for identical non-numeric types (today\'s same-type behaviour is preserved)', () => {
+			for (const t of NON_NUMERICS) {
+				expect(sharesSeekKeySpace(t, t), `${t.name} vs itself`).to.equal(true);
+			}
+		});
+
+		it('fails for distinct non-numeric pairs (BOOLEAN is not in the numeric key space)', () => {
+			// BOOLEAN is the deliberate omission: the key serializer and the store's byte
+			// encoding both fold booleans into the numeric space, but BOOLEAN_TYPE.compare
+			// ranks by `a === b` and so disagrees with a 1/0 operand — the memory BTree
+			// would be ordered by a comparator the probe side does not share.
+			expect(sharesSeekKeySpace(BOOLEAN_TYPE, INTEGER_TYPE)).to.equal(false);
+			expect(sharesSeekKeySpace(INTEGER_TYPE, BOOLEAN_TYPE)).to.equal(false);
+			expect(sharesSeekKeySpace(TEXT_TYPE, BLOB_TYPE)).to.equal(false);
+			expect(sharesSeekKeySpace(DATE_TYPE, DATETIME_TYPE)).to.equal(false);
+		});
+
+		it('fails for a plugin-registered numeric type against every builtin numeric', () => {
+			// The whitelist is identity against the three registry singletons, NOT
+			// `type.isNumeric`. A plugin type supplies its own `compare` — which is what a
+			// memory BTree over such a column is ordered by — while the probe side keys by
+			// storage class; the two need not agree, and a seek has no residual able to
+			// repair an under-fetch. If this ever flips, the gate has been "simplified"
+			// into an isNumeric check and cross-type plugin seeks became unsound.
+			const PLUGIN_NUMERIC: LogicalType = {
+				name: 'PLUGNUM',
+				physicalType: PhysicalType.INTEGER,
+				isNumeric: true,
+				validate: (v) => v === null || typeof v === 'number' || typeof v === 'bigint',
+				compare: (a, b) => (a === b ? 0 : (a as number) < (b as number) ? -1 : 1),
+			};
+			for (const t of NUMERICS) {
+				expect(sharesSeekKeySpace(PLUGIN_NUMERIC, t), `PLUGNUM vs ${t.name}`).to.equal(false);
+				expect(sharesSeekKeySpace(t, PLUGIN_NUMERIC), `${t.name} vs PLUGNUM`).to.equal(false);
+			}
+			expect(sharesSeekKeySpace(PLUGIN_NUMERIC, PLUGIN_NUMERIC), 'but a type always shares with itself')
+				.to.equal(true);
+		});
+
+		it('holds for the numeric type ALIASES, which resolve to the same singletons', () => {
+			// The whitelist is by object identity, so the feature reaches `bigint` / `double` /
+			// `decimal` columns only as long as the registry keeps aliasing them to the three
+			// singletons rather than minting look-alike objects. Give any of them its own
+			// object and both seek rewrites silently stop firing for that spelling.
+			const ALIASES = ['INT', 'BIGINT', 'SMALLINT', 'TINYINT', 'MEDIUMINT', 'FLOAT', 'DOUBLE', 'DECIMAL'];
+			for (const a of ALIASES) {
+				for (const b of ALIASES) {
+					const ta = getType(a)!;
+					const tb = getType(b)!;
+					expect(sharesSeekKeySpace(ta, tb), `${a} vs ${b}`).to.equal(true);
+				}
+				expect(sharesSeekKeySpace(getType(a)!, TEXT_TYPE), `${a} vs TEXT`).to.equal(false);
+			}
 		});
 	});
 

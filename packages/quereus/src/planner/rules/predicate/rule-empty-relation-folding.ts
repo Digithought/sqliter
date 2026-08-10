@@ -27,7 +27,7 @@
  * bounded: rules chain within a single node visit via the per-node fixed-
  * point loop in `applyPassRules`, but the Structural pass itself is one
  * top-down traversal — a parent already visited won't re-fire when an inner
- * Filter folds. See "Cascade limits" in `docs/optimizer.md`.
+ * Filter folds. See "Cascade limits" in `docs/optimizer-rule-families.md`.
  */
 
 import { createLogger } from '../../../common/logger.js';

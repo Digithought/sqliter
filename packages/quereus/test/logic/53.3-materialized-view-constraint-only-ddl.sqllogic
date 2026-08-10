@@ -1,0 +1,409 @@
+-- 53.3-materialized-view-constraint-only-ddl.sqllogic — a body-irrelevant
+-- `table_modified` on a source (constraint/stats/tags-only: old/new columns and
+-- physical PK identical) RECOMPILES each live dependent MV's row-time plan in
+-- place instead of marking it stale: DROP/RENAME/ADD CONSTRAINT and ANALYZE keep
+-- dependents live — writes keep propagating with no REFRESH required. Recompile,
+-- never skip: constraint metadata feeds the COMPILED plan (the join-residual arm
+-- rests on FK referential integrity; CHECKs seed optimizer domain folds), so the
+-- plan is rebuilt against the new catalog. Any recompile failure falls back to
+-- today's mark-stale path; a stale MV serves its frozen snapshot (writes stop
+-- propagating) until REFRESH or drop-and-recreate.
+
+-- ===================================
+-- 1. DROP CONSTRAINT (CHECK) keeps the MV live
+-- ===================================
+
+create table a (id integer primary key, v integer not null, constraint chk check (v > 0));
+insert into a values (1, 5);
+create materialized view mva as select id, v from a;
+
+alter table a drop constraint chk;
+
+-- still live: a write the dropped CHECK would have rejected propagates
+insert into a values (2, -1);
+select * from mva order by id;
+→ [{"id":1,"v":5},{"id":2,"v":-1}]
+
+-- REFRESH still works (never went stale; idempotent re-attach)
+refresh materialized view mva;
+select * from mva order by id;
+→ [{"id":1,"v":5},{"id":2,"v":-1}]
+
+drop materialized view mva;
+drop table a;
+
+-- ===================================
+-- 2. RENAME CONSTRAINT keeps the MV live
+-- ===================================
+
+create table b (id integer primary key, v integer not null, constraint chk check (v > 0));
+insert into b values (1, 5);
+create materialized view mvb as select id, v from b;
+
+alter table b rename constraint chk to chk2;
+
+insert into b values (2, 6);
+select * from mvb order by id;
+→ [{"id":1,"v":5},{"id":2,"v":6}]
+
+drop materialized view mvb;
+drop table b;
+
+-- ===================================
+-- 3. ADD CONSTRAINT CHECK keeps the MV live
+-- ===================================
+
+create table c (id integer primary key, v integer not null);
+insert into c values (1, 5);
+create materialized view mvc as select id, v from c;
+
+alter table c add constraint chk check (v > 0);
+
+insert into c values (2, 6);
+select * from mvc order by id;
+→ [{"id":1,"v":5},{"id":2,"v":6}]
+
+-- the added CHECK is enforced on the source (the recompiled validator path)
+insert into c values (3, -1);
+-- error: check
+
+-- add→drop roundtrip: dropping the just-added CHECK is another
+-- body-irrelevant event — still live, and the previously-rejected
+-- write now propagates
+alter table c drop constraint chk;
+insert into c values (3, -1);
+select * from mvc order by id;
+→ [{"id":1,"v":5},{"id":2,"v":6},{"id":3,"v":-1}]
+
+drop materialized view mvc;
+drop table c;
+
+-- ===================================
+-- 4. ADD UNIQUE on an UNPROJECTED column keeps the MV live
+--    (cannot move the projected key set — strict-PK gate passes)
+-- ===================================
+
+create table d (id integer primary key, v integer not null, u integer not null);
+insert into d values (1, 5, 100);
+create materialized view mvd as select id, v from d;
+
+alter table d add constraint uq unique (u);
+
+insert into d values (2, 6, 200);
+select * from mvd order by id;
+→ [{"id":1,"v":5},{"id":2,"v":6}]
+
+drop materialized view mvd;
+drop table d;
+
+-- ===================================
+-- 5. FK-drop demotes the join-residual arm (the recompile-not-skip proof).
+--    The 1:1-join maintenance arm rests on NOT-NULL FK→PK referential
+--    integrity (lookup side upsert-only). With the FK dropped, a now-possible
+--    delete of a referenced parent row must remove the joined MV rows — under
+--    a stale (skipped) compiled plan they would linger as phantoms.
+-- ===================================
+
+create table p5 (id integer primary key, nm text not null);
+create table t5 (tid integer primary key, fk integer not null, constraint fkp foreign key (fk) references p5 (id));
+insert into p5 values (1, 'one'), (2, 'two');
+insert into t5 values (10, 1), (20, 2);
+create materialized view mv5 as select t5.tid, p5.nm from t5 join p5 on t5.fk = p5.id;
+
+select * from mv5 order by tid;
+→ [{"tid":10,"nm":"one"},{"tid":20,"nm":"two"}]
+
+alter table t5 drop constraint fkp;
+
+-- still live, and the recompiled plan handles the FK-less world: deleting a
+-- referenced parent removes the joined rows
+delete from p5 where id = 1;
+select * from mv5 order by tid;
+→ [{"tid":20,"nm":"two"}]
+
+-- a dangling child row (legal now) joins nothing
+insert into t5 values (11, 99);
+select * from mv5 order by tid;
+→ [{"tid":20,"nm":"two"}]
+
+drop materialized view mv5;
+drop table t5;
+drop table p5;
+
+-- ===================================
+-- 6. Dropped UNIQUE that backed the recorded backing PK forces staleness:
+--    `keysOf` no longer proves the recorded key (id is unprojected, so the
+--    derived key falls back and shifts) → strict-PK mismatch → stale fallback.
+--    Stale = frozen snapshot: writes stop propagating; REFRESH errors with the
+--    shape diagnostic; drop-and-recreate recovers.
+-- ===================================
+
+create table f (id integer primary key, u text not null, v text, constraint uq unique (u));
+insert into f values (1, 'x', 'one');
+create materialized view mvf as select u, v from f;
+
+select * from mvf order by u;
+→ [{"u":"x","v":"one"}]
+
+alter table f drop constraint uq;
+
+-- frozen: the write does not propagate
+insert into f values (2, 'y', 'two');
+select * from mvf order by u;
+→ [{"u":"x","v":"one"}]
+
+-- refresh cannot rebuild it (derived key shifted past the backing PK)
+refresh materialized view mvf;
+-- error: output shape changed incompatibly
+
+-- drop and recreate (with a body whose key is still provable) is the recovery
+drop materialized view mvf;
+drop table f;
+
+-- ===================================
+-- 7. ANALYZE keeps MVs live (statistics-only table_modified)
+-- ===================================
+
+create table g (id integer primary key, v integer not null);
+insert into g values (1, 1);
+create materialized view mvg as select id, v from g;
+
+analyze g;
+
+-- no staleness: read succeeds and writes keep propagating
+insert into g values (2, 2);
+select * from mvg order by id;
+→ [{"id":1,"v":1},{"id":2,"v":2}]
+
+drop materialized view mvg;
+drop table g;
+
+-- ===================================
+-- 7b. A tag-only ALTER is body-irrelevant: it fires table_modified on the source
+--     but does not stale the MV
+-- ===================================
+-- (the CREATE/DROP INDEX instance of the same classification lives in
+--  53.3.1-materialized-view-index-ddl-irrelevance — it needs standalone index DDL)
+
+create table g2 (id integer primary key, v integer not null);
+insert into g2 values (1, 1);
+create materialized view mvg2 as select id, v from g2;
+
+insert into g2 values (2, 2);
+select * from mvg2 order by id;
+→ [{"id":1,"v":1},{"id":2,"v":2}]
+
+insert into g2 values (3, 3);
+select * from mvg2 order by id;
+→ [{"id":1,"v":1},{"id":2,"v":2},{"id":3,"v":3}]
+
+alter table g2 set tags (note = 'x');
+insert into g2 values (4, 4);
+select * from mvg2 order by id;
+→ [{"id":1,"v":1},{"id":2,"v":2},{"id":3,"v":3},{"id":4,"v":4}]
+
+drop materialized view mvg2;
+drop table g2;
+
+-- ===================================
+-- 8. Pre-existing staleness is never cleared by a constraint-only DDL:
+--    a body-RELEVANT change (column retype) marks the MV stale; a later
+--    constraint-only DDL on the same source skips it (no recompile, no
+--    flag-clear) — only REFRESH recovers.
+-- ===================================
+
+create table h (id integer primary key, v integer not null, constraint chk check (v > 0));
+insert into h values (1, 5);
+create materialized view mvh as select id, v from h;
+
+alter table h alter column v set data type real;
+
+-- stale (frozen): the write does not propagate
+insert into h values (2, 6);
+select id from mvh order by id;
+→ [{"id":1}]
+
+alter table h drop constraint chk;
+
+-- STILL stale — the constraint-only DDL must not revive it
+insert into h values (3, 7);
+select id from mvh order by id;
+→ [{"id":1}]
+
+-- REFRESH recovers (reshapes the backing to the retyped column)
+refresh materialized view mvh;
+select id from mvh order by id;
+→ [{"id":1},{"id":2},{"id":3}]
+
+drop materialized view mvh;
+drop table h;
+
+-- ===================================
+-- 9. Mid-statement failure independence: one DDL, two dependents — the
+--    PK-shifted one stales, the sibling recompiles and stays live.
+-- ===================================
+
+create table i (id integer primary key, u text not null, v integer not null, constraint uq unique (u));
+insert into i values (1, 'x', 5);
+create materialized view mvi_keyed_u as select u, v from i;
+create materialized view mvi_keyed_id as select id, v from i;
+
+alter table i drop constraint uq;
+
+insert into i values (2, 'y', 6);
+
+-- the u-keyed MV froze (its backing key lost its proof)
+select * from mvi_keyed_u order by u;
+→ [{"u":"x","v":5}]
+
+-- the id-keyed sibling stayed live
+select * from mvi_keyed_id order by id;
+→ [{"id":1,"v":5},{"id":2,"v":6}]
+
+drop materialized view mvi_keyed_u;
+drop materialized view mvi_keyed_id;
+drop table i;
+
+-- ===================================
+-- 10. MV-over-MV: a constraint-only DDL on the base keeps BOTH levels live
+--     (the recompile path emits no backing invalidation, so the consumer
+--     never sees a staleness cascade)
+-- ===================================
+
+create table j (id integer primary key, v integer not null, constraint chk check (v >= 0));
+insert into j values (1, 1);
+create materialized view mvj1 as select id, v from j;
+create materialized view mvj2 as select id, v from mvj1;
+
+alter table j drop constraint chk;
+
+-- a write the dropped CHECK would have rejected cascades through the chain
+insert into j values (2, -5);
+select * from mvj1 order by id;
+→ [{"id":1,"v":1},{"id":2,"v":-5}]
+select * from mvj2 order by id;
+→ [{"id":1,"v":1},{"id":2,"v":-5}]
+
+drop materialized view mvj2;
+drop materialized view mvj1;
+drop table j;
+
+-- ===================================
+-- 11. Forced recompile failure still cascades staleness to consumers: the
+--     producer's stale fallback emits its backing invalidation, whose
+--     same-object table_modified classifies body-RELEVANT (the reference-
+--     equality guard) and stales the consumer. Both freeze.
+-- ===================================
+
+create table k (id integer primary key, u text not null, v text, constraint uq unique (u));
+insert into k values (1, 'x', 'one');
+create materialized view mvk1 as select u, v from k;
+create materialized view mvk2 as select u from mvk1;
+
+alter table k drop constraint uq;
+
+-- both frozen: the write reaches neither level
+insert into k values (2, 'y', 'two');
+select * from mvk1 order by u;
+→ [{"u":"x","v":"one"}]
+select * from mvk2 order by u;
+→ [{"u":"x"}]
+
+drop materialized view mvk2;
+drop materialized view mvk1;
+drop table k;
+
+-- ===================================
+-- 12. RENAME TO of an FK target with an MV reading BOTH tables: the cascade's
+--     constraint-rewrite table_modified on the child is body-irrelevant, but
+--     at that instant the MV body may still name the old table (shape
+--     derivation throws → stale fallback); the rename propagation's own MV
+--     loop then rewrites the body and restores it live. End state: live.
+-- ===================================
+
+create table lp (id integer primary key);
+create table lc (id integer primary key, pid integer not null references lp (id));
+insert into lp values (1);
+insert into lc values (10, 1);
+create materialized view mvl as select lc.id, lp.id as pid from lc join lp on lc.pid = lp.id;
+
+alter table lp rename to lp2;
+
+insert into lp2 values (2);
+insert into lc values (20, 2);
+select * from mvl order by id;
+→ [{"id":10,"pid":1},{"id":20,"pid":2}]
+
+refresh materialized view mvl;
+select * from mvl order by id;
+→ [{"id":10,"pid":1},{"id":20,"pid":2}]
+
+drop materialized view mvl;
+drop table lc;
+drop table lp2;
+
+-- ===================================
+-- 13. CHECK-contradiction folds (CHECK seeds optimizer domain facts that fold
+--     the body's WHERE to empty). The conservative discipline:
+--     (a) at create, a fully-folded body is rejected outright (it reads no
+--         source table — its dependencies could never be recorded);
+--     (b) adding a contradicting CHECK to a live MV's source folds the
+--         re-planned body, shrinking its source set → the sourceTables guard
+--         forces the stale fallback rather than leaving a live-but-frozen
+--         plan in place. Frozen until the contradiction is resolved.
+-- ===================================
+
+create table m (id integer primary key, v integer not null, constraint chk check (v > 10));
+create materialized view mvm as select id, v from m where v < 5;
+-- error: reads no source table
+drop table m;
+
+create table n (id integer primary key, v integer not null);
+create materialized view mvn as select id, v from n where v < 5;
+insert into n values (1, 3), (2, 20);
+select * from mvn order by id;
+→ [{"id":1,"v":3}]
+
+delete from n where id = 1;
+alter table n add constraint chk check (v > 10);
+
+-- stale (frozen): the re-planned body folded to empty, so the source set
+-- shrank and the recompile fell back to stale — never a silently-wrong plan
+select * from mvn order by id;
+→ []
+
+-- refresh cannot re-derive a folded body either
+refresh materialized view mvn;
+-- error: reads no source table
+
+drop materialized view mvn;
+drop table n;
+
+-- ===================================
+-- 14. ADD UNIQUE that subsumes the existing compound backing key:
+--     keysOf's first key shrinks (compound {a,b} → single {a}) but the old
+--     backing PK {a,b} is still a superkey → MV stays live.
+-- ===================================
+
+create table t14 (id integer primary key, a text not null, b text not null,
+                  constraint uq_ab unique (a, b));
+-- id is not projected; only compound key {a,b} is the backing PK
+insert into t14 values (1, 'x', 'p');
+create materialized view mv14 as select a, b from t14;
+
+alter table t14 add constraint uq_a unique (a);
+-- keysOf now returns {0} (a alone) as the first key — {a,b} is subsumed
+-- superkey check: {0} ⊆ {0,1} → backing PK still valid → stay live
+
+insert into t14 values (2, 'y', 'q');
+select * from mv14 order by a;
+→ [{"a":"x","b":"p"},{"a":"y","b":"q"}]
+
+-- live maintenance keeps working under the unchanged (wider) backing PK {a,b}:
+-- a delete propagates too, not just inserts
+delete from t14 where a = 'x';
+select * from mv14 order by a;
+→ [{"a":"y","b":"q"}]
+
+drop materialized view mv14;
+drop table t14;

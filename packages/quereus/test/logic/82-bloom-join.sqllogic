@@ -100,6 +100,74 @@ SELECT l.id, r.id FROM bj_nocase_l l JOIN bj_nocase_r r ON l.name = r.name ORDER
 SELECT l.id, l.name, r.id AS rid FROM bj_nocase_l l LEFT JOIN bj_nocase_r r ON l.name = r.name ORDER BY l.id;
 → [{"id":1,"name":"Alice","rid":10},{"id":2,"name":"Bob","rid":20},{"id":3,"name":"Charlie","rid":null}]
 
+-- Asymmetric collation (ticket join-key-collation-resolution-alignment): left
+-- defaults to BINARY, right declares NOCASE. The matched-collation gate demotes the
+-- asymmetric pair out of the bloom path (kept conservative — the physical ordering
+-- property is collation-blind), so this runs as a nested loop, but the comparison
+-- still resolves to NOCASE via the shared lattice — IDENTICAL result to the
+-- symmetric bloom join above. Mirror spelling: the old left-first key normalizer
+-- would have built/probed under BINARY and missed the case-variant matches.
+CREATE TABLE bj_mix_l (id INTEGER PRIMARY KEY, name TEXT);
+CREATE TABLE bj_mix_r (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE);
+INSERT INTO bj_mix_l VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
+INSERT INTO bj_mix_r VALUES (10, 'alice'), (20, 'BOB'), (30, 'Dave');
+
+SELECT l.id, r.id FROM bj_mix_l l JOIN bj_mix_r r ON l.name = r.name ORDER BY l.id;
+→ [{"id":1,"id:1":10},{"id":2,"id:1":20}]
+
+DROP TABLE bj_mix_l;
+DROP TABLE bj_mix_r;
+
+-- Residual condition: an equi conjunct (k) picks the bloom path, and the
+-- cross-side non-equi conjunct (l.s < r.t) stays behind as the residual, which the
+-- probe loop evaluates per candidate pair. Exercises the residual sub-program
+-- param, which is only present when the ON clause has a non-equi conjunct.
+CREATE TABLE bj_res_l (id INTEGER PRIMARY KEY, k INTEGER, s TEXT);
+CREATE TABLE bj_res_r (id INTEGER PRIMARY KEY, k INTEGER, t TEXT);
+INSERT INTO bj_res_l VALUES (1, 1, 'm'), (2, 1, 'z'), (3, 2, 'a'), (4, 3, 'q');
+INSERT INTO bj_res_r VALUES (10, 1, 'p'), (20, 1, 'b'), (30, 2, 'c'), (40, 9, 'x');
+
+SELECT 1 AS ok FROM query_plan('SELECT * FROM bj_res_l l JOIN bj_res_r r ON l.k = r.k AND l.s < r.t')
+WHERE properties LIKE '%bloom%' LIMIT 1;
+→ [{"ok":1}]
+
+-- Inner: only pairs whose residual holds survive
+SELECT l.id AS lid, r.id AS rid FROM bj_res_l l JOIN bj_res_r r ON l.k = r.k AND l.s < r.t ORDER BY lid, rid;
+→ [{"lid":1,"rid":10},{"lid":3,"rid":30}]
+
+-- LEFT: a left row whose every equi candidate fails the residual is unmatched, not dropped
+SELECT 1 AS ok FROM query_plan('SELECT * FROM bj_res_l l LEFT JOIN bj_res_r r ON l.k = r.k AND l.s < r.t')
+WHERE properties LIKE '%bloom%' LIMIT 1;
+→ [{"ok":1}]
+
+SELECT l.id AS lid, r.id AS rid FROM bj_res_l l LEFT JOIN bj_res_r r ON l.k = r.k AND l.s < r.t ORDER BY lid, rid;
+→ [{"lid":1,"rid":10},{"lid":2,"rid":null},{"lid":3,"rid":30},{"lid":4,"rid":null}]
+
+-- SEMI: residual gates the match bit. Spelled as an existence flag rather than a
+-- correlated `exists (select ...)`: the subquery form plans as EXISTS over an index
+-- seek and never reaches a join at all, so it would give the residual param no
+-- coverage (see 08.2-existence-flag-semijoin-recovery.sqllogic for the rewrite).
+SELECT 1 AS ok FROM query_plan('SELECT l.id AS lid FROM bj_res_l l LEFT JOIN bj_res_r r ON l.k = r.k AND l.s < r.t EXISTS RIGHT AS h WHERE h')
+WHERE properties LIKE '%bloom%' LIMIT 1;
+→ [{"ok":1}]
+
+SELECT l.id AS lid FROM bj_res_l l LEFT JOIN bj_res_r r ON l.k = r.k AND l.s < r.t EXISTS RIGHT AS h WHERE h ORDER BY lid;
+→ [{"lid":1},{"lid":3}]
+
+-- ANTI: complement of the semi result
+SELECT 1 AS ok FROM query_plan('SELECT l.id AS lid FROM bj_res_l l LEFT JOIN bj_res_r r ON l.k = r.k AND l.s < r.t EXISTS RIGHT AS h WHERE NOT h')
+WHERE properties LIKE '%bloom%' LIMIT 1;
+→ [{"ok":1}]
+
+SELECT l.id AS lid FROM bj_res_l l LEFT JOIN bj_res_r r ON l.k = r.k AND l.s < r.t EXISTS RIGHT AS h WHERE NOT h ORDER BY lid;
+→ [{"lid":2},{"lid":4}]
+
+-- NOTE: no residual case here forces build/probe side-swap (the swap only fires for
+-- inner joins whose left side is the larger one, and the cost model decides). If a
+-- swap-related residual bug ever surfaces, add a case that pins the swap.
+DROP TABLE bj_res_l;
+DROP TABLE bj_res_r;
+
 -- Cleanup
 DROP TABLE bj_left;
 DROP TABLE bj_right;

@@ -3,7 +3,7 @@ import type { TableSchema } from '../../schema/table.js';
 import type { FunctionSchema } from '../../schema/function.js';
 import type { AnyVirtualTableModule } from '../../vtab/module.js';
 import type { CollationFunction } from '../../util/comparison.js';
-import { QuereusError } from '../../common/errors.js';
+import { QuereusError, RelationNotFoundError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
 
@@ -45,9 +45,9 @@ export function resolveTableSchema(
 		// Resolve table schema with explicit schema name
 		const tableSchema = ctx.schemaManager.findTable(tableName, resolvedSchemaName);
 		if (!tableSchema) {
-			throw new QuereusError(
-				`Table not found: ${resolvedSchemaName}.${tableName}`,
-				StatusCode.ERROR
+			// Message text is asserted on by the sqllogic suites — keep it byte-identical.
+			throw new RelationNotFoundError(
+				`Table not found: ${resolvedSchemaName}.${tableName}`
 			);
 		}
 
@@ -85,7 +85,9 @@ export function resolveTableSchema(
 	if (!tableSchema) {
 		// Generate helpful error message
 		const searchedSchemas = schemaPath || ['main', 'temp'];
-		const existsIn = ctx.schemaManager.findSchemasContainingTable(tableName);
+		// Views count here: an unqualified name resolves through the path across
+		// tables and views alike, so an off-path VIEW is exactly as suggestible.
+		const existsIn = ctx.schemaManager.findSchemasContainingRelation(tableName);
 
 		let errorMsg = `Table '${tableName}' not found in schema path: ${searchedSchemas.join(', ')}`;
 
@@ -101,7 +103,7 @@ export function resolveTableSchema(
 			}
 		}
 
-		throw new QuereusError(errorMsg, StatusCode.ERROR);
+		throw new RelationNotFoundError(errorMsg);
 	}
 
 	// Record dependency
@@ -206,6 +208,9 @@ export function resolveVtabModule(
 
 /**
  * Resolves a collation function at build time and records the dependency.
+ * Delegates the lookup to `db.getCollationResolver()` — the one resolution
+ * primitive — so a build-time miss reports the same `no such collation
+ * sequence: X` error as emit time, and never falls back to BINARY.
  */
 export function resolveCollation(
 	ctx: PlanningContext,
@@ -220,14 +225,7 @@ export function resolveCollation(
 		return cached as CollationFunction;
 	}
 
-	// Resolve collation
-	const collation = ctx.db._getCollation(collationName);
-	if (!collation) {
-		throw new QuereusError(
-			`Collation not found: ${collationName}`,
-			StatusCode.ERROR
-		);
-	}
+	const collation = ctx.db.getCollationResolver()(collationName);
 
 	// Record dependency
 	const dependency: SchemaDependency = {

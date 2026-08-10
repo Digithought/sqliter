@@ -48,10 +48,8 @@ describe('Reference Graph Builder', () => {
 		// Check that every node has stats
 		for (const [_node, stats] of refGraph) {
 			expect(stats).to.have.property('parentCount');
-			expect(stats).to.have.property('appearsInLoop');
 			expect(stats).to.have.property('estimatedRows');
 			expect(stats).to.have.property('deterministic');
-			expect(stats).to.have.property('loopMultiplier');
 		}
 	});
 
@@ -77,9 +75,8 @@ describe('Reference Graph Builder', () => {
 			expect(stats.parents).to.be.instanceOf(Set);
 			expect(stats).to.have.property('estimatedRows');
 			expect(stats).to.have.property('deterministic');
-			// Loop context detection is now deferred to physical optimization
-			expect(stats).to.have.property('appearsInLoop');
-			expect(stats).to.have.property('loopMultiplier');
+			// Loop context detection is deferred to physical optimization
+			// (rule-nested-loop-right-cache), so RefStats carries no loop fields.
 		}
 	});
 
@@ -169,8 +166,6 @@ describe('Reference Graph Builder', () => {
 			expect(stats.parents).to.be.instanceOf(Set);
 			expect(stats).to.have.property('estimatedRows');
 			expect(stats).to.have.property('deterministic');
-			// Loop multipliers default to 1 without execution strategy info
-			expect(stats.loopMultiplier).to.be.at.least(1);
 		}
 	});
 
@@ -194,8 +189,6 @@ describe('Reference Graph Builder', () => {
 			expect(stats.parents).to.be.instanceOf(Set);
 			expect(stats).to.have.property('estimatedRows');
 			expect(stats).to.have.property('deterministic');
-			// Without execution strategy info, loop multipliers default to 1
-			expect(stats.loopMultiplier).to.be.at.least(1);
 		}
 	});
 

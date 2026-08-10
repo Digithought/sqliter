@@ -9,7 +9,8 @@ import type { JoinCapable, PredicateSourceCapable } from '../framework/character
 import { hashJoinCost } from '../cost/index.js';
 import type { JoinType } from './join-node.js';
 import { analyzeJoinKeyCoverage, combineJoinKeys } from '../util/key-utils.js';
-import { buildJoinAttributes, buildJoinRelationType, estimateJoinRows, propagateJoinFds, type EquiJoinPair } from './join-utils.js';
+import { buildJoinAttributes, buildJoinRelationType, describeEquiPairs, estimateJoinRows, joinPhysicalRows, propagateJoinFds, propagateJoinInds, valueFactPairs, type EquiJoinPair } from './join-utils.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 
 export type { EquiJoinPair } from './join-utils.js';
 
@@ -24,6 +25,8 @@ export type { EquiJoinPair } from './join-utils.js';
  */
 export class BloomJoinNode extends PlanNode implements BinaryRelationalNode, JoinCapable, PredicateSourceCapable {
 	override readonly nodeType = PlanNodeType.HashJoin;
+	readonly isJoinCapable = true as const;
+	readonly isPredicateSourceCapable = true as const;
 	private attributesCache: Cached<Attribute[]>;
 
 	constructor(
@@ -42,7 +45,9 @@ export class BloomJoinNode extends PlanNode implements BinaryRelationalNode, Joi
 	) {
 		const leftRows = left.estimatedRows ?? 100;
 		const rightRows = right.estimatedRows ?? 100;
-		const cost = left.getTotalCost() + right.getTotalCost() + hashJoinCost(rightRows, leftRows);
+		// Self-cost only: children (left, right, residualCondition) flow in via
+		// getTotalCost(). Self is the hash-join build+probe cost.
+		const cost = hashJoinCost(rightRows, leftRows);
 		super(scope, cost);
 
 		this.attributesCache = new Cached(() => this.buildAttributes());
@@ -59,12 +64,17 @@ export class BloomJoinNode extends PlanNode implements BinaryRelationalNode, Joi
 		return this.attributesCache.value;
 	}
 
+	/** Pairs this join may mint value-level facts from — see {@link valueFactPairs}. */
+	private factPairs(): readonly EquiJoinPair[] {
+		return valueFactPairs(this.equiPairs);
+	}
+
 	getType(): RelationType {
 		const leftType = this.left.getType();
 		const rightType = this.right.getType();
 		const leftIndex = this.left.getAttributeIndex();
 		const rightIndex = this.right.getAttributeIndex();
-		const indexPairs = this.equiPairs.map(p => ({
+		const indexPairs = this.factPairs().map(p => ({
 			left: leftIndex.get(p.leftAttrId) ?? -1,
 			right: rightIndex.get(p.rightAttrId) ?? -1,
 		})).filter(p => p.left >= 0 && p.right >= 0);
@@ -79,16 +89,22 @@ export class BloomJoinNode extends PlanNode implements BinaryRelationalNode, Joi
 		const leftIndex = this.left.getAttributeIndex();
 		const rightIndex = this.right.getAttributeIndex();
 
-		// Map attribute-ID-based equi-pairs to column-index-based pairs
-		const indexPairs = this.equiPairs.map(p => ({
+		// Map attribute-ID-based equi-pairs to column-index-based pairs.
+		// Value-fact consumers only — see `factPairs`.
+		const indexPairs = this.factPairs().map(p => ({
 			left: leftIndex.get(p.leftAttrId) ?? -1,
 			right: rightIndex.get(p.rightAttrId) ?? -1,
 		}));
 
+		// PHYSICAL child cardinalities — the logical getters read `undefined`
+		// through a physical access node (see `physicalSourceRows`).
+		const leftRows = physicalSourceRows(leftPhys, this.left);
+		const rightRows = physicalSourceRows(rightPhys, this.right);
+
 		const result = analyzeJoinKeyCoverage(
 			this.joinType, leftPhys, rightPhys,
 			this.left.getType(), this.right.getType(),
-			indexPairs, this.left.estimatedRows, this.right.estimatedRows,
+			indexPairs, leftRows, rightRows,
 			leftAttrs.length,
 		);
 
@@ -99,11 +115,12 @@ export class BloomJoinNode extends PlanNode implements BinaryRelationalNode, Joi
 		);
 
 		return {
-			estimatedRows: result.estimatedRows,
+			estimatedRows: joinPhysicalRows(this.joinType, result.estimatedRows, leftRows, rightRows),
 			fds: fdResult.fds,
 			equivClasses: fdResult.equivClasses,
 			constantBindings: fdResult.constantBindings,
 			domainConstraints: fdResult.domainConstraints,
+			inds: propagateJoinInds(this.joinType, leftPhys, rightPhys, leftAttrs.length),
 		};
 	}
 
@@ -173,7 +190,7 @@ export class BloomJoinNode extends PlanNode implements BinaryRelationalNode, Joi
 		return {
 			joinType: this.joinType,
 			algorithm: 'bloom',
-			equiPairs: this.equiPairs.map(p => ({ left: p.leftAttrId, right: p.rightAttrId })),
+			equiPairs: describeEquiPairs(this.equiPairs),
 			hasResidual: !!this.residualCondition,
 			leftRows: this.left.estimatedRows,
 			rightRows: this.right.estimatedRows,

@@ -1,31 +1,41 @@
 import type { WindowNode } from '../../planner/nodes/window-node.js';
-import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import type { OutputValue, Row, SqlValue } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { emitPlanNode, emitCallFromPlan } from '../emitters.js';
-import { resolveWindowFunction, type WindowFunctionSchema } from '../../schema/window-function.js';
+import { bindWindowSchema, resolveWindowFunction, type WindowFunctionSchema } from '../../schema/window-function.js';
+import { argComparisonContext } from './aggregate-setup.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
-import { createTypedComparator, createOrderByComparatorFast } from '../../util/comparison.js';
-import type { LogicalType } from '../../types/logical-type.js';
-import { resolveKeyNormalizer, serializeKeyNullGrouping } from '../../util/key-serializer.js';
+import { createTypedComparator, createTypedOrderByComparator, semanticKeyTransform } from '../../util/comparison.js';
+import { hashKeyCollationName } from '../../planner/analysis/comparison-collation.js';
+import { serializeKeyNullGrouping } from '../../util/key-serializer.js';
 import { createLogger } from '../../common/logger.js';
 import { buildRowDescriptor } from '../../util/row-descriptor.js';
 import { RowDescriptor } from '../../planner/nodes/plan-node.js';
 import type * as AST from '../../parser/ast.js';
-import { createRowSlot, type RowSlot } from '../context-helpers.js';
+import { createRowSlot, type RowSlot, type ContextInstaller } from '../context-helpers.js';
 import { tryExtractNumericLiteral } from '../../util/ast-literal.js';
 
 const log = createLogger('runtime:emit:window');
 
 export function emitWindow(plan: WindowNode, ctx: EmissionContext): Instruction {
-	// Get schemas for all window functions in this node
-	const functionSchemas = plan.functions.map(func => {
+	// Resolve + bind each window function's schema ONCE here: the call site's
+	// argument types and collations specialize comparison-sensitive windows
+	// (min/max via bindArgs) so their step ranks by the argument's semantic order,
+	// exactly as the min/max aggregate does. Every execution shape below —
+	// the buffered frame walk (computeAggregateFunction), the streaming running
+	// aggregate (stepRunningAgg) and the sliding-frame scans — folds through THIS
+	// schema, so the physical shapes cannot drift apart. Nothing per-row resolves
+	// a type or a collation.
+	const functionSchemas = plan.functions.map((func, fi) => {
 		const schema = resolveWindowFunction(func.functionName);
 		if (!schema) {
 			throw new QuereusError(`Window function ${func.functionName} not found`, StatusCode.INTERNAL);
 		}
-		return schema;
+		const argBindings = (plan.functionArguments[fi] ?? []).map(argPlan => argComparisonContext(argPlan, ctx));
+		return bindWindowSchema(schema, argBindings);
 	});
 
 	// Emit callbacks for partition expressions
@@ -48,26 +58,43 @@ export function emitWindow(plan: WindowNode, ctx: EmissionContext): Instruction 
 	// Create row descriptors
 	const sourceRowDescriptor = buildRowDescriptor(plan.source.getAttributes());
 
-	// Pre-resolve ORDER BY comparators using actual expression types (not hardcoded BINARY)
+	// Pre-resolve ORDER BY comparators using actual expression types (not hardcoded BINARY).
+	// Semantic-ordering types (TIMESPAN, JSON) rank by the type's compare — matching the
+	// typed peer-equality comparators below, so ordering and peer detection agree.
 	const orderByComparators = plan.orderByExpressions.map((exprPlan, i) => {
 		const exprType = exprPlan.getType();
 		const collationName = exprType.collationName || 'BINARY';
 		const collationFunc = ctx.resolveCollation(collationName);
 		const orderClause = plan.windowSpec.orderBy[i];
-		return createOrderByComparatorFast(orderClause.direction, orderClause.nulls, collationFunc);
+		return createTypedOrderByComparator(exprType.logicalType, orderClause.direction, orderClause.nulls, collationFunc);
 	});
 
 	// Pre-resolve typed equality comparators for ORDER BY (used in ranking functions)
 	const orderByEqualityComparators = plan.orderByExpressions.map(exprPlan => {
 		const exprType = exprPlan.getType();
 		const collationFunc = exprType.collationName ? ctx.resolveCollation(exprType.collationName) : undefined;
-		return createTypedComparator(exprType.logicalType as LogicalType, collationFunc);
+		return createTypedComparator(exprType.logicalType, collationFunc);
 	});
 
 	// Pre-resolve collation normalizers for partition key serialization
-	const partitionKeyNormalizers = plan.partitionExpressions.map(exprPlan =>
-		resolveKeyNormalizer(exprPlan.getType().collationName)
-	);
+	const partitionKeyNormalizers = plan.partitionExpressions.map(exprPlan => {
+		const exprType = exprPlan.getType();
+		return ctx.resolveKeyNormalizer(hashKeyCollationName(exprType.collationName, [exprType]));
+	});
+
+	// Partition-key canonicalizers for semantic-ordering key types: values the type's
+	// compare treats as equal (TIMESPAN 'PT1H' ≡ 'PT60M') must land in one partition,
+	// so they serialize via the type's groupKey representative (mirrors GROUP BY in
+	// hash-aggregate.ts).
+	const partitionKeyCanonicalizers = plan.partitionExpressions.map(
+		exprPlan => semanticKeyTransform(exprPlan.getType().logicalType));
+	const hasPartitionCanonicalizer = partitionKeyCanonicalizers.some(c => c !== undefined);
+	const serializePartitionKey = (values: SqlValue[]): string => {
+		const keyValues = hasPartitionCanonicalizer
+			? values.map((v, i) => partitionKeyCanonicalizers[i] ? partitionKeyCanonicalizers[i]!(v) : v)
+			: values;
+		return serializeKeyNullGrouping(keyValues, partitionKeyNormalizers);
+	};
 
 	async function* run(
 		rctx: RuntimeContext,
@@ -91,7 +118,9 @@ export function emitWindow(plan: WindowNode, ctx: EmissionContext): Instruction 
 		}
 
 		// Single source slot shared across all partition/sort/ranking/aggregate operations
-		const sourceSlot = createRowSlot(rctx, sourceRowDescriptor);
+		// Best-effort installer label for QUEREUS_CONTEXT_STRICT diagnostics (detection ignores it).
+		const installer: ContextInstaller = { nodeType: plan.nodeType, id: plan.id };
+		const sourceSlot = createRowSlot(rctx, sourceRowDescriptor, installer);
 		try {
 			if (plan.streaming) {
 				// Streaming fast path: source already arrives in
@@ -100,7 +129,7 @@ export function emitWindow(plan: WindowNode, ctx: EmissionContext): Instruction 
 				yield* runStreaming(
 					plan, functionSchemas, rctx, source, sourceRowDescriptor,
 					partitionCallbackList, orderByCallbackList, funcArgCallbackGroups,
-					partitionKeyNormalizers, orderByEqualityComparators,
+					serializePartitionKey, orderByEqualityComparators,
 				);
 				return;
 			}
@@ -122,7 +151,7 @@ export function emitWindow(plan: WindowNode, ctx: EmissionContext): Instruction 
 			} else {
 				// With partitioning - group by partition keys
 				const partitions = await groupByPartitions(
-					allRows, partitionCallbackList, rctx, sourceSlot, partitionKeyNormalizers
+					allRows, partitionCallbackList, rctx, sourceSlot, serializePartitionKey
 				);
 
 				for (const partitionRows of partitions.values()) {
@@ -150,7 +179,7 @@ export function emitWindow(plan: WindowNode, ctx: EmissionContext): Instruction 
 
 	return {
 		params: [sourceInstruction, ...allCallbacks],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `window(${plan.functions.map(f => f.functionName).join(', ')})`
 	};
 }
@@ -160,7 +189,7 @@ async function groupByPartitions(
 	partitionCallbacks: Array<(ctx: RuntimeContext) => OutputValue>,
 	rctx: RuntimeContext,
 	sourceSlot: RowSlot,
-	keyNormalizers: readonly ((s: string) => string)[]
+	serializePartitionKey: (values: SqlValue[]) => string
 ): Promise<Map<string, Row[]>> {
 	const partitions = new Map<string, Row[]>();
 
@@ -171,9 +200,11 @@ async function groupByPartitions(
 		// would race on the shared inner-scan RowSlot.
 		const partitionValues: SqlValue[] = [];
 		for (const callback of partitionCallbacks) {
-			partitionValues.push(await callback(rctx) as SqlValue);
+			// Resolve without a per-row microtask hop (see runtime/async-util.ts).
+			const raw = callback(rctx);
+			partitionValues.push((raw instanceof Promise ? await raw : raw) as SqlValue);
 		}
-		const partitionKey = serializeKeyNullGrouping(partitionValues, keyNormalizers);
+		const partitionKey = serializePartitionKey(partitionValues);
 
 		if (!partitions.has(partitionKey)) {
 			partitions.set(partitionKey, []);
@@ -299,7 +330,9 @@ async function sortRows(
 		sourceSlot.set(row);
 		const values: SqlValue[] = [];
 		for (const callback of orderByCallbacks) {
-			values.push(await callback(rctx) as SqlValue);
+			// Resolve without a per-row microtask hop (see runtime/async-util.ts).
+			const raw = callback(rctx);
+			values.push((raw instanceof Promise ? await raw : raw) as SqlValue);
 		}
 		rowsWithValues.push({ row, values });
 	}
@@ -573,14 +606,14 @@ function getFrameBounds(
 	} else if (frame.start.type === 'preceding') {
 		const offset = getFrameOffset(frame.start.value);
 		if (isRange) {
-			start = findRangeOffsetStart(currentIndex, totalRows, orderByValues, -offset);
+			start = rangeOffsetStart(currentIndex, totalRows, orderByValues, equalityComparators, -offset);
 		} else {
 			start = currentIndex - offset;
 		}
 	} else if (frame.start.type === 'following') {
 		const offset = getFrameOffset(frame.start.value);
 		if (isRange) {
-			start = findRangeOffsetStart(currentIndex, totalRows, orderByValues, offset);
+			start = rangeOffsetStart(currentIndex, totalRows, orderByValues, equalityComparators, offset);
 		} else {
 			start = currentIndex + offset;
 		}
@@ -603,14 +636,14 @@ function getFrameBounds(
 	} else if (frame.end.type === 'preceding') {
 		const offset = getFrameOffset(frame.end.value);
 		if (isRange) {
-			end = findRangeOffsetEnd(currentIndex, totalRows, orderByValues, -offset);
+			end = rangeOffsetEnd(currentIndex, totalRows, orderByValues, equalityComparators, -offset);
 		} else {
 			end = currentIndex - offset;
 		}
 	} else if (frame.end.type === 'following') {
 		const offset = getFrameOffset(frame.end.value);
 		if (isRange) {
-			end = findRangeOffsetEnd(currentIndex, totalRows, orderByValues, offset);
+			end = rangeOffsetEnd(currentIndex, totalRows, orderByValues, equalityComparators, offset);
 		} else {
 			end = currentIndex + offset;
 		}
@@ -677,23 +710,40 @@ function arePeerRows(
 }
 
 /**
- * For RANGE N PRECEDING/FOLLOWING: find the first row whose ORDER BY value
- * is >= (currentValue + offset). Uses the first ORDER BY expression only
- * (SQL standard requires single ORDER BY for numeric RANGE offsets).
+ * Numeric form of an ORDER BY value for RANGE offset arithmetic. SQL NULL must
+ * become NaN, not `Number(null) === 0` — a NULL-keyed row is outside every
+ * finite-valued row's `[v - n, v + m]` interval, and coercing it to zero would
+ * silently pull the NULL rows into any frame whose interval happens to span
+ * zero. Mirrors the streaming emitter's `orderByVal0Num`, so both paths agree.
  */
-function findRangeOffsetStart(
+function rangeOrdinal(value: SqlValue): number {
+	return value === null ? NaN : Number(value);
+}
+
+/**
+ * RANGE `n PRECEDING` / `n FOLLOWING` start bound. A row whose ordering key has
+ * no place on the numeric line — SQL NULL above all — is not `offset` away from
+ * anything, so its frame is its peer group, exactly the reading `CURRENT ROW`
+ * gets. The streaming emitter's non-finite peer span is the same rule; the two
+ * paths must not answer differently for the same frame.
+ */
+function rangeOffsetStart(
 	currentIndex: number,
 	totalRows: number,
 	orderByValues: SqlValue[][],
+	equalityComparators: Array<(a: SqlValue, b: SqlValue) => number>,
 	offset: number // negative for PRECEDING, positive for FOLLOWING
 ): number {
-	const currentVal = Number(orderByValues[currentIndex][0]);
-	if (!Number.isFinite(currentVal)) return currentIndex;
-	const targetVal = currentVal + offset;
+	const currentVal = rangeOrdinal(orderByValues[currentIndex][0]);
+	if (!Number.isFinite(currentVal)) {
+		return findFirstPeer(currentIndex, totalRows, orderByValues, equalityComparators);
+	}
 
-	// Scan from beginning to find first row >= targetVal
+	// First row whose ordering value is >= the target. Uses the first ORDER BY
+	// expression only (a numeric RANGE offset requires a single sort key).
+	const targetVal = currentVal + offset;
 	for (let i = 0; i < totalRows; i++) {
-		const rowVal = Number(orderByValues[i][0]);
+		const rowVal = rangeOrdinal(orderByValues[i][0]);
 		if (Number.isFinite(rowVal) && rowVal >= targetVal) {
 			return i;
 		}
@@ -701,23 +751,24 @@ function findRangeOffsetStart(
 	return totalRows; // No matching row (empty frame start)
 }
 
-/**
- * For RANGE N PRECEDING/FOLLOWING: find the last row whose ORDER BY value
- * is <= (currentValue + offset).
- */
-function findRangeOffsetEnd(
+/** End-bound counterpart of {@link rangeOffsetStart}: last row whose ordering
+ *  value is <= (currentValue + offset), or the peer group's last row when the
+ *  current row's key is non-finite. */
+function rangeOffsetEnd(
 	currentIndex: number,
 	totalRows: number,
 	orderByValues: SqlValue[][],
+	equalityComparators: Array<(a: SqlValue, b: SqlValue) => number>,
 	offset: number
 ): number {
-	const currentVal = Number(orderByValues[currentIndex][0]);
-	if (!Number.isFinite(currentVal)) return currentIndex;
-	const targetVal = currentVal + offset;
+	const currentVal = rangeOrdinal(orderByValues[currentIndex][0]);
+	if (!Number.isFinite(currentVal)) {
+		return findLastPeer(currentIndex, totalRows, orderByValues, equalityComparators);
+	}
 
-	// Scan from end to find last row <= targetVal
+	const targetVal = currentVal + offset;
 	for (let i = totalRows - 1; i >= 0; i--) {
-		const rowVal = Number(orderByValues[i][0]);
+		const rowVal = rangeOrdinal(orderByValues[i][0]);
 		if (Number.isFinite(rowVal) && rowVal <= targetVal) {
 			return i;
 		}
@@ -929,7 +980,7 @@ async function* runStreaming(
 	partitionCallbacks: ReadonlyArray<(ctx: RuntimeContext) => OutputValue>,
 	orderByCallbacks: ReadonlyArray<(ctx: RuntimeContext) => OutputValue>,
 	funcArgCallbackGroups: ReadonlyArray<ReadonlyArray<(ctx: RuntimeContext) => OutputValue>>,
-	partitionKeyNormalizers: ReadonlyArray<(s: string) => string>,
+	serializePartitionKey: (values: SqlValue[]) => string,
 	orderByEqualityComparators: ReadonlyArray<(a: SqlValue, b: SqlValue) => number>,
 ): AsyncIterable<Row> {
 	const streaming = plan.streaming!;
@@ -951,11 +1002,23 @@ async function* runStreaming(
 
 	// We register our own source-attribute getter directly in the rctx context.
 	// This bypasses the slot abstraction so we can fully control insertion
-	// order: each iteration we delete-then-re-set the entry, pushing it to
-	// the *end* of the map's insertion order. This matters when streaming
-	// Windows are stacked — without re-promotion, an outer Window's slot
-	// (registered later) would shadow ours during our iterations, and our
-	// attribute resolutions would read the outer Window's stale row.
+	// order. `promote()` delete-then-re-sets the entry, pushing it to the *end*
+	// of the map's insertion order so it wins the `attributeIndex` for the
+	// source attribute IDs at two moments: (a) while we evaluate our own
+	// partition/order-by/arg callbacks against the current row, and (b) at the
+	// instant we yield, so a downstream consumer (an outer Window, or a Project)
+	// resolves source columns through the *yielded* row.
+	//
+	// But we must NOT leave that context winning while we pull the *next* source
+	// row — see the "source-attr contexts and child pulls" invariant in
+	// docs/runtime.md. Our `myDesc` shares the source's attribute IDs, and a
+	// streaming child below us (e.g. a residual Filter) updates its own slot by
+	// `set(row)` alone, which does not reclaim the index. If we stayed promoted
+	// across the pull, the child would read *our* last-yielded row instead of
+	// its current row (the same shadowing defect fixed in aggregate.ts). So we
+	// `demote()` at the end of each iteration — tear-down-before-pull — letting
+	// the deepest child win the index during the pull, then `promote()` again
+	// when the next row arrives.
 	//
 	// Use a fresh descriptor reference (NOT `sourceRowDescriptor`) so we
 	// occupy our own map slot rather than co-tenanting Window's outer
@@ -968,6 +1031,8 @@ async function* runStreaming(
 	const myRef = { current: undefined as Row | undefined };
 	const myGetter = () => myRef.current!;
 	let myRegistered = false;
+	// Best-effort installer label for QUEREUS_CONTEXT_STRICT diagnostics (detection ignores it).
+	const installer: ContextInstaller = { nodeType: plan.nodeType, id: plan.id };
 
 	const promote = (row: Row): void => {
 		myRef.current = row;
@@ -978,8 +1043,17 @@ async function* runStreaming(
 		if (myRegistered) {
 			rctx.context.delete(myDesc);
 		}
-		rctx.context.set(myDesc, myGetter);
+		rctx.context.set(myDesc, myGetter, installer);
 		myRegistered = true;
+	};
+
+	// Release our source-attr context so the child below reclaims the
+	// attributeIndex during the next pull (tear-down-before-pull).
+	const demote = (): void => {
+		if (myRegistered) {
+			rctx.context.delete(myDesc);
+			myRegistered = false;
+		}
 	};
 
 	try {
@@ -991,14 +1065,18 @@ async function* runStreaming(
 		// RowSlot.
 		const partitionValues: SqlValue[] = [];
 		for (const cb of partitionCallbacks) {
-			partitionValues.push(await cb(rctx) as SqlValue);
+			// Resolve without a per-row microtask hop (see runtime/async-util.ts).
+			const rawP = cb(rctx);
+			partitionValues.push((rawP instanceof Promise ? await rawP : rawP) as SqlValue);
 		}
-		const partitionKey = serializeKeyNullGrouping(partitionValues, partitionKeyNormalizers);
+		const partitionKey = serializePartitionKey(partitionValues);
 
 		// Resolve ORDER BY values (same shared-subtree concern as above).
 		const orderByValues: SqlValue[] = [];
 		for (const cb of orderByCallbacks) {
-			orderByValues.push(await cb(rctx) as SqlValue);
+			// Resolve without a per-row microtask hop (see runtime/async-util.ts).
+			const rawO = cb(rctx);
+			orderByValues.push((rawO instanceof Promise ? await rawO : rawO) as SqlValue);
 		}
 
 		// Partition boundary: close out the previous partition.
@@ -1096,7 +1174,7 @@ async function* runStreaming(
 					stepRunningAgg(entry, fi, fs, fc, argVal, isRangeMode);
 					break;
 				case 'slidingAgg':
-					handleSlidingArrival(entry, fi, fs, argVal, orderByVal0Num);
+					handleSlidingArrival(entry, fc, fs, argVal, orderByVal0Num);
 					break;
 			}
 		}
@@ -1113,6 +1191,11 @@ async function* runStreaming(
 			promote(yieldedRow);
 			yield yieldedRow;
 		}
+
+		// Tear down our source-attr context before pulling the next source row
+		// so a streaming child (e.g. a residual Filter) reclaims the index and
+		// reads its current row, not our last-yielded one.
+		demote();
 	}
 
 	// Source exhausted: flush trailing partition (if any).
@@ -1274,7 +1357,7 @@ async function* finalizePartition(
 	for (let fi = 0; fi < funcContexts.length; fi++) {
 		const fs = state.funcStates[fi];
 		if (fs.mode.kind !== 'slidingAgg') continue;
-		finalizeSlidingTrailing(fi, fs);
+		finalizeSlidingTrailing(funcContexts[fi], fs);
 	}
 	// Yield queued entries in order. Promote our slot to each entry's row so
 	// downstream attribute resolution sees the correct row.
@@ -1336,24 +1419,28 @@ function slidingFinalAcc(name: string, acc: { sum: number; count: number }): Sql
 	}
 }
 
-function slidingScanMin(buf: SlidingBufEntry[], lo: number, hi: number): SqlValue {
-	let best: SqlValue = null;
+/**
+ * MIN/MAX over a sliding-frame buffer slice, folded through the BOUND schema's own
+ * step/final rather than a local `<`. Reusing the schema is what keeps the sliding
+ * fast path ranking identically to the buffered frame walk — both consume the
+ * comparator `bindWindowSchema` installed at emit (semantic ordering for
+ * TIMESPAN/JSON arguments, the declared collation for text, storage-class order
+ * otherwise). `lo > hi` (empty slice) folds to the empty accumulator ⇒ NULL.
+ */
+function slidingScanExtremum(
+	schema: WindowFunctionSchema,
+	buf: SlidingBufEntry[],
+	lo: number,
+	hi: number,
+): SqlValue {
+	if (!schema.step) return null;
+	let acc: unknown = null;
+	let rowCount = 0;
 	for (let k = lo; k <= hi; k++) {
-		const v = buf[k].argVal;
-		if (v === null) continue;
-		if (best === null || v < best) best = v;
+		acc = schema.step(acc, buf[k].argVal);
+		rowCount++;
 	}
-	return best;
-}
-
-function slidingScanMax(buf: SlidingBufEntry[], lo: number, hi: number): SqlValue {
-	let best: SqlValue = null;
-	for (let k = lo; k <= hi; k++) {
-		const v = buf[k].argVal;
-		if (v === null) continue;
-		if (best === null || v > best) best = v;
-	}
-	return best;
+	return schema.final ? schema.final(acc, rowCount) : acc as SqlValue;
 }
 
 function slidingScanCountNonNull(buf: SlidingBufEntry[], lo: number, hi: number): number {
@@ -1375,10 +1462,11 @@ function slidingScanSum(buf: SlidingBufEntry[], lo: number, hi: number): { sum: 
 	return { sum, count };
 }
 
-/** Per-row dispatch for slidingAgg functions. */
+/** Per-row dispatch for slidingAgg functions. `fc` carries the emit-time-bound
+ *  registry schema, consulted by the MIN/MAX scans. */
 function handleSlidingArrival(
 	entry: StreamingRowEntry,
-	fi: number,
+	fc: StreamingFunctionContext,
 	fs: StreamingFuncState,
 	argVal: SqlValue,
 	orderByVal0Num: number,
@@ -1386,9 +1474,9 @@ function handleSlidingArrival(
 	const m = fs.mode as Extract<StreamingFuncState['mode'], { kind: 'slidingAgg' }>;
 	fs.slidingBuffer!.push({ argVal, orderByVal0: orderByVal0Num });
 	if (m.frameMode === 'rows') {
-		handleSlidingRowsArrival(entry, fi, fs, m, argVal);
+		handleSlidingRowsArrival(entry, fc, fs, m, argVal);
 	} else {
-		handleSlidingRangeArrival(entry, fi, fs, m, orderByVal0Num);
+		handleSlidingRangeArrival(entry, fc, fs, m, orderByVal0Num);
 	}
 }
 
@@ -1396,7 +1484,7 @@ function handleSlidingArrival(
 
 function handleSlidingRowsArrival(
 	entry: StreamingRowEntry,
-	fi: number,
+	fc: StreamingFunctionContext,
 	fs: StreamingFuncState,
 	m: Extract<StreamingFuncState['mode'], { kind: 'slidingAgg' }>,
 	argVal: SqlValue,
@@ -1406,12 +1494,12 @@ function handleSlidingRowsArrival(
 	}
 	fs.slidingPending!.push(entry);
 	while (fs.slidingPending!.length > m.following) {
-		finalizeSlidingRowsEntry(fi, fs, m);
+		finalizeSlidingRowsEntry(fc, fs, m);
 	}
 }
 
 function finalizeSlidingRowsEntry(
-	fi: number,
+	fc: StreamingFunctionContext,
 	fs: StreamingFuncState,
 	m: Extract<StreamingFuncState['mode'], { kind: 'slidingAgg' }>,
 ): void {
@@ -1436,10 +1524,8 @@ function finalizeSlidingRowsEntry(
 			value = slidingFinalAcc(m.name, fs.slidingAcc!);
 			break;
 		case 'min':
-			value = slidingScanMin(buf, lo, hi);
-			break;
 		case 'max':
-			value = slidingScanMax(buf, lo, hi);
+			value = slidingScanExtremum(fc.schema, buf, lo, hi);
 			break;
 		case 'first_value':
 			value = lo > hi ? null : buf[lo].argVal;
@@ -1451,7 +1537,7 @@ function finalizeSlidingRowsEntry(
 			value = null;
 	}
 	const targetEntry = fs.slidingPending!.shift()!;
-	fillSlot(targetEntry, fi, value);
+	fillSlot(targetEntry, fc.fi, value);
 	fs.slidingNextFinalizeIdx!++;
 }
 
@@ -1459,7 +1545,7 @@ function finalizeSlidingRowsEntry(
 
 function handleSlidingRangeArrival(
 	entry: StreamingRowEntry,
-	fi: number,
+	fc: StreamingFunctionContext,
 	fs: StreamingFuncState,
 	m: Extract<StreamingFuncState['mode'], { kind: 'slidingAgg' }>,
 	orderByVal0Num: number,
@@ -1488,7 +1574,7 @@ function handleSlidingRangeArrival(
 	}
 
 	while (pending.length > 0 && pending[0].rightClosed) {
-		finalizeSlidingRangeEntry(fi, fs, m);
+		finalizeSlidingRangeEntry(fc, fs, m);
 	}
 }
 
@@ -1537,7 +1623,7 @@ function findNonFinitePeerSpan(buf: SlidingBufEntry[]): { lo: number; hi: number
 }
 
 function finalizeSlidingRangeEntry(
-	fi: number,
+	fc: StreamingFunctionContext,
 	fs: StreamingFuncState,
 	m: Extract<StreamingFuncState['mode'], { kind: 'slidingAgg' }>,
 ): void {
@@ -1571,10 +1657,8 @@ function finalizeSlidingRangeEntry(
 				break;
 			}
 			case 'min':
-				value = slidingScanMin(buf, lo, hi);
-				break;
 			case 'max':
-				value = slidingScanMax(buf, lo, hi);
+				value = slidingScanExtremum(fc.schema, buf, lo, hi);
 				break;
 			case 'first_value':
 				value = buf[lo].argVal;
@@ -1586,7 +1670,7 @@ function finalizeSlidingRangeEntry(
 				value = null;
 		}
 	}
-	fillSlot(head.entry, fi, value);
+	fillSlot(head.entry, fc.fi, value);
 	pending.shift();
 
 	// Trim buffer rows that no remaining pending entry needs.
@@ -1641,15 +1725,15 @@ function trimSlidingRangeBuffer(
 	}
 }
 
-function finalizeSlidingTrailing(fi: number, fs: StreamingFuncState): void {
+function finalizeSlidingTrailing(fc: StreamingFunctionContext, fs: StreamingFuncState): void {
 	const m = fs.mode as Extract<StreamingFuncState['mode'], { kind: 'slidingAgg' }>;
 	if (m.frameMode === 'rows') {
 		while (fs.slidingPending!.length > 0) {
-			finalizeSlidingRowsEntry(fi, fs, m);
+			finalizeSlidingRowsEntry(fc, fs, m);
 		}
 	} else {
 		while (fs.slidingRangePending!.length > 0) {
-			finalizeSlidingRangeEntry(fi, fs, m);
+			finalizeSlidingRangeEntry(fc, fs, m);
 		}
 	}
 }

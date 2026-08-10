@@ -1,0 +1,32 @@
+-- 102.0.1-schema-catalog-indexed-table.sqllogic
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Carved out of 102-schema-catalog-edge-cases: that file's DDL round-trips,
+-- multi-schema search-path handling, table_info(), views, assertions and window
+-- coverage need no index DDL. This one section round-trips a table that carries
+-- secondary indexes, so it moves here rather than costing a backend without
+-- first-class CREATE INDEX the whole catalog file.
+--
+-- Subject: a table created with two secondary indexes stays queryable through the
+-- indexed columns, and both indexes drop cleanly.
+
+-- ===================================
+-- Table with indexes
+-- ===================================
+
+CREATE TABLE rt_indexed (id INTEGER PRIMARY KEY, name TEXT, category TEXT);
+CREATE INDEX idx_name ON rt_indexed (name);
+CREATE INDEX idx_cat ON rt_indexed (category);
+INSERT INTO rt_indexed VALUES (1, 'Alice', 'A'), (2, 'Bob', 'B');
+
+-- Verify indexes are used (data accessible via indexed columns)
+SELECT id FROM rt_indexed WHERE name = 'Alice';
+→ [{"id": 1}]
+
+SELECT id FROM rt_indexed WHERE category = 'B';
+→ [{"id": 2}]
+
+DROP INDEX idx_name;
+DROP INDEX idx_cat;
+DROP TABLE rt_indexed;

@@ -5,7 +5,7 @@ import { BinaryOpNode, LiteralNode, BetweenNode, UnaryOpNode, CastNode } from '.
 import { ColumnReferenceNode, ParameterReferenceNode } from '../../src/planner/nodes/reference.js';
 import type { ScalarPlanNode } from '../../src/planner/nodes/plan-node.js';
 import type * as AST from '../../src/parser/ast.js';
-import { INTEGER_TYPE } from '../../src/types/builtin-types.js';
+import { INTEGER_TYPE, TEXT_TYPE } from '../../src/types/builtin-types.js';
 import { InNode } from '../../src/planner/nodes/subquery.js';
 import {
 	extractConstraints,
@@ -36,6 +36,35 @@ function colRef(attrId: number, name: string, index: number): ColumnReferenceNod
 function lit(value: unknown): LiteralNode {
 	const expr: AST.LiteralExpr = { type: 'literal', value } as unknown as AST.LiteralExpr;
 	return new LiteralNode(scope, expr);
+}
+
+/** TEXT-typed column reference, optionally carrying an explicitly-declared collation (the existing colRef helper is INTEGER-typed). */
+function textColRef(attrId: number, name: string, index: number, collation?: string): ColumnReferenceNode {
+	const expr: AST.ColumnExpr = { type: 'column', schema: undefined as unknown as string, table: undefined as unknown as string, name } as unknown as AST.ColumnExpr;
+	const columnType = {
+		typeClass: 'scalar' as const,
+		logicalType: TEXT_TYPE,
+		collationName: collation,
+		collationSource: collation !== undefined ? 'declared' as const : undefined,
+		nullable: false,
+		isReadOnly: false,
+	};
+	return new ColumnReferenceNode(scope, expr, columnType, attrId, index);
+}
+
+/** The folded-`COLLATE` shape: a literal whose *type* carries the collation with
+ *  `'explicit'` provenance (constant folding preserves the whole type, including
+ *  the CollateNode's rank-3 source). */
+function collatedLit(value: string, collation: string): LiteralNode {
+	const expr: AST.LiteralExpr = { type: 'literal', value } as unknown as AST.LiteralExpr;
+	return new LiteralNode(scope, expr, {
+		typeClass: 'scalar',
+		logicalType: TEXT_TYPE,
+		collationName: collation,
+		collationSource: 'explicit',
+		nullable: false,
+		isReadOnly: true,
+	});
 }
 
 function paramRef(name: string): ParameterReferenceNode {
@@ -924,7 +953,7 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 		// and singleton-IN-correlated bindings are skipped uniformly.
 		it('correlated singleton IN (correlated: true) does NOT cover', () => {
 			const c = makeConstraint('IN', 0);
-			c.value = [undefined];
+			c.value = [null];
 			c.bindingKind = 'mixed';
 			c.correlated = true;
 			const result = computeCoveredKeysForConstraints([c], [[0]]);
@@ -984,13 +1013,13 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 			expect(result.allConstraints[0].bindingKind).to.equal('correlated');
 		});
 
-		it('col = sameTableCol → expression binding', () => {
+		it('col = sameTableCol → residual (not a constraint, value unknown until scan)', () => {
 			const col_a = colRef(101, 'a', 1);
 			const col_b = colRef(102, 'b', 2);
 			const expr = binOp('=', col_a, col_b);
 			const result = extractConstraints(expr, [TABLE_A]);
-			expect(result.allConstraints).to.have.length(1);
-			expect(result.allConstraints[0].bindingKind).to.equal('expression');
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.residualPredicate).to.not.equal(undefined);
 		});
 
 		it('param = col (reversed) → parameter binding with flipped op', () => {
@@ -1033,17 +1062,15 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 			expect(result.allConstraints[0].correlated).to.equal(true);
 		});
 
-		// Same-table cast-wrapped ref reaches the 'expression' bindingKind branch
-		// (inner is a same-table column ref) and the walk correctly returns false —
-		// a legitimate same-table filter must not be de-classified.
-		it('p.id = cast(p.b) (cast-wrapped same-table ref) → correlated false, bindingKind expression', () => {
+		// Same-table cast-wrapped ref: the cast unwraps to a same-table ColumnReference,
+		// which is a per-row value and can never be a seek key — declined to residual.
+		it('p.id = cast(p.b) (cast-wrapped same-table ref) → residual (not a constraint)', () => {
 			const id = colRef(100, 'id', 0);
 			const b = colRef(102, 'b', 2);
 			const expr = binOp('=', id, castNode(b));
 			const result = extractConstraints(expr, [TABLE_A]);
-			expect(result.allConstraints).to.have.length(1);
-			expect(result.allConstraints[0].bindingKind).to.equal('expression');
-			expect(result.allConstraints[0].correlated).to.equal(false);
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.residualPredicate).to.exist;
 		});
 
 		// Documents the extractor limitation: a general-expression value side
@@ -1059,14 +1086,14 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 			expect(result.residualPredicate).to.exist;
 		});
 
-		it('p.id = p.b (bare same-table ref) → correlated false', () => {
+		// Same-table bare column ref: per-row value, declined to residual.
+		it('p.id = p.b (bare same-table ref) → residual (not a constraint)', () => {
 			const id = colRef(100, 'id', 0);
 			const b = colRef(102, 'b', 2);
 			const expr = binOp('=', id, b);
 			const result = extractConstraints(expr, [TABLE_A]);
-			expect(result.allConstraints).to.have.length(1);
-			expect(result.allConstraints[0].bindingKind).to.equal('expression');
-			expect(result.allConstraints[0].correlated).to.equal(false);
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.residualPredicate).to.exist;
 		});
 
 		it('p.id = :param → correlated false (parameter does not escape row scope)', () => {
@@ -1164,14 +1191,14 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 	// Edge cases: two-column expressions (no extraction)
 	// ===================================================================
 	describe('two-column binary expressions', () => {
-		it('col = col with no literals → no extraction (no table mapping for value side)', () => {
+		it('col = col with no literals → residual (same-table col ref can never be a seek key)', () => {
 			const a = colRef(101, 'a', 1);
 			const b = colRef(102, 'b', 2);
 			const expr = binOp('=', a, b);
 			const result = extractConstraints(expr, [TABLE_A]);
-			// Both sides are columns from the same table → expression binding
-			expect(result.allConstraints).to.have.length(1);
-			expect(result.allConstraints[0].bindingKind).to.equal('expression');
+			// Both sides are columns from the same table — value is unknown until the row is scanned.
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.residualPredicate).to.not.equal(undefined);
 		});
 	});
 
@@ -1240,12 +1267,17 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 	});
 
 	// ===================================================================
-	// CastNode wrapping — tests that unwrapCast works for col/lit/param
+	// CAST wrapping: a no-op cast is value-preserving and may be stripped;
+	// a converting cast changes the compared value and must block pushdown.
+	// `colRef` is INTEGER-typed, so castNode(col, 'INTEGER') is a no-op and
+	// castNode(col) (default TEXT) converts. A `lit(n)` JS number types as REAL,
+	// so its no-op cast target is 'REAL'. Regression cover for
+	// `bug-cast-stripped-from-seek-constraints`.
 	// ===================================================================
-	describe('CastNode wrapping (unwrapCast)', () => {
-		it('CAST(col) = lit → extracts through cast', () => {
+	describe('CAST wrapping — no-op strips, converting cast blocks extraction', () => {
+		it('no-op CAST(col) = lit → extracts', () => {
 			const col = colRef(101, 'a', 1);
-			const expr = binOp('=', castNode(col), lit(42));
+			const expr = binOp('=', castNode(col, 'INTEGER'), lit(42));
 			const result = extractConstraints(expr, [TABLE_A]);
 			expect(result.allConstraints).to.have.length(1);
 			expect(result.allConstraints[0].op).to.equal('=');
@@ -1253,68 +1285,257 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 			expect(result.allConstraints[0].value).to.equal(42);
 		});
 
-		it('col = CAST(lit) → extracts through cast on literal', () => {
+		it('converting CAST(col) = lit → no constraint, residual predicate', () => {
 			const col = colRef(101, 'a', 1);
-			const expr = binOp('=', col, castNode(lit(42)));
+			const expr = binOp('=', castNode(col, 'TEXT'), lit(42));
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.residualPredicate).to.exist;
+		});
+
+		it('chained no-op CASTs over col → still extracts', () => {
+			const col = colRef(101, 'a', 1);
+			const expr = binOp('=', castNode(castNode(col, 'INTEGER'), 'INTEGER'), lit(42));
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(1);
+			expect(result.allConstraints[0].columnIndex).to.equal(1);
+		});
+
+		it('col = no-op CAST(lit) → extracts with the literal value', () => {
+			const col = colRef(101, 'a', 1);
+			const expr = binOp('=', col, castNode(lit(42), 'REAL'));
 			const result = extractConstraints(expr, [TABLE_A]);
 			expect(result.allConstraints).to.have.length(1);
 			expect(result.allConstraints[0].op).to.equal('=');
 			expect(result.allConstraints[0].value).to.equal(42);
+			expect(result.allConstraints[0].bindingKind).to.equal('literal');
 		});
 
-		it('CAST(col) = CAST(lit) → extracts through double cast', () => {
+		// `getLiteralValue` returns the pre-cast value, so extracting through a
+		// converting cast on the literal side would seek on the integer 42 for
+		// `a = cast(42 as text)`. Decline instead.
+		it('col = converting CAST(lit) → no constraint, residual predicate', () => {
 			const col = colRef(101, 'a', 1);
-			const expr = binOp('=', castNode(col), castNode(lit(7)));
+			const expr = binOp('=', col, castNode(lit(42), 'TEXT'));
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.residualPredicate).to.exist;
+		});
+
+		it('no-op CAST(col) = no-op CAST(lit) → extracts through both', () => {
+			const col = colRef(101, 'a', 1);
+			const expr = binOp('=', castNode(col, 'INTEGER'), castNode(lit(7), 'REAL'));
 			const result = extractConstraints(expr, [TABLE_A]);
 			expect(result.allConstraints).to.have.length(1);
 			expect(result.allConstraints[0].value).to.equal(7);
 		});
 
-		it('CAST(lit) < col → flip works through cast', () => {
+		it('converting CAST(col) = converting CAST(lit) → no constraint', () => {
 			const col = colRef(101, 'a', 1);
-			const expr = binOp('<', castNode(lit(3)), col);
+			const expr = binOp('=', castNode(col, 'TEXT'), castNode(lit(7), 'TEXT'));
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.residualPredicate).to.exist;
+		});
+
+		it('no-op CAST(lit) < col → flip works through cast', () => {
+			const col = colRef(101, 'a', 1);
+			const expr = binOp('<', castNode(lit(3), 'REAL'), col);
 			const result = extractConstraints(expr, [TABLE_A]);
 			expect(result.allConstraints).to.have.length(1);
 			expect(result.allConstraints[0].op).to.equal('>');
 			expect(result.allConstraints[0].value).to.equal(3);
 		});
 
-		it('BETWEEN with CAST(col) → extracts', () => {
+		it('converting CAST(lit) < col → no constraint, residual predicate', () => {
 			const col = colRef(101, 'a', 1);
-			const expr = betweenNode(castNode(col), lit(10), lit(20));
+			const expr = binOp('<', castNode(lit(3), 'TEXT'), col);
 			const result = extractConstraints(expr, [TABLE_A]);
-			// CastNode wrapping the column — unwrapCast should handle it
-			// But actually BetweenNode checks `expr.expr` which is the cast itself
-			// The extraction checks isColumnReference(col) which calls unwrapCast
-			expect(result.allConstraints.length).to.be.greaterThanOrEqual(0);
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.residualPredicate).to.exist;
 		});
 
-		it('IN with CAST(col) → extraction depends on nodeType check', () => {
+		it('BETWEEN over no-op CAST(col) → extracts both bounds', () => {
 			const col = colRef(101, 'a', 1);
-			// InNode checks condition.nodeType === PlanNodeType.ColumnReference directly
-			// A cast wrapping means condition.nodeType is Cast, not ColumnReference
+			const expr = betweenNode(castNode(col, 'INTEGER'), lit(10), lit(20));
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(2);
+			expect(result.allConstraints.map(c => c.op).sort()).to.deep.equal(['<=', '>=']);
+		});
+
+		it('BETWEEN over converting CAST(col) → residual, no range constraints', () => {
+			const col = colRef(101, 'a', 1);
+			const expr = betweenNode(castNode(col, 'TEXT'), lit(10), lit(20));
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.residualPredicate).to.exist;
+		});
+
+		it('IN with CAST(col) condition → not extracted (InNode requires a bare column ref)', () => {
+			const col = colRef(101, 'a', 1);
 			const expr = inNode(castNode(col), [lit(1), lit(2)]);
 			const result = extractConstraints(expr, [TABLE_A]);
-			// InNode doesn't unwrap cast on the condition — this goes to residual
 			expect(result.allConstraints).to.have.length(0);
 		});
 
-		it('IS NULL on CAST(col) → extraction depends on unwrapCast', () => {
+		it('IS NULL on no-op CAST(col) → extracts', () => {
 			const col = colRef(101, 'a', 1);
-			const expr = unaryOp('IS NULL', castNode(col));
+			const expr = unaryOp('IS NULL', castNode(col, 'INTEGER'));
 			const result = extractConstraints(expr, [TABLE_A]);
-			// extractNullConstraint calls isColumnReference which calls unwrapCast
 			expect(result.allConstraints).to.have.length(1);
 			expect(result.allConstraints[0].op).to.equal('IS NULL');
 		});
 
-		it('col = CAST(param) → parameter binding through cast', () => {
+		// `cast(x as text) is null` is null-preserving today, but the constraint
+		// would name column `a` while the seek shape describes the cast's output.
+		// Decline rather than reason about it.
+		it('IS NULL on converting CAST(col) → residual', () => {
+			const col = colRef(101, 'a', 1);
+			const expr = unaryOp('IS NULL', castNode(col, 'TEXT'));
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.residualPredicate).to.exist;
+		});
+
+		// Value-side casts over a parameter stay usable: `valueExpr` retains the
+		// whole CastNode and is evaluated at runtime, so `bindingKind` may be
+		// classified through a converting cast.
+		it('col = converting CAST(param) → parameter binding, cast retained in valueExpr', () => {
 			const col = colRef(101, 'a', 1);
 			const param = paramRef(':p1');
-			const expr = binOp('=', col, castNode(param));
+			const cast = castNode(param, 'TEXT');
+			const expr = binOp('=', col, cast);
 			const result = extractConstraints(expr, [TABLE_A]);
 			expect(result.allConstraints).to.have.length(1);
 			expect(result.allConstraints[0].bindingKind).to.equal('parameter');
+			expect(result.allConstraints[0].valueExpr).to.equal(cast);
+		});
+
+		it('col = no-op CAST(param) → parameter binding', () => {
+			const col = colRef(101, 'a', 1);
+			const param = paramRef(':p1');
+			const expr = binOp('=', col, castNode(param, 'INTEGER'));
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(1);
+			expect(result.allConstraints[0].bindingKind).to.equal('parameter');
+		});
+
+		// Covered-key integration: a converting cast on the key column must not
+		// produce a covering equality (no false ≤1-row claim).
+		it('converting CAST(pk) = lit → PK not covered', () => {
+			const id = colRef(100, 'id', 0);
+			const expr = binOp('=', castNode(id, 'TEXT'), lit(1));
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.coveredKeysByTable!.get('t') ?? []).to.have.length(0);
+		});
+
+		it('no-op CAST(pk) = lit → PK covered', () => {
+			const id = colRef(100, 'id', 0);
+			const expr = binOp('=', castNode(id, 'INTEGER'), lit(1));
+			const result = extractConstraints(expr, [TABLE_A]);
+			const covered = result.coveredKeysByTable!.get('t')!;
+			expect(covered).to.have.length(1);
+			expect(covered[0]).to.deep.equal([0]);
+		});
+
+		it('pk = converting CAST(lit) → PK not covered', () => {
+			const id = colRef(100, 'id', 0);
+			const expr = binOp('=', id, castNode(lit(1), 'TEXT'));
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.coveredKeysByTable!.get('t') ?? []).to.have.length(0);
+		});
+
+		// OR collapse: every branch must survive extraction, so a converting cast
+		// in one branch keeps the whole OR residual.
+		it('converting CAST(col)=1 OR converting CAST(col)=2 → residual, no IN collapse', () => {
+			const col = colRef(101, 'a', 1);
+			const expr = orNode(
+				binOp('=', castNode(col, 'TEXT'), lit(1)),
+				binOp('=', castNode(col, 'TEXT'), lit(2)),
+			);
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.residualPredicate).to.exist;
+		});
+
+		it('no-op CAST(col)=1 OR no-op CAST(col)=2 → IN (1,2)', () => {
+			const col = colRef(101, 'a', 1);
+			const expr = orNode(
+				binOp('=', castNode(col, 'INTEGER'), lit(1)),
+				binOp('=', castNode(col, 'INTEGER'), lit(2)),
+			);
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(1);
+			expect(result.allConstraints[0].op).to.equal('IN');
+			expect(result.allConstraints[0].value).to.deep.equal([1, 2]);
+		});
+
+		// A converting cast on the column side no longer makes that column the
+		// constrained one. When the *other* side is a bare column of another
+		// table, the constraint rebinds to it: `u.y = cast(t.a as text)` is a
+		// sound correlated seek on `u`, with the cast evaluated at runtime.
+		it('converting CAST(t.a) = u.y → constraint binds to u.y, cast kept in valueExpr', () => {
+			const a = colRef(101, 'a', 1);
+			const y = colRef(201, 'y', 1);
+			const cast = castNode(a, 'TEXT');
+			const expr = binOp('=', cast, y);
+			const result = extractConstraints(expr, [TABLE_A, TABLE_B]);
+			expect(result.allConstraints).to.have.length(1);
+			const c = result.allConstraints[0];
+			expect(c.targetRelation).to.equal('u');
+			expect(c.attributeId).to.equal(201);
+			expect(c.op).to.equal('=');
+			expect(c.bindingKind).to.equal('correlated');
+			expect(c.correlated).to.equal(true);
+			expect(c.valueExpr).to.equal(cast);
+		});
+
+		// Same-table on both sides: the value is unknown until the row is
+		// scanned, so no seek key exists either way.
+		it('converting CAST(t.a) = t.b → no constraint, residual predicate', () => {
+			const a = colRef(101, 'a', 1);
+			const b = colRef(102, 'b', 2);
+			const expr = binOp('=', castNode(a, 'TEXT'), b);
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.residualPredicate).to.exist;
+		});
+
+		// Value side is the cast: the column side is untouched, so the seek on
+		// `t.a` survives and evaluates the cast per outer row.
+		it('t.a = converting CAST(u.y) → correlated constraint on t.a, cast kept in valueExpr', () => {
+			const a = colRef(101, 'a', 1);
+			const y = colRef(201, 'y', 1);
+			const cast = castNode(y, 'TEXT');
+			const expr = binOp('=', a, cast);
+			const result = extractConstraints(expr, [TABLE_A, TABLE_B]);
+			const c = result.allConstraints.find(x => x.targetRelation === 't')!;
+			expect(c).to.exist;
+			expect(c.attributeId).to.equal(101);
+			expect(c.bindingKind).to.equal('correlated');
+			expect(c.valueExpr).to.equal(cast);
+		});
+
+		// IN list elements go through `getLiteralValue`, which returns the
+		// pre-cast value — so a converting cast in the list must decline rather
+		// than extract `a IN (1)` for `a IN (cast(1 as text))`.
+		it('col IN (converting CAST(lit)) → no constraint, residual predicate', () => {
+			const col = colRef(101, 'a', 1);
+			const expr = inNode(col, [castNode(lit(1), 'TEXT')]);
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.residualPredicate).to.exist;
+		});
+
+		it('col IN (no-op CAST(lit)) → extracts with the literal value', () => {
+			const col = colRef(101, 'a', 1);
+			const expr = inNode(col, [castNode(lit(1), 'REAL')]);
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(1);
+			expect(result.allConstraints[0].op).to.equal('IN');
+			expect(result.allConstraints[0].value).to.deep.equal([1]);
 		});
 	});
 
@@ -1442,6 +1663,93 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 			expect(result.allConstraints[0].op).to.equal('IN');
 			expect(result.allConstraints[0].bindingKind).to.equal('mixed');
 			expect(result.allConstraints[0].valueExpr).to.exist;
+		});
+	});
+
+	// ===================================================================
+	// OR collapse collation gate (or-equality-collapse-collation-blind):
+	// a collapse is sound only when every disjunct's effective comparison
+	// collation equals the column operand's own collation (what the collapsed
+	// IN / OR_RANGE compares under). Mismatches must produce NO constraint and
+	// a residualPredicate — this is the "no seek strips the residual"
+	// guarantee at its source.
+	// ===================================================================
+	describe('OR collapse — collation gate', () => {
+		it('eq→IN under-match: NOCASE-collated literals over a plain TEXT column → no constraint, OR residual', () => {
+			const expr = orNode(
+				binOp('=', textColRef(102, 'b', 2), collatedLit('bob', 'NOCASE')),
+				binOp('=', textColRef(102, 'b', 2), collatedLit('x', 'NOCASE'))
+			);
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.residualPredicate).to.exist;
+		});
+
+		it('eq→IN over-match: BINARY-collated literals over a NOCASE-declared column → no constraint, OR residual', () => {
+			const expr = orNode(
+				binOp('=', textColRef(102, 'b', 2, 'NOCASE'), collatedLit('bob', 'BINARY')),
+				binOp('=', textColRef(102, 'b', 2, 'NOCASE'), collatedLit('x', 'BINARY'))
+			);
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.residualPredicate).to.exist;
+		});
+
+		it('eq-as-range→OR_RANGE: NOCASE-collated equality + plain range over a plain column → no constraint, OR residual', () => {
+			const expr = orNode(
+				binOp('=', textColRef(102, 'b', 2), collatedLit('bob', 'NOCASE')),
+				binOp('>', textColRef(102, 'b', 2), lit('z'))
+			);
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.residualPredicate).to.exist;
+		});
+
+		it('BETWEEN branch with a NOCASE-collated bound → no OR_RANGE, OR residual', () => {
+			const expr = orNode(
+				betweenNode(textColRef(102, 'b', 2), collatedLit('a', 'NOCASE'), lit('m')),
+				binOp('>', textColRef(102, 'b', 2), lit('z'))
+			);
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.residualPredicate).to.exist;
+		});
+
+		it('matched: NOCASE-declared column with NOCASE-collated and plain literals → IN still fires', () => {
+			const expr = orNode(
+				binOp('=', textColRef(102, 'b', 2, 'NOCASE'), collatedLit('bob', 'NOCASE')),
+				binOp('=', textColRef(102, 'b', 2, 'NOCASE'), lit('x'))
+			);
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(1);
+			expect(result.allConstraints[0].op).to.equal('IN');
+			expect(result.allConstraints[0].value).to.deep.equal(['bob', 'x']);
+			expect(result.residualPredicate).to.be.undefined;
+		});
+
+		it('matched: plain range disjuncts over a NOCASE-declared column → OR_RANGE still fires', () => {
+			const expr = orNode(
+				binOp('<', textColRef(102, 'b', 2, 'NOCASE'), lit('a')),
+				binOp('>', textColRef(102, 'b', 2, 'NOCASE'), lit('m'))
+			);
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(1);
+			expect(result.allConstraints[0].op).to.equal('OR_RANGE');
+		});
+
+		it('written order is immaterial: a NOCASE-folded literal on EITHER side of a BINARY-declared column makes the comparison NOCASE → collapse declined', () => {
+			// `'bob' COLLATE NOCASE = b` compares NOCASE regardless of spelling
+			// order (explicit rank 3 outranks the declared BINARY in the
+			// symmetric provenance lattice), so collapsing into an IN that the
+			// column's BINARY collation would drive is unsound — the gate must
+			// keep the OR residual.
+			const expr = orNode(
+				binOp('=', collatedLit('bob', 'NOCASE'), textColRef(102, 'b', 2, 'BINARY')),
+				binOp('=', textColRef(102, 'b', 2, 'BINARY'), lit('x'))
+			);
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.residualPredicate).to.exist;
 		});
 	});
 
@@ -1919,14 +2227,13 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 			expect(c.valueExpr).to.exist;
 		});
 
-		it('col = otherCol (same table) → expression binding', () => {
+		it('col = otherCol (same table) → residual (value unknown until row scanned)', () => {
 			const a = colRef(101, 'a', 1);
 			const b = colRef(102, 'b', 2);
 			const expr = binOp('=', a, b);
 			const result = extractConstraints(expr, [TABLE_A]);
-			const c = result.allConstraints[0];
-			expect(c.bindingKind).to.equal('expression');
-			expect(c.valueExpr).to.exist;
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.residualPredicate).to.not.equal(undefined);
 		});
 
 		it('col = otherTableCol → correlated binding', () => {
@@ -2732,14 +3039,14 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 			expect(c.valueExpr).to.exist;
 		});
 
-		it('col(left) = cast(lit)(right) → nonLiteral true but valueSide is literal', () => {
+		it('col(left) = no-op cast(lit)(right) → nonLiteral true but valueSide is literal', () => {
 			const col = colRef(101, 'a', 1);
-			const expr = binOp('=', col, castNode(lit(42)));
+			const expr = binOp('=', col, castNode(lit(42), 'REAL'));
 			const result = extractConstraints(expr, [TABLE_A]);
 			const c = result.allConstraints[0];
 			// nonLiteral = !isLiteral(col) || !isLiteral(cast(lit)) = true || false = true
-			// valueSide = rhs = cast(lit), isLiteralConstant(cast(lit)) = true (unwraps)
-			// → enters the "literal" branch inside nonLiteral block
+			// valueSide = rhs = cast(lit), isLiteralConstant(cast(lit)) = true (the
+			// no-op cast unwraps) → enters the "literal" branch inside nonLiteral block
 			expect(c.bindingKind).to.equal('literal');
 			expect(c.valueExpr).to.be.undefined;
 		});

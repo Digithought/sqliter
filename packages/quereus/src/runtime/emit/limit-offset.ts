@@ -1,5 +1,6 @@
 import type { LimitOffsetNode } from '../../planner/nodes/limit-offset.js';
-import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import { emitPlanNode, emitCallFromPlan } from '../emitters.js';
 import { type SqlValue, type Row, MaybePromise } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
@@ -67,7 +68,7 @@ export function emitLimitOffset(plan: LimitOffsetNode, ctx: EmissionContext): In
 
 	return {
 		params,
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `limit_offset(${plan.limit ? 'LIMIT' : ''}${plan.limit && plan.offset ? ',' : ''}${plan.offset ? 'OFFSET' : ''})`
 	};
 }

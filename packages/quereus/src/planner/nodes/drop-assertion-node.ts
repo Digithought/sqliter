@@ -11,6 +11,7 @@ export class DropAssertionNode extends VoidNode {
 
   constructor(
     scope: Scope,
+    public readonly schemaName: string,
     public readonly name: string,
     public readonly ifExists: boolean,
   ) {
@@ -18,11 +19,12 @@ export class DropAssertionNode extends VoidNode {
   }
 
   override toString(): string {
-    return `DROP ASSERTION ${this.name}`;
+    return `DROP ASSERTION ${this.schemaName}.${this.name}`;
   }
 
   override getLogicalAttributes(): Record<string, unknown> {
     return {
+      schemaName: this.schemaName,
       name: this.name,
       ifExists: this.ifExists,
     };

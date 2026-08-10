@@ -1,0 +1,55 @@
+-- 10.5.4-composite-pk-index-update-phantom.sqllogic
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Regression: a composite-PK table with a secondary index on a non-PK column.
+-- Updating (or deleting) the indexed column must drop the OLD index entry's
+-- primary key so a later seek of the OLD value yields no phantom row.
+--
+-- Pre-fix, MemoryIndexEntry.primaryKeys was a JS Set keyed by reference; a
+-- composite PK is a freshly-allocated array each extraction, so removeEntry
+-- could never drop it by value. The stale PK lingered in the OLD index entry
+-- and a `WHERE v = <old>` seek through that index surfaced the row even though
+-- its value had changed.
+--
+-- NOTE: whether this manifests end-to-end depends on the access planner
+-- routing the equality seek through the secondary index. If it full-scans the
+-- primary tree it would return the correct (empty) result regardless of the
+-- bug — the authoritative regression lives in
+-- test/vtab/memory-index-pk-value-identity.spec.ts at the MemoryIndex level.
+
+CREATE TABLE ci (a INTEGER, b INTEGER, v INTEGER, PRIMARY KEY (a, b));
+INSERT INTO ci VALUES (1, 1, 100), (1, 2, 200), (2, 1, 300);
+CREATE INDEX ci_v ON ci (v);
+
+-- Baseline: the indexed seek finds the right row before any update.
+SELECT a, b FROM ci WHERE v = 100;
+→ [{"a":1,"b":1}]
+
+-- Update the indexed column of the (1,1) row: 100 -> 999.
+UPDATE ci SET v = 999 WHERE a = 1 AND b = 1;
+
+-- Seek the OLD index value: must be empty (no phantom from a stale PK).
+SELECT a, b FROM ci WHERE v = 100;
+→ []
+
+-- The NEW value is findable, mapped to exactly the updated row.
+SELECT a, b FROM ci WHERE v = 999 ORDER BY a, b;
+→ [{"a":1,"b":1}]
+
+-- Untouched rows are unaffected.
+SELECT a, b FROM ci WHERE v = 200;
+→ [{"a":1,"b":2}]
+SELECT a, b FROM ci WHERE v = 300;
+→ [{"a":2,"b":1}]
+
+-- Delete a composite-PK row and confirm its index value drops out too.
+DELETE FROM ci WHERE a = 1 AND b = 2;
+SELECT a, b FROM ci WHERE v = 200;
+→ []
+
+-- Full ordered view: only the live rows remain.
+SELECT a, b, v FROM ci ORDER BY a, b;
+→ [{"a":1,"b":1,"v":999},{"a":2,"b":1,"v":300}]
+
+DROP TABLE ci;

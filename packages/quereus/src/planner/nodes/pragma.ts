@@ -1,6 +1,6 @@
 import type { SqlValue } from '../../common/types.js';
 import * as AST from '../../parser/ast.js';
-import { Attribute, type RelationalPlanNode } from './plan-node.js';
+import { Attribute, type RelationalPlanNode, type PhysicalProperties } from './plan-node.js';
 import { PlanNodeType } from './plan-node-type.js';
 import { expressionToString } from '../../emit/ast-stringify.js';
 import { PlanNode } from './plan-node.js';
@@ -8,6 +8,7 @@ import type { RelationType } from '../../common/datatype.js';
 import type { Scope } from '../scopes/scope.js';
 import { TEXT_TYPE } from '../../types/builtin-types.js';
 import { Cached } from '../../util/cached.js';
+import { addSingletonFd } from '../util/fd-utils.js';
 
 export class PragmaPlanNode extends PlanNode implements RelationalPlanNode {
 	override readonly nodeType = PlanNodeType.Pragma;
@@ -76,6 +77,18 @@ export class PragmaPlanNode extends PlanNode implements RelationalPlanNode {
 
 	getChildren(): PlanNode[] {
 		return [];
+	}
+
+	override computePhysical(): Partial<PhysicalProperties> {
+		// A PRAGMA read yields exactly one row; a PRAGMA write yields none. Either
+		// way the relation is ≤1-row, so back the declared empty key in
+		// `RelationType.keys` with the canonical singleton `∅ → all_cols` FD. The
+		// two channels are read independently — `keysOf` surfaces the declared key,
+		// while `characteristics.guaranteesUniqueRows` / join-commute read the FD —
+		// so both must carry the ≤1-row fact (see the independent-channel singleton
+		// law in test/property.spec.ts).
+		const fds = addSingletonFd([], this.getType().columns.length);
+		return { estimatedRows: 1, fds: fds.length > 0 ? fds : undefined };
 	}
 
 	withChildren(_newChildren: readonly PlanNode[]): PlanNode {

@@ -10,9 +10,11 @@ import { createLogger } from '../../common/logger.js';
 import type { SqlValue, JSONValue } from '../../common/types.js';
 import { createScalarFunction, createAggregateFunction } from '../registration.js';
 import { coerceToJsonValue, resolveJsonPathForModify, prepareJsonValue, deepCopyJson, getJsonType } from './json-helpers.js';
+import { ANY_RETURN, BOOLEAN_RETURN_NOT_NULL, INTEGER_RETURN, JSON_RETURN, TEXT_RETURN } from './return-types.js';
 import type { ScalarFunctionCallNode } from '../../planner/nodes/function.js';
 import type { EmissionContext } from '../../runtime/emission-context.js';
-import type { Instruction, InstructionRun, RuntimeContext } from '../../runtime/types.js';
+import type { Instruction, RuntimeContext } from '../../runtime/types.js';
+import { asRun } from '../../runtime/types.js';
 import { PlanNodeType } from '../../planner/nodes/plan-node-type.js';
 import { LiteralNode } from '../../planner/nodes/scalar.js';
 import { emitPlanNode } from '../../runtime/emitters.js';
@@ -24,7 +26,7 @@ const errorLog = log.extend('error');
 
 // json_valid(X)
 export const jsonValidFunc = createScalarFunction(
-	{ name: 'json_valid', numArgs: 1, deterministic: true },
+	{ name: 'json_valid', numArgs: 1, deterministic: true, returnType: BOOLEAN_RETURN_NOT_NULL },
 	(json: SqlValue): SqlValue => {
 		if (json === null) return false;
 		// Native objects are always valid JSON
@@ -77,7 +79,7 @@ function emitJsonSchema(
 
 				return {
 					params: [jsonArgInstruction],
-					run: run as InstructionRun,
+					run: asRun(run),
 					note: `json_schema(cached:${schemaDef.substring(0, 20)}...)`
 				};
 			} catch (e) {
@@ -91,7 +93,7 @@ function emitJsonSchema(
 
 // json_schema(X, schema_def)
 export const jsonSchemaFunc = createScalarFunction(
-	{ name: 'json_schema', numArgs: 2, deterministic: true },
+	{ name: 'json_schema', numArgs: 2, deterministic: true, returnType: BOOLEAN_RETURN_NOT_NULL },
 	(json: SqlValue, schemaDef: SqlValue): SqlValue => {
 		if (typeof schemaDef !== 'string') return false;
 
@@ -114,7 +116,7 @@ jsonSchemaFunc.customEmitter = emitJsonSchema;
 
 // json_type(X, P?)
 export const jsonTypeFunc = createScalarFunction(
-	{ name: 'json_type', numArgs: -1, deterministic: true },
+	{ name: 'json_type', numArgs: -1, deterministic: true, returnType: TEXT_RETURN },
 	(json: SqlValue, path?: SqlValue): SqlValue => {
 		const data = coerceToJsonValue(json);
 		if (data === undefined) return null;
@@ -131,8 +133,11 @@ export const jsonTypeFunc = createScalarFunction(
 );
 
 // json_extract(X, P1, P2, ...)
+// ANY is declared deliberately, not forgotten: the result is whatever the path
+// resolves to — a JSON object/array, a string, a number, a boolean — and nothing
+// about the argument types narrows it. Every other JSON builtin declares a real type.
 export const jsonExtractFunc = createScalarFunction(
-	{ name: 'json_extract', numArgs: -1, deterministic: true },
+	{ name: 'json_extract', numArgs: -1, deterministic: true, returnType: ANY_RETURN },
 	(json: SqlValue, ...paths: SqlValue[]): SqlValue => {
 		const data = coerceToJsonValue(json);
 		if (data === undefined) return null;
@@ -163,9 +168,9 @@ export const jsonExtractFunc = createScalarFunction(
 	}
 );
 
-// json_quote(X)
+// json_quote(X) — serialized JSON *source text*, not a native JSON value
 export const jsonQuoteFunc = createScalarFunction(
-	{ name: 'json_quote', numArgs: 1, deterministic: true },
+	{ name: 'json_quote', numArgs: 1, deterministic: true, returnType: TEXT_RETURN },
 	(value: SqlValue): SqlValue => {
 		if (value === null) return 'null';
 		switch (typeof value) {
@@ -192,8 +197,11 @@ export const jsonQuoteFunc = createScalarFunction(
 );
 
 // json_array(X, Y, ...) — returns native array
+// NOTE: JSON_RETURN is nullable, but this one provably never returns null. Declaring the
+// looser truth keeps every JSON-returning builtin on one constant. If a NOT NULL
+// inference ever keys off scalar-function nullability, give this a not-null variant.
 export const jsonArrayFunc = createScalarFunction(
-	{ name: 'json_array', numArgs: -1, deterministic: true },
+	{ name: 'json_array', numArgs: -1, deterministic: true, returnType: JSON_RETURN },
 	(...args: SqlValue[]): SqlValue => {
 		return args.map(arg => prepareJsonValue(arg));
 	}
@@ -201,7 +209,7 @@ export const jsonArrayFunc = createScalarFunction(
 
 // json_object(N1, V1, N2, V2, ...) — returns native object
 export const jsonObjectFunc = createScalarFunction(
-	{ name: 'json_object', numArgs: -1, deterministic: true },
+	{ name: 'json_object', numArgs: -1, deterministic: true, returnType: JSON_RETURN },
 	(...args: SqlValue[]): SqlValue => {
 		if (args.length % 2 !== 0) return null;
 		const obj: Record<string, JSONValue> = {};
@@ -219,7 +227,7 @@ export const jsonObjectFunc = createScalarFunction(
 
 // json_array_length(json, path?)
 export const jsonArrayLengthFunc = createScalarFunction(
-	{ name: 'json_array_length', numArgs: -1, deterministic: true },
+	{ name: 'json_array_length', numArgs: -1, deterministic: true, returnType: INTEGER_RETURN },
 	(json: SqlValue, path?: SqlValue): SqlValue => {
 		const data = coerceToJsonValue(json);
 		if (data === undefined) return null;
@@ -237,7 +245,7 @@ export const jsonArrayLengthFunc = createScalarFunction(
 
 // json_patch(json, patch) — returns native object
 export const jsonPatchFunc = createScalarFunction(
-	{ name: 'json_patch', numArgs: 2, deterministic: false },
+	{ name: 'json_patch', numArgs: 2, deterministic: false, returnType: JSON_RETURN },
 	(json: SqlValue, patchVal: SqlValue): SqlValue => {
 		const data = coerceToJsonValue(json);
 		const patchData = coerceToJsonValue(patchVal);
@@ -267,7 +275,7 @@ export const jsonPatchFunc = createScalarFunction(
 
 // json_insert(JSON, PATH, VALUE, PATH, VALUE, ...) — returns native object
 export const jsonInsertFunc = createScalarFunction(
-	{ name: 'json_insert', numArgs: -1, deterministic: true },
+	{ name: 'json_insert', numArgs: -1, deterministic: true, returnType: JSON_RETURN },
 	(json: SqlValue, ...args: SqlValue[]): SqlValue => {
 		const data = coerceToJsonValue(json);
 		if (data === undefined) return null;
@@ -309,7 +317,7 @@ export const jsonInsertFunc = createScalarFunction(
 
 // json_replace(JSON, PATH, VALUE, PATH, VALUE, ...) — returns native object
 export const jsonReplaceFunc = createScalarFunction(
-	{ name: 'json_replace', numArgs: -1, deterministic: true },
+	{ name: 'json_replace', numArgs: -1, deterministic: true, returnType: JSON_RETURN },
 	(json: SqlValue, ...args: SqlValue[]): SqlValue => {
 		const data = coerceToJsonValue(json);
 		if (data === undefined) return null;
@@ -349,7 +357,7 @@ export const jsonReplaceFunc = createScalarFunction(
 
 // json_set(JSON, PATH, VALUE, PATH, VALUE, ...) — returns native object
 export const jsonSetFunc = createScalarFunction(
-	{ name: 'json_set', numArgs: -1, deterministic: true },
+	{ name: 'json_set', numArgs: -1, deterministic: true, returnType: JSON_RETURN },
 	(json: SqlValue, ...args: SqlValue[]): SqlValue => {
 		const data = coerceToJsonValue(json);
 		if (data === undefined) return null;
@@ -396,7 +404,7 @@ export const jsonSetFunc = createScalarFunction(
 
 // json_remove(JSON, PATH, PATH, ...) — returns native object
 export const jsonRemoveFunc = createScalarFunction(
-	{ name: 'json_remove', numArgs: -1, deterministic: true },
+	{ name: 'json_remove', numArgs: -1, deterministic: true, returnType: JSON_RETURN },
 	(json: SqlValue, ...paths: SqlValue[]): SqlValue => {
 		const data = coerceToJsonValue(json);
 		if (data === undefined) return null;
@@ -434,7 +442,7 @@ export const jsonRemoveFunc = createScalarFunction(
 
 // json_group_array(value) — returns native array
 export const jsonGroupArrayFunc = createAggregateFunction(
-	{ name: 'json_group_array', numArgs: 1, initialValue: [] },
+	{ name: 'json_group_array', numArgs: 1, initialValue: [], returnType: JSON_RETURN },
 	(acc: JSONValue[], value: SqlValue): JSONValue[] => {
 		acc.push(prepareJsonValue(value));
 		return acc;
@@ -446,7 +454,7 @@ export const jsonGroupArrayFunc = createAggregateFunction(
 
 // json_group_object(name, value) — returns native object
 export const jsonGroupObjectFunc = createAggregateFunction(
-	{ name: 'json_group_object', numArgs: 2, initialValue: {} },
+	{ name: 'json_group_object', numArgs: 2, initialValue: {}, returnType: JSON_RETURN },
 	(acc: Record<string, JSONValue>, name: SqlValue, value: SqlValue): Record<string, JSONValue> => {
 		if (name === null || name === undefined) {
 			return acc;

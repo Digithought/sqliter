@@ -13,6 +13,11 @@ import type { ScalarFunctionCallNode } from '../nodes/function.js';
 import type { AggregateFunctionCallNode } from '../nodes/aggregate-function.js';
 import type { ArrayIndexNode } from '../nodes/array-index-node.js';
 import type { WindowFunctionCallNode } from '../nodes/window-function.js';
+import type { JSONValue } from '../../common/json-types.js';
+import { canonicalJsonString } from '../../util/json-canonical.js';
+import { createLogger } from '../../common/logger.js';
+
+const log = createLogger('planner:expression-fingerprint');
 
 /** Commutative binary operators where operand order doesn't matter */
 const COMMUTATIVE_OPS = new Set(['+', '*', '=', '!=', '<>', 'AND', 'OR']);
@@ -65,6 +70,10 @@ export function fingerprintExpression(node: ScalarPlanNode): string {
 
 		case PlanNodeType.Cast: {
 			const ca = node as unknown as CastNode;
+			// NOTE: keys off the written target name, so `cast(x as varchar)` and
+			// `cast(x as text)` fingerprint apart even though both resolve to TEXT. Only
+			// costs a missed CSE (never an over-merge); switch to
+			// `ca.getType().logicalType.name` if alias-spelled casts ever need to share.
 			return `CA:${ca.expression.targetType}(${fingerprintExpression(ca.operand)})`;
 		}
 
@@ -109,6 +118,28 @@ function fingerprintLiteral(node: LiteralNode): string {
 	if (typeof value === 'boolean') return `LI:${value}`;
 	if (value instanceof Uint8Array) {
 		return `LI:x${Array.from(value, b => b.toString(16).padStart(2, '0')).join('')}`;
+	}
+	if (typeof value === 'object') {
+		// A JSON document (the only OBJECT-class literal). `String(value)` collapses
+		// every one of them to '[object Object]', which would make CSE treat
+		// `v = {"a":1}` and `v = {"a":2}` as the same expression and evaluate only the
+		// first. Canonical JSON is the same key derivation the value comparator and the
+		// index agree on: reorder-equal documents share a fingerprint, distinct ones
+		// never do.
+		//
+		// NOTE: the fingerprint embeds the whole document, so it grows with the literal.
+		// Fine while literals are hand-written or small folded constants; if large JSON
+		// constants ever become common, hash the canonical string instead of inlining it.
+		try {
+			return `LI:j${canonicalJsonString(value as JSONValue)}`;
+		} catch (e) {
+			// Not serializable (cyclic, or a non-JSON host object). Fall back to a
+			// per-node fingerprint so it is never deduplicated against anything — safe,
+			// but it silently disables CSE for this literal, so say so.
+			log('literal object is not canonicalizable, fingerprinting node %d uniquely: %s',
+				node.id, e instanceof Error ? e.message : String(e));
+			return `LI:?${node.id}`;
+		}
 	}
 	return `LI:?${String(value)}`;
 }

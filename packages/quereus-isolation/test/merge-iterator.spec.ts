@@ -451,4 +451,72 @@ describe('MergeIterator', () => {
 			});
 		});
 	});
+
+	describe('iteration laziness (incremental, not full-materialization)', () => {
+		// A counting async source: yields arr in order while recording how many times
+		// its iterator was pulled. mergeStreams is expected to pull ONE element ahead of
+		// what the consumer has taken — never to drain the whole source up front. A
+		// regression to full-materialization (e.g. buffering the underlying into an array
+		// before merging) would make `pulls` jump to arr.length after a single consume,
+		// which is exactly the range-scan drift this guards against.
+		function countingSource<T>(arr: readonly T[]): { iterable: AsyncIterable<T>; pulls: () => number } {
+			let pulls = 0;
+			const iterable: AsyncIterable<T> = {
+				[Symbol.asyncIterator](): AsyncIterator<T> {
+					let i = 0;
+					return {
+						next: async (): Promise<IteratorResult<T>> => {
+							pulls++;
+							if (i < arr.length) return { done: false, value: arr[i++] };
+							return { done: true, value: undefined };
+						},
+					};
+				},
+			};
+			return { iterable, pulls: () => pulls };
+		}
+
+		it('consuming one element from a large underlying pass-through pulls one row ahead, not the whole stream', async () => {
+			const underlyingRows: Row[] = Array.from({ length: 100 }, (_, i) => [i, `r${i}`] as Row);
+			const underlying = countingSource(underlyingRows);
+
+			const merged = mergeStreams(fromArray<MergeEntry>([]), underlying.iterable, intPKConfig);
+			const iter = merged[Symbol.asyncIterator]();
+
+			const first = await iter.next();
+			expect(first.done).to.be.false;
+			expect(first.value).to.deep.equal([0, 'r0']);
+
+			// The merge primes both heads once up front; consuming the first element must NOT
+			// have pulled all 100 underlying rows. A materializing rewrite would read 100 here.
+			expect(underlying.pulls()).to.be.at.most(2);
+
+			await iter.return?.(undefined);
+		});
+
+		it('a bounded take pulls proportional to what was consumed across the overlay seam', async () => {
+			// Underlying [0..99]; overlay stages an insert (id=50→'x') that must interleave in
+			// order. Take only the first 3 merged rows and assert we did not run past the seam.
+			const underlyingRows: Row[] = Array.from({ length: 100 }, (_, i) => [i, `r${i}`] as Row);
+			const underlying = countingSource(underlyingRows);
+			const overlay = countingSource<MergeEntry>([createMergeEntry([50, 'x'], [50])]);
+
+			const merged = mergeStreams(overlay.iterable, underlying.iterable, intPKConfig);
+			const iter = merged[Symbol.asyncIterator]();
+
+			const taken: Row[] = [];
+			for (let n = 0; n < 3; n++) {
+				const step = await iter.next();
+				expect(step.done).to.be.false;
+				taken.push(step.value);
+			}
+			expect(taken).to.deep.equal([[0, 'r0'], [1, 'r1'], [2, 'r2']]);
+
+			// Three rows consumed near the front of the base ⇒ only a few underlying rows pulled,
+			// nowhere near the staged insert at id=50 and nowhere near draining all 100.
+			expect(underlying.pulls()).to.be.at.most(4);
+
+			await iter.return?.(undefined);
+		});
+	});
 });

@@ -1,38 +1,47 @@
 import type * as AST from '../../parser/ast.js';
-import { PlanNode, type RelationalPlanNode, type ScalarPlanNode } from '../nodes/plan-node.js';
+import { PlanNode, type Attribute, type RelationalPlanNode, type ScalarPlanNode } from '../nodes/plan-node.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import type { PlanningContext } from '../planning-context.js';
 import { SingleRowNode } from '../nodes/single-row.js';
 import { buildTableReference } from './table.js';
+import { isMaintainedTable } from '../../schema/derivation.js';
+import { isViewSchema } from '../../schema/view.js';
 import { AliasedScope } from '../scopes/aliased.js';
 import { RegisteredScope } from '../scopes/registered.js';
 import type { Scope } from '../scopes/scope.js';
 import { MultiScope } from '../scopes/multi.js';
 import { ShadowScope } from '../scopes/shadow.js';
+import { EmptyScope } from '../scopes/empty.js';
 import { ProjectNode, type Projection } from '../nodes/project-node.js';
-import { buildExpression } from './expression.js';
+import { buildComparison, buildExpression } from './expression.js';
 import { FilterNode } from '../nodes/filter.js';
 import { buildTableFunctionCall } from './table-function.js';
 import { CTEReferenceNode } from '../nodes/cte-reference-node.js';
 import { InternalRecursiveCTERefNode as _InternalRecursiveCTERefNode } from '../nodes/internal-recursive-cte-ref-node.js';
 import type { CTEScopeNode, CTEPlanNode } from '../nodes/cte-node.js';
-import { JoinNode } from '../nodes/join-node.js';
+import { JoinNode, type ExistenceColumnSpec } from '../nodes/join-node.js';
+import { EXISTENCE_FLAG_TYPE } from '../nodes/join-utils.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
+import { BinaryOpNode } from '../nodes/scalar.js';
 import { TEXT_TYPE } from '../../types/builtin-types.js';
 import { ValuesNode } from '../nodes/values-node.js';
 import { createLogger } from '../../common/logger.js';
 import { AliasNode } from '../nodes/alias-node.js';
+import { AssertedKeysNode } from '../nodes/asserted-keys-node.js';
+import { computeLensAssertedKeyFds } from '../../schema/lens-prover.js';
+import { buildLensAuxiliaryAccessMarker } from './lens-auxiliary-access.js';
 
 // Import decomposed functionality
-import { buildWithContext } from './select-context.js';
+import { buildWithContext, enterStoredBodyEnv } from './select-context.js';
+import { storedBodyContext } from '../stored-body-context.js';
 import { buildCompoundSelect } from './select-compound.js';
 import { analyzeSelectColumns, buildStarProjections } from './select-projections.js';
-import { buildAggregatePhase, buildFinalAggregateProjections } from './select-aggregates.js';
+import { buildAggregatePhase, buildFinalAggregateProjections, buildGroupedWindowContext, type GroupedWindowContext } from './select-aggregates.js';
 import { buildWindowPhase } from './select-window.js';
 import { buildFinalProjections, applyDistinct, applyOrderBy, applyLimitOffset, createProjectionOutputScope } from './select-modifiers.js';
 import { SortNode, type SortKey } from '../nodes/sort.js';
-import { buildSelectListAsts, resolveOrdinalReference } from './select-ordinal.js';
+import { buildOrdinalAwareExpression, buildSelectListEntries } from './select-ordinal.js';
 
 import { buildInsertStmt } from './insert.js';
 import { buildUpdateStmt } from './update.js';
@@ -61,13 +70,22 @@ export function buildSelectStmt(
   preserveInputColumns: boolean = true
 ): PlanNode {
 
-	// Apply schema path from statement if present
+	// A sub-select copied out of a stored view / MV body by the write-through lowering carries
+	// that body's whole naming environment on the AST node (`AST.StoredBodyEnv`, stamped by
+	// `mapNestedSelects` in `mutation/scope-transform.ts` from `buildViewMutation`). Re-enter
+	// it here — home schema, the body's declared `with schema` path, and the body's own
+	// leading `with` clause as this fragment's parent CTE namespace, in that order. A
+	// pass-through for every other statement; see `enterStoredBodyEnv`.
+	const { ctx: storedCtx, parentCTEs: storedParentCTEs } =
+		enterStoredBodyEnv(ctx, stmt.storedBodyEnv, parentCTEs);
+
+	// A fragment's OWN `with schema` clause outranks the carried path.
 	const contextWithSchemaPath = stmt.schemaPath
-		? { ...ctx, schemaPath: stmt.schemaPath }
-		: ctx;
+		? { ...storedCtx, schemaPath: stmt.schemaPath }
+		: storedCtx;
 
 	// Phase 0: Handle WITH clause if present
-	const { contextWithCTEs, cteNodes } = buildWithContext(contextWithSchemaPath, stmt, parentCTEs);
+	const { contextWithCTEs, cteNodes } = buildWithContext(contextWithSchemaPath, stmt, storedParentCTEs);
 
 	// Handle compound set operations (UNION / INTERSECT / EXCEPT)
 	if (stmt.compound) {
@@ -91,16 +109,36 @@ export function buildSelectStmt(
 	}
 
 	// Phase 2: Create the main scope for this SELECT statement
+	// NOTE: the `|| ft.scope` fallback only fires for the FROM-less SingleRowNode, which
+	// buildFrom never registers. Every scope buildFrom does register is own-only (see
+	// registerColumnScope); a node's own `.scope` is the enclosing chain, so if this
+	// fallback ever starts firing for a real source it silently reinstates the chaining
+	// this ShadowScope exists to replace.
 	const columnScopes = fromTables.map(ft => ctx.outputScopes.get(ft) || ft.scope).filter(Boolean);
 	const selectScope = new ShadowScope([...columnScopes, contextWithCTEs.scope]);
 	let selectContext: PlanningContext = { ...contextWithCTEs, scope: selectScope };
 
 	let input: RelationalPlanNode = fromTables[0];
 
-	// Plan WHERE clause
+	// Plan WHERE clause. An enclosing aggregate query's `aggregates` context is
+	// still visible here so a correlated outer-aggregate reference in a subquery's
+	// WHERE (e.g. `… where lim.cap = sum(ord.amt)`, sum from the outer GROUP BY)
+	// resolves to that outer aggregate's output column.
 	if (stmt.where) {
 		const whereExpression = buildExpression(selectContext, stmt.where);
 		input = new FilterNode(selectScope, input, whereExpression);
+	}
+
+	// From here on this SELECT collects and resolves its OWN aggregates. Drop any
+	// enclosing query's aggregate context so a nested aggregate this level
+	// introduces — e.g. `(select count(*) from c)` in the ORDER BY of a GROUP BY
+	// query — is not fingerprint-matched against an outer aggregate in
+	// buildFunctionCall and bound to the outer output alias (which degenerates the
+	// subquery into a multi-row column read: "Scalar subquery returned more than
+	// one row"). This level repopulates `aggregates` for its own HAVING/ORDER BY
+	// once buildAggregatePhase has built them. (fix/order-by-aggregate-subquery-scope-leak)
+	if (selectContext.aggregates) {
+		selectContext = { ...selectContext, aggregates: undefined };
 	}
 
 	// Build projections based on the SELECT list
@@ -108,39 +146,61 @@ export function buildSelectStmt(
 
 	// Analyze SELECT columns
 	const {
-		projections: columnProjections,
+		projectionsByColumn,
 		aggregates,
 		windowFunctions,
 		hasAggregates: hasAggregatesInSelect,
 		hasWindowFunctions,
 		hasWrappedAggregates
-	} = analyzeSelectColumns(stmt.columns, selectContext);
+	} = analyzeSelectColumns(stmt.columns, selectContext, input);
 	// `hasAggregates` may grow as buildAggregatePhase collects HAVING-only or
 	// ORDER-BY-only aggregates; track it locally so the post-aggregate branch
 	// is taken when those promote a non-aggregate query into an aggregate one.
 	let hasAggregates = hasAggregatesInSelect;
 
-	// Handle SELECT * separately
+	// Assemble the projection list in WRITTEN select-list order, expanding each star
+	// in place. Output columns follow the order the user wrote them — a star ahead of
+	// a named column emits its columns first, behind it emits them last — which is what
+	// SQLite/PostgreSQL do, and what the grouped path (`buildFinalAggregateProjections`,
+	// which walks `stmt.columns` itself) has always done.
+	//
+	// Star expansions are also kept keyed by their AST column so the aggregate path can
+	// expand each star back to *its own* columns — a select list may hold more than
+	// one star (`select a.*, b.* from a join b`).
+	const starProjectionsByColumn = new Map<AST.ResultColumn, Projection[]>();
 	for (const column of stmt.columns) {
 		if (column.type === 'all') {
-			const starProjections = buildStarProjections(column, input, selectScope);
-			projections.push(...starProjections);
+			const expanded = buildStarProjections(column, input, selectScope);
+			starProjectionsByColumn.set(column, expanded);
+			projections.push(...expanded);
+			continue;
 		}
+		// Non-star column. Aggregate items produced no projection (they are routed
+		// into the aggregate phase instead) and are simply absent from the map.
+		const columnProjection = projectionsByColumn.get(column);
+		if (columnProjection) projections.push(columnProjection);
 	}
 
-	// Add non-star projections
-	projections.push(...columnProjections);
-
-	// Build the source-order AST list of SELECT-list output columns (with stars expanded)
+	// Build the source-order list of SELECT-list output columns (with stars expanded)
 	// for resolving GROUP BY / ORDER BY positional ordinals.
-	const selectListAsts = buildSelectListAsts(stmt.columns, input);
+	const selectListEntries = buildSelectListEntries(stmt.columns, input);
 
 	// Process aggregates if present
-	const aggregateResult = buildAggregatePhase(input, stmt, selectContext, aggregates, hasAggregates, projections, hasWrappedAggregates, selectListAsts);
+	const aggregateResult = buildAggregatePhase(input, stmt, selectContext, aggregates, hasAggregates, projections, hasWrappedAggregates, selectListEntries, starProjectionsByColumn);
 	input = aggregateResult.output;
 	let preAggregateSort = aggregateResult.preAggregateSort;
 	let orderByAppliedEarly = false;
 	let aggregateProjectionScope: RegisteredScope | undefined;
+	// Set when the query is BOTH grouped and windowed: the grouped select-list
+	// projection list, to be projected above the window phase's WindowNode.
+	let windowSelectProjections: Projection[] | undefined;
+	// Also set only for a grouped, windowed query: what the aggregate's rows carry,
+	// so the window phase can redirect a window specification onto them and reject
+	// one that reads anything else.
+	let windowGroupedContext: GroupedWindowContext | undefined;
+	// The node whose output attributes ARE this SELECT's result columns, once one
+	// exists. A positional ORDER BY binds to its Nth attribute (see applyOrderBy).
+	let orderByOutputRelation: RelationalPlanNode | undefined;
 
 	// Update context if we have aggregates
 	if (aggregateResult.aggregateScope) {
@@ -167,31 +227,66 @@ export function buildSelectStmt(
 			!hasWindowFunctions &&
 			stmt.orderBy && stmt.orderBy.length > 0
 		) {
-			input = applyOrderBy(input, stmt, selectContext, preAggregateSort, undefined, true, selectListAsts);
+			input = applyOrderBy(input, stmt, selectContext, preAggregateSort, undefined, true, selectListEntries);
 			orderByAppliedEarly = true;
 		}
 
-		// Build final projections if needed
-		if (aggregateResult.needsFinalProjection && aggregateResult.aggregateNode && aggregateResult.groupByExpressions) {
+		// A grouped, windowed query's window specifications and function arguments are
+		// built against the aggregate-output scope but fall through to the pre-aggregate
+		// select scope for anything the aggregate does not carry. Some of what falls
+		// through is a legal grouping key under another spelling and some is a genuinely
+		// ungrouped column, so hand the window phase both halves: the maps that redirect
+		// the former onto the aggregate's own output columns, and the strict coverage
+		// test that rejects the latter at plan time. The aggregate's source relation goes
+		// along so both halves can tell which references belong to THIS query — a window
+		// specification may contain a subquery, whose own columns and whose correlated
+		// references to an enclosing query are neither redirected nor rejected.
+		if (
+			hasWindowFunctions &&
+			aggregateResult.aggregateNode &&
+			aggregateResult.groupByExpressions &&
+			aggregateResult.groupByExpressions.length > 0
+		) {
+			windowGroupedContext = buildGroupedWindowContext(
+				aggregateResult.groupByExpressions,
+				aggregateResult.aggregateNode.getAttributes(),
+				aggregateResult.aggregateNode.getRelations()[0],
+			);
+		}
+
+		// Build final projections if needed. A window function in the select list also
+		// forces one: the window phase projects the select list ABOVE its WindowNode, so
+		// the grouped select list must be materialized as a projection list here even when
+		// the AggregateNode's own output would otherwise have been the result shape.
+		if ((aggregateResult.needsFinalProjection || hasWindowFunctions) && aggregateResult.aggregateNode && aggregateResult.groupByExpressions) {
 			const finalProjections = buildFinalAggregateProjections(
 				stmt,
 				selectContext,
 				aggregateResult.aggregateScope,
 				aggregateResult.aggregateNode,
 				aggregates,
-				aggregateResult.groupByExpressions
+				aggregateResult.groupByExpressions,
+				starProjectionsByColumn
 			);
-			// When HAVING-only or ORDER-BY-only aggregates were added, don't preserve
-			// input columns so they are stripped from the output (they exist only for
-			// those clauses).
-			const preserveForAggregate =
-				preserveInputColumns &&
-				!aggregateResult.hasHavingOnlyAggregates &&
-				!aggregateResult.hasOrderByOnlyAggregates;
-			input = new ProjectNode(selectScope, input, finalProjections, undefined, undefined, preserveForAggregate);
-			// Expose final-projection output column names (including SELECT-list aliases)
-			// so subsequent ORDER BY can reference aliases like the non-aggregate path.
-			aggregateProjectionScope = createProjectionOutputScope(input);
+			if (hasWindowFunctions) {
+				// Hand the grouped select list to the window phase instead of projecting it
+				// here: the WindowNode must sit between the aggregate output and the final
+				// projection, so there is exactly ONE projection and it is above the window.
+				windowSelectProjections = finalProjections;
+			} else {
+				// When HAVING-only or ORDER-BY-only aggregates were added, don't preserve
+				// input columns so they are stripped from the output (they exist only for
+				// those clauses).
+				const preserveForAggregate =
+					preserveInputColumns &&
+					!aggregateResult.hasHavingOnlyAggregates &&
+					!aggregateResult.hasOrderByOnlyAggregates;
+				input = new ProjectNode(selectScope, input, finalProjections, undefined, undefined, preserveForAggregate);
+				// Expose final-projection output column names (including SELECT-list aliases)
+				// so subsequent ORDER BY can reference aliases like the non-aggregate path.
+				aggregateProjectionScope = createProjectionOutputScope(input);
+				orderByOutputRelation = input;
+			}
 		}
 	}
 
@@ -215,15 +310,14 @@ export function buildSelectStmt(
 				if (orderByClause.expr.type === 'column') {
 					const orderColumn = orderByClause.expr.name.toLowerCase();
 					if (!selectedColumns.has(orderColumn)) {
-						// Apply ORDER BY before window projections
-						const sortKeys: SortKey[] = stmt.orderBy.map(orderBy => {
-							const resolved = resolveOrdinalReference(orderBy.expr, selectListAsts, 'ORDER BY');
-							return {
-								expression: buildExpression(selectContext, resolved ?? orderBy.expr),
-								direction: orderBy.direction,
-								nulls: orderBy.nulls
-							};
-						});
+						// Apply ORDER BY before window projections. This sort sits BELOW the
+						// window projection, so a positional reference resolves through the
+						// select list (no output attributes exist yet to bind to).
+						const sortKeys: SortKey[] = stmt.orderBy.map(orderBy => ({
+							expression: buildOrdinalAwareExpression(selectContext, orderBy.expr, selectListEntries, 'ORDER BY'),
+							direction: orderBy.direction,
+							nulls: orderBy.nulls
+						}));
 						input = new SortNode(selectContext.scope, input, sortKeys);
 						preWindowSort = true;
 						break;
@@ -232,7 +326,10 @@ export function buildSelectStmt(
 			}
 		}
 
-		input = buildWindowPhase(input, windowFunctions, selectContext, stmt);
+		input = buildWindowPhase(input, windowFunctions, selectContext, windowSelectProjections ?? projections, windowGroupedContext);
+		// The window phase ends in a ProjectNode over the SELECT list, so that node's
+		// attributes are this query's result columns.
+		orderByOutputRelation = input;
 
 		// Update context to include window output columns
 		const windowOutputScope = new RegisteredScope(selectContext.scope);
@@ -253,16 +350,25 @@ export function buildSelectStmt(
 		}
 	}
 
-	// Handle final projections for non-aggregate, non-window cases
-	if (!hasAggregates && !hasWindowFunctions) {
-		const finalResult = buildFinalProjections(input, projections, selectScope, stmt, selectContext, preserveInputColumns, selectListAsts);
+	// Handle final projections for non-aggregate, non-window cases.
+	// A GROUP BY with no aggregate functions anywhere still went through the
+	// aggregate phase (which built its own final projection against the
+	// AggregateNode output); re-running buildFinalProjections here would emit a
+	// second projection whose column references still point at *pre-aggregate*
+	// attributes, which the AggregateNode does not output.
+	const hasGrouping = Boolean(aggregateResult.aggregateScope);
+	if (!hasGrouping && !hasWindowFunctions) {
+		const finalResult = buildFinalProjections(input, projections, selectScope, stmt, selectContext, preserveInputColumns, selectListEntries);
 		input = finalResult.output;
 		selectContext = finalResult.finalContext;
 		preAggregateSort = finalResult.preAggregateSort;
+		// Either the final ProjectNode, or — for an identity `select *` — the source
+		// itself, whose attributes already ARE the select list.
+		orderByOutputRelation = finalResult.output;
 
 		// Apply final modifiers with projection scope for column alias resolution
 		input = applyDistinct(input, stmt, selectScope);
-		input = applyOrderBy(input, stmt, selectContext, preAggregateSort, finalResult.projectionScope, false, selectListAsts);
+		input = applyOrderBy(input, stmt, selectContext, preAggregateSort, finalResult.projectionScope, false, selectListEntries, orderByOutputRelation);
 		input = applyLimitOffset(input, stmt, selectContext, finalResult.projectionScope);
 	} else {
 		// Apply final modifiers. For the aggregate path, expose the final-projection
@@ -273,7 +379,7 @@ export function buildSelectStmt(
 		if (!orderByAppliedEarly) {
 			// In the aggregate path, ORDER BY may legally reference aggregates; in the
 			// window path it may reference window outputs. Both are now in selectContext.
-			input = applyOrderBy(input, stmt, selectContext, preAggregateSort, aggregateProjectionScope, hasAggregates, selectListAsts);
+			input = applyOrderBy(input, stmt, selectContext, preAggregateSort, aggregateProjectionScope, hasAggregates, selectListEntries, orderByOutputRelation);
 		}
 		input = applyLimitOffset(input, stmt, selectContext, aggregateProjectionScope);
 	}
@@ -304,14 +410,21 @@ export function buildValuesStmt(
 /**
  * Registers each column of a relational node as a symbol in a new scope,
  * wrapped with an AliasedScope for qualified name resolution.
+ *
+ * The scope is deliberately parented on {@link EmptyScope} — a FROM source's scope
+ * holds ONLY its own columns and answers "no" for anything else. The fallback to the
+ * enclosing query is composed exactly once by each consumer (`buildSelectStmt`'s
+ * `ShadowScope`, `buildJoin`'s ON-condition and LATERAL `ShadowScope`s). Chaining each
+ * source scope to the caller's scope instead would make `MultiScope`'s first-match reach
+ * the outer scope through peer #1 before peer #2 is ever consulted, so a join's own
+ * right-hand source loses name lookup to a same-named enclosing symbol.
  */
 function registerColumnScope(
-	parentScope: Scope,
 	node: RelationalPlanNode,
 	scopeName: string,
 	alias: string,
 ): Scope {
-	const registered = new RegisteredScope(parentScope);
+	const registered = new RegisteredScope(EmptyScope.instance);
 	const attributes = node.getAttributes();
 	node.getType().columns.forEach((c, i) => {
 		const attr = attributes[i];
@@ -344,8 +457,12 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 	if (fromClause.type === 'table') {
 		const tableName = fromClause.table.name.toLowerCase();
 
-		// Check if this is a CTE reference
-		if (cteNodes.has(tableName)) {
+		// Check if this is a CTE reference. A schema-qualified name (`main.c`) names a
+		// schema object, never a CTE — CTEs live in no schema — so a qualifier sends the
+		// name straight to the ordinary view / table resolution below, even when a
+		// same-named CTE is in scope. Matches the write path (`resolveCteTarget`) and
+		// SQLite / PostgreSQL.
+		if (!fromClause.table.schema && cteNodes.has(tableName)) {
 			const cteNode = cteNodes.get(tableName)!;
 
 			// Check if this is an internal recursive CTE reference
@@ -357,7 +474,7 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 				}
 				fromTable = internalRefNode;
 
-				columnScope = registerColumnScope(parentContext.scope, fromTable, tableName, fromClause.alias?.toLowerCase() ?? tableName);
+				columnScope = registerColumnScope(fromTable, tableName, fromClause.alias?.toLowerCase() ?? tableName);
 			} else {
 				// Regular CTE reference - cache by CTE name + alias to ensure consistent attribute IDs
 				const cacheKey = `${tableName}:${fromClause.alias || tableName}`;
@@ -379,24 +496,36 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 					logger(`Created new CTE reference ${cacheKey}, attrs=[${attrs.map(a => a.id).join(',')}]`);
 				}
 
-				columnScope = registerColumnScope(parentContext.scope, cteRefNode, tableName, fromClause.alias?.toLowerCase() ?? tableName);
+				columnScope = registerColumnScope(cteRefNode, tableName, fromClause.alias?.toLowerCase() ?? tableName);
 
 				fromTable = cteRefNode;
 			}
 		} else {
-			// Check if this is a view
-			const schemaName = fromClause.table.schema || parentContext.db.schemaManager.getCurrentSchemaName();
-			const viewSchema = parentContext.db.schemaManager.getView(schemaName, fromClause.table.name);
+			// Check if this is a view. An unqualified name resolves through the
+			// schema search path — one path entry at a time, that schema's tables
+			// and views checked together — exactly as `buildTableReference` below
+			// resolves a plain table name.
+			const resolvedItem = parentContext.db.schemaManager.findSchemaItem(
+				fromClause.table.name,
+				fromClause.table.schema,
+				parentContext.schemaPath,
+			);
+			const viewSchema = isViewSchema(resolvedItem) ? resolvedItem : undefined;
+			const maintainedTable = !isViewSchema(resolvedItem) && isMaintainedTable(resolvedItem) ? resolvedItem : undefined;
 
 			if (viewSchema) {
 				// Build the view's body. The body is a QueryExpr — today only
 				// SELECT and VALUES bodies plan; DML bodies are rejected at
 				// CREATE VIEW plan time so we never get here with one.
+				// The body plans under the VIEW's home-schema path (not the
+				// caller's) so its unqualified source names resolve next to the
+				// view — independent of the reading statement's search path.
+				const viewBodyContext = storedBodyContext(parentContext, viewSchema.schemaName);
 				let viewSelectNode: RelationalPlanNode;
 				if (viewSchema.selectAst.type === 'select') {
-					viewSelectNode = buildSelectStmt(parentContext, viewSchema.selectAst, cteNodes) as RelationalPlanNode;
+					viewSelectNode = buildSelectStmt(viewBodyContext, viewSchema.selectAst) as RelationalPlanNode;
 				} else if (viewSchema.selectAst.type === 'values') {
-					viewSelectNode = buildValuesStmt(parentContext, viewSchema.selectAst);
+					viewSelectNode = buildValuesStmt(viewBodyContext, viewSchema.selectAst);
 				} else {
 					throw new QuereusError(
 						`View '${viewSchema.name}' has a ${viewSchema.selectAst.type.toUpperCase()} body, which is not yet supported.`,
@@ -430,6 +559,33 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 					viewSelectNode = new ProjectNode(parentContext.scope, viewSelectNode, projections);
 				}
 
+				// Lens boundary: contribute the declared logical key(s) the lens proves
+				// or actively enforces as FDs the compiled body alone may not surface
+				// (docs/lens.md § Constraint Attachment; docs/optimizer-fd.md). Only a
+				// logical schema's lens slot yields any — a plain view / MV has none,
+				// so this never affects ordinary views. The
+				// node wraps the view's ProjectNode (whose output indices == the lens
+				// prover's output-index space), inside the optional AliasNode.
+				const lensSlot = parentContext.db.schemaManager.getSchema(viewSchema.schemaName)?.getLensSlot(viewSchema.name);
+				if (lensSlot) {
+					const assertedFds = computeLensAssertedKeyFds(lensSlot, parentContext.db);
+					if (assertedFds.length > 0) {
+						viewSelectNode = new AssertedKeysNode(parentContext.scope, viewSelectNode, assertedFds);
+					}
+
+					// Read-path access-shape marker: carry the lens table's routable
+					// auxiliary-access advertisements (nd-tree spatial / vector knn /
+					// full-text) to `rule-lens-auxiliary-access`, which routes a matching
+					// outer-query predicate through the auxiliary structure (auxiliary
+					// seek ⋈ logical-key) instead of a residual filter over the full
+					// decomposition scan. Only built when ≥1 auxiliary is routable, so a
+					// non-lens / non-routable-lens view is untouched.
+					const auxMarker = buildLensAuxiliaryAccessMarker(parentContext, lensSlot, viewSelectNode);
+					if (auxMarker) {
+						viewSelectNode = auxMarker;
+					}
+				}
+
 				// Wrap with AliasNode if aliased to update relationName on attributes
 				if (fromClause.alias) {
 					fromTable = new AliasNode(parentContext.scope, viewSelectNode, fromClause.alias.toLowerCase());
@@ -437,7 +593,49 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 					fromTable = viewSelectNode;
 				}
 
-				columnScope = registerColumnScope(parentContext.scope, fromTable, fromClause.table.name.toLowerCase(), fromClause.alias?.toLowerCase() ?? fromClause.table.name.toLowerCase());
+				columnScope = registerColumnScope(fromTable, fromClause.table.name.toLowerCase(), fromClause.alias?.toLowerCase() ?? fromClause.table.name.toLowerCase());
+			} else if (maintainedTable) {
+				// Maintained table (materialized view): resolves through the ORDINARY
+				// table path — the table IS the materialization, one catalog record.
+
+				// The only currency hazard for a row-time MV is a *structural* source
+				// change (`stale`): the table's data itself is kept consistent
+				// transactionally, so it never silently drifts. Re-validate the body on
+				// `stale` before resolving the reference.
+				if (maintainedTable.derivation.stale) {
+					// Re-validate the body against current source schemas. An
+					// incompatible change (dropped source, dropped column, …) makes
+					// the body fail to plan — surface the staleness diagnostic. Under the
+					// MV's home-schema path, like every other body re-plan: the caller's
+					// path would make a perfectly resolvable non-`main` body look
+					// incompatibly changed, hiding the materialized rows behind a false
+					// staleness error.
+					const bodyContext = storedBodyContext(parentContext, maintainedTable.schemaName);
+					try {
+						if (maintainedTable.derivation.selectAst.type === 'select') {
+							buildSelectStmt(bodyContext, maintainedTable.derivation.selectAst);
+						} else if (maintainedTable.derivation.selectAst.type === 'values') {
+							buildValuesStmt(bodyContext, maintainedTable.derivation.selectAst);
+						}
+					} catch (e) {
+						const message = e instanceof Error ? e.message : String(e);
+						throw new QuereusError(
+							`materialized view '${fromClause.table.name}' is stale; a source changed in an incompatible way — drop and recreate (${message})`,
+							StatusCode.ERROR,
+							e instanceof Error ? e : undefined,
+						);
+					}
+				}
+
+				let tableNode: RelationalPlanNode = buildTableReference(fromClause, parentContext);
+
+				if (fromClause.alias) {
+					tableNode = new AliasNode(parentContext.scope, tableNode, fromClause.alias.toLowerCase());
+				}
+
+				fromTable = tableNode;
+
+				columnScope = registerColumnScope(fromTable, fromClause.table.name.toLowerCase(), fromClause.alias?.toLowerCase() ?? fromClause.table.name.toLowerCase());
 			} else {
 				// Regular table
 				let tableNode: RelationalPlanNode = buildTableReference(fromClause, parentContext);
@@ -449,7 +647,7 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 
 				fromTable = tableNode;
 
-				columnScope = registerColumnScope(parentContext.scope, fromTable, fromClause.table.name.toLowerCase(), fromClause.alias?.toLowerCase() ?? fromClause.table.name.toLowerCase());
+				columnScope = registerColumnScope(fromTable, fromClause.table.name.toLowerCase(), fromClause.alias?.toLowerCase() ?? fromClause.table.name.toLowerCase());
 			}
 		}
 
@@ -462,7 +660,7 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 		}
 		fromTable = funcNode;
 
-		columnScope = registerColumnScope(parentContext.scope, fromTable, '', fromClause.alias?.toLowerCase() ?? fromClause.name.name.toLowerCase());
+		columnScope = registerColumnScope(fromTable, '', fromClause.alias?.toLowerCase() ?? fromClause.name.name.toLowerCase());
 
 	} else if (fromClause.type === 'subquerySource') {
 		// Build the subquery body. SubquerySource now carries any QueryExpr;
@@ -501,8 +699,9 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 			? new AliasNode(parentContext.scope, subqueryNode, alias)
 			: subqueryNode;
 
-		// Create scope for subquery columns
-		const subqueryScope = new RegisteredScope(parentContext.scope);
+		// Create scope for subquery columns. Own-only, parented on EmptyScope, for the
+		// same reason as registerColumnScope — see its doc comment.
+		const subqueryScope = new RegisteredScope(EmptyScope.instance);
 		const subqueryAttributes = fromTable.getAttributes();
 
 		// Use provided column names or infer from subquery
@@ -566,26 +765,46 @@ function buildJoin(joinClause: AST.JoinClause, parentContext: PlanningContext, c
 	// Create a combined scope for the join that includes both left and right columns
 	const combinedScope = new MultiScope([leftScope, rightScope]);
 
-	// Create a new planning context with the combined scope for condition evaluation
+	// Context for building the ON condition: the join's own two peers first, then the
+	// enclosing query. Both peers are own-only scopes (see registerColumnScope), so
+	// neither can answer for the other, and everything they do not own — a correlated
+	// outer column, a bind parameter — must still resolve, one level later.
 	const joinContext: PlanningContext = {
 		...parentContext,
-		scope: combinedScope
+		scope: new ShadowScope([combinedScope, parentContext.scope])
 	};
 
 	let condition: ScalarPlanNode | undefined;
 	let usingColumns: string[] | undefined;
 
-	// Handle ON condition
+	// ON and USING are mutually exclusive spellings of the same predicate (the parser
+	// accepts one or the other), and USING desugars into the ON condition it means.
 	if (joinClause.condition) {
 		condition = buildExpression(joinContext, joinClause.condition);
+	} else if (joinClause.columns) {
+		usingColumns = joinClause.columns;
+		condition = buildUsingCondition(
+			usingColumns, leftNode.getAttributes(), rightNode.getAttributes(), joinContext.scope);
 	}
 
-	// Handle USING columns
-	if (joinClause.columns) {
-		usingColumns = joinClause.columns;
-		// Convert USING to ON condition: table1.col1 = table2.col1 AND table1.col2 = table2.col2 ...
-		// For now, store the column names and let the emitter handle the condition
-		// TODO: This could be improved by synthesizing the equality conditions here
+	// Existence (`exists … as`) flags: mint a stable attribute id per clause (once,
+	// here — so it survives `withChildren` rebuilds) and expose each by its `as`
+	// name through a scope layered over the combined join scope. The flag's output
+	// column index is after both sides (leftCols + rightCols + i), matching where
+	// `buildJoinAttributes`/`buildJoinRelationType` append it.
+	let existence: ExistenceColumnSpec[] | undefined;
+	let columnScope: Scope = combinedScope;
+	if (joinClause.existence && joinClause.existence.length > 0) {
+		existence = joinClause.existence.map(e => ({ attrId: PlanNode.nextAttrId(), name: e.name, side: e.side }));
+		const leftCols = leftNode.getType().columns.length;
+		const rightCols = rightNode.getType().columns.length;
+		const flagScope = new RegisteredScope(combinedScope);
+		existence.forEach((spec, i) => {
+			const columnIndex = leftCols + rightCols + i;
+			flagScope.registerSymbol(spec.name.toLowerCase(), (exp, s) =>
+				new ColumnReferenceNode(s, exp as AST.ColumnExpr, EXISTENCE_FLAG_TYPE, spec.attrId, columnIndex));
+		});
+		columnScope = flagScope;
 	}
 
 	const joinNode = new JoinNode(
@@ -594,12 +813,110 @@ function buildJoin(joinClause: AST.JoinClause, parentContext: PlanningContext, c
 		rightNode,
 		joinClause.joinType,
 		condition,
-		usingColumns
+		usingColumns,
+		existence,
 	);
 
-	// Use the combined scope as the column scope for the join
-	// This allows both qualified and unqualified column references to resolve properly
-	parentContext.outputScopes.set(joinNode, combinedScope);
+	// Use the combined scope (plus any existence-flag names) as the column scope for
+	// the join. This allows both qualified and unqualified column references to
+	// resolve properly.
+	parentContext.outputScopes.set(joinNode, columnScope);
 
 	return joinNode;
+}
+
+/**
+ * Desugar `using (c1, c2, …)` into the `on l.c1 = r.c1 and l.c2 = r.c2 …` condition
+ * it is defined to mean, so a USING join is *the same plan* an equivalent ON join
+ * builds. Each pair goes through `buildComparison` — the same helper `buildExpression`
+ * uses for a spelled-out `=` — so everything hanging off a real comparison node
+ * applies to USING for free and cannot drift from the ON spelling:
+ *
+ * - cross-type coercion — a JSON column paired with a TEXT one compares structurally,
+ *   an INTEGER paired with a TEXT one numerically (ticket
+ *   `bug-using-join-skips-cross-type-coercion`; before the desugar USING compared
+ *   raw storage classes and matched nothing).
+ * - `BinaryOpNode.generateType`'s collation-lattice validation — a `using (c)` over
+ *   columns with conflicting explicit/declared collations raises the identical
+ *   ambiguous-collation error as `l.c = r.c`, at plan time rather than only as the
+ *   emitter's backstop. Both spellings resolve each pair through the SAME symmetric
+ *   provenance lattice.
+ * - `extractEquiPairs` — hash/merge key selection, collation tagging and the
+ *   semantic-ordering gate, all off the one extractor.
+ *
+ * A NATURAL join (not yet parsed) desugars to USING pairs and inherits all of this.
+ *
+ * Column references are built **from attributes**, not by resolving a synthesized
+ * qualified `AST.ColumnExpr` through the join scope: a USING column can be ambiguous
+ * by name within one side (`a join b using (k) join c using (k)` — the left side of
+ * the second join has two `k` columns). First-match-per-side by name is the pairing
+ * rule USING has always used here.
+ *
+ * NOTE: the nested-loop USING path used to resolve one comparator per column at emit
+ * time; it now evaluates a condition sub-program per row pair, like every ON join.
+ * Only USING joins that fall back to nested loop (cross-type pairs, existence-flag
+ * joins) pay this, and it is not measured. If a USING-heavy workload ever profiles
+ * slower, the fix belongs in the shared ON-condition evaluation path — not in a
+ * restored USING special case.
+ */
+export function buildUsingCondition(
+	usingColumns: readonly string[],
+	leftAttrs: readonly Attribute[],
+	rightAttrs: readonly Attribute[],
+	scope: Scope,
+): ScalarPlanNode {
+	if (usingColumns.length === 0) {
+		throw new QuereusError('USING clause requires at least one column', StatusCode.ERROR);
+	}
+
+	const conjuncts = usingColumns.map(colName =>
+		buildUsingColumnEquality(colName, leftAttrs, rightAttrs, scope));
+
+	return conjuncts.reduce((acc, cur) => new BinaryOpNode(
+		acc.scope,
+		{ type: 'binary', operator: 'AND', left: acc.expression, right: cur.expression },
+		acc,
+		cur,
+	));
+}
+
+/** One USING column's `l.c = r.c` conjunct, built exactly as the ON spelling builds it. */
+function buildUsingColumnEquality(
+	colName: string,
+	leftAttrs: readonly Attribute[],
+	rightAttrs: readonly Attribute[],
+	scope: Scope,
+): BinaryOpNode {
+	const left = buildUsingOperand(colName, leftAttrs, 'left', scope);
+	const right = buildUsingOperand(colName, rightAttrs, 'right', scope);
+	return buildComparison(
+		scope,
+		{ type: 'binary', operator: '=', left: left.expression, right: right.expression },
+		left,
+		right,
+	);
+}
+
+/**
+ * One side's operand for a USING column: a reference to the FIRST attribute of that
+ * name on that side (see the pairing rule on {@link buildUsingCondition}), qualified
+ * by its relation so the synthesized AST reads like the ON spelling.
+ */
+function buildUsingOperand(
+	colName: string,
+	attrs: readonly Attribute[],
+	side: 'left' | 'right',
+	scope: Scope,
+): ColumnReferenceNode {
+	const lower = colName.toLowerCase();
+	const index = attrs.findIndex(a => a.name.toLowerCase() === lower);
+	if (index === -1) {
+		throw new QuereusError(
+			`USING column not found on ${side} side of join: ${colName}`, StatusCode.ERROR);
+	}
+	const attr = attrs[index];
+	const expr: AST.ColumnExpr = attr.relationName
+		? { type: 'column', name: attr.name, table: attr.relationName }
+		: { type: 'column', name: attr.name };
+	return new ColumnReferenceNode(scope, expr, attr.type, attr.id, index);
 }

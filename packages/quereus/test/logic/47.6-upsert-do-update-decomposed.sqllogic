@@ -1,0 +1,100 @@
+-- The `on conflict ... do update` arm is also reached by writes nobody spelled as an
+-- UPSERT. An UPDATE through a logical (lens) table whose columns are split across
+-- decomposition members lowers an optional member's anchor-resolvable assignment to a
+-- synthesized `insert into <member> (...) select ... on conflict (<key>) do update set
+-- <col> = excluded.<col>` (planner/mutation/decomposition.ts,
+-- buildOptionalMemberInsertSelect with action 'update'). Rows whose member tuple already
+-- exists take the DO UPDATE arm, so the arm's validation has to hold there too.
+--
+-- Companion to 47.5, which pins the user-spelled arm. Ticket
+-- bug-upsert-do-update-skips-constraint-checks.
+--
+-- The member CHECK is UPDATE-scoped on purpose: an unscoped one would already be caught
+-- by the INSERT-shaped pass over the proposed row, so only an `on update` CHECK proves
+-- the ARM is what refused the write.
+
+-- ===================================
+-- Basis: anchor Car_core + optional Car_perf, sharing logical key `id`, advertised
+-- through quereus.lens.decomp.* tags (same construction as 51-lens-foundation § 4).
+-- ===================================
+
+create table Car_core (id integer primary key, make text) with tags (
+	"quereus.lens.decomp.logical.d1" = 'Car',
+	"quereus.lens.decomp.role.d1" = 'primary-storage',
+	"quereus.lens.decomp.anchor.d1" = 'Car_core',
+	"quereus.lens.decomp.presence.d1" = 'mandatory',
+	"quereus.lens.decomp.keykind.d1" = 'logical-tuple',
+	"quereus.lens.decomp.key.d1" = 'id',
+	"quereus.lens.decomp.col.d1.id" = 'id',
+	"quereus.lens.decomp.col.d1.make" = 'make'
+);
+
+create table Car_perf (
+	id integer primary key,
+	speed integer null,
+	constraint slow_only check on update (speed < 100)
+) with tags (
+	"quereus.lens.decomp.logical.d1" = 'Car',
+	"quereus.lens.decomp.role.d1" = 'primary-storage',
+	"quereus.lens.decomp.anchor.d1" = 'Car_core',
+	"quereus.lens.decomp.presence.d1" = 'optional',
+	"quereus.lens.decomp.keykind.d1" = 'logical-tuple',
+	"quereus.lens.decomp.key.d1" = 'id',
+	"quereus.lens.decomp.col.d1.maxSpeed" = 'speed'
+);
+
+-- run
+
+insert into Car_core values (1, 'Honda'), (2, 'Mazda');
+insert into Car_perf values (1, 10);
+
+-- run
+
+declare logical schema appcar {
+	table Car {
+		id integer primary key,
+		make text,
+		maxSpeed integer null
+	}
+}
+
+-- run
+
+declare lens for appcar over main { }
+
+-- run
+
+apply schema appcar;
+
+-- run
+
+select * from appcar.Car order by id;
+→ [{"id": 1, "make": "Honda", "maxSpeed": 10}, {"id": 2, "make": "Mazda", "maxSpeed": null}]
+
+-- ===================================
+-- An anchor-resolvable assignment (`id * 1000`, computable over the anchor scan) takes
+-- the single-statement flavour: absent member rows insert, present ones take DO UPDATE.
+-- Car 1's member row exists, so its composed row is the arm's, and the UPDATE-scoped
+-- CHECK refuses it.
+-- ===================================
+
+update appcar.Car set maxSpeed = id * 1000 where id = 1;
+-- error: CHECK constraint failed: slow_only (speed < 100)
+
+-- nothing moved on either member.
+select id, speed from Car_perf order by id;
+→ [{"id": 1, "speed": 10}]
+select * from appcar.Car order by id;
+→ [{"id": 1, "make": "Honda", "maxSpeed": 10}, {"id": 2, "make": "Mazda", "maxSpeed": null}]
+
+-- ===================================
+-- The same statement shape with a value the CHECK admits writes through: car 1 takes the
+-- DO UPDATE arm, car 2 (no member row) materializes through the INSERT branch — where
+-- the UPDATE-scoped CHECK correctly does NOT apply.
+-- ===================================
+
+update appcar.Car set maxSpeed = id * 10;
+select id, speed from Car_perf order by id;
+→ [{"id": 1, "speed": 10}, {"id": 2, "speed": 20}]
+select * from appcar.Car order by id;
+→ [{"id": 1, "make": "Honda", "maxSpeed": 10}, {"id": 2, "make": "Mazda", "maxSpeed": 20}]

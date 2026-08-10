@@ -1,0 +1,105 @@
+-- 07.7.1-scalar-agg-decorrelation-filter.sqllogic
+-- Correlated scalar-aggregate subqueries used in a WHERE or HAVING comparison
+-- are decorrelated into grouped left joins (rule scalar-agg-decorrelation-filter,
+-- the Filter anchor). A HAVING clause is a FilterNode whose source is an
+-- Aggregate, so one anchor covers both WHERE and HAVING. These tests pin the
+-- observable semantics of the decorrelated shapes AND the shapes the rule must
+-- reject (which stay on the correlated per-row path, still correct).
+
+-- Setup: outer `o` (some rows with no matching child, one NULL correlation key),
+-- child `c` grouped by fk.
+CREATE TABLE o (id INTEGER PRIMARY KEY, k INTEGER NULL, total INTEGER NULL);
+CREATE TABLE c (id INTEGER PRIMARY KEY, fk INTEGER NULL, amount INTEGER NULL);
+
+INSERT INTO o VALUES (1, 10, 8), (2, 20, 3), (3, 30, 100), (4, null, -5), (5, 40, 20);
+INSERT INTO c VALUES (1, 10, 5), (2, 10, 7), (3, 20, 4), (4, 20, 8), (5, 40, 1);
+
+-- Per-o subquery values (avg(amount) / count(*) where c.fk = o.k):
+--   o1 k=10 → {5,7} avg 6, count 2
+--   o2 k=20 → {4,8} avg 6, count 2
+--   o3 k=30 → {}   avg NULL, count 0
+--   o4 k=NULL → {} avg NULL, count 0   (NULL key never matches)
+--   o5 k=40 → {1}  avg 1, count 1
+
+-- WHERE comparison against a correlated avg: three-valued logic preserved by the
+-- LEFT-join NULL-pad (o.total > NULL → NULL → row excluded).
+SELECT o.id, o.total FROM o WHERE o.total > (SELECT avg(c.amount) FROM c WHERE c.fk = o.k) ORDER BY o.id;
+→ [{"id":1,"total":8},{"id":5,"total":20}]
+
+-- WHERE against a correlated count: the empty group must yield 0 (non-NULL empty
+-- value → CASE marker path), so a no-match outer row SURVIVES the filter rather
+-- than being dropped. This is the count-bug analogue for the Filter anchor.
+SELECT o.id, o.total FROM o WHERE (SELECT count(*) FROM c WHERE c.fk = o.k) = 0 ORDER BY o.id;
+→ [{"id":3,"total":100},{"id":4,"total":-5}]
+
+-- Subquery inside a disjunction: the LEFT join is unconditional and matches
+-- <=1 row per outer row (group keys are a unique key), so outer multiplicity is
+-- preserved and the substituted value drives the OR correctly.
+SELECT o.id, o.total FROM o WHERE o.total < 0 OR o.total > (SELECT avg(c.amount) FROM c WHERE c.fk = o.k) ORDER BY o.id;
+→ [{"id":1,"total":8},{"id":4,"total":-5},{"id":5,"total":20}]
+
+-- Two scalar-agg subqueries in one predicate: one stacked LEFT join each.
+SELECT o.id, o.total FROM o WHERE o.total > (SELECT avg(c.amount) FROM c WHERE c.fk = o.k) AND (SELECT count(*) FROM c WHERE c.fk = o.k) >= 2 ORDER BY o.id;
+→ [{"id":1,"total":8}]
+
+-- EXISTS plus a scalar-agg comparison in the same WHERE: subquery-decorrelation
+-- turns EXISTS into a semi-join first, then this rule decorrelates the avg
+-- comparison over the already-rewritten source. Both fire; result stays correct.
+SELECT o.id, o.total FROM o WHERE EXISTS (SELECT 1 FROM c WHERE c.fk = o.k) AND o.total > (SELECT avg(c.amount) FROM c WHERE c.fk = o.k) ORDER BY o.id;
+→ [{"id":1,"total":8},{"id":5,"total":20}]
+
+-- Bail-but-correct: non-equi correlation (c.fk < o.k) cannot become a group key,
+-- so the subquery stays correlated. Result must still be right.
+--   avg(amount) where fk < k:  o1 {} NULL, o2 {10}=6, o3 {10,20}=6, o4 {} NULL, o5 {10,20}=6
+SELECT o.id, o.total FROM o WHERE o.total > (SELECT avg(c.amount) FROM c WHERE c.fk < o.k) ORDER BY o.id;
+→ [{"id":3,"total":100},{"id":5,"total":20}]
+
+-- Bail-but-correct: a non-aggregate LIMIT 1 subquery is not the aggregate root
+-- the rule requires, so it stays correlated. (ORDER BY makes the pick
+-- deterministic.)  min amount per k: o1 5, o2 4, o5 1; o3/o4 no rows → NULL.
+--   o1 8>5 T, o2 3>4 F, o5 20>1 T.
+SELECT o.id, o.total FROM o WHERE o.total > (SELECT c.amount FROM c WHERE c.fk = o.k ORDER BY c.amount LIMIT 1) ORDER BY o.id;
+→ [{"id":1,"total":8},{"id":5,"total":20}]
+
+-- Mixed: one decorrelatable (avg) and one bail (LIMIT 1) subquery in the SAME
+-- predicate. The avg becomes a grouped left join; the LIMIT-1 subquery stays
+-- correlated over the join source (its outer refs still resolve on the join's
+-- left side). Both must evaluate correctly together.
+--   avg/k: o1 6,o2 6,o3 NULL,o5 1 ;  min/k: o1 5,o2 4,o3 NULL,o5 1.
+--   o1 8>6 ∧ 8>5 T; o2 3>6 F; o3 100>NULL NULL; o4 NULL; o5 20>1 ∧ 20>1 T.
+SELECT o.id FROM o WHERE o.total > (SELECT avg(c.amount) FROM c WHERE c.fk = o.k) AND o.total > (SELECT c.amount FROM c WHERE c.fk = o.k ORDER BY c.amount LIMIT 1) ORDER BY o.id;
+→ [{"id":1},{"id":5}]
+
+-- HAVING setup: group `ord` by k, correlate a per-group cap table `lim` on the
+-- group key.
+CREATE TABLE ord (id INTEGER PRIMARY KEY, k INTEGER NULL, amt INTEGER);
+CREATE TABLE lim (id INTEGER PRIMARY KEY, gk INTEGER NULL, cap INTEGER);
+
+INSERT INTO ord VALUES (1,10,5),(2,10,7),(3,20,4),(4,20,2),(5,30,9);
+INSERT INTO lim VALUES (1,10,3),(2,10,6),(3,20,10);
+-- group sums: k=10 → 12, k=20 → 6, k=30 → 9
+
+-- HAVING comparison correlating to the group key (ord.k): decorrelates the same
+-- as a WHERE, the Filter's source being the group Aggregate.
+--   min(cap) where gk=k:  k=10 → 3, k=20 → 10, k=30 → NULL
+SELECT ord.k, sum(ord.amt) AS s FROM ord GROUP BY ord.k HAVING sum(ord.amt) > (SELECT min(lim.cap) FROM lim WHERE lim.gk = ord.k) ORDER BY ord.k;
+→ [{"k":10,"s":12}]
+
+-- HAVING with a correlated count empty-group: group k=30 has no lim rows →
+-- count 0 → survives the HAVING filter (empty-value marker in the Filter path).
+SELECT ord.k, sum(ord.amt) AS s FROM ord GROUP BY ord.k HAVING (SELECT count(*) FROM lim WHERE lim.gk = ord.k) = 0 ORDER BY ord.k;
+→ [{"k":30,"s":9}]
+
+-- HAVING correlating to the aggregate result itself (sum(ord.amt)): valid but
+-- unusual. Whether it decorrelates or bails, the result must be correct.
+--   count(*) where cap = sum:  k=10 sum12 → 0, k=20 sum6 → 1 (cap 6), k=30 sum9 → 0
+SELECT ord.k, sum(ord.amt) AS s FROM ord GROUP BY ord.k HAVING sum(ord.amt) > (SELECT count(*) FROM lim WHERE lim.cap = sum(ord.amt)) ORDER BY ord.k;
+→ [{"k":10,"s":12},{"k":20,"s":6},{"k":30,"s":9}]
+
+-- Two stacked scalar-agg subqueries in one HAVING predicate: one grouped left
+-- join each, over the group Aggregate as source (the anchor-agnostic stacking
+-- path, previously covered only for WHERE).
+--   min(cap)/k: 10→3,20→10,30→NULL ;  count/k: 10→2,20→1,30→0.
+--   k=10 12>3 ∧ 12>2 T; k=20 6>10 F; k=30 9>NULL NULL.
+SELECT ord.k, sum(ord.amt) AS s FROM ord GROUP BY ord.k HAVING sum(ord.amt) > (SELECT min(lim.cap) FROM lim WHERE lim.gk = ord.k) AND sum(ord.amt) > (SELECT count(*) FROM lim WHERE lim.gk = ord.k) ORDER BY ord.k;
+→ [{"k":10,"s":12}]

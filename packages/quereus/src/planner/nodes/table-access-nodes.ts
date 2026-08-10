@@ -11,8 +11,11 @@ import type { Scope } from '../scopes/scope.js';
 import { Cached } from '../../util/cached.js';
 import type { FilterInfo } from '../../vtab/filter-info.js';
 import type { ScalarPlanNode } from './plan-node.js';
-import { TableAccessCapable } from '../framework/characteristics.js';
-import { addFd, singletonFd } from '../util/fd-utils.js';
+import type { TableAccessCapable } from '../framework/characteristics.js';
+import { addSingletonFd } from '../util/fd-utils.js';
+// Type-only: the runtime cycle `constraint-extractor → nodes/reference → …` is real,
+// so this must never become a value import.
+import type { PredicateConstraint } from '../analysis/constraint-extractor.js';
 
 /**
  * Advertisement lifted from a `BestAccessPlanResult` onto a physical leaf node:
@@ -64,6 +67,8 @@ function liftAdvertisement(
  * Provides common functionality for sequential scan, index scan, and index seek
  */
 export abstract class TableAccessNode extends PlanNode implements UnaryRelationalNode, TableAccessCapable {
+	// Brand inherited by SeqScanNode / IndexScanNode / IndexSeekNode / EmptyResultNode.
+	readonly isTableAccessCapable = true as const;
 	private attributesCache: Cached<Attribute[]>;
 	private outputType: Cached<RelationType>;
 
@@ -172,6 +177,17 @@ export class SeqScanNode extends TableAccessNode {
 			equivClasses: sourcePhysical?.equivClasses,
 			constantBindings: sourcePhysical?.constantBindings,
 			domainConstraints: sourcePhysical?.domainConstraints,
+			// A full scan preserves the table reference's seeded INDs. (Even a
+			// row-reducing seek would preserve a per-row inclusion claim — the
+			// subset of surviving rows still satisfies it — so this is safe across
+			// every access node here.)
+			inds: sourcePhysical?.inds,
+			// Backward update-lineage passes through the module-boundary access node
+			// unchanged (columns and attribute ids are identical to the table
+			// reference) — without this the seeded lineage would be lost the moment
+			// the optimizer wraps the table in an access node.
+			updateLineage: sourcePhysical?.updateLineage,
+			attributeDefaults: sourcePhysical?.attributeDefaults,
 		};
 		if (this.rangeBoundedOn) out.rangeBoundedOn = this.rangeBoundedOn;
 		return out;
@@ -228,6 +244,15 @@ export class IndexScanNode extends TableAccessNode {
 		public readonly rangeBoundedOn?: PhysicalProperties['rangeBoundedOn'],
 		/** When true, suppress the lifted `monotonicOn` advertisement (defensive escalation). */
 		public readonly suppressMonotonic: boolean = false,
+		/**
+		 * True when a SortNode was dropped on the strength of this scan's
+		 * `providesOrdering` (sort absorption in `rule-grow-retrieve`): the
+		 * scan's emission order is the only thing producing the requested
+		 * ORDER BY. Rewrites that change this leaf's emission order
+		 * (`rule-key-set-seek`) must decline. False for a vacuously-advertised
+		 * ordering nothing consumed.
+		 */
+		public readonly orderingLoadBearing: boolean = false,
 	) {
 		super(scope, source, filterInfo, estimatedCostOverride);
 	}
@@ -252,6 +277,11 @@ export class IndexScanNode extends TableAccessNode {
 			equivClasses: sourcePhysical?.equivClasses,
 			constantBindings: sourcePhysical?.constantBindings,
 			domainConstraints: sourcePhysical?.domainConstraints,
+			// INDs survive the scan (a per-row inclusion claim holds on any subset).
+			inds: sourcePhysical?.inds,
+			// Pass the backward update-lineage through the access boundary unchanged.
+			updateLineage: sourcePhysical?.updateLineage,
+			attributeDefaults: sourcePhysical?.attributeDefaults,
 			...lifted,
 		};
 		if (this.rangeBoundedOn) out.rangeBoundedOn = this.rangeBoundedOn;
@@ -301,6 +331,7 @@ export class IndexScanNode extends TableAccessNode {
 			this.advertisement,
 			this.rangeBoundedOn,
 			this.suppressMonotonic,
+			this.orderingLoadBearing,
 		);
 	}
 }
@@ -360,12 +391,83 @@ export class IndexSeekNode extends TableAccessNode {
 		public readonly rangeBoundedOn?: PhysicalProperties['rangeBoundedOn'],
 		/** When true, suppress the lifted `monotonicOn` advertisement (defensive escalation). */
 		public readonly suppressMonotonic: boolean = false,
+		/**
+		 * True when a SortNode was dropped on the strength of this seek's
+		 * `providesOrdering` (sort absorption in `rule-grow-retrieve`): the seek's
+		 * emission order is the only thing producing the requested ORDER BY.
+		 * Rewrites that change this leaf's emission order must decline. False for a
+		 * vacuously-advertised ordering nothing consumed.
+		 */
+		public readonly orderingLoadBearing: boolean = false,
+		/**
+		 * The planner-level constraints this seek's keys were built from — the exact
+		 * `PredicateConstraint` objects `rule-select-access-path` consumed, each carrying
+		 * its original `sourceExpression` (and therefore its effective comparison
+		 * collation, which `filterInfo.constraints` cannot express).
+		 *
+		 * This node's `FilterInfo` is the ONLY place these predicates are enforced: they
+		 * were dropped from the tree on the module's promise (`handledFilters`). A rewrite
+		 * that replaces this node's `FilterInfo` must re-apply them (as a `Filter`) or
+		 * re-offer them to the module; a rewrite that cannot must decline.
+		 *
+		 * Caveats for a consumer that re-applies them:
+		 * - Under a `COARSER_SAFE` collation cover the seek is already wrapped in a
+		 *   residual `Filter` carrying the same predicate, so re-applying yields a
+		 *   doubly-applied predicate — correct, but one extra evaluation.
+		 * - `rules/join/index-nested-loop.ts` builds seeks from *synthesized* correlated
+		 *   equalities (`innerCol = outerCol`) whose `sourceExpression` references an
+		 *   attribute from the OUTER side of the join. Those are recorded faithfully, but
+		 *   they are not re-appliable in an arbitrary position — a consumer must gate on
+		 *   the position it intends to re-apply at.
+		 *
+		 * Undefined ⇒ this node was built by a path that did not thread the consumed set
+		 * (never true for `selectPhysicalNode`'s output). An empty array is impossible: a
+		 * seek exists only because at least one constraint was consumed.
+		 *
+		 * NOTE: deliberately NOT exposed via `getChildren` (OPT-009). No emitter reads these
+		 * expressions — `runtime/emit/scan.ts` emits `seekKeys` only — so they are inert and
+		 * merely hold pre-rewrite subtrees after a seek rebuild. The consumers above re-apply
+		 * them into fresh rule output the pass then descends into. Expose them if an emitter
+		 * ever reads them.
+		 */
+		public readonly pushedConstraints?: readonly PredicateConstraint[],
 	) {
 		super(scope, source, filterInfo, estimatedCostOverride);
 	}
 
 	getAccessMethod(): 'index-seek' {
 		return 'index-seek';
+	}
+
+	/**
+	 * Clone recording what this seek's `FilterInfo` is enforcing (see
+	 * {@link pushedConstraints}) and whether its emission order is load-bearing.
+	 * Exists so the single stamping site in `rule-select-access-path` need not
+	 * re-list every constructor argument.
+	 */
+	withProvenance(
+		pushedConstraints: readonly PredicateConstraint[],
+		orderingLoadBearing: boolean,
+	): IndexSeekNode {
+		return new IndexSeekNode(
+			this.scope,
+			this.source,
+			this.filterInfo,
+			this.indexName,
+			this.seekKeys,
+			this.isRange,
+			this.providesOrdering,
+			// No cost override: the base falls back to `filterInfo.indexInfoOutput.
+			// estimatedCost`, which is the very `accessPlan.cost` every seek arm passes
+			// as its override — so the clone re-derives the same self-cost. Same
+			// reasoning as `withChildren` below.
+			undefined,
+			this.advertisement,
+			this.rangeBoundedOn,
+			this.suppressMonotonic,
+			orderingLoadBearing,
+			pushedConstraints,
+		);
 	}
 
 	computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
@@ -378,11 +480,21 @@ export class IndexSeekNode extends TableAccessNode {
 		}
 		const base = {
 			ordering: this.providesOrdering,
+			// NOTE: capped by a real catalog table count now (catalogRowCount), not
+			// just the static schema estimate — for an analyzed table under 100 rows
+			// this reports the whole table rather than a flat 100. If seek cardinality
+			// ever drives a bad plan, derive it from the seek key's own selectivity
+			// instead of min(tableRows, 100).
 			estimatedRows: Math.min(this.source.estimatedRows || 1000, 100),
 			fds: sourcePhysical?.fds,
 			equivClasses: sourcePhysical?.equivClasses,
 			constantBindings: sourcePhysical?.constantBindings,
 			domainConstraints: sourcePhysical?.domainConstraints,
+			// A row-reducing seek still preserves the per-row inclusion claim.
+			inds: sourcePhysical?.inds,
+			// Pass the backward update-lineage through the access boundary unchanged.
+			updateLineage: sourcePhysical?.updateLineage,
+			attributeDefaults: sourcePhysical?.attributeDefaults,
 			...lifted,
 		} as Partial<PhysicalProperties>;
 		if (this.rangeBoundedOn) base.rangeBoundedOn = this.rangeBoundedOn;
@@ -392,8 +504,7 @@ export class IndexSeekNode extends TableAccessNode {
 				// Full PK equality seek — at most one row. Encode via the singleton
 				// FD `∅ → all_cols`.
 				const colCount = this.source.getType().columns.length;
-				const singleton = singletonFd(colCount);
-				const fds = singleton ? addFd(base.fds ?? [], singleton) : base.fds;
+				const fds = addSingletonFd(base.fds ?? [], colCount);
 				return { ...base, estimatedRows: 1, fds } as Partial<PhysicalProperties>;
 			}
 		}
@@ -467,6 +578,11 @@ export class IndexSeekNode extends TableAccessNode {
 			this.advertisement,
 			this.rangeBoundedOn,
 			this.suppressMonotonic,
+			// Both must survive a rebuild: a lost `orderingLoadBearing` silently
+			// re-enables an emission-order rewrite that should decline, and lost
+			// `pushedConstraints` makes the seek look like it enforces nothing.
+			this.orderingLoadBearing,
+			this.pushedConstraints,
 		);
 	}
 }

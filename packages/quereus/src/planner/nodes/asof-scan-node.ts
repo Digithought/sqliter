@@ -6,6 +6,7 @@ import { Cached } from '../../util/cached.js';
 import { StatusCode } from '../../common/types.js';
 import { quereusError } from '../../common/errors.js';
 import { buildJoinAttributes, buildJoinRelationType } from './join-utils.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 
 /**
  * Pair of attribute IDs identifying matching attributes on the left and right sides
@@ -91,8 +92,9 @@ export class AsofScanNode extends PlanNode implements BinaryRelationalNode {
 	) {
 		const leftRows = left.estimatedRows ?? 100;
 		const rightRows = right.estimatedRows ?? 100;
-		// O(L + R) per-row work plus the children's own costs.
-		const cost = left.getTotalCost() + right.getTotalCost() + leftRows + rightRows;
+		// Self-cost only: children (left, right) flow in via getTotalCost(). Self is
+		// the O(L + R) per-row work.
+		const cost = leftRows + rightRows;
 		super(scope, cost);
 
 		this.attributesCache = new Cached(() => this.buildAttributes());
@@ -169,7 +171,9 @@ export class AsofScanNode extends PlanNode implements BinaryRelationalNode {
 		return {
 			ordering,
 			monotonicOn,
-			estimatedRows: this.left.estimatedRows,
+			// Asof emits one row per left row — relay the left side's PHYSICAL count
+			// (its logical getter reads `undefined` through a physical access node).
+			estimatedRows: physicalSourceRows(leftPhys, this.left),
 			// Key-encoding FDs from left are not re-emitted here: appending right
 			// values per left row doesn't preserve uniqueness on left's keys (the
 			// asof match may be NULL-padded under `outer` and the right side has no

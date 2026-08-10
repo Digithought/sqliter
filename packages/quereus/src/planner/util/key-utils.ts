@@ -5,7 +5,8 @@ import type { TableSchema } from '../../schema/table.js';
 import { resolveReferencedColumns } from '../../schema/table.js';
 import { ColumnReferenceNode, ParameterReferenceNode } from '../nodes/reference.js';
 import { LiteralNode } from '../nodes/scalar.js';
-import { isSuperkey, isUnique, keysOf, type KeyRel } from './fd-utils.js';
+import { isAtMostOneRow, isUnique, isUniqueDeterminant, keysOf, type KeyRel } from './fd-utils.js';
+import { changesRowPopulation } from './row-population.js';
 
 /**
  * Project unique keys through a projection mapping.
@@ -185,6 +186,32 @@ function dedupeKeys(keys: ColRef[][]): ColRef[][] {
 }
 
 /**
+ * Select the "lex-min" key from a list of keys: the one with the fewest columns,
+ * ties broken by the lowest first-column index. Empty keys (≤1-row markers) are
+ * skipped, and `undefined` is returned when there is no non-empty key. Used to
+ * bound join-product key blow-up to a single key per side.
+ *
+ * Generic over the key element via an index accessor so the same logic serves
+ * both the ColRef form (`combineJoinKeys`) and the column-index form
+ * (`analyzeJoinKeyCoverage`).
+ */
+function selectLexMinKey<K>(
+	keys: ReadonlyArray<ReadonlyArray<K>>,
+	indexOf: (el: K) => number,
+): ReadonlyArray<K> | undefined {
+	let best: ReadonlyArray<K> | undefined;
+	for (const key of keys) {
+		if (key.length === 0) continue;
+		if (best === undefined
+			|| key.length < best.length
+			|| (key.length === best.length && indexOf(key[0]) < indexOf(best[0]))) {
+			best = key;
+		}
+	}
+	return best;
+}
+
+/**
  * Combine unique keys across a join (logical `RelationType.keys` form).
  *
  * Soundness mirrors `analyzeJoinKeyCoverage`: a side's key survives the join
@@ -236,15 +263,41 @@ export function combineJoinKeys(
 			const rightEqSet = new Set<number>((equiPairs ?? []).map(p => p.right));
 			// Left's keys survive only when each left row matches ≤ 1 right row,
 			// i.e. the equi-pairs cover a right-side key (or right is ≤1-row).
-			if (joinPairsCoverKey(rightKeys, rightEqSet)) {
+			const leftKeysSurvive = joinPairsCoverKey(rightKeys, rightEqSet);
+			if (leftKeysSurvive) {
 				for (const key of leftKeys) {
 					result.push(key.map(c => ({ index: c.index, desc: c.desc })));
 				}
 			}
 			// Symmetrically for the right side.
-			if (joinPairsCoverKey(leftKeys, leftEqSet)) {
+			const rightKeysSurvive = joinPairsCoverKey(leftKeys, leftEqSet);
+			if (rightKeysSurvive) {
 				for (const key of rightKeys) {
 					result.push(key.map(c => ({ index: c.index + leftColumnCount, desc: c.desc })));
+				}
+			}
+			// True relational product: when NEITHER side's key is covered by the
+			// equi-predicate (a bare cross join, or an inner join whose predicate
+			// touches no key) but BOTH sides advertise a non-empty key, the pair
+			// (leftKey, rightKey) is itself unique on the product — leftKey is
+			// unique on the left, rightKey on the right, and inner/cross only
+			// removes (leftRow, rightRow) pairs, never duplicates one, so each
+			// (leftKey-value, rightKey-value) combination occurs at most once.
+			// Emit exactly ONE product key (the lex-min from each side) so growth
+			// is bounded to ≤1 new key per join node regardless of how many keys
+			// each side carries. A ≤1-row side has only the empty key, which makes
+			// joinPairsCoverKey vacuously true above (so the survivor branch already
+			// fired) and also makes selectLexMinKey return undefined, so the ≤1-row
+			// case never reaches a product key. Full-row set-ness of the product is
+			// carried separately by RelationType.isSet.
+			if (!leftKeysSurvive && !rightKeysSurvive) {
+				const leftPick = selectLexMinKey(leftKeys, c => c.index);
+				const rightPick = selectLexMinKey(rightKeys, c => c.index);
+				if (leftPick && rightPick) {
+					result.push([
+						...leftPick.map(c => ({ index: c.index, desc: c.desc })),
+						...rightPick.map(c => ({ index: c.index + leftColumnCount, desc: c.desc })),
+					]);
 				}
 			}
 			// When both sides are ≤1-row their empty keys both push through above,
@@ -303,8 +356,12 @@ export interface JoinKeyCoverageResult {
  * @param leftType       Logical type of the left child (for logical keys + colCount)
  * @param rightType      Logical type of the right child (for logical keys + colCount)
  * @param equiPairs      Equi-join column index pairs (left index, right index)
- * @param leftRows       Estimated rows from left child
- * @param rightRows      Estimated rows from right child
+ * @param leftRows       Estimated rows from the left child — pass the PHYSICAL
+ *                       count (`physicalSourceRows`), not the logical getter: a
+ *                       physical access node declares no `estimatedRows` getter,
+ *                       so the logical read is `undefined` by the time a join's
+ *                       `computePhysical` runs.
+ * @param rightRows      Estimated rows from the right child (same rule)
  * @param leftColumnCount Number of columns on the left side (for shifting right key indices)
  */
 export function analyzeJoinKeyCoverage(
@@ -363,20 +420,24 @@ export function analyzeJoinKeyCoverage(
 		return keys.some(key => key.length > 0 && key.every(idx => eqSet.has(idx)));
 	}
 
-	// A side's key is "covered" when the equi-pairs are a superkey of it. The
-	// single `isUnique` call folds the old `coversLogicalKey || isSuperkey` pair
-	// AND adds empty-key recognition: a ≤1-row side has `[]` in `keysOf`, and
-	// `[] ⊆ anything`, so `isUnique` reports it covered regardless of equi-pairs.
+	// A side's key is "covered" when the equi-pairs are row-unique on it. The
+	// single `isUnique` call folds the old two-surface check AND adds empty-key
+	// recognition: a ≤1-row side has `[]` in `keysOf`, and `[] ⊆ anything`, so
+	// `isUnique` reports it covered regardless of equi-pairs. The no-logical-type
+	// fallback uses the same kind-aware uniqueness primitive with a conservative
+	// `isSet: false` (set-ness is unknowable without the type) — coverage alone
+	// must never mint a preserved key, since `withKeyFds` turns preserved keys
+	// into 'unique' FDs downstream.
 	const leftKeyCovered = leftRel
 		? isUnique(equiPairs.map(p => p.left), leftRel)
-		: coversLogicalKey(leftLogicalKeys, leftEqSet) || isSuperkey(leftEqSet, leftPhys?.fds, leftColCount);
+		: coversLogicalKey(leftLogicalKeys, leftEqSet) || isUniqueDeterminant(leftEqSet, leftPhys?.fds, leftColCount, false);
 	const rightKeyCovered = rightRel
 		? isUnique(equiPairs.map(p => p.right), rightRel)
-		: coversLogicalKey(rightLogicalKeys, rightEqSet) || isSuperkey(rightEqSet, rightPhys?.fds, rightColCount);
+		: coversLogicalKey(rightLogicalKeys, rightEqSet) || isUniqueDeterminant(rightEqSet, rightPhys?.fds, rightColCount, false);
 
-	// ≤1-row sides: `isUnique([], rel)` is true iff the relation is at-most-one-row.
-	const leftIsSingleton = leftRel ? isUnique([], leftRel) : false;
-	const rightIsSingleton = rightRel ? isUnique([], rightRel) : false;
+	// ≤1-row sides: the named spelling of the at-most-one-row predicate.
+	const leftIsSingleton = leftRel ? isAtMostOneRow(leftRel) : false;
+	const rightIsSingleton = rightRel ? isAtMostOneRow(rightRel) : false;
 
 	const preservedKeys: number[][] = [];
 	let estimatedRows: number | undefined = undefined;
@@ -391,6 +452,23 @@ export function analyzeJoinKeyCoverage(
 		// Cardinality reduction: when a key is covered, result rows ≤ the other side's rows
 		if (rightKeyCovered && typeof leftRows === 'number') estimatedRows = leftRows;
 		if (leftKeyCovered && typeof rightRows === 'number') estimatedRows = (estimatedRows === undefined) ? rightRows : Math.min(estimatedRows, rightRows);
+
+		// True relational product (mirrors combineJoinKeys): neither side's key is
+		// covered by the equi-predicate, yet both sides are keyed, so the composite
+		// (leftKey + rightKey-shifted) is itself unique - each (leftKey, rightKey)
+		// pair occurs at most once (inner/cross only removes pairs, never
+		// duplicates). Emit ONE lex-min product key to bound blow-up to one new key
+		// per node. A 1-row side carries only the empty key, so selectLexMinKey
+		// returns undefined for it and the composite is skipped (the singleton
+		// branch above already handles that case). rightKeysShifted is already
+		// shifted; propagateJoinFds materializes this as the composite-key FD.
+		if (!leftKeyCovered && !rightKeyCovered) {
+			const leftPick = selectLexMinKey(leftKeys, i => i);
+			const rightPick = selectLexMinKey(rightKeysShifted, i => i);
+			if (leftPick && rightPick) {
+				preservedKeys.push([...leftPick, ...rightPick]);
+			}
+		}
 	} else if (joinType === 'left') {
 		// LEFT outer: left's keys survive (and left's rowcount caps the output) iff
 		// the equi-pairs cover a right-side unique key — each left row then matches
@@ -417,8 +495,39 @@ export function analyzeJoinKeyCoverage(
 /**
  * Extract TableSchema from a plan node by walking down through common wrappers
  * to find a RetrieveNode or TableReferenceNode.
+ *
+ * Permissive: answers "which table does this subtree ultimately read?", walking
+ * through ANY single-relation operator including aggregates and recursive CTEs.
+ * When the question is instead "whose statistics describe the rows arriving
+ * here", use {@link extractRowSourceTableSchema}.
+ *
+ * **Not for FK/PK alignment**, and no production caller uses it for that any
+ * more: a schema alone cannot say which base-table column an output position
+ * came from, which is the defect `resolveTableColumnMapping` (`ind-utils.ts`)
+ * exists to prevent. It survives as the permissive half of the pair the
+ * selectivity rule's strict walk is defined against — its own unit tests pin
+ * that contrast.
  */
 export function extractTableSchema(node: RelationalPlanNode): TableSchema | undefined {
+	return walkToTableSchema(node, false);
+}
+
+/**
+ * The base table whose rows actually reach `node` — declines at any operator that
+ * changes the row population (aggregate, recursive CTE, set operation) rather than
+ * walking through it. Use this when the question is "whose statistics describe these
+ * rows"; use {@link extractTableSchema} when the question is "which table does this
+ * subtree read" (FK/key analysis).
+ */
+export function extractRowSourceTableSchema(node: RelationalPlanNode): TableSchema | undefined {
+	return walkToTableSchema(node, true);
+}
+
+/**
+ * Shared descent for both variants. `strict` stops the single-relation descent at
+ * any row-population-changing operator so the two walks cannot drift apart.
+ */
+function walkToTableSchema(node: RelationalPlanNode, strict: boolean): TableSchema | undefined {
 	// Use duck typing to avoid circular imports
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const n = node as any;
@@ -433,10 +542,17 @@ export function extractTableSchema(node: RelationalPlanNode): TableSchema | unde
 		return n.tableRef.tableSchema as TableSchema | undefined;
 	}
 
+	// A row-population-changing node still has exactly one relation in some shapes
+	// (an aggregate's source, a recursive CTE's base case), so the strict walk must
+	// decline BEFORE the single-child descent below would step through it.
+	if (strict && changesRowPopulation(node)) {
+		return undefined;
+	}
+
 	// Walk through single-child wrappers (Filter, Project, Sort, etc.)
 	const relations = node.getRelations?.() ?? [];
 	if (relations.length === 1) {
-		return extractTableSchema(relations[0] as RelationalPlanNode);
+		return walkToTableSchema(relations[0] as RelationalPlanNode, strict);
 	}
 
 	return undefined;
@@ -444,6 +560,15 @@ export function extractTableSchema(node: RelationalPlanNode): TableSchema | unde
 
 /**
  * Check if an FK→PK relationship aligns with equi-join pairs.
+ *
+ * **`fkTableCols` / `pkTableCols` must be BASE-TABLE column indices**, not the
+ * output column positions of whatever relational subtree the join sees. FK and
+ * PK declarations are stored in each table's own column order, and a sub-select
+ * (or any projection) between the table and the join renames, reorders, and
+ * drops columns — so an output index compared against a declaration silently
+ * names a different column. Translate first via `ind-utils.ts`'s
+ * `resolveTableColumnMapping` + `mapColumnsToTable`, and decline when a join
+ * column has no base-table origin.
  *
  * Alignment is *positional*: for each declared FK column at index `i`, the
  * equi-pair partner must equal the FK's declared `referencedColumns[i]`. A
@@ -457,8 +582,8 @@ export function extractTableSchema(node: RelationalPlanNode): TableSchema | unde
 export function checkFkPkAlignment(
 	fkTable: TableSchema,
 	pkTable: TableSchema,
-	fkEquiIndices: ReadonlyArray<number>,
-	pkEquiIndices: ReadonlyArray<number>,
+	fkTableCols: ReadonlyArray<number>,
+	pkTableCols: ReadonlyArray<number>,
 ): boolean {
 	if (!fkTable.foreignKeys) return false;
 
@@ -478,10 +603,11 @@ export function checkFkPkAlignment(
 		}
 		if (refCols.length !== fk.columns.length) continue;
 
-		// Build mapping: for each equi-pair, fk column index -> pk column index
+		// Build mapping: for each equi-pair, fk table column index -> pk table
+		// column index
 		const equiMap = new Map<number, number>();
-		for (let i = 0; i < fkEquiIndices.length; i++) {
-			equiMap.set(fkEquiIndices[i], pkEquiIndices[i]);
+		for (let i = 0; i < fkTableCols.length; i++) {
+			equiMap.set(fkTableCols[i], pkTableCols[i]);
 		}
 
 		const pkColSet = new Set(pkDef.map(pk => pk.index));

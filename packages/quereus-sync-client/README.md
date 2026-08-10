@@ -1,5 +1,9 @@
 # @quereus/sync-client
 
+> **Stability: Experimental** — a research track; the API and the wire protocol it speaks
+> may change or disappear without notice, in any release including a patch. See
+> [Stability Tiers](../../docs/stability.md#tiers).
+
 WebSocket sync client for [Quereus](https://github.com/gotchoices/quereus). Handles connection management, reconnection, and bidirectional change synchronization.
 
 ## Features
@@ -7,6 +11,7 @@ WebSocket sync client for [Quereus](https://github.com/gotchoices/quereus). Hand
 - **Automatic reconnection**: Exponential backoff (1s → 60s max) on connection loss
 - **Local change batching**: Debounces rapid changes into efficient batches
 - **Delta sync**: Only sends changes since last successful sync
+- **Snapshot bootstrap**: A new (empty) device downloads a full copy of the database, with progress reporting and automatic resume of an interrupted transfer
 - **Framework agnostic**: Works in any JavaScript environment with WebSocket support
 - **Type-safe**: Full TypeScript support
 
@@ -87,6 +92,15 @@ interface SyncClientOptions {
 
   /** Debounce window for local changes in ms (default: 50) */
   localChangeDebounceMs?: number;
+
+  /** Auto-download a full snapshot on first connect to an empty replica (default: true) */
+  bootstrapOnEmpty?: boolean;
+
+  /** Snapshot stall watchdog: abort if no chunk arrives within this window in ms (default: 60000) */
+  snapshotChunkTimeoutMs?: number;
+
+  /** Fine-grained snapshot transfer progress */
+  onSnapshotProgress?: (progress: SnapshotProgress) => void;
 }
 ```
 
@@ -94,9 +108,12 @@ interface SyncClientOptions {
 
 - `connect(url: string, databaseId: string, token?: string): Promise<void>` - Connect to sync server
 - `disconnect(): Promise<void>` - Disconnect and stop reconnection attempts
+- `requestSnapshot(): Promise<void>` - Explicitly download a full snapshot. **Do not write to the database while it is landing** — a concurrent local write is overwritten by the snapshot and never pushed
+- `hasPendingSnapshot(): Promise<boolean>` - Whether an interrupted snapshot left the local database partial (usable before connecting; the next connect resumes the transfer)
 - `status: SyncStatus` - Current connection status (getter property)
 - `isConnected: boolean` - Whether the WebSocket is open (getter property)
 - `isSynced: boolean` - Whether the client is fully synced (getter property)
+- `isBootstrapping: boolean` - Whether a snapshot transfer is in flight (getter property)
 
 ### Serialization Helpers
 
@@ -123,6 +140,7 @@ DISCONNECTED → CONNECTING → SYNCING → SYNCED
 
 - `disconnected`: Not connected
 - `connecting`: WebSocket connecting, handshake in progress
+- `bootstrapping`: A full snapshot is streaming in — the local database is partial; hold writes until it finishes
 - `syncing`: Connected, exchanging initial changes
 - `synced`: Fully synchronized, real-time updates active
 - `error`: Connection error (will auto-reconnect if enabled)
@@ -140,6 +158,10 @@ The client implements the Quereus sync WebSocket protocol:
 | `apply_changes` | Client→Server | Send local changes |
 | `apply_result` | Server→Client | Confirm changes applied |
 | `push_changes` | Server→Client | Real-time changes from other clients |
+| `get_snapshot` | Client→Server | Request a full snapshot stream |
+| `resume_snapshot` | Client→Server | Resume an interrupted snapshot from a checkpoint |
+| `snapshot_chunk` | Server→Client | One streamed snapshot chunk |
+| `snapshot_complete` | Server→Client | Snapshot stream finished |
 | `ping`/`pong` | Both | Keepalive |
 
 ## Related Packages

@@ -4,6 +4,7 @@
 
 import { describe, it } from 'mocha';
 import { expect } from 'chai';
+import * as quereus from '../src/index.js';
 import {
 	// Comparison functions
 	compareSqlValues,
@@ -11,7 +12,10 @@ import {
 	compareRows,
 	compareTypedValues,
 	createTypedComparator,
-	compareWithOrderBy,
+	createTypedRowComparator,
+	createCollationRowComparator,
+	compareWithOrderByFast,
+	createOrderByComparatorFast,
 	SortDirection,
 	NullsOrdering,
 	isTruthy,
@@ -20,9 +24,9 @@ import {
 	BINARY_COLLATION,
 	NOCASE_COLLATION,
 	RTRIM_COLLATION,
-	registerCollation,
-	getCollation,
-	resolveCollation,
+	builtinCollationResolver,
+	normalizeCollationName,
+	resolveCollationFunctions,
 	// Coercion functions
 	tryCoerceToNumber,
 	coerceToNumberForArithmetic,
@@ -64,10 +68,28 @@ describe('Public API Exports', () => {
 			expect(comparator(1, 2)).to.equal(-1);
 		});
 
-		it('should export compareWithOrderBy', () => {
-			expect(compareWithOrderBy).to.be.a('function');
-			expect(compareWithOrderBy(1, 2, 'asc')).to.equal(-1);
-			expect(compareWithOrderBy(1, 2, 'desc')).to.equal(1);
+		it('should export createTypedRowComparator', () => {
+			expect(createTypedRowComparator).to.be.a('function');
+			const comparator = createTypedRowComparator([INTEGER_TYPE]);
+			expect(comparator([1], [2])).to.equal(-1);
+		});
+
+		it('should export createCollationRowComparator', () => {
+			expect(createCollationRowComparator).to.be.a('function');
+			const comparator = createCollationRowComparator([NOCASE_COLLATION]);
+			expect(comparator(['a'], ['A'])).to.equal(0);
+		});
+
+		it('should export compareWithOrderByFast', () => {
+			expect(compareWithOrderByFast).to.be.a('function');
+			expect(compareWithOrderByFast(1, 2, SortDirection.ASC, NullsOrdering.DEFAULT, BINARY_COLLATION)).to.equal(-1);
+			expect(compareWithOrderByFast(1, 2, SortDirection.DESC, NullsOrdering.DEFAULT, BINARY_COLLATION)).to.equal(1);
+		});
+
+		it('should export createOrderByComparatorFast', () => {
+			expect(createOrderByComparatorFast).to.be.a('function');
+			const comparator = createOrderByComparatorFast('desc', undefined, BINARY_COLLATION);
+			expect(comparator(1, 2)).to.equal(1);
 		});
 
 		it('should export SortDirection and NullsOrdering enums', () => {
@@ -100,10 +122,33 @@ describe('Public API Exports', () => {
 			expect(RTRIM_COLLATION).to.be.a('function');
 		});
 
-		it('should export collation management functions', () => {
-			expect(registerCollation).to.be.a('function');
-			expect(getCollation).to.be.a('function');
-			expect(resolveCollation).to.be.a('function');
+		it('should export builtinCollationResolver, which knows only the built-ins', () => {
+			expect(builtinCollationResolver).to.be.a('function');
+			expect(builtinCollationResolver('nocase')).to.equal(NOCASE_COLLATION);
+			expect(builtinCollationResolver('RTRIM')).to.equal(RTRIM_COLLATION);
+			expect(builtinCollationResolver('BINARY')).to.equal(BINARY_COLLATION);
+			expect(builtinCollationResolver('SPANISH')).to.be.undefined;
+		});
+
+		it('should export normalizeCollationName', () => {
+			expect(normalizeCollationName).to.be.a('function');
+			expect(normalizeCollationName('  nocase ')).to.equal('NOCASE');
+		});
+
+		it('should export resolveCollationFunctions, defaulting an absent name to BINARY', () => {
+			expect(resolveCollationFunctions).to.be.a('function');
+			const resolved = resolveCollationFunctions(
+				name => builtinCollationResolver(name)!,
+				['NOCASE', undefined],
+			);
+			expect(resolved).to.deep.equal([NOCASE_COLLATION, BINARY_COLLATION]);
+		});
+
+		it('should not export a process-global collation registry', () => {
+			const api = quereus as unknown as Record<string, unknown>;
+			expect(api.registerCollation, 'registerCollation lives on Database, not the module').to.be.undefined;
+			expect(api.getCollation).to.be.undefined;
+			expect(api.resolveCollation).to.be.undefined;
 		});
 	});
 

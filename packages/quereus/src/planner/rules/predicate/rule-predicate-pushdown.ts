@@ -10,11 +10,19 @@
  * - Across Alias: safe because AliasNode only renames relationName; attribute IDs are unchanged
  * - Across Project: only if predicate references attribute IDs available below the Project source
  *   (we verify attribute-id coverage), and we keep predicate unchanged (IDs preserved by design)
- * - Into Retrieve: wrap Retrieve.source with a Filter
+ * - Into Retrieve: wrap Retrieve.source with a Filter — EXCEPT when the Retrieve already
+ *   carries an index-style moduleCtx (see the guard in tryPushDown), because that access
+ *   path is already committed and `Retrieve.source` is no longer read at physicalization
  *
  * Non-moves (for now):
  * - Across Limit/Offset (changes semantics)
- * - Across Aggregate/Window/Join (requires deeper analysis)
+ * - Across Aggregate/Window (requires deeper analysis)
+ *
+ * Join is handled by a SEPARATE rule — `rule-join-predicate-pushdown` — because
+ * the join case is "split a predicate and distribute the parts per side", not
+ * "slide one Filter past one commuting node". It registers just ahead of this
+ * rule, so a conjunct it drops onto a join branch is picked up here and carried
+ * across that branch's Alias / into its Retrieve.
  */
 
 import { createLogger } from '../../../common/logger.js';
@@ -29,11 +37,13 @@ import { DistinctNode } from '../../nodes/distinct-node.js';
 import { ProjectNode } from '../../nodes/project-node.js';
 import { RetrieveNode } from '../../nodes/retrieve-node.js';
 import { AliasNode } from '../../nodes/alias-node.js';
-import { CapabilityDetectors, PlanNodeCharacteristics } from '../../framework/characteristics.js';
+import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 import type { ScalarPlanNode } from '../../nodes/plan-node.js';
 import { normalizePredicate } from '../../analysis/predicate-normalizer.js';
+import { collectPredicateAttributeIds } from '../../analysis/predicate-dependencies.js';
 import { collectBindingsInExpr } from '../../analysis/binding-collector.js';
 import { extractConstraints, createTableInfoFromNode } from '../../analysis/constraint-extractor.js';
+import { isIndexStyleContext } from '../shared/index-style-context.js';
 
 const log = createLogger('optimizer:rule:predicate-pushdown');
 
@@ -64,6 +74,16 @@ function tryPushDown(child: RelationalPlanNode, predicate: ScalarPlanNode, scope
 
 	// Reach a Retrieve boundary: insert only the supported portion inside pipeline
 	if (child instanceof RetrieveNode) {
+		// Once ruleGrowRetrieve has equipped this Retrieve with an index-style context,
+		// ruleSelectAccessPath physicalizes from moduleCtx alone and never reads
+		// `source` — a predicate pushed in here would be silently dropped. Decline;
+		// the Filter stays above the Retrieve, where grow-retrieve can still absorb it
+		// into a fresh access-plan probe (which residualizes what the module declines).
+		if (isIndexStyleContext(child.moduleCtx)) {
+			log('Retrieve already committed to an index-style access plan; not pushing');
+			return null;
+		}
+
 		log('Pushing predicate into Retrieve pipeline (supported-only)');
 		const tableInfo = createTableInfoFromNode(child.tableRef, `${child.tableRef.tableSchema.name}`);
 		const extraction = extractConstraints(predicate, [tableInfo]);
@@ -118,8 +138,11 @@ function tryPushDown(child: RelationalPlanNode, predicate: ScalarPlanNode, scope
 			log('Pushing predicate below Project (eligible)');
 			const under = child.source;
 			const newUnder = new FilterNode(under.scope, under, predicate);
-			// Rebuild Project with same projections over the filtered source
-			return new ProjectNode(child.scope, newUnder, child.projections, undefined, undefined, child.preserveInputColumns);
+			// Rebuild Project with same projections over the filtered source,
+			// preserving the original attribute IDs — a computed projection would
+			// otherwise be assigned a fresh attribute ID, stranding upstream
+			// column references that still point at the old one.
+			return new ProjectNode(child.scope, newUnder, child.projections, undefined, child.getAttributes(), child.preserveInputColumns);
 		}
 		return null;
 	}
@@ -130,33 +153,20 @@ function tryPushDown(child: RelationalPlanNode, predicate: ScalarPlanNode, scope
 
 function canPushAcrossProject(project: ProjectNode, predicate: ScalarPlanNode): boolean {
 	// If project preserves input columns and all predicate-attested attributes exist below, it's safe.
+	// The dependency set spans sub-query operands too: a correlated reference inside
+	// `exists (…)` reads an outer attribute exactly like a top-level one does, and pushing
+	// below the Project that mints it strands it at runtime.
+	// NOTE: this refuses one case it could allow — a correlation onto a GRANDPARENT scope's
+	// attribute, which the Project neither produces nor consumes, so the push would be safe.
+	// It is refused because the gate's rule is "must exist below", and an outer-scope id does
+	// not. Buying it back means distinguishing "outer-scope id" from "id this Project defines",
+	// e.g. by testing membership in the Project's own output attributes first.
 	const sourceAttrIds = new Set(project.source.getAttributes().map(a => a.id));
-	const referenced = collectReferencedAttributeIds(predicate);
+	const referenced = collectPredicateAttributeIds(predicate);
 	for (const id of referenced) {
 		if (!sourceAttrIds.has(id)) return false;
 	}
 	return true;
-}
-
-function collectReferencedAttributeIds(expr: ScalarPlanNode): Set<number> {
-	const ids = new Set<number>();
-	walkExpr(expr, node => {
-		if (CapabilityDetectors.isColumnReference(node)) {
-			ids.add(node.attributeId);
-		}
-	});
-	return ids;
-}
-
-function walkExpr(expr: ScalarPlanNode, fn: (n: ScalarPlanNode) => void): void {
-	fn(expr);
-	for (const c of expr.getChildren()) {
-		// Only scalar children
-		if (!isRelationalNode(c)) {
-			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-			walkExpr(c as any as ScalarPlanNode, fn);
-		}
-	}
 }
 
 

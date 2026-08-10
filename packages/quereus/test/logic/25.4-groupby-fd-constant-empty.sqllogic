@@ -1,0 +1,55 @@
+-- 25.4-groupby-fd-constant-empty.sqllogic
+-- Regression: ruleGroupByFdSimplification must never drop *every* GROUP BY
+-- column. When all group columns are equality-pinned to constants
+-- (`where a = 0 and k = 6`), FD propagation gives each an empty-determinant FD
+-- (`{} -> col`), minimalCover drains the cover, and the rule used to rebuild the
+-- aggregate with an empty GROUP BY (a scalar aggregate). A scalar aggregate
+-- emits one all-NULL `count=0` row over an empty input; a grouped query must
+-- emit ZERO rows. Target: rule-groupby-fd-simplification.ts.
+
+create table t (id integer primary key, a integer, b integer, k integer);
+insert into t values (2, 3, 4, 2), (3, 7, 1, 9);
+
+-- Multi-column, constant-pinned, EMPTY match -> [] (the regression).
+-- Pre-fix this returned [{"a":null,"k":null,"c":0,"s":null}].
+select a, k, count(*) as c, sum(b) as s from t where a = 0 and k = 6 group by a, k;
+→ []
+
+-- Multi-column, constant-pinned, NON-EMPTY match -> exactly one group row.
+-- Row id=3 (a=7, b=1, k=9) is the only match. Confirms the bail leaves the
+-- non-empty result correct.
+select a, k, count(*) as c, sum(b) as s from t where a = 7 and k = 9 group by a, k;
+→ [{"a":7,"k":9,"c":1,"s":1}]
+
+-- Single-column control, EMPTY match -> [] (must stay correct; rule never fires
+-- for a one-column GROUP BY because of the `groupBy.length <= 1` early return).
+select k, count(*) as c, sum(a) as s from t where k = 6 group by k;
+→ []
+
+-- Mixed: one constant-pinned column (`a`, dropped via the `{} -> a` FD and
+-- re-emitted as MIN(a)) plus one free column (`b`, kept as the surviving group
+-- key). Confirmed by plan dump to rewrite to `group by b -> min(a), count(*)`.
+-- Over an EMPTY match (`a = 0` matches no row) the surviving key still gates row
+-- production, so the result is zero rows — the partial-drop path must not
+-- resurrect the spurious-row bug.
+select a, b, count(*) as c from t where a = 0 group by a, b;
+→ []
+
+drop table t;
+
+-- Partial-drop coverage: the guard must only trigger when ALL grouping columns
+-- would be dropped. Here `name` is functionally determined by the primary key
+-- `id`, so the rule legitimately drops `name` (re-emitting MIN(name)) while
+-- KEEPING `id` as the surviving group key.
+create table u (id integer primary key, name text, dept text);
+insert into u values (1, 'alice', 'eng'), (2, 'bob', 'sales');
+
+select id, name, count(*) as c from u group by id, name order by id;
+→ [{"id":1,"name":"alice","c":1},{"id":2,"name":"bob","c":1}]
+
+-- Same FD-simplifiable shape over an EMPTY match still yields zero rows: a
+-- surviving key (`id`) gates row production, so no spurious row appears.
+select id, name, count(*) as c from u where id = 99 group by id, name;
+→ []
+
+drop table u;

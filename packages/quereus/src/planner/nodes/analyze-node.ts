@@ -4,13 +4,14 @@
  */
 
 import type * as AST from '../../parser/ast.js';
-import { Attribute, type RelationalPlanNode } from './plan-node.js';
+import { Attribute, type RelationalPlanNode, type PhysicalProperties } from './plan-node.js';
 import { PlanNodeType } from './plan-node-type.js';
 import { PlanNode } from './plan-node.js';
 import type { RelationType } from '../../common/datatype.js';
 import type { Scope } from '../scopes/scope.js';
 import { TEXT_TYPE, INTEGER_TYPE } from '../../types/builtin-types.js';
 import { Cached } from '../../util/cached.js';
+import { addSingletonFd } from '../util/fd-utils.js';
 
 export class AnalyzePlanNode extends PlanNode implements RelationalPlanNode {
 	override readonly nodeType = PlanNodeType.Analyze;
@@ -53,13 +54,30 @@ export class AnalyzePlanNode extends PlanNode implements RelationalPlanNode {
 					generated: true,
 				},
 			],
-			keys: [[]],
+			// `ANALYZE <table>` emits exactly one summary row (≤1-row ⇒ empty key);
+			// bare `ANALYZE` emits one row per table in the schema (a bag ⇒ no key).
+			// The conditional fixes a prior over-claim where bare ANALYZE hardcoded
+			// `keys: [[]]` despite returning many rows.
+			keys: this.targetTableName ? [[]] : [],
 			rowConstraints: [],
 		};
 	}
 
 	get estimatedRows(): number | undefined {
 		return this.targetTableName ? 1 : 10; // 1 for single table, ~10 for all tables
+	}
+
+	override computePhysical(): Partial<PhysicalProperties> {
+		// Mirror the declared-key channel on the independent FD channel: only the
+		// single-table form is ≤1-row, so only it carries the canonical singleton
+		// `∅ → all_cols` FD. Bare ANALYZE stays a bag (no FD). Keeping both channels
+		// in agreement is what the independent-channel singleton law pins.
+		const colCount = this.getType().columns.length;
+		const fds = this.targetTableName ? addSingletonFd([], colCount) : [];
+		return {
+			estimatedRows: this.estimatedRows,
+			fds: fds.length > 0 ? fds : undefined,
+		};
 	}
 
 	private buildAttributes(): Attribute[] {

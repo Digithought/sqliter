@@ -78,7 +78,7 @@ export interface StoreManagerConfig {
   cleanupIntervalMs: number;
   /** Sync config passed to createSyncModule */
   syncConfig?: {
-    tombstoneTTL?: number;
+    retentionHorizonMs?: number;
     batchSize?: number;
   };
   /** Hooks for customizing behavior */
@@ -140,6 +140,8 @@ export class StoreManager {
   private readonly isValidDatabaseId: (databaseId: string, context?: StoreContext) => boolean;
   private readonly stores = new Map<string, StoreEntry>();
   private readonly pendingOpens = new Map<string, Promise<StoreEntry>>();
+  /** In-flight closes keyed by databaseId. An acquire awaits this before opening a fresh handle. */
+  private readonly pendingCloses = new Map<string, Promise<void>>();
   private readonly onStoreCreated?: (entry: StoreEntry) => Promise<void>;
   /** Tracks closed stores eligible for disk eviction: databaseId → { storagePath, closedAt } */
   private readonly closedStores = new Map<string, { storagePath: string; closedAt: number }>();
@@ -169,13 +171,35 @@ export class StoreManager {
 
   /**
    * Get or open a store for a database. Increments refCount.
-   * Uses pendingOpens to prevent concurrent open+restore for the same databaseId.
+   * Uses pendingOpens to prevent concurrent open+restore for the same databaseId,
+   * and awaits pendingCloses so an in-flight close of the same key fully finishes
+   * before we vend or re-open a handle (see closeStore for the serialization invariant).
    * @param databaseId The database identifier
    * @param context Optional auth context for auth-aware path resolution
    */
   async acquire(databaseId: string, context?: StoreContext): Promise<StoreEntry> {
+    // Reject once shutdown has begun — the store map is being torn down and a
+    // handle vended here would never be closed by shutdown().
+    // NOTE: best-effort only — this checks _shuttingDown at entry, but the awaits
+    // below (pendingCloses, evictLRU, openAndRestore) can yield to a shutdown() that
+    // flips the flag mid-acquire, so a handle could still be opened after teardown
+    // started. Harmless today: no caller acquires concurrently with shutdown. If that
+    // ever changes, re-check _shuttingDown after each await and back out the open.
+    if (this._shuttingDown) {
+      throw new Error(`Cannot acquire store ${databaseId}: StoreManager is shutting down`);
+    }
+
     // Remove from eviction candidates — store is being (re-)opened
     this.closedStores.delete(databaseId);
+
+    // Serialize against an in-flight close of the SAME key: closeStore synchronously
+    // removes the entry from this.stores and registers its close promise here before
+    // awaiting close(). Waiting for it guarantees we never observe (and refCount++) a
+    // handle mid-teardown; after it resolves we fall through and open a fresh handle.
+    const closing = this.pendingCloses.get(databaseId);
+    if (closing) {
+      await closing;
+    }
 
     // Check if already open
     let entry = this.stores.get(databaseId);
@@ -218,11 +242,24 @@ export class StoreManager {
    * Release a store reference. Decrements refCount.
    */
   release(databaseId: string): void {
+    this.decRef(databaseId, true);
+  }
+
+  /**
+   * Release a pin taken by {@link acquireIfOpen}, without refreshing
+   * `lastAccess` — see the NOTE there for why background sweeps must not count
+   * as access.
+   */
+  releasePin(databaseId: string): void {
+    this.decRef(databaseId, false);
+  }
+
+  private decRef(databaseId: string, touch: boolean): void {
     const entry = this.stores.get(databaseId);
     if (!entry) return;
 
     entry.refCount = Math.max(0, entry.refCount - 1);
-    entry.lastAccess = Date.now();
+    if (touch) entry.lastAccess = Date.now();
     serviceLog('Store released: %s, refCount=%d', databaseId, entry.refCount);
   }
 
@@ -238,6 +275,42 @@ export class StoreManager {
    */
   get(databaseId: string): StoreEntry | undefined {
     return this.stores.get(databaseId);
+  }
+
+  /**
+   * Snapshot of the database IDs currently open. A plain array copy, so the
+   * caller can await between entries without tripping over concurrent
+   * open/close mutating the live map.
+   */
+  openDatabaseIds(): string[] {
+    return Array.from(this.stores.keys());
+  }
+
+  /**
+   * Pin an already-open store, or return undefined if it is not open. Unlike
+   * {@link acquire} this never opens (or re-opens) a store — it is for
+   * background work that should touch only what is already resident, e.g. the
+   * periodic sync-maintenance sweep.
+   *
+   * Synchronous by design: the refCount bump lands in the same synchronous
+   * section as the `stores.get`, which makes it atomic with respect to
+   * `closeStore`'s equally-synchronous "guard then delete" section (see the
+   * serialization invariant on {@link closeStore}). So the store cannot be
+   * closed out from under a caller that got an entry back, and a caller that
+   * lost the race gets undefined rather than a half-torn-down handle.
+   *
+   * NOTE: deliberately does NOT touch `lastAccess`. A maintenance sweep is not
+   * user access; refreshing the timestamp on every pass would keep otherwise-idle
+   * stores permanently above the idle-close threshold.
+   */
+  acquireIfOpen(databaseId: string): StoreEntry | undefined {
+    if (this._shuttingDown) return undefined;
+
+    const entry = this.stores.get(databaseId);
+    if (!entry) return undefined;
+
+    entry.refCount++;
+    return entry;
   }
 
   /**
@@ -337,7 +410,10 @@ export class StoreManager {
     });
 
     const storeEvents = new StoreEventEmitter();
-    const { syncManager } = await createSyncModule(store, storeEvents, this.config.syncConfig);
+    // Relay-only: the coordinator has no local engine and produces no local DML,
+    // so no transactionSource is wired — it only applies remote changes and serves
+    // getChangesSince. (storeEvents is retained for the StoreEntry/adapter wiring.)
+    const { syncManager } = await createSyncModule(store, this.config.syncConfig);
 
     return {
       databaseId,
@@ -442,8 +518,17 @@ export class StoreManager {
 
   /**
    * Close a specific store.
-   * Re-checks refCount to avoid closing a store acquired between the eviction
-   * decision and this call (race window across await boundaries).
+   *
+   * Serialization invariant: the close decision and the removal from this.stores
+   * happen in ONE synchronous section (no await between the refCount guard and the
+   * stores.delete). JS is single-threaded, so that section is atomic w.r.t. any
+   * racing acquire:
+   *   - acquire's sync section ran first → it bumped refCount, the guard here bails,
+   *     the entry stays live.
+   *   - this sync section runs first → the entry is gone from this.stores and the
+   *     in-flight close is registered in pendingCloses BEFORE we await close(); a
+   *     later acquire finds no entry, awaits pendingCloses, then opens a fresh handle
+   *     (correct for LevelDB's single-open lock — old handle fully closed first).
    */
   private async closeStore(databaseId: string, context?: StoreContext): Promise<void> {
     const entry = this.stores.get(databaseId);
@@ -453,20 +538,30 @@ export class StoreManager {
     // between the caller's refCount check and now.
     if (entry.refCount > 0) return;
 
-    // Resolve storage path before closing (needed for eviction tracking)
+    // Synchronously retire the entry from the live map so no acquire can observe it
+    // mid-teardown, and resolve the storage path (sync) before any await.
+    this.stores.delete(databaseId);
     const storagePath = this.resolveStoragePath(databaseId, context);
 
-    try {
-      await entry.store.close();
-      this.stores.delete(databaseId);
-      serviceLog('Store closed: %s', databaseId);
+    const closePromise = (async () => {
+      try {
+        await entry.store.close();
+        serviceLog('Store closed: %s', databaseId);
 
-      // Track for disk eviction if configured
-      if (this.diskEvictionIdleMs > 0 && this.onEvictStore) {
-        this.closedStores.set(databaseId, { storagePath, closedAt: Date.now() });
+        // Track for disk eviction if configured
+        if (this.diskEvictionIdleMs > 0 && this.onEvictStore) {
+          this.closedStores.set(databaseId, { storagePath, closedAt: Date.now() });
+        }
+      } catch (err) {
+        serviceLog('Error closing store %s: %O', databaseId, err);
       }
-    } catch (err) {
-      serviceLog('Error closing store %s: %O', databaseId, err);
+    })();
+
+    this.pendingCloses.set(databaseId, closePromise);
+    try {
+      await closePromise;
+    } finally {
+      this.pendingCloses.delete(databaseId);
     }
   }
 }

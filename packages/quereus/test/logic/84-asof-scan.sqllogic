@@ -203,6 +203,36 @@ SELECT t.id, q.bid FROM (SELECT id, symbol, ts FROM asof_trades_rt ORDER BY ts) 
 DROP TABLE asof_trades_rt;
 DROP TABLE asof_quotes_rt;
 
+-- Asymmetric partition collation (ticket join-key-collation-resolution-alignment):
+-- ONLY the right (quotes) side declares NOCASE; the left (trades) side defaults to
+-- BINARY. The partition comparison resolves through the shared provenance lattice
+-- to NOCASE (a declared collation outranks a defaulted BINARY) regardless of which
+-- side spells it — so 'A' on the left still buckets with 'a' on the right. The
+-- pre-alignment left-first `leftType.collationName ?? rightType.collationName`
+-- picked the left's defaulted BINARY and the buckets diverged.
+CREATE TABLE asof_trades_mix (id INTEGER PRIMARY KEY, symbol TEXT, ts INTEGER);
+CREATE TABLE asof_quotes_mix (ts INTEGER PRIMARY KEY, symbol TEXT COLLATE NOCASE, bid REAL);
+
+INSERT INTO asof_trades_mix VALUES (1, 'A', 100), (2, 'a', 200), (3, 'B', 150);
+INSERT INTO asof_quotes_mix VALUES (50, 'a', 1.0), (180, 'b', 2.0);
+
+-- This must remain an ASOFSCAN — the partition-collation resolution under review
+-- only runs in the asof emitter; if the plan ever degraded to a generic correlated
+-- subquery the result assertion below would pass vacuously without exercising it.
+SELECT op FROM query_plan('select t.id, q.bid from (select id, symbol, ts from asof_trades_mix order by ts) t left join lateral (select bid from asof_quotes_mix q where q.symbol = t.symbol and q.ts <= t.ts order by q.ts desc limit 1) q on true') WHERE op = 'ASOFSCAN';
+→ [{"op":"ASOFSCAN"}]
+
+-- t.id=1 (A,100): A/a quotes ≤ 100 → ts=50 → 1.0
+-- t.id=2 (a,200): A/a quotes ≤ 200 → ts=50 → 1.0
+-- t.id=3 (B,150): B/b quotes ≤ 150 → none (only ts=180) → null
+SELECT t.id, q.bid FROM (SELECT id, symbol, ts FROM asof_trades_mix ORDER BY ts) t LEFT JOIN LATERAL (
+  SELECT bid FROM asof_quotes_mix q WHERE q.symbol = t.symbol AND q.ts <= t.ts ORDER BY q.ts DESC LIMIT 1
+) q ON true ORDER BY t.id;
+→ [{"id":1,"bid":1},{"id":2,"bid":1},{"id":3,"bid":null}]
+
+DROP TABLE asof_trades_mix;
+DROP TABLE asof_quotes_mix;
+
 -- Cleanup
 DROP TABLE asof_trades;
 DROP TABLE asof_quotes;

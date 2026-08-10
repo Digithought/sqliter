@@ -1,0 +1,105 @@
+-- ALTER TABLE ALTER COLUMN ... SET COLLATE — change a column's collation in place.
+-- This file covers the query-layer semantics that derive purely from the column
+-- schema collation (ORDER BY / `=` follow the new collation), the table_info
+-- round-trip, unknown-collation rejection, set-back-to-BINARY, and idempotent
+-- re-apply. All of these update + re-register the column schema, so they run under
+-- BOTH the memory module (`yarn test`) and the store module (`yarn test:store`).
+--
+-- Structure re-sort + existing-row uniqueness re-validation (memory-specific) live
+-- in 41.7.1-alter-column-collate-unique.sqllogic.
+
+-- ===================================
+-- 1. SET COLLATE NOCASE changes `=` semantics on a non-key column.
+-- ===================================
+
+create table t_eq (id integer primary key, name text);
+insert into t_eq values (1, 'abc'), (2, 'ABC'), (3, 'abd');
+
+-- Under BINARY, only the exact 'ABC' matches.
+select count(*) as n from t_eq where name = 'ABC';
+→ [{"n":1}]
+
+alter table t_eq alter column name set collate nocase;
+
+-- Under NOCASE, both 'abc' and 'ABC' equal 'ABC'.
+select count(*) as n from t_eq where name = 'ABC';
+→ [{"n":2}]
+
+drop table t_eq;
+
+-- ===================================
+-- 2. SET COLLATE NOCASE changes ORDER BY on a non-key column.
+-- ===================================
+
+create table t_ord (id integer primary key, name text);
+insert into t_ord values (1, 'b'), (2, 'A'), (3, 'C');
+
+-- BINARY: all uppercase sort before lowercase → A, C, b
+select name from t_ord order by name;
+→ [{"name":"A"},{"name":"C"},{"name":"b"}]
+
+alter table t_ord alter column name set collate nocase;
+
+-- NOCASE: case-folded order → A, b, C
+select name from t_ord order by name;
+→ [{"name":"A"},{"name":"b"},{"name":"C"}]
+
+drop table t_ord;
+
+-- ===================================
+-- 3. table_info round-trip; set-back-to-BINARY clears it.
+-- ===================================
+
+create table t_ti (id integer primary key, name text);
+
+select name, collation from table_info('t_ti') order by cid;
+→ [{"name":"id","collation":"BINARY"},{"name":"name","collation":"BINARY"}]
+
+alter table t_ti alter column name set collate nocase;
+select name, collation from table_info('t_ti') order by cid;
+→ [{"name":"id","collation":"BINARY"},{"name":"name","collation":"NOCASE"}]
+
+-- the canonical UPPERCASE spelling round-trips identically
+alter table t_ti alter column name set collate RTRIM;
+select name, collation from table_info('t_ti') order by cid;
+→ [{"name":"id","collation":"BINARY"},{"name":"name","collation":"RTRIM"}]
+
+-- SET COLLATE BINARY restores the default
+alter table t_ti alter column name set collate binary;
+select name, collation from table_info('t_ti') order by cid;
+→ [{"name":"id","collation":"BINARY"},{"name":"name","collation":"BINARY"}]
+
+drop table t_ti;
+
+-- ===================================
+-- 4. Unknown / unsupported collation rejected (same error shape as CREATE TABLE).
+-- ===================================
+
+create table t_bad (id integer primary key, name text);
+-- run
+
+alter table t_bad alter column name set collate nosuchcollation;
+-- error: Unknown collation 'nosuchcollation' for type 'TEXT'
+
+-- the rejected ALTER left the column untouched
+select name, collation from table_info('t_bad') order by cid;
+→ [{"name":"id","collation":"BINARY"},{"name":"name","collation":"BINARY"}]
+
+drop table t_bad;
+
+-- ===================================
+-- 5. Idempotent: re-applying the same collation is a harmless no-op.
+-- ===================================
+
+create table t_idem (id integer primary key, name text);
+insert into t_idem values (1, 'a'), (2, 'B');
+alter table t_idem alter column name set collate nocase;
+alter table t_idem alter column name set collate nocase;
+
+select name, collation from table_info('t_idem') order by cid;
+→ [{"name":"id","collation":"BINARY"},{"name":"name","collation":"NOCASE"}]
+
+select name from t_idem order by name;
+→ [{"name":"a"},{"name":"B"}]
+
+drop table t_idem;

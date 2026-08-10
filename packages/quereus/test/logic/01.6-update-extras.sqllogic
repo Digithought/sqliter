@@ -100,3 +100,19 @@ select id, name from pk_change order by id;
 → [{"id":1,"name":"one"},{"id":99,"name":"two"}]
 
 drop table pk_change;
+
+-- ===================================
+-- 8. UPDATE assigning the same column twice is rejected (no silent last-wins)
+-- ===================================
+
+create table dup_set (id integer primary key, b integer);
+insert into dup_set values (1, 10);
+
+update dup_set set b = 1, b = 2 where id = 1;
+-- error: duplicate assignment
+
+-- the rejected UPDATE made no change.
+select id, b from dup_set order by id;
+→ [{"id":1,"b":10}]
+
+drop table dup_set;

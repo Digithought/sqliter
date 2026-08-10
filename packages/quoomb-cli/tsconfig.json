@@ -22,5 +22,9 @@
   "exclude": [
     "dist",
     "node_modules"
+  ],
+  "references": [
+    { "path": "../plugin-loader" },
+    { "path": "../quereus" }
   ]
 }

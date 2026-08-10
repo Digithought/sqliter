@@ -136,6 +136,86 @@ describe('Aggregate predicate pushdown', () => {
 		expect(filtersAbove, 'No Filter above hash/stream aggregate').to.have.lengthOf(0);
 	});
 
+	// Regression guard for `bug-correlated-subquery-cannot-read-outer-computed-column`.
+	// `isConjunctPushable` used to see only the conjunct's own scalar column references,
+	// so a single `or`/`case` conjunct mixing a pushable GROUP BY column with a
+	// correlated sub-query looked pushable. Moving it below the aggregate stranded the
+	// correlated reference — "No row context found for column g" at runtime.
+	// Row-set coverage: test/logic/07.7.8-correlated-ref-to-computed-column.sqllogic.
+	describe('conjuncts carrying a correlated sub-query', () => {
+		beforeEach(async () => {
+			await db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER) USING memory');
+			await db.exec('CREATE TABLE side (n INTEGER PRIMARY KEY) USING memory');
+			await db.exec(`INSERT INTO t VALUES
+				(1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 0, 40),
+				(5, -1, 50), (6, -1, 60), (7, -1, 70), (8, -1, 80)`);
+			await db.exec('INSERT INTO side VALUES (1), (2), (3)');
+		});
+
+		async function filtersAboveAggregate(sql: string): Promise<number> {
+			const ops = await queryPlanOps(sql);
+			const aIdx = aggIndex(ops);
+			expect(aIdx, 'plan must contain an aggregate').to.be.greaterThanOrEqual(0);
+			return ops.slice(0, aIdx).filter(op => op === 'FILTER').length;
+		}
+
+		it('keeps an `or` conjunct mixing a GROUP BY column with a correlated EXISTS above the aggregate', async () => {
+			const q = 'select g, count(*) as c from t group by g '
+				+ 'having g > 1 or exists (select 1 from side where side.n = g)';
+
+			expect(await allRows<{ g: number; c: number }>(q + ' order by g')).to.deep.equal([
+				{ g: 1, c: 2 },
+				{ g: 2, c: 1 },
+			]);
+			expect(await filtersAboveAggregate(q), 'correlated conjunct must stay above the aggregate')
+				.to.equal(1);
+		});
+
+		it('keeps a `case` conjunct whose WHEN holds a correlated EXISTS above the aggregate', async () => {
+			const q = 'select g, count(*) as c from t group by g '
+				+ 'having (case when exists (select 1 from side where side.n = g) then g else 0 end) > 0';
+
+			expect(await allRows<{ g: number; c: number }>(q + ' order by g')).to.deep.equal([
+				{ g: 1, c: 2 },
+				{ g: 2, c: 1 },
+			]);
+			expect(await filtersAboveAggregate(q), 'correlated conjunct must stay above the aggregate')
+				.to.equal(1);
+		});
+
+		it('still pushes a plain GROUP BY conjunct below the aggregate on the same table', async () => {
+			// The discriminating half: the refusal above is about the correlation, not a
+			// blanket stop on this shape.
+			const q = 'select g, count(*) as c from t group by g having g > 0';
+
+			expect(await allRows<{ g: number; c: number }>(q + ' order by g')).to.deep.equal([
+				{ g: 1, c: 2 },
+				{ g: 2, c: 1 },
+			]);
+			expect(await filtersAboveAggregate(q), 'plain GROUP BY predicate must push below the aggregate')
+				.to.equal(0);
+		});
+
+		it('still pushes an `or` conjunct whose sub-query is UNCORRELATED', async () => {
+			// The half that pins the guard to *correlation* rather than to "carries a
+			// sub-query". Same unsplittable `or` shape as the refused cases above, but the
+			// `exists` reads nothing from outside itself, so nothing is stranded below the
+			// aggregate and the conjunct must still push. `side` holds 1, so the `exists` is
+			// true and every group survives.
+			const q = 'select g, count(*) as c from t group by g '
+				+ 'having g > 0 or exists (select 1 from side where side.n = 1)';
+
+			expect(await allRows<{ g: number; c: number }>(q + ' order by g')).to.deep.equal([
+				{ g: -1, c: 4 },
+				{ g: 0, c: 1 },
+				{ g: 1, c: 2 },
+				{ g: 2, c: 1 },
+			]);
+			expect(await filtersAboveAggregate(q), 'uncorrelated sub-query must not block the push')
+				.to.equal(0);
+		});
+	});
+
 	it('scalar aggregate (no GROUP BY) — rule does not fire', async () => {
 		const q = "select sum(total) as t from orders having sum(total) > 0";
 		const rows = await allRows<{ t: number }>(q);

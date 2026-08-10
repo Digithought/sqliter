@@ -1,0 +1,1616 @@
+-- 41.10.2-alter-drop-column-check-and-assertion.sqllogic
+--
+-- Subject: `ALTER TABLE … DROP COLUMN` vs. the three EXPRESSION dependents that used to
+-- survive the drop verbatim — a CHECK constraint on the same table, an assertion whose
+-- CHECK body names the column, and a sibling column's DEFAULT (§15-18).
+--
+-- DROP COLUMN's dependents split in two. A STRUCTURAL dependent (a UNIQUE over the
+-- column, the table's own FK using it as a child column — §41.10 and §41.10.1) is
+-- defined by a column set, so losing a column makes it a DIFFERENT constraint and the
+-- engine removes it with the column. An EXPRESSION dependent is arbitrary user logic
+-- with no narrowed form at all, so the engine REFUSES the drop: that is what the
+-- generated-column and partial-index guards already did, and these two now join them.
+--
+-- Left unguarded, both dependents fail much later — while a WRITE statement is being
+-- planned, before any row is touched. The CHECK arm makes its own table unwritable;
+-- the assertion arm makes the WHOLE DATABASE unwritable, because the assertion
+-- evaluator recompiles every live assertion on any commit that touched any table, so
+-- one unresolvable body blocks writes to tables that have nothing to do with the
+-- altered one. §6 asserts exactly that: an unrelated table stays writable.
+--
+-- Detection is scope-aware, not a bare name match: a CHECK expression and an assertion
+-- body may both contain subqueries, so a depth-blind walk would false-refuse a legal
+-- drop whose only same-named column lives on ANOTHER table. §4 and §7 pin that.
+--
+-- Detection also follows VIEW and MATERIALIZED VIEW bodies, to any depth — the assertion
+-- arm in §23, the CHECK / DEFAULT / generated arm in §26-§29 — because a rule that reads
+-- the column through a view breaks just as thoroughly as one that names it. §30 re-pins
+-- the scope controls one hop deeper, since that is where a name-collecting walk would
+-- quietly turn a missed refusal into a false one.
+--
+-- Detection follows column REPUBLICATION too (§31-§36): a view whose `select *` /
+-- `select t.*` re-exposes the column spells its name nowhere, so each body is probed
+-- against every republication target of the dropped column, not the base table alone
+-- (schema/column-republication.ts — the same lineage RENAME COLUMN's cascade re-targets
+-- on). §35 is the one place drop and rename diverge: an explicit column list stops the
+-- rename cascade (published names are pinned) but breaks OUTRIGHT under the drop (the
+-- star's arity changes), so it refuses on being named at all. §36 guards the false-refusal
+-- direction, including the view-aware column-source resolver's fix of §29's old wrong answer.
+--
+-- No `-- requires-capability:` directive: the file uses no standalone index DDL, so it
+-- runs under both the memory module (`yarn test`) and the store module
+-- (`yarn test:store`). The store leg matters — it persists table DDL, so a CHECK broken
+-- by an unguarded drop would survive a reopen.
+
+-- ===================================================================
+-- 1. A NAMED CHECK naming the dropped column refuses the drop, and the
+--    table is left completely untouched (the guard runs before the module).
+-- ===================================================================
+
+create table DcChk (id integer primary key, a integer, b integer, constraint chk_ab check (b > a));
+insert into DcChk values (1, 1, 2);
+-- run
+
+alter table DcChk drop column a;
+-- error: chk_ab
+
+-- Untouched: the column is still there and still holds its value...
+select a, b from DcChk;
+→ [{"a":1,"b":2}]
+
+-- ...and the CHECK still enforces, so nothing was half-applied.
+insert into DcChk values (2, 5, 4);
+-- error: chk_ab
+
+insert into DcChk values (3, 5, 9);
+select count(*) as c from DcChk;
+→ [{"c":2}]
+
+drop table DcChk;
+-- run
+
+-- ===================================================================
+-- 2. An UNNAMED table-level CHECK has no name to quote, so the message
+--    quotes its expression instead — the only handle the user has on it.
+-- ===================================================================
+--
+-- Accepted cost: `DROP CONSTRAINT` resolves by name only, so this column is undroppable
+-- short of rebuilding the table. Same position SQLite takes.
+
+create table DcAnon (id integer primary key, a integer, b integer, check (b > a));
+-- run
+
+alter table DcAnon drop column a;
+-- error: it is referenced by the CHECK constraint (b > a)
+
+drop table DcAnon;
+-- run
+
+-- ===================================================================
+-- 2b. A COLUMN-LEVEL unnamed CHECK is auto-named `_check_<column>` at
+--     declaration time, so unlike §2 it DOES have a name to address.
+-- ===================================================================
+--
+-- The asymmetry with §2 is deliberate and worth pinning: `constraint-builder.ts` names a
+-- column-level CHECK `_check_<column>` when it lifts it to the table's constraint list,
+-- and that name is stored, so the refusal quotes it and `DROP CONSTRAINT` can resolve it.
+-- A column's OWN inline CHECK is refused like any other — the guard does not special-case
+-- "this CHECK only exists because of the column being dropped".
+
+create table DcCol (id integer primary key, a integer check (a > 0), b integer);
+insert into DcCol values (1, 5, 6);
+-- run
+
+alter table DcCol drop column a;
+-- error: CHECK constraint '_check_a'
+
+-- Still enforcing, so nothing was half-applied.
+insert into DcCol values (2, -1, 6);
+-- error: _check_a
+
+alter table DcCol drop constraint _check_a;
+alter table DcCol drop column a;
+select b from DcCol;
+→ [{"b":6}]
+
+drop table DcCol;
+-- run
+
+-- ===================================================================
+-- 3. A CHECK that does NOT name the dropped column is no obstacle, and
+--    still enforces over its own column afterwards.
+-- ===================================================================
+
+create table DcOther (id integer primary key, a integer, b integer, constraint chk_b check (b > 0));
+insert into DcOther values (1, 7, 3);
+alter table DcOther drop column a;
+select b from DcOther;
+→ [{"b":3}]
+
+insert into DcOther values (2, -1);
+-- error: chk_b
+
+insert into DcOther values (3, 4);
+select count(*) as c from DcOther;
+→ [{"c":2}]
+
+drop table DcOther;
+-- run
+
+-- ===================================================================
+-- 4. A CHECK whose only match for the dropped name sits inside a SUBQUERY
+--    over ANOTHER table must NOT block the drop.
+-- ===================================================================
+--
+-- The `v` inside the subquery binds to `DcSrc.v`, not to the dropped `DcSub.v`. A
+-- depth-blind walk sees the bare name and false-refuses.
+
+create table DcSrc (uid integer primary key, v integer);
+insert into DcSrc values (1, 5);
+create table DcSub (id integer primary key, v integer, w integer, check ((select min(v) from DcSrc) >= 0));
+insert into DcSub values (1, 2, 3);
+-- run
+
+alter table DcSub drop column v;
+select w from DcSub;
+→ [{"w":3}]
+
+-- Still writable, and the surviving CHECK still evaluates against DcSrc.
+insert into DcSub values (2, 9);
+select count(*) as c from DcSub;
+→ [{"c":2}]
+
+drop table DcSub;
+drop table DcSrc;
+-- run
+
+-- ===================================================================
+-- 5. Escape hatch for a NAMED CHECK: drop the constraint, then the column.
+-- ===================================================================
+
+create table DcEsc (id integer primary key, a integer, b integer, constraint chk_esc check (b > a));
+insert into DcEsc values (1, 1, 2);
+-- run
+
+alter table DcEsc drop column a;
+-- error: chk_esc
+
+alter table DcEsc drop constraint chk_esc;
+alter table DcEsc drop column a;
+select b from DcEsc;
+→ [{"b":2}]
+
+-- Nothing constrains the surviving column any more.
+insert into DcEsc values (2, -5);
+select count(*) as c from DcEsc;
+→ [{"c":2}]
+
+drop table DcEsc;
+-- run
+
+-- ===================================================================
+-- 6. An ASSERTION whose body names the column refuses the drop — and an
+--    UNRELATED table stays writable, which is the damage this prevents.
+-- ===================================================================
+
+create table DcAsrt (id integer primary key, x integer, y integer);
+create table DcBystander (id integer primary key);
+insert into DcAsrt values (1, 4, 5);
+commit;
+-- run
+
+create assertion dc_nonneg check (not exists (select 1 from DcAsrt where x < 0));
+-- run
+
+alter table DcAsrt drop column x;
+-- error: dc_nonneg
+
+-- The column survived, so the assertion still compiles and every write still commits —
+-- including a write to a table that never appears in the assertion body. Unguarded, the
+-- drop would have made THIS insert fail with `Column not found: x`.
+insert into DcBystander values (1);
+commit;
+select count(*) as c from DcBystander;
+→ [{"c":1}]
+
+-- The assertion still does its job on the altered table.
+insert into DcAsrt values (2, -1, 0);
+commit;
+-- error: dc_nonneg
+
+-- ===================================================================
+-- 7. An assertion body that names the TABLE but not the dropped column is
+--    no obstacle — including a `select *` body, which names no column at all.
+-- ===================================================================
+
+alter table DcAsrt drop column y;
+select x from DcAsrt where id = 1;
+→ [{"x":4}]
+
+create table DcStar (id integer primary key, p integer, q integer);
+create assertion dc_star check (not exists (select * from DcStar where id < 0));
+-- run
+
+alter table DcStar drop column p;
+insert into DcStar values (1, 8);
+commit;
+select q from DcStar;
+→ [{"q":8}]
+
+-- ...and a body whose only match for the name sits on a DIFFERENT table, the assertion
+-- mirror of §4. `z` in the body is DcZb.z, so DcZa.z drops freely.
+create table DcZa (id integer primary key, z integer);
+create table DcZb (id integer primary key, z integer);
+create assertion dc_z check (not exists (select 1 from DcZb where z < 0));
+-- run
+
+alter table DcZa drop column z;
+commit;
+select count(*) as c from DcZa;
+→ [{"c":0}]
+
+drop assertion dc_z;
+drop table DcZa;
+drop table DcZb;
+drop assertion dc_star;
+drop table DcStar;
+-- run
+
+-- ===================================================================
+-- 8. Escape hatch for an assertion: drop the assertion, then the column.
+-- ===================================================================
+
+drop assertion dc_nonneg;
+alter table DcAsrt drop column x;
+-- run
+
+select id from DcAsrt;
+→ [{"id":1}]
+
+drop table DcAsrt;
+drop table DcBystander;
+-- run
+
+-- ===================================================================
+-- 9. Spelling does not matter: a case-only variant and a table-qualified
+--    reference both block the drop.
+-- ===================================================================
+
+create table DcCase (id integer primary key, a integer, b integer, check (B > A));
+-- run
+
+alter table DcCase drop column a;
+-- error: it is referenced by the CHECK constraint (B > A)
+
+drop table DcCase;
+-- run
+
+create table DcQual (id integer primary key, a integer, b integer, check (DcQual.b > DcQual.a));
+-- run
+
+alter table DcQual drop column a;
+-- error: it is referenced by the CHECK constraint
+
+drop table DcQual;
+-- run
+
+create table DcQAsrt (id integer primary key, x integer, y integer);
+create assertion dc_qual check (not exists (select 1 from DcQAsrt where DcQAsrt.x < 0));
+-- run
+
+alter table DcQAsrt drop column x;
+-- error: dc_qual
+
+drop assertion dc_qual;
+drop table DcQAsrt;
+-- run
+
+-- ===================================================================
+-- 10. Both dependents at once: the CHECK message wins, because the CHECK
+--     guard runs first — widening blast radius, most local violation first.
+-- ===================================================================
+
+create table DcBoth (id integer primary key, a integer, b integer, constraint chk_both check (b > a));
+-- run
+
+create assertion dc_both check (not exists (select 1 from DcBoth where a < 0));
+-- run
+
+alter table DcBoth drop column a;
+-- error: chk_both
+
+drop assertion dc_both;
+drop table DcBoth;
+-- run
+
+-- ===================================================================
+-- 11. The two PRE-EXISTING expression guards are unchanged by the new ones,
+--     and a table with no CHECKs at all still drops cleanly.
+-- ===================================================================
+--
+-- The generated-column guard is checked ahead of the CHECK guard, so its message is the
+-- one reported even though the CHECK also names the column. The partial-index guard is
+-- NOT exercised here: declaring a partial index needs `create index … where`, which
+-- would force a `requires-capability: standalone-index-ddl` directive and take this file
+-- out of the store leg — the leg that matters most for a persisted CHECK. It has no
+-- sqllogic coverage anywhere else either.
+
+create table DcGen (id integer primary key, a integer, g integer generated always as (a + 1), constraint chk_gen check (a > 0));
+-- run
+
+alter table DcGen drop column a;
+-- error: generated column 'g'
+
+drop table DcGen;
+-- run
+
+create table DcBare (id integer primary key, a integer, b integer);
+insert into DcBare values (1, 1, 2);
+alter table DcBare drop column a;
+select b from DcBare;
+→ [{"b":2}]
+
+drop table DcBare;
+-- run
+
+-- ===================================================================
+-- 12. A CHECK naming the column through a ROW-IMAGE qualifier —
+--     `new.<col>` / `old.<col>` — refuses the drop like any other.
+-- ===================================================================
+--
+-- `new.<col>` / `old.<col>` name the row being written explicitly; an unqualified
+-- column in a CHECK means the same thing implicitly (docs/sql-ddl.md § CHECK
+-- Constraints). The two spellings must refuse identically, or the qualified one
+-- silently buys an unwritable table: the drop is accepted and every subsequent write
+-- then fails while being planned, with `new.a isn't a column`.
+--
+-- The walk decides this the same way RENAME COLUMN decides what to rewrite, so §26–§27
+-- of 41.3-alter-rename-propagation are the other half of the same guarantee.
+
+create table DcNew (id integer primary key, a integer, b integer, constraint chk_new check (new.a > 0));
+insert into DcNew values (1, 5, 6);
+-- run
+
+alter table DcNew drop column a;
+-- error: CHECK constraint 'chk_new'
+
+-- Untouched, exactly as §1 asserts for the unqualified spelling.
+select a, b from DcNew;
+→ [{"a":5,"b":6}]
+
+insert into DcNew values (2, -1, 6);
+-- error: chk_new
+
+drop table DcNew;
+-- run
+
+-- A DELETE-only CHECK names the OLD row image; same refusal.
+create table DcOld (id integer primary key, a integer, b integer, constraint chk_old check on delete (old.a > 0));
+insert into DcOld values (1, 5, 6);
+insert into DcOld values (2, -1, 7);
+-- run
+
+alter table DcOld drop column a;
+-- error: CHECK constraint 'chk_old'
+
+-- Still enforcing over the OLD row, so nothing was half-applied.
+delete from DcOld where id = 2;
+-- error: chk_old
+
+delete from DcOld where id = 1;
+select count(*) as c from DcOld;
+→ [{"c":1}]
+
+drop table DcOld;
+-- run
+
+-- Case folds like every other identifier in the engine.
+create table DcNewCase (id integer primary key, a integer, b integer, constraint chk_case check (NEW.A > 0));
+-- run
+
+alter table DcNewCase drop column a;
+-- error: CHECK constraint 'chk_case'
+
+drop table DcNewCase;
+-- run
+
+-- ===================================================================
+-- 13. `new` and `old` are NOT reserved words here, so the row-image match is
+--     scope-aware: a subquery over a real table named "new" is not a row image.
+-- ===================================================================
+--
+-- `create table "new" (…)` is legal, so `"new".a` inside a CHECK subquery binds to that
+-- table's column, not to the written row. A depth-blind `qualifier === 'new'` match would
+-- false-refuse this drop — the row-image mirror of §4.
+
+create table "new" (a integer primary key);
+insert into "new" values (3);
+create table DcShadow (id integer primary key, a integer, b integer, check ((select max("new".a) from "new") >= 0));
+insert into DcShadow values (1, 2, 3);
+-- run
+
+alter table DcShadow drop column a;
+select b from DcShadow;
+→ [{"b":3}]
+
+-- Still writable, and the surviving CHECK still evaluates against the "new" table.
+insert into DcShadow values (2, 9);
+select count(*) as c from DcShadow;
+→ [{"c":2}]
+
+drop table DcShadow;
+drop table "new";
+-- run
+
+-- ===================================================================
+-- 14. The same scope-awareness for a `new` rebound by an ALIAS or by a CTE name
+-- ===================================================================
+--
+-- §13 covers the rebind-by-unaliased-source shape only; a FROM source can bind the name
+-- by alias or by `with` clause too, and neither is a row image. Both drops must be
+-- ALLOWED. Refusal half of §28 in 41.3-alter-rename-propagation.
+
+create table UcAlias (k integer primary key, a integer);
+create table DcAlias (id integer primary key, a integer, b integer,
+                      check ((select max("new".a) from UcAlias as "new") >= 0));
+insert into DcAlias values (1, 2, 3);
+-- run
+
+alter table DcAlias drop column a;
+select b from DcAlias;
+→ [{"b":3}]
+
+drop table DcAlias;
+drop table UcAlias;
+-- run
+
+create table DcCte (id integer primary key, a integer, b integer,
+                    check ((with "new" as (select 1 as a) select max("new".a) from "new") >= 0));
+insert into DcCte values (1, 2, 3);
+-- run
+
+alter table DcCte drop column a;
+select b from DcCte;
+→ [{"b":3}]
+
+drop table DcCte;
+-- run
+
+-- ===================================================================
+-- 15. A sibling column's DEFAULT naming the dropped column refuses the drop
+-- ===================================================================
+--
+-- A DEFAULT is a third EXPRESSION dependent and gets the same policy as the two above.
+-- Left unguarded the drop succeeded and the table could then accept NO new row at all:
+-- every insert failed at plan time with "new.a isn't a column". The guard runs FIRST of
+-- the four — ordered by widening blast radius, and a DEFAULT names a column of the very
+-- table being altered, the narrowest end.
+--
+-- The message names the column whose DEFAULT is in the way, the handle the user needs.
+-- Forward half of §29 in 41.3-alter-rename-propagation.
+
+create table DcDef (id integer primary key, a integer, b integer default (new.a + 1));
+insert into DcDef (id, a) values (1, 5);
+-- run
+
+alter table DcDef drop column a;
+-- error: it is referenced by the DEFAULT of column 'b'
+
+-- Untouched: the column is still there, still holds its value...
+select id, a, b from DcDef;
+→ [{"id":1,"a":5,"b":6}]
+
+-- ...and the DEFAULT still computes, so nothing was half-applied.
+insert into DcDef (id, a) values (2, 9);
+select id, b from DcDef where id = 2;
+→ [{"id":2,"b":10}]
+
+drop table DcDef;
+-- run
+
+-- ===================================================================
+-- 16. Dropping the column that OWNS a self-naming DEFAULT is still allowed
+-- ===================================================================
+--
+-- A column's own DEFAULT goes away with the column, so there is nothing for the drop to
+-- orphan. Refusing here would turn away a legal drop; the guard skips the dropped
+-- column's own default for exactly that reason.
+
+create table DcDefSelf (id integer primary key, a integer default (new.id + 1), b integer);
+insert into DcDefSelf (id, b) values (1, 7);
+-- run
+
+alter table DcDefSelf drop column a;
+select id, b from DcDefSelf;
+→ [{"id":1,"b":7}]
+
+-- Still writable afterwards.
+insert into DcDefSelf (id, b) values (2, 8);
+select count(*) as c from DcDefSelf;
+→ [{"c":2}]
+
+drop table DcDefSelf;
+-- run
+
+-- ===================================================================
+-- 17. A DEFAULT whose only match sits inside a SUBQUERY over ANOTHER table
+--     is no obstacle — the same scope-awareness §4 pins for a CHECK
+-- ===================================================================
+--
+-- The inner `v` binds to `UcDef.v`, not to this table's own `v`, so a depth-blind name
+-- match would false-refuse a legal drop. Sharing the probe with the rename walk is what
+-- keeps the two definitions of "names the column" identical.
+
+create table UcDef (k integer primary key, v integer);
+insert into UcDef values (1, 11);
+-- run
+
+create table DcDefSub (id integer primary key, v integer,
+                       w integer default ((select min(v) from UcDef)));
+insert into DcDefSub (id, v) values (1, 2);
+-- run
+
+alter table DcDefSub drop column v;
+select id, w from DcDefSub;
+→ [{"id":1,"w":11}]
+
+-- Still writable, and the surviving DEFAULT still reads UcDef.
+insert into DcDefSub (id) values (2);
+select id, w from DcDefSub where id = 2;
+→ [{"id":2,"w":11}]
+
+drop table DcDefSub;
+drop table UcDef;
+-- run
+
+-- ===================================================================
+-- 18. A `new` rebound by an inner FROM inside a DEFAULT does not block the drop
+-- ===================================================================
+--
+-- Mirror of §13 for the DEFAULT arm: `"new".a` there names the real table `"new"`, not
+-- this table's row image, so dropping this table's own like-named column is legal.
+
+create table "new" (a integer primary key);
+insert into "new" values (3);
+-- run
+
+create table DcDefShadow (id integer primary key, a integer,
+                          b integer default ((select max("new".a) from "new")));
+insert into DcDefShadow (id, a) values (1, 7);
+-- run
+
+alter table DcDefShadow drop column a;
+select id, b from DcDefShadow;
+→ [{"id":1,"b":3}]
+
+drop table DcDefShadow;
+drop table "new";
+-- run
+
+-- ===================================================================
+-- 19. A CHECK on ANOTHER table, reading this column through a subquery,
+--     refuses the drop — and the message names that other table
+-- ===================================================================
+--
+-- §1–§18 all keep the dependent on the altered table. But a CHECK may contain a
+-- subquery, so another table's constraint can legitimately read this one; RENAME COLUMN
+-- has always rewritten exactly those, across every table in every schema, while the DROP
+-- guard used to scan the altered table alone. The drop was accepted and the OTHER table
+-- became unwritable, with `Column not found: v` naming neither this table, nor the
+-- dropped column, nor the constraint that broke.
+--
+-- The message has to name the referencing table: it is the one handle the user has on a
+-- statement that mentions only the altered one.
+
+create table DcXsrc (id integer primary key, v integer);
+insert into DcXsrc values (1, 10);
+create table DcXref (id integer primary key, n integer,
+                     constraint ck_xref check (n < (select max(v) from DcXsrc)));
+-- run
+
+alter table DcXsrc drop column v;
+-- error: CHECK constraint 'ck_xref' on table 'DcXref'
+
+-- Untouched, so the referencing table is still writable — the damage this prevents.
+insert into DcXref values (1, 1);
+select n from DcXref;
+→ [{"n":1}]
+
+-- ...and the CHECK still enforces against DcXsrc.
+insert into DcXref values (2, 99);
+-- error: ck_xref
+
+-- Escape hatch, same shape as §5: drop the constraint, then the column.
+alter table DcXref drop constraint ck_xref;
+alter table DcXsrc drop column v;
+select id from DcXsrc;
+→ [{"id":1}]
+
+drop table DcXref;
+drop table DcXsrc;
+-- run
+
+-- ===================================================================
+-- 20. Same for a DEFAULT and a GENERATED body on another table
+-- ===================================================================
+--
+-- Both are column-level expressions and reach this column the only way they can — through
+-- a subquery — so both get the DEFAULT guard's message plus the owning table's name.
+
+create table DcDsrc (id integer primary key, v integer);
+insert into DcDsrc values (1, 11);
+create table DcDref (id integer primary key, w integer default ((select min(v) from DcDsrc)));
+-- run
+
+alter table DcDsrc drop column v;
+-- error: the DEFAULT of column 'w' on table 'DcDref'
+
+-- Still writable, and the DEFAULT still reads DcDsrc.
+insert into DcDref (id) values (1);
+select id, w from DcDref;
+→ [{"id":1,"w":11}]
+
+drop table DcDref;
+drop table DcDsrc;
+-- run
+
+-- A generated body must qualify its subquery's column (`DcGsrc.v`) — an unqualified name
+-- there is resolved against the OWNING table at declaration time and rejected outright.
+create table DcGsrc (id integer primary key, v integer);
+insert into DcGsrc values (1, 12);
+create table DcGref (id integer primary key,
+                     g integer generated always as ((select max(DcGsrc.v) from DcGsrc)));
+insert into DcGref (id) values (1);
+-- run
+
+alter table DcGsrc drop column v;
+-- error: the GENERATED expression of column 'g' on table 'DcGref'
+
+select id, g from DcGref;
+→ [{"id":1,"g":12}]
+
+drop table DcGref;
+drop table DcGsrc;
+-- run
+
+-- ===================================================================
+-- 21. A like-named column on a THIRD table does not block the drop
+-- ===================================================================
+--
+-- The other-table mirror of §4: the scan is scope-aware in both directions, so widening
+-- it to every table must not start refusing drops whose only name match belongs to a
+-- table nobody mentioned. `v` in DcNref's CHECK binds DcNoise.v.
+
+create table DcNsrc (id integer primary key, v integer);
+create table DcNoise (k integer primary key, v integer);
+create table DcNref (id integer primary key, n integer, check ((select min(v) from DcNoise) >= 0));
+insert into DcNsrc values (1, 5);
+-- run
+
+alter table DcNsrc drop column v;
+select id from DcNsrc;
+→ [{"id":1}]
+
+drop table DcNref;
+drop table DcNoise;
+drop table DcNsrc;
+-- run
+
+-- The commonest false-refusal shape: another table simply HAS a column of the same name
+-- and constrains its own, bare or self-qualified. Neither is a reference to this one.
+create table DcOwn (id integer primary key, v integer);
+create table DcOwnBare (id integer primary key, v integer, check (v > 0));
+create table DcOwnQual (id integer primary key, v integer, check (DcOwnQual.v > 0));
+insert into DcOwn values (1, 4);
+-- run
+
+alter table DcOwn drop column v;
+select id from DcOwn;
+→ [{"id":1}]
+
+-- The other tables' own constraints are untouched and still enforcing.
+insert into DcOwnBare values (1, -1);
+-- error: CHECK constraint failed
+
+insert into DcOwnQual values (1, -1);
+-- error: CHECK constraint failed
+
+drop table DcOwnQual;
+drop table DcOwnBare;
+drop table DcOwn;
+-- run
+
+-- ===================================================================
+-- 22. Cross-schema: what decides a match is whether the reference RESOLVES
+--     to the altered table, not whether the bare names collide
+-- ===================================================================
+--
+-- Same rule §48–§49 of 41.3-alter-rename-propagation pin for the rename: a CHECK in
+-- `temp` naming `main.DcCs` explicitly IS a reference, while a bare name in `temp` that
+-- `temp` itself holds is not.
+
+create table main.DcCs (id integer primary key, v integer);
+create table temp.DcCsRef (id integer primary key, n integer,
+                           constraint ck_cs check (n < (select max(v) from main.DcCs)));
+-- run
+
+alter table main.DcCs drop column v;
+-- error: CHECK constraint 'ck_cs' on table 'temp.DcCsRef'
+
+drop table temp.DcCsRef;
+drop table main.DcCs;
+-- run
+
+create table main.DcDup (id integer primary key, v integer);
+create table temp.DcDup (id integer primary key, v integer);
+-- The CHECK's home is temp, so its bare `DcDup` binds temp.DcDup.
+create table temp.DcDupRef (id integer primary key, n integer,
+                            check (n < (select max(v) from DcDup)));
+insert into main.DcDup values (1, 7);
+-- run
+
+alter table main.DcDup drop column v;
+select id from main.DcDup;
+→ [{"id":1}]
+
+drop table temp.DcDupRef;
+drop table temp.DcDup;
+drop table main.DcDup;
+-- run
+
+-- ===================================================================
+-- 23. An assertion reaches the column THROUGH a view
+-- ===================================================================
+--
+-- The assertion body names a view; the VIEW's body names the column. Dropping the
+-- column used to be accepted and then made every write to the whole database fail —
+-- the assertion evaluator recompiles every live assertion on any commit.
+--
+-- No column lineage through the view's projection is built, and none is needed: the
+-- match is on the view's own body. If no body in the chain named the column, the
+-- assertion could not have been reading it.
+
+create table DcVw (id integer primary key, x integer);
+create view DcVwV as select id, x from DcVw;
+create table DcVwBystander (id integer primary key);
+create assertion dc_vw check (not exists (select 1 from DcVwV where x < 0));
+-- run
+
+-- The message names the chain — an assertion whose body does not mention `x` is
+-- unactionable advice without it.
+alter table DcVw drop column x;
+-- error: it is referenced by assertion 'dc_vw' through view 'DcVwV'
+
+-- Clean no-op: the unrelated table is still writable, which is exactly what the
+-- missed refusal used to break.
+insert into DcVwBystander values (1);
+commit;
+select count(*) as c from DcVwBystander;
+→ [{"c":1}]
+
+drop assertion dc_vw;
+alter table DcVw drop column x;
+drop view DcVwV;
+drop table DcVw;
+drop table DcVwBystander;
+-- run
+
+-- Three levels deep — one-hop expansion is the natural under-fix.
+create table DcCh (id integer primary key, x integer);
+create view DcCh1 as select id, x from DcCh;
+create view DcCh2 as select id, x from DcCh1;
+create assertion dc_ch check (not exists (select 1 from DcCh2 where x < 0));
+-- run
+
+alter table DcCh drop column x;
+-- error: it is referenced by assertion 'dc_ch' through view 'DcCh2' -> view 'DcCh1'
+
+drop assertion dc_ch;
+drop view DcCh2;
+drop view DcCh1;
+drop table DcCh;
+-- run
+
+-- A view in the chain that names the TABLE but not the column is no obstacle,
+-- exactly as a direct `select *` body is not (§7).
+create table DcVwStar (id integer primary key, p integer, q integer);
+create view DcVwStarV as select id, q from DcVwStar;
+create assertion dc_vw_star check (not exists (select 1 from DcVwStarV where q < 0));
+-- run
+
+alter table DcVwStar drop column p;
+insert into DcVwStar values (1, 8);
+commit;
+select q from DcVwStar;
+→ [{"q":8}]
+
+drop assertion dc_vw_star;
+drop view DcVwStarV;
+drop table DcVwStar;
+-- run
+
+-- ===================================================================
+-- 24. The assertion guard consults assertions in EVERY schema
+-- ===================================================================
+--
+-- Same rule §22 pins for CHECK constraints: what decides a match is whether the
+-- reference RESOLVES to the altered table, not which schema the rule lives in. The
+-- refusal qualifies the assertion so the user can find the thing to drop.
+
+create table main.DcXs (id integer primary key, v integer);
+create assertion temp.dc_xs check (not exists (select 1 from main.DcXs where v < 0));
+-- run
+
+alter table main.DcXs drop column v;
+-- error: it is referenced by assertion 'temp.dc_xs'
+
+drop assertion temp.dc_xs;
+alter table main.DcXs drop column v;
+drop table main.DcXs;
+-- run
+
+-- ...and a bare name in `temp` that `temp` itself holds is not a reference to main's.
+create table main.DcXsDup (id integer primary key, v integer);
+create table temp.DcXsDup (id integer primary key, v integer);
+create assertion temp.dc_xs_dup check (not exists (select 1 from DcXsDup where v < 0));
+insert into main.DcXsDup values (1, 7);
+-- run
+
+alter table main.DcXsDup drop column v;
+select id from main.DcXsDup;
+→ [{"id":1}]
+
+drop assertion temp.dc_xs_dup;
+drop table temp.DcXsDup;
+drop table main.DcXsDup;
+-- run
+
+-- The two widenings composed: a `temp` assertion reaching a `main` column through a
+-- `main` view. Only the composition proves the column probe runs each reached body
+-- under that body's OWN home schema rather than the root assertion's — the view's
+-- bare `DcXv` must bind main's even though the assertion lives in temp.
+create table main.DcXv (id integer primary key, v integer);
+create view main.DcXvV as select id, v from DcXv;
+create assertion temp.dc_xv check (not exists (select 1 from main.DcXvV where v < 0));
+-- run
+
+alter table main.DcXv drop column v;
+-- error: it is referenced by assertion 'temp.dc_xv' through view 'DcXvV'
+
+drop assertion temp.dc_xv;
+drop view main.DcXvV;
+drop table main.DcXv;
+-- run
+
+-- ===================================================================
+-- 25. A merely SHADOWED name in the reach is still not a reference
+-- ===================================================================
+--
+-- The closure walks every body it reaches with the same scope-aware probe, so a
+-- `with DcSh as (…)` that shadows the name binds the CTE, not the real table. This is
+-- the property a collect-everything walk would silently lose, turning a missed
+-- refusal into a false one.
+
+create table DcSh (id integer primary key, x integer);
+create table DcShSrc (id integer primary key, x integer);
+create assertion dc_sh check (not exists (
+  with DcSh as (select id, x from DcShSrc) select 1 from DcSh where x < 0));
+-- run
+
+alter table DcSh drop column x;
+select id from DcSh;
+→ []
+
+-- ...and the table the CTE actually reads IS still protected.
+alter table DcShSrc drop column x;
+-- error: it is referenced by assertion 'dc_sh'
+
+drop assertion dc_sh;
+drop table DcShSrc;
+drop table DcSh;
+-- run
+
+-- ===================================================================
+-- 26. A CHECK on another table reaches the column THROUGH a view
+-- ===================================================================
+--
+-- §19's shape with a view in the middle. The referencing CHECK never spells `DcRv` at
+-- all — it reads a view whose body does — and dropping the column used to be accepted,
+-- leaving DcRvRef unwritable with an error naming neither the column nor the constraint.
+--
+-- No column lineage through the view's projection is needed here, exactly as in §23: the
+-- match is on the VIEW's body. If no body in the chain named the column, the CHECK could
+-- not have been reading it.
+
+create table DcRv (id integer primary key, v integer);
+insert into DcRv values (1, 10);
+create view DcRvV as select id, v from DcRv;
+create table DcRvRef (id integer primary key, n integer,
+                      constraint ck_dcrv check (n < (select max(DcRvV.v) from DcRvV)));
+-- run
+
+-- The message names the chain — a constraint whose body does not mention `v` is
+-- unactionable advice without it. Same spelling the assertion arm uses in §23.
+alter table DcRv drop column v;
+-- error: Cannot drop column 'v' from 'DcRv': CHECK constraint 'ck_dcrv' on table 'DcRvRef' reaches it through view 'DcRvV'
+
+-- Nothing was applied: the column is still there, and the CHECK still enforces.
+select v from DcRv;
+→ [{"v":10}]
+
+insert into DcRvRef values (1, 99);
+-- error: ck_dcrv
+
+-- Escape hatch, same as §19: drop the constraint, then the column.
+alter table DcRvRef drop constraint ck_dcrv;
+alter table DcRv drop column v;
+select id from DcRv;
+→ [{"id":1}]
+
+drop table DcRvRef;
+drop view DcRvV;
+drop table DcRv;
+-- run
+
+-- Three levels deep, and the whole path is rendered.
+create table DcCv (id integer primary key, v integer);
+create view DcCv1 as select id, v from DcCv;
+create view DcCv2 as select id, v from DcCv1;
+create table DcCvRef (id integer primary key, n integer,
+                      constraint ck_dccv check (n < (select max(DcCv2.v) from DcCv2)));
+-- run
+
+alter table DcCv drop column v;
+-- error: CHECK constraint 'ck_dccv' on table 'DcCvRef' reaches it through view 'DcCv2' -> view 'DcCv1'
+
+alter table DcCvRef drop constraint ck_dccv;
+drop view DcCv2;
+drop view DcCv1;
+drop table DcCv;
+drop table DcCvRef;
+-- run
+
+-- A view in the chain that names the TABLE but not the COLUMN is no obstacle, exactly as
+-- a direct `select id, q` body is not (§7, §23). The TABLE verb has no such hole — it
+-- matches the object, not a column — which is 41.10.4 §10's business, not this file's.
+create table DcVs (id integer primary key, p integer, q integer);
+create view DcVsV as select id, q from DcVs;
+create table DcVsRef (id integer primary key, n integer,
+                      check (n < (select max(DcVsV.q) from DcVsV)));
+insert into DcVs values (1, 3, 8);
+-- run
+
+alter table DcVs drop column p;
+select q from DcVs;
+→ [{"q":8}]
+
+drop table DcVsRef;
+drop view DcVsV;
+drop table DcVs;
+-- run
+
+-- ===================================================================
+-- 27. A materialized view in the chain reads as one
+-- ===================================================================
+
+create table DcMv (id integer primary key, v integer);
+insert into DcMv values (1, 6);
+create materialized view DcMvM as select id, v from DcMv;
+create table DcMvRef (id integer primary key, n integer,
+                      constraint ck_dcmv check (n < (select max(DcMvM.v) from DcMvM)));
+-- run
+
+alter table DcMv drop column v;
+-- error: CHECK constraint 'ck_dcmv' on table 'DcMvRef' reaches it through materialized view 'DcMvM'
+
+alter table DcMvRef drop constraint ck_dcmv;
+drop materialized view DcMvM;
+drop table DcMv;
+drop table DcMvRef;
+-- run
+
+-- ===================================================================
+-- 28. DEFAULT and GENERATED bodies follow chains too
+-- ===================================================================
+--
+-- §20's shapes one view deeper. All three arms run the same probe, so widening one
+-- without the others would let two guards over the same DDL disagree.
+
+create table DcDv (id integer primary key, v integer);
+insert into DcDv values (1, 11);
+create view DcDvV as select id, v from DcDv;
+create table DcDvRef (id integer primary key, w integer default ((select min(DcDvV.v) from DcDvV)));
+-- run
+
+alter table DcDv drop column v;
+-- error: the DEFAULT of column 'w' on table 'DcDvRef' reaches it through view 'DcDvV'
+
+insert into DcDvRef (id) values (1);
+select id, w from DcDvRef;
+→ [{"id":1,"w":11}]
+
+drop table DcDvRef;
+drop view DcDvV;
+drop table DcDv;
+-- run
+
+create table DcGv (id integer primary key, v integer);
+insert into DcGv values (1, 12);
+create view DcGvV as select id, v from DcGv;
+create table DcGvRef (id integer primary key,
+                      g integer generated always as ((select max(DcGvV.v) from DcGvV)));
+insert into DcGvRef (id) values (1);
+-- run
+
+alter table DcGv drop column v;
+-- error: the GENERATED expression of column 'g' on table 'DcGvRef' reaches it through view 'DcGvV'
+
+select id, g from DcGvRef;
+→ [{"id":1,"g":12}]
+
+drop table DcGvRef;
+drop view DcGvV;
+drop table DcGv;
+-- run
+
+-- ===================================================================
+-- 29. An OWN-table CHECK reaching its own column through a view
+-- ===================================================================
+--
+-- The seeded probe still applies to the CHECK's OWN body and to nothing below it: a view
+-- body is a relation with no written-row seed, so a reached body's unqualified names bind
+-- through its own FROM clauses.
+--
+-- Both spellings refuse. The QUALIFIED one (`DcOvV.v`) matches on the view's body, which
+-- names `DcOv.v`. The UNQUALIFIED one binds the view's own exposed `v` —
+-- `buildColumnSourceResolver` answers "does source X expose column `v`?" for a VIEW by
+-- reading its published columns — and refuses through the same view: the view is a
+-- REPUBLICATION target of the dropped column (schema/column-republication.ts), so a
+-- reference spelled against the view counts. What this scope-awareness buys is the
+-- other direction, pinned in §36: an unqualified `v` binding a view over ANOTHER table
+-- no longer false-refuses this table's drop.
+
+create table DcOv (id integer primary key, v integer);
+create view DcOvV as select id, v from DcOv;
+-- run
+
+alter table DcOv add constraint ck_dcov check (id < (select max(DcOvV.v) from DcOvV));
+-- run
+
+alter table DcOv drop column v;
+-- error: Cannot drop column 'v' from 'DcOv': CHECK constraint 'ck_dcov' reaches it through view 'DcOvV'
+
+alter table DcOv drop constraint ck_dcov;
+alter table DcOv add constraint ck_dcov2 check (id < (select max(v) from DcOvV));
+-- run
+
+alter table DcOv drop column v;
+-- error: Cannot drop column 'v' from 'DcOv': CHECK constraint 'ck_dcov2' reaches it through view 'DcOvV'
+
+alter table DcOv drop constraint ck_dcov2;
+alter table DcOv drop column v;
+select count(*) as c from DcOv;
+→ [{"c":0}]
+
+drop view DcOvV;
+drop table DcOv;
+-- run
+
+-- ===================================================================
+-- 30. The widening must not start false-refusing
+-- ===================================================================
+--
+-- §21 and §25 re-pinned one view deeper: the closure is scope-aware by construction, so
+-- adding hops must not turn a missed refusal into a false one.
+
+-- §21's shape with a view in the way: `uv` re-exposes a LIKE-NAMED column of a THIRD
+-- table, so dropping this table's own `v` is still legal.
+create table DcPv (id integer primary key, v integer);
+create table DcPvNoise (k integer primary key, v integer);
+create view DcPvV as select k, v from DcPvNoise;
+create table DcPvRef (id integer primary key, n integer,
+                      check ((select min(DcPvV.v) from DcPvV) >= 0));
+insert into DcPv values (1, 5);
+-- run
+
+alter table DcPv drop column v;
+select id from DcPv;
+→ [{"id":1}]
+
+drop table DcPvRef;
+drop view DcPvV;
+drop table DcPvNoise;
+drop table DcPv;
+-- run
+
+-- §25's shape one hop out of the assertion arm and into this one: a CTE inside the VIEW's
+-- body that merely SHADOWS the name binds the CTE, and the table it really reads IS
+-- protected.
+create table DcSv (id integer primary key, x integer);
+create table DcSvSrc (id integer primary key, x integer);
+create view DcSvV as with DcSv as (select id, x from DcSvSrc) select id, x from DcSv;
+create table DcSvRef (id integer primary key, n integer,
+                      check ((select min(DcSvV.x) from DcSvV) >= 0));
+-- run
+
+alter table DcSv drop column x;
+select count(*) as c from DcSv;
+→ [{"c":0}]
+
+alter table DcSvSrc drop column x;
+-- error: reaches it through view 'DcSvV'
+
+drop table DcSvRef;
+drop view DcSvV;
+drop table DcSvSrc;
+drop table DcSv;
+-- run
+
+-- §22's cross-schema rule composed with the chain: the view's bare `DcXvw` binds MAIN's
+-- because the VIEW lives in main, even though the CHECK that reaches it lives in temp.
+create table main.DcXvw (id integer primary key, v integer);
+create view main.DcXvwV as select id, v from DcXvw;
+create table temp.DcXvwRef (id integer primary key, n integer,
+                            constraint ck_dcxvw check (n < (select max(DcXvwV.v) from main.DcXvwV)));
+-- run
+
+alter table main.DcXvw drop column v;
+-- error: CHECK constraint 'ck_dcxvw' on table 'temp.DcXvwRef' reaches it through view 'DcXvwV'
+
+drop table temp.DcXvwRef;
+drop view main.DcXvwV;
+drop table main.DcXvw;
+-- run
+
+-- ...and the other direction: a bare name inside a `temp` view body that `temp` itself
+-- holds says nothing about main's like-named table.
+create table main.DcXvd (id integer primary key, v integer);
+create table temp.DcXvd (id integer primary key, v integer);
+create view temp.DcXvdV as select id, v from DcXvd;
+create table temp.DcXvdRef (id integer primary key, n integer,
+                            check (n < (select max(DcXvdV.v) from DcXvdV)));
+insert into main.DcXvd values (1, 7);
+-- run
+
+alter table main.DcXvd drop column v;
+select id from main.DcXvd;
+→ [{"id":1}]
+
+drop table temp.DcXvdRef;
+drop view temp.DcXvdV;
+drop table temp.DcXvd;
+drop table main.DcXvd;
+-- run
+
+-- ===================================================================
+-- 31. A view that re-exposes the column by a STAR blocks the drop
+-- ===================================================================
+--
+-- `create view v as select * from t` spells the column nowhere, so the name probe over
+-- the chain's bodies sees nothing — the hole that used to let this drop through, after
+-- which the assertion failed every write to the whole database with `Column not found`.
+-- The guard now probes every body against every REPUBLICATION target of the dropped
+-- column (schema/column-republication.ts — the same lineage the RENAME COLUMN cascade
+-- re-targets on), and the assertion's `where x < 0` references the column against the
+-- view, which IS such a target.
+
+create table DcSt (id integer primary key, x integer);
+create table DcStBy (id integer primary key);
+create view DcStV as select * from DcSt;
+create assertion dc_st check (not exists (select 1 from DcStV where x < 0));
+-- run
+
+alter table DcSt drop column x;
+-- error: it is referenced by assertion 'dc_st'
+
+-- Clean no-op: the unrelated table is still writable — the whole-database blast radius
+-- this refusal exists to prevent.
+insert into DcStBy values (1);
+commit;
+select count(*) as c from DcStBy;
+→ [{"c":1}]
+
+-- The assertion still does its job through the star.
+insert into DcSt values (1, -1);
+commit;
+-- error: dc_st
+
+drop assertion dc_st;
+alter table DcSt drop column x;
+drop view DcStV;
+drop table DcSt;
+drop table DcStBy;
+-- run
+
+-- The `select t.*` spelling re-exposes identically.
+create table DcSq (id integer primary key, x integer);
+create view DcSqV as select DcSq.* from DcSq;
+create assertion dc_sq check (not exists (select 1 from DcSqV where x < 0));
+-- run
+
+alter table DcSq drop column x;
+-- error: it is referenced by assertion 'dc_sq'
+
+drop assertion dc_sq;
+drop view DcSqV;
+drop table DcSq;
+-- run
+
+-- ===================================================================
+-- 32. The same star hole on the CHECK / DEFAULT arm
+-- ===================================================================
+--
+-- Blast radius one table instead of the database, same lineage answer — both guard
+-- families consult the one republication fixpoint, so they cannot disagree.
+
+create table DcSc (id integer primary key, x integer);
+create view DcScV as select * from DcSc;
+create table DcScRef (id integer primary key, n integer,
+                      constraint ck_dcsc check (n < (select max(DcScV.x) from DcScV)));
+-- run
+
+alter table DcSc drop column x;
+-- error: CHECK constraint 'ck_dcsc' on table 'DcScRef'
+
+-- The unqualified spelling binds the view's exposed column and refuses the same way.
+alter table DcScRef drop constraint ck_dcsc;
+alter table DcScRef add constraint ck_dcsc2 check (n < (select max(x) from DcScV));
+-- run
+
+alter table DcSc drop column x;
+-- error: CHECK constraint 'ck_dcsc2' on table 'DcScRef'
+
+alter table DcScRef drop constraint ck_dcsc2;
+alter table DcSc drop column x;
+select count(*) as c from DcSc;
+→ [{"c":0}]
+
+drop table DcScRef;
+drop view DcScV;
+drop table DcSc;
+-- run
+
+-- A DEFAULT reading through the star, same answer.
+create table DcSd (id integer primary key, x integer);
+create view DcSdV as select * from DcSd;
+create table DcSdRef (id integer primary key, w integer default ((select min(DcSdV.x) from DcSdV)));
+-- run
+
+alter table DcSd drop column x;
+-- error: the DEFAULT of column 'w' on table 'DcSdRef'
+
+drop table DcSdRef;
+drop view DcSdV;
+drop table DcSd;
+-- run
+
+-- ===================================================================
+-- 33. A chain with the star at either position
+-- ===================================================================
+--
+-- Star at the BOTTOM: v2's body names the column against v1, and v1 is a republication
+-- target, so the match lands on v2's body and the message names it.
+
+create table DcCb (id integer primary key, x integer);
+create view DcCb1 as select * from DcCb;
+create view DcCb2 as select id, x from DcCb1;
+create assertion dc_cb check (not exists (select 1 from DcCb2 where x < 0));
+-- run
+
+alter table DcCb drop column x;
+-- error: it is referenced by assertion 'dc_cb' through view 'DcCb2'
+
+drop assertion dc_cb;
+drop view DcCb2;
+drop view DcCb1;
+drop table DcCb;
+-- run
+
+-- Star at the TOP (v1 names the column, v2 stars over v1): already refused before the
+-- widening, re-pinned so the whole path still renders.
+create table DcCt (id integer primary key, x integer);
+create view DcCt1 as select id, x from DcCt;
+create view DcCt2 as select * from DcCt1;
+create assertion dc_ct check (not exists (select 1 from DcCt2 where x < 0));
+-- run
+
+alter table DcCt drop column x;
+-- error: it is referenced by assertion 'dc_ct' through view 'DcCt2' -> view 'DcCt1'
+
+drop assertion dc_ct;
+drop view DcCt2;
+drop view DcCt1;
+drop table DcCt;
+-- run
+
+-- ===================================================================
+-- 34. A MATERIALIZED VIEW star refuses too — deliberately conservative
+-- ===================================================================
+--
+-- An MV's backing table keeps its own columns, so the assertion would in fact have kept
+-- compiling and running against frozen contents (the MV goes stale and its next
+-- `refresh materialized view` would fail). Refusing anyway keeps ONE rule for both
+-- object kinds, matches the named-projection MV refusal §27 pins, and errs the same
+-- direction `DROP TABLE` does for the same object.
+
+create table DcSm (id integer primary key, x integer);
+create materialized view DcSmM as select * from DcSm;
+create assertion dc_sm check (not exists (select 1 from DcSmM where x < 0));
+-- run
+
+alter table DcSm drop column x;
+-- error: it is referenced by assertion 'dc_sm'
+
+drop assertion dc_sm;
+alter table DcSm drop column x;
+drop materialized view DcSmM;
+drop table DcSm;
+-- run
+
+-- ===================================================================
+-- 35. An EXPLICIT COLUMN LIST over a star breaks the whole view
+-- ===================================================================
+--
+-- `create view v(a, b) as select * from t` pins the published names, so no published
+-- name shifts — the rename cascade rightly ignores such a view. The drop must not: the
+-- lineage here is POSITIONAL, and dropping any starred-over column changes the body's
+-- arity, breaking the view outright — every reader of it, not one column. A rule whose
+-- reach names such a view at all refuses, and the message says the view breaks
+-- entirely rather than pointing at a column name no body spells.
+
+create table DcSl (id integer primary key, x integer);
+create table DcSlBy (id integer primary key);
+create view DcSlV(a, b) as select * from DcSl;
+create assertion dc_sl check (not exists (select 1 from DcSlV where b < 0));
+-- run
+
+alter table DcSl drop column x;
+-- error: dropping the column breaks it outright
+
+insert into DcSlBy values (1);
+commit;
+select count(*) as c from DcSlBy;
+→ [{"c":1}]
+
+drop assertion dc_sl;
+drop view DcSlV;
+drop table DcSl;
+drop table DcSlBy;
+-- run
+
+-- The CHECK arm gets the same refusal from the same lineage.
+create table DcSl2 (id integer primary key, x integer);
+create view DcSl2V(a, b) as select * from DcSl2;
+create table DcSl2Ref (id integer primary key, n integer,
+                       constraint ck_dcsl2 check (n < (select max(b) from DcSl2V)));
+-- run
+
+alter table DcSl2 drop column x;
+-- error: dropping the column breaks it outright
+
+drop table DcSl2Ref;
+drop view DcSl2V;
+drop table DcSl2;
+-- run
+
+-- Guard rail: an explicit column list over a body that does NOT star over the table
+-- pins nothing positional — dropping an unprojected column is still legal even while a
+-- rule reads the view.
+create table DcSl3 (id integer primary key, x integer);
+create view DcSl3V(a) as select id from DcSl3;
+create assertion dc_sl3 check (not exists (select 1 from DcSl3V where a < 0));
+-- run
+
+alter table DcSl3 drop column x;
+select count(*) as c from DcSl3;
+→ [{"c":0}]
+
+drop assertion dc_sl3;
+drop view DcSl3V;
+drop table DcSl3;
+-- run
+
+-- ===================================================================
+-- 36. The widening must not start false-refusing
+-- ===================================================================
+--
+-- A star view republishes EVERY column of its source, but target-ness is per dropped
+-- column and the probe still matches names — a rule reading only a surviving column
+-- through the star is no obstacle.
+
+create table DcSg (id integer primary key, x integer, y integer);
+create view DcSgV as select * from DcSg;
+create assertion dc_sg check (not exists (select 1 from DcSgV where y < 0));
+-- run
+
+alter table DcSg drop column x;
+select count(*) as c from DcSg;
+→ [{"c":0}]
+
+-- ...and the column the rule DOES read through the star still refuses.
+alter table DcSg drop column y;
+-- error: it is referenced by assertion 'dc_sg'
+
+drop assertion dc_sg;
+drop view DcSgV;
+drop table DcSg;
+-- run
+
+-- The view-aware column-source resolver also fixes the OPPOSITE direction — §29's old
+-- false refusal: an own-table CHECK whose unqualified `v` binds a view over ANOTHER
+-- table said nothing about this table's `v`, yet used to block its drop (the resolver
+-- looked the view up as a table, found no columns, and fell back to the owning-table
+-- seed). The reference resolves inside the subquery, so the drop is legal.
+
+create table DcSg2 (id integer primary key, v integer);
+create table DcSg2u (id integer primary key, v integer);
+create view DcSg2uv as select v from DcSg2u;
+-- run
+
+alter table DcSg2 add constraint ck_dcsg2 check (id < (select max(v) from DcSg2uv));
+-- run
+
+alter table DcSg2 drop column v;
+select count(*) as c from DcSg2;
+→ [{"c":0}]
+
+-- The constraint still enforces against the view over the other table.
+insert into DcSg2u values (1, 0);
+insert into DcSg2 values (5);
+-- error: ck_dcsg2
+
+insert into DcSg2u values (2, 50);
+insert into DcSg2 values (5);
+select count(*) as c from DcSg2;
+→ [{"c":1}]
+
+drop table DcSg2;
+drop view DcSg2uv;
+drop table DcSg2u;
+-- run
+
+-- ===================================================================
+-- 37. ANOTHER table's row-image qualifier does not block dropping a column
+--     of a table called "new"
+-- ===================================================================
+--
+-- §12 pins the refusal when the row image is the ALTERED table's own (`check
+-- (new.a > 0)` on the table being altered); §13/§14 pin the FROM-rebound edges. The
+-- remaining cell of the matrix: the qualifier sits on a DIFFERENT table, where it names
+-- THAT table's row image — not a column of the real table "new" — so `alter table "new"
+-- drop column v` is legal. Pre-fix the guard treated the foreign `new.v` as a reference
+-- to the table "new" and false-refused.
+
+create table "new" (id integer primary key, v integer);
+create table DcNwCk (id integer primary key, v integer, constraint ck_dcnw check (new.v > 0));
+create table DcNwDf (id integer primary key, v integer, d integer default (new.v + 1));
+-- run
+
+alter table "new" drop column v;
+select count(*) as c from "new";
+→ [{"c":0}]
+
+-- Both foreign tables keep working against their own row images.
+insert into DcNwCk values (1, 5);
+insert into DcNwDf (id, v) values (1, 4);
+select d from DcNwDf;
+→ [{"d":5}]
+
+drop table DcNwDf;
+drop table DcNwCk;
+drop table "new";
+-- run
+
+-- ...and a GENUINE reference to the table "new" (through a subquery FROM) still
+-- refuses, so the allowance is the row image and not the name.
+create table "new" (id integer primary key, v integer);
+create table DcNwRef (id integer primary key, n integer,
+                      constraint ck_dcnwref check (n < (select max("new".v) from "new")));
+-- run
+
+alter table "new" drop column v;
+-- error: CHECK constraint 'ck_dcnwref' on table 'DcNwRef'
+
+drop table DcNwRef;
+drop table "new";
+-- run
+
+-- ===================================================================
+-- 38. An ALIASED FROM source keeps its columns in scope
+-- ===================================================================
+--
+-- A FROM alias adds a qualifier; it does not take the source's columns out of
+-- scope, so a bare `x` written against `from t a` binds `t.x` exactly as it
+-- would against `from t`. The scope walk used to treat an aliased source as
+-- contributing nothing to unqualified resolution, so this drop was ACCEPTED and
+-- the orphaned assertion then failed every write to the whole database with
+-- `Column not found: x`.
+
+create table DcAl (id integer primary key, x integer);
+create table DcAlBy (id integer primary key);
+create assertion dc_al check (not exists (select 1 from DcAl a where x < 0));
+-- run
+
+alter table DcAl drop column x;
+-- error: it is referenced by assertion 'dc_al'
+
+-- The database is still writable, which is the whole point of refusing.
+insert into DcAlBy values (1);
+commit;
+select count(*) as c from DcAlBy;
+→ [{"c":1}]
+
+drop assertion dc_al;
+drop table DcAl;
+drop table DcAlBy;
+-- run
+
+-- The republication arm: a view that re-exposes the column through a bare star
+-- over an aliased source is a republisher like any other, so a rule reading it
+-- blocks the drop even though no body spells the column's name.
+create table DcAlS (id integer primary key, x integer);
+create view DcAlSV as select * from DcAlS a;
+create assertion dc_als check (not exists (select 1 from DcAlSV where x < 0));
+-- run
+
+-- No chain in the message: the fixpoint makes DcAlSV a republication TARGET, so the
+-- assertion's own body names the column directly against it — the same shape §31
+-- pins for `select *` / `select t.*` over an unaliased source.
+alter table DcAlS drop column x;
+-- error: it is referenced by assertion 'dc_als'
+
+drop assertion dc_als;
+drop view DcAlSV;
+drop table DcAlS;
+-- run
+
+-- ...and the CHECK arm of the same shape, under a join whose renamed side carries
+-- the alias.
+create table DcAlJ (id integer primary key, x integer);
+create table DcAlJU (id integer primary key, n integer);
+create table DcAlJRef (id integer primary key, n integer,
+                       constraint ck_dcalj check (n < (select max(x)
+                                                       from DcAlJ a join DcAlJU u on a.id = u.id)));
+-- run
+
+alter table DcAlJ drop column x;
+-- error: CHECK constraint 'ck_dcalj' on table 'DcAlJRef'
+
+drop table DcAlJRef;
+drop table DcAlJU;
+drop table DcAlJ;
+-- run
+
+-- ...and the column-DEFAULT arm. Same walk, different site: the assertion and CHECK
+-- arms above both reach the walk through a body the drop guard probes as a rule,
+-- while a DEFAULT is an expression carried by a column. Both bare-under-alias
+-- spellings are here — one where the alias is the only thing between the ref and
+-- the source, one where the source is joined.
+create table DcAlD (id integer primary key, x integer);
+create table DcAlDRef (id integer primary key,
+                       n integer default ((select max(x) from DcAlD a where x > 0)));
+-- run
+
+alter table DcAlD drop column x;
+-- error: it is referenced by the DEFAULT of column 'n' on table 'DcAlDRef'
+
+drop table DcAlDRef;
+drop table DcAlD;
+-- run
+
+-- Guard rail: widening the binding must not start capturing a bare name that
+-- legitimately binds somewhere ELSE. Here the rule's `x` binds the aliased `DcAlO`,
+-- not the altered table, so dropping DcAlN.x is still legal.
+create table DcAlN (id integer primary key, x integer);
+create table DcAlO (id integer primary key, x integer);
+create assertion dc_aln check (not exists (select 1 from DcAlO b where x < 0));
+-- run
+
+alter table DcAlN drop column x;
+select count(*) as c from DcAlN;
+→ [{"c":0}]
+
+drop assertion dc_aln;
+drop table DcAlO;
+drop table DcAlN;
+-- run

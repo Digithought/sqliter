@@ -1,0 +1,198 @@
+-- 51.5-materialized-views-coarsened-key.sqllogic — coarsened backing key: the
+-- collation-weakening parallel-migration shape (docs/migration.md § Convergence
+-- hazards). A body with no provable unique key whose source primary key survives
+-- through value-preserving passthrough lineage (bare column / collate / no-op
+-- cast) is keyed on the coarsened lineage key K' instead of rejected. The create
+-- emits the key-coarsening warning (record stamp covered in
+-- coarsened-backing-key.spec.ts); behavior contract pinned here:
+--   * create-fill stays LOUD on colliding seed data ("must be a set");
+--   * steady-state row-time maintenance merges colliding source rows
+--     last-writer-wins (deterministic oscillation until the sources are merged);
+--   * a delete of one colliding sibling deletes the shared derived row while the
+--     sibling source row lives (the documented anomaly); the sibling's next edit
+--     or a REFRESH re-asserts it;
+--   * REFRESH during a collision window is loud (it is a re-fill — same posture
+--     as create-fill).
+--
+-- Source text PKs are declared `collate binary` explicitly so the case-variant
+-- fixtures key identically cross-module (the store host reconciles
+-- implicit-collation text PKs to its table-level key collation, NOCASE by
+-- default, which would reject the colliding source rows at the SOURCE insert).
+
+-- ===================================
+-- 1. The migration shape creates over clean data (was: bag rejection)
+-- ===================================
+
+create table contact_v1 (handle text collate binary primary key, email text);
+insert into contact_v1 values ('Bob', 'bob@x.test'), ('Carol', 'carol@x.test');
+
+create materialized view contact_v2 as select handle collate nocase as handle, email from contact_v1;
+
+select handle, email from contact_v2 order by handle;
+→ [{"handle":"Bob","email":"bob@x.test"},{"handle":"Carol","email":"carol@x.test"}]
+
+-- ===================================
+-- 2. Colliding seed data still fails loudly at fill (the at-deploy rejection)
+-- ===================================
+
+create table dup_src (handle text collate binary primary key);
+insert into dup_src values ('Bob'), ('bob');
+create materialized view dup_v2 as select handle collate nocase as handle from dup_src;
+-- error: must be a set
+
+-- nothing half-registered: the name is free again
+create table dup_v2 (x integer primary key);
+drop table dup_v2;
+
+-- ===================================
+-- 3. Steady state: a colliding source insert LWW-merges into the shared derived
+--    row, and each sibling edit re-asserts its own image (deterministic oscillation)
+-- ===================================
+
+insert into contact_v1 values ('CAROL', 'caps@x.test');
+select count(*) as n from contact_v1;
+→ [{"n":3}]
+
+-- the two case-variants share one NOCASE backing key — last writer won
+select count(*) as n from contact_v2;
+→ [{"n":2}]
+select handle, email from contact_v2 where handle = 'carol';
+→ [{"handle":"CAROL","email":"caps@x.test"}]
+
+-- an edit of the other sibling re-asserts ITS image into the shared key
+update contact_v1 set email = 'carol2@x.test' where handle = 'Carol';
+select handle, email from contact_v2 where handle = 'carol';
+→ [{"handle":"Carol","email":"carol2@x.test"}]
+
+-- REFRESH is a re-fill: during a collision window it is loud, like create-fill
+refresh materialized view contact_v2;
+-- error: must be a set
+
+-- ===================================
+-- 4. Delete-one-sibling anomaly: the shared derived row vanishes while the
+--    sibling source row lives; REFRESH recovers it
+-- ===================================
+
+delete from contact_v1 where handle = 'CAROL';
+select count(*) as n from contact_v1;
+→ [{"n":2}]
+-- 'Carol' still lives in the source, but its derived row is gone (documented anomaly)
+select count(*) as n from contact_v2;
+→ [{"n":1}]
+
+refresh materialized view contact_v2;
+select handle, email from contact_v2 order by handle;
+→ [{"handle":"Bob","email":"bob@x.test"},{"handle":"Carol","email":"carol2@x.test"}]
+
+-- the surviving sibling's next edit also recovers, without a refresh
+insert into contact_v1 values ('DAVE', 'dave@x.test');
+insert into contact_v1 values ('dave', 'dave2@x.test');
+select email from contact_v2 where handle = 'dave';
+→ [{"email":"dave2@x.test"}]
+delete from contact_v1 where handle = 'dave';
+select count(*) as n from contact_v2 where handle = 'dave';
+→ [{"n":0}]
+update contact_v1 set email = 'dave3@x.test' where handle = 'DAVE';
+select handle, email from contact_v2 where handle = 'dave';
+→ [{"handle":"DAVE","email":"dave3@x.test"}]
+
+-- ===================================
+-- 5. Multi-column passthrough body (cannot be grouped) — composite coarsened key
+-- ===================================
+
+create table mc (a text collate binary, b text collate binary, v integer, primary key (a, b));
+insert into mc values ('X', '1', 10), ('Y', '1', 20);
+create materialized view mc_v as select a collate nocase as a, b, v from mc;
+select a, b, v from mc_v order by a, b;
+→ [{"a":"X","b":"1","v":10},{"a":"Y","b":"1","v":20}]
+
+-- distinct b keeps case-variants apart…
+insert into mc values ('x', '2', 30);
+select count(*) as n from mc_v;
+→ [{"n":3}]
+
+-- …while a same-b case-variant LWW-merges
+insert into mc values ('y', '1', 40);
+select count(*) as n from mc_v;
+→ [{"n":3}]
+select v from mc_v where a = 'y' and b = '1';
+→ [{"v":40}]
+
+-- ===================================
+-- 6. A key-dropping projection still keeps the bag rejection
+-- ===================================
+
+create materialized view still_bag as select email from contact_v1;
+-- error: no provable unique key
+
+-- A collated GROUP BY key registers with a REAL (non-coarsened) key: the group
+-- columns genuinely key the aggregate output, published under exactly their
+-- grouping (NOCASE) collation (ticket collated-groupby-key-completeness — the
+-- non-coarsened complement to this file's coarsened-lineage shape). Here
+-- contact_v1 = {Bob, Carol, DAVE} with no NOCASE collisions, so three groups.
+create materialized view grp_bag as select handle collate nocase as h, count(*) as n from contact_v1 group by handle collate nocase;
+select h, n from grp_bag order by h;
+→ [{"h":"Bob","n":1},{"h":"Carol","n":1},{"h":"DAVE","n":1}]
+
+-- ===================================
+-- 7. Refining direction (BINARY output over a NOCASE-keyed source) is a true
+--    unique key — accepted silently, byte-exact backing keys
+-- ===================================
+
+create table nck (h text collate nocase primary key, v integer);
+insert into nck values ('Bob', 1);
+create materialized view nck_v as select h collate binary as h, v from nck;
+select h, v from nck_v;
+→ [{"h":"Bob","v":1}]
+
+-- ===================================
+-- 8. An ORDER BY coarsened body keeps the contract: the ordering seed is
+--    suppressed so the backing keys on K' alone — colliding seed data stays
+--    LOUD and a colliding insert still LWW-merges (with the seed, the widened
+--    physical key would have admitted both siblings silently)
+-- ===================================
+
+create table ord_src (handle text collate binary primary key, email text);
+insert into ord_src values ('Bob', 'b@x.test'), ('bob', 'b2@x.test');
+create materialized view ord_v as select handle collate nocase as handle, email from ord_src order by email;
+-- error: must be a set
+
+delete from ord_src where handle = 'bob';
+create materialized view ord_v as select handle collate nocase as handle, email from ord_src order by email;
+insert into ord_src values ('BOB', 'b3@x.test');
+select handle, email from ord_v;
+→ [{"handle":"BOB","email":"b3@x.test"}]
+
+-- ===================================
+-- 9. Explicit-collation backing key survives the store reconcile
+--    (ticket join-key-collation-resolution-alignment): an MV column published with
+--    an EXPLICIT collation now stamps `ColumnSchema.collationExplicit`, so the store
+--    module keys the backing PK under the PUBLISHED collation instead of re-keying
+--    every implicit text PK under its table-level default (NOCASE). A body whose key
+--    column is explicit `collate binary` must therefore keep case-variant rows that
+--    are DISTINCT under BINARY but would collide under the store default — proving
+--    the published collation, not the store default, governs the backing key. (Under
+--    the memory module the backing already keys on the column's collation field; this
+--    case earns its keep under `yarn test:store`.)
+-- ===================================
+
+create table bin_src (handle text collate binary primary key, v integer);
+insert into bin_src values ('Bob', 1), ('bob', 2);
+create materialized view bin_v as select handle collate binary as handle, v from bin_src;
+
+-- Both case-variants survive: 'Bob' and 'bob' are distinct under the published
+-- BINARY key. A NOCASE re-key (the historic implicit-default reconcile) would have
+-- collapsed them to one row (or rejected the fill as "not a set").
+select count(*) as n from bin_v;
+→ [{"n":2}]
+select handle, v from bin_v order by v;
+→ [{"handle":"Bob","v":1},{"handle":"bob","v":2}]
+
+-- A genuinely-implicit (default-collation) MV column keeps the historic behavior:
+-- no explicit stamp, so the store applies its table-level default. Pin the
+-- value-level result (collation-agnostic) so the case runs identically cross-module.
+create table plain_src (id integer primary key, label text);
+insert into plain_src values (1, 'Xyz'), (2, 'abc');
+create materialized view plain_v as select id, label from plain_src;
+select id, label from plain_v order by id;
+→ [{"id":1,"label":"Xyz"},{"id":2,"label":"abc"}]

@@ -9,7 +9,7 @@ import {
 	NUMERIC_TYPE,
 	ANY_TYPE,
 } from './builtin-types.js';
-import { DATE_TYPE, TIME_TYPE, DATETIME_TYPE, TIMESPAN_TYPE } from './temporal-types.js';
+import { DATE_TYPE, TIME_TYPE, DATETIME_TYPE, TIMESTAMP_TYPE, TIMESPAN_TYPE } from './temporal-types.js';
 import { JSON_TYPE } from './json-type.js';
 import { createLogger } from '../common/logger.js';
 
@@ -36,6 +36,7 @@ class TypeRegistry {
 		this.registerType(DATE_TYPE);
 		this.registerType(TIME_TYPE);
 		this.registerType(DATETIME_TYPE);
+		this.registerType(TIMESTAMP_TYPE);
 		this.registerType(TIMESPAN_TYPE);
 		this.registerType(JSON_TYPE);
 

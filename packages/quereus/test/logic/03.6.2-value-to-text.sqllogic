@@ -1,0 +1,224 @@
+-- 03.6.2-value-to-text.sqllogic
+-- ONE value-to-text conversion (src/util/value-text.ts) behind every site that has
+-- to render a value as text: CAST / text() / TEXT-column writes, `||`, LIKE operand
+-- coercion, and group_concat. The real invariant is AGREEMENT — the same value must
+-- spell the same way whichever construct produced it. Per-type unit coverage lives in
+-- test/util/value-text.spec.ts; this file pins the SQL-visible behaviour.
+
+-- === Per-source-type table ===
+
+select cast('hello' as text) as r;
+→ [{"r":"hello"}]
+
+select cast(123 as text) as r;
+→ [{"r":"123"}]
+
+select cast(3.14 as text) as r;
+→ [{"r":"3.14"}]
+
+select cast(true as text) as r;
+→ [{"r":"true"}]
+
+select cast(false as text) as r;
+→ [{"r":"false"}]
+
+select cast(null as text) as r;
+→ [{"r":null}]
+
+-- Bigint: exact decimal digits, no Number() round-trip.
+select cast(cast('9007199254740993' as integer) as text) as r;
+→ [{"r":"9007199254740993"}]
+
+-- Blob: UTF-8 decode. Was hex ('6162') through CAST and decimal bytes ('97,98')
+-- through `||`; both now read the bytes as text, the way SQLite does.
+select cast(x'6162' as text) as r;
+→ [{"r":"ab"}]
+
+-- The conversion function shares the rule (it is TEXT_TYPE.parse).
+select text(x'6162') as r;
+→ [{"r":"ab"}]
+
+-- JSON object: the document's own text, not the placeholder '[object Object]'.
+select cast(json('{"a":1}') as text) as r;
+→ [{"r":"{\"a\":1}"}]
+
+-- JSON array: real JSON, not the JS Array.toString() spelling '1,2,3'.
+select cast(json('[1,2,3]') as text) as r;
+→ [{"r":"[1,2,3]"}]
+
+-- Nested document survives whole.
+select cast(json('{"a":{"x":1},"b":[1,null]}') as text) as r;
+→ [{"r":"{\"a\":{\"x\":1},\"b\":[1,null]}"}]
+
+-- Key order is the DOCUMENT's, deliberately not canonical (sorted) order:
+-- canonical form is for grouping keys and fingerprints, not for display.
+select cast(json('{"b":2,"a":1}') as text) as r;
+→ [{"r":"{\"b\":2,\"a\":1}"}]
+
+-- === Edge cases ===
+
+-- Empty blob renders as the empty string, not NULL.
+select cast(x'' as text) as r;
+→ [{"r":""}]
+
+-- BOM: the decoder is built with ignoreBOM, so EF BB BF stays ONE U+FEFF
+-- character instead of being silently stripped to ''.
+select length(cast(x'efbbbf' as text)) as r;
+→ [{"r":1}]
+
+-- Invalid UTF-8 becomes U+FFFD. This is LOSSY on purpose — the conversion has to
+-- be total (castCanYieldNull declares TEXT total over non-null operands), so it
+-- replaces rather than throws.
+select cast(x'ff' as text) as r;
+→ [{"r":"�"}]
+
+-- ...and the loss is real: distinct invalid blobs collide onto the same text.
+-- Pinned so nobody "fixes" the replacement behaviour by accident.
+select cast(x'ff' as text) = cast(x'fe' as text) as r;
+→ [{"r":true}]
+
+-- Multi-byte sequences decode properly.
+select cast(x'e4b8ad' as text) as r;
+→ [{"r":"中"}]
+
+-- A JSON column holding a string scalar is physically a JS string, so it renders
+-- bare — the conversion dispatches on the runtime value and cannot see that the
+-- declared type is JSON.
+select cast(json('"hello"') as text) as r;
+→ [{"r":"hello"}]
+
+-- JSON null parses to SQL NULL, so the cast is NULL — not the text 'null'.
+select cast(json('null') as text) as r;
+→ [{"r":null}]
+
+-- cast(<json> as blob) is the UTF-8 of the document's text ('{"a":1}'),
+-- not of '[object Object]'.
+select cast(json('{"a":1}') as blob) = x'7b2261223a317d' as r;
+→ [{"r":true}]
+
+-- === NULL propagation is unchanged ===
+
+select null || 'x' as r;
+→ [{"r":null}]
+
+select 'x' || null as r;
+→ [{"r":null}]
+
+select cast(null as text) is null as r;
+→ [{"r":true}]
+
+-- === Concatenation, LIKE and group_concat use the same rule ===
+
+create table vt_b (id integer primary key, b blob);
+insert into vt_b values (1, x'6162'), (2, x'6163');
+-- run
+
+select b || '' as r from vt_b order by id;
+→ [{"r":"ab"},{"r":"ac"}]
+
+select id from vt_b where b like 'ab' order by id;
+→ [{"id":1}]
+
+-- Same LIKE through a non-constant pattern, so the dynamic per-row path is
+-- exercised too: constLikePattern and emitLikeOp must derive the same string.
+select id from vt_b where b like (select b from vt_b where id = 1) order by id;
+→ [{"id":1}]
+
+select group_concat(b) as r from vt_b;
+→ [{"r":"ab,ac"}]
+
+select group_concat(b, '-') as r from vt_b;
+→ [{"r":"ab-ac"}]
+
+-- === The agreement invariants ===
+
+-- CAST and `||` derive the same text for every row.
+select cast(b as text) = (b || '') as r from vt_b order by id;
+→ [{"r":true},{"r":true}]
+
+-- group_concat over the raw values agrees with group_concat over the cast values.
+select group_concat(b) = group_concat(cast(b as text)) as r from vt_b;
+→ [{"r":true}]
+
+-- LIKE's operand coercion agrees with CAST.
+select b like cast(b as text) as r from vt_b order by id;
+→ [{"r":true},{"r":true}]
+
+-- The `like` FUNCTION is the same operation as the LIKE operator, so it must derive
+-- the same text. (It used to use JS stringification and answer false here.)
+select like(cast(b as text), b) = (b like cast(b as text)) as r from vt_b order by id;
+→ [{"r":true},{"r":true}]
+
+select like('ab', x'6162') as r;
+→ [{"r":true}]
+
+-- glob() shares the coercion with like().
+select glob('ab', x'6162') as r;
+→ [{"r":true}]
+
+-- Same for a JSON document rendered as its own text.
+select like('%"a"%', json('{"a":1}')) as r;
+→ [{"r":true}]
+
+-- Same three-way agreement over a JSON value.
+create table vt_j (id integer primary key, j json);
+insert into vt_j values (1, '{"a":1}'), (2, '[1,2,3]');
+-- run
+
+select cast(j as text) = (j || '') as r from vt_j order by id;
+→ [{"r":true},{"r":true}]
+
+select group_concat(j) as r from vt_j;
+→ [{"r":"{\"a\":1},[1,2,3]"}]
+
+-- group_concat still skips NULLs.
+create table vt_n (id integer primary key, v text null);
+insert into vt_n values (1, 'a'), (2, null), (3, 'b');
+-- run
+
+select group_concat(v) as r from vt_n;
+→ [{"r":"a,b"}]
+
+-- === The write path stores the conversion, not just the display ===
+
+-- Inserting a blob into a TEXT column now STORES the UTF-8 decode (was the hex
+-- spelling). This changes stored values, and it is lossy for non-UTF-8 bytes.
+create table vt_w (id integer primary key, t text);
+insert into vt_w values (1, x'6162'), (2, x'e4b8ad');
+-- run
+
+select t from vt_w order by id;
+→ [{"t":"ab"},{"t":"中"}]
+
+select typeof(t) as ty from vt_w order by id;
+→ [{"ty":"text"},{"ty":"text"}]
+
+-- An ALTER that retypes a BLOB column to TEXT backfills through the same rule.
+create table vt_r (id integer primary key, b blob);
+insert into vt_r values (1, x'6162');
+alter table vt_r alter column b set data type text;
+-- run
+
+select b from vt_r order by id;
+→ [{"b":"ab"}]
+
+-- A TEXT column DEFAULT written as a blob literal folds through the same rule.
+create table vt_d (id integer primary key, t text default x'6162');
+insert into vt_d (id) values (1);
+-- run
+
+select t from vt_d;
+→ [{"t":"ab"}]
+
+-- === `->>` comes along for free ===
+-- The parser desugars `a ->> b` to cast(json_extract(a, b) as text), so fixing
+-- CAST fixes the operator.
+
+select '{"a":{"x":1}}' ->> 'a' as r;
+→ [{"r":"{\"x\":1}"}]
+
+select '{"a":[1,2]}' ->> 'a' as r;
+→ [{"r":"[1,2]"}]
+
+select '{"a":"s"}' ->> 'a' as r;
+→ [{"r":"s"}]

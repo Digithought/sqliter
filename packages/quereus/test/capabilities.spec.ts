@@ -1,10 +1,12 @@
 import { expect } from 'chai';
-import { Database } from '../src/index.js';
+import { Database, QuereusError } from '../src/index.js';
 import { MemoryTableModule } from '../src/vtab/memory/module.js';
 import { MemoryTable } from '../src/vtab/memory/table.js';
 import type { TableSchema } from '../src/schema/table.js';
 import type { ColumnSchema } from '../src/schema/column.js';
 import { INTEGER_TYPE, TEXT_TYPE, REAL_TYPE } from '../src/types/index.js';
+import { resolveDdlTransactionality, assertDdlTransactionPolicy } from '../src/runtime/emit/ddl-transaction-policy.js';
+import type { AnyVirtualTableModule } from '../src/vtab/module.js';
 
 describe('Module Capabilities', () => {
 	let db: Database;
@@ -39,11 +41,9 @@ describe('Module Capabilities', () => {
 			columns: Object.freeze(columns),
 			columnIndexMap,
 			primaryKeyDefinition: Object.freeze(primaryKeyDefinition),
-			primaryKey: Object.freeze(primaryKey),
 			indexes: Object.freeze([]),
 			checkConstraints: Object.freeze([]),
 			vtabModule: module,
-			isTemporary: false,
 			isView: false
 		};
 	}
@@ -56,6 +56,8 @@ describe('Module Capabilities', () => {
 		expect(caps.persistent).to.be.false;
 		expect(caps.secondaryIndexes).to.be.true;
 		expect(caps.rangeScans).to.be.true;
+		// Memory's schema changes escape the transaction but its DML rolls back.
+		expect(caps.ddlTransactionality).to.equal('non-transactional');
 	});
 
 	it('extractPrimaryKey extracts correct values', async () => {
@@ -336,5 +338,88 @@ describe('Module Capabilities', () => {
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const caps = (minimalModule as any).getCapabilities?.() ?? {};
 		expect(caps).to.deep.equal({});
+	});
+});
+
+describe('DDL transaction policy', () => {
+	let db: Database;
+	let module: MemoryTableModule;
+
+	beforeEach(async () => {
+		db = new Database();
+		module = new MemoryTableModule();
+		await db.exec('create table t (id integer primary key, v text)');
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	describe('resolveDdlTransactionality', () => {
+		it('resolves the memory module to non-transactional', () => {
+			expect(resolveDdlTransactionality(module)).to.equal('non-transactional');
+		});
+
+		it('defaults an undefined module to non-transactional', () => {
+			expect(resolveDdlTransactionality(undefined)).to.equal('non-transactional');
+		});
+
+		it('defaults a module without getCapabilities to non-transactional', () => {
+			// A flagless stub — no getCapabilities at all — must NOT be assumed clean.
+			const stub = {
+				create: async () => { throw new Error('nyi'); },
+				connect: async () => { throw new Error('nyi'); },
+				destroy: async () => { /* noop */ },
+			} as unknown as AnyVirtualTableModule;
+			expect(resolveDdlTransactionality(stub)).to.equal('non-transactional');
+		});
+
+		it('defaults a module whose getCapabilities omits the flag to non-transactional', () => {
+			const stub = {
+				create: async () => { throw new Error('nyi'); },
+				connect: async () => { throw new Error('nyi'); },
+				destroy: async () => { /* noop */ },
+				getCapabilities: () => ({ isolation: true }),
+			} as unknown as AnyVirtualTableModule;
+			expect(resolveDdlTransactionality(stub)).to.equal('non-transactional');
+		});
+	});
+
+	describe('assertDdlTransactionPolicy gate', () => {
+		it('is a no-op under the default permissive policy, even in an explicit transaction', async () => {
+			await db.beginTransaction();
+			// Should not throw despite memory being non-transactional.
+			assertDdlTransactionPolicy(db, module, 'memory', 'CREATE INDEX x');
+			await db.rollback();
+		});
+
+		it('is a no-op under strict in autocommit mode', () => {
+			void db.exec("pragma ddl_transaction_policy = 'strict'");
+			expect(db.getAutocommit()).to.be.true;
+			assertDdlTransactionPolicy(db, module, 'memory', 'CREATE INDEX x');
+		});
+
+		it('refuses a non-transactional module inside an explicit transaction under strict', async () => {
+			await db.exec("pragma ddl_transaction_policy = 'strict'");
+			await db.beginTransaction();
+			expect(() => assertDdlTransactionPolicy(db, module, 'memory', 'CREATE INDEX x'))
+				.to.throw(QuereusError, /ddl_transaction_policy = strict/);
+			// The transaction is untouched — still open.
+			expect(db.getAutocommit()).to.be.false;
+			await db.rollback();
+		});
+
+		it('refuses a flagless stub module (defaults to non-transactional) under strict', async () => {
+			const stub = {
+				create: async () => { throw new Error('nyi'); },
+				connect: async () => { throw new Error('nyi'); },
+				destroy: async () => { /* noop */ },
+			} as unknown as AnyVirtualTableModule;
+			await db.exec("pragma ddl_transaction_policy = 'strict'");
+			await db.beginTransaction();
+			expect(() => assertDdlTransactionPolicy(db, stub, 'stub', 'DROP TABLE t'))
+				.to.throw(QuereusError, /non-transactional/);
+			await db.rollback();
+		});
 	});
 });

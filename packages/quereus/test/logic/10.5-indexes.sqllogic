@@ -1,4 +1,6 @@
 -- indexes.sqllogic - Testing index creation and usage
+--
+-- requires-capability: standalone-index-ddl
 
 -- Setup base table for index testing
 CREATE TABLE idx_test (
@@ -151,7 +153,7 @@ DROP INDEX idx_nonexistent;
 
 -- DROP TRIGGER: parser rejects (not a supported object type)
 DROP TRIGGER some_trigger;
--- error: Expected TABLE, VIEW, INDEX, or ASSERTION after DROP
+-- error: Expected TABLE, VIEW, MATERIALIZED VIEW, INDEX, or ASSERTION after DROP
 
 DROP TABLE drop_idx_test;
 

@@ -595,6 +595,57 @@ SELECT id,
 FROM stream_s_null ORDER BY id;
 → [{"id":1,"s":10,"c":1},{"id":2,"s":40,"c":2},{"id":3,"s":30,"c":1},{"id":4,"s":30,"c":1}]
 
+-- One-sided frames. `CURRENT ROW` is the offset-zero case of the bound it
+-- replaces, so these run the same streaming sliding-buffer state machine as
+-- the two-sided forms above.
+
+-- ROWS BETWEEN 2 PRECEDING AND CURRENT ROW — the trailing moving sum.
+SELECT id, SUM(val) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS s
+FROM stream_s ORDER BY id;
+→ [{"id":1,"s":10},{"id":2,"s":30},{"id":3,"s":60},{"id":4,"s":90},{"id":5,"s":120},{"id":6,"s":150}]
+
+-- The start-only spelling `ROWS 2 PRECEDING` means the same frame.
+SELECT id, SUM(val) OVER (ORDER BY id ROWS 2 PRECEDING) AS s
+FROM stream_s ORDER BY id;
+→ [{"id":1,"s":10},{"id":2,"s":30},{"id":3,"s":60},{"id":4,"s":90},{"id":5,"s":120},{"id":6,"s":150}]
+
+-- ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING — the leading moving sum.
+SELECT id, SUM(val) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING) AS s
+FROM stream_s ORDER BY id;
+→ [{"id":1,"s":60},{"id":2,"s":90},{"id":3,"s":120},{"id":4,"s":150},{"id":5,"s":110},{"id":6,"s":60}]
+
+-- ROWS BETWEEN CURRENT ROW AND CURRENT ROW — the single current row.
+SELECT id, SUM(val) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS s
+FROM stream_s ORDER BY id;
+→ [{"id":1,"s":10},{"id":2,"s":20},{"id":3,"s":30},{"id":4,"s":40},{"id":5,"s":50},{"id":6,"s":60}]
+
+-- Trailing MIN / MAX (the running min-max shape over an ordered table).
+SELECT id,
+       MIN(val) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS mn,
+       MAX(val) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS mx
+FROM stream_s ORDER BY id;
+→ [{"id":1,"mn":10,"mx":10},{"id":2,"mn":10,"mx":20},{"id":3,"mn":20,"mx":30},{"id":4,"mn":30,"mx":40},{"id":5,"mn":40,"mx":50},{"id":6,"mn":50,"mx":60}]
+
+-- A one-sided frame and the default (running) frame in one query: distinct
+-- frames land in distinct window nodes and each keeps its own strategy.
+SELECT id,
+       SUM(val) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS trailing,
+       SUM(val) OVER (ORDER BY id) AS running
+FROM stream_s ORDER BY id;
+→ [{"id":1,"trailing":10,"running":10},{"id":2,"trailing":30,"running":30},{"id":3,"trailing":50,"running":60},{"id":4,"trailing":70,"running":100},{"id":5,"trailing":90,"running":150},{"id":6,"trailing":110,"running":210}]
+
+-- Trailing frame with PARTITION BY: the frame restarts at each partition.
+SELECT id, SUM(val) OVER (PARTITION BY grp ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s
+FROM stream_s ORDER BY id;
+→ [{"id":1,"s":10},{"id":2,"s":30},{"id":3,"s":50},{"id":4,"s":40},{"id":5,"s":90},{"id":6,"s":110}]
+
+-- One-sided frame over NULL argument values: NULLs still don't contribute.
+SELECT id,
+       SUM(val) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s,
+       COUNT(val) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS c
+FROM stream_s_null ORDER BY id;
+→ [{"id":1,"s":10,"c":1},{"id":2,"s":10,"c":1},{"id":3,"s":30,"c":1},{"id":4,"s":30,"c":1}]
+
 DROP TABLE stream_s;
 DROP TABLE stream_s_one;
 DROP TABLE stream_s_null;
@@ -628,6 +679,41 @@ SELECT val,
 FROM range_slide ORDER BY val, id;
 → [{"val":10,"mn":10,"mx":20},{"val":15,"mn":10,"mx":25},{"val":15,"mn":10,"mx":25},{"val":20,"mn":10,"mx":25},{"val":25,"mn":15,"mx":25},{"val":40,"mn":40,"mx":40}]
 
+-- One-sided RANGE frames. In RANGE mode `CURRENT ROW` means the whole peer
+-- group, which is exactly the offset-zero interval [v, v] — so the two 15s
+-- must be treated identically at either edge of the frame.
+
+-- val=10: [0,10] → 10
+-- val=15 (twice): [5,15] → 10,15,15 = 40
+-- val=20: [10,20] → 10,15,15,20 = 60
+-- val=25: [15,25] → 15,15,20,25 = 75
+-- val=40: [30,40] → 40
+SELECT val, SUM(val) OVER (ORDER BY val RANGE BETWEEN 10 PRECEDING AND CURRENT ROW) AS s
+FROM range_slide ORDER BY val, id;
+→ [{"val":10,"s":10},{"val":15,"s":40},{"val":15,"s":40},{"val":20,"s":60},{"val":25,"s":75},{"val":40,"s":40}]
+
+-- The start-only spelling `RANGE 10 PRECEDING` means the same frame.
+SELECT val, SUM(val) OVER (ORDER BY val RANGE 10 PRECEDING) AS s
+FROM range_slide ORDER BY val, id;
+→ [{"val":10,"s":10},{"val":15,"s":40},{"val":15,"s":40},{"val":20,"s":60},{"val":25,"s":75},{"val":40,"s":40}]
+
+-- val=10: [10,20] → 10,15,15,20 = 60
+-- val=15 (twice): [15,25] → 15,15,20,25 = 75
+-- val=20: [20,30] → 20,25 = 45
+-- val=25: [25,35] → 25
+-- val=40: [40,50] → 40
+SELECT val, SUM(val) OVER (ORDER BY val RANGE BETWEEN CURRENT ROW AND 10 FOLLOWING) AS s
+FROM range_slide ORDER BY val, id;
+→ [{"val":10,"s":60},{"val":15,"s":75},{"val":15,"s":75},{"val":20,"s":45},{"val":25,"s":25},{"val":40,"s":40}]
+
+-- RANGE BETWEEN CURRENT ROW AND CURRENT ROW is exactly the peer group, so the
+-- two val=15 rows each see a frame of 2 rows and everything else sees 1.
+SELECT val,
+       COUNT(*) OVER (ORDER BY val RANGE BETWEEN CURRENT ROW AND CURRENT ROW) AS c,
+       SUM(val) OVER (ORDER BY val RANGE BETWEEN CURRENT ROW AND CURRENT ROW) AS s
+FROM range_slide ORDER BY val, id;
+→ [{"val":10,"c":1,"s":10},{"val":15,"c":2,"s":30},{"val":15,"c":2,"s":30},{"val":20,"c":1,"s":20},{"val":25,"c":1,"s":25},{"val":40,"c":1,"s":40}]
+
 -- NULL ordering values: a NULL-val row's RANGE window is the contiguous NULL
 -- peer span. Finite-val rows' RANGE windows exclude NULL rows entirely.
 CREATE TABLE range_null (id INTEGER PRIMARY KEY, val INTEGER NULL);
@@ -640,6 +726,22 @@ INSERT INTO range_null VALUES (1, NULL), (2, NULL), (3, 10), (4, 20), (5, 30);
 SELECT id, val, SUM(val) OVER (ORDER BY val RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING) AS s
 FROM range_null ORDER BY id;
 → [{"id":1,"val":null,"s":null},{"id":2,"val":null,"s":null},{"id":3,"val":10,"s":10},{"id":4,"val":20,"s":20},{"id":5,"val":30,"s":30}]
+
+-- Same, with an interval that reaches down to zero. NULL is not zero: the two
+-- NULL rows must still stay out of val=10's frame. (Regression — the buffered
+-- frame walk read the ORDER BY value with a bare `Number(...)`, which turns
+-- NULL into 0 and pulled both NULL rows in.)
+-- val=NULL (id=1,2): the NULL peer group → no non-null vals → SUM=NULL.
+-- val=10: [0,10] → 10.  val=20: [10,20] → 30.  val=30: [20,30] → 50.
+SELECT id, val, SUM(val) OVER (ORDER BY val RANGE BETWEEN 10 PRECEDING AND CURRENT ROW) AS s
+FROM range_null ORDER BY id;
+→ [{"id":1,"val":null,"s":null},{"id":2,"val":null,"s":null},{"id":3,"val":10,"s":10},{"id":4,"val":20,"s":30},{"id":5,"val":30,"s":50}]
+
+-- A fractional RANGE offset is not a supported frame offset on either physical
+-- path — it must raise, not quietly depend on which plan the optimizer picks.
+SELECT val, SUM(val) OVER (ORDER BY val RANGE BETWEEN 1.5 PRECEDING AND CURRENT ROW) AS s
+FROM range_null ORDER BY val, id;
+-- error: Invalid window frame offset
 
 DROP TABLE range_slide;
 DROP TABLE range_null;
@@ -682,3 +784,403 @@ FROM nested_w ORDER BY id;
 → [{"id":1,"val":10,"adj":999,"rn":1},{"id":2,"val":20,"adj":998,"rn":2},{"id":3,"val":30,"adj":997,"rn":3}]
 
 DROP TABLE nested_w;
+
+-- =============================================================================
+-- Window functions in a GROUPED query.
+--
+-- The window runs over the GROUPED rows — one row per group — so
+-- `row_number() over (order by a) ... group by a` numbers the groups, not the
+-- underlying rows. Regression for
+-- bug-window-function-over-grouped-query-crashes: the grouped select list and
+-- the window select list used to be built by two separate walks, leaving a raw
+-- window-function expression in a projection *below* the node that computes
+-- window values ("No emitter registered for WindowFunctionCall").
+--
+-- No primary key on `wg`, so the functional-dependency GROUP BY reduction cannot
+-- rewrite the grouping keys out from under these.
+-- =============================================================================
+
+create table wg (a text, b text);
+insert into wg values ('x','1'),('y','2'),('x','3');
+
+-- Bare window function over the groups: two groups, so 1 and 2 (not 1..3).
+select a, row_number() over (order by a) as rn from wg group by a order by a;
+→ [{"a":"x","rn":1},{"a":"y","rn":2}]
+
+-- Alongside a real aggregate.
+select a, count(*) as c, row_number() over (order by a) as rn from wg group by a order by a;
+→ [{"a":"x","c":2,"rn":1},{"a":"y","c":1,"rn":2}]
+
+-- Window function wrapped in arithmetic keeps the surrounding expression.
+select a, 1000 - row_number() over (order by a) as adj from wg group by a order by a;
+→ [{"a":"x","adj":999},{"a":"y","adj":998}]
+
+-- HAVING filters groups before the window sees them, so rn restarts at 1.
+select a, row_number() over (order by a) as rn from wg group by a having count(*) > 1;
+→ [{"a":"x","rn":1}]
+
+-- ORDER BY a window alias.
+select a, row_number() over (order by a) as rn from wg group by a order by rn desc;
+→ [{"a":"y","rn":2},{"a":"x","rn":1}]
+
+-- COUNT(*) OVER () counts GROUPS (2), not source rows (3).
+select a, count(*) over () as g from wg group by a order by a;
+→ [{"a":"x","g":2},{"a":"y","g":2}]
+
+-- LIMIT over the lot.
+select a, row_number() over (order by a) as rn from wg group by a order by rn limit 1;
+→ [{"a":"x","rn":1}]
+
+-- Grouped `select *` plus a window column. `group by a, b` collapses no rows
+-- here, so all three groups survive and the window numbers all three.
+select *, row_number() over (order by a, b) as rn from wg group by a, b order by a, b;
+→ [{"a":"x","b":"1","rn":1},{"a":"x","b":"3","rn":2},{"a":"y","b":"2","rn":3}]
+
+-- An aggregate already in the SELECT list may be spelled out again in the window
+-- specification — it reads the computed aggregate column.
+select a, count(*) as c, row_number() over (order by count(*) desc) as rn
+from wg group by a order by rn;
+→ [{"a":"x","c":2,"rn":1},{"a":"y","c":1,"rn":2}]
+
+-- A window specification is subject to the same GROUP BY restriction as the rest
+-- of the select list: the grouped rows carry only grouping keys and aggregate
+-- results, so an ungrouped column must fail at plan time (it used to reach the
+-- runtime as a base-table reference and die with an internal row-context error).
+select a, row_number() over (order by b) as rn from wg group by a;
+-- error: Column 'b' must appear in the GROUP BY clause or be used in an aggregate function
+
+select a, count(*) over (partition by b) as c from wg group by a;
+-- error: Column 'b' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- Same rule for a window function's arguments.
+select a, sum(b) over () as s from wg group by a;
+-- error: Column 'b' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- Without a GROUP BY there is no grouped-window redirect or coverage check at all
+-- (they are built only for a grouped query). The shape is rejected earlier, by the
+-- select-list aggregate/non-aggregate mixing rule, so it never reaches the window
+-- phase to need one.
+select count(*) as c, row_number() over (order by count(*)) as rn from wg;
+-- error: Cannot mix aggregate and non-aggregate columns in SELECT list without GROUP BY
+
+-- An aggregate that appears ONLY in the window specification is a named
+-- limitation, not an internal error: it would have to be collected into the
+-- aggregate node before the window phase runs.
+select a, row_number() over (order by count(*)) as rn from wg group by a;
+-- error: Aggregate function count in a window function's ORDER BY is only supported when the same aggregate also appears in the SELECT list
+
+-- Same limitation when the window spec's aggregate differs from the SELECT
+-- list's only in its argument (bug-aggregate-reuse-matching-ignores-arguments):
+-- `sum(a+0)` here is not `sum(b+0)`, so it is not the aggregate already
+-- collected for the SELECT list and must be rejected the same way.
+select a, sum(b+0) as s, row_number() over (order by sum(a+0)) as rn from wg group by a;
+-- error: Aggregate function sum in a window function's ORDER BY is only supported when the same aggregate also appears in the SELECT list
+
+-- The match is textual, so a *qualifier* divergence lands in that same
+-- limitation even though both spellings name the same column: `sum(w.b)` in the
+-- select list is not the fingerprint `sum(b)` the window spec asks for. Writing
+-- both the same way, or referencing the select-list alias, both work.
+select a, sum(w.b) as s, row_number() over (order by sum(b)) as rn from wg w group by a;
+-- error: Aggregate function sum in a window function's ORDER BY is only supported when the same aggregate also appears in the SELECT list
+
+-- Same limitation for a literal-case divergence
+-- (bug-aggregate-match-ignores-string-literal-case): a quoted string literal's
+-- case is part of an aggregate's identity, so `count(nullif(b,'a'))` here is not
+-- `count(nullif(b,'A'))` and must be rejected the same way — reading the wrong
+-- aggregate silently would be worse than this loud error.
+create table wgc (id integer primary key, g integer, b text);
+insert into wgc values (1, 1, 'A'), (2, 1, 'A'), (3, 1, 'a');
+
+select g, count(nullif(b,'A')) as c, row_number() over (order by count(nullif(b,'a'))) as w
+from wgc group by g;
+-- error: Aggregate function count in a window function's ORDER BY is only supported when the same aggregate also appears in the SELECT list
+
+drop table wgc;
+
+-- Two window functions with different specifications each get their own window
+-- output column; neither collapses onto the other's.
+select a, row_number() over (order by a) as p, count(*) over (partition by a) as q
+from wg group by a order by a;
+→ [{"a":"x","p":1,"q":1},{"a":"y","p":2,"q":1}]
+
+-- Two textually identical window functions resolve to their own columns too.
+select a, row_number() over (order by a) as p, row_number() over (order by a) as q
+from wg group by a order by a;
+→ [{"a":"x","p":1,"q":1},{"a":"y","p":2,"q":2}]
+
+-- A window specification may name an aggregate by its SELECT-list alias — that
+-- resolves through the aggregate output scope, like ORDER BY does.
+select a, count(*) as c, row_number() over (order by c) as rn from wg group by a order by rn;
+→ [{"a":"y","c":1,"rn":1},{"a":"x","c":2,"rn":2}]
+
+-- A grouping key may be named in a window specification by ANY spelling that
+-- denotes it, not only the one the GROUP BY used. The aggregate output scope
+-- registers a qualified name only when the GROUP BY key was itself written
+-- qualified, and registers a non-bare key only under a synthetic `group_N` name,
+-- so the other spellings bind to a base-table column the grouped row does not
+-- carry; the window phase redirects those subtrees onto the aggregate's own group
+-- output column (bug-window-spec-reads-base-table-column — they used to die with
+-- an internal "No row context found for column a" error).
+
+-- GROUP BY key written qualified, window spec qualified.
+select wg.a, row_number() over (order by wg.a) as rn from wg group by wg.a order by rn;
+→ [{"a":"x","rn":1},{"a":"y","rn":2}]
+
+-- GROUP BY key written bare, window spec table-qualified.
+select a, row_number() over (order by wg.a) as rn from wg group by a order by rn;
+→ [{"a":"x","rn":1},{"a":"y","rn":2}]
+
+-- Same, alias-qualified through a FROM alias.
+select a, row_number() over (order by w.a) as rn from wg w group by a order by rn;
+→ [{"a":"x","rn":1},{"a":"y","rn":2}]
+
+-- A non-bare grouping key spelled out again in the window specification.
+select a || '!' as k, row_number() over (order by a || '!') as rn from wg group by a || '!' order by rn;
+→ [{"k":"x!","rn":1},{"k":"y!","rn":2}]
+
+-- Same, in PARTITION BY: each group is its own partition, so every count is 1.
+select a || '!' as k, count(*) over (partition by a || '!') as c from wg group by a || '!' order by k;
+→ [{"k":"x!","c":1},{"k":"y!","c":1}]
+
+-- The grouping key nested inside a larger window-specification expression: the
+-- redirect recurses, so only the `a || '!'` subtree is rewritten.
+select a || '!' as k, row_number() over (order by upper(a || '!')) as rn from wg group by a || '!' order by rn;
+→ [{"k":"x!","rn":1},{"k":"y!","rn":2}]
+
+-- A window function ARGUMENT naming the grouping key another way works too.
+select a, max(wg.a) over () as m from wg group by a order by a;
+→ [{"a":"x","m":"y"},{"a":"y","m":"y"}]
+
+-- Identifier case is not part of a spelling: the fingerprint that matches a
+-- non-bare grouping key folds identifier case.
+select a || '!' as k, row_number() over (order by A || '!') as rn from wg group by a || '!' order by rn;
+→ [{"k":"x!","rn":1},{"k":"y!","rn":2}]
+
+-- A quoted literal's case IS part of it, so `a || 'x'` is not the grouping key
+-- `a || 'X'` and its bare `a` is an ungrouped reference.
+select a || 'X' as k, row_number() over (order by a || 'x') as rn from wg group by a || 'X';
+-- error: Column 'a' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- A qualified grouping key nested inside a larger window-specification expression.
+select a, row_number() over (order by upper(wg.a)) as rn from wg group by a order by rn;
+→ [{"a":"x","rn":1},{"a":"y","rn":2}]
+
+-- A wrapper around the grouping key survives the redirect.
+select a, row_number() over (order by a collate nocase) as rn from wg group by a order by rn;
+→ [{"a":"x","rn":1},{"a":"y","rn":2}]
+
+-- A *qualified* ungrouped column is not accidentally redirected onto a group key.
+select a, row_number() over (order by wg.b) as rn from wg group by a;
+-- error: Column 'wg.b' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- Neither is a same-shaped expression over the wrong column.
+select a || '!' as k, row_number() over (order by b || '!') as rn from wg group by a || '!';
+-- error: Column 'b' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- Referencing a grouping key by its SELECT-list alias is NOT one of the spellings
+-- that works (an *aggregate* alias does — see above). Different root cause,
+-- tracked as bug-window-spec-cannot-name-group-key-by-select-alias.
+select a as k, row_number() over (order by k) as rn from wg group by a;
+-- error: Column not found: k
+
+-- A grouped, windowed query composes as a subquery source: its window column is
+-- an ordinary output column to the enclosing query.
+with q as (select a, row_number() over (order by a) as rn from wg group by a)
+select * from q where rn > 1;
+→ [{"a":"y","rn":2}]
+
+-- A window specification may also contain a SUBQUERY that correlates back to the
+-- grouping key. The redirect and the coverage check both descend through the
+-- subquery to reach it, keying off the attribute ids the aggregate's INPUT
+-- produces so the subquery's own columns are left alone
+-- (bug-window-spec-subquery-reads-base-table-column — every shape below used to
+-- die with an internal "No row context found for column a" error).
+
+-- Scalar subquery in ORDER BY: `max(b)` per group is '3' for a='x' and '2' for
+-- a='y', so ascending puts y first.
+select a, row_number() over (order by (select max(t.b) from wg t where t.a = wg.a)) as rn
+from wg group by a order by rn;
+→ [{"a":"y","rn":1},{"a":"x","rn":2}]
+
+-- `exists (…)` correlated on the grouping key: true only for the group that has a
+-- row with b > '2' (a='x'), so y sorts first.
+select a, row_number() over (order by (case when exists (select 1 from wg t where t.a = wg.a and t.b > '2') then 1 else 0 end)) as rn
+from wg group by a order by rn;
+→ [{"a":"y","rn":1},{"a":"x","rn":2}]
+
+-- `x in (select …)`, correlated on both sides of the membership test.
+select a, row_number() over (order by (case when wg.a in (select t.a from wg t where t.a = wg.a and t.b > '2') then 1 else 0 end)) as rn
+from wg group by a order by rn;
+→ [{"a":"y","rn":1},{"a":"x","rn":2}]
+
+-- In a window function's ARGUMENT rather than its specification: the per-group
+-- values '3' and '2' summed over the whole (unpartitioned) window.
+select a, sum((select max(t.b) from wg t where t.a = wg.a)) over () as s
+from wg group by a order by a;
+→ [{"a":"x","s":5},{"a":"y","s":5}]
+
+-- In PARTITION BY: the correlated subquery yields a distinct value per group, so
+-- every partition holds exactly one grouped row.
+select a, count(*) over (partition by (select max(t.b) from wg t where t.a = wg.a)) as c
+from wg group by a order by a;
+→ [{"a":"x","c":1},{"a":"y","c":1}]
+
+-- The mirror image, and the reason the redirect cannot simply match by name: a
+-- BARE `a` written inside the subquery names the subquery's OWN `t.a`, not the
+-- grouping key, so the predicate is the tautology `t.a = t.a` and every group sees
+-- the same global `max(b)`. One partition of two grouped rows, not two of one.
+select a, count(*) over (partition by (select max(t.b) from wg t where t.a = a)) as c
+from wg group by a order by a;
+→ [{"a":"x","c":2},{"a":"y","c":2}]
+
+-- A correlated reference to a NON-grouped column is rejected at plan time, with the
+-- same message a bare ungrouped column in a window specification gets.
+select a, row_number() over (order by (select max(t.b) from wg t where t.b = wg.b)) as rn
+from wg group by a;
+-- error: Column 'wg.b' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- Same rejection when the ungrouped column is only on one side of the correlation.
+select a, row_number() over (order by (select count(*) from wg t where t.a = wg.b)) as rn
+from wg group by a;
+-- error: Column 'wg.b' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- An UNCORRELATED subquery in a window specification reads nothing of this query's
+-- and is left entirely alone.
+select a, row_number() over (order by (select max(t.b) from wg t), a) as rn
+from wg group by a order by rn;
+→ [{"a":"x","rn":1},{"a":"y","rn":2}]
+
+-- A window specification inside a GROUPED SUBQUERY may correlate to the ENCLOSING
+-- query. `o.a` is not one of the inner query's pre-grouping columns, so the inner
+-- coverage check has no business rejecting it — it used to, because its only
+-- vocabulary was "is this an aggregate output column".
+select o.a,
+       (select count(*) from (select row_number() over (order by i.b, o.a) rn
+                              from wg i where i.a = o.a group by i.b) z) c
+from wg o group by o.a order by o.a;
+→ [{"a":"x","c":2},{"a":"y","c":1}]
+
+-- A whole SUBQUERY can be the grouping key, and repeating it verbatim in the window
+-- specification must resolve to that key's output column. It is matched by identity
+-- fingerprint at the top level of the specification, where the expression is written
+-- in this query's own scope — the "does this subtree read only pre-grouping columns"
+-- test that guards the same rule INSIDE a subquery cannot be applied here, because a
+-- correlated grouping key legitimately reads the subquery's columns too. Two groups:
+-- max(b) is '3' for a='x' and '2' for a='y'.
+select count(*) as n, row_number() over (order by (select max(t.b) from wg t where t.a = wg.a)) as rn
+from wg group by (select max(t.b) from wg t where t.a = wg.a) order by rn;
+→ [{"n":1,"rn":1},{"n":2,"rn":2}]
+
+-- The mirror: an expression grouping key named from INSIDE a subquery in the
+-- specification. `wgk` has no column `a`, so the bare `a` resolves outward to this
+-- query's grouping key and IS redirected. Each group matches one `wgk` row, so both
+-- grouped rows land in the same partition.
+create table wgk (c text);
+insert into wgk values ('x!'), ('y!'), ('z!');
+
+select a || '!' as k, count(*) over (partition by (select count(*) from wgk t where t.c = a || '!')) as c
+from wg group by a || '!' order by k;
+→ [{"k":"x!","c":2},{"k":"y!","c":2}]
+
+drop table wgk;
+
+-- An aggregate inside a subquery in the window specification belongs to the
+-- SUBQUERY, so its arguments get no exemption from the coverage check: `wg.b` is a
+-- correlated reference to an ungrouped column of the grouped query and is rejected at
+-- plan time. (Only this query's OWN top-level aggregates read pre-grouping columns by
+-- definition — see the `count(*) over (order by count(*) desc)` cases above.)
+select a, row_number() over (order by (select max(wg.b) from wg t)) as rn
+from wg group by a;
+-- error: Column 'wg.b' must appear in the GROUP BY clause or be used in an aggregate function
+
+select a, row_number() over (order by (select count(wg.b) from wg t where t.a = wg.a)) as rn
+from wg group by a;
+-- error: Column 'wg.b' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- The GROUPING key inside such an aggregate is legal, and is redirected onto the
+-- aggregate's output column: max('x'||b) is 'x3', max('y'||b) is 'y3'.
+select a, row_number() over (order by (select max(wg.a || t.b) from wg t)) as rn
+from wg group by a order by rn;
+→ [{"a":"x","rn":1},{"a":"y","rn":2}]
+
+-- A CTE is planned ONCE and shared by every reference to it, so when the grouped
+-- query and a subquery in its window specification both read the same CTE, the CTE
+-- body is reachable from both. Its own columns are not this query's pre-grouping
+-- columns and must not be treated as such — this rejected with "Column 'b' must
+-- appear in the GROUP BY clause", naming a column written only inside the CTE.
+with c as (select a, b from wg where b <> '')
+select a, row_number() over (order by (select count(*) from c z), a) as rn
+from c group by a order by rn;
+→ [{"a":"x","rn":1},{"a":"y","rn":2}]
+
+-- Same shape, correlated: the redirect still reaches the grouping key through the
+-- shared CTE. `max(b)` is '3' for a='x' and '2' for a='y', so y sorts first.
+with c as (select a, b from wg where b <> '')
+select a, row_number() over (order by (select max(t.b) from c t where t.a = c.a)) as rn
+from c group by a order by rn;
+→ [{"a":"y","rn":1},{"a":"x","rn":2}]
+
+-- And an ungrouped correlated reference is still rejected when the CTE is shared.
+with c as (select a, b from wg where b <> '')
+select a, row_number() over (order by (select max(t.b) from c t where t.b = c.b)) as rn
+from c group by a;
+-- error: Column 'c.b' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- A RECURSIVE CTE is shared the same way.
+with recursive r(n) as (select 1 union all select n + 1 from r where n < 3)
+select n, row_number() over (order by (select count(*) from r z), n) as rn
+from r group by n order by rn;
+→ [{"n":1,"rn":1},{"n":2,"rn":2},{"n":3,"rn":3}]
+
+drop table wg;
+
+-- =============================================================================
+-- `*` in a window query.
+--
+-- The window phase's projection used to walk the AST select list and handle only
+-- non-star entries, so a `*` was skipped outright and its columns never reached
+-- the output. The projection is now the query's ONE select-list projection, with
+-- stars already expanded, so a star is an ordinary entry.
+--
+-- Column NAMES and ORDER are asserted in test/plan/grouped-projection-shape.spec.ts
+-- (row objects compare key-order-insensitively here); this file pins the values.
+-- =============================================================================
+
+create table sw (v integer primary key, g text);
+insert into sw values (1,'a'),(2,'b');
+
+-- Star before the window column.
+select *, row_number() over (order by v) as w from sw order by v;
+→ [{"v":1,"g":"a","w":1},{"v":2,"g":"b","w":2}]
+
+-- Star after the window column.
+select row_number() over (order by v) as w, * from sw order by v;
+→ [{"w":1,"v":1,"g":"a"},{"w":2,"v":2,"g":"b"}]
+
+-- A named column repeated by a later star is disambiguated as `v:1`.
+select v, row_number() over (order by v) as w, * from sw order by w;
+→ [{"v":1,"w":1,"v:1":1,"g":"a"},{"v":2,"w":2,"v:1":2,"g":"b"}]
+
+-- Qualified star.
+select sw.*, row_number() over (order by v) as w from sw order by v;
+→ [{"v":1,"g":"a","w":1},{"v":2,"g":"b","w":2}]
+
+-- A positional ORDER BY over a star-bearing window query binds the window column
+-- (position 3 = the column after the two star columns).
+select *, row_number() over (order by v) as w from sw order by 3 desc;
+→ [{"v":2,"g":"b","w":2},{"v":1,"g":"a","w":1}]
+
+-- DISTINCT over a window column.
+select distinct row_number() over (order by v) as w from sw order by w;
+→ [{"w":1},{"w":2}]
+
+-- An UNALIASED window column keeps its authored expression as its output name,
+-- like every other unaliased select-list column. (It used to be named after the
+-- array-index node the rewrite substitutes in — `[2]`.)
+select row_number() over (order by v) from sw order by v;
+→ [{"row_number() over (order by v)":1},{"row_number() over (order by v)":2}]
+
+select v, 1000 - row_number() over (order by v) from sw order by v;
+→ [{"v":1,"1000 - row_number() over (order by v)":999},{"v":2,"1000 - row_number() over (order by v)":998}]
+
+drop table sw;

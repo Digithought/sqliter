@@ -11,64 +11,97 @@
  *   - Index stores: {schema}.{table}_idx_{name} - one per secondary index
  *   - {prefix}.__stats__ - Unified stats store (row counts for all tables)
  *   - Catalog store: __catalog__ - DDL metadata keyed by {schema}.{table}
+ *
+ * The class is layered across eight files, each adding one job to the one below:
+ *   `store-module-base.ts`         - module state, store handles, coordinator, name collisions
+ *   `store-module-catalog.ts`      - the catalog store: DDL entries, shutdown marker, stale-MV set
+ *   `store-module-schema-sync.ts`  - rehydration, lazy reconnect, engine schema-change subscription
+ *   `store-module-index.ts`        - CREATE / DROP INDEX and the implicit `_uc_*` store reconcile
+ *   `store-module-alter-column.ts` - ALTER TABLE ... ALTER COLUMN
+ *   `store-module-alter.ts`        - ALTER TABLE dispatch and every other arm
+ *   `store-module-rename.ts`       - ALTER TABLE ... RENAME TO (two-phase)
+ *   `store-module.ts`              - this file: module lifecycle, capabilities, backing host
+ *
+ * Three groups read no module state and are free functions instead of layers:
+ *   `store-module-access-plan.ts`    - which access path this module advertises
+ *   `store-module-index-build.ts`    - index population + UNIQUE validation over a row stream
+ *   `store-module-schema-rewrite.ts` - pure schema-to-schema rewrites around DDL
+ *
+ * A layer may call downward, never upward. Nothing enforces that explicitly — it holds
+ * because a base class cannot name a subclass member, so an upward call fails to compile.
  */
 
 import type {
-	Database,
-	TableSchema,
-	TableIndexSchema,
-	VirtualTableModule,
-	BaseModuleConfig,
+	BackingHost,
 	BestAccessPlanRequest,
 	BestAccessPlanResult,
-	OrderingSpec,
-	SqlValue,
+	Database,
+	LensDeploymentSnapshot,
+	MappingAdvertisement,
 	ModuleCapabilities,
-	SchemaChangeInfo,
-	ColumnSchema,
+	Schema,
+	SqlValue,
+	TableSchema,
+	VirtualTableModule,
 } from '@quereus/quereus';
-import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse } from '@quereus/quereus';
-import type { CompiledPredicate } from '@quereus/quereus';
-
-import type { KVStore, KVStoreProvider } from './kv-store.js';
-import type { StoreEventEmitter } from './events.js';
-import { TransactionCoordinator } from './transaction.js';
-import { StoreTable, type StoreTableConfig, type StoreTableModule } from './store-table.js';
 import {
-	buildCatalogKey,
-	buildCatalogScanBounds,
-	buildIndexKey,
-	buildFullScanBounds,
-	buildStatsKey,
+	QuereusError,
+	StatusCode,
+	buildAdvertisementsFromTags,
+	generateDropTableDDL,
+	generateTableDDL,
+} from '@quereus/quereus';
+import { StoreBackingHost } from './backing-host.js';
+import { StoreTable } from './store-table.js';
+import type { StoreTableModule } from './store-table-base.js';
+import {
+	CLEAN_SHUTDOWN_META_NAME,
+	STALE_MVS_META_NAME,
+	buildDataStoreName,
+	buildMetaCatalogKey,
 } from './key-builder.js';
-import { deserializeRow } from './serialization.js';
-import { generateTableDDL } from '@quereus/quereus';
+import { StoreModuleRename } from './store-module-rename.js';
+import type { LensDeploymentListener, StoreModuleConfig } from './store-module-base.js';
+import { computeBestAccessPlan } from './store-module-access-plan.js';
+import { reconcilePkCollations } from './store-module-schema-rewrite.js';
 
 /**
- * Result of catalog rehydration.
+ * `request` with the table's own size filled into `estimatedRows` when the planner
+ * supplied none — otherwise `request` unchanged.
+ *
+ * The planner's hint comes only from `ANALYZE`-collected statistics, so a
+ * never-analyzed table arrives as `undefined` and every cost in
+ * `computeBestAccessPlan` would be computed against its fixed 1000-row placeholder,
+ * whatever the table actually holds. This module maintains a running row count as it
+ * writes ({@link StoreTable.getKnownRowCount}), so it can answer for itself.
+ *
+ * A supplied hint WINS: it is the number the rest of the plan was costed with (join
+ * ordering, cache thresholds and sort costs all read the same catalog statistics), and
+ * a module quietly pricing against a different figure would make the access path
+ * disagree with the plan around it. A stale post-`ANALYZE` count therefore stays stale
+ * here — engine-wide snapshot semantics, not a separate rule.
+ *
+ * Floored at 1: `rows: 0` is not "this table is empty" in the access-plan protocol, it
+ * is a module PROVING its predicate unsatisfiable, and `rule-select-access-path` acts
+ * on it by replacing the whole table access with a static empty relation. A live count
+ * is a snapshot taken at PLAN time, so an empty table can still be read after rows are
+ * written into it by the very same statement — a view update materializing its missing
+ * non-preserved-side row does exactly that.
+ *
+ * NOTE: a prepared `Statement` holds its compiled plan and recompiles only on a schema
+ * change, so a long-lived prepared statement keeps the costs derived from the size the
+ * table had at first compile. Harmless while this only moves costs, not plan shape; if a
+ * prepared statement is ever seen picking a plan wrong for the table's current size, the
+ * fix belongs at the statement's recompile trigger, not here.
  */
-export interface RehydrationResult {
-	tables: string[];
-	indexes: string[];
-	errors: RehydrationError[];
-}
-
-/**
- * An error encountered while rehydrating a single DDL entry.
- */
-export interface RehydrationError {
-	ddl: string;
-	error: Error;
-}
-
-/**
- * Configuration options for StoreModule tables.
- */
-export interface StoreModuleConfig extends BaseModuleConfig {
-	/** Collation for text keys. Default: 'NOCASE'. */
-	collation?: 'BINARY' | 'NOCASE';
-	/** Additional platform-specific options. */
-	[key: string]: unknown;
+function sizeRequestFromLiveCount(
+	request: BestAccessPlanRequest,
+	table: StoreTable | undefined,
+): BestAccessPlanRequest {
+	if (request.estimatedRows !== undefined) return request;
+	const liveRows = table?.getKnownRowCount();
+	if (liveRows === undefined) return request;
+	return { ...request, estimatedRows: Math.max(1, liveRows) };
 }
 
 /**
@@ -84,24 +117,34 @@ export interface StoreModuleConfig extends BaseModuleConfig {
  * db.registerModule('store', module);
  * ```
  */
-export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleConfig>, StoreTableModule {
-	private provider: KVStoreProvider;
-	private stores: Map<string, KVStore> = new Map();
-	private coordinators: Map<string, TransactionCoordinator> = new Map();
-	private tables: Map<string, StoreTable> = new Map();
-	private eventEmitter?: StoreEventEmitter;
-
-	constructor(provider: KVStoreProvider, eventEmitter?: StoreEventEmitter) {
-		this.provider = provider;
-		this.eventEmitter = eventEmitter;
-	}
+export class StoreModule extends StoreModuleRename implements VirtualTableModule<StoreTable, StoreModuleConfig>, StoreTableModule {
+	/**
+	 * Declines the engine's concurrent committed-read path. Declared explicitly
+	 * rather than left to the `false` default so the two reasons stay attached to
+	 * the code — both would have to be fixed before this could flip:
+	 *
+	 * - `connect` returns a SHARED cached `StoreTable` per table key, so the
+	 *   `_readCommitted` connect option is dropped on the floor: the "committed
+	 *   snapshot" reader gets the same instance the writer is using.
+	 * - `StoreTable.query` merges the coordinator's pending-op view over the
+	 *   committed store (read-your-own-writes — see the `getCapabilities` doc
+	 *   comment below), so a read taken while a commit flushes those ops observes
+	 *   a partially applied batch.
+	 *
+	 * See `docs/module-authoring.md` § "Committed-Snapshot Reads (`_readCommitted`)".
+	 */
+	readonly readCommittedSnapshot = false as const;
 
 	/**
 	 * Returns capability flags for this module.
 	 *
-	 * The base StoreModule does NOT provide transaction isolation.
-	 * Without isolation, queries see only committed data (no read-your-own-writes
-	 * within a transaction). To enable isolation, wrap with IsolationModule:
+	 * The base StoreModule does NOT provide transaction isolation: there is no
+	 * snapshot isolation and no cross-connection isolation (readers on other
+	 * connections see only committed data). Within a transaction, reads through
+	 * the table's shared coordinator DO see that transaction's own pending
+	 * writes (read-your-own-writes — `StoreTable.query` merges the pending op
+	 * view over the committed store). For full isolation, wrap with
+	 * IsolationModule:
 	 *
 	 * ```typescript
 	 * import { IsolationModule, MemoryTableModule } from '@quereus/quereus';
@@ -118,25 +161,147 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	getCapabilities(): ModuleCapabilities {
 		return {
 			isolation: false,
-			savepoints: false,
+			// Coordinator-buffered ops support savepoint create/release/rollback-to
+			// within a transaction (advisory flag — not engine-consulted).
+			savepoints: true,
 			persistent: true,
 			secondaryIndexes: true,
 			rangeScans: true,
+			// Worst-case summary across this module's DDL. The row-rewriting ALTER arms
+			// and renameTable call ddlCommitPendingOps(), which commits the WHOLE module
+			// transaction (schema change + every buffered write) at DDL time — a later
+			// rollback undoes nothing. Non-committing DDL (create index, add constraint,
+			// schema-only arms) is merely non-transactional, but the declared value is
+			// the worst case. See docs/store.md § "DDL that implicitly commits".
+			ddlTransactionality: 'auto-commit',
 		};
 	}
 
 	/**
-	 * Get the event emitter for this module.
+	 * Generic-module mapping advertisements: assembled from the `quereus.lens.decomp.*`
+	 * reserved tags on this basis schema's tables. Returns `[]` when the schema has no
+	 * such tags, leaving the lens default mapper on its name-match path.
+	 * See `docs/lens.md` § The Default Mapper.
 	 */
-	getEventEmitter(): StoreEventEmitter | undefined {
-		return this.eventEmitter;
+	getMappingAdvertisements(_db: Database, basisSchema: Schema): readonly MappingAdvertisement[] {
+		return buildAdvertisementsFromTags(basisSchema);
 	}
 
 	/**
-	 * Get the KVStoreProvider used by this module.
+	 * Backing-host capability (engine `vtab/backing-host.ts`): resolve the
+	 * privileged surface for a store table this module owns, or undefined when the
+	 * table is unknown to it. The host binds the CURRENT (StoreTable, coordinator)
+	 * pair — `destroy` evicts both maps, so a drop+recreate yields fresh instances
+	 * and the returned host is pinned to one backing-table incarnation (the engine
+	 * resolves hosts fresh per call, never caching them). Resolution goes through
+	 * `StoreModuleSchemaSync.getOrReconnectTable` so a rehydrated-but-untouched (or rename-evicted)
+	 * backing still resolves; the ownership pre-check keeps the reconnect fallback
+	 * from adopting a registered table owned by a different module (`vtabModule`
+	 * must be this StoreModule, or a wrapper — IsolationModule — exposing it as
+	 * `underlying`). Attaching the coordinator eagerly makes the shared
+	 * StoreTable's read paths merge the host's pending writes (reads-own-writes
+	 * for a `select` from the MV mid-transaction).
 	 */
-	getProvider(): KVStoreProvider {
-		return this.provider;
+	getBackingHost(db: Database, schemaName: string, tableName: string): BackingHost | undefined {
+		const table = this.resolveOwnedTable(db, schemaName, tableName);
+		if (!table) return undefined;
+		return new StoreBackingHost(table, table.attachCoordinator());
+	}
+
+	/**
+	 * Resolve a {@link StoreTable} this module owns, reconnecting a
+	 * rehydrated-but-untouched (or rename-evicted) table via
+	 * `StoreModuleSchemaSync.getOrReconnectTable`. The ownership pre-check keeps the reconnect
+	 * fallback from adopting a registered table owned by a DIFFERENT module:
+	 * `vtabModule` must be this StoreModule, or a wrapper (IsolationModule)
+	 * exposing it as `underlying`. Returns undefined for an unknown/non-owned
+	 * table. Shared by {@link getBackingHost} and
+	 * {@link getTableForExternalWrite}; neither attaches a coordinator here —
+	 * each layers its own pending-state policy on top.
+	 */
+	private resolveOwnedTable(db: Database, schemaName: string, tableName: string): StoreTable | undefined {
+		const tableKey = `${schemaName}.${tableName}`.toLowerCase();
+		if (!this.tables.has(tableKey)) {
+			const registered = db.schemaManager.getTable(schemaName, tableName);
+			const wrapper = registered?.vtabModule as { underlying?: unknown } | undefined;
+			if (!registered || (registered.vtabModule !== this && wrapper?.underlying !== this)) {
+				return undefined;
+			}
+		}
+		return this.getOrReconnectTable(db, schemaName, tableName);
+	}
+
+	/**
+	 * Resolve the live {@link StoreTable} for an externally-applied write to a
+	 * SOURCE table (committed put/delete + secondary-index + stats maintenance via
+	 * {@link StoreTable.applyExternalRowChanges}). Returns undefined when the table
+	 * is not this module's.
+	 *
+	 * Resolution goes through {@link resolveOwnedTable} (the shared ownership
+	 * pre-check + reconnect fallback). Unlike `getBackingHost` it attaches no
+	 * coordinator: external writes target committed storage, and the before-image
+	 * read (`readEffectiveRowByKey`) merges any already-attached coordinator's
+	 * pending state on its own (none when the table is freshly reconnected).
+	 */
+	getTableForExternalWrite(db: Database, schemaName: string, tableName: string): StoreTable | undefined {
+		return this.resolveOwnedTable(db, schemaName, tableName);
+	}
+
+	/**
+	 * Bind (or clear, with `undefined`) the lens-deployment forwarder. The host
+	 * (worker) calls this to route a logical `apply schema`'s deployment to the
+	 * sync layer; see {@link notifyLensDeployment}.
+	 */
+	setLensDeploymentListener(listener: LensDeploymentListener | undefined): void {
+		this.lensDeploymentListener = listener;
+	}
+
+	/**
+	 * Engine `onRegister` hook: subscribe to the database's schema-change notifier the
+	 * moment this module is registered, before any statement can run.
+	 *
+	 * Views and materialized views never route through a module table hook, so without
+	 * this the module would only learn its `Database` from the first
+	 * `create`/`connect`/`alterTable`/`rehydrateCatalog` — and a `create view` issued
+	 * before that (the first statement of a brand-new database, say) would fire
+	 * `view_added` at a module that is not listening yet and silently never persist.
+	 *
+	 * Idempotent with the lazy call sites; a second `Database` logs
+	 * `ensureSchemaSubscription`'s "different Database" warning here rather than at first
+	 * table use (a warning, not a throw — one module instance still serves one Database).
+	 */
+	onRegister(db: Database, _moduleName: string): void {
+		this.ensureSchemaSubscription(db);
+	}
+
+	/**
+	 * Engine `notifyLensDeployment` hook: a logical `apply schema X` fires this on
+	 * every registered module once the lens catalog mutation + snapshot rotation
+	 * complete (see `VirtualTableModule.notifyLensDeployment`). The store module —
+	 * the basis-backing host — forwards the deployment to the bound listener so the
+	 * sync layer can update its basis-table lifecycle bookkeeping.
+	 *
+	 * INVERSION OF THE ENGINE FIRING CONTRACT: the engine documents that a throwing
+	 * notification aborts `apply schema X`. We deliberately wrap the listener in
+	 * try/catch and SWALLOW (structured-log only) here — lifecycle bookkeeping is
+	 * advisory and must never brick a schema apply. A bookkeeping bug is a logged
+	 * warning, not a failed deploy.
+	 */
+	async notifyLensDeployment(
+		db: Database,
+		logicalSchemaName: string,
+		snapshot: LensDeploymentSnapshot,
+	): Promise<void> {
+		if (!this.lensDeploymentListener) return;
+		try {
+			await this.lensDeploymentListener(db, logicalSchemaName, snapshot);
+		} catch (e) {
+			// Advisory bookkeeping — swallow so a listener bug cannot abort the deploy.
+			console.warn(
+				`[StoreModule] lens-deployment listener failed for logical schema '${logicalSchemaName}'; `
+					+ `lifecycle bookkeeping skipped: ${e instanceof Error ? e.message : String(e)}`,
+			);
+		}
 	}
 
 	/**
@@ -148,6 +313,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * event handlers (like sync module) try to access it.
 	 */
 	async create(db: Database, tableSchema: TableSchema): Promise<StoreTable> {
+		this.ensureSchemaSubscription(db);
 		const tableKey = `${tableSchema.schemaName}.${tableSchema.name}`.toLowerCase();
 
 		if (this.tables.has(tableKey)) {
@@ -159,6 +325,27 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 
 		const config = this.parseConfig(tableSchema.vtabArgs as Record<string, SqlValue> | undefined);
 
+		// Apply the store's default key collation K to any IMPLICIT-default text PK column
+		// (an explicit per-column PK collation is honored natively by the per-column key
+		// encoding — see reconcilePkCollations / StoreTable.pkKeyCollations). The reconciled
+		// schema is what StoreTable holds and what `finalizeCreatedTableSchema` registers, so
+		// an undecorated text PK reports/keys under K rather than the engine BINARY default.
+		const keyCollation = (config.collation || 'NOCASE').toUpperCase();
+		const reconciledSchema = reconcilePkCollations(tableSchema, keyCollation);
+
+		// Reject when this new table's physical data store name already names an
+		// existing store (the only real positive here is data-vs-index: a sibling
+		// index store `{schema}.t_idx_<x>` already occupies `{schema}.{thisTable}` —
+		// data-vs-data is prevented by engine table-name uniqueness). Must precede
+		// `getStore`, which eagerly opens/creates the directory.
+		const dataStoreName = buildDataStoreName(tableSchema.schemaName, tableSchema.name);
+		this.assertStoreNameFree(
+			db,
+			tableSchema.schemaName,
+			dataStoreName,
+			`data store of new table '${tableSchema.schemaName}.${tableSchema.name}'`,
+		);
+
 		// Eagerly initialize the store BEFORE creating the table or emitting events.
 		// This ensures the underlying storage (e.g., IndexedDB object store) exists
 		// before any schema change handlers try to access it.
@@ -168,7 +355,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		const table = new StoreTable(
 			db,
 			this,
-			tableSchema,
+			reconciledSchema,
 			config,
 			this.eventEmitter
 			// isConnected defaults to false for newly created tables
@@ -182,7 +369,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			objectType: 'table',
 			schemaName: tableSchema.schemaName,
 			objectName: tableSchema.name,
-			ddl: generateTableDDL(tableSchema),
+			ddl: generateTableDDL(reconciledSchema),
 		});
 
 		return table;
@@ -201,6 +388,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		options: StoreModuleConfig,
 		importedTableSchema?: TableSchema
 	): Promise<StoreTable> {
+		this.ensureSchemaSubscription(db);
 		const tableKey = `${schemaName}.${tableName}`.toLowerCase();
 
 		// Check if we already have this table connected
@@ -212,6 +400,12 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// Convert options to Record<string, SqlValue> for vtabArgs
 		const vtabArgs: Record<string, SqlValue> = {};
 		if (options?.collation !== undefined) vtabArgs.collation = options.collation;
+		// `options` is the raw DDL arg record (snake_case keys), so read `max_batch_bytes`,
+		// not the parsed `maxBatchBytes` field — the latter is never populated here, which
+		// silently dropped a configured budget across reopen. `?? maxBatchBytes` still honors
+		// a caller that hands in an already-parsed config.
+		const rawMaxBatchBytes = options?.max_batch_bytes ?? options?.maxBatchBytes;
+		if (rawMaxBatchBytes !== undefined) vtabArgs.max_batch_bytes = rawMaxBatchBytes as SqlValue;
 
 		// Resolve the table schema:
 		// 1. Use importedTableSchema if provided (from catalog import or runtime)
@@ -235,7 +429,6 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 					columnIndexMap: new Map(),
 					primaryKeyDefinition: [],
 					checkConstraints: Object.freeze([]),
-					isTemporary: false,
 					isView: false,
 					vtabModuleName: 'store',
 					vtabArgs,
@@ -247,6 +440,19 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 
 		const config = this.parseConfig(vtabArgs);
 
+		// The load path does NOT reconcile PK collations: a persisted / hand-authored
+		// DDL stays loadable as-declared. Physical key bytes are always K-encoded by
+		// `StoreTable.encodeOptions`, so a legacy divergent text-PK collation is a
+		// stale `table_info` declaration, not a correctness risk. Reconciling the
+		// transient `StoreTable` here would be pointless anyway — `importCatalog`'s
+		// post-import reconcile loop (`table.updateSchema(fresh)`) immediately
+		// overwrites it with the `SchemaManager`-registered schema. A genuine
+		// reopen-time migration (an engine import-path hook reconciling the
+		// *registered* schema to K) was considered and deliberately not built:
+		// only pre-`store-pk-collate-create-time-divergence` data can carry such a
+		// DDL, and backwards compatibility is out of scope (AGENTS.md). If legacy
+		// migration ever comes into scope, the fix is a module-consulted
+		// normalization hook on `importCatalog`/`rehydrateCatalog`.
 		const table = new StoreTable(
 			db,
 			this,
@@ -264,7 +470,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * Destroys a store table and its storage.
 	 */
 	async destroy(
-		_db: Database,
+		db: Database,
 		_pAux: unknown,
 		_moduleName: string,
 		schemaName: string,
@@ -272,965 +478,173 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	): Promise<void> {
 		const tableKey = `${schemaName}.${tableName}`.toLowerCase();
 
-		// Clear internal maps synchronously before any await, so a concurrent
-		// create() cannot observe the stale table/store/coordinator across a
-		// microtask boundary mid-destroy.
+		// Capture the schema BEFORE we drop in-memory references so we can hand the
+		// provider the authoritative index list (exact store names) rather than let
+		// it prefix-scan `{table}_idx_`, which would also delete a sibling table
+		// literally named `{table}_idx_<x>`. Prefer the cached StoreTable's own
+		// schema; fall back to the schema manager (mirrors renameTable). If neither
+		// yields a schema (already deregistered), fall back to [] — index stores
+		// can't be swept by name then, but that is no worse than today for the
+		// no-sibling case and strictly safer for the sibling case.
 		const table = this.tables.get(tableKey);
-		this.tables.delete(tableKey);
-		this.stores.delete(tableKey);
-		this.coordinators.delete(tableKey);
+		const currentSchema: TableSchema | undefined =
+			table?.getSchema() ?? db.schemaManager.getTable(schemaName, tableName);
+		// Materialized index list, so the hidden `_uc_*` stores backing plain UNIQUEs are
+		// torn down too — the engine-facing `.indexes` omits them and would leak them.
+		const indexNames = this.materializedIndexNames(table, currentSchema);
 
-		if (table) {
-			await table.disconnect();
-		}
+		await this.tearDownTableStorage(schemaName, tableName, indexNames);
 
-		// Delete all stores for this table (data, indexes, stats)
-		if (this.provider.deleteTableStores) {
-			await this.provider.deleteTableStores(schemaName, tableName);
-		} else {
-			// Fallback: just close the data store
-			await this.provider.closeStore(schemaName, tableName);
-		}
-
-		// Remove DDL from catalog
-		await this.removeTableDDL(schemaName, tableName);
-
-		// Emit schema change event for table drop
+		// Emit schema change event for table drop. The `ddl` is what a sync peer
+		// re-executes to replicate the drop — a drop with no DDL crosses the wire as
+		// an empty statement and silently changes nothing on the receiver.
 		this.eventEmitter?.emitSchemaChange({
 			type: 'drop',
 			objectType: 'table',
 			schemaName,
 			objectName: tableName,
+			ddl: generateDropTableDDL(schemaName, tableName),
 		});
 	}
 
 	/**
-	 * Creates an index on a store-backed table.
-	 */
-	async createIndex(
-		_db: Database,
-		schemaName: string,
-		tableName: string,
-		indexSchema: TableIndexSchema
-	): Promise<void> {
-		const tableKey = `${schemaName}.${tableName}`.toLowerCase();
-		const table = this.tables.get(tableKey);
-
-		if (!table) {
-			throw new QuereusError(
-				`Store table '${tableName}' not found in schema '${schemaName}'`,
-				StatusCode.NOTFOUND
-			);
-		}
-
-		// Create the index store
-		const indexStore = await this.provider.getIndexStore(schemaName, tableName, indexSchema.name);
-
-		// Build index entries for existing rows
-		const dataStore = await this.getStore(tableKey, table.getConfig());
-		const tableSchema = table.getSchema();
-		await this.buildIndexEntries(dataStore, indexStore, tableSchema, indexSchema);
-
-		// Refresh the connected table's cached schema so subsequent DML
-		// maintains the new index (the engine's schema registry is updated
-		// separately by SchemaManager.createIndex, but the StoreTable instance
-		// holds its own reference captured at connect time). Mirrors
-		// SchemaManager.addIndexToTableSchema, including the UNIQUE → derived
-		// uniqueConstraint entry so checkUniqueConstraints enforces it.
-		const updatedIndexes = Object.freeze([
-			...(tableSchema.indexes ?? []),
-			indexSchema,
-		]);
-		const updatedSchema: TableSchema = { ...tableSchema, indexes: updatedIndexes };
-		if (indexSchema.unique) {
-			// `derivedFromIndex` tags this synthesized constraint so a future
-			// `StoreModule.dropIndex` can filter it out symmetrically (mirrors
-			// SchemaManager.dropIndex / MemoryTableManager.dropIndex). Without that
-			// filter on the drop side, the UNIQUE check would survive the index.
-			updatedSchema.uniqueConstraints = Object.freeze([
-				...(tableSchema.uniqueConstraints ?? []),
-				{
-					name: indexSchema.name,
-					columns: Object.freeze(indexSchema.columns.map(c => c.index)),
-					predicate: indexSchema.predicate,
-					derivedFromIndex: indexSchema.name,
-				},
-			]);
-		}
-		table.updateSchema(updatedSchema);
-
-		// Emit schema change event
-		this.eventEmitter?.emitSchemaChange({
-			type: 'create',
-			objectType: 'index',
-			schemaName,
-			objectName: indexSchema.name,
-		});
-	}
-
-	/**
-	 * Drops an index on a store-backed table.
+	 * Reclaim the local storage of a DETACHED basis table by name — the store-side
+	 * target of the sync layer's basis-eviction sweep
+	 * (`SyncManager.evictExpiredBasisTables`, `docs/migration.md` § 4 Contract).
 	 *
-	 * Mirrors createIndex: refreshes the connected StoreTable's cached
-	 * tableSchema (removing the index entry and any UNIQUE constraint
-	 * synthesized from it, tagged with `derivedFromIndex`), releases the
-	 * cached index-store handle, and tears down the underlying index store.
+	 * Unlike {@link destroy}, the table is no longer in the engine schema (it was
+	 * removed from the basis on detach; only its physical storage lingered), so
+	 * there is no `db`/schema to consult and NO schema-change event is emitted — the
+	 * engine already saw the detach. The caller (the sync recorder) supplies the
+	 * captured secondary-index name list it retained from before detach, because the
+	 * table schema (and its index list) is gone: passing the exact names avoids the
+	 * provider prefix-scanning `{table}_idx_`, which can clobber a sibling table
+	 * literally named `{table}_idx_<x>`.
+	 *
+	 * Idempotent: any cached handles are evicted and disconnected, then the data /
+	 * index / stats stores and the catalog DDL are removed. Storage already gone (a
+	 * prior real `drop table` ran `destroy`) is treated as success — the provider's
+	 * `deleteTableStores` no-ops on absent stores and `removeTableDDL` no-ops on an
+	 * absent key.
 	 */
-	async dropIndex(
-		_db: Database,
+	async reclaimDetachedTable(
 		schemaName: string,
 		tableName: string,
-		indexName: string,
+		indexNames: readonly string[],
+	): Promise<void> {
+		await this.tearDownTableStorage(schemaName, tableName, indexNames);
+	}
+
+	/**
+	 * Tear down a table's in-memory handles and physical storage: evict the cached
+	 * StoreTable / store / coordinator (synchronously, before any await, so a
+	 * concurrent reconnect cannot observe a stale instance mid-teardown), disconnect
+	 * the handle, delete the provider's data / index / stats stores (by the exact
+	 * index names — never a `{table}_idx_` prefix scan, which could clobber a sibling
+	 * table literally named `{table}_idx_<x>`), and remove the catalog DDL.
+	 *
+	 * Shared by {@link destroy} (live `drop table`) and {@link reclaimDetachedTable}
+	 * (post-detach eviction). The caller owns the index-name source (live schema vs.
+	 * the captured pre-detach list) and any schema-change event. Idempotent: the
+	 * provider no-ops on absent stores and `removeTableDDL` no-ops on an absent key.
+	 */
+	private async tearDownTableStorage(
+		schemaName: string,
+		tableName: string,
+		indexNames: readonly string[],
 	): Promise<void> {
 		const tableKey = `${schemaName}.${tableName}`.toLowerCase();
-		const table = this.tables.get(tableKey);
 
-		if (!table) {
-			throw new QuereusError(
-				`Store table '${tableName}' not found in schema '${schemaName}'`,
-				StatusCode.NOTFOUND,
-			);
+		const table = this.tables.get(tableKey);
+		this.tables.delete(tableKey);
+		this.stores.delete(tableKey);
+		// NOTE: the coordinator is module-wide and shared by sibling tables, so a
+		// single table's teardown must NOT evict the coordinator itself. But the
+		// evicted StoreTable's stats-callback pair MUST be deregistered, or its
+		// closures (capturing this instance) stay pinned on the shared coordinator
+		// for the module's lifetime — a leak bounded by drop/recreate count.
+		// table.dispose() both flushes pending stats and runs that disposer.
+		if (table) {
+			await table.dispose();
 		}
 
-		const tableSchema = table.getSchema();
-		const lowerIndexName = indexName.toLowerCase();
-
-		// Mirror SchemaManager.dropIndex: strip the index AND any UNIQUE
-		// constraint synthesized from it (tagged with `derivedFromIndex` by
-		// StoreModule.createIndex). Collapse uniqueConstraints to undefined
-		// when empty.
-		const updatedIndexes = Object.freeze(
-			(tableSchema.indexes ?? []).filter(
-				idx => idx.name.toLowerCase() !== lowerIndexName,
-			),
-		);
-		const remainingUniqueConstraints = (tableSchema.uniqueConstraints ?? []).filter(
-			uc => uc.derivedFromIndex?.toLowerCase() !== lowerIndexName,
-		);
-		const updatedSchema: TableSchema = {
-			...tableSchema,
-			indexes: updatedIndexes,
-			uniqueConstraints: remainingUniqueConstraints.length > 0
-				? Object.freeze(remainingUniqueConstraints)
-				: undefined,
-		};
-		// Update the cached schema BEFORE tearing down the store so that a
-		// failure of the physical drop doesn't leave the schema enforcing an
-		// index whose backing store has already been mutated.
-		table.updateSchema(updatedSchema);
-
-		// Drop the cached handle on the table side and tear down the
-		// underlying KVStore. `deleteIndexStore` (if the provider implements
-		// it) closes the handle before removing the directory; otherwise we
-		// just close it.
-		await table.releaseIndexStore(indexName);
-		if (this.provider.deleteIndexStore) {
-			await this.provider.deleteIndexStore(schemaName, tableName, indexName);
+		// Delete all stores for this table (data, indexes, stats)
+		if (this.provider.deleteTableStores) {
+			await this.provider.deleteTableStores(schemaName, tableName, indexNames);
 		} else {
-			await this.provider.closeIndexStore(schemaName, tableName, indexName);
+			// Fallback: just close the data store
+			await this.provider.closeStore(schemaName, tableName);
 		}
 
-		this.eventEmitter?.emitSchemaChange({
-			type: 'drop',
-			objectType: 'index',
-			schemaName,
-			objectName: indexName,
-		});
-	}
-
-	/**
-	 * Build index entries for all existing rows in a table.
-	 *
-	 * For UNIQUE indexes, performs an in-pass duplicate check (honoring partial
-	 * predicates and SQL NULL semantics: multiple NULLs are allowed) and throws
-	 * CONSTRAINT before any entries are written. Mirrors the memory module's
-	 * populateNewIndex so `CREATE UNIQUE INDEX` over duplicated data fails
-	 * atomically.
-	 */
-	private async buildIndexEntries(
-		dataStore: KVStore,
-		indexStore: KVStore,
-		tableSchema: TableSchema,
-		indexSchema: TableIndexSchema
-	): Promise<void> {
-		const encodeOptions = { collation: 'NOCASE' as const };
-		const pkDirections = tableSchema.primaryKeyDefinition.map(pk => !!pk.desc);
-		const indexDirections = indexSchema.columns.map(col => !!col.desc);
-
-		const predicate: CompiledPredicate | undefined = indexSchema.predicate
-			? compilePredicate(indexSchema.predicate, tableSchema.columns)
-			: undefined;
-		const seen: Set<string> | undefined = indexSchema.unique ? new Set() : undefined;
-
-		// Scan all data rows
-		const bounds = buildFullScanBounds();
-		const batch = indexStore.batch();
-
-		for await (const entry of dataStore.iterate(bounds)) {
-			const row = deserializeRow(entry.value);
-
-			// Partial index: skip rows whose predicate is not unambiguously TRUE.
-			if (predicate && predicate.evaluate(row) !== true) continue;
-
-			// Extract PK values
-			const pkValues = tableSchema.primaryKeyDefinition.map(pk => row[pk.index]);
-
-			// Extract index column values
-			const indexValues = indexSchema.columns.map(col => row[col.index]);
-
-			if (seen) {
-				// SQL UNIQUE allows multiple NULLs: skip dup detection when any
-				// indexed column is NULL for this row.
-				const hasNull = indexValues.some(v => v === null);
-				if (!hasNull) {
-					const keySig = JSON.stringify(indexValues);
-					if (seen.has(keySig)) {
-						const colNames = indexSchema.columns
-							.map(c => tableSchema.columns[c.index]?.name ?? String(c.index))
-							.join(', ');
-						throw new QuereusError(
-							`UNIQUE constraint failed: ${tableSchema.name} (${colNames})`,
-							StatusCode.CONSTRAINT,
-						);
-					}
-					seen.add(keySig);
-				}
-			}
-
-			// Build and store index key
-			const indexKey = buildIndexKey(
-				indexValues,
-				pkValues,
-				encodeOptions,
-				indexDirections,
-				pkDirections,
-			);
-			batch.put(indexKey, new Uint8Array(0)); // Index value is empty
-		}
-
-		await batch.write();
-	}
-
-	/**
-	 * Alters an existing store table's structure (ADD/DROP/RENAME COLUMN).
-	 * Performs eager row migration for ADD and DROP, schema-only update for RENAME.
-	 * Returns the updated TableSchema for the engine to register.
-	 */
-	async alterTable(
-		db: Database,
-		schemaName: string,
-		tableName: string,
-		change: SchemaChangeInfo,
-	): Promise<TableSchema> {
-		const tableKey = `${schemaName}.${tableName}`.toLowerCase();
-		// Lazy-connect: `renameTable` evicts the old key from `this.tables` and
-		// expects the next `connect()` to repopulate under the new name, but
-		// `apply schema` can call `alterTable` immediately after a rename without
-		// an intervening connect. Mirror connect()'s schemaManager lookup so the
-		// follow-up ALTER finds the moved table.
-		let table = this.tables.get(tableKey);
-		if (!table) {
-			const registeredSchema = db.schemaManager.getTable(schemaName, tableName);
-			if (registeredSchema) {
-				table = new StoreTable(
-					db,
-					this,
-					registeredSchema,
-					this.parseConfig(registeredSchema.vtabArgs ?? {}),
-					this.eventEmitter,
-					true, // isConnected - DDL already exists in storage
-				);
-				this.tables.set(tableKey, table);
-			}
-		}
-
-		if (!table) {
-			throw new QuereusError(
-				`Store table '${tableName}' not found in schema '${schemaName}'. Cannot alter.`,
-				StatusCode.ERROR,
-			);
-		}
-
-		const oldSchema = table.getSchema();
-		const defaultNotNull = db.options.getStringOption('default_column_nullability') === 'not_null';
-
-		switch (change.type) {
-			case 'addColumn': {
-				const newColSchema = columnDefToSchema(change.columnDef, defaultNotNull);
-
-				// Extract default value from column def constraints. Use the shared
-				// `tryFoldLiteral` helper so signed numerics like `-123.0`
-				// (a UnaryExpr in the AST) are recognized — matching the
-				// memory-mode path and the engine-level ALTER validation.
-				let defaultValue: SqlValue = null;
-				const defaultConstraint = change.columnDef.constraints?.find(c => c.type === 'default');
-				if (defaultConstraint?.expr) {
-					const folded = tryFoldLiteral(defaultConstraint.expr);
-					if (folded !== undefined) {
-						defaultValue = folded;
-					}
-				}
-
-				// Refuse NOT NULL without a literal DEFAULT on a non-empty table (SQLite-compatible).
-				if (newColSchema.notNull && defaultValue === null) {
-					if (await table.hasAnyRows()) {
-						throw new QuereusError(
-							`Cannot add NOT NULL column '${newColSchema.name}' to non-empty table `
-								+ `'${schemaName}.${tableName}' without a DEFAULT value`,
-							StatusCode.CONSTRAINT,
-						);
-					}
-				}
-
-				// Build updated schema: append new column
-				const updatedColumns: ReadonlyArray<ColumnSchema> = Object.freeze([...oldSchema.columns, newColSchema]);
-				const updatedSchema: TableSchema = {
-					...oldSchema,
-					columns: updatedColumns,
-					columnIndexMap: buildColumnIndexMap(updatedColumns),
-				};
-
-				// Migrate rows: append default value to each row
-				const remap = buildColumnRemap(
-					oldSchema.columns.map(c => c.name),
-					updatedColumns.map(c => c.name),
-				);
-				await table.migrateRows(remap, defaultValue);
-
-				// Update table schema and persist DDL
-				table.updateSchema(updatedSchema);
-				await this.saveTableDDL(updatedSchema);
-
-				this.eventEmitter?.emitSchemaChange({
-					type: 'alter',
-					objectType: 'table',
-					schemaName,
-					objectName: tableName,
-				});
-
-				return updatedSchema;
-			}
-
-			case 'dropColumn': {
-				const colNameLower = change.columnName.toLowerCase();
-				const colIndex = oldSchema.columns.findIndex(c => c.name.toLowerCase() === colNameLower);
-				if (colIndex === -1) {
-					throw new QuereusError(`Column '${change.columnName}' not found.`, StatusCode.ERROR);
-				}
-
-				// Build updated schema: remove column and reindex PK/indexes
-				// Filter by original index BEFORE remapping to avoid incorrectly
-				// removing columns that remap to the dropped column's position.
-				const updatedColumns = oldSchema.columns.filter((_, idx) => idx !== colIndex);
-				const updatedPkDef = oldSchema.primaryKeyDefinition
-					.filter(def => def.index !== colIndex)
-					.map(def => ({
-						...def,
-						index: def.index > colIndex ? def.index - 1 : def.index,
-					}));
-				const updatedIndexes = (oldSchema.indexes || [])
-					.map(idx => ({
-						...idx,
-						columns: idx.columns
-							.filter(ic => ic.index !== colIndex)
-							.map(ic => ({ ...ic, index: ic.index > colIndex ? ic.index - 1 : ic.index })),
-					}))
-					.filter(idx => idx.columns.length > 0);
-
-				const updatedSchema: TableSchema = {
-					...oldSchema,
-					columns: Object.freeze(updatedColumns),
-					columnIndexMap: buildColumnIndexMap(updatedColumns),
-					primaryKeyDefinition: Object.freeze(updatedPkDef),
-					indexes: Object.freeze(updatedIndexes),
-				};
-
-				// Migrate rows: remove the dropped column slot
-				const remap = buildColumnRemap(
-					oldSchema.columns.map(c => c.name),
-					updatedColumns.map(c => c.name),
-				);
-				await table.migrateRows(remap, null);
-
-				// Update table schema and persist DDL
-				table.updateSchema(updatedSchema);
-				await this.saveTableDDL(updatedSchema);
-
-				this.eventEmitter?.emitSchemaChange({
-					type: 'alter',
-					objectType: 'table',
-					schemaName,
-					objectName: tableName,
-				});
-
-				return updatedSchema;
-			}
-
-			case 'renameColumn': {
-				if (!change.newColumnDefAst) {
-					throw new QuereusError('RENAME COLUMN requires a new column definition AST', StatusCode.INTERNAL);
-				}
-
-				const oldNameLower = change.oldName.toLowerCase();
-				const colIndex = oldSchema.columns.findIndex(c => c.name.toLowerCase() === oldNameLower);
-				if (colIndex === -1) {
-					throw new QuereusError(`Column '${change.oldName}' not found.`, StatusCode.ERROR);
-				}
-
-				const newColSchema = columnDefToSchema(change.newColumnDefAst, defaultNotNull);
-				const updatedColumns = oldSchema.columns.map((c, i) => i === colIndex ? newColSchema : c);
-				const updatedIndexes = (oldSchema.indexes || []).map(idx => ({
-					...idx,
-					columns: idx.columns.map(ic =>
-						ic.index === colIndex ? { ...ic, name: change.newName } : ic
-					),
-				}));
-
-				const updatedSchema: TableSchema = {
-					...oldSchema,
-					columns: Object.freeze(updatedColumns),
-					columnIndexMap: buildColumnIndexMap(updatedColumns),
-					indexes: Object.freeze(updatedIndexes),
-				};
-
-				// Rename is schema-only — no row migration needed
-				table.updateSchema(updatedSchema);
-				await this.saveTableDDL(updatedSchema);
-
-				this.eventEmitter?.emitSchemaChange({
-					type: 'alter',
-					objectType: 'table',
-					schemaName,
-					objectName: tableName,
-				});
-
-				return updatedSchema;
-			}
-
-			case 'alterPrimaryKey': {
-				const newPkColumns = change.newPkColumns;
-				const updatedSchema: TableSchema = {
-					...oldSchema,
-					primaryKeyDefinition: Object.freeze(
-						newPkColumns.map(pk => ({ index: pk.index, desc: pk.desc })),
-					),
-				};
-
-				// Re-key the data store. Throws CONSTRAINT on duplicates without
-				// mutating the store, giving us all-or-nothing semantics for the
-				// validation phase.
-				await table.rekeyRows(newPkColumns);
-
-				// Secondary index keys embed the PK suffix — clear + rebuild every
-				// index against the now-rekeyed data store.
-				const dataStore = await this.getStore(tableKey, table.getConfig());
-				for (const indexSchema of oldSchema.indexes ?? []) {
-					const indexStore = await this.getIndexStore(schemaName, tableName, indexSchema.name);
-					const clearBatch = indexStore.batch();
-					for await (const entry of indexStore.iterate(buildFullScanBounds())) {
-						clearBatch.delete(entry.key);
-					}
-					await clearBatch.write();
-					await this.buildIndexEntries(dataStore, indexStore, updatedSchema, indexSchema);
-				}
-
-				table.updateSchema(updatedSchema);
-				await this.saveTableDDL(updatedSchema);
-
-				this.eventEmitter?.emitSchemaChange({
-					type: 'alter',
-					objectType: 'table',
-					schemaName,
-					objectName: tableName,
-				});
-
-				return updatedSchema;
-			}
-
-			case 'addConstraint': {
-				throw new QuereusError(
-					`Store table does not support ADD CONSTRAINT ${change.constraint.type}`,
-					StatusCode.UNSUPPORTED,
-				);
-			}
-
-			case 'alterColumn': {
-				const colNameLower = change.columnName.toLowerCase();
-				const colIndex = oldSchema.columns.findIndex(c => c.name.toLowerCase() === colNameLower);
-				if (colIndex === -1) {
-					throw new QuereusError(`Column '${change.columnName}' not found.`, StatusCode.ERROR);
-				}
-				const oldCol = oldSchema.columns[colIndex];
-				let newCol: ColumnSchema = oldCol;
-
-				// Pull exactly one of the three attributes from the change.
-				if (change.setNotNull !== undefined) {
-					if (change.setNotNull === true && !oldCol.notNull) {
-						// Backfill NULLs from a literal DEFAULT, or throw.
-						let defaultLiteral: SqlValue | undefined;
-						const expr = oldCol.defaultValue;
-						if (expr && (expr as { type?: string }).type === 'literal') {
-							defaultLiteral = (expr as { value?: SqlValue }).value ?? null;
-						}
-						const nullCount = await table.rowsWithNullAtIndex(colIndex);
-						if (nullCount > 0) {
-							if (defaultLiteral === undefined || defaultLiteral === null) {
-								throw new QuereusError(
-									`column ${change.columnName} contains NULL values`,
-									StatusCode.CONSTRAINT,
-								);
-							}
-							const fill = defaultLiteral;
-							await table.mapRowsAtIndex(colIndex, (v) => v === null ? fill : v);
-						}
-						newCol = { ...oldCol, notNull: true };
-					} else if (change.setNotNull === false && oldCol.notNull) {
-						if (oldSchema.primaryKeyDefinition.some(def => def.index === colIndex)) {
-							throw new QuereusError(
-								`Cannot DROP NOT NULL on PRIMARY KEY column '${change.columnName}'`,
-								StatusCode.CONSTRAINT,
-							);
-						}
-						newCol = { ...oldCol, notNull: false };
-					} else {
-						return oldSchema; // already in desired state
-					}
-				} else if (change.setDataType !== undefined) {
-					const newLogicalType = inferType(change.setDataType);
-					if (newLogicalType.physicalType !== oldCol.logicalType.physicalType) {
-						// Physical conversion required — walk every row and attempt parse.
-						await table.mapRowsAtIndex(colIndex, (v) => {
-							if (v === null) return v;
-							try {
-								return validateAndParse(v, newLogicalType, change.columnName) as SqlValue;
-							} catch {
-								throw new QuereusError(
-									`Cannot convert value in '${change.columnName}' to ${change.setDataType}`,
-									StatusCode.MISMATCH,
-								);
-							}
-						});
-					}
-					newCol = { ...oldCol, logicalType: newLogicalType };
-				} else if (change.setDefault !== undefined) {
-					newCol = { ...oldCol, defaultValue: change.setDefault };
-				} else {
-					throw new QuereusError('ALTER COLUMN requires an attribute to change', StatusCode.INTERNAL);
-				}
-
-				const updatedColumns = oldSchema.columns.map((c, i) => i === colIndex ? newCol : c);
-				const updatedSchema: TableSchema = {
-					...oldSchema,
-					columns: Object.freeze(updatedColumns),
-					columnIndexMap: buildColumnIndexMap(updatedColumns),
-				};
-
-				table.updateSchema(updatedSchema);
-				await this.saveTableDDL(updatedSchema);
-
-				this.eventEmitter?.emitSchemaChange({
-					type: 'alter',
-					objectType: 'table',
-					schemaName,
-					objectName: tableName,
-				});
-
-				return updatedSchema;
-			}
-		}
-	}
-
-	/**
-	 * Rename a store-backed table.
-	 *
-	 * Drops every in-memory reference to the old name (so the coordinator, open
-	 * handles, and cached StoreTable instance don't linger with stale paths),
-	 * delegates physical storage relocation to the provider, then rewrites the
-	 * persistent catalog DDL under the new key. After this returns, the next
-	 * access to `newName` will reconnect via `connect()` and open fresh stores
-	 * against the moved directories.
-	 */
-	async renameTable(
-		db: Database,
-		schemaName: string,
-		oldName: string,
-		newName: string,
-	): Promise<void> {
-		const oldKey = `${schemaName}.${oldName}`.toLowerCase();
-		const newKey = `${schemaName}.${newName}`.toLowerCase();
-
-		if (this.tables.has(newKey)) {
-			throw new QuereusError(
-				`Store table '${newName}' already exists in schema '${schemaName}'`,
-				StatusCode.ERROR,
-			);
-		}
-
-		// Capture the current schema BEFORE we drop in-memory references, so the
-		// new catalog DDL reflects the real column set.
-		const existing = this.tables.get(oldKey);
-		const currentSchema: TableSchema | undefined =
-			existing?.getSchema() ?? db.schemaManager.getTable(schemaName, oldName);
-
-		// ALTER TABLE is effectively DDL-committing on a store-backed table:
-		// once we move the on-disk directory, prior buffered writes can no
-		// longer be rolled back through the coordinator. Flush any pending
-		// ops to the old store NOW, before its handle is closed. Subsequent
-		// commit() calls on the same coordinator are no-ops (inTransaction
-		// is cleared), which keeps the enclosing transaction safe.
-		const coordinator = this.coordinators.get(oldKey);
-		if (coordinator?.isInTransaction()) {
-			await coordinator.commit();
-		}
-
-		// Flush any lazy stats the cached handle was buffering; disconnect failures
-		// must not block the rename.
-		if (existing) {
-			try {
-				await existing.disconnect();
-			} catch {
-				/* ignore — physical rename must proceed */
-			}
-		}
-
-		this.tables.delete(oldKey);
-		this.stores.delete(oldKey);
-		this.coordinators.delete(oldKey);
-
-		// Move physical storage (data directory + index directories).
-		if (this.provider.renameTableStores) {
-			await this.provider.renameTableStores(schemaName, oldName, newName);
-		}
-
-		// Rewrite persistent catalog under the new name. Write the new DDL first
-		// so a crash mid-rename leaves the table discoverable under at least one
-		// name rather than neither.
-		if (currentSchema) {
-			const renamedSchema: TableSchema = { ...currentSchema, name: newName };
-			await this.saveTableDDL(renamedSchema);
-		}
-		await this.removeTableDDL(schemaName, oldName);
-
-		// Relocate the stats entry (unified __stats__ store, keyed by schema.table).
-		try {
-			const statsStore = await this.provider.getStatsStore(schemaName, newName);
-			const oldStatsKey = buildStatsKey(schemaName, oldName);
-			await statsStore.delete(oldStatsKey);
-		} catch {
-			/* stats are advisory — a stale entry under the old key is harmless */
-		}
-
-		this.eventEmitter?.emitSchemaChange({
-			type: 'alter',
-			objectType: 'table',
-			schemaName,
-			objectName: newName,
-		});
+		// Remove DDL from catalog. Drain the persist queue first: the `table_added`
+		// listener writes a freshly created table's entry asynchronously, so a
+		// create-then-drop in the same session could otherwise land that queued write
+		// AFTER this delete and resurrect the entry as a phantom table on reopen. Every
+		// other direct catalog write in the module is followed by a queued
+		// `table_modified` (or, for RENAME, a queued `removeTableDDL`) that re-establishes
+		// the truth; a drop has no such follow-up, so it drains explicitly.
+		//
+		// NOTE: the drain assumes no `persistQueue` task ever reaches teardown — a queued
+		// task calling `destroy`/`reclaimDetachedTable` would await the very chain it is a
+		// link in and hang. Holds today: every queued task body is a catalog read/write
+		// (`persistTableCatalogEntryIfChanged`, `persistCatalogIfChanged`, the view/MV
+		// saves and removes, `writeDurableStaleMvSet`, `removeTableDDL`), and the only
+		// caller of `reclaimDetachedTable` is the host-driven basis-eviction sweep. If a
+		// persist task ever needs to drop a table, give teardown a captured queue tail
+		// instead of the live one.
+		await this.whenCatalogPersisted();
+		await this.removeTableDDL(schemaName, tableName);
 	}
 
 	/**
 	 * Modern access planning interface.
+	 *
+	 * Every plan is stamped with `honorsCollatedRangeBounds`: the store's post-fetch
+	 * row filter (`StoreTable.matchesFilters` → `compareValues`) compares each pushed
+	 * constraint — including LT/LE/GT/GE range bounds — under the column's declared
+	 * collation, so the access path's collation-cover analysis may keep a
+	 * collation-matched non-BINARY (NOCASE/RTRIM) PK range/BETWEEN seek instead of
+	 * declining to a SeqScan + residual (see `classifyConstraintCover` in
+	 * rule-select-access-path.ts). The seek really does narrow: `StoreTable.scanPKRange`
+	 * (via `StoreTable.buildPKRangeBounds`) encodes the LT/LE/GT/GE bounds under the
+	 * same per-column key collations the data keys use and iterates that
+	 * seek-start/early-termination window. The window is a SUPERSET, so the post-fetch
+	 * row filter still reproduces the exact collation semantics. (A collation that cannot
+	 * key at all never reaches a PK column: `StoreTable`'s constructor rejects it at DDL
+	 * time.) Mirrors the memory module's advertisement.
+	 *
+	 * The seek/ordering claims are additionally gated on the key collation being
+	 * ORDER-PRESERVING — byte order and comparator order must coincide, or the seek would
+	 * under-fetch and the ordering advertisement would elide a Sort it must not. That gate
+	 * needs the connection's collation registry, hence `db` is threaded down.
+	 *
+	 * The request is sized from the table's own maintained row count when the planner
+	 * supplied no estimate — see {@link sizeRequestFromLiveCount}.
 	 */
 	getBestAccessPlan(
-		_db: Database,
+		db: Database,
 		tableInfo: TableSchema,
 		request: BestAccessPlanRequest
 	): BestAccessPlanResult {
-		const estimatedRows = request.estimatedRows ?? 1000;
-
-		// Check for primary key equality constraints
-		const pkColumns = tableInfo.primaryKeyDefinition.map(pk => pk.index);
-		const pkFilters = request.filters.filter(f =>
-			f.columnIndex !== undefined &&
-			pkColumns.includes(f.columnIndex) &&
-			f.op === '='
-		);
-
-		if (pkFilters.length === pkColumns.length && pkColumns.length > 0) {
-			// Full PK match - point lookup (single row; no monotonic advertisement)
-			const handledFilters = request.filters.map(f =>
-				pkFilters.some(pf => pf.columnIndex === f.columnIndex && pf.op === f.op)
-			);
-			return AccessPlanBuilder
-				.eqMatch(1, 0.1)
-				.setHandledFilters(handledFilters)
-				.setIsSet(true)
-				.setIndexName('_primary_')
-				.setExplanation('Store primary key lookup')
-				.build();
-		}
-
-		// Check for range constraints on the leading PK column.
-		// The legacy access-path rule (rule-select-access-path.ts) only forwards
-		// range bounds for primaryKeyDefinition[0]; ranges on later PK columns
-		// are silently dropped if marked handled. So only claim handled=true
-		// when the range is on the first PK column.
-		const rangeOps = ['<', '<=', '>', '>='];
-		const firstPkColumn = tableInfo.primaryKeyDefinition[0]?.index;
-		const rangeFilters = firstPkColumn !== undefined
-			? request.filters.filter(f =>
-				f.columnIndex === firstPkColumn &&
-				rangeOps.includes(f.op))
-			: [];
-
-		if (rangeFilters.length > 0) {
-			// Range scan on first PK column. Iteration is by PK key order (see
-			// StoreTable.scanPKRange), so we can advertise monotonic emission on
-			// the leading PK column. The scan still visits the entire data store
-			// today (TODO in scanPKRange to refine bounds), but the order
-			// guarantee already holds.
-			const handledFilters = request.filters.map(f =>
-				rangeFilters.some(rf => rf.columnIndex === f.columnIndex && rf.op === f.op)
-			);
-			const rangeRows = Math.max(1, Math.floor(estimatedRows * 0.3));
-			const plan = AccessPlanBuilder
-				.rangeScan(rangeRows, 0.2)
-				.setHandledFilters(handledFilters)
-				.setIndexName('_primary_')
-				.setSeekColumns([firstPkColumn!])
-				.setExplanation('Store primary key range scan')
-				.build();
-			return { ...plan, ...this.buildPkOrderingAdvertisement(tableInfo, request) };
-		}
-
-		// Check for secondary index usage
-		// Note: query() does not yet implement secondary index scans — it falls
-		// back to a full table scan + matchesFilters.  We still advertise better
-		// cost estimates when a usable index exists (so the planner prefers this
-		// table access) but we must NOT mark filters as handled, otherwise the
-		// engine won't supply them to matchesFilters and rows pass unfiltered.
-		const indexes = tableInfo.indexes || [];
-		for (const index of indexes) {
-			const indexColumns = index.columns.map(c => c.index);
-			const indexFilters = request.filters.filter(f =>
-				f.columnIndex !== undefined &&
-				indexColumns.includes(f.columnIndex) &&
-				f.op === '='
-			);
-
-			if (indexFilters.length > 0) {
-				const matchedRows = Math.max(1, Math.floor(estimatedRows * 0.1));
-				return AccessPlanBuilder
-					.eqMatch(matchedRows, 0.3)
-					.setHandledFilters(new Array(request.filters.length).fill(false))
-					.setExplanation(`Store index scan on ${index.name}`)
-					.build();
-			}
-		}
-
-		// Fallback to full scan. The store iterates rows in PK key order
-		// (see StoreTable.query / store.iterate over buildFullScanBounds), so
-		// the scan is monotonic on the leading PK column. Advertise that so
-		// downstream rules (merge-join, asof-scan) can fire on store-backed
-		// tables, matching memory-mode behavior.
-		const plan = AccessPlanBuilder
-			.fullScan(estimatedRows)
-			.setHandledFilters(new Array(request.filters.length).fill(false))
-			.setExplanation('Store full table scan')
-			.build();
-		return { ...plan, ...this.buildPkOrderingAdvertisement(tableInfo, request) };
-	}
-
-	/**
-	 * Compute the PK-ordering advertisement for a scan-style plan. Returns the
-	 * `providesOrdering` / `monotonicOn` / `supportsAsofRight` fields for a plan
-	 * whose iteration is driven by the primary-key key order (full scan or PK
-	 * range scan).
-	 *
-	 * `providesOrdering` is set only when it actually matches what the caller
-	 * needs:
-	 *   - When the request carries `requiredOrdering`, claim it only if the
-	 *     requested keys form a prefix of the PK with matching directions.
-	 *     Claiming PK order against an `ORDER BY <other column>` would cause
-	 *     the absorb-Sort rule to drop the Sort and yield wrong-order rows.
-	 *   - When no `requiredOrdering` is present, advertise the full PK
-	 *     ordering so downstream rules (merge-join, sort elision after a
-	 *     filter) can opportunistically use it.
-	 *
-	 * `monotonicOn` reflects the access path itself and is independent of any
-	 * `requiredOrdering`; it always advertises the leading PK column. Strict
-	 * monotonicity is claimed iff the PK is single-column — composite PKs can
-	 * repeat values on the leading column.
-	 *
-	 * Returns an empty object when there is no PK (heap-only table) — without a
-	 * leading key column there is no natural emit order.
-	 */
-	private buildPkOrderingAdvertisement(
-		tableInfo: TableSchema,
-		request: BestAccessPlanRequest,
-	): Pick<BestAccessPlanResult, 'providesOrdering' | 'orderingIndexName' | 'monotonicOn' | 'supportsAsofRight'> {
-		const pk = tableInfo.primaryKeyDefinition;
-		if (pk.length === 0) return {};
-
-		const leading = pk[0];
-		const monotonicOn = {
-			columnIndex: leading.index,
-			direction: leading.desc ? 'desc' as const : 'asc' as const,
-			strict: pk.length === 1,
-		};
-
-		const pkOrdering: OrderingSpec[] = pk.map(col => ({
-			columnIndex: col.index,
-			desc: !!col.desc,
-		}));
-
-		// Pick the providesOrdering to advertise based on requiredOrdering.
-		const required = request.requiredOrdering;
-		let providesOrdering: readonly OrderingSpec[] | undefined;
-		if (required && required.length > 0) {
-			// Only claim ordering when the requested keys form a prefix of the
-			// PK with matching directions. nullsFirst is intentionally not
-			// matched here — if the request specifies an explicit NULLS
-			// FIRST/LAST, leave the Sort in place rather than assume the PK
-			// scan's natural NULL placement matches.
-			if (required.length > pk.length) return { monotonicOn, supportsAsofRight: true };
-			for (let i = 0; i < required.length; i++) {
-				if (required[i].columnIndex !== pkOrdering[i].columnIndex) return { monotonicOn, supportsAsofRight: true };
-				if (required[i].desc !== pkOrdering[i].desc) return { monotonicOn, supportsAsofRight: true };
-				if (required[i].nullsFirst !== undefined) return { monotonicOn, supportsAsofRight: true };
-			}
-			providesOrdering = required;
-		} else {
-			providesOrdering = pkOrdering;
-		}
+		// NOTE: this module does not call `validateAccessPlan` / `validateAccessPlanRequest`,
+		// so a malformed request (e.g. a `runtimeSet` whose `maxCount` is not a positive
+		// integer) is not rejected at this boundary the way it is for the memory module. It
+		// degrades safely instead: `equalitySeekKeyCount` returns null for every malformed
+		// shape, so the filter is simply never claimed and survives as a residual. If an
+		// engine bug ever needs catching here rather than absorbing, call
+		// `validateAccessPlan(request, plan)` on the way out.
+		// Table key collation K (default NOCASE). Any K reaching here has a key normalizer:
+		// `StoreTable`'s constructor rejects one that cannot key, and a name we cannot resolve
+		// to a table falls back to the built-in NOCASE. `||`, not `??`, so an empty-string
+		// `config.collation` reads as the default here exactly as it does in
+		// `StoreTable.encodeOptions` — the two must agree or `analyzePKAccess` would decline a
+		// window `computeBestAccessPlan` already marked handled.
+		const table = this.getTable(tableInfo.schemaName, tableInfo.name);
+		const tableKeyCollation = (table?.getConfig().collation || 'NOCASE').toUpperCase();
 
 		return {
-			providesOrdering,
-			orderingIndexName: '_primary_',
-			monotonicOn,
-			supportsAsofRight: true,
-		};
-	}
-
-	// --- StoreTableModule interface implementation ---
-
-	/**
-	 * Get or create a data store for a table.
-	 */
-	async getStore(tableKey: string, _config: StoreTableConfig): Promise<KVStore> {
-		let store = this.stores.get(tableKey);
-		if (!store) {
-			const [schemaName, tableName] = tableKey.split('.');
-			store = await this.provider.getStore(schemaName, tableName);
-
-			if (!store) {
-				throw new Error(`Provider.getStore returned null/undefined for ${tableKey}`);
-			}
-
-			this.stores.set(tableKey, store);
-		}
-		return store;
-	}
-
-	/**
-	 * Get or create an index store for a table.
-	 */
-	async getIndexStore(schemaName: string, tableName: string, indexName: string): Promise<KVStore> {
-		return this.provider.getIndexStore(schemaName, tableName, indexName);
-	}
-
-	/**
-	 * Get or create a stats store for a table.
-	 */
-	async getStatsStore(schemaName: string, tableName: string): Promise<KVStore> {
-		return this.provider.getStatsStore(schemaName, tableName);
-	}
-
-	/**
-	 * Get or create a transaction coordinator for a table.
-	 */
-	async getCoordinator(tableKey: string, config: StoreTableConfig): Promise<TransactionCoordinator> {
-		let coordinator = this.coordinators.get(tableKey);
-		if (!coordinator) {
-			const store = await this.getStore(tableKey, config);
-			coordinator = new TransactionCoordinator(store, this.eventEmitter);
-			this.coordinators.set(tableKey, coordinator);
-		}
-		return coordinator;
-	}
-
-	/**
-	 * Save table DDL to the catalog store.
-	 */
-	async saveTableDDL(tableSchema: TableSchema): Promise<void> {
-		const ddl = generateTableDDL(tableSchema);
-		const catalogKey = buildCatalogKey(tableSchema.schemaName, tableSchema.name);
-		const encoder = new TextEncoder();
-		const encodedDDL = encoder.encode(ddl);
-
-		const catalogStore = await this.provider.getCatalogStore();
-		await catalogStore.put(catalogKey, encodedDDL);
-	}
-
-	/**
-	 * Load all DDL statements from the catalog store.
-	 * Used to restore persisted tables on startup.
-	 */
-	async loadAllDDL(): Promise<string[]> {
-		const catalogStore = await this.provider.getCatalogStore();
-		const bounds = buildCatalogScanBounds();
-		const decoder = new TextDecoder();
-		const ddlStatements: string[] = [];
-
-		for await (const entry of catalogStore.iterate(bounds)) {
-			const ddl = decoder.decode(entry.value);
-			ddlStatements.push(ddl);
-		}
-
-		return ddlStatements;
-	}
-
-	/**
-	 * Rehydrate persisted catalog into the in-memory schema manager.
-	 *
-	 * Loads all DDL from the catalog store and imports each entry
-	 * individually. Parse failures are collected rather than fatal,
-	 * so a single corrupt entry does not prevent other tables from
-	 * loading.
-	 *
-	 * Call after `db.registerModule()` (and `db.setDefaultVtabName()`
-	 * if DDL may lack a USING clause).
-	 */
-	async rehydrateCatalog(db: Database): Promise<RehydrationResult> {
-		const ddlStatements = await this.loadAllDDL();
-		const result: RehydrationResult = { tables: [], indexes: [], errors: [] };
-
-		if (ddlStatements.length === 0) {
-			return result;
-		}
-
-		for (const ddl of ddlStatements) {
-			try {
-				const imported = await db.schemaManager.importCatalog([ddl]);
-				result.tables.push(...imported.tables);
-				result.indexes.push(...imported.indexes);
-			} catch (e: unknown) {
-				const error = e instanceof Error ? e : new Error(String(e));
-				console.warn(
-					`[StoreModule] Failed to rehydrate DDL entry, skipping: ${error.message}\n  DDL: ${ddl.substring(0, 120)}`
-				);
-				result.errors.push({ ddl, error });
-			}
-		}
-
-		return result;
-	}
-
-	/**
-	 * Remove DDL from the catalog store when a table is dropped.
-	 */
-	async removeTableDDL(schemaName: string, tableName: string): Promise<void> {
-		const catalogKey = buildCatalogKey(schemaName, tableName);
-		const catalogStore = await this.provider.getCatalogStore();
-		await catalogStore.delete(catalogKey);
-	}
-
-	/**
-	 * Parse module configuration from vtab args.
-	 */
-	private parseConfig(args: Record<string, SqlValue> | undefined): StoreModuleConfig {
-		return {
-			collation: (args?.collation as 'BINARY' | 'NOCASE') || 'NOCASE',
+			...computeBestAccessPlan(db, tableInfo, sizeRequestFromLiveCount(request, table), tableKeyCollation),
+			honorsCollatedRangeBounds: true,
 		};
 	}
 
@@ -1238,37 +652,69 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * Close all stores.
 	 */
 	async closeAll(): Promise<void> {
+		// Capture the stale-at-close MV set BEFORE the unsubscribe block clears
+		// `subscribedDb`. Nothing between here and the marker write can change these
+		// flags (closeAll only drains the persist queue and disconnects tables).
+		// `stale` is in-memory-only runtime state — an MV whose row-time maintenance was
+		// detached mid-session (any `table_modified` on a source: an ALTER, even a
+		// `create index`) so subsequent source writes never reached its backing. Carrying
+		// the names lets the next open exclude exactly those from the adopt fast path.
+		//
+		// No subscribed db ⇒ the empty set. `onRegister` subscribes at
+		// `Database.registerModule`, so that case now means a module never registered on
+		// any `Database` (constructed and closed directly), which by construction observed
+		// no schema at all and so detached no persisted MV's maintenance. A module that IS
+		// registered but otherwise idle takes the normal path and enumerates its db's
+		// maintained tables — an empty list when it has none. Memory-backed MVs that appear in the set are
+		// harmless: their catalog entries always refill (no phase-1 pre-existing backing),
+		// so withholding trust from them is a no-op.
+		const staleAtClose = this.computeStaleMvSet();
+
+		// Stop listening first so no new persist work is enqueued mid-close, then drain
+		// the queued catalog writes (tag swaps) before the provider closes.
+		if (this.schemaListenerUnsub) {
+			this.schemaListenerUnsub();
+			this.schemaListenerUnsub = undefined;
+			this.subscribedDb = undefined;
+		}
+		await this.persistQueue;
+
 		for (const table of this.tables.values()) {
 			await table.disconnect();
 		}
 		this.tables.clear();
-		this.coordinators.clear();
+		this.moduleCoordinator = undefined;
+
+		// Every batch has flushed (persist queue drained, tables disconnected):
+		// attest the clean shutdown so the next open may take the materialized-view
+		// adopt fast path. The marker VALUE is the JSON stale-at-close set (`[]` when
+		// nothing is stale) — `rehydrateCatalog` excludes those MVs from the fast path
+		// so they refill. Consumed (single-use) by `rehydrateCatalog`. Written LAST,
+		// immediately before the provider closes — anything that dies before this line
+		// leaves no marker and the next open refills everything.
+		const catalogStore = await this.provider.getCatalogStore();
+		await catalogStore.put(
+			buildMetaCatalogKey(CLEAN_SHUTDOWN_META_NAME),
+			new TextEncoder().encode(JSON.stringify(staleAtClose)),
+		);
+
+		// Also write the DURABLE stale-MV set (persistent current-truth, NOT single-use) —
+		// but ONLY for an atomic provider, the sole reader/truster of it (see
+		// `StoreModuleBase.atomicProvider`). Same array as the marker payload, under a separate
+		// reserved meta key that the next open READS (never deletes). In the atomic-commit
+		// domain this — not the crash-losable marker — is the adopt fast path's
+		// logical-staleness exclusion basis, so a clean close (a) corrects any rename-restore
+		// drift (the one staleness CLEAR transition that fires no event) and (b) guarantees
+		// the entry exists even in a session with no staleness events. `provider.closeAll()`
+		// below flushes it.
+		if (this.atomicProvider) {
+			await catalogStore.put(
+				buildMetaCatalogKey(STALE_MVS_META_NAME),
+				new TextEncoder().encode(JSON.stringify(staleAtClose)),
+			);
+		}
 
 		await this.provider.closeAll();
 		this.stores.clear();
 	}
-
-	/**
-	 * Get a table by schema and name.
-	 */
-	getTable(schemaName: string, tableName: string): StoreTable | undefined {
-		const tableKey = `${schemaName}.${tableName}`.toLowerCase();
-		return this.tables.get(tableKey);
-	}
-}
-
-/**
- * Build a column remap array: newColumnIndex -> oldColumnIndex | -1.
- * Maps each column in the new layout to its position in the old layout.
- * -1 means the column is new (fill with default).
- */
-function buildColumnRemap(oldColumnNames: string[], newColumnNames: string[]): number[] {
-	const oldIndexByName = new Map<string, number>();
-	for (let i = 0; i < oldColumnNames.length; i++) {
-		oldIndexByName.set(oldColumnNames[i].toLowerCase(), i);
-	}
-	return newColumnNames.map(name => {
-		const oldIdx = oldIndexByName.get(name.toLowerCase());
-		return oldIdx !== undefined ? oldIdx : -1;
-	});
 }

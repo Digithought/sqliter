@@ -5,16 +5,20 @@
  * this context instead of accessing SyncManagerImpl internals directly.
  */
 
-import type { KVStore } from '@quereus/store';
+import type { KVStore, WriteBatch } from '@quereus/store';
+import type { SqlValue } from '@quereus/quereus';
 import type { HLCManager, HLC } from '../clock/hlc.js';
 import type { SiteId } from '../clock/site.js';
 import type { ColumnVersionStore } from '../metadata/column-version.js';
 import type { TombstoneStore } from '../metadata/tombstones.js';
 import type { ChangeLogStore } from '../metadata/change-log.js';
 import type { SchemaMigrationStore } from '../metadata/schema-migration.js';
-import type { SyncConfig, ApplyToStoreCallback } from './protocol.js';
+import type { QuarantineStore } from '../metadata/quarantine.js';
+import type { BasisLifecycleStore } from '../metadata/basis-lifecycle.js';
+import type { SyncConfig, ApplyToStoreCallback, ApplyToStoreResult, UnknownTableDisposition } from './protocol.js';
 import type { SyncEventEmitterImpl } from './events.js';
-import { SYNC_KEY_PREFIX } from '../metadata/keys.js';
+import type { StagedRowState } from './staged-transaction-metadata.js';
+import { SYNC_KEY_PREFIX, type PkKeying } from '../metadata/keys.js';
 
 /**
  * Context shared across sync sub-modules.
@@ -30,11 +34,52 @@ export interface SyncContext {
 	readonly tombstones: TombstoneStore;
 	readonly changeLog: ChangeLogStore;
 	readonly schemaMigrations: SchemaMigrationStore;
+	readonly quarantine: QuarantineStore;
+	readonly basisLifecycle: BasisLifecycleStore;
 	readonly syncEvents: SyncEventEmitterImpl;
 	readonly applyToStore?: ApplyToStoreCallback;
 
 	getSiteId(): SiteId;
 	getCurrentHLC(): HLC;
+
+	/**
+	 * Per-table pk-identity keying (key collation normalizers + semantic key
+	 * transforms) for building in-memory row-grouping keys that agree with the
+	 * `cv:`/`tb:`/`cl:` storage keys. Throws when the table's schema is
+	 * unavailable and a schema oracle is wired; resolves to the raw keying on a
+	 * relay-only deployment with no oracle (see `metadata/pk-identity.ts`).
+	 */
+	getPkKeying(schema: string, table: string): PkKeying;
+
+	/**
+	 * Whether `(schema, table)` is in the local basis. Backed by the
+	 * `getTableSchema` oracle; when no oracle was provided detection is inert and
+	 * this returns `true` for every table (the store adapter's defensive throw
+	 * remains the fallback for genuinely-retired tables).
+	 */
+	isTableInBasis(schema: string, table: string): boolean;
+
+	/**
+	 * Current column names for an in-basis table, or `undefined` when the table is
+	 * outside the local basis (or no `getTableSchema` oracle was wired). Backs both
+	 * the drain path's basis gate (`undefined` ⇒ the held group's table is not back,
+	 * skip it) and its schema-drift filter (a held column change for a column absent
+	 * from this set is drift-dropped). Implemented via `getTableSchema` in
+	 * `SyncManagerImpl`.
+	 */
+	getTableColumnNames(schema: string, table: string): readonly string[] | undefined;
+
+	/**
+	 * Record cumulative unknown-table disposition stats (surfaced via
+	 * `SyncManager.getUnknownTableStats`). Telemetry-only; called once per
+	 * diverted `(schema, table)` group after successful admission.
+	 */
+	recordUnknownTable(
+		disposition: UnknownTableDisposition,
+		schema: string,
+		table: string,
+		changeCount: number,
+	): void;
 }
 
 /**
@@ -50,6 +95,84 @@ export async function persistHLCState(ctx: SyncContext): Promise<void> {
 }
 
 /**
+ * Stage the deletion of every column version of a row, together with the
+ * change-log entries that index them, into the caller's `batch`. The caller
+ * owns the write — nothing is committed here.
+ *
+ * The `cl:` change log is a derived HLC-ordered index over live `cv:`/`tb:`
+ * records: `collectChangesSince` resolves each entry back to its record and drops
+ * the entry when that record is gone. So once a row's column versions are deleted,
+ * their `cl:` entries can never produce output again — they are pure garbage that
+ * still costs a KV lookup per delta scan. Deleting them with their target is what
+ * keeps the change log proportional to LIVE data instead of to the replica's
+ * lifetime delete volume.
+ *
+ * Both stores' deletions share the one `WriteBatch`, so no crash can leave the
+ * index and the data disagreeing.
+ *
+ * Used by both delete paths — local DML capture (`recordDataEvent`) and inbound
+ * apply (`commitChangeMetadata`) — which must stay symmetric: a relay runs almost
+ * exclusively the latter.
+ *
+ * `keepColumns` names columns whose cell record must SURVIVE this cleanup: on the
+ * inbound path, a column write in the same apply batch that beat the delete under
+ * `allowResurrection` (see change-applicator's `reconcileInBatchDeletes`). The scan
+ * reads committed storage, which by cleanup time already includes those records —
+ * both the `cv:` delete and its paired `cl:` delete skip them. Empty/absent for
+ * every caller unless resurrection is on.
+ *
+ * `staged` is the local-capture path's read-your-own-writes overlay state for
+ * the row (see `staged-transaction-metadata.ts`): the committed scan cannot see
+ * cell records the transaction has only STAGED into `batch`, so the column set
+ * here is (committed scan) ∪ (staged live columns), each `cl:` removal keyed by
+ * the staged HLC where one exists (the committed entry's removal was already
+ * staged when the cell was rewritten). A cleared row's committed columns not
+ * re-staged since are skipped — the clear that set `rowCleared` staged their
+ * removals already. Absent on the inbound path, whose batch is committed before
+ * cleanup runs.
+ */
+export async function deleteRowVersionsAndLogEntries(
+	ctx: SyncContext,
+	batch: WriteBatch,
+	schema: string,
+	table: string,
+	pk: SqlValue[],
+	options?: {
+		keepColumns?: ReadonlySet<string>;
+		staged?: StagedRowState;
+	},
+): Promise<void> {
+	const keepColumns = options?.keepColumns;
+	const staged = options?.staged;
+
+	const removed = await ctx.columnVersions.deleteRowVersionsBatch(batch, schema, table, pk, keepColumns);
+
+	// `cl:` entry HLC per column: committed HLCs, overridden by the staged HLC
+	// where this transaction rewrote the cell.
+	const entryHlcByColumn = new Map<string, HLC>();
+	for (const [column, version] of removed) {
+		if (staged?.rowCleared && !staged.stagedColumns.has(column)) continue;
+		entryHlcByColumn.set(column, version.hlc);
+	}
+	if (staged) {
+		for (const [column, hlc] of staged.stagedColumns) {
+			if (keepColumns?.has(column)) continue;
+			entryHlcByColumn.set(column, hlc);
+			if (!removed.has(column)) {
+				// Staged-only cell (this transaction created it): no committed record
+				// for the scan to find, so stage its removal explicitly. Batch ordering
+				// makes this later delete win over the earlier staged put.
+				ctx.columnVersions.deleteColumnVersionBatch(batch, schema, table, pk, column);
+			}
+		}
+	}
+
+	for (const [column, hlc] of entryHlcByColumn) {
+		ctx.changeLog.deleteEntryBatch(batch, hlc, 'column', schema, table, pk, column);
+	}
+}
+
+/**
  * Normalize an unknown caught value into an Error instance.
  */
 export function toError(error: unknown): Error {
@@ -57,11 +180,42 @@ export function toError(error: unknown): Error {
 }
 
 /**
+ * Abort the apply if the store reported any per-change errors.
+ *
+ * The store adapter continues applying other tables when one fails, collecting
+ * each failure in `result.errors` rather than throwing — so the maximal set of
+ * resolvable rows reaches committed storage. The *consumer* must still treat
+ * any non-empty `errors` exactly like the whole-batch throw path: emit an error
+ * sync-state event and throw BEFORE committing any CRDT metadata, so the whole
+ * batch re-resolves and re-applies idempotently on the next sync attempt.
+ *
+ * This upholds the write-ordering invariant (docs/sync.md § Transactional
+ * Integrity): CRDT metadata must not be committed when the corresponding data
+ * write did not land — for per-change failures, not just whole-batch throws.
+ *
+ * No-op when `result.errors` is empty.
+ */
+export function throwIfApplyErrors(ctx: SyncContext, result: ApplyToStoreResult): void {
+	if (result.errors.length === 0) return;
+
+	const detail = result.errors
+		.map(({ change, error }) => `${change.schema}.${change.table} (${change.type}): ${error.message}`)
+		.join('; ');
+	const error = new Error(
+		`apply-to-store failed for ${result.errors.length} change(s): ${detail}`,
+		{ cause: result.errors[0].error },
+	);
+
+	ctx.syncEvents.emitSyncStateChange({ status: 'error', error });
+	throw error;
+}
+
+/**
  * Write HLC state into an existing WriteBatch.
  */
 export function persistHLCStateBatch(
 	ctx: SyncContext,
-	batch: import('@quereus/store').WriteBatch,
+	batch: WriteBatch,
 ): void {
 	const state = ctx.hlcManager.getState();
 	const buffer = new Uint8Array(10);

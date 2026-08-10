@@ -1,0 +1,241 @@
+-- 41.5-cross-schema-foreign-keys.sqllogic — a FOREIGN KEY whose parent table
+-- lives in a different schema than the child, end to end: child-side EXISTS,
+-- parent-side RESTRICT / CASCADE / SET NULL / SET DEFAULT, a maintained-table
+-- parent, and FK introspection of the parent schema. Same-schema FK behaviour is
+-- unchanged and stays covered by 41-foreign-keys.sqllogic.
+
+pragma foreign_keys = true;
+
+-- Register an auxiliary physical schema `s2`. Child / parent tables are created
+-- imperatively below so each scenario reads like an ordinary CREATE TABLE.
+declare schema s2 {}
+apply schema s2;
+-- run
+
+-- ===================================================================
+-- Child in s2 → parent in main: child-side INSERT validation
+-- The synthesized EXISTS resolves the parent via its own (main) schema even
+-- though the constraint is built under the child's (s2) schema.
+-- ===================================================================
+
+create table m (id integer primary key, label text);
+insert into m values (1, 'one'), (2, 'two');
+
+create table s2.child (
+    id integer primary key,
+    m_id integer null,
+    foreign key (m_id) references main.m(id) on delete restrict
+);
+
+-- parent row exists → ok
+insert into s2.child values (1, 1);
+select * from s2.child;
+→ [{"id":1,"m_id":1}]
+
+-- NULL FK column passes MATCH SIMPLE even across schemas
+insert into s2.child values (2, null);
+select id, m_id from s2.child order by id;
+→ [{"id":1,"m_id":1},{"id":2,"m_id":null}]
+
+-- orphan (no parent row 99 in main.m) → child-side EXISTS fails
+insert into s2.child values (3, 99);
+-- error: constraint failed
+
+select count(*) as n from s2.child;
+→ [{"n":2}]
+
+-- ===================================================================
+-- Parent-side RESTRICT: deleting / updating a referenced main.m row is blocked
+-- by the cross-schema child in s2 (NOT EXISTS resolves the child via its schema).
+-- ===================================================================
+
+-- delete a referenced parent row → blocked
+delete from m where id = 1;
+-- error: constraint failed
+
+select count(*) as n from m;
+→ [{"n":2}]
+
+-- delete an unreferenced parent row → ok
+delete from m where id = 2;
+select id from m order by id;
+→ [{"id":1}]
+
+drop table s2.child;
+drop table m;
+
+-- ===================================================================
+-- ON DELETE CASCADE across schemas: deleting the main parent removes the s2 child
+-- ===================================================================
+
+create table mp (id integer primary key, v text);
+create table s2.cc (
+    cid integer primary key,
+    p_id integer,
+    foreign key (p_id) references main.mp(id) on delete cascade
+);
+insert into mp values (1, 'a'), (2, 'b');
+insert into s2.cc values (10, 1), (11, 1), (20, 2);
+
+select count(*) as n from s2.cc;
+→ [{"n":3}]
+
+delete from mp where id = 1;
+
+select count(*) as n from mp where id = 1;
+→ [{"n":0}]
+
+-- child rows referencing the deleted parent are gone
+select cid from s2.cc order by cid;
+→ [{"cid":20}]
+
+drop table s2.cc;
+drop table mp;
+
+-- ===================================================================
+-- ON DELETE SET NULL across schemas
+-- ===================================================================
+
+create table msn (id integer primary key, v text);
+create table s2.csn (
+    cid integer primary key,
+    p_id integer null,
+    foreign key (p_id) references main.msn(id) on delete set null
+);
+insert into msn values (1, 'x'), (2, 'y');
+insert into s2.csn values (1, 1), (2, 1), (3, 2);
+
+delete from msn where id = 1;
+
+select cid, p_id from s2.csn order by cid;
+→ [{"cid":1,"p_id":null},{"cid":2,"p_id":null},{"cid":3,"p_id":2}]
+
+drop table s2.csn;
+drop table msn;
+
+-- ===================================================================
+-- ON DELETE SET DEFAULT across schemas
+-- ===================================================================
+
+create table msd (id integer primary key, v text);
+create table s2.csd (
+    cid integer primary key,
+    p_id integer default 0,
+    foreign key (p_id) references main.msd(id) on delete set default
+);
+insert into msd values (0, 'default'), (1, 'one'), (2, 'two');
+insert into s2.csd values (1, 1), (2, 1), (3, 2);
+
+delete from msd where id = 1;
+
+select cid, p_id from s2.csd order by cid;
+→ [{"cid":1,"p_id":0},{"cid":2,"p_id":0},{"cid":3,"p_id":2}]
+
+drop table s2.csd;
+drop table msd;
+
+-- ===================================================================
+-- Maintained-table parent in main, child in s2: a maintenance delete of the
+-- parent row must fire the cross-schema child's RESTRICT through the reverse-FK
+-- index (keyed under the parent's schema, main).
+-- ===================================================================
+
+create table src (id integer primary key, v text);
+create table mm (id integer primary key, v text) maintained as select id, v from src;
+create table s2.cmm (
+    cid integer primary key,
+    m_id integer,
+    foreign key (m_id) references main.mm(id) on delete restrict
+);
+insert into src values (1, 'a'), (2, 'b');
+insert into s2.cmm values (10, 1);
+
+-- maintenance delete of mm(1) blocked by the cross-schema RESTRICT child
+delete from src where id = 1;
+-- error: violates RESTRICT
+
+-- atomic rollback: source + maintained parent + child all intact
+select id from mm order by id;
+→ [{"id":1},{"id":2}]
+select count(*) as n from s2.cmm;
+→ [{"n":1}]
+
+-- deleting the unreferenced parent row maintains cleanly
+delete from src where id = 2;
+select id from mm order by id;
+→ [{"id":1}]
+
+drop table s2.cmm;
+drop table mm;
+drop table src;
+
+-- ===================================================================
+-- Self-referencing FK declared with an explicit own-schema qualifier
+-- (`references s2.tree` from s2.tree): resolves against the child's own schema,
+-- validates at CREATE (table not yet registered), and enforces + cascades.
+-- ===================================================================
+
+create table s2.tree (
+    id integer primary key,
+    parent_id integer null,
+    foreign key (parent_id) references s2.tree(id) on delete cascade
+);
+
+-- root with NULL parent into an empty table → ok (MATCH SIMPLE)
+insert into s2.tree values (1, null);
+insert into s2.tree values (2, 1), (3, 1);
+select id, parent_id from s2.tree order by id;
+→ [{"id":1,"parent_id":null},{"id":2,"parent_id":1},{"id":3,"parent_id":1}]
+
+-- orphan child → fails
+insert into s2.tree values (4, 99);
+-- error: constraint failed
+
+-- cascade delete of the root removes its children
+delete from s2.tree where id = 1;
+select count(*) as n from s2.tree;
+→ [{"n":0}]
+
+drop table s2.tree;
+
+-- ===================================================================
+-- FK introspection across schemas (the reverse direction: child in main,
+-- parent in s2). foreign_key_info surfaces the true parent schema. This also
+-- exercises the child-side EXISTS against an s2 parent from a main child.
+-- ===================================================================
+
+create table s2.par (id integer primary key, label text);
+create table mchild (
+    id integer primary key,
+    p_id integer,
+    foreign key (p_id) references s2.par(id) on delete restrict
+);
+
+select referenced_table, referenced_schema from foreign_key_info('mchild');
+→ [{"referenced_table":"par","referenced_schema":"s2"}]
+
+-- enforcement still holds with the parent in s2
+insert into s2.par values (1, 'p1');
+insert into mchild values (1, 1);
+select * from mchild;
+→ [{"id":1,"p_id":1}]
+
+insert into mchild values (2, 99);
+-- error: constraint failed
+
+drop table mchild;
+drop table s2.par;
+
+-- Regression: an ordinary same-schema FK reports its own schema (not null),
+-- unchanged from before this feature.
+create table sm_parent (id integer primary key);
+create table sm_child (
+    id integer primary key,
+    p_id integer,
+    foreign key (p_id) references sm_parent(id)
+);
+select referenced_table, referenced_schema from foreign_key_info('sm_child');
+→ [{"referenced_table":"sm_parent","referenced_schema":"main"}]
+
+drop table sm_child;
+drop table sm_parent;

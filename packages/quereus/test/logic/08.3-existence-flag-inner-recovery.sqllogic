@@ -1,0 +1,102 @@
+-- 08.3-existence-flag-inner-recovery.sqllogic
+-- The fallback complement of 08.2: a POSITIVE probe-only outer-join `exists … as`
+-- flag (`where flag`) is recovered to a plain INNER join (flag dropped, both sides
+-- kept) whenever a semi join would be wrong or impossible — either a right-side
+-- column is demanded above the join, OR R fans out (non-unique on the join column,
+-- where a semi join would collapse duplicates). Pure optimization — these assert
+-- end-to-end result correctness against real data.
+
+-- ===== No declared FK: positive probe + right column recovers to an inner join =====
+
+create table ec (cc integer primary key, pr integer null, cv integer);
+create table ep (pp integer primary key, pv integer);
+insert into ep values (1, 10), (2, 20);
+-- cc 1 (pr 1) matches pv 10; cc 2 (pr 9) no match; cc 3 (pr 2) matches pv 20; cc 4 (pr null) no match
+insert into ec values (1, 1, 100), (2, 9, 200), (3, 2, 300), (4, null, 400);
+
+-- bare probe: keep matched rows, carry the demanded right column p.pv
+select cc, pv from ec c left join ep p on p.pp = c.pr exists right as hasP where hasP order by cc;
+→ [{"cc":1,"pv":10},{"cc":3,"pv":20}]
+
+-- double negation collapses to a positive probe ⇒ inner
+select cc, pv from ec c left join ep p on p.pp = c.pr exists right as hasP where not not hasP order by cc;
+→ [{"cc":1,"pv":10},{"cc":3,"pv":20}]
+
+-- literal `= true` probe ⇒ inner
+select cc, pv from ec c left join ep p on p.pp = c.pr exists right as hasP where hasP = true order by cc;
+→ [{"cc":1,"pv":10},{"cc":3,"pv":20}]
+
+-- `is true` / `is not false` probe forms over the non-null flag ⇒ inner
+select cc, pv from ec c left join ep p on p.pp = c.pr exists right as hasP where hasP is true order by cc;
+→ [{"cc":1,"pv":10},{"cc":3,"pv":20}]
+
+select cc, pv from ec c left join ep p on p.pp = c.pr exists right as hasP where hasP is not false order by cc;
+→ [{"cc":1,"pv":10},{"cc":3,"pv":20}]
+
+-- residual AND-conjunct retained above the inner join (cv > 150 keeps only cc 3)
+select cc, pv from ec c left join ep p on p.pp = c.pr exists right as hasP where hasP and c.cv > 150 order by cc;
+→ [{"cc":3,"pv":20}]
+
+-- negative probe + right column must NOT convert (anti rows have a NULL right side);
+-- stays a left join and the unmatched rows carry NULL pv.
+select cc, pv from ec c left join ep p on p.pp = c.pr exists right as hasP where not hasP order by cc;
+→ [{"cc":2,"pv":null},{"cc":4,"pv":null}]
+
+-- no right column demanded ⇒ defers to the semi recovery (rows WITH a match)
+select cc from ec c left join ep p on p.pp = c.pr exists right as hasP where hasP order by cc;
+→ [{"cc":1},{"cc":3}]
+
+-- flag also selected ⇒ retained (not a probe-only shape) and reads back correctly
+select cc, hasP, pv from ec c left join ep p on p.pp = c.pr exists right as hasP where hasP order by cc;
+→ [{"cc":1,"hasP":true,"pv":10},{"cc":3,"hasP":true,"pv":20}]
+
+drop table ec;
+drop table ep;
+
+-- ===== Fan-out: the case the semi rule cannot handle =====
+-- A plain `left join … exists right as` yields one row per MATCHING right row, so
+-- a left row with K matches fans out to K rows. An inner join keeps all K (no
+-- collapse), unlike a semi join — this is the headline capability of this rule.
+
+create table fc (cc integer primary key);
+create table fp (id integer primary key, pp integer);
+insert into fc values (1), (2);
+-- cc 1 matches THREE fp rows (pp=1); cc 2 matches none.
+insert into fp values (10, 1), (11, 1), (12, 1);
+
+-- with a right column demanded ⇒ inner join, all three fanned rows kept
+select cc, id from fc c left join fp p on p.pp = c.cc exists right as h where h order by cc, id;
+→ [{"cc":1,"id":10},{"cc":1,"id":11},{"cc":1,"id":12}]
+
+-- NO right column demanded, but R fans out (non-unique): the semi rule abstains on
+-- its fan-out guard, so the inner fallback recovers a fan-out-safe inner join that
+-- keeps all three rows (a semi join would have collapsed them to one).
+select cc from fc c left join fp p on p.pp = c.cc exists right as h where h order by cc;
+→ [{"cc":1},{"cc":1},{"cc":1}]
+
+-- `is true` positive probe over the fan-out rides the same fallback
+select cc from fc c left join fp p on p.pp = c.cc exists right as h where h is true order by cc;
+→ [{"cc":1},{"cc":1},{"cc":1}]
+
+-- negative probe stays anti (fan-out-immune; unmatched rows never duplicate)
+select cc from fc c left join fp p on p.pp = c.cc exists right as h where not h order by cc;
+→ [{"cc":2}]
+
+drop table fc;
+drop table fp;
+
+-- ===== Declared nullable FK with a NULL FK row: no orphan leaks =====
+-- A NULL FK never satisfies the ON condition, so it is unmatched under both the
+-- flag (false, dropped by `where flag`) and the inner join (no match).
+
+create table par (pid integer primary key, pname text);
+create table chi (cid integer primary key, pref integer null references par(pid), cval integer);
+insert into par values (1, 'P1'), (2, 'P2');
+insert into chi values (10, 1, 100), (20, null, 200), (30, 2, 300), (40, null, 400);
+
+-- positive probe + right column (par.pname) ⇒ inner join; NULL-pref rows absent
+select cid, pname from chi left join par on par.pid = chi.pref exists right as hasP where hasP order by cid;
+→ [{"cid":10,"pname":"P1"},{"cid":30,"pname":"P2"}]
+
+drop table chi;
+drop table par;

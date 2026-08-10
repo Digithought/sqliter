@@ -1,23 +1,61 @@
 import type { SqlValue, Row, CompareFn } from '../common/types.js';
 
 /**
+ * How a module's DDL (schema-change) statements behave with respect to the
+ * enclosing transaction. A single worst-case summary across every DDL statement
+ * the module can execute — per-statement detail belongs in the backend docs, not
+ * this flag. Severity order (least → most surprising):
+ *
+ *  - `'transactional'` — the reference semantics: a schema change is part of the
+ *    enclosing transaction. The catalog entry and physical structures are buffered
+ *    with the transaction, visible to later statements inside it, made durable
+ *    atomically with the DML at commit, and discarded whole on `rollback` /
+ *    `rollback to savepoint`. No built-in module reaches this tier today.
+ *  - `'non-transactional'` — the schema change escapes the transaction (it survives
+ *    `rollback`) but buffered DML still rolls back normally. This is the memory
+ *    module, and the store's non-committing DDL statements.
+ *  - `'auto-commit'` — executing certain DDL commits the module's buffered
+ *    transaction at DDL time: the schema change AND every buffered write become
+ *    durable immediately, and a later `rollback` undoes nothing. This is the store
+ *    module (its row-rewriting ALTER arms and `renameTable` flush pending ops).
+ *
+ * A module declares its WORST case: the store does both non-transactional and
+ * auto-committing DDL, so it declares `'auto-commit'`.
+ *
+ * Consumed by the `ddl_transaction_policy = 'strict'` gate, which refuses a
+ * module-dispatching DDL statement inside an explicit transaction on any module
+ * whose tier is not `'transactional'`. See `runtime/emit/ddl-transaction-policy.ts`
+ * and docs/module-capabilities.md § "DDL transactionality tiers".
+ */
+export type DdlTransactionality = 'transactional' | 'non-transactional' | 'auto-commit';
+
+/**
  * Capability flags that modules can advertise to consumers.
  * Used for runtime capability discovery and isolation layer decisions.
  */
 export interface ModuleCapabilities {
-	/** Module provides transaction isolation (read-your-own-writes, snapshot reads) */
+	// ── Advisory / non-binding flags ──────────────────────────────────────────
+	// The five flags below (isolation, savepoints, persistent, secondaryIndexes,
+	// rangeScans) are ADVISORY: the engine does NOT consult them to choose a code
+	// path. They are asserted only in tests, and the isolation layer augments
+	// `isolation` / `savepoints` for its own bookkeeping — nothing reads them as a
+	// gate. Toggling one changes no engine behavior. Only `delegatesNotNullBackfill`,
+	// `permitsGrandfatheredCheckViolators`, and `ddlTransactionality` (below) are
+	// live capability gates. See docs/module-capabilities.md § "Surface inventory".
+
+	/** Advisory: module provides transaction isolation (read-your-own-writes, snapshot reads). Not engine-consulted. */
 	isolation?: boolean;
 
-	/** Module supports savepoints within transactions */
+	/** Advisory: module supports savepoints within transactions. Not engine-consulted. */
 	savepoints?: boolean;
 
-	/** Module persists data across restarts */
+	/** Advisory: module persists data across restarts. Not engine-consulted. */
 	persistent?: boolean;
 
-	/** Module supports secondary indexes */
+	/** Advisory: module supports secondary indexes. Not engine-consulted. */
 	secondaryIndexes?: boolean;
 
-	/** Module supports range scans (not just point lookups) */
+	/** Advisory: module supports range scans (not just point lookups). Not engine-consulted. */
 	rangeScans?: boolean;
 
 	/**
@@ -66,6 +104,23 @@ export interface ModuleCapabilities {
 	 * lifted by separate paths and are NOT gated by this flag.
 	 */
 	permitsGrandfatheredCheckViolators?: boolean;
+
+	/**
+	 * Declares how this module's DDL behaves inside a transaction — the third LIVE
+	 * capability gate alongside `delegatesNotNullBackfill` and
+	 * `permitsGrandfatheredCheckViolators`. See {@link DdlTransactionality} for the
+	 * three tiers.
+	 *
+	 * Default/absent ⇒ `'non-transactional'`. A module must EXPLICITLY claim
+	 * `'transactional'`; assuming the clean semantics by default would let every
+	 * existing module silently over-promise.
+	 *
+	 * Read live by the `ddl_transaction_policy = 'strict'` gate: a module-dispatching
+	 * DDL statement inside an explicit transaction is refused unless the owning
+	 * module's tier is `'transactional'`. Under the default `'permissive'` policy the
+	 * flag is not consulted and behavior is unchanged.
+	 */
+	ddlTransactionality?: DdlTransactionality;
 }
 
 /**

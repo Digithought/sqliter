@@ -122,6 +122,7 @@ function leafWithRangeBound(leaf: AccessLeaf, rb: PhysicalProperties['rangeBound
 			leaf.advertisement,
 			rb,
 			leaf.suppressMonotonic,
+			leaf.orderingLoadBearing,
 		);
 	}
 	// IndexSeekNode
@@ -137,6 +138,8 @@ function leafWithRangeBound(leaf: AccessLeaf, rb: PhysicalProperties['rangeBound
 		leaf.advertisement,
 		rb,
 		leaf.suppressMonotonic,
+		leaf.orderingLoadBearing,
+		leaf.pushedConstraints,
 	);
 }
 
@@ -156,6 +159,7 @@ function leafWithMonotonicSuppressed(leaf: AccessLeaf): AccessLeaf {
 			leaf.advertisement,
 			leaf.rangeBoundedOn,
 			true,
+			leaf.orderingLoadBearing,
 		);
 	}
 	return new IndexSeekNode(
@@ -170,6 +174,8 @@ function leafWithMonotonicSuppressed(leaf: AccessLeaf): AccessLeaf {
 		leaf.advertisement,
 		leaf.rangeBoundedOn,
 		true,
+		leaf.orderingLoadBearing,
+		leaf.pushedConstraints,
 	);
 }
 

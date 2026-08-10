@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import { QuereusError } from '../common/errors.js';
 import { StatusCode } from '../common/types.js';
 import type { TableSchema } from '../schema/table.js';
@@ -6,8 +5,6 @@ import type { VirtualTable } from '../vtab/table.js';
 import type { RuntimeContext } from './types.js';
 import type { VirtualTableConnection } from '../vtab/connection.js';
 import { createLogger } from '../common/logger.js';
-import type { MemoryVirtualTableConnection } from '../vtab/memory/connection.js';
-import type { MemoryTable } from '../vtab/memory/table.js';
 import type { RowDescriptor, Attribute } from '../planner/nodes/plan-node.js';
 
 const log = createLogger('runtime:utils');
@@ -71,6 +68,19 @@ export async function asyncIterableToArray<T>(iterable: AsyncIterable<T>): Promi
  * This ensures transaction consistency by reusing connections within the same context.
  */
 export async function getVTableConnection(ctx: RuntimeContext, tableSchema: TableSchema): Promise<VirtualTableConnection> {
+	if (ctx.readCommitted) {
+		// NOTE: this helper currently has no callers anywhere in the repo, so the
+		// guard below is a standing precondition for whoever revives it, not an
+		// active safety net. Delete both together if the helper goes.
+		// Assertion, not control flow: this helper is the transaction-JOINING path —
+		// it reuses the writer's registered connection and `registerConnection`
+		// auto-joins new connections to the open transaction. A mutex-free committed
+		// read is gated read-only before routing (Database._isConcurrentReadEligible),
+		// so reaching here means the eligibility gate failed.
+		throw new QuereusError(
+			`getVTableConnection reached during a committed read (table '${tableSchema.schemaName}.${tableSchema.name}')`,
+			StatusCode.INTERNAL);
+	}
 	const tableName = `${tableSchema.schemaName}.${tableSchema.name}`;
 
 	// Check if we already have an active connection for this table
@@ -133,23 +143,16 @@ export async function getVTable(ctx: RuntimeContext, tableSchema: TableSchema): 
 	// Pass the full tableSchema to connect() so modules can use the primaryKeyDefinition
 	const vtabInstance = await module.connect(ctx.db, moduleInfo.auxData, tableSchema.vtabModuleName, tableSchema.schemaName, tableSchema.name, vtabArgs, tableSchema);
 
-	// If we have an active connection for this table, inject it into the VirtualTable
-	// Only inject if the connection's manager matches the new table's manager
-	// (a stale connection from a dropped-then-recreated table must not be reused)
+	// If a connection for this table is already registered, offer it to the fresh instance
+	// via the module-neutral adoptConnection hook. The module owns the accept/reject
+	// decision (subtype + backing-state match); the runtime knows nothing about any module.
 	const qualifiedName = `${tableSchema.schemaName}.${tableSchema.name}`;
 	const existingConnections = ctx.db.getConnectionsForTable(qualifiedName);
-	if (existingConnections.length > 0 && tableSchema.vtabModuleName === 'memory') {
-		const memoryConnection = existingConnections[0] as MemoryVirtualTableConnection;
-		const memoryTable = vtabInstance as MemoryTable;
-		if (memoryConnection.getMemoryConnection && memoryTable.setConnection) {
-			const existingMemConn = memoryConnection.getMemoryConnection();
-			if (existingMemConn.tableManager === memoryTable.manager) {
-				memoryTable.setConnection(existingMemConn);
-				log(`Injected existing connection into VirtualTable for table ${qualifiedName}`);
-			} else {
-				log(`Skipped stale connection injection for table ${qualifiedName} (manager mismatch)`);
-			}
-		}
+	if (existingConnections.length > 0) {
+		// NOTE: getVTable adopts existingConnections[0]; if covering-connection semantics ever
+		// matter here (cf. isCovering in connection.ts / DeferredConstraintQueue), prefer the
+		// covering connection.
+		await vtabInstance.adoptConnection?.(existingConnections[0]);
 	}
 
 	return vtabInstance;
@@ -161,7 +164,7 @@ export async function getVTable(ctx: RuntimeContext, tableSchema: TableSchema): 
 export async function disconnectVTable(ctx: RuntimeContext, vtab: VirtualTable): Promise<void> {
 	// Disconnect the VirtualTable instance
 	if (typeof vtab.disconnect === 'function') {
-		await vtab.disconnect().catch((e: any) => {
+		await vtab.disconnect().catch((e: unknown) => {
 			errorLog(`Error during disconnect for table '${vtab.tableName}': ${e}`);
 		});
 	}

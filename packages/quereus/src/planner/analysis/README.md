@@ -38,7 +38,7 @@ const foldedExpr = foldScalars(originalExpression);
 ```
 
 ### Optimizer Rules
-Constant folding runs as early `rewrite` phase rules (priority 10) targeting nodes with expressions:
+Constant folding runs as early `rewrite` phase rules targeting nodes with expressions:
 - Project (projection expressions)
 - Filter (predicate expressions) 
 - Window, Aggregate, Sort, Values, Join

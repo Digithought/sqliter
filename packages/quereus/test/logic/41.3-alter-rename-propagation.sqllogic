@@ -1,6 +1,7 @@
 -- adapted from SQLite test/alter.test and test/altertab.test
 -- RENAME TABLE / RENAME COLUMN must propagate into dependent objects:
--- views, CHECK constraints, FOREIGN KEY references, indexes, CTEs in views.
+-- views, CHECK constraints, FOREIGN KEY references, CTEs in views.
+-- (the index-definition cases live in 41.3.1-alter-rename-index-propagation)
 
 -- ===================================
 -- 1. RENAME TABLE referenced by a CHECK constraint
@@ -19,20 +20,10 @@ select count(*) as cnt from t_chk2;
 drop table t_chk2;
 
 -- ===================================
--- 2. RENAME TABLE referenced by a partial-index WHERE clause
+-- 2. RENAME TABLE / RENAME COLUMN referenced by a partial-index WHERE clause
 -- ===================================
-
-create table t_pidx (id integer primary key, v integer not null);
-create index ix_t_pidx on t_pidx(v) where v > 0;
-
-alter table t_pidx rename to t_pidx2;
-
-insert into t_pidx2 values (1, 5), (2, -1);
-
-select v from t_pidx2 where v > 0 order by v;
-→ [{"v":5}]
-
-drop table t_pidx2;
+-- Lives in 41.3.1-alter-rename-index-propagation (bare and table-qualified
+-- predicate, plus the RENAME COLUMN form); it needs standalone CREATE INDEX.
 
 -- ===================================
 -- 3. RENAME TABLE referenced by a FOREIGN KEY in another table
@@ -449,13 +440,8 @@ drop table t_self;
 -- ===================================
 -- 7. RENAME COLUMN referenced inside an index expression
 -- ===================================
-
--- Quereus doesn't support indices on expressions yet; rename propagation tested elsewhere
-create table t_idxc (id integer primary key, v integer not null);
-create index ix_idxc on t_idxc(v + 1);
--- error: not supported
-
-drop table if exists t_idxc;
+-- Lives in 41.3.1-alter-rename-index-propagation (an index over an expression is
+-- still rejected outright); it needs standalone CREATE INDEX.
 
 -- ===================================
 -- 8. Aliased renamed table inside a view body
@@ -613,7 +599,7 @@ drop table t_nest;
 -- ===================================
 -- 13. Shadowing CTE inside a derived-table subquery — unqualified ref
 -- ===================================
--- Outer FROM has the renamed real table (so the outer frame's `unaliased`
+-- Outer FROM has the renamed real table (so the outer frame's `qualifiers`
 -- has it). A nested derived-table subquery introduces a same-name
 -- non-exposing CTE; the inner unqualified `k` must resolve to the inner
 -- CTE row source, not to the outer real-table binding, and therefore
@@ -714,3 +700,1653 @@ drop table t_corr_u;
 -- as a scalar subquery, not `(WITH … SELECT …)`. The CTE-shadow path is
 -- already covered by cases 6f, 6g, 6m, 6n, 12, and 13 in the non-CHECK
 -- propagation path.)
+
+-- ===================================
+-- 18. RENAME COLUMN rewrites a view's `with defaults` target
+-- ===================================
+-- The dominant clause use case: the defaulted NOT NULL column is projected
+-- away, so the body rewrite alone never touches the view — the clause rewrite
+-- must both fire (clause-only change still propagates) and rewrite
+-- `created` → `created_at`, or the write-through errors with
+-- "'with defaults (created = …)' names column 'created'".
+
+create table t_vd (id integer primary key, name text, created integer not null);
+create view v_vd as select id, name from t_vd with defaults (created = 99);
+
+alter table t_vd rename column created to created_at;
+
+insert into v_vd values (1, 'x');
+
+select id, name, created_at from t_vd;
+→ [{"id":1,"name":"x","created_at":99}]
+
+-- insertability derivation reads the rewritten clause from the catalog
+select is_insertable_into from view_info('v_vd');
+→ [{"is_insertable_into":"YES"}]
+
+drop view v_vd;
+drop table t_vd;
+
+-- ===================================
+-- 19. RENAME TO of a table referenced inside an `with defaults` expr subquery
+-- ===================================
+-- The clause expr is appended to VALUES rows, so it cannot reference base
+-- columns at top level — but a subquery inside it can reference any table.
+-- Pre-fix the stale reference errored "Table 'aud_t' not found".
+
+create table aud_t (c integer primary key);
+insert into aud_t values (5);
+
+create table t_vd2 (id integer primary key, ts integer not null);
+create view v_vd2 as select id from t_vd2 with defaults (ts = (select max(c) from aud_t));
+
+alter table aud_t rename to aud_t2;
+
+insert into v_vd2 values (10);
+
+select id, ts from t_vd2;
+→ [{"id":10,"ts":5}]
+
+drop view v_vd2;
+drop table t_vd2;
+drop table aud_t2;
+
+-- ===================================
+-- 20. RENAME COLUMN inside an `with defaults` expr subquery
+-- ===================================
+-- The renamed table is NOT a FROM table of the view, so the clause's expr gets
+-- the plain scope-aware walk — the subquery's `c` must still rewrite to `c2`.
+
+create table aud_c (c integer primary key);
+insert into aud_c values (7);
+
+create table t_vd3 (id integer primary key, ts integer not null);
+create view v_vd3 as select id from t_vd3 with defaults (ts = (select max(c) from aud_c));
+
+alter table aud_c rename column c to c2;
+
+insert into v_vd3 values (11);
+
+select id, ts from t_vd3;
+→ [{"id":11,"ts":7}]
+
+drop view v_vd3;
+drop table t_vd3;
+drop table aud_c;
+
+-- ===================================
+-- 21. RENAME COLUMN hitting both a view's body and its `with defaults` target
+-- ===================================
+-- The defaulted column is also projected, so one rename rewrites the body
+-- projection AND the clause target; inserting with a column list omits it and
+-- the default lands under the new name.
+
+create table t_vd4 (id integer primary key, v integer not null);
+create view v_vd4 as select id, v from t_vd4 with defaults (v = 42);
+
+alter table t_vd4 rename column v to w;
+
+insert into v_vd4 (id) values (1);
+
+select id, w from t_vd4;
+→ [{"id":1,"w":42}]
+
+select id, w from v_vd4;
+→ [{"id":1,"w":42}]
+
+drop view v_vd4;
+drop table t_vd4;
+
+-- ===================================
+-- 22. RENAME COLUMN on a same-named table in ANOTHER schema must NOT rewrite
+--     the clause (FROM-table scoping is schema-aware)
+-- ===================================
+-- The view's FROM table is temp.t_vd5; renaming main.t_vd5's column must leave
+-- the clause alone — the scope-aware walk binds the clause to temp.t_vd5 (a
+-- schema-qualified FROM source), so a bare-name collision in another schema
+-- cannot false-rewrite the target and break inserts.
+
+create table temp.t_vd5 (id integer primary key, name text, created integer not null);
+create table t_vd5 (id integer primary key, created integer not null);
+create view v_vd5 as select id, name from temp.t_vd5 with defaults (created = 99);
+
+alter table t_vd5 rename column created to created_at;
+
+-- the clause still targets temp.t_vd5.created, which did not rename
+insert into v_vd5 values (1, 'x');
+
+select id, name, created from temp.t_vd5;
+→ [{"id":1,"name":"x","created":99}]
+
+drop view v_vd5;
+drop table t_vd5;
+drop table temp.t_vd5;
+
+-- ===================================
+-- 23. RENAME COLUMN must NOT false-capture a like-named column inside a
+--     `with defaults` expr subquery (forward scope-aware resolver)
+-- ===================================
+-- The renamed column (t_vd6.cap) shares its name with lim_vd6.cap, which the
+-- clause's subquery references. The forward walk descends `select.defaults`: the
+-- body projection `cap` rewrites to `cap_new`, but an enclosing FROM seed would
+-- ALSO false-capture the inner `cap` → `cap_new` and the write-through subquery
+-- `select max(cap_new) from lim_vd6` would then error ("no such column"). The
+-- threaded `resolveColumnInSource` keeps the inner ref bound to lim_vd6
+-- (declared-side / differ parity, see schema-differ.spec.ts).
+
+create table lim_vd6 (id integer primary key, cap integer);
+insert into lim_vd6 values (1, 50);
+
+create table t_vd6 (id integer primary key, cap integer, ts integer not null);
+create view v_vd6 as select id, cap from t_vd6 with defaults (ts = (select max(cap) from lim_vd6));
+
+alter table t_vd6 rename column cap to cap_new;
+
+-- the projected body column followed the rename (id, cap_new); the inner subquery
+-- still targets lim_vd6.cap — a false-capture would break the default evaluation.
+insert into v_vd6 (id, cap_new) values (9, 7);
+
+select id, cap_new, ts from t_vd6;
+→ [{"id":9,"cap_new":7,"ts":50}]
+
+drop view v_vd6;
+drop table t_vd6;
+drop table lim_vd6;
+
+-- ===================================
+-- 24. RENAME COLUMN rewrites a `new.<col>` reference in the table's own CHECK
+-- ===================================
+-- A CHECK may name the row being written explicitly (docs/sql-ddl.md § CHECK
+-- Constraints); unqualified columns mean the same row implicitly, and §10b above
+-- already pins that spelling. Pre-fix the qualified one was left alone, so after the
+-- rename every write failed at plan time with "new.a isn't a column".
+--
+-- Both halves matter: the violating insert must still be REJECTED (proving the
+-- constraint still enforces, not merely that it parses) and the conforming one accepted.
+
+create table t_rinew (id integer primary key, a integer, constraint chk_rinew check (new.a > 0));
+
+alter table t_rinew rename column a to z;
+
+insert into t_rinew values (1, -5);
+-- error: CHECK constraint failed: chk_rinew
+
+insert into t_rinew values (2, 7);
+
+select id, z from t_rinew;
+→ [{"id":2,"z":7}]
+
+drop table t_rinew;
+
+-- ===================================
+-- 25. Same for `old.<col>` in a DELETE-only CHECK, verified by an actual DELETE
+-- ===================================
+-- `check on delete` sees only the OLD row image, so the rename has to follow the
+-- `old.` qualifier or the table becomes undeletable.
+
+create table t_riold (id integer primary key, a integer, constraint chk_riold check on delete (old.a > 0));
+insert into t_riold values (1, 5), (2, -1);
+
+alter table t_riold rename column a to z;
+
+-- deleting the row that violates the rule is still refused...
+delete from t_riold where id = 2;
+-- error: CHECK constraint failed: chk_riold
+
+-- ...and deleting the conforming row still succeeds.
+delete from t_riold where id = 1;
+
+select id, z from t_riold;
+→ [{"id":2,"z":-1}]
+
+drop table t_riold;
+
+-- ===================================
+-- 26. A case-folded `NEW.A` follows the rename too
+-- ===================================
+
+create table t_ricase (id integer primary key, a integer, constraint chk_ricase check (NEW.A > 0));
+
+alter table t_ricase rename column a to z;
+
+insert into t_ricase values (1, -3);
+-- error: CHECK constraint failed: chk_ricase
+
+insert into t_ricase values (2, 4);
+
+select id, z from t_ricase;
+→ [{"id":2,"z":4}]
+
+drop table t_ricase;
+
+-- ===================================
+-- 27. A `new` REBOUND BY AN INNER FROM is not a row image and must NOT rewrite
+-- ===================================
+-- `new` and `old` are not reserved words in this parser, so `create table "new" (…)` is
+-- legal and a CHECK subquery may read from it. Rewriting `"new".a` → `"new".z` there
+-- would leave the CHECK naming a column that table does not have, and the next write
+-- would fail at plan time. This is why the row-image match consults the scope stack
+-- instead of matching the qualifier by name alone. Mirror of §15.
+
+create table "new" (a integer primary key);
+insert into "new" values (3);
+
+create table t_rishadow (id integer primary key, a integer,
+                         check ((select max("new".a) from "new") >= 0));
+
+alter table t_rishadow rename column a to z;
+
+-- the CHECK still evaluates (against the "new" table), so the write goes through
+insert into t_rishadow values (1, 7);
+
+select id, z from t_rishadow;
+→ [{"id":1,"z":7}]
+
+drop table t_rishadow;
+drop table "new";
+
+-- ===================================
+-- 28. `new` rebound by an ALIAS, or by a CTE name, is likewise not a row image
+-- ===================================
+-- §27 covers the rebind-by-unaliased-source shape only. A FROM source can bind the
+-- name three other ways, and each has to suppress the row-image rewrite the same
+-- way; these two are the reachable ones (`select … from U as "new"`, and a
+-- `with "new" as (…)` clause). Rewriting `"new".a` → `"new".z` in either would name a
+-- column the aliased/CTE row source does not have, and the next write would fail at
+-- plan time.
+
+create table u_rialias (k integer primary key, a integer);
+insert into u_rialias values (1, 4);
+
+create table t_rialias (id integer primary key, a integer,
+                        check ((select max("new".a) from u_rialias as "new") >= 0));
+
+alter table t_rialias rename column a to z;
+
+insert into t_rialias values (1, 7);
+
+select id, z from t_rialias;
+→ [{"id":1,"z":7}]
+
+drop table t_rialias;
+drop table u_rialias;
+
+create table t_ricte (id integer primary key, a integer,
+                      check ((with "new" as (select 1 as a) select max("new".a) from "new") >= 0));
+
+alter table t_ricte rename column a to z;
+
+insert into t_ricte values (1, 7);
+
+select id, z from t_ricte;
+→ [{"id":1,"z":7}]
+
+drop table t_ricte;
+
+-- ===================================
+-- 29. RENAME COLUMN rewrites a `new.<col>` reference in a sibling column's DEFAULT
+-- ===================================
+-- A column DEFAULT names its siblings through the row-image qualifier — the same
+-- namespace §24 pins for a CHECK, and decided by the same walk. Pre-fix the rewrite
+-- pass never looked at `table.columns` at all, so after the rename every insert failed
+-- at plan time with "new.a isn't a column" and the table could accept no new rows.
+--
+-- Both halves matter: the post-rename insert must succeed AND the default must still
+-- compute the right value from the renamed column.
+
+create table t_rdnew (id integer primary key, a integer, b integer default (new.a + 1));
+
+insert into t_rdnew (id, a) values (1, 5);
+
+alter table t_rdnew rename column a to z;
+
+insert into t_rdnew (id, z) values (2, 7);
+
+select id, z, b from t_rdnew order by id;
+→ [{"id":1,"z":5,"b":6},{"id":2,"z":7,"b":8}]
+
+drop table t_rdnew;
+
+-- ===================================
+-- 30. A case-folded `NEW.A` in a DEFAULT follows the rename too
+-- ===================================
+-- Mirror of §26 for the DEFAULT arm — the same walk decides both, so the folding is
+-- shared rather than re-implemented.
+
+create table t_rdcase (id integer primary key, a integer, b integer default (NEW.A + 1));
+
+alter table t_rdcase rename column a to z;
+
+insert into t_rdcase (id, z) values (1, 7);
+
+select id, z, b from t_rdcase;
+→ [{"id":1,"z":7,"b":8}]
+
+drop table t_rdcase;
+
+-- ===================================
+-- 31. A DEFAULT installed by `alter column … set default` follows the rename
+-- ===================================
+-- `SET DEFAULT` writes the very same `ColumnSchema.defaultValue` field the inline
+-- spelling does, so it is not a separate gap — pinned here so a future refactor that
+-- splits the two storage paths trips this test.
+
+create table t_rdset (id integer primary key, a integer, b integer);
+
+alter table t_rdset alter column b set default (new.a + 1);
+
+alter table t_rdset rename column a to z;
+
+insert into t_rdset (id, z) values (2, 7);
+
+select id, z, b from t_rdset;
+→ [{"id":2,"z":7,"b":8}]
+
+drop table t_rdset;
+
+-- ===================================
+-- 32. RENAME COLUMN rewrites a generated column's expression
+-- ===================================
+-- A generated column's body reads its siblings BARE (`generated always as (a + 1)`) —
+-- it has no FROM clause, so the unqualified name binds to the owning table exactly as
+-- it does inside a CHECK. Pre-fix the rename left it naming `a` and the next insert
+-- failed with "Column not found: a".
+--
+-- Deliberately NOT table-qualified (`generated always as (t.a + 1)`): that spelling
+-- fails on insert with or without a rename, tracked by
+-- `bug-generated-column-own-table-qualified-reference-unusable`.
+
+create table t_rgen (id integer primary key, a integer, g integer generated always as (a + 1));
+
+insert into t_rgen (id, a) values (1, 5);
+
+alter table t_rgen rename column a to z;
+
+insert into t_rgen (id, z) values (2, 7);
+
+select id, z, g from t_rgen order by id;
+→ [{"id":1,"z":5,"g":6},{"id":2,"z":7,"g":8}]
+
+drop table t_rgen;
+
+-- ===================================
+-- 33. A DEFAULT and a generated expression on the same table both follow one rename
+-- ===================================
+-- The two fields are rewritten by one pass over `table.columns`; this pins that
+-- neither arm short-circuits the other.
+
+create table t_rboth (id integer primary key, a integer,
+                      b integer default (new.a + 1),
+                      g integer generated always as (a * 2));
+
+insert into t_rboth (id, a) values (1, 5);
+
+alter table t_rboth rename column a to z;
+
+insert into t_rboth (id, z) values (2, 7);
+
+select id, z, b, g from t_rboth order by id;
+→ [{"id":1,"z":5,"b":6,"g":10},{"id":2,"z":7,"b":8,"g":14}]
+
+drop table t_rboth;
+
+-- ===================================
+-- 34. A DEFAULT's subquery reading a like-named column on ANOTHER table must NOT rewrite
+-- ===================================
+-- The rewrite is scope-AWARE, not a depth-blind name match: the inner `v` binds to
+-- `u_dsub.v`, so renaming this table's own `v` must leave it alone. Rewriting it would
+-- leave the default naming a column `u_dsub` does not have. Mirror of the CHECK case
+-- at §15 for the DEFAULT arm.
+
+create table u_dsub (k integer primary key, v integer);
+insert into u_dsub values (1, 11);
+
+create table t_dsub (id integer primary key, v integer,
+                     w integer default ((select min(v) from u_dsub)));
+
+alter table t_dsub rename column v to vz;
+
+insert into t_dsub (id, vz) values (1, 2);
+
+select id, vz, w from t_dsub;
+→ [{"id":1,"vz":2,"w":11}]
+
+drop table t_dsub;
+drop table u_dsub;
+
+-- ===================================
+-- 35. A DEFAULT on ANOTHER table reaching the renamed column through a subquery DOES rewrite
+-- ===================================
+-- The other half of §34: here the inner `a` genuinely binds to the renamed table's
+-- column (it is the subquery's own FROM source), so the rename must follow it or
+-- `u_xdef` becomes uninsertable. The unseeded walk decides this arm — an unqualified
+-- ref in someone else's default binds inside its own subquery's FROM, never to the
+-- renamed table implicitly.
+
+create table t_xdef (id integer primary key, a integer);
+insert into t_xdef values (1, 42);
+
+create table u_xdef (id integer primary key, c integer default ((select max(a) from t_xdef)));
+
+alter table t_xdef rename column a to z;
+
+insert into u_xdef (id) values (1);
+
+select id, c from u_xdef;
+→ [{"id":1,"c":42}]
+
+drop table u_xdef;
+drop table t_xdef;
+
+-- ===================================
+-- 36. A `new` REBOUND BY AN INNER FROM inside a DEFAULT is not a row image
+-- ===================================
+-- Mirror of §27 for the DEFAULT arm: `create table "new" (…)` is legal, so a default's
+-- subquery may read from it. Rewriting `"new".a` → `"new".z` would leave the default
+-- naming a column that table does not have and the next insert would fail at plan time.
+
+create table "new" (a integer primary key);
+insert into "new" values (3);
+
+create table t_dshadow (id integer primary key, a integer,
+                        b integer default ((select max("new".a) from "new")));
+
+alter table t_dshadow rename column a to z;
+
+insert into t_dshadow (id, z) values (1, 7);
+
+select id, z, b from t_dshadow;
+→ [{"id":1,"z":7,"b":3}]
+
+drop table t_dshadow;
+drop table "new";
+
+-- ===================================
+-- 37. A NESTED subquery in another object binds its inner ref to the INNER source
+-- ===================================
+-- §34-35 pin the one-level cases. The nesting below is what distinguishes a
+-- scope-aware walk from a "the renamed table is somewhere in scope" one: the inner
+-- `max(a)` binds to `u_xnest`, while the OUTER frame is the renamed table. Only the
+-- column-source resolver can tell the two apart — without it the inner ref is rewritten
+-- to `max(z)`, which then resolves against the outer frame instead and the expression
+-- silently starts reading a different table's column (no error, wrong value).
+--
+-- Both arms of the foreign-object rewrite are pinned: a DEFAULT (this ticket's arm) and
+-- a CHECK (the arm next to it, which had the same hole).
+
+create table t_xnest (id integer primary key, a integer);
+insert into t_xnest values (1, 1);
+
+create table u_xnest (id integer primary key, a integer);
+insert into u_xnest values (1, 99);
+
+create table x_xnest (id integer primary key,
+                      c integer default ((select (select max(a) from u_xnest) from t_xnest limit 1)));
+
+create table y_xnest (id integer primary key, n integer,
+                      check (n < (select (select max(a) from u_xnest) from t_xnest limit 1)));
+
+alter table t_xnest rename column a to z;
+
+-- 99 (u_xnest.a), not 1 (t_xnest.z): the inner ref was left alone.
+insert into x_xnest (id) values (1);
+
+select id, c from x_xnest;
+→ [{"id":1,"c":99}]
+
+-- Same for the CHECK: `n < 99` passes; a rewritten inner ref would compare against 1.
+insert into y_xnest (id, n) values (1, 1);
+
+select id, n from y_xnest;
+→ [{"id":1,"n":1}]
+
+drop table y_xnest;
+drop table x_xnest;
+drop table u_xnest;
+drop table t_xnest;
+
+-- ===================================
+-- 38. RENAME TO rewrites a table named inside ANOTHER table's column DEFAULT
+-- ===================================
+-- The table-rename pass walks CHECK expressions and index predicates; the two
+-- expressions a column carries — a DEFAULT and a generated body — were invisible to
+-- it, so pre-fix `t_tdef` accepted no rows at all after the rename, failing with
+-- "Table 'u_tdef' not found in schema path: main" — an error naming a table the user
+-- renamed in a different statement.
+
+create table u_tdef (k integer primary key, v integer);
+insert into u_tdef values (1, 42);
+
+create table t_tdef (id integer primary key, w integer default ((select min(v) from u_tdef)));
+
+alter table u_tdef rename to u_tdef2;
+
+insert into t_tdef (id) values (1);
+
+select id, w from t_tdef;
+→ [{"id":1,"w":42}]
+
+-- The renamed table is what the default now reads: change it and the next default follows.
+insert into u_tdef2 values (2, 7);
+
+insert into t_tdef (id) values (2);
+
+select id, w from t_tdef where id = 2;
+→ [{"id":2,"w":7}]
+
+drop table t_tdef;
+drop table u_tdef2;
+
+-- ===================================
+-- 39. RENAME TO follows a SELF-referencing DEFAULT on the renamed table itself
+-- ===================================
+-- The renamed table's own default names the renamed table. `runRenameTable` rewrites
+-- the renamed table's schema BEFORE the catalog swap, so no listener — and, on a store
+-- backend, no persisted DDL bundle — ever observes a default naming the vanished old
+-- name. Unlike the column verb there is no seeded/unseeded split: the same walk decides
+-- this arm and §38.
+
+create table t_self (id integer primary key, w integer default ((select count(*) from t_self)));
+
+insert into t_self (id) values (1);
+
+alter table t_self rename to t_self9;
+
+insert into t_self9 (id) values (2);
+
+select id, w from t_self9;
+→ [{"id":1,"w":0},{"id":2,"w":1}]
+
+drop table t_self9;
+
+-- ===================================
+-- 40. RENAME TO rewrites a generated column's expression
+-- ===================================
+-- The other of the two expressions a column carries. The cross-table subquery must be
+-- QUALIFIED here (`u_tgen.v`, not a bare `v`): the generated-column dependency check
+-- rejects an unqualified foreign ref at create time ("Column 'v' referenced by generated
+-- column 'gg' not found in table 'g_tgen'"), so only the qualified shape is reachable.
+
+create table u_tgen (k integer primary key, v integer);
+insert into u_tgen values (1, 10);
+
+create table g_tgen (id integer primary key,
+                     gg integer generated always as ((select min(u_tgen.v) from u_tgen) + id));
+
+alter table u_tgen rename to u_tgen2;
+
+insert into g_tgen (id) values (5);
+
+select id, gg from g_tgen;
+→ [{"id":5,"gg":15}]
+
+drop table g_tgen;
+drop table u_tgen2;
+
+-- ===================================
+-- 41. RENAME TO must NOT rewrite a same-named table in ANOTHER schema inside a DEFAULT
+-- ===================================
+-- The rewrite is schema-aware: the default's subquery reads temp.u_tsch, so renaming
+-- main.u_tsch must leave it alone. Rewriting it would leave the default naming a table
+-- temp does not have and `t_tsch` would stop accepting rows.
+--
+-- The alias/CTE shadowing shapes are pinned in §42-§47 below: the table walker is
+-- scope-aware, so a name the body itself binds (a CTE, a FROM alias, a subquery source)
+-- is not a reference and is left untouched across all four arms (checks, predicates,
+-- defaults, generated bodies).
+
+create table temp.u_tsch (k integer primary key, v integer);
+insert into temp.u_tsch values (1, 11);
+
+create table u_tsch (k integer primary key, v integer);
+insert into u_tsch values (1, 22);
+
+create table t_tsch (id integer primary key, w integer default ((select min(v) from temp.u_tsch)));
+
+alter table u_tsch rename to u_tsch2;
+
+insert into t_tsch (id) values (1);
+
+select id, w from t_tsch;
+→ [{"id":1,"w":11}]
+
+drop table t_tsch;
+drop table u_tsch2;
+drop table temp.u_tsch;
+
+-- ===================================
+-- 42. RENAME TO leaves a view CTE that SHADOWS the old name untouched
+-- ===================================
+-- The `from zap` inside the view resolves to the view's own CTE, not the real table,
+-- so the rename must not touch the body. Pre-fix the walk rewrote it to `from zap2`,
+-- silently repointing the view at the real (renamed) table while its declared CTE
+-- went unused.
+
+create table zap (id integer primary key, k integer);
+insert into zap values (1, 100);
+
+create view v_shadow as with zap as (select 1 as k) select k from zap;
+
+alter table zap rename to zap2;
+
+-- the view still returns its CTE's row, not the renamed table's
+select k from v_shadow;
+→ [{"k":1}]
+
+-- and the real table is reachable under its new name
+select k from zap2;
+→ [{"k":100}]
+
+drop view v_shadow;
+drop table zap2;
+
+-- ===================================
+-- 43. DROP TABLE is NOT refused for an assertion whose body only DECLARES a same-named CTE
+-- ===================================
+-- The drop guard runs the same walk read-only, so it inherited the over-match as a
+-- FALSE REFUSAL: an assertion that merely declares `with zap as (…)` blocked
+-- `drop table zap`. The walk is scope-aware now, so the drop goes through — and the
+-- assertion (which never read the real table) keeps evaluating on later writes.
+
+create table zap (id integer primary key, k integer);
+create table t_asrt_other (id integer primary key);
+
+create assertion a_shadow check (not exists (with zap as (select 1 as k) select k from zap where k < 0));
+
+drop table zap;
+
+-- writes elsewhere still recompile and pass the assertion
+insert into t_asrt_other values (1);
+
+select count(*) as cnt from t_asrt_other;
+→ [{"cnt":1}]
+
+drop assertion a_shadow;
+drop table t_asrt_other;
+
+-- ===================================
+-- 44. An ALIASED SUBQUERY SOURCE named like the renamed table is untouched
+-- ===================================
+-- `(select 5 as k) zap` binds the name to the derived table; `zap.k` resolves through
+-- that alias. Pre-fix the qualified ref rewrote to `zap2.k` (while the alias stayed
+-- `zap`), leaving the view unplannable.
+
+create table zap (id integer primary key, k integer);
+insert into zap values (1, 100);
+
+create view v_sub as select zap.k from (select 5 as k) zap;
+
+alter table zap rename to zap2;
+
+select k from v_sub;
+→ [{"k":5}]
+
+drop view v_sub;
+drop table zap2;
+
+-- ===================================
+-- 45. An ALIASED TABLE SOURCE `from other zap` binds `zap.k` to OTHER, not the renamed table
+-- ===================================
+-- The alias `zap` qualifies rows of t_alias_other; renaming the real `zap` must leave
+-- both the alias and the qualified ref alone.
+
+create table zap (id integer primary key, k integer);
+insert into zap values (1, 100);
+
+create table t_alias_other (id integer primary key, k integer);
+insert into t_alias_other values (1, 7);
+
+create view v_alias as select zap.k from t_alias_other zap;
+
+alter table zap rename to zap3;
+
+select k from v_alias;
+→ [{"k":7}]
+
+drop view v_alias;
+drop table t_alias_other;
+drop table zap3;
+
+-- ===================================
+-- 46. Positive regressions: genuine references still rewrite under shadow-adjacent shapes
+-- ===================================
+-- Scope-awareness must not under-match: (a) a `from zap` inside a CTE BODY is a real
+-- reference (the CTE's own name is not in scope in a non-recursive body); (b) a
+-- schema-qualified `main.zap` is never a CTE, even where a same-named CTE is in scope;
+-- (c) an aliased real source `from zap z` still reads the real table.
+
+create table zap (id integer primary key, k integer);
+insert into zap values (1, 42);
+
+create view v_pos1 as with c as (select k from zap) select k from c;
+-- (The three-part `main.zap.k` COLUMN ref is pinned at the AST level in
+-- test/schema/table-rename-scope.spec.ts; the planner does not resolve that
+-- spelling in a view body today.)
+create view v_pos2 as with zap as (select 1 as k) select k from main.zap;
+create view v_pos3 as select z.k from zap z;
+
+alter table zap rename to zap4;
+
+select k from v_pos1;
+→ [{"k":42}]
+
+select k from v_pos2;
+→ [{"k":42}]
+
+select k from v_pos3;
+→ [{"k":42}]
+
+drop view v_pos3;
+drop view v_pos2;
+drop view v_pos1;
+drop table zap4;
+
+-- ===================================
+-- 47. RENAME of a table literally named `new` leaves its CHECK's row image alone
+-- ===================================
+-- `new` is not a reserved word, so `create table "new"` is legal — and inside that
+-- table's own CHECK, `new.a` names the ROW BEING WRITTEN, not the table. Pre-fix the
+-- rename rewrote the qualifier to the new table name; now the row image survives and
+-- the constraint keeps enforcing. (The partial-index mirror — where `new.x` IS a real
+-- reference — lives in 41.3.1 §8.)
+
+create table "new" (id integer primary key, a integer, constraint chk_fresh check (new.a > 0));
+
+alter table "new" rename to fresh;
+
+insert into fresh values (1, -5);
+-- error: CHECK constraint failed: chk_fresh
+
+insert into fresh values (2, 5);
+
+select id, a from fresh;
+→ [{"id":2,"a":5}]
+
+drop table fresh;
+
+-- ===================================
+-- 48. Dependents in ANOTHER schema follow the rename (views + assertions)
+-- ===================================
+-- The propagation used to rewrite dependent views / materialized views /
+-- assertions only while iterating the renamed table's OWN schema, so a `temp`
+-- view over `main.t` kept naming a table that no longer existed and every read
+-- of it failed (an assertion in that position broke every WRITE). Every schema
+-- is walked now; what decides a match is whether the reference RESOLVES to the
+-- renamed object under the walked body's own home schema path.
+
+create table main.xs_cs (id integer primary key, x integer not null);
+insert into main.xs_cs values (1, 10);
+create view temp.v_cs as select id, x from main.xs_cs;
+create assertion temp.a_cs check (not exists (select 1 from main.xs_cs where x < 0));
+
+alter table main.xs_cs rename to xs_cs2;
+
+-- The view body followed the rename and still reads.
+select id, x from temp.v_cs;
+→ [{"id":1,"x":10}]
+
+-- The assertion followed it too: writes still succeed…
+insert into main.xs_cs2 values (2, 20);
+
+-- …and the rule is still enforced.
+insert into main.xs_cs2 values (3, -1);
+-- error: Assertion
+
+-- Column verb, same cross-schema dependents.
+alter table main.xs_cs2 rename column x to y;
+
+select id, y from temp.v_cs order by id;
+→ [{"id":1,"y":10},{"id":2,"y":20}]
+
+insert into main.xs_cs2 values (4, -1);
+-- error: Assertion
+
+drop assertion temp.a_cs;
+drop view temp.v_cs;
+drop table main.xs_cs2;
+
+-- ===================================
+-- 49. …but only when the reference actually resolves to the renamed table
+-- ===================================
+-- A `temp`-owned view whose bare `t` means `temp.t` must NOT follow a rename of
+-- the same-named `main.t`; the converse — a bare name in `temp` that falls
+-- through the home path to `main` because `temp` has no such table — must.
+
+create table main.dup_cs (id integer primary key, x integer);
+create table temp.dup_cs (id integer primary key, x integer);
+insert into temp.dup_cs values (1, 111);
+-- The view's home is temp, so its bare `dup_cs` binds temp.dup_cs.
+create view temp.v_bare as select id, x from dup_cs;
+
+-- `temp` holds no `only_main`, so this bare name falls through to main.
+create table main.only_main (id integer primary key, x integer);
+insert into main.only_main values (1, 222);
+create view temp.v_fall as select id, x from only_main;
+
+alter table main.dup_cs rename to dup_cs2;
+alter table main.only_main rename to only_main2;
+
+-- Untouched: still reading temp.dup_cs.
+select id, x from temp.v_bare;
+→ [{"id":1,"x":111}]
+
+-- Rewritten: follows main.only_main → main.only_main2.
+select id, x from temp.v_fall;
+→ [{"id":1,"x":222}]
+
+drop view temp.v_fall;
+drop view temp.v_bare;
+drop table main.only_main2;
+drop table temp.dup_cs;
+drop table main.dup_cs2;
+
+-- ===================================
+-- 50. RENAME COLUMN cascades through a view-over-view chain
+-- ===================================
+-- Rewriting v1's body also shifts the name v1 PUBLISHES (x → y), so v2 —
+-- which reads v1, not the renamed table — must be rewritten in a second
+-- round. Pre-fix v2's body kept naming `x` and every read of it failed.
+
+create table w_c50 (id integer primary key, x integer);
+insert into w_c50 values (1, 10);
+
+create view v1_c50 as select id, x from w_c50;
+create view v2_c50 as select id, x from v1_c50;
+
+alter table w_c50 rename column x to y;
+
+select id, y from v2_c50;
+→ [{"id":1,"y":10}]
+
+-- the old name is gone at every level
+select x from v2_c50;
+-- error: not found
+
+drop view v2_c50;
+drop view v1_c50;
+drop table w_c50;
+
+-- ===================================
+-- 51. Three-level chain: every body follows
+-- ===================================
+
+create table t_c51 (id integer primary key, x integer);
+insert into t_c51 values (1, 42);
+
+create view c51_a as select id, x from t_c51;
+create view c51_b as select id, x from c51_a;
+create view c51_c as select id, x from c51_b;
+
+alter table t_c51 rename column x to y;
+
+select id, y from c51_c;
+→ [{"id":1,"y":42}]
+
+drop view c51_c;
+drop view c51_b;
+drop view c51_a;
+drop table t_c51;
+
+-- ===================================
+-- 52. An ALIASED republish does NOT cascade
+-- ===================================
+-- `x as x` keeps publishing `x` after the rename (the alias pins the output
+-- name), so the reader must NOT be rewritten — the sharpest false-positive
+-- case for a syntactic "bare x in the result columns" shortcut.
+
+create table w_c52 (id integer primary key, x integer);
+insert into w_c52 values (1, 5);
+
+create view v1_c52 as select id, x as x from w_c52;
+create view v2_c52 as select id, x from v1_c52;
+
+alter table w_c52 rename column x to y;
+
+-- v1 still publishes `x`; v2 still reads it
+select id, x from v2_c52;
+→ [{"id":1,"x":5}]
+
+drop view v2_c52;
+drop view v1_c52;
+drop table w_c52;
+
+-- ===================================
+-- 53. An explicit view column list stops the cascade
+-- ===================================
+-- `create view v(a, b)` publishes `a, b` regardless of the body — the same
+-- guard an explicit CTE column list is for the in-body exposure analysis.
+
+create table w_c53 (id integer primary key, x integer);
+insert into w_c53 values (3, 8);
+
+create view v1_c53 (a, b) as select id, x from w_c53;
+create view v2_c53 as select a, b from v1_c53;
+
+alter table w_c53 rename column x to y;
+
+select a, b from v2_c53;
+→ [{"a":3,"b":8}]
+
+drop view v2_c53;
+drop view v1_c53;
+drop table w_c53;
+
+-- ===================================
+-- 54. A `select *` view republishes the renamed column — readers follow
+-- ===================================
+-- The star body never names the column, so the round-1 rewrite leaves it
+-- untouched — yet its published names shift with the base table's. This is
+-- the case a "look for a bare x in the result columns" shortcut gets wrong.
+
+create table w_c54 (id integer primary key, x integer);
+insert into w_c54 values (2, 7);
+
+create view v1_c54 as select * from w_c54;
+create view v2_c54 as select id, x from v1_c54;
+
+alter table w_c54 rename column x to y;
+
+select id, y from v2_c54;
+→ [{"id":2,"y":7}]
+
+drop view v2_c54;
+drop view v1_c54;
+drop table w_c54;
+
+-- ===================================
+-- 55. A reader of the view that does NOT touch the renamed column is untouched
+-- ===================================
+
+create table w_c55 (id integer primary key, x integer);
+insert into w_c55 values (1, 9);
+
+create view v1_c55 as select id, x from w_c55;
+create view v2_c55 as select id from v1_c55;
+
+alter table w_c55 rename column x to y;
+
+select id from v2_c55;
+→ [{"id":1}]
+
+drop view v2_c55;
+drop view v1_c55;
+drop table w_c55;
+
+-- ===================================
+-- 56. Published-name collision REFUSES the rename, before any side effect
+-- ===================================
+-- v1 publishes `x` (a passthrough of the renamed column) AND its own `y`;
+-- following the rename would make it publish two `y`s, mirroring the
+-- base-verb refusal of a rename that collides with an existing column.
+-- The statement must be a clean no-op: the table keeps `x` and v1 still reads.
+
+create table w_c56 (id integer primary key, x integer);
+insert into w_c56 values (1, 4);
+
+create view v1_c56 as select x, id as y from w_c56;
+
+alter table w_c56 rename column x to y;
+-- error: already publishes a column named 'y'
+
+-- clean no-op: the base column and the view are untouched
+select x, y from v1_c56;
+→ [{"x":4,"y":1}]
+
+drop view v1_c56;
+drop table w_c56;
+
+-- ===================================
+-- 57. The cascade crosses schemas, and a body touched by TWO rounds settles
+-- ===================================
+-- main.t → main.v1 → temp.v2: the second round must reach dependents in every
+-- schema, exactly like the first. The `vb` view is touched twice — round 1
+-- rewrites its subquery on the base table, round 2 its projection through v1.
+
+create table w_c57 (id integer primary key, x integer);
+insert into w_c57 values (1, 77);
+
+create view v1_c57 as select id, x from w_c57;
+create view temp.v2_c57 as select id, x from main.v1_c57;
+create view vb_c57 as select v1_c57.x as through_view, (select max(w_c57.x) from w_c57) as direct from v1_c57;
+
+alter table w_c57 rename column x to y;
+
+select id, y from temp.v2_c57;
+→ [{"id":1,"y":77}]
+
+select through_view, direct from vb_c57;
+→ [{"through_view":77,"direct":77}]
+
+drop view vb_c57;
+drop view temp.v2_c57;
+drop view v1_c57;
+drop table w_c57;
+
+-- ===================================
+-- 58. Round order must not matter: the reader sits in an EARLIER-iterated
+--     schema (main) than the view it reads (temp)
+-- ===================================
+-- Within one schema a reader is always created after — and therefore iterated
+-- after — its dependency; putting the reader in main and the shifted view in
+-- temp exercises the reader-before-dependency visit order. Correctness cannot
+-- depend on it: the reader's reference is rewritten only in the round AFTER
+-- the view's shift is discovered.
+
+create table temp.w_c58 (id integer primary key, x integer);
+insert into temp.w_c58 values (1, 21);
+
+create view temp.v1_c58 as select id, x from temp.w_c58;
+create view main.v2_c58 as select id, x from temp.v1_c58;
+
+alter table temp.w_c58 rename column x to y;
+
+select id, y from main.v2_c58;
+→ [{"id":1,"y":21}]
+
+drop view main.v2_c58;
+drop view temp.v1_c58;
+drop table temp.w_c58;
+
+-- ===================================
+-- 59. A case-only respelling is not a published-name collision
+-- ===================================
+-- `x` → `X` renames the column to a name every dependent already publishes —
+-- but that name IS the renamed column, not a second one, so the cascade's
+-- collision refusal must not fire. Both levels follow the new spelling.
+
+create table w_c59 (id integer primary key, x integer);
+insert into w_c59 values (1, 6);
+
+create view v1_c59 as select id, x from w_c59;
+create view v2_c59 as select x from v1_c59;
+
+alter table w_c59 rename column x to X;
+
+select X from v2_c59;
+→ [{"X":6}]
+
+drop view v2_c59;
+drop view v1_c59;
+drop table w_c59;
+
+-- ===================================
+-- 60. The rewrite preserves what a reference resolves to when the NEW name
+--     is already taken earlier on the body's home path (collision)
+-- ===================================
+-- A temp-owned body reading bare `t_c60` means main.t_c60 (temp holds none).
+-- After `alter table main.t_c60 rename to t2_c60`, the bare new name would
+-- resolve to the pre-existing temp.t2_c60 instead — so the propagation adds
+-- the schema qualifier and every dependent keeps reading the renamed table.
+-- (§49 covers the no-collision half: bare rewrites stay unqualified there.)
+
+create table main.t_c60 (id integer primary key, x integer);
+insert into main.t_c60 values (1, 10);
+-- The collision: temp already holds the rename target's name.
+create table temp.t2_c60 (id integer primary key, x integer);
+insert into temp.t2_c60 values (99, 999);
+
+create view temp.v_c60 as select id, x from t_c60;
+create materialized view temp.mv_c60 as select id, x from t_c60;
+create assertion temp.a_c60 check (not exists (select 1 from t_c60 where x < 0));
+
+alter table main.t_c60 rename to t2_c60;
+
+-- The view still reads the renamed table, not temp.t2_c60.
+select id, x from temp.v_c60;
+→ [{"id":1,"x":10}]
+
+-- REFRESH re-plans the MV body from its stored text — the path that exposed a
+-- mis-bound bare reference — and must not swap in temp.t2_c60's rows.
+refresh materialized view temp.mv_c60;
+
+select id, x from temp.mv_c60;
+→ [{"id":1,"x":10}]
+
+-- The assertion still enforces against the renamed table…
+insert into main.t2_c60 values (2, -1);
+-- error: Assertion
+
+-- …and is NOT watching the same-named temp table.
+insert into temp.t2_c60 values (2, -1);
+
+drop assertion temp.a_c60;
+drop materialized view temp.mv_c60;
+drop view temp.v_c60;
+drop table main.t2_c60;
+drop table temp.t2_c60;
+
+-- ===================================
+-- 61. An inner reference binding a VIEW that exposes the old name is not
+--     false-captured by the rename
+-- ===================================
+-- The seeded CHECK walk stops at any inner FROM frame whose sources already
+-- expose the renamed column — otherwise the outer seed captures a name that
+-- legitimately binds inside the subquery. `buildColumnSourceResolver` answers
+-- that "does this source expose this column?" question for a VIEW (its explicit
+-- column list, else its body's projections and stars), not only for a table, so
+-- a view over ANOTHER table shields its own `v` exactly as that table would.
+-- The DROP COLUMN mirror of this case is 41.10.2 §36; the two verbs share the
+-- one resolver, which is what keeps them from drifting apart.
+
+create table t_c61 (id integer primary key, v integer);
+create table u_c61 (id integer primary key, v integer);
+create view uv_c61 as select v from u_c61;
+
+alter table t_c61 add constraint ck_c61 check (id < (select max(v) from uv_c61));
+insert into u_c61 values (1, 50);
+
+alter table t_c61 rename column v to z;
+
+-- The CHECK's `v` still names the view's column, so the constraint keeps
+-- enforcing the rule it was written for.
+insert into t_c61 values (10, 1);
+
+select id, z from t_c61;
+→ [{"id":10,"z":1}]
+
+insert into t_c61 values (99, 2);
+-- error: ck_c61
+
+-- The renamed column is the one the rename actually moved.
+insert into t_c61 (id, z) values (11, 7);
+select count(*) as c from t_c61;
+→ [{"c":2}]
+
+drop table t_c61;
+drop view uv_c61;
+drop table u_c61;
+
+-- ===================================
+-- 62. Renaming a column of a table called "new" / "old" leaves OTHER tables'
+--     row-image qualifiers untouched
+-- ===================================
+-- Inside a CHECK, a column DEFAULT or a generated body, a bare unbound `new.<col>` /
+-- `old.<col>` names the row being written — that TABLE'S OWN row image, never a
+-- catalog table. So renaming a column of a real table called "new" must not touch
+-- another table's `new.v`: pre-fix it did, the other table's CHECK/DEFAULT then named
+-- a column it does not have, and every later write to it failed with an error naming
+-- neither the table nor the statement that broke it. §24/§29 pin the OWN-table rewrite
+-- (the qualifier follows its own table's rename); this section pins the foreign no-op.
+
+create table "new" (id integer primary key, v integer);
+create table nwck_c62 (id integer primary key, v integer, constraint ck_c62 check (new.v > 0));
+create table nwdf_c62 (id integer primary key, v integer, d integer default (new.v + 1));
+insert into nwck_c62 values (1, 5);
+insert into nwdf_c62 (id, v) values (1, 4);
+
+alter table "new" rename column v to w;
+
+-- Both tables still writable: their qualifiers still name their own row images.
+-- (No generated-body arm: a generated expression rejects the `new.` qualifier
+-- outright — `new.v isn't a column` — so it cannot carry a foreign row image.
+-- The walker-level cell is pinned by test/schema/row-image-context-matrix.spec.ts.)
+insert into nwck_c62 values (2, 7);
+insert into nwdf_c62 (id, v) values (2, 9);
+select id, d from nwdf_c62 order by id;
+→ [{"id":1,"d":5},{"id":2,"d":10}]
+
+-- ...and the CHECK still enforces.
+insert into nwck_c62 values (3, -1);
+-- error: ck_c62
+
+drop table nwdf_c62;
+drop table nwck_c62;
+drop table "new";
+
+-- `old.` behaves identically.
+create table "old" (id integer primary key, v integer);
+create table odck_c62 (id integer primary key, v integer,
+                       constraint ckod_c62 check on update (old.v >= 0));
+insert into odck_c62 values (1, 5);
+
+alter table "old" rename column v to w;
+
+update odck_c62 set v = 6 where id = 1;
+select v from odck_c62;
+→ [{"v":6}]
+
+drop table odck_c62;
+drop table "old";
+
+-- Controls: a GENUINE reference to the table called "new" still rewrites. A
+-- FROM-bound subquery reference (bare and qualified alike) is not a row image —
+-- the qualifier binds through the subquery's FROM, so the rename follows it.
+create table "new" (id integer primary key, v integer);
+insert into "new" values (1, 10);
+create table r_c62 (id integer primary key, n integer,
+                    constraint ckr_c62 check (n < (select max(v) from "new")));
+create table rq_c62 (id integer primary key, n integer,
+                     constraint ckrq_c62 check (n < (select max("new".v) from "new")));
+
+alter table "new" rename column v to w;
+
+insert into r_c62 values (1, 5);
+insert into rq_c62 values (1, 5);
+insert into r_c62 values (2, 99);
+-- error: ckr_c62
+insert into rq_c62 values (2, 99);
+-- error: ckrq_c62
+
+-- ...and the OWN-table row image of "new" itself still follows its own rename
+-- (§24's shape, on a table that happens to be called "new").
+alter table "new" add constraint cknw_c62 check (new.w >= 0);
+alter table "new" rename column w to x;
+insert into "new" values (2, 20);
+insert into "new" values (3, -1);
+-- error: cknw_c62
+
+drop table rq_c62;
+drop table r_c62;
+drop table "new";
+
+-- ===================================
+-- 63. A `with inverse` expression's `new.` refs are inert to renames of a
+--     table called "new"
+-- ===================================
+-- Inside a result column's `with inverse (…)` clause, `new.<x>` names an OUTPUT
+-- column of the enclosing select (docs/sql-select.md § Result-column inverses) —
+-- written-row context sitting inside a view body. Neither a column rename nor a
+-- table rename of a real table called "new" may touch it; pre-fix both corrupted
+-- the clause and every later write through the view failed validation.
+
+create table "new" (id integer primary key, v integer);
+create table people_c63 (id integer primary key, code5 text);
+create view vp_c63 as
+  select id, case code5 when 'A1' then 'A' end as v
+    with inverse (code5 = case new.v when 'A' then 'A1' end)
+  from people_c63;
+insert into vp_c63 (id, v) values (1, 'A');
+
+alter table "new" rename column v to w;
+
+insert into vp_c63 (id, v) values (2, 'A');
+select id, code5 from people_c63 order by id;
+→ [{"id":1,"code5":"A1"},{"id":2,"code5":"A1"}]
+
+alter table "new" rename to fresh_c63;
+
+insert into vp_c63 (id, v) values (3, 'A');
+select count(*) as c from people_c63;
+→ [{"c":3}]
+
+drop view vp_c63;
+drop table people_c63;
+drop table fresh_c63;
+
+-- The same shape one level in from a seeded CHECK — the inverse clause of a
+-- subquery select inside another table's own CHECK is that INNER select's
+-- written-row namespace, not the outer table's, so the outer rename leaves its
+-- `new.a` alone (the inner output `a` is an alias and does not shift).
+create table src_c63 (id integer primary key, a integer);
+create table ck8_c63 (id integer primary key, a integer,
+  constraint c8_c63 check (a < (select count(*)
+                                from (select id as a with inverse (id = new.a) from src_c63)) + 100));
+
+alter table ck8_c63 rename column a to b;
+
+insert into ck8_c63 (id, b) values (1, 0);
+select id, b from ck8_c63;
+→ [{"id":1,"b":0}]
+
+drop table ck8_c63;
+drop table src_c63;
+
+-- ===================================
+-- 64. The output-name shift stops at a NESTED select's own inverse clause
+-- ===================================
+-- When a rename shifts the enclosing select's published output name, sibling
+-- `new.<old>` refs in its inverse clauses follow (§'s above). A subquery inside
+-- such an expression may be a select with its OWN inverse clause, whose `new.`
+-- refs belong to THAT select's outputs — the pass must not reach into it.
+
+create table b_c64 (id integer primary key, v integer);
+create table c_c64 (id integer primary key, v integer);
+create view vw_c64 as
+  select id, v
+    with inverse (v = new.v + (select count(*)
+                               from (select v with inverse (v = new.v) from c_c64)))
+  from b_c64;
+insert into c_c64 values (1, 1);
+
+alter table b_c64 rename column v to w;
+
+-- The outer output shifted v → w (readers follow, §54), so the outer `new.v`
+-- followed the shift; the inner select still publishes `v`, so its own `new.v`
+-- must not have moved. The write-through evaluates the outer clause:
+-- base w = new.w + count over c_c64 = 41 + 1.
+insert into vw_c64 (id, w) values (1, 41);
+select id, w from b_c64;
+→ [{"id":1,"w":42}]
+
+drop view vw_c64;
+drop table c_c64;
+drop table b_c64;
+
+-- ===================================
+-- 65. RENAME COLUMN follows through an ALIASED FROM source
+-- ===================================
+-- A FROM alias adds a qualifier; it does not take the source's columns out of
+-- scope. So a bare `x` under `from t a` binds `t.x` and must follow the rename,
+-- and a bare star over an aliased source republishes like any other star — the
+-- cascade re-targets on it. Before the scope walk bound aliased sources, both
+-- bodies were left naming a column that no longer existed and every read of the
+-- view failed with `Column not found: x`.
+
+create table al_c65 (id integer primary key, x integer);
+insert into al_c65 values (1, 5);
+
+-- Bare ref under an alias, and a star over an aliased source.
+create view alv_c65 as select id, x from al_c65 a;
+create view als_c65 as select * from al_c65 a;
+-- A second-level reader pins the CASCADE: als_c65's published name shifts, so
+-- this body must be re-targeted too.
+create view alr_c65 as select x from als_c65;
+-- run
+
+alter table al_c65 rename column x to z;
+
+select id, z from alv_c65;
+→ [{"id":1,"z":5}]
+
+select id, z from als_c65;
+→ [{"id":1,"z":5}]
+
+select z from alr_c65;
+→ [{"z":5}]
+
+drop view alr_c65;
+drop view als_c65;
+drop view alv_c65;
+drop table al_c65;
+-- run
+
+-- A MATERIALIZED view over an aliased source is a second site on the same walk:
+-- its body rewrite carries the shifted output name onto the backing table in
+-- place, so the star has to be recognised as a passthrough there too.
+create table alm_c65 (id integer primary key, x integer);
+insert into alm_c65 values (1, 5);
+create materialized view almv_c65 as select * from alm_c65 a;
+-- run
+
+alter table alm_c65 rename column x to z;
+
+select id, z from almv_c65;
+→ [{"id":1,"z":5}]
+
+drop materialized view almv_c65;
+drop table alm_c65;
+-- run
+
+-- Guard rail: the widened binding must not capture a bare name that binds
+-- elsewhere. The inner `x` here belongs to the aliased alo_c65, so the rename of
+-- ali_c65.x must leave it alone and the view must keep planning.
+create table ali_c65 (id integer primary key, x integer);
+create table alo_c65 (id integer primary key, x integer);
+insert into ali_c65 values (1, 5);
+insert into alo_c65 values (1, 9);
+create view alg_c65 as select id, (select max(x) from alo_c65 b) as m from ali_c65;
+-- run
+
+alter table ali_c65 rename column x to z;
+
+select id, m from alg_c65;
+→ [{"id":1,"m":9}]
+
+drop view alg_c65;
+drop table alo_c65;
+drop table ali_c65;
+-- run
+
+-- A `with defaults` target is the third site on the widened binding, and the one
+-- least like a body reference: the clause names a projected-away base column and
+-- rides the walk as a synthetic bare ref (see § 18 for the unaliased spelling), so
+-- an aliased FROM used to leave it un-rewritten and the write-through then failed
+-- with "'with defaults (created = …)' names column 'created'".
+create table ald_c65 (id integer primary key, name text, created integer not null);
+create view alvd_c65 as select id, name from ald_c65 a with defaults (created = 99);
+-- run
+
+alter table ald_c65 rename column created to created_at;
+
+insert into alvd_c65 values (1, 'x');
+
+select id, name, created_at from ald_c65;
+→ [{"id":1,"name":"x","created_at":99}]
+
+drop view alvd_c65;
+drop table ald_c65;
+-- run
+
+-- ...and the `with inverse` ASSIGNMENT TARGET, the fourth site: also a bare
+-- base-column name riding the walk as a synthetic probe (§ 63 covers the clause's
+-- `new.` refs, which stay inert either way). Under an aliased FROM the target used
+-- to be left naming the old column, and every write through the view then failed.
+create table ali2_c65 (id integer primary key, code5 text);
+create view alvi_c65 as
+  select id, case code5 when 'A1' then 'A' end as v
+    with inverse (code5 = case new.v when 'A' then 'A1' end)
+  from ali2_c65 a;
+insert into alvi_c65 (id, v) values (1, 'A');
+-- run
+
+alter table ali2_c65 rename column code5 to code6;
+
+insert into alvi_c65 (id, v) values (2, 'A');
+
+select id, code6 from ali2_c65 order by id;
+→ [{"id":1,"code6":"A1"},{"id":2,"code6":"A1"}]
+
+drop view alvi_c65;
+drop table ali2_c65;
+-- run
+
+-- ===================================
+-- 66. A rename must not change what an UNTOUCHED reference resolves to
+-- ===================================
+-- The mirror of §60. There the rename REWROTE a reference and had to keep it
+-- pointing at the renamed table; here it rewrites nothing at all, but the name
+-- it CREATES captures a reference whose body never mentions the renamed table.
+-- A temp-owned body reading bare `k_c66` means main.k_c66 (temp holds none);
+-- `alter table temp.o_c66 rename to k_c66` puts a `k_c66` in temp, earlier on
+-- that body's home path. Every dependent must keep reading main.k_c66.
+
+create table main.k_c66 (id integer primary key, x integer);
+insert into main.k_c66 values (1, 10);
+-- The capture: renaming this onto `k_c66` shadows main.k_c66 for temp-owned bodies.
+create table temp.o_c66 (id integer primary key, x integer);
+insert into temp.o_c66 values (99, 999);
+
+create view temp.v_c66 as select id, x from k_c66;
+create materialized view temp.mv_c66 as select id, x from k_c66;
+create assertion temp.a_c66 check (not exists (select 1 from k_c66 where x < 0));
+-- A main-owned body reading the same bare name: main leads its own home path,
+-- so nothing can capture it and its stored text must not churn.
+create view main.vm_c66 as select id, x from k_c66;
+
+alter table temp.o_c66 rename to k_c66;
+
+select id, x from temp.v_c66;
+→ [{"id":1,"x":10}]
+
+select id, x from main.vm_c66;
+→ [{"id":1,"x":10}]
+
+-- The already-materialized rows mask a re-bind until the stored body re-plans.
+refresh materialized view temp.mv_c66;
+
+select id, x from temp.mv_c66;
+→ [{"id":1,"x":10}]
+
+-- The assertion still enforces against main.k_c66…
+insert into main.k_c66 values (2, -1);
+-- error: Assertion
+
+-- …and is NOT watching the table that took its name.
+insert into temp.k_c66 values (2, -1);
+
+drop view main.vm_c66;
+drop assertion temp.a_c66;
+drop materialized view temp.mv_c66;
+drop view temp.v_c66;
+drop table temp.k_c66;
+drop table main.k_c66;
+
+-- ===================================
+-- 67. A rename must not change what a body QUALIFIER binds
+-- ===================================
+-- Inside one body, the bare qualifier an unaliased FROM source exposes must
+-- keep binding that source. Renaming a source onto a name already live as a
+-- qualifier in that part of the body pins the pre-rename spelling as an
+-- explicit alias (`from t2 as t`), so `t.x` keeps reading the renamed table
+-- instead of collapsing onto whichever same-spelled source wins.
+
+-- Sibling source in another schema: the join must not become self-referential.
+create table main.qa_c67 (id integer primary key, x integer);
+insert into main.qa_c67 values (1, 10);
+create table temp.qb_c67 (id integer primary key, x integer);
+insert into temp.qb_c67 values (2, 20);
+create view temp.qv_c67 as select qa_c67.x as a, qb_c67.x as b from qa_c67 join temp.qb_c67 on qa_c67.id = qb_c67.id - 1;
+
+select * from temp.qv_c67;
+→ [{"a": 10, "b": 20}]
+
+alter table main.qa_c67 rename to qb_c67;
+
+select * from temp.qv_c67;
+→ [{"a": 10, "b": 20}]
+
+drop view temp.qv_c67;
+drop table temp.qb_c67;
+drop table main.qb_c67;
+-- run
+
+-- Sibling's alias, single schema: b must keep reading the aliased table.
+create table qt_c67 (id integer primary key, x integer);
+insert into qt_c67 values (1, 10);
+create table qu_c67 (id integer primary key, x integer);
+insert into qu_c67 values (1, 77);
+create view qw_c67 as select qt_c67.x as a, z.x as b from qt_c67 join qu_c67 as z on qt_c67.id = z.id;
+
+alter table qt_c67 rename to z;
+
+select * from qw_c67;
+→ [{"a": 10, "b": 77}]
+
+drop view qw_c67;
+drop table qu_c67;
+drop table z;
+-- run
+
+-- CTE the body declares: the renamed source is schema-qualified as well as
+-- aliased (a bare source spelling the CTE's name would bind the CTE outright).
+create table qc_c67 (id integer primary key, x integer);
+insert into qc_c67 values (1, 10);
+create view qcv_c67 as with c as (select 1 as id, 999 as x) select qc_c67.x as a, c.x as b from qc_c67 join c on qc_c67.id = c.id;
+
+alter table qc_c67 rename to c;
+
+select * from qcv_c67;
+→ [{"a": 10, "b": 999}]
+
+drop view qcv_c67;
+drop table c;
+-- run
+
+-- Enclosing frame's qualifier: the correlated EXISTS must stay correlated.
+-- id 7 has no match in the renamed table, so a lost correlation would admit it.
+create table main.qe_c67 (id integer primary key, x integer);
+insert into main.qe_c67 values (1, 10);
+create table temp.qf_c67 (id integer primary key, x integer);
+insert into temp.qf_c67 values (1, 20), (7, 70);
+create view temp.qev_c67 as select qf_c67.x as a from temp.qf_c67 where exists (select 1 from qe_c67 where qe_c67.id = qf_c67.id);
+
+alter table main.qe_c67 rename to qf_c67;
+
+select * from temp.qev_c67 order by a;
+→ [{"a": 20}]
+
+drop view temp.qev_c67;
+drop table temp.qf_c67;
+drop table main.qf_c67;
+-- run
+
+-- Deep capture: an alias of the new name INSIDE a correlated subquery would
+-- capture the outer qualifier's new spelling — the outer source aliases too.
+create table qg_c67 (id integer primary key, x integer);
+insert into qg_c67 values (1, 10), (2, 20);
+create table qh_c67 (id integer primary key);
+insert into qh_c67 values (1);
+create view qgv_c67 as select qg_c67.x from qg_c67 where exists (select 1 from qh_c67 as g2 where g2.id = qg_c67.id);
+
+alter table qg_c67 rename to g2;
+
+select * from qgv_c67;
+→ [{"x": 10}]
+
+drop view qgv_c67;
+drop table qh_c67;
+drop table g2;
+-- run
+
+-- Control: a source that already carries an author alias needs no pin — the
+-- alias is the qualifier and a rename never moves it.
+create table qi_c67 (id integer primary key, x integer);
+insert into qi_c67 values (1, 10);
+create table temp.qj_c67 (id integer primary key, x integer);
+insert into temp.qj_c67 values (1, 20);
+create view temp.qiv_c67 as select tt.x as a, qj_c67.x as b from qi_c67 as tt join temp.qj_c67 on tt.id = qj_c67.id;
+
+alter table qi_c67 rename to qj_c67;
+
+select * from temp.qiv_c67;
+→ [{"a": 10, "b": 20}]
+
+drop view temp.qiv_c67;
+drop table temp.qj_c67;
+drop table main.qj_c67;
+-- run
+
+-- Materialized-view twin: a maintained body is rewritten by the same walk, so
+-- the pin must survive the re-hash and re-plan the refresh performs.
+create table qm_c67 (id integer primary key, x integer);
+insert into qm_c67 values (1, 10);
+create table qn_c67 (id integer primary key, x integer);
+insert into qn_c67 values (1, 77);
+create materialized view qmv_c67 as select qm_c67.id as k, qm_c67.x as a, z_c67.x as b from qm_c67 join qn_c67 as z_c67 on qm_c67.id = z_c67.id;
+
+select * from qmv_c67;
+→ [{"k": 1, "a": 10, "b": 77}]
+
+alter table qm_c67 rename to z_c67;
+
+-- The stored rows mask a re-bind until the body re-plans.
+refresh materialized view qmv_c67;
+
+select * from qmv_c67;
+→ [{"k": 1, "a": 10, "b": 77}]
+
+drop materialized view qmv_c67;
+drop table qn_c67;
+drop table z_c67;
+-- run
+
+-- Assertion twin: the stored CHECK body goes through the same walk, so its
+-- qualifiers must keep binding what they bound.
+create table qp_c67 (id integer primary key, x integer);
+insert into qp_c67 values (1, 10);
+create table qq_c67 (id integer primary key, x integer);
+insert into qq_c67 values (1, 77), (2, 77), (3, 77);
+create assertion qa_c67 check (not exists (select 1 from qp_c67 join qq_c67 as w_c67 on qp_c67.id = w_c67.id where qp_c67.x < 0));
+
+alter table qp_c67 rename to w_c67;
+
+-- Still watching the renamed table…
+insert into w_c67 values (2, -1);
+-- error: Assertion
+
+-- …and not the sibling whose alias it now spells.
+insert into qq_c67 values (4, -1);
+
+drop assertion qa_c67;
+drop table qq_c67;
+drop table w_c67;

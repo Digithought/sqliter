@@ -1,4 +1,5 @@
 description: Sort+StreamAggregate branch in ruleAggregatePhysical is unreachable with current cost constants — consider removing or making testable
+difficulty: easy
 prereq: none
 files:
   packages/quereus/src/planner/rules/aggregate/rule-aggregate-streaming.ts (lines 90-102)

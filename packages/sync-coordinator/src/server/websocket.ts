@@ -9,57 +9,22 @@ import {
   siteIdFromBase64,
   siteIdToBase64,
   deserializeHLC,
+  PROTOCOL_VERSION,
   type HLC,
   type ChangeSet,
-  type SnapshotCheckpoint,
+  type ClientMessage,
+  type HandshakeMessage,
+  type GetChangesMessage,
+  type ApplyChangesMessage,
+  type ResumeSnapshotMessage,
 } from '@quereus/sync';
 import type { CoordinatorService } from '../service/coordinator-service.js';
 import type { ClientIdentity, ClientSession } from '../service/types.js';
-import { wsLog, serializeChangeSet, deserializeChangeSet, serializeSnapshotChunk } from '../common/index.js';
+import { wsLog, serializeChangeSet, deserializeChangeSet, serializeSnapshotChunk, deserializeSnapshotCheckpoint } from '../common/index.js';
 
-// ============================================================================
-// Message Types
-// ============================================================================
-
-interface HandshakeMessage {
-  type: 'handshake';
-  /** Database ID for multi-tenant routing (e.g., 'a1-s42') */
-  databaseId: string;
-  /** Client's site ID (base64 encoded) */
-  siteId: string;
-  token?: string;
-}
-
-interface GetChangesMessage {
-  type: 'get_changes';
-  sinceHLC?: string; // base64 encoded
-}
-
-interface ApplyChangesMessage {
-  type: 'apply_changes';
-  changes: unknown[];
-}
-
-interface GetSnapshotMessage {
-  type: 'get_snapshot';
-}
-
-interface ResumeSnapshotMessage {
-  type: 'resume_snapshot';
-  checkpoint: SnapshotCheckpoint;
-}
-
-interface PingMessage {
-  type: 'ping';
-}
-
-type ClientMessage =
-  | HandshakeMessage
-  | GetChangesMessage
-  | ApplyChangesMessage
-  | GetSnapshotMessage
-  | ResumeSnapshotMessage
-  | PingMessage;
+// The ClientMessage union and its per-message interfaces are the shared wire
+// definitions from @quereus/sync (`sync/wire.ts`), the single source of truth
+// this coordinator and the sync client both speak.
 
 // ============================================================================
 // WebSocket Handler
@@ -84,8 +49,11 @@ export function registerWebSocket(
     let session: ClientSession | null = null;
     let socketClosed = false;
 
-    const sendError = (code: string, message: string) => {
-      socket.send(JSON.stringify({ type: 'error', code, message }));
+    // `fatal` tells the client whether to stop auto-reconnecting. Fatal errors
+    // are ones where the session is unrecoverable and we typically also close
+    // the socket; transient per-request errors leave the session intact.
+    const sendError = (code: string, message: string, fatal = false) => {
+      socket.send(JSON.stringify({ type: 'error', code, message, fatal }));
     };
 
     const sendMessage = (msg: object) => {
@@ -140,13 +108,31 @@ export function registerWebSocket(
 
     // Handler functions
     async function handleHandshake(msg: HandshakeMessage) {
+      // Wire-version gate — checked FIRST, before the session guard and before
+      // authenticating, so a peer on an incompatible protocol is rejected
+      // without touching the store. Strict integer equality; an absent version
+      // (a pre-versioning client) counts as a mismatch — that drift is exactly
+      // what this guards against, so it is not silently accepted.
+      if (msg.protocolVersion !== PROTOCOL_VERSION) {
+        const clientPart = msg.protocolVersion === undefined
+          ? 'client sent none (pre-versioning client)'
+          : `client speaks v${msg.protocolVersion}`;
+        sendError(
+          'PROTOCOL_VERSION_MISMATCH',
+          `Sync protocol version mismatch: server speaks v${PROTOCOL_VERSION}, ${clientPart}`,
+          true,
+        );
+        socket.close(4003, 'Protocol version mismatch');
+        return;
+      }
+
       if (session) {
-        sendError('ALREADY_AUTHENTICATED', 'Already authenticated');
+        sendError('ALREADY_AUTHENTICATED', 'Already authenticated', true);
         return;
       }
 
       if (!msg.databaseId) {
-        sendError('MISSING_DATABASE_ID', 'databaseId is required');
+        sendError('MISSING_DATABASE_ID', 'databaseId is required', true);
         socket.close(4002, 'Missing databaseId');
         return;
       }
@@ -179,6 +165,8 @@ export function registerWebSocket(
           databaseId: msg.databaseId,
           serverSiteId: siteIdToBase64(serverSiteId),
           connectionId: session.connectionId,
+          // Echo the version so the client can run the same check in reverse.
+          protocolVersion: PROTOCOL_VERSION,
         });
 
         wsLog('Handshake complete: %s (db: %s)', session.connectionId.slice(0, 8), msg.databaseId);
@@ -190,7 +178,7 @@ export function registerWebSocket(
           session = null;
         }
         const errMsg = err instanceof Error ? err.message : 'Authentication failed';
-        sendError('AUTH_FAILED', errMsg);
+        sendError('AUTH_FAILED', errMsg, true);
         socket.close(4001, 'Authentication failed');
       }
     }
@@ -232,7 +220,10 @@ export function registerWebSocket(
 
         const result = await service.applyChanges(session.databaseId, session.identity, changes);
 
-        sendMessage({ type: 'apply_result', ...result });
+        // Echo the client's correlation id so it can tie this ack to the exact
+        // batch it sent. `requestId: undefined` is dropped by JSON.stringify, so
+        // a push without one (or a legacy client) simply gets no id back.
+        sendMessage({ type: 'apply_result', requestId: msg.requestId, ...result });
       } catch (err) {
         const msg2 = err instanceof Error ? err.message : 'Failed to apply changes';
         wsLog('apply_changes error: %s', msg2);
@@ -265,7 +256,12 @@ export function registerWebSocket(
       }
 
       try {
-        for await (const chunk of service.resumeSnapshotStream(session.databaseId, session.identity, msg.checkpoint)) {
+        // The checkpoint arrives from JSON.parse in its serialized form (base64
+        // siteId/HLC); decode before handing it to the service, which expects the
+        // binary in-memory shape. Its CONTENTS are still client-supplied and
+        // unchecked against the session — see `bug-sync-resume-snapshot-unvalidated-checkpoint`.
+        const checkpoint = deserializeSnapshotCheckpoint(msg.checkpoint);
+        for await (const chunk of service.resumeSnapshotStream(session.databaseId, session.identity, checkpoint)) {
           sendMessage({ type: 'snapshot_chunk', chunk: serializeSnapshotChunk(chunk) });
         }
         sendMessage({ type: 'snapshot_complete' });

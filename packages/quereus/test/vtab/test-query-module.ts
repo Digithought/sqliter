@@ -4,7 +4,7 @@ import type { VirtualTableModule, BaseModuleConfig, SupportAssessment } from '..
 import type { TableSchema } from '../../src/schema/table.js';
 import type { PlanNode } from '../../src/planner/nodes/plan-node.js';
 import { PlanNodeType } from '../../src/planner/nodes/plan-node-type.js';
-import type { Row } from '../../src/common/types.js';
+import type { Row, UpdateResult } from '../../src/common/types.js';
 import { StatusCode } from '../../src/common/types.js';
 import { IndexInfo } from '../../src/vtab/index-info.js';
 import { FilterInfo } from '../../src/vtab/filter-info.js';
@@ -120,7 +120,7 @@ export class TestQueryTable extends VirtualTable {
 	disconnectCount = 0;
 
 	private get data(): Row[] {
-		const key = `${this.tableSchema.schemaName}.${this.tableSchema.name}`;
+		const key = `${this.schemaName}.${this.tableName}`;
 		let rows = TestQueryTable.sharedData.get(key);
 		if (!rows) {
 			rows = [];
@@ -144,41 +144,45 @@ export class TestQueryTable extends VirtualTable {
 	}
 
 	// Required update method
-	async update(args: UpdateArgs): Promise<Row | undefined> {
+	async update(args: UpdateArgs): Promise<UpdateResult> {
 		// Simple implementation for testing
 		switch (args.operation) {
 			case 'insert':
 				if (args.values) {
 					this.data.push(args.values);
-					return args.values;
+					return { status: 'ok', row: args.values };
 				}
 				break;
-			case 'delete':
+			case 'delete': {
 				// Remove based on old key values
 				// For simplicity, just remove first matching row
-				if (args.oldKeyValues) {
+				const oldKeyValues = args.oldKeyValues;
+				if (oldKeyValues) {
 					const index = this.data.findIndex(row =>
-						row.every((val, i) => val === args.oldKeyValues![i])
+						row.every((val, i) => val === oldKeyValues[i])
 					);
 					if (index >= 0) {
 						this.data.splice(index, 1);
 					}
 				}
 				break;
-			case 'update':
+			}
+			case 'update': {
 				// Update based on old key values
-				if (args.oldKeyValues && args.values) {
+				const oldKeyValues = args.oldKeyValues;
+				if (oldKeyValues && args.values) {
 					const index = this.data.findIndex(row =>
-						row.every((val, i) => val === args.oldKeyValues[i])
+						row.every((val, i) => val === oldKeyValues[i])
 					);
 					if (index >= 0) {
 						this.data[index] = args.values;
-						return args.values;
+						return { status: 'ok', row: args.values };
 					}
 				}
 				break;
+			}
 		}
-		return undefined;
+		return { status: 'ok' };
 	}
 
 	// Optional query method for standard table access

@@ -47,7 +47,7 @@ CREATE TABLE t_parse_empty ();
 
 -- DROP with unsupported object type
 DROP TRIGGER some_trigger;
--- error: Expected TABLE, VIEW, INDEX, or ASSERTION after DROP
+-- error: Expected TABLE, VIEW, MATERIALIZED VIEW, INDEX, or ASSERTION after DROP
 
 -- Incomplete CASE expression
 SELECT CASE WHEN 1 THEN 2;

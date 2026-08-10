@@ -1,0 +1,169 @@
+-- 41.10.1-alter-drop-column-unique-index.sqllogic
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Subject: `ALTER TABLE … DROP COLUMN` over a standalone `CREATE INDEX` that spans the
+-- dropped column — which of the two fates the index meets, and whether the rows it
+-- indexes are still answered correctly afterwards.
+--
+-- A UNIQUE index spanning the dropped column must be removed OUTRIGHT, not narrowed to
+-- its surviving columns — narrowing invents a UNIQUE the table never declared, and one
+-- nothing enforces (the matching derived UNIQUE constraint is removed, since a
+-- constraint missing one of its columns is a different, stronger constraint). A
+-- narrowed survivor would then be reported by index_info, trusted by the planner's
+-- at-most-one-matching-row proofs, and re-persisted as a real CREATE UNIQUE INDEX.
+-- A plain (non-unique) index is narrowed instead, and survives.
+--
+-- Sections 4 and 5 index rows written BEFORE the drop, which is what exercises a
+-- module's obligation to reshape the index's PHYSICAL structure — re-encode the one the
+-- drop narrowed (its key holds one fewer column value), tear down the one it removed. A
+-- module that only rewrites the schema answers a later indexed lookup SHORT (the narrowed
+-- case) or DOUBLE (a same-named index rebuilt over a store still holding the removed
+-- index's entries).
+--
+-- Every case runs under the memory module (`yarn test`) and the store module
+-- (`yarn test:store`); the assertions read module-agnostic engine introspection.
+
+-- ===================================================================
+-- 1. A UNIQUE index spanning the dropped column is removed outright
+-- ===================================================================
+
+create table DcUx (id integer primary key, b integer, c integer);
+create unique index ux_bc on DcUx (b, c);
+alter table DcUx drop column b;
+-- run
+
+-- Neither the index nor its derived constraint survives.
+select count(*) as c from index_info('DcUx');
+→ [{"c":0}]
+select count(*) as c from unique_constraint_info('DcUx');
+→ [{"c":0}]
+
+-- And nothing is enforced over the surviving column: duplicate c values are accepted,
+-- which is correct — no UNIQUE over (c) was ever declared.
+insert into DcUx values (1, 5);
+insert into DcUx values (2, 5);
+select count(*) as c from DcUx;
+→ [{"c":2}]
+
+drop table DcUx;
+-- run
+
+-- ===================================================================
+-- 2. A UNIQUE index that keeps every column is renumbered, not dropped
+-- ===================================================================
+
+create table DcKeep (id integer primary key, b integer, c integer, d integer);
+create unique index ux_cd on DcKeep (c, d);
+insert into DcKeep values (1, 9, 10, 11);
+alter table DcKeep drop column b;
+-- run
+
+-- Survives over its own (renumbered) columns, still unique.
+select index_name, column_name from index_info('DcKeep') order by column_name;
+→ [{"index_name":"ux_cd","column_name":"c"},{"index_name":"ux_cd","column_name":"d"}]
+
+insert into DcKeep values (2, 10, 11);
+-- error: UNIQUE
+
+insert into DcKeep values (3, 10, 12);
+select count(*) as c from DcKeep;
+→ [{"c":2}]
+
+drop table DcKeep;
+-- run
+
+-- ===================================================================
+-- 3. A plain (non-unique) index spanning the dropped column is narrowed —
+--    it constrains nothing, so the surviving columns remain a usable index
+-- ===================================================================
+
+create table DcPlain (id integer primary key, b integer, c integer);
+create index ix_bc on DcPlain (b, c);
+alter table DcPlain drop column b;
+-- run
+
+select index_name, column_name from index_info('DcPlain');
+→ [{"index_name":"ix_bc","column_name":"c"}]
+
+-- Duplicates are fine on a plain index, and the index still serves lookups.
+insert into DcPlain values (1, 5);
+insert into DcPlain values (2, 5);
+select count(*) as c from DcPlain where c = 5;
+→ [{"c":2}]
+
+drop table DcPlain;
+-- run
+
+-- ===================================================================
+-- 4. A narrowed index still answers lookups over rows indexed BEFORE the drop
+-- ===================================================================
+--
+-- The pre-drop rows are the point: their index entries were written under the WIDE key
+-- (b's value ahead of c's) while every later seek computes the NARROW one. A module that
+-- leaves them unreshaped answers the seek short — `c = 100` finds nothing — and a later
+-- DELETE cannot match its own entries, so they orphan.
+
+create table DcPre (id integer primary key, b integer, c integer);
+create index ix_bc on DcPre (b, c);
+insert into DcPre values (1, 10, 100);
+insert into DcPre values (2, 20, 200);
+alter table DcPre drop column b;
+-- run
+
+select index_name, column_name from index_info('DcPre');
+→ [{"index_name":"ix_bc","column_name":"c"}]
+
+-- Each pre-drop row is reachable through the narrowed index, exactly once.
+select id from DcPre where c = 100;
+→ [{"id":1}]
+select id from DcPre where c > 0 order by id;
+→ [{"id":1},{"id":2}]
+
+-- A row inserted after the drop joins them under the same encoding.
+insert into DcPre values (3, 300);
+select id from DcPre where c > 150 order by id;
+→ [{"id":2},{"id":3}]
+
+-- DELETE recomputes each index key: a table drained through the index leaves no row
+-- findable, pre-drop or post-drop.
+delete from DcPre;
+select count(*) as n from DcPre;
+→ [{"n":0}]
+select count(*) as n from DcPre where c > 0;
+→ [{"n":0}]
+
+drop table DcPre;
+-- run
+
+-- ===================================================================
+-- 5. Re-creating an index under the REMOVED index's name gets a clean structure
+-- ===================================================================
+--
+-- The single-column index collapses (its only column is gone), so its name is free again.
+-- A module that left the removed index's physical structure behind hands it to the new
+-- index of the same name, which then holds both encodings — a range scan yields each row
+-- twice, and a count is doubled.
+
+create table DcReuse (id integer primary key, b integer, c integer);
+create index ix_b on DcReuse (b);
+insert into DcReuse values (1, 10, 100);
+insert into DcReuse values (2, 20, 200);
+alter table DcReuse drop column b;
+-- run
+
+select count(*) as n from index_info('DcReuse');
+→ [{"n":0}]
+
+create index ix_b on DcReuse (c);
+-- run
+
+select id from DcReuse where c > 0 order by id;
+→ [{"id":1},{"id":2}]
+select count(*) as n from DcReuse where c > 0;
+→ [{"n":2}]
+select id from DcReuse where c = 100;
+→ [{"id":1}]
+
+drop table DcReuse;
+-- run

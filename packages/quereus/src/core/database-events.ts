@@ -12,6 +12,7 @@
 
 import { createLogger } from '../common/logger.js';
 import type { Row, SqlValue } from '../common/types.js';
+import { sqlValueIdentical } from '../util/comparison.js';
 import type { VTableDataChangeEvent, VTableSchemaChangeEvent, VTableEventEmitter } from '../vtab/events.js';
 
 const log = createLogger('core:database-events');
@@ -21,6 +22,11 @@ const errorLog = log.extend('error');
 /**
  * Data change event emitted at the database level.
  * Extends VTableDataChangeEvent with module identification.
+ *
+ * See `docs/usage.md` § Subscribing to Data Changes for the key contract every producer
+ * follows: `key` is projected from the event's own row image, and an `update` never moves a
+ * row (a relocating primary-key change is a `delete` at the old key then an `insert` at the new
+ * one, in that order — ordering guaranteed, adjacency not).
  */
 export interface DatabaseDataChangeEvent {
 	/** The type of mutation operation */
@@ -31,7 +37,7 @@ export interface DatabaseDataChangeEvent {
 	schemaName: string;
 	/** Table name */
 	tableName: string;
-	/** Primary key values */
+	/** Primary key projected from this event's own image: `newRow` for insert/update, `oldRow` for delete */
 	key?: SqlValue[];
 	/** Previous row data (for update/delete) */
 	oldRow?: Row;
@@ -58,6 +64,9 @@ export interface DatabaseSchemaChangeEvent {
 	schemaName: string;
 	/** Object name (table name for table/column, index name for index) */
 	objectName: string;
+	/** Old object name — `RENAME TO` only: the table name before the rename
+	 *  (`objectName` carries the new one). Companion to `oldColumnName`. */
+	oldObjectName?: string;
 	/** Column name (for column operations) */
 	columnName?: string;
 	/** Old column name (for column rename) */
@@ -68,8 +77,70 @@ export interface DatabaseSchemaChangeEvent {
 	remote: boolean;
 }
 
+/**
+ * Materialized-view key-coarsening **collision** event emitted at the database
+ * level — the operational complement to the create-time key-coarsening warning
+ * (`docs/materialized-views.md` § Coarsened backing keys). Fired from row-time
+ * maintenance whenever an upsert under the coarsened backing key K′ replaces a
+ * backing row whose **source identity differs** from the incoming row's — i.e.
+ * two distinct source-key tuples (`'Bob'` / `'bob'`) merged into one derived row
+ * under K′'s coarsened (output) collation, last-writer-win (`docs/migration.md`
+ * § Convergence hazards). One event per realized colliding merge, delivered on
+ * the commit that realized it (it rides the same transaction batching the
+ * data/schema channels use, so a collision inside a rolled-back transaction
+ * reports nothing).
+ */
+export interface MaintenanceCollisionEvent {
+	/** Schema name of the maintained (backing) table. */
+	schemaName: string;
+	/** Maintained (backing) table name. */
+	tableName: string;
+	/** The coarsened backing key K′ values (from the incoming/new row), in key order. */
+	key: SqlValue[];
+	/** Names of the weakened K′ column(s) whose values diverged under the source
+	 *  (pre-coarsening, stricter) collation — the columns whose coarsening realized
+	 *  the merge. */
+	weakenedColumns: string[];
+	/** The replaced backing row (the losing source identity's prior image). */
+	oldRow: Row;
+	/** The incoming backing row that won the merge (the new image). */
+	newRow: Row;
+	/** Reserved: true when the colliding write arrived via the external-change
+	 *  ingest seam (peer) rather than local DML. Not threaded through maintenance
+	 *  in v1 (see the ticket's Out of scope) — left unset. */
+	remote?: boolean;
+}
+
+/**
+ * The complete, ordered fact set of one committed logical transaction, delivered
+ * as a single group on the {@link DatabaseEventEmitter.onTransactionCommit}
+ * channel. This is the authoritative "one transaction = one group" boundary the
+ * sync layer anchors an HLC to: it spans **all** tables touched by the
+ * transaction (every module's emitter feeds the same engine-level batch), so a
+ * cross-table commit is never split — unlike a per-table store coordinator, which
+ * commits each table separately. See `docs/sync.md` § Transaction-Based Change
+ * Grouping.
+ *
+ * Delivered once from `flushBatch()` (i.e. after a successful commit), never on
+ * rollback. The `dataEvents`/`schemaEvents` carry the same
+ * {@link DatabaseDataChangeEvent}/{@link DatabaseSchemaChangeEvent} shapes the
+ * per-event `onDataChange`/`onSchemaChange` channels deliver — `onTransactionCommit`
+ * is purely additive and does not replace them.
+ */
+export interface TransactionCommitBatch {
+	/** All data events of the committed transaction, in flush order (base batch
+	 *  then each savepoint layer, in push order — the same order `flushBatch`
+	 *  emits per-event). Per-module/per-table arrival order at commit, not global
+	 *  DML-interleave order; deterministic and replayable. */
+	readonly dataEvents: ReadonlyArray<DatabaseDataChangeEvent>;
+	/** All schema events of the committed transaction, in flush order. */
+	readonly schemaEvents: ReadonlyArray<DatabaseSchemaChangeEvent>;
+}
+
 export type DatabaseDataChangeListener = (event: DatabaseDataChangeEvent) => void;
 export type DatabaseSchemaChangeListener = (event: DatabaseSchemaChangeEvent) => void;
+export type MaintenanceCollisionListener = (event: MaintenanceCollisionEvent) => void;
+export type TransactionCommitListener = (batch: TransactionCommitBatch) => void;
 
 /**
  * Options for subscribing to data change events.
@@ -114,10 +185,107 @@ interface PendingDataEvent {
 interface PendingSchemaEvent {
 	moduleName: string;
 	event: VTableSchemaChangeEvent;
+	/**
+	 * Position in the emitter's lifetime-monotonic schema-event stream, stamped by
+	 * {@link DatabaseEventEmitter.pushSchemaEvent}. Read only by
+	 * {@link DatabaseEventEmitter.discardSchemaEventsSince}.
+	 */
+	seq: number;
 }
 
 /** Default maximum number of listeners per event type before a warning is logged. */
 const DEFAULT_MAX_LISTENERS = 100;
+
+/**
+ * Whether a batched event names `(schemaLower, tableLower)` — the single matching rule
+ * every batched-event rewrite (row-shape remap, table-name relabel, primary-key re-key)
+ * applies, on both the data and the maintenance-collision channel. Both operands are
+ * compared lowercased, so callers pass already-lowercased names.
+ */
+function namesTable(
+	event: { schemaName: string; tableName: string },
+	schemaLower: string,
+	tableLower: string,
+): boolean {
+	return event.schemaName.toLowerCase() === schemaLower
+		&& event.tableName.toLowerCase() === tableLower;
+}
+
+/**
+ * Project `row` through `indices`, or `undefined` when any index is out of bounds for
+ * it. Shared by the re-key itself and its update-image tie-break, so both refuse the
+ * same partial projection rather than emitting an `undefined` key slot.
+ */
+function projectKey(row: Row, indices: readonly number[]): SqlValue[] | undefined {
+	const out: SqlValue[] = [];
+	for (const i of indices) {
+		if (i < 0 || i >= row.length) return undefined;
+		out.push(row[i]);
+	}
+	return out;
+}
+
+/**
+ * Whether projecting `row` through `indices` reproduces `key` value-for-value —
+ * the test that identifies which image an event's recorded `key` was derived from.
+ */
+function keyMatchesImage(row: Row, indices: readonly number[], key: readonly SqlValue[]): boolean {
+	if (indices.length !== key.length) return false;
+	const projected = projectKey(row, indices);
+	if (!projected) return false;
+	return projected.every((v, i) => sqlValueIdentical(v, key[i]));
+}
+
+/**
+ * The row image whose projection through the RETIRED primary key produced the event's
+ * recorded `key` — the image {@link DatabaseEventEmitter.rekeyBatchedDataEvents} must
+ * re-project through the new key so the re-key preserves whichever row the producer
+ * was addressing.
+ *
+ * This is just the producers' own key rule (docs/usage.md § Subscribing to Data Changes)
+ * read backwards: `key` is projected from `newRow` for an insert or an update, from
+ * `oldRow` for a delete. An update's two images can still differ in a key column — a
+ * NOCASE 'apple' → 'APPLE' rewrite leaves the row in place, and the contract keys it by the
+ * post-image — which is why `newRow` is not merely a convenience here.
+ *
+ * A recorded `key` that the chosen image does not reproduce under the retired key means the
+ * producer broke that rule (a module with its own emitter that normalizes key values, or one
+ * still keying an update by its pre-image). The re-key then addresses a different row than
+ * the producer meant, so it says so and proceeds by the contract.
+ */
+function selectKeySourceImage(
+	event: VTableDataChangeEvent,
+	oldPkIndices: readonly number[],
+): Row | undefined {
+	if (event.type === 'delete') return event.oldRow;
+
+	const image = event.newRow ?? event.oldRow;
+	if (event.key && image !== undefined && !keyMatchesImage(image, oldPkIndices, event.key)) {
+		warnLog('rekeyBatchedDataEvents: the %s event on %s.%s carries key %O, which its row image does not reproduce under the retired key columns %O — the producer is not keying events from the row image; re-keying from that image anyway',
+			event.type, event.schemaName, event.tableName, event.key, oldPkIndices);
+	}
+	return image;
+}
+
+/**
+ * Names of the columns whose values differ between two same-arity row images —
+ * the `changedColumns` recomputation for a remapped update event. Same strict
+ * (`!==`) comparison the memory module's `computeChangedColumns` uses.
+ */
+function computeChangedColumnNames(oldRow: Row, newRow: Row, columnNames: readonly string[]): string[] {
+	const changed: string[] = [];
+	for (let i = 0; i < columnNames.length; i++) {
+		if (oldRow[i] !== newRow[i]) changed.push(columnNames[i]);
+	}
+	return changed;
+}
+
+/**
+ * Which producer an event reached the emitter from: `'module'` = forwarded from a module's own
+ * emitter, `'auto'` = generated by the engine for a module without one. Only used to label the
+ * log line when an event is discarded.
+ */
+type EventOrigin = 'module' | 'auto';
 
 /**
  * Central event emitter for database-level reactivity.
@@ -132,18 +300,55 @@ const DEFAULT_MAX_LISTENERS = 100;
 export class DatabaseEventEmitter {
 	private dataListeners = new Set<DatabaseDataChangeListener>();
 	private schemaListeners = new Set<DatabaseSchemaChangeListener>();
+	private collisionListeners = new Set<MaintenanceCollisionListener>();
+	private transactionCommitListeners = new Set<TransactionCommitListener>();
 	private maxListeners = DEFAULT_MAX_LISTENERS;
 
 	/** Batched events waiting for commit (base transaction level) */
 	private batchedDataEvents: PendingDataEvent[] = [];
 	private batchedSchemaEvents: PendingSchemaEvent[] = [];
+	private batchedCollisionEvents: MaintenanceCollisionEvent[] = [];
 
 	/** Savepoint layers for event batching - each layer captures events since that savepoint */
 	private dataEventLayers: PendingDataEvent[][] = [];
 	private schemaEventLayers: PendingSchemaEvent[][] = [];
+	private collisionEventLayers: MaintenanceCollisionEvent[][] = [];
+
+	/**
+	 * Next value stamped onto a batched schema event's {@link PendingSchemaEvent.seq}.
+	 *
+	 * NEVER reset — not by {@link startBatch}, not by {@link flushBatch}, not by
+	 * {@link removeAllListeners}. Every stamp is therefore distinct for the emitter's whole
+	 * lifetime, so an event batched BEFORE a scope opened can never be mistaken for one
+	 * batched inside it, however many transactions and savepoint layers came between.
+	 *
+	 * That is a guard against under-matching only. `discardSchemaEventsSince` drops
+	 * everything from its watermark ON, so a watermark held past its own scope would also
+	 * retract events batched after it — which is why the only caller
+	 * (`withStatementScopedSchemaEvents` in `runtime/emit/alter-schema-event.ts`) takes one
+	 * and spends it inside a single try/catch, never storing it.
+	 */
+	private schemaEventSeq = 0;
+
+	/**
+	 * Cumulative count of COMMITTED key-coarsening collisions, keyed by lowercased
+	 * qualified `schema.table` of the maintained table. Incremented in
+	 * {@link flushBatch} as each batched collision is emitted (or immediately on the
+	 * non-batching path) — so the count reflects only collisions that actually
+	 * committed, consistent with event delivery, and survives a host that never
+	 * subscribed an `onMaintenanceCollision` listener.
+	 */
+	private collisionCounts = new Map<string, number>();
 
 	/** Whether we're currently in a transaction (batching mode) */
 	private isBatching = false;
+
+	/**
+	 * Nesting depth of open {@link withPublicEventsSuppressed} scopes. Non-zero ⇒ the
+	 * application-facing channels are suppressed. A counter rather than a flag so an inner
+	 * scope's exit cannot leave suppression stuck on (or off) for the outer one.
+	 */
+	private publicEventSuppressionDepth = 0;
 
 	/** Map of module emitters we've subscribed to, for cleanup */
 	private moduleSubscriptions = new Map<string, { dataUnsub?: () => void; schemaUnsub?: () => void }>();
@@ -214,6 +419,175 @@ export class DatabaseEventEmitter {
 	 */
 	hasSchemaListeners(): boolean {
 		return this.schemaListeners.size > 0;
+	}
+
+	/**
+	 * Subscribe to materialized-view key-coarsening collision events
+	 * ({@link MaintenanceCollisionEvent}). Events share the data/schema channels'
+	 * transaction-batching discipline — delivered after the commit that realized
+	 * the merge, dropped on rollback.
+	 * @param listener Callback invoked for each committed collision
+	 * @returns Unsubscribe function
+	 */
+	onMaintenanceCollision(listener: MaintenanceCollisionListener): () => void {
+		this.collisionListeners.add(listener);
+		this.checkListenerCount('collision', this.collisionListeners.size);
+		log('Added maintenance-collision listener, total: %d', this.collisionListeners.size);
+		return () => {
+			this.collisionListeners.delete(listener);
+			log('Removed maintenance-collision listener, total: %d', this.collisionListeners.size);
+		};
+	}
+
+	/**
+	 * Check if there are any maintenance-collision listeners registered.
+	 */
+	hasCollisionListeners(): boolean {
+		return this.collisionListeners.size > 0;
+	}
+
+	/**
+	 * Subscribe to grouped per-transaction commit batches
+	 * ({@link TransactionCommitBatch}). Fired **once** per committed logical
+	 * transaction, after the per-event {@link onDataChange}/{@link onSchemaChange}
+	 * delivery, carrying every data and schema event of that transaction (across
+	 * all tables) in flush order — the authoritative grouping boundary for
+	 * "one transaction = one group". Never fires on rollback, and never fires for a
+	 * transaction that produced no data or schema events (an empty/idle commit).
+	 * This is additive: the per-event channels are untouched.
+	 * @param listener Callback invoked once per committed transaction
+	 * @returns Unsubscribe function
+	 */
+	onTransactionCommit(listener: TransactionCommitListener): () => void {
+		this.transactionCommitListeners.add(listener);
+		this.checkListenerCount('transaction-commit', this.transactionCommitListeners.size);
+		log('Added transaction-commit listener, total: %d', this.transactionCommitListeners.size);
+		return () => {
+			this.transactionCommitListeners.delete(listener);
+			log('Removed transaction-commit listener, total: %d', this.transactionCommitListeners.size);
+		};
+	}
+
+	/**
+	 * Check if there are any transaction-commit listeners registered.
+	 */
+	hasTransactionCommitListeners(): boolean {
+		return this.transactionCommitListeners.size > 0;
+	}
+
+	/**
+	 * Whether the engine must collect data-change events for delivery — true when
+	 * any per-event {@link onDataChange} listener OR any {@link onTransactionCommit}
+	 * listener is registered. A transaction-commit listener needs the grouped data
+	 * events, so the auto-event generation gate must open for it too even when no
+	 * per-event data listener is subscribed. Consulted by the DML executor's
+	 * auto-event gate (see `dml-executor.ts`).
+	 *
+	 * Always false inside a {@link withPublicEventsSuppressed} scope — the cheapest place
+	 * to suppress is before the event is ever built.
+	 */
+	needsDataEvents(): boolean {
+		if (this.publicEventSuppressionDepth > 0) return false;
+		return this.dataListeners.size > 0 || this.transactionCommitListeners.size > 0;
+	}
+
+	/**
+	 * Whether the engine must collect schema-change events for delivery — true when
+	 * any per-event {@link onSchemaChange} listener OR any {@link onTransactionCommit}
+	 * listener is registered. Companion to {@link needsDataEvents}; consulted by the
+	 * schema manager's auto-event gate (see `schema/manager.ts`).
+	 *
+	 * Always false inside a {@link withPublicEventsSuppressed} scope, as above.
+	 */
+	needsSchemaEvents(): boolean {
+		if (this.publicEventSuppressionDepth > 0) return false;
+		return this.schemaListeners.size > 0 || this.transactionCommitListeners.size > 0;
+	}
+
+	/**
+	 * Run `fn` with the PUBLIC event channels suppressed: {@link onDataChange},
+	 * {@link onSchemaChange}, and — because a suppressed statement contributes nothing to the
+	 * group — {@link onTransactionCommit}. While the scope is open,
+	 * {@link needsDataEvents}/{@link needsSchemaEvents} report false so the engine's own
+	 * producers never build an event, and any event that arrives anyway (a module with its own
+	 * emitter reaches {@link handleModuleDataEvent}/{@link handleModuleSchemaEvent} without
+	 * consulting a gate) is dropped with a log line rather than silently.
+	 *
+	 * This covers ONLY those application-facing channels. It deliberately does **not** touch
+	 * the internal catalog change notifier
+	 * (`db.schemaManager.getChangeNotifier().notifyChange`), which invalidates the optimizer's
+	 * and the write path's cached schemas: that is engine plumbing, and a suppressed scope's
+	 * own DDL must keep firing it or those caches go stale mid-statement. The
+	 * maintenance-collision channel ({@link queueCollision}) is likewise untouched — no
+	 * suppressed scope today writes through materialized-view maintenance.
+	 *
+	 * For engine-internal scaffolding the application never issued. Sole caller today: the
+	 * shadow-table rebuild behind `ALTER TABLE … ALTER PRIMARY KEY` on a module that cannot
+	 * re-key in place (`runtime/emit/alter-table.ts`).
+	 *
+	 * Suppression is global, not table-scoped: while the scope is open an event on ANY table
+	 * from ANY source is dropped. That is safe only because `Database` serializes statements
+	 * behind its execution mutex, so a scope opened mid-statement cannot swallow a concurrent
+	 * statement's events — `fn` must therefore do nothing but engine-internal work (nested
+	 * `_execWithinTransaction` SQL, which runs under the caller's already-held mutex). A caller
+	 * that awaited genuinely user-visible work inside `fn` would silently swallow the user's
+	 * own events; scope it to the scaffolding instead.
+	 *
+	 * Nests, and restores the previous depth even when `fn` throws.
+	 */
+	async withPublicEventsSuppressed<T>(fn: () => Promise<T>): Promise<T> {
+		this.publicEventSuppressionDepth++;
+		log('Suppressing public event channels (depth: %d)', this.publicEventSuppressionDepth);
+		try {
+			return await fn();
+		} finally {
+			this.publicEventSuppressionDepth--;
+			log('Restoring public event channels (depth: %d)', this.publicEventSuppressionDepth);
+		}
+	}
+
+	/**
+	 * Whether a {@link withPublicEventsSuppressed} scope is currently open.
+	 */
+	isPublicEventsSuppressed(): boolean {
+		return this.publicEventSuppressionDepth > 0;
+	}
+
+	/**
+	 * Whether an arriving data event must be dropped because a
+	 * {@link withPublicEventsSuppressed} scope is open — logging it when so, so a discarded
+	 * event stays traceable.
+	 */
+	private dropDataEventWhileSuppressed(
+		origin: EventOrigin,
+		moduleName: string,
+		event: VTableDataChangeEvent,
+	): boolean {
+		if (!this.isPublicEventsSuppressed()) return false;
+		log('Dropped %s data event from %s while public events are suppressed: %s on %s.%s',
+			origin, moduleName, event.type, event.schemaName, event.tableName);
+		return true;
+	}
+
+	/** Schema-channel counterpart of {@link dropDataEventWhileSuppressed}. */
+	private dropSchemaEventWhileSuppressed(
+		origin: EventOrigin,
+		moduleName: string,
+		event: VTableSchemaChangeEvent,
+	): boolean {
+		if (!this.isPublicEventsSuppressed()) return false;
+		log('Dropped %s schema event from %s while public events are suppressed: %s %s %s',
+			origin, moduleName, event.type, event.objectType, event.objectName);
+		return true;
+	}
+
+	/**
+	 * Read-only snapshot of the cumulative committed-collision counter, keyed by
+	 * lowercased qualified `schema.table`. A fresh copy each call, so the caller
+	 * cannot mutate the live counter.
+	 */
+	getMaterializedViewCollisionStats(): ReadonlyMap<string, number> {
+		return new Map(this.collisionCounts);
 	}
 
 	/**
@@ -297,10 +671,109 @@ export class DatabaseEventEmitter {
 	}
 
 	/**
+	 * Get the active collision event store (top savepoint layer or base).
+	 */
+	private getActiveCollisionStore(): MaintenanceCollisionEvent[] {
+		return this.collisionEventLayers.length > 0
+			? this.collisionEventLayers[this.collisionEventLayers.length - 1]
+			: this.batchedCollisionEvents;
+	}
+
+	/**
+	 * Every data-event store a batched rewrite must walk: the base batch plus each open
+	 * savepoint layer. A rewrite touches all of them because a layer's events are still
+	 * undelivered — a later RELEASE merges them into the parent and the commit ships them.
+	 */
+	private allDataEventStores(): PendingDataEvent[][] {
+		return [this.batchedDataEvents, ...this.dataEventLayers];
+	}
+
+	/** Schema-channel counterpart of {@link allDataEventStores}. */
+	private allSchemaEventStores(): PendingSchemaEvent[][] {
+		return [this.batchedSchemaEvents, ...this.schemaEventLayers];
+	}
+
+	/** Collision-channel counterpart of {@link allDataEventStores}. */
+	private allCollisionEventStores(): MaintenanceCollisionEvent[][] {
+		return [this.batchedCollisionEvents, ...this.collisionEventLayers];
+	}
+
+	/**
+	 * The ONE place a schema event enters the batch, so every batched schema event carries a
+	 * {@link PendingSchemaEvent.seq} stamp — both the module-emitter path
+	 * ({@link handleModuleSchemaEvent}) and the engine's own ({@link emitAutoSchemaEvent})
+	 * route through here. A second push site that skipped the stamp would produce an event
+	 * {@link discardSchemaEventsSince} silently cannot retract.
+	 */
+	private pushSchemaEvent(moduleName: string, event: VTableSchemaChangeEvent): void {
+		this.getActiveSchemaStore().push({ moduleName, event, seq: this.schemaEventSeq++ });
+	}
+
+	/**
+	 * Take a watermark identifying "every schema event batched from here on" — the mark half
+	 * of the mark/discard pair {@link discardSchemaEventsSince} completes. Used to make one
+	 * statement's schema events retractable when the statement then fails; see
+	 * `runtime/emit/alter-schema-event.ts` § `withStatementScopedSchemaEvents`.
+	 */
+	beginSchemaEventScope(): number {
+		return this.schemaEventSeq;
+	}
+
+	/**
+	 * Drop every BATCHED schema event stamped at or after `watermark`, and return how many
+	 * went. The retraction half of {@link beginSchemaEventScope}: a statement that produced
+	 * schema events and then threw must announce nothing, and a module that emits from inside
+	 * its own `alterTable` has already put its event in the batch by the time the engine's
+	 * revert runs.
+	 *
+	 * Walks the base batch AND every open savepoint layer, like
+	 * {@link remapBatchedDataEvents} / {@link renameBatchedEvents} do — a layer's events are
+	 * still undelivered, and a RELEASE would merge them into the parent.
+	 *
+	 * Matching is by the per-event STAMP, never by a remembered array length: between the mark
+	 * and the discard a savepoint layer can be pushed, popped, or released, and
+	 * {@link releaseSavepointLayer} moves entries between arrays. A stamp travels with the
+	 * event through all of that; an index into an array does not.
+	 *
+	 * DATA events are deliberately untouched, and this is a trap worth stating: the store
+	 * module's `ddlCommitPendingOps()` flushes the transaction's EARLIER buffered writes into
+	 * this batch during an ALTER, so those data events fall inside the failing statement's
+	 * window while belonging to previous, successful statements. Retracting them would
+	 * silently swallow committed work. The maintenance-collision channel is out of scope for
+	 * the same reason (nothing in a DDL statement's window produced it).
+	 *
+	 * No-op when not batching: without a batch the events were already delivered
+	 * synchronously and there is nothing left to retract.
+	 */
+	discardSchemaEventsSince(watermark: number): number {
+		if (!this.isBatching) return 0;
+
+		// NOTE: splices per matching event, so a scope covering N events costs O(N × batch
+		// size). One ALTER statement batches at most a handful (its module announces once),
+		// so this is nothing today. If a scope ever spans many schema events — a batched DDL
+		// arm, a whole failed migration — partition each store into a kept array instead.
+		let discarded = 0;
+		for (const store of this.allSchemaEventStores()) {
+			for (let i = store.length - 1; i >= 0; i--) {
+				if (store[i].seq < watermark) continue;
+				store.splice(i, 1);
+				discarded++;
+			}
+		}
+
+		if (discarded > 0) {
+			log('Discarded %d batched schema events stamped at or after watermark %d (the statement that produced them failed)',
+				discarded, watermark);
+		}
+		return discarded;
+	}
+
+	/**
 	 * Handle a data change event from a module.
 	 * If batching, queue the event; otherwise emit immediately.
 	 */
 	private handleModuleDataEvent(moduleName: string, event: VTableDataChangeEvent): void {
+		if (this.dropDataEventWhileSuppressed('module', moduleName, event)) return;
 		if (this.isBatching) {
 			this.getActiveDataStore().push({ moduleName, event });
 			log('Batched data event from %s: %s on %s.%s', moduleName, event.type, event.schemaName, event.tableName);
@@ -315,8 +788,9 @@ export class DatabaseEventEmitter {
 	 * but we support batching for consistency.
 	 */
 	private handleModuleSchemaEvent(moduleName: string, event: VTableSchemaChangeEvent): void {
+		if (this.dropSchemaEventWhileSuppressed('module', moduleName, event)) return;
 		if (this.isBatching) {
-			this.getActiveSchemaStore().push({ moduleName, event });
+			this.pushSchemaEvent(moduleName, event);
 			log('Batched schema event from %s: %s %s', moduleName, event.type, event.objectName);
 		} else {
 			this.emitSchemaEvent(moduleName, event);
@@ -331,6 +805,7 @@ export class DatabaseEventEmitter {
 	 * @param event The event to emit (will be converted to DatabaseDataChangeEvent)
 	 */
 	emitAutoDataEvent(moduleName: string, event: VTableDataChangeEvent): void {
+		if (this.dropDataEventWhileSuppressed('auto', moduleName, event)) return;
 		if (this.isBatching) {
 			this.getActiveDataStore().push({ moduleName, event });
 			log('Batched auto data event from %s: %s on %s.%s', moduleName, event.type, event.schemaName, event.tableName);
@@ -347,20 +822,64 @@ export class DatabaseEventEmitter {
 	 * @param event The event to emit
 	 */
 	emitAutoSchemaEvent(moduleName: string, event: VTableSchemaChangeEvent): void {
+		if (this.dropSchemaEventWhileSuppressed('auto', moduleName, event)) return;
 		if (this.isBatching) {
-			this.getActiveSchemaStore().push({ moduleName, event });
+			this.pushSchemaEvent(moduleName, event);
 		} else {
 			this.emitSchemaEvent(moduleName, event);
 		}
 	}
 
 	/**
-	 * Emit a data event to all listeners.
+	 * Queue a materialized-view key-coarsening collision for delivery. If batching
+	 * (inside a transaction/savepoint), the event is captured in the active store
+	 * and emitted only on commit (dropped on rollback); otherwise it is emitted —
+	 * and counted — immediately. Mirrors {@link emitAutoDataEvent}.
 	 */
-	private emitDataEvent(moduleName: string, event: VTableDataChangeEvent): void {
-		if (this.dataListeners.size === 0) return;
+	queueCollision(event: MaintenanceCollisionEvent): void {
+		if (this.isBatching) {
+			this.getActiveCollisionStore().push(event);
+			log('Batched maintenance-collision event on %s.%s', event.schemaName, event.tableName);
+		} else {
+			this.emitCollisionEvent(event);
+		}
+	}
 
-		const dbEvent: DatabaseDataChangeEvent = {
+	/**
+	 * Count and emit one collision event. The cumulative committed-collision
+	 * counter is incremented FIRST (always — even with no listeners, so the count
+	 * survives a host that never subscribed), then the event is delivered to each
+	 * listener. A throwing listener is isolated so it cannot break emission to the
+	 * others or the commit (mirrors {@link emitDataEvent}).
+	 */
+	private emitCollisionEvent(event: MaintenanceCollisionEvent): void {
+		const counterKey = `${event.schemaName}.${event.tableName}`.toLowerCase();
+		this.collisionCounts.set(counterKey, (this.collisionCounts.get(counterKey) ?? 0) + 1);
+
+		if (this.collisionListeners.size === 0) return;
+
+		log('Emitting maintenance-collision event on %s.%s (weakened: %s)',
+			event.schemaName, event.tableName, event.weakenedColumns.join(', '));
+
+		for (const listener of this.collisionListeners) {
+			try {
+				listener(event);
+			} catch (e) {
+				errorLog('Maintenance-collision listener error on %s.%s: %O',
+					event.schemaName, event.tableName, e);
+			}
+		}
+	}
+
+	/**
+	 * Project a pending data event into the database-level {@link DatabaseDataChangeEvent}
+	 * shape delivered to listeners. The single source of truth for the projection,
+	 * reused by both the per-event {@link emitDataEvent} path and the grouped
+	 * {@link flushBatch} transaction-commit batch so listeners on either channel see
+	 * identical shapes.
+	 */
+	private toDataChangeEvent(moduleName: string, event: VTableDataChangeEvent): DatabaseDataChangeEvent {
+		return {
 			type: event.type,
 			moduleName,
 			schemaName: event.schemaName,
@@ -371,6 +890,34 @@ export class DatabaseEventEmitter {
 			changedColumns: event.changedColumns,
 			remote: event.remote ?? false,
 		};
+	}
+
+	/**
+	 * Project a pending schema event into the database-level {@link DatabaseSchemaChangeEvent}
+	 * shape. Companion to {@link toDataChangeEvent}; same dual-use rationale.
+	 */
+	private toSchemaChangeEvent(moduleName: string, event: VTableSchemaChangeEvent): DatabaseSchemaChangeEvent {
+		return {
+			type: event.type,
+			objectType: event.objectType,
+			moduleName,
+			schemaName: event.schemaName,
+			objectName: event.objectName,
+			oldObjectName: event.oldObjectName,
+			columnName: event.columnName,
+			oldColumnName: event.oldColumnName,
+			ddl: event.ddl,
+			remote: event.remote ?? false,
+		};
+	}
+
+	/**
+	 * Emit a data event to all listeners.
+	 */
+	private emitDataEvent(moduleName: string, event: VTableDataChangeEvent): void {
+		if (this.dataListeners.size === 0) return;
+
+		const dbEvent = this.toDataChangeEvent(moduleName, event);
 
 		log('Emitting data event: %s on %s.%s (module: %s, remote: %s)',
 			dbEvent.type, dbEvent.schemaName, dbEvent.tableName, moduleName, dbEvent.remote);
@@ -391,17 +938,7 @@ export class DatabaseEventEmitter {
 	private emitSchemaEvent(moduleName: string, event: VTableSchemaChangeEvent): void {
 		if (this.schemaListeners.size === 0) return;
 
-		const dbEvent: DatabaseSchemaChangeEvent = {
-			type: event.type,
-			objectType: event.objectType,
-			moduleName,
-			schemaName: event.schemaName,
-			objectName: event.objectName,
-			columnName: event.columnName,
-			oldColumnName: event.oldColumnName,
-			ddl: event.ddl,
-			remote: event.remote ?? false,
-		};
+		const dbEvent = this.toSchemaChangeEvent(moduleName, event);
 
 		log('Emitting schema event: %s %s %s (module: %s, remote: %s)',
 			dbEvent.type, dbEvent.objectType, dbEvent.objectName, moduleName, dbEvent.remote);
@@ -423,8 +960,10 @@ export class DatabaseEventEmitter {
 		this.isBatching = true;
 		this.batchedDataEvents = [];
 		this.batchedSchemaEvents = [];
+		this.batchedCollisionEvents = [];
 		this.dataEventLayers = [];
 		this.schemaEventLayers = [];
+		this.collisionEventLayers = [];
 		log('Started event batching');
 	}
 
@@ -446,13 +985,21 @@ export class DatabaseEventEmitter {
 			allSchemaEvents.push(...layer);
 		}
 
+		const allCollisionEvents: MaintenanceCollisionEvent[] = [...this.batchedCollisionEvents];
+		for (const layer of this.collisionEventLayers) {
+			allCollisionEvents.push(...layer);
+		}
+
 		// Clear all
 		this.batchedDataEvents = [];
 		this.batchedSchemaEvents = [];
+		this.batchedCollisionEvents = [];
 		this.dataEventLayers = [];
 		this.schemaEventLayers = [];
+		this.collisionEventLayers = [];
 
-		log('Flushing %d data events and %d schema events', allDataEvents.length, allSchemaEvents.length);
+		log('Flushing %d data events, %d schema events, and %d collision events',
+			allDataEvents.length, allSchemaEvents.length, allCollisionEvents.length);
 
 		// Emit schema events first (table creation before data insertion makes logical sense)
 		for (const { moduleName, event } of allSchemaEvents) {
@@ -463,6 +1010,247 @@ export class DatabaseEventEmitter {
 		for (const { moduleName, event } of allDataEvents) {
 			this.emitDataEvent(moduleName, event);
 		}
+
+		// Then count + emit collision events (each increments the cumulative counter,
+		// so the count reflects only committed collisions).
+		for (const event of allCollisionEvents) {
+			this.emitCollisionEvent(event);
+		}
+
+		// Finally, deliver the whole committed transaction as a single grouped
+		// batch on the additive onTransactionCommit channel. Built from the same
+		// allDataEvents/allSchemaEvents projections the per-event path used, so the
+		// shapes match. Skipped entirely when no listener is subscribed (avoid the
+		// per-commit allocation in the common no-subscriber case) or when the
+		// transaction produced no data/schema facts (an empty/idle commit, or one
+		// that produced only collisions — collisions keep their own channel).
+		if (this.transactionCommitListeners.size > 0 && (allDataEvents.length + allSchemaEvents.length) > 0) {
+			this.emitTransactionCommit({
+				dataEvents: allDataEvents.map(({ moduleName, event }) => this.toDataChangeEvent(moduleName, event)),
+				schemaEvents: allSchemaEvents.map(({ moduleName, event }) => this.toSchemaChangeEvent(moduleName, event)),
+			});
+		}
+	}
+
+	/**
+	 * Deliver one grouped {@link TransactionCommitBatch} to each transaction-commit
+	 * listener. A throwing listener is isolated so it cannot break delivery to the
+	 * others or the commit (mirrors {@link emitDataEvent}).
+	 */
+	private emitTransactionCommit(batch: TransactionCommitBatch): void {
+		log('Emitting transaction-commit batch: %d data events, %d schema events',
+			batch.dataEvents.length, batch.schemaEvents.length);
+
+		for (const listener of this.transactionCommitListeners) {
+			try {
+				listener(batch);
+			} catch (e) {
+				errorLog('Transaction-commit listener error: %O', e);
+			}
+		}
+	}
+
+	/**
+	 * Rewrite the row images of every BATCHED data event for one table, in place, after a
+	 * mid-transaction column-set, column-name, or column-value change (`ALTER TABLE
+	 * ADD/DROP/RENAME COLUMN`, `ALTER COLUMN … SET DATA TYPE` / `SET NOT NULL` backfill).
+	 * Covers {@link batchedDataEvents} and every {@link dataEventLayers} savepoint layer,
+	 * so a commit delivers each event's `oldRow`/`newRow` in the schema current at delivery.
+	 * No-op when not batching: in autocommit the earlier events were already delivered,
+	 * and there is no earlier same-transaction write to fix.
+	 *
+	 * An event that already carried `changedColumns` gets it re-derived against
+	 * `newColumnNames`; one that never carried it keeps it absent, because some modules
+	 * (the store) deliberately omit it and leave the per-column diff to the consumer —
+	 * synthesizing one only for transactions that happened to ALTER would make the
+	 * delivered shape depend on unrelated DDL.
+	 *
+	 * BEST-EFFORT, unlike the module-side pending-ROW reshape (whose failure must reject
+	 * the ALTER): these are historical row images, including superseded intermediate ones
+	 * a backfill evaluator or value conversion can legitimately fail on. A `remapRow`
+	 * throw leaves that event's image as it was (logged), and never rejects an ALTER
+	 * that would otherwise succeed.
+	 */
+	async remapBatchedDataEvents(
+		schemaName: string,
+		tableName: string,
+		remapRow: (row: Row, which: 'old' | 'new') => Row | Promise<Row>,
+		newColumnNames: readonly string[],
+	): Promise<void> {
+		if (!this.isBatching) return;
+
+		const schemaLower = schemaName.toLowerCase();
+		const tableLower = tableName.toLowerCase();
+		let remapped = 0;
+		for (const store of this.allDataEventStores()) {
+			for (const entry of store) {
+				const event = entry.event;
+				if (!namesTable(event, schemaLower, tableLower)) continue;
+				const next: VTableDataChangeEvent = { ...event };
+				try {
+					if (event.oldRow !== undefined) next.oldRow = await remapRow(event.oldRow, 'old');
+				} catch (e) {
+					warnLog('remapBatchedDataEvents: oldRow remap failed on %s.%s, leaving image as-is: %O',
+						event.schemaName, event.tableName, e);
+				}
+				try {
+					if (event.newRow !== undefined) next.newRow = await remapRow(event.newRow, 'new');
+				} catch (e) {
+					warnLog('remapBatchedDataEvents: newRow remap failed on %s.%s, leaving image as-is: %O',
+						event.schemaName, event.tableName, e);
+				}
+				if (next.changedColumns) {
+					// Both images present at a common arity ⇒ re-derive positionally: a dropped
+					// column falls out, an added one can appear, and a RENAME's new name
+					// replaces the old. Otherwise (a delete's lone image, or a remap that failed
+					// on one side and left it at the old arity) a positional diff is meaningless,
+					// so only drop names that no longer exist.
+					if (next.oldRow && next.newRow && next.oldRow.length === next.newRow.length) {
+						next.changedColumns = computeChangedColumnNames(next.oldRow, next.newRow, newColumnNames);
+					} else {
+						const valid = new Set(newColumnNames.map(n => n.toLowerCase()));
+						next.changedColumns = next.changedColumns.filter(n => valid.has(n.toLowerCase()));
+					}
+				}
+				entry.event = next;
+				remapped++;
+			}
+		}
+		if (remapped > 0) {
+			log('Remapped %d batched data events on %s.%s after mid-transaction ALTER', remapped, schemaName, tableName);
+		}
+	}
+
+	/**
+	 * Relabel every BATCHED event naming `(schemaName, oldTableName)` to `newTableName`,
+	 * in place, after a mid-transaction `ALTER TABLE … RENAME TO`. Covers
+	 * {@link batchedDataEvents} and every {@link dataEventLayers} savepoint layer, plus the
+	 * collision channel ({@link batchedCollisionEvents} / {@link collisionEventLayers}) —
+	 * a maintained table (materialized view) can be renamed too. So a commit delivers each
+	 * event under the name the table has at delivery, not the one it had at write time.
+	 *
+	 * No-op when not batching: in autocommit the earlier events were already delivered under
+	 * the name the table had at the time, which is correct.
+	 *
+	 * Relabelling cannot fail (it moves no value and reads no schema), so unlike
+	 * {@link remapBatchedDataEvents} this is synchronous and needs no per-event `try`.
+	 * `key` and `changedColumns` are untouched — a rename moves no value and changes no column.
+	 *
+	 * Batched SCHEMA events are deliberately NOT relabelled; see the call site in
+	 * `runtime/emit/alter-table.ts`.
+	 */
+	renameBatchedEvents(schemaName: string, oldTableName: string, newTableName: string): void {
+		if (!this.isBatching) return;
+
+		const schemaLower = schemaName.toLowerCase();
+		const oldLower = oldTableName.toLowerCase();
+		let relabelled = 0;
+
+		for (const store of this.allDataEventStores()) {
+			for (const entry of store) {
+				if (!namesTable(entry.event, schemaLower, oldLower)) continue;
+				entry.event = { ...entry.event, tableName: newTableName };
+				relabelled++;
+			}
+		}
+
+		for (const store of this.allCollisionEventStores()) {
+			for (let i = 0; i < store.length; i++) {
+				if (!namesTable(store[i], schemaLower, oldLower)) continue;
+				store[i] = { ...store[i], tableName: newTableName };
+				relabelled++;
+			}
+		}
+
+		if (relabelled > 0) {
+			log('Relabelled %d batched events from %s.%s to %s after mid-transaction RENAME TO',
+				relabelled, schemaName, oldTableName, newTableName);
+		}
+	}
+
+	/**
+	 * Re-derive the `key` of every BATCHED data event for one table from the event's own
+	 * row image, after a mid-transaction `ALTER TABLE … ALTER PRIMARY KEY`. Covers
+	 * {@link batchedDataEvents} and every {@link dataEventLayers} savepoint layer, so a
+	 * commit delivers each event under the primary key the table has at delivery — a
+	 * consumer that addresses rows by `key` (an incremental cache, the sync engine's change
+	 * log) can still pair the event with a row the table now contains. Without it a widened
+	 * key delivers too few values and a narrowed one too many, and the arity mismatch alone
+	 * makes the event unmatchable.
+	 *
+	 * `oldPkIndices` / `newPkIndices` are column indices into the row images as they stand
+	 * NOW: ALTER PRIMARY KEY changes no column, and any earlier ALTER in the same
+	 * transaction already remapped the images via {@link remapBatchedDataEvents}.
+	 *
+	 * NOTE: that assumes the earlier remap succeeded. Its per-image failures are best-effort
+	 * and leave an image at its pre-ALTER layout; an index long enough for such an image
+	 * projects the wrong column rather than bailing out, since only out-of-bounds is
+	 * detectable here. If those failures ever become something other than a logged rarity,
+	 * pass the current column count through and skip any image that does not match it.
+	 *
+	 * The image each event's key is projected from is picked by {@link selectKeySourceImage}
+	 * — `newRow` for an insert, `oldRow` for a delete, and for an update whichever image
+	 * reproduces the recorded `key` under `oldPkIndices`.
+	 *
+	 * No-op when not batching: in autocommit the earlier events were already delivered under
+	 * the key the table had at the time, which is correct.
+	 *
+	 * Like {@link renameBatchedEvents} this is synchronous and needs no per-event `try` — it
+	 * reads no schema and evaluates no expression, only projecting values already present in
+	 * the row image. BEST-EFFORT in the same sense as {@link remapBatchedDataEvents}: an
+	 * event with no `key`, no usable image, or an image too short for `newPkIndices` keeps
+	 * its `key` as-is (logged at warn) rather than aborting an otherwise-valid ALTER.
+	 *
+	 * The maintenance-collision channel needs no counterpart: every structural ALTER on a
+	 * maintained table is rejected up front, so a materialized view's primary key cannot
+	 * change mid-transaction.
+	 */
+	rekeyBatchedDataEvents(
+		schemaName: string,
+		tableName: string,
+		oldPkIndices: readonly number[],
+		newPkIndices: readonly number[],
+	): void {
+		if (!this.isBatching) return;
+
+		const schemaLower = schemaName.toLowerCase();
+		const tableLower = tableName.toLowerCase();
+		let rekeyed = 0;
+
+		for (const store of this.allDataEventStores()) {
+			for (const entry of store) {
+				const event = entry.event;
+				if (!namesTable(event, schemaLower, tableLower)) continue;
+				if (!event.key) {
+					// Not anomalous: `key` is optional on the public event and a module may
+					// legitimately never populate it, so this is debug, not warn — a producer
+					// that omits the key omits it for every event, and an ALTER PRIMARY KEY
+					// mid-transaction would otherwise warn once per batched event.
+					log('rekeyBatchedDataEvents: %s event on %s.%s carries no key, leaving as-is',
+						event.type, event.schemaName, event.tableName);
+					continue;
+				}
+				const image = selectKeySourceImage(event, oldPkIndices);
+				if (image === undefined) {
+					warnLog('rekeyBatchedDataEvents: %s event on %s.%s has no usable row image, leaving key as-is',
+						event.type, event.schemaName, event.tableName);
+					continue;
+				}
+				const nextKey = projectKey(image, newPkIndices);
+				if (!nextKey) {
+					warnLog('rekeyBatchedDataEvents: new key column out of bounds for the %s image on %s.%s (arity %d), leaving key as-is',
+						event.type, event.schemaName, event.tableName, image.length);
+					continue;
+				}
+				entry.event = { ...event, key: nextKey };
+				rekeyed++;
+			}
+		}
+
+		if (rekeyed > 0) {
+			log('Re-keyed %d batched data events on %s.%s after mid-transaction ALTER PRIMARY KEY',
+				rekeyed, schemaName, tableName);
+		}
 	}
 
 	/**
@@ -472,11 +1260,15 @@ export class DatabaseEventEmitter {
 		this.isBatching = false;
 		const discardedData = this.batchedDataEvents.length + this.dataEventLayers.reduce((sum, layer) => sum + layer.length, 0);
 		const discardedSchema = this.batchedSchemaEvents.length + this.schemaEventLayers.reduce((sum, layer) => sum + layer.length, 0);
+		const discardedCollision = this.batchedCollisionEvents.length + this.collisionEventLayers.reduce((sum, layer) => sum + layer.length, 0);
 		this.batchedDataEvents = [];
 		this.batchedSchemaEvents = [];
+		this.batchedCollisionEvents = [];
 		this.dataEventLayers = [];
 		this.schemaEventLayers = [];
-		log('Discarded %d data events and %d schema events', discardedData, discardedSchema);
+		this.collisionEventLayers = [];
+		log('Discarded %d data events, %d schema events, and %d collision events',
+			discardedData, discardedSchema, discardedCollision);
 	}
 
 	/**
@@ -486,6 +1278,7 @@ export class DatabaseEventEmitter {
 	beginSavepointLayer(): void {
 		this.dataEventLayers.push([]);
 		this.schemaEventLayers.push([]);
+		this.collisionEventLayers.push([]);
 		log('Started savepoint event layer (depth: %d)', this.dataEventLayers.length);
 	}
 
@@ -496,8 +1289,9 @@ export class DatabaseEventEmitter {
 	rollbackSavepointLayer(): void {
 		const discardedData = this.dataEventLayers.pop();
 		const discardedSchema = this.schemaEventLayers.pop();
-		log('Rolled back savepoint event layer, discarded %d data and %d schema events',
-			discardedData?.length ?? 0, discardedSchema?.length ?? 0);
+		const discardedCollision = this.collisionEventLayers.pop();
+		log('Rolled back savepoint event layer, discarded %d data, %d schema, and %d collision events',
+			discardedData?.length ?? 0, discardedSchema?.length ?? 0, discardedCollision?.length ?? 0);
 	}
 
 	/**
@@ -523,8 +1317,16 @@ export class DatabaseEventEmitter {
 			targetSchema.push(...topSchema);
 		}
 
-		log('Released savepoint event layer, merged %d data and %d schema events',
-			topData?.length ?? 0, topSchema?.length ?? 0);
+		const topCollision = this.collisionEventLayers.pop();
+		if (topCollision && topCollision.length > 0) {
+			const targetCollision = this.collisionEventLayers.length > 0
+				? this.collisionEventLayers[this.collisionEventLayers.length - 1]
+				: this.batchedCollisionEvents;
+			targetCollision.push(...topCollision);
+		}
+
+		log('Released savepoint event layer, merged %d data, %d schema, and %d collision events',
+			topData?.length ?? 0, topSchema?.length ?? 0, topCollision?.length ?? 0);
 	}
 
 	/**
@@ -535,20 +1337,27 @@ export class DatabaseEventEmitter {
 	removeAllListeners(): void {
 		const dataCount = this.dataListeners.size;
 		const schemaCount = this.schemaListeners.size;
+		const collisionCount = this.collisionListeners.size;
+		const txCommitCount = this.transactionCommitListeners.size;
 
-		if (dataCount > 0 || schemaCount > 0) {
+		if (dataCount > 0 || schemaCount > 0 || collisionCount > 0 || txCommitCount > 0) {
 			warnLog(
-				'removeAllListeners() called with %d data and %d schema listeners still registered — possible listener leak',
-				dataCount, schemaCount
+				'removeAllListeners() called with %d data, %d schema, %d collision, and %d transaction-commit listeners still registered — possible listener leak',
+				dataCount, schemaCount, collisionCount, txCommitCount
 			);
 		}
 
 		this.dataListeners.clear();
 		this.schemaListeners.clear();
+		this.collisionListeners.clear();
+		this.transactionCommitListeners.clear();
 		this.batchedDataEvents = [];
 		this.batchedSchemaEvents = [];
+		this.batchedCollisionEvents = [];
 		this.dataEventLayers = [];
 		this.schemaEventLayers = [];
+		this.collisionEventLayers = [];
+		this.collisionCounts.clear();
 		this.isBatching = false;
 
 		// Unhook all module emitters

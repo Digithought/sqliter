@@ -4,6 +4,7 @@ import type { SqlValue, Row } from '../common/types.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode } from '../common/types.js';
 import { createLogger } from '../common/logger.js';
+import { CONTEXT_STRICT } from './strict-flags.js';
 
 const ctxLog = createLogger('runtime:context');
 const ctxLookupLog = createLogger('runtime:context:lookup');
@@ -11,11 +12,20 @@ const ctxLookupLog = createLogger('runtime:context:lookup');
 type IndexEntry = { rowGetter: RowGetter; columnIndex: number };
 
 /**
+ * Best-effort label identifying which emitter installed a row context. Threaded
+ * (optionally) into {@link RowContextMap.set} / {@link createRowSlot} /
+ * {@link withRowContext} purely to enrich the `QUEREUS_CONTEXT_STRICT` diagnostic.
+ * Shadow **detection never depends on it** — it degrades to the descriptor's
+ * attribute-ID list — so threading labels through emit sites can be incremental.
+ */
+export type ContextInstaller = { nodeType: string; id: string } | string;
+
+/**
  * Iterate the attribute IDs in a descriptor, yielding [attrId, columnIndex].
  * Uses for...in to handle both sparse arrays and plain objects (e.g. spread-created
  * descriptors in aggregate.ts).
  */
-function* descriptorEntries(descriptor: RowDescriptor): Generator<[number, number]> {
+export function* descriptorEntries(descriptor: RowDescriptor): Generator<[number, number]> {
 	for (const key in descriptor) {
 		const attrId = +key;
 		const columnIndex = descriptor[attrId];
@@ -36,15 +46,34 @@ function* descriptorEntries(descriptor: RowDescriptor): Generator<[number, numbe
 export class RowContextMap {
 	private map = new Map<RowDescriptor, RowGetter>();
 
-	/** Direct attribute-ID → resolver for O(1) column lookup. */
+	/**
+	 * Direct attribute-ID → resolver for O(1) column lookup. Last-`set`-wins:
+	 * `slot.set(row)` does NOT update this; only `set`/`delete` on this map do.
+	 * See the "source-attr contexts and child pulls" invariant in docs/runtime.md
+	 * for why a streaming operator must release its source-attr context before
+	 * pulling its child.
+	 */
 	readonly attributeIndex: Array<IndexEntry | undefined> = [];
 
-	set(descriptor: RowDescriptor, rowGetter: RowGetter): this {
+	/**
+	 * Strict context-shadow harness (`QUEREUS_CONTEXT_STRICT`) hooks. **Undefined
+	 * on the base map** — implemented only by the strict `RowContextMap` subclass
+	 * in strict-fork.ts. Declared optional so the hot paths ({@link resolveAttribute},
+	 * {@link createRowSlot}'s per-row `set`) degrade to a no-op when the flag is
+	 * off: no per-row cost and no epoch side-tables on the base map. `declare` so no
+	 * field is emitted on the base instance — the strict subclass supplies the real
+	 * implementations as instance fields.
+	 */
+	declare noteRowSet?: (descriptor: RowDescriptor) => void;
+	declare assertNoShadow?: (attributeId: number, columnName: string | undefined, rctx: RuntimeContext) => void;
+
+	set(descriptor: RowDescriptor, rowGetter: RowGetter, _installer?: ContextInstaller): this {
 		this.map.set(descriptor, rowGetter);
 		// Index this descriptor's attribute IDs (overwrites previous bindings)
 		for (const [attrId, columnIndex] of descriptorEntries(descriptor)) {
 			this.attributeIndex[attrId] = { rowGetter, columnIndex };
 		}
+		// `_installer` is ignored on the base map; the strict subclass records it.
 		return this;
 	}
 
@@ -101,6 +130,12 @@ export interface RowSlot {
 	 * IDs in between this slot's `set` calls — without re-claiming, downstream
 	 * lookups would resolve through the child's slot whose row is the iterator's
 	 * cursor position, not this slot's matched row.
+	 *
+	 * This is the *child-shadows-operator* resolution of the "source-attr
+	 * contexts and child pulls" invariant (docs/runtime.md); call it before
+	 * yielding (see emit/asof-scan.ts). The mirror direction —
+	 * operator-shadows-child — is resolved by tear-down-before-pull instead
+	 * (see emit/aggregate.ts and emit/window.ts).
 	 */
 	reactivate(): void;
 	/** Tear down (removes descriptor from context) */
@@ -114,7 +149,8 @@ export interface RowSlot {
  */
 export function createRowSlot(
 	rctx: RuntimeContext,
-	descriptor: RowDescriptor
+	descriptor: RowDescriptor,
+	installer?: ContextInstaller
 ): RowSlot {
 	// Internal boxed reference - one allocation per slot
 	const ref = { current: undefined as Row | undefined };
@@ -122,7 +158,7 @@ export function createRowSlot(
 	const getter: RowGetter = () => ref.current!;
 
 	// Install only once — RowContextMap maintains the attribute index
-	rctx.context.set(descriptor, getter);
+	rctx.context.set(descriptor, getter, installer);
 	if (ctxLog.enabled && rctx.contextTracker) {
 		rctx.contextTracker.addContext(descriptor, 'createRowSlot');
 	}
@@ -133,11 +169,15 @@ export function createRowSlot(
 	return {
 		set(row: Row) {
 			ref.current = row;
+			// Strict-only: bump this descriptor's epoch. `slot.set` does NOT reclaim
+			// the attributeIndex, so a stale operator context can keep winning while
+			// this child row is newer — the shadow the harness detects.
+			if (CONTEXT_STRICT) rctx.context.noteRowSet?.(descriptor);
 		},
 		reactivate() {
 			// Re-call set() on the context map so attributeIndex points back at
 			// this slot's getter for all attribute IDs in `descriptor`.
-			rctx.context.set(descriptor, getter);
+			rctx.context.set(descriptor, getter, installer);
 		},
 		close() {
 			rctx.context.delete(descriptor);
@@ -156,6 +196,16 @@ export function createRowSlot(
  * a slot created but not yet set).
  */
 export function resolveAttribute(rctx: RuntimeContext, attributeId: number, columnName?: string): SqlValue {
+	// Strict shadow check (QUEREUS_CONTEXT_STRICT): assert the attribute-index
+	// winner is the most-recently-set live context for this attr, catching an
+	// operator that left a stale source-attr context winning while a child set a
+	// newer row. Off ⇒ branch not taken, no cost, no epoch bookkeeping exists.
+	// See docs/runtime.md § Invariant: source-attr contexts and child pulls.
+	// NOTE: per-read cost is O(live contexts carrying the attr); that count is small
+	// in practice. If a pathological plan makes strict-mode CI slow, index the
+	// per-attr candidate list instead of scanning all live entries.
+	if (CONTEXT_STRICT) rctx.context.assertNoShadow?.(attributeId, columnName, rctx);
+
 	const entry = rctx.context.attributeIndex[attributeId];
 	if (entry !== undefined) {
 		const row = entry.rowGetter();
@@ -234,12 +284,13 @@ export async function withAsyncRowContext<T>(
 	rctx: RuntimeContext,
 	descriptor: RowDescriptor,
 	rowGetter: RowGetter,
-	fn: () => T | Promise<T>
+	fn: () => T | Promise<T>,
+	installer?: ContextInstaller
 ): Promise<T> {
 	const attrs = Object.keys(descriptor).filter(k => descriptor[parseInt(k)] !== undefined);
 	ctxLog('PUSH async context with attrs=[%s]', attrs.join(','));
 
-	rctx.context.set(descriptor, rowGetter);
+	rctx.context.set(descriptor, rowGetter, installer);
 	if (ctxLog.enabled && rctx.contextTracker) {
 		rctx.contextTracker.addContext(descriptor, 'withAsyncRowContext');
 	}
@@ -264,12 +315,13 @@ export function withRowContext<T>(
 	rctx: RuntimeContext,
 	descriptor: RowDescriptor,
 	rowGetter: RowGetter,
-	fn: () => T
+	fn: () => T,
+	installer?: ContextInstaller
 ): T {
 	const attrs = Object.keys(descriptor).filter(k => descriptor[parseInt(k)] !== undefined);
 	ctxLog('PUSH context with attrs=[%s]', attrs.join(','));
 
-	rctx.context.set(descriptor, rowGetter);
+	rctx.context.set(descriptor, rowGetter, installer);
 	if (ctxLog.enabled && rctx.contextTracker) {
 		rctx.contextTracker.addContext(descriptor, 'withRowContext');
 	}

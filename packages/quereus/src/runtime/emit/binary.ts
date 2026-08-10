@@ -1,17 +1,38 @@
 import { StatusCode } from "../../common/types.js";
 import { quereusError } from "../../common/errors.js";
-import type { SqlValue } from "../../common/types.js";
-import type { Instruction, InstructionRun, RuntimeContext } from "../types.js";
+import type { SqlValue, MaybePromise } from "../../common/types.js";
+import type { Instruction, RuntimeContext } from "../types.js";
+import { asRun } from "../types.js";
 import type { BinaryOpNode } from "../../planner/nodes/scalar.js";
-import { emitPlanNode } from "../emitters.js";
-import { compareSqlValuesFast, isTruthy } from "../../util/comparison.js";
+import { LiteralNode } from "../../planner/nodes/scalar.js";
+import type { ScalarPlanNode } from "../../planner/nodes/plan-node.js";
+import { hasRelationalDescendant } from "../../planner/analysis/scalar-subqueries.js";
+import { emitPlanNode, emitCallFromPlan } from "../emitters.js";
+import { compareSqlValuesFast, createTypedComparator, hasSemanticOrdering, isTruthy } from "../../util/comparison.js";
+import type { LogicalType } from "../../types/logical-type.js";
 import type { CollationFunction } from "../../util/comparison.js";
 import { coerceToNumberForArithmetic } from "../../util/coercion.js";
-import { simpleLike } from "../../util/patterns.js";
+import { canonicalizeInteger } from "../../util/numeric-canonical.js";
+import { valueToText } from "../../util/value-text.js";
+import { simpleLike, compileLikeMatcher } from "../../util/patterns.js";
 import type { EmissionContext } from "../emission-context.js";
 import { tryTemporalArithmetic, tryTemporalComparison } from "./temporal-arithmetic.js";
+import { runTemporalCase, temporalOpCaseForTypes, unsupportedTemporalOp } from "../../types/temporal-ops.js";
+import { effectiveComparisonCollation } from "../../planner/analysis/comparison-collation.js";
+import { emitScalarOp, type ScalarOpSpec } from "./scalar-op.js";
 
-export function emitBinaryOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
+/**
+ * Operator dispatch for a binary node — the single entry point both consumers share, so
+ * neither has to restate which operator routes to which body. `undefined` means the node
+ * has no {@link ScalarOpSpec}: today that is exactly the AND/OR short-circuit form, whose
+ * right operand is a deferred sub-program rather than a value (see
+ * {@link buildLogicalOpSpec}). A fusion consumer treats `undefined` as "do not fuse";
+ * {@link emitBinaryOp} falls back to {@link emitShortCircuitLogicalOp}.
+ *
+ * An unsupported operator throws here rather than returning `undefined` — that is an
+ * unimplemented operator, not a node that declines to fuse.
+ */
+export function buildBinaryOpSpec(plan: BinaryOpNode, ctx: EmissionContext): ScalarOpSpec | undefined {
 	// Normalize operator to uppercase for case-insensitive matching of keywords
 	const operator = plan.expression.operator.toUpperCase();
 
@@ -21,7 +42,7 @@ export function emitBinaryOp(plan: BinaryOpNode, ctx: EmissionContext): Instruct
 		case '*':
 		case '/':
 		case '%':
-			return emitNumericOp(plan, ctx);
+			return buildNumericOpSpec(plan);
 		case '=':
 		case '==':
 		case '!=':
@@ -30,19 +51,24 @@ export function emitBinaryOp(plan: BinaryOpNode, ctx: EmissionContext): Instruct
 		case '<=':
 		case '>':
 		case '>=':
-			return emitComparisonOp(plan, ctx);
+			return buildComparisonOpSpec(plan, ctx);
 		case '||':
-			return emitConcatOp(plan, ctx);
+			return buildConcatOpSpec(plan);
 		case 'AND':
 		case 'OR':
 		case 'XOR':
-			return emitLogicalOp(plan, ctx);
+			return buildLogicalOpSpec(plan);
 		case 'LIKE':
-			return emitLikeOp(plan, ctx);
-		// TODO: emitBitwise
+			return buildLikeOpSpec(plan);
+		// TODO: bitwise operators
 		default:
 			quereusError(`Unsupported binary operator: ${plan.expression.operator}`, StatusCode.UNSUPPORTED, undefined, plan.expression);
 	}
+}
+
+export function emitBinaryOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
+	const spec = buildBinaryOpSpec(plan, ctx);
+	return spec ? emitScalarOp(spec, ctx) : emitShortCircuitLogicalOp(plan, ctx);
 }
 
 /** Handle arithmetic when at least one operand is bigint.
@@ -58,7 +84,11 @@ function mixedBigIntArithmetic(
 ): SqlValue {
 	if (typeof v1 === 'bigint' && typeof v2 === 'bigint') {
 		try {
-			return innerBigInt(v1, v2);
+			// Narrow a result that lands inside the safe-integer range back to number
+			// (R1, util/numeric-canonical.ts) — on the success path only; the catch
+			// arms (division by zero, RangeError) still return null. Narrowing itself
+			// cannot throw.
+			return canonicalizeInteger(innerBigInt(v1, v2));
 		} catch {
 			return null;
 		}
@@ -71,10 +101,11 @@ function mixedBigIntArithmetic(
 	const num = typeof v1n === 'bigint' ? v2n as number : v1n as number;
 	if (Number.isInteger(num)) {
 		try {
-			return innerBigInt(
+			// Same success-path narrowing as the both-bigint arm above.
+			return canonicalizeInteger(innerBigInt(
 				typeof v1n === 'bigint' ? v1n : BigInt(v1n),
 				typeof v2n === 'bigint' ? v2n : BigInt(v2n)
-			);
+			));
 		} catch {
 			// Fall through to float path (e.g., division by zero)
 		}
@@ -87,7 +118,46 @@ function mixedBigIntArithmetic(
 	return result;
 }
 
-export function emitNumericOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
+/**
+ * The general arithmetic body: sniff the values for a temporal shape first, then fall back
+ * to coercing numeric arithmetic.
+ *
+ * Two branches of {@link buildNumericOpSpec} share it — the temporal arm whose declared
+ * types settle nothing, and the non-temporal generic path — because value sniffing is the
+ * defined semantics for both. They differ only in the note they carry; keeping one body
+ * means they cannot come to differ in behavior.
+ */
+function buildCoercingArithmeticRun(
+	operator: string,
+	inner: (v1: number, v2: number) => number,
+	innerBigInt: (v1: bigint, v2: bigint) => bigint,
+): (ctx: RuntimeContext, v1: SqlValue, v2: SqlValue) => SqlValue {
+	return function runCoercingArithmetic(_ctx: RuntimeContext, v1: SqlValue, v2: SqlValue): SqlValue {
+		const temporalResult = tryTemporalArithmetic(operator, v1, v2);
+		if (temporalResult !== undefined) {
+			return temporalResult;
+		}
+
+		if (v1 !== null && v2 !== null) {
+			if (typeof v1 === 'bigint' || typeof v2 === 'bigint') {
+				return mixedBigIntArithmetic(v1, v2, inner, innerBigInt);
+			} else {
+				const n1 = coerceToNumberForArithmetic(v1);
+				const n2 = coerceToNumberForArithmetic(v2);
+				try {
+					const result = inner(n1, n2);
+					if (!Number.isFinite(result)) return null;
+					return result;
+				} catch {
+					return null;
+				}
+			}
+		}
+		return null;
+	};
+}
+
+export function buildNumericOpSpec(plan: BinaryOpNode): ScalarOpSpec {
 	let inner: (v1: number, v2: number) => number;
 	let innerBigInt: (v1: bigint, v2: bigint) => bigint;
 
@@ -124,45 +194,74 @@ export function emitNumericOp(plan: BinaryOpNode, ctx: EmissionContext): Instruc
 	let note: string;
 
 	if (leftLogical.isTemporal || rightLogical.isTemporal) {
-		// Temporal path: must check temporal arithmetic first
-		run = function runTemporalArithmetic(ctx: RuntimeContext, v1: SqlValue, v2: SqlValue): SqlValue {
-			const temporalResult = tryTemporalArithmetic(plan.expression.operator, v1, v2);
-			if (temporalResult !== undefined) {
-				return temporalResult;
-			}
+		// Temporal path. Both operands' declared logical types are already in hand — that
+		// is *why* this branch was selected — so the (operator, left kind, right kind)
+		// lookup into the operation table (types/temporal-ops.ts) happens once here rather
+		// than once per row. Same lookup `BinaryOpNode.generateType` used to announce the
+		// result type, through the same function, so the two cannot select different cases.
+		// Three arms, chosen at emit:
+		const { kinds, entry } = temporalOpCaseForTypes(plan.expression.operator, leftLogical, rightLogical);
 
-			if (v1 !== null && v2 !== null) {
-				if (typeof v1 === 'bigint' || typeof v2 === 'bigint') {
-					return mixedBigIntArithmetic(v1, v2, inner, innerBigInt);
-				} else {
-					const n1 = coerceToNumberForArithmetic(v1);
-					const n2 = coerceToNumberForArithmetic(v2);
-					try {
-						const result = inner(n1, n2);
-						if (!Number.isFinite(result)) return null;
-						return result;
-					} catch {
-						return null;
-					}
-				}
-			}
-			return null;
-		};
-		note = `${plan.expression.operator}(temporal)`;
+		if (kinds && entry) {
+			// (1) Specialized: the case is fixed, so the per-row path is one call into the
+			// shared envelope — no value sniffing at all.
+			//
+			// This arm TRUSTS the declared types. A DATE-declared operand actually holding
+			// `'garbage'` returns null here (runTemporalCase's catch), where the sniffing
+			// path below would have raised `Unsupported temporal operation`. That is the
+			// intended trade: write-side coercion enforces declared logical types on every
+			// normal path, so only a misbehaving virtual table can produce such a value.
+			run = function runTemporalCased(_ctx: RuntimeContext, v1: SqlValue, v2: SqlValue): SqlValue {
+				return runTemporalCase(entry, v1, v2);
+			};
+			note = `${plan.expression.operator}(temporal-${kinds[0]}-${kinds[1]})`;
+		} else if (kinds) {
+			// (2) Statically unsupported: both kinds are known and the table has no case
+			// for them (DATE + DATE, DATE * NUMBER, TIME − DATE, anything with `%`), so no
+			// combination of runtime values can succeed.
+			//
+			// The throw deliberately stays at RUNTIME rather than moving to emit/plan time.
+			// Today the error is raised only when a row is actually evaluated, so
+			// `select case when 0 then date_a + date_b else 1 end`, the same expression
+			// under `where 1 = 0`, and the same expression over an empty table all succeed.
+			// Hoisting the throw would turn each into a hard failure for no gain — a
+			// constant-throw closure costs nothing per row on the paths that never run it.
+			//
+			// The null check is load-bearing: `date_a + date_b` with a NULL operand returns
+			// null today rather than erroring, and must keep doing so.
+			run = function runTemporalUnsupported(_ctx: RuntimeContext, v1: SqlValue, v2: SqlValue): SqlValue {
+				if (v1 === null || v2 === null) return null;
+				unsupportedTemporalOp();
+			};
+			note = `${plan.expression.operator}(temporal-unsupported)`;
+		} else {
+			// (3) Fallback: at least one operand is TEXT / ANY / NULL / TIMESTAMP / a
+			// plugin-registered temporal type, so the declared types cannot settle the
+			// case. Runtime sniffing IS the defined semantics there (a TEXT column holding
+			// a duration string is a supported shape), so this arm is the generic body
+			// below under a different note — same function, so they cannot drift.
+			run = buildCoercingArithmeticRun(plan.expression.operator, inner, innerBigInt);
+			note = `${plan.expression.operator}(temporal)`;
+		}
 	} else if (leftLogical.isNumeric && rightLogical.isNumeric) {
 		// Numeric-only path: skip temporal check and coercion entirely
+		//
+		// NOTE: accepted tradeoff — the two null checks plus two `typeof === 'bigint'`
+		// checks below are NOT collapsed into one `typeof === 'number'` pair with the
+		// null/bigint handling behind a fallback. Measured at 1.19 ns vs 1.22 ns per
+		// operation (isolated microbench, see `compareSqlValuesFast` in
+		// util/comparison.ts) — no difference at all, so the guard would be pure noise.
 		run = function runNumericOnly(ctx: RuntimeContext, v1: SqlValue, v2: SqlValue): SqlValue {
 			if (v1 !== null && v2 !== null) {
 				if (typeof v1 === 'bigint' || typeof v2 === 'bigint') {
 					return mixedBigIntArithmetic(v1, v2, inner, innerBigInt);
 				} else {
-					try {
-						const result = inner(v1 as number, v2 as number);
-						if (!Number.isFinite(result)) return null;
-						return result;
-					} catch {
-						return null;
-					}
+					// No try/catch: `inner` over plain numbers cannot throw (division by
+					// zero yields Infinity/NaN, caught by the finite check below); only
+					// the bigint arm above can throw (handled inside mixedBigIntArithmetic).
+					const result = inner(v1 as number, v2 as number);
+					if (!Number.isFinite(result)) return null;
+					return result;
 				}
 			}
 			return null;
@@ -170,54 +269,25 @@ export function emitNumericOp(plan: BinaryOpNode, ctx: EmissionContext): Instruc
 		note = `${plan.expression.operator}(numeric-fast)`;
 	} else {
 		// Generic path: temporal check + coercion (for TEXT or mixed types)
-		run = function runGenericArithmetic(ctx: RuntimeContext, v1: SqlValue, v2: SqlValue): SqlValue {
-			const temporalResult = tryTemporalArithmetic(plan.expression.operator, v1, v2);
-			if (temporalResult !== undefined) {
-				return temporalResult;
-			}
-
-			if (v1 !== null && v2 !== null) {
-				if (typeof v1 === 'bigint' || typeof v2 === 'bigint') {
-					return mixedBigIntArithmetic(v1, v2, inner, innerBigInt);
-				} else {
-					const n1 = coerceToNumberForArithmetic(v1);
-					const n2 = coerceToNumberForArithmetic(v2);
-					try {
-						const result = inner(n1, n2);
-						if (!Number.isFinite(result)) return null;
-						return result;
-					} catch {
-						return null;
-					}
-				}
-			}
-			return null;
-		};
+		run = buildCoercingArithmeticRun(plan.expression.operator, inner, innerBigInt);
 		note = `${plan.expression.operator}(numeric)`;
 	}
 
-	const leftExpr = emitPlanNode(plan.left, ctx);
-	const rightExpr = emitPlanNode(plan.right, ctx);
-
 	return {
-		params: [leftExpr, rightExpr],
-		run: run as InstructionRun,
+		operands: [plan.left, plan.right],
+		run,
 		note
 	};
 }
 
-export function emitComparisonOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
-	// Determine collation to use for comparison
+export function buildComparisonOpSpec(plan: BinaryOpNode, ctx: EmissionContext): ScalarOpSpec {
 	const leftType = plan.left.getType();
 	const rightType = plan.right.getType();
-	let collationName = 'BINARY';
 
-	// Use collation from either operand (right side takes precedence for COLLATE expressions)
-	if (rightType.collationName) {
-		collationName = rightType.collationName;
-	} else if (leftType.collationName) {
-		collationName = leftType.collationName;
-	}
+	// One shared, symmetric resolution for plan-time facts and runtime behavior
+	// (analysis/comparison-collation.ts). The throw inside is an unreachable
+	// backstop — BinaryOpNode.generateType already rejected conflicts at plan time.
+	const collationName = effectiveComparisonCollation(plan.left, plan.right);
 
 	// Pre-resolve collation function for optimal performance
 	const collationFunc = ctx.resolveCollation(collationName);
@@ -235,9 +305,33 @@ export function emitComparisonOp(plan: BinaryOpNode, ctx: EmissionContext): Inst
 	let run: (ctx: RuntimeContext, v1: SqlValue, v2: SqlValue) => SqlValue;
 	let noteTag: string;
 
-	if (!needsTemporalCheck && bothSameCategory) {
+	// Both operands declare the SAME logical type with semantic ordering (TIMESPAN,
+	// JSON): route the operator through the type's compare so `<`/`>`/`=` agree with
+	// ORDER BY and index order (elapsed-time for TIMESPAN, structural for JSON).
+	// createTypedComparator keeps the storage-class-mismatch fallback, so a runtime
+	// probe of a different storage class orders by class rather than falsely matching.
+	// Mixed pairs (typed column vs plain text literal) fall to the generic path below,
+	// whose runtime temporal check already handles duration-vs-text semantically.
+	const sharedSemanticType = leftLogical === rightLogical && hasSemanticOrdering(leftLogical as LogicalType)
+		? leftLogical as LogicalType
+		: undefined;
+
+	if (sharedSemanticType) {
+		const typedCompare = createTypedComparator(sharedSemanticType, collationFunc);
+		const cmpToResult = buildCmpToResult(operator, plan);
+		run = function runSemanticTypedCompare(_ctx: RuntimeContext, v1: SqlValue, v2: SqlValue): SqlValue {
+			if (v1 === null || v2 === null) return null;
+			return cmpToResult(typedCompare(v1, v2));
+		};
+		noteTag = 'compare-typed';
+	} else if (!needsTemporalCheck && bothSameCategory) {
 		// Fast same-category comparison: no temporal check, no coercion needed
 		// Use compareSqlValuesFast which handles runtime type mismatches gracefully
+		//
+		// NOTE: accepted tradeoff — this does NOT further specialize on the known category
+		// (both-TEXT → guarded `typeof` pair → collation call, both-numeric → guarded
+		// inline three-way). Measured and declined; the numbers and the revisit condition
+		// are on `compareSqlValuesFast` in util/comparison.ts.
 		const cmpToResult = buildCmpToResult(operator, plan);
 		run = function runSameCategoryCompare(ctx: RuntimeContext, v1: SqlValue, v2: SqlValue): SqlValue {
 			if (v1 === null || v2 === null) return null;
@@ -250,12 +344,9 @@ export function emitComparisonOp(plan: BinaryOpNode, ctx: EmissionContext): Inst
 		noteTag = 'compare';
 	}
 
-	const leftExpr = emitPlanNode(plan.left, ctx);
-	const rightExpr = emitPlanNode(plan.right, ctx);
-
 	return {
-		params: [leftExpr, rightExpr],
-		run: run as InstructionRun,
+		operands: [plan.left, plan.right],
+		run,
 		note: `${plan.expression.operator}(${noteTag}${collationName !== 'BINARY' ? ` ${collationName}` : ''})`
 	};
 }
@@ -301,75 +392,199 @@ function buildGenericComparisonRun(
 	};
 }
 
-export function emitConcatOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
+export function buildConcatOpSpec(plan: BinaryOpNode): ScalarOpSpec {
 	function run(ctx: RuntimeContext, v1: SqlValue, v2: SqlValue): SqlValue {
 		// SQL concatenation: NULL || anything -> NULL
 		if (v1 === null || v2 === null) return null;
 
-		// Convert both operands to strings
-		const s1 = String(v1);
-		const s2 = String(v2);
-		return s1 + s2;
+		// Convert both operands through the shared value-to-text rule, so `b || ''`
+		// spells a blob or a JSON document exactly as `cast(b as text)` does.
+		return valueToText(v1) + valueToText(v2);
 	}
 
-	const leftExpr = emitPlanNode(plan.left, ctx);
-	const rightExpr = emitPlanNode(plan.right, ctx);
-
 	return {
-		params: [leftExpr, rightExpr],
-		run: run as InstructionRun,
+		operands: [plan.left, plan.right],
+		run,
 		note: '||(concat)'
 	};
 }
 
-export function emitLogicalOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
-	// Normalize operator to uppercase for case-insensitive matching
-	const operator = plan.expression.operator.toUpperCase();
+/** Truth-table combine for a single logical operator, over already-truthiness-coerced
+ *  operands (`null` = SQL NULL). Selected once at emit time by {@link selectLogicalCombine}
+ *  so the per-row path never re-dispatches on the operator string. */
+type LogicalCombine = (b1: boolean | null, b2: boolean | null) => SqlValue;
 
-	function run(ctx: RuntimeContext, v1: SqlValue, v2: SqlValue): SqlValue {
-		// SQL three-valued logic. Coerce non-NULL operands to a boolean using
-		// SQL truthiness (isTruthy) rather than JS truthiness so that values like
-		// blobs and non-numeric strings agree with how FilterNode/CASE/NOT treat
-		// them — otherwise `<blob> AND true` and a bare `<blob>` predicate diverge.
+/** false dominates; else NULL if any operand is NULL; else true. */
+const combineAnd: LogicalCombine = (b1, b2) => {
+	if (b1 === false || b2 === false) return false;
+	if (b1 === null || b2 === null) return null;
+	return true;
+};
+
+/** true dominates; else NULL if any operand is NULL; else false. */
+const combineOr: LogicalCombine = (b1, b2) => {
+	if (b1 === true || b2 === true) return true;
+	if (b1 === null || b2 === null) return null;
+	return false;
+};
+
+/** NULL with anything -> NULL; else logical inequality. */
+const combineXor: LogicalCombine = (b1, b2) => {
+	if (b1 === null || b2 === null) return null;
+	return b1 !== b2;
+};
+
+function selectLogicalCombine(operator: string, plan: BinaryOpNode): LogicalCombine {
+	switch (operator) {
+		case 'AND': return combineAnd;
+		case 'OR': return combineOr;
+		case 'XOR': return combineXor;
+		default:
+			quereusError(`Unsupported logical operator: ${plan.expression.operator}`, StatusCode.UNSUPPORTED, undefined, plan.expression);
+	}
+}
+
+/**
+ * The 3VL combine over raw operand values, resolved once at emit time (not per row) —
+ * single source of truth shared by the eager spec body and the deferred short-circuit
+ * path below, so the two cannot diverge (the parity tests in
+ * test/and-or-short-circuit.spec.ts guard exactly this).
+ *
+ * Coerces non-NULL operands to a boolean using SQL truthiness (isTruthy) rather than
+ * JS truthiness so that values like blobs and non-numeric strings agree with how
+ * FilterNode/CASE/NOT treat them — otherwise `<blob> AND true` and a bare `<blob>`
+ * predicate diverge.
+ */
+function buildCombineLogical(operator: string, plan: BinaryOpNode): (v1: SqlValue, v2: SqlValue) => SqlValue {
+	const combine = selectLogicalCombine(operator, plan);
+	return function combineLogical(v1: SqlValue, v2: SqlValue): SqlValue {
 		const b1 = v1 === null ? null : isTruthy(v1);
 		const b2 = v2 === null ? null : isTruthy(v2);
-		switch (operator) {
-			case 'AND': {
-				// false dominates; else NULL if any operand is NULL; else true.
-				if (b1 === false || b2 === false) return false;
-				if (b1 === null || b2 === null) return null;
-				return true;
-			}
+		return combine(b1, b2);
+	};
+}
 
-			case 'OR': {
-				// true dominates; else NULL if any operand is NULL; else false.
-				if (b1 === true || b2 === true) return true;
-				if (b1 === null || b2 === null) return null;
-				return false;
-			}
+/**
+ * Short-circuit deferral gate: AND/OR whose right operand contains a subquery
+ * (a scalar/IN/EXISTS subquery — a relational descendant). Such an operand is emitted
+ * as an on-demand callback and evaluated lazily, only when the left operand does not
+ * already decide the result (`false AND x` → false; `true OR x` → true). This stops an
+ * expensive/side-effecting subquery from running on every row for nothing. Left stays
+ * eager — it is always needed and always evaluated first, so operand order is unchanged.
+ *
+ * NOTE: only a *subquery* right operand defers. A non-subquery expensive scalar operand
+ * (deeply nested arithmetic, or a volatile/slow UDF called directly rather than inside a
+ * subquery) is still evaluated eagerly. Such operands are rare and the dominant expensive
+ * case in SQL is the subquery; if a non-subquery volatile/expensive scalar operand ever
+ * shows up hot, extend this gate with a cost or volatility check.
+ */
+function usesShortCircuit(plan: BinaryOpNode, operator: string): boolean {
+	return (operator === 'AND' || operator === 'OR') && hasRelationalDescendant(plan.right);
+}
 
-			case 'XOR': {
-				// NULL with anything -> NULL; else logical inequality.
-				if (b1 === null || b2 === null) return null;
-				return b1 !== b2;
-			}
+/**
+ * Eager two-operand combine. Used for XOR (both operands always required) and for
+ * AND/OR whose right operand is cheap (no subquery) — the zero-overhead path.
+ *
+ * `undefined` for the short-circuit form, whose right operand is a `SubProgram` param
+ * rather than a value and whose body returns `MaybePromise` — not a {@link ScalarOpSpec}
+ * body. Consumers fall back: the emitter below builds that Instruction itself, and a
+ * fusion consumer must decline to fuse.
+ */
+export function buildLogicalOpSpec(plan: BinaryOpNode): ScalarOpSpec | undefined {
+	// Normalize operator to uppercase for case-insensitive matching
+	const operator = plan.expression.operator.toUpperCase();
+	if (usesShortCircuit(plan, operator)) return undefined;
 
-			default:
-				quereusError(`Unsupported logical operator: ${plan.expression.operator}`, StatusCode.UNSUPPORTED, undefined, plan.expression);
-		}
+	const combineLogical = buildCombineLogical(operator, plan);
+
+	function run(_ctx: RuntimeContext, v1: SqlValue, v2: SqlValue): SqlValue {
+		return combineLogical(v1, v2);
 	}
 
-	const leftExpr = emitPlanNode(plan.left, ctx);
-	const rightExpr = emitPlanNode(plan.right, ctx);
-
 	return {
-		params: [leftExpr, rightExpr],
-		run: run as InstructionRun,
+		operands: [plan.left, plan.right],
+		run,
 		note: `${plan.expression.operator}(logical)`
 	};
 }
 
-export function emitLikeOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
+function emitShortCircuitLogicalOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
+	const operator = plan.expression.operator.toUpperCase();
+	const combineLogical = buildCombineLogical(operator, plan);
+
+	const leftExpr = emitPlanNode(plan.left, ctx);
+	const rightCall = emitCallFromPlan(plan.right, ctx);
+
+	// The left-operand value that decides the result on its own, resolved once at
+	// emit time: `false AND x` → false, `true OR x` → true. Also the result itself.
+	const decidingValue = operator === 'AND' ? false : true;
+
+	function runShortCircuit(
+		ctx: RuntimeContext,
+		v1: SqlValue,
+		rightFn: (ctx: RuntimeContext) => MaybePromise<SqlValue>
+	): MaybePromise<SqlValue> {
+		// Left decides — the right operand is never fetched (`false AND x` → false;
+		// `true OR x` → true). Same SQL truthiness as the eager path.
+		const b1 = v1 === null ? null : isTruthy(v1);
+		if (b1 === decidingValue) return decidingValue;
+
+		// Otherwise fetch the deferred right and combine with the shared 3VL
+		// (combineLogical) — byte-identical to the eager path. Stay synchronous
+		// when the right sub-program resolves synchronously; only take the
+		// microtask hop on a genuinely async subquery (see docs/runtime.md
+		// "Avoid a per-row microtask hop on the synchronous fast path"). A
+		// left-decides row returned above, so it never pays an async tick.
+		const raw = rightFn(ctx);
+		return raw instanceof Promise
+			? raw.then(v2 => combineLogical(v1, v2))
+			: combineLogical(v1, raw);
+	}
+
+	return {
+		params: [leftExpr, rightCall],
+		run: asRun(runShortCircuit),
+		note: `${plan.expression.operator}(logical short-circuit)`
+	};
+}
+
+/**
+ * If `node` is a literal-constant, non-NULL pattern, return the exact string the
+ * per-row path would derive from it ({@link valueToText}), otherwise undefined.
+ * A NULL literal, a not-yet-resolved Promise value, or any non-literal node
+ * falls through to the dynamic (memoized) per-row path so semantics are
+ * unchanged. Cast/collate-wrapped literals are intentionally NOT unwrapped —
+ * emitLikeOp ignores collation, and peeling could silently diverge.
+ */
+function constLikePattern(node: ScalarPlanNode): string | undefined {
+	if (!(node instanceof LiteralNode)) return undefined;
+	const value = node.expression.value;
+	if (value === null || value === undefined || value instanceof Promise) return undefined;
+	return valueToText(value);
+}
+
+export function buildLikeOpSpec(plan: BinaryOpNode): ScalarOpSpec {
+	// Fast path: the pattern operand is a literal constant. Compile the matcher
+	// once here at emit time and capture it in the closure, so no per-row compile
+	// or cache lookup happens at all. The literal operand is NOT declared as an
+	// operand since its value is already baked into `matcher` — this spec's arity
+	// is one, while the plan node still has two children.
+	const constPattern = constLikePattern(plan.right);
+	if (constPattern !== undefined) {
+		const matcher = compileLikeMatcher(constPattern);
+		function runConstPattern(_ctx: RuntimeContext, text: SqlValue): SqlValue {
+			// text LIKE <const>: NULL text → NULL, else run the pre-compiled matcher.
+			if (text === null) return null;
+			return matcher(valueToText(text));
+		}
+		return {
+			operands: [plan.left],
+			run: runConstPattern,
+			note: 'LIKE(like-const)'
+		};
+	}
+
 	function run(ctx: RuntimeContext, text: SqlValue, pattern: SqlValue): SqlValue {
 		// SQL LIKE logic: text LIKE pattern
 		// NULL handling: if either operand is NULL, result is NULL
@@ -377,20 +592,18 @@ export function emitLikeOp(plan: BinaryOpNode, ctx: EmissionContext): Instructio
 			return null;
 		}
 
-		// Convert both operands to strings and perform LIKE matching
-		const textStr = String(text);
-		const patternStr = String(pattern);
+		// Convert both operands through the shared value-to-text rule and perform LIKE
+		// matching (memoized compile). Must agree with `constLikePattern` above, or the
+		// constant-pattern fast path starts answering differently from this one.
+		const textStr = valueToText(text);
+		const patternStr = valueToText(pattern);
 
 		return simpleLike(patternStr, textStr);
 	}
 
-	const leftExpr = emitPlanNode(plan.left, ctx);
-	const rightExpr = emitPlanNode(plan.right, ctx);
-
 	return {
-		params: [leftExpr, rightExpr],
-		run: run as InstructionRun,
+		operands: [plan.left, plan.right],
+		run,
 		note: 'LIKE(like)'
 	};
 }
-

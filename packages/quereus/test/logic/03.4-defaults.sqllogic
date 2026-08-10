@@ -31,3 +31,524 @@ SELECT * FROM t_defaults ORDER BY id;
 → [{"id":1,"name":"test1","created_timestamp":9999,"computed":"custom"},{"id":2,"name":"test2","created_timestamp":1500,"computed":"prefix_suffix"},{"id":3,"name":"unnamed","created_timestamp":2000,"computed":"prefix_suffix"},{"id":4,"name":"unnamed","created_timestamp":1500,"computed":"prefix_suffix"}]
 
 DROP TABLE t_defaults;
+
+-- ===================================
+-- DEFAULT deriving from a populated sibling via new.<column>
+-- A default may read a value the INSERT actually supplies; only INSERT-supplied
+-- columns are visible, so a default never depends on another column's default
+-- (which would impose an evaluation-order race).
+-- ===================================
+
+CREATE TABLE t_newref (
+  id INTEGER PRIMARY KEY,
+  base INTEGER,
+  title TEXT,
+  doubled INTEGER DEFAULT (new.base * 2),
+  slug TEXT DEFAULT (lower(new.title))
+);
+
+-- Siblings populated → the defaults derive from them
+INSERT INTO t_newref (id, base, title) VALUES (1, 10, 'Hello');
+SELECT id, base, title, doubled, slug FROM t_newref WHERE id = 1;
+→ [{"id":1,"base":10,"title":"Hello","doubled":20,"slug":"hello"}]
+
+-- An explicitly supplied value overrides the default (new.* unused)
+INSERT INTO t_newref (id, base, title, doubled) VALUES (2, 10, 'X', 999);
+SELECT doubled FROM t_newref WHERE id = 2;
+→ [{"doubled":999}]
+
+-- Referencing a column the INSERT did not supply → clear resolution error
+-- (here `title` is omitted, so `new.title` in slug's default has no value).
+INSERT INTO t_newref (id, base) VALUES (3, 7);
+-- error: isn't a column
+
+DROP TABLE t_newref;
+
+-- ===================================
+-- new.<column> NOT NULL default — error attribution
+-- A NOT NULL violation is always reported against the FIRST NOT-NULL column (in
+-- declaration order) whose effective NEW value is NULL — independent of which
+-- column any DEFAULT references. These cases run through the materialised-row
+-- (buildNotNullDefaults) path via OR REPLACE / explicit values, NOT the
+-- row-expansion `isn't a column` path above. They lock in that attribution
+-- across the nullable / not-null sibling matrix so the historical
+-- "misattribution" concern is not re-filed.
+-- ===================================
+
+-- A BARE sibling is itself NOT NULL (default_column_nullability='not_null', the
+-- engine default — see 43-default-nullability.sqllogic). Omitting `a` makes IT
+-- the first NOT-NULL violator, so the message names the sibling `a`, NOT the
+-- defaulted column `b`. This is CORRECT: `a` violates its OWN NOT NULL and is
+-- checked before `b`. (REPLACE form: `a` has no DEFAULT to substitute.)
+create table c1 (id integer primary key, a integer, b integer not null default (new.a));
+insert or replace into c1 (id, b) values (1, null);
+-- error: NOT NULL constraint failed: c1.a
+
+-- Plain INSERT/ABORT throws via a different site (throwForAction) but names the
+-- same column.
+insert into c1 (id, b) values (1, null);
+-- error: NOT NULL constraint failed: c1.a
+
+DROP TABLE c1;
+
+-- When the sibling is EXPLICITLY nullable, NULL-ing it no longer makes it a
+-- violator, so the defaulted NOT NULL column `b` is named instead.
+create table c2 (id integer primary key, a integer null, b integer not null default (new.a));
+
+-- OR REPLACE substitutes b's DEFAULT (new.a); the sibling is NULL (omitted), so
+-- the substituted value is still NULL → names the defaulted column b.
+insert or replace into c2 (id, b) values (1, null);
+-- error: NOT NULL constraint failed: c2.b
+
+-- Plain INSERT with explicit NULL for b: no substitution, b stays NULL → names b.
+insert into c2 (id, b) values (2, null);
+-- error: NOT NULL constraint failed: c2.b
+
+-- Sibling supplied non-NULL → OR REPLACE substitutes new.a successfully, so b
+-- takes the substituted sibling value (assert the STORED value, not just success).
+insert or replace into c2 (id, a, b) values (3, 7, null);
+select a, b from c2 where id = 3;
+→ [{"a":7,"b":7}]
+
+-- Both sibling and defaulted column explicitly NULL → the default resolves to
+-- NULL → names the defaulted column b.
+insert or replace into c2 (id, a, b) values (4, null, null);
+-- error: NOT NULL constraint failed: c2.b
+
+-- IGNORE: the defaulted column is NULL with no usable default → the row is
+-- silently skipped (IGNORE is handled before DEFAULT substitution), no error and
+-- no row inserted.
+insert or ignore into c2 (id, b) values (5, null);
+select id from c2 where id = 5;
+→ []
+
+-- IGNORE asymmetry — substitution is REPLACE-only. Here the DEFAULT *could*
+-- satisfy NOT NULL (a=7 ⇒ new.a=7), yet OR IGNORE still skips the row: it bails
+-- on the NOT NULL violation BEFORE attempting substitution. The id=5 case above
+-- can't distinguish this from "substitute then re-check" (new.a is NULL there
+-- regardless); a non-NULL sibling makes the row's absence the proof.
+insert or ignore into c2 (id, a, b) values (6, 7, null);
+select id from c2 where id = 6;
+→ []
+
+DROP TABLE c2;
+
+-- Column ordering — first violator wins. The NOT NULL DEFAULTED column `b` is
+-- declared BEFORE its referenced sibling `a` (a is bare ⇒ also NOT NULL). With
+-- both explicitly NULL, BOTH violate, but the message names `b` because it is
+-- first in declaration order (matches SQLite's first-violation reporting).
+-- Contrast c1, where the sibling came first and was named. Explicit NULLs keep
+-- this on the materialised-row path; omitting both would instead raise the
+-- row-expansion `isn't a column` resolution error.
+create table c_ord (id integer primary key, b integer not null default (new.a), a integer);
+insert or replace into c_ord (id, a, b) values (1, null, null);
+-- error: NOT NULL constraint failed: c_ord.b
+
+DROP TABLE c_ord;
+
+-- ===================================
+-- new.<column> through a single-source VIEW insert
+-- A view INSERT re-plans through the same row-expansion path, so the default
+-- still derives from the supplied sibling.
+-- ===================================
+
+CREATE TABLE base_nv (
+  id INTEGER PRIMARY KEY,
+  base INTEGER,
+  doubled INTEGER DEFAULT (new.base * 2)
+);
+CREATE VIEW v_nv AS SELECT id, base, doubled FROM base_nv;
+
+INSERT INTO v_nv (id, base) VALUES (1, 10);
+SELECT base, doubled FROM base_nv WHERE id = 1;
+→ [{"base":10,"doubled":20}]
+
+DROP VIEW v_nv;
+DROP TABLE base_nv;
+
+-- ===================================
+-- new.<column> nested inside a subquery in a DEFAULT resolves as a correlated
+-- read of the row being inserted.
+-- ===================================
+
+CREATE TABLE t_sub (
+  id INTEGER PRIMARY KEY,
+  x INTEGER,
+  y INTEGER DEFAULT (coalesce((SELECT new.x), 0))
+);
+INSERT INTO t_sub (id, x) VALUES (1, 7);
+SELECT y FROM t_sub WHERE id = 1;
+→ [{"y":7}]
+
+DROP TABLE t_sub;
+
+-- ===================================
+-- new.<column> alongside GENERATED columns
+-- A `new.` default coexists with generated columns (the two-pass expansion is
+-- unaffected); but `new.<generated_col>` is NOT a source-supplied value, so it
+-- raises a resolution error.
+-- ===================================
+
+CREATE TABLE t_gen (
+  id INTEGER PRIMARY KEY,
+  base INTEGER,
+  dbl INTEGER DEFAULT (new.base * 2),
+  g INTEGER GENERATED ALWAYS AS (base + 1) STORED
+);
+INSERT INTO t_gen (id, base) VALUES (1, 10);
+SELECT dbl, g FROM t_gen WHERE id = 1;
+→ [{"dbl":20,"g":11}]
+
+DROP TABLE t_gen;
+
+CREATE TABLE t_gen_ref (
+  id INTEGER PRIMARY KEY,
+  x INTEGER,
+  g INTEGER GENERATED ALWAYS AS (x * 2) STORED,
+  y INTEGER DEFAULT (new.g)
+);
+INSERT INTO t_gen_ref (id, x) VALUES (1, 5);
+-- error: isn't a column
+
+DROP TABLE t_gen_ref;
+
+-- ===================================
+-- Identity-resolving default: new.<column> inside a correlated subquery over
+-- ANOTHER base table resolves an existing parent row's key from a supplied
+-- value (the PK-is-FK extension-table / lens basis pattern). The default reads
+-- new.value and looks the matching parent rowId up, rather than minting a fresh
+-- surrogate.
+-- ===================================
+
+CREATE TABLE h0_users_id (
+  rowId INTEGER PRIMARY KEY,
+  value INTEGER
+);
+INSERT INTO h0_users_id (rowId, value) VALUES (10, 100), (20, 200);
+
+CREATE TABLE h2_uprof (
+  rowId INTEGER PRIMARY KEY DEFAULT (SELECT rowId FROM h0_users_id h0 WHERE h0.value = new.value),
+  value INTEGER
+);
+
+-- value=200 resolves the parent's rowId=20 through the correlated subquery
+INSERT INTO h2_uprof (value) VALUES (200);
+SELECT rowId, value FROM h2_uprof WHERE value = 200;
+→ [{"rowId":20,"value":200}]
+
+-- a second resolution against a different supplied value
+INSERT INTO h2_uprof (value) VALUES (100);
+SELECT rowId, value FROM h2_uprof ORDER BY rowId;
+→ [{"rowId":10,"value":100},{"rowId":20,"value":200}]
+
+DROP TABLE h2_uprof;
+DROP TABLE h0_users_id;
+
+-- ===================================
+-- ALTER COLUMN SET DEFAULT routes through the same DDL validator CREATE TABLE uses,
+-- so the stored default is consistent with what INSERT will accept: `new.<column>`
+-- is accepted (deferred to INSERT time); a bare column / non-deterministic default
+-- is rejected at ALTER time (closing the previously-silent-accept gap).
+-- ===================================
+
+create table sd_t (id integer primary key, x integer, y integer);
+
+-- a `new.<col>` SET DEFAULT is accepted (build/determinism deferred to INSERT).
+alter table sd_t alter column y set default (new.x * 10);
+
+-- and is exercised by a later insert that supplies the sibling.
+insert into sd_t (id, x) values (1, 4);
+select x, y from sd_t where id = 1;
+→ [{"x":4,"y":40}]
+
+-- supplying y directly overrides the default.
+insert into sd_t (id, x, y) values (2, 4, 99);
+select x, y from sd_t where id = 2;
+→ [{"x":4,"y":99}]
+
+-- omitting the sibling the default reads → the same resolution error as the
+-- single-source path (new.x has no supplied value).
+insert into sd_t (id) values (3);
+-- error: isn't a column
+
+DROP TABLE sd_t;
+
+-- a bare-column SET DEFAULT is now rejected at ALTER time (no mutation context).
+create table sd_bare (id integer primary key, a integer, b integer);
+alter table sd_bare alter column b set default (a + 1);
+-- error: bare column
+DROP TABLE sd_bare;
+
+-- a non-deterministic SET DEFAULT is rejected at ALTER time.
+create table sd_nd (id integer primary key, v integer);
+alter table sd_nd alter column v set default (random());
+-- error: non-deterministic
+DROP TABLE sd_nd;
+
+-- DROP DEFAULT needs no validation and still works.
+create table sd_drop (id integer primary key, w integer null default 7);
+insert into sd_drop (id) values (1);
+select w from sd_drop where id = 1;
+→ [{"w":7}]
+alter table sd_drop alter column w drop default;
+insert into sd_drop (id) values (2);
+select w from sd_drop where id = 2;
+→ [{"w":null}]
+DROP TABLE sd_drop;
+
+-- ===================================
+-- ALTER TABLE ADD COLUMN with a new.<column> DEFAULT backfills existing rows
+-- per-row from their OWN sibling, and a later insert derives the column from the
+-- INSERT-supplied sibling (parity with the single-source path).
+-- ===================================
+
+create table ac_t (id integer primary key, base integer);
+insert into ac_t (id, base) values (1, 10), (2, 5), (3, 0);
+
+-- new.<col> default: each existing row backfills from its own base.
+alter table ac_t add column doubled integer default (new.base * 2);
+select id, base, doubled from ac_t order by id;
+→ [{"id":1,"base":10,"doubled":20},{"id":2,"base":5,"doubled":10},{"id":3,"base":0,"doubled":0}]
+
+-- a later insert supplying base derives doubled.
+insert into ac_t (id, base) values (4, 7);
+select doubled from ac_t where id = 4;
+→ [{"doubled":14}]
+
+-- an explicitly supplied value still overrides the default.
+insert into ac_t (id, base, doubled) values (5, 7, 999);
+select doubled from ac_t where id = 5;
+→ [{"doubled":999}]
+
+-- omitting the sibling the default reads → the same resolution error as the
+-- single-source insert path (new.base has no supplied value).
+insert into ac_t (id) values (6);
+-- error: isn't a column
+
+DROP TABLE ac_t;
+
+-- A literal-folding ADD COLUMN default still bulk-backfills (fast path unchanged).
+create table ac_lit (id integer primary key, a integer);
+insert into ac_lit (id, a) values (1, 1), (2, 2);
+alter table ac_lit add column c integer default (3 + 4);
+select id, c from ac_lit order by id;
+→ [{"id":1,"c":7},{"id":2,"c":7}]
+DROP TABLE ac_lit;
+
+-- ADD COLUMN NOT NULL whose per-row backfill is non-null for every row succeeds.
+create table ac_nn2 (id integer primary key, base integer not null);
+insert into ac_nn2 (id, base) values (1, 10), (2, 4);
+alter table ac_nn2 add column doubled integer not null default (new.base * 2);
+select id, base, doubled from ac_nn2 order by id;
+→ [{"id":1,"base":10,"doubled":20},{"id":2,"base":4,"doubled":8}]
+DROP TABLE ac_nn2;
+
+-- ADD COLUMN NOT NULL whose per-row backfill yields NULL for some row is rejected,
+-- and the table is left unchanged (the new column was not added).
+create table ac_nn (id integer primary key, base integer null);
+insert into ac_nn (id, base) values (1, 10), (2, null);
+alter table ac_nn add column doubled integer not null default (new.base * 2);
+-- error:
+select * from ac_nn order by id;
+→ [{"id":1,"base":10},{"id":2,"base":null}]
+DROP TABLE ac_nn;
+
+-- ADD COLUMN with BOTH a non-foldable (per-row) DEFAULT and a CHECK on the new
+-- column enforces the CHECK against every backfilled row, evaluated per-row inside
+-- the backfill hook (mirrors the NOT NULL per-row path). A passing CHECK adds the
+-- column and backfills; a violating row aborts the ALTER and leaves the table
+-- unchanged on both the memory and store modules. The literal-default + CHECK path
+-- (see 90.2.1 §3) is unaffected and still validates/reverts via the post-backfill scan.
+
+-- Passing CHECK: every backfilled row satisfies it → column added with derived values.
+create table ac_chk_ok (id integer primary key, base integer null);
+insert into ac_chk_ok (id, base) values (1, 5), (2, 3);
+alter table ac_chk_ok add column c integer default (new.base * 2) check (c > 0);
+select id, base, c from ac_chk_ok order by id;
+→ [{"id":1,"base":5,"c":10},{"id":2,"base":3,"c":6}]
+DROP TABLE ac_chk_ok;
+
+-- A CHECK referencing BOTH the new column and an existing sibling resolves both.
+create table ac_chk_ref (id integer primary key, base integer null);
+insert into ac_chk_ref (id, base) values (1, 5), (2, 3);
+alter table ac_chk_ref add column c integer default (new.base * 2) check (c > base);
+select id, base, c from ac_chk_ref order by id;
+→ [{"id":1,"base":5,"c":10},{"id":2,"base":3,"c":6}]
+DROP TABLE ac_chk_ref;
+
+-- One backfilled row violates the CHECK (base=-3 → c=-6, fails c > 0): the ALTER aborts
+-- and the table is left unchanged (no `c` column).
+create table ac_chk_bad (id integer primary key, base integer null);
+insert into ac_chk_bad (id, base) values (1, 5), (2, -3);
+alter table ac_chk_bad add column c integer default (new.base * 2) check (c > 0);
+-- error:
+select * from ac_chk_bad order by id;
+→ [{"id":1,"base":5},{"id":2,"base":-3}]
+DROP TABLE ac_chk_bad;
+
+-- ALL rows violate the CHECK (the original silent-admission scenario): still rejected and
+-- the table is left unchanged.
+create table ac_chk_all (id integer primary key, base integer null);
+insert into ac_chk_all (id, base) values (1, 5), (2, 3);
+alter table ac_chk_all add column c integer default (new.base * 2) check (c > 1000000);
+-- error:
+select * from ac_chk_all order by id;
+→ [{"id":1,"base":5},{"id":2,"base":3}]
+DROP TABLE ac_chk_all;
+
+-- MULTIPLE CHECKs on one ADD COLUMN, all satisfied → column added (each predicate
+-- compiled and evaluated per backfilled row).
+create table ac_chk_multi_ok (id integer primary key, base integer null);
+insert into ac_chk_multi_ok (id, base) values (1, 5), (2, 3);
+alter table ac_chk_multi_ok add column c integer default (new.base * 2) check (c > 0) check (c < 100);
+select id, base, c from ac_chk_multi_ok order by id;
+→ [{"id":1,"base":5,"c":10},{"id":2,"base":3,"c":6}]
+DROP TABLE ac_chk_multi_ok;
+
+-- MULTIPLE CHECKs where the SECOND fails for one row (row 1: c=10 fails c < 8): the ALTER
+-- aborts and the table is left unchanged — confirms every predicate is enforced, not just
+-- the first.
+create table ac_chk_multi_bad (id integer primary key, base integer null);
+insert into ac_chk_multi_bad (id, base) values (1, 5), (2, 3);
+alter table ac_chk_multi_bad add column c integer default (new.base * 2) check (c > 0) check (c < 8);
+-- error:
+select * from ac_chk_multi_bad order by id;
+→ [{"id":1,"base":5},{"id":2,"base":3}]
+DROP TABLE ac_chk_multi_bad;
+
+-- After a successful per-row CHECK ADD COLUMN, the CHECK is merged into the table-level
+-- constraint set, so a FUTURE insert violating it is rejected (the backfill enforcement
+-- and write-time enforcement share the same predicate).
+create table ac_chk_future (id integer primary key, base integer null);
+insert into ac_chk_future (id, base) values (1, 5);
+alter table ac_chk_future add column c integer default (new.base * 2) check (c > 0);
+insert into ac_chk_future (id, base, c) values (2, 1, -5);
+-- error:
+select id, base, c from ac_chk_future order by id;
+→ [{"id":1,"base":5,"c":10}]
+DROP TABLE ac_chk_future;
+
+-- TRUTHINESS: a bare-column CHECK yields bigint 0n for a backfilled 0 (integer
+-- literals lex to bigint at runtime). The old backfill test `result === false ||
+-- result === 0` missed 0n and silently admitted the row; the shared isTruthy rule
+-- rejects it. base=0 → c=0n → CHECK fails → ALTER aborts, table unchanged.
+create table ac_chk_truthy (id integer primary key, base integer null);
+insert into ac_chk_truthy (id, base) values (1, 5), (2, 0);
+alter table ac_chk_truthy add column c integer default (new.base) check (c);
+-- error:
+select * from ac_chk_truthy order by id;
+→ [{"id":1,"base":5},{"id":2,"base":0}]
+DROP TABLE ac_chk_truthy;
+
+-- TRUTHINESS control: all backfilled values truthy → column added.
+create table ac_chk_truthy_ok (id integer primary key, base integer null);
+insert into ac_chk_truthy_ok (id, base) values (1, 5), (2, 3);
+alter table ac_chk_truthy_ok add column c integer default (new.base) check (c);
+select id, base, c from ac_chk_truthy_ok order by id;
+→ [{"id":1,"base":5,"c":5},{"id":2,"base":3,"c":3}]
+DROP TABLE ac_chk_truthy_ok;
+
+-- COLLATION parity: a `collate nocase` new column with a CHECK comparing it to a lowercase
+-- literal. The backfilled value 'ABC' equals 'abc' only under NOCASE — so this passes iff the
+-- new column's declared collation drives the backfill-time CHECK (matching write-time).
+create table ac_chk_coll (id integer primary key, name text);
+insert into ac_chk_coll (id, name) values (1, 'ABC');
+alter table ac_chk_coll add column c text collate nocase default (new.name) check (c = 'abc');
+select id, name, c from ac_chk_coll order by id;
+→ [{"id":1,"name":"ABC","c":"ABC"}]
+DROP TABLE ac_chk_coll;
+
+-- ADD COLUMN with a new.<col> default on an EMPTY table: no rows to backfill, so
+-- even a NOT NULL per-row default adds cleanly; future inserts derive the value.
+create table ac_empty (id integer primary key, base integer);
+alter table ac_empty add column doubled integer not null default (new.base * 2);
+insert into ac_empty (id, base) values (1, 4);
+select id, base, doubled from ac_empty order by id;
+→ [{"id":1,"base":4,"doubled":8}]
+DROP TABLE ac_empty;
+
+-- A default reading MULTIPLE new.<col> siblings backfills each existing row from its own.
+create table ac_multi (id integer primary key, a integer, b integer);
+insert into ac_multi (id, a, b) values (1, 2, 3), (2, 10, 1);
+alter table ac_multi add column s integer default (new.a + new.b);
+select id, s from ac_multi order by id;
+→ [{"id":1,"s":5},{"id":2,"s":11}]
+DROP TABLE ac_multi;
+
+-- ===================================
+-- Identity-resolving default through a DECOMPOSITION fan-out. The anchor key
+-- column's surrogate `default` correlates on a SIBLING supplied logical column
+-- (`new.value`) the anchor's own base table does NOT carry — it lives on another
+-- member. The produced row's NEW context now threads into every member insert, so
+-- the engine's own fan-out resolves the parent surrogate per produced row and
+-- EC-threads it across the members (the multi-member dual of the single-source
+-- identity-resolving default above). Before this, the fan-out's buildNotNullDefaults
+-- raised `new.value isn't a column` from buildDecompositionMemberInsert.
+-- ===================================
+
+create table hd_parent (pid integer primary key, value integer);
+
+-- run
+
+insert into hd_parent (pid, value) values (10, 100), (20, 200), (30, 300);
+
+-- run
+
+-- Per-column decomposition of logical T(value): anchor hd_anchor holds ONLY the
+-- surrogate key rowId, whose default resolves the parent's pid from the inserted
+-- value (`new.value`); member hd_value carries the value column. The resolved rowId
+-- threads from the anchor default into hd_value via the shared key.
+create table hd_anchor (
+	rowId integer primary key default (select pid from hd_parent p where p.value = new.value)
+) with tags (
+	"quereus.lens.decomp.logical.dT" = 'T',
+	"quereus.lens.decomp.role.dT" = 'primary-storage',
+	"quereus.lens.decomp.anchor.dT" = 'hd_anchor',
+	"quereus.lens.decomp.presence.dT" = 'mandatory',
+	"quereus.lens.decomp.keykind.dT" = 'surrogate',
+	"quereus.lens.decomp.key.dT" = 'rowId'
+);
+
+create table hd_value (rowId integer primary key, value integer) with tags (
+	"quereus.lens.decomp.logical.dT" = 'T',
+	"quereus.lens.decomp.role.dT" = 'primary-storage',
+	"quereus.lens.decomp.anchor.dT" = 'hd_anchor',
+	"quereus.lens.decomp.presence.dT" = 'mandatory',
+	"quereus.lens.decomp.keykind.dT" = 'surrogate',
+	"quereus.lens.decomp.key.dT" = 'rowId',
+	"quereus.lens.decomp.col.dT.value" = 'value'
+);
+
+-- run
+
+declare logical schema xd { table T { value integer } }
+
+-- run
+
+apply schema xd;
+
+-- run
+
+-- value=200 resolves the parent pid=20 via the anchor default and threads that
+-- surrogate into the value member (no longer throws `new.value isn't a column`).
+insert into xd.T (value) values (200);
+select rowId, value from hd_value;
+→ [{"rowId":20,"value":200}]
+
+-- the identical surrogate landed on the anchor member.
+select rowId from hd_anchor;
+→ [{"rowId":20}]
+
+-- Multi-row in ONE statement: each produced row resolves its OWN parent from its
+-- supplied value (the NEW context is per produced row, not once per statement).
+insert into xd.T (value) values (100), (300);
+select rowId, value from hd_value order by rowId;
+→ [{"rowId":10,"value":100},{"rowId":20,"value":200},{"rowId":30,"value":300}]
+
+-- the view reads back the full logical image (anchor ⋈ value on the shared key).
+select value from xd.T order by value;
+→ [{"value":100},{"value":200},{"value":300}]
+
+DROP TABLE hd_value;
+DROP TABLE hd_anchor;
+DROP TABLE hd_parent;

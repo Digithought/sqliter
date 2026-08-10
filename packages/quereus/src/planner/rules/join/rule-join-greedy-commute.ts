@@ -12,7 +12,7 @@ const log = createLogger('optimizer:rule:join-greedy-commute');
 function isSingleton(node: RelationalPlanNode): boolean {
 	const colCount = node.getAttributes().length;
 	if (colCount === 0) return node.physical?.estimatedRows === 1;
-	return hasSingletonFd(node.physical?.fds, colCount);
+	return hasSingletonFd(node.physical?.fds, colCount, node.getType().isSet);
 }
 
 /**

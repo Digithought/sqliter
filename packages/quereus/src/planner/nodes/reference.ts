@@ -1,7 +1,8 @@
 import type { BaseType, ScalarType, RelationType } from '../../common/datatype.js';
-import { PlanNode, type ZeroAryRelationalNode, type ZeroAryScalarNode, type Attribute, type InjectivityResult, type MonotonicityResult, type PhysicalProperties, type FunctionalDependency, type ConstantBinding, type DomainConstraint } from './plan-node.js';
+import { PlanNode, type ZeroAryRelationalNode, type ZeroAryScalarNode, type Attribute, type InjectivityResult, type MonotonicityResult, type PhysicalProperties, type FunctionalDependency, type ConstantBinding, type DomainConstraint, type InclusionDependency, type UpdateSite, type AttributeDefault } from './plan-node.js';
 import { addFd, closeConstantBindingsOverEcs, mergeConstantBindings, mergeDomainConstraints, mergeEquivClasses } from '../util/fd-utils.js';
-import { getCheckExtraction, type CheckExtraction } from '../analysis/check-extraction.js';
+import { seedTableForeignKeyInds } from '../util/ind-utils.js';
+import { getTrustedCheckExtraction, type CheckExtraction } from '../analysis/check-extraction.js';
 import { getPartialUniqueGuardedFds } from '../analysis/partial-unique-extraction.js';
 import { getAssertionHoistedConstraints } from '../analysis/assertion-hoist-cache.js';
 import type { SchemaManager } from '../../schema/manager.js';
@@ -9,7 +10,8 @@ import { PlanNodeType } from './plan-node-type.js';
 import type { TableSchema } from '../../schema/table.js';
 import type { Scope } from '../scopes/scope.js';
 import type * as AST from '../../parser/ast.js';
-import { relationTypeFromTableSchema } from '../type-utils.js';
+import { columnSchemaToScalarType, relationTypeFromTableSchema } from '../type-utils.js';
+import { catalogRowCount } from '../stats/table-cardinality.js';
 import { Cached } from '../../util/cached.js';
 import type { FunctionSchema } from '../../schema/function.js';
 import { isTableValuedFunctionSchema } from '../../schema/function.js';
@@ -20,20 +22,13 @@ import type { AnyVirtualTableModule } from '../../vtab/module.js';
 import { getModuleConcurrencyMode } from '../../vtab/concurrency.js';
 import type { ColumnBindingProvider } from '../framework/characteristics.js';
 import type { TableAccessCapable } from '../framework/characteristics.js';
-
-/** Shared empty `CheckExtraction` instance used when a vtab module's
- *  `permitsGrandfatheredCheckViolators` capability suppresses the CHECK
- *  contribution lift in `TableReferenceNode.computePhysical`. */
-const EMPTY_CHECK_EXTRACTION: CheckExtraction = {
-	fds: [],
-	equivPairs: [],
-	constantBindings: [],
-	domainConstraints: [],
-};
+import type { ColumnReferenceCapable } from '../framework/characteristics.js';
 
 /** Represents a reference to a table in the global schema. */
 export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNode, TableAccessCapable, ColumnBindingProvider {
 	override readonly nodeType = PlanNodeType.TableReference;
+	readonly isTableAccessCapable = true as const;
+	readonly isColumnBindingProviderCapable = true as const;
 
 	private typeCache: Cached<RelationType>;
 	private attributesCache: Cached<Attribute[]>;
@@ -63,13 +58,7 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 			return this.tableSchema.columns.map((column) => ({
 				id: PlanNode.nextAttrId(),
 				name: column.name,
-				type: {
-					typeClass: 'scalar' as const,
-					logicalType: column.logicalType,
-					nullable: !column.notNull,
-					isReadOnly: false,
-					collationName: column.collation
-				},
+				type: columnSchemaToScalarType(column),
 				sourceRelation: `${this.tableSchema.schemaName}.${this.tableSchema.name}`,
 				relationName: this.tableSchema.name
 			}));
@@ -100,14 +89,14 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 	}
 
 	get estimatedRows(): number | undefined {
-		return this.tableSchema.estimatedRows;
+		return catalogRowCount(this.tableSchema);
 	}
 
 	computePhysical(_childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
 		// Seed FDs from declared keys: each declared key (PK + UNIQUE) becomes
 		// `key → other-columns`. This is the canonical encoding of "K is a unique
-		// key" — downstream consumers query `physical.fds` (via `isSuperkey` /
-		// `hasAnyKey`) without special-casing keys.
+		// key" — downstream consumers query `physical.fds` (via
+		// `isUniqueDeterminant` / `hasAnyKey`) without special-casing keys.
 		const relType = this.getType();
 		const colCount = relType.columns.length;
 		let fds: ReadonlyArray<FunctionalDependency> = [];
@@ -120,7 +109,7 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 				if (!detSet.has(i)) dep.push(i);
 			}
 			if (dep.length === 0) continue;
-			fds = addFd(fds, { determinants: det, dependents: dep });
+			fds = addFd(fds, { determinants: det, dependents: dep, kind: 'unique' });
 		}
 
 		// Merge in CHECK-derived FDs/ECs/bindings/domains. Cached per-schema.
@@ -133,12 +122,17 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 		// physical properties would let consumers (e.g. the filter-contradiction
 		// rule) fold WHERE predicates that would have matched the violators.
 		// Assertion-hoist and partial-UNIQUE contributions are independent
-		// paths and are NOT gated by this flag.
-		const permitsCheckViolators =
-			this.vtabModule.getCapabilities?.().permitsGrandfatheredCheckViolators === true;
-		const checkExt: CheckExtraction = permitsCheckViolators
-			? EMPTY_CHECK_EXTRACTION
-			: getCheckExtraction(this.tableSchema);
+		// paths and are NOT gated by this flag. The gate lives centrally in
+		// `getTrustedCheckExtraction`; the node's own module reference is passed
+		// explicitly (it is resolved at construction, independent of the schema).
+		const checkExt: CheckExtraction = getTrustedCheckExtraction(this.tableSchema, this.vtabModule);
+		// CHECK-derived FDs fold unconditionally. They are pure value claims
+		// (`kind: 'determination'`, or guarded), and the kind-aware readers
+		// (`isUniqueDeterminant`) never read a determination as a uniqueness
+		// claim — the endpoint gate that used to live here is subsumed (ticket
+		// fd-determination-reader-side-rule, replacing the
+		// fd-check-assertion-key-bag-overclaim producer gate). Guarded FDs fold
+		// untouched as before — they stay inert until Filter activation.
 		for (const fd of checkExt.fds) {
 			fds = addFd(fds, fd);
 		}
@@ -161,7 +155,12 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 			? getAssertionHoistedConstraints(this.schemaManager, this.tableSchema)
 			: undefined;
 		if (hoisted) {
-			for (const fd of hoisted.fds) fds = addFd(fds, fd);
+			// Unconditional fold, like checkExt (the readers are kind-aware).
+			// Folded AFTER checkExt so structurally-identical entries keep
+			// `declared-check` provenance.
+			for (const fd of hoisted.fds) {
+				fds = addFd(fds, fd);
+			}
 		}
 
 		let equivClasses: ReadonlyArray<ReadonlyArray<number>> = [];
@@ -190,11 +189,46 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 			domainConstraints = mergeDomainConstraints(domainConstraints, hoisted.domainConstraints);
 		}
 
+		// Seed inclusion dependencies from declared foreign keys whose referenced
+		// columns are the parent's primary key. Output indices equal table column
+		// indices here, so the FK child columns are used verbatim as `cols`. Needs
+		// the schema manager to resolve parent tables; when absent (isolated test
+		// construction) no INDs are seeded.
+		let inds: ReadonlyArray<InclusionDependency> = [];
+		if (this.schemaManager !== undefined) {
+			const sm = this.schemaManager;
+			inds = seedTableForeignKeyInds(this.tableSchema, (t, s) => sm.findTable(t, s));
+		}
+
 		const out: Partial<PhysicalProperties> = {};
 		if (fds.length > 0) out.fds = fds;
 		if (equivClasses.length > 0) out.equivClasses = equivClasses;
 		if (constantBindings.length > 0) out.constantBindings = constantBindings;
 		if (domainConstraints.length > 0) out.domainConstraints = domainConstraints;
+		if (inds.length > 0) out.inds = inds;
+
+		// Backward update-lineage seed (the derived dual of the forward FDs above):
+		// every output attribute traces to its own base column; generated columns
+		// are read-only at every level (`computed`); declared column defaults seed
+		// `attributeDefaults`. `table` is this node's numeric plan-node id — the
+		// relation discriminator the orchestrator uses across multi-source bodies
+		// (a self-join produces two TableReferenceNodes with distinct ids).
+		const attrs = this.getAttributes();
+		const tableId = Number(this.id);
+		const updateLineage = new Map<number, UpdateSite>();
+		const attributeDefaults = new Map<number, AttributeDefault>();
+		this.tableSchema.columns.forEach((col, i) => {
+			const attr = attrs[i];
+			if (!attr) return;
+			if (col.generated) {
+				updateLineage.set(attr.id, { kind: 'computed', expr: col.generatedExpr ?? { type: 'column', name: col.name } });
+			} else {
+				updateLineage.set(attr.id, { kind: 'base', table: tableId, baseColumn: col.name });
+				if (col.defaultValue) attributeDefaults.set(attr.id, { kind: 'base-default', value: col.defaultValue });
+			}
+		});
+		if (updateLineage.size > 0) out.updateLineage = updateLineage;
+		if (attributeDefaults.size > 0) out.attributeDefaults = attributeDefaults;
 		// Concurrency safety: read-only subtree over a module that tolerates
 		// concurrent calls. The base PlanNode `physical` getter ANDs children's
 		// `concurrencySafe` automatically; here we set the leaf value.
@@ -240,7 +274,7 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 			columns: this.tableSchema.columns.map(col => col.name),
 			...(this.readCommitted ? { readCommitted: true } : {}),
 			estimates: {
-				rows: this.tableSchema.estimatedRows
+				rows: this.estimatedRows
 			}
 		};
 	}
@@ -328,8 +362,9 @@ export class TableFunctionReferenceNode extends PlanNode implements ZeroAryRelat
  * Represents a reference to a column from a relational node.
  * Uses attribute IDs for stable references across plan transformations.
  */
-export class ColumnReferenceNode extends PlanNode implements ZeroAryScalarNode {
+export class ColumnReferenceNode extends PlanNode implements ZeroAryScalarNode, ColumnReferenceCapable {
 	override readonly nodeType = PlanNodeType.ColumnReference;
+	readonly isColumnReferenceCapable = true as const;
 
 	constructor(
 		scope: Scope,

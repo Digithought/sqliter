@@ -11,11 +11,13 @@
 
 import { createLogger } from '../common/logger.js';
 import type { Row, SqlValue } from '../common/types.js';
+import { encodeKeyTuple, decodeKeyTuple } from '../util/key-tuple-codec.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode } from '../common/types.js';
 import type { VirtualTableConnection } from '../vtab/connection.js';
 import type { DatabaseEventEmitter } from './database-events.js';
 import type { DeferredConstraintQueue } from '../runtime/deferred-constraint-queue.js';
+import type { AssertionViolation } from './database-assertions.js';
 
 const log = createLogger('core:transaction');
 const debugLog = log.extend('debug');
@@ -37,8 +39,10 @@ export interface TransactionManagerContext {
 	getEventEmitter(): DatabaseEventEmitter;
 	/** Get the deferred constraint queue */
 	getDeferredConstraints(): DeferredConstraintQueue;
-	/** Run global assertions before commit */
-	runGlobalAssertions(): Promise<void>;
+	/** Run global assertions before commit. When `sink` is supplied (report
+	 *  mode), violations are collected into it and the commit proceeds instead
+	 *  of throwing on the first violation. */
+	runGlobalAssertions(sink?: AssertionViolation[]): Promise<void>;
 	/** Run deferred row constraints before commit */
 	runDeferredRowConstraints(): Promise<void>;
 	/** Fire post-commit watchers (Database.watch). Errors logged, never rolled
@@ -118,6 +122,12 @@ export class TransactionManager {
 	/** Flag indicating we're in a coordinated multi-connection commit */
 	private inCoordinatedCommit = false;
 
+	/** Sink the next commit's global-assertion pass collects violations into
+	 *  instead of throwing (report mode). Installed by the external-row
+	 *  ingestion seam right before its implicit commit and consumed-and-cleared
+	 *  by {@link commitTransaction}; null for every ordinary commit. */
+	private pendingCommitAssertionSink: AssertionViolation[] | null = null;
+
 	constructor(private readonly ctx: TransactionManagerContext) {}
 
 	// ============================================================================
@@ -137,6 +147,17 @@ export class TransactionManager {
 	/** Get the source of the current transaction, or null if not in a transaction */
 	getTransactionSource(): TransactionSource | null {
 		return this.transactionSource;
+	}
+
+	/**
+	 * Install (or clear, with `null`) the sink the NEXT commit's global-assertion
+	 * pass collects violations into instead of throwing. The external-row
+	 * ingestion seam sets this immediately before its seam-owned implicit commit
+	 * and clears it in a finally; {@link commitTransaction} also consumes-and-
+	 * clears it, so an ordinary commit is never left in collect mode.
+	 */
+	setPendingCommitAssertionSink(sink: AssertionViolation[] | null): void {
+		this.pendingCommitAssertionSink = sink;
 	}
 
 	/** Check if we're in an implicit transaction */
@@ -228,10 +249,20 @@ export class TransactionManager {
 		// Snapshot connections before evaluating deferred constraints
 		const connectionsToCommit = this.ctx.getAllConnections();
 
+		// Consume the pending report-mode sink read-and-clear: even if this commit
+		// fails for another reason (a connection commit error, a deferred row
+		// constraint), the NEXT ordinary commit must throw on violation as usual.
+		const assertionSink = this.pendingCommitAssertionSink;
+		this.pendingCommitAssertionSink = null;
+
 		let commitSucceeded = false;
 		try {
-			// Evaluate global assertions and deferred row constraints BEFORE committing
-			await this.ctx.runGlobalAssertions();
+			// Evaluate global assertions and deferred row constraints BEFORE
+			// committing. With a sink (report mode) a violation is collected and the
+			// commit proceeds — derived effects land and watch dispatches; with none
+			// (default) the first violation throws into the catch below and rolls
+			// back, discarding batched events.
+			await this.ctx.runGlobalAssertions(assertionSink ?? undefined);
 			await this.ctx.runDeferredRowConstraints();
 
 			// Mark coordinated commit to relax layer validation for sibling layers
@@ -259,6 +290,10 @@ export class TransactionManager {
 			} catch (err) {
 				errorLog('Post-commit watcher dispatch threw: %O', err);
 			}
+
+			// Materialized views are NOT a post-commit consumer: each is row-time
+			// maintained synchronously at the DML boundary, so its backing table is
+			// already current and committed in lockstep with the source write.
 		} catch (e) {
 			// On pre-commit assertion failure (or commit error), rollback all connections
 			const conns = this.ctx.getAllConnections();
@@ -409,9 +444,18 @@ export class TransactionManager {
 	// Change Log Management
 	// ============================================================================
 
-	/** Serialize a tuple of SqlValues for stable Map keying. */
+	/**
+	 * Serialize a tuple of SqlValues for stable Map keying.
+	 *
+	 * Uses the reversible, type-faithful {@link encodeKeyTuple} codec so a bigint
+	 * PK (any integer beyond `Number.MAX_SAFE_INTEGER`) no longer crashes the
+	 * write, blobs round-trip, and a JSON-object PK component keeps its canonical
+	 * (recursive object-key-sorted) form — reorder-equal objects still coalesce to
+	 * one change-log entry. Numeric type identity is preserved (bigint stays
+	 * distinct from number); see the codec's NOTE for the coalescing tripwire.
+	 */
 	private serializeKeyTuple(values: readonly SqlValue[]): string {
-		return JSON.stringify(values);
+		return encodeKeyTuple(values);
 	}
 
 	/** The active (top) layer that should receive change records. */
@@ -451,7 +495,7 @@ export class TransactionManager {
 	/**
 	 * Merge an incoming op into the active layer with last-write-wins semantics:
 	 *  - INSERT after DELETE → UPDATE (rare; same PK reappears with new values)
-	 *  - UPDATE after INSERT → INSERT (with refreshed newProjection)
+	 *  - UPDATE after INSERT → INSERT (newProjection updated in place)
 	 *  - DELETE after INSERT → drop entry (net no-op)
 	 *  - DELETE after UPDATE → DELETE with carrying-over oldProjection from the first OLD
 	 *  - INSERT/UPDATE chains preserve the original `oldProjection` so the OLD
@@ -547,6 +591,15 @@ export class TransactionManager {
 	 * Record an UPDATE operation. When the PK changes value, this is recorded
 	 * as a DELETE of the old PK followed by an INSERT of the new PK. Otherwise
 	 * it is recorded as a single UPDATE with both projections.
+	 *
+	 * NOTE: "changes value" here is `encodeKeyTuple` identity, which is value-based and
+	 * collation-BLIND — deliberately coarser than the data-event contract's relocation test
+	 * (`primaryKeyRelocated` in runtime/emit/dml-executor.ts), which asks the primary key's
+	 * own comparator. So a case-only rewrite under a `NOCASE` key splits here while the
+	 * `onDataChange` channel keeps it one in-place update. Harmless for this log's purpose —
+	 * it drives re-evaluation, and naming both key spellings is over-broad, never wrong. If a
+	 * consumer ever treats a change-log split as an assertion that the row MOVED, share the
+	 * comparator instead of the encoder.
 	 */
 	recordUpdate(baseTable: string, oldRow: Row, newRow: Row, pkIndices: readonly number[]): void {
 		const lower = baseTable.toLowerCase();
@@ -591,7 +644,7 @@ export class TransactionManager {
 			for (const pkKey of rowMap.keys()) {
 				if (seen.has(pkKey)) continue;
 				seen.add(pkKey);
-				tuples.push(JSON.parse(pkKey) as SqlValue[]);
+				tuples.push(decodeKeyTuple(pkKey));
 			}
 		};
 		collect(this.changeLog);
@@ -639,7 +692,9 @@ export class TransactionManager {
 			if (!projection) return;
 			const tuple: SqlValue[] = [];
 			for (const i of projectionIndices) tuple.push(projection[i] as SqlValue);
-			const tkey = JSON.stringify(tuple);
+			// Encode-only (never decoded here) — the type-faithful codec also
+			// avoids the bigint `JSON.stringify` crash on a captured column value.
+			const tkey = encodeKeyTuple(tuple);
 			if (seen.has(tkey)) return;
 			seen.add(tkey);
 			out.push(tuple);

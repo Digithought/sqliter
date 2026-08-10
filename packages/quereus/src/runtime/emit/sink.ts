@@ -1,5 +1,6 @@
 import type { SinkNode } from '../../planner/nodes/sink-node.js';
-import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import type { Row } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { emitPlanNode } from '../emitters.js';
@@ -21,7 +22,7 @@ export function emitSink(plan: SinkNode, ctx: EmissionContext): Instruction {
 
 	return {
 		params: [sourceInstruction],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `sink(${plan.operation})`
 	};
 }

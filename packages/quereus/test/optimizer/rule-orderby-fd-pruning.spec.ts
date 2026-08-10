@@ -61,12 +61,16 @@ describe('ruleOrderByFdPruning', () => {
 		for (const s of sorts) expect(s.sortKeys).to.have.length(1);
 	});
 
-	it('EC-driven: WHERE a = b ORDER BY a, b → ORDER BY a', async () => {
+	it('EC-driven: WHERE a = b ORDER BY a DESC, b → ORDER BY a DESC (EC drops b)', async () => {
+		// Use DESC on the first key so the heap index (ascending) can't satisfy
+		// the ordering via trySortAbsorbViaIndexOrdering — the Sort must survive
+		// for ruleOrderByFdPruning to reduce it using the EC from WHERE a = b.
 		await db.exec('CREATE TABLE e (a INTEGER, b INTEGER) USING memory');
-		const plan = db.getPlan('SELECT a, b FROM e WHERE a = b ORDER BY a, b');
+		const plan = db.getPlan('SELECT a, b FROM e WHERE a = b ORDER BY a DESC, b');
 		const sort = findFirstSort(plan);
-		expect(sort, 'sort survives because EC predicate is above the leaf').to.not.equal(undefined);
+		expect(sort, 'sort survives (DESC prevents index-ordering absorption)').to.not.equal(undefined);
 		expect(sort!.sortKeys, 'EC equates b to a so b is droppable').to.have.length(1);
+		expect(sort!.sortKeys[0].direction, 'surviving key keeps DESC').to.equal('desc');
 	});
 
 	it('No-FD baseline: ORDER BY a, b over independent cols → unchanged', async () => {

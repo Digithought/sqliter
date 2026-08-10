@@ -1,0 +1,328 @@
+-- 13.9-schema-authored-cte-isolation.sqllogic - a table's own DDL never binds a statement's CTEs
+--
+-- A column DEFAULT, a generated-column expression, a CHECK constraint and a foreign-key
+-- check are written in the TABLE's definition, not in the statement doing the write, so
+-- their unqualified relation names must always mean real schema objects. They used to be
+-- built on a planning context that still carried the statement's common-table-expression
+-- definitions, so a caller naming a CTE after a real table silently changed what someone
+-- else's DDL meant — a wrong stored value, or a spurious constraint failure.
+--
+-- Two flavours leak, and the DML builders differed in which reached them:
+--   * INHERITED — the definitions come from an ENCLOSING statement, arriving through
+--     `ctx.cteNodes` (all three builders);
+--   * OWN — the definitions come from the write statement's own leading `with` clause
+--     (UPDATE / DELETE only; INSERT's own clause was already kept out, pinned by
+--     13.8-insert-with-clause-visibility.sqllogic § "schema-authored DEFAULT expressions").
+-- `schemaAuthoredContext` (planner/building/schema-authored-context.ts) closes both.
+--
+-- Every arm below is written so the WRONG binding is observable: the caller's CTE and the
+-- real table disagree, and the assertion pins the real table's answer.
+
+pragma foreign_keys = true;
+
+-- `c` is a real table with 3 rows; `p` has 1 row, so a CTE `c` over `p` has 1 row.
+create table c (k integer primary key);
+insert into c values (1), (2), (3);
+create table p (id integer primary key);
+insert into p values (10);
+-- run
+
+-- ===== Column DEFAULT (inherited) =====
+
+create table sa_def (id integer primary key, w integer default (select count(*) from c));
+-- run
+
+with c as (select id from p),
+     b as (insert into sa_def (id) values (1) returning id)
+select count(*) as n from b;
+→ [{"n":1}]
+
+-- 3 (the real table), not 1 (the caller's CTE over p).
+select id, w from sa_def order by id;
+→ [{"id":1,"w":3}]
+
+-- ===== Generated column (inherited) =====
+
+create table sa_gen (id integer primary key, g integer generated always as ((select count(*) from c)));
+-- run
+
+with c as (select id from p),
+     b as (insert into sa_gen (id) values (1) returning id)
+select count(*) as n from b;
+→ [{"n":1}]
+
+select id, g from sa_gen order by id;
+→ [{"id":1,"g":3}]
+
+-- ===== CHECK on INSERT (inherited) =====
+-- The check holds against the real `c` (3 rows) and fails against the caller's (1 row),
+-- so a leak shows up as a spurious `CHECK constraint failed`.
+
+create table sa_cki (id integer primary key, check ((select count(*) from c) = 3));
+-- run
+
+with c as (select id from p),
+     b as (insert into sa_cki values (1) returning id)
+select count(*) as n from b;
+→ [{"n":1}]
+
+select id from sa_cki order by id;
+→ [{"id":1}]
+
+-- The other direction: a check that the REAL table can never satisfy must not be rescued
+-- by a caller CTE that would satisfy it.
+
+create table sa_ckx (id integer primary key, check ((select count(*) from c) = 1));
+-- run
+
+with c as (select id from p),
+     b as (insert into sa_ckx values (1) returning id)
+select count(*) as n from b;
+-- error: CHECK
+
+select count(*) as n from sa_ckx;
+→ [{"n":0}]
+
+-- ===== CHECK on UPDATE =====
+
+create table sa_cku (id integer primary key, v integer, check ((select count(*) from c) = 3));
+insert into sa_cku values (1, 1);
+-- run
+
+-- (a) the UPDATE's OWN leading with clause
+with c as (select id from p) update sa_cku set v = 2 where id = 1;
+
+select id, v from sa_cku order by id;
+→ [{"id":1,"v":2}]
+
+-- (b) definitions INHERITED from an enclosing statement
+with c as (select id from p),
+     b as (update sa_cku set v = 3 where id = 1 returning id)
+select count(*) as n from b;
+→ [{"n":1}]
+
+select id, v from sa_cku order by id;
+→ [{"id":1,"v":3}]
+
+-- ===== CHECK on DELETE =====
+
+create table sa_ckd (id integer primary key, v integer, check on delete ((select count(*) from c) = 3));
+insert into sa_ckd values (1, 1), (2, 2);
+-- run
+
+-- (a) the DELETE's OWN leading with clause
+with c as (select id from p) delete from sa_ckd where id = 1;
+
+select id, v from sa_ckd order by id;
+→ [{"id":2,"v":2}]
+
+-- (b) definitions INHERITED from an enclosing statement
+with c as (select id from p),
+     b as (delete from sa_ckd where id = 2 returning id)
+select count(*) as n from b;
+→ [{"n":1}]
+
+select count(*) as n from sa_ckd;
+→ [{"n":0}]
+
+-- ===== NOT NULL column DEFAULT (used by REPLACE substitution) =====
+-- `buildNotNullDefaults` pre-builds the DEFAULT evaluator the constraint runtime
+-- substitutes when REPLACE meets an explicit NULL. Same schema-authored surface.
+
+create table sa_nnd (id integer primary key, w integer not null default (select count(*) from c));
+-- run
+
+with c as (select id from p),
+     b as (insert or replace into sa_nnd (id, w) values (1, null) returning id)
+select count(*) as n from b;
+→ [{"n":1}]
+
+select id, w from sa_nnd order by id;
+→ [{"id":1,"w":3}]
+
+-- ===== Child-side foreign key (INSERT) =====
+-- The synthesized probe is `exists (select 1 from main.<parent> where …)`. `buildFrom` used
+-- to match a CTE on the BARE table name and ignore the schema qualifier, so a caller
+-- `with fkp as (…)` won even against the schema-qualified synthesized FROM. Two independent
+-- fixes now close that: `schemaAuthoredContext` keeps the caller's CTEs out of this context
+-- at all, and `buildFrom` skips its CTE lookup for a qualified name
+-- (13.10-cte-qualified-name.sqllogic). The arms below still pin the behaviour.
+-- Here the real parent HAS the referenced row and the caller's CTE does not, so a leak
+-- shows up as a spurious `CHECK constraint failed: _fk_…`.
+
+create table fkp (id integer primary key);
+insert into fkp values (1);
+create table fkc (id integer primary key, pid integer references fkp(id));
+-- run
+
+-- (a) inherited
+with fkp as (select 99 as id),
+     b as (insert into fkc values (1, 1) returning id)
+select count(*) as n from b;
+→ [{"n":1}]
+
+select id, pid from fkc order by id;
+→ [{"id":1,"pid":1}]
+
+-- (b) the INSERT's own leading with clause. This one already behaved before the fix —
+-- `buildInsertStmt` hands the FK builder the bare `ctx`, which never carried the
+-- statement's OWN clause — so it pins the contract rather than the closed leak.
+with fkp as (select 99 as id) insert into fkc values (2, 1);
+
+select id, pid from fkc order by id;
+→ [{"id":1,"pid":1},{"id":2,"pid":1}]
+
+-- ===== Child-side foreign key (UPDATE) =====
+
+create table fkc2 (id integer primary key, pid integer null references fkp(id));
+insert into fkc2 values (1, null);
+-- run
+
+with fkp as (select 99 as id),
+     b as (update fkc2 set pid = 1 where id = 1 returning id)
+select count(*) as n from b;
+→ [{"n":1}]
+
+select id, pid from fkc2 order by id;
+→ [{"id":1,"pid":1}]
+
+-- ===== Parent-side RESTRICT foreign key (DELETE) =====
+-- The parent-side `not exists (select 1 from main.<child> where …)` probe is built only
+-- when the batched-RESTRICT gate declines, which a second inbound non-RESTRICT FK forces.
+-- The real child table is EMPTY (the delete is legal); the caller's CTE holds a matching
+-- row, so a leak shows up as a spurious rejection of a legal delete.
+
+create table pkp (id integer primary key);
+create table pkc (id integer primary key, pid integer references pkp(id) on delete restrict);
+create table pkc2 (id integer primary key, pid integer references pkp(id) on delete cascade);
+insert into pkp values (1), (2);
+-- run
+
+with pkc as (select 1 as pid),
+     b as (delete from pkp where id = 1 returning id)
+select count(*) as n from b;
+→ [{"n":1}]
+
+select id from pkp order by id;
+→ [{"id":2}]
+
+-- The real RESTRICT is still enforced — a caller CTE must not disable it either.
+-- (The rejection comes from the plan-time `not exists` probe, whose diagnostic is the
+-- synthesized constraint's name rather than the runtime RESTRICT wording.)
+insert into pkc values (1, 2);
+-- run
+
+with pkc as (select 99 as pid) delete from pkp where id = 2;
+-- error: CHECK constraint failed: _fk_pkc_pid
+
+select id from pkp order by id;
+→ [{"id":2}]
+
+-- ===== Parent-side RESTRICT foreign key (UPDATE) =====
+
+create table qkp (id integer primary key);
+create table qkc (id integer primary key, pid integer references qkp(id) on update restrict);
+create table qkc2 (id integer primary key, pid integer references qkp(id) on update cascade);
+insert into qkp values (1);
+-- run
+
+with qkc as (select 1 as pid),
+     b as (update qkp set id = 5 where id = 1 returning id)
+select count(*) as n from b;
+→ [{"n":1}]
+
+select id from qkp order by id;
+→ [{"id":5}]
+
+-- ===== View target: the base op re-planned through the same builders inherits the fix =====
+
+create table vsa_t (id integer primary key, w integer default (select count(*) from c));
+create view vsa AS select id, w from vsa_t;
+-- run
+
+with c as (select id from p) insert into vsa (id) values (1);
+
+select id, w from vsa_t order by id;
+→ [{"id":1,"w":3}]
+
+-- ===== Multi-source view INSERT: the anchor key column's declared DEFAULT =====
+-- The shared surrogate is minted ONCE per produced row at the envelope, from the anchor
+-- key column's own `default` — the one schema-authored expression the decomposition
+-- lowering builds itself rather than delegating to `buildInsertStmt`
+-- (`buildKeyDefault` in planner/building/view-mutation-builder.ts). A caller CTE named
+-- after the anchor used to change the high-water mark the allocator observed.
+
+create table kd_core (rid integer primary key default (coalesce((select max(rid) from kd_core), 0) + mutation_ordinal()), name text);
+create table kd_contact (rid integer primary key, email text);
+create view kd_v as select c.name as name, k.email as email
+  from kd_core c join kd_contact k on k.rid = c.rid;
+insert into kd_core values (100, 'seed');
+-- run
+
+with kd_core as (select 0 as rid) insert into kd_v (name, email) values ('Ada', 'ada@x.io');
+
+-- 101 (above the real high-water mark 100), not 1 (above the caller's CTE).
+select rid, name from kd_core order by rid;
+→ [{"rid":100,"name":"seed"},{"rid":101,"name":"Ada"}]
+
+select rid, email from kd_contact order by rid;
+→ [{"rid":101,"email":"ada@x.io"}]
+
+-- ===== Controls: the clearing reaches ONLY the schema-authored expressions =====
+-- (a) The statement that must NOT leak into the default still reads the CTE everywhere
+-- the user wrote it: the insert's source and its scalar subquery see `c` as the 1-row
+-- CTE (`v = 1`), while the column default sees the real 3-row table (`w = 3`).
+
+create table sa_both (id integer primary key, v integer, w integer default (select count(*) from c));
+-- run
+
+with c as (select id from p),
+     b as (insert into sa_both (id, v) select id, (select count(*) from c) from c returning id)
+select count(*) as n from b;
+→ [{"n":1}]
+
+select id, v, w from sa_both order by id;
+→ [{"id":10,"v":1,"w":3}]
+
+-- (b) A schema-authored expression's OWN `with` clause still binds: the namespace is
+-- cleared on the way IN, not disabled, so a default may declare and read its own CTE —
+-- and a relation that clause reads is still the real table, not the caller's.
+
+create table sa_ownwith (id integer primary key, w integer default ((with q as (select count(*) as n from c) select n from q)));
+-- run
+
+with c as (select id from p),
+     b as (insert into sa_ownwith (id) values (1) returning id)
+select count(*) as n from b;
+→ [{"n":1}]
+
+select id, w from sa_ownwith order by id;
+→ [{"id":1,"w":3}]
+
+-- Cleanup
+drop table sa_ownwith;
+drop table sa_both;
+drop view kd_v;
+drop view vsa;
+drop table kd_contact;
+drop table kd_core;
+drop table vsa_t;
+drop table qkc2;
+drop table qkc;
+drop table qkp;
+drop table pkc2;
+drop table pkc;
+drop table pkp;
+drop table fkc2;
+drop table fkc;
+drop table fkp;
+drop table sa_nnd;
+drop table sa_ckd;
+drop table sa_cku;
+drop table sa_ckx;
+drop table sa_cki;
+drop table sa_gen;
+drop table sa_def;
+drop table p;
+drop table c;
+-- run

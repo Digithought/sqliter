@@ -1,0 +1,108 @@
+-- View updateability — Phase 1 rejections.
+-- Honest contract of body shapes NOT handled yet; each must raise a diagnostic.
+
+create table t (id integer primary key, name text);
+create table t2 (id integer primary key, name text);
+
+-- Computed-lineage projection: a computed view column is read-only (no-inverse),
+-- named in the diagnostic.
+create view vc as select id, length(name) as name_len from t;
+
+insert into vc (id, name_len) values (1, 5);
+-- error: name_len
+
+update vc set name_len = 9 where id = 1;
+-- error: name_len
+
+-- Aggregate body: not row-decomposable.
+create view va as select count(*) as c from t;
+
+insert into va (c) values (1);
+-- error: cannot write through view
+
+-- Set-operation (UNION) body.
+create view vu as select id from t union all select id from t2;
+
+insert into vu (id) values (1);
+-- error: cannot write through view
+
+-- Join body (multi-source inner join): update / delete AND insert write-through
+-- are SHIPPED (see 93.4-view-mutation.sqllogic). This view projects only the
+-- shared key `tid`, so an insert supplying just `tid` leaves both base tables'
+-- NOT NULL `name` columns (no default) unfilled — a `no-default` rejection naming
+-- the obstructing base column, not a blanket "insert not supported".
+create view vj as select t.id as tid from t join t2 on t.id = t2.id;
+
+insert into vj (tid) values (9);
+-- error: no default
+
+-- Outer (left) join body: BOTH the preserved side and a non-preserved-side update are
+-- now write-through-able (see 93.4-view-mutation.sqllogic § Outer joins — the matched-
+-- update / null-extended-insert materialization), so the prior `voj` non-preserved-update
+-- rejection moved there. What stays deferred is a FULL outer join (no preserved anchor):
+-- every side is null-extended, so a non-preserved update cannot key a materialization.
+create view voj_full as select t.id as tid, t2.name as n2 from t full join t2 on t.id = t2.id;
+
+update voj_full set n2 = 'q' where tid = 1;
+-- error: cannot write through view
+
+-- VALUES body: no base-table lineage.
+create view vv as values (1), (2);
+
+insert into vv values (3);
+-- error: no recoverable base operation
+
+-- Predicate contradiction: insert violates the view's selection at plan time.
+create view vp as select id, name from t where id = 1;
+
+insert into vp (id, name) values (2, 'x');
+-- error: contradicts its selection predicate
+
+-- RETURNING through a view is SHIPPED (see 93.4-view-mutation.sqllogic § RETURNING).
+-- Single-source insert/update/delete RETURNING (incl. computed view columns) and
+-- multi-source inner-join update/delete RETURNING are supported. Only a
+-- multi-source (join) INSERT … RETURNING is still rejected:
+create table jt1 (id integer primary key, a integer);
+create table jt2 (id integer primary key, c integer);
+create view rjv as select t1.id as id, t1.a as a, t2.c as c
+    from jt1 t1 join jt2 t2 on t2.id = t1.id;
+insert into rjv (id, a, c) values (1, 2, 3) returning id;
+-- error: RETURNING through a multi-source
+
+-- (A multi-source UPDATE that rewrites a column its own WHERE predicate filters on
+-- is now SHIPPED via per-row identity capture — see 93.4 § RETURNING (d). The
+-- former loud rejection for that shape has been removed.)
+
+-- Per-row identity capture now stitches on EACH side's PK columns (composite keys
+-- flattened to k<side>_0, k<side>_1, …), so a multi-source UPDATE … RETURNING through
+-- a join view whose (even non-written) side has a COMPOSITE PK is now SHIPPED — the
+-- RETURNING re-query correlates the full joined row by all sides' captured keys.
+create table cpp (a integer, b integer, label text, primary key (a, b));
+create table cpc (cid integer primary key, ra integer, rb integer, note text);
+insert into cpp values (1, 1, 'L');
+insert into cpc values (10, 1, 1, 'n');
+create view cppv as select c.cid as cid, c.note as note, p.label as label
+    from cpc c join cpp p on p.a = c.ra and p.b = c.rb;
+update cppv set note = 'N' where cid = 10 returning cid, note;
+→ [{"cid":10,"note":"N"}]
+
+-- the same update WITHOUT returning also works (identified by the child PK alone).
+update cppv set note = 'M' where cid = 10;
+select cid, note, label from cppv order by cid;
+→ [{"cid":10,"note":"M","label":"L"}]
+
+-- LIMIT body: the predicate-conjoin rewrite cannot reproduce the row-count
+-- window, so a mutation could escape it. Reject rather than widen the write.
+create view vlim as select id, name from t limit 5;
+
+delete from vlim;
+-- error: LIMIT/OFFSET body
+
+update vlim set name = 'z' where id = 1;
+-- error: LIMIT/OFFSET body
+
+-- DISTINCT body: no 1:1 base-row lineage.
+create view vdist as select distinct name from t;
+
+delete from vdist where name = 'a';
+-- error: DISTINCT body

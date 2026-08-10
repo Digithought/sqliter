@@ -1,0 +1,378 @@
+-- 06.3.4-view-info.sqllogic — view_info() per-view updateability surface.
+-- The engine-idiomatic realization of docs/view-updateability.md
+-- § Information Schema Surface (information_schema.views → view_info() TVF).
+-- Columns: schema, name, is_insertable_into, is_updatable, is_deletable,
+-- effective_targets (JSON array of base-table names). Values are 'YES'/'NO'.
+
+-- ===================================================================
+-- Identity single-source view: every column projected → fully mutable.
+-- ===================================================================
+
+create table t (id integer primary key, name text);
+create view v_identity as select id, name from t;
+
+select schema, name from view_info('v_identity');
+→ [{"schema":"main","name":"v_identity"}]
+
+select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('v_identity');
+→ [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES","effective_targets":"[\"t\"]"}]
+
+-- ===================================================================
+-- Rename projection: base lineage survives the alias rename.
+-- ===================================================================
+
+create view v_rename as select id as user_id, name as full_name from t;
+select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('v_rename');
+→ [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES","effective_targets":"[\"t\"]"}]
+
+-- ===================================================================
+-- Projected-away PK: still updatable, but not deletable (no row identity)
+-- and not insertable (the not-null PK has no recoverable value).
+-- ===================================================================
+
+create view v_no_pk as select name from t;
+select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('v_no_pk');
+→ [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"NO","effective_targets":"[\"t\"]"}]
+
+-- ===================================================================
+-- Constant-FD default for a PROJECTED-AWAY column: `country` is dropped by
+-- the projection but pinned to 'US' by the selection predicate, so an insert
+-- can recover it → insertable even though it is omitted.
+-- ===================================================================
+
+create table adults (name text primary key, age integer, country text);
+create view adults_bare as select name, age from adults where country = 'US';
+select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('adults_bare');
+→ [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES","effective_targets":"[\"adults\"]"}]
+
+-- The crux, load-bearing: the projected-away pinned column is NOT NULL with no
+-- declared default, so insertability hinges ENTIRELY on the whole-spine
+-- constant-FD recovery (the pin lives on the Filter, below the projection that
+-- drops the column). Without it, this would be 'NO' — contrast nn_unpinned below.
+create table nn_adults (name text primary key, age integer, country text not null);
+create view nn_pinned as select name, age from nn_adults where country = 'US';
+select is_insertable_into, is_deletable, effective_targets from view_info('nn_pinned');
+→ [{"is_insertable_into":"YES","is_deletable":"YES","effective_targets":"[\"nn_adults\"]"}]
+
+-- Negative control: same not-null projected-away column, but UNPINNED (no
+-- predicate) → no recoverable value → not insertable. Isolates the pin as the
+-- sole cause of the 'YES' above.
+create view nn_unpinned as select name, age from nn_adults;
+select is_insertable_into, is_deletable, effective_targets from view_info('nn_unpinned');
+→ [{"is_insertable_into":"NO","is_deletable":"YES","effective_targets":"[\"nn_adults\"]"}]
+
+-- ===================================================================
+-- Constant-FD default with `select *` (the column survives the projection).
+-- ===================================================================
+
+create table men (name text primary key, color text);
+create view greenmen as select * from men where color = 'green';
+select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('greenmen');
+→ [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES","effective_targets":"[\"men\"]"}]
+
+-- ===================================================================
+-- Declared base-column default survives projection: the omitted `name`
+-- column has a DEFAULT, so it is not a not-null-without-default worry.
+-- ===================================================================
+
+create table u (id integer primary key, name text default 'unknown');
+create view u_v as select id from u;
+select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('u_v');
+→ [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES","effective_targets":"[\"u\"]"}]
+
+-- ===================================================================
+-- Not-null-without-default base column not projected → not insertable.
+-- (`extra` is not projected, has no default, and no predicate pin.)
+-- ===================================================================
+
+create table req (id integer primary key, name text, extra text);
+create view req_v as select id, name from req;
+select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('req_v');
+→ [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"YES","effective_targets":"[\"req\"]"}]
+
+-- ===================================================================
+-- Correlated scalar subquery in the projection: the inner table is reached
+-- only through a SCALAR child, never `getRelations()`, so it must NOT appear
+-- in effective_targets nor rescue the outer not-null `req` via the whole-spine
+-- defaultable walk (its base id is distinct and never an effective target).
+-- Only the outer `subq_outer` is a target; `req` stays unrecoverable → NO.
+-- ===================================================================
+create table subq_outer (id integer primary key, req text not null);
+create table subq_inner (k integer primary key, v text);
+create view subq_v as
+    select id, (select v from subq_inner where k = id) as note from subq_outer;
+select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('subq_v');
+→ [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"YES","effective_targets":"[\"subq_outer\"]"}]
+
+-- ===================================================================
+-- Computed-only body: a non-invertible expression → wholly read-only.
+-- ===================================================================
+
+create view computed_v as select name || '!' as banner from t;
+select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('computed_v');
+→ [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO","effective_targets":"[]"}]
+
+-- ===================================================================
+-- VALUES body: no base-table lineage → wholly read-only.
+-- ===================================================================
+
+create view values_v as values (1, 2), (3, 4);
+select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('values_v');
+→ [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO","effective_targets":"[]"}]
+
+-- ===================================================================
+-- Aggregate body: aggregate output is read-only at the column level.
+-- ===================================================================
+
+create view agg_v as select count(*) as n from t;
+select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('agg_v');
+→ [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO","effective_targets":"[]"}]
+
+-- ===================================================================
+-- Recursive-CTE body: read-only; no recoverable base lineage.
+-- ===================================================================
+
+create view rec_v as
+    with recursive c(n) as (select 1 union all select n + 1 from c where n < 3)
+    select n from c;
+select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('rec_v');
+→ [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO","effective_targets":"[]"}]
+
+-- ===================================================================
+-- Multi-source key-preserving inner join: both base tables are effective
+-- targets and the view is updatable; but the parent PK (pid) is hidden by
+-- the projection → not deletable at every base, and the child's not-null
+-- `pref` is unrecoverable → not insertable. (per-base rules)
+-- ===================================================================
+
+create table ms_parent (pid integer primary key, label text);
+create table ms_child (cid integer primary key, pref integer, note text,
+    foreign key (pref) references ms_parent(pid));
+create view ms_jv as
+    select c.cid as cid, c.note as note, p.label as label
+    from ms_child c join ms_parent p on p.pid = c.pref;
+select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('ms_jv');
+→ [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"NO","effective_targets":"[\"ms_child\",\"ms_parent\"]"}]
+
+-- Surface agrees with propagate(): the two-table inner equi-join accepts a write
+-- (the positive control for the Divergence 3 shape gate below — isDecomposableJoinBody
+-- keeps this exact shape writable, unlike the cross / > 2-table shapes). No row
+-- matches, so the routed base update is a clean no-op rather than an error.
+update ms_jv set note = 'x' where cid = 999;
+
+-- ===================================================================
+-- Multi-source inner join exposing an INVERSE-profile column (`nv1 = c.nv + 1`):
+-- still is_updatable='YES' (its `base`-with-`inverse` site is writable, like any
+-- base site), effective_targets both bases. Same per-base shape as ms_jv: the
+-- parent PK is hidden → not deletable at every base, and the child's not-null
+-- `pref` is unrecoverable → not insertable (the inverse column is not insertable
+-- through the multi-source envelope, but `pref` already forces NO here). The
+-- multi-source UPDATE path consumes the inverse — see column_info goldens for the
+-- per-column write. docs § Scalar Invertibility, § Inner Join.
+-- ===================================================================
+
+create table iv_parent (pid integer primary key, label text);
+create table iv_child (cid integer primary key, pref integer, nv integer,
+    foreign key (pref) references iv_parent(pid));
+create view iv_jv as
+    select c.cid as cid, c.nv + 1 as nv1, p.label as label
+    from iv_child c join iv_parent p on p.pid = c.pref;
+select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('iv_jv');
+→ [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"NO","effective_targets":"[\"iv_child\",\"iv_parent\"]"}]
+
+-- ===================================================================
+-- Divergence 1 — a view-declared insert default rescues insertability. `created`
+-- is a not-null, no-declared-default base column projected away by the view; the
+-- `with defaults (created = …)` clause recovers it → insertable. The default
+-- provenance is never threaded onto the physical surface (consumed only in the
+-- rewrite), so deriveViewInfo folds the view's declared defaults in directly.
+-- Cross-checked by a real insert through the view — the dynamic truth the
+-- surface now matches.
+-- ===================================================================
+
+create table dfi (id integer primary key, name text, created integer not null);
+create view dfi_v as select id, name from dfi with defaults (created = 999);
+select is_insertable_into, is_updatable, is_deletable, effective_targets
+    from view_info('dfi_v');
+→ [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES","effective_targets":"[\"dfi\"]"}]
+
+-- The omitted not-null column is supplied by the declared default at insert time.
+insert into dfi_v (id, name) values (1, 'x');
+select * from dfi order by id;
+→ [{"id":1,"name":"x","created":999}]
+
+-- Negative control: same table+view shape WITHOUT a declared default → not
+-- insertable (isolates the clause as the sole cause of the YES above).
+create view dfi_v_nodefault as select id, name from dfi;
+select is_insertable_into from view_info('dfi_v_nodefault');
+→ [{"is_insertable_into":"NO"}]
+
+-- An unresolvable insert-default name (a typo) is silently skipped, NOT raised: a
+-- read-only introspection surface stays conservative (the column simply does
+-- not contribute insertability). The not-null `created` is still unrecovered → NO.
+-- (At write time the same name is a hard sited error — see 93.4.)
+create view dfi_v_typo as select id, name from dfi with defaults (nope = 0);
+select is_insertable_into from view_info('dfi_v_typo');
+→ [{"is_insertable_into":"NO"}]
+
+-- ===================================================================
+-- Divergence 2 — outer-join bodies report PER-SIDE and agree with propagate().
+-- A LEFT (or RIGHT) outer join is partially writable: the preserved side's columns are
+-- base-updatable, the view is insertable (preserved-only / both-side routing) and
+-- deletable (delete-to-preserved). The non-preserved (`null-extended`) side's columns are
+-- now ALSO updatable (the matched-update / null-extended-insert materialization keyed off
+-- the preserved anchor — `view-write-optional-member-transitions`), so the view-level
+-- is_updatable stays YES. RIGHT is the exact mirror of LEFT (the right operand is the
+-- preserved side) and the runtime now executes it (outer-join-right-full-runtime), so it
+-- is re-admitted (view-write-right-join-readmit). FULL stays conservative all-`NO`: it has
+-- no preserved side, hence no anchor to materialize off, so every write rejects.
+-- ===================================================================
+
+create table oj_a (aid integer primary key, av text);
+create table oj_b (bid integer primary key, bv text);
+insert into oj_a values (1, 'a1');
+
+-- LEFT: oj_a preserved, oj_b non-preserved. aid/av updatable; the view is
+-- insertable (preserved-only insert always works — oj_a's PK is projected) and
+-- deletable (delete routes to oj_a, whose PK is exposed). Both bases are effective
+-- targets (a both-side insert reaches oj_b).
+create view oj_left as
+    select a.aid as aid, a.av as av, b.bv as bv
+    from oj_a a left join oj_b b on b.bid = a.aid;
+select is_insertable_into, is_updatable, is_deletable, effective_targets
+    from view_info('oj_left');
+→ [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES","effective_targets":"[\"oj_a\",\"oj_b\"]"}]
+
+-- Surface agrees with propagate(): a preserved-side update is accepted, and a
+-- non-preserved-side update is now accepted too — aid=1 has no oj_b match, so this
+-- materializes oj_b(bid=1, bv='z') via the EC join key (bid = aid) and the row reads
+-- back joined.
+update oj_left set av = 'z' where aid = 1;
+update oj_left set bv = 'z' where aid = 1;
+select aid, av, bv from oj_left where aid = 1;
+→ [{"aid":1,"av":"z","bv":"z"}]
+
+-- RIGHT: oj_b is preserved (the right operand of a `right` join), oj_a is non-preserved
+-- (null-extended) — the exact mirror of oj_left above. bid/bv (oj_b) are base-updatable;
+-- the preserved PK `bid` is projected, so the view is insertable (preserved-only /
+-- both-side routing) and deletable (delete routes to oj_b). The non-preserved `av` (oj_a)
+-- is updatable too (matched-update / null-extended-insert materialization keyed off the
+-- preserved oj_b anchor). Both bases are effective targets (a both-side insert reaches
+-- oj_a). The runtime now executes a RIGHT join (outer-join-right-full-runtime) and
+-- write-through recognition admits it (view-write-right-join-readmit).
+create view oj_right as
+    select a.av as av, b.bid as bid, b.bv as bv
+    from oj_a a right join oj_b b on b.bid = a.aid;
+select is_insertable_into, is_updatable, is_deletable, effective_targets
+    from view_info('oj_right');
+→ [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES","effective_targets":"[\"oj_a\",\"oj_b\"]"}]
+
+-- Surface agrees with propagate(): both a preserved-side (oj_b) update and a
+-- non-preserved-side (oj_a) update are accepted. Seed a preserved oj_b row whose bid has
+-- no matching oj_a (bid=2; oj_a only has aid=1), so updating the preserved `bv` writes
+-- oj_b directly, while updating the non-preserved `av` materializes oj_a(aid=2, av='zz')
+-- via the EC join key (aid = bid) — the exact mirror of oj_left's `set bv` above.
+insert into oj_b values (2, 'b2');
+update oj_right set bv = 'zz' where bid = 2;
+update oj_right set av = 'zz' where bid = 2;
+select av, bid, bv from oj_right where bid = 2;
+→ [{"av":"zz","bid":2,"bv":"zz"}]
+
+-- FULL: every side null-extended ⇒ no preserved anchor ⇒ conservative all-`NO`. FULL is
+-- still gated (no preserved anchor); RIGHT is now admitted (view-write-right-join-readmit).
+create view oj_full as
+    select a.aid as aid, a.av as av, b.bid as bid, b.bv as bv
+    from oj_a a full join oj_b b on b.bid = a.aid;
+select is_insertable_into, is_updatable, is_deletable, effective_targets
+    from view_info('oj_full');
+→ [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO","effective_targets":"[]"}]
+
+-- Surface agrees with propagate(): a write through the full-outer view is deferred.
+update oj_full set av = 'z' where aid = 1;
+-- error: cannot write through view
+
+-- ===================================================================
+-- Divergence 3 — non-inner join bodies report conservative and agree with
+-- propagate(). A cross join (and a comma/implicit join) never null-extends (only
+-- LEFT/RIGHT/FULL do — deriveJoinUpdateLineage), so it carries strict-`base`
+-- lineage and slips past the Divergence-2 outer-join gate above. Without the AST
+-- shape gate (isJoinBody && !isDecomposableJoinBody) deriveViewInfo would resolve
+-- its bases and over-report is_updatable='YES'. propagate() rejects a cross join
+-- (collectInnerJoinSources requires an ON/USING predicate), so the surface must
+-- report the conservative all-`NO`/`[]` row — cross-checked below against a real
+-- (rejected) mutation.
+--
+-- n-way (≥2) inner equi-joins — composite-PK sides and self-joins included — are
+-- now DECOMPOSABLE (isDecomposableJoinBody accepts them), so they report writable
+-- and agree with propagate() accepting the write (covered after the cross join).
+--
+-- Comma / implicit join bodies are NOT tested here: a multi-source comma FROM
+-- never produces a buildable view — with aliases (from a x, b y) it is a parse
+-- error, and without aliases the select builder rejects multiple FROM sources —
+-- so such a body is never introspected with base lineage; there is no buildable
+-- case. The shape gate still covers it defensively (isDecomposableJoinBody
+-- requires a single JOIN FROM), so it stays conservative if that ever becomes
+-- plannable.
+-- ===================================================================
+
+create table xj_a (aid integer primary key, av text);
+create table xj_b (bid integer primary key, bv text);
+create table xj_c (cid integer primary key, cv text);
+
+-- Cross join (two-table, no ON): strict-`base` lineage, but unwritable.
+create view xj_cross as
+    select a.aid as aid, a.av as av, b.bv as bv
+    from xj_a a cross join xj_b b;
+select is_insertable_into, is_updatable, is_deletable, effective_targets
+    from view_info('xj_cross');
+→ [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO","effective_targets":"[]"}]
+
+-- Surface agrees with propagate(): a write through the cross-join view is rejected.
+update xj_cross set av = 'z' where aid = 1;
+-- error: cannot write through view
+
+-- Three-table inner join (> 2 base tables): now decomposable ⇒ updatable, with all
+-- three bases in effective_targets. Not deletable (xj_b/xj_c PKs are not projected,
+-- so a per-base row identity is not constructible from the view image) and not
+-- insertable (their not-null PKs are unrecoverable). Agrees with propagate().
+create view xj_three as
+    select a.aid as aid, a.av as av, b.bv as bv, c.cv as cv
+    from xj_a a join xj_b b on b.bid = a.aid join xj_c c on c.cid = a.aid;
+select is_insertable_into, is_updatable, is_deletable, effective_targets
+    from view_info('xj_three');
+→ [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"NO","effective_targets":"[\"xj_a\",\"xj_b\",\"xj_c\"]"}]
+
+-- Surface agrees with propagate(): a write through the 3-table-join view is accepted
+-- (no row matches the empty bases, so it is a clean no-op rather than an error).
+update xj_three set av = 'z' where aid = 1;
+
+-- Self-join (two alias-bound sites on one table): now decomposable ⇒ updatable. Both
+-- aliases resolve to xj_a, so effective_targets collapses to the single base name.
+-- Not deletable (alias b's PK `aid` is not exposed — only b.av is projected) and not
+-- insertable (b's not-null PK is unrecoverable). Agrees with propagate() accepting.
+create view xj_self as
+    select a.aid as aid, a.av as av, b.av as av2
+    from xj_a a join xj_a b on b.aid = a.aid;
+select is_insertable_into, is_updatable, is_deletable, effective_targets
+    from view_info('xj_self');
+→ [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"NO","effective_targets":"[\"xj_a\"]"}]
+
+-- Surface agrees with propagate(): a write through the self-join view is accepted
+-- (empty base ⇒ clean no-op).
+update xj_self set av = 'z' where aid = 1;
+
+-- ===================================================================
+-- Name filter vs. full enumeration.
+-- ===================================================================
+
+-- A name filter returns exactly the one matching row.
+select count(*) as c from view_info('ms_jv');
+→ [{"c":1}]
+
+-- An unknown name filter returns nothing.
+select count(*) as c from view_info('does_not_exist');
+→ [{"c":0}]
+
+-- The 0-arg form enumerates every view (spot-check two distinct names).
+select name from view_info() where name in ('v_identity', 'ms_jv') order by name;
+→ [{"name":"ms_jv"},{"name":"v_identity"}]

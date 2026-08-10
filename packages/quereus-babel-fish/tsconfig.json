@@ -3,11 +3,6 @@
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "baseUrl": ".",
-    "paths": {
-      "@quereus/quereus": ["../quereus/dist/src/index.d.ts"],
-      "@quereus/quereus/parser": ["../quereus/dist/src/parser/index.d.ts"]
-    },
     "lib": ["ES2022", "DOM"],
     "declaration": true,
     "declarationMap": true,
@@ -24,8 +19,12 @@
     "noImplicitReturns": true,
     "noFallthroughCasesInSwitch": true,
     "noUnusedLocals": true,
-    "noUnusedParameters": true
+    "noUnusedParameters": true,
+    "composite": true
   },
   "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist", "test"]
+  "exclude": ["node_modules", "dist", "test"],
+  "references": [
+    { "path": "../quereus" }
+  ]
 }

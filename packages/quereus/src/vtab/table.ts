@@ -1,4 +1,4 @@
-import type { AnyVirtualTableModule, SchemaChangeInfo } from './module.js';
+import type { AnyVirtualTableModule, EffectiveRowSource, SchemaChangeInfo } from './module.js';
 import type { Database } from '../core/database.js';
 import type { TableSchema } from '../schema/table.js';
 import type { MaybePromise, Row, SqlValue, CompareFn, UpdateResult } from '../common/types.js';
@@ -19,20 +19,40 @@ export interface UpdateArgs {
 	operation: RowOp;
 	/** For INSERT/UPDATE, the values to insert/update. For DELETE, undefined */
 	values: Row | undefined;
-	/** For UPDATE/DELETE, the old key values of the row to modify. Undefined for INSERT */
+	/**
+	 * For UPDATE/DELETE, the old key values of the row to modify. Undefined for INSERT.
+	 *
+	 * COMPACT: exactly one cell per `primaryKeyDefinition` entry, in that order — NOT a
+	 * full row indexed by column position. A vtab must address it as `keyValues[i]` for
+	 * PK column `i`, never `row[pkDef[i].index]`; the two agree only when the PK columns
+	 * happen to be the table's leading columns in PK order.
+	 */
 	oldKeyValues?: Row;
 	/** Conflict resolution mode (defaults to ABORT if unspecified) */
 	onConflict?: ConflictResolution;
 	/** Optional: Deterministic SQL statement that reproduces this mutation (if logMutations is enabled) */
 	mutationStatement?: string;
 	/**
-	 * If true, `values` is already coerced to the table's declared column logical
-	 * types (e.g. flushed from an overlay that coerced on write). The vtab may skip
-	 * its own coercion pass. Used by the isolation layer's overlay→underlying flush
-	 * to avoid double-parsing values that are not idempotent under parse (e.g.
-	 * JSON scalar strings).
+	 * If true, `values` (and any key cells in `oldKeyValues`) are already coerced
+	 * to the table's declared column logical types, and the vtab may skip its own
+	 * coercion pass — conversion is not idempotent for every type (JSON scalar
+	 * strings double-parse to a different value or throw). Set by the DML executor
+	 * (whose emitters convert every write at the top of the pipeline, driven by
+	 * static expression types — docs/types.md § Where coercion happens) and by the
+	 * isolation layer's overlay→underlying flush and tombstone writes (rows built
+	 * from already-converted stored values). Direct API callers leave it unset and
+	 * the vtab converts raw values itself, as before.
 	 */
 	preCoerced?: boolean;
+	/**
+	 * If true, the caller has already validated all PK/UNIQUE constraints for the
+	 * final committed state; the vtab should skip its own constraint re-checks and
+	 * just persist the row (plus index/event maintenance). Used only by the
+	 * isolation overlay→underlying flush, where the merged-view pre-checks are the
+	 * sole authority and a value-swap cycle cannot be applied row-by-row without a
+	 * transient duplicate that logical UNIQUE enforcement would wrongly reject.
+	 */
+	trustedWrite?: boolean;
 }
 
 /**
@@ -42,7 +62,26 @@ export interface UpdateArgs {
 export abstract class VirtualTable {
 	public readonly module: AnyVirtualTableModule;
 	public readonly db: Database;
+	/**
+	 * The **bare** table name — never schema-qualified. It is the `tableName` the module's
+	 * `create()`/`connect()` was called with, and every consumer that wants the qualified form
+	 * composes `` `${schemaName}.${tableName}` `` itself. A module that stores a qualified name
+	 * here doubles the schema in each of those compositions:
+	 * - `vtab/memory/table.ts` and `quereus-store/src/common/store-table-base.ts` name the
+	 *   `VirtualTableConnection` they register with the database. The engine matches that name
+	 *   against `<schema>.<table>` when resolving a connection (see
+	 *   `runtime/deferred-constraint-queue.ts`), so a doubled name never matches.
+	 * - `quereus-isolation` keys its per-connection overlays by the pair; a mismatch there used
+	 *   to discard staged rows at commit (`docs/design-isolation-layer.md` § "Table identity").
+	 *
+	 * Modules needing a qualified lookup key must derive it, not overload this field.
+	 *
+	 * NOTE: nothing enforces this at runtime — every in-repo module complies. If third-party
+	 * modules start violating it, assert bareness in the constructor rather than hardening
+	 * each consumer.
+	 */
 	public readonly tableName: string;
+	/** The schema (database) this table lives in, e.g. `main`. */
 	public readonly schemaName: string;
 	public errorMessage?: string;
 	public tableSchema?: TableSchema;
@@ -104,7 +143,21 @@ export abstract class VirtualTable {
 	 * Performs an INSERT, UPDATE, or DELETE operation.
 	 *
 	 * Returns an UpdateResult indicating success or constraint violation:
-	 * - `{ status: 'ok', row?: Row }` - Success. Row is new/updated row for INSERT/UPDATE, undefined for DELETE.
+	 * - `{ status: 'ok', row?: Row }` - Success. The presence of `row` is how the module
+	 *   reports that a row was actually written or removed. Omitting it means "no row
+	 *   changed" (an UPDATE/DELETE whose key was not found, or a conflict the module
+	 *   resolved as IGNORE): the executor then skips the whole post-write pipeline and
+	 *   emits nothing downstream — so every module must return `row` on a real write.
+	 *   For INSERT/UPDATE, `row` is the row the module actually STORED: the proposed
+	 *   `args.values` after the module's own coercion to the declared column logical
+	 *   types. A module that coerces MUST return the coerced row, because the DML
+	 *   executor reports `row` (not `args.values`) to every post-write consumer —
+	 *   RETURNING, change tracking, row-time materialized-view maintenance, FK cascades,
+	 *   data-change events. Returning the raw input from a coercing module makes
+	 *   RETURNING disagree with a subsequent `select` on the same row. A row whose width
+	 *   is not the table's column count makes the executor fall back to `args.values`.
+	 *   For DELETE, only the presence of `row` is consulted, never its contents (the OLD
+	 *   image comes from the source scan), so a PK-only placeholder is acceptable.
 	 * - `{ status: 'constraint', constraint, message?, existingRow? }` - Constraint violation.
 	 *   For 'unique' constraints, existingRow contains the conflicting row (enables UPSERT).
 	 *
@@ -132,6 +185,24 @@ export abstract class VirtualTable {
 	 * @returns The current VirtualTableConnection instance, if any
 	 */
 	getConnection?(): VirtualTableConnection | undefined;
+
+	/**
+	 * (Optional) Offered an existing, already-registered connection for this table so the
+	 * instance can reuse it instead of opening its own. The runtime calls this on a freshly
+	 * connected instance when a connection for the same qualified table name is already
+	 * registered; it passes the registered VirtualTableConnection and ignores the result.
+	 *
+	 * The module decides whether to adopt: it should downcast to its own connection type,
+	 * reject connections it did not create (instanceof / brand check) and connections whose
+	 * backing state no longer matches this instance (e.g. a stale connection from a
+	 * dropped-then-recreated table), and silently do nothing when it declines.
+	 *
+	 * Ownership is NOT transferred: the adopted connection remains owned by the database
+	 * connection registry that registered it. Adopting it must not make this instance
+	 * responsible for closing it beyond the module's existing disconnect contract. The hook
+	 * must be safe to call more than once on the same instance.
+	 */
+	adoptConnection?(connection: VirtualTableConnection): MaybePromise<void>;
 
 	/**
 	 * Begins a transaction on this virtual table
@@ -180,15 +251,26 @@ export abstract class VirtualTable {
 	/**
 	 * Modifies the schema of this virtual table
 	 * @param changeInfo Object describing the schema modification
+	 * @param validateOnly When true, run every pre-mutation validation the change would run
+	 *   and throw exactly what the real application would throw, but mutate NOTHING — a
+	 *   dry-run. A caller coordinating this table's change with another irreversible
+	 *   mutation (the isolation layer sequencing a per-connection overlay against the
+	 *   shared underlying table) uses it to surface a refusal while everything is still
+	 *   untouched. Support is per-module (the bundled memory module supports it for
+	 *   `alterColumn`); a module that cannot validate without mutating must throw rather
+	 *   than silently apply.
 	 * @throws QuereusError or ConstraintError on failure
 	 */
-	alterSchema?(changeInfo: SchemaChangeInfo): Promise<void>;
+	alterSchema?(changeInfo: SchemaChangeInfo, validateOnly?: boolean): Promise<void>;
 
 	/**
 	 * Creates a secondary index on the virtual table
 	 * @param indexInfo The index definition
+	 * @param rows Optional {@link EffectiveRowSource} — the rows the DDL-issuing connection
+	 *   can see, supplied by a wrapper module that holds pending rows this table cannot
+	 *   reach. When present, the UNIQUE duplicate check MUST judge this stream.
 	 */
-	createIndex?(indexInfo: IndexSchema): Promise<void>;
+	createIndex?(indexInfo: IndexSchema, rows?: EffectiveRowSource): Promise<void>;
 
 	/**
 	 * Drops a secondary index from the virtual table

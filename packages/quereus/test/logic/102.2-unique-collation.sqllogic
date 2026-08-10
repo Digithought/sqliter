@@ -1,0 +1,181 @@
+-- 102.2-unique-collation.sqllogic — a UNIQUE constraint over a column declared
+-- with a non-binary collation (e.g. `text collate NOCASE`) must enforce under that
+-- collation, not BINARY (unique-constraint-honors-column-collation). The auto-built
+-- UNIQUE index carries the column's declared collation, and every conflict validator
+-- (auto-index path, cold scan, and the row-time covering-MV path) re-compares with the
+-- column collation. Uses the canonical UPPERCASE spelling `NOCASE` / `RTRIM` — the
+-- lowercase spelling is rejected at DDL by a separate collation-name case-sensitivity
+-- quirk documented in 102.1-unique-edge-cases.sqllogic.
+--
+-- Runs under BOTH the memory module (`yarn test`) and the store module
+-- (`yarn test:store`); §4 additionally exercises the MV-backed enforcement path on
+-- each module, using a non-derived NOCASE column through a row-time covering MV.
+--
+-- Every section here declares its UNIQUE inline or table-level, so the enforcement
+-- collation is always the column's. The counterpart shapes — where the collation
+-- comes from an explicit `create unique index … collate …` instead — live in
+-- 102.2.1-unique-collation-index-derived (former §§9-13), split out because they
+-- need standalone index DDL.
+
+-- ===================================
+-- 1. Table-level `unique (x)` over a NOCASE column — auto-index enforcement.
+-- ===================================
+
+create table ta (id integer primary key, x text collate NOCASE, unique (x));
+insert into ta values (1, 'abc');
+
+-- a case-insensitive duplicate is a UNIQUE violation under NOCASE (was silently
+-- accepted as a distinct value under the old BINARY enforcement)
+insert into ta values (2, 'ABC');
+-- error: UNIQUE constraint failed: ta (x)
+
+select count(*) as n from ta;
+→ [{"n":1}]
+
+-- a value that is NOT NOCASE-equal still inserts (guard against over-matching)
+insert into ta values (3, 'abd');
+select id, x from ta order by id;
+→ [{"id":1,"x":"abc"},{"id":3,"x":"abd"}]
+
+-- ===================================
+-- 2. Column-level inline `x text collate NOCASE unique` — same enforcement.
+-- ===================================
+
+create table tb (id integer primary key, x text collate NOCASE unique);
+insert into tb values (1, 'abc');
+
+insert into tb values (2, 'ABC');
+-- error: UNIQUE constraint failed: tb (x)
+
+select count(*) as n from tb;
+→ [{"n":1}]
+
+-- ===================================
+-- 3. OR IGNORE / OR REPLACE interplay on a NOCASE duplicate.
+-- ===================================
+
+create table tc (id integer primary key, x text collate NOCASE unique);
+insert into tc values (1, 'abc');
+
+-- OR IGNORE: the case-insensitive duplicate is silently skipped
+insert or ignore into tc values (2, 'ABC');
+select id, x from tc order by id;
+→ [{"id":1,"x":"abc"}]
+
+-- OR REPLACE: the case-insensitive duplicate (id=1) is evicted, the new row lands
+insert or replace into tc values (3, 'ABC');
+select id, x from tc order by id;
+→ [{"id":3,"x":"ABC"}]
+
+-- ===================================
+-- 4. Row-time covering MV over a NOCASE column — MV-backed enforcement path.
+--    `findIndexForConstraint` prefers the covering MV over the auto-index, so this
+--    drives `checkUniqueViaMaterializedView` (memory) / `findUniqueConflictViaCoveringMv`
+--    (store). Mirrors 54-covering-mv-enforcement.sqllogic.
+-- ===================================
+
+create table tm (id integer primary key, x text collate NOCASE, unique (x));
+create materialized view tm_ix as select x, id from tm order by x;
+insert into tm values (1, 'abc');
+
+-- default ABORT through the covering MV: a NOCASE duplicate with a different PK is rejected
+insert into tm values (2, 'ABC');
+-- error: UNIQUE constraint failed: tm (x)
+
+select count(*) as n from tm;
+→ [{"n":1}]
+
+-- OR REPLACE through the covering MV: id=1 evicted, id=10 lands
+insert or replace into tm values (10, 'ABC');
+select id, x from tm order by id;
+→ [{"id":10,"x":"ABC"}]
+
+-- a non-NOCASE-equal value still inserts through the covering path
+insert into tm values (11, 'abd');
+select id, x from tm order by id;
+→ [{"id":10,"x":"ABC"},{"id":11,"x":"abd"}]
+
+-- ===================================
+-- 5. Generality with a second collation: `collate RTRIM` ignores trailing spaces.
+-- ===================================
+
+create table tr (id integer primary key, x text collate RTRIM, unique (x));
+insert into tr values (1, 'abc');
+
+-- a trailing-space-only variant collides under RTRIM
+insert into tr values (2, 'abc   ');
+-- error: UNIQUE constraint failed: tr (x)
+
+select count(*) as n from tr;
+→ [{"n":1}]
+
+-- a genuinely different value still inserts
+insert into tr values (3, 'abcd');
+select id, x from tr order by id;
+→ [{"id":1,"x":"abc"},{"id":3,"x":"abcd"}]
+
+-- ===================================
+-- 6. Composite UNIQUE with a mix of NOCASE + BINARY members — each member is
+--    compared under its OWN declared collation (per-column threading), not a
+--    single table-wide collation. The NOCASE member folds case; the BINARY
+--    member does not.
+-- ===================================
+
+create table tcomp (id integer primary key, a text collate NOCASE, b text collate BINARY, unique (a, b));
+insert into tcomp values (1, 'abc', 'xyz');
+
+-- both members match under their own collations (a: NOCASE-equal, b: BINARY-equal) → conflict
+insert into tcomp values (2, 'ABC', 'xyz');
+-- error: UNIQUE constraint failed: tcomp
+
+select count(*) as n from tcomp;
+→ [{"n":1}]
+
+-- a matches under NOCASE but b differs under BINARY ('XYZ' != 'xyz'), so the composite
+-- key is distinct and the row inserts — proves the BINARY member is NOT case-folded
+insert into tcomp values (3, 'ABC', 'XYZ');
+select id, a, b from tcomp order by id;
+→ [{"id":1,"a":"abc","b":"xyz"},{"id":3,"a":"ABC","b":"XYZ"}]
+
+-- ===================================
+-- 7. UPDATE onto a NOCASE-equal value is rejected (the conflict validators back
+--    UPDATE as well as INSERT). Guards the UPDATE path, not just INSERT.
+-- ===================================
+
+create table tu (id integer primary key, x text collate NOCASE, unique (x));
+insert into tu values (1, 'abc');
+insert into tu values (2, 'def');
+
+-- moving id=2's value onto a NOCASE-equal of id=1's value collides
+update tu set x = 'ABC' where id = 2;
+-- error: UNIQUE constraint failed: tu
+
+-- the aborted UPDATE left both rows unchanged
+select id, x from tu order by id;
+→ [{"id":1,"x":"abc"},{"id":2,"x":"def"}]
+
+-- updating onto a genuinely distinct value still succeeds
+update tu set x = 'xyz' where id = 2;
+select id, x from tu order by id;
+→ [{"id":1,"x":"abc"},{"id":2,"x":"xyz"}]
+
+-- ===================================
+-- 8. The LOWERCASE collation spelling `collate nocase` normalizes to NOCASE and
+--    enforces identically to the uppercase form (DDL case-insensitivity fix).
+-- ===================================
+
+create table tl (id integer primary key, x text collate nocase unique);
+insert into tl values (1, 'abc');
+
+-- a case-variant duplicate collides under the normalized NOCASE collation
+insert into tl values (2, 'ABC');
+-- error: UNIQUE constraint failed: tl (x)
+
+select count(*) as n from tl;
+→ [{"n":1}]
+
+-- a non-NOCASE-equal value still inserts
+insert into tl values (3, 'abd');
+select id, x from tl order by id;
+→ [{"id":1,"x":"abc"},{"id":3,"x":"abd"}]
+

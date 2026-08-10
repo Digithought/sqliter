@@ -1,0 +1,376 @@
+-- 51-materialized-views.sqllogic — materialized view core. Every MV is row-time
+-- maintained: source writes are reflected immediately (within the writing
+-- transaction), and `refresh materialized view` is an explicit full-rebuild verb
+-- (no longer required for currency).
+
+-- ===================================
+-- 1. Initial materialization
+-- ===================================
+
+create table t (x integer primary key, y text);
+insert into t values (1, 'a'), (2, 'b'), (3, 'c');
+create materialized view mv as select x, y from t;
+
+-- MV equals the body at create time
+select * from mv order by x;
+→ [{"x":1,"y":"a"},{"x":2,"y":"b"},{"x":3,"y":"c"}]
+
+select x, y from t order by x;
+→ [{"x":1,"y":"a"},{"x":2,"y":"b"},{"x":3,"y":"c"}]
+
+-- ===================================
+-- 2. Source mutation is reflected immediately (row-time); refresh is idempotent
+-- ===================================
+
+insert into t values (4, 'd');
+
+-- MV reflects the new source row without any refresh
+select * from mv order by x;
+→ [{"x":1,"y":"a"},{"x":2,"y":"b"},{"x":3,"y":"c"},{"x":4,"y":"d"}]
+
+-- refresh is an explicit full rebuild — a no-op for an already-current MV
+refresh materialized view mv;
+select * from mv order by x;
+→ [{"x":1,"y":"a"},{"x":2,"y":"b"},{"x":3,"y":"c"},{"x":4,"y":"d"}]
+
+-- ===================================
+-- 3. Write boundary — DML on the MV name routes through to the source table
+--    (write-through via view updateability), and the backing reflects it within
+--    the statement. Full write-through coverage is in 53.1; this just locks the
+--    core boundary having flipped from "read-only" to "write-through".
+-- ===================================
+
+-- insert through the MV lands in the source and is reflected in the MV
+insert into mv values (9, 'z');
+select * from mv order by x;
+→ [{"x":1,"y":"a"},{"x":2,"y":"b"},{"x":3,"y":"c"},{"x":4,"y":"d"},{"x":9,"y":"z"}]
+select x, y from t order by x;
+→ [{"x":1,"y":"a"},{"x":2,"y":"b"},{"x":3,"y":"c"},{"x":4,"y":"d"},{"x":9,"y":"z"}]
+
+-- update through the MV
+update mv set y = 'Z' where x = 9;
+select y from mv where x = 9;
+→ [{"y":"Z"}]
+
+-- delete through the MV (restores the pre-write state for the next section)
+delete from mv where x = 9;
+select * from mv order by x;
+→ [{"x":1,"y":"a"},{"x":2,"y":"b"},{"x":3,"y":"c"},{"x":4,"y":"d"}]
+
+-- Source remains writable; reflected immediately
+insert into t values (5, 'e');
+select * from mv order by x;
+→ [{"x":1,"y":"a"},{"x":2,"y":"b"},{"x":3,"y":"c"},{"x":4,"y":"d"},{"x":5,"y":"e"}]
+
+-- ===================================
+-- 4. Drop cascades — backing table goes away, name no longer resolves
+-- ===================================
+
+drop materialized view mv;
+
+select * from mv;
+-- error: not found
+
+drop table t;
+
+-- ===================================
+-- 5. order by in the body seeds the backing-table scan order
+-- ===================================
+
+create table ot (x integer primary key, y integer);
+insert into ot values (1, 30), (2, 10), (3, 20);
+create materialized view omv as select x, y from ot order by y;
+
+-- No explicit ORDER BY: scan follows the body's order by y
+select * from omv;
+→ [{"x":2,"y":10},{"x":3,"y":20},{"x":1,"y":30}]
+
+drop materialized view omv;
+drop table ot;
+
+-- ===================================
+-- 6. Mandatory gate — a body that drops the source primary key is rejected at
+--    create (a materialized view must project its source key so each source row
+--    maps to exactly one backing row). The diagnostic steers to a plain view /
+--    `create table … as`, never a refresh policy.
+-- ===================================
+
+create table pt (x integer primary key, y text);
+insert into pt values (1, 'a'), (2, 'b'), (3, 'c');
+create materialized view pmv as select y from pt;
+-- error: cannot be materialized
+-- the failed create rolled the backing table back, so the name is free
+create materialized view pmv as select x, y from pt;
+select * from pmv order by x;
+→ [{"x":1,"y":"a"},{"x":2,"y":"b"},{"x":3,"y":"c"}]
+drop materialized view pmv;
+drop table pt;
+
+-- ===================================
+-- 7. Error paths
+-- ===================================
+
+refresh materialized view missing_mv;
+-- error: no such materialized view
+
+drop materialized view missing_mv;
+-- error: no such materialized view
+
+create table plain (id integer primary key);
+drop materialized view plain;
+-- error: not a materialized view
+
+-- Unified model: DROP TABLE on a maintained table drops table + derivation
+-- (one record); DROP VIEW still redirects.
+create materialized view plain_mv as select id from plain;
+drop view plain_mv;
+-- error: use DROP MATERIALIZED VIEW
+drop table plain_mv;
+refresh materialized view plain_mv;
+-- error: no such materialized view
+-- the name is free again after the unified drop
+create table plain_mv (z integer primary key);
+drop table plain_mv;
+drop table plain;
+
+-- ===================================
+-- 8. Schema-change staleness
+-- ===================================
+
+create table s (x integer primary key, y text);
+insert into s values (1, 'a');
+create materialized view smv as select x, y from s;
+
+-- Dropping a source makes the body unplannable → staleness diagnostic on next read
+drop table s;
+select * from smv;
+-- error: stale
+drop materialized view smv;
+
+-- An incompatible ALTER (dropping a referenced column) → staleness diagnostic
+create table s2 (x integer primary key, y text);
+insert into s2 values (1, 'a');
+create materialized view smv2 as select x, y from s2;
+alter table s2 drop column y;
+select * from smv2;
+-- error: stale
+drop materialized view smv2;
+drop table s2;
+
+-- ===================================
+-- 9. refresh reconciles the backing SHAPE to the re-planned body IDENTITY-
+--    PRESERVINGLY when a source ALTER shifts it. A trailing source-column add
+--    reaching a single-source `select *` body is expressible in place (same table
+--    incarnation, via the module's alterTable + a data reconcile). An interleaving
+--    join `select *` — the new orders column lands BEFORE the customers columns —
+--    is inexpressible by append-only adds and is a sited error, leaving the table
+--    and its rows untouched (recoverable by detach→alter→attach or drop+recreate).
+-- ===================================
+
+-- (a) in-place reshape: single-source select*, trailing add
+create table rs_src (id integer primary key, a integer);
+insert into rs_src values (1, 10);
+create materialized view rsv as select * from rs_src;
+
+-- before the alter: 2 columns
+select * from rsv;
+→ [{"id":1,"a":10}]
+
+alter table rs_src add column b integer default 5;
+refresh materialized view rsv;
+
+-- after: the appended column reached the backing in place — value under the right label
+select * from rsv;
+→ [{"id":1,"a":10,"b":5}]
+
+-- row-time maintenance binds to the reshaped backing — a later source row carries the new column
+insert into rs_src values (2, 20, 7);
+select * from rsv where id = 2;
+→ [{"id":2,"a":20,"b":7}]
+
+drop materialized view rsv;
+drop table rs_src;
+
+-- (b) inexpressible interleave: a join select* whose new column lands mid-output → sited error
+create table rs_cust (id integer primary key, name text not null);
+create table rs_ord (id integer primary key, customer_id integer not null references rs_cust(id), amt integer not null);
+create materialized view rsj as select * from rs_ord o join rs_cust c on o.customer_id = c.id;
+insert into rs_cust values (1, 'alice');
+insert into rs_ord values (10, 1, 100);
+
+-- before the alter: 5 columns (the colliding c.id surfaces as id:1)
+select * from rsj;
+→ [{"id":10,"customer_id":1,"amt":100,"id:1":1,"name":"alice"}]
+
+alter table rs_ord add column extra text default 'x';
+refresh materialized view rsj;
+-- error: changed incompatibly
+
+-- the table is untouched: the stored snapshot still reads at the old 5-column shape
+select * from rsj;
+→ [{"id":10,"customer_id":1,"amt":100,"id:1":1,"name":"alice"}]
+
+drop materialized view rsj;
+drop table rs_ord;
+drop table rs_cust;
+
+-- ===================================
+-- 10. An explicit column list is a declared interface: a refresh whose body output
+--     count shifted under it errors (rather than silently widening the list).
+-- ===================================
+
+create table rs_t (x integer primary key, y text);
+insert into rs_t values (1, 'a');
+create materialized view rs_decl(a, b) as select * from rs_t;
+alter table rs_t add column z integer null;
+refresh materialized view rs_decl;
+-- error: drop and recreate
+drop materialized view rs_decl;
+drop table rs_t;
+
+-- ===================================
+-- 11. In-transaction source ALTER + REFRESH (mv-refresh-intxn-altered-source-stale-read).
+--     §9 is the autocommit analog; here the alter+refresh run inside one explicit
+--     transaction over a single-source `select *` MV (a trailing add → in-place
+--     reshape). With an MV over the source, an autocommit-collapsed source
+--     connection is detached from its manager's map but stays in the Database
+--     registry; `MemoryTable.ensureConnection` reuses it for the in-transaction read.
+--     ensureSchemaChangeSafety formerly re-pointed only connections still in the map,
+--     so the detached one kept a stale pre-alter readLayer (2-column shape) — the
+--     same-transaction source read missed `extra`, and refresh reshaped+refilled the
+--     backing with misaligned data. The fix re-points every registered source
+--     connection at the new base, so both the direct source read and the refresh
+--     observe the post-alter 3-column shape.
+-- ===================================
+
+create table itx_src (id integer primary key, a integer);
+create materialized view itxv as select * from itx_src;
+insert into itx_src values (10, 100);
+
+-- a direct autocommit source scan leaves a detached-but-registered source connection
+select * from itx_src order by id;
+→ [{"id":10,"a":100}]
+
+select * from itxv;
+→ [{"id":10,"a":100}]
+
+begin;
+alter table itx_src add column extra text default 'x';
+-- (b) the same-transaction direct source read returns the new column + backfilled default
+select * from itx_src order by id;
+→ [{"id":10,"a":100,"extra":"x"}]
+-- (a) refresh reshapes the backing in place from the post-alter source — values under right labels
+refresh materialized view itxv;
+commit;
+
+select * from itxv;
+→ [{"id":10,"a":100,"extra":"x"}]
+
+-- row-time maintenance still binds to the reshaped backing post-commit
+insert into itx_src values (20, 200, 'custom');
+select * from itxv where id = 20;
+→ [{"id":20,"a":200,"extra":"custom"}]
+
+drop materialized view itxv;
+drop table itx_src;
+
+-- ===================================
+-- 11. Unified maintained-table model: one catalog entry, one namespace,
+--     write-through dispatch order
+-- ===================================
+
+create table um_src (id integer primary key, v text not null);
+insert into um_src values (1, 'a');
+create materialized view um_mv as select id, v from um_src;
+
+-- exactly ONE catalog entry for the maintained table, surfaced as a
+-- materialized view with its canonical create-materialized-view DDL
+select type, name from schema() where name like 'um_%' order by name;
+→ [{"type":"materialized_view","name":"um_mv"},{"type":"table","name":"um_src"}]
+
+-- one namespace: a table cannot squat the MV's name, an MV cannot squat a table's
+create table um_mv (z integer primary key);
+-- error: already exists
+create materialized view um_src as select id from um_src;
+-- error: already exists
+
+-- DML naming the maintained table routes write-through to the SOURCE (never the
+-- direct table write), even though the name now plain-resolves as a table
+insert into um_mv values (2, 'b');
+select * from um_src order by id;
+→ [{"id":1,"v":"a"},{"id":2,"v":"b"}]
+update um_mv set v = 'B' where id = 2;
+select v from um_src where id = 2;
+→ [{"v":"B"}]
+delete from um_mv where id = 2;
+select count(*) n from um_src;
+→ [{"n":1}]
+
+-- ALTER TABLE on the maintained table: structural changes are rejected (the
+-- shape is defined by the body), tag actions steer to ALTER MATERIALIZED VIEW
+alter table um_mv add column extra integer;
+-- error: materialized view
+alter table um_mv rename column v to w;
+-- error: materialized view
+alter table um_mv set tags (purpose = 'x');
+-- error: ALTER MATERIALIZED VIEW
+
+-- ...but RENAME is an ordinary rename plus a maintenance re-key: write-through
+-- and row-time maintenance stay live under the new name
+alter table um_mv rename to um_mv2;
+insert into um_src values (3, 'c');
+select * from um_mv2 order by id;
+→ [{"id":1,"v":"a"},{"id":3,"v":"c"}]
+insert into um_mv2 values (4, 'd');
+select v from um_src where id = 4;
+→ [{"v":"d"}]
+select type, name from schema() where name like 'um_%' order by name;
+→ [{"type":"materialized_view","name":"um_mv2"},{"type":"table","name":"um_src"}]
+delete from um_mv2 where id > 1;
+alter table um_mv2 rename to um_mv;
+
+-- create-time tags live on the unified record and survive a refresh
+drop materialized view um_mv;
+create materialized view um_mv as select id, v from um_src with tags (purpose = 'demo');
+refresh materialized view um_mv;
+select tags from schema() where name = 'um_mv';
+→ [{"tags":"{\"purpose\":\"demo\"}"}]
+
+drop materialized view um_mv;
+drop table um_src;
+
+-- ===================================
+-- BLOB backing primary key under the full-rebuild floor
+-- ===================================
+-- A `select distinct` body is maintained by the full-rebuild floor, which applies
+-- a single keyed 'replace-all' diff against the backing. That diff builds an
+-- in-memory set of the new rows' primary keys; a single-column BLOB PK is stored
+-- in it as a bare Uint8Array, which inheritree's default freeze-on-insert cannot
+-- hold (bug-in-subquery-blob-values-crash — Object.freeze rejects a non-empty
+-- array buffer view). Any source write to such an MV crashed.
+
+create table bpk_src (id integer primary key, b blob);
+insert into bpk_src values (1, x'6162'), (2, x'6164');
+create materialized view bpk_mv as select distinct b from bpk_src;
+
+select count(*) as n from bpk_mv;
+→ [{"n":2}]
+
+-- a source insert drives the rebuild diff: new key, and a duplicate that must not
+-- add a row
+insert into bpk_src values (3, x'6169'), (4, x'6162');
+select count(*) as n from bpk_mv;
+→ [{"n":3}]
+
+-- a delete that removes the last occurrence of a value drops it from the backing
+delete from bpk_src where b = x'6169';
+select count(*) as n from bpk_mv;
+→ [{"n":2}]
+
+-- explicit full rebuild over the same BLOB-keyed backing
+refresh materialized view bpk_mv;
+select count(*) as n from bpk_mv;
+→ [{"n":2}]
+
+drop materialized view bpk_mv;
+drop table bpk_src;

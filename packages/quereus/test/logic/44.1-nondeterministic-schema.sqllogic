@@ -259,7 +259,7 @@ CREATE TABLE relaxed_default_colref (
     a INTEGER,
     b INTEGER DEFAULT (a)
 );
--- error: may not reference columns
+-- error: may not reference a bare column
 
 CREATE TABLE relaxed_check_bindparam (
     id INTEGER PRIMARY KEY,
@@ -267,5 +267,51 @@ CREATE TABLE relaxed_check_bindparam (
     CHECK (v > ?)
 );
 -- error: may not reference bind parameters
+
+PRAGMA nondeterministic_schema = false;
+
+-- ===================================
+-- new.<column> DEFAULT determinism: the DDL build/determinism check is deferred
+-- to INSERT time (the row scope isn't available at CREATE TABLE), so the
+-- determinism gate is re-evaluated when the row is expanded. A pure `new.<col>`
+-- reference is deterministic; wrapping it around a non-deterministic function is
+-- not — and must be rejected under strict mode but allowed under the relaxed gate.
+-- ===================================
+
+-- Strict mode: a pure new.<col> default is deterministic and inserts cleanly.
+CREATE TABLE newref_det (
+    id INTEGER PRIMARY KEY,
+    x INTEGER,
+    y INTEGER DEFAULT (new.x + 1)
+);
+INSERT INTO newref_det (id, x) VALUES (1, 5);
+SELECT y FROM newref_det WHERE id = 1;
+→ [{"y":6}]
+DROP TABLE newref_det;
+
+-- Strict mode: new.<col> combined with a non-deterministic function is rejected
+-- at INSERT time (the deferred determinism check fires when the default fires).
+CREATE TABLE newref_nondet (
+    id INTEGER PRIMARY KEY,
+    x INTEGER,
+    y INTEGER DEFAULT (new.x + random())
+);
+INSERT INTO newref_nondet (id, x) VALUES (1, 5);
+-- error: Non-deterministic expression not allowed in DEFAULT
+DROP TABLE newref_nondet;
+
+-- Relaxed mode: the same non-deterministic new.<col> default is permitted; the
+-- value is resolved into a concrete literal per row.
+PRAGMA nondeterministic_schema = true;
+
+CREATE TABLE newref_relaxed (
+    id INTEGER PRIMARY KEY,
+    x INTEGER,
+    y INTEGER DEFAULT (new.x + random())
+);
+INSERT INTO newref_relaxed (id, x) VALUES (1, 5);
+SELECT COUNT(*) AS n, COUNT(y) AS non_null_y FROM newref_relaxed;
+→ [{"n":1,"non_null_y":1}]
+DROP TABLE newref_relaxed;
 
 PRAGMA nondeterministic_schema = false;

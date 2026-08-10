@@ -1,5 +1,6 @@
 import type { DropAssertionNode } from '../../planner/nodes/drop-assertion-node.js';
-import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { QuereusError } from '../../common/errors.js';
 import { SqlValue, StatusCode } from '../../common/types.js';
@@ -14,21 +15,21 @@ export function emitDropAssertion(plan: DropAssertionNode, _ctx: EmissionContext
 		await rctx.db._ensureTransaction();
 
 		const schemaManager = rctx.db.schemaManager;
-		const schema = schemaManager.getMainSchema(); // Look in main schema for now
+		const schema = schemaManager.getSchema(plan.schemaName);
 
-		const existing = schema.getAssertion(plan.name);
+		const existing = schema?.getAssertion(plan.name);
 		if (!existing) {
 			if (plan.ifExists) {
-				log('Assertion %s not found, but IF EXISTS specified', plan.name);
+				log('Assertion %s.%s not found, but IF EXISTS specified', plan.schemaName, plan.name);
 				return null;
 			}
 			throw new QuereusError(
-				`Assertion ${plan.name} not found`,
+				`Assertion ${plan.name} not found in schema ${plan.schemaName}`,
 				StatusCode.NOTFOUND
 			);
 		}
 
-		const removed = schemaManager.removeAssertion(schema.name, plan.name);
+		const removed = schemaManager.removeAssertion(plan.schemaName, plan.name);
 		if (!removed && !plan.ifExists) {
 			throw new QuereusError(
 				`Failed to remove assertion ${plan.name}`,
@@ -37,15 +38,15 @@ export function emitDropAssertion(plan: DropAssertionNode, _ctx: EmissionContext
 		}
 
 		// Invalidate cached plan for this assertion
-		rctx.db.invalidateAssertionCache(plan.name);
+		rctx.db.invalidateAssertionCache(plan.schemaName, plan.name);
 
-		log('Dropped assertion %s', plan.name);
+		log('Dropped assertion %s.%s', plan.schemaName, plan.name);
 		return null;
 	}
 
 	return {
 		params: [],
-		run: run as InstructionRun,
-		note: `dropAssertion(${plan.name})`
+		run: asRun(run),
+		note: `dropAssertion(${plan.schemaName}.${plan.name})`
 	};
 }

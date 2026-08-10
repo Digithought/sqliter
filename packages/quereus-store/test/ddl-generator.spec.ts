@@ -3,7 +3,7 @@
  */
 
 import { expect } from 'chai';
-import { generateTableDDL, generateIndexDDL, INTEGER_TYPE, TEXT_TYPE, REAL_TYPE } from '@quereus/quereus';
+import { Database, generateTableDDL, generateIndexDDL, INTEGER_TYPE, TEXT_TYPE, REAL_TYPE } from '@quereus/quereus';
 import type { TableSchema, TableIndexSchema, ColumnSchema } from '@quereus/quereus';
 
 /** Helper to build a minimal TableSchema for testing. */
@@ -95,16 +95,6 @@ describe('DDL generator', () => {
 			});
 			const ddl = generateTableDDL(schema);
 			expect(ddl).to.include('"inventory"."items"');
-		});
-
-		it('includes TEMP for temporary tables', () => {
-			const schema = makeTableSchema({
-				name: 'tmp',
-				isTemporary: true,
-				columns: [makeColumn('x', INTEGER_TYPE)],
-			});
-			const ddl = generateTableDDL(schema);
-			expect(ddl).to.include('TEMP');
 		});
 
 		it('includes USING clause for virtual tables', () => {
@@ -252,6 +242,135 @@ describe('DDL generator', () => {
 			expect(ddl).to.include('WITH TAGS');
 			expect(ddl).to.include("label = 'email index'");
 			expect(ddl).to.include('priority = 1');
+		});
+	});
+
+	// generateTableDDL must serialize table-level constraints, or store-backed
+	// tables silently lose them across reopen (the catalog persists this string and
+	// re-parses it). These build real TableSchemas through a Database (memory vtab)
+	// and assert the emitted DDL carries each constraint clause + name.
+	describe('generateTableDDL table constraints', () => {
+		async function schemaOf(setupSqls: string[], tableName: string): Promise<{ schema: TableSchema; close: () => Promise<void> }> {
+			const db = new Database();
+			for (const sql of setupSqls) await db.exec(sql);
+			const schema = db.schemaManager.getTable('main', tableName);
+			expect(schema, `table '${tableName}' created`).to.exist;
+			return { schema: schema!, close: () => db.close() };
+		}
+
+		it('emits CHECK / UNIQUE / FOREIGN KEY clauses with their names', async () => {
+			const { schema, close } = await schemaOf(
+				[
+					'CREATE TABLE parent (pid INTEGER PRIMARY KEY) USING memory',
+					`CREATE TABLE t (
+						id INTEGER PRIMARY KEY,
+						email TEXT,
+						qty INTEGER,
+						pref INTEGER,
+						CONSTRAINT uq_email UNIQUE (email),
+						CONSTRAINT chk_qty CHECK (qty > 0),
+						CONSTRAINT fk_pref FOREIGN KEY (pref) REFERENCES parent (pid)
+					) USING memory`,
+				],
+				't',
+			);
+			try {
+				const ddl = generateTableDDL(schema);
+				// Constraint bodies route through quoteIdentifier (bare for non-keywords),
+				// so column refs and constraint names emit unquoted here.
+				const lower = ddl.toLowerCase();
+				expect(lower, ddl).to.include('unique (email)');
+				expect(lower, ddl).to.include('(qty > 0)');
+				expect(lower, ddl).to.include('foreign key (pref) references parent(pid)');
+				expect(lower, ddl).to.include('constraint uq_email');
+				expect(lower, ddl).to.include('constraint chk_qty');
+				expect(lower, ddl).to.include('constraint fk_pref');
+			} finally {
+				await close();
+			}
+		});
+
+		it('does NOT emit a CREATE UNIQUE INDEX-derived UNIQUE as a table constraint', async () => {
+			const { schema, close } = await schemaOf(
+				[
+					'CREATE TABLE t2 (id INTEGER PRIMARY KEY, email TEXT) USING memory',
+					'CREATE UNIQUE INDEX uq ON t2 (email)',
+				],
+				't2',
+			);
+			try {
+				// Sanity: the index really did synthesize a derived UNIQUE constraint, so
+				// the negative assertion below is meaningful (not vacuously true).
+				const derived = (schema.uniqueConstraints ?? []).filter(c => c.derivedFromIndex);
+				expect(derived, 'index-derived UNIQUE present on schema').to.have.lengthOf(1);
+
+				const ddl = generateTableDDL(schema);
+				expect(ddl.toLowerCase(), ddl).to.not.include('unique (');
+			} finally {
+				await close();
+			}
+		});
+	});
+
+	// generateTableDDL must serialize GENERATED ALWAYS AS, or a store-backed table's
+	// computed columns silently revert to plain nullable columns on reopen — the rule
+	// that computes them is never persisted, so every post-reopen row stores null there
+	// (bug-store-reopen-loses-computed-columns).
+	describe('generateTableDDL generated columns', () => {
+		function genExpr(col: string, operator: string, n: number): ColumnSchema['generatedExpr'] {
+			return {
+				type: 'binary',
+				operator,
+				left: { type: 'column', name: col },
+				right: { type: 'literal', value: n },
+			};
+		}
+
+		it('emits GENERATED ALWAYS AS (...) STORED for a stored generated column', () => {
+			const schema = makeTableSchema({
+				name: 'g',
+				columns: [
+					makeColumn('id', INTEGER_TYPE, { primaryKey: true, pkOrder: 1 }),
+					makeColumn('a', INTEGER_TYPE, { notNull: false }),
+					makeColumn('g', INTEGER_TYPE, {
+						notNull: false,
+						generated: true,
+						generatedExpr: genExpr('a', '+', 1),
+						generatedStored: true,
+					}),
+				],
+				primaryKeyDefinition: [{ index: 0 }],
+			});
+			const ddl = generateTableDDL(schema);
+			expect(ddl, ddl).to.include('"g" INTEGER NULL GENERATED ALWAYS AS (a + 1) STORED');
+		});
+
+		it('emits GENERATED ALWAYS AS (...) VIRTUAL for a virtual generated column', () => {
+			const schema = makeTableSchema({
+				name: 'g',
+				columns: [
+					makeColumn('id', INTEGER_TYPE, { primaryKey: true, pkOrder: 1 }),
+					makeColumn('a', INTEGER_TYPE, { notNull: false }),
+					makeColumn('v', INTEGER_TYPE, {
+						notNull: false,
+						generated: true,
+						generatedExpr: genExpr('a', '*', 2),
+						generatedStored: false,
+					}),
+				],
+				primaryKeyDefinition: [{ index: 0 }],
+			});
+			const ddl = generateTableDDL(schema);
+			expect(ddl, ddl).to.include('"v" INTEGER NULL GENERATED ALWAYS AS (a * 2) VIRTUAL');
+		});
+
+		it('does not emit GENERATED when generatedExpr is absent (unreachable-defence guard)', () => {
+			const schema = makeTableSchema({
+				name: 'g',
+				columns: [makeColumn('x', INTEGER_TYPE, { notNull: false, generated: true })],
+			});
+			const ddl = generateTableDDL(schema);
+			expect(ddl, ddl).to.not.include('GENERATED');
 		});
 	});
 });

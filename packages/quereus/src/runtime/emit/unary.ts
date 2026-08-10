@@ -1,14 +1,35 @@
 import { StatusCode } from "../../common/types.js";
 import { quereusError } from "../../common/errors.js";
 import type { SqlValue } from "../../common/types.js";
-import type { Instruction, InstructionRun, RuntimeContext } from "../types.js";
+import type { Instruction, RuntimeContext } from "../types.js";
 import type { UnaryOpNode } from "../../planner/nodes/scalar.js";
-import { emitPlanNode } from "../emitters.js";
 import type { EmissionContext } from "../emission-context.js";
+import { emitScalarOp, type ScalarOpSpec } from "./scalar-op.js";
 import { isTruthy } from "../../util/comparison.js";
+import { canonicalizeInteger } from "../../util/numeric-canonical.js";
 import { Temporal } from 'temporal-polyfill';
+import { TIMESPAN_TYPE } from "../../types/temporal-types.js";
 
-export function emitUnaryOp(plan: UnaryOpNode, ctx: EmissionContext): Instruction {
+/**
+ * `~v = -v - 1` over the engine's arbitrary-precision integer domain.
+ *
+ * JS's `~` operator coerces through ToInt32 first, so it is only correct below 2^31:
+ * `~3000000000` evaluates to 1294967295 instead of -3000000001. Complement
+ * arithmetically instead and canonicalize the result (R1, util/numeric-canonical.ts) —
+ * `~(2^53 - 1)` leaves the safe range and must widen, `~(-2^53)` re-enters it and must
+ * narrow.
+ *
+ * A non-finite operand keeps the historical `~ToInt32(x)` result of -1; see the NaN
+ * note at the numeric-fast call site.
+ */
+function bitwiseNot(operand: number | bigint): number | bigint {
+	const truncated = typeof operand === 'bigint' ? operand : Math.trunc(operand);
+	if (typeof truncated === 'number' && !Number.isFinite(truncated)) return -1;
+	const exact = canonicalizeInteger(truncated);
+	return canonicalizeInteger(typeof exact === 'bigint' ? -exact - 1n : -exact - 1);
+}
+
+export function buildUnaryOpSpec(plan: UnaryOpNode): ScalarOpSpec {
 	// Select the operation function at emit time
 	let run: (ctx: RuntimeContext, operand: SqlValue) => SqlValue;
 	let note: string;
@@ -16,9 +37,12 @@ export function emitUnaryOp(plan: UnaryOpNode, ctx: EmissionContext): Instructio
 	// Normalize operator to uppercase for case-insensitive matching
 	const operator = plan.expression.operator.toUpperCase();
 
+	// Plan-time operand type — drives the specialized arithmetic paths below.
+	const operandLogical = plan.operand.getType().logicalType;
+
 	switch (operator) {
 		case 'NOT':
-			run = (ctx: RuntimeContext, operand: SqlValue) => {
+			run = (_ctx: RuntimeContext, operand: SqlValue) => {
 				// SQL NOT: NULL -> NULL, false -> true, true -> false
 				if (operand === null) return null;
 				return !isTruthy(operand);
@@ -27,75 +51,150 @@ export function emitUnaryOp(plan: UnaryOpNode, ctx: EmissionContext): Instructio
 			break;
 
 		case 'IS NULL':
-			run = (ctx: RuntimeContext, operand: SqlValue) => {
+			run = (_ctx: RuntimeContext, operand: SqlValue) => {
 				return operand === null;
 			};
 			note = 'IS NULL';
 			break;
 
 		case 'IS NOT NULL':
-			run = (ctx: RuntimeContext, operand: SqlValue) => {
+			run = (_ctx: RuntimeContext, operand: SqlValue) => {
 				return operand !== null;
 			};
 			note = 'IS NOT NULL';
 			break;
 
-		case '-':
-			run = (ctx: RuntimeContext, operand: SqlValue) => {
-				if (operand === null) return null;
+		case 'IS TRUE':
+			run = (_ctx: RuntimeContext, operand: SqlValue) => {
+				// Total predicate: NULL operand is not true; otherwise SQL truthiness.
+				return operand === null ? false : isTruthy(operand);
+			};
+			note = 'IS TRUE';
+			break;
 
-				// Check if it's a timespan (ISO 8601 duration string)
-				if (typeof operand === 'string' && (operand.startsWith('P') || operand.startsWith('-P'))) {
-					try {
-						const duration = Temporal.Duration.from(operand);
-						return duration.negated().toString();
-					} catch {
-						// Not a valid duration, fall through to numeric handling
+		case 'IS NOT TRUE':
+			run = (_ctx: RuntimeContext, operand: SqlValue) => {
+				// ≡ NOT (x IS TRUE): the NULL row flips into the true bucket.
+				return operand === null ? true : !isTruthy(operand);
+			};
+			note = 'IS NOT TRUE';
+			break;
+
+		case 'IS FALSE':
+			run = (_ctx: RuntimeContext, operand: SqlValue) => {
+				// Total predicate: NULL operand is not false; otherwise not-truthy.
+				return operand === null ? false : !isTruthy(operand);
+			};
+			note = 'IS FALSE';
+			break;
+
+		case 'IS NOT FALSE':
+			run = (_ctx: RuntimeContext, operand: SqlValue) => {
+				// ≡ NOT (x IS FALSE): the NULL row flips into the true bucket.
+				return operand === null ? true : isTruthy(operand);
+			};
+			note = 'IS NOT FALSE';
+			break;
+
+		case '-': {
+			// Use plan-time type info to select a specialized run function, mirroring
+			// the binary arithmetic emitter's numeric-fast / temporal split.
+			if (operandLogical.isNumeric) {
+				run = (_ctx: RuntimeContext, operand: SqlValue) => {
+					if (operand === null) return null;
+					// Bigint arm narrows the result back to number when it fits (R1);
+					// on canonical input negation preserves magnitude, so this only
+					// fires for a non-canonical bigint from a vtab/UDF.
+					return typeof operand === 'bigint' ? canonicalizeInteger(-operand) : -(operand as number);
+				};
+				note = '-(numeric-fast)';
+			} else if (operandLogical === TIMESPAN_TYPE) {
+				run = (_ctx: RuntimeContext, operand: SqlValue) => {
+					if (operand === null) return null;
+					return Temporal.Duration.from(operand as string).negated().toString();
+				};
+				note = '-(timespan)';
+			} else {
+				run = (_ctx: RuntimeContext, operand: SqlValue) => {
+					if (operand === null) return null;
+
+					// Check if it's a timespan (ISO 8601 duration string)
+					if (typeof operand === 'string' && (operand.startsWith('P') || operand.startsWith('-P'))) {
+						try {
+							const duration = Temporal.Duration.from(operand);
+							return duration.negated().toString();
+						} catch {
+							// Not a valid duration, fall through to numeric handling
+						}
 					}
-				}
 
-				// Numeric negation
-				if (typeof operand === 'number') return -operand;
-				if (typeof operand === 'bigint') return -operand;
-				// Try to convert to number
-				const num = Number(operand);
-				return isNaN(num) ? null : -num;
-			};
-			note = 'unary -';
+					// Numeric negation
+					if (typeof operand === 'number') return -operand;
+					if (typeof operand === 'bigint') return canonicalizeInteger(-operand);
+					// Try to convert to number
+					const num = Number(operand);
+					return isNaN(num) ? null : -num;
+				};
+				note = 'unary -';
+			}
 			break;
+		}
 
-		case '+':
-			run = (ctx: RuntimeContext, operand: SqlValue) => {
-				// Unary plus - convert to number if possible
-				if (operand === null) return null;
-				if (typeof operand === 'number' || typeof operand === 'bigint') return operand;
-				const plusNum = Number(operand);
-				return isNaN(plusNum) ? null : plusNum;
-			};
-			note = 'unary +';
+		case '+': {
+			if (operandLogical.isNumeric) {
+				// Already number/bigint — unary plus is the identity.
+				run = (_ctx: RuntimeContext, operand: SqlValue) => operand;
+				note = '+(numeric-fast)';
+			} else {
+				run = (_ctx: RuntimeContext, operand: SqlValue) => {
+					// Unary plus - convert to number if possible
+					if (operand === null) return null;
+					if (typeof operand === 'number' || typeof operand === 'bigint') return operand;
+					const plusNum = Number(operand);
+					return isNaN(plusNum) ? null : plusNum;
+				};
+				note = 'unary +';
+			}
 			break;
+		}
 
-		case '~':
-			run = (ctx: RuntimeContext, operand: SqlValue) => {
-				if (operand === null) return null;
-				if (typeof operand === 'bigint') return ~operand;
-				// Convert to integer and apply bitwise NOT
-				const num = Number(operand);
-				if (isNaN(num)) return null;
-				return ~Math.trunc(num);
-			};
-			note = 'bitwise ~';
+		case '~': {
+			if (operandLogical.isNumeric) {
+				// Already number/bigint — skip the Number() conversion attempt.
+				// NOTE: a NaN operand yields -1 here where the generic path below yields
+				// null. No numeric-typed expression can produce NaN today (arithmetic
+				// nulls out non-finite results, and REAL_TYPE.parse rejects 'NaN'); if a
+				// path ever admits NaN into a numeric-typed value, restore an isNaN check.
+				run = (_ctx: RuntimeContext, operand: SqlValue) => {
+					if (operand === null) return null;
+					return bitwiseNot(operand as number | bigint);
+				};
+				note = '~(numeric-fast)';
+			} else {
+				run = (_ctx: RuntimeContext, operand: SqlValue) => {
+					if (operand === null) return null;
+					if (typeof operand === 'bigint') return bitwiseNot(operand);
+					// Convert to integer and apply bitwise NOT
+					const num = Number(operand);
+					if (isNaN(num)) return null;
+					return bitwiseNot(num);
+				};
+				note = 'bitwise ~';
+			}
 			break;
+		}
 
 		default:
 			quereusError(`Unsupported unary operator: ${plan.expression.operator}`, StatusCode.UNSUPPORTED, undefined, plan.expression);
 	}
 
-	const operandExpr = emitPlanNode(plan.operand, ctx);
-
 	return {
-		params: [operandExpr],
-		run: run as InstructionRun,
+		operands: [plan.operand],
+		run,
 		note
 	};
+}
+
+export function emitUnaryOp(plan: UnaryOpNode, ctx: EmissionContext): Instruction {
+	return emitScalarOp(buildUnaryOpSpec(plan), ctx);
 }

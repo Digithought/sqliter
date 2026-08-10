@@ -1,5 +1,5 @@
 import { isRelationalNode, PlanNode } from './plan-node.js';
-import type { RelationalPlanNode, Attribute, BinaryRelationalNode, ScalarPlanNode } from './plan-node.js';
+import type { RelationalPlanNode, Attribute, BinaryRelationalNode, ScalarPlanNode, DomainConstraint } from './plan-node.js';
 import type { RelationType } from '../../common/datatype.js';
 import type { PhysicalProperties } from './plan-node.js';
 import { PlanNodeType } from './plan-node-type.js';
@@ -7,18 +7,59 @@ import type { Scope } from '../scopes/scope.js';
 import { Cached } from '../../util/cached.js';
 import { StatusCode } from '../../common/types.js';
 import { quereusError } from '../../common/errors.js';
-import { JoinCapable, type PredicateSourceCapable } from '../framework/characteristics.js';
+import type { JoinCapable, PredicateSourceCapable } from '../framework/characteristics.js';
 import { normalizePredicate } from '../analysis/predicate-normalizer.js';
 import { combineJoinKeys, analyzeJoinKeyCoverage } from '../util/key-utils.js';
 import { BinaryOpNode } from './scalar.js';
 import { ColumnReferenceNode } from './reference.js';
-import { buildJoinAttributes, buildJoinRelationType, estimateJoinRows, propagateJoinMonotonicOn, propagateJoinFds } from './join-utils.js';
+import { buildJoinAttributes, buildJoinRelationType, estimateJoinRows, joinPhysicalRows, propagateJoinMonotonicOn, propagateJoinFds, propagateJoinInds } from './join-utils.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
+import { isValueDiscriminatingEquality } from '../analysis/comparison-collation.js';
+import { deriveJoinUpdateLineage, type JoinExistenceSite } from '../analysis/update-lineage.js';
+import { semanticOrderingsAgree } from '../../util/comparison.js';
 
 export type JoinType = 'inner' | 'left' | 'right' | 'full' | 'cross' | 'semi' | 'anti';
 
 /**
+ * One `exists [<side>] as <name>` existence match-flag column the JoinNode
+ * appends after both sides. The `attrId` is minted once at build time (so it is
+ * stable across `withChildren` rebuilds, like the per-side attribute ids the
+ * join preserves); `side` is the resolved non-preserved side whose match the
+ * flag reifies.
+ */
+export interface ExistenceColumnSpec {
+	readonly attrId: number;
+	readonly name: string;
+	readonly side: 'left' | 'right';
+}
+
+/**
  * Extract equi-join column index pairs from a join condition (AND-of-equalities).
  * Returns pairs of {left, right} column indices.
+ *
+ * An equi-pair is a VALUE-level pairing fact — its consumers (join key
+ * coverage, FD/EC propagation, FK-alignment rules, join elimination, the
+ * coverage prover) all assume matched rows are value-equal on the pair, so a
+ * pair is only recognized when the comparison is value-discriminating
+ * (`isValueDiscriminatingEquality`): for textual columns, every collation
+ * either side contributes must be BINARY. A NOCASE comparison over a
+ * BINARY-keyed column matches several distinct key values, so a pair minted
+ * from it would falsely claim key coverage / preserved keys (ticket
+ * `collation-blind-equality-fact-extraction`). Declared-non-BINARY equi-joins
+ * therefore contribute NO pairs (a sound under-claim: keys combine as a cross
+ * product, eliminations don't fire). Physical join algorithm selection is
+ * unaffected — it uses its own extractor (`rules/join/equi-pair-extractor.ts`)
+ * and resolves collations at emit time.
+ *
+ * The gate also requires the two sides to agree on semantic ordering
+ * (`semanticOrderingsAgree`): a pair whose sides disagree (`timespan_col = text_col`)
+ * matches rows that are NOT value-equal ('PT1H' against 'PT60M'), so no pair is minted
+ * for it, mirroring the physical extractor (`rules/join/equi-pair-extractor.ts`).
+ *
+ * Operands must be **bare** `ColumnReferenceNode`s: a `COLLATE`-wrapped side
+ * (`l.x = r.b collate nocase`) is structurally rejected. That exclusion is
+ * load-bearing — do not "improve" this with a collate-unwrapping step without
+ * re-deriving the gate above against the wrapper's collation.
  */
 export function extractEquiPairsFromCondition(
 	condition: ScalarPlanNode | undefined,
@@ -44,7 +85,9 @@ export function extractEquiPairsFromCondition(
 				continue;
 			}
 			if (op === '=') {
-				if (n.left instanceof ColumnReferenceNode && n.right instanceof ColumnReferenceNode) {
+				if (n.left instanceof ColumnReferenceNode && n.right instanceof ColumnReferenceNode
+					&& isValueDiscriminatingEquality(n.left, n.right)
+					&& semanticOrderingsAgree(n.left.getType().logicalType, n.right.getType().logicalType)) {
 					let lIdx = leftIdToIndex.get(n.left.attributeId);
 					let rIdx = rightIdToIndex.get(n.right.attributeId);
 					if (lIdx !== undefined && rIdx !== undefined) {
@@ -69,6 +112,8 @@ export function extractEquiPairsFromCondition(
  */
 export class JoinNode extends PlanNode implements BinaryRelationalNode, JoinCapable, PredicateSourceCapable {
 	readonly nodeType = PlanNodeType.Join;
+	readonly isJoinCapable = true as const;
+	readonly isPredicateSourceCapable = true as const;
 	private attributesCache: Cached<Attribute[]>;
 
 	constructor(
@@ -77,17 +122,24 @@ export class JoinNode extends PlanNode implements BinaryRelationalNode, JoinCapa
 		public readonly right: RelationalPlanNode,
 		public readonly joinType: JoinType,
 		public readonly condition?: ScalarPlanNode,
-		public readonly usingColumns?: readonly string[]
+		/**
+		 * The column names a `using (…)` join was written with. **Presentational
+		 * only — `condition` is authoritative.** `buildUsingCondition`
+		 * (planner/building/select.ts) desugars USING into the equivalent
+		 * `l.c = r.c and …` and stores it in `condition`, so every consumer
+		 * (physical selection, equi-pair extraction, the nested-loop emitter)
+		 * reads the condition and none re-derives the comparison from these names.
+		 * They survive so EXPLAIN can print how the join was actually written.
+		 */
+		public readonly usingColumns?: readonly string[],
+		public readonly existence?: readonly ExistenceColumnSpec[],
 	) {
-		// Cost estimate: base cost is sum of children plus join cost
-		const leftCost = left.getTotalCost();
-		const rightCost = right.getTotalCost();
+		// Self-cost only: the children (left, right, condition) flow in via
+		// getTotalCost(); self is the nested-loop join cost heuristic.
 		const leftRows = left.estimatedRows ?? 100;
 		const rightRows = right.estimatedRows ?? 100;
-
-		// Simple join cost heuristic - nested loop cost
 		const joinCost = leftRows * rightRows;
-		super(scope, leftCost + rightCost + joinCost);
+		super(scope, joinCost);
 
 		this.attributesCache = new Cached(() => this.buildAttributes());
 	}
@@ -105,9 +157,15 @@ export class JoinNode extends PlanNode implements BinaryRelationalNode, JoinCapa
 			this.condition, leftAttrs, rightAttrs
 		);
 
+		// PHYSICAL child cardinalities, not the logical getters: by the time this
+		// runs both sides are usually physical access nodes (or wrappers over them),
+		// which declare no `estimatedRows` getter — see `physicalSourceRows`.
+		const leftRows = physicalSourceRows(leftPhys, this.left);
+		const rightRows = physicalSourceRows(rightPhys, this.right);
+
 		const result = analyzeJoinKeyCoverage(
 			this.joinType, leftPhys, rightPhys, leftType, rightType,
-			pairs, this.left.estimatedRows, this.right.estimatedRows,
+			pairs, leftRows, rightRows,
 			leftType.columns.length,
 		);
 
@@ -124,18 +182,72 @@ export class JoinNode extends PlanNode implements BinaryRelationalNode, JoinCapa
 			leftType.columns.length, totalCols, result.preservedKeys,
 		);
 
+		// Backward update-lineage: compose per-source lineage along the join FDs
+		// the forward pass computed (output attribute ids are preserved per side,
+		// so the maps merge directly). Outer joins wrap the non-preserved side's
+		// sites `null-extended` under the join predicate — annotation only; write
+		// materialization is a later phase. Each existence flag registers an
+		// `existence` site (read-only here) under the same join predicate.
+		const { updateLineage, attributeDefaults } = deriveJoinUpdateLineage(
+			this.joinType,
+			leftPhys?.updateLineage, rightPhys?.updateLineage,
+			leftPhys?.attributeDefaults, rightPhys?.attributeDefaults,
+			this.condition?.expression,
+			this.existenceSites(),
+		);
+
 		return {
-			estimatedRows: result.estimatedRows,
+			estimatedRows: joinPhysicalRows(this.joinType, result.estimatedRows, leftRows, rightRows),
 			monotonicOn: propagateJoinMonotonicOn(this.joinType, leftPhys, rightPhys, attrIdPairs),
+			// `fdResult.fds` already covers `key → flag` for each preserved key: the
+			// forward walk's `withKeyFds` builds `key → all_other_cols` over the FULL
+			// output column count (which includes the appended flags), so a flag is a
+			// dependent of every preserved key and never a determinant — Invariant 1.
 			fds: fdResult.fds,
 			equivClasses: fdResult.equivClasses,
 			constantBindings: fdResult.constantBindings,
-			domainConstraints: fdResult.domainConstraints,
+			// Each flag carries a `{true,false}` enum domain (the clean-boolean point).
+			domainConstraints: this.withFlagDomains(fdResult.domainConstraints),
+			inds: propagateJoinInds(this.joinType, leftPhys, rightPhys, leftType.columns.length),
+			updateLineage,
+			attributeDefaults,
 		};
 	}
 
+	/** Output column index of the i-th existence flag (appended after both sides). */
+	private flagColumnIndex(i: number): number {
+		return this.left.getType().columns.length + this.right.getType().columns.length + i;
+	}
+
+	/** Existence sites for the backward lineage walk (empty when no flags). */
+	private existenceSites(): ReadonlyArray<JoinExistenceSite> | undefined {
+		if (!this.existence || this.existence.length === 0) return undefined;
+		return this.existence.map(spec => ({
+			attrId: spec.attrId,
+			side: spec.side,
+			componentTable: Number(spec.side === 'left' ? this.left.id : this.right.id),
+		}));
+	}
+
+	/** Append a `{true,false}` enum domain constraint per existence flag. */
+	private withFlagDomains(
+		domains: ReadonlyArray<DomainConstraint> | undefined,
+	): ReadonlyArray<DomainConstraint> | undefined {
+		if (!this.existence || this.existence.length === 0) return domains;
+		const out = [...(domains ?? [])];
+		this.existence.forEach((_spec, i) => {
+			out.push({ kind: 'enum', column: this.flagColumnIndex(i), values: [true, false] });
+		});
+		return out;
+	}
+
+	/** True when this join exposes one or more `exists … as` match flags. */
+	get hasExistenceColumns(): boolean {
+		return !!this.existence && this.existence.length > 0;
+	}
+
 	private buildAttributes(): Attribute[] {
-		return buildJoinAttributes(this.left.getAttributes(), this.right.getAttributes(), this.joinType);
+		return buildJoinAttributes(this.left.getAttributes(), this.right.getAttributes(), this.joinType, undefined, this.existence);
 	}
 
 	getAttributes(): Attribute[] {
@@ -151,7 +263,7 @@ export class JoinNode extends PlanNode implements BinaryRelationalNode, JoinCapa
 			this.condition, this.left.getAttributes(), this.right.getAttributes(),
 		);
 		const keys = combineJoinKeys(leftType.keys, rightType.keys, this.joinType, leftType.columns.length, pairs);
-		return buildJoinRelationType(leftType, rightType, this.joinType, keys);
+		return buildJoinRelationType(leftType, rightType, this.joinType, keys, this.existence);
 	}
 
 	getChildren(): readonly PlanNode[] {
@@ -190,14 +302,20 @@ export class JoinNode extends PlanNode implements BinaryRelationalNode, JoinCapa
 			return this;
 		}
 
-		// Create new instance - JoinNode creates new attributes by combining left and right
+		// Create new instance - JoinNode creates new attributes by combining left and
+		// right. The existence specs carry pre-minted stable attribute ids, so they
+		// are threaded verbatim (the appended flag columns survive the rebuild).
+		// `usingColumns` is dropped when the condition is rewritten: it only labels the
+		// predicate the desugar produced, so keeping it over a different condition would
+		// make `toString` print `USING(...)` for a predicate that is no longer that.
 		return new JoinNode(
 			this.scope,
 			newLeft as RelationalPlanNode,
 			newRight as RelationalPlanNode,
 			this.joinType,
 			newCondition as ScalarPlanNode | undefined,
-			this.usingColumns
+			conditionChanged ? undefined : this.usingColumns,
+			this.existence,
 		);
 	}
 
@@ -207,10 +325,12 @@ export class JoinNode extends PlanNode implements BinaryRelationalNode, JoinCapa
 
 	override toString(): string {
 		const joinTypeDisplay = this.joinType.toUpperCase();
-		if (this.condition) {
-			return `${joinTypeDisplay} JOIN ON condition`;
-		} else if (this.usingColumns) {
+		// USING first: a USING join always carries a desugared condition too (see the
+		// `usingColumns` field), and the USING spelling is the faithful one for EXPLAIN.
+		if (this.usingColumns) {
 			return `${joinTypeDisplay} JOIN USING(${this.usingColumns.join(', ')})`;
+		} else if (this.condition) {
+			return `${joinTypeDisplay} JOIN ON condition`;
 		} else {
 			return `${joinTypeDisplay} JOIN`;
 		}
@@ -221,6 +341,7 @@ export class JoinNode extends PlanNode implements BinaryRelationalNode, JoinCapa
 			joinType: this.joinType,
 			hasCondition: !!this.condition,
 			usingColumns: this.usingColumns,
+			existence: this.existence?.map(e => `exists ${e.side} as ${e.name}`),
 			leftRows: this.left.estimatedRows,
 			rightRows: this.right.estimatedRows
 		};

@@ -1,6 +1,8 @@
 import { expect } from 'chai';
 import { parse, parseAll, type BinaryExpr, type UnaryExpr, type LiteralExpr, type SelectStmt, type Expression, type BetweenExpr } from '../src/parser/index.js';
 import { ParseError } from '../src/parser/parser.js';
+import { astToString } from '../src/emit/index.js';
+import type { CreateMaterializedViewStmt, RefreshMaterializedViewStmt, DropStmt } from '../src/parser/ast.js';
 
 /** Shorthand to parse an expression from a SELECT wrapper */
 function parseExpr(exprSql: string): Expression {
@@ -177,6 +179,40 @@ describe('Parser', () => {
 		});
 	});
 
+	describe('IS [NOT] TRUE / FALSE', () => {
+		it('should parse IS TRUE', () => {
+			const un = expectUnary(parseExpr('1 IS TRUE'), 'IS TRUE');
+			expectLiteral(un.expr, 1);
+		});
+
+		it('should parse IS NOT TRUE', () => {
+			const un = expectUnary(parseExpr('1 IS NOT TRUE'), 'IS NOT TRUE');
+			expectLiteral(un.expr, 1);
+		});
+
+		it('should parse IS FALSE', () => {
+			const un = expectUnary(parseExpr('1 IS FALSE'), 'IS FALSE');
+			expectLiteral(un.expr, 1);
+		});
+
+		it('should parse IS NOT FALSE', () => {
+			const un = expectUnary(parseExpr('1 IS NOT FALSE'), 'IS NOT FALSE');
+			expectLiteral(un.expr, 1);
+		});
+
+		it('binds tighter than prefix NOT: not 1 is true → NOT(1 IS TRUE)', () => {
+			const outer = expectUnary(parseExpr('not 1 is true'), 'NOT');
+			const inner = expectUnary(outer.expr, 'IS TRUE');
+			expectLiteral(inner.expr, 1);
+		});
+
+		it('still rejects a general IS <expr> (non-NULL/TRUE/FALSE)', () => {
+			// The TRUE/FALSE additions must not consume tokens for the generic
+			// `IS` path: `1 is x` backtracks the IS and leaves it dangling → parse error.
+			expect(() => parse('select 1 is x')).to.throw();
+		});
+	});
+
 	describe('Location Tracking', () => {
 		it('should track locations on expression nodes', () => {
 			const expr = parseExpr('1 + 2');
@@ -225,6 +261,99 @@ describe('Parser', () => {
 			}
 		});
 
+		it('should parse bare (no-AS) alias followed by another select item', () => {
+			const stmt = parse('select 1 a, 2 b, 3 c') as SelectStmt;
+			expect(stmt.columns).to.have.length(3);
+			for (const [col, expected] of [[stmt.columns[0], 'a'], [stmt.columns[1], 'b'], [stmt.columns[2], 'c']] as const) {
+				expect(col.type).to.equal('column');
+				if (col.type === 'column') {
+					expect(col.alias).to.equal(expected);
+				}
+			}
+		});
+
+		it('should parse bare alias mixed with an AS alias in the same list', () => {
+			const stmt = parse('select 1 as num, 2 b') as SelectStmt;
+			expect(stmt.columns).to.have.length(2);
+			const [first, second] = stmt.columns;
+			expect(first.type).to.equal('column');
+			expect(second.type).to.equal('column');
+			if (first.type === 'column') expect(first.alias).to.equal('num');
+			if (second.type === 'column') expect(second.alias).to.equal('b');
+		});
+
+		it('should parse a bare alias before a window function column', () => {
+			const stmt = parse('select o.k kk, row_number() over () rn from o') as SelectStmt;
+			expect(stmt.columns).to.have.length(2);
+			const [first, second] = stmt.columns;
+			expect(first.type).to.equal('column');
+			expect(second.type).to.equal('column');
+			if (first.type === 'column') expect(first.alias).to.equal('kk');
+			if (second.type === 'column') expect(second.alias).to.equal('rn');
+		});
+
+		it('should not treat a following column as an alias when there is no bare identifier gap', () => {
+			const stmt = parse('select a, b from t') as SelectStmt;
+			expect(stmt.columns).to.have.length(2);
+			const [first, second] = stmt.columns;
+			expect(first.type).to.equal('column');
+			expect(second.type).to.equal('column');
+			if (first.type === 'column') expect(first.alias).to.be.undefined;
+			if (second.type === 'column') expect(second.alias).to.be.undefined;
+		});
+
+		it('should parse a bare table alias in a comma-separated FROM list', () => {
+			const stmt = parse('select 1 from t a, u b') as SelectStmt;
+			expect(stmt.from).to.have.length(2);
+			const [first, second] = stmt.from!;
+			expect(first.type).to.equal('table');
+			expect(second.type).to.equal('table');
+			if (first.type === 'table') expect(first.alias).to.equal('a');
+			if (second.type === 'table') expect(second.alias).to.equal('b');
+		});
+
+		it('should parse a bare subquery alias in a comma-separated FROM list', () => {
+			const stmt = parse('select 1 from (select 1) x, (select 2) y') as SelectStmt;
+			expect(stmt.from).to.have.length(2);
+			const [first, second] = stmt.from!;
+			expect(first.type).to.equal('subquerySource');
+			expect(second.type).to.equal('subquerySource');
+			if (first.type === 'subquerySource') expect(first.alias).to.equal('x');
+			if (second.type === 'subquerySource') expect(second.alias).to.equal('y');
+		});
+
+		it('should parse a bare table-function alias in a comma-separated FROM list', () => {
+			const stmt = parse('select 1 from f(1) x, g(2) y') as SelectStmt;
+			expect(stmt.from).to.have.length(2);
+			const [first, second] = stmt.from!;
+			expect(first.type).to.equal('functionSource');
+			expect(second.type).to.equal('functionSource');
+			if (first.type === 'functionSource') expect(first.alias).to.equal('x');
+			if (second.type === 'functionSource') expect(second.alias).to.equal('y');
+		});
+
+		it('should parse bare aliases inside a nested subquery projection list', () => {
+			const stmt = parse('select s.a, s.b from (select 1 a, 2 b) s') as SelectStmt;
+			const [source] = stmt.from!;
+			expect(source.type).to.equal('subquerySource');
+			if (source.type !== 'subquerySource') return;
+			const inner = source.subquery as SelectStmt;
+			expect(inner.columns).to.have.length(2);
+			const [a, b] = inner.columns;
+			if (a.type === 'column') expect(a.alias).to.equal('a');
+			if (b.type === 'column') expect(b.alias).to.equal('b');
+		});
+
+		it('should not swallow a JOIN keyword as a bare table alias', () => {
+			const stmt = parse('select 1 from t a join u b on a.k = b.k') as SelectStmt;
+			expect(stmt.from).to.have.length(1);
+			const [join] = stmt.from!;
+			expect(join.type).to.equal('join');
+			if (join.type !== 'join') return;
+			expect(join.left.type === 'table' && join.left.alias).to.equal('a');
+			expect(join.right.type === 'table' && join.right.alias).to.equal('b');
+		});
+
 		it('should parse SELECT *', () => {
 			const stmt = parse('select * from t') as SelectStmt;
 			expect(stmt.columns).to.have.length(1);
@@ -258,6 +387,21 @@ describe('Parser', () => {
 					expect(e.token).to.exist;
 					expect(e.token.startLine).to.be.a('number');
 				}
+			}
+		});
+
+		it('should propagate a typed ParseError unchanged, preserving subclass and location', () => {
+			// This site (unknown rename_policy value) is one of the few that throws
+			// the ParseError subclass directly rather than the base QuereusError.
+			try {
+				parse(`apply schema temp options (rename_policy = 'bogus')`);
+				expect.fail('Should have thrown');
+			} catch (e: unknown) {
+				expect(e).to.be.instanceOf(ParseError);
+				const err = e as ParseError;
+				expect(err.line).to.be.a('number');
+				expect(err.column).to.be.a('number');
+				expect(err.message).to.include('Unknown rename_policy');
 			}
 		});
 	});
@@ -347,6 +491,362 @@ describe('Parser', () => {
 			const action = stmt.action as Extract<import('../src/parser/ast.js').AlterTableAction, { type: 'alterColumn' }>;
 			expect(action.columnName).to.equal('c');
 			expect(action.setDefault).to.equal(null);
+		});
+	});
+
+	describe('ALTER TABLE ADD / DROP TAGS (per-key tag mutation)', () => {
+		type AlterTableStmt = import('../src/parser/ast.js').AlterTableStmt;
+
+		// ── table level ──
+		it('parses ADD TAGS at the table level as a merge setTags', () => {
+			const stmt = parse(`alter table t add tags (audit = true)`) as AlterTableStmt;
+			expect(stmt.action).to.deep.equal({
+				type: 'setTags', target: { kind: 'table' }, mode: 'merge', tags: { audit: true },
+			});
+		});
+
+		it('parses DROP TAGS at the table level as a dropTags', () => {
+			const stmt = parse(`alter table t drop tags (audit, legacy)`) as AlterTableStmt;
+			expect(stmt.action).to.deep.equal({
+				type: 'dropTags', target: { kind: 'table' }, keys: ['audit', 'legacy'],
+			});
+		});
+
+		it('parses the existing table-level SET TAGS with mode replace', () => {
+			const stmt = parse(`alter table t set tags (a = 1)`) as AlterTableStmt;
+			expect(stmt.action).to.deep.equal({
+				type: 'setTags', target: { kind: 'table' }, mode: 'replace', tags: { a: 1 },
+			});
+		});
+
+		it('treats ADD TAGS () / DROP TAGS () as empty (no-op) lists', () => {
+			const add = parse(`alter table t add tags ()`) as AlterTableStmt;
+			expect(add.action).to.deep.equal({ type: 'setTags', target: { kind: 'table' }, mode: 'merge', tags: {} });
+			const drop = parse(`alter table t drop tags ()`) as AlterTableStmt;
+			expect(drop.action).to.deep.equal({ type: 'dropTags', target: { kind: 'table' }, keys: [] });
+		});
+
+		// ── column level ──
+		it('parses ALTER COLUMN ADD TAGS as a column merge', () => {
+			const stmt = parse(`alter table t alter column c add tags (searchable = true)`) as AlterTableStmt;
+			expect(stmt.action).to.deep.equal({
+				type: 'setTags', target: { kind: 'column', columnName: 'c' }, mode: 'merge', tags: { searchable: true },
+			});
+		});
+
+		it('parses ALTER COLUMN DROP TAGS as a column dropTags', () => {
+			const stmt = parse(`alter table t alter column c drop tags (searchable)`) as AlterTableStmt;
+			expect(stmt.action).to.deep.equal({
+				type: 'dropTags', target: { kind: 'column', columnName: 'c' }, keys: ['searchable'],
+			});
+		});
+
+		it('parses ALTER COLUMN SET TAGS with mode replace', () => {
+			const stmt = parse(`alter table t alter column c set tags (a = 1)`) as AlterTableStmt;
+			expect(stmt.action).to.deep.equal({
+				type: 'setTags', target: { kind: 'column', columnName: 'c' }, mode: 'replace', tags: { a: 1 },
+			});
+		});
+
+		// ── named-constraint level ──
+		it('parses ALTER CONSTRAINT ADD TAGS as a constraint merge', () => {
+			const stmt = parse(`alter table t alter constraint uq add tags (msg = 'dup')`) as AlterTableStmt;
+			expect(stmt.action).to.deep.equal({
+				type: 'setTags', target: { kind: 'constraint', constraintName: 'uq' }, mode: 'merge', tags: { msg: 'dup' },
+			});
+		});
+
+		it('parses ALTER CONSTRAINT DROP TAGS as a constraint dropTags', () => {
+			const stmt = parse(`alter table t alter constraint uq drop tags (msg)`) as AlterTableStmt;
+			expect(stmt.action).to.deep.equal({
+				type: 'dropTags', target: { kind: 'constraint', constraintName: 'uq' }, keys: ['msg'],
+			});
+		});
+
+		it('parses ALTER CONSTRAINT SET TAGS with mode replace', () => {
+			const stmt = parse(`alter table t alter constraint uq set tags (a = 1)`) as AlterTableStmt;
+			expect(stmt.action).to.deep.equal({
+				type: 'setTags', target: { kind: 'constraint', constraintName: 'uq' }, mode: 'replace', tags: { a: 1 },
+			});
+		});
+
+		it('rejects an ALTER CONSTRAINT verb that is not SET / ADD / DROP', () => {
+			expect(() => parse(`alter table t alter constraint uq rename tags (a)`)).to.throw();
+		});
+
+		// ── column-named-`tags` disambiguation (the `(` look-ahead guard) ──
+		it('keeps ADD <col> / ADD COLUMN <col> parsing as ADD COLUMN even when the column is named tags', () => {
+			const noKw = parse(`alter table t add tags integer`) as AlterTableStmt;
+			expect(noKw.action.type).to.equal('addColumn');
+			expect((noKw.action as Extract<typeof noKw.action, { type: 'addColumn' }>).column.name).to.equal('tags');
+
+			const withKw = parse(`alter table t add column tags integer`) as AlterTableStmt;
+			expect(withKw.action.type).to.equal('addColumn');
+			expect((withKw.action as Extract<typeof withKw.action, { type: 'addColumn' }>).column.name).to.equal('tags');
+		});
+
+		it('keeps DROP <col> / DROP COLUMN <col> parsing as DROP COLUMN even when the column is named tags', () => {
+			const noKw = parse(`alter table t drop tags`) as AlterTableStmt;
+			expect(noKw.action).to.deep.equal({ type: 'dropColumn', name: 'tags' });
+
+			const withKw = parse(`alter table t drop column tags`) as AlterTableStmt;
+			expect(withKw.action).to.deep.equal({ type: 'dropColumn', name: 'tags' });
+		});
+
+		it('round-trips ADD / DROP TAGS through astToString', () => {
+			for (const sql of [
+				`alter table t add tags (audit = true)`,
+				`alter table t drop tags (audit, legacy)`,
+				`alter table t alter column c add tags (searchable = true)`,
+				`alter table t alter column c drop tags (searchable)`,
+				`alter table t alter constraint uq add tags (msg = 'dup')`,
+				`alter table t alter constraint uq drop tags (msg)`,
+			]) {
+				const stmt = parse(sql);
+				// Re-parse the stringified form and compare the action — proves the
+				// emitter is parseable and structurally identical.
+				const reparsed = parse(astToString(stmt));
+				expect((reparsed as AlterTableStmt).action).to.deep.equal((stmt as AlterTableStmt).action);
+			}
+		});
+	});
+
+	describe('ALTER VIEW / MATERIALIZED VIEW / INDEX SET / ADD / DROP TAGS', () => {
+		type AlterViewStmt = import('../src/parser/ast.js').AlterViewStmt;
+		type AlterMaterializedViewStmt = import('../src/parser/ast.js').AlterMaterializedViewStmt;
+		type AlterIndexStmt = import('../src/parser/ast.js').AlterIndexStmt;
+
+		it('parses ALTER VIEW ... SET TAGS as a replace setTags', () => {
+			const stmt = parse(`alter view v set tags (cacheable = true)`) as AlterViewStmt;
+			expect(stmt.type).to.equal('alterView');
+			expect(stmt.name.name).to.equal('v');
+			expect(stmt.action).to.deep.equal({ type: 'setTags', mode: 'replace', tags: { cacheable: true } });
+		});
+
+		it('parses ALTER MATERIALIZED VIEW ... SET TAGS as a replace setTags', () => {
+			const stmt = parse(`alter materialized view mv set tags (owner = 'analytics')`) as AlterMaterializedViewStmt;
+			expect(stmt.type).to.equal('alterMaterializedView');
+			expect(stmt.name.name).to.equal('mv');
+			expect(stmt.action).to.deep.equal({ type: 'setTags', mode: 'replace', tags: { owner: 'analytics' } });
+		});
+
+		it('parses ALTER INDEX ... SET TAGS as a replace setTags', () => {
+			const stmt = parse(`alter index idx set tags (purpose = 'search')`) as AlterIndexStmt;
+			expect(stmt.type).to.equal('alterIndex');
+			expect(stmt.name.name).to.equal('idx');
+			expect(stmt.action).to.deep.equal({ type: 'setTags', mode: 'replace', tags: { purpose: 'search' } });
+		});
+
+		// ── ADD TAGS → merge setTags ──
+		it('parses ALTER VIEW ... ADD TAGS as a merge setTags', () => {
+			const stmt = parse(`alter view v add tags (cacheable = true)`) as AlterViewStmt;
+			expect(stmt.action).to.deep.equal({ type: 'setTags', mode: 'merge', tags: { cacheable: true } });
+		});
+
+		it('parses ALTER MATERIALIZED VIEW ... ADD TAGS as a merge setTags', () => {
+			const stmt = parse(`alter materialized view mv add tags (owner = 'team-b')`) as AlterMaterializedViewStmt;
+			expect(stmt.action).to.deep.equal({ type: 'setTags', mode: 'merge', tags: { owner: 'team-b' } });
+		});
+
+		it('parses ALTER INDEX ... ADD TAGS as a merge setTags', () => {
+			const stmt = parse(`alter index idx add tags (purpose = 'search')`) as AlterIndexStmt;
+			expect(stmt.action).to.deep.equal({ type: 'setTags', mode: 'merge', tags: { purpose: 'search' } });
+		});
+
+		// ── DROP TAGS → dropTags ──
+		it('parses ALTER VIEW ... DROP TAGS as a dropTags', () => {
+			const stmt = parse(`alter view v drop tags (purpose)`) as AlterViewStmt;
+			expect(stmt.action).to.deep.equal({ type: 'dropTags', keys: ['purpose'] });
+		});
+
+		it('parses ALTER MATERIALIZED VIEW ... DROP TAGS as a dropTags', () => {
+			const stmt = parse(`alter materialized view mv drop tags (legacy, owner)`) as AlterMaterializedViewStmt;
+			expect(stmt.action).to.deep.equal({ type: 'dropTags', keys: ['legacy', 'owner'] });
+		});
+
+		it('parses ALTER INDEX ... DROP TAGS as a dropTags', () => {
+			const stmt = parse(`alter index idx drop tags (purpose)`) as AlterIndexStmt;
+			expect(stmt.action).to.deep.equal({ type: 'dropTags', keys: ['purpose'] });
+		});
+
+		// ── empty-list forms ──
+		it('parses an empty SET TAGS () as the clear-all form', () => {
+			const stmt = parse(`alter index idx set tags ()`) as AlterIndexStmt;
+			expect(stmt.action).to.deep.equal({ type: 'setTags', mode: 'replace', tags: {} });
+		});
+
+		it('parses empty ADD TAGS () / DROP TAGS () as no-op lists', () => {
+			const add = parse(`alter view v add tags ()`) as AlterViewStmt;
+			expect(add.action).to.deep.equal({ type: 'setTags', mode: 'merge', tags: {} });
+			const drop = parse(`alter view v drop tags ()`) as AlterViewStmt;
+			expect(drop.action).to.deep.equal({ type: 'dropTags', keys: [] });
+		});
+
+		it('honors a schema-qualified object name', () => {
+			const stmt = parse(`alter view main.v set tags (a = 1)`) as AlterViewStmt;
+			expect(stmt.name.schema).to.equal('main');
+			expect(stmt.name.name).to.equal('v');
+		});
+
+		it('rejects ALTER on an unsupported object keyword', () => {
+			expect(() => parse(`alter sequence s set tags (a = 1)`)).to.throw();
+		});
+
+		it('rejects a tag verb that is not SET / ADD / DROP', () => {
+			expect(() => parse(`alter view v rename tags (a)`)).to.throw();
+		});
+
+		it('round-trips all nine view / MV / index tag forms through astToString', () => {
+			for (const sql of [
+				`alter view v set tags (cacheable = true)`,
+				`alter view v add tags (cacheable = true)`,
+				`alter view v drop tags (purpose)`,
+				`alter materialized view mv set tags (owner = 'team-b')`,
+				`alter materialized view mv add tags (owner = 'team-b')`,
+				`alter materialized view mv drop tags (legacy)`,
+				`alter index idx set tags (purpose = 'search')`,
+				`alter index idx add tags (purpose = 'search')`,
+				`alter index idx drop tags (purpose)`,
+				// A quoted reserved-looking key proves tagKeysBodyToString quotes keys.
+				`alter view v drop tags ("quereus.id")`,
+			]) {
+				const stmt = parse(sql);
+				const reparsed = parse(astToString(stmt));
+				expect((reparsed as AlterViewStmt).action, sql).to.deep.equal((stmt as AlterViewStmt).action);
+			}
+		});
+	});
+
+	// Guards the shared CONTEXTUAL_KEYWORDS constant in parser.ts: these tokenized-but-contextual
+	// reserved words must still be accepted as identifiers in every context, and the two extended
+	// sets (+temp/temporary in tableIdentifier, +replace in the function-call path) must keep working.
+	describe('Contextual keywords as identifiers', () => {
+		it('accepts a contextual keyword as a qualified column reference', () => {
+			const stmt = parse(`select cascade.restrict from cascade`) as SelectStmt;
+			const col = stmt.columns[0];
+			expect(col.type).to.equal('column');
+			const expr = (col as { expr: Expression }).expr as { type: string; table?: string; name: string };
+			expect(expr.type).to.equal('column');
+			expect(expr.table).to.equal('cascade');
+			expect(expr.name).to.equal('restrict');
+		});
+
+		it('accepts a contextual keyword as a column alias', () => {
+			const stmt = parse(`select x as "default" from t`) as SelectStmt;
+			const col = stmt.columns[0];
+			expect(col.type).to.equal('column');
+			expect((col as { alias?: string }).alias).to.equal('default');
+		});
+
+		it('accepts a contextual keyword as a table-valued function name (base set)', () => {
+			const stmt = parse(`select * from like(1)`) as SelectStmt;
+			const from = stmt.from![0] as { type: string; name: { name: string } };
+			expect(from.type).to.equal('functionSource');
+			expect(from.name.name).to.equal('like');
+		});
+
+		it("accepts 'replace' as a scalar function name (function-call spread set)", () => {
+			const stmt = parse(`select replace('a', 'a', 'b')`) as SelectStmt;
+			const expr = (stmt.columns[0] as { expr: Expression }).expr as { type: string; name: string };
+			expect(expr.type).to.equal('function');
+			expect(expr.name).to.equal('replace');
+		});
+
+		it("accepts 'temp'/'temporary' as schema/table names (tableIdentifier spread set)", () => {
+			const qualified = parse(`select * from temp.foo`) as SelectStmt;
+			const qFrom = qualified.from![0] as { type: string; table: { schema?: string; name: string } };
+			expect(qFrom.table.schema).to.equal('temp');
+			expect(qFrom.table.name).to.equal('foo');
+
+			const bare = parse(`select * from temporary`) as SelectStmt;
+			const bFrom = bare.from![0] as { type: string; table: { name: string } };
+			expect(bFrom.table.name).to.equal('temporary');
+		});
+
+		it('accepts a contextual keyword as a CTE name (shared CONTEXTUAL_KEYWORDS set)', () => {
+			const stmt = parse(`with "key" as (select 1 as a) select * from "key"`) as SelectStmt;
+			expect(stmt.withClause).to.exist;
+			expect(stmt.withClause!.ctes[0].name).to.equal('key');
+		});
+
+		// The CTE name/column list now shares the full CONTEXTUAL_KEYWORDS set
+		// (ticket parser-cte-contextual-keyword-subset), so the keywords formerly
+		// omitted from the CTE subset — references/on/cascade/restrict — are accepted
+		// as CTE names too, matching how they are already accepted as table names.
+		it('accepts a previously-omitted reserved-but-table-legal keyword as a CTE name', () => {
+			const stmt = parse(`with references as (select 1 as a) select * from references`) as SelectStmt;
+			expect(stmt.withClause!.ctes[0].name).to.equal('references');
+			// ...consistent with the same word being accepted as a table name:
+			expect(() => parse(`select * from references`)).to.not.throw();
+			// `on` is in CONTEXTUAL_KEYWORDS too — exercise it explicitly, not just transitively.
+			const onStmt = parse(`with on as (select 1 as a) select * from on`) as SelectStmt;
+			expect(onStmt.withClause!.ctes[0].name).to.equal('on');
+		});
+
+		it('round-trips a keyword-named CTE through ast-stringify', () => {
+			// The emitter must quote the keyword (e.g. `with "references" as ...`) so the
+			// widened parser accepts it on re-parse and the name survives unchanged.
+			const stmt = parse(`with references as (select 1 as a) select * from references`) as SelectStmt;
+			const reparsed = parse(astToString(stmt)) as SelectStmt;
+			expect(reparsed.withClause!.ctes[0].name).to.equal('references');
+		});
+
+		it('accepts a previously-omitted reserved-but-table-legal keyword in a CTE column list', () => {
+			const stmt = parse(`with c(cascade, restrict) as (select 1, 2) select * from c`) as SelectStmt;
+			expect(stmt.withClause!.ctes[0].columns).to.deep.equal(['cascade', 'restrict']);
+		});
+	});
+
+	describe('Materialized Views', () => {
+		it('parses CREATE MATERIALIZED VIEW with a SELECT body', () => {
+			const stmt = parse(`create materialized view mv as select x, y from t`) as CreateMaterializedViewStmt;
+			expect(stmt.type).to.equal('createMaterializedView');
+			expect(stmt.view.name).to.equal('mv');
+			expect(stmt.ifNotExists).to.equal(false);
+			expect(stmt.select.type).to.equal('select');
+		});
+
+		it('parses an explicit column list', () => {
+			const stmt = parse(`create materialized view mv(a, b) as select x, y from t`) as CreateMaterializedViewStmt;
+			expect(stmt.columns).to.deep.equal(['a', 'b']);
+		});
+
+		it('parses IF NOT EXISTS', () => {
+			const stmt = parse(`create materialized view if not exists mv as select 1 as x`) as CreateMaterializedViewStmt;
+			expect(stmt.ifNotExists).to.equal(true);
+		});
+
+		it('parses an optional USING backing-module clause', () => {
+			const stmt = parse(`create materialized view mv using mem() as select x from t`) as CreateMaterializedViewStmt;
+			expect(stmt.moduleName).to.equal('mem');
+		});
+
+		it('parses REFRESH MATERIALIZED VIEW', () => {
+			const stmt = parse(`refresh materialized view mv`) as RefreshMaterializedViewStmt;
+			expect(stmt.type).to.equal('refreshMaterializedView');
+			expect(stmt.name.name).to.equal('mv');
+		});
+
+		it('parses DROP MATERIALIZED VIEW with objectType materializedView', () => {
+			const stmt = parse(`drop materialized view mv`) as DropStmt;
+			expect(stmt.type).to.equal('drop');
+			expect(stmt.objectType).to.equal('materializedView');
+			expect(stmt.name.name).to.equal('mv');
+		});
+
+		it('round-trips through ast-stringify', () => {
+			const sql = `create materialized view mv as select x, y from t order by y`;
+			const stmt = parse(sql);
+			const reparsed = parse(astToString(stmt)) as CreateMaterializedViewStmt;
+			expect(reparsed.type).to.equal('createMaterializedView');
+			expect(reparsed.view.name).to.equal('mv');
+			expect(reparsed.select.type).to.equal('select');
+		});
+
+		it('round-trips DROP MATERIALIZED VIEW (not "drop materializedview")', () => {
+			const out = astToString(parse(`drop materialized view mv`));
+			expect(out).to.equal('drop materialized view mv');
+			expect(parse(out)).to.have.property('type', 'drop');
 		});
 	});
 });

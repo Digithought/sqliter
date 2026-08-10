@@ -1,5 +1,6 @@
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
+import type { SqlValue } from '../../src/common/types.js';
 
 describe('Scalar CSE (common subexpression elimination)', () => {
 	let db: Database;
@@ -22,7 +23,7 @@ describe('Scalar CSE (common subexpression elimination)', () => {
 		await db.exec("INSERT INTO orders VALUES (1, 10, 5), (2, 20, 3), (3, 5, 100), (4, 8, 2)");
 	}
 
-	async function collect(sql: string, params?: unknown[]): Promise<unknown[]> {
+	async function collect(sql: string, params?: SqlValue[]): Promise<unknown[]> {
 		const rows: unknown[] = [];
 		for await (const r of db.eval(sql, params)) rows.push(r);
 		return rows;

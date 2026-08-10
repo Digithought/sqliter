@@ -1,10 +1,17 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 /**
  * Characteristics-based plan node analysis
  *
  * This module provides utilities for analyzing plan nodes based on their capabilities
  * and characteristics rather than their specific types, enabling robust and extensible
  * optimization rules.
+ *
+ * Cross-class capabilities (the `*Capable` interfaces below) are detected via a
+ * compiler-enforced brand: each interface declares a unique `readonly is<X>Capable:
+ * true` marker, every implementer sets it, and the `CapabilityDetectors` guards test
+ * exactly that marker. Because `implements XCapable` fails to compile unless the class
+ * also sets the brand, "implements the capability" and "is detected as having it" are
+ * the same fact — a new implementer cannot silently be missed by a guard. Concrete
+ * class identity still uses `instanceof`; dispatch/serialization still uses `nodeType`.
  */
 
 import type { PlanNode, RelationalPlanNode, ScalarPlanNode, ConstantNode, TableDescriptor, MonotonicOnInfo } from '../nodes/plan-node.js';
@@ -36,9 +43,16 @@ export class PlanNodeCharacteristics {
 	 * forward the property through its own `computePhysical` override.
 	 */
 	static subtreeHasSideEffects(node: PlanNode): boolean {
-		if (this.hasSideEffects(node)) return true;
-		for (const child of node.getChildren()) {
-			if (this.subtreeHasSideEffects(child)) return true;
+		// Iterative worklist (not recursion) so a deep plan cannot overflow the
+		// native call stack — matching the pass framework's iterative traversal.
+		// Early-exits on the first side-effecting node rather than draining fully.
+		const stack: PlanNode[] = [node];
+		while (stack.length > 0) {
+			const current = stack.pop()!;
+			if (this.hasSideEffects(current)) return true;
+			for (const child of current.getChildren()) {
+				stack.push(child);
+			}
 		}
 		return false;
 	}
@@ -120,8 +134,8 @@ export class PlanNodeCharacteristics {
 
 	/**
 	 * True iff the relation is guaranteed to produce at most one row — i.e.,
-	 * the singleton FD `∅ → all_cols` holds. (Replaces the legacy `[[]]`
-	 * uniqueKeys marker.)
+	 * the kind-aware ≤1-row read (`hasSingletonFd`) holds. (Replaces the legacy
+	 * `[[]]` uniqueKeys marker.)
 	 */
 	static guaranteesUniqueRows(node: PlanNode): boolean {
 		if (!isRelationalNode(node)) return false;
@@ -131,18 +145,18 @@ export class PlanNodeCharacteristics {
 			// since the singleton FD isn't representable.
 			return node.physical.estimatedRows === 1;
 		}
-		return hasSingletonFd(node.physical.fds, colCount);
+		return hasSingletonFd(node.physical.fds, colCount, node.getType().isSet);
 	}
 
 	/**
 	 * True iff the relation has at least one non-trivial unique key — i.e., an
-	 * FD whose determinants form a superkey of all output columns, with the
-	 * determinant set strictly smaller than the full column list.
+	 * FD whose determinants are provably row-unique over all output columns,
+	 * with the determinant set strictly smaller than the full column list.
 	 */
 	static hasUniqueKeys(node: PlanNode): boolean {
 		if (!isRelationalNode(node)) return false;
 		const colCount = node.getAttributes().length;
-		return hasAnyKey(node.physical.fds, colCount);
+		return hasAnyKey(node.physical.fds, colCount, node.getType().isSet);
 	}
 
 	// Relational capabilities
@@ -178,6 +192,8 @@ export class PlanNodeCharacteristics {
  * Interface for nodes that can provide predicates (WHERE clauses, join conditions)
  */
 export interface PredicateCapable extends PlanNode {
+	/** Capability brand — set to `true` by every implementer; enables total, misfire-proof detection. */
+	readonly isPredicateCapable: true;
 	getPredicate(): ScalarPlanNode | null;
 	withPredicate(newPredicate: ScalarPlanNode | null): PlanNode;
 }
@@ -186,6 +202,8 @@ export interface PredicateCapable extends PlanNode {
  * Interface for nodes that can expose one or more local predicates (e.g., WHERE, ON)
  */
 export interface PredicateSourceCapable extends PlanNode {
+	/** Capability brand — see {@link PredicateCapable.isPredicateCapable}. */
+	readonly isPredicateSourceCapable: true;
 	getPredicates(): readonly ScalarPlanNode[];
 }
 
@@ -193,6 +211,8 @@ export interface PredicateSourceCapable extends PlanNode {
  * Interface for nodes that can combine predicates (for pushdown optimization)
  */
 export interface PredicateCombinable extends PredicateCapable {
+	/** Capability brand — see {@link PredicateCapable.isPredicateCapable}. */
+	readonly isPredicateCombinableCapable: true;
 	canCombinePredicates(): boolean;
 	combineWith(other: ScalarPlanNode): ScalarPlanNode;
 }
@@ -201,6 +221,8 @@ export interface PredicateCombinable extends PredicateCapable {
  * Interface for table access nodes
  */
 export interface TableAccessCapable extends RelationalPlanNode {
+	/** Capability brand — see {@link PredicateCapable.isPredicateCapable}. */
+	readonly isTableAccessCapable: true;
 	readonly tableSchema: TableSchema;
 	getAccessMethod(): 'sequential' | 'index-scan' | 'index-seek' | 'virtual';
 }
@@ -209,6 +231,8 @@ export interface TableAccessCapable extends RelationalPlanNode {
  * Interface for aggregation operations
  */
 export interface AggregationCapable extends RelationalPlanNode {
+	/** Capability brand — see {@link PredicateCapable.isPredicateCapable}. */
+	readonly isAggregationCapable: true;
 	getGroupingKeys(): readonly ScalarPlanNode[];
 	getAggregateExpressions(): readonly { expr: ScalarPlanNode; alias: string; attributeId: number }[];
 	requiresOrdering(): boolean;
@@ -220,6 +244,8 @@ export interface AggregationCapable extends RelationalPlanNode {
  * Interface for sorting operations
  */
 export interface SortCapable extends PlanNode {
+	/** Capability brand — see {@link PredicateCapable.isPredicateCapable}. */
+	readonly isSortCapable: true;
 	getSortKeys(): readonly { expression: ScalarPlanNode; direction: 'asc' | 'desc'; nulls?: 'first' | 'last' }[];
 	withSortKeys(keys: readonly { expression: ScalarPlanNode; direction: 'asc' | 'desc'; nulls?: 'first' | 'last' }[]): PlanNode;
 }
@@ -228,6 +254,8 @@ export interface SortCapable extends PlanNode {
  * Interface for limit/offset capability
  */
 export interface LimitCapable extends PlanNode {
+	/** Capability brand — see {@link PredicateCapable.isPredicateCapable}. */
+	readonly isLimitCapable: true;
 	getLimitExpression(): ScalarPlanNode | undefined;
 	getOffsetExpression(): ScalarPlanNode | undefined;
 }
@@ -236,6 +264,8 @@ export interface LimitCapable extends PlanNode {
  * Interface for nodes that can provide stable attribute→column bindings for constraint mapping
  */
 export interface ColumnBindingProvider extends PlanNode {
+	/** Capability brand — see {@link PredicateCapable.isPredicateCapable}. */
+	readonly isColumnBindingProviderCapable: true;
 	/** Relation name used for mapping/presentation (e.g., schema.table or alias) */
 	getBindingRelationName(): string;
 	/** Attributes (id/name) visible at this binding boundary */
@@ -248,6 +278,8 @@ export interface ColumnBindingProvider extends PlanNode {
  * Interface for projection operations
  */
 export interface ProjectionCapable extends RelationalPlanNode {
+	/** Capability brand — see {@link PredicateCapable.isPredicateCapable}. */
+	readonly isProjectionCapable: true;
 	getProjections(): readonly { node: ScalarPlanNode; alias: string; attributeId: number }[];
 	withProjections(projections: readonly { node: ScalarPlanNode; alias: string; attributeId: number }[]): PlanNode;
 }
@@ -256,6 +288,8 @@ export interface ProjectionCapable extends RelationalPlanNode {
  * Interface for join operations
  */
 export interface JoinCapable extends RelationalPlanNode {
+	/** Capability brand — see {@link PredicateCapable.isPredicateCapable}. */
+	readonly isJoinCapable: true;
 	getJoinType(): 'inner' | 'left' | 'right' | 'full' | 'cross' | 'semi' | 'anti';
 	getJoinCondition(): ScalarPlanNode | undefined;
 	getLeftSource(): RelationalPlanNode;
@@ -267,6 +301,8 @@ export interface JoinCapable extends RelationalPlanNode {
  * Interface for cached operations
  */
 export interface CacheCapable extends PlanNode {
+	/** Capability brand — see {@link PredicateCapable.isPredicateCapable}. */
+	readonly isCacheCapable: true;
 	getCacheStrategy(): string | null;
 	isCached(): boolean;
 }
@@ -275,10 +311,21 @@ export interface CacheCapable extends PlanNode {
  * Interface for Common Table Expression operations
  */
 export interface CTECapable extends RelationalPlanNode {
+	/** Capability brand — see {@link PredicateCapable.isPredicateCapable}. */
+	readonly isCTECapable: true;
 	readonly cteName: string;
 	readonly columns: string[] | undefined;
 	readonly materializationHint: 'materialized' | 'not_materialized' | undefined;
 	readonly isRecursive: boolean;
+	/** Stable identity for this CTE, preserved across optimizer rebuilds. */
+	readonly tableDescriptor: TableDescriptor;
+	/**
+	 * Resolved buffer-once-per-execution decision. On the capability (not just on
+	 * `CTENode`) so a rule rebuilding a CTE carries it over without an `instanceof`
+	 * — dropping it would re-execute the body, which for a data-modifying CTE means
+	 * a second write.
+	 */
+	readonly materialize: boolean;
 	getCTESource(): RelationalPlanNode;
 }
 
@@ -286,6 +333,8 @@ export interface CTECapable extends RelationalPlanNode {
  * Interface for column reference nodes
  */
 export interface ColumnReferenceCapable extends ScalarPlanNode {
+	/** Capability brand — see {@link PredicateCapable.isPredicateCapable}. */
+	readonly isColumnReferenceCapable: true;
 	readonly attributeId: number;
 	readonly columnIndex: number;
 	readonly expression: AST.ColumnExpr;
@@ -295,6 +344,11 @@ export interface ColumnReferenceCapable extends ScalarPlanNode {
  * Interface for window function call nodes
  */
 export interface WindowFunctionCapable extends ScalarPlanNode {
+	/** Capability brand — see {@link PredicateCapable.isPredicateCapable}. Distinct from
+	 *  {@link AggregateFunctionCapable.isAggregateFunctionCapable}, so window and aggregate
+	 *  function-call nodes — which share `nodeType === ScalarFunctionCall`/`WindowFunctionCall`
+	 *  shapes — are told apart by brand alone, no nodeType/schema tiebreak needed. */
+	readonly isWindowFunctionCapable: true;
 	readonly functionName: string;
 	readonly isDistinct: boolean;
 	readonly alias?: string;
@@ -304,6 +358,11 @@ export interface WindowFunctionCapable extends ScalarPlanNode {
  * Interface for aggregate function call nodes
  */
 export interface AggregateFunctionCapable extends ScalarPlanNode {
+	/** Capability brand — see {@link PredicateCapable.isPredicateCapable}. Carried ONLY by
+	 *  `AggregateFunctionCallNode`, never by `ScalarFunctionCallNode` (both wear
+	 *  `nodeType === ScalarFunctionCall`), so the brand — not the function schema — is the
+	 *  aggregate/scalar discriminant. */
+	readonly isAggregateFunctionCapable: true;
 	readonly functionName: string;
 	readonly isDistinct: boolean;
 	readonly args: ReadonlyArray<ScalarPlanNode>;
@@ -313,6 +372,8 @@ export interface AggregateFunctionCapable extends ScalarPlanNode {
  * Interface for internal recursive CTE reference nodes
  */
 export interface RecursiveCTERefCapable extends RelationalPlanNode {
+	/** Capability brand — see {@link PredicateCapable.isPredicateCapable}. */
+	readonly isRecursiveCTERefCapable: true;
 	readonly cteName: string;
 	readonly workingTableDescriptor: TableDescriptor;
 }
@@ -321,160 +382,87 @@ export interface RecursiveCTERefCapable extends RelationalPlanNode {
  * Type guards for capability detection
  */
 export class CapabilityDetectors {
+	// Every guard is a single brand comparison. The cast is typed (never `any`) and
+	// narrowed to just the brand field via `Partial<Pick<X, 'is…Capable'>>`: picking
+	// only the brand avoids a spurious "insufficient overlap" error that a full
+	// `Partial<X>` triggers on the relational/scalar interfaces (their `getType()`
+	// return type conflicts with the base `PlanNode.getType()`), while keeping the
+	// guard tied to the interface — rename a brand and this stops compiling. A unique
+	// brand name cannot misfire on an incidental property. Guards that may receive a
+	// possibly-null node keep the leading null-guard so the property read cannot throw.
+
 	static canPushDownPredicate(node: PlanNode): node is PredicateCapable {
-		return 'getPredicate' in node &&
-			typeof (node as any).getPredicate === 'function' &&
-			'withPredicate' in node &&
-			typeof (node as any).withPredicate === 'function';
+		return (node as Partial<Pick<PredicateCapable, 'isPredicateCapable'>>).isPredicateCapable === true;
 	}
 
 	static canCombinePredicates(node: PlanNode): node is PredicateCombinable {
-		return this.canPushDownPredicate(node) &&
-			'canCombinePredicates' in node &&
-			typeof (node as any).canCombinePredicates === 'function';
+		return (node as Partial<Pick<PredicateCombinable, 'isPredicateCombinableCapable'>>).isPredicateCombinableCapable === true;
 	}
 
 	static isPredicateSource(node: PlanNode): node is PredicateSourceCapable {
-		return 'getPredicates' in node && typeof (node as any).getPredicates === 'function';
+		return (node as Partial<Pick<PredicateSourceCapable, 'isPredicateSourceCapable'>>).isPredicateSourceCapable === true;
 	}
 
 	static isTableAccess(node: PlanNode): node is TableAccessCapable {
-		return PlanNodeCharacteristics.isRelational(node) &&
-			'tableSchema' in node &&
-			'getAccessMethod' in node &&
-			typeof (node as any).getAccessMethod === 'function';
+		return (node as Partial<Pick<TableAccessCapable, 'isTableAccessCapable'>>).isTableAccessCapable === true;
 	}
 
 	static isAggregating(node: PlanNode): node is AggregationCapable {
-		return PlanNodeCharacteristics.isRelational(node) &&
-			'getGroupingKeys' in node &&
-			typeof (node as any).getGroupingKeys === 'function' &&
-			'getAggregateExpressions' in node &&
-			typeof (node as any).getAggregateExpressions === 'function';
+		return (node as Partial<Pick<AggregationCapable, 'isAggregationCapable'>>).isAggregationCapable === true;
 	}
 
 	static isSortable(node: PlanNode): node is SortCapable {
-		return 'getSortKeys' in node &&
-			typeof (node as any).getSortKeys === 'function' &&
-			'withSortKeys' in node &&
-			typeof (node as any).withSortKeys === 'function';
+		return (node as Partial<Pick<SortCapable, 'isSortCapable'>>).isSortCapable === true;
 	}
 
 	static isLimit(node: PlanNode): node is LimitCapable {
-		return 'getLimitExpression' in node &&
-			typeof (node as any).getLimitExpression === 'function' &&
-			'getOffsetExpression' in node &&
-			typeof (node as any).getOffsetExpression === 'function';
+		return (node as Partial<Pick<LimitCapable, 'isLimitCapable'>>).isLimitCapable === true;
 	}
 
 	static isColumnBindingProvider(node: PlanNode): node is ColumnBindingProvider {
-		return 'getBindingRelationName' in node &&
-			(typeof (node as any).getBindingRelationName === 'string' || typeof (node as any).getBindingRelationName === 'function');
+		return (node as Partial<Pick<ColumnBindingProvider, 'isColumnBindingProviderCapable'>>).isColumnBindingProviderCapable === true;
 	}
 
 	static canProject(node: PlanNode): node is ProjectionCapable {
-		return PlanNodeCharacteristics.isRelational(node) &&
-			'getProjections' in node &&
-			typeof (node as any).getProjections === 'function';
+		return (node as Partial<Pick<ProjectionCapable, 'isProjectionCapable'>>).isProjectionCapable === true;
 	}
 
 	static isJoin(node: PlanNode): node is JoinCapable {
-		return PlanNodeCharacteristics.isRelational(node) &&
-			'getJoinType' in node &&
-			typeof (node as any).getJoinType === 'function' &&
-			'getLeftSource' in node &&
-			'getRightSource' in node;
+		return (node as Partial<Pick<JoinCapable, 'isJoinCapable'>>).isJoinCapable === true;
 	}
 
 	static isCached(node: PlanNode): node is CacheCapable {
-		return 'getCacheStrategy' in node &&
-			typeof (node as any).getCacheStrategy === 'function';
+		return (node as Partial<Pick<CacheCapable, 'isCacheCapable'>>).isCacheCapable === true;
 	}
 
 	static isCTE(node: PlanNode): node is CTECapable {
-		return PlanNodeCharacteristics.isRelational(node) &&
-			'cteName' in node &&
-			typeof (node as any).cteName === 'string' &&
-			'getCTESource' in node &&
-			typeof (node as any).getCTESource === 'function';
+		return (node as Partial<Pick<CTECapable, 'isCTECapable'>>).isCTECapable === true;
 	}
 
 	static isColumnReference(node: PlanNode): node is ColumnReferenceCapable {
 		if (!node) return false;
-		return PlanNodeCharacteristics.isScalar(node) &&
-			'attributeId' in node &&
-			typeof (node as any).attributeId === 'number' &&
-			'columnIndex' in node &&
-			typeof (node as any).columnIndex === 'number' &&
-			'expression' in node;
+		return (node as Partial<Pick<ColumnReferenceCapable, 'isColumnReferenceCapable'>>).isColumnReferenceCapable === true;
 	}
 
 	static isWindowFunction(node: PlanNode): node is WindowFunctionCapable {
 		if (!node) return false;
-		// Check nodeType specifically to distinguish from AggregateFunctionCallNode
-		return node.nodeType === 'WindowFunctionCall' &&
-			PlanNodeCharacteristics.isScalar(node) &&
-			'functionName' in node &&
-			typeof (node as any).functionName === 'string' &&
-			'isDistinct' in node &&
-			typeof (node as any).isDistinct === 'boolean';
+		// The window brand is distinct from the aggregate-function brand, so this no
+		// longer needs a `nodeType === 'WindowFunctionCall'` tiebreak against
+		// AggregateFunctionCallNode — the brand alone tells them apart.
+		return (node as Partial<Pick<WindowFunctionCapable, 'isWindowFunctionCapable'>>).isWindowFunctionCapable === true;
 	}
 
 	static isAggregateFunction(node: PlanNode): node is AggregateFunctionCapable {
 		if (!node) return false;
-		// Check for AggregateFunctionCallNode - it uses ScalarFunctionCall nodeType but has args property
-		return PlanNodeCharacteristics.isScalar(node) &&
-			'functionName' in node &&
-			typeof (node as any).functionName === 'string' &&
-			'isDistinct' in node &&
-			typeof (node as any).isDistinct === 'boolean' &&
-			'args' in node &&
-			Array.isArray((node as any).args) &&
-			'functionSchema' in node;
+		// Only AggregateFunctionCallNode carries this brand; ScalarFunctionCallNode (same
+		// nodeType) does not, so the old build-time `isAggregateFunctionSchema` tiebreak —
+		// and its null-throw hazard on a missing functionSchema — is gone.
+		return (node as Partial<Pick<AggregateFunctionCapable, 'isAggregateFunctionCapable'>>).isAggregateFunctionCapable === true;
 	}
 
 	static isRecursiveCTERef(node: PlanNode): node is RecursiveCTERefCapable {
 		if (!node) return false;
-		return PlanNodeCharacteristics.isRelational(node) &&
-			'cteName' in node &&
-			typeof (node as any).cteName === 'string' &&
-			'workingTableDescriptor' in node;
-	}
-}
-
-/**
- * Extensible capability registry for custom characteristics
- */
-export class CapabilityRegistry {
-	private static readonly detectors = new Map<string, (node: PlanNode) => boolean>();
-
-	static register(
-		capability: string,
-		detector: (node: PlanNode) => boolean
-	): void {
-		this.detectors.set(capability, detector);
-	}
-
-	static hasCapability(node: PlanNode, capability: string): boolean {
-		const detector = this.detectors.get(capability);
-		return detector ? detector(node) : false;
-	}
-
-	static getCapable(
-		nodes: readonly PlanNode[],
-		capability: string
-	): PlanNode[] {
-		const detector = this.detectors.get(capability);
-		if (!detector) return [];
-		return nodes.filter(detector);
-	}
-
-	static getAllCapabilities(): string[] {
-		return Array.from(this.detectors.keys());
-	}
-
-	static unregister(capability: string): boolean {
-		return this.detectors.delete(capability);
+		return (node as Partial<Pick<RecursiveCTERefCapable, 'isRecursiveCTERefCapable'>>).isRecursiveCTERefCapable === true;
 	}
 }
 
@@ -488,8 +476,9 @@ export class CachingAnalysis {
 			return false;
 		}
 
-		// Already cached nodes don't need re-caching
-		if (CapabilityDetectors.isCached(node) && (node as any).isCached()) {
+		// Already cached nodes don't need re-caching. `isCached` narrows to
+		// `CacheCapable`, so its `isCached()` method is callable without a cast.
+		if (CapabilityDetectors.isCached(node) && node.isCached()) {
 			return false;
 		}
 
@@ -531,42 +520,3 @@ export class CachingAnalysis {
 	}
 }
 
-/**
- * Predicate analysis utilities
- */
-export class PredicateAnalysis {
-	static canPushDown(predicate: ScalarPlanNode, targetNode: PlanNode): boolean {
-		if (!CapabilityDetectors.canPushDownPredicate(targetNode)) {
-			return false;
-		}
-
-		// Check if predicate only references columns from target
-		return this.predicateReferencesOnly(predicate, targetNode);
-	}
-
-	static canCombine(pred1: ScalarPlanNode, pred2: ScalarPlanNode): boolean {
-		// Basic heuristic: both must be deterministic
-		return PlanNodeCharacteristics.isDeterministic(pred1) &&
-			PlanNodeCharacteristics.isDeterministic(pred2);
-	}
-
-	private static predicateReferencesOnly(_predicate: ScalarPlanNode, _targetNode: PlanNode): boolean {
-		// TODO: Implement column reference analysis
-		// For now, conservatively return true
-		return true;
-	}
-}
-
-// Register built-in capabilities
-CapabilityRegistry.register('predicate-pushdown', CapabilityDetectors.canPushDownPredicate);
-CapabilityRegistry.register('table-access', CapabilityDetectors.isTableAccess);
-CapabilityRegistry.register('aggregation', CapabilityDetectors.isAggregating);
-CapabilityRegistry.register('sort', CapabilityDetectors.isSortable);
-CapabilityRegistry.register('projection', CapabilityDetectors.canProject);
-CapabilityRegistry.register('join', CapabilityDetectors.isJoin);
-CapabilityRegistry.register('cache', CapabilityDetectors.isCached);
-CapabilityRegistry.register('cte', CapabilityDetectors.isCTE);
-CapabilityRegistry.register('column-reference', CapabilityDetectors.isColumnReference);
-CapabilityRegistry.register('window-function', CapabilityDetectors.isWindowFunction);
-CapabilityRegistry.register('aggregate-function', CapabilityDetectors.isAggregateFunction);
-CapabilityRegistry.register('recursive-cte-ref', CapabilityDetectors.isRecursiveCTERef);

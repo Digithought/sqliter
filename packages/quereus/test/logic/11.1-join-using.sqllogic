@@ -67,4 +67,201 @@ select cu_a.id as aid, cu_a.name as aname, cu_b.id as bid from cu_a join cu_b us
 
 drop table cu_a;
 drop table cu_b;
--- COLLATE NOCASE on TEXT columns isn't supported by Quereus; that branch removed.
+
+-- USING with COLLATE NOCASE TEXT keys folds case: the join honors the columns'
+-- collation, so 'BOB' matches 'bob'
+-- (unique-collation-name-case-insensitive-normalization).
+create table cn_a (id integer primary key, name text collate nocase);
+create table cn_b (id integer primary key, name text collate nocase);
+
+insert into cn_a values (1, 'alice'), (2, 'BOB'), (3, 'carol');
+insert into cn_b values (10, 'alice'), (20, 'bob'), (30, 'carol');
+
+select cn_a.id as aid, cn_a.name as aname, cn_b.id as bid from cn_a join cn_b using (name) order by cn_a.id;
+→ [{"aid":1,"aname":"alice","bid":10},{"aid":2,"aname":"BOB","bid":20},{"aid":3,"aname":"carol","bid":30}]
+
+drop table cn_a;
+drop table cn_b;
+-- run
+
+-- ===== USING collation precedence (both spellings) + conflict =====
+-- (ticket join-key-collation-resolution-alignment) A USING pair resolves its
+-- comparison collation through the shared provenance lattice
+-- (explicit > declared > default > BINARY), SYMMETRICALLY: a declared NOCASE on
+-- EITHER side governs the join regardless of which side spells it, matching the
+-- equivalent `l.name = r.name`. Fixtures are chosen so BINARY yields 0 matches
+-- and NOCASE yields 3 — the row count alone pins which collation is in effect.
+
+-- Left declares NOCASE, right defaults to BINARY → NOCASE wins (folds case).
+create table up_l (id integer primary key, name text collate nocase);
+create table up_r (id integer primary key, name text);
+insert into up_l values (1, 'Alice'), (2, 'BOB'), (3, 'carol');
+insert into up_r values (10, 'alice'), (20, 'bob'), (30, 'CAROL');
+select up_l.id as lid, up_r.id as rid from up_l join up_r using (name) order by up_l.id;
+→ [{"lid":1,"rid":10},{"lid":2,"rid":20},{"lid":3,"rid":30}]
+
+-- Mirror spelling: left defaults to BINARY, right declares NOCASE → still NOCASE.
+-- The pre-alignment left-only rule (`leftType ?? BINARY`) would have compared
+-- under BINARY here and matched nothing; the symmetric lattice folds case.
+create table um_l (id integer primary key, name text);
+create table um_r (id integer primary key, name text collate nocase);
+insert into um_l values (1, 'Alice'), (2, 'BOB'), (3, 'carol');
+insert into um_r values (10, 'alice'), (20, 'bob'), (30, 'CAROL');
+select um_l.id as lid, um_r.id as rid from um_l join um_r using (name) order by um_l.id;
+→ [{"lid":1,"rid":10},{"lid":2,"rid":20},{"lid":3,"rid":30}]
+
+drop table up_l;
+drop table up_r;
+drop table um_l;
+drop table um_r;
+-- run
+
+-- Conflicting DECLARED collations on a USING pair → plan-time ambiguous-collation
+-- error, raised at build: `using (name)` desugars to the `l.name = r.name`
+-- BinaryOpNode, whose type generation reports the conflict. The spelled-out ON
+-- form must error IDENTICALLY (uniformity between USING and ON).
+create table cf_a (id integer primary key, name text collate nocase);
+create table cf_b (id integer primary key, name text collate rtrim);
+insert into cf_a values (1, 'bob');
+insert into cf_b values (10, 'BOB');
+-- run
+
+select cf_a.id from cf_a join cf_b using (name);
+-- error: ambiguous collation
+
+select cf_a.id from cf_a join cf_b on cf_a.name = cf_b.name;
+-- error: ambiguous collation
+
+-- An explicit COLLATE on the comparison resolves the ambiguity (rank-3 explicit
+-- outranks both declared collations), so the same join builds and runs. USING has
+-- no per-column COLLATE syntax, so pin the resolution via the ON form: under the
+-- explicit NOCASE, 'bob' matches 'BOB'.
+select cf_a.id as aid, cf_b.id as bid from cf_a join cf_b on cf_a.name = cf_b.name collate nocase order by cf_a.id;
+→ [{"aid":1,"bid":10}]
+
+drop table cf_a;
+drop table cf_b;
+-- run
+
+-- ===== NULL USING keys never match =====
+-- `using (k)` is `l.k = r.k`, and `null = null` is UNKNOWN, so two NULL keys do
+-- NOT join — on either physical path. The nested-loop emitter compares through an
+-- ORDERING comparator, which ranks NULL/NULL as equal, so it carries its own NULL
+-- guard; the hash path drops NULL keys by construction. The two must agree with
+-- each other and with the spelled-out ON form.
+create table nu_l (id integer primary key, k text null);
+create table nu_r (id integer primary key, k text null);
+insert into nu_l values (1, null), (2, 'a');
+insert into nu_r values (10, null), (20, 'a');
+
+select nu_l.id as lid, nu_r.id as rid from nu_l join nu_r using (k) order by nu_l.id;
+→ [{"lid":2,"rid":20}]
+
+select nu_l.id as lid, nu_r.id as rid from nu_l join nu_r on nu_l.k = nu_r.k order by nu_l.id;
+→ [{"lid":2,"rid":20}]
+
+-- LEFT JOIN: the NULL-keyed left row survives, null-extended, rather than pairing
+-- with the NULL-keyed right row.
+select nu_l.id as lid, nu_r.id as rid from nu_l left join nu_r using (k) order by nu_l.id;
+→ [{"lid":1,"rid":null},{"lid":2,"rid":20}]
+
+drop table nu_l;
+drop table nu_r;
+-- run
+
+-- ===== Cross-type USING pairs coerce exactly as the ON form does =====
+-- (ticket bug-using-join-skips-cross-type-coercion) `using (k)` desugars to
+-- `l.k = r.k`, so `insertCrossTypeCoercion` reconciles the pair: a JSON column
+-- against a TEXT one compares structurally (key order irrelevant), and an INTEGER
+-- against a TEXT one compares numerically. Before the desugar USING compared raw
+-- storage classes and returned 0 rows where the ON spelling returned the row.
+create table xj_l (id integer primary key, k json);
+create table xj_r (id integer primary key, k text);
+insert into xj_l values (1, '{"a":1,"b":2}');
+insert into xj_r values (10, '{"b":2,"a":1}');
+
+select xj_l.id as lid, xj_r.id as rid from xj_l join xj_r using (k);
+→ [{"lid":1,"rid":10}]
+
+select xj_l.id as lid, xj_r.id as rid from xj_l join xj_r on xj_l.k = xj_r.k;
+→ [{"lid":1,"rid":10}]
+
+create table xn_l (id integer primary key, k integer);
+create table xn_r (id integer primary key, k text);
+insert into xn_l values (1, 5), (2, 6);
+insert into xn_r values (10, '5'), (20, 'six');
+
+select xn_l.id as lid, xn_r.id as rid from xn_l join xn_r using (k);
+→ [{"lid":1,"rid":10}]
+
+select xn_l.id as lid, xn_r.id as rid from xn_l join xn_r on xn_l.k = xn_r.k;
+→ [{"lid":1,"rid":10}]
+
+-- A cross-type USING pair runs as nested loop (the coerced operand is a CastNode, so
+-- no equi-pair is extracted), which is the path an outer join's null-extension takes.
+-- The unmatched left row must still survive, and the ON form must agree.
+select xn_l.id as lid, xn_r.id as rid from xn_l left join xn_r using (k) order by xn_l.id;
+→ [{"lid":1,"rid":10},{"lid":2,"rid":null}]
+
+select xn_l.id as lid, xn_r.id as rid from xn_l left join xn_r on xn_l.k = xn_r.k order by xn_l.id;
+→ [{"lid":1,"rid":10},{"lid":2,"rid":null}]
+
+drop table xj_l;
+drop table xj_r;
+drop table xn_l;
+drop table xn_r;
+-- run
+
+-- Multi-column USING where only ONE column is cross-type: the same-type column still
+-- keys the join and the coerced one is evaluated as a residual predicate. Both must
+-- apply — row (2,'7') differs on the coerced column and must not join.
+create table xm_l (id integer primary key, a integer, b integer);
+create table xm_r (id integer primary key, a integer, b text);
+insert into xm_l values (1, 100, 5), (2, 200, 6);
+insert into xm_r values (10, 100, '5'), (20, 200, '7');
+
+select xm_l.id as lid, xm_r.id as rid from xm_l join xm_r using (a, b) order by xm_l.id;
+→ [{"lid":1,"rid":10}]
+
+select xm_l.id as lid, xm_r.id as rid from xm_l join xm_r on xm_l.a = xm_r.a and xm_l.b = xm_r.b order by xm_l.id;
+→ [{"lid":1,"rid":10}]
+
+drop table xm_l;
+drop table xm_r;
+-- run
+
+-- ===== A USING column absent from a side is an error, not a silent empty result =====
+-- Formerly the emitter's USING comparator returned false for an unresolved column
+-- index, so the join produced zero rows and raised nothing.
+create table mi_l (id integer primary key, k integer);
+create table mi_r (id integer primary key, k integer);
+insert into mi_l values (1, 10);
+insert into mi_r values (10, 10);
+-- run
+
+select mi_l.id from mi_l join mi_r using (zzz);
+-- error: USING column not found on left side of join: zzz
+
+drop table mi_l;
+drop table mi_r;
+-- run
+
+-- ===== Three-way USING: first-match-per-side pairing =====
+-- The second join's left side (the a-b join) carries TWO `k` attributes. The pair
+-- is formed from the FIRST match on each side, i.e. `t3a.k = t3c.k` — pinned by
+-- making the first join a LEFT join so a null-extended row has `t3b.k` NULL while
+-- `t3a.k` still holds 20. Pairing on `t3b.k` would drop that row.
+create table t3a (id integer primary key, k integer);
+create table t3b (id integer primary key, k integer);
+create table t3c (id integer primary key, k integer);
+insert into t3a values (1, 10), (2, 20);
+insert into t3b values (11, 10);
+insert into t3c values (111, 10), (222, 20);
+
+select t3a.id as aid, t3b.id as bid, t3c.id as cid
+  from t3a left join t3b using (k) join t3c using (k) order by t3a.id;
+→ [{"aid":1,"bid":11,"cid":111},{"aid":2,"bid":null,"cid":222}]
+
+drop table t3a;
+drop table t3b;
+drop table t3c;

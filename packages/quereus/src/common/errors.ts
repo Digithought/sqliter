@@ -71,6 +71,70 @@ export class RollbackConflictError extends ConstraintError {
 }
 
 /**
+ * Error thrown when a statement names a table or view that does not resolve —
+ * the object is absent, or the schema qualifying it is not attached.
+ *
+ * Distinct from the generic `QuereusError` so callers can positively recognise
+ * "the relation is not there" without matching message text. Deliberately scoped
+ * to *relations* only: a missing column, function, parameter, or tag is a
+ * different failure and must not be reported through this class, since callers
+ * use it to decide that "no such row" is an observed fact rather than a failed
+ * lookup.
+ *
+ * Carries `StatusCode.NOTFOUND`, but note that code is shared with several
+ * unrelated absent-object errors — the class / `name` is the discriminator.
+ */
+export class RelationNotFoundError extends QuereusError {
+	constructor(message: string, cause?: Error, line?: number, column?: number) {
+		super(message, StatusCode.NOTFOUND, cause, line, column);
+		this.name = 'RelationNotFoundError';
+		Object.setPrototypeOf(this, RelationNotFoundError.prototype);
+	}
+}
+
+/**
+ * Error thrown when an in-flight statement is cancelled via an `AbortSignal`
+ * (e.g. a request-timeout). Extends `QuereusError` (so it survives the engine's
+ * `instanceof QuereusError` re-throw paths unchanged) while exposing the web
+ * convention `name === 'AbortError'` for callers that match on that.
+ */
+export class AbortError extends QuereusError {
+	constructor(message: string = 'Operation aborted', cause?: Error) {
+		super(message, StatusCode.ABORT, cause);
+		this.name = 'AbortError';
+		Object.setPrototypeOf(this, AbortError.prototype);
+	}
+}
+
+/**
+ * Cooperative-cancellation checkpoint. Throws an {@link AbortError} when the
+ * supplied signal has already been aborted; a no-op when the signal is absent
+ * or still active. Called at row and statement boundaries during execution.
+ *
+ * The signal's `reason` (if any) is preserved: an `Error` reason becomes the
+ * thrown error's `cause`, and a string reason becomes its message.
+ */
+export function throwIfAborted(signal?: AbortSignal): void {
+	if (!signal?.aborted) return;
+	const reason = (signal as { reason?: unknown }).reason;
+	if (reason instanceof Error) {
+		throw new AbortError(reason.message, reason);
+	}
+	throw new AbortError(typeof reason === 'string' ? reason : 'Operation aborted');
+}
+
+/**
+ * Type guard recognizing cancellation errors. Returns `true` for our own
+ * {@link AbortError} and for any foreign error that follows the web convention
+ * `name === 'AbortError'` (e.g. a platform `DOMException` raised by a fetch /
+ * stream abort), so callers can classify cancellation uniformly regardless of
+ * which layer produced it.
+ */
+export function isAbortError(e: unknown): boolean {
+	return e instanceof AbortError || (e instanceof Error && e.name === 'AbortError');
+}
+
+/**
  * Error thrown when the API is used incorrectly
  */
 export class MisuseError extends QuereusError {

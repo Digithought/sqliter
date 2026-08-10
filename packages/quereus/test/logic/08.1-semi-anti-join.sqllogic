@@ -115,9 +115,14 @@ SELECT d.name FROM departments d WHERE d.id = (SELECT min(dept_id) FROM employee
 
 -- ===== query_plan() introspection: verify semi/anti join appears =====
 
--- Verify correlated EXISTS produces a semi join (node_type and joinType property)
-SELECT node_type, json_extract(properties, '$.joinType') as jt FROM query_plan('SELECT d.name FROM departments d WHERE EXISTS (SELECT 1 FROM employees e WHERE e.dept_id = d.id)') WHERE node_type IN ('Join', 'HashJoin') ORDER BY id;
-→ [{"node_type":"HashJoin","jt":"semi"}]
+-- Verify correlated EXISTS produces a semi join. The physical node is
+-- backend-dependent: under the memory vtab rule-key-set-seek rewrites the hash
+-- semi join into a KeySetSemiJoin (the module accepts a runtime key-set
+-- multi-seek on the primary key), while the store module declines the
+-- runtime-set probe on its PK arm and keeps the HashJoin. Either way the
+-- joinType stays 'semi', which is what this pins.
+SELECT json_extract(properties, '$.joinType') as jt FROM query_plan('SELECT d.name FROM departments d WHERE EXISTS (SELECT 1 FROM employees e WHERE e.dept_id = d.id)') WHERE node_type IN ('Join', 'HashJoin', 'KeySetSemiJoin') ORDER BY id;
+→ [{"jt":"semi"}]
 
 -- Verify NOT EXISTS produces an anti join
 SELECT node_type, json_extract(properties, '$.joinType') as jt FROM query_plan('SELECT d.name FROM departments d WHERE NOT EXISTS (SELECT 1 FROM employees e WHERE e.dept_id = d.id)') WHERE node_type IN ('Join', 'HashJoin') ORDER BY id;
@@ -143,3 +148,44 @@ select count(*) as n from tt2 left join tt1 on c_real1 in (select c_text1 from t
 
 drop table tt1;
 drop table tt2;
+
+-- ===== FK-backed folds through a derived parent table =====
+
+-- rule-anti-join-fk-empty and rule-semi-join-fk-trivial peel a projection off
+-- the parent side and translate the equi columns back to the parent's own
+-- column indices. These pin the ANSWERS; the plan shapes are pinned in
+-- test/plan/subquery-decorrelation.spec.ts.
+
+create table fkp (id integer primary key, other integer);
+create table fkc (id integer primary key, p_id integer not null references fkp(id));
+insert into fkp values (1, 99), (2, 98);
+insert into fkc values (10, 1), (20, 2);
+
+-- Every child row has a parent, so NOT EXISTS is empty — the fold must agree.
+select id from fkc where not exists (select 1 from (select other, id from fkp) d where d.id = fkc.p_id) order by id;
+→ []
+
+-- The same shape equating a NON-referenced parent column. `other` sits at the
+-- derived table's output index 0 — the index the FK references — so an
+-- untranslated comparison would fold to empty and drop every row.
+select id from fkc where not exists (select 1 from (select other, id from fkp) d where d.other = fkc.p_id) order by id;
+→ [{"id":10},{"id":20}]
+
+-- Composite FK: both equi columns translate, and the FK's declared (fa→a,
+-- fb→b) pairing must survive the reordering derived table.
+create table fkp2 (a integer, b integer, extra text, primary key (a, b));
+create table fkc2 (id integer primary key, fa integer not null, fb integer not null, foreign key (fa, fb) references fkp2(a, b));
+insert into fkp2 values (1, 2, 'x'), (3, 4, 'y');
+insert into fkc2 values (10, 1, 2), (20, 3, 4);
+
+select id from fkc2 where exists (select 1 from (select b, a, extra from fkp2) q where q.a = fkc2.fa and q.b = fkc2.fb) order by id;
+→ [{"id":10},{"id":20}]
+
+-- Permuted against the FK's pairing: a different, uncovered inclusion.
+select id from fkc2 where exists (select 1 from (select b, a, extra from fkp2) q where q.a = fkc2.fb and q.b = fkc2.fa) order by id;
+→ []
+
+drop table fkc2;
+drop table fkp2;
+drop table fkc;
+drop table fkp;

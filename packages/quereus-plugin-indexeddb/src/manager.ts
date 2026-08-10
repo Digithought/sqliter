@@ -25,11 +25,26 @@ export class IndexedDBManager {
   private dbVersion: number = 1;
   private objectStores: Set<string> = new Set();
   private openPromise: Promise<void> | null = null;
-  private upgradePromise: Promise<void> | null = null;
+  /** Tail of the serialized schema-mutation queue (create/delete/rename stores). */
+  private schemaTail: Promise<void> = Promise.resolve();
   private closed = false;
 
   private constructor(dbName: string) {
     this.dbName = dbName;
+  }
+
+  /**
+   * Run a schema mutation serialized against all other schema mutations. Version
+   * upgrades close and reopen the database at a bumped version; two overlapping
+   * upgrades would race their `onupgradeneeded` transitions and throw VersionError,
+   * so every version-changing op is chained through this single queue.
+   */
+  private runSerialized<T>(fn: () => Promise<T>): Promise<T> {
+    // Chain regardless of prior outcome so one failure doesn't wedge the queue.
+    const run = this.schemaTail.then(fn, fn);
+    // Keep the tail alive but swallow the result so a rejection doesn't poison later ops.
+    this.schemaTail = run.then(() => {}, () => {});
+    return run;
   }
 
   /**
@@ -66,10 +81,16 @@ export class IndexedDBManager {
       throw new Error('IndexedDBManager is closed');
     }
 
-    // Wait for any ongoing upgrade to complete
-    if (this.upgradePromise) {
-      await this.upgradePromise;
-    }
+    // Let any in-flight schema mutation finish first: doUpgrade/doDelete/doRename
+    // null out this.db while reopening, so returning it mid-op would hand back a
+    // stale/closed handle.
+    // NOTE: this only waits for schema ops enqueued *before* this call. A schema
+    // mutation enqueued in the microtask gap between this await resolving and the
+    // caller building its transaction can still close the returned handle out from
+    // under a data write. IDB close() defers to already-open transactions, so the
+    // common concurrent case survives; if data-write-vs-DDL interleaving ever
+    // surfaces InvalidStateError, make the write path retry on a closed handle.
+    await this.schemaTail;
 
     if (this.db) {
       return this.db;
@@ -81,9 +102,14 @@ export class IndexedDBManager {
       return this.db!;
     }
 
+    // Reset openPromise in finally so a failed open (timeout / onerror) doesn't
+    // stay cached — a later call re-attempts instead of replaying the rejection.
     this.openPromise = this.doOpen();
-    await this.openPromise;
-    this.openPromise = null;
+    try {
+      await this.openPromise;
+    } finally {
+      this.openPromise = null;
+    }
     return this.db!;
   }
 
@@ -189,24 +215,18 @@ export class IndexedDBManager {
    * Creates the store via database version upgrade if needed.
    */
   async ensureObjectStore(storeName: string): Promise<void> {
-    // Wait for any ongoing upgrade to complete
-    if (this.upgradePromise) {
-      await this.upgradePromise;
-    }
-
     await this.ensureOpen();
 
     if (this.objectStores.has(storeName)) {
       return; // Already exists
     }
 
-    // Serialize upgrades to prevent race conditions
-    this.upgradePromise = this.doUpgrade(storeName);
-    try {
-      await this.upgradePromise;
-    } finally {
-      this.upgradePromise = null;
-    }
+    await this.runSerialized(async () => {
+      // Re-check inside the lock: a queued peer may have already created it,
+      // which avoids a redundant version bump.
+      if (this.objectStores.has(storeName)) return;
+      await this.doUpgrade(storeName);
+    });
   }
 
   private async doUpgrade(storeName: string): Promise<void> {
@@ -264,24 +284,17 @@ export class IndexedDBManager {
    * Delete an object store (table).
    */
   async deleteObjectStore(storeName: string): Promise<void> {
-    // Wait for any ongoing upgrade to complete
-    if (this.upgradePromise) {
-      await this.upgradePromise;
-    }
-
     await this.ensureOpen();
 
     if (!this.objectStores.has(storeName)) {
       return; // Doesn't exist
     }
 
-    // Serialize against concurrent operations via upgradePromise
-    this.upgradePromise = this.doDeleteObjectStore(storeName);
-    try {
-      await this.upgradePromise;
-    } finally {
-      this.upgradePromise = null;
-    }
+    await this.runSerialized(async () => {
+      // Re-check inside the lock: a queued peer may have already deleted it.
+      if (!this.objectStores.has(storeName)) return;
+      await this.doDeleteObjectStore(storeName);
+    });
   }
 
   private async doDeleteObjectStore(storeName: string): Promise<void> {
@@ -326,6 +339,151 @@ export class IndexedDBManager {
         this.objectStores.clear();
         for (let i = 0; i < db.objectStoreNames.length; i++) {
           this.objectStores.add(db.objectStoreNames[i]);
+        }
+        resolve(db);
+      };
+    });
+  }
+
+  /**
+   * Rename one or more object stores within a single versionchange transaction.
+   *
+   * Object stores cannot be renamed in place, so each `{from → to}` is relocated
+   * by an atomic copy-then-delete: create `to`, cursor-copy every entry from
+   * `from` into it, then delete `from`. Because schema ops and the cursor copy
+   * all ride one versionchange transaction, the whole batch is all-or-nothing —
+   * any error aborts the transaction and leaves the database exactly as before
+   * (old stores intact, new stores never created).
+   */
+  async renameObjectStores(renames: Array<{ from: string; to: string }>): Promise<void> {
+    await this.ensureOpen();
+
+    await this.runSerialized(async () => {
+      // Evaluate the filter and collision guard inside the lock so they see state
+      // committed by any queued peer, not a stale snapshot from before we waited.
+
+      // Only move sources that actually materialized as object stores. A table
+      // that was declared but never connected has no backing store yet — mirrors
+      // LevelDB's pathExists guard for a never-materialized directory.
+      const filtered = renames.filter((r) => this.objectStores.has(r.from));
+      if (filtered.length === 0) {
+        return; // nothing physical to move
+      }
+
+      // Pre-bump collision guard: refuse before mutating anything if any target
+      // already exists, so a failed rename never leaves a half-created store.
+      for (const { from, to } of filtered) {
+        if (this.objectStores.has(to)) {
+          throw new Error(`Cannot rename object store '${from}' to '${to}': object store '${to}' already exists`);
+        }
+      }
+
+      await this.doRenameObjectStores(filtered);
+    });
+  }
+
+  private async doRenameObjectStores(renames: Array<{ from: string; to: string }>): Promise<void> {
+    // Close current connection and reopen with new version
+    this.db?.close();
+    this.db = null;
+    this.dbVersion++;
+
+    this.db = await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error('IndexedDB rename upgrade timed out'));
+      }, 10000);
+
+      const request = indexedDB.open(this.dbName, this.dbVersion);
+
+      // Capture a meaningful copy/abort error so the caller sees a real message
+      // rather than a bare AbortError surfaced by the failed open request.
+      let copyError: Error | null = null;
+
+      request.onerror = () => {
+        clearTimeout(timeout);
+        reject(copyError ?? new Error(`Failed to rename IndexedDB object stores: ${request.error?.message}`));
+      };
+
+      request.onblocked = () => {
+        // Don't reject immediately - the onversionchange handler on the blocking
+        // connection should close it, allowing the upgrade to proceed.
+        console.warn('IndexedDB rename upgrade is blocked, waiting for other connections to close...');
+      };
+
+      request.onupgradeneeded = (event) => {
+        const db = (event.target as IDBOpenDBRequest).result;
+        const tx = (event.target as IDBOpenDBRequest).transaction!;
+
+        tx.onabort = () => {
+          if (!copyError) {
+            copyError = tx.error ?? new Error('IndexedDB rename transaction aborted');
+          }
+        };
+
+        // Drive the renames sequentially with a cursor-chained driver so a
+        // request is always pending — that keeps the versionchange transaction
+        // alive until the last copy completes, at which point it auto-commits.
+        let i = 0;
+        const processNext = () => {
+          if (i >= renames.length) return; // no more requests → tx commits
+          const { from, to } = renames[i];
+
+          if (!db.objectStoreNames.contains(from)) {
+            // Source vanished unexpectedly — skip rather than throw mid-tx.
+            i++;
+            processNext();
+            return;
+          }
+          if (!db.objectStoreNames.contains(to)) {
+            db.createObjectStore(to);
+          }
+
+          // NOTE: this copies one record per IDB request, so renaming a table costs about
+          // one round trip per row (`IndexedDBStore.iterate` pages forward reads with
+          // getAllKeys/getAll for exactly this reason). Kept per-row here because a rename
+          // is a rare one-off DDL and the chained cursor is what keeps the versionchange
+          // transaction alive; page it the same way if renaming a large table ever shows up
+          // as slow.
+          const cursorReq = tx.objectStore(from).openCursor();
+          cursorReq.onsuccess = () => {
+            const cursor = cursorReq.result;
+            if (cursor) {
+              // Keys/values are ArrayBuffers; copy them verbatim with out-of-line keys.
+              tx.objectStore(to).put(cursor.value, cursor.key);
+              cursor.continue();
+            } else {
+              // Copy exhausted — drop the old store and advance.
+              db.deleteObjectStore(from);
+              i++;
+              processNext();
+            }
+          };
+          cursorReq.onerror = () => {
+            copyError = cursorReq.error ?? new Error(`Failed to copy object store '${from}' to '${to}'`);
+            try {
+              tx.abort();
+            } catch {
+              /* transaction already aborting */
+            }
+          };
+        };
+
+        processNext();
+      };
+
+      request.onsuccess = () => {
+        clearTimeout(timeout);
+        const db = request.result;
+
+        // Handle version change requests
+        db.onversionchange = () => {
+          db.close();
+          this.db = null;
+        };
+
+        this.objectStores.clear();
+        for (let j = 0; j < db.objectStoreNames.length; j++) {
+          this.objectStores.add(db.objectStoreNames[j]);
         }
         resolve(db);
       };

@@ -1,0 +1,89 @@
+-- 55-internal-eviction-reporting.sqllogic — a secondary-UNIQUE REPLACE eviction (a new
+-- row collides on a NON-PK UNIQUE with an existing row at a DIFFERENT primary key) is
+-- reported to the DML executor via `UpdateResult.evictedRows`, so the executor runs the
+-- full delete pipeline for the evicted row: FK ON DELETE actions, change-tracking, and
+-- events. Before internal-eviction-reporting the eviction happened invisibly inside the
+-- substrate's update(), so none of those cross-cuts fired for it.
+--
+-- This file runs under BOTH the memory module (`yarn test`) and the store module
+-- (`yarn test:store`, which wraps the store in the isolation layer). The FK cascades
+-- below are driven by the executor, so they must fire on every substrate.
+
+PRAGMA foreign_keys = true;
+
+-- ===================================
+-- 1. NON-COVERED (plain UNIQUE index/scan, no covering MV) — FK ON DELETE CASCADE on the
+--    evictee's children. This validates the FK fix independently of the covering-MV path:
+--    the UNIQUE(email) conflict is detected by the auto-index (memory) / source scan
+--    (store), and the eviction must still cascade.
+-- ===================================
+
+create table p1 (id integer primary key, email text not null, unique (email));
+create table c1 (cid integer primary key, pid integer not null, foreign key (pid) references p1(id) on delete cascade);
+insert into p1 values (1, 'a@x');
+insert into c1 values (10, 1), (11, 1);
+
+-- secondary-UNIQUE REPLACE: new row (id=2, email='a@x') collides on UNIQUE(email) with
+-- id=1 (a DIFFERENT PK), evicting id=1; id=1's children cascade away.
+insert or replace into p1 values (2, 'a@x');
+select id, email from p1 order by id;
+→ [{"id":2,"email":"a@x"}]
+select cid, pid from c1 order by cid;
+→ []
+
+-- ===================================
+-- 2. NON-COVERED — FK ON DELETE SET NULL nulls the evictee's children instead of deleting.
+-- ===================================
+
+create table p2 (id integer primary key, email text not null, unique (email));
+create table c2 (cid integer primary key, pid integer null, foreign key (pid) references p2(id) on delete set null);
+insert into p2 values (1, 'b@x');
+insert into c2 values (10, 1);
+
+insert or replace into p2 values (2, 'b@x');
+select id, email from p2 order by id;
+→ [{"id":2,"email":"b@x"}]
+select cid, pid from c2 order by cid;
+→ [{"cid":10,"pid":null}]
+
+-- ===================================
+-- 3. NON-COVERED — UPDATE that moves a row onto an occupied secondary-UNIQUE value under a
+--    schema-level ON CONFLICT REPLACE default evicts the row at the other PK and cascades.
+--    (UPDATE OR <action> is unsupported, so the constraint default governs.)
+-- ===================================
+
+create table p4 (id integer primary key, email text not null, unique (email) on conflict replace);
+create table c4 (cid integer primary key, pid integer not null, foreign key (pid) references p4(id) on delete cascade);
+insert into p4 values (1, 'm@x'), (2, 'n@x');
+insert into c4 values (20, 2);
+
+-- moving id=1 onto email='n@x' collides with id=2; the REPLACE default evicts id=2,
+-- cascading away id=2's child.
+update p4 set email = 'n@x' where id = 1;
+select id, email from p4 order by id;
+→ [{"id":1,"email":"n@x"}]
+select cid, pid from c4 order by cid;
+→ []
+
+-- ===================================
+-- 4. COVERED (covering materialized view) — the FK ON DELETE CASCADE fires for the eviction
+--    AND the covering MV's backing is maintained for it, on every substrate (the isolation
+--    layer now gets covering-MV backing consistency for free, via the executor's eviction
+--    pipeline rather than its own merged-view detection).
+-- ===================================
+
+create table p3 (id integer primary key, x integer not null, y integer not null, unique (x, y));
+create materialized view p3_ix as select x, y, id from p3 order by x, y;
+create table c3 (cid integer primary key, pid integer not null, foreign key (pid) references p3(id) on delete cascade);
+insert into p3 values (1, 5, 5);
+insert into c3 values (10, 1);
+
+insert or replace into p3 values (2, 5, 5);
+select id, x, y from p3 order by id;
+→ [{"id":2,"x":5,"y":5}]
+-- the evicted parent's child cascaded away
+select cid, pid from c3 order by cid;
+→ []
+-- the covering MV's backing reflects only the surviving row (id=2)
+select x, y, id from p3_ix order by x, y;
+→ [{"x":5,"y":5,"id":2}]

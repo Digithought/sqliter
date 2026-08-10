@@ -9,7 +9,7 @@
  *
  * **Why a post-pass, not a formation-time decision.** `rule-fanout-lookup-join`
  * forms the node in `PassId.Structural`; this rule runs in `PassId.Post-
- * Optimization` (priority 16, in the `eager-prefetch-probe` / `async-gather`
+ * Optimization` (in the `eager-prefetch-probe` / `async-gather`
  * neighborhood) after physical-pass selection has finalized leaf
  * `expectedLatencyMs` / `estimatedRows` / `concurrencySafe`. Matching the
  * already-built `FanOutLookupJoinNode` keeps the batched decision a single,
@@ -80,14 +80,14 @@ import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 const log = createLogger('optimizer:rule:fanout-batched-outer');
 
 /**
- * Best-available row estimate for the fan-out's outer. The leaf access node
- * carries `physical.estimatedRows` but several pass-through wrappers (notably
- * `AliasNode`) propagate it via the `.estimatedRows` getter, which the leaves do
- * not all populate — so a value can be present on the leaf's `physical` yet
- * undefined on the wrapper above it. Read the node's own estimate first, then
- * descend single-relation pass-throughs (alias/filter/sort/…) to recover the
- * leaf's estimate. A multi-relation node (a join outer in a subquery cluster)
- * returns `undefined`, which the caller treats as failing the cardinality gate.
+ * Best-available row estimate for the fan-out's outer. Single-source relays now
+ * carry the leaf's `physical.estimatedRows` upward (`physicalSourceRows`), but not
+ * every wrapper does — a CTE reference or a set operation in between stamps
+ * nothing — so a value can be present on the leaf's `physical` yet undefined above
+ * it. Read the node's own estimate first, then descend single-relation
+ * pass-throughs (alias/filter/sort/…) to recover the leaf's estimate. A
+ * multi-relation node (a join outer in a subquery cluster) returns `undefined`,
+ * which the caller treats as failing the cardinality gate.
  */
 function outerRowEstimate(node: RelationalPlanNode): number | undefined {
 	const direct = node.physical?.estimatedRows ?? node.estimatedRows;

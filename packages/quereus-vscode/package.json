@@ -2,7 +2,7 @@
 	"name": "quereus-vscode",
 	"displayName": "Quereus SQL",
 	"description": "Language support for Quereus SQL: syntax, diagnostics, completions, hovers, semantic tokens",
-	"version": "3.3.0",
+	"version": "4.11.0",
 	"icon": "images/icon.ico",
 	"publisher": "GotChoicesFoundation",
 	"files": [
@@ -73,18 +73,18 @@
 		"pub:vsm": "yarn run package && npx --yes @vscode/vsce publish --packagePath quereus-vscode-%npm_package_version%.vsix --pat %VSCE_PAT%",
 		"test": "cd ../.. && node --import ./packages/quereus-vscode/register.mjs node_modules/mocha/bin/mocha.js \"packages/quereus-vscode/server/test/**/*.spec.ts\" --reporter min --colors",
 		"lint": "echo 'No lint configured for extension'",
-		"typecheck": "tsc -p server/tsconfig.json --noEmit && tsc -p client/tsconfig.json --noEmit"
+		"typecheck": "tsc -p server/tsconfig.json --noEmit && tsc -p client/tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit"
 	},
 	"dependencies": {
 		"@quereus/quereus": "workspace:^",
-		"vscode-languageclient": "^9.0.1"
+		"vscode-languageclient": "^10.0.0"
 	},
 	"devDependencies": {
 		"@types/vscode": "^1.109.0",
-		"esbuild": "^0.27.2",
-		"rimraf": "^6.1.2",
+		"esbuild": "^0.28.1",
+		"rimraf": "^6.1.3",
 		"typescript": "^5.9.3",
-		"vscode-languageserver": "^9.0.1",
+		"vscode-languageserver": "^10.0.0",
 		"vscode-languageserver-textdocument": "^1.0.12"
 	}
 }

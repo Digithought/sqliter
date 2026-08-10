@@ -3,6 +3,7 @@ import type { RelationType } from '../../common/datatype.js';
 import { PlanNodeType } from './plan-node-type.js';
 import type { Scope } from '../scopes/scope.js';
 import { Cached } from '../../util/cached.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 
 /**
  * Plan node that wraps a relational node and updates the relationName on its attributes.
@@ -20,7 +21,9 @@ export class AliasNode extends PlanNode implements UnaryRelationalNode {
 		public readonly source: RelationalPlanNode,
 		public readonly alias: string
 	) {
-		super(scope, source.estimatedCost);
+		// Self-cost only: pure rename, the source flows in via getChildren(). Using
+		// source.estimatedCost here would double-count the source's self-cost.
+		super(scope, 0.01);
 		this.attributesCache = new Cached(() => this.buildAttributes());
 		this.typeCache = new Cached(() => this.buildType());
 	}
@@ -63,16 +66,20 @@ export class AliasNode extends PlanNode implements UnaryRelationalNode {
 	computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
 		const sourcePhysical = childrenPhysical[0];
 		return {
-			estimatedRows: this.source.estimatedRows,
+			estimatedRows: physicalSourceRows(sourcePhysical, this.source),
 			ordering: sourcePhysical?.ordering,
 			// Alias preserves attribute IDs unchanged — pass monotonicOn through.
 			monotonicOn: sourcePhysical?.monotonicOn,
 			// Alias is purely a rename — FDs, equivalence classes, constant
-			// bindings, and domain constraints carry through unchanged.
+			// bindings, domain constraints, INDs, and backward update-lineage carry
+			// through unchanged (attribute ids are preserved).
 			fds: sourcePhysical?.fds,
 			equivClasses: sourcePhysical?.equivClasses,
 			constantBindings: sourcePhysical?.constantBindings,
 			domainConstraints: sourcePhysical?.domainConstraints,
+			inds: sourcePhysical?.inds,
+			updateLineage: sourcePhysical?.updateLineage,
+			attributeDefaults: sourcePhysical?.attributeDefaults,
 		};
 	}
 

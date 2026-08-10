@@ -17,7 +17,9 @@ export class SinkNode extends PlanNode {
 		/** Describes the operation for information purposes */
 		public readonly operation: string,
 	) {
-		super(scope, source.getTotalCost() + 0.1); // Minimal cost for consuming
+		// Self-cost only: the source flows in via getChildren(). Self is the minimal
+		// consumption overhead.
+		super(scope, 0.1);
 	}
 
 	getType(): ScalarType {

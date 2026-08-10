@@ -20,7 +20,7 @@
  *     per column so an in-scope contradiction on column `a` still fires
  *     even if an unrelated LIKE on column `b` is present.
  *
- * Registered at Structural pass priority 27 — runs alongside the empty-
+ * Registered in the Structural pass — runs alongside the empty-
  * relation-folding rules so any `Filter(_, false)` produced by other rules
  * has already been collapsed.
  */
@@ -37,7 +37,7 @@ import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 
 const log = createLogger('optimizer:rule:filter-contradiction');
 
-export function ruleFilterContradiction(node: PlanNode, _ctx: OptContext): PlanNode | null {
+export function ruleFilterContradiction(node: PlanNode, ctx: OptContext): PlanNode | null {
 	if (!(node instanceof FilterNode)) return null;
 
 	// `Filter(_, lit-false|null|0|0n)` is the empty-folding rule's job; bail out
@@ -67,8 +67,10 @@ export function ruleFilterContradiction(node: PlanNode, _ctx: OptContext): PlanN
 		bindings,
 		(attrId) => attrIdToIndex.get(attrId),
 		collationOf,
+		ctx.db.getCollationResolver(),
 	);
 
+	// `'unknown'` ("cannot prove unsatisfiable") and `'sat'` both leave the Filter alone.
 	if (result !== 'unsat') return null;
 
 	// Refuse to drop a source that carries a write — folding to Empty would

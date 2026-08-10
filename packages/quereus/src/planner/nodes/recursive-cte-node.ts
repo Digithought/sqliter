@@ -29,9 +29,23 @@ export class RecursiveCTENode extends PlanNode implements CTEPlanNode, CTEScopeN
 		public readonly maxRecursion?: number,
 		tableDescriptor?: TableDescriptor,
 		public readonly limitExpr?: ScalarPlanNode,
-		public readonly offsetExpr?: ScalarPlanNode
+		public readonly offsetExpr?: ScalarPlanNode,
+		/**
+		 * Resolved materialization decision for emission, set by the
+		 * materialization-advisory pass: when true, emitRecursiveCTE drives the
+		 * recursion once per statement execution into a shared buffer that every
+		 * reference replays (multi-referenced recursive CTEs — gated purely on
+		 * reference count, ignoring the materialization hint; see
+		 * MaterializationAdvisory.shouldMaterializeCTE). When false, each reference
+		 * streams its own drive (single-reference: keeps early-exit under an outer
+		 * LIMIT working).
+		 */
+		public readonly materialize: boolean = false
 	) {
-		super(scope, baseCaseQuery.getTotalCost() + recursiveCaseQuery.getTotalCost() + 50); // Higher cost for recursion
+		// Self-cost only: the base and recursive cases are both in getChildren(),
+		// so their subtree costs flow in once via getTotalCost(). Self is the fixed
+		// recursion overhead.
+		super(scope, 50);
 		this._recursiveCaseQuery = recursiveCaseQuery;
 		this.tableDescriptor = tableDescriptor || {}; // Identity object for table context lookup
 		this.attributesCache = new Cached(() => this.buildAttributes());
@@ -48,9 +62,12 @@ export class RecursiveCTENode extends PlanNode implements CTEPlanNode, CTEScopeN
 	 */
 	setRecursiveCaseQuery(query: RelationalPlanNode): void {
 		this._recursiveCaseQuery = query;
-		// Clear caches since they might depend on the recursive case
+		// Clear caches since they might depend on the recursive case. The memoized
+		// total-cost captured the placeholder recursive case at construction, so it
+		// must be invalidated too (self-cost is a constant, but a child changed).
 		this.attributesCache = new Cached(() => this.buildAttributes());
 		this.typeCache = new Cached(() => this.buildType());
+		this.invalidateTotalCostCache();
 	}
 
 	private buildAttributes(): Attribute[] {
@@ -146,10 +163,37 @@ export class RecursiveCTENode extends PlanNode implements CTEPlanNode, CTEScopeN
 			this.maxRecursion,
 			this.tableDescriptor,
 			newLimitExpr,
-			newOffsetExpr
+			newOffsetExpr,
+			this.materialize
 		);
 
 		return newNode;
+	}
+
+	/**
+	 * Clone with a flipped `materialize` decision, preserving every other field
+	 * (crucially the `tableDescriptor` identity and the recursive case). Lets the
+	 * materialization-advisory pass set the flag without hand-copying the full
+	 * constructor argument list (which `withChildren` already owns).
+	 */
+	withMaterialize(materialize: boolean): RecursiveCTENode {
+		if (this.materialize === materialize) {
+			return this;
+		}
+		return new RecursiveCTENode(
+			this.scope,
+			this.cteName,
+			this.columns,
+			this.baseCaseQuery,
+			this.recursiveCaseQuery,
+			this.isUnionAll,
+			this.materializationHint,
+			this.maxRecursion,
+			this.tableDescriptor,
+			this.limitExpr,
+			this.offsetExpr,
+			materialize
+		);
 	}
 
 	override toString(): string {
@@ -157,7 +201,8 @@ export class RecursiveCTENode extends PlanNode implements CTEPlanNode, CTEScopeN
 		const columnsText = this.columns ? `(${this.columns.join(', ')})` : '';
 		const unionText = this.isUnionAll ? 'UNION ALL' : 'UNION';
 		const materializationText = this.materializationHint ? ` ${this.materializationHint.toUpperCase()}` : '';
-		return `${recursiveText}CTE ${this.cteName}${columnsText} [${unionText}]${materializationText}`;
+		const bufferedText = this.materialize ? ' [buffered]' : '';
+		return `${recursiveText}CTE ${this.cteName}${columnsText} [${unionText}]${materializationText}${bufferedText}`;
 	}
 
 	override getLogicalAttributes(): Record<string, unknown> {
@@ -166,6 +211,7 @@ export class RecursiveCTENode extends PlanNode implements CTEPlanNode, CTEScopeN
 			columns: this.columns,
 			isUnionAll: this.isUnionAll,
 			materializationHint: this.materializationHint,
+			materialize: this.materialize,
 			isRecursive: true,
 			maxRecursion: this.maxRecursion,
 			baseCaseType: this.baseCaseQuery.getType(),

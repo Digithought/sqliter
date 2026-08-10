@@ -64,7 +64,10 @@ with data as (select id from ct where val = 'nonexistent')
 select exists (select 1 from data) as has_it;
 → [{"has_it":false}]
 
--- ===== CTE used in UPDATE (not yet supported — CTE not visible in UPDATE subquery) =====
+-- ===== CTE used in UPDATE — the leading WITH is now in scope for SET/WHERE =====
+-- UPDATE/DELETE previously ignored the statement's WITH clause, so a CTE read in a
+-- SET value / WHERE subquery failed to resolve ("not found"). The CTE-name DML write
+-- target work threads the statement's CTEs into scope, closing that read gap.
 
 create table ct_target (id integer primary key, val text);
 insert into ct_target values (1, 'old');
@@ -72,21 +75,21 @@ insert into ct_target values (1, 'old');
 
 with src as (select val from ct where id = 1)
 update ct_target set val = (select val from src) where id = 1;
--- error: not found
+-- run
 
--- Verify target unchanged
+-- The CTE read resolved: ct.val where id=1 is 'root'.
 select * from ct_target;
-→ [{"id":1,"val":"old"}]
+→ [{"id":1,"val":"root"}]
 
--- ===== CTE used in DELETE (not yet supported) =====
+-- ===== CTE used in DELETE — the leading WITH is likewise in scope for the WHERE =====
 
 with to_del as (select id from ct_target)
 delete from ct_target where id in (select id from to_del);
--- error: not found
+-- run
 
--- Verify target unchanged
+-- The CTE read resolved: every ct_target row whose id is in to_del was deleted.
 select count(*) as cnt from ct_target;
-→ [{"cnt":1}]
+→ [{"cnt":0}]
 
 drop table ct_target;
 -- run

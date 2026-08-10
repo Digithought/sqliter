@@ -205,3 +205,33 @@ select id, val from self_ref order by id;
 → [{"id":1,"val":10},{"id":2,"val":20},{"id":3,"val":30},{"id":102,"val":99},{"id":103,"val":99}]
 
 drop table self_ref;
+
+-- ===================================
+-- 11. Duplicate column in the INSERT column list is rejected (no silent
+--     last-wins / confusing shape). PostgreSQL rejects this as
+--     "column \"a\" specified more than once". See ticket
+--     insert-family-duplicate-column-targets-silent-last-wins.
+-- ===================================
+
+create table dup_cols (a integer primary key, b integer null);
+
+insert into dup_cols (a, a) values (1, 2);
+-- error: specified more than once
+
+-- case-insensitive duplicate is also rejected.
+insert into dup_cols (a, b, A) values (1, 2, 3);
+-- error: specified more than once
+
+-- the rejected inserts made no change.
+select a, b from dup_cols order by a;
+→ []
+
+-- false-positive guard: the check keys on exact-name collision, so a legitimate
+-- distinct-column list still works — including columns that merely share a prefix.
+create table prefix_cols (ab integer primary key, abc integer null);
+insert into prefix_cols (ab, abc) values (1, 2);
+select ab, abc from prefix_cols order by ab;
+→ [{"ab":1,"abc":2}]
+drop table prefix_cols;
+
+drop table dup_cols;

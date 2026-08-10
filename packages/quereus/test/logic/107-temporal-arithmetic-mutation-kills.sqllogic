@@ -295,6 +295,118 @@ SELECT timespan('PT1H') * null as result;
 SELECT timespan('PT1H') / null as result;
 → [{"result":null}]
 
+SELECT null * timespan('PT1H') as result;
+→ [{"result":null}]
+
+SELECT timespan('PT1H') - null as result;
+→ [{"result":null}]
+
+SELECT null / timespan('PT1H') as result;
+→ [{"result":null}]
+
+SELECT time('10:00:00') - null as result;
+→ [{"result":null}]
+
+-- ============================================================
+-- Chained temporal arithmetic
+--
+-- The declared result type of the inner expression is what the outer operator
+-- specializes on (types/temporal-ops.ts). Before that table existed the planner
+-- announced the LEFT operand's type for every temporal pair, so the inner
+-- `date - date` claimed DATE while holding a duration string.
+-- ============================================================
+
+-- (DATE - DATE) is a TIMESPAN, so the outer + is TIMESPAN + TIMESPAN
+SELECT (date('2024-01-20') - date('2024-01-15')) + timespan('P1D') as result;
+→ [{"result":"P6D"}]
+
+-- (DATE + TIMESPAN) is a DATE, so the outer - is DATE - DATE → a TIMESPAN
+SELECT (date('2024-01-20') + timespan('P1D')) - date('2024-01-15') as result;
+→ [{"result":"P6D"}]
+
+-- (TIMESPAN / TIMESPAN) is a REAL, so the outer + is plain numeric arithmetic
+SELECT (timespan('PT2H') / timespan('PT1H')) + 1 as result;
+→ [{"result":3}]
+
+-- (TIMESPAN - TIMESPAN) is a TIMESPAN
+SELECT (timespan('PT2H') - timespan('PT30M')) + timespan('PT30M') as result;
+→ [{"result":"PT2H"}]
+
+-- (NUMBER * TIMESPAN) is a TIMESPAN, so the outer + finds no NUMBER case.
+-- Returned null before the result type was fixed: the inner expression was
+-- announced INTEGER, the outer + took the numeric fast path, and `'PT7200S' + 3`
+-- produced a non-finite value. An error is the honest answer.
+SELECT (2 * timespan('PT1H')) + 3 as result;
+-- error: Unsupported temporal operation
+
+-- ============================================================
+-- Unsupported combinations still raise, byte for byte
+-- ============================================================
+
+SELECT date('2024-01-15') + date('2024-01-16') as result;
+-- error: Unsupported temporal operation
+
+SELECT date('2024-01-15') * 2 as result;
+-- error: Unsupported temporal operation
+
+SELECT time('10:00:00') - date('2024-01-15') as result;
+-- error: Unsupported temporal operation
+
+SELECT timespan('PT1H') % timespan('PT1H') as result;
+-- error: Unsupported temporal operation
+
+SELECT date('2024-01-15') - 5 as result;
+-- error: Unsupported temporal operation
+
+-- A number past 2^53 is a bigint, which the `*` / `/` number cases reject.
+-- Preserved as found — see the NOTE on scaleTimespan in types/temporal-ops.ts.
+SELECT timespan('PT1H') * 9007199254740993 as result;
+-- error: Unsupported temporal operation
+
+-- ============================================================
+-- Operands whose declared type settles nothing keep sniffing values at runtime
+-- ============================================================
+
+-- TEXT operand: no plan-time kind, so the pair falls back to runtime shape probes,
+-- which find no (undefined, date) case.
+SELECT 'not-a-date' - date('2024-01-15') as result;
+-- error: Unsupported temporal operation
+
+-- ...and the same fallback still succeeds when the TEXT value does look temporal
+SELECT timespan('PT1H') + 'PT1H' as result;
+→ [{"result":"PT2H"}]
+
+-- ============================================================
+-- TIMESTAMP is deliberately outside the table
+--
+-- It is an integer instant, not a string temporal, and appears in no case — so
+-- `ts + 1` keeps taking the runtime-sniffed path (both values look numeric, so
+-- nothing temporal matches) and plain numeric arithmetic answers.
+-- ============================================================
+
+CREATE TABLE ts_int (id INTEGER PRIMARY KEY, t TIMESTAMP);
+INSERT INTO ts_int VALUES (1, 1705276800000);
+-- run
+
+SELECT t + 1 as result FROM ts_int;
+→ [{"result":1705276800001}]
+
+SELECT t - t as result FROM ts_int;
+→ [{"result":0}]
+
+DROP TABLE ts_int;
+
+-- ============================================================
+-- DATETIME - DATETIME drops the time of day
+--
+-- Both sides collapse to a PlainDate before the difference is taken, so a
+-- 2-hour remainder disappears. Locked here as preserved-as-found behavior; the
+-- fix is tracked as `bug-datetime-difference-drops-time-of-day`.
+-- ============================================================
+
+SELECT datetime('2024-01-20T10:00:00') - datetime('2024-01-15T08:00:00') as result;
+→ [{"result":"P5D"}]
+
 -- ============================================================
 -- TIMESPAN comparisons (semantic, not lexicographic)
 -- ============================================================
@@ -328,15 +440,357 @@ SELECT id FROM ts_test WHERE dur >= 'PT1H' ORDER BY id;
 SELECT id FROM ts_test WHERE dur != 'PT1H' ORDER BY id;
 → [{"id":1},{"id":3},{"id":4},{"id":5}]
 
--- ORDER BY with timespans (lexicographic on stored TEXT — P1D < PT*)
+-- ORDER BY with timespans: semantic (elapsed-time) order, matching `<`/`>` above
+-- (see docs/types.md "Semantic ordering"; was lexicographic before that ruling)
 SELECT id, dur FROM ts_test ORDER BY dur;
-→ [{"id":4,"dur":"P1D"},{"id":5,"dur":"PT0S"},{"id":2,"dur":"PT1H"},{"id":3,"dur":"PT2H"},{"id":1,"dur":"PT30M"}]
+→ [{"id":5,"dur":"PT0S"},{"id":1,"dur":"PT30M"},{"id":2,"dur":"PT1H"},{"id":3,"dur":"PT2H"},{"id":4,"dur":"P1D"}]
 
--- MIN / MAX aggregation (lexicographic)
+-- MIN / MAX aggregation ranks by elapsed time, same as ORDER BY / `<` above
+-- (the aggregate binds to the argument's TIMESPAN type at emit — docs/types.md
+-- "Semantic ordering"). Text order would report mn=P1D, mx=PT30M.
 SELECT min(dur) as mn, max(dur) as mx FROM ts_test;
-→ [{"mn":"P1D","mx":"PT30M"}]
+→ [{"mn":"PT0S","mx":"P1D"}]
+
+-- min/max agree with the ordering sites: order by … limit 1 (asc and desc)
+SELECT (min(dur) = (SELECT dur FROM ts_test ORDER BY dur LIMIT 1)) as min_agrees,
+       (max(dur) = (SELECT dur FROM ts_test ORDER BY dur DESC LIMIT 1)) as max_agrees
+FROM ts_test;
+→ [{"min_agrees":true,"max_agrees":true}]
+
+-- DISTINCT dedup is already semantic; the DISTINCT form must match the plain form
+SELECT min(distinct dur) as mn, max(distinct dur) as mx FROM ts_test;
+→ [{"mn":"PT0S","mx":"P1D"}]
 
 DROP TABLE ts_test;
+
+-- GROUP BY shape (hash aggregate): the bound comparator must reach the grouped
+-- path too, not just the single-group stream aggregate.
+CREATE TABLE ts_grp (id INTEGER PRIMARY KEY, g INTEGER, dur TIMESPAN);
+INSERT INTO ts_grp VALUES
+  (1, 1, 'PT30M'), (2, 1, 'PT2H'), (3, 1, 'PT90M'),
+  (4, 2, 'P1D'), (5, 2, 'PT10M');
+-- run
+
+SELECT g, min(dur) as mn, max(dur) as mx FROM ts_grp GROUP BY g ORDER BY g;
+→ [{"g":1,"mn":"PT30M","mx":"PT2H"},{"g":2,"mn":"PT10M","mx":"P1D"}]
+
+DROP TABLE ts_grp;
+
+-- Materialized view over TIMESPAN min/max: store-maintained values must rank by
+-- the same semantic comparator as direct evaluation, through BOTH maintenance
+-- arms — the delta merge on insert and the tighten residual fallback on a
+-- delete of the extreme.
+CREATE TABLE ts_src (id INTEGER PRIMARY KEY, g INTEGER, dur TIMESPAN);
+INSERT INTO ts_src VALUES (1, 1, 'PT30M'), (2, 1, 'PT2H'), (3, 1, 'PT90M');
+CREATE MATERIALIZED VIEW ts_mv AS
+  SELECT g, count(*) AS c, min(dur) AS mn, max(dur) AS mx FROM ts_src GROUP BY g;
+-- run
+
+-- (a) create-fill: stored equals the directly-evaluated body (text order would
+-- store mn=PT2H, mx=PT90M).
+SELECT g, c, mn, mx FROM ts_mv ORDER BY g;
+→ [{"g":1,"c":3,"mn":"PT30M","mx":"PT2H"}]
+
+-- (b) an insert exercises the delta merge path. 'P1D' is chosen because its text
+-- and elapsed-time orders disagree against BOTH stored extrema: it sorts before
+-- 'PT30M' textually (a text merge would wrongly drop mn to P1D) yet is the longest
+-- duration here (a text merge would wrongly leave mx at PT2H).
+INSERT INTO ts_src VALUES (4, 1, 'P1D');
+SELECT g, c, mn, mx FROM ts_mv ORDER BY g;
+→ [{"g":1,"c":4,"mn":"PT30M","mx":"P1D"}]
+
+-- stored and direct agree after the delta merge
+SELECT g, count(*) AS c, min(dur) AS mn, max(dur) AS mx FROM ts_src GROUP BY g ORDER BY g;
+→ [{"g":1,"c":4,"mn":"PT30M","mx":"P1D"}]
+
+-- (c) a delete of the extreme exercises the tighten residual fallback (min/max
+-- cannot retract arithmetically — the group re-derives from live source state).
+DELETE FROM ts_src WHERE id = 4;
+SELECT g, c, mn, mx FROM ts_mv ORDER BY g;
+→ [{"g":1,"c":3,"mn":"PT30M","mx":"PT2H"}]
+
+DROP MATERIALIZED VIEW ts_mv;
+DROP TABLE ts_src;
+
+-- ============================================================
+-- Semantic ordering reaches a COMPUTED difference, not just a declared column
+--
+-- Everything above orders a column DECLARED timespan. `date - date` produces the
+-- same duration strings, and until the operation table (types/temporal-ops.ts)
+-- gave it a TIMESPAN result type the planner announced DATE — so every ordering
+-- site fell back to text order and disagreed with the `<`/`>` results above.
+-- Each expectation below is a value the old announcement got wrong: text order
+-- ranks 'P15D' before 'P1D' before 'P9D'.
+-- ============================================================
+
+CREATE TABLE spans (id INTEGER PRIMARY KEY, a DATE NOT NULL, b DATE NOT NULL);
+INSERT INTO spans VALUES
+  (1, '2024-01-20', '2024-01-05'),
+  (2, '2024-01-20', '2024-01-11'),
+  (3, '2024-01-20', '2024-01-19');
+-- run
+
+SELECT id, a - b AS g FROM spans ORDER BY (a - b);
+→ [{"id":3,"g":"P1D"},{"id":2,"g":"P9D"},{"id":1,"g":"P15D"}]
+
+SELECT min(a - b) AS mn, max(a - b) AS mx FROM spans;
+→ [{"mn":"P1D","mx":"P15D"}]
+
+SELECT DISTINCT (a - b) AS g FROM spans ORDER BY 1;
+→ [{"g":"P1D"},{"g":"P9D"},{"g":"P15D"}]
+
+-- the computed difference and a declared TIMESPAN literal rank against each other
+SELECT id FROM spans WHERE (a - b) > timespan('P8D') ORDER BY id;
+→ [{"id":1},{"id":2}]
+
+-- a materialized view over the computed difference stores and orders it the same way
+CREATE MATERIALIZED VIEW spans_mv AS SELECT id, (a - b) AS g FROM spans;
+-- run
+
+SELECT id, g FROM spans_mv ORDER BY g;
+→ [{"id":3,"g":"P1D"},{"id":2,"g":"P9D"},{"id":1,"g":"P15D"}]
+
+DROP MATERIALIZED VIEW spans_mv;
+DROP TABLE spans;
+
+-- ============================================================
+-- Dividing a calendar duration truncates the sub-month remainder
+--
+-- months have no fixed day count, so the remainder cannot cascade to days.
+-- See the NOTE on divideDuration in src/types/temporal-ops.ts.
+-- ============================================================
+
+SELECT timespan('P1Y2M') / 2 AS result;
+→ [{"result":"P7M"}]
+
+SELECT timespan('P1M') / 2 AS result;
+→ [{"result":"PT0S"}]
+
+-- ============================================================
+-- The three emit-time arms, over COLUMNS
+--
+-- Every case above operates on literals, which constant-fold before a row is ever
+-- scanned. These run the same shapes per row instead, so each of the three arms of
+-- the temporal branch in runtime/emit/binary.ts is exercised where it matters:
+--   arm 1  both declared kinds resolve and the operation table has a case
+--   arm 2  both resolve and the table has NO case (a constant-throw body)
+--   arm 3  a declared type settles nothing, so runtime value sniffing decides
+-- The emitted note for each is asserted in test/runtime/scalar-op-spec.spec.ts.
+-- ============================================================
+
+CREATE TABLE arms (
+  id INTEGER PRIMARY KEY,
+  dt DATE, dt2 DATE,
+  sp TIMESPAN, sp2 TIMESPAN,
+  txt TEXT,
+  n INTEGER
+);
+INSERT INTO arms VALUES
+  (1, '2024-01-20', '2024-01-15', 'P1D', 'PT12H', 'PT1H', 2),
+  (2, '2024-03-01', '2024-02-01', 'P2D', 'PT6H', 'P3D', 3);
+-- run
+
+-- arm 1: DATE + TIMESPAN, case fixed at emit
+SELECT id, dt + sp AS r FROM arms ORDER BY id;
+→ [{"id":1,"r":"2024-01-21"},{"id":2,"r":"2024-03-03"}]
+
+-- arm 1: DATE - DATE announces TIMESPAN, and the value agrees
+SELECT id, dt - dt2 AS r FROM arms ORDER BY id;
+→ [{"id":1,"r":"P5D"},{"id":2,"r":"P29D"}]
+
+-- arm 1: TIMESPAN * NUMBER
+SELECT id, sp2 * n AS r FROM arms ORDER BY id;
+→ [{"id":1,"r":"PT86400S"},{"id":2,"r":"PT64800S"}]
+
+-- arm 3: a TEXT operand settles nothing at emit, so the value decides — and this
+-- value does look like a duration, so the (timespan, timespan) case still applies
+SELECT id, txt + sp AS r FROM arms ORDER BY id;
+→ [{"id":1,"r":"P1DT1H"},{"id":2,"r":"P5D"}]
+
+-- Deep chain: every level specializes on the level below's announced type.
+-- (dt + sp) is a DATE, minus dt2 is a TIMESPAN, plus sp2 is a TIMESPAN.
+SELECT id, dt + sp - dt2 + sp2 AS r FROM arms ORDER BY id;
+→ [{"id":1,"r":"P6DT12H"},{"id":2,"r":"P31DT6H"}]
+
+-- ============================================================
+-- arm 1, the rest of the operation table, over COLUMNS
+--
+-- The cases above reach four of the table's entries. The remainder — TIME and
+-- DATETIME shifts, the commuted TIMESPAN-first forms, mixed DATE/DATETIME
+-- differences, and the two division cases — are otherwise pinned only by literal
+-- expressions, which constant-fold before a row is scanned. These run them per row,
+-- so a wrong entry in the emit-time lookup cannot hide behind the folder.
+-- ============================================================
+
+CREATE TABLE arms2 (
+  id INTEGER PRIMARY KEY,
+  dt DATE,
+  dtm DATETIME, dtm2 DATETIME,
+  tm TIME, tm2 TIME,
+  sp TIMESPAN, sp2 TIMESPAN,
+  n INTEGER
+);
+INSERT INTO arms2 VALUES
+  (1, '2024-01-15', '2024-01-20T08:15:00', '2024-01-10T06:00:00', '10:30:00', '08:00:00', 'PT1H30M', 'PT30M', 3);
+-- run
+
+-- TIME ± TIMESPAN, and the commuted TIMESPAN + TIME
+SELECT tm + sp AS a, tm - sp AS b, sp + tm AS c FROM arms2;
+→ [{"a":"12:00:00","b":"09:00:00","c":"12:00:00"}]
+
+-- DATETIME ± TIMESPAN, and the commuted TIMESPAN + DATETIME
+SELECT dtm + sp AS a, dtm - sp AS b, sp + dtm AS c FROM arms2;
+→ [{"a":"2024-01-20T09:45:00","b":"2024-01-20T06:45:00","c":"2024-01-20T09:45:00"}]
+
+-- the commuted TIMESPAN + DATE. PT30M carries no whole days, and a DATE has no time
+-- of day to carry them into, so the date is unchanged — the same sub-day truncation
+-- `date('2024-01-15') + timespan('PT30M')` shows as a literal.
+SELECT sp2 + dt AS r FROM arms2;
+→ [{"r":"2024-01-15"}]
+
+-- TIME - TIME
+SELECT tm - tm2 AS r FROM arms2;
+→ [{"r":"PT2H30M"}]
+
+-- the three mixed DATE/DATETIME differences (all collapse to whole days — see the
+-- NOTE on dateDifference in types/temporal-ops.ts)
+SELECT dtm - dtm2 AS a, dtm - dt AS b, dt - dtm2 AS c FROM arms2;
+→ [{"a":"P10D","b":"P5D","c":"P5D"}]
+
+-- TIMESPAN ± TIMESPAN
+SELECT sp + sp2 AS a, sp - sp2 AS b FROM arms2;
+→ [{"a":"PT2H","b":"PT1H"}]
+
+-- TIMESPAN / TIMESPAN announces REAL, TIMESPAN / NUMBER announces TIMESPAN,
+-- and NUMBER * TIMESPAN is the commuted scale case
+SELECT sp / sp2 AS a, sp / n AS b, n * sp AS c FROM arms2;
+→ [{"a":3,"b":"PT1800S","c":"PT16200S"}]
+
+-- A view body is emitted like any other scalar op, so the specialized arm applies there too
+CREATE VIEW arms2_v AS SELECT id, dtm + sp AS shifted FROM arms2;
+-- run
+SELECT shifted FROM arms2_v;
+→ [{"shifted":"2024-01-20T09:45:00"}]
+DROP VIEW arms2_v;
+
+DROP TABLE arms2;
+
+-- A CHECK constraint is another scalar-op site: the specialized body decides the verdict
+CREATE TABLE arm_check (
+  id INTEGER PRIMARY KEY,
+  dt DATE,
+  sp TIMESPAN,
+  CHECK (dt + sp > dt)
+);
+-- run
+INSERT INTO arm_check VALUES (1, '2024-01-15', 'P1D');
+-- run
+SELECT dt + sp AS r FROM arm_check;
+→ [{"r":"2024-01-16"}]
+
+-- a negative shift moves the date backwards, so the constraint rejects the row
+INSERT INTO arm_check VALUES (2, '2024-01-15', '-P1D');
+-- error: CHECK constraint
+
+DROP TABLE arm_check;
+
+-- arm 2: no case for DATE + DATE. The throw is per row, not at emit — so a query
+-- that never evaluates the expression still succeeds (next three).
+SELECT id, dt + dt2 AS r FROM arms ORDER BY id;
+-- error: Unsupported temporal operation
+
+-- ...guarded by a CASE that never selects it
+SELECT id, CASE WHEN 0 THEN dt + dt2 ELSE 'skipped' END AS r FROM arms ORDER BY id;
+→ [{"id":1,"r":"skipped"},{"id":2,"r":"skipped"}]
+
+-- ...filtered out before evaluation
+SELECT dt + dt2 AS r FROM arms WHERE 1 = 0;
+→ []
+
+-- ...or over no rows at all
+CREATE TABLE arms_empty (id INTEGER PRIMARY KEY, dt DATE, dt2 DATE);
+-- run
+SELECT dt + dt2 AS r FROM arms_empty;
+→ []
+DROP TABLE arms_empty;
+
+-- ============================================================
+-- NULL short-circuits ahead of the arm choice, on all three arms
+--
+-- All three bodies null-check before doing anything else, so a NULL operand is
+-- NULL rather than an error — including on arm 2, where a non-NULL pair throws.
+-- ============================================================
+
+CREATE TABLE arm_nulls (id INTEGER PRIMARY KEY, dt DATE NULL, dt2 DATE NULL, sp TIMESPAN NULL, txt TEXT NULL, n INTEGER NULL);
+INSERT INTO arm_nulls VALUES (1, null, null, null, null, null);
+-- run
+
+-- arm 1 (date, timespan) with a NULL operand
+SELECT dt + sp AS r FROM arm_nulls;
+→ [{"r":null}]
+
+-- arm 1 (timespan, number) with a NULL operand
+SELECT sp * n AS r FROM arm_nulls;
+→ [{"r":null}]
+
+-- arm 2 (date, date) — no case exists, yet NULL still wins over the throw
+SELECT dt + dt2 AS r FROM arm_nulls;
+→ [{"r":null}]
+
+-- arm 3 (text, date)
+SELECT txt - dt AS r FROM arm_nulls;
+→ [{"r":null}]
+
+DROP TABLE arm_nulls;
+
+-- ============================================================
+-- A bigint on the NUMBER side of `*` / `/`
+--
+-- `sp * big` resolves to the (timespan, number) case at emit, and the case's own
+-- `typeof n === 'number'` guard then rejects the bigint — the same error the
+-- value-sniffed path produced, reached by a different route. This is the one place
+-- that guard is reachable (see the NOTE on scaleTimespan in types/temporal-ops.ts).
+-- ============================================================
+
+CREATE TABLE bigmul (id INTEGER PRIMARY KEY, sp TIMESPAN, big INTEGER);
+INSERT INTO bigmul VALUES (1, 'PT1H', 9007199254740993);
+-- run
+
+SELECT sp * big AS r FROM bigmul;
+-- error: Unsupported temporal operation
+
+SELECT sp / big AS r FROM bigmul;
+-- error: Unsupported temporal operation
+
+DROP TABLE bigmul;
+
+-- ============================================================
+-- A DATE-declared column cannot hold a value that is not a DATE
+--
+-- The specialized arm trusts the declared type: a DATE-typed operand holding a
+-- non-parseable string would return null where value sniffing raised
+-- `Unsupported temporal operation`. These pin the two ways a caller might try to
+-- manufacture such a value — write-side coercion rejects the insert outright, and a
+-- failed CAST yields NULL rather than the garbage string — so the divergence is not
+-- reachable through SQL. Only a misbehaving virtual table could produce one.
+-- ============================================================
+
+CREATE TABLE trust (id INTEGER PRIMARY KEY, dt DATE, sp TIMESPAN);
+-- run
+
+INSERT INTO trust VALUES (1, 'garbage', 'PT1H');
+-- error: Cannot convert 'garbage' to DATE
+
+INSERT INTO trust VALUES (2, '2024-01-15', 'PT1H');
+-- run
+
+-- a failed cast is NULL, so the null check answers before the declared type matters
+SELECT cast('garbage' as DATE) + sp AS r FROM trust;
+→ [{"r":null}]
+
+DROP TABLE trust;
+
+DROP TABLE arms;
 
 -- ============================================================
 -- Temporal arithmetic in WHERE clause (ensures dispatch path is exercised)

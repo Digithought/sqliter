@@ -1,0 +1,8 @@
+{
+	"maxWords": 12000,
+	"slackWords": 500,
+	"note": "Ratchet entries grandfather a doc that is over maxWords, recording its size at the time. A doc may shrink; it may grow only within `slackWords` of its recorded size, and that drift is reported on every run. Past the grace band the check fails: shrink the doc, or re-record with `node scripts/check-docs.mjs --update-ratchet --force` and say why in the commit message. `--update-ratchet` (no --force) only ever lowers, so total unforced growth stays bounded by `slackWords` for the life of an entry; run it after a doc shrinks. It also retires an entry once its doc measures at or below maxWords — the doc is then held to the same published cap as every other unratcheted doc, which is the point of the cap. A doc with no entry must come in under maxWords, which carries no grace band, and gets a notice (not a failure) once it is within `slackWords` of it, so the warning lands before the build turns red. See docs/doc-conventions.md.",
+	"ratchet": {
+		"docs/lens.md": 17934
+	}
+}

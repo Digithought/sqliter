@@ -20,7 +20,11 @@ describe('Sample plugins (package.json–centric)', () => {
 
   it('loads string-functions and executes reverse()', async () => {
     const url = fileUrlFromHere('../../sample-plugins/string-functions/index.js');
-    const manifest = await dynamicLoadModule(url, db, {});
+    // `db as any`: @quereus/plugin-loader's published types resolve `@quereus/quereus`
+    // to `dist/`, while this test's `Database` comes from `src/` — two structurally
+    // identical classes with distinct module identities. The cast bridges them without
+    // making the test depend on a freshly-built `dist/` artifact. See review handoff.
+    const manifest = await dynamicLoadModule(url, db as any, {});
     expect(manifest?.name ?? 'String Functions').to.be.a('string');
 
     const rows: any[] = [];
@@ -33,7 +37,7 @@ describe('Sample plugins (package.json–centric)', () => {
 
   it('loads custom-collations and sorts naturally with NUMERIC', async () => {
     const url = fileUrlFromHere('../../sample-plugins/custom-collations/index.js');
-    await dynamicLoadModule(url, db, {});
+    await dynamicLoadModule(url, db as any, {});
 
     await db.exec('CREATE TABLE files(name TEXT)');
     await db.exec("INSERT INTO files(name) VALUES ('file10'), ('file2'), ('file1')");
@@ -49,7 +53,7 @@ describe('Sample plugins (package.json–centric)', () => {
 
   it('loads comprehensive-demo and operates key_value_store', async () => {
     const url = fileUrlFromHere('../../sample-plugins/comprehensive-demo/index.js');
-    await dynamicLoadModule(url, db, { enable_debug: false });
+    await dynamicLoadModule(url, db as any, { enable_debug: false });
 
     await db.exec("CREATE TABLE kv (key TEXT, value TEXT) USING key_value_store(store = 'test')");
     await db.exec("INSERT INTO kv(key, value) VALUES ('a', '1')");

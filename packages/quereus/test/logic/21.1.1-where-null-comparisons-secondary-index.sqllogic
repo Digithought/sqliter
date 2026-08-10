@@ -1,0 +1,35 @@
+-- 21.1.1-where-null-comparisons-secondary-index.sqllogic
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Carved out of 21.1-where-null-comparisons: that file's three-valued-logic
+-- coverage, including "a NULL bound must not become a seek bound", is already
+-- made against the PRIMARY KEY column with no index DDL. This section repeats the
+-- same assertions one level down, on a column reachable only through a standalone
+-- secondary index, so it moves here instead of costing a backend without
+-- first-class CREATE INDEX the whole NULL-comparison file.
+--
+-- Subject: a NULL comparison against a SECONDARY-INDEXED column must not be pushed
+-- down as a seek bound either (key ordering sorts NULL below everything, so a
+-- pushed `> NULL` lower bound would wrongly match every row).
+
+create table wn (id integer primary key, val integer null, txt text null);
+insert into wn values (1, 10, 'a'), (2, null, 'b'), (3, 30, null), (4, null, null);
+
+create index wn_val on wn (val);
+
+select id from wn where val > null order by id;
+→ []
+
+select id from wn where null < val order by id;
+→ []
+
+select id from wn where val between null and 30 order by id;
+→ []
+
+-- Sanity: non-NULL bounds on the same column still seek correctly
+select id from wn where val between 10 and 30 order by id;
+→ [{"id":1},{"id":3}]
+
+drop index wn_val;
+drop table wn;

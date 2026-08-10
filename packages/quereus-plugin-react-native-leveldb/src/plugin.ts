@@ -92,7 +92,8 @@ export interface ReactNativeLevelDBPluginConfig {
 	moduleName?: string;
 
 	/**
-	 * Enable transaction isolation (read-your-own-writes, snapshot isolation).
+	 * Enable transaction isolation (read-committed + read-your-own-writes, no
+	 * write-write conflict detection — NOT snapshot isolation).
 	 * When true, wraps the store module with an isolation layer.
 	 * @default true
 	 */

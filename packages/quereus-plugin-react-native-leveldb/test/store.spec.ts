@@ -1,217 +1,15 @@
 /**
  * Tests for React Native LevelDB store implementation.
  *
- * Uses a mock LevelDB implementation to test the store without
- * requiring the actual rn-leveldb native module.
+ * Uses the shared mock LevelDB (`test/mock-leveldb.ts`) to test the store without
+ * requiring the actual rn-leveldb native module. The broader contract is covered by
+ * `test/conformance.spec.ts`, which drives the same mock through the shared
+ * `runKVStoreConformance` battery; these cases are the package's own targeted checks.
  */
 
 import { expect } from 'chai';
-import { ReactNativeLevelDBStore, type LevelDB, type LevelDBIterator, type LevelDBWriteBatch, type LevelDBWriteBatchConstructor } from '../src/store.js';
-
-/**
- * Mock WriteBatch implementation for testing.
- * Accumulates operations and applies them when write() is called on the db.
- */
-class MockLevelDBWriteBatch implements LevelDBWriteBatch {
-	private ops: Array<{ type: 'put'; key: ArrayBuffer; value: ArrayBuffer } | { type: 'del'; key: ArrayBuffer }> = [];
-
-	put(key: ArrayBuffer, value: ArrayBuffer): void {
-		this.ops.push({ type: 'put', key, value });
-	}
-
-	delete(key: ArrayBuffer): void {
-		this.ops.push({ type: 'del', key });
-	}
-
-	close(): void {
-		this.ops = [];
-	}
-
-	/** Internal method for MockLevelDB to get operations */
-	getOps(): Array<{ type: 'put'; key: ArrayBuffer; value: ArrayBuffer } | { type: 'del'; key: ArrayBuffer }> {
-		return this.ops;
-	}
-}
-
-/**
- * Mock LevelDB implementation for testing.
- * Simulates rn-leveldb's synchronous API.
- */
-class MockLevelDB implements LevelDB {
-	private data = new Map<string, ArrayBuffer>();
-	private closed = false;
-
-	put(key: ArrayBuffer | string, value: ArrayBuffer | string): void {
-		this.checkOpen();
-		const keyBuf = typeof key === 'string' ? this.stringToBuffer(key) : key;
-		const valueBuf = typeof value === 'string' ? this.stringToBuffer(value) : value;
-		this.data.set(this.keyToString(keyBuf), this.copyBuffer(valueBuf));
-	}
-
-	getBuf(key: ArrayBuffer | string): ArrayBuffer | null {
-		this.checkOpen();
-		const keyBuf = typeof key === 'string' ? this.stringToBuffer(key) : key;
-		const value = this.data.get(this.keyToString(keyBuf));
-		return value ? this.copyBuffer(value) : null;
-	}
-
-	delete(key: ArrayBuffer | string): void {
-		this.checkOpen();
-		const keyBuf = typeof key === 'string' ? this.stringToBuffer(key) : key;
-		this.data.delete(this.keyToString(keyBuf));
-	}
-
-	write(batch: LevelDBWriteBatch): void {
-		this.checkOpen();
-		// Cast to MockLevelDBWriteBatch to access getOps()
-		const mockBatch = batch as MockLevelDBWriteBatch;
-		for (const op of mockBatch.getOps()) {
-			if (op.type === 'put') {
-				this.put(op.key, op.value);
-			} else {
-				this.delete(op.key);
-			}
-		}
-	}
-
-	close(): void {
-		this.closed = true;
-	}
-
-	newIterator(): LevelDBIterator {
-		this.checkOpen();
-		return new MockLevelDBIterator(this.data);
-	}
-
-	private checkOpen(): void {
-		if (this.closed) {
-			throw new Error('Database is closed');
-		}
-	}
-
-	private keyToString(key: ArrayBuffer): string {
-		return Array.from(new Uint8Array(key)).join(',');
-	}
-
-	private copyBuffer(buffer: ArrayBuffer): ArrayBuffer {
-		const copy = new ArrayBuffer(buffer.byteLength);
-		new Uint8Array(copy).set(new Uint8Array(buffer));
-		return copy;
-	}
-
-	private stringToBuffer(str: string): ArrayBuffer {
-		const encoder = new TextEncoder();
-		return encoder.encode(str).buffer as ArrayBuffer;
-	}
-}
-
-/**
- * Mock iterator for testing.
- */
-class MockLevelDBIterator implements LevelDBIterator {
-	private entries: Array<{ key: ArrayBuffer; value: ArrayBuffer }> = [];
-	private index = -1;
-	private closed = false;
-
-	constructor(data: Map<string, ArrayBuffer>) {
-		// Convert map to sorted array of entries
-		for (const [keyStr, value] of data) {
-			const keyParts = keyStr.split(',').map(Number);
-			const key = new ArrayBuffer(keyParts.length);
-			new Uint8Array(key).set(keyParts);
-			this.entries.push({ key, value });
-		}
-		// Sort by key bytes
-		this.entries.sort((a, b) => {
-			const aBytes = new Uint8Array(a.key);
-			const bBytes = new Uint8Array(b.key);
-			const minLen = Math.min(aBytes.length, bBytes.length);
-			for (let i = 0; i < minLen; i++) {
-				if (aBytes[i] !== bBytes[i]) {
-					return aBytes[i] - bBytes[i];
-				}
-			}
-			return aBytes.length - bBytes.length;
-		});
-	}
-
-	valid(): boolean {
-		return !this.closed && this.index >= 0 && this.index < this.entries.length;
-	}
-
-	seek(target: ArrayBuffer | string): LevelDBIterator {
-		this.checkOpen();
-		const key = typeof target === 'string' ? this.stringToBuffer(target) : target;
-		const targetBytes = new Uint8Array(key);
-		this.index = this.entries.findIndex(entry => {
-			const entryBytes = new Uint8Array(entry.key);
-			return this.compareBytes(entryBytes, targetBytes) >= 0;
-		});
-		if (this.index === -1) {
-			this.index = this.entries.length; // Past end
-		}
-		return this;
-	}
-
-	seekToFirst(): LevelDBIterator {
-		this.checkOpen();
-		this.index = this.entries.length > 0 ? 0 : -1;
-		return this;
-	}
-
-	seekLast(): LevelDBIterator {
-		this.checkOpen();
-		this.index = this.entries.length > 0 ? this.entries.length - 1 : -1;
-		return this;
-	}
-
-	next(): void {
-		this.checkOpen();
-		this.index++;
-	}
-
-	prev(): void {
-		this.checkOpen();
-		this.index--;
-	}
-
-	keyBuf(): ArrayBuffer {
-		this.checkOpen();
-		if (!this.valid()) throw new Error('Iterator not valid');
-		return this.entries[this.index].key;
-	}
-
-	valueBuf(): ArrayBuffer {
-		this.checkOpen();
-		if (!this.valid()) throw new Error('Iterator not valid');
-		return this.entries[this.index].value;
-	}
-
-	close(): void {
-		this.closed = true;
-	}
-
-	private checkOpen(): void {
-		if (this.closed) {
-			throw new Error('Iterator is closed');
-		}
-	}
-
-	private compareBytes(a: Uint8Array, b: Uint8Array): number {
-		const minLen = Math.min(a.length, b.length);
-		for (let i = 0; i < minLen; i++) {
-			if (a[i] !== b[i]) {
-				return a[i] - b[i];
-			}
-		}
-		return a.length - b.length;
-	}
-
-	private stringToBuffer(str: string): ArrayBuffer {
-		const encoder = new TextEncoder();
-		return encoder.encode(str).buffer as ArrayBuffer;
-	}
-}
+import { ReactNativeLevelDBStore, type LevelDBWriteBatchConstructor } from '../src/store.js';
+import { MockLevelDB, MockLevelDBWriteBatch } from './mock-leveldb.js';
 
 describe('ReactNativeLevelDBStore', () => {
 	let store: ReactNativeLevelDBStore;
@@ -368,6 +166,29 @@ describe('ReactNativeLevelDBStore', () => {
 			expect(entries.length).to.equal(2);
 			expect(entries[0].key[0]).to.equal(2);
 			expect(entries[1].key[0]).to.equal(3);
+		});
+
+		// The native iterator must be released however the walk ends. Conformance tier 7
+		// checks the store stays usable after an abandoned scan, which a leaked MOCK
+		// iterator would not disturb — only the mock's own live-iterator count can see it.
+		it('should close the native iterator on exhaustion, break, and a consumer throw', async () => {
+			for await (const _entry of store.iterate()) { /* drain */ }
+			expect(mockDb.openIteratorCount()).to.equal(0, 'after exhaustion');
+
+			for await (const _entry of store.iterate()) {
+				break;
+			}
+			expect(mockDb.openIteratorCount()).to.equal(0, 'after break');
+
+			try {
+				for await (const _entry of store.iterate()) {
+					throw new Error('consumer boom');
+				}
+				expect.fail('Should have thrown');
+			} catch (e) {
+				expect((e as Error).message).to.equal('consumer boom');
+			}
+			expect(mockDb.openIteratorCount()).to.equal(0, 'after a consumer throw');
 		});
 	});
 

@@ -1250,7 +1250,7 @@ import { FanOutLookupJoinNode, type FanOutBranchSpec } from '../../src/planner/n
 import { PlanNode, type Attribute, type PhysicalProperties } from '../../src/planner/nodes/plan-node.js';
 import { PlanNodeType } from '../../src/planner/nodes/plan-node-type.js';
 import type { Scope } from '../../src/planner/scopes/scope.js';
-import type { BaseType, RelationType, ScalarType } from '../../src/common/datatype.js';
+import type { RelationType, ScalarType } from '../../src/common/datatype.js';
 import { validatePhysicalTree } from '../../src/planner/validation/plan-validator.js';
 
 const mockScope = { resolveSymbol: () => undefined } as unknown as Scope;
@@ -1286,7 +1286,7 @@ class MockRelNode extends PlanNode {
 		} as RelationType;
 	}
 
-	getType(): BaseType { return this._type; }
+	getType(): RelationType { return this._type; }
 	getChildren(): readonly PlanNode[] { return []; }
 	override getAttributes(): readonly Attribute[] { return this._attrs; }
 	override computePhysical(): Partial<PhysicalProperties> { return this._physicalOverride; }

@@ -85,9 +85,9 @@ export function loadEnvConfig(): PartialCoordinatorConfig {
   }
 
   // Sync settings
-  if (process.env.SYNC_TOMBSTONE_TTL) {
+  if (process.env.SYNC_RETENTION_HORIZON_MS) {
     config.sync = config.sync || {};
-    config.sync.tombstoneTTL = parseInt(process.env.SYNC_TOMBSTONE_TTL, 10);
+    config.sync.retentionHorizonMs = parseInt(process.env.SYNC_RETENTION_HORIZON_MS, 10);
   }
   if (process.env.SYNC_BATCH_SIZE) {
     config.sync = config.sync || {};

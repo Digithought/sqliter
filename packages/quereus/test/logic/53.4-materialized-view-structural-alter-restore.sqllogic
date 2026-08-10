@@ -1,0 +1,436 @@
+-- 53.4-materialized-view-structural-alter-restore.sqllogic — a STRUCTURAL source
+-- ALTER (ADD COLUMN / DROP COLUMN / ALTER COLUMN SET DATA TYPE / SET·DROP NOT NULL /
+-- SET COLLATE) keeps a dependent MV LIVE when the MV body provably never reads the
+-- altered column, instead of always marking it stale. This generalizes the
+-- constraint-only recompile of 53.3: the listener re-derives the backing shape AND —
+-- for a value-semantics ALTER (type/collation) — proves the change is DISJOINT from
+-- every source column the body reads (directly, in a WHERE/join/group/order position,
+-- or transitively through a generated column). Shape identity does NOT imply content
+-- identity for a structural ALTER, so the disjointness proof is what makes keep-live
+-- sound. Any failure falls back to today's mark-stale path; a stale MV serves its
+-- frozen snapshot (writes stop propagating) until REFRESH or drop-and-recreate.
+
+-- ===================================
+-- 1. ADD COLUMN unreferenced → live (the new column is invisible to the body)
+-- ===================================
+
+create table t1 (id integer primary key, u integer not null, v integer not null);
+insert into t1 values (1, 10, 100);
+create materialized view mv1 as select id, u from t1;
+
+alter table t1 add column w integer default 0;
+
+-- still live: the write propagates and the new column never reaches the MV
+insert into t1 (id, u, v) values (2, 20, 200);
+select * from mv1 order by id;
+→ [{"id":1,"u":10},{"id":2,"u":20}]
+
+drop materialized view mv1;
+drop table t1;
+
+-- ===================================
+-- 2. ADD COLUMN with a `select *` body → frozen; REFRESH reshapes
+-- ===================================
+
+create table t2 (id integer primary key, v integer not null);
+insert into t2 values (1, 10);
+create materialized view mv2 as select * from t2;
+
+alter table t2 add column w integer default 0;
+
+-- frozen: `select *` re-derives to 3 columns ⇒ shape mismatch ⇒ stale
+insert into t2 (id, v) values (2, 20);
+select * from mv2 order by id;
+→ [{"id":1,"v":10}]
+
+-- REFRESH reshapes the backing to the wider body (the added column backfilled to 0)
+refresh materialized view mv2;
+select * from mv2 order by id;
+→ [{"id":1,"v":10,"w":0},{"id":2,"v":20,"w":0}]
+
+drop materialized view mv2;
+drop table t2;
+
+-- ===================================
+-- 3. DROP COLUMN unreferenced → live
+-- ===================================
+
+create table t3 (id integer primary key, u integer not null, v integer not null);
+insert into t3 values (1, 10, 100);
+create materialized view mv3 as select id, u from t3;
+
+alter table t3 drop column v;
+
+-- still live: the body reads id,u (never v); re-derives the identical shape
+insert into t3 (id, u) values (2, 20);
+select * from mv3 order by id;
+→ [{"id":1,"u":10},{"id":2,"u":20}]
+
+drop materialized view mv3;
+drop table t3;
+
+-- ===================================
+-- 4. DROP COLUMN referenced (in projection) → frozen; recover via drop-and-recreate
+-- ===================================
+
+create table t4 (id integer primary key, u integer not null, v integer not null);
+insert into t4 values (1, 10, 100);
+create materialized view mv4 as select id, v from t4;
+
+alter table t4 drop column v;
+insert into t4 (id, u) values (2, 20);
+
+-- stale: the body references the dropped column, so the next reference re-validates
+-- the body, which no longer plans (v is gone) → the staleness diagnostic
+select id from mv4 order by id;
+-- error: drop and recreate
+
+-- drop-and-recreate (over a body that no longer names v) recovers
+drop materialized view mv4;
+create materialized view mv4 as select id, u from t4;
+select * from mv4 order by id;
+→ [{"id":1,"u":10},{"id":2,"u":20}]
+
+drop materialized view mv4;
+drop table t4;
+
+-- ===================================
+-- 5. DROP COLUMN with a `select *` body → frozen
+-- ===================================
+
+create table t5 (id integer primary key, v integer not null, x integer);
+insert into t5 values (1, 10, 1000);
+create materialized view mv5 as select * from t5;
+
+alter table t5 drop column x;
+
+-- frozen: `select *` re-derives to fewer columns ⇒ shape mismatch ⇒ stale
+insert into t5 (id, v) values (2, 20);
+select id, v from mv5 order by id;
+→ [{"id":1,"v":10}]
+
+drop materialized view mv5;
+drop table t5;
+
+-- ===================================
+-- 6. ALTER COLUMN SET DATA TYPE on an unprojected, UNREFERENCED column → live
+-- ===================================
+
+create table t6 (id integer primary key, u integer not null, v integer not null);
+insert into t6 values (1, 10, 100);
+create materialized view mv6 as select id, u from t6;
+
+alter table t6 alter column v set data type real;
+
+-- live: v is neither projected nor read ⇒ value-semantics change is disjoint
+insert into t6 (id, u, v) values (2, 20, 200);
+select * from mv6 order by id;
+→ [{"id":1,"u":10},{"id":2,"u":20}]
+
+drop materialized view mv6;
+drop table t6;
+
+-- ===================================
+-- 7. ALTER COLUMN SET DATA TYPE on a PROJECTED column → frozen; REFRESH reshapes
+--    (parity with case 8 of 53.3 — the output column type shifts)
+-- ===================================
+
+create table t7 (id integer primary key, v integer not null);
+insert into t7 values (1, 5);
+create materialized view mv7 as select id, v from t7;
+
+alter table t7 alter column v set data type real;
+
+-- frozen: the projected column's output type shifts ⇒ shape mismatch ⇒ stale
+insert into t7 values (2, 6);
+select id from mv7 order by id;
+→ [{"id":1}]
+
+-- REFRESH reshapes the backing column to the new type
+refresh materialized view mv7;
+select id from mv7 order by id;
+→ [{"id":1},{"id":2}]
+
+drop materialized view mv7;
+drop table t7;
+
+-- ===================================
+-- 8. ALTER COLUMN SET DATA TYPE on an unprojected WHERE column → frozen
+--    (shape identical, but the content-stability gate proves it is READ)
+-- ===================================
+
+create table t8 (id integer primary key, u integer not null, v integer not null);
+insert into t8 values (1, 10, 5), (2, 20, 50);
+create materialized view mv8 as select id, u from t8 where v > 10;
+select * from mv8 order by id;
+→ [{"id":2,"u":20}]
+
+alter table t8 alter column v set data type real;
+
+-- frozen: v is unprojected (shape unchanged) but READ in WHERE ⇒ disjointness fails
+insert into t8 (id, u, v) values (3, 30, 100);
+select * from mv8 order by id;
+→ [{"id":2,"u":20}]
+
+drop materialized view mv8;
+drop table t8;
+
+-- ===================================
+-- 9. ALTER COLUMN SET COLLATE on an unprojected WHERE column → frozen
+--    (NOCASE flips which rows the predicate admits — the canonical
+--    content-changes-but-shape-doesn't proof). REFRESH recovers under the new collation.
+-- ===================================
+
+create table t9 (id integer primary key, u integer not null, name text not null);
+insert into t9 values (1, 10, 'apple'), (2, 20, 'APPLE');
+create materialized view mv9 as select id, u from t9 where name = 'apple';
+-- under BINARY only the exact-case row matches
+select * from mv9 order by id;
+→ [{"id":1,"u":10}]
+
+alter table t9 alter column name set collate nocase;
+
+-- frozen: name is unprojected (shape unchanged) but READ in WHERE ⇒ disjointness fails.
+-- The keep-live path would have served the BINARY-era row set even as the predicate's
+-- meaning changed — the divergence the proof prevents.
+insert into t9 (id, u, name) values (3, 30, 'apple');
+select * from mv9 order by id;
+→ [{"id":1,"u":10}]
+
+-- REFRESH re-derives under NOCASE: now 'apple', 'APPLE', and 'apple' all match
+refresh materialized view mv9;
+select * from mv9 order by id;
+→ [{"id":1,"u":10},{"id":2,"u":20},{"id":3,"u":30}]
+
+drop materialized view mv9;
+drop table t9;
+
+-- ===================================
+-- 10. ALTER COLUMN SET COLLATE on a fully UNREFERENCED column → live
+-- ===================================
+
+create table t10 (id integer primary key, u integer not null, name text not null);
+insert into t10 values (1, 10, 'apple');
+create materialized view mv10 as select id, u from t10;
+
+alter table t10 alter column name set collate nocase;
+
+-- live: name is neither projected nor read ⇒ disjoint ⇒ writes keep propagating
+insert into t10 (id, u, name) values (2, 20, 'BANANA');
+select * from mv10 order by id;
+→ [{"id":1,"u":10},{"id":2,"u":20}]
+
+drop materialized view mv10;
+drop table t10;
+
+-- ===================================
+-- 11. ALTER COLUMN DROP NOT NULL on an unprojected column → live
+--     (NOT NULL is content-irrelevant; the value-semantics-changed set is empty)
+-- ===================================
+
+create table t11 (id integer primary key, u integer not null, v integer not null);
+insert into t11 values (1, 10, 100);
+create materialized view mv11 as select id, u from t11;
+
+alter table t11 alter column v drop not null;
+
+-- live: a NOT NULL change cannot alter an existing value; v unprojected/unread
+insert into t11 (id, u) values (2, 20);
+select * from mv11 order by id;
+→ [{"id":1,"u":10},{"id":2,"u":20}]
+
+drop materialized view mv11;
+drop table t11;
+
+-- ===================================
+-- 12. ALTER COLUMN SET NOT NULL on a PROJECTED column → frozen
+--     (output nullability shifts ⇒ shape mismatch)
+-- ===================================
+
+create table t12 (id integer primary key, v integer null);
+insert into t12 values (1, 5);
+create materialized view mv12 as select id, v from t12;
+
+alter table t12 alter column v set not null;
+
+-- frozen: the projected column's output nullability shifts ⇒ shape mismatch ⇒ stale
+insert into t12 values (2, 6);
+select id from mv12 order by id;
+→ [{"id":1}]
+
+drop materialized view mv12;
+drop table t12;
+
+-- ===================================
+-- 13. Generated-column indirection: body projects g (generated from v) but never
+--     names v; ALTER COLUMN v type → frozen via the transitive-closure proof.
+--     Without the closure this would be UNSOUND (live with stale g values).
+-- ===================================
+
+create table t13 (id integer primary key, v integer not null, g integer generated always as (v * 2) stored);
+insert into t13 (id, v) values (1, 5);
+create materialized view mv13 as select id, g from t13;
+select * from mv13 order by id;
+→ [{"id":1,"g":10}]
+
+alter table t13 alter column v set data type real;
+
+-- frozen: v is read transitively through the generated column g ⇒ disjointness fails
+insert into t13 (id, v) values (2, 6);
+select id from mv13 order by id;
+→ [{"id":1}]
+
+drop materialized view mv13;
+drop table t13;
+
+-- ===================================
+-- 14. Self-join over the altered source, altered column read via one alias → frozen
+-- ===================================
+
+create table t14 (id integer primary key, u integer not null, v integer not null);
+insert into t14 values (1, 10, 2), (2, 20, 1);
+create materialized view mv14 as select a.id, a.u from t14 a join t14 b on a.v = b.id;
+select * from mv14 order by id;
+→ [{"id":1,"u":10},{"id":2,"u":20}]
+
+alter table t14 alter column v set data type real;
+
+-- frozen: v is read via alias `a` in the join predicate (union over self-join occurrences)
+insert into t14 (id, u, v) values (3, 30, 1);
+select * from mv14 order by id;
+→ [{"id":1,"u":10},{"id":2,"u":20}]
+
+drop materialized view mv14;
+drop table t14;
+
+-- ===================================
+-- 15. Multi-dependent independence: one ALTER, two dependents — the one that reads
+--     the altered column freezes, the sibling that does not stays live.
+-- ===================================
+
+create table t15 (id integer primary key, u integer not null, v integer not null);
+insert into t15 values (1, 10, 100);
+create materialized view mv15_reads as select id, u from t15 where v > 50;
+create materialized view mv15_noreads as select id, u from t15;
+
+alter table t15 alter column v set data type real;
+insert into t15 (id, u, v) values (2, 20, 200);
+
+-- the WHERE-v dependent froze
+select * from mv15_reads order by id;
+→ [{"id":1,"u":10}]
+
+-- the sibling that never reads v stayed live
+select * from mv15_noreads order by id;
+→ [{"id":1,"u":10},{"id":2,"u":20}]
+
+drop materialized view mv15_reads;
+drop materialized view mv15_noreads;
+drop table t15;
+
+-- ===================================
+-- 16. Pre-existing staleness is never cleared by a structural ALTER:
+--     a projected retype stales the MV; a later (disjoint) ADD COLUMN must NOT
+--     revive it — only REFRESH recovers (mirror of case 8 of 53.3).
+-- ===================================
+
+create table t16 (id integer primary key, v integer not null);
+insert into t16 values (1, 5);
+create materialized view mv16 as select id, v from t16;
+
+alter table t16 alter column v set data type real;
+
+-- frozen: the write does not propagate
+insert into t16 values (2, 6);
+select id from mv16 order by id;
+→ [{"id":1}]
+
+-- a disjoint structural ALTER (ADD COLUMN) must NOT revive a pre-existing stale flag
+alter table t16 add column w integer default 0;
+insert into t16 (id, v) values (3, 7);
+select id from mv16 order by id;
+→ [{"id":1}]
+
+-- REFRESH recovers (reshapes the backing to the retyped column)
+refresh materialized view mv16;
+select id from mv16 order by id;
+→ [{"id":1},{"id":2},{"id":3}]
+
+drop materialized view mv16;
+drop table t16;
+
+-- ===================================
+-- 17a. MV-over-MV: a structural ALTER on the base that keeps the producer LIVE keeps
+--      BOTH levels live (the keep-live path emits no backing invalidation, so the
+--      consumer never sees a spurious staleness cascade).
+-- ===================================
+
+create table b17 (id integer primary key, u integer not null, v integer not null);
+insert into b17 values (1, 10, 100);
+create materialized view mv17a as select id, u from b17;
+create materialized view mv17b as select id, u from mv17a;
+
+alter table b17 alter column v set data type real;
+
+insert into b17 (id, u, v) values (2, 20, 200);
+select * from mv17a order by id;
+→ [{"id":1,"u":10},{"id":2,"u":20}]
+select * from mv17b order by id;
+→ [{"id":1,"u":10},{"id":2,"u":20}]
+
+drop materialized view mv17b;
+drop materialized view mv17a;
+drop table b17;
+
+-- ===================================
+-- 17b. MV-over-MV: a structural ALTER that STALES the producer cascades to the
+--      consumer via emitBackingInvalidation. The synthetic same-object table_modified
+--      is deliberately NOT intercepted by the keep-live recompile (the
+--      `oldObject !== newObject` guard) — THE load-bearing constraint. Both freeze.
+-- ===================================
+
+create table b18 (id integer primary key, v integer not null);
+insert into b18 values (1, 5);
+create materialized view mv18a as select id, v from b18;
+create materialized view mv18b as select id, v from mv18a;
+
+alter table b18 alter column v set data type real;
+
+insert into b18 values (2, 6);
+select id from mv18a order by id;
+→ [{"id":1}]
+select id from mv18b order by id;
+→ [{"id":1}]
+
+drop materialized view mv18b;
+drop materialized view mv18a;
+drop table b18;
+
+-- ===================================
+-- 18. Content gate reaches a NESTED relation: the altered column is read ONLY
+--     inside a correlated subquery (neither projected nor in a top-level WHERE).
+--     The read-set walk must recurse through `getRelations` into the subquery to
+--     see the correlated reference — otherwise the MV would be wrongly kept live
+--     (unsound: serving the pre-ALTER row set). Mirror of case 14 for nesting
+--     rather than a self-join.
+-- ===================================
+
+create table t19 (id integer primary key, u integer not null, v integer not null);
+create table keys19 (k integer primary key);
+insert into t19 values (1, 10, 5), (2, 20, 6);
+insert into keys19 values (5);
+create materialized view mv19 as select id, u from t19 where exists (select 1 from keys19 where keys19.k = t19.v);
+select * from mv19 order by id;
+→ [{"id":1,"u":10}]
+
+alter table t19 alter column v set data type real;
+
+-- frozen: t19.v is read only via the correlated reference inside the EXISTS subquery,
+-- reached through the read-set walk's recursion into nested relations ⇒ disjointness fails
+insert into t19 (id, u, v) values (3, 30, 5);
+select * from mv19 order by id;
+→ [{"id":1,"u":10}]
+
+drop materialized view mv19;
+drop table keys19;
+drop table t19;

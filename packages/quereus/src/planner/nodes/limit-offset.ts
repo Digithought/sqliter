@@ -7,7 +7,8 @@ import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import type { LimitCapable } from '../framework/characteristics.js';
 import { CastNode, CollateNode, LiteralNode } from './scalar.js';
-import { mergeFds, singletonFd } from '../util/fd-utils.js';
+import { addSingletonFd } from '../util/fd-utils.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 
 /**
  * Represents a LIMIT/OFFSET operation.
@@ -15,6 +16,7 @@ import { mergeFds, singletonFd } from '../util/fd-utils.js';
  */
 export class LimitOffsetNode extends PlanNode implements UnaryRelationalNode, LimitCapable {
 	override readonly nodeType = PlanNodeType.LimitOffset;
+	readonly isLimitCapable = true as const;
 
 	constructor(
 		scope: Scope,
@@ -23,9 +25,9 @@ export class LimitOffsetNode extends PlanNode implements UnaryRelationalNode, Li
 		public readonly offset: ScalarPlanNode | undefined,
 		estimatedCostOverride?: number
 	) {
-		// Cost is proportional to offset + limit (rows we need to process)
-		// We assume limit and offset are constants, but in practice they could be expressions
-		super(scope, estimatedCostOverride ?? source.getTotalCost());
+		// Self-cost only: the source (and limit/offset exprs) flow in via
+		// getChildren(). Slicing rows is negligible self work.
+		super(scope, estimatedCostOverride ?? 0.01);
 	}
 
 	// LimitCapable interface
@@ -86,7 +88,15 @@ export class LimitOffsetNode extends PlanNode implements UnaryRelationalNode, Li
 	}
 
 	get estimatedRows(): number | undefined {
-		const sourceRows = this.source.estimatedRows;
+		return this.rowsFrom(this.source.estimatedRows);
+	}
+
+	/**
+	 * The LIMIT/OFFSET row estimate as a pure function of the source cardinality,
+	 * shared by the logical getter and `computePhysical` (which feeds it the
+	 * PHYSICAL source count) so the two cannot drift apart.
+	 */
+	private rowsFrom(sourceRows: number | undefined): number | undefined {
 		if (sourceRows === undefined) return undefined;
 
 		const limit = this.constantLimit();
@@ -113,14 +123,11 @@ export class LimitOffsetNode extends PlanNode implements UnaryRelationalNode, Li
 		let fds = sourcePhysical?.fds;
 		const limit = this.constantLimit();
 		if (limit !== undefined && limit <= 1) {
-			const singleton = singletonFd(this.getAttributes().length);
-			if (singleton !== undefined) {
-				fds = mergeFds(sourcePhysical?.fds ?? [], [singleton]);
-			}
+			fds = addSingletonFd(sourcePhysical?.fds ?? [], this.getAttributes().length);
 		}
 
 		return {
-			estimatedRows: this.estimatedRows,
+			estimatedRows: this.rowsFrom(physicalSourceRows(sourcePhysical, this.source)),
 			ordering: sourcePhysical?.ordering,
 			// LIMIT/OFFSET preserves FDs/ECs/bindings — slicing rows doesn't break
 			// per-row determinations.
@@ -128,6 +135,8 @@ export class LimitOffsetNode extends PlanNode implements UnaryRelationalNode, Li
 			equivClasses: sourcePhysical?.equivClasses,
 			constantBindings: sourcePhysical?.constantBindings,
 			domainConstraints: sourcePhysical?.domainConstraints,
+			// Slicing rows keeps a per-row inclusion claim — INDs pass through.
+			inds: sourcePhysical?.inds,
 			// LIMIT/OFFSET preserves monotonicOn — slicing a sorted prefix preserves ordering.
 			monotonicOn: sourcePhysical?.monotonicOn,
 		};

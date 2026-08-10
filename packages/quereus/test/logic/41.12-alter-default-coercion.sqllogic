@@ -1,0 +1,200 @@
+-- ALTER backfill DEFAULTs are converted to the column's declared type.
+--
+-- A backfilled cell must be indistinguishable from the cell a fresh INSERT under
+-- the same DEFAULT would produce — same value, same typeof — for the literal
+-- ADD COLUMN path, the per-row `new.<col>` evaluator path, and the SET NOT NULL
+-- backfill. Runs under both the memory module (`yarn test`) and the store module
+-- (`yarn test:store`); `typeof(...)` reads the stored value, so it is
+-- module-agnostic.
+
+-- ============================================================
+-- 1. ADD COLUMN, literal default whose type differs from the column's
+-- ============================================================
+
+create table t_lit (a integer primary key, b integer);
+insert into t_lit values (1, 10);
+-- run
+
+alter table t_lit add column n integer default '7';
+-- run
+
+-- Row 2 is inserted AFTER the ALTER, so the same DEFAULT applies through the
+-- ordinary write path. Both rows must agree on value and on typeof.
+insert into t_lit (a, b) values (2, 20);
+-- run
+
+select a, n, typeof(n) as t from t_lit order by a;
+→ [{"a":1,"n":7,"t":"integer"},{"a":2,"n":7,"t":"integer"}]
+
+drop table t_lit;
+-- run
+
+-- Signed numeric default (a UnaryExpr, not a bare literal) on a REAL column.
+create table t_neg (a integer primary key, b integer);
+insert into t_neg values (1, 10);
+-- run
+
+alter table t_neg add column n real default -123.0;
+-- run
+
+insert into t_neg (a, b) values (2, 20);
+-- run
+
+-- `typeof` reports the stored VALUE's storage class, and an integral REAL reads back
+-- as 'integer' — on both rows, which is the point: backfill and insert agree.
+select a, n, typeof(n) as t from t_neg order by a;
+→ [{"a":1,"n":-123,"t":"integer"},{"a":2,"n":-123,"t":"integer"}]
+
+drop table t_neg;
+-- run
+
+-- ============================================================
+-- 2. ADD COLUMN, literal default on a JSON column
+--
+-- The DEFAULT's raw source text ('"abc"') is not the stored form any write path
+-- produces — the stored form is the parsed JSON scalar (abc).
+-- ============================================================
+
+create table t_json (a integer primary key, b integer);
+insert into t_json values (1, 10);
+-- run
+
+alter table t_json add column n json default '"abc"';
+-- run
+
+insert into t_json (a, b) values (2, 20);
+-- run
+
+select a, n from t_json order by a;
+→ [{"a":1,"n":"abc"},{"a":2,"n":"abc"}]
+
+drop table t_json;
+-- run
+
+-- ============================================================
+-- 2b. ADD COLUMN, literal default on temporal columns
+--
+-- A temporal type's parse CANONICALIZES, so the backfilled cell must hold the
+-- canonical spelling (the one `set data type` rewrites to and an INSERT stores),
+-- not the DEFAULT's raw source text.
+-- ============================================================
+
+create table t_temporal (a integer primary key, b integer);
+insert into t_temporal values (1, 10);
+-- run
+
+alter table t_temporal add column d date default '2024-06-05T00:00:00Z';
+-- run
+
+alter table t_temporal add column sp timespan default '1 hour';
+-- run
+
+insert into t_temporal (a, b) values (2, 20);
+-- run
+
+select a, d, sp from t_temporal order by a;
+→ [{"a":1,"d":"2024-06-05","sp":"PT1H"},{"a":2,"d":"2024-06-05","sp":"PT1H"}]
+
+drop table t_temporal;
+-- run
+
+-- ============================================================
+-- 3. ADD COLUMN, per-row `new.<col>` evaluator default across types
+-- ============================================================
+
+create table t_eval (a integer primary key, b text);
+insert into t_eval values (1, '7');
+-- run
+
+alter table t_eval add column n integer default (new.b);
+-- run
+
+insert into t_eval (a, b) values (2, '20');
+-- run
+
+select a, n, typeof(n) as t from t_eval order by a;
+→ [{"a":1,"n":7,"t":"integer"},{"a":2,"n":20,"t":"integer"}]
+
+drop table t_eval;
+-- run
+
+-- ============================================================
+-- 4. Regression guard: identity case must NOT be re-converted
+--
+-- When the default expression's static type already IS the new column's type,
+-- the evaluated value is ALREADY in stored form and must be copied verbatim.
+-- JSON's parse reads a plain JS string as JSON *source*, so a blanket coercion
+-- would turn the stored text `9` into the number 9 and throw on stored `abc`.
+-- ============================================================
+
+create table t_ident (a integer primary key, j json);
+insert into t_ident values (1, '"abc"'), (2, '9');
+-- run
+
+select a, j from t_ident order by a;
+→ [{"a":1,"j":"abc"},{"a":2,"j":9}]
+
+alter table t_ident add column k json default (new.j);
+-- run
+
+select a, k from t_ident order by a;
+→ [{"a":1,"k":"abc"},{"a":2,"k":9}]
+
+drop table t_ident;
+-- run
+
+-- ============================================================
+-- 5. ALTER COLUMN ... SET NOT NULL backfills the converted DEFAULT
+-- ============================================================
+
+create table t_snn (a integer primary key, b integer null default '5');
+insert into t_snn (a, b) values (1, null);
+-- run
+
+alter table t_snn alter column b set not null;
+-- run
+
+select a, b, typeof(b) as t from t_snn order by a;
+→ [{"a":1,"b":5,"t":"integer"}]
+
+-- The backfilled cell matches what an INSERT letting the DEFAULT apply stores.
+insert into t_snn (a) values (2);
+-- run
+
+select a, b, typeof(b) as t from t_snn order by a;
+→ [{"a":1,"b":5,"t":"integer"},{"a":2,"b":5,"t":"integer"}]
+
+drop table t_snn;
+-- run
+
+-- ============================================================
+-- 6. An unconvertible literal default rejects the ALTER
+--
+-- Same MISMATCH the equivalent INSERT raises, and — deliberately — regardless of
+-- how many rows the table happens to hold, so DDL acceptance does not depend on
+-- the data.
+-- ============================================================
+
+create table t_bad (a integer primary key);
+insert into t_bad values (1);
+-- run
+
+alter table t_bad add column n integer default 'abc';
+-- error: Type conversion failed
+
+-- The column was not added.
+select * from t_bad order by a;
+→ [{"a":1}]
+
+drop table t_bad;
+-- run
+
+-- Empty table: same rejection.
+create table t_bad_empty (a integer primary key);
+-- run
+
+alter table t_bad_empty add column n integer default 'abc';
+-- error: Type conversion failed
+
+drop table t_bad_empty;
+-- run

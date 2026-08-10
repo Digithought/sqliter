@@ -12,11 +12,12 @@
  *
  * Usage:
  *   import { createSyncModule } from '@quereus/sync';
- *   import { LevelDBModule, StoreEventEmitter } from '@quereus/store';
+ *   import { LevelDBStore } from '@quereus/store';
  *
- *   const storeEvents = new StoreEventEmitter();
  *   const kv = await LevelDBStore.open({ path: './sync-metadata' });
- *   const { syncManager, syncEvents } = await createSyncModule(kv, storeEvents);
+ *   // `db` is the engine Database; it captures local changes at the
+ *   // transaction boundary. Omit transactionSource for a relay-only deployment.
+ *   const { syncManager, syncEvents } = await createSyncModule(kv, { transactionSource: db });
  */
 
 // Clock module
@@ -26,7 +27,10 @@ export {
   HLCManager,
   compareHLC,
   hlcEquals,
+  maxHLC,
   createHLC,
+  deterministicTxnId,
+  MAX_OPSEQ,
   serializeHLC,
   deserializeHLC,
   // HLC JSON serialization (for schema seeds and transport)
@@ -56,6 +60,8 @@ export {
   type Change,
   // Schema types
   type SchemaMigrationType,
+  type SchemaObjectKind,
+  migrationObjectKind,
   type SchemaMigration,
   // Transaction types
   type ChangeSet,
@@ -65,7 +71,10 @@ export {
   type ColumnVersionEntry,
   type TableSnapshot,
   type Snapshot,
+  type SnapshotTombstone,
   type PeerSyncState,
+  // Snapshot wire-format gate (both apply paths refuse a mismatched stamp)
+  SNAPSHOT_WIRE_FORMAT_VERSION,
   // Streaming snapshot types
   type SnapshotChunkType,
   type SnapshotHeaderChunk,
@@ -86,10 +95,77 @@ export {
   type ConflictContext,
   type ConflictResolution,
   type ConflictResolver,
+  // Unknown-table disposition
+  type UnknownTableDisposition,
+  // Basis-table eviction
+  type BasisEvictionConfig,
+  type DropLocalTableCallback,
   // Configuration
   type SyncConfig,
   DEFAULT_SYNC_CONFIG,
 } from './sync/protocol.js';
+
+// Wire protocol - shared transport/JSON layer (base64 helpers, Serialized* types,
+// codec fns, message envelopes, PROTOCOL_VERSION). Single source of truth for the
+// format the sync client and coordinator exchange.
+export {
+  // Version
+  PROTOCOL_VERSION,
+  // Base64 + HLC transport helpers
+  bytesToBase64,
+  base64ToBytes,
+  serializeHLCForTransport,
+  deserializeHLCFromTransport,
+  // Serialized (JSON-shape) types
+  type SerializedChangeSet,
+  type SerializedChange,
+  type SerializedSchemaMigration,
+  type SerializedSnapshotChunk,
+  type SerializedSnapshotHeaderChunk,
+  type SerializedSnapshotTableStartChunk,
+  type SerializedSnapshotColumnVersionsChunk,
+  type SerializedSnapshotTombstoneChunk,
+  type SerializedSnapshotTableEndChunk,
+  type SerializedSnapshotSchemaMigrationChunk,
+  type SerializedSnapshotFooterChunk,
+  type SerializedSnapshotCheckpoint,
+  // Codec functions
+  serializeChangeSet,
+  deserializeChangeSet,
+  serializeSnapshotChunk,
+  deserializeSnapshotChunk,
+  serializeSnapshotCheckpoint,
+  deserializeSnapshotCheckpoint,
+  // Message unions + per-message interfaces
+  type ClientMessage,
+  type HandshakeMessage,
+  type GetChangesMessage,
+  type ApplyChangesMessage,
+  type GetSnapshotMessage,
+  type ResumeSnapshotMessage,
+  type PingMessage,
+  type ServerMessage,
+  type HandshakeAckMessage,
+  type ChangesMessage,
+  type PushChangesMessage,
+  type ApplyResultMessage,
+  type SnapshotChunkMessage,
+  type SnapshotCompleteMessage,
+  type RequestChangesMessage,
+  type ErrorMessage,
+  type PongMessage,
+} from './sync/wire.js';
+
+// Host-driven maintenance pass. The library still schedules nothing — this is
+// only the shape of one pass (ordering, error isolation, single-flight); the
+// host arms the timer around it.
+export {
+  SYNC_MAINTENANCE_INTERVAL_MS,
+  type SyncMaintenanceTarget,
+  type MaintenanceLogger,
+  runSyncMaintenancePass,
+  createSyncMaintenanceTicker,
+} from './sync/maintenance.js';
 
 // Built-in conflict resolvers
 export {
@@ -105,12 +181,16 @@ export { SyncManagerImpl } from './sync/sync-manager-impl.js';
 // Store adapter for applying remote changes
 export { createStoreAdapter, type SyncStoreAdapterOptions } from './sync/store-adapter.js';
 
+// In-SQL introspection TVF (opt-in: host calls after createSyncModule)
+export { registerBasisLifecycleTvf } from './sql/basis-lifecycle-tvf.js';
+
 // Factory function
 export {
   createSyncModule,
   type CreateSyncModuleResult,
   type CreateSyncModuleOptions,
   type GetTableSchemaCallback,
+  type TransactionCommitSource,
 } from './create-sync-module.js';
 
 // Reactive events
@@ -118,6 +198,11 @@ export {
   type RemoteChangeEvent,
   type LocalChangeEvent,
   type ConflictEvent,
+  type UnknownTableEvent,
+  type AssertionViolationEvent,
+  type BasisTableLifecycleEvent,
+  type BasisTableEvictedEvent,
+  type HeldChangesDrainedEvent,
   type SyncState,
   type Unsubscribe,
   type SyncEventEmitter,
@@ -132,15 +217,24 @@ export {
   buildTombstoneKey,
   buildTransactionKey,
   buildPeerStateKey,
+  buildPeerSentStateKey,
   buildSchemaMigrationKey,
   buildColumnVersionScanBounds,
   buildTableColumnVersionScanBounds,
   buildTombstoneScanBounds,
   buildSchemaMigrationScanBounds,
-  encodePK,
-  decodePK,
+  // Pk identity (what per-row metadata is filed under; the raw pk lives in record values)
+  type PkKeying,
+  type PkKeyingResolver,
+  encodePkIdentity,
+  encodeRawPkIdentity,
+  resolvePkKeying,
+  createPkKeyingResolver,
+  makePkIdentityEncoder,
+  SYNC_METADATA_FORMAT_VERSION,
   // Column versions
   type ColumnVersion,
+  type ColumnVersionData,
   ColumnVersionStore,
   serializeColumnVersion,
   deserializeColumnVersion,
@@ -152,6 +246,27 @@ export {
   TombstoneStore,
   serializeTombstone,
   deserializeTombstone,
+  // Quarantine (held out-of-basis straggler changes)
+  type QuarantineEntry,
+  QuarantineStore,
+  serializeQuarantineEntry,
+  deserializeQuarantineEntry,
+  buildQuarantineKey,
+  buildQuarantineScanBounds,
+  // Basis-table lifecycle (legacy-table retirement bookkeeping)
+  type BasisLifecycleState,
+  type BasisTableLifecycleRecord,
+  type EvictPolicy,
+  BasisLifecycleStore,
+  classifyBasisLifecycle,
+  parseEvictPolicyTag,
+  effectiveEvictHorizonMs,
+  quietSince,
+  isEvictable,
+  serializeBasisLifecycleRecord,
+  deserializeBasisLifecycleRecord,
+  buildBasisLifecycleKey,
+  buildAllBasisLifecycleScanBounds,
   // Peer state
   type PeerState,
   PeerStateStore,

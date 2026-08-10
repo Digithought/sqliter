@@ -14,11 +14,20 @@ import { Scheduler } from "../../runtime/scheduler.js";
 import { analyzeRowSpecific } from "../../planner/analysis/constraint-extractor.js";
 import { Parser } from "../../parser/parser.js";
 import * as AST from "../../parser/ast.js";
+import { astToString } from "../../emit/ast-stringify.js";
 import { GlobalScope } from "../../planner/scopes/global.js";
 import { ParameterScope } from "../../planner/scopes/param.js";
+import { computeBasisBackfill } from "../../schema/basis-backfill.js";
+import { computeSchemaHash } from "../../schema/schema-hasher.js";
 import type { PlanningContext } from "../../planner/planning-context.js";
 import { BuildTimeDependencyTracker } from "../../planner/planning-context.js";
 import { buildBlock } from "../../planner/building/block.js";
+import { resolveBaseSite } from "../../planner/analysis/update-lineage.js";
+import type { LensSlot } from "../../schema/lens.js";
+import { createLogger } from "../../common/logger.js";
+import { splitBaseKey } from "../../util/qualified-name.js";
+
+const log = createLogger('func:builtins:explain');
 
 interface NamedSchemaLike {
 	name: string;
@@ -228,8 +237,11 @@ export const schedulerProgramFunc = createIntegratedTableValuedFunction(
 			// Parse and plan the SQL to get the actual plan tree
 			const plan = db.getPlan(sql);
 
-			// Emit the plan to get the instruction tree
-			const emissionContext = new EmissionContext(db);
+			// Emit the plan to get the instruction tree. Unfused: this TVF exists to show
+			// the instruction graph, and execution_trace() joins against it by instruction
+			// index — both must report the same (full, sub-program) form. Scalar fusion
+			// would dissolve scalar sub-programs into single fused(...) instructions.
+			const emissionContext = new EmissionContext(db, { fuseScalars: false });
 			const rootInstruction = emitPlanNode(plan, emissionContext);
 
 			// Create a scheduler to get the instruction sequence
@@ -459,6 +471,10 @@ export const executionTraceFunc = createIntegratedTableValuedFunction(
 			let stmt: ReturnType<Database['prepare']> | undefined;
 			try {
 				stmt = db.prepare(sql);
+				// Trace the UNFUSED graph so instruction indices line up with the
+				// scheduler_program() rows joined above. Compile is deferred, so setting
+				// this right after prepare is race-free (see Statement._emitUnfused).
+				stmt._emitUnfused = true;
 
 				// Execute the query with tracing to collect actual instruction events
 				const results: Row[] = [];
@@ -713,6 +729,243 @@ export const schemaSizeFunc = createIntegratedTableValuedFunction(
 	}
 );
 
+// Effective-lens introspection: the composed read body + per-attribute
+// provenance for a logical table (docs/lens.md § quereus_effective_lens).
+export const effectiveLensFunc = createIntegratedTableValuedFunction(
+	{
+		name: 'quereus_effective_lens',
+		numArgs: 2,
+		deterministic: false, // Depends on current lens deployment state.
+		returnType: {
+			typeClass: 'relation',
+			isReadOnly: true,
+			isSet: false,
+			columns: [
+				{ name: 'logical_column', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'source', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				// The put disposition: 'authored' (a `with inverse` clause supplies the
+				// put) · 'inferred' (registry invertibility / identity / passthrough) ·
+				// 'none' (computed, read-only). docs/lens.md § quereus_effective_lens.
+				{ name: 'inverse', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				// Advertisement-backed provenance: the member relationId of the resolved
+				// primary-storage decomposition that backs this column, or NULL when the
+				// column is name-match / override-only (docs/lens.md § The Default Mapper).
+				{ name: 'advertised_member', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				// The resolved decomposition's anchor relationId (= advertisement id), or
+				// NULL when no advertisement backs this logical table.
+				{ name: 'advertisement_anchor', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				{ name: 'effective_sql', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+			],
+			keys: [],
+			rowConstraints: [],
+		},
+	},
+	async function* (db: Database, schemaArg: SqlValue, tableArg: SqlValue): AsyncIterable<Row> {
+		if (typeof schemaArg !== 'string' || typeof tableArg !== 'string') {
+			throw new QuereusError('quereus_effective_lens(schema, table) requires two string arguments', StatusCode.ERROR);
+		}
+
+		const schema = db.schemaManager.getSchema(schemaArg);
+		if (!schema) {
+			throw new QuereusError(`quereus_effective_lens: schema '${schemaArg}' not found`, StatusCode.NOTFOUND);
+		}
+		if (schema.kind !== 'logical') {
+			throw new QuereusError(`quereus_effective_lens: schema '${schemaArg}' is not a logical schema`, StatusCode.ERROR);
+		}
+		const slot = schema.getLensSlot(tableArg);
+		if (!slot) {
+			throw new QuereusError(`quereus_effective_lens: no lens slot for '${schemaArg}.${tableArg}'`, StatusCode.NOTFOUND);
+		}
+
+		// Repeat the composed body on every row (symmetry with query_plan), so a
+		// single SELECT surfaces both the per-column provenance and the SQL. The
+		// advertisement columns surface the resolved decomposition (if any) that
+		// backs each logical column — additive to the existing provenance rows.
+		const effectiveSql = astToString(slot.compiledBody);
+		const anchor = slot.advertisement?.storage?.anchorRelationId ?? null;
+		const inverse = lensInverseDispositions(db, slot);
+		for (let i = 0; i < slot.columnProvenance.length; i++) {
+			const p = slot.columnProvenance[i];
+			yield [p.logicalColumn, p.source, inverse[i] ?? 'none', p.advertisedBy ?? null, anchor, effectiveSql];
+		}
+	}
+);
+
+/**
+ * Per-logical-column put disposition for `quereus_effective_lens` — `'authored'`
+ * (a `with inverse` clause supplies the put) / `'inferred'` (an identity,
+ * passthrough, or registry-inverted base write path — including an optional
+ * member's null-extended base column, whose put the fan-out materializes) /
+ * `'none'` (computed, read-only). Read off the **logically** planned body's
+ * backward `updateLineage` (the same surface `column_info` reads, planned via
+ * `_buildPlan` for the same lineage-preservation reason), positionally aligned
+ * with the slot's column provenance — the compiled body's output columns are
+ * the logical columns in declaration order. A body that fails to plan degrades
+ * every column to `'none'` rather than failing the TVF.
+ */
+function lensInverseDispositions(db: Database, slot: LensSlot): string[] {
+	try {
+		const { plan } = db._buildPlan([slot.compiledBody as AST.Statement]);
+		const root = plan.getRelations()[0];
+		if (!root) return slot.columnProvenance.map(() => 'none');
+		const lineage = root.physical?.updateLineage;
+		const attrs = root.getAttributes();
+		return slot.columnProvenance.map((_p, i) => {
+			const attr = attrs[i];
+			const site = resolveBaseSite(attr ? lineage?.get(attr.id) : undefined);
+			if (site.authored) return 'authored';
+			if (site.baseColumn !== undefined) return 'inferred';
+			return 'none';
+		});
+	} catch (e) {
+		log('quereus_effective_lens: lens body failed to plan for inverse dispositions, reporting none: %O', e);
+		return slot.columnProvenance.map(() => 'none');
+	}
+}
+
+// Basis re-decomposition backfill introspection: per-new-basis-relation backfill
+// DDL the engine generates for a pure re-decomposition, tagged engine-generated
+// vs app-supplied (docs/lens.md § The deployed basis representation).
+//
+// Sequencing contract (the generated SQL reads the PRIOR get-body over the PRIOR
+// basis tables, which must still hold data when the app runs it):
+//   1. apply schema Y — migrate the basis (new members created; prior members
+//      retained, not dropped — they are the backfill source).
+//   2. apply schema X — recompile the lens (rotates the snapshot; `previous` now
+//      holds the prior get-body).
+//   3. select * from quereus_basis_backfill('x') — run the re-decomposition /
+//      partial `backfill_sql`; supply app data for missing / needs-data rows.
+//   4. GC the now-detached prior basis members when convenient (out of scope).
+export const basisBackfillFunc = createIntegratedTableValuedFunction(
+	{
+		name: 'quereus_basis_backfill',
+		numArgs: 1,
+		deterministic: false, // Depends on the rotated deployment-snapshot pair.
+		returnType: {
+			typeClass: 'relation',
+			isReadOnly: true,
+			isSet: false,
+			columns: [
+				{ name: 'logical_table', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'basis_relation', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				// 're-decomposition' | 'partial' | 'needs-data'
+				{ name: 'category', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				// The generated insert…select…from(<prior get>); NULL when needs-data.
+				{ name: 'backfill_sql', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				// Comma-joined basis columns the engine backfills.
+				{ name: 'generated_columns', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				// Comma-joined basis columns the application must supply (empty for re-decomposition).
+				{ name: 'missing_columns', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'reason', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+			],
+			keys: [],
+			rowConstraints: [],
+		},
+	},
+	async function* (db: Database, schemaArg: SqlValue): AsyncIterable<Row> {
+		if (typeof schemaArg !== 'string') {
+			throw new QuereusError('quereus_basis_backfill(logical_schema) requires a string argument', StatusCode.ERROR);
+		}
+
+		const schema = db.schemaManager.getSchema(schemaArg);
+		if (!schema) {
+			throw new QuereusError(`quereus_basis_backfill: schema '${schemaArg}' not found`, StatusCode.NOTFOUND);
+		}
+		if (schema.kind !== 'logical') {
+			throw new QuereusError(`quereus_basis_backfill: schema '${schemaArg}' is not a logical schema`, StatusCode.ERROR);
+		}
+
+		// The rotated snapshot pair is the source of truth — robust to the lens
+		// already pointing at the new basis. With no `previous` (a first deploy, or
+		// nothing deployed) there is nothing to backfill.
+		const snaps = db.declaredSchemaManager.getDeployedLensSnapshots(schemaArg);
+		if (!snaps?.previous || !snaps.current) return;
+
+		// Recompute the live basis hash so a basis that drifted out-of-band since
+		// the last lens deploy surfaces as a per-row warning rather than silently
+		// generating a stale backfill.
+		const basisDeclared = snaps.current.basisSchemaName
+			? db.declaredSchemaManager.getDeclaredSchema(snaps.current.basisSchemaName)
+			: undefined;
+		const liveBasisHash = basisDeclared ? computeSchemaHash(basisDeclared) : undefined;
+
+		const rows = computeBasisBackfill(snaps.previous, snaps.current, liveBasisHash);
+		for (const r of rows) {
+			yield [
+				r.logicalTable,
+				r.basisRelation,
+				r.category,
+				r.backfillSql,
+				r.generatedColumns.join(', '),
+				r.missingColumns.join(', '),
+				r.reason,
+			];
+		}
+	}
+);
+
+// Lens advisory governance introspection: the **expand** path for the deploy
+// summary's `acknowledged: N` tally (docs/lens.md § Acknowledging advisories).
+// One row per advisory of the last deploy of a logical schema — active ones, the
+// ones an in-source `quereus.lens.ack.<code>` tag suppressed, and any that
+// re-surfaced because their recorded fingerprint no longer matches.
+export const lensAdvisoriesFunc = createIntegratedTableValuedFunction(
+	{
+		name: 'quereus_lens_advisories',
+		numArgs: 1,
+		deterministic: false, // Depends on the current lens deploy report.
+		returnType: {
+			typeClass: 'relation',
+			isReadOnly: true,
+			isSet: false,
+			columns: [
+				{ name: 'logical_table', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'code', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'constraint', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				{ name: 'column', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				// 'active' | 're-surfaced' | 'acknowledged' | 'acknowledged-unconditional'
+				{ name: 'status', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'rationale', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				{ name: 'current_fingerprint', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				{ name: 'recorded_fingerprint', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				{ name: 'message', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+			],
+			keys: [],
+			rowConstraints: [],
+		},
+	},
+	async function* (db: Database, schemaArg: SqlValue): AsyncIterable<Row> {
+		if (typeof schemaArg !== 'string') {
+			throw new QuereusError('quereus_lens_advisories(logical_schema) requires a string argument', StatusCode.ERROR);
+		}
+		const schema = db.schemaManager.getSchema(schemaArg);
+		if (!schema) {
+			throw new QuereusError(`quereus_lens_advisories: schema '${schemaArg}' not found`, StatusCode.NOTFOUND);
+		}
+		if (schema.kind !== 'logical') {
+			throw new QuereusError(`quereus_lens_advisories: schema '${schemaArg}' is not a logical schema`, StatusCode.ERROR);
+		}
+		const report = db.declaredSchemaManager.getDeployedLensReport(schemaArg);
+		if (!report) return; // never deployed (or a blocked deploy left no report)
+
+		// Default-report rows (un-acknowledged + re-surfaced), then the expanded
+		// acknowledged ones. Each row is grouped by its logical table + code.
+		for (const w of report.warnings) {
+			yield [
+				w.site.table, w.code, w.site.constraint ?? null, w.site.column ?? null,
+				w.resurfaced ? 're-surfaced' : 'active', null, null, null, w.message,
+			];
+		}
+		for (const a of report.acknowledged) {
+			yield [
+				a.site.table, a.code, a.site.constraint ?? null, a.site.column ?? null,
+				a.unconditional ? 'acknowledged-unconditional' : 'acknowledged',
+				a.rationale, a.currentFingerprint, a.recordedFingerprint ?? null, a.message,
+			];
+		}
+	}
+);
+
 // Explain assertion analysis and prepared parameterization (pre-physical)
 export const explainAssertionFunc = createIntegratedTableValuedFunction(
 	{
@@ -740,9 +993,15 @@ export const explainAssertionFunc = createIntegratedTableValuedFunction(
 			throw new QuereusError('explain_assertion(name) requires an assertion name', StatusCode.ERROR);
 		}
 
-		// Find assertion across all schemas
+		// Accept `schema.name` (schema-scoped lookup) or a bare name (find-first
+		// across all schemas — assertion names are only unique per schema).
 		const all = db.schemaManager.getAllAssertions();
-		const assertion = all.find(a => a.name.toLowerCase() === assertionName.toLowerCase());
+		const dot = assertionName.indexOf('.');
+		const wantedSchema = dot >= 0 ? assertionName.slice(0, dot).toLowerCase() : undefined;
+		const wantedName = (dot >= 0 ? assertionName.slice(dot + 1) : assertionName).toLowerCase();
+		const assertion = all.find(a =>
+			a.name.toLowerCase() === wantedName
+			&& (wantedSchema === undefined || a.schemaName.toLowerCase() === wantedSchema));
 		if (!assertion) {
 			throw new QuereusError(`Assertion not found: ${assertionName}`, StatusCode.NOTFOUND);
 		}
@@ -769,11 +1028,20 @@ export const explainAssertionFunc = createIntegratedTableValuedFunction(
 			schemaDependencies: new BuildTimeDependencyTracker(),
 			schemaCache: new Map(),
 			cteReferenceCache: new Map(),
-			outputScopes: new Map()
+			outputScopes: new Map(),
+			// The stored body resolves unqualified names against the assertion's
+			// home schema, same as commit-time enforcement.
+			schemaPath: db._homeSchemaPath(assertion.schemaName)
 		};
 
-		const plan = buildBlock(ctx, [ast]);
-		const analyzed = db.optimizer.optimizeForAnalysis(plan, db) as unknown as RelationalPlanNode;
+		// Suppress assertion-hoisting while planning, exactly as the commit-time
+		// evaluator does: otherwise a canonical-shaped assertion's own hoisted
+		// facts fold its violation query to empty and the explain shows no
+		// classifications at all.
+		const analyzed = db.schemaManager.withSuppressedAssertionHoist(() => {
+			const plan = buildBlock(ctx, [ast]);
+			return db.optimizer.optimizeForAnalysis(plan, db) as unknown as RelationalPlanNode;
+		});
 
 		// Classify each table reference as row/group/global.
 		const { classifications, groupKeys } = analyzeRowSpecific(analyzed);
@@ -782,7 +1050,7 @@ export const explainAssertionFunc = createIntegratedTableValuedFunction(
 			const base = `${relationKey.split('#')[0]}`;
 			let prepared: string | null = null;
 			if (base) {
-				const [schemaName, tableName] = base.split('.');
+				const [schemaName, tableName] = splitBaseKey(base);
 				const table = db._findTable(tableName, schemaName);
 				if (table) {
 					if (cls === 'row') {

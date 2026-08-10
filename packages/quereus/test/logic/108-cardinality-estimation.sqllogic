@@ -1,6 +1,11 @@
 -- 108-cardinality-estimation.sqllogic
--- Validates that ANALYZE populates statistics which feed into cost-based
--- optimizer decisions (plan shape, index selection, access method)
+-- Exercises ANALYZE (initial run, re-run after data changes) over skewed data
+-- and checks that results stay correct throughout — row counts, GROUP BY
+-- distribution, equality/range filters, and joins. It does NOT assert plan
+-- shape, index selection, or access method; nothing here fails if ANALYZE's
+-- statistics are ignored by the optimizer. Cost-based plan-shape assertions
+-- driven by ANALYZE statistics live in test/where-conjunct-ordering.spec.ts
+-- and test/optimizer/*.spec.ts.
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- Setup: table with skewed data distribution

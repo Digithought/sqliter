@@ -17,3 +17,20 @@ SELECT age, name FROM users WHERE age > 25 AND name LIKE 'A%';
 → [{"age": 30, "name": "Alice"}]
 
 DROP TABLE users;
+
+-- Regression: pushing a filter below a Project must preserve the projection's
+-- attribute IDs. A computed column was re-assigned a fresh attribute ID on the
+-- rebuild, stranding an outer projection that kept ONLY the computed column
+-- while filtering on a different (pruned) column ("No row context found").
+create table t (id integer primary key, code20 text not null);
+insert into t values (3, 'C1');
+create view v_plain as select id, case code20 when 'A1' then 'A' else 'C' end as code from t;
+
+select code from v_plain where id = 3;
+→ [{"code":"C"}]
+
+select code from (select id, case code20 when 'A1' then 'A' else 'C' end as code from t) where id = 3;
+→ [{"code":"C"}]
+
+drop view v_plain;
+drop table t;

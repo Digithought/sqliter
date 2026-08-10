@@ -32,6 +32,11 @@ class MockCtx implements DeltaExecutorContext {
 	getRowCount(base: string): number | undefined {
 		return this.rowCounts.get(base.toLowerCase());
 	}
+
+	globallyChanged = new Set<string>();
+	isGloballyChanged(base: string): boolean {
+		return this.globallyChanged.has(base.toLowerCase());
+	}
 }
 
 interface RecordedCall {
@@ -302,5 +307,84 @@ describe('DeltaExecutor: dispatch semantics', () => {
 		dispose();
 		await exec.runAll();
 		expect(calls).to.have.length(0);
+	});
+});
+
+describe('DeltaExecutor: RunAllOptions + isGloballyChanged (cascading seams)', () => {
+	it('dispatches subscriptions in the order returned by opts.order', async () => {
+		const ctx = new MockCtx();
+		ctx.setChanged('main.a', [[1]]);
+		ctx.setChanged('main.b', [[2]]);
+		const exec = new DeltaExecutor(ctx);
+		const calls: RecordedCall[] = [];
+		exec.register(makeSub({
+			id: 'subA', dependencies: ['main.a'],
+			bindings: [['main.a#1', { kind: 'row', keyColumns: [0] }]],
+			relationToBase: [['main.a#1', 'main.a']], pkIndicesByBase: [['main.a', [0]]],
+			apply: record(calls, 'subA'),
+		}));
+		exec.register(makeSub({
+			id: 'subB', dependencies: ['main.b'],
+			bindings: [['main.b#1', { kind: 'row', keyColumns: [0] }]],
+			relationToBase: [['main.b#1', 'main.b']], pkIndicesByBase: [['main.b', [0]]],
+			apply: record(calls, 'subB'),
+		}));
+		// Reverse insertion order via opts.order.
+		await exec.runAll({ order: (subs) => [...subs].reverse() });
+		expect(calls.map(c => c.id)).to.deep.equal(['subB', 'subA']);
+	});
+
+	it('rescanPerSubscription makes a base added by an earlier apply visible to a later one', async () => {
+		const ctx = new MockCtx();
+		ctx.setChanged('main.a', [[1]]);
+		const exec = new DeltaExecutor(ctx);
+		const calls: RecordedCall[] = [];
+		// subA's apply grows the change source with main.b (mimics a producer MV
+		// writing its backing table mid-pass).
+		exec.register(makeSub({
+			id: 'subA', dependencies: ['main.a'],
+			bindings: [['main.a#1', { kind: 'row', keyColumns: [0] }]],
+			relationToBase: [['main.a#1', 'main.a']], pkIndicesByBase: [['main.a', [0]]],
+			apply: async () => { ctx.setChanged('main.b', [[9]]); },
+		}));
+		exec.register(makeSub({
+			id: 'subB', dependencies: ['main.b'],
+			bindings: [['main.b#1', { kind: 'row', keyColumns: [0] }]],
+			relationToBase: [['main.b#1', 'main.b']], pkIndicesByBase: [['main.b', [0]]],
+			apply: record(calls, 'subB'),
+		}));
+		const order = (subs: DeltaSubscription[]) => [...subs].sort((x, y) => x.id.localeCompare(y.id));
+
+		// Without rescan: subB never sees main.b (snapshot taken before subA ran).
+		await exec.runAll({ order });
+		expect(calls).to.have.length(0);
+
+		// With rescan: subB observes main.b that subA added.
+		ctx.changed.delete('main.b');
+		await exec.runAll({ order, rescanPerSubscription: true });
+		expect(calls.map(c => c.id)).to.deep.equal(['subB']);
+		expect(calls[0].perRelation[0][1]).to.deep.equal([[9]]);
+	});
+
+	it('isGloballyChanged forces a row relation to global without fetching tuples', async () => {
+		const ctx = new MockCtx();
+		ctx.setChanged('main.t', [[1], [2]]);
+		ctx.globallyChanged.add('main.t');
+		let fetched = false;
+		const origFetch = ctx.getChangedTuples.bind(ctx);
+		ctx.getChangedTuples = (base, cols, pk) => { fetched = true; return origFetch(base, cols, pk); };
+		const exec = new DeltaExecutor(ctx);
+		const calls: RecordedCall[] = [];
+		exec.register(makeSub({
+			id: 'sub1', dependencies: ['main.t'],
+			bindings: [['main.t#1', { kind: 'row', keyColumns: [0] }]],
+			relationToBase: [['main.t#1', 'main.t']], pkIndicesByBase: [['main.t', [0]]],
+			apply: record(calls, 'sub1'),
+		}));
+		await exec.runAll();
+		expect(calls).to.have.length(1);
+		expect(calls[0].perRelation).to.deep.equal([]);
+		expect(calls[0].global).to.deep.equal(['main.t#1']);
+		expect(fetched).to.equal(false);
 	});
 });

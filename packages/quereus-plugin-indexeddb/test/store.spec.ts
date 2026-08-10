@@ -4,10 +4,10 @@
 
 import { expect } from 'chai';
 import 'fake-indexeddb/auto';
-import { IndexedDBStore } from '../src/store.js';
+import { IndexedDBStore, MultiStoreWriteBatch } from '../src/store.js';
 import { IndexedDBManager } from '../src/manager.js';
 import { IndexedDBProvider } from '../src/provider.js';
-import { Database, asyncIterableToArray, type Row } from '@quereus/quereus';
+import { Database, asyncIterableToArray } from '@quereus/quereus';
 import { StoreModule, createIsolatedStoreModule } from '@quereus/store';
 
 describe('IndexedDBStore', () => {
@@ -34,111 +34,10 @@ describe('IndexedDBStore', () => {
     });
   });
 
-  describe('Basic operations', () => {
-    it('should put and get a value', async () => {
-      const key = new Uint8Array([1, 2, 3]);
-      const value = new Uint8Array([4, 5, 6]);
-
-      await store.put(key, value);
-      const result = await store.get(key);
-
-      expect(result).to.deep.equal(value);
-    });
-
-    it('should return undefined for non-existent key', async () => {
-      const key = new Uint8Array([1, 2, 3]);
-      const result = await store.get(key);
-      expect(result).to.be.undefined;
-    });
-
-    it('should delete a key', async () => {
-      const key = new Uint8Array([1, 2, 3]);
-      const value = new Uint8Array([4, 5, 6]);
-
-      await store.put(key, value);
-      await store.delete(key);
-      const result = await store.get(key);
-
-      expect(result).to.be.undefined;
-    });
-
-    it('should check if key exists with has()', async () => {
-      const key = new Uint8Array([1, 2, 3]);
-      const value = new Uint8Array([4, 5, 6]);
-
-      expect(await store.has(key)).to.be.false;
-      await store.put(key, value);
-      expect(await store.has(key)).to.be.true;
-    });
-
-    it('should overwrite existing values', async () => {
-      const key = new Uint8Array([1, 2, 3]);
-      const value1 = new Uint8Array([4, 5, 6]);
-      const value2 = new Uint8Array([7, 8, 9]);
-
-      await store.put(key, value1);
-      await store.put(key, value2);
-      const result = await store.get(key);
-
-      expect(result).to.deep.equal(value2);
-    });
-  });
-
-  describe('Iteration', () => {
-    beforeEach(async () => {
-      await store.put(new Uint8Array([1]), new Uint8Array([10]));
-      await store.put(new Uint8Array([2]), new Uint8Array([20]));
-      await store.put(new Uint8Array([3]), new Uint8Array([30]));
-      await store.put(new Uint8Array([4]), new Uint8Array([40]));
-      await store.put(new Uint8Array([5]), new Uint8Array([50]));
-    });
-
-    it('should iterate all entries in order', async () => {
-      const entries: Array<{ key: Uint8Array; value: Uint8Array }> = [];
-      for await (const entry of store.iterate({})) {
-        entries.push(entry);
-      }
-
-      expect(entries).to.have.length(5);
-      expect(entries[0].key).to.deep.equal(new Uint8Array([1]));
-      expect(entries[4].key).to.deep.equal(new Uint8Array([5]));
-    });
-
-    it('should iterate with gte bound', async () => {
-      const entries: Array<{ key: Uint8Array; value: Uint8Array }> = [];
-      for await (const entry of store.iterate({ gte: new Uint8Array([3]) })) {
-        entries.push(entry);
-      }
-
-      expect(entries).to.have.length(3);
-      expect(entries[0].key).to.deep.equal(new Uint8Array([3]));
-    });
-
-    it('should iterate in reverse', async () => {
-      const entries: Array<{ key: Uint8Array; value: Uint8Array }> = [];
-      for await (const entry of store.iterate({ reverse: true })) {
-        entries.push(entry);
-      }
-
-      expect(entries).to.have.length(5);
-      expect(entries[0].key).to.deep.equal(new Uint8Array([5]));
-      expect(entries[4].key).to.deep.equal(new Uint8Array([1]));
-    });
-  });
-
+  // Point ops, iteration & ordering, and basic batch put/delete are covered for this
+  // backend by the shared KVStore conformance suite (see conformance.spec.ts). This
+  // file keeps only IndexedDB-SPECIFIC behavior with no cross-backend analogue.
   describe('Batch operations', () => {
-    it('should execute batch put operations', async () => {
-      const batch = store.batch();
-      batch.put(new Uint8Array([1]), new Uint8Array([10]));
-      batch.put(new Uint8Array([2]), new Uint8Array([20]));
-      batch.put(new Uint8Array([3]), new Uint8Array([30]));
-      await batch.write();
-
-      expect(await store.get(new Uint8Array([1]))).to.deep.equal(new Uint8Array([10]));
-      expect(await store.get(new Uint8Array([2]))).to.deep.equal(new Uint8Array([20]));
-      expect(await store.get(new Uint8Array([3]))).to.deep.equal(new Uint8Array([30]));
-    });
-
     it('should complete write batch during a concurrent version upgrade', async () => {
       // This exercises the race condition: ensureObjectStore triggers a version
       // upgrade that closes this.db and sets it to null.  Before the fix,
@@ -150,16 +49,18 @@ describe('IndexedDBStore', () => {
       batch.put(new Uint8Array([10]), new Uint8Array([100]));
       batch.put(new Uint8Array([11]), new Uint8Array([110]));
 
-      // Start the upgrade — this runs synchronously until its first internal await
+      // Start the upgrade. doUpgrade() closes the current connection before
+      // reopening at the bumped version, so getDatabase() briefly returns null.
       const upgradePromise = manager.ensureObjectStore('new-table-for-race-test');
-      // Yield one microtask tick so ensureObjectStore progresses past ensureOpen()
-      // into doUpgrade(), which closes the database and sets upgradePromise on
-      // the manager.  This simulates the real scenario where an upgrade is
-      // already in flight when a write batch fires.
-      await Promise.resolve();
+      // Wait until that in-flight window is observable (bounded, so we never spin):
+      // this guarantees the write below fires while a version upgrade is genuinely
+      // in flight, forcing it through ensureOpen()'s wait-for-schema-queue path.
+      for (let i = 0; i < 50 && manager.getDatabase() !== null; i++) {
+        await Promise.resolve();
+      }
 
       // Now start the batch write while the upgrade is in-flight.
-      // ensureOpen() sees upgradePromise and waits for the upgrade to complete.
+      // ensureOpen() awaits the schema queue and then returns the reopened db.
       const writePromise = batch.write();
 
       await Promise.all([upgradePromise, writePromise]);
@@ -170,6 +71,34 @@ describe('IndexedDBStore', () => {
 
       // The new object store should also exist
       expect(manager.hasObjectStore('new-table-for-race-test')).to.be.true;
+    });
+  });
+
+  // The streaming/batch-boundary iteration behavior (mid-iteration consumer awaits,
+  // reverse across the boundary, limit spanning it, and the collapsed-range DataError
+  // regression on inclusive bounds landing on a 256-entry multiple) is now asserted
+  // for this backend by the shared conformance suite's Tier 3 (conformance.spec.ts).
+  // MultiStoreWriteBatch is IndexedDB-specific (not the KVStore.batch surface), so its
+  // reuse test stays here.
+  describe('Batch reuse after commit', () => {
+    it('does not re-apply a committed MultiStoreWriteBatch on reuse', async () => {
+      const manager = store.getManager();
+      const k1 = new Uint8Array([3]);
+      const v1 = new Uint8Array([33]);
+      const k2 = new Uint8Array([4]);
+      const v2 = new Uint8Array([44]);
+
+      const mb = new MultiStoreWriteBatch(manager);
+      mb.putToStore(storeName, k1, v1);
+      await mb.write();
+      expect(await store.get(k1)).to.deep.equal(v1);
+
+      await store.delete(k1);
+      mb.putToStore(storeName, k2, v2);
+      await mb.write();
+
+      expect(await store.get(k1)).to.be.undefined;
+      expect(await store.get(k2)).to.deep.equal(v2);
     });
   });
 });
@@ -268,11 +197,12 @@ describe('IndexedDB Store Integration', () => {
       expect(entries).to.have.length(1);
 
       // The key should not be empty - integer 42 should be encoded
-      expect(entries[0].key.length).to.be.greaterThan(0);      // For an integer, the encoded key should have:
-      // - 1 byte type prefix (0x01 for INTEGER)
-      // - 8 bytes for the bigint value (big-endian with sign flip)
-      // Total: 9 bytes
-      expect(entries[0].key.length).to.equal(9);
+      expect(entries[0].key.length).to.be.greaterThan(0);      // For a numeric, the encoded key should have:
+      // - 1 byte type prefix (0x01 for NUMERIC)
+      // - 8 bytes sortable double (big-endian with sign flip)
+      // - 8 bytes signed tie-break tail
+      // Total: 17 bytes
+      expect(entries[0].key.length).to.equal(17);
     });
 
     it('should handle zero as integer primary key', async () => {
@@ -550,10 +480,11 @@ describe('IndexedDB Store Integration with Isolation', () => {
       expect(entries).to.have.length(1);
       expect(entries[0].key.length).to.be.greaterThan(0);
 
-      // Verify the key is a properly encoded integer (9 bytes: 1 type prefix + 8 value bytes)
-      expect(entries[0].key.length).to.equal(9);
+      // Verify the key is a properly encoded numeric (17 bytes: 1 type prefix +
+      // 8-byte sortable double + 8-byte signed tie-break tail).
+      expect(entries[0].key.length).to.equal(17);
 
-      // First byte should be 0x01 (TYPE_INTEGER)
+      // First byte should be 0x01 (TYPE_NUMERIC — unified int/real numeric tag)
       expect(entries[0].key[0]).to.equal(0x01);
     });
 

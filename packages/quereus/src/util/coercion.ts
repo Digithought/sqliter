@@ -26,6 +26,14 @@ export function tryCoerceToNumber(value: SqlValue): SqlValue {
  * Converts a value to a number for arithmetic contexts.
  * Non-numeric strings become 0 (SQL arithmetic semantics).
  * Used for +, -, *, /, % operations.
+ *
+ * NOTE: return type is `number`, so a numeric string past
+ * Number.MAX_SAFE_INTEGER (e.g. `'9007199254740993' + 0`) rounds here —
+ * unlike CAST/comparison, which go through INTEGER_TYPE.parse/NUMERIC_TYPE.parse
+ * (types/builtin-types.ts) and preserve exact bigint precision past 2^53. Fixing
+ * this means widening this function's return type to `number | bigint` and
+ * propagating that into mixedBigIntArithmetic (runtime/emit/binary.ts) — separate
+ * blast radius from the CAST/comparison/insert fix this note sits next to.
  */
 export function coerceToNumberForArithmetic(value: SqlValue): number {
 	if (typeof value === 'number') {
@@ -76,24 +84,46 @@ export function coerceForComparison(v1: SqlValue, v2: SqlValue): [SqlValue, SqlV
 	return [v1, v2];
 }
 
+/** Aggregates that never want their argument read as a number. */
+const NON_NUMERIC_AGGREGATES = new Set(['COUNT', 'GROUP_CONCAT']);
+
+/**
+ * Does this aggregate read its arguments numerically? False for COUNT, GROUP_CONCAT and
+ * the `JSON_*` family, which take their arguments as-is.
+ *
+ * Split out so the routing decision has one home: the aggregate emitters resolve it once
+ * per call site at emit time (`computeAggregateValueTransforms`,
+ * runtime/emit/aggregate-setup.ts) rather than per row, and must reach the same verdict
+ * this function does.
+ */
+export function aggregateCoercesArguments(functionName: string): boolean {
+	const upperName = functionName.toUpperCase();
+	return !NON_NUMERIC_AGGREGATES.has(upperName) && !upperName.startsWith('JSON_');
+}
+
+/**
+ * The value-level half of aggregate-argument coercion: a numeric-looking string becomes
+ * a number, everything else passes through. Callers that have already established the
+ * aggregate coerces at all (see {@link aggregateCoercesArguments}) use this directly.
+ *
+ * NOTE: this converts a numeric-looking string for min/max too, so `min('5','10')`
+ * over a plain TEXT column returns the NUMBER 5 — disagreeing with
+ * `order by … limit 1`, which keeps text order. Predates the semantic-ordering
+ * min/max binding and is unchanged by it (the emitters skip the transform entirely when
+ * every argument type is numeric or carries semantic ordering). Tracked as backlog
+ * `bug-text-minmax-numeric-coercion`.
+ */
+export function coerceAggregateValue(value: SqlValue): SqlValue {
+	return typeof value === 'string' && value.trim() !== '' ? tryCoerceToNumber(value) : value;
+}
+
 /**
  * Coerces a value for aggregate function arguments.
  * Most aggregate functions should accept numeric strings as numbers.
  * For COUNT, no coercion needed. For SUM/AVG, numeric strings should be converted.
  */
-const NON_NUMERIC_AGGREGATES = new Set(['COUNT', 'GROUP_CONCAT']);
-
 export function coerceForAggregate(value: SqlValue, functionName: string): SqlValue {
-	const upperName = functionName.toUpperCase();
-	if (NON_NUMERIC_AGGREGATES.has(upperName) || upperName.startsWith('JSON_')) {
-		return value;
-	}
-
-	if (typeof value === 'string' && value.trim() !== '') {
-		return tryCoerceToNumber(value);
-	}
-
-	return value;
+	return aggregateCoercesArguments(functionName) ? coerceAggregateValue(value) : value;
 }
 
 /**

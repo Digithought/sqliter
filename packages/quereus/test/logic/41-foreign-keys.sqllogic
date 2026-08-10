@@ -85,9 +85,10 @@ INSERT INTO employees VALUES (1, 'Alice', 1), (2, 'Bob', 1);
 SELECT count(*) FROM departments;
 → [{"count(*)":2}]
 
--- Attempt to delete a referenced department (should fail - RESTRICT)
+-- Attempt to delete a referenced department (should fail - RESTRICT; enforced
+-- by the batched statement-end probe since fk-restrict-statement-batch)
 DELETE FROM departments WHERE id = 1;
--- error: CHECK constraint failed: _fk_employees_dept_id
+-- error: violates RESTRICT from 'employees'
 
 -- Verify nothing was deleted
 SELECT count(*) FROM departments;
@@ -100,9 +101,9 @@ SELECT count(*) FROM departments;
 
 -- --- RESTRICT on UPDATE ---
 
--- Attempt to update referenced PK (should fail - RESTRICT)
+-- Attempt to update referenced PK (should fail - RESTRICT; batched probe)
 UPDATE departments SET id = 99 WHERE id = 1;
--- error: CHECK constraint failed: _fk_employees_dept_id
+-- error: violates RESTRICT from 'employees'
 
 -- Verify nothing changed
 SELECT id FROM departments;
@@ -133,7 +134,7 @@ SELECT count(*) FROM products;
 
 -- NO ACTION → RESTRICT: deleting parent with existing children fails
 DELETE FROM categories WHERE id = 1;
--- error: CHECK constraint failed: _fk_products_cat_id
+-- error: violates RESTRICT from 'products'
 
 -- Nothing changed
 SELECT count(*) FROM categories WHERE id = 1;
@@ -744,7 +745,7 @@ SELECT id, name FROM pmask_parent;
 
 -- UPDATE that touches the referenced PK still trips RESTRICT
 UPDATE pmask_parent SET id = 'b' WHERE id = 'a';
--- error: CHECK constraint failed:
+-- error: violates RESTRICT from 'pmask_child'
 
 DROP TABLE pmask_child;
 DROP TABLE pmask_parent;
@@ -774,11 +775,11 @@ INSERT INTO pmask2_child_label VALUES (20, 'L1');
 -- Updating `label` only: pmask2_child_code's parent-side check (on `code`) must skip;
 -- pmask2_child_label's check fires on `label` change → RESTRICT.
 UPDATE pmask2_parent SET label = 'L2' WHERE id = 1;
--- error: CHECK constraint failed:
+-- error: violates RESTRICT from 'pmask2_child_label'
 
 -- Updating `code` only: symmetric — pmask2_child_code's check fires.
 UPDATE pmask2_parent SET code = 'C2' WHERE id = 1;
--- error: CHECK constraint failed:
+-- error: violates RESTRICT from 'pmask2_child_code'
 
 -- Updating neither referenced column: both checks must skip.
 UPDATE pmask2_parent SET extra = 'ok' WHERE id = 1;
@@ -789,4 +790,212 @@ SELECT id, code, label, extra FROM pmask2_parent;
 DROP TABLE pmask2_child_label;
 DROP TABLE pmask2_child_code;
 DROP TABLE pmask2_parent;
+
+-- ===================================================================
+-- Phase: change-detection short-circuit coerces before comparing
+-- (regression for bug-fk-restrict-change-detection-uncoerced)
+-- ===================================================================
+-- The referenced-column-change short-circuit used to compare the stored OLD
+-- value against the raw, uncoerced NEW value, so a value spelled differently
+-- from its stored form (integer 1 written as text '1'; a JSON object written
+-- with reordered keys) read as "changed" and wrongly tripped RESTRICT even
+-- though the stored value would not actually move. Both tables below carry a
+-- RESTRICT child and a CASCADE child on the SAME parent so the gate that
+-- batches pure-RESTRICT statements (see 41.9-fk-restrict-batched.sqllogic)
+-- excludes them: the update runs the per-row transitive pre-walk
+-- (assertNoRestrictedChildrenForParentMutation + the cascade-recursion arm of
+-- assertTransitiveRestrictsForParentMutation), not the batched accumulator.
+
+CREATE TABLE crc_parent (id INTEGER PRIMARY KEY, other INTEGER);
+CREATE TABLE crc_restrict_child (cid INTEGER PRIMARY KEY, p_id INTEGER,
+    FOREIGN KEY (p_id) REFERENCES crc_parent(id) ON UPDATE RESTRICT);
+CREATE TABLE crc_cascade_child (cid INTEGER PRIMARY KEY, p_id INTEGER,
+    FOREIGN KEY (p_id) REFERENCES crc_parent(id) ON UPDATE CASCADE);
+
+INSERT INTO crc_parent VALUES (1, 100);
+INSERT INTO crc_restrict_child VALUES (10, 1);
+INSERT INTO crc_cascade_child VALUES (20, 1);
+
+-- Rewriting the integer key as the text '1' does not change the stored value:
+-- must NOT trip RESTRICT.
+UPDATE crc_parent SET id = '1' WHERE id = 1;
+SELECT id FROM crc_parent;
+→ [{"id":1}]
+
+-- The cascade child must be untouched too — no key change means no
+-- propagating UPDATE should fire (the short-circuit is shared by both arms).
+SELECT p_id FROM crc_cascade_child;
+→ [{"p_id":1}]
+
+-- Sanity: a genuine key change with a live RESTRICT child still raises the
+-- error, so the fix cannot silently disable enforcement. Mixed actions are
+-- not batchable, so this is the plan-time synthesized parent-side NOT EXISTS
+-- (ConstraintCheckNode), not the runtime pre-walk's friendlier message.
+UPDATE crc_parent SET id = 2 WHERE id = 1;
+-- error: CHECK constraint failed: _fk_crc_restrict_child_p_id
+
+DROP TABLE crc_cascade_child;
+DROP TABLE crc_restrict_child;
+DROP TABLE crc_parent;
+
+-- Same short-circuit, JSON-typed key: a value re-typed through the column's
+-- logical type (validateAndParse) rather than compared as raw text — a JSON
+-- object rewritten with different whitespace / key order is the same stored
+-- value.
+
+CREATE TABLE crcj_parent (id JSON PRIMARY KEY, other INTEGER);
+CREATE TABLE crcj_restrict_child (cid INTEGER PRIMARY KEY, p_id JSON,
+    FOREIGN KEY (p_id) REFERENCES crcj_parent(id) ON UPDATE RESTRICT);
+CREATE TABLE crcj_cascade_child (cid INTEGER PRIMARY KEY, p_id JSON,
+    FOREIGN KEY (p_id) REFERENCES crcj_parent(id) ON UPDATE CASCADE);
+
+INSERT INTO crcj_parent VALUES ('{"a":1,"b":2}', 100);
+INSERT INTO crcj_restrict_child VALUES (10, '{"a":1,"b":2}');
+INSERT INTO crcj_cascade_child VALUES (20, '{"a":1,"b":2}');
+
+-- Reorder-equal JSON key: must NOT trip RESTRICT.
+UPDATE crcj_parent SET id = '{"b": 2, "a": 1}' WHERE other = 100;
+SELECT id FROM crcj_parent;
+→ [{"id":{"b":2,"a":1}}]
+
+-- Cascade child untouched (no key change ⇒ no propagating UPDATE).
+SELECT p_id FROM crcj_cascade_child;
+→ [{"p_id":{"a":1,"b":2}}]
+
+-- Sanity: a genuine JSON key change with a live RESTRICT child still raises
+-- the error (plan-time NOT EXISTS, as above — mixed actions are not batchable).
+UPDATE crcj_parent SET id = '{"a":9,"b":9}' WHERE other = 100;
+-- error: CHECK constraint failed: _fk_crcj_restrict_child_p_id
+
+DROP TABLE crcj_cascade_child;
+DROP TABLE crcj_restrict_child;
+DROP TABLE crcj_parent;
+
+-- ON DELETE RESTRICT has no NEW row, so the change-detection short-circuit
+-- never runs for it — guard that the refactor left the delete path alone.
+CREATE TABLE crcd_parent (id INTEGER PRIMARY KEY);
+CREATE TABLE crcd_child (cid INTEGER PRIMARY KEY, p_id INTEGER,
+    FOREIGN KEY (p_id) REFERENCES crcd_parent(id) ON DELETE RESTRICT);
+
+INSERT INTO crcd_parent VALUES (1);
+INSERT INTO crcd_child VALUES (10, 1);
+
+DELETE FROM crcd_parent WHERE id = 1;
+-- error: violates RESTRICT from 'crcd_child'
+
+DROP TABLE crcd_child;
+DROP TABLE crcd_parent;
+
+-- ===================================================================
+-- Phase: ON UPDATE action gate — untouched referenced column must not
+-- fire the action at all (regression for fk-update-actions-fire-when-key-unchanged)
+-- ===================================================================
+-- executeForeignKeyActions used to re-issue the child DML for CASCADE / SET NULL /
+-- SET DEFAULT after every parent UPDATE, even when the referenced column never
+-- changed. Updating an unrelated parent column wrongly rewrote (or nulled) child
+-- rows that were never re-keyed. Each block below asserts the untouched case is a
+-- no-op and a genuine re-key still fires the action.
+
+-- SET DEFAULT: an untouched referenced column must leave the child alone; a
+-- genuine re-key must still re-point the child to the default (a live parent key).
+CREATE TABLE fkgd_parent (id INTEGER PRIMARY KEY, other INTEGER);
+CREATE TABLE fkgd_child (cid INTEGER PRIMARY KEY, p_id INTEGER DEFAULT 99,
+    FOREIGN KEY (p_id) REFERENCES fkgd_parent(id) ON UPDATE SET DEFAULT);
+
+INSERT INTO fkgd_parent VALUES (1, 100), (99, 200);
+INSERT INTO fkgd_child VALUES (10, 1);
+
+UPDATE fkgd_parent SET other = 111 WHERE id = 1;
+SELECT p_id FROM fkgd_child WHERE cid = 10;
+→ [{"p_id":1}]
+
+UPDATE fkgd_parent SET id = 7 WHERE id = 1;
+SELECT p_id FROM fkgd_child WHERE cid = 10;
+→ [{"p_id":99}]
+
+DROP TABLE fkgd_child;
+DROP TABLE fkgd_parent;
+
+-- SET NULL, nullable child column: an untouched referenced column must leave the
+-- child alone; a genuine re-key must still null it out.
+CREATE TABLE fkgn_parent (id INTEGER PRIMARY KEY, other INTEGER);
+CREATE TABLE fkgn_child (cid INTEGER PRIMARY KEY, p_id INTEGER NULL,
+    FOREIGN KEY (p_id) REFERENCES fkgn_parent(id) ON UPDATE SET NULL);
+
+INSERT INTO fkgn_parent VALUES (1, 100);
+INSERT INTO fkgn_child VALUES (10, 1);
+
+UPDATE fkgn_parent SET other = 111 WHERE id = 1;
+SELECT p_id FROM fkgn_child WHERE cid = 10;
+→ [{"p_id":1}]
+
+UPDATE fkgn_parent SET id = 7 WHERE id = 1;
+SELECT p_id FROM fkgn_child WHERE cid = 10;
+→ [{"p_id":null}]
+
+DROP TABLE fkgn_child;
+DROP TABLE fkgn_parent;
+
+-- SET NULL, non-nullable child column: before the fix, an update leaving the
+-- referenced column alone still re-issued the child SET NULL and tripped NOT NULL.
+-- It must now succeed as a no-op on the child. This is the case most likely to
+-- regress unnoticed, since the symptom was an error rather than silently bad data.
+-- NOT NULL is spelled out even though it is Quereus's column default, so the case
+-- keeps testing what it claims if that default ever changes.
+CREATE TABLE fkgnn_parent (id INTEGER PRIMARY KEY, other INTEGER);
+CREATE TABLE fkgnn_child (cid INTEGER PRIMARY KEY, p_id INTEGER NOT NULL,
+    FOREIGN KEY (p_id) REFERENCES fkgnn_parent(id) ON UPDATE SET NULL);
+
+INSERT INTO fkgnn_parent VALUES (1, 100);
+INSERT INTO fkgnn_child VALUES (10, 1);
+
+UPDATE fkgnn_parent SET other = 111 WHERE id = 1;
+SELECT p_id FROM fkgnn_child WHERE cid = 10;
+→ [{"p_id":1}]
+
+DROP TABLE fkgnn_child;
+DROP TABLE fkgnn_parent;
+
+-- CASCADE: an untouched referenced column must leave the child value alone (a
+-- phantom rewrite-to-same-value used to fire here — see the runtime spec for the
+-- data-change-event assertion this value-only check cannot make); a genuine
+-- re-key must still cascade.
+CREATE TABLE fkgc_parent (id INTEGER PRIMARY KEY, other INTEGER);
+CREATE TABLE fkgc_child (cid INTEGER PRIMARY KEY, p_id INTEGER,
+    FOREIGN KEY (p_id) REFERENCES fkgc_parent(id) ON UPDATE CASCADE);
+
+INSERT INTO fkgc_parent VALUES (1, 100);
+INSERT INTO fkgc_child VALUES (10, 1);
+
+UPDATE fkgc_parent SET other = 111 WHERE id = 1;
+SELECT p_id FROM fkgc_child WHERE cid = 10;
+→ [{"p_id":1}]
+
+UPDATE fkgc_parent SET id = 7 WHERE id = 1;
+SELECT p_id FROM fkgc_child WHERE cid = 10;
+→ [{"p_id":7}]
+
+DROP TABLE fkgc_child;
+DROP TABLE fkgc_parent;
+
+-- Composite CASCADE: the gate asks whether ANY referenced column changed, so a
+-- parent update that moves only the second key column must still cascade, while
+-- one that moves neither must not fire at all.
+CREATE TABLE fkgmc_parent (a INTEGER, b INTEGER, other INTEGER, PRIMARY KEY (a, b));
+CREATE TABLE fkgmc_child (cid INTEGER PRIMARY KEY, ref_a INTEGER, ref_b INTEGER,
+    FOREIGN KEY (ref_a, ref_b) REFERENCES fkgmc_parent(a, b) ON UPDATE CASCADE);
+
+INSERT INTO fkgmc_parent VALUES (1, 2, 100);
+INSERT INTO fkgmc_child VALUES (10, 1, 2);
+
+UPDATE fkgmc_parent SET other = 111 WHERE a = 1 AND b = 2;
+SELECT ref_a, ref_b FROM fkgmc_child WHERE cid = 10;
+→ [{"ref_a":1,"ref_b":2}]
+
+UPDATE fkgmc_parent SET b = 20 WHERE a = 1 AND b = 2;
+SELECT ref_a, ref_b FROM fkgmc_child WHERE cid = 10;
+→ [{"ref_a":1,"ref_b":20}]
+
+DROP TABLE fkgmc_child;
+DROP TABLE fkgmc_parent;
 

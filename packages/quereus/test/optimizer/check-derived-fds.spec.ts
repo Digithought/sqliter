@@ -4,9 +4,13 @@ import {
 	extractCheckConstraints,
 } from '../../src/planner/analysis/check-extraction.js';
 import type { ConstantBinding, DomainConstraint } from '../../src/planner/nodes/plan-node.js';
-import type { RowConstraintSchema } from '../../src/schema/table.js';
-import { DEFAULT_ROWOP_MASK } from '../../src/schema/table.js';
+import type { RowConstraintSchema, RowOpMask } from '../../src/schema/table.js';
+import { DEFAULT_ROWOP_MASK, RowOpFlag } from '../../src/schema/table.js';
 import type * as AST from '../../src/parser/ast.js';
+import type { DeclaredColumnInfo } from '../../src/planner/analysis/comparison-collation.js';
+import { INTEGER_TYPE, TEXT_TYPE } from '../../src/types/builtin-types.js';
+import { TIMESPAN_TYPE } from '../../src/types/temporal-types.js';
+import { JSON_TYPE } from '../../src/types/json-type.js';
 
 // ---------------------------------------------------------------------------
 // AST builders for unit tests
@@ -48,6 +52,14 @@ function check(expr: AST.Expression): RowConstraintSchema {
 	return { expr, operations: DEFAULT_ROWOP_MASK };
 }
 
+function qcol(table: string, name: string): AST.ColumnExpr {
+	return { type: 'column', name, table };
+}
+
+function checkWith(expr: AST.Expression, overrides: Partial<RowConstraintSchema>): RowConstraintSchema {
+	return { expr, operations: DEFAULT_ROWOP_MASK, ...overrides };
+}
+
 const colMap = new Map<string, number>([
 	['a', 0],
 	['b', 1],
@@ -61,13 +73,21 @@ const colMap = new Map<string, number>([
 
 const allDeterministic = () => true;
 
+// BINARY-declared TEXT metadata for every column — the value-discrimination
+// gate is a pass-through for these shapes; collation-gate behavior has its own
+// describe block below.
+const colMeta: DeclaredColumnInfo[] = Array.from(
+	{ length: colMap.size },
+	() => ({ collation: 'BINARY', logicalType: TEXT_TYPE }),
+);
+
 // ---------------------------------------------------------------------------
 // Unit tests for extractCheckConstraints
 // ---------------------------------------------------------------------------
 
 describe('extractCheckConstraints (unit)', () => {
 	it('check (a = b) emits bi-directional FDs and an EC pair', () => {
-		const result = extractCheckConstraints([check(bin('=', col('a'), col('b')))], colMap, allDeterministic);
+		const result = extractCheckConstraints([check(bin('=', col('a'), col('b')))], colMap, allDeterministic, colMeta);
 		expect(result.fds).to.have.length(2);
 		expect(result.fds.some(fd => fd.determinants.includes(0) && fd.dependents.includes(1))).to.equal(true);
 		expect(result.fds.some(fd => fd.determinants.includes(1) && fd.dependents.includes(0))).to.equal(true);
@@ -77,7 +97,7 @@ describe('extractCheckConstraints (unit)', () => {
 	});
 
 	it("check (status = 'a') emits ∅ → status FD plus a literal binding", () => {
-		const result = extractCheckConstraints([check(bin('=', col('status'), lit('a')))], colMap, allDeterministic);
+		const result = extractCheckConstraints([check(bin('=', col('status'), lit('a')))], colMap, allDeterministic, colMeta);
 		expect(result.fds).to.have.length(1);
 		expect(result.fds[0].determinants).to.deep.equal([]);
 		expect(result.fds[0].dependents).to.deep.equal([5]);
@@ -88,7 +108,7 @@ describe('extractCheckConstraints (unit)', () => {
 	});
 
 	it('check (qty >= 0) emits a range domain with inclusive lower bound', () => {
-		const result = extractCheckConstraints([check(bin('>=', col('qty'), lit(0)))], colMap, allDeterministic);
+		const result = extractCheckConstraints([check(bin('>=', col('qty'), lit(0)))], colMap, allDeterministic, colMeta);
 		expect(result.domainConstraints).to.have.length(1);
 		const d = result.domainConstraints[0];
 		expect(d.kind).to.equal('range');
@@ -105,6 +125,7 @@ describe('extractCheckConstraints (unit)', () => {
 			[check(between(col('qty'), lit(0), lit(100)))],
 			colMap,
 			allDeterministic,
+			colMeta,
 		);
 		expect(result.domainConstraints).to.have.length(1);
 		const d = result.domainConstraints[0];
@@ -122,6 +143,7 @@ describe('extractCheckConstraints (unit)', () => {
 			[check(and(bin('>', col('qty'), lit(0)), bin('<', col('qty'), lit(100))))],
 			colMap,
 			allDeterministic,
+			colMeta,
 		);
 		expect(result.domainConstraints).to.have.length(2);
 		const lower = result.domainConstraints.find(d => d.kind === 'range' && d.min !== undefined) as DomainConstraint & { kind: 'range' } | undefined;
@@ -137,6 +159,7 @@ describe('extractCheckConstraints (unit)', () => {
 			[check(inExpr(col('status'), [lit('a'), lit('i'), lit('d')]))],
 			colMap,
 			allDeterministic,
+			colMeta,
 		);
 		expect(result.domainConstraints).to.have.length(1);
 		const d = result.domainConstraints[0];
@@ -151,6 +174,7 @@ describe('extractCheckConstraints (unit)', () => {
 			[check(and(bin('=', col('a'), col('b')), bin('=', col('status'), lit('a'))))],
 			colMap,
 			allDeterministic,
+			colMeta,
 		);
 		expect(result.fds.length).to.be.greaterThanOrEqual(3);
 		expect(result.equivPairs).to.deep.equal([[0, 1]]);
@@ -163,6 +187,7 @@ describe('extractCheckConstraints (unit)', () => {
 			[check(or(bin('=', col('a'), col('b')), bin('=', col('x'), col('y'))))],
 			colMap,
 			allDeterministic,
+			colMeta,
 		);
 		expect(result.fds).to.have.length(0);
 		expect(result.equivPairs).to.have.length(0);
@@ -175,6 +200,7 @@ describe('extractCheckConstraints (unit)', () => {
 			[check(bin('>', col('a'), col('b')))],
 			colMap,
 			allDeterministic,
+			colMeta,
 		);
 		expect(result.fds).to.have.length(0);
 		expect(result.domainConstraints).to.have.length(0);
@@ -185,6 +211,7 @@ describe('extractCheckConstraints (unit)', () => {
 			[check(bin('=', col('b'), bin('+', col('a'), lit(1))))],
 			colMap,
 			allDeterministic,
+			colMeta,
 		);
 		expect(result.fds).to.have.length(1);
 		expect(result.fds[0].determinants).to.deep.equal([0]);
@@ -199,6 +226,7 @@ describe('extractCheckConstraints (unit)', () => {
 			[check(bin('=', col('b'), bin('+', col('a'), col('c'))))],
 			colMap,
 			allDeterministic,
+			colMeta,
 		);
 		expect(result.fds).to.have.length(0);
 	});
@@ -208,6 +236,7 @@ describe('extractCheckConstraints (unit)', () => {
 			[check(bin('<', lit(0), col('qty')))],
 			colMap,
 			allDeterministic,
+			colMeta,
 		);
 		expect(result.domainConstraints).to.have.length(1);
 		const d = result.domainConstraints[0];
@@ -221,7 +250,7 @@ describe('extractCheckConstraints (unit)', () => {
 	});
 
 	it('check (a == b) — the `==` operator alias is recognized as equality', () => {
-		const result = extractCheckConstraints([check(bin('==', col('a'), col('b')))], colMap, allDeterministic);
+		const result = extractCheckConstraints([check(bin('==', col('a'), col('b')))], colMap, allDeterministic, colMeta);
 		expect(result.fds).to.have.length(2);
 		expect(result.equivPairs).to.deep.equal([[0, 1]]);
 	});
@@ -232,6 +261,7 @@ describe('extractCheckConstraints (unit)', () => {
 			[check(bin('=', col('b'), fn('random_fn', col('a'))))],
 			colMap,
 			isDeterministic,
+			colMeta,
 		);
 		expect(result.fds).to.have.length(0);
 		expect(result.constantBindings).to.have.length(0);
@@ -240,11 +270,397 @@ describe('extractCheckConstraints (unit)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Row-invariant gate — ticket check-extraction-rowop-mask-transition-checks,
+// refined per-conjunct by ticket check-extraction-per-conjunct-old-screen.
+// A CHECK contributes facts only when its operation mask covers INSERT and
+// UPDATE (enforcement filters by `shouldCheckConstraint`, so other masks
+// leave entry paths unenforced) and it is not deferred. `old.` row-image
+// references (OLD is NULL on the INSERT path, so old.-form predicates are
+// transition constraints, not row invariants) are screened per AND-conjunct:
+// the conjunct containing the ref is skipped, sibling conjuncts extract
+// normally; an `old.` ref inside a non-AND shape (e.g. an OR disjunct) still
+// kills that entire conjunct.
+// ---------------------------------------------------------------------------
+
+describe('extractCheckConstraints row-invariant gate', () => {
+	function expectEmpty(result: ReturnType<typeof extractCheckConstraints>): void {
+		expect(result.fds).to.have.length(0);
+		expect(result.equivPairs).to.have.length(0);
+		expect(result.constantBindings).to.have.length(0);
+		expect(result.domainConstraints).to.have.length(0);
+	}
+
+	const shapes: Array<[string, AST.Expression]> = [
+		['a = b', bin('=', col('a'), col('b'))],
+		['qty >= 0', bin('>=', col('qty'), lit(0))],
+		["status in ('a','i')", inExpr(col('status'), [lit('a'), lit('i')])],
+	];
+
+	const nonQualifyingMasks: Array<[string, RowOpMask]> = [
+		['insert-only', RowOpFlag.INSERT],
+		['update-only', RowOpFlag.UPDATE],
+		['delete-only', RowOpFlag.DELETE],
+		['insert|delete', (RowOpFlag.INSERT | RowOpFlag.DELETE) as RowOpMask],
+		['update|delete', (RowOpFlag.UPDATE | RowOpFlag.DELETE) as RowOpMask],
+	];
+
+	for (const [maskName, mask] of nonQualifyingMasks) {
+		it(`${maskName} mask extracts nothing (equality, range, and in shapes)`, () => {
+			for (const [, expr] of shapes) {
+				expectEmpty(extractCheckConstraints(
+					[checkWith(expr, { operations: mask })], colMap, allDeterministic, colMeta));
+			}
+		});
+	}
+
+	it('insert|update and insert|update|delete masks extract as before', () => {
+		const qualifying: RowOpMask[] = [
+			DEFAULT_ROWOP_MASK,
+			(RowOpFlag.INSERT | RowOpFlag.UPDATE | RowOpFlag.DELETE) as RowOpMask,
+		];
+		for (const mask of qualifying) {
+			const eq = extractCheckConstraints(
+				[checkWith(bin('=', col('a'), col('b')), { operations: mask })], colMap, allDeterministic, colMeta);
+			expect(eq.fds).to.have.length(2);
+			expect(eq.equivPairs).to.deep.equal([[0, 1]]);
+			const range = extractCheckConstraints(
+				[checkWith(bin('>=', col('qty'), lit(0)), { operations: mask })], colMap, allDeterministic, colMeta);
+			expect(range.domainConstraints).to.have.length(1);
+		}
+	});
+
+	it('deferrable / initiallyDeferred checks extract nothing (defensive — not declarable via SQL today)', () => {
+		expectEmpty(extractCheckConstraints(
+			[checkWith(bin('=', col('a'), col('b')), { deferrable: true })], colMap, allDeterministic, colMeta));
+		expectEmpty(extractCheckConstraints(
+			[checkWith(bin('=', col('a'), col('b')), { initiallyDeferred: true })], colMap, allDeterministic, colMeta));
+	});
+
+	it('old. as a plain operand kills the check (old.a = b)', () => {
+		expectEmpty(extractCheckConstraints(
+			[check(bin('=', qcol('old', 'a'), col('b')))], colMap, allDeterministic, colMeta));
+	});
+
+	it('old. buried in a compound RHS kills the check (a = old.b + 1)', () => {
+		expectEmpty(extractCheckConstraints(
+			[check(bin('=', col('a'), bin('+', qcol('old', 'b'), lit(1))))], colMap, allDeterministic, colMeta));
+	});
+
+	it('old. in an implication-form guard disjunct kills the check', () => {
+		expectEmpty(extractCheckConstraints(
+			[check(or(bin('<>', qcol('old', 'status'), lit('x')), bin('=', col('a'), col('b'))))],
+			colMap, allDeterministic, colMeta));
+	});
+
+	it('old. in BETWEEN and IN shapes kills the check', () => {
+		expectEmpty(extractCheckConstraints(
+			[check(between(qcol('old', 'qty'), lit(0), lit(100)))], colMap, allDeterministic, colMeta));
+		expectEmpty(extractCheckConstraints(
+			[check(inExpr(qcol('old', 'status'), [lit('a')]))], colMap, allDeterministic, colMeta));
+	});
+
+	it('OLD qualifier matches case-insensitively', () => {
+		expectEmpty(extractCheckConstraints(
+			[check(bin('=', qcol('OLD', 'a'), col('b')))], colMap, allDeterministic, colMeta));
+	});
+
+	it('a gated check does not suppress sibling checks in the same array', () => {
+		const result = extractCheckConstraints([
+			check(bin('=', qcol('old', 'a'), col('b'))),
+			checkWith(bin('=', col('x'), col('y')), { operations: RowOpFlag.INSERT }),
+			check(bin('>=', col('qty'), lit(0))),
+		], colMap, allDeterministic, colMeta);
+		expect(result.fds).to.have.length(0);
+		expect(result.equivPairs).to.have.length(0);
+		expect(result.constantBindings).to.have.length(0);
+		expect(result.domainConstraints).to.have.length(1);
+		expect(result.domainConstraints[0].column).to.equal(6);
+	});
+
+	it("mixed check ((old.a is null or a = old.a) and status in ('a','i')) contributes exactly the status enum", () => {
+		const isNull = (e: AST.Expression): AST.UnaryExpr => ({ type: 'unary', operator: 'IS NULL', expr: e });
+		const result = extractCheckConstraints(
+			[check(and(
+				or(isNull(qcol('old', 'a')), bin('=', col('a'), qcol('old', 'a'))),
+				inExpr(col('status'), [lit('a'), lit('i')]),
+			))],
+			colMap, allDeterministic, colMeta);
+		// Nothing from the old-conjunct...
+		expect(result.fds).to.have.length(0);
+		expect(result.equivPairs).to.have.length(0);
+		expect(result.constantBindings).to.have.length(0);
+		// ...but the invariant sibling conjunct contributes its enum domain.
+		expect(result.domainConstraints).to.deep.equal([
+			{ kind: 'enum', column: 5, values: ['a', 'i'] },
+		]);
+	});
+
+	it('old. inside an OR disjunct kills that whole conjunct, not just the disjunct', () => {
+		// Implication-form OR with an old.-ref guard: the per-conjunct argument
+		// does not extend through OR, so the entire OR conjunct is skipped —
+		// while the AND-sibling range conjunct still extracts.
+		const result = extractCheckConstraints(
+			[check(and(
+				or(bin('<>', qcol('old', 'status'), lit('x')), bin('=', col('a'), col('b'))),
+				bin('>=', col('qty'), lit(0)),
+			))],
+			colMap, allDeterministic, colMeta);
+		expect(result.fds).to.have.length(0);
+		expect(result.equivPairs).to.have.length(0);
+		expect(result.constantBindings).to.have.length(0);
+		expect(result.domainConstraints).to.have.length(1);
+		expect(result.domainConstraints[0].column).to.equal(6);
+	});
+
+	it('new.a = b extracts identically to a = b (NEW is the stored row image)', () => {
+		const qualified = extractCheckConstraints(
+			[check(bin('=', qcol('new', 'a'), col('b')))], colMap, allDeterministic, colMeta);
+		const bare = extractCheckConstraints(
+			[check(bin('=', col('a'), col('b')))], colMap, allDeterministic, colMeta);
+		expect(qualified).to.deep.equal(bare);
+		expect(qualified.equivPairs).to.deep.equal([[0, 1]]);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Value-discrimination (collation) gate — ticket
+// check-extraction-collation-blind-fds. Facts may only be minted when the
+// enforcement comparison is BINARY for textual operands (enforcement resolves
+// declared column collations plus explicit COLLATE wrappers).
+// ---------------------------------------------------------------------------
+
+describe('extractCheckConstraints collation gate', () => {
+	function collateAst(expr: AST.Expression, collation: string): AST.CollateExpr {
+		return { type: 'collate', expr, collation };
+	}
+
+	function metaWith(overrides: Record<number, DeclaredColumnInfo>): DeclaredColumnInfo[] {
+		const m = colMeta.slice();
+		for (const [idx, info] of Object.entries(overrides)) m[Number(idx)] = info;
+		return m;
+	}
+
+	const NOCASE_TEXT: DeclaredColumnInfo = { collation: 'NOCASE', logicalType: TEXT_TYPE };
+	const NOCASE_INT: DeclaredColumnInfo = { collation: 'NOCASE', logicalType: INTEGER_TYPE };
+
+	it('col = col with a NOCASE-declared side mints no FDs, EC pair, or bindings', () => {
+		const result = extractCheckConstraints(
+			[check(bin('=', col('a'), col('b')))],
+			colMap, allDeterministic, metaWith({ 0: NOCASE_TEXT }),
+		);
+		expect(result.fds).to.have.length(0);
+		expect(result.equivPairs).to.have.length(0);
+		expect(result.constantBindings).to.have.length(0);
+	});
+
+	it('col = literal on a NOCASE-declared text column mints no pin or binding', () => {
+		const result = extractCheckConstraints(
+			[check(bin('=', col('status'), lit('a')))],
+			colMap, allDeterministic, metaWith({ 5: NOCASE_TEXT }),
+		);
+		expect(result.fds).to.have.length(0);
+		expect(result.constantBindings).to.have.length(0);
+	});
+
+	it('col = (col collate nocase) mints no one-way FD even over BINARY-declared columns (R1 shape)', () => {
+		const result = extractCheckConstraints(
+			[check(bin('=', col('b'), collateAst(col('c'), 'NOCASE')))],
+			colMap, allDeterministic, colMeta,
+		);
+		expect(result.fds).to.have.length(0);
+	});
+
+	it('col = (col collate binary) keeps the one-way FD (BINARY wrapper subtree)', () => {
+		const result = extractCheckConstraints(
+			[check(bin('=', col('b'), collateAst(col('c'), 'binary')))],
+			colMap, allDeterministic, colMeta,
+		);
+		expect(result.fds).to.have.length(1);
+		expect(result.fds[0].determinants).to.deep.equal([2]);
+		expect(result.fds[0].dependents).to.deep.equal([1]);
+	});
+
+	it('an inert declared collation on a non-textual column keeps equality facts', () => {
+		const result = extractCheckConstraints(
+			[check(bin('=', col('qty'), lit(5)))],
+			colMap, allDeterministic, metaWith({ 6: NOCASE_INT }),
+		);
+		expect(result.fds).to.have.length(1);
+		expect(result.constantBindings).to.have.length(1);
+	});
+
+	it('text domains under a NOCASE-declared column are suppressed (range, BETWEEN, IN enum)', () => {
+		const m = metaWith({ 5: NOCASE_TEXT });
+		const range = extractCheckConstraints([check(bin('>=', col('status'), lit('m')))], colMap, allDeterministic, m);
+		expect(range.domainConstraints).to.have.length(0);
+		const btw = extractCheckConstraints([check(between(col('status'), lit('a'), lit('z')))], colMap, allDeterministic, m);
+		expect(btw.domainConstraints).to.have.length(0);
+		const enm = extractCheckConstraints([check(inExpr(col('status'), [lit('a'), lit('b')]))], colMap, allDeterministic, m);
+		expect(enm.domainConstraints).to.have.length(0);
+	});
+
+	it('numeric domains on a non-textual column keep extracting despite an inert declared collation', () => {
+		const m = metaWith({ 6: NOCASE_INT });
+		const range = extractCheckConstraints([check(bin('>=', col('qty'), lit(0)))], colMap, allDeterministic, m);
+		expect(range.domainConstraints).to.have.length(1);
+		const enm = extractCheckConstraints([check(inExpr(col('qty'), [lit(1), lit(2)]))], colMap, allDeterministic, m);
+		expect(enm.domainConstraints).to.have.length(1);
+	});
+
+	it('a NOCASE-collate-wrapped IN value suppresses the enum domain', () => {
+		const result = extractCheckConstraints(
+			[check(inExpr(col('status'), [lit('a'), collateAst(lit('b'), 'NOCASE')]))],
+			colMap, allDeterministic, colMeta,
+		);
+		expect(result.domainConstraints).to.have.length(0);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Semantic-ordering gate on cross-column facts — invariant OPT-051, ticket
+// check-derived-equivalence-ignores-semantic-ordering. TIMESPAN and JSON
+// compare by meaning, not stored text ('PT1H' = 'PT60M'), so a mixed pair such
+// as `d timespan` / `s text` shares no notion of "same value" and may mint no
+// cross-column fact. Constant pins stay ungated (a pin claims only that the
+// column compares equal to the literal under its own comparison).
+// ---------------------------------------------------------------------------
+
+describe('extractCheckConstraints semantic-ordering gate', () => {
+	function metaWith(overrides: Record<number, DeclaredColumnInfo>): DeclaredColumnInfo[] {
+		const m = colMeta.slice();
+		for (const [idx, info] of Object.entries(overrides)) m[Number(idx)] = info;
+		return m;
+	}
+
+	const TS: DeclaredColumnInfo = { collation: 'BINARY', logicalType: TIMESPAN_TYPE };
+	const JSONC: DeclaredColumnInfo = { collation: 'BINARY', logicalType: JSON_TYPE };
+
+	// `a` (0) semantic, `b` (1) plain text — the headline mixed pair.
+	const mixed = metaWith({ 0: TS });
+	// Both semantic and the SAME type — the over-declining control.
+	const sameType = metaWith({ 0: TS, 1: TS });
+
+	function expectNoCrossColumnFacts(
+		result: ReturnType<typeof extractCheckConstraints>,
+		why: string,
+	): void {
+		expect(result.fds, `${why}: FDs`).to.have.length(0);
+		expect(result.equivPairs, `${why}: EC pair`).to.have.length(0);
+	}
+
+	it('check (timespan_col = text_col) mints no mirror FDs and no EC pair, in both operand orders', () => {
+		expectNoCrossColumnFacts(
+			extractCheckConstraints([check(bin('=', col('a'), col('b')))], colMap, allDeterministic, mixed),
+			'timespan = text');
+		expectNoCrossColumnFacts(
+			extractCheckConstraints([check(bin('=', col('b'), col('a')))], colMap, allDeterministic, mixed),
+			'text = timespan');
+	});
+
+	it('check (timespan_col = json_col) — two DIFFERENT semantic types are declined too', () => {
+		expectNoCrossColumnFacts(
+			extractCheckConstraints(
+				[check(bin('=', col('a'), col('b')))], colMap, allDeterministic, metaWith({ 0: TS, 1: JSONC })),
+			'timespan = json');
+	});
+
+	it('check (json_col = text_col) mints no cross-column facts', () => {
+		expectNoCrossColumnFacts(
+			extractCheckConstraints(
+				[check(bin('=', col('a'), col('b')))], colMap, allDeterministic, metaWith({ 0: JSONC })),
+			'json = text');
+	});
+
+	it('check (timespan_col = timespan_col) still mints both mirror FDs and the EC pair', () => {
+		const result = extractCheckConstraints(
+			[check(bin('=', col('a'), col('b')))], colMap, allDeterministic, sameType);
+		expect(result.fds).to.have.length(2);
+		expect(result.fds.some(fd => fd.determinants.includes(0) && fd.dependents.includes(1))).to.equal(true);
+		expect(result.fds.some(fd => fd.determinants.includes(1) && fd.dependents.includes(0))).to.equal(true);
+		expect(result.equivPairs).to.deep.equal([[0, 1]]);
+	});
+
+	it("check (timespan_col = 'PT1H') keeps its ∅ → col pin and binding — pins are ungated", () => {
+		const result = extractCheckConstraints(
+			[check(bin('=', col('a'), lit('PT1H')))], colMap, allDeterministic, mixed);
+		expect(result.fds).to.have.length(1);
+		expect(result.fds[0].determinants).to.deep.equal([]);
+		expect(result.fds[0].dependents).to.deep.equal([0]);
+		expect(result.constantBindings).to.have.length(1);
+		expect(result.constantBindings[0].attrs).to.deep.equal([0]);
+		expect(result.constantBindings[0].value).to.deep.equal({ kind: 'literal', value: 'PT1H' });
+	});
+
+	// --- Arm 3: the one-way `col = expr` determination. -----------------------
+
+	it('check (text_col = trim(timespan_col)) mints no one-way FD across a mixed pair', () => {
+		expectNoCrossColumnFacts(
+			extractCheckConstraints(
+				[check(bin('=', col('b'), fn('trim', col('a'))))], colMap, allDeterministic, mixed),
+			'text = trim(timespan)');
+		// Operand order reversed: the expression on the left.
+		expectNoCrossColumnFacts(
+			extractCheckConstraints(
+				[check(bin('=', fn('trim', col('a')), col('b')))], colMap, allDeterministic, mixed),
+			'trim(timespan) = text');
+	});
+
+	it('check (timespan_col = trim(timespan_col)) keeps the one-way FD for a same-type pair', () => {
+		const result = extractCheckConstraints(
+			[check(bin('=', col('b'), fn('trim', col('a'))))], colMap, allDeterministic, sameType);
+		expect(result.fds).to.have.length(1);
+		expect(result.fds[0].determinants).to.deep.equal([0]);
+		expect(result.fds[0].dependents).to.deep.equal([1]);
+	});
+
+	// --- Arm 2: the implication form `g <> lit or d = s`. ---------------------
+	// No query shape has been found where a guarded mixed pair returns a wrong
+	// row (guard activation writes the class onto the Filter itself, which
+	// `rule-predicate-inference-equivalence` does not read), so the extractor
+	// output IS the assertion here — see the ticket's arm-2 note.
+
+	it('implication-form check (status <> 1 or timespan_col = text_col) mints no guarded mirror pair', () => {
+		expectNoCrossColumnFacts(
+			extractCheckConstraints(
+				[check(or(bin('<>', col('status'), lit(1)), bin('=', col('a'), col('b'))))],
+				colMap, allDeterministic, mixed),
+			'guarded timespan = text');
+	});
+
+	it('implication-form check over a same-type pair keeps its guarded mirror FDs and the valueEquality tag', () => {
+		const result = extractCheckConstraints(
+			[check(or(bin('<>', col('status'), lit(1)), bin('=', col('a'), col('b'))))],
+			colMap, allDeterministic, sameType);
+		expect(result.fds).to.have.length(2);
+		expect(result.fds.every(fd => fd.valueEquality === true), 'valueEquality tag survives').to.equal(true);
+		expect(result.fds.every(fd => fd.guard !== undefined), 'guard survives').to.equal(true);
+		// Equivalences/bindings are unconditional facts — never lifted from a guarded body.
+		expect(result.equivPairs).to.have.length(0);
+		expect(result.constantBindings).to.have.length(0);
+	});
+
+	it('implication-form one-way body (status <> 1 or text_col = trim(timespan_col)) is declined', () => {
+		expectNoCrossColumnFacts(
+			extractCheckConstraints(
+				[check(or(bin('<>', col('status'), lit(1)), bin('=', col('b'), fn('trim', col('a')))))],
+				colMap, allDeterministic, mixed),
+			'guarded text = trim(timespan)');
+		// Same-type control keeps it.
+		const kept = extractCheckConstraints(
+			[check(or(bin('<>', col('status'), lit(1)), bin('=', col('b'), fn('trim', col('a')))))],
+			colMap, allDeterministic, sameType);
+		expect(kept.fds).to.have.length(1);
+		expect(kept.fds[0].determinants).to.deep.equal([0]);
+		expect(kept.fds[0].dependents).to.deep.equal([1]);
+	});
+});
+
+// ---------------------------------------------------------------------------
 // End-to-end propagation through query_plan(...)
 // ---------------------------------------------------------------------------
 
 interface PhysicalProps {
-	fds?: { determinants: number[]; dependents: number[] }[];
+	fds?: { determinants: number[]; dependents: number[]; kind: 'unique' | 'determination' }[];
 	equivClasses?: number[][];
 	constantBindings?: ConstantBinding[];
 	domainConstraints?: DomainConstraint[];
@@ -272,15 +688,37 @@ describe('CHECK-derived FDs/domains: end-to-end propagation', () => {
 	beforeEach(() => { db = new Database(); });
 	afterEach(async () => { await db.close(); });
 
-	it('table with check (b = a + 1): TableReference exposes FD a → b', async () => {
+	// The one-way determination FD `{a}→{b}` from `check (b = a + 1)` now folds
+	// onto the TableReference unconditionally as `kind: 'determination'`. The
+	// kind-aware readers (`isUniqueDeterminant`) never read a determination as a
+	// uniqueness claim, so a narrow `select distinct a, b` over a non-keyed table
+	// cannot re-derive `{a}` as a phantom key — the old producer-side gate
+	// (ticket fd-oneway-determination-key-bag-overclaim) is subsumed (ticket
+	// fd-determination-reader-side-rule). Both arms pin the kinds: a mere
+	// determination when `a` is not a key, upgradable to 'unique' when it is.
+	it('table with check (b = a + 1): the one-way FD a → b folds as a determination when a is not a key', async () => {
+		// `id` is the PK, so neither `a` (col 1) nor `b` (col 2) is a key.
 		await db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, CHECK (b = a + 1)) USING memory");
 		const rows = await planRows(db, 'SELECT * FROM t');
 		const props = physicalOf(rows, r => r.op === 'TABLEREF' || r.op === 'TABLEREFERENCE' || r.node_type === 'TableReference')
 			?? physicalOf(rows, r => r.op === 'SEQSCAN' || r.op === 'SEQ SCAN' || r.op === 'INDEXSCAN');
 		expect(props, 'expected physical props on a leaf').to.not.equal(undefined);
-		// `a` is column index 1, `b` is column index 2.
+		// `a` is column index 1, `b` is column index 2 — kept, as a pure value claim.
 		const fd = props!.fds?.find(fd => fd.determinants.length === 1 && fd.determinants[0] === 1 && fd.dependents.includes(2));
-		expect(fd, 'expected FD a → b').to.not.equal(undefined);
+		expect(fd, 'one-way FD a → b folds as a determination').to.not.equal(undefined);
+		expect(fd!.kind, 'a is not a key ⇒ a pure value claim').to.equal('determination');
+	});
+
+	it('table with check (b = a + 1): the one-way FD a → b is PRESENT when a is the PK', async () => {
+		// `a` (col 0) is the PK, so `{a}→{b}` is a sound key — the gate keeps it.
+		await db.exec("CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER, CHECK (b = a + 1)) USING memory");
+		const rows = await planRows(db, 'SELECT * FROM t');
+		const props = physicalOf(rows, r => r.op === 'TABLEREF' || r.op === 'TABLEREFERENCE' || r.node_type === 'TableReference')
+			?? physicalOf(rows, r => r.op === 'SEQSCAN' || r.op === 'SEQ SCAN' || r.op === 'INDEXSCAN');
+		expect(props, 'expected physical props on a leaf').to.not.equal(undefined);
+		// `a` is column index 0, `b` is column index 1.
+		const fd = props!.fds?.find(fd => fd.determinants.length === 1 && fd.determinants[0] === 0 && fd.dependents.includes(1));
+		expect(fd, 'expected FD a → b (a is the real key)').to.not.equal(undefined);
 	});
 
 	it("table with check (status in ('a','i')): TableReference carries the enum domain", async () => {

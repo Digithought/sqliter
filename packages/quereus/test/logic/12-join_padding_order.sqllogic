@@ -8,11 +8,6 @@ CREATE TABLE t2 (id INTEGER PRIMARY KEY, t1_id INTEGER, info TEXT);
 INSERT INTO t2 VALUES (101, 1, 'InfoA1'), (102, 1, 'InfoA2'), (103, 2, 'InfoB');
 -- Note: t1.id = 3 has no match in t2
 
--- Setup Indexed Table for ORDER BY consumption test
-CREATE TABLE t_idx (id INTEGER PRIMARY KEY, name TEXT);
-CREATE INDEX t_idx_name ON t_idx (name);
-INSERT INTO t_idx VALUES (1, 'Xavier'), (2, 'Alice'), (3, 'Bob');
-
 -- ==================================
 -- LEFT JOIN Padding Tests
 -- ==================================
@@ -50,26 +45,8 @@ ORDER BY t1.id, t2.id;
 -- ==================================
 -- ORDER BY Consumption Tests
 -- ==================================
-
--- Test: ORDER BY Consumed by Index (ASC)
--- Expect query plan to use index on t_idx.name, no Sort operation needed
-SELECT name FROM t_idx ORDER BY name ASC;
-→ [{"name":"Alice"},{"name":"Bob"},{"name":"Xavier"}]
-
--- Test: ORDER BY Consumed by Index (DESC)
--- Expect query plan to use index on t_idx.name (backwards), no Sort operation needed
-SELECT name FROM t_idx ORDER BY name DESC;
-→ [{"name":"Xavier"},{"name":"Bob"},{"name":"Alice"}]
-
--- Test: ORDER BY Not Consumed (Different Column)
--- Expect query plan to use PK for scan, requires Sort operation
-SELECT name FROM t_idx ORDER BY id DESC;
-→ [{"name":"Bob"},{"name":"Alice"},{"name":"Xavier"}]
-
--- Test: ORDER BY Not Consumed (Expression)
--- Expect query plan to use PK for scan, requires Sort operation
-SELECT name FROM t_idx ORDER BY lower(name);
-→ [{"name":"Alice"},{"name":"Bob"},{"name":"Xavier"}]
+-- The secondary-index variants (ORDER BY consumed / not consumed on an indexed
+-- column) live in 12.1-orderby-index-consumption; they need standalone CREATE INDEX.
 
 -- Test: ORDER BY on JOIN result (Likely Not Consumed)
 -- Order by t1.val, join order might not preserve this. Expect Sort.
@@ -78,6 +55,4 @@ SELECT t1.val, t2.info FROM t1 JOIN t2 ON t1.id = t2.t1_id ORDER BY t1.val DESC,
 
 DROP TABLE t1;
 DROP TABLE t2;
-DROP TABLE t_idx;
-
 

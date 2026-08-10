@@ -1,0 +1,26 @@
+{
+	// Root "solution" config for `tsc -b`. Empty files + references = build-mode
+	// entrypoint: `tsc -b tsconfig.build.json` compiles every class-A (pure-tsc)
+	// library package in dependency order, incrementally. Order is derived from
+	// each package tsconfig's `references` array, NOT hand-maintained here.
+	// Bundled apps (quoomb-web, shared-ui, quereus-vscode) are NOT listed — they
+	// emit via vite/esbuild and run as explicit build steps after this graph.
+	"files": [],
+	"references": [
+		{ "path": "packages/quereus" },
+		{ "path": "packages/plugin-loader" },
+		{ "path": "packages/quereus-isolation" },
+		{ "path": "packages/quereus-store" },
+		{ "path": "packages/quereus-sync" },
+		{ "path": "packages/quereus-sync-client" },
+		{ "path": "packages/sync-coordinator" },
+		{ "path": "packages/quereus-plugin-leveldb" },
+		{ "path": "packages/quereus-plugin-indexeddb" },
+		{ "path": "packages/quereus-plugin-react-native-leveldb" },
+		{ "path": "packages/quereus-plugin-nativescript-sqlite" },
+		{ "path": "packages/quereus-babel-fish" },
+		{ "path": "packages/sample-plugins" },
+		{ "path": "packages/quoomb-cli" },
+		{ "path": "packages/tools/planviz" }
+	]
+}

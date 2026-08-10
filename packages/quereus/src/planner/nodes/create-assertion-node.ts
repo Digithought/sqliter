@@ -12,6 +12,7 @@ export class CreateAssertionNode extends VoidNode {
 
   constructor(
     scope: Scope,
+    public readonly schemaName: string,
     public readonly name: string,
     public readonly checkExpression: AST.Expression,
   ) {
@@ -19,11 +20,12 @@ export class CreateAssertionNode extends VoidNode {
   }
 
   override toString(): string {
-    return `CREATE ASSERTION ${this.name}`;
+    return `CREATE ASSERTION ${this.schemaName}.${this.name}`;
   }
 
   override getLogicalAttributes(): Record<string, unknown> {
     return {
+      schemaName: this.schemaName,
       name: this.name,
       checkExpression: this.checkExpression.toString?.() || 'complex expression',
     };

@@ -1,6 +1,21 @@
 # Transaction Coordinator Architecture
 
-The Transaction Coordinator provides **connection-scoped transaction isolation** for virtual table modules. It enables multiple concurrent operations to work independently without interfering with each other's transaction state.
+> **Stability: Experimental** — see [Stability Tiers](stability.md#tiers).
+
+> **Current implementation note (module-scoped, no isolation).** The text below
+> describes the original connection-scoped *isolation* design. The shipped
+> `@quereus/store` coordinator differs in two ways the rest of this doc predates:
+> (1) it is **one coordinator per storage module**, shared by every table the
+> module owns — the unit of *cross-table atomicity* (a transaction touching
+> several of the module's tables commits/rolls back as one all-or-nothing batch),
+> not per-table; and (2) every op is addressed by its explicit target `KVStore`
+> handle — there is no default-store bucket and no `getStore()` accessor (read
+> paths pass the data-store handle explicitly). The bare store module reports
+> `isolation: false` (`getCapabilities`); cross-connection isolation is layered by
+> `IsolationModule`, not by this coordinator. Read the sections below for the
+> mutation/commit/savepoint mechanics, with those two corrections in mind.
+
+The Transaction Coordinator provides transaction support for virtual table modules. It enables multiple concurrent operations to work with coherent commit/rollback and savepoint semantics.
 
 ## Problem Statement
 

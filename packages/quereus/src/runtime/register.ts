@@ -13,12 +13,19 @@ import { emitDropTable } from './emit/drop-table.js';
 import { emitDropIndex } from './emit/drop-index.js';
 import { emitCreateView } from './emit/create-view.js';
 import { emitDropView } from './emit/drop-view.js';
+import {
+	emitCreateMaterializedView,
+	emitRefreshMaterializedView,
+	emitDropMaterializedView,
+} from './emit/materialized-view.js';
 import { emitCreateAssertion } from './emit/create-assertion.js';
 import { emitDropAssertion } from './emit/drop-assertion.js';
 import { emitCTE } from './emit/cte.js';
 import { emitCTEReference } from './emit/cte-reference.js';
 import { emitInternalRecursiveCTERef } from './emit/internal-recursive-cte-ref.js';
 import { emitAlias } from './emit/alias.js';
+import { emitAssertedKeys } from './emit/asserted-keys.js';
+import { emitLensAuxiliaryAccess } from './emit/lens-auxiliary-access.js';
 import { emitInsert } from './emit/insert.js';
 import { emitUpdate } from './emit/update.js';
 import { emitDmlExecutor } from './emit/dml-executor.js';
@@ -27,6 +34,7 @@ import { emitProject } from './emit/project.js';
 import { emitColumnReference } from './emit/column-reference.js';
 import { emitArrayIndex } from './emit/array-index.js';
 import { emitValues, emitSingleRow, emitTableLiteral } from './emit/values.js';
+import { emitEnvelopeScan } from './emit/envelope-scan.js';
 import { emitFilter } from './emit/filter.js';
 import { emitDistinct } from './emit/distinct.js';
 import { emitScalarFunctionCall } from './emit/scalar-function.js';
@@ -49,8 +57,10 @@ import { emitSetOperation } from './emit/set-operation.js';
 import { emitConstraintCheck } from './emit/constraint-check.js';
 import { emitAddConstraint } from './emit/add-constraint.js';
 import { emitAlterTable } from './emit/alter-table.js';
+import { emitSetObjectTags } from './emit/set-object-tags.js';
 import { emitLoopJoin } from './emit/join.js';
 import { emitBloomJoin } from './emit/bloom-join.js';
+import { emitKeySetSemiJoin } from './emit/key-set-semi-join.js';
 import { emitMergeJoin } from './emit/merge-join.js';
 import { emitAsofScan } from './emit/asof-scan.js';
 import { emitCache } from './emit/cache.js';
@@ -59,12 +69,13 @@ import { emitAsyncGather } from './emit/async-gather.js';
 import { emitFanOutLookupJoin } from './emit/fanout-lookup-join.js';
 import { emitReturning } from './emit/returning.js';
 import { emitSink } from './emit/sink.js';
+import { emitViewMutation } from './emit/view-mutation.js';
 import { emitBetween } from './emit/between.js';
 import { emitRetrieve } from './emit/retrieve.js';
 import { emitRemoteQuery } from './emit/remote-query.js';
 import { emitEmptyResult } from './emit/empty-result.js';
 import { emitEmptyRelation } from './emit/empty-relation.js';
-import { emitDeclareSchema, emitDiffSchema, emitApplySchema, emitExplainSchema } from './emit/schema-declarative.js';
+import { emitDeclareSchema, emitDeclareLens, emitDiffSchema, emitApplySchema, emitExplainSchema } from './emit/schema-declarative.js';
 
 let registered = false;
 
@@ -92,6 +103,8 @@ export function registerEmitters() {
 	// Relational emitters (mix of logical and physical for now)
 	registerEmitter(PlanNodeType.Block, emitBlock as EmitterFunc);
 	registerEmitter(PlanNodeType.Alias, emitAlias as EmitterFunc);
+	registerEmitter(PlanNodeType.AssertedKeys, emitAssertedKeys as EmitterFunc);
+	registerEmitter(PlanNodeType.LensAuxiliaryAccess, emitLensAuxiliaryAccess as EmitterFunc);
 	registerEmitter(PlanNodeType.CTEReference, emitCTEReference as EmitterFunc);
 	registerEmitter(PlanNodeType.InternalRecursiveCTERef, emitInternalRecursiveCTERef as EmitterFunc);
 	registerEmitter(PlanNodeType.Retrieve, emitRetrieve as EmitterFunc);
@@ -106,6 +119,7 @@ export function registerEmitters() {
 
 	registerEmitter(PlanNodeType.Values, emitValues as EmitterFunc);
 	registerEmitter(PlanNodeType.TableLiteral, emitTableLiteral as EmitterFunc);
+	registerEmitter(PlanNodeType.EnvelopeScan, emitEnvelopeScan as EmitterFunc);
 	registerEmitter(PlanNodeType.SingleRow, emitSingleRow as EmitterFunc);
 	registerEmitter(PlanNodeType.Filter, emitFilter as EmitterFunc);
 	registerEmitter(PlanNodeType.Project, emitProject as EmitterFunc);
@@ -133,6 +147,9 @@ export function registerEmitters() {
 	registerEmitter(PlanNodeType.DropIndex, emitDropIndex as EmitterFunc);
 	registerEmitter(PlanNodeType.CreateView, emitCreateView as EmitterFunc);
 	registerEmitter(PlanNodeType.DropView, emitDropView as EmitterFunc);
+	registerEmitter(PlanNodeType.CreateMaterializedView, emitCreateMaterializedView as EmitterFunc);
+	registerEmitter(PlanNodeType.RefreshMaterializedView, emitRefreshMaterializedView as EmitterFunc);
+	registerEmitter(PlanNodeType.DropMaterializedView, emitDropMaterializedView as EmitterFunc);
 	registerEmitter(PlanNodeType.CreateAssertion, emitCreateAssertion as EmitterFunc);
 	registerEmitter(PlanNodeType.DropAssertion, emitDropAssertion as EmitterFunc);
 	registerEmitter(PlanNodeType.Insert, emitInsert as EmitterFunc);
@@ -142,6 +159,7 @@ export function registerEmitters() {
 	registerEmitter(PlanNodeType.ConstraintCheck, emitConstraintCheck as EmitterFunc);
 	registerEmitter(PlanNodeType.AddConstraint, emitAddConstraint as EmitterFunc);
 	registerEmitter(PlanNodeType.AlterTable, emitAlterTable as EmitterFunc);
+	registerEmitter(PlanNodeType.SetObjectTags, emitSetObjectTags as EmitterFunc);
 	registerEmitter(PlanNodeType.Returning, emitReturning as EmitterFunc);
 
 	// Transaction control emitters
@@ -151,6 +169,7 @@ export function registerEmitters() {
 
 	// Declarative schema
 	registerEmitter(PlanNodeType.DeclareSchema, emitDeclareSchema as EmitterFunc);
+	registerEmitter(PlanNodeType.DeclareLens, emitDeclareLens as EmitterFunc);
 	registerEmitter(PlanNodeType.DiffSchema, emitDiffSchema as EmitterFunc);
 	registerEmitter(PlanNodeType.ApplySchema, emitApplySchema as EmitterFunc);
 	registerEmitter(PlanNodeType.ExplainSchema, emitExplainSchema as EmitterFunc);
@@ -161,6 +180,7 @@ export function registerEmitters() {
 	// Join emitters
 	registerEmitter(PlanNodeType.Join, emitLoopJoin as EmitterFunc);
 	registerEmitter(PlanNodeType.HashJoin, emitBloomJoin as EmitterFunc);
+	registerEmitter(PlanNodeType.KeySetSemiJoin, emitKeySetSemiJoin as EmitterFunc);
 	registerEmitter(PlanNodeType.MergeJoin, emitMergeJoin as EmitterFunc);
 	registerEmitter(PlanNodeType.AsofScan, emitAsofScan as EmitterFunc);
 
@@ -178,4 +198,7 @@ export function registerEmitters() {
 
 	// Sink emitter
 	registerEmitter(PlanNodeType.Sink, emitSink as EmitterFunc);
+
+	// View-/MV-mediated mutation substrate emitter
+	registerEmitter(PlanNodeType.ViewMutation, emitViewMutation as EmitterFunc);
 }

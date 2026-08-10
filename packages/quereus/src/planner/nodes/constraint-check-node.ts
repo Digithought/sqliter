@@ -1,5 +1,5 @@
 import type { Scope } from '../scopes/scope.js';
-import { PlanNode, type RelationalPlanNode, type Attribute, type RowDescriptor, type ScalarPlanNode, isRelationalNode, isScalarNode } from './plan-node.js';
+import { PlanNode, type RelationalPlanNode, type Attribute, type RowDescriptor, type ScalarPlanNode, isRelationalNode, asScalarNodes } from './plan-node.js';
 import { PlanNodeType } from './plan-node-type.js';
 import type { TableReferenceNode } from './reference.js';
 import type { RelationType } from '../../common/datatype.js';
@@ -83,59 +83,57 @@ export class ConstraintCheckNode extends PlanNode implements RelationalPlanNode 
     if (this.notNullDefaults) {
       this.notNullDefaults.forEach(d => children.push(d.defaultNode));
     }
+    // Add mutation context value expressions so the optimizer can rewrite them too.
+    if (this.mutationContextValues) {
+      children.push(...this.mutationContextValues.values());
+    }
     return children;
   }
 
   withChildren(newChildren: readonly PlanNode[]): PlanNode {
     const constraintCount = this.constraintChecks.length;
     const defaultCount = this.notNullDefaults?.length ?? 0;
-    const expectedChildren = 1 + constraintCount + defaultCount;
+    const ctxKeys = [...(this.mutationContextValues?.keys() ?? [])];
+    const expectedChildren = 1 + constraintCount + defaultCount + ctxKeys.length;
     if (newChildren.length !== expectedChildren) {
       throw new Error(`ConstraintCheckNode expects ${expectedChildren} children, got ${newChildren.length}`);
     }
 
     const newSource = newChildren[0];
-    const newConstraintExprs = newChildren.slice(1, 1 + constraintCount);
-    const newDefaultExprs = newChildren.slice(1 + constraintCount);
+    const newConstraintExprs = asScalarNodes(newChildren.slice(1, 1 + constraintCount), 'ConstraintCheckNode constraint');
+    const newDefaultExprs = asScalarNodes(newChildren.slice(1 + constraintCount, 1 + constraintCount + defaultCount), 'ConstraintCheckNode default');
+    const newCtxExprs = asScalarNodes(newChildren.slice(1 + constraintCount + defaultCount), 'ConstraintCheckNode context');
 
     // Type check the source
     if (!isRelationalNode(newSource)) {
       throw new Error('ConstraintCheckNode: first child must be a RelationalPlanNode');
     }
 
-    // Type check constraint expressions
-    for (let i = 0; i < newConstraintExprs.length; i++) {
-      const expr = newConstraintExprs[i];
-      if (!isScalarNode(expr)) {
-        throw new Error(`ConstraintCheckNode: constraint child ${i + 1} must be a ScalarPlanNode`);
-      }
-    }
-    for (let i = 0; i < newDefaultExprs.length; i++) {
-      const expr = newDefaultExprs[i];
-      if (!isScalarNode(expr)) {
-        throw new Error(`ConstraintCheckNode: default child ${i + 1} must be a ScalarPlanNode`);
-      }
-    }
-
     // Return same instance if nothing changed
+    const ctxExprs = [...(this.mutationContextValues?.values() ?? [])];
     const constraintsUnchanged = newConstraintExprs.every((expr, i) => expr === this.constraintChecks[i].expression);
     const defaultsUnchanged = !this.notNullDefaults
       || newDefaultExprs.every((expr, i) => expr === this.notNullDefaults![i].defaultNode);
-    if (newSource === this.source && constraintsUnchanged && defaultsUnchanged) {
+    const ctxUnchanged = newCtxExprs.every((e, i) => e === ctxExprs[i]);
+    if (newSource === this.source && constraintsUnchanged && defaultsUnchanged && ctxUnchanged) {
       return this;
     }
 
     // Rebuild constraint checks with new expressions
     const newConstraintChecks = this.constraintChecks.map((check, i) => ({
       ...check,
-      expression: newConstraintExprs[i] as ScalarPlanNode
+      expression: newConstraintExprs[i]
     }));
 
     const newNotNullDefaults = this.notNullDefaults
       ? this.notNullDefaults.map((d, i) => ({
           ...d,
-          defaultNode: newDefaultExprs[i] as ScalarPlanNode,
+          defaultNode: newDefaultExprs[i],
         }))
+      : undefined;
+
+    const newContextValues = this.mutationContextValues
+      ? new Map(ctxKeys.map((k, i) => [k, newCtxExprs[i]] as const))
       : undefined;
 
     // Create new instance
@@ -148,7 +146,7 @@ export class ConstraintCheckNode extends PlanNode implements RelationalPlanNode 
       this.newRowDescriptor,
       this.flatRowDescriptor,
       newConstraintChecks,
-      this.mutationContextValues,
+      newContextValues,
       this.contextAttributes,
       this.contextDescriptor,
       this.onConflict,

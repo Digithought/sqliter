@@ -12,6 +12,24 @@ export function getModuleConcurrencyMode(module: AnyVirtualTableModule): VtabCon
 }
 
 /**
+ * Whether the module declares that a `_readCommitted` connection serves a stable,
+ * self-consistent snapshot of committed state for the life of the scan — the
+ * precondition for running a read outside the execution mutex, concurrently with
+ * another statement's virtual-table commit.
+ *
+ * Fails closed: an undeclared module (every module that predates the flag) reads
+ * as `false` and keeps taking the serialized path. See
+ * `VirtualTableModule.readCommittedSnapshot` for the obligation, and
+ * `docs/module-authoring.md` § "Committed-Snapshot Reads (`_readCommitted`)".
+ *
+ * Deliberately NOT folded into {@link getModuleConcurrencyMode}: that answers a
+ * per-connection reentrancy question, this one a cross-connection tearing question.
+ */
+export function getModuleReadCommittedSnapshot(module: AnyVirtualTableModule): boolean {
+	return module.readCommittedSnapshot === true;
+}
+
+/**
  * Promise-chain tail per connection. The tail resolves when the current
  * critical section's release fires; subsequent acquirers await it and
  * chain a fresh promise on. WeakMap keyed by connection so a discarded

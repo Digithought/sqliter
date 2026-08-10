@@ -1,0 +1,21 @@
+-- 99.0.1-schema-index-listing.sqllogic
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Carved out of 99-conversion-edge-cases: that file is type-conversion edge cases
+-- plus introspection-function checks, and this was its only index DDL — a table
+-- plus one `create index` existing solely so schema() has an index row to list.
+-- On its own here, the conversion coverage stays runnable on backends without
+-- first-class CREATE INDEX.
+--
+-- Subject: schema() lists an index row alongside the table row that owns it.
+
+CREATE TABLE idx_test (id INTEGER PRIMARY KEY, name TEXT, score REAL);
+CREATE INDEX idx_name ON idx_test (name);
+-- run
+
+-- Should show both table and index in schema
+SELECT type, name FROM schema() WHERE name = 'idx_test' OR name = 'idx_name' ORDER BY type;
+→ [{"type":"index","name":"idx_name"},{"type":"table","name":"idx_test"}]
+
+DROP TABLE idx_test;

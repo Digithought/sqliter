@@ -1,0 +1,342 @@
+-- Comparison collation: provenance-ranked, symmetric resolution. Ticket
+-- comparison-collation-provenance-and-precedence. Each operand contributes
+-- (collation, rank) from its type's provenance: explicit COLLATE (rank 3) >
+-- explicitly-declared column collation (rank 2) > defaulted collation (rank 1;
+-- a defaulted BINARY contributes nothing) > BINARY floor. The highest rank
+-- wins; same-rank explicit/declared conflicts error at prepare time;
+-- same-rank default conflicts resolve to BINARY silently. Resolution is
+-- symmetric — `a = b` and `b = a` always resolve identically — which
+-- deliberately diverges from SQLite's left-operand precedence (docs/types.md
+-- § Comparison collation resolution). IS [NOT] is parsed only in its unary
+-- NULL/TRUE/FALSE forms, so binary IS never reaches comparison resolution.
+
+-- =============================================================================
+-- 1. Headline: declared NOCASE vs defaulted BINARY resolves NOCASE from
+--    EITHER side (the defaulted BINARY of a plain column contributes nothing).
+-- =============================================================================
+
+create table t_dn (id integer primary key, b text, c text collate nocase);
+insert into t_dn values (1, 'Bob', 'bob'), (2, 'xyz', 'zzz');
+
+select id from t_dn where b = c;
+→ [{"id":1}]
+
+-- flipped spelling: identical resolution (previously BINARY → no rows).
+select id from t_dn where c = b;
+→ [{"id":1}]
+
+-- ordering comparisons resolve through the same lattice.
+select id from t_dn where b <= c order by id;
+→ [{"id":1},{"id":2}]
+select id from t_dn where c >= b order by id;
+→ [{"id":1},{"id":2}]
+
+-- =============================================================================
+-- 2. explicit vs explicit: same name fine; different names error (both
+--    spellings, and for ordering operators too); errors fire even for
+--    statically non-textual operands (consistent strictness).
+-- =============================================================================
+
+select id from t_dn where b collate nocase = c collate nocase;
+→ [{"id":1}]
+
+select id from t_dn where b collate nocase = c collate rtrim;
+-- error: conflicting COLLATE clauses
+
+select id from t_dn where c collate rtrim = b collate nocase;
+-- error: conflicting COLLATE clauses
+
+select id from t_dn where b collate rtrim < c collate nocase;
+-- error: conflicting COLLATE clauses
+
+select id from t_dn where id collate nocase = id collate rtrim;
+-- error: conflicting COLLATE clauses
+
+-- =============================================================================
+-- 3. explicit BINARY (rank 3) beats declared NOCASE (rank 2): `collate binary`
+--    is a real demand, not the absence of one.
+-- =============================================================================
+
+select id from t_dn where c = 'BOB';
+→ [{"id":1}]
+
+select id from t_dn where c = 'BOB' collate binary;
+→ []
+
+select id from t_dn where 'BOB' collate binary = c;
+→ []
+
+-- =============================================================================
+-- 4. declared vs declared: same name fine; different names are a prepare-time
+--    error (both spellings); an explicit COLLATE disambiguates; a declared
+--    `collate binary` column counts at rank 2 (conflicts with declared NOCASE)
+--    while declared-binary vs plain resolves BINARY with no error.
+-- =============================================================================
+
+create table t_dd (id integer primary key, n1 text collate nocase, n2 text collate nocase, r text collate rtrim, bb text collate binary, p text);
+insert into t_dd values (1, 'Ann', 'ANN', 'x ', 'q', 'Q');
+
+select id from t_dd where n1 = n2;
+→ [{"id":1}]
+
+select id from t_dd where n1 = r;
+-- error: ambiguous collation
+
+select id from t_dd where r = n1;
+-- error: ambiguous collation
+
+-- rank 3 outranks the conflicted pair.
+select id from t_dd where n1 = r collate binary;
+→ []
+
+-- declared BINARY vs declared NOCASE: a real rank-2 conflict.
+select id from t_dd where bb = n1;
+-- error: ambiguous collation
+
+-- declared BINARY vs plain (defaulted) column: BINARY, silently. 'q' vs 'Q'
+-- proves the comparison is BINARY (NOCASE would match).
+select id from t_dd where bb = p;
+→ []
+select id from t_dd where p = bb;
+→ []
+
+drop table t_dd;
+
+-- =============================================================================
+-- 5. The error fires wherever the comparison compiles. CHECK predicates
+--    compile when the enforcing DML plans (constraint-builder), so the
+--    conflict surfaces at the first write against the table; WHERE-clause
+--    conflicts surface at that statement's prepare. (The FK variant now also
+--    validates at CREATE/ALTER — see § 10 and 41.1-fk-collation-conflict —
+--    but CREATE-time detection of a conflicted CHECK is still unimplemented,
+--    so a conflicted CHECK remains caught at the first write below.)
+-- =============================================================================
+
+create table t_chk_conflict (id integer primary key, a text collate nocase, b text collate rtrim, check (a = b));
+insert into t_chk_conflict values (1, 'x', 'x');
+-- error: ambiguous collation
+drop table t_chk_conflict;
+
+create table t_dml_conf (id integer primary key, a text collate nocase, b text collate rtrim);
+insert into t_dml_conf values (1, 'x', 'x');
+update t_dml_conf set a = 'y' where a = b;
+-- error: ambiguous collation
+drop table t_dml_conf;
+
+-- =============================================================================
+-- 6. Defaulted collations are preferences: a defaulted non-BINARY collation
+--    wins over a defaulted BINARY, but two DIFFERENT defaulted collations
+--    resolve to BINARY silently (no error). Tables created under different
+--    session defaults.
+-- =============================================================================
+
+pragma default_collation='nocase';
+create table t_def_nc (id integer primary key, v text);
+pragma default_collation='rtrim';
+create table t_def_rt (id integer primary key, w text);
+pragma default_collation='binary';
+create table t_def_b (id integer primary key, u text);
+
+-- 'Bob'/'bob' would match under NOCASE; 'bob '/'bob' would match under RTRIM;
+-- neither matches under BINARY — so 0 proves the defaults-conflict → BINARY rule.
+insert into t_def_nc values (1, 'Bob'), (2, 'bob ');
+insert into t_def_rt values (1, 'bob');
+select count(*) as cnt from t_def_nc join t_def_rt on v = w;
+→ [{"cnt":0}]
+select count(*) as cnt from t_def_rt join t_def_nc on w = v;
+→ [{"cnt":0}]
+
+-- defaulted NOCASE vs defaulted BINARY: NOCASE wins (rank-1 BINARY contributes
+-- nothing), from either side.
+insert into t_def_b values (1, 'BOB');
+select count(*) as cnt from t_def_nc join t_def_b on v = u;
+→ [{"cnt":1}]
+select count(*) as cnt from t_def_b join t_def_nc on u = v;
+→ [{"cnt":1}]
+
+drop table t_def_nc;
+drop table t_def_rt;
+drop table t_def_b;
+
+-- =============================================================================
+-- 7. Propagation through concat: provenance rides through `||` by rank; a
+--    plain operand's defaulted BINARY no longer shadows a declared collation
+--    on the other side, and a concat of two DIFFERENT declared collations
+--    propagates no collation — the comparison falls back to BINARY.
+-- =============================================================================
+
+create table t_cc (id integer primary key, b text, c text collate nocase, r text collate rtrim);
+insert into t_cc values (1, 'B', 'ob', 'OB');
+
+-- declared NOCASE survives concat with a plain operand (previously the plain
+-- side's defaulted BINARY shadowed it).
+select count(*) as cnt from t_cc where b || c = 'bOB';
+→ [{"cnt":1}]
+
+-- explicit COLLATE nested inside an operand propagates rank 3 through concat.
+select count(*) as cnt from t_cc where (b collate nocase) || c = 'bOB';
+→ [{"cnt":1}]
+
+-- concat-laundered declared conflict: no collation propagates; the comparison
+-- is BINARY ('obOB' matches byte-exactly, the NOCASE-variant does not).
+select count(*) as cnt from t_cc where c || r = 'obOB';
+→ [{"cnt":1}]
+select count(*) as cnt from t_cc where c || r = 'OBob';
+→ [{"cnt":0}]
+
+drop table t_cc;
+
+-- =============================================================================
+-- 8. BETWEEN: each bound is an independent comparison. Two differently-
+--    collated explicit bounds are NOT a conflict with each other; a
+--    declared-vs-declared conflict on ONE bound errors; NOT BETWEEN takes the
+--    same path; an explicit COLLATE on the conflicted bound disambiguates.
+-- =============================================================================
+
+create table t_bt (id integer primary key, v text);
+insert into t_bt values (1, 'm');
+
+select id from t_bt where v between 'M' collate nocase and 'z ' collate rtrim;
+→ [{"id":1}]
+
+drop table t_bt;
+
+create table t_bt2 (id integer primary key, v text collate nocase, lo text collate rtrim);
+insert into t_bt2 values (1, 'm', 'a');
+
+select id from t_bt2 where v between lo and 'z';
+-- error: ambiguous collation
+
+select id from t_bt2 where v not between lo and 'z';
+-- error: ambiguous collation
+
+select id from t_bt2 where v between lo collate binary and 'z';
+→ [{"id":1}]
+
+drop table t_bt2;
+
+-- =============================================================================
+-- 9. IN: the condition and every RHS value resolve to ONE collation through
+--    the lattice. A declared-NOCASE element drives a plain condition; element
+--    contributions conflict like operands; a subquery RHS contributes its
+--    output column's collation.
+-- =============================================================================
+
+create table t_in (id integer primary key, a text, n text collate nocase);
+insert into t_in values (1, 'BOB', 'bob');
+
+-- condition declared NOCASE with a literal list: NOCASE (unchanged).
+select id from t_in where n in ('BOB', 'x');
+→ [{"id":1}]
+
+-- plain condition, declared-NOCASE element: NOCASE (new symmetric behavior;
+-- previously the condition's defaulted BINARY drove the comparison).
+select id from t_in where a in (n);
+→ [{"id":1}]
+
+-- NOT IN resolves identically.
+select id from t_in where a not in (n);
+→ []
+
+-- list elements with conflicting explicit collations: error.
+select id from t_in where a in ('x' collate nocase, 'y' collate rtrim);
+-- error: conflicting COLLATE clauses
+
+-- subquery RHS: declared-NOCASE output column vs plain condition → NOCASE.
+create table t_in_src (v text collate nocase);
+insert into t_in_src values ('bob');
+select id from t_in where a in (select v from t_in_src);
+→ [{"id":1}]
+drop table t_in_src;
+
+-- condition and element with conflicting declared collations: error.
+create table t_in2 (id integer primary key, n text collate nocase, r text collate rtrim);
+insert into t_in2 values (1, 'x', 'x');
+select id from t_in2 where n in (r);
+-- error: ambiguous collation
+drop table t_in2;
+
+drop table t_in;
+drop table t_dn;
+
+-- =============================================================================
+-- 10. FK with parent and child declaring DIFFERENT explicit collations: the
+--     conflict is now rejected at CREATE TABLE (declaration time) through the
+--     same lattice the synthesized parent-existence comparison uses — no longer
+--     deferred to the first DML. Ticket fk-collation-conflict-create-time-
+--     validation. (The DML-time error remains the residual for a forward-
+--     declared parent; that path is covered in 41.1-fk-collation-conflict.)
+-- =============================================================================
+
+pragma foreign_keys = true;
+create table fkp_conf (k text collate rtrim primary key);
+create table fkc_conf (id integer primary key, ref text collate nocase references fkp_conf(k));
+-- error: conflicting collations
+drop table fkp_conf;
+pragma foreign_keys = false;
+
+-- =============================================================================
+-- 11. SET COLLATE provenance (ticket collation-provenance-stability-set-collate-
+--     and-reload). `ALTER COLUMN ... SET COLLATE` is a user declaration with the
+--     same standing as a CREATE-time COLLATE clause: it marks the collation
+--     explicit (rank 2 'declared') regardless of the column's creation history,
+--     so the rank is a function of the current catalog column, not its past.
+--     Runs under BOTH memory and store (SET COLLATE re-registers the schema on
+--     each — see the 41.7 header). The same statement that previously diverged
+--     (rank 1 vs rank 2 depending on whether the column happened to be created
+--     with a COLLATE clause) now resolves identically.
+-- =============================================================================
+
+-- 11a. The reproduced bug, now fixed: SET COLLATE NOCASE on a column created
+--      WITHOUT a COLLATE clause vs a declared RTRIM column ⇒ rank-2 vs rank-2,
+--      ambiguous-collation error (was silently RTRIM — rank-1 lost to rank-2).
+create table sc_r1 (id integer primary key, v text, r text collate rtrim);
+insert into sc_r1 values (1, 'xx', 'xx');
+alter table sc_r1 alter column v set collate nocase;
+select id from sc_r1 where v = r;
+-- error: ambiguous collation
+drop table sc_r1;
+
+-- 11b. History independence: the SAME SET COLLATE NOCASE statement on a column
+--      created WITH `collate binary` yields the identical rank-2 result — the
+--      same ambiguous-collation error against a declared RTRIM column. The rank
+--      follows the current column, not whether it was once created with COLLATE.
+create table sc_r1b (id integer primary key, v text collate binary, r text collate rtrim);
+insert into sc_r1b values (1, 'xx', 'xx');
+alter table sc_r1b alter column v set collate nocase;
+select id from sc_r1b where v = r;
+-- error: ambiguous collation
+drop table sc_r1b;
+
+-- 11c. SET COLLATE NOCASE on a plain column vs a declared BINARY column: a real
+--      rank-2 vs rank-2 conflict (declared `collate binary` contributes at rank
+--      2), ambiguous-collation error.
+create table sc_db (id integer primary key, v text, b text collate binary);
+insert into sc_db values (1, 'xx', 'xx');
+alter table sc_db alter column v set collate nocase;
+select id from sc_db where v = b;
+-- error: ambiguous collation
+drop table sc_db;
+
+-- 11d. SET COLLATE NOCASE on a plain column vs another plain (defaulted-BINARY)
+--      column: rank-2 NOCASE wins over the rank-1 BINARY that contributes
+--      nothing, so the comparison resolves NOCASE and the case-folded row matches.
+create table sc_p (id integer primary key, v text, p text);
+insert into sc_p values (1, 'AB', 'ab'), (2, 'xy', 'zz');
+alter table sc_p alter column v set collate nocase;
+select id from sc_p where v = p;
+→ [{"id":1}]
+drop table sc_p;
+
+-- 11e. SET COLLATE binary is rank 2 too (a real BINARY demand, not the absence of
+--      one): on a defaulted-BINARY column it flips the column explicit, so a
+--      conflict against a declared NOCASE column is an ambiguous-collation error
+--      in-session (was silently NOCASE — rank-1 defaulted BINARY lost to rank-2).
+--      This pins the "consistency argues yes" decision; no reopen assertion (the
+--      flag does not survive a store reload, by design — BINARY DDL is elided).
+create table sc_bin (id integer primary key, v text, n text collate nocase);
+insert into sc_bin values (1, 'xx', 'xx');
+alter table sc_bin alter column v set collate binary;
+select id from sc_bin where v = n;
+-- error: ambiguous collation
+drop table sc_bin;

@@ -1,0 +1,347 @@
+-- 08.4-key-set-semi-join.sqllogic — behaviour of the key-set semi join rewrite
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Whole-file directive rather than a split: the rewrite under test only plans over a
+-- SECONDARY-INDEXED column, so the index in the setup is load-bearing for every scenario
+-- here — there is no index-free remainder to carve out.
+--
+-- `where col in (select …)` over a secondary-indexed column plans as a
+-- KeySetSemiJoin under the memory vtab: the inner set is materialized once and,
+-- when small enough, handed to the module as a plan=5 multi-seek. These cases
+-- pin the OBSERVABLE behaviour only (rows, counts) — the same answers must come
+-- back whether the runtime seeks or scans. Plan-shape and seek-vs-scan
+-- assertions live in test/optimizer/key-set-seek.spec.ts and
+-- test/vtab/key-set-semi-join-runtime.spec.ts.
+
+-- Setup: target with a secondary index on v, key source, and data.
+CREATE TABLE big (pk INTEGER PRIMARY KEY, v INTEGER NULL, w INTEGER NULL);
+CREATE INDEX idx_big_v ON big(v);
+CREATE TABLE small (id INTEGER PRIMARY KEY, k INTEGER NULL);
+
+INSERT INTO big VALUES (1, 10, 1), (2, 20, 2), (3, 30, 3), (4, 40, 4), (5, NULL, 5);
+INSERT INTO small VALUES (1, 10), (2, 30), (3, 999);
+
+-- ===== Key set contents =====
+
+-- Basic membership: only matching rows return, each exactly once.
+SELECT pk FROM big WHERE v IN (SELECT k FROM small) ORDER BY pk;
+→ [{"pk":1},{"pk":3}]
+
+-- Duplicates in the inner must not fan out the target.
+INSERT INTO small VALUES (4, 10), (5, 10);
+SELECT pk FROM big WHERE v IN (SELECT k FROM small) ORDER BY pk;
+→ [{"pk":1},{"pk":3}]
+
+-- Inner NULLs are skipped; non-NULL members still match.
+INSERT INTO small VALUES (6, NULL);
+SELECT pk FROM big WHERE v IN (SELECT k FROM small) ORDER BY pk;
+→ [{"pk":1},{"pk":3}]
+
+-- A NULL target value never matches anything.
+SELECT pk FROM big WHERE v IN (SELECT k FROM small) AND pk = 5;
+→ []
+
+-- Empty inner ⇒ no rows.
+SELECT pk FROM big WHERE v IN (SELECT k FROM small WHERE k > 10000);
+→ []
+
+-- All-NULL inner ⇒ no rows.
+SELECT pk FROM big WHERE v IN (SELECT k FROM small WHERE k IS NULL);
+→ []
+
+-- ORDER BY above the semi join stays correct whichever access path runs.
+SELECT pk, v FROM big WHERE v IN (SELECT k FROM small) ORDER BY v DESC;
+→ [{"pk":3,"v":30},{"pk":1,"v":10}]
+
+-- ===== Types and collation =====
+
+-- NOCASE target column and index: case variants of a member match.
+CREATE TABLE ci (pk INTEGER PRIMARY KEY, s TEXT COLLATE NOCASE);
+CREATE INDEX idx_ci_s ON ci(s);
+CREATE TABLE ssrc (id INTEGER PRIMARY KEY, s TEXT);
+INSERT INTO ci VALUES (1, 'Alpha'), (2, 'beta'), (3, 'GAMMA');
+INSERT INTO ssrc VALUES (1, 'alpha'), (2, 'gamma');
+SELECT pk FROM ci WHERE s IN (SELECT s FROM ssrc) ORDER BY pk;
+→ [{"pk":1},{"pk":3}]
+
+-- BINARY target column and index, BINARY keys: exact-case only.
+CREATE TABLE bin (pk INTEGER PRIMARY KEY, s TEXT);
+CREATE INDEX idx_bin_s ON bin(s);
+INSERT INTO bin VALUES (1, 'Alpha'), (2, 'alpha');
+SELECT pk FROM bin WHERE s IN (SELECT s FROM ssrc) ORDER BY pk;
+→ [{"pk":2}]
+
+-- TIMESPAN keys decline the seek but keep semantic equality:
+-- 'PT1H' still matches 'PT60M' through the surviving hash semi join.
+CREATE TABLE spans (pk INTEGER PRIMARY KEY, d TIMESPAN);
+CREATE INDEX idx_spans_d ON spans(d);
+CREATE TABLE spansrc (id INTEGER PRIMARY KEY, d TIMESPAN);
+INSERT INTO spans VALUES (1, timespan('PT1H')), (2, timespan('P1D'));
+INSERT INTO spansrc VALUES (1, timespan('PT60M'));
+SELECT pk FROM spans WHERE d IN (SELECT d FROM spansrc);
+→ [{"pk":1}]
+
+-- ===== DML =====
+
+-- DELETE with an IN-subquery source.
+DELETE FROM big WHERE v IN (SELECT k FROM small);
+SELECT pk FROM big ORDER BY pk;
+→ [{"pk":2},{"pk":4},{"pk":5}]
+
+-- UPDATE with an IN-subquery source.
+INSERT INTO small VALUES (7, 20);
+UPDATE big SET w = -1 WHERE v IN (SELECT k FROM small);
+SELECT pk, w FROM big ORDER BY pk;
+→ [{"pk":2,"w":-1},{"pk":4,"w":4},{"pk":5,"w":5}]
+
+-- Self-referencing DELETE: the key set drains before the target opens, so the
+-- pre-statement snapshot decides membership.
+CREATE TABLE selfref (pk INTEGER PRIMARY KEY, x INTEGER NULL);
+CREATE INDEX idx_selfref_x ON selfref(x);
+INSERT INTO selfref VALUES (1, 10), (2, 20), (3, 30), (4, 40);
+DELETE FROM selfref WHERE x IN (SELECT x FROM selfref WHERE x <= 20);
+SELECT pk FROM selfref ORDER BY pk;
+→ [{"pk":3},{"pk":4}]
+
+-- ===== Shapes that leave the runtime free to seek =====
+--
+-- Every case above pins its rows with `ORDER BY <a column the target's own walk
+-- already provides>`. Both backends absorb that sort into the target leaf, which
+-- marks the leaf's emission order load-bearing; since the seek index (idx on v)
+-- is NOT the walk index in those cases, the rewrite declines — they exercise the
+-- surviving hash semi join, not the seek. (When the two indexes coincide the
+-- rewrite now fires despite the absorbed sort — see the primary-key section at
+-- the end of this file.) The aggregate forms below need no ORDER BY, so the
+-- runtime may push the multi-seek. Same answers either way, which is exactly the
+-- property being pinned.
+
+CREATE TABLE seekt (pk INTEGER PRIMARY KEY, v INTEGER NULL);
+CREATE INDEX idx_seekt_v ON seekt(v);
+CREATE TABLE seekk (id INTEGER PRIMARY KEY, k INTEGER NULL);
+INSERT INTO seekt VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, NULL);
+INSERT INTO seekk VALUES (1, 10), (2, 30), (3, 30), (4, 777);
+
+SELECT count(*) AS c, sum(v) AS s FROM seekt WHERE v IN (SELECT k FROM seekk);
+→ [{"c":2,"s":40}]
+
+-- Empty key set through the same shape.
+SELECT count(*) AS c FROM seekt WHERE v IN (SELECT k FROM seekk WHERE k > 10000);
+→ [{"c":0}]
+
+-- Read-your-own-writes: rows staged in an open transaction must be visible through
+-- whichever access path the runtime chose — a seek reads each window through the
+-- same effective-row merge a full scan does.
+BEGIN;
+INSERT INTO seekt VALUES (6, 777);
+SELECT count(*) AS c FROM seekt WHERE v IN (SELECT k FROM seekk);
+→ [{"c":3}]
+UPDATE seekt SET v = 30 WHERE pk = 2;
+SELECT count(*) AS c FROM seekt WHERE v IN (SELECT k FROM seekk);
+→ [{"c":4}]
+DELETE FROM seekt WHERE pk = 1;
+SELECT count(*) AS c FROM seekt WHERE v IN (SELECT k FROM seekk);
+→ [{"c":3}]
+COMMIT;
+SELECT count(*) AS c FROM seekt WHERE v IN (SELECT k FROM seekk);
+→ [{"c":3}]
+
+-- Multi-row DELETE inside an explicit transaction: each seek window is a
+-- distinct key; deleting rows mid-statement must not disturb later windows.
+CREATE TABLE txt (pk INTEGER PRIMARY KEY, v INTEGER NULL);
+CREATE INDEX idx_txt_v ON txt(v);
+CREATE TABLE txkeys (id INTEGER PRIMARY KEY, k INTEGER NULL);
+INSERT INTO txt VALUES (1, 100), (2, 200), (3, 300), (4, 400), (5, 500);
+INSERT INTO txkeys VALUES (1, 200), (2, 400), (3, 500);
+BEGIN;
+DELETE FROM txt WHERE v IN (SELECT k FROM txkeys);
+SELECT pk FROM txt ORDER BY pk;
+→ [{"pk":1},{"pk":3}]
+COMMIT;
+SELECT pk FROM txt ORDER BY pk;
+→ [{"pk":1},{"pk":3}]
+
+-- ===== Cross-type numeric keys =====
+--
+-- INTEGER, REAL and NUMERIC share ONE seek key space: a numeric key's identity is its
+-- VALUE, not the JavaScript representation (number vs bigint) that happens to hold it.
+-- The membership check (`canonicalNumeric`), the in-memory index comparators and the
+-- persistent store's key encoding all agree on that, so the rewrite admits these pairs
+-- and the seek is exact in either direction. This file runs under BOTH backends, which
+-- is what makes it the home for the row-level contract.
+--
+-- Every query below is an aggregate with no ORDER BY, so the runtime is free to push the
+-- multi-seek (see the note above on why an ORDER BY the target's own walk provides makes
+-- the rewrite decline). The answers must be identical whether it seeks or scans.
+
+CREATE TABLE xt (pk INTEGER PRIMARY KEY, v INTEGER NULL);
+CREATE INDEX idx_xt_v ON xt(v);
+CREATE TABLE xr (id INTEGER PRIMARY KEY, r REAL NULL);
+CREATE TABLE xik (id INTEGER PRIMARY KEY, k INTEGER NULL);
+INSERT INTO xt VALUES (1, 10), (2, 20), (3, 30);
+INSERT INTO xr VALUES (1, 10.0), (2, 30.0), (3, 99.5);
+INSERT INTO xik VALUES (1, 10), (2, 30), (3, 77);
+
+-- INTEGER target, REAL keys: the whole-number reals match by value; 99.5 matches nothing.
+SELECT count(*) AS c, sum(v) AS s FROM xt WHERE v IN (SELECT r FROM xr);
+→ [{"c":2,"s":40}]
+
+-- A NON-INTEGRAL key against a whole-number column matches NOTHING. This is the case a
+-- coercion-based implementation would get wrong: truncating 10.5 to 10 would return pk 1.
+INSERT INTO xr VALUES (4, 10.5);
+SELECT count(*) AS c FROM xt WHERE v IN (SELECT r FROM xr WHERE r = 10.5);
+→ [{"c":0}]
+
+-- REAL target, INTEGER keys — the reverse direction.
+CREATE TABLE xrt (pk INTEGER PRIMARY KEY, r REAL NULL);
+CREATE INDEX idx_xrt_r ON xrt(r);
+INSERT INTO xrt VALUES (1, 10.0), (2, 20.5), (3, 30.0);
+SELECT count(*) AS c, min(pk) AS lo, max(pk) AS hi FROM xrt WHERE r IN (SELECT k FROM xik);
+→ [{"c":2,"lo":1,"hi":3}]
+
+-- NUMERIC target, INTEGER keys.
+CREATE TABLE xnt (pk INTEGER PRIMARY KEY, n NUMERIC NULL);
+CREATE INDEX idx_xnt_n ON xnt(n);
+INSERT INTO xnt VALUES (1, 10), (2, 20.5), (3, 30);
+SELECT count(*) AS c, min(pk) AS lo, max(pk) AS hi FROM xnt WHERE n IN (SELECT k FROM xik);
+→ [{"c":2,"lo":1,"hi":3}]
+
+-- NUMERIC key column, reached the ordinary way: set-operation column-type merging turns
+-- a REAL branch and an INTEGER branch into one NUMERIC column.
+SELECT count(*) AS c, sum(v) AS s FROM xt WHERE v IN (SELECT r FROM xr UNION ALL SELECT k FROM xik);
+→ [{"c":2,"s":40}]
+
+-- Past 2^53: a whole-number REAL key must match the integer of EQUAL magnitude and must
+-- NOT reach its neighbour one above, which no longer shares its nearest double.
+CREATE TABLE xbt (pk INTEGER PRIMARY KEY, v INTEGER NULL);
+CREATE INDEX idx_xbt_v ON xbt(v);
+CREATE TABLE xbr (id INTEGER PRIMARY KEY, r REAL NULL);
+INSERT INTO xbt VALUES (1, 9007199254740992), (2, 9007199254740993);
+INSERT INTO xbr VALUES (1, 9007199254740992.0);
+SELECT count(*) AS c, min(pk) AS lo FROM xbt WHERE v IN (SELECT r FROM xbr);
+→ [{"c":1,"lo":1}]
+
+-- Signed zero: -0.0 and 0 are one value everywhere (the key serializer folds both to
+-- `n:0`, the store encoder normalizes -0 to +0), so the stored 0 row comes back.
+CREATE TABLE xzt (pk INTEGER PRIMARY KEY, v INTEGER NULL);
+CREATE INDEX idx_xzt_v ON xzt(v);
+CREATE TABLE xzk (id INTEGER PRIMARY KEY, r REAL NULL);
+INSERT INTO xzt VALUES (1, 0), (2, 5);
+INSERT INTO xzk VALUES (1, -0.0);
+SELECT count(*) AS c, min(pk) AS lo FROM xzt WHERE v IN (SELECT r FROM xzk);
+→ [{"c":1,"lo":1}]
+
+-- NULL keys are unchanged by any of this: still dropped before the seek.
+INSERT INTO xr VALUES (5, NULL);
+SELECT count(*) AS c, sum(v) AS s FROM xt WHERE v IN (SELECT r FROM xr);
+→ [{"c":2,"s":40}]
+
+-- ===== Primary-key IN-subquery (the merge semi join arm) =====
+--
+-- `pk in (select <its own pk> from …)` walks BOTH sides in primary-key order, so on
+-- the memory backend it plans as a merge semi join and reaches the KeySetSemiJoin
+-- through the `key-set-seek-merge` anchor — including under an ORDER BY the walk
+-- absorbed, because the seek index IS the walk index and the node claims the walk's
+-- own order. The persistent store declines a runtime-set IN on its primary key
+-- (backlog/feat-store-pk-in-list-multiseek) and keeps the merge join there. The two
+-- backends therefore run DIFFERENT plans for every case below, which is exactly why
+-- these assert ROWS only — the answers must be byte-identical either way.
+
+CREATE TABLE pkt (pk INTEGER PRIMARY KEY, v TEXT);
+CREATE TABLE pksrc (id INTEGER PRIMARY KEY);
+CREATE TABLE pkkeys (id INTEGER PRIMARY KEY, k INTEGER NULL);
+INSERT INTO pkt VALUES (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four'), (5, 'five');
+INSERT INTO pksrc VALUES (4), (2), (999);
+INSERT INTO pkkeys VALUES (1, 4), (2, 2), (3, 4), (4, NULL), (5, 999);
+
+-- The headline shape, with the ORDER BY the walk absorbs (memory seeks anyway now).
+SELECT pk, v FROM pkt WHERE pk IN (SELECT id FROM pksrc) ORDER BY pk;
+→ [{"pk":2,"v":"two"},{"pk":4,"v":"four"}]
+
+-- The same membership without ORDER BY, pinned through order-free aggregates.
+SELECT count(*) AS c, min(pk) AS lo, max(pk) AS hi FROM pkt WHERE pk IN (SELECT id FROM pksrc);
+→ [{"c":2,"lo":2,"hi":4}]
+
+-- Duplicate and NULL keys against the primary key: dupes must not fan out the
+-- target, NULLs are dropped from the set. (`k` is not the source's own key, so
+-- backends are free to serve this by whichever arm plans — the rows may not care.)
+SELECT pk FROM pkt WHERE pk IN (SELECT k FROM pkkeys) ORDER BY pk;
+→ [{"pk":2},{"pk":4}]
+
+-- Empty key set on the primary-key shape.
+SELECT pk FROM pkt WHERE pk IN (SELECT id FROM pksrc WHERE id > 10000);
+→ []
+
+-- DELETE through the primary-key shape: exactly the matching rows go.
+DELETE FROM pkt WHERE pk IN (SELECT id FROM pksrc);
+SELECT pk, v FROM pkt ORDER BY pk;
+→ [{"pk":1,"v":"one"},{"pk":3,"v":"three"},{"pk":5,"v":"five"}]
+
+-- UPDATE through the same shape.
+INSERT INTO pksrc VALUES (5);
+UPDATE pkt SET v = 'touched' WHERE pk IN (SELECT id FROM pksrc);
+SELECT pk, v FROM pkt ORDER BY pk;
+→ [{"pk":1,"v":"one"},{"pk":3,"v":"three"},{"pk":5,"v":"touched"}]
+
+-- Descending primary key: the walk and the seek both descend (the memory backend
+-- advertises the true direction), and an absorbed ORDER BY pk DESC stays served.
+CREATE TABLE pkd (pk INTEGER, v TEXT, PRIMARY KEY (pk DESC));
+INSERT INTO pkd VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd');
+SELECT pk, v FROM pkd WHERE pk IN (SELECT id FROM pksrc) ORDER BY pk DESC;
+→ [{"pk":4,"v":"d"},{"pk":2,"v":"b"}]
+SELECT count(*) AS c, min(pk) AS lo FROM pkd WHERE pk IN (SELECT id FROM pksrc);
+→ [{"c":2,"lo":2}]
+
+-- Read-your-own-writes through the primary-key shape: staged rows must be visible
+-- and ordered wherever the runtime seeks.
+BEGIN;
+INSERT INTO pkt VALUES (2, 'reborn');
+SELECT pk, v FROM pkt WHERE pk IN (SELECT id FROM pksrc) ORDER BY pk;
+→ [{"pk":2,"v":"reborn"},{"pk":5,"v":"touched"}]
+DELETE FROM pkt WHERE pk = 5;
+SELECT pk, v FROM pkt WHERE pk IN (SELECT id FROM pksrc) ORDER BY pk;
+→ [{"pk":2,"v":"reborn"}]
+ROLLBACK;
+SELECT pk, v FROM pkt WHERE pk IN (SELECT id FROM pksrc) ORDER BY pk;
+→ [{"pk":5,"v":"touched"}]
+
+-- ===== A second indexed column also filtered (pushed-constraint target) =====
+--
+-- `<indexed col> = <value> and <key col> in (select …)`: the extra predicate is
+-- pushed into the target leaf as its own index seek, and the key-set rewrite —
+-- when a backend's costs admit it — keeps that seek as the target and re-applies
+-- the predicate above the semi join. Seeded so one row matches the key set but
+-- fails the extra filter (the worst failure mode: without the re-applied
+-- predicate a seek would return — or a DML would touch — it) and one row matches
+-- the extra filter but is not in the key set. Both must stay excluded whichever
+-- access path the runtime picks, on either backend.
+
+CREATE TABLE pc (pk INTEGER PRIMARY KEY, v INTEGER NULL, s TEXT NULL, w INTEGER NULL);
+CREATE INDEX idx_pc_v ON pc(v);
+CREATE INDEX idx_pc_s ON pc(s);
+CREATE TABLE pckeys (id INTEGER PRIMARY KEY, k INTEGER NULL);
+-- pk 2: in the key set (v=20) but s='y'. pk 4: s='x' but v=40 is not in the set.
+INSERT INTO pc VALUES (1, 10, 'x', 0), (2, 20, 'y', 0), (3, 30, 'x', 0), (4, 40, 'x', 0), (5, NULL, 'x', 0);
+INSERT INTO pckeys VALUES (1, 10), (2, 20), (3, 30), (4, 999);
+
+SELECT pk FROM pc WHERE s = 'x' AND v IN (SELECT k FROM pckeys) ORDER BY pk;
+→ [{"pk":1},{"pk":3}]
+
+-- DELETE: only the doubly-matching rows go. Deleting pk 2 (key-set member,
+-- wrong s) would be the dropped-predicate bug this section guards against.
+DELETE FROM pc WHERE s = 'x' AND v IN (SELECT k FROM pckeys);
+SELECT pk FROM pc ORDER BY pk;
+→ [{"pk":2},{"pk":4},{"pk":5}]
+
+-- UPDATE through the same shape: pk 2 and pk 4 must stay untouched.
+INSERT INTO pc VALUES (6, 30, 'x', 0);
+UPDATE pc SET w = -1 WHERE s = 'x' AND v IN (SELECT k FROM pckeys);
+SELECT pk, w FROM pc ORDER BY pk;
+→ [{"pk":2,"w":0},{"pk":4,"w":0},{"pk":5,"w":0},{"pk":6,"w":-1}]
+
+-- Range form of the pushed predicate (a primary-key range seek as the target).
+CREATE TABLE pcr (pk INTEGER PRIMARY KEY, v INTEGER NULL);
+CREATE INDEX idx_pcr_v ON pcr(v);
+INSERT INTO pcr VALUES (1, 10), (2, 20), (3, 30), (4, 40);
+SELECT pk FROM pcr WHERE pk > 2 AND v IN (SELECT k FROM pckeys) ORDER BY pk;
+→ [{"pk":3}]

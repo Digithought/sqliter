@@ -47,13 +47,13 @@ drop view if exists cr_bad;
 drop table cr_base;
 
 -- ===================================
--- 3. TEMP VIEW lifecycle
+-- 3. View lifecycle
 -- ===================================
 
 create table tv_base (id integer primary key, val integer);
 insert into tv_base values (1, 10), (2, 20);
 
-create temp view tv_t as select id, val from tv_base where val > 10;
+create view tv_t as select id, val from tv_base where val > 10;
 
 select * from tv_t;
 → [{"id":2,"val":20}]
@@ -94,7 +94,7 @@ create view main.sq_v as select id, val from sq_base where val > 10;
 select * from main.sq_v;
 → [{"id":2,"val":20}]
 
-create temp view temp.sq_tv as select id from sq_base;
+create view temp.sq_tv as select id from sq_base;
 
 drop view temp.sq_tv;
 drop view main.sq_v;

@@ -67,6 +67,12 @@ export function ruleMutatingSubqueryCache(node: PlanNode, _context: OptContext):
 
 	// Create new join node with cached right side
 	// Note: We still need to use specific constructor since we don't have a generic join builder yet
+	// NOTE: this raw constructor call drops `existence` — a side-effect-bearing
+	// right side on a join that also carries `exists … as` flag columns would
+	// lose those flags. join-physical-selection skips existence joins, but this
+	// rule does not guard them. The sibling rule-nested-loop-right-cache uses
+	// `withChildren` (which threads `existence` verbatim) precisely to avoid
+	// this; migrate this rule to `withChildren` if existence joins ever reach it.
 	const result = new JoinNode(
 		node.scope,
 		joinNode.getLeftSource(),

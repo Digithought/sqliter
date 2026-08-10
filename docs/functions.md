@@ -1,5 +1,7 @@
 # Built-in Functions Reference
 
+> **Stability: Stable** — see [Stability Tiers](stability.md#tiers).
+
 This document lists the built-in SQL functions available in Quereus. For the underlying type system, validation rules, and custom type registration, see the [Type System Documentation](types.md).
 
 ---
@@ -12,7 +14,8 @@ Quereus uses conversion functions instead of the SQL `CAST` operator for explici
 |---|---|---|
 | `integer(X)` | INTEGER | Truncates reals, parses strings, booleans to 0/1 |
 | `real(X)` | REAL | Parses strings, integers to float, booleans to 0.0/1.0 |
-| `text(X)` | TEXT | Stringifies numbers, booleans to `'true'`/`'false'`, blobs to hex |
+| `text(X)` | TEXT | The one value-to-text conversion (see [types.md § Value to text](types.md#value-to-text)): numbers stringified, booleans to `'true'`/`'false'`, blobs UTF-8-decoded, JSON documents to their own text. Never throws |
+| `blob(X)` | BLOB | A string becomes its literal UTF-8 bytes — no hex sniffing. Use `unhex(X)` for a hex string. Throws on a JSON document; `cast(X as blob)` stays lenient there and yields the document's own text as bytes |
 | `boolean(X)` | BOOLEAN | 0/`'false'` is false; non-zero/`'true'` is true |
 | `date(X)` | TEXT | `YYYY-MM-DD` format. Accepts `'now'` for current UTC date |
 | `time(X)` | TEXT | `HH:MM:SS` format. Accepts `'now'` for current UTC time |
@@ -24,6 +27,7 @@ Quereus uses conversion functions instead of the SQL `CAST` operator for explici
 select integer('42');        -- 42
 select real(42);             -- 42.0
 select text(true);           -- 'true'
+select blob('ab');           -- x'6162' (literal UTF-8 bytes, not hex-decoded)
 select boolean(0);           -- false
 select date('now');           -- '2024-01-15'
 select timespan('2 hours');  -- 'PT2H'
@@ -69,8 +73,8 @@ select clamp(15, 0, 10);  -- 10
 | `nullif(X, Y)` | 2 | any | `NULL` if X = Y, else X |
 | `iif(X, Y, Z)` | 3 | any | If X is truthy then Y, else Z |
 | `typeof(X)` | 1 | TEXT | Type name: `'null'`, `'integer'`, `'real'`, `'text'`, `'blob'`, `'json'` |
-| `greatest(X, Y, ...)` | variadic | any | Largest value using SQL comparison |
-| `least(X, Y, ...)` | variadic | any | Smallest value using SQL comparison |
+| `greatest(X, Y, ...)` | variadic | any | Largest value using SQL comparison; NULLs are skipped |
+| `least(X, Y, ...)` | variadic | any | Smallest value using SQL comparison; NULLs are skipped |
 | `choose(N, V1, V2, ...)` | variadic | any | Returns the N-th value (1-based index). `NULL` if out of range |
 
 ```sql
@@ -82,6 +86,20 @@ select greatest(3, 1, 2);          -- 3
 select least(3, 1, 2);             -- 1
 select choose(2, 'a', 'b', 'c');   -- 'b'
 ```
+
+`nullif`, `greatest` and `least` compare exactly as the `=` operator and `order by`
+do — honoring a column's declared collation, semantic-ordering types like TIMESPAN,
+JSON documents, and the numeric reading of a numeric-looking string (`nullif(int_col,
+'1')` matches, as `int_col = '1'` does) — rather than raw bytes. See
+[types.md](types.md#comparison-collation-resolution).
+
+The reconciliation applies to the *comparison* only. All three return one of their
+arguments verbatim, so a converted copy is what gets compared and the original
+argument is what comes back — `nullif('3', 1)` returns the text `'3'`,
+`greatest(int_col, '2')` returns the text `'2'` when the literal wins, and
+`least('abc', 1)` returns `'abc'` (the comparison reads `'abc'` as `0`, which loses
+to `1`, but `0` is never a result). Storage class survives too:
+`typeof(nullif('3', 1))` is `text`.
 
 ---
 
@@ -98,11 +116,25 @@ select choose(2, 'a', 'b', 'c');   -- 'b'
 | `ltrim(X, Y?)` | 1-2 | TEXT | Remove leading chars |
 | `rtrim(X, Y?)` | 1-2 | TEXT | Remove trailing chars |
 | `replace(X, Y, Z)` | 3 | TEXT | Replace all occurrences of Y in X with Z. Case-sensitive |
-| `instr(X, Y)` | 2 | INTEGER | 1-based position of first occurrence of Y in X. 0 if not found. `NULL` if either input is `NULL` || `reverse(X)` | 1 | TEXT | Reverse the string. Unicode-aware |
+| `instr(X, Y)` | 2 | INTEGER | 1-based position of first occurrence of Y in X. 0 if not found. `NULL` if either input is `NULL` |
+| `reverse(X)` | 1 | TEXT | Reverse the string. Unicode-aware |
 | `lpad(X, N, P)` | 3 | TEXT | Left-pad X to length N using pad string P |
 | `rpad(X, N, P)` | 3 | TEXT | Right-pad X to length N using pad string P |
-| `like(pattern, string)` | 2 | INTEGER | LIKE match: `%` = any chars, `_` = one char. Case-sensitive |
-| `glob(pattern, string)` | 2 | INTEGER | GLOB match: `*` = any chars, `?` = one char. Case-sensitive |
+| `like(pattern, string)` | 2 | BOOLEAN | LIKE match: `%` = any chars, `_` = one char. Case-sensitive. `NULL` if either argument is `NULL`. A non-text operand is rendered through the one value-to-text conversion first (see [types.md § Value to text](types.md#value-to-text)) |
+| `glob(pattern, string)` | 2 | BOOLEAN | GLOB match: `*` = any chars, `?` = one char. Case-sensitive. `NULL` if either argument is `NULL`. Operands render the same way `like` renders them |
+| `hex(X)` | 1 | TEXT | Uppercase hex spelling of X's bytes, no separator. A non-blob argument converts to bytes first, the same path `cast(X as blob)` takes |
+| `unhex(X)` | 1 | BLOB | Parses a hex string into bytes. `NULL` (not an error) if X is not a whole number of hex digit pairs |
+
+`hex`/`unhex` are on the one *blob* conversion (`hex` converts a non-blob argument through
+the same path `cast(X as blob)` takes; see [types.md § Binary types](types.md#binary-types)), so they are
+not part of the divergence below.
+
+The rest of the table above is **not** yet on the one value-to-text conversion. Given a
+non-text argument, `substr`/`substring`, `trim`/`ltrim`/`rtrim`, `replace` and `instr`
+still use JavaScript's own stringification (a BLOB becomes its comma-joined byte numbers,
+`97,98`), while `lower`, `upper`, `reverse`, `lpad` and `rpad` return `NULL` instead. Pass
+`text(X)` explicitly if the argument may not be text. Tracked as
+`debt-string-builtins-coerce-three-different-ways`.
 
 ```sql
 select lower('Quereus');             -- 'quereus'
@@ -114,6 +146,8 @@ select replace('abc abc', 'b', 'X'); -- 'aXc aXc'
 select instr('banana', 'a');         -- 2
 select reverse('hello');             -- 'olleh'
 select lpad('42', 5, '0');          -- '00042'
+select hex(x'cafe');                -- 'CAFE'
+select unhex('cafe');               -- x'cafe'
 ```
 
 ### String Table-Valued Function
@@ -154,7 +188,7 @@ Aggregate functions compute a single result from multiple rows within a `GROUP B
 | `avg(X)` | 1 | REAL | Average. `NULL` for empty set |
 | `min(X)` | 1 | any | Minimum non-NULL value |
 | `max(X)` | 1 | any | Maximum non-NULL value |
-| `group_concat(X, Y?)` | 1-2 | TEXT | Concatenate values, separated by Y (default `','`) |
+| `group_concat(X, Y?)` | 1-2 | TEXT | Concatenate values, separated by Y (default `','`). Skips NULLs. Non-text values render through the one value-to-text conversion (see [types.md § Value to text](types.md#value-to-text)) — a BLOB is UTF-8-decoded, a JSON document keeps its own text |
 | `var_pop(X)` | 1 | REAL | Population variance. `NULL` if fewer than 1 value |
 | `var_pop(X)` | 1 | REAL | Population variance. `NULL` for empty set |
 | `var_samp(X)` | 1 | REAL | Sample variance. `NULL` if fewer than 2 values |
@@ -171,7 +205,7 @@ select json_group_object(key, value) from config;
 -- {"theme":"dark","fontSize":12}  (native object)
 ```
 
-**Difference from SQLite:** `sum()` promotes to BIGINT to avoid overflow, falling back to REAL only when types are mixed.
+**Difference from SQLite:** `sum()` promotes to BIGINT to avoid overflow. It accumulates exact integers and floating-point values in *separate* running totals and combines them only at the end, so the answer does not depend on the order rows were scanned. A fold that saw only `bigint`s and safe integers returns an exact integer; a fold that saw anything else — a fraction, a whole `number` past 9,007,199,254,740,991, or a non-finite — returns REAL. A REAL total that overflows returns `Infinity` (agreeing with `total()` and `avg()`), unlike binary `+`, which returns `NULL` on a non-finite result.
 
 ---
 
@@ -272,14 +306,14 @@ select epoch_s_frac('2024-07-26 12:30:45.5');-- 1721997045.5
 
 | Function | Returns | Description |
 |---|---|---|
-| `IsISODate(text)` | INTEGER | 1 if valid `YYYY-MM-DD` (leap-year aware), 0 otherwise |
-| `IsISODateTime(text)` | INTEGER | 1 if valid ISO 8601 datetime with `T` separator, 0 otherwise |
+| `IsISODate(text)` | BOOLEAN | `true` if valid `YYYY-MM-DD` (leap-year aware), `false` otherwise. Never `NULL` |
+| `IsISODateTime(text)` | BOOLEAN | `true` if valid ISO 8601 datetime with `T` separator, `false` otherwise. Never `NULL` |
 
 ```sql
-select IsISODate('2024-02-29');         -- 1 (leap year)
-select IsISODate('2023-02-29');         -- 0
-select IsISODateTime('2024-01-01T00:00:00Z'); -- 1
-select IsISODateTime('2024-01-01 00:00:00');  -- 0 (space not allowed)
+select IsISODate('2024-02-29');         -- true (leap year)
+select IsISODate('2023-02-29');         -- false
+select IsISODateTime('2024-01-01T00:00:00Z'); -- true
+select IsISODateTime('2024-01-01 00:00:00');  -- false (space not allowed)
 ```
 
 ---
@@ -335,7 +369,7 @@ JSON paths use `$` as root, `.key` for object members, and `[N]` for array indic
 
 | Function | Args | Returns | Description |
 |---|---|---|---|
-| `json_valid(json)` | 1 | INTEGER | 1 if well-formed JSON, 0 otherwise |
+| `json_valid(json)` | 1 | BOOLEAN | `true` if well-formed JSON, `false` otherwise. Never `NULL` |
 | `json_type(json, path?)` | 1-2 | TEXT | JSON type: `'null'`, `'true'`, `'false'`, `'integer'`, `'real'`, `'text'`, `'array'`, `'object'` |
 | `json_extract(json, path, ...)` | variadic | any | Extract value at first matching path. Nested arrays/objects returned as native JSON |
 | `json_array_length(json, path?)` | 1-2 | INTEGER | Length of JSON array (0 if not an array) |
@@ -347,7 +381,7 @@ The `->` and `->>` operators are syntactic sugar for `json_extract()`:
 Path shorthand: `'name'` becomes `'$.name'`, `0` becomes `'$[0]'`.
 
 ```sql
-select json_valid('{"a":1}');           -- 1
+select json_valid('{"a":1}');           -- true
 select json_type('{"a":1}', '$.a');     -- 'integer'
 select json_extract('{"a":[1,2]}', '$.a[1]'); -- 2
 select json_array_length('[1,2,3]');    -- 3
@@ -400,7 +434,7 @@ select json_patch('{"a":1}', '[{"op":"add","path":"/b","value":2}]');
 
 ### Schema Validation
 
-**`json_schema(json, schema_definition)`** -- Validates JSON against a TypeScript-like structural schema (powered by [moat-maker](https://github.com/theScottyJam/moat-maker)). Returns 1 if valid, 0 otherwise.
+**`json_schema(json, schema_definition)`** -- Validates JSON against a TypeScript-like structural schema (powered by [moat-maker](https://github.com/theScottyJam/moat-maker)). Returns BOOLEAN: `true` if valid, `false` otherwise (never `NULL`).
 
 **Schema syntax:**
 - Base types: `number`, `string`, `boolean`, `null`, `any`
@@ -413,9 +447,9 @@ select json_patch('{"a":1}', '[{"op":"add","path":"/b","value":2}]');
 When the schema argument is a constant (e.g., in CHECK constraints), the validator is compiled once and cached with the query plan.
 
 ```sql
-select json_schema('[1, 2, 3]', 'number[]');  -- 1
-select json_schema('{"x":42}', '{ x: number }'); -- 1
-select json_schema('[1,"mixed"]', 'number[]');    -- 0
+select json_schema('[1, 2, 3]', 'number[]');  -- true
+select json_schema('{"x":42}', '{ x: number }'); -- true
+select json_schema('[1,"mixed"]', 'number[]');    -- false
 
 create table events (
   id integer primary key,
@@ -541,6 +575,8 @@ One row per (index, indexed-column) pair, ordered by column position within the 
 | `partial` | INTEGER | 1 if the index has a `WHERE` predicate |
 | `tags` | TEXT? | Index tags as JSON object (repeated per row) |
 
+The implicit covering structure backing a plain `UNIQUE` constraint is not a user-addressable index, so neither `index_info()` nor `schema()` lists it — on any backend — unless the constraint opts in via `quereus.expose_implicit_index`. See [sql-ddl.md §6.3](sql-ddl.md#63-indexes-on-virtual-tables).
+
 ### `check_constraint_info(table_name)` columns
 
 | Column | Type | Description |
@@ -570,7 +606,8 @@ One row per (UNIQUE constraint, column) pair. The primary key is excluded — qu
 
 | Column | Type | Description |
 |---|---|---|
-| `name` | TEXT | Assertion name |
+| `schema_name` | TEXT | Schema the assertion lives in |
+| `name` | TEXT | Assertion name (unique per schema) |
 | `violation_sql` | TEXT | The query that should return zero rows when the assertion holds |
 | `deferrable` | INTEGER | 0/1 |
 | `initially_deferred` | INTEGER | 0/1 |
@@ -603,7 +640,7 @@ These table-valued functions provide query introspection and execution tracing. 
 | `stack_trace(sql)` | 1 | Execution stack trace |
 | `execution_trace(sql)` | 1 | Instruction-level trace with timing. Non-deterministic |
 | `row_trace(sql)` | 1 | Row-level data flow trace. Non-deterministic |
-| `explain_assertion(name)` | 1 | Assertion analysis: classification, prepared PK params, violation SQL |
+| `explain_assertion(name)` | 1 | Assertion analysis: classification, prepared PK params, violation SQL. `name` may be `'schema.name'` or bare (first match across schemas) |
 
 ```sql
 select id, op, detail from query_plan('select * from users where age > 25');

@@ -6,6 +6,8 @@
  * - Both inputs advertise `MonotonicOn` on (at least) one of the equi-pair
  *   attributes, with matching direction (ASC for v1, since the merge-join
  *   emitter assumes ASC ordering).
+ * - Neither input reads the other's columns (a merge join drains each side
+ *   independently, so such a side must keep the nested-loop driver).
  *
  * Why this rule exists alongside `rule-join-physical-selection`:
  * The existing rule chooses merge-join when both sources' `physical.ordering`
@@ -34,12 +36,17 @@ import { MergeJoinNode } from '../../nodes/merge-join-node.js';
 import type { EquiJoinPair } from '../../nodes/join-utils.js';
 import { nestedLoopJoinCost, hashJoinCost, mergeJoinCost } from '../../cost/index.js';
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
-import { extractEquiPairs, extractEquiPairsFromUsing, combineResidual, isMergeReadyOnAllPairs } from './equi-pair-extractor.js';
+import { extractEquiPairs, combineResidual, isMergeReadyOnAllPairs } from './equi-pair-extractor.js';
+import { readsColumnsOf } from '../../cache/correlation-detector.js';
 
 const log = createLogger('optimizer:rule:monotonic-merge-join');
 
 export function ruleMonotonicMergeJoin(node: PlanNode, _context: OptContext): PlanNode | null {
 	if (!(node instanceof JoinNode)) return null;
+
+	// Existence-flag joins must stay the nested-loop JoinNode (see
+	// rule-join-physical-selection): the MergeJoin variant would drop the flag.
+	if (node.hasExistenceColumns) return null;
 
 	const joinType = node.joinType;
 	if (joinType !== 'inner' && joinType !== 'left' && joinType !== 'semi' && joinType !== 'anti') return null;
@@ -49,17 +56,33 @@ export function ruleMonotonicMergeJoin(node: PlanNode, _context: OptContext): Pl
 	const leftAttrIds = new Set(leftAttrs.map(a => a.id));
 	const rightAttrIds = new Set(rightAttrs.map(a => a.id));
 
-	const extracted = node.condition
-		? extractEquiPairs(node.condition, leftAttrIds, rightAttrIds)
-		: extractEquiPairsFromUsing(node.usingColumns, leftAttrs, rightAttrs);
+	// A USING join carries a desugared condition (see `buildUsingCondition`), so the
+	// one extractor covers both spellings.
+	const extracted = extractEquiPairs(node.condition, leftAttrIds, rightAttrIds);
 	if (!extracted || extracted.equiPairs.length === 0) return null;
+
+	// Same hazard `rule-join-physical-selection` guards: a merge join drains each
+	// side independently, so a side reading its SIBLING's columns (a `JOIN
+	// LATERAL` subtree, an index-nested-loop's correlated seek) would resolve
+	// against no row. Defensive here — no SQL shape was found that both reads a
+	// sibling's columns and advertises `monotonicOn` on the join key, so this
+	// gate is untested — but the emitter contract is identical, so declining
+	// costs at most one unreachable optimization.
+	if (readsColumnsOf(node.right, node.left) || readsColumnsOf(node.left, node.right)) {
+		log('Declining: a join side reads its sibling\'s columns; nested-loop driver required');
+		return null;
+	}
 
 	// Defer to `rule-join-physical-selection` whenever both sides' physical
 	// ordering already covers ALL equi-pairs in merge-ready order. The
 	// ordering-based path produces a multi-key merge join with full
 	// unique-key propagation; demoting pairs to residual here would lose that
 	// propagation. Our rule is meant to *extend* recognition, not regress it.
-	if (isMergeReadyOnAllPairs(node.left, node.right, extracted.equiPairs)) return null;
+	// Defer only when that rule can actually take merge: it requires EVERY
+	// pair `collationsMatch` (see EquiJoinPair.collationsMatch) — with any
+	// mismatched pair it never merges, so there is nothing to defer to.
+	if (extracted.equiPairs.every(p => p.collationsMatch)
+		&& isMergeReadyOnAllPairs(node.left, node.right, extracted.equiPairs)) return null;
 
 	const leftMon = PlanNodeCharacteristics.getMonotonicOn(node.left);
 	const rightMon = PlanNodeCharacteristics.getMonotonicOn(node.right);
@@ -68,9 +91,14 @@ export function ruleMonotonicMergeJoin(node: PlanNode, _context: OptContext): Pl
 	// Find equi-pairs where BOTH sides are MonotonicOn on their respective
 	// attrId with matching direction. v1 requires ASC because the merge-join
 	// emitter assumes ASC; DESC-DESC streaming would need a reversed compareKeys.
+	// The driving merge key must have matched declared collations: each side's
+	// monotonicOn (like `ordering`) is implicitly under its OWN declared
+	// collation, and the merge comparator resolves the pair's collation — only
+	// a matched pair makes those the same order (see EquiJoinPair.collationsMatch).
 	const matchedIndices: number[] = [];
 	for (let i = 0; i < extracted.equiPairs.length; i++) {
 		const pair = extracted.equiPairs[i];
+		if (!pair.collationsMatch) continue;
 		const l = leftMon.find(m => m.attrId === pair.leftAttrId && m.direction === 'asc');
 		if (!l) continue;
 		const r = rightMon.find(m => m.attrId === pair.rightAttrId && m.direction === 'asc');

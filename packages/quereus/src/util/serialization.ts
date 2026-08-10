@@ -16,6 +16,16 @@ export function uint8ArrayToHex(bytes: Uint8Array): string {
 	return hex.join('');
 }
 
+/**
+ * Maximum number of `Map` entries rendered in a `$map` serialization summary.
+ * Matches the FD/binding/domain/IND bounding convention (`MAX_FDS_PER_NODE` /
+ * `MAX_INDS_PER_NODE` in `planner/util/fd-utils.ts`, both 64): generous enough
+ * that real physical summaries are never truncated in practice, present only to
+ * bound worst-case EXPLAIN / `query_plan()` output. `size` always records the
+ * true entry count even when the rendered entries are capped.
+ */
+export const MAP_SUMMARY_ENTRY_CAP = 64;
+
 export function jsonStringify(obj: any, space?: string | number): string {
   return JSON.stringify(
 		obj,
@@ -29,6 +39,21 @@ export function jsonStringify(obj: any, space?: string | number): string {
 				return value.toString();
 			} else if (value instanceof Uint8Array) {
 				return `0x${uint8ArrayToHex(value)}`;
+			} else if (value instanceof Map) {
+				// A Map has no enumerable own properties, so the default JSON path
+				// renders it as `{}`. Emit a deterministic, bounded summary instead:
+				// insertion-ordered [key, value] pairs plus the true `size`. The pairs
+				// are plain values that re-enter this replacer, so nested bigint /
+				// Uint8Array / Map values are still handled recursively (do not
+				// pre-stringify them). Entries are capped at MAP_SUMMARY_ENTRY_CAP so a
+				// large map cannot blow up EXPLAIN output; `size` still reflects the
+				// full count. Keys (AttributeId numbers or strings) render as strings.
+				const entries: [string, any][] = [];
+				for (const [k, v] of value) {
+					if (entries.length >= MAP_SUMMARY_ENTRY_CAP) break;
+					entries.push([String(k), v]);
+				}
+				return { $map: entries, size: value.size };
 			}
 			return value;
 		},

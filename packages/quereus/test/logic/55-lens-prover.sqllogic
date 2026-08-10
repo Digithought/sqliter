@@ -1,0 +1,202 @@
+-- Lens prover + constraint attachment (docs/lens.md §§ Constraint Attachment /
+-- Coverage checklist; ticket `lens-prover-and-attachment`).
+--
+-- Exercises the prover's user-visible contract through the full SQL pipeline:
+-- the deploy-blocking coverage-checklist errors, and the read-only mutation gate
+-- for a logical table whose primary key is not reconstructible at the lens
+-- boundary. (Per-obligation classification + the advisory report are unit-tested
+-- in test/lens-prover.spec.ts; the live per-write enforcement of row-local /
+-- set-level / FK obligations is the follow-up `lens-constraint-enforcement-wiring`.)
+
+-- ===================================
+-- 1. A proved logical schema deploys and reads through the lens
+-- ===================================
+
+declare schema basis1 {
+	table t (
+		id integer primary key,
+		name text
+	)
+}
+
+-- run
+
+apply schema basis1;
+
+-- run
+
+insert into basis1.t values (1, 'alpha'), (2, 'beta');
+
+-- run
+
+declare logical schema app1 {
+	table t (
+		id integer primary key,
+		name text,
+		unique (id)
+	)
+}
+
+-- run
+
+-- Explicit basis binding (the shared-DB sqllogic harness accumulates basis
+-- schemas across scenarios, so default-basis inference would be ambiguous).
+declare lens for app1 over basis1 { }
+
+-- run
+
+apply schema app1;
+
+-- run
+
+select * from app1.t order by id;
+→ [{"id": 1, "name": "alpha"}, {"id": 2, "name": "beta"}]
+
+-- ===================================
+-- 2. Type mismatch blocks the deploy (logical int over basis text)
+-- ===================================
+
+declare schema basis2 {
+	table t (
+		id text primary key
+	)
+}
+
+-- run
+
+apply schema basis2;
+
+-- run
+
+declare logical schema app2 {
+	table t (
+		id integer primary key
+	)
+}
+
+-- run
+
+declare lens for app2 over basis2 { }
+
+-- run
+
+apply schema app2;
+-- error: lens.type-mismatch
+
+-- ===================================
+-- 3. Nullability mismatch blocks the deploy (NOT NULL logical over nullable basis)
+-- ===================================
+
+declare schema basis3 {
+	table t (
+		id integer primary key,
+		note text null
+	)
+}
+
+-- run
+
+apply schema basis3;
+
+-- run
+
+declare logical schema app3 {
+	table t (
+		id integer primary key,
+		note text
+	)
+}
+
+-- run
+
+declare lens for app3 over basis3 { }
+
+-- run
+
+apply schema app3;
+-- error: lens.nullability-mismatch
+
+-- ===================================
+-- 4. A check over a computed (non-invertible) column is unrealizable
+-- ===================================
+
+declare schema basis4 {
+	table src (
+		id integer primary key,
+		v integer
+	)
+}
+
+-- run
+
+apply schema basis4;
+
+-- run
+
+declare logical schema app4 {
+	table m (
+		id integer primary key,
+		doubled integer,
+		constraint pos check (doubled >= 0)
+	)
+}
+
+-- run
+
+declare lens for app4 over basis4 {
+	view m as select id, v * 2 as doubled from basis4.src
+}
+
+-- run
+
+apply schema app4;
+-- error: lens.unrealizable-constraint
+
+-- ===================================
+-- 5. A non-reconstructible primary key deploys read-only; reads work, writes error
+-- ===================================
+
+declare schema basis5 {
+	table src (
+		id integer primary key,
+		v integer
+	)
+}
+
+-- run
+
+apply schema basis5;
+
+-- run
+
+insert into basis5.src values (1, 10);
+
+-- run
+
+declare logical schema app5 {
+	table m (
+		k integer primary key,
+		v integer
+	)
+}
+
+-- run
+
+-- `k` maps to a computed expression (v + 1) — not reconstructible at the boundary.
+declare lens for app5 over basis5 {
+	view m as select v + 1 as k, v from basis5.src
+}
+
+-- run
+
+apply schema app5;
+
+-- run
+
+-- Reads still resolve through the lens.
+select k, v from app5.m;
+→ [{"k": 11, "v": 10}]
+
+-- Any mutation errors at the lens boundary.
+insert into app5.m (k, v) values (5, 4);
+-- error: read-only

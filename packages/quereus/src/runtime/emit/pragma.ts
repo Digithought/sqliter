@@ -1,6 +1,7 @@
 import type { EmissionContext } from '../emission-context.js';
 import type { PragmaPlanNode } from '../../planner/nodes/pragma.js';
-import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import type { Row, SqlValue } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
 import { QuereusError } from '../../common/errors.js';
@@ -51,7 +52,7 @@ export function emitPragma(plan: PragmaPlanNode, _ctx: EmissionContext): Instruc
 
 	return {
 		params: [],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `PRAGMA ${plan.pragmaName}${plan.value !== undefined ? ` = ${plan.value}` : ''}`
 	};
 }

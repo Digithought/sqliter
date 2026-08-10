@@ -1,7 +1,7 @@
 import { PlanNodeType } from './plan-node-type.js';
 import { PlanNode, type RelationalPlanNode, type ScalarPlanNode, type UnaryRelationalNode, type Attribute, isRelationalNode, type PhysicalProperties } from './plan-node.js';
 import { ColumnReferenceNode } from './reference.js';
-import { addFd, projectConstantBindings, projectDomainConstraints, projectFds, singletonFd, superkeyToFd } from '../util/fd-utils.js';
+import { addFd, addSingletonFd, projectConstantBindings, projectDomainConstraints, projectFds, superkeyToFd } from '../util/fd-utils.js';
 import type { ConstantBinding, DomainConstraint, FunctionalDependency } from './plan-node.js';
 import type { RelationType } from '../../common/datatype.js';
 import type { Scope } from '../scopes/scope.js';
@@ -10,6 +10,9 @@ import { formatExpressionList } from '../../util/plan-formatter.js';
 import { StatusCode } from '../../common/types.js';
 import { quereusError } from '../../common/errors.js';
 import type { AggregationCapable } from '../framework/characteristics.js';
+import { aggregateCost } from '../cost/index.js';
+import { aggregateRowsFrom, physicalSourceRows } from '../util/row-estimates.js';
+import { disambiguateColumnNames } from '../util/output-names.js';
 
 export interface AggregateExpression {
   expression: ScalarPlanNode;
@@ -53,9 +56,9 @@ export function propagateAggregateFds(
     // Single-group aggregate: emit the singleton FD if there is at least one
     // output column. Source-side FDs do not survive — every source row collapses
     // into one output row, so per-row source determinations no longer apply.
-    const singleton = singletonFd(outputColumnCount);
+    const fds = addSingletonFd([], outputColumnCount);
     return {
-      fds: singleton ? [singleton] : undefined,
+      fds: fds.length > 0 ? fds : undefined,
     };
   }
 
@@ -107,6 +110,7 @@ export function propagateAggregateFds(
  */
 export class AggregateNode extends PlanNode implements UnaryRelationalNode, AggregationCapable {
   override readonly nodeType = PlanNodeType.Aggregate;
+  readonly isAggregationCapable = true as const;
 
   private outputTypeCache: Cached<RelationType>;
   private attributesCache: Cached<Attribute[]>;
@@ -119,7 +123,12 @@ export class AggregateNode extends PlanNode implements UnaryRelationalNode, Aggr
     estimatedCostOverride?: number,
     public readonly preserveAttributeIds?: readonly Attribute[]
   ) {
-    super(scope, estimatedCostOverride ?? source.getTotalCost());
+    // Self-cost only: the source (and group-by/aggregate exprs) flow in via
+    // getChildren(). Self is a modeled aggregate cost (mirrors estimatedRows'
+    // group-count heuristic); the prior `source.getTotalCost()` double-counted.
+    const sourceRows = source.estimatedRows ?? 1000;
+    const outputRows = groupBy.length > 0 ? Math.max(1, Math.floor(sourceRows / 2)) : 1;
+    super(scope, estimatedCostOverride ?? aggregateCost(sourceRows, outputRows));
 
     this.outputTypeCache = new Cached(() => this.buildOutputType());
     this.attributesCache = new Cached(() => this.buildAttributes());
@@ -136,18 +145,39 @@ export class AggregateNode extends PlanNode implements UnaryRelationalNode, Aggr
     return `group_${index}`;
   }
 
+  /**
+   * The published output names: GROUP BY keys then aggregates, with duplicates
+   * numbered (`a`, `a:1`) exactly like a ProjectNode's.
+   *
+   * `GROUP BY l.a, r.a` gives both keys the base name `a`, and this node is the
+   * query root whenever the SELECT list already agrees with the aggregate's own
+   * layout (no capping projection is built) — so without the suffix a result-row
+   * object would carry one `a` and drop the other column's value.
+   *
+   * Only the *type* names are disambiguated; {@link buildAttributes} keeps the
+   * base names, which `createAggregateOutputScope` reads to decide that a bare
+   * `a` is ambiguous across two group keys.
+   */
+  private buildColumnNames(): string[] {
+    return disambiguateColumnNames([
+      ...this.groupBy.map((expr, index) => this.getGroupByColumnName(expr, index)),
+      ...this.aggregates.map(agg => agg.alias)
+    ]);
+  }
+
   private buildOutputType(): RelationType {
     // Build the output relation type based on group by columns and aggregates
+    const names = this.buildColumnNames();
     const columns = [
       // Group by columns come first
       ...this.groupBy.map((expr, index) => ({
-        name: this.getGroupByColumnName(expr, index),
+        name: names[index],
         type: expr.getType(),
         generated: false
       })),
       // Then aggregate columns
-      ...this.aggregates.map(agg => ({
-        name: agg.alias,
+      ...this.aggregates.map((agg, index) => ({
+        name: names[this.groupBy.length + index],
         type: agg.expression.getType(),
         generated: true
       }))
@@ -260,18 +290,13 @@ export class AggregateNode extends PlanNode implements UnaryRelationalNode, Aggr
   }
 
   get estimatedRows(): number | undefined {
-    const sourceRows = this.source.estimatedRows;
-    if (sourceRows === undefined) return undefined;
+    return this.rowsFrom(this.source.estimatedRows);
+  }
 
-    // If we have GROUP BY, the output rows depend on the number of distinct groups
-    // For now, we'll use a conservative estimate
-    if (this.groupBy.length > 0) {
-      // Estimate that we'll have at most sourceRows/2 groups, but at least 1
-      return Math.max(1, Math.floor(sourceRows / 2));
-    } else {
-      // No GROUP BY means we're aggregating the entire table into a single row
-      return 1;
-    }
+  private rowsFrom(sourceRows: number | undefined): number | undefined {
+    // The logical node is deliberately more conservative than its physical
+    // counterparts about how much a GROUP BY collapses: 2 rows per group, not 10.
+    return aggregateRowsFrom(sourceRows, this.groupBy.length > 0, 2);
   }
 
   computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
@@ -284,7 +309,7 @@ export class AggregateNode extends PlanNode implements UnaryRelationalNode, Aggr
     );
 
     return {
-      estimatedRows: this.estimatedRows,
+      estimatedRows: this.rowsFrom(physicalSourceRows(sourcePhysical, this.source)),
       ordering: sourcePhysical?.ordering,
       fds,
       equivClasses,

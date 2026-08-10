@@ -4,6 +4,17 @@ import type { LogicalType } from "../types/logical-type.js";
 
 export type TypeClass = 'scalar' | 'relation' | 'list' | 'void';
 
+/**
+ * Provenance of a {@link ScalarType}'s `collationName`, ranked for comparison
+ * resolution (see `planner/analysis/comparison-collation.ts`):
+ * - `'explicit'` — a `COLLATE` expression (CollateNode) demanded it.
+ * - `'declared'` — a column declared with an explicit `COLLATE` clause
+ *   (`ColumnSchema.collationExplicit`).
+ * - `'default'`  — a defaulted column collation (session `default_collation`,
+ *   store-module reconcile, or the engine BINARY default).
+ */
+export type CollationSource = 'explicit' | 'declared' | 'default';
+
 export type BaseType = DeepReadonly<{
 	typeClass: TypeClass;
 }>
@@ -18,6 +29,8 @@ export type ScalarType = DeepReadonly<BaseType & {
 	logicalType: LogicalType;
 	/** The optional collation name of the scalar value. */
 	collationName?: string;
+	/** Provenance of `collationName`; absent means unknown/derived (treated as `'default'`). */
+	collationSource?: CollationSource;
 	/** If nullable, null values are allowed and may be encountered in inference contexts too. */
 	nullable: boolean;
 	/** Indicates that it is inferred const, computed, or otherwise immutable.  Missing assumes false. */

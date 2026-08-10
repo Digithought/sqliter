@@ -8,15 +8,64 @@
 import type { SqlValue } from '../../common/types.js';
 import type { ScalarPlanNode } from '../nodes/plan-node.js';
 import type { TableSchema } from '../../schema/table.js';
-import type { StatsProvider } from './index.js';
+import type { ColumnStatsResolver, StatsProvider } from './index.js';
 import { NaiveStatsProvider } from './index.js';
 import { createLogger } from '../../common/logger.js';
+import { catalogRowCount } from './table-cardinality.js';
 import { selectivityFromHistogram } from './histogram.js';
+import { combineConjunctive, combineDisjunctive } from './selectivity-combine.js';
+import { splitConjuncts, splitDisjuncts } from '../analysis/predicate-conjuncts.js';
 import type { BinaryOpNode, LiteralNode, BetweenNode, UnaryOpNode } from '../nodes/scalar.js';
 import type { ColumnReferenceNode } from '../nodes/reference.js';
 import type { InNode } from '../nodes/subquery.js';
 
 const log = createLogger('optimizer:stats:catalog');
+
+/**
+ * Guard against unbounded recursion through nested OR / NOT structures.
+ * (AND and OR levels are each flattened in one step, so this only bites on
+ * genuinely alternating boolean nesting.)
+ */
+const MAX_BOOLEAN_DEPTH = 16;
+
+// ── Boolean-walk result ─────────────────────────────────────────────────
+
+/**
+ * What a walk over a predicate's boolean structure managed to establish.
+ *
+ * - `complete` — the statistics answered for the predicate as a whole; `value` is
+ *   the estimate.
+ * - `lowerBound` — an `OR` had at least one branch out of reach of the statistics,
+ *   so `value` is a FLOOR rather than an estimate: `a or b` keeps at least as many
+ *   rows as `a` alone, so the most permissive branch that could be read bounds the
+ *   whole disjunction from below. The true selectivity lies somewhere in `[value, 1]`.
+ *   NOTE: the floor is only exact when the readable branch is itself exact. An AND
+ *   branch drops its unknown conjuncts, so it reports an UPPER bound of its own
+ *   value, and a floor built from it can sit above the truth. The error direction is
+ *   the same one AND deliberately takes (over-estimate surviving rows), so nothing
+ *   downstream is worse off; if an exact floor is ever needed, an AND with a dropped
+ *   conjunct would have to be excluded from the max here.
+ *
+ * `undefined` in place of an `Estimate` means nothing could be established at all.
+ */
+type Estimate =
+	| { readonly kind: 'complete'; readonly value: number }
+	| { readonly kind: 'lowerBound'; readonly value: number };
+
+const complete = (value: number): Estimate => ({ kind: 'complete', value });
+const lowerBound = (value: number): Estimate => ({ kind: 'lowerBound', value });
+
+/**
+ * What the recursive estimate walk carries down: the table's statistics, plus the
+ * optional resolver that identifies a predicate's columns by attribute identity
+ * rather than by the name written in their AST (see {@link ColumnStatsResolver}).
+ *
+ * Bundled into one object so the walk's six methods keep two-parameter signatures.
+ */
+interface EstimateContext {
+	readonly stats: TableStatistics;
+	readonly resolve?: ColumnStatsResolver;
+}
 
 // ── Statistics data structures ──────────────────────────────────────────
 
@@ -84,29 +133,60 @@ export class CatalogStatsProvider implements StatsProvider {
 	}
 
 	tableRows(table: TableSchema): number | undefined {
-		const stats = table.statistics;
-		if (stats) {
-			log('Table %s: catalog rowCount=%d', table.name, stats.rowCount);
-			return stats.rowCount;
-		}
-		return this.fallback.tableRows(table);
+		const rows = catalogRowCount(table);
+		if (rows === undefined) return this.fallback.tableRows(table);
+		log('Table %s: rowCount=%d (source: %s)', table.name, rows, table.statistics ? 'catalog' : 'schema');
+		return rows;
 	}
 
-	selectivity(table: TableSchema, predicate: ScalarPlanNode): number | undefined {
-		const stats = table.statistics;
-		if (!stats) return this.fallback.selectivity(table, predicate);
-
-		const sel = this.estimatePredicateSelectivity(stats, predicate);
-		if (sel !== undefined) {
-			log('Predicate selectivity for %s on %s: %f (catalog)', predicate.nodeType, table.name, sel);
-			return sel;
+	selectivity(table: TableSchema, predicate: ScalarPlanNode, resolve?: ColumnStatsResolver): number | undefined {
+		const estimate = this.estimate(table, predicate, resolve);
+		if (estimate?.kind === 'complete') {
+			log('Predicate selectivity for %s on %s: %f (catalog)', predicate.nodeType, table.name, estimate.value);
+			return estimate.value;
 		}
-		return this.fallback.selectivity(table, predicate);
+
+		const naive = this.fallback.selectivity(table, predicate);
+		if (estimate === undefined) return naive;
+
+		// A partly-known OR: keep the naive guess's caution, but never report below the
+		// floor the statistics already prove. Reporting the floor on its own would be
+		// wrong in the other direction — an unread branch may match far more rows than
+		// the branch that was read.
+		const lifted = naive === undefined ? estimate.value : Math.max(naive, estimate.value);
+		log('Predicate selectivity for %s on %s: %f (naive %o against catalog floor %f)',
+			predicate.nodeType, table.name, lifted, naive, estimate.value);
+		return lifted;
 	}
 
-	joinSelectivity(leftTable: TableSchema, rightTable: TableSchema, joinCondition: ScalarPlanNode): number | undefined {
+	/**
+	 * The catalog half of {@link selectivity}: undefined rather than a naive guess
+	 * when the table carries no statistics, or when the predicate's shape puts it out
+	 * of reach of the ones it has —
+	 *
+	 * - the column is not a direct child of the comparison (`lower(cat) = 'x'` —
+	 *   {@link extractColumnFromPredicate} looks one level down and finds none), or
+	 * - the column was minted above the base table (a computed projection, an
+	 *   aggregate or window output), which a caller-supplied
+	 *   {@link ColumnStatsResolver} reports by resolving the attribute to nothing.
+	 *
+	 * A partly-known OR reads as undefined here: this method means "real statistics
+	 * answered *the predicate*", and `rule-filter-selectivity` uses it as its
+	 * does-this-relation-have-usable-statistics gate. A floor is not an answer.
+	 */
+	statsOnlySelectivity(table: TableSchema, predicate: ScalarPlanNode, resolve?: ColumnStatsResolver): number | undefined {
+		const estimate = this.estimate(table, predicate, resolve);
+		return estimate?.kind === 'complete' ? estimate.value : undefined;
+	}
+
+	joinSelectivity(
+		leftTable: TableSchema,
+		rightTable: TableSchema,
+		joinCondition: ScalarPlanNode,
+		resolve?: ColumnStatsResolver,
+	): number | undefined {
 		// For equi-joins, use 1/max(ndv_left, ndv_right) if we can extract columns
-		const colNames = extractEquiJoinColumns(joinCondition);
+		const colNames = extractEquiJoinColumns(joinCondition, resolve);
 		if (colNames) {
 			// Check FK→PK: if one side has an FK referencing the other's PK,
 			// use 1/ndv_pk for tighter selectivity
@@ -171,6 +251,13 @@ export class CatalogStatsProvider implements StatsProvider {
 		return this.fallback.distinctValues?.(table, columnName);
 	}
 
+	/**
+	 * NOTE: no {@link ColumnStatsResolver} is threaded here, so the delegated estimate
+	 * matches columns by AST name. Nothing in the engine calls this today (only its own
+	 * tests do), so nothing is wrong now — but the first production caller must widen
+	 * this signature to take a resolver and pass it down, or it will silently get the
+	 * name matching the selectivity family no longer uses.
+	 */
 	indexSelectivity(table: TableSchema, indexName: string, predicate: ScalarPlanNode): number | undefined {
 		// Delegate to base selectivity — real column stats already improve this
 		const sel = this.selectivity(table, predicate);
@@ -185,20 +272,190 @@ export class CatalogStatsProvider implements StatsProvider {
 		return colStats?.distinctCount;
 	}
 
-	private estimatePredicateSelectivity(
-		stats: TableStatistics,
+	/**
+	 * Entry point for predicate selectivity: no statistics at all, or the empty
+	 * table, short-circuit; otherwise walk the predicate's boolean structure.
+	 */
+	private estimate(
+		table: TableSchema,
+		predicate: ScalarPlanNode,
+		resolve?: ColumnStatsResolver,
+	): Estimate | undefined {
+		const stats = table.statistics;
+		if (!stats) return undefined;
+		if (stats.rowCount === 0) return complete(0);
+		return this.estimateNode({ stats, resolve }, predicate, 0);
+	}
+
+	/**
+	 * Recurse over the boolean structure (AND / OR / NOT) of a predicate,
+	 * delegating anything else to {@link estimateLeaf}.
+	 *
+	 * Returns undefined when nothing useful can be said, which lets `selectivity`
+	 * fall through to the naive provider exactly as it did before this recursion
+	 * existed.
+	 */
+	private estimateNode(
+		ctx: EstimateContext,
+		node: ScalarPlanNode,
+		depth: number
+	): Estimate | undefined {
+		if (depth > MAX_BOOLEAN_DEPTH) return undefined;
+
+		if (node.nodeType === 'BinaryOp') {
+			// Planner convention is uppercase 'AND' / 'OR' (see predicate-normalizer).
+			const op = (node as unknown as BinaryOpNode).expression.operator;
+			if (op === 'AND') return this.estimateConjunction(ctx, node, depth);
+			if (op === 'OR') return this.estimateDisjunction(ctx, node, depth);
+		}
+
+		if (node.nodeType === 'UnaryOp') {
+			// 'NOT' is boolean structure; the other unary operators ('IS NULL' etc.)
+			// are leaves and fall through to estimateLeaf below.
+			if ((node as unknown as UnaryOpNode).expression.operator === 'NOT') {
+				// Read the operand through getChildren() rather than `.operand`, matching
+				// how the rest of this file introspects nodes structurally.
+				const operand = node.getChildren()[0] as ScalarPlanNode | undefined;
+				if (!operand) return undefined;
+				const inner = this.estimateNode(ctx, operand, depth + 1);
+				// A lower bound negates into an UPPER bound, which nothing downstream
+				// models, so a partly-known operand makes the negation unknown.
+				if (inner?.kind !== 'complete') return undefined;
+				// NOTE: estimateConjunction's "unknown conjunct counts as 1.0" makes an AND
+				// estimate an UPPER bound, and negating flips that into a LOWER bound — so
+				// `not (a = 1 and lower(s) = 'x')` errs low where the AND path claims to err
+				// high. Bounded (the true value is between this and 1) and the direction only
+				// inverts under an explicit NOT, which the planner rarely leaves standing. If
+				// negated mixed-knowledge predicates ever drive a bad plan, widen `Estimate`
+				// to carry an upper-bound kind as well.
+				return complete(1 - inner.value);
+			}
+		}
+
+		return this.leafEstimate(ctx, node);
+	}
+
+	/** {@link estimateLeaf} lifted into the {@link Estimate} vocabulary. */
+	private leafEstimate(ctx: EstimateContext, node: ScalarPlanNode): Estimate | undefined {
+		const sel = this.estimateLeaf(ctx, node);
+		return sel === undefined ? undefined : complete(sel);
+	}
+
+	/**
+	 * AND: estimate each conjunct and combine the ones we could estimate.
+	 *
+	 * An unestimable conjunct is treated as selectivity 1.0 (claim no reduction)
+	 * rather than handed to NaiveStatsProvider's flat 0.1. That number is
+	 * fabricated, and multiplying it in biases the whole estimate downward;
+	 * over-estimating surviving rows is the safer error direction for plan choice.
+	 * Concretely `a = 1 and lower(b) = 'x'` now estimates 1/ndv(a) where it used to
+	 * estimate 0.1 — a deliberate change, not a regression.
+	 *
+	 * If *every* conjunct is unknown we return undefined so the whole-predicate
+	 * naive fallback in `selectivity()` still runs.
+	 *
+	 * A conjunct that only produced a lower bound (a partly-known OR) counts as
+	 * unknown here for the same reason: folding a floor into the product would drag
+	 * the result down, and AND deliberately errs high.
+	 */
+	private estimateConjunction(
+		ctx: EstimateContext,
+		node: ScalarPlanNode,
+		depth: number
+	): Estimate | undefined {
+		const conjuncts = splitConjuncts(node);
+		// splitConjuncts only descends through real BinaryOpNode instances; if it
+		// handed back the node itself there is nothing to decompose.
+		if (conjuncts.length === 1 && conjuncts[0] === node) return this.leafEstimate(ctx, node);
+
+		const known: number[] = [];
+		for (const conjunct of conjuncts) {
+			const est = this.estimateNode(ctx, conjunct, depth + 1);
+			if (est?.kind === 'complete') known.push(est.value);
+		}
+		if (known.length === 0) return undefined;
+
+		// NOTE: conjuncts on the *same* column (`a > 1 and a < 10`) are strongly
+		// anti-correlated and are not paired into a single range here. Exponential
+		// backoff damps the error (0.333 · √0.333 ≈ 0.19 instead of 0.11) but does
+		// not remove it; same-column range pairing would.
+		return complete(this.floorCombined(ctx.stats, combineConjunctive(known), known.length));
+	}
+
+	/**
+	 * OR: estimate every disjunct; combine them when all were readable, otherwise
+	 * report what was proved as a lower bound.
+	 *
+	 * Unlike AND there is no safe default for an unknown disjunct — assuming 1.0
+	 * would make the whole disjunction 1.0 (safe but useless), and assuming 0 would
+	 * silently drop a branch that may match everything. But giving up outright
+	 * discards a bound already in hand: `a or b` keeps at least as many rows as `a`,
+	 * so the most permissive branch that COULD be read floors the whole disjunction.
+	 * That floor travels out as a `lowerBound`, which `selectivity` uses to lift the
+	 * naive guess (see there) and `statsOnlySelectivity` still reports as unknown.
+	 *
+	 * The floor is the max of the readable branches, NOT their disjunctive
+	 * combination: `1 - Π(1 - sᵢ)` assumes the branches are independent, which is an
+	 * estimate rather than a proof — if one readable branch subsumes another the true
+	 * value is only the max.
+	 */
+	private estimateDisjunction(
+		ctx: EstimateContext,
+		node: ScalarPlanNode,
+		depth: number
+	): Estimate | undefined {
+		const disjuncts = splitDisjuncts(node);
+		// See estimateConjunction: nothing to decompose when the walk is a no-op.
+		if (disjuncts.length === 1 && disjuncts[0] === node) return this.leafEstimate(ctx, node);
+
+		const sels: number[] = [];
+		let anyUnreadable = false;
+		for (const disjunct of disjuncts) {
+			const est = this.estimateNode(ctx, disjunct, depth + 1);
+			if (est === undefined) {
+				anyUnreadable = true;
+				continue;
+			}
+			// A branch's own lower bound is still a lower bound on the disjunction.
+			// NOTE: unreachable today — splitDisjuncts flattens nested ORs, and no other
+			// node kind produces a lowerBound, so no disjunct can carry one. Kept because
+			// it is the correct handling the moment another kind does.
+			if (est.kind === 'lowerBound') anyUnreadable = true;
+			sels.push(est.value);
+		}
+		if (sels.length === 0) return undefined;
+
+		if (anyUnreadable) return lowerBound(Math.max(...sels));
+
+		return complete(this.floorCombined(ctx.stats, combineDisjunctive(sels), sels.length));
+	}
+
+	/**
+	 * Never claim fewer than one surviving row once two or more selectivities were
+	 * actually combined. Deliberately not applied to a single leaf estimate:
+	 * `IS NULL` on a column with nullCount 0 legitimately returns 0 today, and
+	 * `FilterNode.estimatedRows` already floors the row count at 1.
+	 */
+	private floorCombined(stats: TableStatistics, sel: number, combinedCount: number): number {
+		if (combinedCount < 2) return sel;
+		// rowCount === 0 short-circuits in estimatePredicateSelectivity, so the
+		// max() here only guards against a negative / absent count.
+		return Math.max(sel, 1 / Math.max(stats.rowCount, 1));
+	}
+
+	/** Estimate a single (non-boolean) comparison against column statistics. */
+	private estimateLeaf(
+		ctx: EstimateContext,
 		predicate: ScalarPlanNode
 	): number | undefined {
-		if (stats.rowCount === 0) return 0;
-
 		// Try to extract column reference from the predicate for column-level estimation
-		const colInfo = extractColumnFromPredicate(predicate);
+		const colInfo = extractColumnFromPredicate(predicate, ctx.resolve);
 		if (!colInfo) return undefined;
 
-		const colStats = stats.columnStats.get(colInfo.columnName.toLowerCase());
+		const colStats = ctx.stats.columnStats.get(colInfo.columnName.toLowerCase());
 		if (!colStats) return undefined;
 
-		const { rowCount } = stats;
+		const { rowCount } = ctx.stats;
 
 		switch (predicate.nodeType) {
 			case 'BinaryOp': {
@@ -279,12 +536,30 @@ export class CatalogStatsProvider implements StatsProvider {
 // These extract structural info from plan nodes using typed imports of the
 // concrete node classes (BinaryOpNode, UnaryOpNode, etc.).
 
-function extractColumnFromPredicate(predicate: ScalarPlanNode): { columnName: string } | undefined {
+function extractColumnFromPredicate(
+	predicate: ScalarPlanNode,
+	resolve?: ColumnStatsResolver,
+): { columnName: string } | undefined {
 	// BinaryOp, In, Between, UnaryOp all typically have a column child
+	// NOTE: for a column-vs-column comparison on one table (`where x = y`) this
+	// picks the first ColumnReference and the caller finds no literal, so `=`
+	// yields 1/ndv(x) — wrong, since it models "x equals a constant" rather than
+	// "x equals another varying column". Pre-existing; fixing it needs a real
+	// two-sided comparison classifier.
 	const children = predicate.getChildren();
 	for (const child of children) {
 		if (child.nodeType === 'ColumnReference') {
-			const name = (child as unknown as ColumnReferenceNode).expression.name;
+			const col = child as unknown as ColumnReferenceNode;
+			if (resolve) {
+				// Identity path: an attribute minted above the base table resolves to
+				// nothing, and the estimate declines rather than borrowing whichever base
+				// column happens to share its AST name. Note this returns outright instead
+				// of trying the next child — "the compared column has no statistics" is the
+				// answer, not a reason to read the other operand.
+				const resolved = resolve(col.attributeId);
+				return resolved === undefined ? undefined : { columnName: resolved };
+			}
+			const name = col.expression.name;
 			if (name) return { columnName: name };
 		}
 	}
@@ -307,7 +582,10 @@ function extractConstantValue(predicate: ScalarPlanNode): SqlValue | undefined {
 function extractInListSize(predicate: ScalarPlanNode): number | undefined {
 	const node = predicate as unknown as InNode;
 	if (Array.isArray(node.values)) return node.values.length;
-	// Some IN nodes store the list in children after the first (column) child
+	// Some IN nodes store the list in children after the first (column) child.
+	// NOTE: `x in (select …)` has no value list, so this falls to children.length-1
+	// === 1 and the caller reports 1/ndv — the estimate for a single equality
+	// rather than for the subquery's real cardinality. Pre-existing.
 	const children = predicate.getChildren();
 	if (children.length > 1) return children.length - 1;
 	return undefined;
@@ -328,7 +606,10 @@ function extractBetweenBounds(predicate: ScalarPlanNode): { low: SqlValue; high:
 	return undefined;
 }
 
-function extractEquiJoinColumns(condition: ScalarPlanNode): { left: string; right: string } | undefined {
+function extractEquiJoinColumns(
+	condition: ScalarPlanNode,
+	resolve?: ColumnStatsResolver,
+): { left: string; right: string } | undefined {
 	if (condition.nodeType !== 'BinaryOp') return undefined;
 	const op = (condition as unknown as BinaryOpNode).expression.operator;
 	if (op !== '=' && op !== '==') return undefined;
@@ -340,9 +621,17 @@ function extractEquiJoinColumns(condition: ScalarPlanNode): { left: string; righ
 	const right = children[1];
 	if (left.nodeType !== 'ColumnReference' || right.nodeType !== 'ColumnReference') return undefined;
 
-	const leftName = (left as unknown as ColumnReferenceNode).expression.name;
-	const rightName = (right as unknown as ColumnReferenceNode).expression.name;
+	const leftName = columnStatsName(left as unknown as ColumnReferenceNode, resolve);
+	const rightName = columnStatsName(right as unknown as ColumnReferenceNode, resolve);
 	if (!leftName || !rightName) return undefined;
 
 	return { left: leftName, right: rightName };
+}
+
+/**
+ * The base-table column a reference's statistics live under: by attribute identity
+ * when a resolver is available, otherwise by the name in the AST.
+ */
+function columnStatsName(col: ColumnReferenceNode, resolve?: ColumnStatsResolver): string | undefined {
+	return resolve ? resolve(col.attributeId) : col.expression.name;
 }

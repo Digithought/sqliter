@@ -17,7 +17,16 @@ export class DeleteNode extends PlanNode implements RelationalPlanNode {
     public readonly source: RelationalPlanNode, // Typically a FilterNode wrapping a TableReferenceNode
     public readonly oldRowDescriptor?: RowDescriptor, // For constraint checking
     public readonly flatRowDescriptor?: RowDescriptor,
-    public readonly mutationContextValues?: Map<string, ScalarPlanNode>, // Mutation context value expressions
+    /**
+     * Mutation context value expressions.
+     *
+     * NOTE: deliberately NOT exposed via `getChildren` (OPT-009): no emitter or rule reads
+     * this map from this node — only `DmlExecutorNode` / `ConstraintCheckNode` consume it,
+     * and they expose their copies. It is therefore a pass-through reference that goes
+     * stale (holds pre-rewrite subtrees) once the optimizer rebuilds those nodes. If
+     * anything ever starts reading it here, expose it as a child first.
+     */
+    public readonly mutationContextValues?: Map<string, ScalarPlanNode>,
     public readonly contextAttributes?: Attribute[], // Mutation context attributes
     public readonly contextDescriptor?: RowDescriptor, // Mutation context row descriptor
   ) {

@@ -1,0 +1,415 @@
+-- Authored inverses (`with inverse (col = expr, …)`) — write-through consumption
+-- (docs/vu-inverses.md § Authored inverses). The clause supplies authored
+-- put expressions computing base columns from the written view row (`new.<col>`
+-- refs), upgrading a computed (registry-opaque) column to writable + insertable.
+-- Parser/AST round-trip is pinned by the parser ticket; this file pins the
+-- build-time validation, lineage upgrade, and UPDATE/INSERT lowering.
+
+-- ===================================
+-- Worked example: a non-injective code collapse. Writes through the view store
+-- the authored representative; reads (incl. RETURNING) normalize through the
+-- forward expression — the PutGet observable (GetPut is intentionally lossy).
+-- ===================================
+
+create table ai_t (id integer primary key, code20 text not null);
+insert into ai_t values (1, 'A2'), (2, 'B2');
+
+create view ai_v as select id, case code20
+		when 'A1' then 'A' when 'A2' then 'A'
+		when 'B1' then 'B' when 'B2' then 'B'
+		else 'C' end as code
+	with inverse (code20 = case new.code when 'A' then 'A1' when 'B' then 'B1' else 'C1' end)
+	from ai_t;
+
+select * from ai_v order by id;
+→ [{"id":1,"code":"A"},{"id":2,"code":"B"}]
+
+-- UPDATE through the view stores the representative ('B' → 'B1', not the row's
+-- original fine-grained value).
+update ai_v set code = 'B' where id = 1;
+select * from ai_t order by id;
+→ [{"id":1,"code20":"B1"},{"id":2,"code20":"B2"}]
+
+-- INSERT through the view: the insertability gate is lifted for the authored
+-- column (a registry-`inverse` / opaque computed column stays non-insertable).
+insert into ai_v (id, code) values (3, 'A');
+select * from ai_t where id = 3;
+→ [{"id":3,"code20":"A1"}]
+
+-- RETURNING reads back through the FORWARD expression over the post-mutation
+-- base value: writing 'C' stores 'C1', and the returned `code` is the normalized
+-- representative 'C' (PutGet holds; the stored value is the representative).
+update ai_v set code = 'C' where id = 3 returning id, code;
+→ [{"id":3,"code":"C"}]
+select code20 from ai_t where id = 3;
+→ [{"code20":"C1"}]
+
+-- Re-select normalizes identically. (`id` is projected alongside `code` to
+-- sidestep a pre-existing planner bug — "No row context" when the WHERE
+-- references a column the outer projection prunes; see tickets/.pre-existing-error.md.)
+select id, code from ai_v where id = 3;
+→ [{"id":3,"code":"C"}]
+
+-- view_info / column_info agree with the dynamic truth: the authored column is
+-- updatable, with its (single-put) base trace, and the view is insertable.
+select column_name, is_updatable, base_table, base_column from column_info('ai_v') order by cid;
+→ [{"column_name":"id","is_updatable":"YES","base_table":"ai_t","base_column":"id"},{"column_name":"code","is_updatable":"YES","base_table":"ai_t","base_column":"code20"}]
+select is_updatable, is_insertable_into from view_info('ai_v');
+→ [{"is_updatable":"YES","is_insertable_into":"YES"}]
+
+-- Conflict resolution: the lowered base values participate normally in
+-- `insert or replace` (the id=3 row's code20 is replaced via the inverse).
+insert or replace into ai_v (id, code) values (3, 'B');
+select code20 from ai_t where id = 3;
+→ [{"code20":"B1"}]
+
+-- ===================================
+-- Build-time validation — position-independent (fails on a bare SELECT that is
+-- never a write target, naming the result column and the offending target/ref).
+-- ===================================
+
+-- unknown assignment target (not a FROM-source column)
+select id, code20 as c with inverse (nope = new.c) from ai_t;
+-- error: WITH INVERSE target 'nope' does not resolve
+
+-- a bare (non-new-qualified) base column ref in the inverse expression
+select id, case code20 when 'A1' then 'A' else 'C' end as c
+	with inverse (code20 = code20 || new.c) from ai_t;
+-- error: without the NEW qualifier
+
+-- a new.<ref> to a non-output column
+select id, code20 as c with inverse (code20 = new.zzz) from ai_t;
+-- error: 'new.zzz' does not resolve to an output column
+
+-- the same target across two result columns of one select
+select code20 as a with inverse (code20 = new.a),
+       code20 as b with inverse (code20 = new.b) from ai_t;
+-- error: both author a WITH INVERSE put to base column 'code20'
+
+-- a duplicate target WITHIN one clause is a parse error (parser ticket)
+select code20 as a with inverse (code20 = new.a, code20 = new.a) from ai_t;
+-- error: Duplicate column 'code20' in WITH INVERSE
+
+-- ===================================
+-- Unused clause stays inert: a top-level select carrying the clause executes
+-- identically to the same select without it, and the plan shape is unchanged
+-- (the metadata must not block optimization).
+-- ===================================
+
+select id, code20 || '!' as bang with inverse (code20 = new.bang) from ai_t order by id;
+→ [{"id":1,"bang":"B1!"},{"id":2,"bang":"B2!"},{"id":3,"bang":"B1!"}]
+
+select (select group_concat(node_type) from query_plan('select id, code20 || ''!'' as bang from ai_t'))
+     = (select group_concat(node_type) from query_plan('select id, code20 || ''!'' as bang with inverse (code20 = new.bang) from ai_t'))
+	as same_plan;
+→ [{"same_plan":true}]
+
+-- ===================================
+-- Authored wins over inferred: an authored inverse on an identity column
+-- overrides the inferred verbatim put (writes normalize through the authored
+-- expression), and on a registry-invertible column overrides the inferred
+-- inverse entirely (the clause is total per column).
+-- ===================================
+
+create table aw_t (k integer primary key, name text null, n integer null);
+insert into aw_t values (1, 'bob', 10);
+
+-- identity column with an authored normalize-on-write
+create view aw_v1 as select k, name with inverse (name = upper(new.name)) from aw_t;
+update aw_v1 set name = 'carl' where k = 1;
+select name from aw_t where k = 1;
+→ [{"name":"CARL"}]
+
+-- insert through it normalizes too
+insert into aw_v1 (k, name) values (2, 'dana');
+select name from aw_t where k = 2;
+→ [{"name":"DANA"}]
+
+-- registry-invertible (`n + 1`) overridden by an authored put: the registry
+-- inverse would store w - 1; the authored put stores w * 10 instead.
+create view aw_v2 as select k, n + 1 as np with inverse (n = new.np * 10) from aw_t;
+update aw_v2 set np = 5 where k = 1;
+select n from aw_t where k = 1;
+→ [{"n":50}]
+
+-- ...and the authored column is insertable where the registry-inverse one is not.
+insert into aw_v2 (k, np) values (3, 2);
+select n from aw_t where k = 3;
+→ [{"n":20}]
+
+-- ===================================
+-- Self-referential inverse: target shares the output name; the target namespace
+-- (base) and the new.-namespace (view output) stay distinct.
+-- ===================================
+
+create table sr_t (id integer primary key, x integer);
+insert into sr_t values (1, 10);
+create view sr_v as select id, x + 0 as x with inverse (x = new.x + 1) from sr_t;
+update sr_v set x = 5 where id = 1;
+select x from sr_t where id = 1;
+→ [{"x":6}]
+
+-- ===================================
+-- Multi-target puts: one view column fans out to two base columns (full-name
+-- split), for UPDATE and INSERT alike.
+-- ===================================
+
+create table mt_t (id integer primary key, b text, c text);
+insert into mt_t values (1, 'Ada', 'Lovelace');
+create view mt_v as select id, b || ' ' || c as full_name
+	with inverse (b = substr(new.full_name, 1, instr(new.full_name, ' ') - 1),
+	              c = substr(new.full_name, instr(new.full_name, ' ') + 1))
+	from mt_t;
+
+update mt_v set full_name = 'Grace Hopper' where id = 1;
+select * from mt_t where id = 1;
+→ [{"id":1,"b":"Grace","c":"Hopper"}]
+
+insert into mt_v (id, full_name) values (2, 'Alan Turing');
+select * from mt_t where id = 2;
+→ [{"id":2,"b":"Alan","c":"Turing"}]
+
+-- a multi-target column reports updatable with NO single base trace
+select column_name, is_updatable, base_table, base_column from column_info('mt_v') where column_name = 'full_name';
+→ [{"column_name":"full_name","is_updatable":"YES","base_table":null,"base_column":null}]
+
+-- ===================================
+-- Multi-target across two sides of a join: two child ops, atomic, ordered by
+-- the existing FK-parent-first rule.
+-- ===================================
+
+create table j_pa (pid integer primary key, aval text);
+create table j_pb (bid integer primary key, pid integer not null references j_pa(pid), bval text);
+insert into j_pa values (1, 'x');
+insert into j_pb values (10, 1, 'y');
+create view j_v as select j_pa.pid as pid, j_pb.bid as bid, aval || '/' || bval as combo
+	with inverse (aval = substr(new.combo, 1, instr(new.combo, '/') - 1),
+	              bval = substr(new.combo, instr(new.combo, '/') + 1))
+	from j_pa join j_pb on j_pa.pid = j_pb.pid;
+
+select * from j_v;
+→ [{"pid":1,"bid":10,"combo":"x/y"}]
+
+update j_v set combo = 'AA/BB' where pid = 1;
+select * from j_pa;
+→ [{"pid":1,"aval":"AA"}]
+select * from j_pb;
+→ [{"bid":10,"pid":1,"bval":"BB"}]
+
+-- insert through the join envelope with an authored column is deferred (precise
+-- diagnostic, not a silent mis-route)
+insert into j_v (pid, bid, combo) values (2, 20, 'c/d');
+-- error: authored inverse (WITH INVERSE); evaluating authored puts through a join view's insert envelope is deferred
+
+-- ===================================
+-- NULL flow: an authored expression producing NULL into a NOT NULL base column
+-- is an ordinary constraint error sited at the base op.
+-- ===================================
+
+create table nn_t (id integer primary key, val text not null);
+insert into nn_t values (1, 'a');
+create view nn_v as select id, val || '' as v2 with inverse (val = new.v2) from nn_t;
+update nn_v set v2 = null where id = 1;
+-- error: NOT NULL constraint failed: nn_t.val
+select val from nn_t where id = 1;
+→ [{"val":"a"}]
+
+-- ===================================
+-- Interaction with `with defaults`: an authored-inverse target column takes
+-- the inverse-computed value ahead of the clause entry for that base column
+-- (it is a supplied value, not an omission); an unrelated entry still fills.
+-- ===================================
+
+create table di_t (id integer primary key, code20 text not null, tag text);
+create view di_v as select id, case code20 when 'A1' then 'A' else 'C' end as code
+	with inverse (code20 = case new.code when 'A' then 'A1' else 'C1' end)
+	from di_t
+	with defaults (code20 = 'X9', tag = 'defaulted');
+
+insert into di_v (id, code) values (1, 'A');
+select * from di_t where id = 1;
+→ [{"id":1,"code20":"A1","tag":"defaulted"}]
+
+-- ===================================
+-- ALTER … RENAME propagation. A rename of a FROM-table base column rewrites the
+-- clause's target; a rename that shifts an UNALIASED projection's output name
+-- retargets `new.<old>` refs; a renamed table inside an assignment's subquery
+-- rewrites scope-aware.
+-- ===================================
+
+-- target rename: code20 → code_raw rewrites the inverse target alongside the body
+alter table ai_t rename column code20 to code_raw;
+update ai_v set code = 'A' where id = 1;
+select code_raw from ai_t where id = 1;
+→ [{"code_raw":"A1"}]
+
+-- output-name shift: `b` is projected bare (output name = b); renaming b → b2
+-- shifts the output name, so `new.b` in the sibling clause must follow.
+create table rn_t (id integer primary key, b text, c text);
+insert into rn_t values (1, 'base', 'old');
+create view rn_v as select id, b, b || '?' as e with inverse (c = new.b || '-' || new.e) from rn_t;
+alter table rn_t rename column b to b2;
+update rn_v set e = 'E!' where id = 1;
+select c from rn_t where id = 1;
+→ [{"c":"base-E!"}]
+
+-- table rename inside an assignment's subquery
+create table lk_t (k text primary key, v text);
+insert into lk_t values ('A', 'mapped-A');
+create table tr_t (id integer primary key, raw text);
+insert into tr_t values (1, 'orig');
+create view tr_v as select id, raw || '' as r2
+	with inverse (raw = (select v from lk_t where k = new.r2)) from tr_t;
+alter table lk_t rename to lk_t2;
+update tr_v set r2 = 'A' where id = 1;
+select raw from tr_t where id = 1;
+→ [{"raw":"mapped-A"}]
+
+-- ===================================
+-- Lens body: the clause inside a `declare lens` override flows through the
+-- sparse-override merger per covered column (gap-filled columns never carry
+-- one); writes through the logical table consume it. Full prover integration
+-- is the authored-inverse-lens-prover ticket.
+-- ===================================
+
+declare schema aib {
+	table Core {
+		id integer primary key,
+		speed integer,
+		color text
+	}
+}
+
+-- run
+
+apply schema aib;
+
+-- run
+
+insert into aib.Core values (1, 60, 'red');
+
+-- run
+
+declare logical schema aiapp {
+	table Car {
+		id integer primary key,
+		mph integer,
+		color text
+	}
+}
+
+-- run
+
+declare lens for aiapp over aib {
+	view Car as select id, speed * 2 as mph with inverse (speed = new.mph / 2) from aib.Core
+}
+
+-- run
+
+apply schema aiapp;
+
+-- run
+
+select * from aiapp.Car order by id;
+→ [{"id":1,"mph":120,"color":"red"}]
+
+update aiapp.Car set mph = 200 where id = 1;
+select speed from aib.Core where id = 1;
+→ [{"speed":100}]
+
+-- run
+
+-- ===================================
+-- Written-row binding: `new.<x>` where `x` is ALSO assigned in the same UPDATE
+-- binds that assignment's value (the written view row is the post-statement
+-- image), order-independently; an unassigned `x` keeps its forward read image.
+-- ===================================
+
+create table ma_t (id integer primary key, a integer, b integer);
+insert into ma_t values (1, 1, 2);
+create view ma_v as select id, a, b + 0 as b2 with inverse (b = new.b2 + new.a) from ma_t;
+
+-- co-assigned: new.a sees the NEW a (10), not the pre-update 1
+update ma_v set b2 = 5, a = 10 where id = 1;
+select a, b from ma_t where id = 1;
+→ [{"a":10,"b":15}]
+
+-- assignment order does not matter (every embedded value reads the pre-update row)
+update ma_v set a = 20, b2 = 7 where id = 1;
+select a, b from ma_t where id = 1;
+→ [{"a":20,"b":27}]
+
+-- unassigned sibling: new.a is the forward read image (current a = 20)
+update ma_v set b2 = 1 where id = 1;
+select b from ma_t where id = 1;
+→ [{"b":21}]
+
+-- ...and the same written-row binding through a join view: new.av co-assigned
+-- on the partner side substitutes the assigned value; unassigned it rides the
+-- captured partner read.
+create table mj_a (pid integer primary key, av text);
+create table mj_b (bid integer primary key, pid integer not null references mj_a(pid), bv text);
+insert into mj_a values (1, 'a');
+insert into mj_b values (10, 1, 'b');
+create view mj_v as select mj_a.pid as pid, mj_b.bid as bid, mj_a.av as av,
+		bv || '' as bv2 with inverse (bv = new.bv2 || '+' || new.av)
+	from mj_a join mj_b on mj_a.pid = mj_b.pid;
+
+update mj_v set bv2 = 'x', av = 'NEWA' where pid = 1;
+select av from mj_a;
+→ [{"av":"NEWA"}]
+select bv from mj_b;
+→ [{"bv":"x+NEWA"}]
+
+update mj_v set bv2 = 'y' where pid = 1;
+select bv from mj_b;
+→ [{"bv":"y+NEWA"}]
+
+-- ===================================
+-- Explicit `create view v(a, b)` column list: output names rename positionally;
+-- `new.<x>` refs (by SELECT-output name) stay bound through the index bridge on
+-- UPDATE and INSERT alike.
+-- ===================================
+
+create table cl_t (id integer primary key, raw text);
+create view cl_v (vid, vcode) as select id, raw || '~' as code with inverse (raw = new.code || '!') from cl_t;
+
+insert into cl_v (vid, vcode) values (1, 'a');
+select raw from cl_t where id = 1;
+→ [{"raw":"a!"}]
+
+update cl_v set vcode = 'b' where vid = 1;
+select raw from cl_t where id = 1;
+→ [{"raw":"b!"}]
+
+select * from cl_v;
+→ [{"vid":1,"vcode":"b!~"}]
+
+-- ===================================
+-- An aggregate result column cannot carry the clause: the aggregate phase never
+-- reaches the projection lineage the clause rides, so it is rejected loud
+-- rather than silently dropped.
+-- ===================================
+
+select sum(x) as s with inverse (x = new.s) from sr_t;
+-- error: WITH INVERSE cannot apply to an aggregate result column
+
+-- a bare (non-new-qualified) ref inside a window operand of an inverse
+-- expression is validated like any other in-scope reference
+select id, x + 0 as x2 with inverse (x = sum(new.x2) over (partition by x)) from sr_t;
+-- error: without the NEW qualifier
+
+-- ===================================
+-- RENAME propagation, star projection: `select *` exposes the renamed column's
+-- output name, so a sibling clause's `new.<old>` refs retarget with it.
+-- ===================================
+
+create table st_t (id integer primary key, tag text, payload text);
+insert into st_t values (1, 'T', 'p');
+create view st_v as select *, payload || '' as p2
+	with inverse (payload = new.p2 || ':' || new.tag) from st_t;
+
+alter table st_t rename column tag to tag2;
+update st_v set p2 = 'q' where id = 1;
+select payload from st_t where id = 1;
+→ [{"payload":"q:T"}]

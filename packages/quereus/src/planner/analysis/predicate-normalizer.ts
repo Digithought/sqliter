@@ -5,6 +5,7 @@ import { BinaryOpNode, UnaryOpNode, LiteralNode, BetweenNode } from '../nodes/sc
 import { ColumnReferenceNode } from '../nodes/reference.js';
 import { InNode } from '../nodes/subquery.js';
 import type * as AST from '../../parser/ast.js';
+import { resolveComparisonCollation, resolveInCollation } from './comparison-collation.js';
 
 /**
  * Normalize a predicate for push-down and constraint extraction.
@@ -192,9 +193,13 @@ function flipComparison(op: string): string | null {
 // Attempt to collapse OR of equalities into an IN list when:
 // - All disjuncts are of the form (col = literal)
 // - The same column is used
+// - Every disjunct's effective comparison collation equals the collation the
+//   rewritten IN would compare under (the lattice merge of the column with
+//   every collected value)
 // - Literal list is small (<= 32) to avoid large INs
-function tryCollapseOrToIn(scope: Scope, disjuncts: ScalarPlanNode[]): ScalarPlanNode | null {
+function tryCollapseOrToIn(_scope: Scope, disjuncts: ScalarPlanNode[]): ScalarPlanNode | null {
     const values: LiteralNode[] = [];
+    const disjunctCollations: string[] = [];
     let column: ColumnReferenceNode | null = null;
 
     for (const d of disjuncts) {
@@ -215,6 +220,16 @@ function tryCollapseOrToIn(scope: Scope, disjuncts: ScalarPlanNode[]): ScalarPla
             return null;
         }
 
+        // Per-disjunct effective collation under the provenance lattice
+        // (symmetric, so the col/lit spelling order is immaterial). Constant
+        // folding keeps `'bob' COLLATE NOCASE` as a literal whose *type*
+        // carries rank-3 NOCASE, so the shape checks above never see the
+        // wrapper but the resolution still does. A conflict cannot normally
+        // reach here (plan-time validation rejected it); bail conservatively.
+        const disjunctResolution = resolveComparisonCollation(b.left.getType(), b.right.getType());
+        if (disjunctResolution.kind !== 'resolved') return null;
+        disjunctCollations.push(disjunctResolution.name);
+
         if (!column) {
             column = col;
         } else if (column.attributeId !== col.attributeId) {
@@ -226,6 +241,19 @@ function tryCollapseOrToIn(scope: Scope, disjuncts: ScalarPlanNode[]): ScalarPla
     }
 
     if (!column || values.length === 0) return null;
+
+    // Collation gate (ticket `or-equality-collapse-collation-blind`): the
+    // rewritten IN compares every value under ONE lattice-merged collation
+    // (`emitIn`), while each written disjunct compares under its own effective
+    // collation. Collapse only when every disjunct agrees with the merged IN
+    // collation; both directions are unsound otherwise (a NOCASE disjunct
+    // collapsed into a BINARY IN under-matches, a BINARY disjunct into a
+    // NOCASE IN over-matches). Declining keeps the OR as-is — a completeness
+    // loss only, like the >32-values bail. Gating BEFORE construction also
+    // guarantees the InNode below validates cleanly.
+    const inResolution = resolveInCollation(column.getType(), values.map(v => v.getType()));
+    if (inResolution.kind !== 'resolved') return null;
+    if (disjunctCollations.some(name => name !== inResolution.name)) return null;
 
     // Build an InNode with constant values
     const ast: AST.InExpr = {

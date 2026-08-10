@@ -22,8 +22,6 @@ function createTestContext(db: Database, overrides?: Partial<OptContext>): OptCo
 		stats: {} as StatsProvider,
 		tuning: { ...DEFAULT_TUNING, ...(overrides?.tuning ?? {}) },
 		phase: 'rewrite',
-		depth: 0,
-		context: new Map(),
 		diagnostics: {},
 		db,
 		visitedRules: new Map(),
@@ -62,7 +60,6 @@ describe('PassManager', () => {
 					nodeType: PlanNodeType.Filter,
 					phase: 'rewrite',
 					fn: () => makeNode(PlanNodeType.Project) as unknown as PlanNode,
-					priority: 10,
 					sideEffectMode: 'safe',
 				},
 				{
@@ -70,7 +67,6 @@ describe('PassManager', () => {
 					nodeType: PlanNodeType.Project,
 					phase: 'rewrite',
 					fn: () => makeNode(PlanNodeType.Filter) as unknown as PlanNode,
-					priority: 20,
 					sideEffectMode: 'safe',
 				},
 			);
@@ -274,7 +270,7 @@ describe('PassManager', () => {
 				nodeType: PlanNodeType.Filter,
 				phase: 'rewrite',
 				fn: (node) => makeNode(PlanNodeType.Project, [...node.getChildren()]) as unknown as PlanNode,
-				priority: 10,
+				sideEffectMode: 'safe',
 			});
 
 			// Bottom-up: Project (leaf) -> SingleRow.
@@ -295,7 +291,7 @@ describe('PassManager', () => {
 					}
 					return node;
 				},
-				priority: 10,
+				sideEffectMode: 'safe',
 			});
 
 			const pm = new PassManager([]);
@@ -373,7 +369,7 @@ describe('PassManager', () => {
 					firings++;
 					return makeNode(PlanNodeType.Project, [...node.getChildren()]) as unknown as PlanNode;
 				},
-				priority: 10,
+				sideEffectMode: 'safe',
 			});
 
 			const pm = new PassManager([]);
@@ -424,7 +420,7 @@ describe('PassManager', () => {
 				nodeType: PlanNodeType.Filter,
 				phase: 'rewrite',
 				fn: (node) => makeFilterNode([...node.getChildren()]) as unknown as PlanNode,
-				priority: 10,
+				sideEffectMode: 'safe',
 			});
 
 			const pm = new PassManager([]);

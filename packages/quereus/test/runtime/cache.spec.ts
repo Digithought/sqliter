@@ -340,4 +340,115 @@ describe('Runtime Shared Cache', () => {
 			expect(second).to.deep.equal(sourceRows);
 		});
 	});
+
+	describe('eager build mode', () => {
+		const eagerConfig: SharedCacheConfig = { threshold: 100, strategy: 'memory', name: 'test-eager', eager: true };
+
+		it('consumer that breaks after the first row still populates the cache', async () => {
+			// This is the exact case that fails under the default streaming config:
+			// a first-match short-circuit aborts the generator before the drain
+			// completes, so cachedResult is never set. Eager mode drains + commits
+			// BEFORE yielding, so the early break cannot defeat it.
+			const sourceRows: Row[] = [[1, 'a'], [2, 'b'], [3, 'c']];
+			let pulled = 0;
+			async function* countingSource(): AsyncIterable<Row> {
+				for (const row of sourceRows) { pulled++; yield row; }
+			}
+			const state = createCacheState();
+
+			let seen = 0;
+			for await (const _row of streamWithCache(countingSource(), eagerConfig, state)) {
+				seen++;
+				break; // short-circuit like IN's first-match early-exit
+			}
+
+			expect(seen).to.equal(1);
+			// Despite the early break, the whole source was drained and committed.
+			expect(pulled).to.equal(3);
+			expect(state.cachedResult).to.deep.equal(sourceRows);
+		});
+
+		it('a later consumer replays the full committed buffer', async () => {
+			const sourceRows: Row[] = [[1, 'a'], [2, 'b'], [3, 'c']];
+			const state = createCacheState();
+
+			// Build pass short-circuits, but eager mode still commits.
+			for await (const _row of streamWithCache(fromRows(sourceRows), eagerConfig, state)) {
+				void _row;
+				break;
+			}
+			expect(state.cachedResult).to.deep.equal(sourceRows);
+
+			// Replay pass: empty source proves the rows come from cache, not the source.
+			const replay = await collect(streamWithCache(fromRows([]), eagerConfig, state));
+			expect(replay).to.deep.equal(sourceRows);
+		});
+
+		it('empty eager source commits an empty buffer', async () => {
+			const state = createCacheState();
+			const result = await collect(streamWithCache(fromRows([]), eagerConfig, state));
+			expect(result).to.deep.equal([]);
+			expect(state.cachedResult).to.deep.equal([]);
+			expect(state.cacheAbandoned).to.be.false;
+		});
+
+		it('over-threshold eager source abandons cache but still delivers all rows', async () => {
+			const config: SharedCacheConfig = { threshold: 2, strategy: 'memory', name: 'test-eager', eager: true };
+			const sourceRows: Row[] = [[1], [2], [3]];
+			const state = createCacheState();
+
+			const result = await collect(streamWithCache(fromRows(sourceRows), config, state));
+
+			expect(result).to.deep.equal(sourceRows);
+			expect(state.cacheAbandoned).to.be.true;
+			expect(state.cachedResult).to.be.undefined;
+		});
+
+		it('deep-copy — mutating a yielded row does not corrupt the eager cache (build pass)', async () => {
+			const sourceRows: Row[] = [[1, 'original']];
+			const state = createCacheState();
+
+			const rows = await collect(streamWithCache(fromRows(sourceRows), eagerConfig, state));
+			rows[0][1] = 'mutated';
+
+			expect(state.cachedResult![0][1]).to.equal('original');
+		});
+
+		it('deep-copy — mutating a yielded row does not corrupt the eager cache (replay pass)', async () => {
+			const sourceRows: Row[] = [[1, 'original']];
+			const state = createCacheState();
+
+			await collect(streamWithCache(fromRows(sourceRows), eagerConfig, state));
+
+			const cached = await collect(streamWithCache(fromRows([]), eagerConfig, state));
+			cached[0][1] = 'mutated';
+
+			expect(state.cachedResult![0][1]).to.equal('original');
+			// A subsequent replay consumer still gets the original.
+			const cached2 = await collect(streamWithCache(fromRows([]), eagerConfig, state));
+			expect(cached2[0][1]).to.equal('original');
+		});
+
+		it('source throws mid eager-drain — nothing committed, next good source builds cleanly', async () => {
+			const config: SharedCacheConfig = { threshold: 10, strategy: 'memory', name: 'test-eager', eager: true };
+			const state = createCacheState();
+			const rows: Row[] = [[1], [2], [3], [4]];
+
+			try {
+				await collect(streamWithCache(throwingSource(rows, 2), config, state));
+				expect.fail('should have thrown');
+			} catch (err: unknown) {
+				expect((err as Error).message).to.equal('source error');
+			}
+
+			// Not committed, and not a threshold abandon — next eval must retry fresh.
+			expect(state.cachedResult).to.be.undefined;
+			expect(state.cacheAbandoned).to.be.false;
+
+			const goodSource: Row[] = [[10], [20]];
+			const result = await collect(streamWithCache(fromRows(goodSource), config, state));
+			expect(result).to.deep.equal(goodSource);
+			expect(state.cachedResult).to.deep.equal(goodSource);
+		});
+	});
 });

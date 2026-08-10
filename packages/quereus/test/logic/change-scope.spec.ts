@@ -62,6 +62,86 @@ describe('Statement.getChangeScope (integration)', () => {
 		const r = scope.watches[0].scope as Extract<WatchScope, { kind: 'rows' }>;
 		expect(r.values).to.deep.equal([[99]]);
 	});
+
+	it('a materialized-view reference reports the SOURCE table, not the MV itself', async () => {
+		// Every MV is row-time maintained: its table is written off the user change
+		// log (synchronously at the DML boundary) and never appears in it — so a
+		// watch on it would never fire. change-scope projects the reference onto the
+		// source instead.
+		await db.exec('CREATE TABLE src (id INTEGER PRIMARY KEY, v TEXT) USING memory');
+		await db.exec("INSERT INTO src VALUES (1, 'a')");
+		await db.exec('CREATE MATERIALIZED VIEW mvi AS SELECT id, v FROM src');
+
+		const scope = db.prepare('select * from mvi').getChangeScope();
+		const tables = scope.watches.map(w => `${w.table.schema}.${w.table.table}`);
+		expect(tables).to.deep.equal(['main.src']);
+		// The MV's own table is NOT reported — nothing user-writes it.
+		expect(tables).to.not.include('main.mvi');
+	});
+
+	it('a query reading both an MV and its source reports the source once', async () => {
+		// The projected source-union scope unions/dedups against a direct read of
+		// the same source table — the source appears exactly once.
+		await db.exec('CREATE TABLE src (id INTEGER PRIMARY KEY, v TEXT) USING memory');
+		await db.exec("INSERT INTO src VALUES (1, 'a')");
+		await db.exec("CREATE MATERIALIZED VIEW mvi AS SELECT id, v FROM src");
+
+		const scope = db.prepare('select mvi.v from mvi join src on src.id = mvi.id').getChangeScope();
+		const tables = scope.watches.map(w => `${w.table.schema}.${w.table.table}`);
+		expect(tables).to.deep.equal(['main.src']);
+	});
+
+	it('the projected source watch is whole-table / all-columns (v1 conservative contract)', async () => {
+		// v1 projects to a `{kind:'full'}`, columns:'all' watch per source even when
+		// the MV body keys on a source PK — sound but coarse (see docs known-imprecisions).
+		await db.exec('CREATE TABLE src (id INTEGER PRIMARY KEY, v TEXT) USING memory');
+		await db.exec("CREATE MATERIALIZED VIEW mvi AS SELECT id, v FROM src");
+
+		const scope = db.prepare('select v from mvi where id = 1').getChangeScope();
+		expect(scope.watches).to.have.length(1);
+		expect(scope.watches[0].table).to.deep.equal({ schema: 'main', table: 'src' });
+		expect(scope.watches[0].columns).to.equal('all');
+		expect(scope.watches[0].scope).to.deep.equal({ kind: 'full' });
+	});
+
+	it('getChangeScope on an MV whose source was dropped throws cleanly (no dropped-table watch)', async () => {
+		// Dropping a source marks the MV stale; re-planning `select * from mvi` for
+		// analysis raises the same "stale; drop and recreate" error executing it does
+		// — so the resolver never yields a watch on the now-missing source table.
+		await db.exec('CREATE TABLE src (id INTEGER PRIMARY KEY, v TEXT) USING memory');
+		await db.exec("CREATE MATERIALIZED VIEW mvi AS SELECT id, v FROM src");
+		await db.exec('DROP TABLE src');
+
+		expect(() => db.prepare('select * from mvi').getChangeScope()).to.throw(/stale/i);
+	});
+
+	it('a read through a view reports the BASE table in its change scope (not the view)', async () => {
+		// View bodies inline to base table references, so change-scope reports the
+		// base (not the view) for free — the analogue of an MV reference projecting
+		// to its sources.
+		await db.exec('CREATE TABLE base (id INTEGER PRIMARY KEY, v TEXT) USING memory');
+		await db.exec('CREATE VIEW vw AS SELECT id, v FROM base WHERE v IS NOT NULL');
+
+		const scope = db.prepare('select * from vw where id = ?').getChangeScope();
+		const tables = scope.watches.map(w => `${w.table.schema}.${w.table.table}`);
+		expect(tables).to.deep.equal(['main.base']);
+		expect(tables).to.not.include('main.vw');
+	});
+
+	it('a view-mediated mutation has the same change scope as the equivalent base mutation', async () => {
+		// View updateability rewrites the DML to target the base table, so a
+		// view-mediated UPDATE is indistinguishable from the base UPDATE at the
+		// change-scope level (no view-specific divergence). Both are no-RETURNING
+		// DML, which by existing design surfaces via Database.watch rather than
+		// getChangeScope watches.
+		await db.exec('CREATE TABLE base (id INTEGER PRIMARY KEY, v TEXT) USING memory');
+		await db.exec('CREATE VIEW vw AS SELECT id, v FROM base WHERE v IS NOT NULL');
+
+		const viewScope = db.prepare('update vw set v = ? where id = ?').getChangeScope();
+		const baseScope = db.prepare('update base set v = ? where id = ? and v is not null').getChangeScope();
+		expect(viewScope.watches).to.deep.equal(baseScope.watches);
+		expect(viewScope.unboundParameters).to.deep.equal(baseScope.unboundParameters);
+	});
 });
 
 describe('Database.watch (integration)', () => {
@@ -156,6 +236,23 @@ describe('Database.watch (integration)', () => {
 		expect(events).to.have.length(1);
 	});
 
+	it('a watcher on a base table sees a view-mediated insert', async () => {
+		// GreenMen / Bob: a watcher registered on the base table `Men` fires when
+		// an insert routed through the view `GreenMen` lands the constant-FD row.
+		await db.exec('CREATE TABLE Men (Name TEXT PRIMARY KEY, Color TEXT) USING memory');
+		await db.exec("CREATE VIEW GreenMen AS SELECT * FROM Men WHERE Color = 'green'");
+		const events: WatchEvent[] = [];
+		const scope: ChangeScope = {
+			watches: [{ table: { schema: 'main', table: 'Men' }, columns: 'all', scope: { kind: 'full' } }],
+			nonDeterministicSources: [],
+			unboundParameters: [],
+		};
+		const sub = db.watch(scope, e => { events.push(e); });
+		await db.exec("INSERT INTO GreenMen (Name) VALUES ('Bob')");
+		expect(events).to.have.length(1);
+		sub.unsubscribe();
+	});
+
 	it('multi-table scope fires once per transaction with all matching watches', async () => {
 		await db.exec('CREATE TABLE a (id INTEGER PRIMARY KEY) USING memory');
 		await db.exec('CREATE TABLE b (id INTEGER PRIMARY KEY) USING memory');
@@ -188,6 +285,25 @@ describe('Database.watch (integration)', () => {
 		await db.exec('UPDATE t SET v = \'new\' WHERE id = 42');
 		expect(events).to.have.length(1);
 		expect(events[0].matched[0].hits).to.deep.equal([[42]]);
+		sub.unsubscribe();
+		await stmt.finalize();
+	});
+
+	it('end-to-end: a watch on an MV fires on a SOURCE mutation', async () => {
+		// The MV reference projects to its source, so the watch is registered on
+		// `src` — a source mutation fires it (the MV's table is never directly
+		// user-written; watching it would never fire).
+		await db.exec('CREATE TABLE src (id INTEGER PRIMARY KEY, v TEXT) USING memory');
+		await db.exec("INSERT INTO src VALUES (1, 'a')");
+		await db.exec("CREATE MATERIALIZED VIEW mvi AS SELECT id, v FROM src");
+		const stmt = db.prepare('select * from mvi');
+		const scope = stmt.getChangeScope();
+		expect(scope.watches.map(w => w.table.table)).to.deep.equal(['src']);
+		const events: WatchEvent[] = [];
+		const sub = db.watch(scope, e => { events.push(e); });
+		await db.exec("INSERT INTO src VALUES (2, 'b')");
+		expect(events).to.have.length(1);
+		expect(events[0].matched.map(m => m.watch.table.table)).to.deep.equal(['src']);
 		sub.unsubscribe();
 		await stmt.finalize();
 	});
@@ -239,6 +355,53 @@ describe('Database.watch (integration)', () => {
 		expect(events).to.have.length(1);
 
 		// unsubscribe is still safe (idempotent) after auto-invalidation.
+		sub.unsubscribe();
+	});
+
+	// Change tracking is fed the row the substrate STORED, not the raw values the
+	// statement proposed (bug-dml-downstream-uses-uncoerced-row). Coercion happens
+	// inside vtab.update(), so a watcher keyed on a coerced column only matches if
+	// the executor records the post-coercion row.
+	it("'rows' watch matches on the STORED key, not the raw proposed one", async () => {
+		await db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT) USING memory');
+		const events: WatchEvent[] = [];
+		const sub = db.watch(handBuiltRowsScope('t', 'id', [[7]]), e => { events.push(e); });
+
+		// TEXT '7' into an INTEGER-affinity PK stores as the number 7.
+		await db.exec("INSERT INTO t VALUES ('7', 'seven')");
+		expect(events).to.have.length(1);
+		expect(events[0].matched[0].hits).to.deep.equal([[7]]);
+
+		// The same coercion on the way out of an UPDATE that moves the key.
+		await db.exec("UPDATE t SET id = '7' WHERE id = 7");
+		expect(events).to.have.length(2);
+		expect(events[1].matched[0].hits).to.deep.equal([[7]]);
+
+		sub.unsubscribe();
+	});
+
+	it("'groups' watch reports the STORED group key for a coerced column", async () => {
+		await db.exec('CREATE TABLE jw (id INTEGER PRIMARY KEY, j JSON) USING memory');
+		const events: WatchEvent[] = [];
+		const scope: ChangeScope = {
+			watches: [{
+				table: { schema: 'main', table: 'jw' },
+				columns: new Set(['j']),
+				scope: { kind: 'groups', groupBy: ['j'] },
+			}],
+			nonDeterministicSources: [],
+			unboundParameters: [],
+		};
+		const sub = db.watch(scope, e => { events.push(e); });
+
+		// The proposed value is TEXT; the stored value is a parsed JSON value, so
+		// the group key a subscriber sees must not be the input string.
+		await db.exec(`INSERT INTO jw VALUES (1, '{"a":1}')`);
+		expect(events).to.have.length(1);
+		const groupKey = events[0].matched[0].hits[0][0];
+		expect(groupKey).to.not.equal('{"a":1}');
+		expect(groupKey).to.deep.equal({ a: 1 });
+
 		sub.unsubscribe();
 	});
 

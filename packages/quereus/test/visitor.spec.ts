@@ -157,6 +157,15 @@ describe('traverseAst', () => {
 		});
 	});
 
+	describe('result-column WITH INVERSE traversal', () => {
+		it('traverses authored-inverse assignment expressions', () => {
+			const types = collectTypes('select a + 1 as b with inverse (a = new.b - 1) from t');
+			// The forward expression `a + 1` and the inverse expression `new.b - 1`
+			expect(types.filter(t => t === 'binary')).to.have.length(2);
+			expect(types.filter(t => t === 'literal')).to.have.length(2);
+		});
+	});
+
 	describe('statement node types', () => {
 		it('traverses INSERT with VALUES', () => {
 			const types = collectTypes('insert into t (a, b) values (1, 2), (3, 4)');
@@ -191,6 +200,22 @@ describe('traverseAst', () => {
 			expect(types).to.include('update');
 			const selects = types.filter(t => t === 'select');
 			expect(selects.length).to.be.greaterThanOrEqual(1);
+		});
+
+		it('traverses an inline-subquery UPDATE target body', () => {
+			// The real body hangs off `targetSource`, not `table` (a synthetic alias
+			// placeholder), so the traversal must descend into it to reach the inner select.
+			const types = collectTypes("update (select id, color from base) as v set color = 'x' where v.id = 1");
+			expect(types).to.include('update');
+			expect(types).to.include('subquerySource');
+			expect(types).to.include('select'); // the inline body
+		});
+
+		it('traverses an inline-subquery DELETE target body', () => {
+			const types = collectTypes('delete from (select id from base) as v where v.id = 1');
+			expect(types).to.include('delete');
+			expect(types).to.include('subquerySource');
+			expect(types).to.include('select');
 		});
 
 		it('traverses DELETE with WHERE', () => {

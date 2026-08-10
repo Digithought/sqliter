@@ -1,14 +1,43 @@
 # @quereus/plugin-leveldb
 
+> **Stability: Beta** — complete and tested, but the surface is still being shaped; a
+> breaking change may land in a minor release. It rides `@quereus/store`'s on-disk key
+> encoding, which is not frozen. See [Stability Tiers](../../docs/stability.md#tiers).
+
 LevelDB storage plugin for Quereus. Provides persistent storage for Node.js environments using the [`@quereus/store`](../quereus-store/) module.
 
 ## Features
 
 - **Fast**: LevelDB offers excellent read/write performance for key-value workloads
-- **Transaction isolation**: Read-your-own-writes and snapshot isolation by default
+- **Transaction isolation**: Read-committed + read-your-own-writes by default (no write-write conflict detection; not snapshot isolation)
 - **Sorted keys**: Efficient range queries with ordered iteration
-- **ACID batches**: Atomic writes across multiple keys
+- **Crash-safe commits**: A whole transaction's data + secondary-index writes commit in one atomic, durable LevelDB batch (see [Storage layout](#storage-layout))
 - **Compression**: Built-in Snappy compression for reduced disk usage
+
+## Storage layout
+
+All of a database's stores live inside **one physical LevelDB** at `basePath`,
+each as a [sublevel](https://github.com/Level/abstract-level#sublevel) keyed by
+its store name:
+
+| Logical store | Sublevel name |
+|---|---|
+| Table data | `{schema}.{table}` |
+| Secondary index | `{schema}.{table}_idx_{name}` |
+| Unified stats | `__stats__` |
+| Catalog (DDL) | `__catalog__` |
+
+Because every sublevel shares one physical store, a single chained batch commits
+across all of a table's sublevels (data + every secondary index) **atomically and
+durably** — closing the crash window where a per-store commit loop could leave a
+table's rows and its indexes divergent on disk. By default each commit is
+`fsync`'d so it survives power loss; see [`syncCommits`](#plugin-settings).
+
+> **Hard cutover (no on-disk migration).** This shared-root layout is the only
+> LevelDB layout. Databases written by the older per-directory layout
+> (`{basePath}/{schema}/{table}`, a separate LevelDB per table) are **not** read
+> by this version and must be re-created. Pre-1.0 dev data is expected to be
+> thrown away; there is no migration importer.
 
 ## Installation
 
@@ -74,7 +103,10 @@ await db.exec(`
 
 ### LevelDBStore
 
-Low-level KVStore implementation:
+Low-level KVStore implementation. `LevelDBStore.open()` opens a **standalone**
+single physical LevelDB database — useful for one-off key-value stores (e.g. sync
+metadata). The multi-table StoreModule backend does not use this directly; it
+opens one shared root and hands out sublevel-backed stores via `LevelDBProvider`.
 
 ```typescript
 import { LevelDBStore } from '@quereus/plugin-leveldb';
@@ -109,11 +141,12 @@ import { createLevelDBProvider } from '@quereus/plugin-leveldb';
 
 const provider = createLevelDBProvider({ basePath: './data' });
 
-const userStore = await provider.getStore('main', 'users');  // ./data/main/users
-const catalogStore = await provider.getCatalogStore();       // ./data/__catalog__
+// All stores are sublevels of the single LevelDB at ./data
+const userStore = await provider.getStore('main', 'users');  // sublevel main.users
+const catalogStore = await provider.getCatalogStore();       // sublevel __catalog__
 
-await provider.closeStore('main', 'users');
-await provider.closeAll();
+await provider.closeStore('main', 'users'); // drops the sublevel handle
+await provider.closeAll();                   // closes the shared root
 ```
 
 ## Configuration
@@ -122,11 +155,13 @@ await provider.closeAll();
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `basePath` | string | `'./data'` | Base directory for all stores |
-| `createIfMissing` | boolean | `true` | Create directories if they don't exist |
+| `basePath` | string | `'./data'` | Directory of the single shared LevelDB database |
+| `createIfMissing` | boolean | `true` | Create the database if it doesn't exist |
+| `syncCommits` | boolean | `true` | `fsync` each transaction commit so it survives power loss (slower commits when on) |
 | `moduleName` | string | `'store'` | Name to register the virtual table module under |
+| `isolation` | boolean | `true` | Wrap with the isolation layer (read-committed + read-your-own-writes; no write-write conflict detection, not snapshot isolation) |
 
-### LevelDBStore Options
+### LevelDBStore Options (standalone `open`)
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|

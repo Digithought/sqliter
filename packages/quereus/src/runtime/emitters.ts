@@ -1,13 +1,13 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import { QuereusError } from "../common/errors.js";
 import type { PlanNode } from "../planner/nodes/plan-node.js";
 import type { PlanNodeType } from "../planner/nodes/plan-node-type.js";
 import type { Instruction, InstructionRun, RuntimeContext } from "./types.js";
-import { StatusCode, type OutputValue } from '../common/types.js';
+import { StatusCode, type OutputValue, type Row, type RuntimeValue } from '../common/types.js';
 import { createLogger } from '../common/logger.js';
 import { Scheduler } from "./scheduler.js";
 import type { EmissionContext } from "./emission-context.js";
 import { isAsyncIterable } from "./utils.js";
+import { tryFuseScalar } from "./scalar-fusion.js";
 
 const log = createLogger('emitters');
 
@@ -68,11 +68,11 @@ export function getEmitterMeta(nodeType: PlanNodeType): EmitterMeta | undefined 
  * Only adds overhead when tracing is enabled.
  */
 function instrumentRunForTracing(plan: PlanNode, originalRun: InstructionRun): InstructionRun {
-	return function (ctx: RuntimeContext, ...args: any[]) {
+	return function (ctx: RuntimeContext, ...args: RuntimeValue[]): OutputValue {
 		const stack = (ctx.planStack = ctx.planStack || []);
 		stack.push(plan);
 
-		let result: any;
+		let result: OutputValue;
 		try {
 			result = originalRun(ctx, ...args);
 		} catch (err) {
@@ -82,10 +82,10 @@ function instrumentRunForTracing(plan: PlanNode, originalRun: InstructionRun): I
 		}
 
 		// If the result is an async iterable, defer the pop until iteration completes
-		if (isAsyncIterable(result)) {
-			const iterable = result as AsyncIterable<unknown>;
+		if (isAsyncIterable<Row>(result)) {
+			const iterable: AsyncIterable<Row> = result;
 			// Wrap iterable to pop stack in a finally block once iteration ends
-			return (async function* () {
+			return (async function* (): AsyncIterable<Row> {
 				try {
 					for await (const item of iterable) {
 						yield item;
@@ -97,8 +97,8 @@ function instrumentRunForTracing(plan: PlanNode, originalRun: InstructionRun): I
 		}
 
 		// If the result is a promise, pop once it settles
-		if (result && typeof (result as Promise<unknown>).then === 'function') {
-			return (result as Promise<unknown>).finally(() => {
+		if (result !== null && typeof result === 'object' && typeof (result as PromiseLike<unknown>).then === 'function') {
+			return (result as Promise<RuntimeValue>).finally(() => {
 				stack.pop();
 			});
 		}
@@ -145,39 +145,57 @@ export function emitCall(root: Instruction): Instruction {
 /**
  * Helper function to emit a plan node and wrap it as a callable instruction.
  * This is useful for emitters that need to create sub-instructions.
+ *
+ * This is also the single front door of scalar fusion: when the emission context
+ * allows it, a pure synchronous scalar subtree compiles into one fused closure
+ * (runtime/scalar-fusion.ts) instead of a per-row sub-program. Transparent to every
+ * consumer — a `FusedScalar` satisfies the same `(ctx) => MaybePromise<SqlValue>`
+ * callback contract a sub-program does, and any plan the fusion compiler cannot
+ * prove pure and synchronous (relational plans, subqueries, custom-emitter or
+ * asynchronous function calls, async literals, over-deep trees) falls back to the
+ * sub-program path unchanged.
+ *
+ * A fused instruction returns the SAME closure on every invocation, where `emitCall`
+ * allocates a fresh arrow each time; nothing keys on sub-program function identity
+ * (verified across the runtime emitters), and identity per emit site is strictly
+ * more stable than identity per invocation.
+ *
+ * NOTE: the three *debug introspection* surfaces emit unfused, but the two *observation*
+ * surfaces that run a normal statement do not — `runtime_stats` metrics and a db-level
+ * `Database.setInstructionTracer` both see a fused subtree as one `fused(...)`
+ * instruction, so per-operator timings and per-operator trace events inside it are gone.
+ * Fine today (both are debug telemetry, and `execution_trace()` covers the per-operator
+ * view via `_emitUnfused`); if per-scalar-operator cost ever has to be attributed from a
+ * normal run, have those two paths force `fuseScalars: false` the way `_emitUnfused` does.
  */
 export function emitCallFromPlan(plan: PlanNode, emissionCtx: EmissionContext): Instruction {
+	if (emissionCtx.fuseScalars) {
+		const fused = tryFuseScalar(plan, emissionCtx);
+		if (fused) {
+			return { params: [], run: () => fused, note: `fused(${plan.toString()})` };
+		}
+	}
 	const instruction = emitPlanNode(plan, emissionCtx);
 	return emitCall(instruction);
 }
 
 /**
- * Creates an instruction that validates its schema dependencies before execution.
- * This should be used for instructions that captured schema objects during emission.
+ * Builds an instruction for an emitter that captured schema objects during emission.
+ *
+ * Schema validation is NOT wrapped here: it is hoisted to once per execution in
+ * `Statement._iterateRowsRawInternal`, which calls
+ * `EmissionContext.validateCapturedSchemaObjects()` once before the scheduler runs.
+ * A single emission context is shared by every capturing instruction, so one central
+ * call covers them all — instead of O(#capturing-instructions × snapshot-size) per run
+ * (worse inside an un-cached nested-loop-join inner, which re-fired per outer row).
+ *
+ * The signature and the six call sites are retained so those emitters stay untouched.
  */
 export function createValidatedInstruction(
 	params: Instruction[],
 	run: InstructionRun,
-	emissionCtx: EmissionContext,
+	_emissionCtx: EmissionContext,
 	note?: string
 ): Instruction {
-	// Only add validation if we actually captured schema objects
-	if (emissionCtx.getCapturedObjectCount() === 0) {
-		return { params, run, note };
-	}
-
-	// Wrap the run function to validate schema before execution
-	const validatedRun: InstructionRun = (ctx: RuntimeContext, ...args: any[]) => {
-		// Validate schema objects are still available
-		emissionCtx.validateCapturedSchemaObjects();
-		// If validation passes, run the original instruction
-		return run(ctx, ...args);
-	};
-
-	return {
-		params,
-		run: validatedRun,
-		note: note ? `validated(${note})` : 'validated',
-		emissionContext: emissionCtx
-	};
+	return { params, run, note };
 }

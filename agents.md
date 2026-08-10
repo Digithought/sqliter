@@ -1,33 +1,34 @@
 ## General
 
-- Use lowercase SQL reserved words (e.g., `select * from Table`)
-- Don't use inline `import()` unless dynamically loading
-- Don't create summary documents; update existing documentation
+- Lowercase SQL reserved words (e.g., `select * from Table`)
+- No inline `import()` unless dynamic load
+- No summary docs; update existing docs instead
 - Stay DRY
 - No lengthy summaries
-- Don't worry about backwards compatibility yet
+- Backwards compat: don't worry yet
 - Use yarn
-- Prefix unused arguments with `_`
-- Enclose `case` blocks in braces if any consts/variables
-- Prefix calls to unused promises (micro-tasks) with `void`
+- Prefix unused args `_`
+- Brace `case` blocks if consts/vars inside
+- Prefix unused promise calls (micro-tasks) `void`
 - ES Modules
-- Don't be type lazy - avoid `any`
-- Don't eat exceptions w/o at least logging; exceptions should be exceptional - not control flow
-- Small, single-purpose functions/methods.  Decomposed sub-functions over grouped code sections
-- No half-baked janky parsers; use a full-fledged parser or better, brainstorm with the dev for another way
+- No `any` — type it right
+- Don't eat exceptions silent; log at least. Exceptions exceptional, not control flow
+- Small single-purpose funcs/methods. Decomposed sub-funcs > grouped sections
+- No janky half-baked parsers; full parser or brainstorm alt approach w/ dev
 - Think cross-platform (browser, node, RN, etc.)
-- .editorconfig contains formatting (tabs for code)
+- `.editorconfig` = formatting source (tabs for code)
 
 ## Tickets (tess)
 
-This project uses [tess](tess/) for AI-driven ticket management.
-Read and follow the ticket workflow rules in tess/agent-rules/tickets.md.
-Tickets are in the [tickets/](tickets/) directory.
+Project uses [tess](tess/) for AI ticket mgmt.
+Read + follow ticket workflow rules in tess/agent-rules/tickets.md.
+Tickets in [tickets/](tickets/) dir.
+If asked to "tend the garden" or similar, see tess/agent-rules/tend.md.
 
 ## Launch process tool (if under PowerShell)
 
-The `launch-process` tool wraps commands in `powershell -Command ...`, which strips inner quotes and parses parentheses as subexpressions. This makes `git commit -m "task(review): ..."` impossible — no escaping strategy works.
-Use a file or pipe based pattern as a work-around.  e.g. `git commit -F .git/COMMIT_EDITMSG`
+`launch-process` wraps cmds in `powershell -Command ...` — strips inner quotes, parses parens as subexpressions. Makes `git commit -m "task(review): ..."` impossible — no escape works.
+Workaround: file or pipe pattern. e.g. `git commit -F .git/COMMIT_EDITMSG`
 
 ## Project Structure
 
@@ -44,7 +45,7 @@ quereus/                   # Main SQL engine — see its README for detailed src
 quoomb-cli/                # CLI tool
 quoomb-web/                # Web UI
 quereus-store/             # Persistent key-value store abstraction
-quereus-isolation/         # Snapshot isolation layer
+quereus-isolation/         # Transaction isolation layer (read-your-own-writes; not snapshot isolation)
 quereus-sync/              # Sync engine
 quereus-sync-client/       # Sync client
 sync-coordinator/          # Sync server/coordinator
@@ -61,53 +62,72 @@ sample-plugins/            # Example plugins
 Task workflow in `tickets/` folder (see `tickets/AGENTS.md`).
 
 ## Build & Test
-- `yarn build` runs sequentially through all packages
-- `yarn test` runs tests across all workspaces — **the default for agents**; fast, memory-backed vtab
-- `yarn test:store` re-runs `packages/quereus` logic tests against the LevelDB store module (slower; exercises the store code path for ALTER, constraints, transactions, etc.)
-- `yarn test:full` runs both — **only run when diagnosing a store-specific issue or preparing a release**
-- Only `packages/quereus` has a lint script (`eslint`)
-- On Windows, lint globs must be single-quoted to avoid command line too long errors
-- Tests use Mocha + ts-node/esm for quereus, Vitest for some other packages
-- Default cwd is the repo root. If you've already `cd packages/quereus` in a prior Bash call, the Bash tool's cwd persists — don't re-prefix subsequent commands with `cd packages/quereus &&`. Either chain everything in one Bash call, or use absolute paths / `yarn workspace @quereus/quereus run <script>` from the root.
-- Streaming long-running output: `2>&1 | tee /tmp/foo.log` is the recommended pattern, but under Windows + Git Bash the `| tee | tail` pipeline can drop stdout to the agent (silent buffering). If `tee` produces nothing, don't rebuild — chain a separate read instead: `yarn test 2>&1 | tee /tmp/test.log; tail -n 80 /tmp/test.log`. Under PowerShell, use `Tee-Object` rather than `tee`.
+- `yarn build` compiles all library packages via `tsc -b tsconfig.build.json` (project references — dependency-ordered, incremental, skips unchanged), then builds the 3 bundled apps (shared-ui, vscode, quoomb-web)
+- `yarn test` runs all workspace tests — **default for agents**; fast, memory-backed vtab
+- `yarn test:store` re-runs `packages/quereus` logic tests vs LevelDB store module (slower; exercises store path for ALTER, constraints, transactions, etc.)
+- `yarn test:full` runs both — **only for store-specific diagnosis or release prep**
+- `yarn lint` fans out across **every** package (`workspaces foreach ... run lint`). Only `packages/quereus` has a real lint (eslint **+** type-checks test files via `tsc -p tsconfig.test.json --noEmit`, catches signature drift in spec call sites too; ~adds tsc pass, slower than eslint alone). Every other package ships an intentional `echo 'No lint configured'` no-op so foreach reaches it instead of silently skipping — each package has a `lint` script, so `yarn check` can't miss one
+- `yarn typecheck` fans out too, and runs inside `yarn check` **after** `yarn build` (a package whose typecheck covers its test files — e.g. `plugin-loader`'s `tsconfig.test.json` pass — resolves workspace deps via their built `dist` types). Put a test-file type pass in `typecheck`, not `lint`, for that reason. Every package needs a `typecheck` script (same reason as `lint`: foreach silently skips a workspace missing it), and every `tsconfig.test.json` must repeat `"exclude": ["node_modules", "dist"]` — `extends` inherits the base `exclude`, and a base that excludes `test` silently filters the test `include` back out, so the pass compiles zero files and reports success. Verify with `tsc -p tsconfig.test.json --noEmit --listFiles` — a zero-file config looks identical to a clean one otherwise
+- Windows: lint globs must single-quote, avoid cmd-line-too-long errors
+- Tests: Mocha + ts-node/esm for quereus, Vitest for other packages
+- Default cwd = repo root. Already `cd packages/quereus` in prior Bash call? cwd persists — don't re-prefix `cd packages/quereus &&`. Chain in one Bash call, or use absolute paths / `yarn workspace @quereus/quereus run <script>` from root.
+- Streaming long output: `2>&1 | tee /tmp/foo.log` recommended, but Windows+Git Bash `| tee | tail` pipeline can drop stdout silently. `tee` empty? Don't rebuild — chain separate read: `yarn test 2>&1 | tee /tmp/test.log; tail -n 80 /tmp/test.log`. PowerShell: use `Tee-Object` not `tee`.
 
 ## Key Architecture Notes
-- All tables are virtual tables (VTab-centric design)
-- Async core: cursors are `AsyncIterable<Row>`
+- All tables virtual tables (VTab-centric design)
+- Async core: cursors `AsyncIterable<Row>`
 - Key-based addressing (no rowids)
-- Type system: logical/physical type separation with temporal types
+- Type system: logical/physical split w/ temporal types
 - Pipeline: SQL → parser → AST → planner/building → PlanNode tree → optimizer rules → emit → Instructions
 
 ## Docs
-- **Start here for engine internals:** `docs/architecture.md` — pipeline, source layout, extension patterns, design decisions, constraints, testing strategy
+- **Start here for engine internals:** `docs/architecture.md` — pipeline, src layout, extension patterns, design decisions, constraints, test strategy
 - **Package overview / user-facing:** `packages/quereus/README.md` — quick start, platform/storage, docs index, current status
-- Deeper topic docs in `docs/` folder (runtime.md, types.md, sql.md, optimizer.md, schema.md, usage.md, etc.)
+- Deeper topic docs in `docs/` (runtime.md, types.md, sql.md, optimizer.md, schema.md, usage.md, etc.)
 
 ----
 
-For all but the most trivial asks, read and maintain the relevant docs along with the work.
+Any non-trivial ask: read + maintain relevant docs alongside work.
 
 ## Code search (tess)
 
-**First tool** for any "where / how / why" question about this codebase: the local code-aware index wired to `mcp__code-search__*`. Reach for `grep`/`Glob` only when you already know the exact filename or literal string. Pick the right sub-tool — they are not interchangeable.
+**First tool** for "where/how/why" Q on codebase: local code-aware index wired to `mcp__code-search__*`. `grep`/`Glob` only when filename or literal string already known. Pick right sub-tool — not interchangeable.
 
 **Decision rule:**
 
-- Query is identifier-shaped (any single symbol, camelCase, snake_case, or a list of names like `fooBar bazQux`)? → `find_references`.
-- Query is prose ("where do we evict pages", "what handles JWT refresh", you don't yet know the identifier)? → `search_code`.
-- About to run more than one `grep` to reconstruct context? → run `search_code` first instead. That is the moment it pays off, even when you already know an identifier.
+- Identifier-shaped query (single symbol, camelCase, snake_case, or name list like `fooBar bazQux`)? → `find_references`.
+- Prose query ("where do we evict pages", "what handles JWT refresh", identifier unknown)? → `search_code`.
+- About to run 2+ `grep` to rebuild context? → `search_code` first instead. Pays off even w/ known identifier.
 
-`search_code` embeds the query as natural language. Identifier-bag queries can still work when the identifiers co-locate in real code, but prose phrasing is more reliable. If `search_code` returns a weak-top warning, the relative-percentage ranking is unreliable — switch to `find_references` or rephrase as prose, do **not** trust the ordering on noisy results.
+`search_code` embeds query as NL. Identifier-bag queries can work if identifiers co-locate in real code, but prose phrasing more reliable. Weak-top warning from `search_code` → relative-% ranking unreliable — switch to `find_references` or rephrase as prose. Don't trust ordering on noisy results.
 
 **Tools:**
 
-- `search_code(query, k?, path_filter?)` — semantic search. Scores are relative within each result set, not absolute. `k` defaults to 5 (max 50) — raise it for broad sweeps, lower it when you know the top hit is enough. `path_filter` is a SQL LIKE pattern, e.g. `"packages/lamina/%"`.
-- `find_references(symbol, max?, path_filter?)` — literal substring; `|` ORs alternatives (`Foo|Bar`). Returns every hit (capped by `max`, default 50, max 500). This is the indexed replacement for `grep` on identifiers.
-- `read_chunk(path, start_line, end_line)` — expand a snippet from either tool without a separate `Read`.
+- `search_code(query, k?, path_filter?)` — semantic search. Scores relative within result set, not absolute. `k` default 5 (max 50) — raise for broad sweeps, lower when top hit enough. `path_filter` = SQL LIKE pattern, e.g. `"packages/lamina/%"`.
+- `find_references(symbol, max?, path_filter?)` — literal substring; `|` ORs alternatives (`Foo|Bar`). Returns every hit (capped by `max`, default 50, max 500). Indexed replacement for `grep` on identifiers.
+- `read_chunk(path, start_line, end_line)` — expand snippet from either tool, no separate `Read` needed.
 
 **Fallbacks:**
 
-- Use `grep`/`Glob` only for filename patterns, regex with anchors/lookarounds, or when you need *every* literal hit (the index is chunk-granular and may miss adjacent matches inside one chunk).
-- Never fall back to `grep` when `find_references` would suffice — it's strictly slower and pulls more bytes.
+- `grep`/`Glob` only for filename patterns, regex w/ anchors/lookarounds, or need *every* literal hit (index chunk-granular, may miss adjacent matches in one chunk).
+- Never fall back to `grep` when `find_references` suffices — strictly slower, pulls more bytes.
 
-**What's indexed:** project source files tracked by git, minus `node_modules/`, `dist/`, `build/`, `.git/`, `tickets/`, `team/`, `docs/`, and a few cache dirs. If a query about prose-heavy material (long-form architecture docs, design notes, READMEs in nested folders) returns nothing, the file may be outside the indexed set — fall back to `Read`/`Glob` for those paths. Projects can override the filter via `tickets/index-config.json` (see tess README § Customize what gets indexed).
+**What's indexed:** project source files tracked by git, minus `node_modules/`, `dist/`, `build/`, `.git/`, `tickets/`, `team/`, `docs/`, few cache dirs. Prose-heavy query (long-form arch docs, design notes, nested READMEs) returns nothing → file likely outside indexed set — fall back to `Read`/`Glob` for those paths. Projects can override filter via `tickets/index-config.json` (see tess README § Customize what gets indexed).
+
+## Caveman
+
+Respond terse like smart caveman. All technical substance stay. Only fluff die.
+
+Rules:
+- Drop: articles (a/an/the), filler (just/really/basically), pleasantries, hedging
+- Fragments OK. Short synonyms. Technical terms exact. Code unchanged.
+- Pattern: [thing] [action] [reason]. [next step].
+- Not: "Sure! I'd be happy to help you with that."
+- Yes: "Bug in auth middleware. Fix:"
+
+Switch level: /caveman lite|full|ultra|wenyan
+Stop: "stop caveman" or "normal mode"
+
+Auto-Clarity: drop caveman for security warnings, irreversible actions, user confused. Resume after.
+
+Boundaries: code/commits/PRs written normal.

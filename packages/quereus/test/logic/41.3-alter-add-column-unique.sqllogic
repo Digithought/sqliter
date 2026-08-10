@@ -1,0 +1,184 @@
+-- ALTER TABLE ADD COLUMN with an inline column-level UNIQUE.
+--
+-- An inline UNIQUE on the new column is routed through the module's `addConstraint`
+-- UNIQUE path — the same path `ALTER TABLE ADD CONSTRAINT … UNIQUE` uses — so it is
+-- materialized, enforced, and (store) persisted, symmetric with CREATE TABLE. These
+-- cases run under both the memory module (`yarn test`) and the store module
+-- (`yarn test:store`); assertions read engine-catalog introspection (table_info /
+-- unique_constraint_info / index_info), which is module-agnostic.
+
+-- ===================================================================
+-- 1. Basic: enforcement + introspection (unnamed inline UNIQUE)
+-- ===================================================================
+
+create table AddU (id integer primary key);
+alter table AddU add column u integer unique;
+
+-- The constraint is materialized and surfaces in introspection (unnamed → name null,
+-- one row per constrained column).
+select name, column_name from unique_constraint_info('AddU');
+→ [{"name":null,"column_name":"u"}]
+
+-- Forward enforcement: a duplicate value is rejected.
+insert into AddU values (1, 5);
+insert into AddU values (2, 5);
+-- error: UNIQUE constraint failed
+
+-- A distinct value still inserts.
+insert into AddU values (3, 6);
+select count(*) as c from AddU;
+→ [{"c":2}]
+
+-- ===================================================================
+-- 2. A named inline UNIQUE round-trips its name
+-- ===================================================================
+
+create table AddNamed (id integer primary key);
+alter table AddNamed add column sku text constraint uq_sku unique;
+select name, column_name from unique_constraint_info('AddNamed');
+→ [{"name":"uq_sku","column_name":"sku"}]
+
+-- Enforcement is active under the named constraint.
+insert into AddNamed values (1, 'a');
+insert into AddNamed values (2, 'a');
+-- error: UNIQUE constraint failed
+
+-- ===================================================================
+-- 3. Existing NULLs are distinct: the add succeeds over multiple NULLs,
+--    and forward duplicates of a non-NULL value are still rejected.
+-- ===================================================================
+
+create table AddNull (id integer primary key);
+insert into AddNull values (1), (2);
+-- Existing rows backfill the new (nullable) column with NULL (no DEFAULT); NULLs are
+-- distinct, so the UNIQUE add succeeds over the two existing NULL rows.
+alter table AddNull add column code integer null unique;
+select count(*) as c from unique_constraint_info('AddNull');
+→ [{"c":1}]
+
+-- Two non-NULL duplicates collide going forward.
+insert into AddNull values (3, 7);
+insert into AddNull values (4, 7);
+-- error: UNIQUE constraint failed
+
+-- ===================================================================
+-- 4. Literal DEFAULT that duplicates across existing rows: the UNIQUE add
+--    fails and the column is fully reverted (no half-applied column /
+--    constraint / index, original schema intact).
+-- ===================================================================
+
+create table AddDefDup (id integer primary key);
+insert into AddDefDup values (1), (2);
+-- DEFAULT 5 backfills the same value to both existing rows → immediate duplicate.
+alter table AddDefDup add column u integer default 5 unique;
+-- error: UNIQUE constraint failed
+
+-- Revert: the column is gone, no orphan constraint, no orphan index.
+select count(*) as c from table_info('AddDefDup') where name = 'u';
+→ [{"c":0}]
+select count(*) as c from unique_constraint_info('AddDefDup');
+→ [{"c":0}]
+select count(*) as c from index_info('AddDefDup');
+→ [{"c":0}]
+
+-- Original schema is intact and usable (single id column).
+insert into AddDefDup values (3);
+select count(*) as c from AddDefDup;
+→ [{"c":3}]
+
+-- ===================================================================
+-- 5. Combined revert: ADD COLUMN carrying BOTH a UNIQUE and a CHECK, where the
+--    UNIQUE materializes successfully (single existing row → no duplicate) but the
+--    CHECK then fails over the backfilled row. The revert must tear down the unique
+--    covering structure too — no orphan in index_info / unique_constraint_info.
+-- ===================================================================
+
+create table AddCombo (id integer primary key);
+insert into AddCombo values (1);
+-- DEFAULT 0 over the single row: UNIQUE passes (one row), but CHECK (u > 0) fails.
+alter table AddCombo add column u integer default 0 check (u > 0) unique;
+-- error: CHECK constraint
+
+-- Full revert: column gone, and neither the unique constraint nor its covering index
+-- (memory) survives as an orphan.
+select count(*) as c from table_info('AddCombo') where name = 'u';
+→ [{"c":0}]
+select count(*) as c from unique_constraint_info('AddCombo');
+→ [{"c":0}]
+select count(*) as c from index_info('AddCombo');
+→ [{"c":0}]
+
+-- The table still works under its original shape, and re-adding the same column with
+-- a CHECK-satisfying DEFAULT now succeeds (proving no stale constraint/index lingers).
+alter table AddCombo add column u integer default 1 check (u > 0) unique;
+select count(*) as c from unique_constraint_info('AddCombo');
+→ [{"c":1}]
+select u from AddCombo;
+→ [{"u":1}]
+
+-- ===================================================================
+-- 6. Standalone DROP COLUMN of a single-column-UNIQUE column. The general
+--    dropColumn fix (prune the dangling UNIQUE + tear down its covering index)
+--    is what the ADD COLUMN revert path relies on; exercise it directly here.
+-- ===================================================================
+
+create table DropU (id integer primary key, a integer, b integer unique);
+insert into DropU values (1, 10, 100);
+-- b is enforced unique while it exists.
+insert into DropU values (2, 20, 100);
+-- error: UNIQUE constraint failed
+alter table DropU drop column b;
+-- Constraint and its covering index are both gone — no orphan.
+select count(*) as c from unique_constraint_info('DropU');
+→ [{"c":0}]
+select count(*) as c from index_info('DropU');
+→ [{"c":0}]
+-- The table is usable under its narrowed shape (b no longer enforced/present).
+insert into DropU values (3, 30);
+select count(*) as c from DropU;
+→ [{"c":2}]
+
+-- ===================================================================
+-- 7. Standalone DROP COLUMN of a column that participates in a MULTI-column
+--    UNIQUE: the whole constraint is removed (a UNIQUE missing a column is a
+--    different constraint), AND its covering index is torn down — not left
+--    orphaned as a narrowed structure over the surviving columns.
+-- ===================================================================
+
+create table DropMultiIn (id integer primary key, a integer, b integer, constraint uq_ab unique (a, b));
+insert into DropMultiIn values (1, 1, 2);
+insert into DropMultiIn values (2, 1, 2);
+-- error: UNIQUE constraint failed
+alter table DropMultiIn drop column b;
+-- The entire uq_ab constraint is gone — and so is its covering index (no orphan
+-- narrowed to column a, which a prior narrow-not-remove bug would have left behind).
+select count(*) as c from unique_constraint_info('DropMultiIn');
+→ [{"c":0}]
+select count(*) as c from index_info('DropMultiIn');
+→ [{"c":0}]
+-- a alone is no longer constrained: a duplicate value is now allowed.
+insert into DropMultiIn values (3, 1);
+insert into DropMultiIn values (4, 1);
+select count(*) as c from DropMultiIn;
+→ [{"c":3}]
+
+-- ===================================================================
+-- 8. Standalone DROP COLUMN of a column NOT in a multi-column UNIQUE: the
+--    constraint survives with its column indices shifted over the removed slot
+--    and still enforces over the correct (renumbered) columns.
+-- ===================================================================
+
+create table DropMultiOut (id integer primary key, x integer, a integer, b integer, constraint uq_ab unique (a, b));
+insert into DropMultiOut values (1, 99, 1, 2);
+-- Drop x (lower index than a and b, not part of uq_ab): the constraint's column
+-- indices shift down by one but it survives intact.
+alter table DropMultiOut drop column x;
+select name, column_name from unique_constraint_info('DropMultiOut') order by column_name;
+→ [{"name":"uq_ab","column_name":"a"},{"name":"uq_ab","column_name":"b"}]
+-- Still enforces (a, b) after the shift: the same (a, b) pair collides…
+insert into DropMultiOut values (2, 1, 2);
+-- error: UNIQUE constraint failed
+-- …but a distinct pair is allowed.
+insert into DropMultiOut values (3, 5, 6);
+select count(*) as c from DropMultiOut;
+→ [{"c":2}]

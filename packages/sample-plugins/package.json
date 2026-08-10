@@ -1,12 +1,14 @@
 {
   "name": "@quereus/sample-plugins",
-  "version": "3.3.0",
+  "version": "4.11.0",
   "description": "Sample plugins demonstrating the Quereus plugin architecture",
   "main": "index.js",
   "type": "module",
   "scripts": {
     "clean": "rimraf dist",
     "build": "tsc",
+    "lint": "echo 'No lint configured'",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json --noEmit",
     "dev": "tsc --watch",
     "serve": "npx http-server -p 8080 --cors",
     "test": "cd ../.. && node --import ./packages/sample-plugins/register.mjs node_modules/mocha/bin/mocha.js \"packages/sample-plugins/test/**/*.spec.ts\" --reporter min --colors"
@@ -39,7 +41,8 @@
     "@quereus/quereus": "workspace:^"
   },
   "devDependencies": {
-    "rimraf": "^6.1.2",
+    "@types/node": "^25.9.3",
+    "rimraf": "^6.1.3",
     "typescript": "^5.9.3"
   }
 }

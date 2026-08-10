@@ -1,0 +1,382 @@
+-- json-structural-equality.sqllogic
+-- Comparing a JSON column against SQL text must agree with the JSON value comparator
+-- and with the index: whitespace and object key order are irrelevant, array element
+-- order is significant (ticket bug-json-equality-not-structural). The text operand is
+-- coerced to JSON at plan time (insertCrossTypeCoercion), so `=`, `<`/`>`, BETWEEN and
+-- IN all route through JSON_TYPE.compare.
+-- No `using memory`, so store mode exercises the persisted byte-key path too.
+
+-- ===================================
+-- 1. Unindexed JSON column: text literal on the right
+-- ===================================
+create table jse_t (id integer primary key, v json);
+insert into jse_t values (1, '{"a":1,"b":2}'), (2, '[1,2,3]'), (3, '"hello"'), (4, '42');
+-- run
+
+-- Byte-identical text matches (this was false before the fix — the stored value is a
+-- native object and the literal a string, so the storage classes never met).
+select id from jse_t where v = '{"a":1,"b":2}';
+→ [{"id":1}]
+
+-- Differently spaced, same document.
+select id from jse_t where v = '{ "a" : 1 , "b" : 2 }';
+→ [{"id":1}]
+
+-- Reordered keys, same document.
+select id from jse_t where v = '{"b":2,"a":1}';
+→ [{"id":1}]
+
+-- Array element order stays significant.
+select id from jse_t where v = '[1,2,3]';
+→ [{"id":2}]
+
+select id from jse_t where v = '[3,2,1]';
+→ []
+
+-- Text on the LEFT works identically — the coercion is symmetric.
+select id from jse_t where '{"b":2,"a":1}' = v;
+→ [{"id":1}]
+
+-- `!=` is the complement, not an error.
+select id from jse_t where v <> '{"b":2,"a":1}' order by id;
+→ [{"id":2},{"id":3},{"id":4}]
+
+-- ===================================
+-- 2. Text that is not valid JSON is FALSE, never an error
+-- ===================================
+-- CAST to JSON is lenient: a parse failure yields NULL, except where the JSON type
+-- itself still accepts the operand — a bare string is a valid JSON string scalar, so
+-- it survives the cast and the comparison is simply unequal rather than an error.
+select id from jse_t where v = 'not json';
+→ []
+
+select count(*) as c from jse_t where v = '{unclosed';
+→ [{"c":0}]
+
+-- An operand the JSON type rejects outright (a blob is a JSON value under no
+-- reading) casts to NULL, so the comparison is UNKNOWN rather than false: `<>`
+-- yields no rows either, where a text operand's `<>` yields every row.
+select count(*) as c from jse_t where v = x'0102';
+→ [{"c":0}]
+
+select count(*) as c from jse_t where v <> x'0102';
+→ [{"c":0}]
+
+select count(*) as c from jse_t where v <> 'not json';
+→ [{"c":4}]
+
+-- SQL NULL on either side stays UNKNOWN (no rows), not an error.
+select count(*) as c from jse_t where v = null;
+→ [{"c":0}]
+
+-- ===================================
+-- 3. JSON scalars
+-- ===================================
+-- A JSON number scalar matches both its JSON source text and a bare SQL number.
+select id from jse_t where v = '42';
+→ [{"id":4}]
+
+select id from jse_t where v = 42;
+→ [{"id":4}]
+
+-- A JSON string scalar matches its quoted JSON source...
+select id from jse_t where v = '"hello"';
+→ [{"id":3}]
+
+-- ...and also the bare text: 'hello' is not valid JSON, so the lenient cast leaves it
+-- as the raw string, and JSON_TYPE.compare compares two string scalars as text. Pinned
+-- deliberately — the quoted form is the one that generalizes to non-string documents.
+select id from jse_t where v = 'hello';
+→ [{"id":3}]
+
+-- ===================================
+-- 4. Ordering: <, >, BETWEEN
+-- ===================================
+-- JSON type rank is null < boolean < number < string < array < object, so the number
+-- 42 sorts below the string scalar and the containers sort above it.
+select id from jse_t where v < '"hello"' order by id;
+→ [{"id":4}]
+
+select id from jse_t where v > '"hello"' order by id;
+→ [{"id":1},{"id":2}]
+
+-- BETWEEN routes both bounds through the same coercion.
+create table jse_b (id integer primary key, v json);
+insert into jse_b values (1, '{"a":1}');
+-- run
+
+select id from jse_b where v between '{"a":0}' and '{"a":2}';
+→ [{"id":1}]
+
+select id from jse_b where v between '{"a":2}' and '{"a":9}';
+→ []
+
+-- ===================================
+-- 5. IN value list
+-- ===================================
+select id from jse_t where v in ('{ "b" : 2 , "a" : 1 }');
+→ [{"id":1}]
+
+select id from jse_t where v in ('[1,2,3]', '{"b":2,"a":1}') order by id;
+→ [{"id":1},{"id":2}]
+
+select id from jse_t where v in ('{"z":26}');
+→ []
+
+-- A non-JSON entry in the list is inert, not an error.
+select id from jse_t where v in ('not json', '{"a":1,"b":2}');
+→ [{"id":1}]
+
+-- ===================================
+-- 5.1 IN subquery
+-- ===================================
+-- A subquery right-hand side has no fixed operand list to wrap at plan time, so the
+-- text→JSON conversion happens PER ROW inside membership evaluation
+-- (`inMembershipKeys`, runtime/emit/subquery.ts). Only the non-JSON side converts, so a
+-- JSON string scalar is never re-parsed. A *correlated* form is decorrelated into a semi
+-- join, whose synthesized `=` carries the same conversion
+-- (`extractInCorrelation` in rule-subquery-decorrelation.ts).
+create table jse_txt (id integer primary key, s text);
+insert into jse_txt values (1, '{ "b" : 2 , "a" : 1 }'), (2, 'not json');
+-- run
+
+-- Uncorrelated (set-probe path): agrees with `=`, spelling irrelevant.
+select id from jse_t where v in (select s from jse_txt);
+→ [{"id":1}]
+
+-- Reverse direction: a TEXT probe against a JSON subquery. "Either side is JSON coerces
+-- the other" holds here too — the probe converts, the members do not.
+select t.id from jse_txt t where t.s in (select v from jse_t);
+→ [{"id":1}]
+
+-- Correlated (decorrelated to a semi join; the coercion rides in the join residual).
+select j.id from jse_t j where j.v in (select t.s from jse_txt t where t.id = j.id);
+→ [{"id":1}]
+
+-- Correlated in the REVERSE direction (TEXT outer, JSON inner). Same rewrite, but now it
+-- is the OUTER operand `coerceObjectPhysicalSet` wraps — the probe-side branch of the
+-- decorrelation coercion, which the forward case above never exercises.
+select t.id from jse_txt t where t.s in (select j.v from jse_t j where j.id = t.id);
+→ [{"id":1}]
+
+-- SELECT-list position: an undeclared column is NOT NULL in this engine, so both sides
+-- are non-nullable and the existence-flag LEFT JOIN arm (decorrelateExistsInProjection)
+-- fires. Its join condition carries the same synthesized `v = cast(s as json)`, verified
+-- against the rendered plan.
+select j.id, (j.v in (select t.s from jse_txt t where t.id = j.id)) as m from jse_t j order by j.id;
+→ [{"id":1,"m":true},{"id":2,"m":false},{"id":3,"m":false},{"id":4,"m":false}]
+
+-- Same shape over a NULLABLE JSON column: the flag is two-valued, so the rewrite
+-- declines and the conjunct stays on emitIn's correlated STREAMING arm — the third of
+-- the three subquery source paths, and the one place a NULL probe short-circuits.
+create table jse_jn (id integer primary key, v json null);
+insert into jse_jn values (1, '{"a":1,"b":2}'), (2, null);
+-- run
+
+select j.id, (j.v in (select t.s from jse_txt t where t.id = j.id)) as m from jse_jn j order by j.id;
+→ [{"id":1,"m":true},{"id":2,"m":null}]
+
+-- Array element order stays significant.
+select id from jse_t where v in (select '[3,2,1]');
+→ []
+
+select id from jse_t where v in (select '[1,2,3]');
+→ [{"id":2}]
+
+-- A non-JSON inner value is inert, not an error: it survives the lenient cast as a plain
+-- string, which no JSON document in jse_t equals.
+select count(*) as c from jse_t where v in (select s from jse_txt where id = 2);
+→ [{"c":0}]
+
+-- Both sides JSON keeps working — regression guard on the untouched (identity) arm.
+-- This is also the one shape here that still decorrelates: agreeing semantic orderings
+-- let extractUncorrelatedIn through, so the plan is a SEMI HASH JOIN, not a set probe.
+create table jse_j2 (id integer primary key, v json);
+insert into jse_j2 values (1, '{ "b" : 2 , "a" : 1 }'), (2, '[9]');
+-- run
+
+select j.id from jse_t j where j.v in (select k.v from jse_j2 k);
+→ [{"id":1}]
+
+-- Two spellings of one document are ONE member of the probe set (duplicate BTree insert
+-- is a no-op). Note IN is a membership test, so the row count alone would be 1 either
+-- way; what this pins is that a multi-row, mixed-spelling inner still matches.
+select count(*) as c from jse_t
+where v in (select '{"a":1,"b":2}' as x union all select '{ "b":2, "a":1 }');
+→ [{"c":1}]
+
+-- A value the JSON type rejects outright (a blob) coerces to NULL, so membership is
+-- UNKNOWN rather than false: neither IN nor NOT IN yields a row.
+create table jse_blob (id integer primary key, b blob);
+insert into jse_blob values (1, x'0102');
+-- run
+
+select count(*) as c from jse_t where v in (select b from jse_blob);
+→ [{"c":0}]
+
+select count(*) as c from jse_t where v not in (select b from jse_blob);
+→ [{"c":0}]
+
+-- Inner NULL keeps three-valued logic: a hit is still TRUE, a miss becomes UNKNOWN.
+create table jse_null (id integer primary key, s text null);
+insert into jse_null values (1, '{ "b" : 2 , "a" : 1 }'), (2, null);
+-- run
+
+select id from jse_t where v in (select s from jse_null);
+→ [{"id":1}]
+
+select id from jse_t where v not in (select s from jse_null);
+→ []
+
+-- NOT IN over a NULL-free inner is the plain complement: the coerced member excludes its
+-- own row and nothing else. (The two NOT IN cases above both land on UNKNOWN, so neither
+-- pins the FALSE-becomes-TRUE direction of the negation.)
+select id from jse_t where v not in (select s from jse_txt where id = 1) order by id;
+→ [{"id":2},{"id":3},{"id":4}]
+
+-- The impure arm (a DML-with-RETURNING inner) drains rather than short-circuiting, and
+-- coerces its drained rows the same way. `count(*)` on the sink pins that the drain still
+-- covers every row past the match.
+create table jse_log (s text);
+-- run
+
+select cast('{"b":2,"a":1}' as json) in (insert into jse_log values ('{ "a" : 1 , "b" : 2 }'), ('nope') returning s) as found;
+→ [{"found":true}]
+
+select count(*) as c from jse_log;
+→ [{"c":2}]
+
+-- ===================================
+-- 5.2 The numeric ↔ textual pairing takes the SAME route
+-- ===================================
+-- `int_col in ('1')` is true, exactly as `int_col = '1'` is
+-- (bug-numeric-text-coercion-skips-in-and-case). The value list is reconciled at plan
+-- time, the subquery forms at membership-evaluation time, and the decorrelating rewrite
+-- declines to the set probe — three routes that must land on one answer.
+create table jse_num (id integer primary key, n integer);
+insert into jse_num values (1, 1), (2, 2);
+create table jse_numtxt (id integer primary key, s text);
+insert into jse_numtxt values (1, '1'), (2, '2');
+-- run
+
+select id from jse_num where n in ('1');
+→ [{"id":1}]
+
+-- Both decorrelation arms now reconcile their synthesized `=` the way a hand-written one
+-- is: the uncorrelated arm's cast wrapper fails the equi-pair gate and falls back to the
+-- set probe, the correlated arm keeps the cast in the join's residual.
+select id from jse_num where n in (select s from jse_numtxt);
+→ [{"id":1},{"id":2}]
+
+select m.id from jse_num m where m.n in (select t.s from jse_numtxt t where t.id = m.id);
+→ [{"id":1},{"id":2}]
+
+-- These two DO reach emitIn's membership evaluation — a non-column left side and a
+-- projection-position IN both decline decorrelation — so they are what actually pins
+-- `inMembershipKeys`' numeric ↔ textual arm.
+select id from jse_num where n + 0 in (select s from jse_numtxt);
+→ [{"id":1},{"id":2}]
+
+select id, (n in (select s from jse_numtxt)) as m from jse_num order by id;
+→ [{"id":1,"m":true},{"id":2,"m":true}]
+
+-- ===================================
+-- 6. The same set with a UNIQUE index on the JSON column
+-- ===================================
+-- Lives in 06.9.2.1-json-structural-equality-index: the indexed answers and the
+-- structural UNIQUE enforcement need a standalone `create unique index`.
+
+-- ===================================
+-- 7. Cross-column: a TEXT column compared against a JSON column
+-- ===================================
+-- Behavior change, made explicit: "one side is JSON" coerces the other side, so a text
+-- column holding JSON source now matches structurally where it was always false.
+-- (`jse_txt` is created in § 5.1 above, which needs it first.)
+select t.id as tid, j.id as jid from jse_txt t join jse_t j on t.s = j.v;
+→ [{"tid":1,"jid":1}]
+
+select t.id as tid, j.id as jid from jse_txt t join jse_t j on j.v = t.s;
+→ [{"tid":1,"jid":1}]
+
+-- ===================================
+-- 8. A TEXT column retyped to JSON answers exactly as a native JSON column does
+-- ===================================
+create table jse_re (id integer primary key, v text);
+insert into jse_re values (1, '{"a":1}');
+-- run
+
+alter table jse_re alter column v set data type json;
+-- run
+
+select id from jse_re where v = '{ "a" : 1 }';
+→ [{"id":1}]
+
+-- The indexed half of this check (same retype, then `create unique index`) lives in
+-- 06.9.2.1-json-structural-equality-index § 2.
+
+-- ===================================
+-- 9. Two DIFFERENT JSON comparisons in one statement stay different
+-- ===================================
+-- Every object literal used to fingerprint as '[object Object]'
+-- (analysis/expression-fingerprint.ts), so scalar CSE folded these two comparisons
+-- into one and evaluated only the first: the AND matched row 1 and the OR missed
+-- row 2. Reachable through `json(...)` before this file existed, and through a
+-- plain text literal after the coercion landed.
+create table jse_cse (id integer primary key, v json);
+insert into jse_cse values (1, '{"a":1}'), (2, '{"a":2}');
+-- run
+
+select id from jse_cse where v = '{"a":1}' and v = '{"a":2}';
+→ []
+
+select id from jse_cse where v = json('{"a":1}') and v = json('{"a":2}');
+→ []
+
+select id from jse_cse where v = '{"a":1}' or v = '{"a":2}' order by id;
+→ [{"id":1},{"id":2}]
+
+-- Reorder-equal literals ARE the same value, so folding them is correct.
+select id from jse_cse where v = '{"a":1}' and v = '{ "a" : 1 }';
+→ [{"id":1}]
+
+select id, (v = '{"a":1}') as p, (v = '{"a":2}') as q from jse_cse order by id;
+→ [{"id":1,"p":true,"q":false},{"id":2,"p":false,"q":true}]
+
+-- ===================================
+-- 10. A simple CASE compares its base structurally, like `=` does
+-- ===================================
+select id, case v when '{ "a" : 1 }' then 'one' when '{"a":2}' then 'two' else 'miss' end as r
+from jse_cse order by id;
+→ [{"id":1,"r":"one"},{"id":2,"r":"two"}]
+
+-- ===================================
+-- 11. Identity sites are unchanged — GROUP BY / DISTINCT were already structural
+-- ===================================
+select count(*) as groups from (select v from jse_t group by v);
+→ [{"groups":4}]
+
+select count(*) as c from (select distinct v from jse_t);
+→ [{"c":4}]
+
+-- ===================================
+-- 12. min/max rank structurally, agreeing with ORDER BY (docs/types.md
+--     "Semantic ordering"). Canonical-text order would report mn=[10], mx=[9].
+-- ===================================
+create table jse_mm (id integer primary key, d json);
+insert into jse_mm values (1, '[8,1]'), (2, '[9]'), (3, '[10]');
+-- run
+
+select id, d from jse_mm order by d;
+→ [{"id":1,"d":[8,1]},{"id":2,"d":[9]},{"id":3,"d":[10]}]
+
+select min(d) as mn, max(d) as mx from jse_mm;
+→ [{"mn":[8,1],"mx":[10]}]
+
+-- DISTINCT agrees with the plain form.
+select min(distinct d) as mn, max(distinct d) as mx from jse_mm;
+→ [{"mn":[8,1],"mx":[10]}]
+
+-- GROUP BY shape (hash aggregate) reaches the same bound comparator: group 1
+-- holds [8,1] and [10], whose structural and canonical-text orders disagree.
+select id % 2 as g, min(d) as mn, max(d) as mx from jse_mm group by id % 2 order by g;
+→ [{"g":0,"mn":[9],"mx":[9]},{"g":1,"mn":[8,1],"mx":[10]}]

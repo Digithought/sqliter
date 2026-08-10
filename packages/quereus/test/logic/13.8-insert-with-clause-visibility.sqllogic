@@ -1,0 +1,254 @@
+-- 13.8-insert-with-clause-visibility.sqllogic - a leading WITH on INSERT reaches every clause
+--
+-- `buildInsertStmt` used to build its leading `with` clause into a local map handed to
+-- exactly ONE consumer — the `select` source branch — instead of deriving one
+-- statement-level planning context the way `buildUpdateStmt` / `buildDeleteStmt` do. Every
+-- other clause of the same statement therefore lost the statement's CTEs and failed with
+-- `Table 'c' not found in schema path: main`: RETURNING, a scalar subquery inside a VALUES
+-- row, ON CONFLICT, WITH CONTEXT, and the view / materialized-view target dispatch.
+--
+-- The same local map also started EMPTY and was filled from the INSERT's own `with` clause
+-- alone, while `buildWithContext` prefers a non-empty explicit argument over the context's
+-- inherited definitions — so an INSERT that carried its own `with` clause dropped every
+-- definition it had inherited from an enclosing statement. That arm is covered at the end.
+
+create table p (id integer primary key, v text);
+insert into p values (1, 'a'), (2, 'b');
+-- run
+
+-- ===== RETURNING sees the statement's CTEs =====
+
+create table q1 (id integer primary key, w text);
+-- run
+
+with c as (select id, v from p) insert into q1 values (5, 'e')
+  returning id, (select count(*) from c) as n;
+→ [{"id":5,"n":2}]
+
+select id, w from q1 order by id;
+→ [{"id":5,"w":"e"}]
+
+-- ===== A scalar subquery inside a VALUES row sees them =====
+
+create table q2 (id integer primary key, w integer);
+-- run
+
+with c as (select id from p) insert into q2 values (6, (select count(*) from c));
+
+select id, w from q2 order by id;
+→ [{"id":6,"w":2}]
+
+-- ===== A view target sees them (source AND returning) =====
+
+create table q3 (id integer primary key, w text);
+create view vq3 as select id, w from q3;
+-- run
+
+with c as (select id, v from p) insert into vq3 select id, v from c;
+
+select id, w from q3 order by id;
+→ [{"id":1,"w":"a"},{"id":2,"w":"b"}]
+
+with c as (select id from p) insert into vq3 values (7, 'g')
+  returning id, (select count(*) from c) as n;
+→ [{"id":7,"n":2}]
+
+-- ===== A materialized-view target sees them =====
+
+create table q4 (id integer primary key, w text);
+create materialized view mvq4 as select id, w from q4;
+-- run
+
+with c as (select id, v from p) insert into mvq4 select id, v from c;
+
+select id, w from q4 order by id;
+→ [{"id":1,"w":"a"},{"id":2,"w":"b"}]
+
+select id, w from mvq4 order by id;
+→ [{"id":1,"w":"a"},{"id":2,"w":"b"}]
+
+-- ===== Nested DML source sees them =====
+-- `insert into … insert into … returning` — the inner DML builds on the same context.
+
+create table q5 (id integer primary key, w text);
+create table q5src (id integer primary key, w text);
+-- run
+
+with c as (select id from p)
+insert into q5 insert into q5src values (8, 'h') returning id + (select count(*) from c), w;
+
+select id, w from q5 order by id;
+→ [{"id":10,"w":"h"}]
+
+-- The UPDATE- and DELETE-bodied source branches take the same context.
+
+create table q5b (id integer primary key, w integer);
+create table q5c (id integer primary key, w integer);
+create table q5upd (id integer primary key, w text);
+insert into q5upd values (1, 'x'), (2, 'y');
+-- run
+
+with c as (select id from p)
+insert into q5b update q5upd set w = 'z' where id = 1 returning id, (select count(*) from c);
+
+select id, w from q5b order by id;
+→ [{"id":1,"w":2}]
+
+with c as (select id from p)
+insert into q5c delete from q5upd where id = 2 returning id, (select count(*) from c);
+
+select id, w from q5c order by id;
+→ [{"id":2,"w":2}]
+
+-- ===== A MULTI-SOURCE view target sees them =====
+-- A join-bodied view decomposes into one base insert per member, each re-planned through
+-- this builder with a `preBuiltSource`. Every member must still carry the statement's CTEs
+-- (and the RETURNING built over the decomposition must too).
+
+create table q11a (id integer primary key, a text);
+create table q11b (id integer primary key, b text);
+create view vq11 as select q11a.id as id, q11a.a as a, q11b.b as b
+  from q11a join q11b on q11a.id = q11b.id;
+-- run
+
+with c as (select id, v from p) insert into vq11 select id, v, v from c;
+
+select id, a from q11a order by id;
+→ [{"id":1,"a":"a"},{"id":2,"a":"b"}]
+
+select id, b from q11b order by id;
+→ [{"id":1,"b":"a"},{"id":2,"b":"b"}]
+
+-- ===== An INSERT's own WITH clause does not hide the ones it INHERITED =====
+-- Arm B: the inner `with c as (…)` used to replace, rather than shadow into, the enclosing
+-- statement's definitions, so `a` vanished and the insert failed `Table 'a' not found`.
+
+create table q6 (id integer primary key, w integer);
+-- run
+
+with a as (select id from p),
+     b as (with c as (select 1 as k) insert into q6 select id + 40, (select k from c) from a returning id)
+select count(*) as n from b;
+→ [{"n":2}]
+
+select id, w from q6 order by id;
+→ [{"id":41,"w":1},{"id":42,"w":1}]
+
+-- ===== An own-clause name still SHADOWS a same-named inherited one =====
+
+create table q7 (id integer primary key, w integer);
+-- run
+
+with a as (select id from p),
+     b as (with a as (select 77 as id) insert into q7 select id, 5 from a returning id)
+select count(*) as n from b;
+→ [{"n":1}]
+
+-- 77, not 1 and 2 — the inner `a` won.
+select id, w from q7 order by id;
+→ [{"id":77,"w":5}]
+
+-- ===== An INSERT nested in FROM / expression position inherits through the context =====
+-- These two shapes reach `buildInsertStmt` with no WITH clause of their own — the enclosing
+-- statement's definitions arrive only via `ctx.cteNodes`. Both only work because RETURNING
+-- is now built on the CTE-aware context rather than the bare one.
+
+create table q12 (id integer primary key, w integer);
+create table q13 (id integer primary key, w integer);
+-- run
+
+with c as (select id from p)
+select n from (insert into q12 values (1, 5) returning (select count(*) from c) as n) as d;
+→ [{"n":2}]
+
+with c as (select id from p)
+select (select n from (insert into q13 values (2, 6) returning (select count(*) from c) as n)) as k;
+→ [{"k":2}]
+
+-- ===== Control: the `select` source branch (the one that always worked) =====
+
+create table q8 (id integer primary key, w text);
+-- run
+
+with c as (select id, v from p) insert into q8 select id + 300, v from c;
+
+select id, w from q8 order by id;
+→ [{"id":301,"w":"a"},{"id":302,"w":"b"}]
+
+-- ===== Control: schema-authored DEFAULT expressions do NOT bind a caller's CTE =====
+-- A table's own DDL is not part of the user's statement, so the statement-level CTE
+-- context is deliberately withheld from column defaults / generated columns / CHECKs.
+-- `c` here is a real table, and the default must keep resolving to it even when the
+-- INSERT declares a CTE of the same name.
+
+create table c (k integer primary key);
+insert into c values (1), (2), (3);
+create table q9 (id integer primary key, w integer default (select count(*) from c));
+-- run
+
+with c as (select id from p) insert into q9 (id) values (9);
+
+-- 3 (the real table), not 2 (the CTE).
+select id, w from q9 order by id;
+→ [{"id":9,"w":3}]
+
+-- ===== ON CONFLICT and WITH CONTEXT: name resolution AND execution both work =====
+-- These two clauses RESOLVE the statement's CTEs (no more `Table 'c' not found`), and a
+-- subquery in either position now executes correctly — `DmlExecutorNode` exposes its
+-- ON CONFLICT / mutation-context expressions as optimizer-visible children, so their
+-- subquery subtrees get rewritten like any other child. Fixed by
+-- `bug-dml-side-expressions-invisible-to-optimizer`.
+
+create table q10 (id integer primary key, w text);
+insert into q10 values (1, 'x');
+create table mc (id integer primary key, v text) with context (who integer);
+-- run
+
+with c as (select id from p) insert into q10 values (1, 'x')
+  on conflict (id) do update set w = (select count(*) from c) returning w;
+→ [{"w":"2"}]
+
+with c as (select id from p) insert into q10 values (1, 'x')
+  on conflict (id) do update set w = 'y' where (select count(*) from c) > 0 returning w;
+→ [{"w":"y"}]
+
+with c as (select id from p) insert into mc with context who = (select count(*) from c)
+  values (1, 'x') returning v;
+→ [{"v":"x"}]
+
+-- The same three shapes work identically with NO leading WITH clause — the fix is
+-- not about CTE visibility.
+insert into q10 values (1, 'x') on conflict (id) do update set w = (select count(*) from p) returning w;
+→ [{"w":"2"}]
+
+insert into mc with context who = (select count(*) from p) values (2, 'x') returning id, v;
+→ [{"id":2,"v":"x"}]
+
+-- Cleanup
+-- q9's DEFAULT reads `c` through a subquery, so it has to go first: dropping a table a
+-- stored expression still names is refused (41.10.4-drop-object-expression-dependents).
+drop materialized view mvq4;
+drop view vq3;
+drop view vq11;
+drop table q9;
+drop table p;
+drop table c;
+drop table q1;
+drop table q2;
+drop table q3;
+drop table q4;
+drop table q5;
+drop table q5src;
+drop table q5b;
+drop table q5c;
+drop table q5upd;
+drop table q11a;
+drop table q11b;
+drop table q12;
+drop table q13;
+drop table q6;
+drop table q7;
+drop table q8;
+drop table q10;
+drop table mc;
+-- run

@@ -7,8 +7,9 @@ import { ColumnReferenceNode } from './reference.js';
 import { expressionToString } from '../../emit/ast-stringify.js';
 import { Cached } from '../../util/cached.js';
 import { deriveProjectionColumnMap, projectKeys } from '../util/key-utils.js';
+import { disambiguateColumnNames } from '../util/output-names.js';
 import { projectOrdering } from '../framework/physical-utils.js';
-import { addFd, projectConstantBindings, projectDomainConstraints, projectFds, superkeyToFd } from '../util/fd-utils.js';
+import { addFd, projectConstantBindings, projectDomainConstraints, projectFds, projectInds, superkeyToFd } from '../util/fd-utils.js';
 
 export interface ReturningProjection {
   node: ScalarPlanNode;
@@ -49,43 +50,23 @@ export class ReturningNode extends PlanNode implements RelationalPlanNode {
 
   private buildOutputType(): RelationType {
     // Return type is based on the projections, similar to ProjectNode
-    // Build column names with proper duplicate handling
-    const columnNames: string[] = [];
-    const nameCount = new Map<string, number>();
-
-    const columns = this.projections.map((proj) => {
+    const columnNames = disambiguateColumnNames(this.projections.map(proj => {
       // Determine base column name; preserve the spelling supplied by the user
       // (matches ProjectNode behaviour for SELECT — case-insensitive matching is
       // a resolution concern, not an output-name concern).
-      let baseName: string;
-      if (proj.alias) {
-        baseName = proj.alias;
-      } else if (proj.node instanceof ColumnReferenceNode) {
+      if (proj.alias) return proj.alias;
+      if (proj.node instanceof ColumnReferenceNode) {
         const expr = proj.node.expression;
-        baseName = expr.table ? `${expr.table}.${expr.name}` : expr.name;
-      } else {
-        baseName = expressionToString(proj.node.expression);
+        return expr.table ? `${expr.table}.${expr.name}` : expr.name;
       }
+      return expressionToString(proj.node.expression);
+    }));
 
-      // Handle duplicate names
-      let finalName: string;
-      const currentCount = nameCount.get(baseName) || 0;
-      if (currentCount === 0) {
-        // First occurrence - use the base name
-        finalName = baseName;
-      } else {
-        // Subsequent occurrences - add numbered suffix
-        finalName = `${baseName}:${currentCount}`;
-      }
-      nameCount.set(baseName, currentCount + 1);
-      columnNames.push(finalName);
-
-      return {
-        name: finalName,
-        type: proj.node.getType(),
-        nullable: true // Conservative assumption
-      };
-    });
+    const columns = this.projections.map((proj, index) => ({
+      name: columnNames[index],
+      type: proj.node.getType(),
+      nullable: true // Conservative assumption
+    }));
 
     // Logical key propagation via the shared projection-mapping helper (covers
     // both bare column references and injective unary projections).
@@ -257,8 +238,13 @@ export class ReturningNode extends PlanNode implements RelationalPlanNode {
     for (const [srcIdx, outIdx] of injectivePairs) {
       const bareOut = map.get(srcIdx);
       if (bareOut === undefined || bareOut === outIdx) continue;
-      fds = addFd(fds, { determinants: [bareOut], dependents: [outIdx] }, { keyHints: projectedKeys });
-      fds = addFd(fds, { determinants: [outIdx], dependents: [bareOut] }, { keyHints: projectedKeys });
+      // Injective-pair FDs are value bijections, not uniqueness claims —
+      // 'determination', emitted unconditionally. The kind-aware readers
+      // (`isUniqueDeterminant`) never derive a key from a determination on a
+      // bag, so no endpoint gate is needed (project-node now matches; ticket
+      // fd-determination-reader-side-rule).
+      fds = addFd(fds, { determinants: [bareOut], dependents: [outIdx], kind: 'determination' }, { keyHints: projectedKeys });
+      fds = addFd(fds, { determinants: [outIdx], dependents: [bareOut], kind: 'determination' }, { keyHints: projectedKeys });
     }
     const projectedEquiv: number[][] = [];
     for (const cls of sourcePhysical?.equivClasses ?? []) {
@@ -271,6 +257,7 @@ export class ReturningNode extends PlanNode implements RelationalPlanNode {
     }
     const projectedBindings = projectConstantBindings(sourcePhysical?.constantBindings ?? [], map);
     const projectedDomains = projectDomainConstraints(sourcePhysical?.domainConstraints ?? [], map);
+    const projectedInds = projectInds(sourcePhysical?.inds ?? [], map);
 
     return {
       estimatedRows: this.estimatedRows,
@@ -279,6 +266,7 @@ export class ReturningNode extends PlanNode implements RelationalPlanNode {
       equivClasses: projectedEquiv.length > 0 ? projectedEquiv : undefined,
       constantBindings: projectedBindings.length > 0 ? projectedBindings : undefined,
       domainConstraints: projectedDomains.length > 0 ? projectedDomains : undefined,
+      inds: projectedInds.length > 0 ? projectedInds : undefined,
     };
   }
 

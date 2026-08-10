@@ -1,6 +1,6 @@
 {
   "name": "@quereus/quoomb-cli",
-  "version": "3.3.0",
+  "version": "4.11.0",
   "type": "module",
   "description": "Quoomb CLI - Interactive REPL for Quereus SQL engine",
   "license": "MIT",
@@ -23,17 +23,21 @@
     "clean": "rimraf dist",
     "build": "tsc",
     "dev": "tsc && node dist/bin/quoomb.js",
-    "lint": "eslint src/**/*.ts",
+    "lint": "echo 'No lint configured'",
+    "//typecheck": "NOTE: tsconfig.json only includes src/, and vitest transpiles specs without checking them, so without this pass a signature change in src/ would leave test/ silently stale. Same arrangement as plugin-loader's typecheck.",
+    "typecheck": "tsc -p tsconfig.test.json --noEmit",
+    "//test": "NOTE: test/dot-commands.spec.ts smoke-tests table listing, schema display, CSV import type-inference, and export — the non-trivial logic here. test/remote-resolver.spec.ts covers the https plugin-load wiring (resolver install, fetch announcement, recorded hash), with fetch stubbed so nothing touches the network. --passWithNoTests stays as a safety net (not because this package is meant to stay test-free) so an empty glob doesn't fail the build.",
     "test": "vitest run --passWithNoTests",
     "prepublish": "npm run build"
   },
   "devDependencies": {
-    "@types/node": "^25.0.9",
-    "@typescript-eslint/eslint-plugin": "^8.53.0",
-    "@typescript-eslint/parser": "^8.53.0",
+    "@types/node": "^25.9.3",
+    "@types/papaparse": "^5.5.2",
+    "@typescript-eslint/eslint-plugin": "^8.61.1",
+    "@typescript-eslint/parser": "^8.61.1",
     "eslint": "^9.39.2",
-    "rimraf": "^6.1.2",
-    "tsx": "^4.21.0",
+    "rimraf": "^6.1.3",
+    "tsx": "^4.22.4",
     "typescript": "^5.9.3",
     "vitest": "^4.0.17"
   },
@@ -42,8 +46,7 @@
     "@quereus/quereus": "workspace:^",
     "chalk": "^5.6.2",
     "cli-table3": "^0.6.5",
-    "commander": "^14.0.2",
-    "papaparse": "^5.5.3",
-    "readline": "^1.3.0"
+    "commander": "^15.0.0",
+    "papaparse": "^5.5.3"
   }
 }

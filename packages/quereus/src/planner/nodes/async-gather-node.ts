@@ -15,6 +15,7 @@ import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import {
 	closeConstantBindingsOverEcs,
+	hasSingletonFd,
 	mergeConstantBindings,
 	mergeDomainConstraints,
 	mergeEquivClasses,
@@ -24,6 +25,7 @@ import {
 	shiftEquivClasses,
 	shiftFds,
 } from '../util/fd-utils.js';
+import { mergeSetOpAdvertisedType } from '../analysis/set-op-type-merge.js';
 
 /**
  * How {@link AsyncGatherNode} combines rows from its N independent child relations.
@@ -132,7 +134,9 @@ export class AsyncGatherNode extends PlanNode implements RelationalPlanNode {
 		public readonly preserveAttributeIds?: readonly Attribute[],
 	) {
 		AsyncGatherNode.validateConstruction(children, combinator, concurrencyCap);
-		super(scope, children.reduce((acc, c) => acc + c.getTotalCost(), 0));
+		// Self-cost only: every child is in getChildren(), so their subtree costs
+		// flow in via getTotalCost(). The gather's own overhead is negligible.
+		super(scope, 0.01);
 		this.attributesCache = new Cached(() => this.buildAttributes());
 		this.zipIndicesCache = new Cached(() => this.computeZipByKeyIndices());
 	}
@@ -331,8 +335,14 @@ export class AsyncGatherNode extends PlanNode implements RelationalPlanNode {
 		}
 		if (this.combinator.kind === 'unionAll') {
 			// Mirror SetOperationNode.buildAttributes: keep left (children[0])
-			// attribute IDs verbatim so ORDER BY references continue to resolve.
-			return this.children[0].getAttributes();
+			// attribute IDs verbatim so ORDER BY references continue to resolve,
+			// but carry the cross-branch merged column types (getType's unionAll
+			// derivation) so the attributes and the relation type cannot drift.
+			const mergedColumns = this.getType().columns;
+			return this.children[0].getAttributes().map((attr, i) =>
+				mergedColumns[i] && attr.type !== mergedColumns[i].type
+					? { ...attr, type: mergedColumns[i].type }
+					: attr);
 		}
 		if (this.combinator.kind === 'zipByKey') {
 			return this.buildZipByKeyAttributes();
@@ -392,19 +402,24 @@ export class AsyncGatherNode extends PlanNode implements RelationalPlanNode {
 
 	getType(): RelationType {
 		if (this.combinator.kind === 'unionAll') {
-			// Per-column nullability is the OR across all children; isSet is
-			// false (unionAll allows duplicates). Other fields fall through
-			// from children[0].
+			// Per-column logical type is the same symmetric cross-branch merge
+			// `SetOperationNode` advertises (a left-deep fold matches the unionAll
+			// chain this gather replaced); nullability is the OR across all
+			// children; isSet is false (unionAll allows duplicates). Other fields
+			// fall through from children[0].
 			const types = this.children.map(c => c.getType());
 			const baseType = types[0];
 			const columns = baseType.columns.map((baseCol, i) => {
+				let logicalType = baseCol.type.logicalType;
 				let nullable = baseCol.type.nullable;
 				for (let j = 1; j < types.length; j++) {
-					nullable = nullable || types[j].columns[i].type.nullable;
+					const childType = types[j].columns[i].type;
+					logicalType = mergeSetOpAdvertisedType(logicalType, childType.logicalType);
+					nullable = nullable || childType.nullable;
 				}
-				return nullable === baseCol.type.nullable
+				return logicalType === baseCol.type.logicalType && nullable === baseCol.type.nullable
 					? baseCol
-					: { ...baseCol, type: { ...baseCol.type, nullable: true } };
+					: { ...baseCol, type: { ...baseCol.type, logicalType, nullable } };
 			});
 			return {
 				typeClass: 'relation',
@@ -527,18 +542,45 @@ export class AsyncGatherNode extends PlanNode implements RelationalPlanNode {
 			};
 		}
 
-		// crossProduct: fold pairwise — identical to N applications of
-		// JoinNode(cross). Each child's FDs hold on its slice of the output row;
-		// concatenation preserves them after shifting column indices.
-		let fds: ReadonlyArray<FunctionalDependency> = childrenPhysical[0].fds ?? [];
+		// crossProduct: fold pairwise — column-layout-wise identical to N
+		// applications of JoinNode(cross). Each child's FDs hold on its slice of
+		// the output row; concatenation preserves them after shifting column
+		// indices. The kind downgrade below records uniqueness loss on the FD
+		// itself; the kind-aware readers (ticket fd-determination-reader-side-rule)
+		// make any side-key FD drop unnecessary — JoinNode now matches.
+		//
+		// Kind downgrade: a child's 'unique' FD stays 'unique' only when every
+		// OTHER child is provably ≤1-row (the child's rows are never duplicated);
+		// otherwise the cross product fans the child out and only the value claim
+		// ('determination') survives — guarded FDs included.
+		//
+		// INDs could shift+merge here exactly like FDs (a cross product preserves
+		// each child's per-row inclusion claims). Deferred — no consumer reads
+		// `inds` in this wave, so we leave it undefined rather than carry it
+		// through AsyncGather. Revisit when a consumer lands.
+		const childColCounts = this.children.map(c => c.getType().columns.length);
+		// `hasSingletonFd` is kind-aware (ticket fd-determination-reader-side-rule):
+		// 'determination' constant pins on a bag no longer over-claim ≤1-row, so
+		// this probe — and therefore the keep-'unique' decision — is sound.
+		const childIsSingleton = childrenPhysical.map((phys, i) =>
+			hasSingletonFd(phys.fds, childColCounts[i], this.children[i].getType().isSet));
+		const kindAdjustedFds = (idx: number): ReadonlyArray<FunctionalDependency> => {
+			const childFds = childrenPhysical[idx].fds ?? [];
+			const keepUnique = childIsSingleton.every((s, j) => j === idx || s);
+			return keepUnique
+				? childFds
+				: childFds.map(fd => (fd.kind === 'unique' ? { ...fd, kind: 'determination' as const } : fd));
+		};
+
+		let fds: ReadonlyArray<FunctionalDependency> = kindAdjustedFds(0);
 		let equiv: ReadonlyArray<ReadonlyArray<number>> = childrenPhysical[0].equivClasses ?? [];
 		let bindings: ReadonlyArray<ConstantBinding> = childrenPhysical[0].constantBindings ?? [];
 		let domains: ReadonlyArray<DomainConstraint> = childrenPhysical[0].domainConstraints ?? [];
-		let runningCols = this.children[0].getType().columns.length;
+		let runningCols = childColCounts[0];
 
 		for (let i = 1; i < this.children.length; i++) {
 			const rightPhys = childrenPhysical[i];
-			const rightFds = rightPhys.fds ?? [];
+			const rightFds = kindAdjustedFds(i);
 			const rightEC = rightPhys.equivClasses ?? [];
 			const rightBindings = rightPhys.constantBindings ?? [];
 			const rightDomains = rightPhys.domainConstraints ?? [];
@@ -552,7 +594,7 @@ export class AsyncGatherNode extends PlanNode implements RelationalPlanNode {
 			bindings = closeConstantBindingsOverEcs(mergedBindings, equiv);
 			domains = mergeDomainConstraints(domains, shiftDomainConstraints(rightDomains, runningCols));
 
-			runningCols += this.children[i].getType().columns.length;
+			runningCols += childColCounts[i];
 		}
 
 		return {

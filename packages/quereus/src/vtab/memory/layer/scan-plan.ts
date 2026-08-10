@@ -6,6 +6,9 @@ import type { TableSchema } from '../../../schema/table.js';
 import type { IndexColumnSchema, PrimaryKeyColumnDefinition } from '../../../schema/table.js';
 import type { IndexConstraint, IndexInfo } from '../../index-info.js';
 import { IndexConstraintOp as ActualIndexConstraintOp } from '../../../common/constants.js';
+import { normalizeCollationName } from '../../../util/comparison.js';
+import { decodeIdxStr } from '../../idx-str.js';
+import { PRIMARY_INDEX_NAME } from '../../index-descriptor.js';
 
 /** Describes an equality constraint for a scan plan */
 export interface ScanPlanEqConstraint {
@@ -40,6 +43,20 @@ export interface ScanPlan {
 	equalityKeys?: BTreeKey[];
 	/** Equality prefix values for prefix-range scans (plan=7) */
 	equalityPrefix?: SqlValue[];
+	/**
+	 * Per-column collations parallel to {@link equalityPrefix}, used so the
+	 * prefix-equality match honours the index column's declared collation rather
+	 * than a BINARY compare. Undefined (or an undefined entry) ⇒ BINARY.
+	 */
+	equalityPrefixCollations?: string[];
+	/**
+	 * Declared collation of the range-bound column — the leading column for a plain
+	 * range, the trailing column for a prefix-range. Threaded into the runtime bound
+	 * filter and early-termination (`plan-filter.ts` / `scan-layer.ts`) so a
+	 * non-BINARY range seek visits exactly the collation-correct window instead of
+	 * under-fetching case/space variants. Undefined ⇒ BINARY.
+	 */
+	boundCollation?: string;
 	/** Lower bound for a range scan (used if planType is RANGE_*) */
 	lowerBound?: ScanPlanRangeBound;
 	/** Upper bound for a range scan (used if planType is RANGE_*) */
@@ -59,18 +76,8 @@ interface IndexSchemaLike {
 
 type ArgvMap = ReadonlyMap<number, number>;
 
-function parseIdxStrParameters(idxStr: string | null): Map<string, string> {
-	const params = new Map<string, string>();
-	if (!idxStr) return params;
-
-	for (const part of idxStr.split(';')) {
-		const [key, value] = part.split('=', 2);
-		if (key && value !== undefined) {
-			params.set(key, value);
-		}
-	}
-	return params;
-}
+/** No decoded parameters — shared so the degenerate path allocates nothing. */
+const NO_PARAMS: ReadonlyMap<string, string> = new Map();
 
 function parseArgvMappings(raw: string | undefined): Map<number, number> {
 	const mappings = new Map<number, number>();
@@ -86,12 +93,6 @@ function parseArgvMappings(raw: string | undefined): Map<number, number> {
 	return mappings;
 }
 
-function resolveIndexName(idxParam: string | undefined): string | 'primary' {
-	const match = idxParam?.match(/^(.*?)\((\d+)\)$/);
-	if (!match) return 'primary';
-	return match[1] === '_primary_' ? 'primary' : match[1];
-}
-
 function resolveIndexSchema(
 	indexName: string | 'primary',
 	tableSchema: TableSchema,
@@ -105,8 +106,19 @@ function resolveIndexSchema(
 	return tableSchema.indexes?.find(idx => idx.name === indexName);
 }
 
-function isDescendingScan(params: Map<string, string>, planType: number): boolean {
+function isDescendingScan(params: ReadonlyMap<string, string>, planType: number): boolean {
 	return params.get('ordCons') === 'DESC' || planType === 1 || planType === 4;
+}
+
+/**
+ * Resolves the declared collation of the index column at `position`, normalized,
+ * or undefined when there is no index schema (⇒ BINARY at compare time). Both
+ * {@link IndexColumnSchema} and {@link PrimaryKeyColumnDefinition} carry an optional
+ * `collation`, so this works uniformly for secondary indexes and the primary key.
+ */
+function resolveColumnCollation(indexSchema: IndexSchemaLike | undefined, position: number): string | undefined {
+	const col = indexSchema?.columns[position];
+	return col?.collation ? normalizeCollationName(col.collation) : undefined;
 }
 
 function findArgValueForColumn(
@@ -252,9 +264,15 @@ function extractRangeBounds(
 export function buildScanPlanFromFilterInfo(filterInfo: FilterInfo, tableSchema: TableSchema): ScanPlan {
 	const { idxNum, idxStr, constraints, args, indexInfoOutput } = filterInfo;
 
-	const params = parseIdxStrParameters(idxStr);
-	const indexName = resolveIndexName(params.get('idx'));
-	const planType = parseInt(params.get('plan') ?? '0', 10);
+	// An idxStr that names no index (null, `fullscan`, `empty`, or any string this
+	// engine never emitted) degenerates to an unbounded primary-key walk — the
+	// behaviour this builder has always had for an unparseable idxStr.
+	const spec = decodeIdxStr(idxStr);
+	const params = spec?.params ?? NO_PARAMS;
+	const indexName: string | 'primary' = spec
+		? (spec.indexName === PRIMARY_INDEX_NAME ? 'primary' : spec.indexName)
+		: 'primary';
+	const planType = spec?.plan ?? 0;
 	const descending = isDescendingScan(params, planType);
 	const argvMap = parseArgvMappings(params.get('argvMap'));
 	const indexSchema = resolveIndexSchema(indexName, tableSchema);
@@ -263,6 +281,7 @@ export function buildScanPlanFromFilterInfo(filterInfo: FilterInfo, tableSchema:
 	let equalityKeys: BTreeKey[] | undefined;
 	let lowerBound: ScanPlanRangeBound | undefined;
 	let upperBound: ScanPlanRangeBound | undefined;
+	let boundCollation: string | undefined;
 
 	const isEqPlan = planType === 2;
 	const isMultiSeekPlan = planType === 5;
@@ -300,13 +319,17 @@ export function buildScanPlanFromFilterInfo(filterInfo: FilterInfo, tableSchema:
 			ranges.push(range);
 		}
 
-		return { indexName, descending, ranges, idxNum, idxStr };
+		// Every range bounds the leading index column, so they share its collation.
+		const boundCollation = resolveColumnCollation(indexSchema, 0);
+		return { indexName, descending, ranges, boundCollation, idxNum, idxStr };
 	}
 
 	if (isPrefixRangePlan && indexSchema) {
 		const prefixLen = parseInt(params.get('prefixLen') ?? '0', 10);
-		// Build equality prefix from the first prefixLen columns
+		// Build equality prefix from the first prefixLen columns, tracking each
+		// column's collation in parallel so the runtime prefix match honours it.
 		const prefix: SqlValue[] = [];
+		const equalityPrefixCollations: string[] = [];
 		for (let i = 0; i < prefixLen; i++) {
 			const colSpec = indexSchema.columns[i];
 			if (!colSpec) break;
@@ -314,6 +337,7 @@ export function buildScanPlanFromFilterInfo(filterInfo: FilterInfo, tableSchema:
 				?? findConstraintValueForColumn(colSpec.index, constraints, args);
 			if (val !== undefined) {
 				prefix.push(val);
+				equalityPrefixCollations.push(resolveColumnCollation(indexSchema, i) ?? 'BINARY');
 			}
 		}
 		// Extract range bounds for the trailing column (the one after the prefix)
@@ -323,7 +347,11 @@ export function buildScanPlanFromFilterInfo(filterInfo: FilterInfo, tableSchema:
 				trailingCol.index, argvMap, args, constraints, indexInfoOutput,
 			));
 		}
-		return { indexName, descending, equalityPrefix: prefix, lowerBound, upperBound, idxNum, idxStr };
+		const boundCollation = resolveColumnCollation(indexSchema, prefixLen);
+		return {
+			indexName, descending, equalityPrefix: prefix, equalityPrefixCollations,
+			boundCollation, lowerBound, upperBound, idxNum, idxStr,
+		};
 	} else if (isEqPlan && indexSchema) {
 		equalityKey = buildEqualityKey(
 			indexName, indexSchema, argvMap, args, constraints, indexInfoOutput, tableSchema,
@@ -350,7 +378,9 @@ export function buildScanPlanFromFilterInfo(filterInfo: FilterInfo, tableSchema:
 		({ lowerBound, upperBound } = extractRangeBounds(
 			indexSchema, argvMap, args, constraints, indexInfoOutput,
 		));
+		// Range bounds apply to the leading index column (see extractRangeBounds).
+		boundCollation = resolveColumnCollation(indexSchema, 0);
 	}
 
-	return { indexName, descending, equalityKey, equalityKeys, lowerBound, upperBound, idxNum, idxStr };
+	return { indexName, descending, equalityKey, equalityKeys, lowerBound, upperBound, boundCollation, idxNum, idxStr };
 }

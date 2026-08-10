@@ -13,9 +13,29 @@ import type * as AST from '../../parser/ast.js';
 import type { SqlValue } from '../../common/types.js';
 
 /**
+ * Resolves an AST column/identifier expression to a base-table column index, or
+ * `undefined` when it is not a (recognized) column of the frame. The default
+ * realization is bare-name resolution — `columnIndexFromExpr` bound to a column
+ * index map, ignoring any table/alias qualifier. The coverage prover injects a
+ * qualifier-aware variant for join bodies, so `alias.col` resolves only against
+ * the source `alias` actually denotes (see `coverage-prover.ts`).
+ */
+export type ColumnIndexResolver = (expr: AST.Expression) => number | undefined;
+
+/**
  * Return the column index for an `AST.ColumnExpr` or unqualified
  * `AST.IdentifierExpr` that names a column in `columnIndexMap`; undefined
- * otherwise. Schema-qualified identifiers (`other.foo`) are rejected.
+ * otherwise. Schema-qualified identifiers (`other.foo`) are rejected. The
+ * table/alias qualifier on a `ColumnExpr` (`alias.col`) is **ignored** — bare
+ * name resolution only; callers needing qualifier-awareness compose a
+ * {@link ColumnIndexResolver}.
+ *
+ * The qualifier-blindness is load-bearing for CHECK extraction: `new.<col>`
+ * row-image references resolve to the bare column, which is deliberate — NEW
+ * is the stored row image, so NEW-qualified references are same-row facts.
+ * Self-table qualifiers (`t.col` on the owning table) resolve the same way.
+ * `old.<col>` references are NOT same-row; check-extraction screens those out
+ * wholesale (`containsOldRowImageRef`) before this resolver ever sees them.
  */
 export function columnIndexFromExpr(
 	expr: AST.Expression,
@@ -90,24 +110,17 @@ export function flattenDisjunction(expr: AST.Expression): AST.Expression[] {
 }
 
 /**
- * Collect the set of column indices referenced by `expr`. Only column /
- * identifier nodes naming columns in `columnIndexMap` count. Returns an empty
- * set when the expression references zero recognized columns; the caller can
- * distinguish "no columns" (constant expression) from "exactly one column"
- * by inspecting the size.
+ * Depth-first iteration over every AST node in `expr`'s subtree. Children are
+ * discovered reflectively (any object/array property carrying a `type` field)
+ * rather than via a typed visitor table, so soundness-sensitive walkers (the
+ * collation gate, the non-determinism screen) cannot silently miss node kinds
+ * a visitor enumeration forgot.
  */
-export function collectColumnNames(
-	expr: AST.Expression,
-	columnIndexMap: ReadonlyMap<string, number>,
-): Set<number> {
-	const out = new Set<number>();
+export function* walkAstNodes(expr: AST.Expression): IterableIterator<AST.AstNode> {
 	const stack: AST.AstNode[] = [expr as AST.AstNode];
 	while (stack.length > 0) {
 		const node = stack.pop()!;
-		const idx = node.type === 'column' || node.type === 'identifier'
-			? columnIndexFromExpr(node as AST.Expression, columnIndexMap)
-			: undefined;
-		if (idx !== undefined) out.add(idx);
+		yield node;
 		for (const key of Object.keys(node)) {
 			const v = (node as unknown as Record<string, unknown>)[key];
 			if (!v) continue;
@@ -121,6 +134,43 @@ export function collectColumnNames(
 				stack.push(v as AST.AstNode);
 			}
 		}
+	}
+}
+
+/**
+ * Collect the collation name of every COLLATE node anywhere in `expr`'s
+ * subtree, as written (uninterpreted — no normalization). Empty array when the
+ * subtree contains none. Used by the schema-level value-discrimination gate
+ * (`comparison-collation.ts`) to detect non-BINARY wrappers inside compound
+ * comparison operands.
+ */
+export function collectCollateNames(expr: AST.Expression): string[] {
+	const out: string[] = [];
+	for (const node of walkAstNodes(expr)) {
+		if (node.type === 'collate') {
+			out.push((node as AST.CollateExpr).collation);
+		}
+	}
+	return out;
+}
+
+/**
+ * Collect the set of column indices referenced by `expr`. Only column /
+ * identifier nodes naming columns in `columnIndexMap` count. Returns an empty
+ * set when the expression references zero recognized columns; the caller can
+ * distinguish "no columns" (constant expression) from "exactly one column"
+ * by inspecting the size.
+ */
+export function collectColumnNames(
+	expr: AST.Expression,
+	columnIndexMap: ReadonlyMap<string, number>,
+): Set<number> {
+	const out = new Set<number>();
+	for (const node of walkAstNodes(expr)) {
+		const idx = node.type === 'column' || node.type === 'identifier'
+			? columnIndexFromExpr(node as AST.Expression, columnIndexMap)
+			: undefined;
+		if (idx !== undefined) out.add(idx);
 	}
 	return out;
 }

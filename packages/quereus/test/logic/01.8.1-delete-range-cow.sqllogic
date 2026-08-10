@@ -1,0 +1,115 @@
+-- Regression for the silent under-delete on a non-front-anchored range DELETE.
+-- Root cause was an inheritree copy-on-write delete bug: deleting a key that triggers
+-- a sibling borrow/merge during rebalance orphaned the freshly-cloned node, dropping
+-- deletions and producing phantom-repeated keys. See delete-range-predicate-under-deletes.
+--
+-- A front-anchored `id <= k` delete only ever merges/borrows with a RIGHT sibling and so
+-- dodged the bug; these cases therefore use tail / interleaved / between predicates, and
+-- a table big enough (n = 200, well past the 64-entry node capacity) that the delete set
+-- forces a real b-tree structural change mid-delete.
+--
+-- Each case asserts matched == deleted via the surviving count, and guards against the
+-- phantom-repeated-key corruption two ways: count(*) == count(distinct id), and a
+-- payload-integrity probe (`v` must equal `id * 10` for every surviving row — a phantom
+-- alias would surface a mismatched payload).
+
+-- ===================================
+-- 1. Tail predicate: delete id > 100
+-- ===================================
+
+create table cow_tail (id integer primary key, v integer);
+insert into cow_tail select value, value * 10 from generate_series(1, 200);
+
+delete from cow_tail where id > 100;
+
+select count(*) as cnt, count(distinct id) as dist, min(id) as mn, max(id) as mx, sum(id) as s from cow_tail;
+→ [{"cnt":100,"dist":100,"mn":1,"mx":100,"s":5050}]
+
+-- No survivor carries a mismatched payload (phantom alias guard).
+select count(*) as bad from cow_tail where v <> id * 10;
+→ [{"bad":0}]
+
+-- Every deleted key is actually gone.
+select count(*) as still_there from cow_tail where id > 100;
+→ [{"still_there":0}]
+
+drop table cow_tail;
+
+-- ===================================
+-- 2. Interleaved predicate: delete id % 2 = 0
+-- ===================================
+
+create table cow_even (id integer primary key, v integer);
+insert into cow_even select value, value * 10 from generate_series(1, 200);
+
+delete from cow_even where id % 2 = 0;
+
+-- Survivors are the 100 odd ids 1,3,..,199; sum of first 100 odds = 100^2 = 10000.
+select count(*) as cnt, count(distinct id) as dist, min(id) as mn, max(id) as mx, sum(id) as s from cow_even;
+→ [{"cnt":100,"dist":100,"mn":1,"mx":199,"s":10000}]
+
+select count(*) as bad from cow_even where v <> id * 10;
+→ [{"bad":0}]
+
+-- No surviving id is even.
+select count(*) as evens_left from cow_even where id % 2 = 0;
+→ [{"evens_left":0}]
+
+drop table cow_even;
+
+-- ===================================
+-- 3. Between predicate: delete id between 51 and 150
+-- ===================================
+
+create table cow_band (id integer primary key, v integer);
+insert into cow_band select value, value * 10 from generate_series(1, 200);
+
+delete from cow_band where id between 51 and 150;
+
+-- Survivors are 1..50 and 151..200 (100 rows); sum = 20100 - sum(51..150) = 20100 - 10050.
+select count(*) as cnt, count(distinct id) as dist, min(id) as mn, max(id) as mx, sum(id) as s from cow_band;
+→ [{"cnt":100,"dist":100,"mn":1,"mx":200,"s":10050}]
+
+select count(*) as bad from cow_band where v <> id * 10;
+→ [{"bad":0}]
+
+-- The whole deleted band is gone.
+select count(*) as band_left from cow_band where id between 51 and 150;
+→ [{"band_left":0}]
+
+drop table cow_band;
+
+-- ===================================
+-- 4. Scattered predicate: delete id % 3 = 0 (66 keys spread across the tree)
+-- ===================================
+
+create table cow_third (id integer primary key, v integer);
+insert into cow_third select value, value * 10 from generate_series(1, 200);
+
+delete from cow_third where id % 3 = 0;
+
+-- 66 multiples of 3 in 1..200 are removed, leaving 134.
+select count(*) as cnt, count(distinct id) as dist from cow_third;
+→ [{"cnt":134,"dist":134}]
+
+select count(*) as bad from cow_third where v <> id * 10;
+→ [{"bad":0}]
+
+select count(*) as thirds_left from cow_third where id % 3 = 0;
+→ [{"thirds_left":0}]
+
+drop table cow_third;
+
+-- ===================================
+-- 5. No-match predicate over a large table is a clean no-op
+-- ===================================
+
+create table cow_nomatch (id integer primary key, v integer);
+insert into cow_nomatch select value, value * 10 from generate_series(1, 200);
+
+delete from cow_nomatch where id > 1000;
+
+select count(*) as cnt, count(distinct id) as dist, sum(id) as s from cow_nomatch;
+→ [{"cnt":200,"dist":200,"s":20100}]
+
+drop table cow_nomatch;

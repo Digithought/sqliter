@@ -18,9 +18,9 @@ export class BlockNode extends PlanNode {
     public readonly parameters: SqlParameters,
     estimatedCostOverride?: number
   ) {
-    // Cost: sum of all statement costs
-    const totalCost = statements.reduce((sum, stmt) => sum + stmt.getTotalCost(), 0);
-    super(scope, estimatedCostOverride ?? totalCost);
+    // Self-cost only: the statements are getChildren(), so their subtree costs
+    // flow in via getTotalCost(). The block's own sequencing overhead is negligible.
+    super(scope, estimatedCostOverride ?? 0.01);
   }
 
   getType(): BaseType {

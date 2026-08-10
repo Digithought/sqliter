@@ -1,0 +1,59 @@
+-- ON CONFLICT (cols) DO UPDATE / DO NOTHING must match an AFFINITY-coerced
+-- conflict: a proposed value of a different storage class that the target
+-- column's affinity coerces onto the stored key (e.g. TEXT '1' inserted into an
+-- INTEGER key holding 1). matchUpsertClause applies the column's affinity to the
+-- proposed value before comparing, so the conflict routes to the UPSERT arm
+-- instead of aborting. Ticket bug-upsert-conflict-target-collation-match.
+--
+-- Runs in BOTH memory and store mode. The isolation overlay
+-- (createIsolatedStoreModule, the store-mode harness) coerces the proposed row
+-- to the declared column types before probing for a conflict, same as the
+-- plain store and in-memory engine (bug-store-isolation-upsert-affinity-coerced-pk),
+-- so a cross-storage-class proposed PK value (e.g. TEXT '1' into an INTEGER key
+-- holding 1) matches the stored key instead of shadowing it with a fresh row.
+-- The collation-variant (same-storage-class) corners of this fix run in BOTH
+-- modes in the sibling file 47.3-upsert-conflict-target-collation.sqllogic.
+
+-- ===================================
+-- 1. Affinity coercion — proposed TEXT '1' into an INTEGER PK holding 1.
+--    The proposed value reaches the match pre-affinity-coercion; applying the
+--    column's INTEGER affinity turns '1' into 1, matching the stored key, so the
+--    existing row's DO UPDATE runs (n = 100 + 1).
+-- ===================================
+
+create table aff_pk (id integer primary key, n integer);
+insert into aff_pk values (1, 100);
+
+insert into aff_pk values ('1', 0) on conflict (id) do update set n = n + 1;
+select id, n, typeof(id) as t from aff_pk order by id;
+→ [{"id":1,"n":101,"t":"integer"}]
+
+drop table aff_pk;
+
+-- ===================================
+-- 2. Affinity coercion, DO NOTHING arm — the coerced conflict is SKIPPED, not
+--    aborted, and the existing row is left intact.
+-- ===================================
+
+create table aff_pk2 (id integer primary key, n integer);
+insert into aff_pk2 values (1, 100);
+
+insert into aff_pk2 values ('1', 999) on conflict (id) do nothing;
+select id, n from aff_pk2 order by id;
+→ [{"id":1,"n":100}]
+
+drop table aff_pk2;
+
+-- ===================================
+-- 3. Affinity coercion on a UNIQUE constraint (not the PK): TEXT '7' collides
+--    with a stored INTEGER 7 under the column's INTEGER affinity.
+-- ===================================
+
+create table aff_uc (id integer primary key, code integer unique, hits integer);
+insert into aff_uc values (1, 7, 1);
+
+insert into aff_uc values (2, '7', 0) on conflict (code) do update set hits = hits + 1;
+select id, code, hits from aff_uc order by id;
+→ [{"id":1,"code":7,"hits":2}]
+
+drop table aff_uc;

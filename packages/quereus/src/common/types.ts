@@ -28,15 +28,58 @@ export type SqlValue = string | number | bigint | boolean | Uint8Array | JsonSql
 export type Row = SqlValue[];
 
 /**
- * Represents a value that can be expected as an input in the runtime environment.
- * This type can be a scalar value, or an async iterable of rows (cursor).
+ * A sub-program handed to an instruction as one of its params: invoke it to run the
+ * child program against the current runtime context. Emitters that receive one
+ * conditionally must declare it as a trailing rest tuple, not an optional param —
+ * see `asRun` in `runtime/types.ts`.
  */
-export type RuntimeValue = SqlValue | Row | AsyncIterable<Row> | ((ctx: RuntimeContext) => OutputValue)
+export type SubProgram = (ctx: RuntimeContext) => OutputValue;
+
+/**
+ * Represents a value that can be expected as an input in the runtime environment.
+ * This type can be a scalar value, an async iterable of rows (cursor), or a sub-program.
+ */
+export type RuntimeValue = SqlValue | Row | AsyncIterable<Row> | SubProgram
 
 /** Represents a value that can be output from an instruction or program. */
 export type OutputValue = MaybePromise<RuntimeValue>;
 
 export type SqlParameters = Record<string, SqlValue> | SqlValue[];
+
+/**
+ * Per-call options for statement execution. Accepted by the database-level
+ * entry points (`Database.exec`, `Database.eval`, `Database.get`) and the
+ * prepared-statement methods (`Statement.run`, `Statement.get`,
+ * `Statement.iterateRows`, `Statement.all`).
+ */
+export interface StatementOptions {
+	/**
+	 * Cooperative cancellation. When the signal aborts, in-flight execution is
+	 * interrupted at the next row or statement boundary and the call rejects with
+	 * an `AbortError`. A signal that is already aborted causes an immediate reject
+	 * before any work is performed.
+	 */
+	signal?: AbortSignal;
+	/**
+	 * Read concurrency for this execution.
+	 *
+	 * - `'serialized'` (default) — queue behind the execution mutex. The read
+	 *   sees whatever an already-queued write left behind, exactly as today.
+	 * - `'committed'` — when the statement is eligible (a read-only query in
+	 *   autocommit mode whose every table's module declares
+	 *   `readCommittedSnapshot`), run WITHOUT the mutex against each table's last
+	 *   committed state, so the read completes even while another statement is
+	 *   blocked in its virtual-table commit. An ineligible statement silently
+	 *   falls back to `'serialized'` — never an error.
+	 *
+	 * `'committed'` deliberately gives up the ordering guarantee that
+	 * `void db.exec(insert); await db.get(select)` shows the insert — the read
+	 * may serve the pre-insert state. That is why it is opt-in per call.
+	 * Honored by the row-returning entry points (`Database.get`, `Database.eval`,
+	 * `Statement.get/all/iterateRows/run`); `Database.exec` ignores it.
+	 */
+	readConcurrency?: 'serialized' | 'committed';
+}
 
 /**
  * Standard status/error codes that significantly match SQLite.
@@ -92,72 +135,6 @@ export enum SqlDataType {
 
 export type CompareFn = (a: SqlValue, b: SqlValue) => number;
 
-export interface DatabaseInfo {
-	path: string | ':memory:';
-	isOpen: boolean;
-	isReadonly: boolean;
-	inTransaction: boolean;
-	name: string;
-}
-
-/**
- * Shared configuration object that can be used by multiple databases
- */
-export interface DatabaseConfig {
-	/**
-	 * Open the database in read-only mode
-	 * @default false
-	 */
-	readonly?: boolean;
-
-	/**
-	 * Register default functions
-	 * @default true
-	 */
-	registerDefaultFunctions?: boolean;
-
-	/**
-	 * Maximum number of retries when opening the database
-	 * @default 3
-	 */
-	maxRetries?: number;
-
-	/**
-	 * Enable WAL mode (Write-Ahead Logging)
-	 * @default true for file databases, false for in-memory
-	 */
-	enableWAL?: boolean;
-
-	/**
-	 * Synchronous setting ('OFF' | 'NORMAL' | 'FULL' | 'EXTRA')
-	 * @default 'NORMAL' with WAL, 'FULL' without WAL
-	 */
-	synchronous?: 'OFF' | 'NORMAL' | 'FULL' | 'EXTRA';
-
-	/**
-	 * Journal mode ('DELETE' | 'TRUNCATE' | 'PERSIST' | 'MEMORY' | 'WAL' | 'OFF')
-	 * @default 'WAL' if enableWAL is true, 'DELETE' otherwise
-	 */
-	journalMode?: 'DELETE' | 'TRUNCATE' | 'PERSIST' | 'MEMORY' | 'WAL' | 'OFF';
-
-	/**
-	 * Cache size in pages (negative value = KB)
-	 * @default -2048 (2MB)
-	 */
-	cacheSize?: number;
-
-	/**
-	 * Page size in bytes (must be power of 2, 512-65536)
-	 * @default 4096
-	 */
-	pageSize?: number;
-
-	/**
-	 * Foreign key constraint enforcement
-	 * @default true
-	 */
-	foreignKeys?: boolean;
-}
 export type RowOp = 'insert' | 'update' | 'delete';
 
 /**
@@ -171,15 +148,46 @@ export type ConstraintType = 'unique' | 'check' | 'not_null' | 'foreign_key';
  * Result of a VirtualTable.update() operation.
  * Replaces exception-based constraint signaling to distinguish expected
  * constraint violations from unexpected errors (network issues, bugs, etc.).
+ *
+ * `row` present means a row really was written/removed; absent means nothing
+ * changed and the executor skips the post-write pipeline entirely. For an
+ * INSERT/UPDATE it is the row the module STORED — the proposed values after the
+ * module's own coercion to the declared column logical types — and the DML
+ * executor reports it, not the proposed row, to every post-write consumer. For a
+ * DELETE only its presence is read, never its contents. See
+ * `VirtualTable.update`'s doc comment for the module-author contract and
+ * docs/runtime.md § per-row post-write pipeline.
+ *
+ * Two REPLACE-displacement channels, both consumed by the DML executor so the
+ * single post-write pipeline (change-tracking, row-time MV maintenance, FK
+ * cascade, auto-events) runs uniformly across substrates:
+ *
+ * - `replacedRow` — the row displaced at the *same PK* by a PK-collision REPLACE.
+ *   The executor models it as an update-in-place of that PK slot (an
+ *   `update(replacedRow → newRow)` on the INSERT path, a `delete(replacedRow)` on
+ *   the UPDATE move path), firing FK actions as a *delete* of the old image.
+ * - `evictedRows` — rows at *other PKs* fully removed because REPLACE resolved a
+ *   non-PK UNIQUE conflict for this same `update()` call, in user-facing schema
+ *   (no overlay tombstone column). The executor models **each** as a full DELETE
+ *   (`_recordDelete` + row-time maintenance + `executeForeignKeyActions('delete')`
+ *   + a delete auto-event), fired **before** the new row's own bookkeeping to match
+ *   the substrate's evict-then-write journal order.
+ *
+ * Both fields are optional and additive: a module that reports neither behaves
+ * exactly as a module would have before they existed. `replacedRow` and
+ * `evictedRows` are independent and may both be present in principle (today's
+ * memory/store INSERT paths short-circuit on a PK collision before the secondary
+ * UNIQUE check, so they do not co-occur there — but the executor handles both
+ * cleanly regardless).
  */
 export type UpdateResult =
-	| { status: 'ok'; row?: Row; replacedRow?: Row }
+	| { status: 'ok'; row?: Row; replacedRow?: Row; evictedRows?: readonly Row[] }
 	| { status: 'constraint'; constraint: ConstraintType; message?: string; existingRow?: Row };
 
 /**
  * Type guard to check if an UpdateResult indicates success.
  */
-export function isUpdateOk(result: UpdateResult): result is { status: 'ok'; row?: Row; replacedRow?: Row } {
+export function isUpdateOk(result: UpdateResult): result is { status: 'ok'; row?: Row; replacedRow?: Row; evictedRows?: readonly Row[] } {
 	return result.status === 'ok';
 }
 

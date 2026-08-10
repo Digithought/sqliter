@@ -4,11 +4,6 @@
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "baseUrl": ".",
-    "paths": {
-      "@quereus/quereus": ["../quereus/src/index.ts"],
-      "@quereus/quereus/parser": ["../quereus/src/parser/index.ts"]
-    },
     "strict": true,
     "sourceMap": true,
     "types": ["node", "mocha"],

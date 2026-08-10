@@ -11,16 +11,15 @@ import { SyncEventEmitterImpl, type ConflictEvent } from '../../src/sync/events.
 import {
 	DEFAULT_SYNC_CONFIG,
 	type SyncConfig,
-	type DataChangeToApply,
-	type SchemaChangeToApply,
 	type ApplyToStoreCallback,
 	type ConflictContext,
 	type ConflictResolver,
 } from '../../src/sync/protocol.js';
 import { localWinsResolver, remoteWinsResolver, lwwResolver } from '../../src/sync/conflict-resolvers.js';
-import { StoreEventEmitter, InMemoryKVStore } from '@quereus/store';
+import { InMemoryKVStore } from '@quereus/store';
 import type { SyncManager } from '../../src/sync/manager.js';
 import type { SqlValue } from '@quereus/quereus';
+import { FakeTransactionSource } from '../helpers/fake-transaction-source.js';
 
 // ============================================================================
 // Test Infrastructure
@@ -78,7 +77,7 @@ class MockDataStore {
 interface Replica {
 	kv: InMemoryKVStore;
 	dataStore: MockDataStore;
-	storeEvents: StoreEventEmitter;
+	source: FakeTransactionSource;
 	syncEvents: SyncEventEmitterImpl;
 	manager: SyncManager;
 }
@@ -86,13 +85,13 @@ interface Replica {
 async function createReplica(config: SyncConfig): Promise<Replica> {
 	const kv = new InMemoryKVStore();
 	const dataStore = new MockDataStore();
-	const storeEvents = new StoreEventEmitter();
+	const source = new FakeTransactionSource();
 	const syncEvents = new SyncEventEmitterImpl();
 	const applyToStore = dataStore.createApplyToStoreCallback();
 
-	const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents, applyToStore);
+	const manager = await SyncManagerImpl.create(kv, source, config, syncEvents, applyToStore);
 
-	return { kv, dataStore, storeEvents, syncEvents, manager };
+	return { kv, dataStore, source, syncEvents, manager };
 }
 
 async function syncOneway(sender: Replica, receiver: Replica): Promise<{ applied: number; conflicts: number }> {
@@ -112,7 +111,7 @@ async function syncBidirectional(a: Replica, b: Replica): Promise<void> {
 }
 
 function emitInsert(replica: Replica, schema: string, table: string, pk: SqlValue[], row: SqlValue[]): void {
-	// Update local data store (emitDataChange only records CRDT metadata, not data)
+	// Update local data store (commitData only records CRDT metadata, not data)
 	const tableKey = `${schema}.${table}`;
 	const pkKey = JSON.stringify(pk);
 	if (!replica.dataStore.tables.has(tableKey)) {
@@ -125,7 +124,7 @@ function emitInsert(replica: Replica, schema: string, table: string, pk: SqlValu
 	}
 	tbl.set(pkKey, cols);
 
-	replica.storeEvents.emitDataChange({ type: 'insert', schemaName: schema, tableName: table, key: pk, newRow: row });
+	replica.source.commitData({ type: 'insert', schemaName: schema, tableName: table, key: pk, newRow: row });
 }
 
 function emitUpdate(replica: Replica, schema: string, table: string, pk: SqlValue[], oldRow: SqlValue[], newRow: SqlValue[]): void {
@@ -143,14 +142,14 @@ function emitUpdate(replica: Replica, schema: string, table: string, pk: SqlValu
 		cols.set(`col_${i}`, newRow[i]);
 	}
 
-	replica.storeEvents.emitDataChange({ type: 'update', schemaName: schema, tableName: table, key: pk, oldRow, newRow });
+	replica.source.commitData({ type: 'update', schemaName: schema, tableName: table, key: pk, oldRow, newRow });
 }
 
 function emitDelete(replica: Replica, schema: string, table: string, pk: SqlValue[], oldRow: SqlValue[]): void {
 	const tableKey = `${schema}.${table}`;
 	replica.dataStore.tables.get(tableKey)?.delete(JSON.stringify(pk));
 
-	replica.storeEvents.emitDataChange({ type: 'delete', schemaName: schema, tableName: table, key: pk, oldRow });
+	replica.source.commitData({ type: 'delete', schemaName: schema, tableName: table, key: pk, oldRow });
 }
 
 const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
@@ -331,7 +330,7 @@ describe('Pluggable Conflict Resolution', () => {
 	describe('No local version (first write)', () => {
 		it('should apply remote change without calling resolver when no local version exists', async () => {
 			let resolverCalled = false;
-			const spy: ConflictResolver = (ctx) => {
+			const spy: ConflictResolver = (_ctx) => {
 				resolverCalled = true;
 				return 'local';
 			};
@@ -387,6 +386,7 @@ describe('Pluggable Conflict Resolution', () => {
 
 			// The write should be skipped due to tombstone, not applied
 			// (applied=0 for the column changes since they're blocked by tombstone)
+			expect(result.applied).to.equal(0);
 			const row = host.dataStore.getRow('main', 'users', [1]);
 			// Row should be deleted (no columns remaining after delete)
 			expect(row).to.be.undefined;
@@ -418,6 +418,95 @@ describe('Pluggable Conflict Resolution', () => {
 			if (conflicts.length > 0) {
 				expect(conflicts[0].schema).to.equal('main');
 			}
+		});
+	});
+
+	describe('Remote before-image exposure', () => {
+		it('passes remotePriorValue/remotePriorHlc into the ConflictContext', async () => {
+			const capturedContexts: ConflictContext[] = [];
+			const spy: ConflictResolver = (ctx) => {
+				capturedContexts.push(ctx);
+				return 'local';
+			};
+
+			const host = await createReplica({ ...DEFAULT_SYNC_CONFIG });
+			const guest = await createReplica({ ...DEFAULT_SYNC_CONFIG, conflictResolver: spy });
+
+			emitInsert(host, 'main', 'items', [1], [1, 'V0']);
+			await delay(5);
+			await syncBidirectional(host, guest);
+
+			// Two host overwrites before the next pull: the surviving change's prior
+			// is the immediately-overwritten V1 (Lamina "what the winning write
+			// overwrote", not "value at last sync").
+			emitUpdate(host, 'main', 'items', [1], [1, 'V0'], [1, 'V1']);
+			await delay(20);
+			emitUpdate(host, 'main', 'items', [1], [1, 'V1'], [1, 'V2']);
+			await delay(20);
+
+			// Guest still holds V0 locally, so applying host's V2 triggers the resolver.
+			await syncOneway(host, guest);
+
+			const ctx = capturedContexts.find(c => c.column === 'col_1');
+			expect(ctx).to.exist;
+			expect(ctx!.localValue).to.equal('V0');
+			expect(ctx!.remoteValue).to.equal('V2');
+			expect(ctx!.remotePriorValue).to.equal('V1');
+			expect(ctx!.remotePriorHlc).to.not.be.undefined;
+		});
+
+		it('emits the remote before-image on an LWW conflict with no resolver', async () => {
+			const config: SyncConfig = { ...DEFAULT_SYNC_CONFIG };
+			const host = await createReplica(config);
+			const guest = await createReplica(config);
+
+			const conflicts: ConflictEvent[] = [];
+			guest.syncEvents.onConflictResolved(e => conflicts.push(e));
+
+			emitInsert(host, 'main', 'users', [1], [1, 'Original']);
+			await delay(5);
+			await syncBidirectional(host, guest);
+
+			// Guest writes first (older), host writes later (newer — wins via LWW).
+			emitUpdate(guest, 'main', 'users', [1], [1, 'Original'], [1, 'Guest Value']);
+			await delay(50);
+			emitUpdate(host, 'main', 'users', [1], [1, 'Original'], [1, 'Host Value']);
+			await delay(10);
+
+			await syncOneway(host, guest);
+
+			const e = conflicts.find(ev => ev.column === 'col_1');
+			expect(e).to.exist;
+			expect(e!.winner).to.equal('remote');
+			// Fast path (no resolver) still resolves by HLC; the event now also carries
+			// the remote write's before-image (the 'Original' it overwrote at the host).
+			expect(e!.remotePriorValue).to.equal('Original');
+			expect(e!.remotePriorHlc).to.not.be.undefined;
+		});
+
+		it('omits remotePrior fields when the incoming change has no prior', async () => {
+			const capturedContexts: ConflictContext[] = [];
+			const spy: ConflictResolver = (ctx) => {
+				capturedContexts.push(ctx);
+				return 'local';
+			};
+
+			// Host re-inserts the SAME pk both replicas already hold, so guest sees a
+			// conflict whose incoming change is a first-write (no before-image).
+			const host = await createReplica({ ...DEFAULT_SYNC_CONFIG });
+			const guest = await createReplica({ ...DEFAULT_SYNC_CONFIG, conflictResolver: spy });
+
+			emitInsert(guest, 'main', 'users', [1], [1, 'GuestSolo']);
+			await delay(5);
+			emitInsert(host, 'main', 'users', [1], [1, 'HostSolo']);
+			await delay(10);
+
+			await syncOneway(host, guest);
+
+			const ctx = capturedContexts.find(c => c.column === 'col_1');
+			expect(ctx).to.exist;
+			expect(ctx).to.not.have.property('remotePriorValue');
+			expect(ctx).to.not.have.property('remotePriorHlc');
 		});
 	});
 

@@ -1,14 +1,19 @@
 # @quereus/plugin-indexeddb
 
+> **Stability: Beta** — complete and tested, but the surface is still being shaped; a
+> breaking change may land in a minor release. It rides `@quereus/store`'s on-disk key
+> encoding, which is not frozen. See [Stability Tiers](../../docs/stability.md#tiers).
+
 IndexedDB storage plugin for Quereus. Provides persistent storage for browser environments using the [`@quereus/store`](../quereus-store/) module.
 
 ## Features
 
 - **Browser-native**: Uses IndexedDB for reliable persistent storage
-- **Transaction isolation**: Read-your-own-writes and snapshot isolation by default
+- **Transaction isolation**: Read-committed + read-your-own-writes by default (no write-write conflict detection; not snapshot isolation)
 - **Read cache**: In-memory LRU cache reduces redundant IDB transactions (enabled by default)
 - **Cross-tab sync**: BroadcastChannel-based synchronization across browser tabs, with automatic cache invalidation
-- **Async iteration**: Efficient range queries with cursor-based iteration
+- **Async iteration**: Range queries paged 256 entries at a time — a forward page costs one
+  `getAllKeys` + `getAll` pair, reverse steps a cursor (see [store docs](../../docs/store.md#key-interfaces))
 
 ## Installation
 

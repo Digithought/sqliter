@@ -1,6 +1,6 @@
 {
   "name": "@quereus/plugin-loader",
-  "version": "3.3.0",
+  "version": "4.11.0",
   "type": "module",
   "description": "Plugin loading system for Quereus - supports dynamic imports for Node.js and browsers",
   "publisher": "Got Choices Foundation",
@@ -20,21 +20,38 @@
     ".": {
       "types": "./dist/src/index.d.ts",
       "import": "./dist/src/index.js"
+    },
+    "./node": {
+      "types": "./dist/src/node-remote.d.ts",
+      "import": "./dist/src/node-remote.js"
+    }
+  },
+  "//typesVersions": "NOTE: consumers still compile with moduleResolution 'node' (node10), which ignores the exports map above. typesVersions is how the './node' subpath's types resolve for them; drop it once every consumer moves to node16/bundler resolution.",
+  "typesVersions": {
+    "*": {
+      "node": [
+        "./dist/src/node-remote.d.ts"
+      ]
     }
   },
   "scripts": {
     "clean": "rimraf dist",
     "build": "tsc",
-    "typecheck": "tsc --noEmit"
+    "lint": "echo 'No lint configured'",
+    "//typecheck": "NOTE: the second pass type-checks test/ too (tsconfig.json only includes src/). vitest transpiles specs without checking them, so without this a signature change in src/ would leave the specs silently stale.",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "//test": "NOTE: test/ covers url validation + the loader's protocol allowlist, npm-spec parsing, CDN url building, env detection, loadPlugin dispatch, config interpolation/validation, the config channel, and https:// module loads through the Node remote resolver (with fetch injected, so no test touches the network). Known gaps (both need network or a DOM): the manifest fetch from a plugin's package.json, and the real browser+CDN load path. --passWithNoTests is deliberately NOT set, so a glob that stops matching fails loudly instead of reporting green.",
+    "test": "vitest run"
   },
   "peerDependencies": {
     "@quereus/quereus": "workspace:^"
   },
   "devDependencies": {
-    "@types/debug": "^4.1.12",
-    "@types/node": "^25.0.9",
-    "rimraf": "^6.1.2",
-    "typescript": "^5.9.3"
+    "@types/debug": "^4.1.13",
+    "@types/node": "^25.9.3",
+    "rimraf": "^6.1.3",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.17"
   },
   "dependencies": {
     "@quereus/quereus": "workspace:^",

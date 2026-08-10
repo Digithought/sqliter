@@ -20,6 +20,12 @@
  *
  * Non-equi residual conjuncts in the ON-clause disqualify the rewrite (they
  * may alter cardinality beyond the FK→PK guarantee).
+ *
+ * The FK→PK alignment step speaks *base-table* column indices. The equi-pairs
+ * arrive as each side's output column positions, which a sub-select in the FROM
+ * list renames, reorders, and drops freely — so both sides are translated
+ * through `resolveTableColumnMapping` / `mapColumnsToTable` first. A join column
+ * with no base-table origin (a computed expression) declines the rewrite.
  */
 
 import { createLogger } from '../../../common/logger.js';
@@ -37,20 +43,20 @@ import { JoinNode, extractEquiPairsFromCondition } from '../../nodes/join-node.j
 import { ColumnReferenceNode } from '../../nodes/reference.js';
 import { BinaryOpNode } from '../../nodes/scalar.js';
 import { normalizePredicate } from '../../analysis/predicate-normalizer.js';
-import { checkFkPkAlignment, extractTableSchema } from '../../util/key-utils.js';
-import { lookupCoveringFK, isRowPreservingPathToTable } from '../../util/ind-utils.js';
+import { checkFkPkAlignment } from '../../util/key-utils.js';
+import { lookupCoveringFK, isRowPreservingPathToTable, mapColumnsToTable, resolveTableColumnMapping } from '../../util/ind-utils.js';
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 
 const log = createLogger('optimizer:rule:join-elimination');
 
-type ChainEntry =
+export type ChainEntry =
 	| { kind: 'filter'; node: FilterNode }
 	| { kind: 'sort'; node: SortNode }
 	| { kind: 'limit'; node: LimitOffsetNode }
 	| { kind: 'distinct'; node: DistinctNode }
 	| { kind: 'alias'; node: AliasNode };
 
-interface ChainWalkResult {
+export interface ChainWalkResult {
 	join: JoinNode;
 	chain: ChainEntry[];
 }
@@ -67,6 +73,11 @@ export function ruleJoinElimination(node: PlanNode, _context: OptContext): PlanN
 	if (!walk) return null;
 
 	const { join, chain } = walk;
+	// An `exists … as` flag depends on whether the non-preserved side matched, but
+	// its attribute id is not a column of that side — so the `usesRight`/`usesLeft`
+	// demand scan cannot see the dependency and the join could be wrongly eliminated
+	// out from under a live flag. Keep the flag-bearing join intact (read half).
+	if (join.hasExistenceColumns) return null;
 	if (join.joinType !== 'left' && join.joinType !== 'right' && join.joinType !== 'inner') return null;
 	if (!join.condition) return null;
 
@@ -112,7 +123,7 @@ export function ruleJoinElimination(node: PlanNode, _context: OptContext): PlanN
 	return rebuildProject(node, newSource);
 }
 
-function collectAttrIds(expr: PlanNode, out: Set<number>): void {
+export function collectAttrIds(expr: PlanNode, out: Set<number>): void {
 	if (expr instanceof ColumnReferenceNode) {
 		out.add(expr.attributeId);
 		return;
@@ -122,7 +133,7 @@ function collectAttrIds(expr: PlanNode, out: Set<number>): void {
 	}
 }
 
-function walkChain(root: RelationalPlanNode, demanded: Set<number>): ChainWalkResult | null {
+export function walkChain(root: RelationalPlanNode, demanded: Set<number>): ChainWalkResult | null {
 	const chain: ChainEntry[] = [];
 	let current: RelationalPlanNode = root;
 
@@ -214,15 +225,22 @@ function tryEliminate(
 		return null;
 	}
 
-	const leftSchema = extractTableSchema(join.left as RelationalPlanNode);
-	const rightSchema = extractTableSchema(join.right as RelationalPlanNode);
-	if (!leftSchema || !rightSchema) return null;
+	// Equi-pairs index each side's OUTPUT columns; the FK/PK declarations speak
+	// base-table column indices. Translate before comparing — an intervening
+	// projection (a sub-select in the FROM list) can rename, reorder, or drop
+	// columns, and a derived column has no table origin at all.
+	const leftMap = resolveTableColumnMapping(join.left as RelationalPlanNode);
+	const rightMap = resolveTableColumnMapping(join.right as RelationalPlanNode);
+	if (!leftMap || !rightMap) return null;
 
 	// FK side is the preserved side; PK side is the side being removed.
-	const fkSchema = sideToRemove === 'right' ? leftSchema : rightSchema;
-	const pkSchema = sideToRemove === 'right' ? rightSchema : leftSchema;
-	const fkEquiCols = pairs.map(p => sideToRemove === 'right' ? p.left : p.right);
-	const pkEquiCols = pairs.map(p => sideToRemove === 'right' ? p.right : p.left);
+	const fkMap = sideToRemove === 'right' ? leftMap : rightMap;
+	const pkMap = sideToRemove === 'right' ? rightMap : leftMap;
+	const fkSchema = fkMap.schema;
+	const pkSchema = pkMap.schema;
+	const fkEquiCols = mapColumnsToTable(pairs.map(p => sideToRemove === 'right' ? p.left : p.right), fkMap);
+	const pkEquiCols = mapColumnsToTable(pairs.map(p => sideToRemove === 'right' ? p.right : p.left), pkMap);
+	if (!fkEquiCols || !pkEquiCols) return null;
 
 	if (!checkFkPkAlignment(fkSchema, pkSchema, fkEquiCols, pkEquiCols)) return null;
 
@@ -234,6 +252,8 @@ function tryEliminate(
 	//     RetrieveNode with a non-trivial pipeline) between the join and the
 	//     base table would have dropped rows that the FK→PK guarantee assumes
 	//     are present, so eliminating would silently survive orphaned FK rows.
+	//     A Project is peeled (it never drops rows); its column renaming is
+	//     already accounted for by the mapping translation above.
 	if (join.joinType === 'inner') {
 		const match = lookupCoveringFK(fkSchema, pkSchema, fkEquiCols, pkEquiCols);
 		if (!match) return null;
@@ -245,7 +265,7 @@ function tryEliminate(
 	return (sideToRemove === 'right' ? join.left : join.right) as RelationalPlanNode;
 }
 
-function rebuildChain(chain: ReadonlyArray<ChainEntry>, bottom: RelationalPlanNode): RelationalPlanNode {
+export function rebuildChain(chain: ReadonlyArray<ChainEntry>, bottom: RelationalPlanNode): RelationalPlanNode {
 	let current = bottom;
 	// Chain was collected top→bottom (root pushed first); rebuild bottom→top.
 	for (let i = chain.length - 1; i >= 0; i--) {
@@ -283,24 +303,46 @@ function rebuildChain(chain: ReadonlyArray<ChainEntry>, bottom: RelationalPlanNo
 
 /**
  * Aggregate counterpart of `ruleJoinElimination`: when an Aggregate sits over
- * a chain ending in an FK-covered inner join and the aggregate's payload only
- * depends on the FK (left) side, drop the join.
+ * a chain ending in an FK-covered `left`/`right`/`inner` join and the
+ * aggregate's payload only depends on the preserved (FK) side, drop the join.
+ * Structurally identical to the Project entrypoint apart from the demand
+ * prologue (group-by + aggregate exprs) and the rebuild epilogue (reconstruct
+ * the `AggregateNode`).
  *
- * Why correct for `count(*)` and similar cardinality-only aggregates: a
- * non-null FK with the IND `L.fk ⊆ R.pk` and an unfiltered R guarantees
- * `|L ⋈ R| == |L|`, so `count(*)` over the join equals `count(*)` over L.
- * More generally, when no aggregate argument or group key references R, the
- * inner join's only effect is to gate L by `fk IS NOT NULL`, which the
- * NOT-NULL precondition already rules out.
+ * Why correct for `count(*)` and similar cardinality-only aggregates:
+ *
+ *  - INNER: a non-null FK with the IND `L.fk ⊆ R.pk` and an unfiltered R
+ *    guarantees `|L ⋈ R| == |L|`, so `count(*)` over the join equals `count(*)`
+ *    over L. More generally, when no aggregate argument or group key references
+ *    R, the inner join's only effect is to gate L by `fk IS NOT NULL`, which the
+ *    NOT-NULL precondition (checked in `tryEliminate`) already rules out.
+ *  - LEFT: `L LEFT JOIN R` preserves every L row (matched → 1 row; unmatched →
+ *    1 null-padded row) and FK→PK alignment guarantees ≤1 match, so
+ *    `|L LEFT JOIN R| == |L|` *unconditionally* — needing **neither** a NOT-NULL
+ *    FK **nor** a row-preserving path to R's base table (a null FK or a filtered
+ *    R simply null-pads the L row rather than dropping it). `tryEliminate` gates
+ *    those two extra checks behind `joinType === 'inner'`, so the outer-join path
+ *    performs exactly the FK→PK alignment + side-effect checks — the correct gate.
+ *  - RIGHT: the mirror of LEFT.
+ *
+ * `full` joins are out of scope (both sides preserved); the `usesRight` /
+ * `usesLeft` demand gate already retains a side the aggregate reads.
+ *
+ * The `hasExistenceColumns` guard is **load-bearing** once outer joins are
+ * eligible: a live `exists … as` flag's attribute id is not a column of either
+ * side, so the `usesRight`/`usesLeft` demand scan cannot see the aggregate's
+ * dependency on the non-preserved side — eliminating the join out from under the
+ * flag would be unsound. (The inner-only gate used to make this guard implicit,
+ * since flags only exist on outer joins.) The `join-existence-pruning-aggregate`
+ * rule strips *undemanded* flags before this rule
+ * sees the node, so all-undemanded → flag gone → eliminate; any demanded → flag
+ * retained → guard abstains.
  *
  * Implementation mirrors the Project entrypoint: collect attribute IDs the
  * Aggregate demands (group-key expressions + every aggregate expression),
  * walk the wrapper chain to find the Join, run the same FK-PK alignment +
- * row-preserving checks as the inner-join case, then rebuild the chain on
- * the preserved side.
- *
- * Only `inner` joins are eligible here — outer joins reduce to inner in this
- * context only when both sides demand attrs, which we'd have rejected already.
+ * (inner-only) row-preserving checks, then rebuild the chain on the preserved
+ * side.
  */
 export function ruleJoinEliminationUnderAggregate(node: PlanNode, _context: OptContext): PlanNode | null {
 	if (!(node instanceof AggregateNode)) return null;
@@ -317,8 +359,13 @@ export function ruleJoinEliminationUnderAggregate(node: PlanNode, _context: OptC
 	if (!walk) return null;
 
 	const { join, chain } = walk;
-	// Only inner-eliminable shapes — see `ruleJoinElimination` notes.
-	if (join.joinType !== 'inner') return null;
+	// A live `exists … as` flag's attr id is not a column of either side, so the
+	// usesRight/usesLeft demand scan cannot see its dependency on the
+	// non-preserved side — eliminating out from under it would be unsound. (The
+	// inner-only gate used to make this guard implicit, since flags only exist on
+	// outer joins.) See `ruleJoinElimination` for the same guard.
+	if (join.hasExistenceColumns) return null;
+	if (join.joinType !== 'left' && join.joinType !== 'right' && join.joinType !== 'inner') return null;
 	if (!join.condition) return null;
 
 	const leftAttrs = join.left.getAttributes();
@@ -335,16 +382,28 @@ export function ruleJoinEliminationUnderAggregate(node: PlanNode, _context: OptC
 	const usesRight = setsIntersect(demanded, rightIds);
 
 	let preserved: RelationalPlanNode | null = null;
-	if (!usesRight) {
-		preserved = tryEliminate(join, 'right', pairs);
-	}
-	if (!preserved && !usesLeft) {
-		preserved = tryEliminate(join, 'left', pairs);
+	switch (join.joinType) {
+		case 'left':
+			if (usesRight) return null;
+			preserved = tryEliminate(join, 'right', pairs);
+			break;
+		case 'right':
+			if (usesLeft) return null;
+			preserved = tryEliminate(join, 'left', pairs);
+			break;
+		case 'inner':
+			if (!usesRight) {
+				preserved = tryEliminate(join, 'right', pairs);
+			}
+			if (!preserved && !usesLeft) {
+				preserved = tryEliminate(join, 'left', pairs);
+			}
+			break;
 	}
 	if (!preserved) return null;
 
-	log('Eliminating inner join under Aggregate; preserved side has %d attrs',
-		preserved.getAttributes().length);
+	log('Eliminating %s join under Aggregate; preserved side has %d attrs',
+		join.joinType, preserved.getAttributes().length);
 
 	const newSource = rebuildChain(chain, preserved);
 	if (!isRelationalNode(newSource)) {
@@ -360,7 +419,7 @@ export function ruleJoinEliminationUnderAggregate(node: PlanNode, _context: OptC
 	);
 }
 
-function rebuildProject(project: ProjectNode, newSource: RelationalPlanNode): ProjectNode {
+export function rebuildProject(project: ProjectNode, newSource: RelationalPlanNode): ProjectNode {
 	const attributes = project.getAttributes();
 	const newProjections = project.projections.map((p, i) => ({
 		node: p.node,

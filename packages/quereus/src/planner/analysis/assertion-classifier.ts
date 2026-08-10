@@ -82,10 +82,16 @@ export function classifyAssertionForHoisting(
 	if (fromItem.type !== 'table') return undefined;
 	const tableSource = fromItem as AST.TableSource;
 
-	// Resolve to a base TableSchema.
+	// Resolve to a base TableSchema. An unqualified name resolves against the
+	// assertion's home schema first (matching how the evaluator plans the stored
+	// body — see Database._homeSchemaPath), then the default main/temp order.
+	// Without the home-first fallback a non-main assertion's unqualified body
+	// could resolve to a same-named table in main and the hoisted synthetic
+	// CHECK would fold onto the wrong table's plan.
 	const tableSchema = schemaManager.findTable(
 		tableSource.table.name,
 		tableSource.table.schema,
+		[assertion.schemaName, 'main', 'temp'],
 	);
 	if (!tableSchema) return undefined;
 

@@ -329,6 +329,10 @@ function resolveProjectedRightAttrs(
 export function ruleLateralTop1Asof(node: PlanNode, context: OptContext): PlanNode | null {
 	if (!(node instanceof JoinNode)) return null;
 
+	// A join carrying `exists … as` match flags is not rewritten into an asof/top-1
+	// lateral shape (which would not carry the appended flag column).
+	if (node.hasExistenceColumns) return null;
+
 	const joinType = node.joinType;
 	// LATERAL is meaningful for inner / left / cross with `ON TRUE` (or no condition).
 	if (joinType !== 'inner' && joinType !== 'left' && joinType !== 'cross') return null;

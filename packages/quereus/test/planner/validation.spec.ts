@@ -514,7 +514,7 @@ describe('plan-validator', () => {
 			const setop = new SetOperationNode(mockScope, prefetch, scanC as any, 'unionAll');
 			// AsyncGather(unionAll) mirrors children[0] (the setop) attributes.
 			const scanD = relNode({ nodeType: PlanNodeType.SeqScan, attributes: [makeAttr(1008), makeAttr(1009), makeAttr(1010), makeAttr(1011)], physical: phys });
-			const gather = new AsyncGatherNode(mockScope, [setop, scanD], { kind: 'unionAll' }, 4);
+			const gather = new AsyncGatherNode(mockScope, [setop, scanD as any], { kind: 'unionAll' }, 4);
 			expect(() => validatePhysicalTree(gather)).not.to.throw();
 		});
 

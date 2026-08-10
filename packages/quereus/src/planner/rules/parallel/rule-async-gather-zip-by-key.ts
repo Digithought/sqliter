@@ -575,11 +575,11 @@ function branchesKeyUnique(
 	branchKeyAttrs: readonly (readonly number[])[],
 ): boolean {
 	for (let b = 0; b < branches.length; b++) {
-		const attrs = branches[b].getAttributes();
+		const attrIndex = branches[b].getAttributeIndex();
 		const keyIndices = new Set<number>();
 		for (const id of branchKeyAttrs[b]) {
-			const ix = attrs.findIndex((a: Attribute) => a.id === id);
-			if (ix < 0) return false;
+			const ix = attrIndex.get(id);
+			if (ix === undefined) return false;
 			keyIndices.add(ix);
 		}
 		const declaredKeys = branches[b].getType().keys;
@@ -605,10 +605,9 @@ function keyCollationsAgree(
 ): boolean {
 	const norm = (c: string | undefined): string => (c && c.length > 0 ? c.toUpperCase() : 'BINARY');
 	const collationOf = (branch: RelationalPlanNode, attrId: number): string => {
-		const attrs = branch.getAttributes();
 		const cols = branch.getType().columns;
-		const ix = attrs.findIndex((a: Attribute) => a.id === attrId);
-		return ix >= 0 ? norm(cols[ix].type.collationName) : 'BINARY';
+		const ix = branch.getAttributeIndex().get(attrId);
+		return ix !== undefined ? norm(cols[ix].type.collationName) : 'BINARY';
 	};
 	for (let pos = 0; pos < k; pos++) {
 		const base = collationOf(branches[0], branchKeyAttrs[0][pos]);

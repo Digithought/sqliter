@@ -1,0 +1,1601 @@
+-- 53-materialized-views-rowtime.sqllogic — row-time (write-through) materialized
+-- views. Every materialized view is row-time maintained: the covering-index-shaped
+-- backing table is kept consistent SYNCHRONOUSLY with each source row-write, within
+-- the same transaction and visible mid-statement (reads-own-writes), and rolled back
+-- in lockstep with the source write. Observable here purely by reading the MV (which
+-- resolves to its backing table); row-time UNIQUE enforcement is covered separately
+-- in 54-covering-mv-enforcement.sqllogic.
+
+-- ===================================
+-- 1. Autocommit write-through — insert / update / delete reflected with no BEGIN
+--    and no manual refresh (maintenance rides the statement-level autocommit).
+-- ===================================
+
+create table rt (id integer primary key, x integer);
+insert into rt values (1, 10), (2, 20);
+create materialized view rt_ix as select x, id from rt order by x;
+
+-- MV equals the body at create time
+select * from rt_ix order by x;
+→ [{"x":10,"id":1},{"x":20,"id":2}]
+
+-- autocommit INSERT is reflected immediately (no refresh)
+insert into rt values (3, 5);
+select * from rt_ix order by x;
+→ [{"x":5,"id":3},{"x":10,"id":1},{"x":20,"id":2}]
+
+-- autocommit UPDATE of a projected column moves the backing row's key
+update rt set x = 100 where id = 2;
+select * from rt_ix order by x;
+→ [{"x":5,"id":3},{"x":10,"id":1},{"x":100,"id":2}]
+
+-- autocommit DELETE removes the backing row
+delete from rt where id = 1;
+select * from rt_ix order by x;
+→ [{"x":5,"id":3},{"x":100,"id":2}]
+
+-- ===================================
+-- 2. Mid-transaction visibility + rollback reverts. The hallmark of row-time:
+--    a `select` from the MV inside an open transaction reflects the just-written
+--    source row BEFORE commit, and rollback discards the backing delta with the
+--    source write.
+-- ===================================
+
+begin;
+insert into rt values (4, 7);
+-- reflected mid-transaction, before commit
+select * from rt_ix order by x;
+→ [{"x":5,"id":3},{"x":7,"id":4},{"x":100,"id":2}]
+rollback;
+-- backing delta discarded alongside the rolled-back source write
+select * from rt_ix order by x;
+→ [{"x":5,"id":3},{"x":100,"id":2}]
+
+-- A committed transaction persists the write-through delta.
+begin;
+insert into rt values (5, 50);
+commit;
+select * from rt_ix order by x;
+→ [{"x":5,"id":3},{"x":50,"id":5},{"x":100,"id":2}]
+
+-- A FAILED source write leaves no backing delta: a multi-row autocommit INSERT
+-- whose second row violates the source PK aborts the whole statement, reverting
+-- both the first row's source write and its backing maintenance (atomic via the
+-- statement savepoint the maintenance connection rides).
+insert into rt values (6, 60), (6, 61);
+-- error: constraint failed
+select * from rt_ix order by x;
+→ [{"x":5,"id":3},{"x":50,"id":5},{"x":100,"id":2}]
+
+-- A FAILED multi-row UPDATE inside an explicit transaction is atomic at the
+-- statement level: the first row's source write AND its row-time backing
+-- maintenance are both reverted when a later row trips a source constraint.
+-- (The statement savepoint that wraps the source UPDATE also unwinds the
+-- backing connection, which rides the same savepoint stack.)
+create table rta (id integer primary key, x integer not null);
+insert into rta values (1, 10), (2, 20), (3, 30);
+create materialized view rta_ix as select x, id from rta order by x;
+select * from rta_ix order by x;
+→ [{"x":10,"id":1},{"x":20,"id":2},{"x":30,"id":3}]
+
+begin;
+-- id=1 updates to x=11 (and maintains the backing), then id=2 violates NOT NULL.
+update rta set x = case when id = 2 then null else x + 1 end where id in (1, 2);
+-- error: NOT NULL constraint failed: rta.x
+
+-- Neither the source nor the MV backing retains id=1's x=11 mid-transaction.
+select x from rta where id = 1;
+→ [{"x":10}]
+select * from rta_ix order by x;
+→ [{"x":10,"id":1},{"x":20,"id":2},{"x":30,"id":3}]
+rollback;
+
+-- And nothing persisted after rollback either.
+select * from rta_ix order by x;
+→ [{"x":10,"id":1},{"x":20,"id":2},{"x":30,"id":3}]
+
+-- ===================================
+-- 3. Partial body (WHERE) — scope transitions. A row contributes a backing row
+--    only while its predicate is unambiguously TRUE; an UPDATE across the
+--    predicate boundary deletes / inserts the backing row.
+-- ===================================
+
+create table rtf (id integer primary key, x integer);
+insert into rtf values (1, 5), (2, -3), (3, 8);
+create materialized view rtf_ix as select x, id from rtf where x > 0 order by x;
+select * from rtf_ix order by x;
+→ [{"x":5,"id":1},{"x":8,"id":3}]
+
+-- id=1 leaves scope (x>0 → x=-1): its backing row disappears
+update rtf set x = -1 where id = 1;
+select * from rtf_ix order by x;
+→ [{"x":8,"id":3}]
+
+-- id=2 enters scope (x=-3 → x=10): its backing row appears
+update rtf set x = 10 where id = 2;
+select * from rtf_ix order by x;
+→ [{"x":8,"id":3},{"x":10,"id":2}]
+
+-- in-scope key-changing update (projected column changes): old key deleted, new upserted
+update rtf set x = 9 where id = 3;
+select * from rtf_ix order by x;
+→ [{"x":9,"id":3},{"x":10,"id":2}]
+
+-- delete of an in-scope row removes its backing row
+delete from rtf where id = 2;
+select * from rtf_ix order by x;
+→ [{"x":9,"id":3}]
+
+-- ===================================
+-- 4. Multi-row statement reads-own-writes — every row's maintenance accumulates
+--    in the same backing pending layer; a multi-row INSERT yields the full set.
+--    (For the covering-index shape the backing key carries the source PK, so two
+--    distinct source rows never collide on the backing key; this verifies
+--    pending-layer accumulation, the read-your-own-writes substrate enforcement
+--    will rely on.)
+-- ===================================
+
+create table m (id integer primary key, x integer);
+create materialized view m_ix as select x, id from m order by x, id;
+insert into m values (1, 5), (2, 5), (3, 7);
+select * from m_ix order by x, id;
+→ [{"x":5,"id":1},{"x":5,"id":2},{"x":7,"id":3}]
+
+-- ===================================
+-- 5. Compound-PK source — backing key carries both PK columns.
+-- ===================================
+
+create table cp (a integer, b integer, v integer, primary key (a, b));
+insert into cp values (1, 1, 100), (1, 2, 200);
+create materialized view cp_ix as select a, b, v from cp;
+select * from cp_ix order by a, b;
+→ [{"a":1,"b":1,"v":100},{"a":1,"b":2,"v":200}]
+insert into cp values (2, 1, 300);
+select * from cp_ix order by a, b;
+→ [{"a":1,"b":1,"v":100},{"a":1,"b":2,"v":200},{"a":2,"b":1,"v":300}]
+update cp set v = 999 where a = 1 and b = 1;
+select * from cp_ix order by a, b;
+→ [{"a":1,"b":1,"v":999},{"a":1,"b":2,"v":200},{"a":2,"b":1,"v":300}]
+
+-- ===================================
+-- 6. Two row-time MVs over one source — both maintained from a single write.
+-- ===================================
+
+create table s (id integer primary key, x integer);
+insert into s values (1, 1);
+create materialized view s_p as select id, x from s;
+create materialized view s_o as select x, id from s order by x;
+insert into s values (2, 2);
+select * from s_p order by id;
+→ [{"id":1,"x":1},{"id":2,"x":2}]
+select * from s_o order by x;
+→ [{"x":1,"id":1},{"x":2,"id":2}]
+
+-- ===================================
+-- 7. Cost-gated-with-floor create gate. **No body is rejected for its SHAPE** — a shape
+--    that fits no bounded-delta arm is maintained by the always-correct full-rebuild floor
+--    (re-evaluate the whole body, replace the backing). Only four NON-shape rejections
+--    remain: non-determinism, a bag (no provable unique key), no relational output, and a
+--    full-rebuild-only body over a source past the size threshold (the size reject needs
+--    StatsProvider counts, and the threshold pragma / its 0-disables behavior / invalid-value
+--    rejection are all covered in materialized-view-diagnostics.spec.ts). This section pins the
+--    remaining rejects (distinctive tails) AND the shape ACCEPTANCES the flip introduced; §26
+--    below then exercises full-rebuild-floor maintenance end-to-end under SQL writes.
+-- ===================================
+
+create table g (id integer primary key, k integer, v integer);
+insert into g values (1, 100, 5);
+create table g2 (id integer primary key, w integer);
+
+-- ── KEPT rejects (all non-shape) ──
+
+-- non-deterministic projected expression — a reproducibility reject (the inverse-projection
+-- arm's arm-specific tail), NOT a shape reject.
+create materialized view bad_nondet as select id, random() as r from g;
+-- error: non-deterministic expression column 'r'
+
+-- a projection dropping the source PK leaves a non-keyed (bag) body — the floor's
+-- no-provable-unique-key reject (the single create row was distinct, so it reached the gate
+-- rather than failing the set contract at fill).
+create materialized view bad_nopk as select v from g;
+-- error: no provable unique key
+
+-- a recursive-CTE `union all` body is a bag (overlapping inputs, no provable key) — floor reject.
+create materialized view bad_rec as with recursive r(n) as (select 1 union all select n + 1 from r where n < 3) select n from r;
+-- error: no provable unique key
+
+-- ── FLIPPED acceptances (shape is no longer a reject) ──
+-- Each CREATEs and reads its snapshot; the floor (or a bounded-delta arm) maintains it.
+-- Deep maintenance equivalence is the property harness's job (maintenance-equivalence.spec.ts
+-- § full-rebuild floor); §26 below exercises floor maintenance under writes.
+
+-- DISTINCT (single source) — a set, maintained by the full-rebuild floor.
+create materialized view ok_distinct as select distinct v from g;
+select v from ok_distinct order by v;
+→ [{"v":5}]
+
+-- scalar aggregate (no GROUP BY) — one global row, full-rebuild floor.
+create materialized view ok_scalar as select count(*) as c, sum(v) as s from g;
+select c, s from ok_scalar;
+→ [{"c":1,"s":5}]
+
+-- UNION over two tables — a set, full-rebuild floor.
+create materialized view ok_union as select id, v from g union select id, w from g2;
+select id, v from ok_union order by id;
+→ [{"id":1,"v":5}]
+
+-- a WHERE-subquery over a second table — full-rebuild floor.
+create materialized view ok_wheresubq as select id, v from g where v in (select w from g2);
+select id, v from ok_wheresubq order by id;
+→ []
+
+-- LIMIT — full-rebuild floor.
+create materialized view ok_limit as select id, v from g limit 10;
+select id, v from ok_limit order by id;
+→ [{"id":1,"v":5}]
+
+-- a correlated scalar-subquery projection column — full-rebuild floor.
+create materialized view ok_subq as select id, (select g.v) as vv from g;
+select id, vv from ok_subq order by id;
+→ [{"id":1,"vv":5}]
+
+-- order-by aggregate (the order-by makes a non-group-key backing column, so the
+-- residual-recompute arm declines) — full-rebuild floor.
+create materialized view ok_obagg as select k, sum(v) as s from g group by k order by sum(v);
+select k, s from ok_obagg order by k;
+→ [{"k":100,"s":5}]
+
+-- a lateral-TVF fan-out whose `order by` reorders the composite key so the base PK no longer
+-- leads it (the prefix-delete arm declines) — full-rebuild floor.
+create materialized view ok_lat_order as select g.id, f.value from g cross join lateral generate_series(1, g.v) f order by f.value;
+select id, value from ok_lat_order order by id, value;
+→ [{"id":1,"value":1},{"id":1,"value":2},{"id":1,"value":3},{"id":1,"value":4},{"id":1,"value":5}]
+
+-- a provably-1:1 FK join WITH a partial WHERE — now a bounded-delta join-residual arm
+-- (mv-join-where-widening), not the floor. This `where jwp.name > 'm'` references the lookup
+-- jwp, so the lookup side is delete-capable; §24.5 exercises the membership flips under writes.
+create table jwp (id integer primary key, name text);
+create table jwt (id integer primary key, fk integer not null references jwp(id));
+insert into jwp values (1, 'alice'), (2, 'zoe');
+insert into jwt values (10, 1), (20, 2);
+create materialized view ok_join_where as select jwt.id, jwp.name from jwt join jwp on jwt.fk = jwp.id where jwp.name > 'm';
+select id, name from ok_join_where order by id;
+→ [{"id":20,"name":"zoe"}]
+
+-- the same FK join as an OUTER (left) join (the join-residual arm declines an outer join) —
+-- still keyed on the driving PK: full-rebuild floor.
+create materialized view ok_join_outer as select jwt.id, jwp.name from jwt left join jwp on jwt.fk = jwp.id;
+select id, name from ok_join_outer order by id;
+→ [{"id":10,"name":"alice"},{"id":20,"name":"zoe"}]
+
+-- NOTE: a *fanning* (non-1:1) join such as `select g.id, g.v from g join g2 on g.k = g2.w`
+-- now also routes to the floor and is ACCEPTED at create, but the floor trusts the optimizer's
+-- set-inference (`keysOf`); when such a body actually fans out it can produce duplicates the
+-- backing key collapses, diverging from the plain view. That `isSet`/`keysOf` over-claim is a
+-- pre-existing optimizer gap the flip exposes — filed as a fix ticket — so it is deliberately
+-- NOT asserted here.
+
+-- ===================================
+-- 8. MV-over-MV cascade. A materialized view whose source is itself another MV's
+--    backing table is accepted: `building/select.ts` rewrites the inner-MV reference
+--    to its backing table, so the outer MV's source base IS the inner MV's backing
+--    base and the existing `rowTimeBySource[backingBase]` index records the
+--    producer→consumer edge. A source write maintains the inner MV's backing, whose
+--    effective per-row change is routed onward to the outer MV — recursively,
+--    synchronously, DAG-ordered, atomic within the statement.
+-- ===================================
+
+-- 2-level chain c2 over c1 over c. insert / update / delete reflect in BOTH levels
+-- with no refresh.
+create table c (id integer primary key, x integer);
+insert into c values (1, 10), (2, 20);
+create materialized view c1 as select id, x from c;
+create materialized view c2 as select id, x from c1;
+select id, x from c1 order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20}]
+select id, x from c2 order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20}]
+
+-- insert cascades to both levels
+insert into c values (3, 30);
+select id, x from c2 order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20},{"id":3,"x":30}]
+
+-- update of a projected column cascades to both levels (delete-old/upsert-new at each)
+update c set x = 99 where id = 2;
+select id, x from c1 order by id;
+→ [{"id":1,"x":10},{"id":2,"x":99},{"id":3,"x":30}]
+select id, x from c2 order by id;
+→ [{"id":1,"x":10},{"id":2,"x":99},{"id":3,"x":30}]
+
+-- delete cascades to both levels
+delete from c where id = 1;
+select id, x from c2 order by id;
+→ [{"id":2,"x":99},{"id":3,"x":30}]
+
+-- Predicate transition through the chain. The inner MV filters x>0; the outer is a
+-- plain passthrough of the inner. An update moving a row out of the inner predicate
+-- removes it from BOTH levels; the reverse re-adds it to both.
+create table pc (id integer primary key, x integer);
+insert into pc values (1, 5), (2, 7);
+create materialized view pc1 as select id, x from pc where x > 0;
+create materialized view pc2 as select id, x from pc1;
+select id, x from pc2 order by id;
+→ [{"id":1,"x":5},{"id":2,"x":7}]
+
+-- id=1 leaves the inner scope (x>0 → x=-1) → removed at level 2 as well
+update pc set x = -1 where id = 1;
+select id, x from pc1 order by id;
+→ [{"id":2,"x":7}]
+select id, x from pc2 order by id;
+→ [{"id":2,"x":7}]
+
+-- reverse: id=1 re-enters the inner scope → re-added to both
+update pc set x = 5 where id = 1;
+select id, x from pc2 order by id;
+→ [{"id":1,"x":5},{"id":2,"x":7}]
+
+-- 3-level chain proves arbitrary depth and DAG order (each level fully written
+-- before its consumer runs).
+create table d (id integer primary key, x integer);
+create materialized view d1 as select id, x from d;
+create materialized view d2 as select id, x from d1;
+create materialized view d3 as select id, x from d2;
+insert into d values (1, 100);
+select id, x from d3 order by id;
+→ [{"id":1,"x":100}]
+update d set x = 200 where id = 1;
+select id, x from d3 order by id;
+→ [{"id":1,"x":200}]
+delete from d where id = 1;
+select id, x from d3 order by id;
+→ []
+
+-- Fan-out at a cascade backing: one inner MV (`fo1`) feeds TWO outer MVs with
+-- distinct backing keys. A single source write maintains the inner backing once,
+-- whose effective per-row change is routed to BOTH dependents (the manager loops
+-- over every MV reading that backing base, not just the first).
+create table fo (id integer primary key, x integer);
+create materialized view fo1 as select id, x from fo;
+create materialized view fo2a as select id, x from fo1;
+create materialized view fo2b as select x, id from fo1 order by x;
+insert into fo values (1, 10), (2, 20);
+select id, x from fo2a order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20}]
+select x, id from fo2b order by x;
+→ [{"x":10,"id":1},{"x":20,"id":2}]
+
+-- update cascades to BOTH fan-out branches (each re-keys its own backing)
+update fo set x = 99 where id = 1;
+select id, x from fo2a order by id;
+→ [{"id":1,"x":99},{"id":2,"x":20}]
+select x, id from fo2b order by x;
+→ [{"x":20,"id":2},{"x":99,"id":1}]
+
+-- delete cascades to both branches
+delete from fo where id = 2;
+select id, x from fo2a order by id;
+→ [{"id":1,"x":99}]
+select x, id from fo2b order by x;
+→ [{"x":99,"id":1}]
+
+-- Mid-transaction visibility through the chain + whole-chain atomic rollback. The
+-- new row is visible at the deepest level before commit (reads-own-writes rides the
+-- per-statement backing connections), and rollback reverts every level in lockstep.
+create table tx (id integer primary key, x integer);
+create materialized view tx1 as select id, x from tx;
+create materialized view tx2 as select id, x from tx1;
+insert into tx values (1, 1);
+
+begin;
+insert into tx values (2, 2);
+select id, x from tx2 order by id;
+→ [{"id":1,"x":1},{"id":2,"x":2}]
+rollback;
+-- both levels reverted together
+select id, x from tx2 order by id;
+→ [{"id":1,"x":1}]
+select id, x from tx1 order by id;
+→ [{"id":1,"x":1}]
+
+-- ===================================
+-- 9. DROP detaches the row-time plan — the dropped name stops resolving, a source
+--    write touches no detached plan, and a freshly-created row-time MV on the same
+--    source is cleanly re-registered and maintained on the next write. (The old
+--    `count(*)` on the source proved nothing; maintenance is observed via the MV.)
+-- ===================================
+
+create table dr (id integer primary key, x integer);
+insert into dr values (1, 1);
+create materialized view dr_ix as select id, x from dr;
+select id, x from dr_ix order by id;
+→ [{"id":1,"x":1}]
+
+-- after DROP the name no longer resolves (plan + backing detached)
+drop materialized view dr_ix;
+select * from dr_ix;
+-- error: not found
+
+-- a fresh row-time MV on the same source proves re-registration is clean: the next
+-- source write is maintained against the NEW plan (and not the detached old one).
+create materialized view dr_ix2 as select x, id from dr order by x;
+insert into dr values (2, 2);
+select x, id from dr_ix2 order by x;
+→ [{"x":1,"id":1},{"x":2,"id":2}]
+
+-- ===================================
+-- 10. UPSERT do-update write-through (DML hook site 1). `on conflict do update`
+--     drives an `update` maintenance op with old=existing, new=the UPDATED image
+--     (existing row cloned, then SET assignments applied) — NOT the proposed insert
+--     row. A `do update … where` that evaluates false is DO NOTHING (backing
+--     unchanged).
+-- ===================================
+
+create table up (id integer primary key, x integer);
+insert into up values (1, 10);
+create materialized view up_ix as select x, id from up order by x;
+select x, id from up_ix order by x;
+→ [{"x":10,"id":1}]
+
+-- conflict on id=1 → DO UPDATE sets x to excluded.x (999); MV reflects updated image
+insert into up values (1, 999) on conflict do update set x = excluded.x;
+select x, id from up_ix order by x;
+→ [{"x":999,"id":1}]
+
+-- DO UPDATE … WHERE false ⇒ DO NOTHING ⇒ backing unchanged
+insert into up values (1, 5) on conflict do update set x = excluded.x where excluded.x < 0;
+select x, id from up_ix order by x;
+→ [{"x":999,"id":1}]
+
+-- DO UPDATE … WHERE true ⇒ update applies (and moves the backing key, x is keyed)
+insert into up values (1, 42) on conflict do update set x = excluded.x where excluded.x > 0;
+select x, id from up_ix order by x;
+→ [{"x":42,"id":1}]
+
+-- ===================================
+-- 11. INSERT OR REPLACE eviction (DML hook site 2). A replace on an existing PK
+--     keeps the source PK fixed, so the backing key (which carries the source PK)
+--     does NOT move — the backing PAYLOAD updates in place for that key. Maintenance
+--     fires as `update` with old=replacedRow, new=the inserted row.
+-- ===================================
+
+create table ir (id integer primary key, x integer);
+insert into ir values (1, 10);
+create materialized view ir_ix as select id, x from ir;
+select id, x from ir_ix order by id;
+→ [{"id":1,"x":10}]
+
+insert or replace into ir values (1, 7);
+select id, x from ir_ix order by id;
+→ [{"id":1,"x":7}]
+
+-- ===================================
+-- 12. UPDATE-causes-REPLACE eviction (DML hook site 4) via a `primary key on
+--     conflict replace` source. A key-changing UPDATE that moves one row's PK onto
+--     another live row's PK evicts the occupant (site 4 → `delete` op) and moves the
+--     updated row (site 5 → `update` op). Both deltas must net correctly in the
+--     backing: the evicted image gone, the moved image present under the new key.
+-- ===================================
+
+create table pr (id integer primary key on conflict replace, v text);
+insert into pr values (1, 'a'), (2, 'b');
+create materialized view pr_ix as select v, id from pr;
+select v, id from pr_ix order by id;
+→ [{"v":"a","id":1},{"v":"b","id":2}]
+
+-- move id=1 onto id=2: (2,'b') is evicted, (1,'a') becomes (2,'a')
+update pr set id = 2 where id = 1;
+select v, id from pr_ix order by id;
+→ [{"v":"a","id":2}]
+
+-- ===================================
+-- 13. Savepoint interaction — lazy backing-connection registration. The backing
+--     connection attaches lazily on first maintenance; the active savepoint stack
+--     must be replayed onto it so ROLLBACK TO lands on a real entry. Mirrors
+--     04a-savepoint-lazy-attach.sqllogic for the backing connection.
+-- ===================================
+
+create table sv (id integer primary key, x integer);
+create materialized view sv_ix as select id, x from sv;
+
+begin;
+insert into sv values (1, 10);
+savepoint sp1;
+insert into sv values (2, 20);
+insert into sv values (3, 30);
+-- all three visible mid-transaction
+select id, x from sv_ix order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20},{"id":3,"x":30}]
+
+-- ROLLBACK TO discards the post-savepoint backing deltas; row 1 (pre-savepoint) stays
+rollback to sp1;
+select id, x from sv_ix order by id;
+→ [{"id":1,"x":10}]
+
+commit;
+-- the committed pre-savepoint delta persists
+select id, x from sv_ix order by id;
+→ [{"id":1,"x":10}]
+
+-- ===================================
+-- 14. NULL / 3-valued partial predicate. `inScope` requires the predicate to be
+--     unambiguously TRUE, so a NULL predicate value is OUT of scope. A nullable
+--     projected PAYLOAD column (distinct from the predicate) carries NULL through to
+--     the backing row.
+-- ===================================
+
+create table np (id integer primary key, x integer null, payload text null);
+create materialized view np_ix as select payload, x, id from np where x > 0;
+
+-- x = NULL ⇒ predicate is NULL (not TRUE) ⇒ no backing row
+insert into np values (1, null, 'p1');
+select payload, x, id from np_ix order by id;
+→ []
+
+-- x = 5 ⇒ in scope ⇒ backing row appears
+insert into np values (2, 5, 'p2');
+select payload, x, id from np_ix order by id;
+→ [{"payload":"p2","x":5,"id":2}]
+
+-- in-scope → NULL ⇒ row leaves
+update np set x = null where id = 2;
+select payload, x, id from np_ix order by id;
+→ []
+
+-- NULL → positive ⇒ row enters
+update np set x = 9 where id = 1;
+select payload, x, id from np_ix order by id;
+→ [{"payload":"p1","x":9,"id":1}]
+
+-- nullable PAYLOAD carries NULL into the backing row (payload NULL ≠ predicate NULL)
+insert into np values (3, 4, null);
+select payload, x, id from np_ix order by id;
+→ [{"payload":"p1","x":9,"id":1},{"payload":null,"x":4,"id":3}]
+
+-- ===================================
+-- 15. Same-key & shared-leading-key updates — delete-old/upsert-new ordering. The
+--     backing key is the ORDER BY column(s) seeded with the source PK, so it always
+--     includes the PK; two distinct source rows can never share a backing key. A
+--     payload-only (or no-op) update keeps the backing key fixed, exercising the
+--     delete-then-upsert-at-the-same-key path (must net to the row present, updated).
+-- ===================================
+
+create table sk (id integer primary key, x integer, payload text);
+insert into sk values (1, 5, 'a'), (2, 8, 'b');
+create materialized view sk_ix as select x, id, payload from sk order by x;
+select x, id, payload from sk_ix order by x, id;
+→ [{"x":5,"id":1,"payload":"a"},{"x":8,"id":2,"payload":"b"}]
+
+-- payload-only update: backing key [x,id]=[5,1] unchanged ⇒ delete-then-upsert same key
+update sk set payload = 'a2' where id = 1;
+select x, id, payload from sk_ix order by x, id;
+→ [{"x":5,"id":1,"payload":"a2"},{"x":8,"id":2,"payload":"b"}]
+
+-- true no-op update (set x = x): same key, same image ⇒ net unchanged
+update sk set x = x where id = 1;
+select x, id, payload from sk_ix order by x, id;
+→ [{"x":5,"id":1,"payload":"a2"},{"x":8,"id":2,"payload":"b"}]
+
+-- shared leading key, distinct PK: move id=1 to x=8 (now both have x=8) — distinct
+-- backing keys [8,1] and [8,2], both present (the PK tiebreak keeps them apart)
+update sk set x = 8 where id = 1;
+select x, id, payload from sk_ix order by x, id;
+→ [{"x":8,"id":1,"payload":"a2"},{"x":8,"id":2,"payload":"b"}]
+
+-- ===================================
+-- 16. Source schema change + refresh / recreate re-registration. A SHAPE-SHIFTING
+--     structural ALTER (here: DROP NOT NULL on a PROJECTED column, which shifts the body's
+--     output nullability) fires a `table_modified` event that marks the MV stale and
+--     DETACHES the row-time plan: the MV keeps reading its last snapshot, and a post-alter
+--     source write is NOT maintained (stale until refresh or recreate). BOTH `refresh
+--     materialized view` and drop+recreate restore the MV — they (a) rebuild the snapshot
+--     to include the missed row(s) AND (b) re-register a fresh row-time plan so subsequent
+--     source writes resume propagating. Dropping the source instead makes the MV read a
+--     clean stale error. (A structural ALTER the body provably does NOT read now keeps the
+--     MV LIVE instead — see 53.4-materialized-view-structural-alter-restore.sqllogic.)
+-- ===================================
+
+-- 16a. `refresh materialized view` re-registers the row-time plan (the bug this file's
+--      ticket fixed: refresh used to rebuild the snapshot but leave the plan detached,
+--      so post-refresh source writes were silently dropped).
+create table al (id integer primary key, x integer);
+insert into al values (1, 10);
+create materialized view al_ix as select id, x from al;
+
+-- a shape-shifting ALTER (drop not null on the projected column x) marks the MV stale and detaches the row-time plan
+alter table al alter column x drop not null;
+-- the post-alter source write is NOT maintained (plan detached); the MV serves the
+-- pre-alter snapshot rather than crashing
+insert into al (id, x) values (2, 20);
+select id, x from al_ix order by id;
+→ [{"id":1,"x":10}]
+
+-- refresh rebuilds the snapshot to include the missed row AND re-registers the plan
+refresh materialized view al_ix;
+select id, x from al_ix order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20}]
+
+-- maintenance has resumed against the re-registered plan: a subsequent write IS reflected
+insert into al (id, x) values (3, 30);
+select id, x from al_ix order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20},{"id":3,"x":30}]
+
+-- 16b. drop+recreate is the other restore path; it must also end fully maintained.
+create table al2 (id integer primary key, x integer);
+insert into al2 values (1, 10);
+create materialized view al2_ix as select id, x from al2;
+
+alter table al2 alter column x drop not null;
+insert into al2 (id, x) values (2, 20);
+select id, x from al2_ix order by id;
+→ [{"id":1,"x":10}]
+
+-- recreate re-registers a fresh row-time plan; the rebuild reflects all source rows
+drop materialized view al2_ix;
+create materialized view al2_ix as select id, x from al2;
+select id, x from al2_ix order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20}]
+
+-- maintenance has resumed against the new plan
+insert into al2 (id, x) values (3, 30);
+select id, x from al2_ix order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20},{"id":3,"x":30}]
+
+-- 16c. Idempotent-registration guard — refreshing a NOT-stale MV re-registers the plan
+--      (release-then-rebuild), which must leave maintenance working with no duplicate
+--      rowTimeBySource entry breaking subsequent writes.
+create table nr (id integer primary key, x integer);
+insert into nr values (1, 10);
+create materialized view nr_ix as select id, x from nr;
+-- refresh a never-stale MV: harmless no-op re-attach
+refresh materialized view nr_ix;
+-- maintenance still fires after the redundant re-register
+insert into nr values (2, 20);
+select id, x from nr_ix order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20}]
+
+-- 16d. Compound-PK MV resumes maintenance after a refresh.
+create table cpr (a integer, b integer, v integer, primary key (a, b));
+insert into cpr values (1, 1, 100);
+create materialized view cpr_ix as select a, b, v from cpr;
+alter table cpr alter column v drop not null;
+insert into cpr (a, b, v) values (1, 2, 200);
+select a, b, v from cpr_ix order by a, b;
+→ [{"a":1,"b":1,"v":100}]
+refresh materialized view cpr_ix;
+select a, b, v from cpr_ix order by a, b;
+→ [{"a":1,"b":1,"v":100},{"a":1,"b":2,"v":200}]
+-- subsequent compound-PK write is maintained
+insert into cpr (a, b, v) values (2, 1, 300);
+select a, b, v from cpr_ix order by a, b;
+→ [{"a":1,"b":1,"v":100},{"a":1,"b":2,"v":200},{"a":2,"b":1,"v":300}]
+
+-- 16e. Partial (WHERE) MV resumes maintenance after a refresh, predicate still honored.
+create table par (id integer primary key, x integer);
+insert into par values (1, 5);
+create materialized view par_ix as select id, x from par where x > 0;
+alter table par alter column x drop not null;
+-- one in-scope and one out-of-scope write while stale (both unmaintained)
+insert into par (id, x) values (2, 8);
+insert into par (id, x) values (3, -1);
+select id, x from par_ix order by id;
+→ [{"id":1,"x":5}]
+refresh materialized view par_ix;
+-- rebuild applies the predicate: the in-scope missed row appears, the out-of-scope does not
+select id, x from par_ix order by id;
+→ [{"id":1,"x":5},{"id":2,"x":8}]
+-- maintenance resumed: in-scope write reflected, out-of-scope still excluded
+insert into par (id, x) values (4, 10);
+insert into par (id, x) values (5, -2);
+select id, x from par_ix order by id;
+→ [{"id":1,"x":5},{"id":2,"x":8},{"id":4,"x":10}]
+
+-- dropping the SOURCE of a row-time MV makes a read a clean stale diagnostic, not a crash
+create table ds (id integer primary key, x integer);
+insert into ds values (1, 10);
+create materialized view ds_ix as select id, x from ds;
+drop table ds;
+select id, x from ds_ix order by id;
+-- error: is stale
+
+-- ===================================
+-- 17. Compound-PK extensions beyond §5 — a compound delete and a compound
+--     key-changing update (moving one PK column). Backing key = compound source PK.
+-- ===================================
+
+create table cpx (a integer, b integer, v integer, primary key (a, b));
+insert into cpx values (1, 1, 100), (1, 2, 200), (2, 1, 300);
+create materialized view cpx_ix as select a, b, v from cpx;
+select a, b, v from cpx_ix order by a, b;
+→ [{"a":1,"b":1,"v":100},{"a":1,"b":2,"v":200},{"a":2,"b":1,"v":300}]
+
+-- compound delete removes exactly the addressed backing row
+delete from cpx where a = 1 and b = 1;
+select a, b, v from cpx_ix order by a, b;
+→ [{"a":1,"b":2,"v":200},{"a":2,"b":1,"v":300}]
+
+-- compound key-change: move (1,2)→(1,9) — old compound key deleted, new upserted
+update cpx set b = 9 where a = 1 and b = 2;
+select a, b, v from cpx_ix order by a, b;
+→ [{"a":1,"b":9,"v":200},{"a":2,"b":1,"v":300}]
+
+-- ===================================
+-- 18. Boundary cases — no maintenance op should fire (or it must net to no change).
+-- ===================================
+
+create table bd (id integer primary key, x integer);
+insert into bd values (1, 5);
+create materialized view bd_ix as select x, id from bd where x > 0;
+select x, id from bd_ix order by id;
+→ [{"x":5,"id":1}]
+
+-- delete of a non-existent row: vtab returns no row ⇒ maintenance never fires
+delete from bd where id = 999;
+select x, id from bd_ix order by id;
+→ [{"x":5,"id":1}]
+
+-- delete of an out-of-scope row from a partial MV: inScope(oldRow) is false ⇒ no op
+insert into bd values (2, -3);
+delete from bd where id = 2;
+select x, id from bd_ix order by id;
+→ [{"x":5,"id":1}]
+
+-- ===================================
+-- 19. Deterministic expression-projection columns
+--     (materialized-view-rowtime-expression-projections). A backing output column may
+--     be a deterministic scalar expression over the single source row (arithmetic,
+--     deterministic functions, CASE, CAST, ‖) — still a pure per-row projection
+--     (O(log n), no body re-execution): each source write evaluates project(row) for
+--     the computed columns, so they stay consistent under insert / update / delete
+--     exactly as a plain view would. PK columns stay passthrough; the computed columns
+--     are not part of the backing key.
+-- ===================================
+
+create table ev (id integer primary key, v integer, name text);
+insert into ev values (1, 10, 'Alice'), (2, 20, 'Bob');
+
+-- arithmetic + deterministic-function projection columns over a single source
+create materialized view ev_ix as select id, v + 1 as v1, abs(v) as av, lower(name) as ln from ev;
+
+-- computed columns equal the body at create time (MV ≡ faster view)
+select id, v1, av, ln from ev_ix order by id;
+→ [{"id":1,"v1":11,"av":10,"ln":"alice"},{"id":2,"v1":21,"av":20,"ln":"bob"}]
+
+-- INSERT: the new row's computed columns appear (negative v exercises abs)
+insert into ev values (3, -5, 'CARA');
+select id, v1, av, ln from ev_ix order by id;
+→ [{"id":1,"v1":11,"av":10,"ln":"alice"},{"id":2,"v1":21,"av":20,"ln":"bob"},{"id":3,"v1":-4,"av":5,"ln":"cara"}]
+
+-- UPDATE of a source column the expressions read: EVERY computed column tracks it
+-- (reads-own-writes), not just passthrough columns
+update ev set v = 100, name = 'Zed' where id = 1;
+select id, v1, av, ln from ev_ix order by id;
+→ [{"id":1,"v1":101,"av":100,"ln":"zed"},{"id":2,"v1":21,"av":20,"ln":"bob"},{"id":3,"v1":-4,"av":5,"ln":"cara"}]
+
+-- DELETE removes the backing row (and its computed columns) entirely
+delete from ev where id = 2;
+select id, v1, av, ln from ev_ix order by id;
+→ [{"id":1,"v1":101,"av":100,"ln":"zed"},{"id":3,"v1":-4,"av":5,"ln":"cara"}]
+
+-- CASE / CAST / ‖ concat projection forms are accepted (the runtime evaluates them,
+-- so a computed backing value is byte-for-byte what `select <body>` produces)
+create materialized view ev_ix2 as
+  select id, case when v > 0 then 'pos' else 'neg' end as sign, cast(v as text) as vt, name || '!' as nx from ev;
+select id, sign, vt, nx from ev_ix2 order by id;
+→ [{"id":1,"sign":"pos","vt":"100","nx":"Zed!"},{"id":3,"sign":"neg","vt":"-5","nx":"CARA!"}]
+
+-- ===================================
+-- 20. Expression columns under a partial WHERE — key-changing update and
+--     predicate-scope transitions. The backing key is the passthrough (order-by + PK)
+--     columns; the computed columns ride each delete-old/upsert-new exactly like the
+--     passthrough payload does.
+-- ===================================
+
+create table evp (id integer primary key, v integer, name text);
+insert into evp values (1, 5, 'aa'), (2, -3, 'bb'), (3, 8, 'cc');
+create materialized view evp_ix as select id, v, v * 10 as v10, upper(name) as un from evp where v > 0 order by v;
+select id, v, v10, un from evp_ix order by v;
+→ [{"id":1,"v":5,"v10":50,"un":"AA"},{"id":3,"v":8,"v10":80,"un":"CC"}]
+
+-- in-scope key-changing update (v is the leading backing key AND read by v10): old key
+-- deleted, new upserted, and v10 tracks the new value
+update evp set v = 6 where id = 1;
+select id, v, v10, un from evp_ix order by v;
+→ [{"id":1,"v":6,"v10":60,"un":"AA"},{"id":3,"v":8,"v10":80,"un":"CC"}]
+
+-- predicate-scope transition IN: id=2 enters scope (v -3 → 4); its computed columns appear
+update evp set v = 4 where id = 2;
+select id, v, v10, un from evp_ix order by v;
+→ [{"id":2,"v":4,"v10":40,"un":"BB"},{"id":1,"v":6,"v10":60,"un":"AA"},{"id":3,"v":8,"v10":80,"un":"CC"}]
+
+-- predicate-scope transition OUT: id=3 leaves scope (v 8 → -1); its backing row (and
+-- computed columns) disappear
+update evp set v = -1 where id = 3;
+select id, v, v10, un from evp_ix order by v;
+→ [{"id":2,"v":4,"v10":40,"un":"BB"},{"id":1,"v":6,"v10":60,"un":"AA"}]
+
+-- ===================================
+-- 21. Per-statement maintenance batching (materialized-view-rowtime-per-statement-
+--     batching). A bulk insert/update/delete resolves each covering MV's backing
+--     connection ONCE per statement (a per-generator-run cache) and applies every
+--     row's backing delta immediately to that one connection's pending layer. This
+--     asserts the amortized path is behaviorally identical to per-row maintenance:
+--     all rows of a bulk statement land in the backing, a bulk update moves every
+--     key, a bulk delete removes every matching backing row, and a statement/txn
+--     rollback reverts the whole bulk backing delta in lockstep.
+-- ===================================
+
+create table blk (id integer primary key, x integer);
+create materialized view blk_ix as select x, id from blk order by x, id;
+
+-- bulk INSERT of many rows in ONE statement: every row's backing maintenance
+-- accumulates on the per-statement cached backing connection.
+insert into blk values (1, 10), (2, 20), (3, 30), (4, 40), (5, 50);
+select x, id from blk_ix order by x;
+→ [{"x":10,"id":1},{"x":20,"id":2},{"x":30,"id":3},{"x":40,"id":4},{"x":50,"id":5}]
+
+-- bulk UPDATE in ONE statement moves every projected backing key (delete-old/upsert-new
+-- per row); the PK tiebreak keeps the backing keys distinct so none collide.
+update blk set x = x + 100;
+select x, id from blk_ix order by x;
+→ [{"x":110,"id":1},{"x":120,"id":2},{"x":130,"id":3},{"x":140,"id":4},{"x":150,"id":5}]
+
+-- bulk DELETE in ONE statement removes exactly the matching backing rows
+delete from blk where id <= 3;
+select x, id from blk_ix order by x;
+→ [{"x":140,"id":4},{"x":150,"id":5}]
+
+-- a transaction rollback reverts a bulk statement's whole backing delta in lockstep
+begin;
+insert into blk values (6, 60), (7, 70), (8, 80);
+select x, id from blk_ix order by x;
+→ [{"x":60,"id":6},{"x":70,"id":7},{"x":80,"id":8},{"x":140,"id":4},{"x":150,"id":5}]
+rollback;
+select x, id from blk_ix order by x;
+→ [{"x":140,"id":4},{"x":150,"id":5}]
+
+-- reads-own-writes BETWEEN statements within one explicit transaction: each bulk
+-- statement's maintenance is visible to the next statement's read (the property
+-- per-statement batching must preserve), and the whole transaction commits in lockstep.
+begin;
+insert into blk values (6, 60), (7, 70);
+select x, id from blk_ix order by x;
+→ [{"x":60,"id":6},{"x":70,"id":7},{"x":140,"id":4},{"x":150,"id":5}]
+update blk set x = 200 where id = 4;
+select x, id from blk_ix order by x;
+→ [{"x":60,"id":6},{"x":70,"id":7},{"x":150,"id":5},{"x":200,"id":4}]
+commit;
+select x, id from blk_ix order by x;
+→ [{"x":60,"id":6},{"x":70,"id":7},{"x":150,"id":5},{"x":200,"id":4}]
+
+-- bulk write through a 2-level chain in ONE statement: the per-statement cache is
+-- keyed by backing base, so it holds BOTH the inner and outer backing connections and
+-- every cascade level amortizes. Insert/update/delete reflect at the deepest level.
+create table bc (id integer primary key, x integer);
+create materialized view bc1 as select id, x from bc;
+create materialized view bc2 as select id, x from bc1;
+insert into bc values (1, 1), (2, 2), (3, 3), (4, 4);
+select id, x from bc2 order by id;
+→ [{"id":1,"x":1},{"id":2,"x":2},{"id":3,"x":3},{"id":4,"x":4}]
+update bc set x = x * 10;
+select id, x from bc2 order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20},{"id":3,"x":30},{"id":4,"x":40}]
+delete from bc where id in (2, 4);
+select id, x from bc2 order by id;
+→ [{"id":1,"x":10},{"id":3,"x":30}]
+
+-- ===================================
+-- 22. Single-source aggregate bodies (`group by` over bare columns) — the
+--     residual-recompute arm. Per source write, the affected group's backing row is
+--     recomputed from live state (delete old slice → run the group-keyed residual →
+--     upsert); an emptied group's backing row is removed. Observable purely by reading
+--     the MV. (materialized-view-rowtime-residual-recompute)
+-- ===================================
+
+create table ag (id integer primary key, k integer, v integer);
+insert into ag values (1, 1, 10), (2, 1, 5), (3, 2, 7);
+create materialized view ag_sum as select k, count(*) as c, sum(v) as s from ag group by k;
+
+-- MV equals the body at create time (groups k=1 {10,5}, k=2 {7}).
+select k, c, s from ag_sum order by k;
+→ [{"k":1,"c":2,"s":15},{"k":2,"c":1,"s":7}]
+
+-- INSERT into an existing group recomputes only that group.
+insert into ag values (4, 2, 3);
+select k, c, s from ag_sum order by k;
+→ [{"k":1,"c":2,"s":15},{"k":2,"c":2,"s":10}]
+
+-- INSERT that opens a NEW group adds a backing row.
+insert into ag values (5, 3, 100);
+select k, c, s from ag_sum order by k;
+→ [{"k":1,"c":2,"s":15},{"k":2,"c":2,"s":10},{"k":3,"c":1,"s":100}]
+
+-- Non-key UPDATE recomputes the affected group's aggregate.
+update ag set v = 20 where id = 1;
+select k, c, s from ag_sum order by k;
+→ [{"k":1,"c":2,"s":25},{"k":2,"c":2,"s":10},{"k":3,"c":1,"s":100}]
+
+-- Group-key-changing UPDATE: move id=2 from k=1 to k=2 (BOTH old + new groups recomputed).
+update ag set k = 2 where id = 2;
+select k, c, s from ag_sum order by k;
+→ [{"k":1,"c":1,"s":20},{"k":2,"c":3,"s":15},{"k":3,"c":1,"s":100}]
+
+-- DELETE the last row of a group → its backing row disappears (emptied group).
+delete from ag where id = 5;
+select k, c, s from ag_sum order by k;
+→ [{"k":1,"c":1,"s":20},{"k":2,"c":3,"s":15}]
+
+-- Mid-transaction visibility + rollback reverts in lockstep (reads-own-writes).
+begin;
+insert into ag values (6, 1, 1000);
+select k, c, s from ag_sum order by k;
+→ [{"k":1,"c":2,"s":1020},{"k":2,"c":3,"s":15}]
+rollback;
+select k, c, s from ag_sum order by k;
+→ [{"k":1,"c":1,"s":20},{"k":2,"c":3,"s":15}]
+
+-- 22b. Partial-WHERE aggregate — only rows whose predicate is TRUE contribute; a
+--      predicate-scope transition recomputes the affected group, and a group whose
+--      every contributing row leaves scope loses its backing row.
+create table agp (id integer primary key, k integer, v integer);
+insert into agp values (1, 1, 5), (2, 1, -2), (3, 2, 8);
+create materialized view agp_sum as select k, sum(v) as s from agp where v > 0 group by k;
+select k, s from agp_sum order by k;
+→ [{"k":1,"s":5},{"k":2,"s":8}]
+
+-- id=2 enters scope (v: -2 → 3): group k=1 recomputed.
+update agp set v = 3 where id = 2;
+select k, s from agp_sum order by k;
+→ [{"k":1,"s":8},{"k":2,"s":8}]
+
+-- id=1 leaves scope (v: 5 → -1): group k=1 recomputed.
+update agp set v = -1 where id = 1;
+select k, s from agp_sum order by k;
+→ [{"k":1,"s":3},{"k":2,"s":8}]
+
+-- the last in-scope row of group k=1 leaves scope → its backing row disappears.
+update agp set v = -5 where id = 2;
+select k, s from agp_sum order by k;
+→ [{"k":2,"s":8}]
+
+-- 22c. Multi-column group by (a, k) — composite group key as the backing key.
+create table agm (id integer primary key, a integer, k integer, v integer);
+insert into agm values (1, 1, 1, 10), (2, 1, 2, 20), (3, 2, 1, 30);
+create materialized view agm_sum as select a, k, sum(v) as s from agm group by a, k;
+select a, k, s from agm_sum order by a, k;
+→ [{"a":1,"k":1,"s":10},{"a":1,"k":2,"s":20},{"a":2,"k":1,"s":30}]
+
+-- key-changing update moves (a,k) from (1,1) to (2,1): old composite group emptied,
+-- new composite group recomputed (regression guard for the multi-column delete key).
+update agm set a = 2 where id = 1;
+select a, k, s from agm_sum order by a, k;
+→ [{"a":1,"k":2,"s":20},{"a":2,"k":1,"s":40}]
+
+-- 22d. HAVING aggregate — the residual re-evaluates HAVING, so a group dropping below
+--      the threshold returns zero rows and its backing row is removed; one rising to the
+--      threshold gains a backing row. (Incidental but load-bearing — locks the behavior.)
+create table agh (id integer primary key, k integer);
+insert into agh values (1, 1), (2, 1), (3, 2);
+create materialized view agh_dup as select k, count(*) as c from agh group by k having count(*) > 1;
+-- only group k=1 (count 2) clears the HAVING threshold.
+select k, c from agh_dup order by k;
+→ [{"k":1,"c":2}]
+
+-- group k=2 rises to count 2 → it now appears.
+insert into agh values (4, 2);
+select k, c from agh_dup order by k;
+→ [{"k":1,"c":2},{"k":2,"c":2}]
+
+-- group k=1 drops to count 1 → below HAVING → its backing row disappears.
+delete from agh where id = 2;
+select k, c from agh_dup order by k;
+→ [{"k":2,"c":2}]
+
+-- 22e. MV-over-MV with an aggregate producer. A recomputed group emits delete+upsert
+--      effective changes (not a single update); a downstream covering-index consumer of
+--      the aggregate backing must tolerate that and stay equivalent through insert,
+--      key-change, and emptied-group cascades.
+create table ags (id integer primary key, k integer, v integer);
+insert into ags values (1, 1, 10), (2, 1, 5), (3, 2, 7);
+create materialized view ags_agg as select k, sum(v) as s from ags group by k;
+create materialized view ags_down as select k, s from ags_agg;
+select k, s from ags_down order by k;
+→ [{"k":1,"s":15},{"k":2,"s":7}]
+
+-- insert recomputes group k=2 → cascades to the downstream MV.
+insert into ags values (4, 2, 100);
+select k, s from ags_down order by k;
+→ [{"k":1,"s":15},{"k":2,"s":107}]
+
+-- key-changing update (id=3 from k=2 to k=1) recomputes both groups → cascades.
+update ags set k = 1 where id = 3;
+select k, s from ags_down order by k;
+→ [{"k":1,"s":22},{"k":2,"s":100}]
+
+-- emptied group k=2 → its aggregate backing row is removed → downstream row disappears.
+delete from ags where k = 2;
+select k, s from ags_down order by k;
+→ [{"k":1,"s":22}]
+
+-- ===================================
+-- 23. Single-source lateral-TVF fan-out bodies (`select T.pk…, f.* from T cross join
+--     lateral tvf(<args over T>) f`) — the prefix-delete arm. Each base row fans out to N
+--     backing rows keyed by the composite product key (base PK ∪ TVF key). Per source
+--     write, the base row's WHOLE fan-out slice is deleted by base-PK prefix and re-fanned
+--     from live state; an INSERT adds a slice, a base-PK-changing UPDATE moves the whole
+--     prefix, a DELETE removes the slice. (materialized-view-rowtime-prefix-delete-lateral-tvf)
+-- ===================================
+
+create table lt (id integer primary key, x integer);
+insert into lt values (1, 2), (2, 3), (3, 0);
+create materialized view lt_fan as select lt.id, lt.x, f.value from lt cross join lateral generate_series(1, lt.x) f;
+
+-- MV equals the body at create time: id=1 → {1,2}, id=2 → {1,2,3}, id=3 (x=0) → empty.
+select id, value from lt_fan order by id, value;
+→ [{"id":1,"value":1},{"id":1,"value":2},{"id":2,"value":1},{"id":2,"value":2},{"id":2,"value":3}]
+
+-- INSERT adds a new base row's whole fan-out slice.
+insert into lt values (4, 2);
+select id, value from lt_fan order by id, value;
+→ [{"id":1,"value":1},{"id":1,"value":2},{"id":2,"value":1},{"id":2,"value":2},{"id":2,"value":3},{"id":4,"value":1},{"id":4,"value":2}]
+
+-- UPDATE that GROWS the fan-out (x: 2 → 4): old slice deleted, new fan-out upserted.
+update lt set x = 4 where id = 1;
+select id, value from lt_fan where id = 1 order by value;
+→ [{"id":1,"value":1},{"id":1,"value":2},{"id":1,"value":3},{"id":1,"value":4}]
+
+-- UPDATE that SHRINKS the fan-out (x: 3 → 1): stale tail rows removed by the prefix delete.
+update lt set x = 1 where id = 2;
+select id, value from lt_fan where id = 2 order by value;
+→ [{"id":2,"value":1}]
+
+-- Base-PK-changing UPDATE moves the WHOLE prefix (id 4 → 7): old prefix gone, new fanned.
+update lt set id = 7 where id = 4;
+select id, value from lt_fan where id in (4, 7) order by id, value;
+→ [{"id":7,"value":1},{"id":7,"value":2}]
+
+-- DELETE removes the whole fan-out slice.
+delete from lt where id = 1;
+select id, value from lt_fan where id = 1 order by value;
+→ []
+
+-- Mid-transaction visibility + rollback reverts the slice in lockstep (reads-own-writes).
+begin;
+insert into lt values (9, 3);
+select id, value from lt_fan where id = 9 order by value;
+→ [{"id":9,"value":1},{"id":9,"value":2},{"id":9,"value":3}]
+rollback;
+select id, value from lt_fan where id = 9 order by value;
+→ []
+
+-- An out-of-scope base row (partial WHERE) fans out to zero rows; a scope transition
+-- re-fans it. The body's WHERE is part of the residual, so maintenance tracks it.
+create table ltw (id integer primary key, x integer, k integer);
+insert into ltw values (1, 2, 9), (2, 3, 1);
+create materialized view ltw_fan as select ltw.id, g.value from ltw cross join lateral generate_series(1, ltw.x) g where ltw.k > 5;
+-- only id=1 (k=9 > 5) is in scope at create.
+select id, value from ltw_fan order by id, value;
+→ [{"id":1,"value":1},{"id":1,"value":2}]
+
+-- id=2 enters scope (k: 1 → 7): its fan-out appears.
+update ltw set k = 7 where id = 2;
+select id, value from ltw_fan order by id, value;
+→ [{"id":1,"value":1},{"id":1,"value":2},{"id":2,"value":1},{"id":2,"value":2},{"id":2,"value":3}]
+
+-- id=1 leaves scope (k: 9 → 2): its whole fan-out slice disappears.
+update ltw set k = 2 where id = 1;
+select id, value from ltw_fan order by id, value;
+→ [{"id":2,"value":1},{"id":2,"value":2},{"id":2,"value":3}]
+
+-- ===================================
+-- 23.5 NOCASE base-PK lateral-TVF fan-out — the prefix-delete arm under a NON-binary base
+--      primary key. `delete-by-prefix` early-terminates its prefix scan on a BINARY compare
+--      (scan-layer.ts) while the backing btree orders the base-PK prefix by its NOCASE
+--      collation. Sound for this arm: the backing base-PK column inherits the source PK
+--      collation and source-PK uniqueness collapses each NOCASE class to one binary value, so
+--      a base row's fan-out rows are binary-homogeneous and contiguous. A case-only PK rewrite
+--      ('apple' → 'APPLE', the SAME PK under NOCASE) re-keys the whole slice to the new bytes.
+--      (prefix-delete-noncase-collation-regression-test)
+-- ===================================
+
+create table ltc (id text collate NOCASE primary key, n integer);
+insert into ltc values ('apple', 2), ('Banana', 3), ('cherry', 0);
+create materialized view ltc_fan as select ltc.id, f.value from ltc cross join lateral generate_series(1, ltc.n) f;
+
+-- MV equals the body at create: apple → {1,2}, Banana → {1,2,3}, cherry (n=0) → empty.
+select id, value from ltc_fan order by id, value;
+→ [{"id":"apple","value":1},{"id":"apple","value":2},{"id":"Banana","value":1},{"id":"Banana","value":2},{"id":"Banana","value":3}]
+
+-- INSERT a new base slice whose binary value ('Date'=0x44) sorts BEFORE the existing
+-- NOCASE-earlier 'apple' (0x61) slice — the maintained backing must still place it correctly.
+insert into ltc values ('Date', 2);
+select id, value from ltc_fan where id = 'Date' order by value;
+→ [{"id":"Date","value":1},{"id":"Date","value":2}]
+
+-- UPDATE GROWS the fan-out (n: 2 → 4): old slice deleted by prefix, new fan-out upserted.
+update ltc set n = 4 where id = 'apple';
+select id, value from ltc_fan where id = 'apple' order by value;
+→ [{"id":"apple","value":1},{"id":"apple","value":2},{"id":"apple","value":3},{"id":"apple","value":4}]
+
+-- UPDATE SHRINKS the fan-out (n: 3 → 1): stale tail rows removed by the prefix delete.
+update ltc set n = 1 where id = 'Banana';
+select id, value from ltc_fan where id = 'Banana' order by value;
+→ [{"id":"Banana","value":1}]
+
+-- A case-only base-PK rewrite ('apple' → 'APPLE') is the SAME PK under NOCASE, but rewrites
+-- the stored bytes the backing keys on: the old-byte slice is deleted by prefix and re-fanned
+-- under the new bytes. A NOCASE `where id = 'apple'` still finds it (now stored 'APPLE').
+update ltc set id = 'APPLE' where id = 'apple';
+select id, value from ltc_fan where id = 'apple' order by value;
+→ [{"id":"APPLE","value":1},{"id":"APPLE","value":2},{"id":"APPLE","value":3},{"id":"APPLE","value":4}]
+
+-- DELETE removes the whole fan-out slice; a lowercase literal matches the stored 'Banana'
+-- under NOCASE.
+delete from ltc where id = 'banana';
+select id, value from ltc_fan where id = 'Banana' order by value;
+→ []
+
+-- Mid-transaction visibility + rollback reverts the slice in lockstep (reads-own-writes).
+begin;
+insert into ltc values ('elder', 3);
+select id, value from ltc_fan where id = 'elder' order by value;
+→ [{"id":"elder","value":1},{"id":"elder","value":2},{"id":"elder","value":3}]
+rollback;
+select id, value from ltc_fan where id = 'elder' order by value;
+→ []
+
+-- ===================================
+-- 24. 1:1 inner-join bodies (`select T.pk…, P.col from T join P on T.fk = P.id`) — the
+--     join-residual arm. T's NOT-NULL FK to P's PK makes the inner join provably 1:1 on T
+--     (no row loss via referential integrity, no fan-out via P's unique PK), so the backing
+--     is keyed on T's PK. A write to the driving table T recomputes its one joined row
+--     (forward, T-PK-keyed residual); a write to the lookup table P refreshes every joined
+--     row referencing it (reverse, P-PK-keyed residual, upsert-only — inner-join + RI
+--     membership is fixed by T.fk). (materialized-view-rowtime-residual-join)
+-- ===================================
+
+create table jp (id integer primary key, name text);
+insert into jp values (1, 'alice'), (2, 'bob'), (3, 'carol');
+create table jt (id integer primary key, fk integer not null references jp(id));
+insert into jt values (10, 1), (20, 1), (30, 2);
+create materialized view jmv as select jt.id, jt.fk, jp.name from jt join jp on jt.fk = jp.id;
+
+-- MV equals the body at create time (jt 10 & 20 both reference jp 1).
+select id, fk, name from jmv order by id;
+→ [{"id":10,"fk":1,"name":"alice"},{"id":20,"fk":1,"name":"alice"},{"id":30,"fk":2,"name":"bob"}]
+
+-- INSERT a driving (jt) row → its one joined row appears (forward residual).
+insert into jt values (40, 3);
+select id, fk, name from jmv order by id;
+→ [{"id":10,"fk":1,"name":"alice"},{"id":20,"fk":1,"name":"alice"},{"id":30,"fk":2,"name":"bob"},{"id":40,"fk":3,"name":"carol"}]
+
+-- UPDATE a driving row's FK → it re-joins to the new lookup row (reads-own-writes).
+update jt set fk = 2 where id = 10;
+select id, fk, name from jmv order by id;
+→ [{"id":10,"fk":2,"name":"bob"},{"id":20,"fk":1,"name":"alice"},{"id":30,"fk":2,"name":"bob"},{"id":40,"fk":3,"name":"carol"}]
+
+-- LOOKUP-side UPDATE (jp.name) → every joined backing row referencing it is refreshed
+-- (reverse residual upserts each, no delete).
+update jp set name = 'BOB' where id = 2;
+select id, fk, name from jmv order by id;
+→ [{"id":10,"fk":2,"name":"BOB"},{"id":20,"fk":1,"name":"alice"},{"id":30,"fk":2,"name":"BOB"},{"id":40,"fk":3,"name":"carol"}]
+
+-- DELETE a driving row → its joined backing row disappears (removed-join-row).
+delete from jt where id = 20;
+select id, fk, name from jmv order by id;
+→ [{"id":10,"fk":2,"name":"BOB"},{"id":30,"fk":2,"name":"BOB"},{"id":40,"fk":3,"name":"carol"}]
+
+-- Key-changing UPDATE of the driving PK moves the backing row to the new key.
+update jt set id = 11 where id = 10;
+select id, fk, name from jmv order by id;
+→ [{"id":11,"fk":2,"name":"BOB"},{"id":30,"fk":2,"name":"BOB"},{"id":40,"fk":3,"name":"carol"}]
+
+-- Mid-transaction visibility + rollback reverts both sides in lockstep.
+begin;
+insert into jp values (4, 'dave');
+insert into jt values (50, 4);
+select id, fk, name from jmv where id = 50;
+→ [{"id":50,"fk":4,"name":"dave"}]
+rollback;
+select id, fk, name from jmv where id = 50;
+→ []
+
+-- A lookup INSERT with no referencing driving row is a no-op for the MV.
+insert into jp values (9, 'zara');
+select id, fk, name from jmv order by id;
+→ [{"id":11,"fk":2,"name":"BOB"},{"id":30,"fk":2,"name":"BOB"},{"id":40,"fk":3,"name":"carol"}]
+
+-- A lookup DELETE of an unreferenced lookup row is likewise a no-op (upsert-only reverse
+-- residual: the deleted key joins no driving row, so the residual is empty — no backing row
+-- to refresh or remove). RI blocks deleting a referenced lookup row, so this is the only
+-- admissible lookup-delete shape.
+delete from jp where id = 9;
+select id, fk, name from jmv order by id;
+→ [{"id":11,"fk":2,"name":"BOB"},{"id":30,"fk":2,"name":"BOB"},{"id":40,"fk":3,"name":"carol"}]
+
+-- ===================================
+-- 24.5. 1:1 inner-join bodies WITH a partial WHERE (mv-join-where-widening). The join-residual
+--       arm now accepts a body WHERE, classified by which base table(s) it references:
+--        - a WHERE over the driving table T only (`where wta.amt > 5`) just relaxes the gate —
+--          the forward T-keyed residual already injects + applies it (an out-of-scope T row
+--          recomputes to zero rows ⇒ removed), and the lookup side stays UPSERT-ONLY because a
+--          T-column predicate cannot move the membership set {T : T.fk = P.id};
+--        - a WHERE referencing the lookup P (`where wpb.score > 5`) makes the lookup side
+--          DELETE-CAPABLE: per affected P key the membership residual (WHERE stripped) deletes
+--          every currently-referencing T.pk backing key, then the in-scope residual re-upserts
+--          the survivors — so a P write that flips a row's WHERE membership adds/removes it.
+-- ===================================
+
+-- --- T-only WHERE: forward residual handles T-side scope flips; lookup stays upsert-only. ---
+create table wpa (id integer primary key, name text);
+create table wta (id integer primary key, fk integer not null references wpa(id), amt integer);
+insert into wpa values (1, 'alice'), (2, 'bob');
+insert into wta values (10, 1, 2), (20, 1, 8), (30, 2, 4);
+create materialized view mvwa as select wta.id, wta.amt, wpa.name from wta join wpa on wta.fk = wpa.id where wta.amt > 5;
+
+-- Create time: only wta 20 (amt 8 > 5) is in scope.
+select id, amt, name from mvwa order by id;
+→ [{"id":20,"amt":8,"name":"alice"}]
+
+-- A driving-row update that moves it INTO the T-side scope (amt 2 → 9) adds its joined row.
+update wta set amt = 9 where id = 10;
+select id, amt, name from mvwa order by id;
+→ [{"id":10,"amt":9,"name":"alice"},{"id":20,"amt":8,"name":"alice"}]
+
+-- A driving-row update that moves it OUT of scope (amt 8 → 1) removes its backing row (the
+-- forward residual recomputes to zero rows, so the delete-without-upsert removes it).
+update wta set amt = 1 where id = 20;
+select id, amt, name from mvwa order by id;
+→ [{"id":10,"amt":9,"name":"alice"}]
+
+-- A lookup (wpa) name update refreshes the projected column of the in-scope joined row — no
+-- add/remove (upsert-only; a T-only predicate cannot move membership on a P write).
+update wpa set name = 'ALICE' where id = 1;
+select id, amt, name from mvwa order by id;
+→ [{"id":10,"amt":9,"name":"ALICE"}]
+
+-- --- P-referencing WHERE: the lookup side is delete-capable (membership flips). ---
+create table wpb (id integer primary key, name text, score integer);
+create table wtb (id integer primary key, fk integer not null references wpb(id));
+insert into wpb values (1, 'alice', 3), (2, 'bob', 7);
+insert into wtb values (10, 1), (20, 1), (30, 2);
+create materialized view mvwb as select wtb.id, wtb.fk, wpb.name, wpb.score from wtb join wpb on wtb.fk = wpb.id where wpb.score > 5;
+
+-- Create time: only rows joined to a wpb with score > 5 (wpb 2). wtb 30 (fk 2).
+select id, fk, name, score from mvwb order by id;
+→ [{"id":30,"fk":2,"name":"bob","score":7}]
+
+-- A lookup update that pulls wpb 1 INTO scope (score 3 → 8): the two wtb rows referencing it
+-- (10, 20) gain backing rows (membership residual delete is a no-op; in-scope residual upserts).
+update wpb set score = 8 where id = 1;
+select id, fk, name, score from mvwb order by id;
+→ [{"id":10,"fk":1,"name":"alice","score":8},{"id":20,"fk":1,"name":"alice","score":8},{"id":30,"fk":2,"name":"bob","score":7}]
+
+-- A lookup update that pushes wpb 2 OUT of scope (score 7 → 2): wtb 30 is removed — the delete
+-- pass deletes its backing key and the in-scope residual returns nothing (upsert-only could not).
+update wpb set score = 2 where id = 2;
+select id, fk, name, score from mvwb order by id;
+→ [{"id":10,"fk":1,"name":"alice","score":8},{"id":20,"fk":1,"name":"alice","score":8}]
+
+-- A driving FK-move re-evaluates the P-side predicate against the NEW p: move wtb 10 to fk 2
+-- (wpb 2 is now score 2, out of scope) → its joined row disappears (the forward residual
+-- applies the full WHERE, including the p column, against the live joined p).
+update wtb set fk = 2 where id = 10;
+select id, fk, name, score from mvwb order by id;
+→ [{"id":20,"fk":1,"name":"alice","score":8}]
+
+-- An in-scope lookup payload update (wpb 1 stays score 8): the delete-then-upsert refreshes the
+-- projected name of its still-referencing row (wtb 20) without adding/removing.
+update wpb set name = 'ALICE' where id = 1;
+select id, fk, name, score from mvwb order by id;
+→ [{"id":20,"fk":1,"name":"ALICE","score":8}]
+
+-- Mid-transaction membership flip + rollback reverts the delete-capable pass in lockstep.
+-- wpb 2 score 2 → 9 pulls its two referencing rows (wtb 10, 30 — both now fk 2) into scope.
+begin;
+update wpb set score = 9 where id = 2;
+select id, fk, name, score from mvwb where fk = 2 order by id;
+→ [{"id":10,"fk":2,"name":"bob","score":9},{"id":30,"fk":2,"name":"bob","score":9}]
+rollback;
+select id, fk, name, score from mvwb order by id;
+→ [{"id":20,"fk":1,"name":"ALICE","score":8}]
+
+-- ===================================
+-- 25. End-of-statement flush boundary (mv-statement-flush-deferral). The DML executor now
+--     drains a per-statement deferred-rebuild set at the end-of-statement savepoint
+--     boundary — but ONLY the FULL-REBUILD arm is ever deferred there. Every arm above is
+--     a BOUNDED-DELTA arm, applied per source row immediately, so for these the deferred set
+--     stays empty and the flush is a transparent no-op. The full-rebuild arm is now reachable
+--     from `create materialized view` (the eligibility flip — this ticket); §26 below exercises
+--     its deferred flush end-to-end under SQL writes, while its instrumented rebuild-count, atomic
+--     rollback, autocommit flush+commit, mixed-arm, and MV-over-MV mixed-arm behavior stays
+--     white-box in test/incremental/maintenance-equivalence.spec.ts (forceFullRebuild + a counter).
+--
+--     The cases below regression-guard that adding the deferred set + flush hook left the
+--     bounded-delta arms untouched: a bulk multi-row statement that also crosses a partial
+--     predicate inside a 2-level MV-over-MV chain still converges at every level, with the
+--     flush running (empty) after the row loop and before the statement commits.
+-- ===================================
+
+create table fb (id integer primary key, x integer);
+insert into fb values (1, 5), (2, -3), (3, 8);
+create materialized view fb1 as select id, x from fb where x > 0;
+create materialized view fb2 as select id, x from fb1;
+select id, x from fb2 order by id;
+→ [{"id":1,"x":5},{"id":3,"x":8}]
+
+-- ONE bulk UPDATE moves id=1 OUT of the inner predicate and id=2 INTO it, in a single
+-- statement: row-by-row maintenance applies during the loop, the (empty) full-rebuild flush
+-- is a no-op, and BOTH chain levels reflect the net result after the statement commits.
+update fb set x = case when id = 1 then -1 when id = 2 then 7 else x end;
+select id, x from fb1 order by id;
+→ [{"id":2,"x":7},{"id":3,"x":8}]
+select id, x from fb2 order by id;
+→ [{"id":2,"x":7},{"id":3,"x":8}]
+
+-- A bulk DELETE in one statement cascades through both levels; the post-loop flush is a no-op.
+delete from fb where id in (2, 3);
+select id, x from fb2 order by id;
+→ []
+
+-- ===================================
+-- 26. Full-rebuild floor maintenance under SQL writes (mv-eligibility-floor-fallthrough). A body
+--     that fits no bounded-delta arm — here a 2-source UNION — is maintained by the always-correct
+--     full-rebuild floor: re-evaluated wholesale at the end-of-statement flush, then `replace-all`
+--     onto the backing. insert / update / delete on EITHER source must reflect through the MV after
+--     each statement commits. (The deferred-flush internals — one rebuild per bulk statement,
+--     atomic rollback, mixed-arm — are white-box in maintenance-equivalence.spec.ts; this is the
+--     end-to-end SQL proof that the floor is now create-reachable and maintained.)
+-- ===================================
+
+create table u1 (id integer primary key, v integer);
+create table u2 (id integer primary key, v integer);
+insert into u1 values (1, 10), (2, 20);
+insert into u2 values (3, 30);
+create materialized view u_all as select id, v from u1 union select id, v from u2;
+select id, v from u_all order by id, v;
+→ [{"id":1,"v":10},{"id":2,"v":20},{"id":3,"v":30}]
+
+-- insert into the SECOND source → floor rebuild picks it up.
+insert into u2 values (4, 40);
+select id, v from u_all order by id, v;
+→ [{"id":1,"v":10},{"id":2,"v":20},{"id":3,"v":30},{"id":4,"v":40}]
+
+-- update a row in the FIRST source → the rebuilt body reflects the new value.
+update u1 set v = 99 where id = 1;
+select id, v from u_all order by id, v;
+→ [{"id":1,"v":99},{"id":2,"v":20},{"id":3,"v":30},{"id":4,"v":40}]
+
+-- delete from the second source → the row leaves the rebuilt body.
+delete from u2 where id = 3;
+select id, v from u_all order by id, v;
+→ [{"id":1,"v":99},{"id":2,"v":20},{"id":4,"v":40}]
+
+-- a bulk multi-row UPDATE on the first source in one statement → all reflected after commit.
+update u1 set v = v + 1;
+select id, v from u_all order by id, v;
+→ [{"id":1,"v":100},{"id":2,"v":21},{"id":4,"v":40}]
+
+-- ===================================
+-- 27. Full-rebuild → full-rebuild CHAIN (mv-comprehensive-coverage-net). Two chained floor MVs:
+--     a write to the base dirties only the producer (round 1); the producer's rebuild emits a
+--     delta that re-dirties the full-rebuild consumer, rebuilt in round 2 — the multi-round
+--     worklist convergence that only became SQL-buildable after the eligibility flip. ch_c
+--     distinct-a over ch_p (a is NOT unique in ch_p) is genuinely full-rebuild, not collapsed to
+--     a passthrough. (Round counts are white-box in maintenance-equivalence.spec.ts; this is the
+--     end-to-end SQL proof both levels converge.)
+-- ===================================
+
+create table ch (id integer primary key, a integer, b integer);
+insert into ch (id, a, b) values (1, 10, 100), (2, 10, 200), (3, 20, 100);
+create materialized view ch_p as select distinct a, b from ch;
+create materialized view ch_c as select distinct a from ch_p;
+select a, b from ch_p order by a, b;
+→ [{"a":10,"b":100},{"a":10,"b":200},{"a":20,"b":100}]
+select a from ch_c order by a;
+→ [{"a":10},{"a":20}]
+
+-- a write introducing a NEW `a` value propagates producer → consumer (drives the round-2 flush).
+insert into ch (id, a, b) values (4, 30, 100);
+select a from ch_c order by a;
+→ [{"a":10},{"a":20},{"a":30}]
+
+-- moving the only a=20 row to a=30 removes a=20 from the consumer (producer's set shrank).
+update ch set a = 30 where id = 3;
+select a from ch_c order by a;
+→ [{"a":10},{"a":30}]
+
+-- delete cascades through both levels.
+delete from ch where a = 10;
+select a, b from ch_p order by a, b;
+→ [{"a":30,"b":100}]
+select a from ch_c order by a;
+→ [{"a":30}]
+
+-- ===================================
+-- 28. Recursive-CTE transitive closure (mv-comprehensive-coverage-net). A recursive body fits no
+--     bounded-delta arm and reads a real source (`tcedge`), so it routes to the full-rebuild floor
+--     and is rebuilt wholesale per writing statement. Edge churn grows / shrinks the closure.
+-- ===================================
+
+create table tcedge (src integer, dst integer, primary key (src, dst));
+insert into tcedge (src, dst) values (1, 2), (2, 3);
+create materialized view tc_mv as
+  with recursive tc(a, b) as (
+    select src, dst from tcedge
+    union
+    select t.a, e.dst from tc t join tcedge e on t.b = e.src
+  ) select a, b from tc;
+select a, b from tc_mv order by a, b;
+→ [{"a":1,"b":2},{"a":1,"b":3},{"a":2,"b":3}]
+
+-- extend the chain 3→4: new multi-hop reachable pairs appear at every prefix.
+insert into tcedge (src, dst) values (3, 4);
+select a, b from tc_mv order by a, b;
+→ [{"a":1,"b":2},{"a":1,"b":3},{"a":1,"b":4},{"a":2,"b":3},{"a":2,"b":4},{"a":3,"b":4}]
+
+-- remove the middle edge 2→3: every path through it vanishes from the closure.
+delete from tcedge where src = 2 and dst = 3;
+select a, b from tc_mv order by a, b;
+→ [{"a":1,"b":2},{"a":3,"b":4}]
+
+-- ===================================
+-- 29. OR FAIL over a full-rebuild MV (mv-comprehensive-coverage-net). OR FAIL keeps the rows that
+--     already succeeded (no statement-scope savepoint wraps them), so a mid-statement abort leaves
+--     them in place — and the deferred full-rebuild flush must still run on the abort path, or the
+--     floor backing would lag the surviving rows mid-transaction. This pins that end-to-end: the MV
+--     reflects the kept rows after the abort, and a rollback reverts source + backing in lockstep.
+-- ===================================
+
+create table ff (id integer primary key, v integer);
+insert into ff (id, v) values (1, 5);
+create materialized view ff_mv as select distinct v from ff;
+select v from ff_mv order by v;
+→ [{"v":5}]
+
+begin;
+-- (10,9) succeeds and dirties the floor MV; (1,9) collides on the PK and FAILs the statement;
+-- (11,11) never runs.
+insert or fail into ff (id, v) values (10, 9), (1, 9), (11, 11);
+-- error: UNIQUE constraint failed
+-- the surviving source row is kept (OR FAIL does not unwind prior rows)…
+select id, v from ff order by id;
+→ [{"id":1,"v":5},{"id":10,"v":9}]
+-- …and the deferred full-rebuild flushed on the abort path, so the MV is NOT left stale at [5].
+select v from ff_mv order by v;
+→ [{"v":5},{"v":9}]
+rollback;
+-- the whole transaction reverts source + backing in lockstep.
+select v from ff_mv order by v;
+→ [{"v":5}]
+
+-- ===================================
+-- 30. Outer (left) join MV — nullable lookup column read-side folding
+--     (mv-outer-join-nullable-backing-isnull). The null-extended lookup column of a LEFT
+--     join must be stamped NULLABLE on the backing table, so a query against the MV with
+--     `name is null` / `is not null` null-checks at runtime instead of folding against a
+--     bogus NOT-NULL backing column. The MV must be indistinguishable from the equivalent
+--     plain view — including these predicate reads, which the full `select *` read never
+--     exercises.
+-- ===================================
+
+create table ojp (id integer primary key, name text);
+create table ojt (id integer primary key, fk integer);
+insert into ojp (id, name) values (1, 'a'), (3, 'c');
+-- fk=9 (id=2) references no ojp row → null-extended by the left join.
+insert into ojt (id, fk) values (1, 1), (2, 9), (3, 3);
+create materialized view oj_mv as select ojt.id, ojt.fk, ojp.name from ojt left join ojp on ojt.fk = ojp.id;
+
+-- full scan: the unmatched row carries a NULL lookup column.
+select id, fk, name from oj_mv order by id;
+→ [{"id":1,"fk":1,"name":"a"},{"id":2,"fk":9,"name":null},{"id":3,"fk":3,"name":"c"}]
+
+-- `name is null` returns the null-extended row (would be [] folded against a NOT-NULL backing).
+select id from oj_mv where name is null;
+→ [{"id":2}]
+
+-- `name is not null` returns only the matched rows (would be all rows folded against NOT-NULL).
+select id from oj_mv where name is not null order by id;
+→ [{"id":1},{"id":3}]
+
+-- equality is unaffected (it does not use the null fold).
+select id from oj_mv where name = 'a';
+→ [{"id":1}]
+
+-- a source write that null-extends another row is reflected through the predicate read: deleting
+-- the only matching ojp (id=1) null-extends ojt id=1 as well.
+delete from ojp where id = 1;
+select id from oj_mv where name is null order by id;
+→ [{"id":1},{"id":2}]
+select id from oj_mv where name is not null;
+→ [{"id":3}]
+
+-- ===================================
+-- 31. Outer (right) join MV — the symmetric case: the null-extended side is the
+--     PRESERVED-against side AND carries the join's other PK. A `right join` keyed on the
+--     preserved right table null-extends the LEFT columns (including the left PK), which the
+--     projection-layer fix must likewise stamp nullable on the backing — not just a plain
+--     lookup column. (A `full` join has no provable key → bag → not materializable, so the
+--     right join is the materializable both-sided-null-extension analog.)
+-- ===================================
+
+create table rjl (id integer primary key, name text);
+create table rjr (id integer primary key, lid integer);
+insert into rjl (id, name) values (1, 'a'), (3, 'c');
+-- lid=9 (rjr id=20) references no rjl row → the LEFT side (name, left PK) is null-extended.
+insert into rjr (id, lid) values (10, 1), (20, 9), (30, 3);
+create materialized view rj_mv as select rjr.id as rid, rjr.lid, rjl.name, rjl.id as lid_pk from rjl right join rjr on rjr.lid = rjl.id;
+
+-- full scan: the unmatched right row null-extends BOTH the lookup column and the left PK.
+select rid, lid, name, lid_pk from rj_mv order by rid;
+→ [{"rid":10,"lid":1,"name":"a","lid_pk":1},{"rid":20,"lid":9,"name":null,"lid_pk":null},{"rid":30,"lid":3,"name":"c","lid_pk":3}]
+
+-- `name is null` over the null-extended lookup column reads at runtime (not folded to []).
+select rid from rj_mv where name is null;
+→ [{"rid":20}]
+
+-- `lid_pk is null` over the null-extended LEFT PK — the column a base-table PK stamps NOT NULL —
+-- must also read at runtime, the symmetric guard the left-join case cannot exercise.
+select rid from rj_mv where lid_pk is null;
+→ [{"rid":20}]
+
+select rid from rj_mv where name is not null order by rid;
+→ [{"rid":10},{"rid":30}]
+
+-- ===================================
+-- 32. Row-time maintenance sees the STORED source row, not the raw proposed one
+--     (bug-dml-downstream-uses-uncoerced-row). The storage layer coerces a write
+--     to the declared column type inside `vtab.update()` — a `json` column given
+--     the text '{ "a" : 1 }' stores the same JSON value as '{"a":1}'. The DML
+--     executor used to hand maintenance the PRE-coercion row, so the
+--     incrementally maintained MV grouped the two spellings into two groups
+--     while the same body evaluated over the base table produced one. The
+--     maintained MV must be indistinguishable from the equivalent plain view.
+-- ===================================
+
+create table jg (id integer primary key, j json, v integer);
+create materialized view jg_mv as select j, count(*) as c, sum(v) as s from jg group by j;
+-- the same body as a plain (always-recomputed-from-base) view, for parity
+create view jg_plain as select j, count(*) as c, sum(v) as s from jg group by j;
+
+-- two structurally-equal, textually-DIFFERENT JSON spellings → ONE group of 2.
+insert into jg values (1, '{"a":1}', 10);
+insert into jg values (2, '{ "a" : 1 }', 5);
+
+select j, c, s from jg_mv order by c;
+→ [{"j":{"a":1},"c":2,"s":15}]
+
+-- ...and the plain view agrees (this is the assertion the maintained MV used to fail).
+select j, c, s from jg_plain order by c;
+→ [{"j":{"a":1},"c":2,"s":15}]
+
+-- a genuinely different JSON value opens its own group.
+insert into jg values (3, '{"a":2}', 7);
+select c, s from jg_mv order by s;
+→ [{"c":1,"s":7},{"c":2,"s":15}]
+select c, s from jg_plain order by s;
+→ [{"c":1,"s":7},{"c":2,"s":15}]
+
+-- a group-key UPDATE whose new key is a whitespace variant of an EXISTING group
+-- must merge into it (raw-row maintenance would have opened a third group).
+update jg set j = '{ "a":1 }' where id = 3;
+select c, s from jg_mv order by s;
+→ [{"c":3,"s":22}]
+select c, s from jg_plain order by s;
+→ [{"c":3,"s":22}]
+
+-- ...and splitting back out again removes the merged contribution.
+update jg set j = '{"a":3}' where id = 3;
+select c, s from jg_mv order by s;
+→ [{"c":1,"s":7},{"c":2,"s":15}]
+select c, s from jg_plain order by s;
+→ [{"c":1,"s":7},{"c":2,"s":15}]
+
+-- an INTEGER-affinity group key behaves the same: '7' stores as 7 and must group
+-- with a numeric 7 rather than beside it.
+create table ng (id integer primary key, k integer, v integer);
+create materialized view ng_mv as select k, count(*) as c from ng group by k;
+insert into ng values (1, 7, 1);
+insert into ng values (2, '7', 2);
+select k, c from ng_mv order by k;
+→ [{"k":7,"c":2}]

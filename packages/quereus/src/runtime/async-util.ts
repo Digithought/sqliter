@@ -10,6 +10,35 @@ import { getAsyncIterator } from './utils.js';
 const log = createLogger('runtime:async-util');
 
 /**
+ * Resolve a possibly-pending value and apply `fn`, WITHOUT a microtask hop on
+ * the synchronous common case.
+ *
+ * Scalar sub-programs (a filter predicate, a projected column, a join
+ * condition) run through a sub-scheduler that completes synchronously and
+ * returns a concrete value whenever no instruction in the sub-program is itself
+ * async — which is the overwhelmingly common case. But `await value` still
+ * schedules a microtask even when `value` is not a thenable (per spec,
+ * `await x` ≡ `await Promise.resolve(x)`), so a per-row/per-column
+ * `await subprogram(rctx)` pays that tick N times for nothing. Branching on
+ * `instanceof Promise` keeps the hot path fully synchronous and only defers
+ * when the value is genuinely pending.
+ *
+ * The result is itself `MaybePromise<R>`: when the input is concrete, `fn` runs
+ * inline and the mapped value is returned directly; only a genuinely pending
+ * input chains through `.then`. Callers that need the plain value must still
+ * branch at the extraction point (`r instanceof Promise ? await r : r`) — that
+ * final `await` then runs only on the rare async path, never on the hot path.
+ *
+ * NOTE: pure-extraction sites (no mapping — e.g. collecting projected columns
+ * into a row array) inline the same `instanceof Promise` branch directly rather
+ * than wrapping an identity `fn` here; a value-returning helper cannot host the
+ * caller's `await` without reintroducing the very hop this avoids.
+ */
+export function resolveMaybe<T, R>(value: MaybePromise<T>, fn: (v: T) => R): MaybePromise<R> {
+	return value instanceof Promise ? value.then(fn) : fn(value);
+}
+
+/**
  * Transform rows using a mapping function
  */
 export async function* mapRows<T extends Row, R>(
@@ -44,8 +73,29 @@ export function tee<T>(src: AsyncIterable<T>): [AsyncIterable<T>, AsyncIterable<
 	const buffer: T[] = [];
 	let srcIterator: AsyncIterator<T> | null = null;
 	let srcDone = false;
-	let consumer1Index = 0;
-	let consumer2Index = 0;
+	let srcClosed = false;
+	// Refcount of consumer generators that have actually been entered. Cleanup
+	// keys off this (not off the two stream objects existing) so a stream that
+	// is never iterated cannot wedge source release: the last entered generator
+	// out closes the source.
+	let liveConsumers = 0;
+	const indices = [0, 0];
+
+	// Release the source exactly once. If it already drained naturally, its
+	// finally has run and there is nothing to return(); otherwise run its
+	// finally via return() so row slots / vtab connections are freed.
+	async function closeSource(): Promise<void> {
+		if (srcClosed) {
+			return;
+		}
+		srcClosed = true;
+		if (srcDone) {
+			return;
+		}
+		if (srcIterator?.return) {
+			await srcIterator.return(undefined);
+		}
+	}
 
 	async function fillBuffer(targetIndex: number): Promise<void> {
 		if (srcDone || buffer.length > targetIndex) {
@@ -60,61 +110,57 @@ export function tee<T>(src: AsyncIterable<T>): [AsyncIterable<T>, AsyncIterable<
 			const result = await srcIterator.next();
 			if (result.done) {
 				srcDone = true;
+				// Full drain: the source finally already ran. Mark closed so a
+				// consumer's teardown below does not redundantly call return().
+				await closeSource();
 			} else {
 				buffer.push(result.value);
 			}
 		}
 	}
 
-	const stream1: AsyncIterable<T> = {
-		async *[Symbol.asyncIterator]() {
-			while (true) {
-				await fillBuffer(consumer1Index);
+	function createStream(self: 0 | 1): AsyncIterable<T> {
+		return {
+			async *[Symbol.asyncIterator]() {
+				liveConsumers++;
+				try {
+					while (true) {
+						await fillBuffer(indices[self]);
 
-				if (consumer1Index >= buffer.length) {
-					if (srcDone) break;
-					continue;
-				}
+						if (indices[self] >= buffer.length) {
+							if (srcDone) break;
+							continue;
+						}
 
-				yield buffer[consumer1Index];
-				consumer1Index++;
+						yield buffer[indices[self]];
+						indices[self]++;
 
-				// Clean up buffer when both consumers have passed this point
-				const minIndex = Math.min(consumer1Index, consumer2Index);
-				if (minIndex > 100) { // Keep some buffer for efficiency
-					buffer.splice(0, minIndex - 100);
-					consumer1Index -= (minIndex - 100);
-					consumer2Index -= (minIndex - 100);
-				}
-			}
-		}
-	};
-
-	const stream2: AsyncIterable<T> = {
-		async *[Symbol.asyncIterator]() {
-			while (true) {
-				await fillBuffer(consumer2Index);
-
-				if (consumer2Index >= buffer.length) {
-					if (srcDone) break;
-					continue;
-				}
-
-				yield buffer[consumer2Index];
-				consumer2Index++;
-
-				// Clean up buffer when both consumers have passed this point
-				const minIndex = Math.min(consumer1Index, consumer2Index);
-				if (minIndex > 100) { // Keep some buffer for efficiency
-					buffer.splice(0, minIndex - 100);
-					consumer1Index -= (minIndex - 100);
-					consumer2Index -= (minIndex - 100);
+						// Clean up buffer when both consumers have passed this point.
+						// NOTE: trim keys off the slower consumer; if one consumer
+						// is never iterated (its index stays 0) while the other
+						// drains a large source, the buffer grows unbounded. Fine
+						// for the intended both-sides-consumed use; revisit if a
+						// caller tees then abandons one side over a big stream.
+						const minIndex = Math.min(indices[0], indices[1]);
+						if (minIndex > 100) { // Keep some buffer for efficiency
+							buffer.splice(0, minIndex - 100);
+							indices[0] -= (minIndex - 100);
+							indices[1] -= (minIndex - 100);
+						}
+					}
+				} finally {
+					// Runs on normal completion, early break, or throw. Last
+					// consumer out releases the source.
+					liveConsumers--;
+					if (liveConsumers === 0) {
+						await closeSource();
+					}
 				}
 			}
-		}
-	};
+		};
+	}
 
-	return [stream1, stream2];
+	return [createStream(0), createStream(1)];
 }
 
 /**
@@ -226,29 +272,60 @@ export async function collect<T>(src: AsyncIterable<T>): Promise<T[]> {
  */
 export async function* merge<T>(...sources: AsyncIterable<T>[]): AsyncIterable<T> {
 	const iterators = sources.map(src => getAsyncIterator(src));
-	const pending = new Map<number, Promise<IteratorResult<T>>>();
+	// Each pending promise is tagged with its source index ONCE, at creation, so
+	// Promise.race over pending.values() can identify the winner without
+	// re-wrapping every other pending promise on each loop iteration (which was
+	// O(sources) wrapper allocations per emitted row and grew handler chains on
+	// slow sources).
+	const pending = new Map<number, Promise<{ index: number; result: IteratorResult<T> }>>();
+	// Indices of sources not yet fully drained. `pending` tracks in-flight reads
+	// for the race; `live` tracks what still needs closing. They diverge exactly
+	// when the consumer breaks right after we yield a value: that source is out
+	// of `pending` (deleted, not yet re-pulled) but its generator is suspended at
+	// a yield and MUST still be released.
+	const live = new Set<number>();
+
+	const pull = (index: number): void => {
+		pending.set(index, iterators[index].next().then(result => ({ index, result })));
+	};
 
 	// Start initial reads
 	for (let i = 0; i < iterators.length; i++) {
-		pending.set(i, iterators[i].next());
+		live.add(i);
+		pull(i);
 	}
 
-	while (pending.size > 0) {
-		// Wait for the first iterator to produce a result
-		const entries = Array.from(pending.entries());
-		const promises = entries.map(([index, promise]) =>
-			promise.then(result => ({ index, result }))
-		);
+	try {
+		while (pending.size > 0) {
+			// Wait for the first source to produce a result. Only the settled
+			// source is re-pulled; the others keep their existing tagged promise.
+			const { index, result } = await Promise.race(pending.values());
+			pending.delete(index);
 
-		const { index, result } = await Promise.race(promises);
-		pending.delete(index);
-
-		if (!result.done) {
-			yield result.value;
-			// Start next read from this iterator
-			pending.set(index, iterators[index].next());
+			if (result.done) {
+				live.delete(index);
+			} else {
+				yield result.value;
+				pull(index);
+			}
 		}
-		// If iterator is done, it's removed from pending and won't be read again
+	} finally {
+		// Close every still-live source. Covers all non-drain exits: consumer
+		// early break (generator return() unwinds through here) and a source
+		// next() throwing (error propagates through here, leaving siblings live).
+		// Fully-drained sources have already been removed from `live`.
+		await Promise.all(Array.from(live).map(async index => {
+			const iterator = iterators[index];
+			if (iterator.return) {
+				try {
+					await iterator.return(undefined);
+				} catch (e) {
+					// Swallow-but-log per AGENTS.md: one failing close must not
+					// mask the others or the original error.
+					log('merge: error closing source %d: %s', index, e);
+				}
+			}
+		}));
 	}
 }
 

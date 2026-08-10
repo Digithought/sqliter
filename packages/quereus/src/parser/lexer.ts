@@ -166,12 +166,22 @@ export enum TokenType {
 	ERROR = 'ERROR'
 }
 
+/**
+ * The parsed value a token carries beyond its raw {@link Token.lexeme}:
+ * - STRING / quoted IDENTIFIER → the unescaped text (`string`)
+ * - INTEGER → `number` (safe range) or `bigint` (overflow)
+ * - FLOAT → the original numeric text (`string`; parsed to a number at AST build)
+ * - BLOB → the decoded bytes (`Uint8Array`)
+ *
+ * All other token types carry no literal (`undefined`).
+ */
+export type TokenLiteral = string | number | bigint | Uint8Array;
+
 // Token represents a lexical token from the SQL input
 export interface Token {
 	type: TokenType;
 	lexeme: string;
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	literal?: any;
+	literal?: TokenLiteral;
 	startLine: number;
 	startColumn: number;
 	startOffset: number;
@@ -301,6 +311,16 @@ export const KEYWORDS: Record<string, TokenType> = {
 	'apply': TokenType.APPLY,
 	'explain': TokenType.EXPLAIN,
 };
+
+/**
+ * Reserved words that the lexer tokenizes specially but which SQL still permits as
+ * identifiers in most contexts (table/column/alias names, function names, etc.).
+ * Shared by the parser (the many `consumeIdentifier(CONTEXTUAL_KEYWORDS, …)` sites)
+ * and the emitter (which must know that, e.g., `like(…)` re-parses bare so it should
+ * not be quoted). Lives next to KEYWORDS so the two classifications stay together;
+ * callers needing extras spread it, e.g. `[...CONTEXTUAL_KEYWORDS, 'replace']`.
+ */
+export const CONTEXTUAL_KEYWORDS = ['key', 'action', 'set', 'default', 'check', 'unique', 'references', 'on', 'cascade', 'restrict', 'like'] as const;
 
 /**
  * Lexer class for tokenizing SQL statements
@@ -494,12 +514,19 @@ export class Lexer {
 		// SQL standard: characters between the quotes are preserved verbatim,
 		// with one exception — a doubled quote ('') represents a single literal
 		// quote. Backslash has no special meaning.
+		//
+		// Each unbroken run (no doubled quote) is taken in a single slice rather than
+		// accumulated character-by-character; the common no-escape string is one slice.
+		// `advance()` still walks each char so line/column tracking stays exact across
+		// embedded newlines.
 		let value = '';
 
 		while (true) {
+			const runStart = this.current;
 			while (!this.isAtEnd() && this.peek() !== quote) {
-				value += this.advance();
+				this.advance();
 			}
+			value += this.source.substring(runStart, this.current);
 
 			if (this.isAtEnd()) {
 				this.addErrorToken("Unterminated string.");
@@ -522,16 +549,19 @@ export class Lexer {
 	}
 
 	private backtickIdentifier(): void {
-		let value = '';
+		// No escape sequence — the whole run is a single slice.
+		const contentStart = this.current;
 
 		while (!this.isAtEnd() && this.peek() !== '`') {
-			value += this.advance();
+			this.advance();
 		}
 
 		if (this.isAtEnd()) {
 			this.addErrorToken("Unterminated identifier.");
 			return;
 		}
+
+		const value = this.source.substring(contentStart, this.current);
 
 		// Consume the closing backtick
 		this.advance();
@@ -545,20 +575,26 @@ export class Lexer {
 	 * Supports "" escape for embedded double quotes.
 	 */
 	private doubleQuotedIdentifier(): void {
+		// Each run up to a `"` is taken in one slice; a doubled `""` is a literal
+		// quote and continues the identifier (the common no-escape case is one slice).
 		let value = '';
 
 		while (!this.isAtEnd()) {
-			if (this.peek() === '"') {
-				// Check for escaped double quote ("")
-				if (this.peekNext() === '"') {
-					value += '"';
-					this.advance(); // First "
-					this.advance(); // Second "
-				} else {
-					break; // End of identifier
-				}
+			const runStart = this.current;
+			while (!this.isAtEnd() && this.peek() !== '"') {
+				this.advance();
+			}
+			value += this.source.substring(runStart, this.current);
+
+			if (this.isAtEnd()) break; // Unterminated — handled below.
+
+			// At a `"`. A doubled `""` is an escaped literal quote; otherwise it ends.
+			if (this.peekNext() === '"') {
+				value += '"';
+				this.advance(); // First "
+				this.advance(); // Second "
 			} else {
-				value += this.advance();
+				break; // End of identifier
 			}
 		}
 
@@ -574,16 +610,19 @@ export class Lexer {
 	}
 
 	private bracketIdentifier(): void {
-		let value = '';
+		// No escape sequence — the whole run is a single slice.
+		const contentStart = this.current;
 
 		while (!this.isAtEnd() && this.peek() !== ']') {
-			value += this.advance();
+			this.advance();
 		}
 
 		if (this.isAtEnd()) {
 			this.addErrorToken("Unterminated identifier.");
 			return;
 		}
+
+		const value = this.source.substring(contentStart, this.current);
 
 		// Consume the closing bracket
 		this.advance();
@@ -679,24 +718,18 @@ export class Lexer {
 			// Store original string as literal for FLOAT
 			this.addToken(TokenType.FLOAT, lexeme);
 		} else {
-			// For integers, parse now to handle potential BigInt
-			try {
-				const num = parseInt(lexeme, 10);
-				if (!Number.isSafeInteger(num)) {
-					try {
-						this.addToken(TokenType.INTEGER, BigInt(lexeme));
-					} catch {
-						this.addErrorToken("Integer literal too large.");
-					}
-				} else {
-					this.addToken(TokenType.INTEGER, num);
-				}
-			} catch {
+			// For integers, parse now to handle potential BigInt. `lexeme` is an
+			// all-digit run, so `parseInt` never returns NaN or throws — only the
+			// safe-integer overflow into BigInt needs guarding.
+			const num = parseInt(lexeme, 10);
+			if (!Number.isSafeInteger(num)) {
 				try {
 					this.addToken(TokenType.INTEGER, BigInt(lexeme));
 				} catch {
-					this.addErrorToken("Invalid integer literal.");
+					this.addErrorToken("Integer literal too large.");
 				}
+			} else {
+				this.addToken(TokenType.INTEGER, num);
 			}
 		}
 	}
@@ -760,8 +793,7 @@ export class Lexer {
 		return c === ' ' || c === '\r' || c === '\n' || c === '\t';
 	}
 
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	private addToken(type: TokenType, literal?: any): void {
+	private addToken(type: TokenType, literal?: TokenLiteral): void {
 		const lexeme = this.source.substring(this.start, this.current);
 		this.tokens.push({
 			type,

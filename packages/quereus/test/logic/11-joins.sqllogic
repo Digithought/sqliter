@@ -38,9 +38,13 @@ SELECT l.id, r.id, e.id FROM t_left l JOIN t_right r ON l.id = r.left_id JOIN t_
 DROP TABLE t_extra;
 -- run
 
--- RIGHT JOIN (not supported yet)
+-- RIGHT JOIN: every right row appears; r.id=40 (left_id=4) has no left match → null-left.
 SELECT l.id, r.id FROM t_left l RIGHT JOIN t_right r ON l.id = r.left_id ORDER BY r.id;
--- error: RIGHT JOIN is not supported yet
+→ [{"id":1,"id:1":10},{"id":2,"id:1":20},{"id":null,"id:1":40}]
+
+-- FULL JOIN: matched rows plus l.id=3 (no right) null-right and r.id=40 (no left) null-left.
+SELECT l.id, r.id FROM t_left l FULL JOIN t_right r ON l.id = r.left_id ORDER BY coalesce(l.id, r.id);
+→ [{"id":1,"id:1":10},{"id":2,"id:1":20},{"id":3,"id:1":null},{"id":null,"id:1":40}]
 
 DROP TABLE t_left;
 DROP TABLE t_right;

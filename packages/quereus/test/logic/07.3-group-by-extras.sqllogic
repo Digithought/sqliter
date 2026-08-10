@@ -58,12 +58,39 @@ select grp as g, count(*) as cnt from gx group by grp having count(*) > 0 order 
 select grp as g from gx group by grp order by g;
 → [{"g":"a"},{"g":"b"}]
 
+-- A non-bare GROUP BY key is matched against the select list by an identity
+-- fingerprint that folds identifier case, so writing the same expression with
+-- different identifier casing still names the same key.
+select grp || sub as combined, count(*) as cnt
+from gx group by GRP || Sub order by combined;
+→ [{"combined":"ax","cnt":2},{"combined":"ay","cnt":1},{"combined":"bx","cnt":1},{"combined":"by","cnt":1}]
+
+-- Quoted literals are NOT case-folded by that fingerprint: `'-'` and the key's
+-- `'.'` differ, so the select-list expression is not the grouping key and the
+-- bare `grp` inside it is an ungrouped reference.
+select grp || '-' as combined from gx group by grp || '.';
+-- error: Column 'grp' must appear in the GROUP BY clause or be used in an aggregate function
+
 drop table gx;
 
--- GROUP BY with COLLATE NOCASE on a TEXT column is not supported by Quereus
--- (engine emits a clear rejection at table creation time).
+-- COLLATE NOCASE written in lowercase on a TEXT column is accepted at DDL (the
+-- name normalizes to canonical NOCASE), and GROUP BY / DISTINCT over that column
+-- honor the column's collation — case-variant values fold into a single group
+-- (unique-collation-name-case-insensitive-normalization).
 create table gn (id integer primary key, name text collate nocase, val integer);
--- error: Collation 'nocase' is not supported
+insert into gn values (1, 'Hello', 10), (2, 'HELLO', 20), (3, 'world', 5);
+
+-- GROUP BY folds 'Hello'/'HELLO' under NOCASE into one group. lower(name) keeps
+-- the assertion independent of which case-variant the engine picks as the group
+-- representative.
+select lower(name) as ln, count(*) as c, sum(val) as s from gn group by name order by ln;
+→ [{"ln":"hello","c":2,"s":30},{"ln":"world","c":1,"s":5}]
+
+-- count(distinct) honors the same collation: the two case-variants count as one.
+select count(distinct name) as n from gn;
+→ [{"n":2}]
+
+drop table gn;
 
 -- GROUP BY a CASE expression
 create table gc (id integer primary key, val integer);
@@ -122,3 +149,171 @@ select grp, count(*) from gf where 1 = 0 group by grp;
 → []
 
 drop table gf;
+
+-- ---------------------------------------------------------------------------
+-- GROUP BY two qualified columns that share a base name (i.id / c.id → `id`).
+-- Standard SQL allows this; it must group correctly rather than crash at plan
+-- time on a duplicate scope symbol.
+-- ---------------------------------------------------------------------------
+create table items (id integer primary key, name text, category_id integer);
+create table categories (id integer primary key, name text, type_id integer);
+create table log_entry_items (entry_id integer primary key, item_id integer);
+insert into items values (1, 'Widget', 100), (2, 'Gadget', 100), (3, 'Gizmo', 200);
+insert into categories values (100, 'Tools', 7), (200, 'Toys', 7);
+insert into log_entry_items values (10, 1), (11, 1), (12, 2);
+
+-- The exact reproduction from the ticket: two qualified same-base-name keys
+-- (`i.id`/`c.id`, `i.name`/`c.name`) group correctly; qualified SELECT columns
+-- resolve to their respective group keys. `usageCount` is 0 for the item with
+-- no log entries (count of a nullable left-join column).
+select i.id, i.name, c.id as categoryId, c.name as categoryName, count(lei.entry_id) as usageCount
+from items i
+join categories c on c.id = i.category_id
+left join log_entry_items lei on lei.item_id = i.id
+where c.type_id = ?
+group by i.id, i.name, c.id, c.name
+order by i.id;
+-- params: [7]
+→ [{"id":1,"name":"Widget","categoryId":100,"categoryName":"Tools","usageCount":2},{"id":2,"name":"Gadget","categoryId":100,"categoryName":"Tools","usageCount":1},{"id":3,"name":"Gizmo","categoryId":200,"categoryName":"Toys","usageCount":0}]
+
+-- Qualified reference in ORDER BY resolves to the group key (bare `id` would be
+-- ambiguous, but the qualifier disambiguates).
+select i.id as itemId, c.id as catId, count(*) as n
+from items i join categories c on c.id = i.category_id
+group by i.id, c.id
+order by c.id, i.id;
+→ [{"itemId":1,"catId":100,"n":1},{"itemId":2,"catId":100,"n":1},{"itemId":3,"catId":200,"n":1}]
+
+-- Qualified reference in HAVING resolves to the group key.
+select i.id as itemId, c.id as catId
+from items i join categories c on c.id = i.category_id
+group by i.id, c.id
+having i.id >= 2
+order by i.id;
+→ [{"itemId":2,"catId":100},{"itemId":3,"catId":200}]
+
+-- Two same-base-name columns projected unqualified-but-aliased → distinct output
+-- columns, no crash.
+select i.id as a, c.id as b, count(*) as n
+from items i join categories c on c.id = i.category_id
+group by i.id, c.id
+order by i.id;
+→ [{"a":1,"b":100,"n":1},{"a":2,"b":100,"n":1},{"a":3,"b":200,"n":1}]
+
+-- Degenerate duplicate key `group by i.id, i.id` (same column twice) must not
+-- crash; the qualified key still resolves.
+select i.id as itemId, count(*) as n
+from items i
+group by i.id, i.id
+order by i.id;
+→ [{"itemId":1,"n":1},{"itemId":2,"n":1},{"itemId":3,"n":1}]
+
+-- Negative: a genuinely ambiguous *bare* reference (HAVING `id` with two `id`
+-- group keys) raises the clear ambiguity error rather than crashing or silently
+-- binding to one source column.
+select i.id as itemId, c.id as catId
+from items i join categories c on c.id = i.category_id
+group by i.id, c.id
+having id >= 0;
+-- error: ambiguous column name: id
+
+-- Regression: single-table `group by c.id, c.name` (distinct base names) still
+-- works and resolves qualified references.
+select c.id, c.name, count(*) as n
+from categories c
+group by c.id, c.name
+order by c.id;
+→ [{"id":100,"name":"Tools","n":1},{"id":200,"name":"Toys","n":1}]
+
+drop table items;
+drop table categories;
+drop table log_entry_items;
+
+-- ---------------------------------------------------------------------------
+-- HAVING / ORDER BY aggregate matching by canonical AST fingerprint, not a
+-- shallow argument peek (bug-aggregate-reuse-matching-ignores-arguments).
+--
+-- A clause above the AggregateNode (HAVING, a top-level ORDER BY) that spells
+-- out an aggregate must only bind to the SELECT list's computed column when the
+-- argument expressions actually match; a differently-shaped argument must be
+-- collected and computed as its own aggregate instead.
+-- ---------------------------------------------------------------------------
+create table wg (a text, b text);
+insert into wg values ('x','1'),('y','2'),('x','3');
+
+-- Fixed: HAVING spells a *different* aggregate (`sum(a+0)`) than the SELECT
+-- list's `sum(b+0)`. `sum(a+0)` is 0 for every group, so no group qualifies.
+select a, sum(b+0) as s from wg group by a having sum(a+0) > 3;
+→ []
+
+-- Fixed: same divergence in ORDER BY. `sum(a+0)` is 0 for every group, so the
+-- sort is a no-op and rows keep source (group-discovery) order.
+select a, sum(b+0) as s from wg group by a order by sum(a+0);
+→ [{"a":"x","s":4},{"a":"y","s":2}]
+
+-- Control: identical spelling (`count(*)`) still reads the computed column.
+select a, count(*) as c from wg group by a having count(*) > 1;
+→ [{"a":"x","c":2}]
+
+-- Control: DISTINCT participates in the match — `count(distinct b)` is its own
+-- aggregate, matched by its own spelling.
+select a, count(distinct b) as cd from wg group by a having count(distinct b) > 1;
+→ [{"a":"x","cd":2}]
+
+-- Control: a SELECT-list alias reference resolves through the aggregate output
+-- scope, not through this matching at all.
+select a, sum(b) as s from wg group by a having s > 3;
+→ [{"a":"x","s":4}]
+
+-- Control: whitespace and redundant parentheses don't defeat the match — the
+-- fingerprint normalizes them.
+select a, sum(b+0) as s from wg group by a having sum(b + 0) > 3;
+→ [{"a":"x","s":4}]
+
+select a, sum(b) as s from wg group by a having sum((b)) > 3;
+→ [{"a":"x","s":4}]
+
+-- Control: identifier case doesn't defeat the match.
+select a, sum(B) as s from wg group by a having sum(b) > 3;
+→ [{"a":"x","s":4}]
+
+-- Narrowing (documented, not fixed): a qualifier divergence (`w.b` vs bare `b`)
+-- no longer matches, so HAVING computes a second, redundant aggregate over the
+-- same column instead of reusing the SELECT list's — the answer is unaffected.
+select a, sum(w.b) as s from wg w group by a having sum(b) > 3;
+→ [{"a":"x","s":4}]
+
+drop table wg;
+
+-- ---------------------------------------------------------------------------
+-- HAVING / ORDER BY aggregate matching folds identifier case only, not literal
+-- case (bug-aggregate-match-ignores-string-literal-case). A quoted string
+-- literal's case is part of an aggregate's identity: two aggregates that differ
+-- only in literal case (`nullif(b,'A')` vs `nullif(b,'a')`) must never collapse
+-- into one, or a clause above the AggregateNode silently reads the wrong number.
+-- ---------------------------------------------------------------------------
+create table wgl (id integer primary key, g integer, b text);
+insert into wgl values
+  (1, 1, 'A'), (2, 1, 'A'), (3, 1, 'a'),
+  (4, 2, 'A'), (5, 2, 'a'), (6, 2, 'a');
+
+-- Fixed: HAVING spells a literal-case-distinct aggregate (`nullif(b,'a')`) from
+-- the SELECT list's `nullif(b,'A')`; HAVING binds to its own aggregate rather
+-- than reusing (and reporting) the SELECT list's.
+select g, count(nullif(b,'A')) as c from wgl where g = 1 group by g having count(nullif(b,'a')) > 1;
+→ [{"g":1,"c":1}]
+
+-- Same shape, both aggregates present in the SELECT list: HAVING must bind to
+-- `d`, not silently reuse `c`.
+select g, count(nullif(b,'A')) as c, count(nullif(b,'a')) as d from wgl where g = 1 group by g having count(nullif(b,'a')) > 1;
+→ [{"g":1,"c":1,"d":2}]
+
+-- Fixed: same divergence in a top-level ORDER BY, using two groups so a wrong
+-- bind changes row order (not just a displayed value). Ordering by
+-- count(nullif(b,'a')) (g=1 → 2, g=2 → 1) puts g=2 first; the buggy fold would
+-- instead have ordered by the SELECT list's count(nullif(b,'A')) (g=1 → 1,
+-- g=2 → 2), putting g=1 first.
+select g, count(nullif(b,'A')) as c from wgl group by g order by count(nullif(b,'a'));
+→ [{"g":2,"c":2},{"g":1,"c":1}]
+
+drop table wgl;

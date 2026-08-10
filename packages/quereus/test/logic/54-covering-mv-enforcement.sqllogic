@@ -1,0 +1,314 @@
+-- 54-covering-mv-enforcement.sqllogic — row-time UNIQUE enforcement routed
+-- through an explicit covering materialized view's backing table
+-- (covering-structure-mv-rowtime-enforcement). The covering MV
+-- `select <uc-cols>, <pk> from T order by <uc-cols>` is both *covering* (the
+-- prover links it to the UNIQUE constraint) and row-time (every MV is row-time
+-- maintained, so its backing is consistent mid-statement), so
+-- `findIndexForConstraint` prefers it over the auto-index and the source PK is
+-- recovered from the MV projection to resolve IGNORE / ABORT / REPLACE against
+-- the correct source row.
+--
+-- This file runs under BOTH the memory module (`yarn test`) and the store module
+-- (`yarn test:store`); under the store the source table is a store table while the
+-- covering MV's backing table is always the memory module, queried through the db.
+
+-- ===================================
+-- 1. INSERT — default ABORT, OR IGNORE, OR REPLACE through the covering MV.
+-- ===================================
+
+create table t (id integer primary key, x integer not null, y integer not null, unique (x, y));
+create materialized view ix as select x, y, id from t order by x, y;
+insert into t values (1, 5, 5);
+
+-- default ABORT: a duplicate (x,y) with a different PK is rejected
+insert into t values (2, 5, 5);
+-- error: UNIQUE constraint failed
+
+select id, x, y from t order by id;
+→ [{"id":1,"x":5,"y":5}]
+
+-- OR IGNORE: the duplicate is silently skipped
+insert or ignore into t values (2, 5, 5);
+select id, x, y from t order by id;
+→ [{"id":1,"x":5,"y":5}]
+
+-- OR REPLACE: the prior source row (recovered by PK = 1) is evicted, the new row lands
+insert or replace into t values (10, 5, 5);
+select id, x, y from t order by id;
+→ [{"id":10,"x":5,"y":5}]
+-- The internal REPLACE eviction is now reported via `UpdateResult.evictedRows`, so the
+-- DML executor's eviction pipeline maintains the covering MV's backing uniformly across
+-- memory, direct store, AND the isolation-wrapped store path (yarn test:store) — the MV
+-- shows only id=10 on every path (internal-eviction-reporting).
+select x, y, id from ix order by x, y;
+→ [{"x":5,"y":5,"id":10}]
+
+-- ===================================
+-- 2. Multi-row INSERT with an intra-statement duplicate (reads-own-writes through
+--    the coordinated backing connection mid-statement).
+-- ===================================
+
+create table m (id integer primary key, x integer not null, y integer not null, unique (x, y));
+create materialized view m_ix as select x, y, id from m order by x, y;
+
+-- ABORT: the second row collides with the first written earlier in the statement
+insert into m values (1, 7, 7), (2, 7, 7);
+-- error: UNIQUE constraint failed
+
+select count(*) as n from m;
+→ [{"n":0}]
+
+-- OR IGNORE: the first row lands, the intra-statement duplicate is skipped
+insert or ignore into m values (1, 7, 7), (2, 7, 7);
+select id, x, y from m order by id;
+→ [{"id":1,"x":7,"y":7}]
+
+-- ===================================
+-- 3. UPDATE — moving a row onto an existing UC value (default ABORT), and a
+--    schema-level ON CONFLICT REPLACE default that evicts + maintains the backing.
+-- ===================================
+
+create table u (id integer primary key, x integer not null, y integer not null, unique (x, y));
+create materialized view u_ix as select x, y, id from u order by x, y;
+insert into u values (1, 5, 5), (2, 6, 6);
+
+-- moving id=1 onto (6,6) collides with id=2 (UPDATE OR <action> is unsupported,
+-- so the constraint's ABORT default governs)
+update u set x = 6, y = 6 where id = 1;
+-- error: UNIQUE constraint failed
+
+select id, x, y from u order by id;
+→ [{"id":1,"x":5,"y":5},{"id":2,"x":6,"y":6}]
+
+create table ur (id integer primary key, x integer not null, y integer not null, unique (x, y) on conflict replace);
+create materialized view ur_ix as select x, y, id from ur order by x, y;
+insert into ur values (1, 5, 5), (2, 6, 6);
+
+-- the REPLACE default drives eviction of id=2 when id=1 moves onto (6,6)
+update ur set x = 6, y = 6 where id = 1;
+select id, x, y from ur order by id;
+→ [{"id":1,"x":6,"y":6}]
+-- the evicted id=2 is reported via `evictedRows`, so its backing entry is removed and
+-- the moved id=1 is maintained — the covering MV shows only (6,6,id=1) on every path.
+select x, y, id from ur_ix order by x, y;
+→ [{"x":6,"y":6,"id":1}]
+
+-- ===================================
+-- 4. UPDATE that changes the PK only (UC value unchanged) is NOT a self-conflict.
+--    The internal old-row delete bypasses the row-time hook, leaving id=1's backing
+--    entry transiently present; the live-source validation must skip that stale
+--    candidate rather than raise a phantom conflict.
+-- ===================================
+
+create table pk (id integer primary key, x integer not null, y integer not null, unique (x, y));
+create materialized view pk_ix as select x, y, id from pk order by x, y;
+insert into pk values (1, 5, 5);
+
+update pk set id = 10 where id = 1;
+select id, x, y from pk order by id;
+→ [{"id":10,"x":5,"y":5}]
+select x, y, id from pk_ix order by x, y;
+→ [{"x":5,"y":5,"id":10}]
+
+-- ===================================
+-- 5. Partial covering MV — a source row outside the predicate is not checked.
+-- ===================================
+-- Lives in 54.1-covering-mv-partial-enforcement: a partial UNIQUE can only be spelled
+-- as `create unique index … where …`, so it needs standalone index DDL.
+
+-- ===================================
+-- 6. A covering MV declared with bare DDL (the only form now — every MV is
+--    row-time maintained) routes enforcement through the MV just like the explicit
+--    cases above. The auto-index also still enforces, so the constraint holds.
+-- ===================================
+
+create table man (id integer primary key, x integer not null, y integer not null, unique (x, y));
+create materialized view man_ix as select x, y, id from man order by x, y;
+insert into man values (1, 5, 5);
+insert into man values (2, 5, 5);
+-- error: UNIQUE constraint failed
+select id, x, y from man order by id;
+→ [{"id":1,"x":5,"y":5}]
+
+-- ===================================
+-- 7. Covering MV that is ALSO a chain link. The level-1 MV `cix` is the covering
+--    structure enforcing UNIQUE(x,y) on `ct`; it is itself the source of a level-2
+--    MV `cix2`. UNIQUE enforcement still routes through the level-1 covering MV
+--    (intra-statement reads-own-writes on its backing), and each level-1 backing
+--    write cascades to the level-2 MV so it stays row-time consistent — including a
+--    full statement rollback when a later row aborts. (A constraint proved by a
+--    *downstream* MV — the prover seeing through the chain to the base table — is the
+--    lens layer's concern, tracked in `lens-prover-and-attachment`; this case covers
+--    the in-reach level-1 covering MV whose backing then cascades.)
+-- ===================================
+
+create table ct (id integer primary key, x integer not null, y integer not null, unique (x, y));
+create materialized view cix as select x, y, id from ct order by x, y;
+create materialized view cix2 as select x, y, id from cix;
+insert into ct values (1, 5, 5);
+
+-- the level-2 MV reflects the cascade from the first insert
+select x, y, id from cix2 order by x, y;
+→ [{"x":5,"y":5,"id":1}]
+
+-- ABORT: an intra-statement duplicate (x,y)=(7,7) is detected via the covering MV;
+-- the whole statement rolls back, leaving the cascaded level-2 MV consistent too.
+insert into ct values (10, 7, 7), (11, 7, 7);
+-- error: UNIQUE constraint failed
+select x, y, id from cix2 order by x, y;
+→ [{"x":5,"y":5,"id":1}]
+
+-- OR IGNORE: the first new row lands and cascades to level 2; the intra-statement
+-- duplicate is skipped (the covering MV's backing reflects the earlier same-statement
+-- row), so level 2 ends with exactly the surviving rows.
+insert or ignore into ct values (10, 7, 7), (11, 7, 7);
+select x, y, id from cix2 order by x, y;
+→ [{"x":5,"y":5,"id":1},{"x":7,"y":7,"id":10}]
+
+-- a plain duplicate against a committed row is still rejected by the covering MV
+insert into ct values (12, 5, 5);
+-- error: UNIQUE constraint failed
+select id, x, y from ct order by id;
+→ [{"id":1,"x":5,"y":5},{"id":10,"x":7,"y":7}]
+
+-- ===================================
+-- 8. Covering MV that ALSO carries a deterministic computed column
+--    (materialized-view-rowtime-expression-projections). The UC columns and PK stay
+--    passthrough (so the prover still links it as the covering structure and the
+--    source PK is recoverable for conflict resolution); the extra computed column is
+--    just stored and maintained alongside. Enforcement (ABORT / REPLACE) is unchanged,
+--    and the computed column tracks the surviving row through a REPLACE eviction.
+-- ===================================
+
+create table ce (id integer primary key, x integer not null, y integer not null, unique (x, y));
+create materialized view ce_ix as select x, y, id, x + y as sxy from ce order by x, y;
+insert into ce values (1, 5, 5);
+select x, y, id, sxy from ce_ix order by x, y;
+→ [{"x":5,"y":5,"id":1,"sxy":10}]
+
+-- default ABORT through the covering MV (the extra computed column does not perturb
+-- the inverse PK/UC map, which reads only the passthrough projectors)
+insert into ce values (2, 5, 5);
+-- error: UNIQUE constraint failed
+select id, x, y from ce order by id;
+→ [{"id":1,"x":5,"y":5}]
+
+-- OR REPLACE: id=1 evicted, id=10 lands; the computed sxy is maintained for the
+-- surviving row
+insert or replace into ce values (10, 5, 5);
+select id, x, y from ce order by id;
+→ [{"id":10,"x":5,"y":5}]
+
+-- ===================================
+-- 9. Per-statement maintenance batching must NOT hide an earlier same-statement row
+--    from a later row's enforcement scan (materialized-view-rowtime-per-statement-
+--    batching). The batching change amortizes the backing-connection *resolution* over
+--    the statement but still applies each row's maintenance immediately, so a later row
+--    in the SAME bulk statement sees every earlier row's backing entry. These cases are
+--    the regression guard for that invariant: a duplicate buried deep in a bulk INSERT,
+--    and an intra-statement OR REPLACE, both resolve against the just-written rows.
+-- ===================================
+
+create table bb (id integer primary key, x integer not null, y integer not null, unique (x, y));
+create materialized view bb_ix as select x, y, id from bb order by x, y;
+insert into bb values (100, 1, 1);
+
+-- ABORT: a LATER row (#5) duplicates an EARLIER row of the SAME statement (#3). The
+-- covering MV's backing reflects rows 1..4 written earlier this statement, so the
+-- duplicate is detected and the WHOLE statement rolls back — neither the bulk rows
+-- nor any backing delta survive (only the pre-existing row remains).
+insert into bb values (1, 10, 10), (2, 20, 20), (3, 30, 30), (4, 40, 40), (5, 30, 30);
+-- error: UNIQUE constraint failed
+select id, x, y from bb order by id;
+→ [{"id":100,"x":1,"y":1}]
+
+-- OR IGNORE: rows 1..4 land and are maintained; row 5 (the intra-statement duplicate
+-- of row 3, seen via the backing) is skipped. The surviving set proves the earlier
+-- same-statement row was visible to the later row's enforcement scan.
+insert or ignore into bb values (1, 10, 10), (2, 20, 20), (3, 30, 30), (4, 40, 40), (5, 30, 30);
+select id, x, y from bb order by id;
+→ [{"id":1,"x":10,"y":10},{"id":2,"x":20,"y":20},{"id":3,"x":30,"y":30},{"id":4,"x":40,"y":40},{"id":100,"x":1,"y":1}]
+
+-- OR REPLACE: an intra-statement duplicate evicts the just-written earlier same-statement
+-- row (recovered from the backing this statement wrote) and the later row lands. Two rows
+-- of one statement share (x,y)=(7,7): row 1 (id=1) is written, then row 2 (id=2) collides
+-- with it and REPLACE evicts id=1 — end state is id=2 only.
+create table rr (id integer primary key, x integer not null, y integer not null, unique (x, y));
+create materialized view rr_ix as select x, y, id from rr order by x, y;
+insert or replace into rr values (1, 7, 7), (2, 7, 7);
+select id, x, y from rr order by id;
+→ [{"id":2,"x":7,"y":7}]
+-- the intra-statement eviction of id=1 is reported via `evictedRows`; its backing entry
+-- is removed and id=2 maintained — the covering MV shows only (7,7,id=2) on every path.
+select x, y, id from rr_ix order by x, y;
+→ [{"x":7,"y":7,"id":2}]
+
+-- ===================================
+-- 10. Per-statement batching must preserve covering-UNIQUE enforcement visibility on the
+--    UPDATE path too (materialized-view-rowtime-per-statement-batching). The update
+--    generator owns the same per-statement BackingConnectionCache as insert, and a
+--    covering UNIQUE is enforced inside the source vtab's update path
+--    (manager.performUpdate → checkUniqueConstraints → checkUniqueViaMaterializedView,
+--    scanning the MV backing). §9 covered only INSERT; this guards UPDATE.
+--
+--    A single bulk UPDATE moves id=1 and id=2 onto the SAME covered value. Whichever
+--    row is processed second has its enforcement scan observe the first row's
+--    same-statement backing write and the whole statement aborts — order-independent
+--    (were the connection cache to hide the earlier same-statement update, both rows
+--    would silently reach x=100). Asserts source end-state only (store-safe).
+-- ===================================
+
+create table ub (id integer primary key, x integer not null, unique (x));
+create materialized view ub_ix as select x, id from ub order by x;
+insert into ub values (1, 1), (2, 2), (3, 3);
+
+update ub set x = 100 where id in (1, 2);
+-- error: UNIQUE constraint failed
+select id, x from ub order by id;
+→ [{"id":1,"x":1},{"id":2,"x":2},{"id":3,"x":3}]
+
+-- ===================================
+-- 11. Write-through to a covering MV (materialized-view-dml-write-through). DML
+--     targeting the covering MV's *name* is rewritten to target the source table
+--     (write-through via view updateability) and re-planned through the base-table
+--     builder, so the source write is UNIQUE-enforced through the same covering MV's
+--     backing it would be for a direct source write. A conflicting write-through is
+--     therefore resolved (ABORT / IGNORE / REPLACE) against the live backing exactly
+--     as a direct source write is — write-through and covering enforcement compose
+--     with no extra wiring. Asserts source end-state only (store-safe).
+-- ===================================
+
+create table wt (id integer primary key, x integer not null, y integer not null, unique (x, y));
+create materialized view wt_ix as select x, y, id from wt order by x, y;
+
+-- the first write-through INSERT lands in the source
+insert into wt_ix (id, x, y) values (1, 5, 5);
+select id, x, y from wt order by id;
+→ [{"id":1,"x":5,"y":5}]
+
+-- default ABORT: a write-through INSERT duplicating (x,y) with a new PK is rejected
+insert into wt_ix (id, x, y) values (2, 5, 5);
+-- error: UNIQUE constraint failed
+select id, x, y from wt order by id;
+→ [{"id":1,"x":5,"y":5}]
+
+-- OR IGNORE through the MV: the duplicate is silently skipped
+insert or ignore into wt_ix (id, x, y) values (2, 5, 5);
+select id, x, y from wt order by id;
+→ [{"id":1,"x":5,"y":5}]
+
+-- OR REPLACE through the MV: the prior source row (recovered by PK = 1 from the backing)
+-- is evicted, the new row lands
+insert or replace into wt_ix (id, x, y) values (10, 5, 5);
+select id, x, y from wt order by id;
+→ [{"id":10,"x":5,"y":5}]
+
+-- UPDATE through the MV moving a row onto an existing UC value is rejected (ABORT
+-- default; UPDATE OR <action> is unsupported, so the constraint default governs)
+create table wu (id integer primary key, x integer not null, y integer not null, unique (x, y));
+create materialized view wu_ix as select x, y, id from wu order by x, y;
+insert into wu_ix (id, x, y) values (1, 5, 5), (2, 6, 6);
+update wu_ix set x = 6, y = 6 where id = 1;
+-- error: UNIQUE constraint failed
+select id, x, y from wu order by id;
+→ [{"id":1,"x":5,"y":5},{"id":2,"x":6,"y":6}]

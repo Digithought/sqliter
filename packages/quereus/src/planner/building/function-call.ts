@@ -7,59 +7,76 @@ import * as AST from "../../parser/ast.js";
 import { ScalarPlanNode } from "../nodes/plan-node.js";
 import { isAggregateFunctionSchema, isScalarFunctionSchema } from '../../schema/function.js';
 import { buildExpression } from "./expression.js";
+import { coerceComparisonGroup } from "./coercion.js";
 import { ScalarFunctionCallNode } from "../nodes/function.js";
 import { resolveFunctionSchema } from "./schema-resolution.js";
 import { CapabilityDetectors } from '../framework/characteristics.js';
 import type { ScalarType } from "../../common/datatype.js";
+import { expressionToIdentityString } from "../../emit/ast-stringify.js";
+
+/** One entry of {@link PlanningContext.aggregates} — an aggregate already computed by the AggregateNode. */
+export type CollectedAggregate = NonNullable<PlanningContext['aggregates']>[number];
+
+/**
+ * The already-computed aggregate this call refers to, if any.
+ *
+ * A clause that runs ABOVE the AggregateNode (HAVING, ORDER BY, a window
+ * specification in a grouped query) may spell out an aggregate the SELECT list
+ * already collected; that spelling means "read the computed column", not
+ * "aggregate again". Matching is by the same canonical-AST fingerprint
+ * (`expressionToIdentityString` — identifier case folded, literal case preserved)
+ * that `dedupeNewAggregates` and `collectInnerAggregates` use for this same
+ * question elsewhere — so `sum(B)` in the SELECT list matches `sum(b)` in HAVING,
+ * whitespace / redundant parens are ignored, and two structurally different
+ * arguments never match. (`buildGroupByCoverage`'s fingerprint is a *different*,
+ * fully case-sensitive `expressionToString` convention — it answers a stricter
+ * question, whether a HAVING/window subtree exactly reproduces a GROUP BY key.)
+ *
+ * NOTE: the fingerprint includes each argument's qualifier, so `sum(w.b)` does
+ * NOT match `sum(b)` even when `w` is the only table in scope. Resolving that
+ * would mean binding each argument to an attribute id, which needs the argument
+ * already built — and this runs BEFORE the build, by design. A HAVING/ORDER BY
+ * caller degrades gracefully (the collect path in select-aggregates.ts builds a
+ * second, redundant aggregate over the same column); a window specification
+ * degrades to the UNSUPPORTED error in `rejectUncollectedAggregates`
+ * (select-window.ts).
+ *
+ * NOTE: each call re-renders every collected aggregate's AST. Collected-aggregate
+ * lists are a handful of entries in practice; if a query shape ever carries enough
+ * of them for build time to show up, cache the fingerprint on the entry when it is
+ * collected (select-aggregates.ts) instead of re-deriving it here.
+ *
+ * Exported so callers that must *reject* an uncollected aggregate can ask the same
+ * question this builder answers — see `buildWindowPhase`.
+ */
+export function findMatchingAggregate(ctx: PlanningContext, expr: AST.FunctionExpr): CollectedAggregate | undefined {
+	if (!ctx.aggregates || ctx.aggregates.length === 0) return undefined;
+
+	const exprKey = expressionToIdentityString(expr);
+	for (const agg of ctx.aggregates) {
+		if (!CapabilityDetectors.isAggregateFunction(agg.expression)) continue;
+		if (expressionToIdentityString(agg.expression.expression) === exprKey) return agg;
+	}
+
+	return undefined;
+}
 
 export function buildFunctionCall(ctx: PlanningContext, expr: AST.FunctionExpr, allowAggregates: boolean): ScalarPlanNode {
 	// In HAVING context, check if this function matches an existing aggregate
-	if (ctx.aggregates && ctx.aggregates.length > 0) {
-		// Try to find a matching aggregate
-		for (const agg of ctx.aggregates) {
-			if (CapabilityDetectors.isAggregateFunction(agg.expression)) {
-				const aggFuncNode = agg.expression as AggregateFunctionCallNode;
-				// Check if function name, argument count, and DISTINCT flag match
-				if (aggFuncNode.functionName.toLowerCase() === expr.name.toLowerCase() &&
-					aggFuncNode.args.length === expr.args.length &&
-					(aggFuncNode.isDistinct || false) === (expr.distinct || false)) {
-					// Check if arguments match
-					let argsMatch = true;
-					for (let i = 0; i < expr.args.length; i++) {
-						const exprArg = expr.args[i];
-						const aggArg = aggFuncNode.args[i];
-						// Simple check: if both are column references, check names match
-						if (exprArg.type === 'column' && aggArg.expression?.type === 'column') {
-							if (exprArg.name.toLowerCase() !== aggArg.expression.name.toLowerCase()) {
-								argsMatch = false;
-								break;
-							}
-						} else if (exprArg.type === 'literal' && aggArg.expression?.type === 'literal') {
-							if (exprArg.value !== aggArg.expression.value) {
-								argsMatch = false;
-								break;
-							}
-						}
-						// For other cases, we'd need more sophisticated comparison
-					}
-
-					if (argsMatch) {
-						// Found matching aggregate - return a column reference to it
-						const columnExpr: AST.ColumnExpr = {
-							type: 'column',
-							name: agg.alias
-						};
-						return new ColumnReferenceNode(
-							ctx.scope,
-							columnExpr,
-							agg.expression.getType(),
-							agg.attributeId,
-							agg.columnIndex
-						);
-					}
-				}
-			}
-		}
+	const matchingAggregate = findMatchingAggregate(ctx, expr);
+	if (matchingAggregate) {
+		// Found matching aggregate - return a column reference to it
+		const columnExpr: AST.ColumnExpr = {
+			type: 'column',
+			name: matchingAggregate.alias
+		};
+		return new ColumnReferenceNode(
+			ctx.scope,
+			columnExpr,
+			matchingAggregate.expression.getType(),
+			matchingAggregate.attributeId,
+			matchingAggregate.columnIndex
+		);
 	}
 
 	// Resolve function schema at build time
@@ -105,6 +122,19 @@ export function buildFunctionCall(ctx: PlanningContext, expr: AST.FunctionExpr, 
 	} else {
 		// Regular scalar function
 		const args = expr.args.map(arg => buildExpression(ctx, arg, allowAggregates));
+
+		// Reconcile a declared comparison group's object-physical operands the way
+		// `=` / IN / simple CASE do, so e.g. `same_value(json_col, '<text>')` compares
+		// JSON against JSON. Must run BEFORE inferReturnType: coercion inserts
+		// CastNodes, which changes the argument types inference sees.
+		//
+		// Skipped for a function that returns one of its arguments (`returnsArg` —
+		// nullif/greatest/least): the cast would replace the RETURNED value too. Those
+		// coerce comparison keys at emit time (`makeComparisonGroup`) instead, which
+		// also lets inferReturnType see the arguments the user actually wrote.
+		if (isScalarFunctionSchema(functionSchema) && functionSchema.comparesArgs && !functionSchema.returnsArg) {
+			coerceComparisonGroup(ctx.scope, functionSchema.comparesArgs, args);
+		}
 
 		// Perform type inference if available
 		let inferredType: ScalarType | undefined;

@@ -13,6 +13,7 @@ import { hasRuleBeenApplied, markRuleApplied, validateSideEffectMode } from './r
 import { createLogger } from '../../common/logger.js';
 import { performConstantFolding } from '../analysis/const-pass.js';
 import { createRuntimeExpressionEvaluator, createRuntimeRelationalEvaluator } from '../analysis/const-evaluator.js';
+import { MaterializationAdvisory } from '../cache/materialization-advisory.js';
 import { StatusCode } from '../../common/types.js';
 import { quereusError } from '../../common/errors.js';
 
@@ -73,6 +74,12 @@ export enum PassId {
 	/** Post-optimization cleanup and caching */
 	PostOptimization = 'post-opt',
 
+	/** Cache materialization advisory — one whole-tree pass */
+	Materialization = 'materialization',
+
+	/** Re-derive plan estimates that a later-than-Physical pass invalidated */
+	FinalEstimates = 'final-estimates',
+
 	/** Final validation */
 	Validation = 'validation',
 }
@@ -122,6 +129,49 @@ function createConstantFoldingPass(): OptimizationPass {
 }
 
 /**
+ * Create the materialization-advisory pass with custom execution.
+ *
+ * Runs the cache materialization advisory exactly ONCE over the whole plan.
+ * `analyzeAndTransform` builds a single reference graph (parent counts are then
+ * global — strictly more correct than the previous per-anchor-subtree-local
+ * counts, which under-counted sharing that spanned two anchors) and walks every
+ * descendant via `getChildren()`, wrapping each recommended relational node with
+ * a `CacheNode`. This replaces the previous 12 per-anchor-type `RuleHandle`
+ * registrations, each of which rebuilt a reference graph over its own subtree
+ * (O(anchors) graph builds per optimize, now 1).
+ *
+ * Placement (order 35) is between PostOptimization (30) and Validation (40) so
+ * the advisory runs AFTER the CacheNodes injected by `cte-optimization` are
+ * already in place — it skips `nodeType === Cache`, so running last avoids
+ * double-wrapping.
+ *
+ * Side-effect soundness (a custom `execute` bypasses `sideEffectMode`
+ * validation, so the reasoning lives here rather than in a RuleHandle field):
+ * the advisory does not explicitly consult `hasSideEffects` — soundness for
+ * impure subtrees rests on CacheNode itself being a run-once fence
+ * (materialize-on-first-read, replay thereafter), so a side-effect-bearing
+ * subtree that the advisory would otherwise wrap runs exactly once instead of
+ * per-reference. That is a count-change but order-preserving rewrite — and
+ * matches the run-once contract the scalar / IN / EXISTS emitters apply
+ * directly when their inner is impure (see `docs/runtime.md`).
+ */
+function createMaterializationPass(): OptimizationPass {
+	return {
+		id: PassId.Materialization,
+		name: 'Materialization Advisory',
+		description: 'Inject caching where reference analysis shows materialization pays off',
+		traversalOrder: TraversalOrder.BottomUp,
+		rules: [],
+		enabled: true,
+		order: 35,
+		execute: (plan: PlanNode, context: OptContext) => {
+			const advisory = new MaterializationAdvisory(context.tuning);
+			return advisory.analyzeAndTransform(plan);
+		},
+	};
+}
+
+/**
  * Standard pass definitions
  */
 export const STANDARD_PASSES: OptimizationPass[] = [
@@ -148,6 +198,28 @@ export const STANDARD_PASSES: OptimizationPass[] = [
 		'Post-Optimization',
 		'Final cleanup, materialization decisions, and caching',
 		30,
+		TraversalOrder.BottomUp
+	),
+
+	createMaterializationPass(),
+
+	// Last plan-mutating pass. A node estimate is derived by a rule that holds an
+	// OptContext (node accessors carry none), so any later pass that re-mints the
+	// node it was stamped on drops the estimate with nothing behind it to restore
+	// the number — `FilterNode.withChildren` dropping a stamped `selectivity`
+	// because Materialization rewrote something inside the predicate is the case
+	// that motivated this pass. Rules registered here re-derive such an estimate
+	// against the FINAL node, so an estimate's survival no longer depends on which
+	// pass happens to touch its node last. Nothing that rewrites the plan may run
+	// behind this pass — neither a manifest rule nor a custom-`execute` pass;
+	// `test/optimizer/rule-manifest.spec.ts` asserts both statically. That check is
+	// deliberately blunt: a genuinely read-only rule registered behind here trips it
+	// too, so adding one is a deliberate edit to that test rather than a silent one.
+	createPass(
+		PassId.FinalEstimates,
+		'Final Estimates',
+		'Re-derive plan estimates invalidated by a later pass rewriting inside a node',
+		37,
 		TraversalOrder.BottomUp
 	),
 
@@ -226,6 +298,11 @@ export class PassManager {
 
 	/**
 	 * Register an optimization pass
+	 *
+	 * NOTE: `pass.rules` is taken as-is; only `addRuleToPass` runs
+	 * `validateSideEffectMode` (see docs/invariants.md § OPT-001). Every pass ships with
+	 * `rules: []`, so nothing bypasses the gate today. If a pass ever arrives pre-populated,
+	 * validate each rule here.
 	 */
 	registerPass(pass: OptimizationPass): void {
 		if (this.passes.has(pass.id)) {
@@ -514,6 +591,19 @@ export class PassManager {
 		let currentNode = node;
 		let changed = true;
 
+		// Rules that declined (returned null / the same node) on the *current*
+		// node id. A declining rule is deterministic in its input node, so once it
+		// declines on a given node it will decline again on the same node — no
+		// point re-offering it every `while` fixpoint iteration. This set is
+		// ephemeral (not stored on the context) and, crucially, is reset whenever
+		// a transform mints a NEW node: the plan piece changed, so every decliner
+		// gets a fresh shot on the new node (a rule that declined on the old shape
+		// may well apply to the new one). Applied rules are handled separately by
+		// `hasRuleBeenApplied` (they are inherited across the re-mint for loop
+		// prevention); declines are not inherited, so no plan output changes vs.
+		// re-scanning every iteration — only redundant same-node re-runs are cut.
+		let declinedOnCurrent = new Set<string>();
+
 		while (changed) {
 			changed = false;
 
@@ -521,9 +611,17 @@ export class PassManager {
 				if (rule.nodeType !== currentNode.nodeType) continue;
 				if (context.tuning.disabledRules?.has(rule.id)) continue;
 				if (hasRuleBeenApplied(currentNode.id, rule.id, context)) continue;
+				if (declinedOnCurrent.has(rule.id)) continue;
 
 				const result = rule.fn(currentNode, context);
 				if (result && result !== currentNode) {
+					// NOTE: a rule is not re-offered its own output. marking the old node id
+					// applied and then inheriting that applied-rule set onto the new node id
+					// means `hasRuleBeenApplied` short-circuits `rule.id` on `result` too, so
+					// the fixpoint loop above never re-invokes this rule on the node it just
+					// produced. A rule that needs a fixpoint over its own rewrites (e.g. merging
+					// an arbitrarily deep stack of nested nodes) must loop internally rather than
+					// rely on the engine to re-offer it — see rule-filter-merge for the pattern.
 					markRuleApplied(currentNode.id, rule.id, context);
 					this.inheritVisitedRules(currentNode.id, result.id, context);
 					state.rulesFired++;
@@ -535,7 +633,18 @@ export class PassManager {
 					}
 					log('Rule %s transformed node in pass %s', rule.id, pass.id);
 					currentNode = result;
+					// New node id — the plan piece changed, so re-offer every decliner.
+					declinedOnCurrent = new Set();
 					changed = true;
+				} else {
+					// Declined on this exact node id; suppress re-offering it until
+					// the node changes (a transform resets the set above).
+					// NOTE: this assumes a decline is a pure function of the node — a
+					// rule that declines but mutates shared `context` state expecting
+					// to re-apply on the *same unchanged* node next iteration would no
+					// longer get that second look. No such rule exists today; if one
+					// is added, exclude it here or key the skip on a context epoch.
+					declinedOnCurrent.add(rule.id);
 				}
 			}
 		}

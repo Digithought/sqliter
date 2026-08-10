@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import { Database } from '../src/index.js';
+import { Database, MisuseError, Statement } from '../src/index.js';
 
 describe('Statement Iterator Cleanup', () => {
 	let db: Database;
@@ -233,6 +233,116 @@ describe('Statement Iterator Cleanup', () => {
 		});
 	});
 
+	describe('Lifecycle soft spots', () => {
+		// (a) iterateRows() must serialize through the exec mutex like all(), so two
+		// concurrent public iterations can't interleave the implicit-transaction lifecycle.
+		it('serializes concurrent iterateRows() through the exec mutex', async () => {
+			const stmt1 = db.prepare('select * from test_data');
+			const stmt2 = db.prepare('select * from test_data');
+
+			const it1 = stmt1.iterateRows();
+			const it2 = stmt2.iterateRows();
+
+			// First pull on it1 acquires and holds the exec mutex.
+			const first1 = await it1.next();
+			expect(first1.done).to.be.false;
+
+			// it2's first pull must wait for the mutex — it can't resolve while it1 holds it.
+			let it2Resolved = false;
+			const it2Next = it2.next().then(r => { it2Resolved = true; return r; });
+
+			// Let the event loop drain; it2 should still be blocked on the mutex.
+			await new Promise(resolve => setTimeout(resolve, 20));
+			expect(it2Resolved, 'iterateRows() must not begin a second run while the first holds the mutex').to.be.false;
+
+			// Draining it1 releases the mutex.
+			await it1.return!();
+
+			// Now it2 proceeds.
+			const first2 = await it2Next;
+			expect(first2.done).to.be.false;
+			expect(it2Resolved).to.be.true;
+
+			await it2.return!();
+			await stmt1.finalize();
+			await stmt2.finalize();
+		});
+
+		// (b) A recompile into a zero-dependency plan must still drop the previous
+		// dependency listener, or one listener leaks per such recompile.
+		it('does not leak schema-change listeners on a zero-dependency recompile', async () => {
+			const notifier = db.schemaManager.getChangeNotifier();
+			const baseline = notifier.getListenerCount();
+
+			// Batch: first statement reads a table (has a dependency), second is a
+			// constant (zero dependencies).
+			const stmt = db.prepare('select * from test_data; select 1');
+
+			stmt.compile();
+			expect(notifier.getListenerCount(), 'table read registers one dependency listener')
+				.to.equal(baseline + 1);
+
+			// Advance to `select 1` and recompile into a zero-dependency plan.
+			expect(stmt.nextStatement()).to.be.true;
+			stmt.compile();
+
+			// The first statement's listener must be gone even though the new plan
+			// registers none.
+			expect(notifier.getListenerCount(), 'zero-dependency recompile must drop the old listener')
+				.to.equal(baseline);
+
+			await stmt.finalize();
+		});
+
+		// (c) reset() must refuse mid-iteration, matching bind/bindAll/clearBindings —
+		// clearing busy would let a second iteration slip past the busy guard.
+		it('refuses reset() while an iteration is in flight', async () => {
+			const stmt = db.prepare('select * from test_data');
+			const it = stmt.iterateRows();
+
+			// Pull one row → iteration in flight (busy = true).
+			const first = await it.next();
+			expect(first.done).to.be.false;
+
+			let threw: unknown;
+			try {
+				await stmt.reset();
+			} catch (e) {
+				threw = e;
+			}
+			expect(threw, 'reset() must throw while busy').to.be.instanceOf(MisuseError);
+
+			// Complete the iteration; the generator's finally clears busy.
+			await it.return!();
+
+			// reset() now succeeds.
+			await stmt.reset();
+			await stmt.finalize();
+		});
+
+		// (d) db.get() binds parameters once (in the constructor via prepare) and must
+		// not rebind via bindAll during stmt.get().
+		it('binds parameters exactly once in db.get()', async () => {
+			const originalBindAll = Statement.prototype.bindAll;
+			let bindAllCount = 0;
+			Statement.prototype.bindAll = function (this: Statement, args: Parameters<typeof originalBindAll>[0]): Statement {
+				bindAllCount++;
+				return originalBindAll.call(this, args);
+			};
+
+			try {
+				const row = await db.get('select * from test_data where id = ?', [2]);
+				expect(row?.value).to.equal(200);
+			} finally {
+				Statement.prototype.bindAll = originalBindAll;
+			}
+
+			// prepare(sql, params) binds the initial values directly in the constructor
+			// (not via bindAll); a bindAll call here would be the redundant second bind.
+			expect(bindAllCount, 'db.get() must not rebind parameters').to.equal(0);
+		});
+	});
+
 	describe('Edge cases', () => {
 		it('should handle empty result set', async () => {
 			const stmt = db.prepare('select * from test_data where id > 1000');
@@ -268,7 +378,7 @@ describe('Statement Iterator Cleanup', () => {
 			expect(first.done).to.be.false;
 
 			// Call return() explicitly
-			const returnResult = await iterator.return();
+			const returnResult = await iterator.return!();
 			expect(returnResult.done).to.be.true;
 
 			// Transaction should be committed
@@ -286,7 +396,7 @@ describe('Statement Iterator Cleanup', () => {
 
 			// Call throw() explicitly
 			try {
-				await iterator.throw(new Error('Direct throw'));
+				await iterator.throw!(new Error('Direct throw'));
 				expect.fail('Should have thrown');
 			} catch (err) {
 				expect((err as Error).message).to.equal('Direct throw');

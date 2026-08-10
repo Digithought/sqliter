@@ -7,10 +7,10 @@
  * non-zero for the synthetic `HighLatencyMemoryModule`), so memory-only plans
  * never trigger the rewrite.
  *
- * Note: binary FULL JOIN has no runtime lowering — the gather rewrite is its
- * ONLY execution path. So the execution tests below assert results directly
- * (there is no rule-disabled baseline to diff against; disabling the rule makes
- * the same query throw `FULL JOIN is not supported`).
+ * Note: binary FULL JOIN does have a nested-loop runtime lowering, but the gather
+ * rewrite is the parallel path the cost gate selects for high-latency modules. The
+ * execution tests below use `HighLatencyMemoryModule` so the rewrite fires, and
+ * assert results directly against the gather path.
  */
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
@@ -52,6 +52,15 @@ function countOp(rows: readonly PlanRow[], op: string, nodeType: string): number
 function sortByK(rows: Record<string, SqlValue>[]): Record<string, SqlValue>[] {
 	return [...rows].sort((a, b) => Number(a.k ?? -1) - Number(b.k ?? -1));
 }
+
+// The declined-fold plan below executes an EagerPrefetch (bloom-probe) above the
+// FULL JOIN; a slot-creating ancestor over an eager-start fork is a known
+// strict-fork false positive (see docs/runtime-parallel.md § EagerPrefetchNode), so that
+// executed-plan test is skipped under QUEREUS_FORK_STRICT like its siblings in
+// parallel-eager-prefetch-probe.spec.ts.
+const strictFork = typeof process !== 'undefined'
+	&& (process.env?.QUEREUS_FORK_STRICT === '1' || process.env?.QUEREUS_FORK_STRICT === 'true');
+const prefetchExecTest = strictFork ? it.skip : it;
 
 describe('ruleAsyncGatherZipByKey', () => {
 	let db: Database;
@@ -372,40 +381,38 @@ describe('ruleAsyncGatherZipByKey', () => {
 		]);
 	});
 
-	it('does NOT fold when a projection subquery references a consumed branch key', async () => {
+	prefetchExecTest('does NOT fold when a projection subquery references a consumed branch key', async () => {
 		// The subquery is correlated to `a.k`, a per-branch key the merge consumes
-		// into the single merged key — it cannot resolve above the gather. The
-		// `subtreeReferencesKey` guard declines the fold; the chain stays a binary
-		// FULL JOIN and errors at emit.
+		// into the single merged key — it cannot resolve above the gather, so the
+		// `subtreeReferencesKey` guard declines the fold. The chain stays a binary
+		// FULL JOIN, which the nested-loop emitter now executes directly.
 		await setup();
 		const sql =
 			`select coalesce(a.k, b.k) as k, a.av, b.bv, (select count(*) from c where c.k = a.k) as cc
 			   from a full outer join b on a.k = b.k`;
 		const plan = await planRows(db, sql);
 		expect(hasAsyncGather(plan), `ops=${plan.map(r => r.op).join(',')}`).to.equal(false);
-		let threw = false;
-		try {
-			await results(db, sql);
-		} catch {
-			threw = true;
-		}
-		expect(threw, 'declined fold leaves an unsupported FULL JOIN that errors at emit').to.equal(true);
+		// The declined fold runs the nested-loop FULL join; the correlated count is 0
+		// for the null-extended `a` row (a.k is null → no `c.k = a.k` match).
+		expect(sortByK(await results(db, sql))).to.deep.equal([
+			{ k: 1, av: 'a1', bv: null, cc: 1 },
+			{ k: 2, av: 'a2', bv: 'b2', cc: 0 },
+			{ k: 3, av: null, bv: 'b3', cc: 0 },
+		]);
 	});
 
-	it('does NOT fold a USING(k) full join (no synthesized ON condition; out of scope)', async () => {
-		// USING / NATURAL full joins carry no explicit `ON` condition, so the chain
-		// walk declines them. They remain an unsupported binary FULL JOIN and error
-		// at emit — this test pins the documented non-support.
+	it('folds a USING(k) full join — the desugared ON condition is what the chain walk reads', async () => {
+		// `buildUsingCondition` desugars `using (k)` into `a.k = b.k` at build time,
+		// so a USING / NATURAL full join is indistinguishable from the spelled-out ON
+		// form here and takes the same zip-by-key gather fold.
 		await setup();
-		const sql = 'select * from a full outer join b using (k)';
+		const sql = 'select coalesce(a.k, b.k) as k, a.av, b.bv from a full outer join b using (k)';
 		const plan = await planRows(db, sql);
-		expect(hasAsyncGather(plan), `ops=${plan.map(r => r.op).join(',')}`).to.equal(false);
-		let threw = false;
-		try {
-			await results(db, sql);
-		} catch {
-			threw = true;
-		}
-		expect(threw, 'unsupported FULL JOIN errors at emit/execution').to.equal(true);
+		expect(hasAsyncGather(plan), `ops=${plan.map(r => r.op).join(',')}`).to.equal(true);
+		expect(sortByK(await results(db, sql))).to.deep.equal([
+			{ k: 1, av: 'a1', bv: null },
+			{ k: 2, av: 'a2', bv: 'b2' },
+			{ k: 3, av: null, bv: 'b3' },
+		]);
 	});
 });

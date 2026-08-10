@@ -1,5 +1,6 @@
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
+import type { SqlParameters } from '../../src/common/types.js';
 
 describe('Constant folding analysis (const-pass)', () => {
 	let db: Database;
@@ -12,7 +13,7 @@ describe('Constant folding analysis (const-pass)', () => {
 		await db.close();
 	});
 
-	async function collect(sql: string, params?: Record<string, unknown> | unknown[]): Promise<unknown[]> {
+	async function collect(sql: string, params?: SqlParameters): Promise<unknown[]> {
 		const rows: unknown[] = [];
 		for await (const r of db.eval(sql, params)) rows.push(r);
 		return rows;

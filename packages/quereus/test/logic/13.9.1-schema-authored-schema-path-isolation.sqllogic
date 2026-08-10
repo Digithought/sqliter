@@ -1,0 +1,382 @@
+-- 13.9.1-schema-authored-schema-path-isolation.sqllogic - a table's own DDL resolves bare
+-- relation names against the table's OWN schema, never the writer's search path
+--
+-- Sibling of 13.9-schema-authored-cte-isolation.sqllogic: same four schema-authored
+-- expression kinds (a column DEFAULT, a generated-column expression, a CHECK constraint,
+-- a synthesized foreign-key probe), the other leak channel. A DEFAULT used to be built on
+-- a planning context still carrying the WRITING statement's schema search path (the
+-- session `pragma schema_path`, or a per-statement `insert … with schema …`), while the
+-- CHECK beside it narrowed to the table's own schema — so one table definition could
+-- disagree with itself about what a bare `c` meant. `schemaAuthoredContext`
+-- (planner/building/schema-authored-context.ts) now narrows the path in ONE place, to the
+-- owning table's schema exactly, with no fallback to the session default path.
+--
+-- Every arm is written so the WRONG binding is observable: the DECOY relation lives in the
+-- schema the writer is pointed at, the real one lives beside the table, the two disagree,
+-- and the assertion pins the owning schema's answer.
+
+pragma foreign_keys = true;
+pragma schema_path = 'main';
+
+-- The decoy `main.c` has 1 row; the real `temp.c` beside every table below has 3.
+create table main.c (k integer primary key);
+insert into main.c values (1);
+create table temp.c (k integer primary key);
+insert into temp.c values (1), (2), (3);
+-- run
+
+-- ===== Column DEFAULT (session schema path) =====
+
+create table temp.sp_def (id integer primary key, w integer default (select count(*) from c));
+-- run
+
+insert into temp.sp_def (id) values (1);
+
+-- 3 (temp.c, beside the table), not 1 (main.c, on the writer's path).
+select id, w from temp.sp_def order by id;
+→ [{"id":1,"w":3}]
+
+-- ===== Generated column, INSERT path =====
+
+create table temp.sp_gen (id integer primary key, v integer, g integer generated always as ((select count(*) from c)));
+-- run
+
+insert into temp.sp_gen (id, v) values (1, 1);
+
+select id, v, g from temp.sp_gen order by id;
+→ [{"id":1,"v":1,"g":3}]
+
+-- ===== UPDATE-path schema-authored build (`building/update.ts`) =====
+-- `building/update.ts` narrows on its own context (`schemaAuthoredUpdateCtx`), shared by
+-- the generated-column recompute, the CHECK build and the NOT NULL defaults. A CHECK is
+-- what pins it here: the generated-column-on-UPDATE arm cannot be written yet, because a
+-- subquery-bearing generated column recomputed on UPDATE currently stores the unresolved
+-- promise itself (tracked separately as `bug-update-generated-column-subquery-not-awaited`
+-- — an un-awaited evaluator in `runtime/emit/update.ts`, unrelated to schema paths). Add
+-- that arm here once that lands.
+
+create table temp.sp_cku (id integer primary key, v integer, check ((select count(*) from c) = 3));
+insert into temp.sp_cku values (1, 1);
+-- run
+
+update temp.sp_cku set v = 2 where id = 1;
+
+select id, v from temp.sp_cku order by id;
+→ [{"id":1,"v":2}]
+
+-- and the other direction on the UPDATE path: an update-only CHECK that only the decoy
+-- satisfies must still reject
+create table temp.sp_ckux (id integer primary key, v integer, check on update ((select count(*) from c) = 1));
+insert into temp.sp_ckux values (1, 1);
+-- run
+
+update temp.sp_ckux set v = 2 where id = 1;
+-- error: CHECK
+
+select id, v from temp.sp_ckux order by id;
+→ [{"id":1,"v":1}]
+
+-- ===== NOT NULL column DEFAULT (REPLACE substitution) =====
+-- `buildNotNullDefaults` pre-builds the DEFAULT evaluator the constraint runtime
+-- substitutes when REPLACE meets an explicit NULL.
+
+create table temp.sp_nnd (id integer primary key, w integer not null default (select count(*) from c));
+-- run
+
+insert or replace into temp.sp_nnd (id, w) values (1, null);
+
+select id, w from temp.sp_nnd order by id;
+→ [{"id":1,"w":3}]
+
+-- ===== Per-statement WITH SCHEMA (distinct from the session pragma) =====
+-- Session path is `temp` here, so only the statement's own `with schema main` points the
+-- writer at the decoy. The default must still read temp.c.
+
+pragma schema_path = 'temp';
+
+create table temp.sp_ws (id integer primary key, w integer default (select count(*) from c));
+-- run
+
+insert into temp.sp_ws (id) values (1) with schema main;
+
+select id, w from temp.sp_ws order by id;
+→ [{"id":1,"w":3}]
+
+pragma schema_path = 'main';
+
+-- ===== Controls: CHECK and child-side FK were already correct, and must stay so =====
+-- The narrowing used to be duplicated inside `buildConstraintChecks` and both foreign-key
+-- builders; collapsing it into the shared helper must not change either one's answer.
+
+-- (a) a CHECK that holds against temp.c (3 rows) and fails against main.c (1 row)
+create table temp.sp_ck (id integer primary key, check ((select count(*) from c) = 3));
+-- run
+
+insert into temp.sp_ck values (1);
+
+select id from temp.sp_ck order by id;
+→ [{"id":1}]
+
+-- (b) the other direction: a CHECK only the DECOY would satisfy must still reject
+create table temp.sp_ckx (id integer primary key, check ((select count(*) from c) = 1));
+-- run
+
+insert into temp.sp_ckx values (1);
+-- error: CHECK
+
+select count(*) as n from temp.sp_ckx;
+→ [{"n":0}]
+
+-- (c) child-side FK probe on a table in the non-default schema. The parent exists only in
+-- `temp` and holds the referenced row, so a broken probe shows up as a spurious
+-- `CHECK constraint failed: _fk_…`.
+create table temp.sp_fkp (id integer primary key);
+insert into temp.sp_fkp values (1);
+create table temp.sp_fkc (id integer primary key, pid integer references sp_fkp(id));
+-- run
+
+insert into temp.sp_fkc values (1, 1);
+
+select id, pid from temp.sp_fkc order by id;
+→ [{"id":1,"pid":1}]
+
+-- ===== Write-through a view whose base table lives in the non-default schema =====
+-- The base op is re-planned through `buildInsertStmt`, so it inherits the narrowing.
+
+create table temp.sp_vt (id integer primary key, w integer default (select count(*) from c));
+create view temp.sp_v as select id, w from sp_vt;
+-- run
+
+insert into temp.sp_v (id) values (1);
+
+select id, w from temp.sp_vt order by id;
+→ [{"id":1,"w":3}]
+
+-- ===== Multi-source view INSERT: the anchor key column's declared DEFAULT =====
+-- The shared surrogate is minted ONCE per produced row at the envelope, from the anchor
+-- key column's own `default` — the one schema-authored expression the decomposition
+-- lowering builds itself rather than delegating to `buildInsertStmt` (`buildKeyDefault`
+-- in planner/building/view-mutation-builder.ts). Its owner is the ANCHOR BASE TABLE's
+-- schema, which is why the analyses carry `keyDefaultSchemaName` alongside the
+-- expression. `main.kd_core` is a decoy with a much higher water mark.
+
+create table main.kd_core (rid integer primary key, name text);
+insert into main.kd_core values (500, 'decoy');
+create table temp.kd_core (rid integer primary key default (coalesce((select max(rid) from kd_core), 0) + mutation_ordinal()), name text);
+create table temp.kd_contact (rid integer primary key, email text);
+create view temp.kd_v as select c.name as name, k.email as email
+  from kd_core c join kd_contact k on k.rid = c.rid;
+insert into temp.kd_core values (100, 'seed');
+-- run
+
+insert into temp.kd_v (name, email) values ('Ada', 'ada@x.io');
+
+-- 101 (above temp.kd_core's real high-water mark 100), not 501 (above the main decoy).
+select rid, name from temp.kd_core order by rid;
+→ [{"rid":100,"name":"seed"},{"rid":101,"name":"Ada"}]
+
+select rid, email from temp.kd_contact order by rid;
+→ [{"rid":101,"email":"ada@x.io"}]
+
+select rid, name from main.kd_core order by rid;
+→ [{"rid":500,"name":"decoy"}]
+
+-- And the owner is the ANCHOR BASE TABLE's schema, not the VIEW's — they can differ.
+-- Here the view lives in `main` (with the session path) while the anchor lives in `temp`,
+-- and the anchor's default reads a bare `ks_seq` that exists in both. Reading it as the
+-- view's schema would take main.ks_seq's mark (500) instead of temp.ks_seq's (100).
+
+create table temp.ks_seq (n integer primary key);
+insert into temp.ks_seq values (100);
+create table main.ks_seq (n integer primary key);
+insert into main.ks_seq values (500);
+create table temp.ks_core (rid integer primary key default (coalesce((select max(n) from ks_seq), 0) + mutation_ordinal()), name text);
+create table temp.ks_contact (rid integer primary key, email text);
+create view main.ks_v as select c.name as name, k.email as email
+  from temp.ks_core c join temp.ks_contact k on k.rid = c.rid;
+-- run
+
+insert into main.ks_v (name, email) values ('Bea', 'bea@x.io');
+
+select rid, name from temp.ks_core order by rid;
+→ [{"rid":101,"name":"Bea"}]
+
+-- ===== Control: a QUALIFIED reference inside a default is unaffected =====
+
+create table temp.sp_q (id integer primary key, w integer default (select count(*) from main.c));
+-- run
+
+insert into temp.sp_q (id) values (1);
+
+select id, w from temp.sp_q order by id;
+→ [{"id":1,"w":1}]
+
+-- ===== The rule is strict: no fallback to the session default path =====
+-- A schema-authored expression naming a relation that lives ONLY in another schema, and
+-- not qualifying it, does not resolve — the same rule CHECK and FK bodies have always
+-- had. (docs/schema.md § Stored bodies resolve against their home schema.)
+
+create table main.sp_only (k integer primary key);
+insert into main.sp_only values (1);
+create table temp.sp_cross (id integer primary key, w integer default (select count(*) from sp_only));
+-- run
+
+insert into temp.sp_cross (id) values (1);
+-- error: sp_only
+
+select count(*) as n from temp.sp_cross;
+→ [{"n":0}]
+
+-- ===== ALTER TABLE ADD COLUMN's CHECK, validated over the existing rows =====
+-- The new column's CHECK is enforced against rows already in the table by a scan
+-- re-prepared from the constraint's own SQL text (`validateBackfillAgainstChecks` in
+-- runtime/emit/alter-table.ts). A freshly-prepared statement carries the SESSION path,
+-- so that scan needs the owning schema pinned on it explicitly — the planning-context
+-- helper never sees it. Both directions, since one alone cannot tell a narrowed path
+-- from a scan that silently did nothing.
+--
+-- The per-row backfill / CHECK path below covers the same rule for a non-foldable
+-- (subquery) DEFAULT and the CHECK predicates that ride alongside it — untestable until
+-- bug-alter-add-column-relation-default-fails-to-emit, since before that fix a subquery
+-- inside either reached the runtime unphysicalized and the whole ALTER errored outright.
+
+create table temp.sp_ac (id integer primary key);
+insert into temp.sp_ac values (1);
+create table temp.sp_acx (id integer primary key);
+insert into temp.sp_acx values (1);
+-- run
+
+-- true only against the main.c decoy (1 row) ⇒ must be REJECTED
+alter table temp.sp_acx add column x integer default 0 check ((select count(*) from c) = 1);
+-- error: CHECK
+
+-- true against temp.c (3 rows), beside the table ⇒ must be ACCEPTED
+alter table temp.sp_ac add column x integer default 0 check ((select count(*) from c) = 3);
+-- run
+
+select id, x from temp.sp_ac order by id;
+→ [{"id":1,"x":0}]
+
+-- ===== ALTER TABLE ADD COLUMN's per-row backfill / CHECK, same rule =====
+
+create table temp.sp_acbf (id integer primary key);
+insert into temp.sp_acbf values (1);
+-- run
+
+-- A non-foldable (subquery) DEFAULT compiles to a per-row backfill node — 3 (temp.c,
+-- beside the table), not 1 (main.c, on the writer's path).
+alter table temp.sp_acbf add column n integer default (select count(*) from c);
+-- run
+
+select id, n from temp.sp_acbf order by id;
+→ [{"id":1,"n":3}]
+
+-- A per-row DEFAULT (`new.id`) with an inline CHECK reading `c` — true against temp.c
+-- (3 rows), beside the table ⇒ accepted.
+alter table temp.sp_acbf add column m integer default (new.id) check ((select count(*) from c) = 3);
+-- run
+
+select id, m from temp.sp_acbf order by id;
+→ [{"id":1,"m":1}]
+
+-- Same shape, but the CHECK is only true against the main.c decoy (1 row) ⇒ rejected —
+-- distinguishes a narrowed path from a CHECK that silently did nothing.
+alter table temp.sp_acbf add column mm integer default (new.id) check ((select count(*) from c) = 1);
+-- error: CHECK
+
+select * from temp.sp_acbf order by id;
+→ [{"id":1,"n":3,"m":1}]
+
+-- ===== A maintained table's declared CHECK, both when it is created and when it derives =====
+-- `create table … maintained as` reaches the same CHECK bodies by two routes that neither
+-- INSERT nor UPDATE uses: the create-time scan over the already-derived rows
+-- (`validateChecksOverExistingRows`, schema/constraint-builder.ts — again a re-prepared
+-- statement, so the path is pinned on the statement) and the per-derived-row validator
+-- (`core/derived-row-validator.ts`, which builds on its OWN fresh planning context — the
+-- one call site that would have lost the narrowing when the constraint and foreign-key
+-- builders stopped narrowing internally).
+
+create table temp.mt_src (id integer primary key, n integer);
+insert into temp.mt_src values (1, 2);
+-- run
+
+-- Created while `temp.mt_src` already holds n = 2: passes against temp.c (2 <= 3),
+-- would fail against the main.c decoy (2 <= 1).
+create table temp.mt (id integer primary key, n integer not null check (n <= (select count(*) from c)))
+	maintained as select id, n from mt_src;
+-- run
+
+select id, n from temp.mt order by id;
+→ [{"id":1,"n":2}]
+
+-- and a row derived AFTER creation goes through the derived-row validator instead
+insert into temp.mt_src values (2, 3);
+
+select id, n from temp.mt order by id;
+→ [{"id":1,"n":2},{"id":2,"n":3}]
+
+-- the same validator must still REJECT: 9 > 3, against temp.c
+insert into temp.mt_src values (3, 9);
+-- error: CHECK
+
+-- ===== A user-declared schema behaves identically (not a `temp`-only special case) =====
+
+declare schema spapp {
+	table c {
+		k INTEGER PRIMARY KEY
+	}
+	table t {
+		id INTEGER PRIMARY KEY,
+		w INTEGER DEFAULT (select count(*) from c)
+	}
+}
+
+apply schema spapp;
+-- run
+
+insert into spapp.c values (1), (2), (3), (4), (5);
+
+insert into spapp.t (id) values (1);
+
+-- 5 (spapp.c), not 1 (main.c, the session path).
+select id, w from spapp.t order by id;
+→ [{"id":1,"w":5}]
+
+-- Cleanup
+drop table spapp.t;
+drop table spapp.c;
+drop table temp.mt;
+drop table temp.mt_src;
+drop table temp.sp_acx;
+drop table temp.sp_ac;
+drop table temp.sp_cross;
+drop table main.sp_only;
+drop table temp.sp_q;
+drop view main.ks_v;
+drop table temp.ks_contact;
+drop table temp.ks_core;
+drop table main.ks_seq;
+drop table temp.ks_seq;
+drop view temp.kd_v;
+drop table temp.kd_contact;
+drop table temp.kd_core;
+drop table main.kd_core;
+drop view temp.sp_v;
+drop table temp.sp_vt;
+drop table temp.sp_fkc;
+drop table temp.sp_fkp;
+drop table temp.sp_ckx;
+drop table temp.sp_ck;
+drop table temp.sp_ckux;
+drop table temp.sp_cku;
+drop table temp.sp_ws;
+drop table temp.sp_nnd;
+drop table temp.sp_gen;
+drop table temp.sp_def;
+-- sp_acbf's added CHECK reads `c` through a subquery (resolving, from temp, to temp.c),
+-- so it has to go before it: dropping a table a stored expression still names is refused
+-- (41.10.4-drop-object-expression-dependents).
+drop table temp.sp_acbf;
+drop table temp.c;
+drop table main.c;
+-- run

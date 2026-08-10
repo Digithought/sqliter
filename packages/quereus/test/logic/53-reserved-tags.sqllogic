@@ -1,0 +1,252 @@
+-- Reserved `quereus.*` tag namespace validation (schema/reserved-tags.ts).
+-- PoC wiring: `apply schema X` on a LOGICAL schema validates the reserved tags
+-- on each logical table (`logical-table` site) and its constraints
+-- (`logical-constraint` site) for shape + site. Unknown / mis-sited / malformed
+-- keys fail the deploy loudly; an empty `quereus.lens.ack` rationale is only a
+-- warning (deploy still succeeds). No reserved tag's *semantics* are read here.
+
+-- Shared basis: a physical schema the logical schemas align against by name.
+declare schema cars_basis {
+	table Car {
+		id integer primary key,
+		vin text
+	}
+}
+
+-- run
+
+apply schema cars_basis;
+
+-- run
+
+insert into cars_basis.Car values (1, 'VIN001'), (2, 'VIN002');
+
+-- run
+
+-- ===================================
+-- 1. Unknown reserved key on a logical table → error at apply
+--    (`quereus.update.taget` is a typo of `target`)
+-- ===================================
+
+declare logical schema bad_unknown {
+	table Car {
+		id integer primary key,
+		vin text
+	} with tags ("quereus.update.taget" = 'Car')
+}
+
+-- run
+
+apply schema bad_unknown;
+-- error: unknown reserved tag
+
+-- ===================================
+-- 2. Mis-sited reserved key on a logical table → error at apply
+--    (`quereus.lens.writable` is legal only on a logical column, never on the
+--    logical table itself)
+-- ===================================
+
+declare logical schema bad_site {
+	table Car {
+		id integer primary key,
+		vin text
+	} with tags ("quereus.lens.writable" = true)
+}
+
+-- run
+
+apply schema bad_site;
+-- error: not allowed
+
+-- ===================================
+-- 2b. The retired `quereus.update.default_for.<col>` key → unknown at apply
+--     (the first-class `with defaults (…)` view clause replaced it; a stray
+--     occurrence is an unknown key now, no longer a mis-site)
+-- ===================================
+
+declare logical schema bad_retired {
+	table Car {
+		id integer primary key,
+		vin text
+	} with tags ("quereus.update.default_for.vin" = '0')
+}
+
+-- run
+
+apply schema bad_retired;
+-- error: unknown reserved tag
+
+-- ===================================
+-- 3. Empty lens.ack rationale → WARNING (deploy succeeds), not an error
+-- ===================================
+
+declare logical schema warn_ack {
+	table Car {
+		id integer primary key,
+		vin text
+	} with tags ("quereus.lens.ack.no-backing-index:vin" = '')
+}
+
+-- run
+
+apply schema warn_ack;
+
+-- run
+
+-- Deploy succeeded despite the empty-rationale warning; reads work.
+select * from warn_ack.Car order by id;
+→ [{"id": 1, "vin": "VIN001"}, {"id": 2, "vin": "VIN002"}]
+
+-- ===================================
+-- 4. Valid lens.ack at a logical table → no diagnostic; deploy succeeds
+-- ===================================
+
+declare logical schema ok_ack {
+	table Car {
+		id integer primary key,
+		vin text
+	} with tags ("quereus.lens.ack.no-backing-index:vin" = 'low-write table; commit-time scan is acceptable')
+}
+
+-- run
+
+apply schema ok_ack;
+
+-- run
+
+select vin from ok_ack.Car where id = 1;
+→ [{"vin": "VIN001"}]
+
+-- ===================================
+-- 5. Valid lens.ack on a logical CONSTRAINT → deploy succeeds
+-- ===================================
+
+declare logical schema ok_ack_con {
+	table Car {
+		id integer primary key,
+		vin text,
+		constraint uq_vin unique (vin) with tags ("quereus.lens.ack.no-backing-index:vin" = 'acceptable')
+	}
+}
+
+-- run
+
+apply schema ok_ack_con;
+
+-- run
+
+select * from ok_ack_con.Car order by id;
+→ [{"id": 1, "vin": "VIN001"}, {"id": 2, "vin": "VIN002"}]
+
+-- ===================================
+-- 6. Free-form user tag on a logical table → untouched, deploy succeeds
+-- ===================================
+
+declare logical schema user_tag {
+	table Car {
+		id integer primary key,
+		vin text
+	} with tags (display_name = 'Cars')
+}
+
+-- run
+
+apply schema user_tag;
+
+-- run
+
+select vin from user_tag.Car order by id;
+→ [{"vin": "VIN001"}, {"vin": "VIN002"}]
+
+-- ===================================
+-- 7. Base-table DML statement tags (`insert/update/delete … with tags (…)`)
+--    validate at the `dml-stmt` site at builder entry — the same hard error
+--    the view-mediated path raises (93.4-view-mutation.sqllogic covers that
+--    path). No reserved key is currently legal at the DML-statement site, so
+--    every `quereus.*` key there is rejected: unknown key →
+--    unknown-reserved-tag; known-but-mis-sited key → tag-not-allowed-here.
+--    Free-form keys pass untouched. A rejected statement writes nothing.
+-- ===================================
+
+create table dml_tags (id integer primary key, note text);
+
+-- run
+
+insert into dml_tags values (1, 'seed');
+
+-- run
+
+-- unknown reserved key on a base-table INSERT → error; nothing written.
+insert into dml_tags with tags ("quereus.bogus" = 1) values (2, 'x');
+-- error: unknown reserved tag
+
+select * from dml_tags order by id;
+→ [{"id": 1, "note": "seed"}]
+
+-- the retired statement-level `quereus.update.default_for.<col>` key is unknown
+-- on a base-table UPDATE too (the view path already rejects it); row unchanged.
+update dml_tags with tags ("quereus.update.default_for.note" = '0') set note = 'changed' where id = 1;
+-- error: unknown reserved tag
+
+select note from dml_tags where id = 1;
+→ [{"note": "seed"}]
+
+-- a KNOWN reserved key mis-sited on a DML statement → tag-not-allowed-here
+-- (distinct from the unknown-key error); row still present.
+delete from dml_tags with tags ("quereus.id" = 'x') where id = 1;
+-- error: not allowed on a DML statement
+
+select count(*) as n from dml_tags;
+→ [{"n": 1}]
+
+-- free-form statement tags (outside quereus.*) are untouched — the write lands.
+insert into dml_tags with tags (provenance = 'import', audit = true) values (3, 'y');
+
+-- run
+
+select id from dml_tags order by id;
+→ [{"id": 1}, {"id": 3}]
+
+-- mixed free-form + reserved still fails atomically — nothing written.
+insert into dml_tags with tags (audit = true, "quereus.bogus" = 1) values (4, 'z');
+-- error: unknown reserved tag
+
+select id from dml_tags order by id;
+→ [{"id": 1}, {"id": 3}]
+
+-- nested DML: a reserved statement tag on DML inside a CTE validates at the
+-- nested statement's own builder entry.
+with w as (insert into dml_tags with tags ("quereus.bogus" = 1) values (5, 'c') returning *) select id from w;
+-- error: unknown reserved tag
+
+select id from dml_tags order by id;
+→ [{"id": 1}, {"id": 3}]
+
+-- DML as INSERT source: the inner statement's reserved tag validates at the
+-- inner statement's own builder entry; neither table is written.
+create table dml_sink (id integer primary key, note text);
+
+-- run
+
+insert into dml_sink insert into dml_tags with tags ("quereus.bogus" = 1) values (9, 'q') returning *;
+-- error: unknown reserved tag
+
+select count(*) as n from dml_sink;
+→ [{"n": 0}]
+
+select id from dml_tags order by id;
+→ [{"id": 1}, {"id": 3}]
+
+-- view-mediated write with free-form statement tags: the single-source lowering
+-- clones the statement (tags ride along) and re-enters the base builder, where
+-- re-validation is a no-op — the write lands exactly once.
+create view dml_v as select id, note from dml_tags;
+
+-- run
+
+insert into dml_v with tags (audit = true) values (7, 'via view');
+
+-- run
+
+select id from dml_tags order by id;
+→ [{"id": 1}, {"id": 3}, {"id": 7}]

@@ -1,0 +1,95 @@
+-- 43.2-deferred-check-new-on-delete.sqllogic
+-- Regression guard for "No row context found for column <col>" on DELETE.
+--
+-- A deferred CHECK constraint (deferred because it contains a subquery) that
+-- fires `on delete` and references `new.<col>` — typically via
+-- `coalesce(new.<col>, old.<col>)` — used to raise
+--   "No row context found for column <col>"
+-- because the DELETE plan tree ran ConstraintCheckNode against the bare
+-- N-column source row instead of the flat 2N OLD/NEW layout that INSERT/UPDATE
+-- produce. Resolving a NEW attribute (which lives at flat indices n..2n-1) then
+-- indexed past the row. The fix expands the DELETE source row to 2N (OLD section
+-- = values being removed, NEW section = all NULL) BEFORE the constraint check.
+--
+-- This is the quereus-local twin of the sereus CadrePeer `AuthorizedInsert`
+-- check (`coalesce(new, old).PeerId`); see
+-- packages/cadre-core/test/seed-bootstrap.spec.ts on the sereus side.
+
+-- ===================================================================
+-- Setup: a registry lookup + a guarded table whose deferred CHECK fires
+-- on insert AND delete and reads coalesce(new.rkey, old.rkey).
+-- rkey is intentionally a NON-PK column so the NEW reference exercises a
+-- plain flat-row NEW slot rather than any PK-specific path.
+-- ===================================================================
+
+create table registry (rkey text primary key);
+
+create table guarded (
+  id integer primary key,
+  rkey text,
+  constraint key_registered check on insert, delete (
+    exists (select 1 from registry r where r.rkey = coalesce(new.rkey, old.rkey))
+  )
+);
+
+insert into registry values ('alpha');
+insert into guarded values (1, 'alpha');
+commit;
+-- run
+
+select count(*) from guarded;
+→ [{"count(*)":1}]
+
+-- ===================================================================
+-- DELETE: the deferred CHECK references new.rkey, which is NULL in the
+-- all-NULL NEW section on delete; coalesce falls back to old.rkey='alpha',
+-- which IS registered, so the deferred check passes at commit and the row
+-- is removed. Before the fix this raised "No row context found".
+-- ===================================================================
+
+begin;
+delete from guarded where id = 1;
+commit;
+-- run
+
+select count(*) from guarded;
+→ [{"count(*)":0}]
+
+-- ===================================================================
+-- insert→delete→insert cycle: re-insert the same row after the delete and
+-- read it back, exercising the round-trip through the now-coherent flat
+-- OLD/NEW layout (the same cycle the sereus regression test walks).
+-- ===================================================================
+
+begin;
+insert into guarded values (1, 'alpha');
+commit;
+-- run
+
+select id, rkey from guarded;
+→ [{"id":1,"rkey":"alpha"}]
+
+-- ===================================================================
+-- The deferred CHECK genuinely fires on DELETE (not silently skipped):
+-- drop the registry entry first so coalesce(new.rkey, old.rkey)='alpha'
+-- misses, and the deferred check rejects the delete at commit. This proves
+-- NEW/OLD resolve to a real value on the DELETE path rather than the check
+-- being bypassed (which would let scenario 1 pass vacuously).
+-- ===================================================================
+
+begin;
+delete from registry where rkey = 'alpha';
+delete from guarded where id = 1;
+commit;
+-- error: CHECK constraint failed: key_registered
+
+-- Failed commit rolled the whole transaction back: both rows survive.
+select id, rkey from guarded;
+→ [{"id":1,"rkey":"alpha"}]
+
+select rkey from registry;
+→ [{"rkey":"alpha"}]
+
+drop table guarded;
+drop table registry;
+-- run

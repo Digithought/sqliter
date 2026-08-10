@@ -3,8 +3,7 @@ export type { MergeEntry, MergeConfig, PKComparator, PKExtractor, SortKeyCompara
 export { mergeStreams, createMergeEntry, createTombstone } from './merge-iterator.js';
 
 // Isolation layer types
-export type { IsolationModuleConfig } from './isolation-types.js';
-export type { UnderlyingTableState } from './isolation-module.js';
+export type { IsolationModuleConfig, UnderlyingTableState, ConnectionOverlayState } from './isolation-types.js';
 
 // Isolation layer classes
 export { IsolationModule } from './isolation-module.js';

@@ -1,10 +1,11 @@
-import { PlanNode, VoidNode, type RelationalPlanNode, Attribute } from './plan-node.js';
+import { PlanNode, VoidNode, type RelationalPlanNode, Attribute, type PhysicalProperties } from './plan-node.js';
 import { PlanNodeType } from './plan-node-type.js';
 import type { Scope } from '../scopes/scope.js';
 import type * as AST from '../../parser/ast.js';
 import { RelationType } from '../../common/datatype.js';
 import { TEXT_TYPE } from '../../types/builtin-types.js';
 import { Cached } from '../../util/cached.js';
+import { addSingletonFd } from '../util/fd-utils.js';
 
 /**
  * DECLARE SCHEMA statement plan node
@@ -28,6 +29,34 @@ export class DeclareSchemaNode extends VoidNode {
 			type: 'declareSchema',
 			schemaName: this.statementAst.schemaName || 'main',
 			itemCount: this.statementAst.items.length
+		};
+	}
+}
+
+/**
+ * DECLARE LENS statement plan node — stores a lens block (basis binding +
+ * per-table overrides) keyed by logical schema name. See docs/lens.md.
+ */
+export class DeclareLensNode extends VoidNode {
+	override readonly nodeType = PlanNodeType.DeclareLens;
+
+	constructor(
+		scope: Scope,
+		public readonly statementAst: AST.DeclareLensStmt
+	) {
+		super(scope, 1);
+	}
+
+	override toString(): string {
+		return `DECLARE LENS FOR ${this.statementAst.logicalSchema} OVER ${this.statementAst.basisSchema}`;
+	}
+
+	override getLogicalAttributes(): Record<string, unknown> {
+		return {
+			type: 'declareLens',
+			logicalSchema: this.statementAst.logicalSchema,
+			basisSchema: this.statementAst.basisSchema,
+			overrideCount: this.statementAst.overrides.length,
 		};
 	}
 }
@@ -193,6 +222,15 @@ export class ExplainSchemaNode extends PlanNode implements RelationalPlanNode {
 
 	getChildren(): PlanNode[] {
 		return [];
+	}
+
+	override computePhysical(): Partial<PhysicalProperties> {
+		// EXPLAIN SCHEMA emits exactly one row (the schema hash), so back the declared
+		// empty key with the canonical singleton `∅ → all_cols` FD — keeping the
+		// independent declared-key and FD channels in agreement (see the
+		// independent-channel singleton law in test/property.spec.ts).
+		const fds = addSingletonFd([], this.getType().columns.length);
+		return { estimatedRows: 1, fds: fds.length > 0 ? fds : undefined };
 	}
 
 	withChildren(newChildren: readonly PlanNode[]): PlanNode {

@@ -300,6 +300,12 @@ function validateFds(
         return false;
       }
     }
+    // Plain-JS plugins bypass the type system — `kind` is required and every
+    // reader trusts it, so reject anything but the two valid values here.
+    if (fd.kind !== 'unique' && fd.kind !== 'determination') {
+      log('Dropping TVF advertisement for %s: FD kind must be \'unique\' or \'determination\', got %s', fnName, fd.kind);
+      return false;
+    }
   }
   return true;
 }

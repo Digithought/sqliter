@@ -1,0 +1,317 @@
+-- 13.6-cte-dml-runs-once.sqllogic - a data-modifying CTE runs ONCE per statement
+--
+-- `with c as (insert/update/delete ... returning ...) select ...` must execute its
+-- write exactly once per statement execution, no matter how many times the rest of
+-- the query names `c`. Every mention then replays one buffer of RETURNING rows.
+--
+-- This held only accidentally before: buffering was gated on the CTE's parent count
+-- (two mentions sharing an alias collapse to ONE reference node, so the gate read
+-- "referenced once") and the buffer was keyed on the plan node's id (which the
+-- constant-folding pass can split into several ids for one CTE). A `values`-bodied
+-- INSERT folds to a table literal and hit both; a `select`-bodied one hit only the
+-- first. Both body shapes are covered below.
+
+-- ===== INSERT body, referenced twice via scalar subqueries =====
+
+create table t1 (k integer primary key, v integer default 0);
+-- run
+
+with c as (insert into t1 (k) values (1) returning k)
+select (select count(*) from c) as a, (select count(*) from c) as b;
+→ [{"a":1,"b":1}]
+
+-- One row inserted, not two — the second mention replayed the buffer.
+select k, v from t1 order by k;
+→ [{"k":1,"v":0}]
+
+-- ===== INSERT body, referenced twice via a self-join =====
+
+create table t2 (k integer primary key);
+-- run
+
+with c as (insert into t2 (k) values (1) returning k)
+select count(*) as n from c c1 join c c2 on c1.k = c2.k;
+→ [{"n":1}]
+
+select k from t2 order by k;
+→ [{"k":1}]
+
+-- ===== INSERT body reading a real table (not constant-foldable) =====
+
+create table src (k integer primary key);
+insert into src values (7), (8);
+create table t3 (k integer primary key);
+-- run
+
+with c as (insert into t3 (k) select k from src returning k)
+select (select count(*) from c) as a, (select count(*) from c) as b;
+→ [{"a":2,"b":2}]
+
+select k from t3 order by k;
+→ [{"k":7},{"k":8}]
+
+-- ===== UPDATE body, referenced twice =====
+-- The silent-corruption case: no error, plausible output, doubled increment.
+
+create table t4 (k integer primary key, v integer);
+insert into t4 values (1, 0), (2, 0);
+-- run
+
+with c as (update t4 set v = v + 1 returning k, v)
+select (select count(*) from c) as a, (select count(*) from c) as b;
+→ [{"a":2,"b":2}]
+
+-- v incremented once, not twice.
+select k, v from t4 order by k;
+→ [{"k":1,"v":1},{"k":2,"v":1}]
+
+-- ===== DELETE body, referenced twice =====
+-- Second mention must see the SAME returned rows, not an empty re-run.
+
+create table t5 (k integer primary key);
+insert into t5 values (1), (2), (3);
+-- run
+
+with c as (delete from t5 where k = 1 returning k)
+select (select count(*) from c) as a, (select count(*) from c) as b;
+→ [{"a":1,"b":1}]
+
+select k from t5 order by k;
+→ [{"k":2},{"k":3}]
+
+-- ===== Explicit MATERIALIZED hint changes nothing =====
+
+create table t6 (k integer primary key);
+-- run
+
+with c as materialized (insert into t6 (k) values (1) returning k)
+select (select count(*) from c) as a, (select count(*) from c) as b;
+→ [{"a":1,"b":1}]
+
+select k from t6 order by k;
+→ [{"k":1}]
+
+-- ===== Explicit NOT MATERIALIZED does NOT license a second write =====
+-- Correctness beats the hint: re-executing the body would mean writing twice.
+-- (Same call the recursive-CTE branch already makes.)
+
+create table t7 (k integer primary key);
+-- run
+
+with c as not materialized (insert into t7 (k) values (1) returning k)
+select (select count(*) from c) as a, (select count(*) from c) as b;
+→ [{"a":1,"b":1}]
+
+select k from t7 order by k;
+→ [{"k":1}]
+
+-- ===== NOT MATERIALIZED on an UPDATE body =====
+
+create table t8 (k integer primary key, v integer);
+insert into t8 values (1, 0);
+-- run
+
+with c as not materialized (update t8 set v = v + 1 returning k, v)
+select (select count(*) from c) as a, (select count(*) from c) as b;
+→ [{"a":1,"b":1}]
+
+select k, v from t8 order by k;
+→ [{"k":1,"v":1}]
+
+-- ===== Three mentions =====
+
+create table t9 (k integer primary key, v integer);
+insert into t9 values (1, 0);
+-- run
+
+with c as (update t9 set v = v + 5 returning k, v)
+select (select count(*) from c) as a, (select sum(v) from c) as b, (select max(k) from c) as d;
+→ [{"a":1,"b":5,"d":1}]
+
+select k, v from t9 order by k;
+→ [{"k":1,"v":5}]
+
+-- ===== Control: referenced ONCE still works =====
+
+create table t10 (k integer primary key);
+-- run
+
+with c as (insert into t10 (k) values (1) returning k) select k from c;
+→ [{"k":1}]
+
+select k from t10 order by k;
+→ [{"k":1}]
+
+-- ===== Control: referenced ZERO times =====
+-- Out of scope here: the planner drops an unreferenced CTE entirely, so the write
+-- never happens (a known deviation from SQLite/PostgreSQL, tracked separately in
+-- backlog `bug-unreferenced-dml-cte-never-runs`). Pinned so this fix does not
+-- accidentally change it in either direction without a deliberate decision.
+
+create table t11 (k integer primary key);
+-- run
+
+with c as (insert into t11 (k) values (1) returning k) select 42 as x;
+→ [{"x":42}]
+
+select count(*) as cnt from t11;
+→ [{"cnt":0}]
+
+-- ===== Two data-modifying CTEs in one WITH clause, each referenced twice =====
+-- Each CTE owns its own buffer key, so neither replays the other's rows.
+
+create table t13a (k integer primary key);
+create table t13b (k integer primary key);
+-- run
+
+with a as (insert into t13a (k) values (1) returning k),
+     b as (insert into t13b (k) values (2) returning k)
+select (select count(*) from a) as a1, (select count(*) from a) as a2,
+       (select count(*) from b) as b1, (select count(*) from b) as b2;
+→ [{"a1":1,"a2":1,"b1":1,"b2":1}]
+
+select k from t13a order by k;
+→ [{"k":1}]
+select k from t13b order by k;
+→ [{"k":2}]
+
+-- ===== Early teardown: LIMIT 0 does NOT skip the write =====
+-- Forced buffering detaches the source drive, so it runs to completion even when
+-- every consumer is torn down first. That is the semantics a write wants: the
+-- statement named the insert, so the insert happens.
+
+create table t14 (k integer primary key);
+-- run
+
+with c as (insert into t14 (k) values (1) returning k) select k from c limit 0;
+→ []
+
+select k from t14 order by k;
+→ [{"k":1}]
+
+-- ===== ROLLBACK still undoes the buffered write =====
+-- The buffer is per statement execution and lives in the runtime context, not in the
+-- storage layer — it never shields a write from transaction rollback.
+
+create table t15 (k integer primary key);
+-- run
+
+begin;
+-- run
+
+with c as (insert into t15 (k) values (1) returning k)
+select (select count(*) from c) as a, (select count(*) from c) as b;
+→ [{"a":1,"b":1}]
+
+rollback;
+-- run
+
+select count(*) as cnt from t15;
+→ [{"cnt":0}]
+
+-- ===== A data-modifying CTE feeding an INSERT through a VIEW still runs once =====
+-- INSERT now builds its leading WITH clause ONCE, above the view-target dispatch, so the
+-- clause is built before `buildViewMutation` re-plans the statement through the same
+-- builder — and the re-plan builds `stmt.withClause` a second time (buildWithClause does
+-- not memoize). One of the two node sets ends up unreferenced, so this should be wasted
+-- planning work rather than a behavior change; pinned here because the thing that must
+-- NOT double is the write inside the CTE body. (UPDATE has had this same
+-- hoist-then-re-plan ordering all along.)
+
+create table t16log (id integer primary key, v text);
+create table t16 (id integer primary key, w text);
+create view vt16 as select id, w from t16;
+-- run
+
+with d as (insert into t16log values (1, 'x') returning id)
+insert into vt16 select id, 'z' from d;
+
+-- One log row, not two — the CTE body executed exactly once across both plannings.
+select id, v from t16log order by id;
+→ [{"id":1,"v":"x"}]
+
+select id, w from t16 order by id;
+→ [{"id":1,"w":"z"}]
+
+-- Same shape with the CTE named twice, so the buffering path is exercised too.
+
+create table t17log (id integer primary key, v text);
+create table t17 (id integer primary key, w integer);
+create view vt17 as select id, w from t17;
+-- run
+
+with d as (insert into t17log values (1, 'x') returning id)
+insert into vt17 select id, (select count(*) from d) from d;
+
+select id, v from t17log order by id;
+→ [{"id":1,"v":"x"}]
+
+select id, w from t17 order by id;
+→ [{"id":1,"w":1}]
+
+-- A MULTI-SOURCE view target is the stronger case: a join-bodied view decomposes into one
+-- base insert per member, and each member re-enters the INSERT builder with the same
+-- statement — so the hoisted WITH clause is built once per member on top of the outer
+-- build. None of those extra plannings may run the CTE body's write.
+
+create table t18log (id integer primary key, v text);
+create table t18a (id integer primary key, a text);
+create table t18b (id integer primary key, b text);
+create view vt18 as select t18a.id as id, t18a.a as a, t18b.b as b
+  from t18a join t18b on t18a.id = t18b.id;
+-- run
+
+with d as (insert into t18log values (1, 'x') returning id)
+insert into vt18 select id, 'aa', 'bb' from d;
+
+-- One log row, not one per view member.
+select id, v from t18log order by id;
+→ [{"id":1,"v":"x"}]
+
+select id, a from t18a order by id;
+→ [{"id":1,"a":"aa"}]
+
+select id, b from t18b order by id;
+→ [{"id":1,"b":"bb"}]
+
+-- ===== Control: a plain SELECT-bodied CTE is untouched =====
+-- Re-evaluating a read-only body is a performance question, not a correctness one;
+-- the row-set answer is identical either way. Pinned so the DML rule did not leak.
+
+create table t12 (k integer primary key);
+insert into t12 values (1), (2);
+-- run
+
+with c as (select k from t12)
+select (select count(*) from c) as a, (select count(*) from c) as b;
+→ [{"a":2,"b":2}]
+
+-- Cleanup
+drop table t1;
+drop table t2;
+drop table src;
+drop table t3;
+drop table t4;
+drop table t5;
+drop table t6;
+drop table t7;
+drop table t8;
+drop table t9;
+drop table t10;
+drop table t11;
+drop table t12;
+drop table t13a;
+drop table t13b;
+drop table t14;
+drop table t15;
+drop view vt16;
+drop table t16;
+drop table t16log;
+drop view vt17;
+drop table t17;
+drop table t17log;
+drop view vt18;
+drop table t18a;
+drop table t18b;
+drop table t18log;
+-- run

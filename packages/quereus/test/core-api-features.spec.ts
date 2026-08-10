@@ -70,6 +70,113 @@ describe('Core API Features', () => {
 					void expect((err as Error).message).to.include('kaboom');
 				}
 			});
+
+			// Database.createScalarFunction never passes a `returnType`, so every
+			// user/plugin scalar function rides the undeclared-return-type default. While
+			// that default was REAL the planner believed all of them returned a number and
+			// cast the other side of a comparison to REAL — a text-returning function
+			// compared against a text literal was silently false, because the literal
+			// became 0. The default is now ANY (unknown), which leaves both operands
+			// alone. Ticket 1-scalar-function-default-return-type-any; the builtin half
+			// lives in test/logic/06.5.3-undeclared-return-type-comparison.sqllogic.
+			describe('undeclared return type', () => {
+
+				beforeEach(() => {
+					db.createScalarFunction('tag', { numArgs: 1 }, (x) => `t:${x}`);
+					db.createScalarFunction('dbl', { numArgs: 1 }, (x) => Number(x) * 2);
+				});
+
+				it('compares a text-returning function against a text literal as text', async () => {
+					// This was false.
+					const row = await db.get("select tag(1) = 't:1' as r");
+					void expect(row!.r).to.equal(true);
+
+					// Literal on the left is the same coercion, mirrored.
+					const mirrored = await db.get("select 't:1' = tag(1) as r");
+					void expect(mirrored!.r).to.equal(true);
+
+					// Not "always true" — unequal text is still unequal, and the
+					// complement is honest.
+					const miss = await db.get("select tag(1) = 't:2' as r, tag(1) <> 't:1' as q");
+					void expect(miss!.r).to.equal(false);
+					void expect(miss!.q).to.equal(false);
+				});
+
+				it('agrees across comparison sites', async () => {
+					const row = await db.get(`select tag(1) in ('t:1') as inlist,
+						case tag(1) when 't:1' then 'yes' else 'no' end as casewhen,
+						tag(1) between 't:0' and 't:2' as btw,
+						tag(1) like 't:%' as lk`);
+					void expect(row!.inlist).to.equal(true);
+					void expect(row!.casewhen).to.equal('yes');
+					void expect(row!.btw).to.equal(true);
+					void expect(row!.lk).to.equal(true);
+				});
+
+				it('compares an unknown-typed value against JSON through the JSON arm', async () => {
+					await db.exec('create table urt_j (id integer primary key, j json)');
+					await db.exec(`insert into urt_j values (1, '{"a":"x"}')`);
+
+					// ANY is not NULL, so insertCrossTypeCoercion still casts the ANY side
+					// to JSON. 't:1' is not JSON source, so the lenient cast leaves the raw
+					// string, which does not equal the object — same answer a TEXT operand
+					// gives. Pinned deliberately.
+					const miss = await db.get('select tag(1) = j as r from urt_j');
+					void expect(miss!.r).to.equal(false);
+
+					// A function that returns JSON source text does match structurally.
+					db.createScalarFunction('as_json_text', { numArgs: 0 }, () => '{ "a" : "x" }');
+					const hit = await db.get('select as_json_text() = j as r from urt_j');
+					void expect(hit!.r).to.equal(true);
+				});
+
+				it('is accepted as an argument by the numeric builtins', async () => {
+					// abs/round/sqrt/floor/ceil/clamp gate their argument at plan time on
+					// isNumeric. An unclassifiable argument has to pass that gate, or every
+					// user function becomes unusable inside them.
+					const row = await db.get(`select abs(dbl(-3)) as a, round(dbl(1.234), 1) as b,
+						sqrt(dbl(8)) as c, floor(dbl(1.4)) as d, ceil(dbl(1.1)) as e,
+						clamp(dbl(50), 0, 10) as f`);
+					void expect(row!.a).to.equal(6);
+					void expect(row!.b).to.equal(2.5);
+					void expect(row!.c).to.equal(4);
+					void expect(row!.d).to.equal(2);
+					void expect(row!.e).to.equal(3);
+					void expect(row!.f).to.equal(10);
+
+					// A function whose value is not numeric defers to the implementation,
+					// which returns null rather than throwing at plan time.
+					const nonNumeric = await db.get('select abs(tag(1)) as r');
+					void expect(nonNumeric!.r).to.equal(null);
+				});
+			});
+
+			it('should hide a hidden function from schema() but keep it callable and in function_info()', async () => {
+				db.createScalarFunction('secret_helper', { numArgs: 0, hidden: true }, () => 7);
+				db.createScalarFunction('visible_helper', { numArgs: 0 }, () => 9);
+
+				// Hidden functions remain fully callable.
+				const row = await db.get('select secret_helper() as result');
+				void expect(row!.result).to.equal(7);
+
+				const inSchema: string[] = [];
+				for await (const r of db.eval(
+					"select name from schema() where type = 'function' and name in ('secret_helper', 'visible_helper')"
+				)) {
+					inSchema.push((r as any).name);
+				}
+				// schema() omits the hidden helper but still lists the visible one.
+				void expect(inSchema).to.deep.equal(['visible_helper']);
+
+				const inFunctionInfo: string[] = [];
+				for await (const r of db.eval(
+					"select name from function_info() where name in ('secret_helper', 'visible_helper') order by name"
+				)) {
+					inFunctionInfo.push((r as any).name);
+				}
+				// function_info() lists both — the hidden flag does not affect introspection.
+				void expect(inFunctionInfo).to.deep.equal(['secret_helper', 'visible_helper']);
+			});
 		});
 
 		describe('createAggregateFunction()', () => {
@@ -134,6 +241,26 @@ describe('Core API Features', () => {
 				// Empty aggregation: finalizer receives the initial state ('')
 				// which becomes null via the || null fallback
 				void expect(row!.result).to.satisfy((v: any) => v === null || v === '');
+			});
+
+			// Same undeclared-return-type default as the scalar case above: no built-in
+			// aggregate rides it, but Database.createAggregateFunction never passes a
+			// returnType, so a text-returning custom aggregate compared against a text
+			// literal was false while the default was REAL.
+			it('compares a text-returning custom aggregate against a text literal as text', async () => {
+				db.createAggregateFunction(
+					'pipe_cat',
+					{ numArgs: 1, initialState: '' },
+					(acc, val) => `${acc as string}${acc ? '|' : ''}${String(val)}`,
+					(acc) => acc as string
+				);
+
+				await db.exec('create table agg_urt (id integer primary key, d text)');
+				await db.exec("insert into agg_urt values (1, 'a'), (2, 'b')");
+
+				const row = await db.get("select pipe_cat(d) = 'a|b' as r, pipe_cat(d) = 'a|c' as q from agg_urt");
+				void expect(row!.r).to.equal(true);
+				void expect(row!.q).to.equal(false);
 			});
 		});
 	});
@@ -276,6 +403,27 @@ describe('Core API Features', () => {
 				db.setOption('default_column_nullability', 'nullable');
 				const value = db.getOption('default_column_nullability');
 				void expect(value).to.equal('nullable');
+			});
+
+			it('should default default_collation to BINARY', () => {
+				void expect(db.getOption('default_collation')).to.equal('BINARY');
+			});
+
+			it('should set and get default_collation', () => {
+				db.setOption('default_collation', 'nocase');
+				void expect(db.getOption('default_collation')).to.equal('nocase');
+			});
+
+			it('should reject an unknown default_collation and roll back', () => {
+				const before = db.getOption('default_collation');
+				void expect(before).to.equal('BINARY');
+
+				void expect(() => {
+					db.setOption('default_collation', 'no_such_collation');
+				}).to.throw(QuereusError);
+
+				// Value must remain unchanged after the rejected set
+				void expect(db.getOption('default_collation')).to.equal('BINARY');
 			});
 		});
 	});

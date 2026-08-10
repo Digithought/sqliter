@@ -1,0 +1,77 @@
+-- 41.2.2-alter-column-retype-index-rebuild.sqllogic
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Carved out of 41.2-alter-column: 14 of that file's 17 scenarios (ADD/DROP NOT NULL,
+-- DEFAULT, PK guards, backfill, the retype value rewrite itself, and the retype's
+-- effect on an inline UNIQUE) need no index DDL. What needs a standalone
+-- `create index` is the SECONDARY-index rebuild — the parent still proves the rewrite
+-- and the UNIQUE re-enforcement through the auto-index, this file proves it for a
+-- user-created index.
+--
+-- Subject: ALTER COLUMN SET DATA TYPE physically rewrites values, so every secondary
+-- index over the column must be rebuilt from the CONVERTED rows — otherwise an
+-- index-driven lookup still probes the pre-retype spelling and misses. Holds for
+-- committed rows and for the transaction's own pending row.
+
+-- ===================================
+-- 1. text -> integer: the index finds rows by the new numeric value
+-- ===================================
+
+create table t_conv (id integer primary key, v text);
+create index t_conv_v on t_conv (v);
+insert into t_conv values (1, '10'), (2, '9');
+alter table t_conv alter column v set data type integer;
+
+select id from t_conv where v = 9;
+→ [{"id": 2}]
+
+drop table t_conv;
+
+-- ===================================
+-- 2. text -> date: normalization moves each value, so the index is rebuilt from the
+--    converted rows and both spellings resolve to the normalized one
+-- ===================================
+
+create table t_idx (id integer primary key, v text);
+create index t_idx_v2 on t_idx (v);
+insert into t_idx values (1, '2024-06-05T00:00:00Z'), (2, '2024-01-02');
+alter table t_idx alter column v set data type date;
+
+select id, v from t_idx order by v;
+→ [{"id": 2, "v": "2024-01-02"}, {"id": 1, "v": "2024-06-05"}]
+
+select id from t_idx where v = '2024-06-05';
+→ [{"id": 1}]
+
+-- a genuinely new date is findable by either spelling.
+insert into t_idx values (4, '2024-07-04T00:00:00Z');
+select id, v from t_idx where v = '2024-07-04';
+→ [{"id": 4, "v": "2024-07-04"}]
+
+drop table t_idx;
+
+-- ===================================
+-- 3. …the same inside the DDL transaction: the transaction's own pending row is
+--    converted AND re-indexed, before and after commit.
+-- ===================================
+
+create table t_idxtx (id integer primary key, v text);
+create index t_idxtx_v on t_idxtx (v);
+insert into t_idxtx values (1, '2024-01-02');
+begin;
+insert into t_idxtx values (2, '2024-06-05T00:00:00Z');
+alter table t_idxtx alter column v set data type date;
+
+select id from t_idxtx where v = '2024-06-05';
+→ [{"id": 2}]
+
+commit;
+
+select id from t_idxtx where v = '2024-06-05';
+→ [{"id": 2}]
+
+select id, v from t_idxtx order by v;
+→ [{"id": 1, "v": "2024-01-02"}, {"id": 2, "v": "2024-06-05"}]
+
+drop table t_idxtx;

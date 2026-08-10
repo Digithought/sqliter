@@ -1,4 +1,5 @@
 description: Index JSON properties via expression indexes on json_extract paths
+difficulty: hard
 prereq: Expression index support (currently throws "not supported yet" in schema/manager.ts:940), json-native-object-storage
 files:
   - packages/quereus/src/schema/manager.ts (expression index creation — currently blocked)

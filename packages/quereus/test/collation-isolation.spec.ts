@@ -21,7 +21,7 @@ describe('Per-database collation isolation', () => {
 		await db.close();
 	});
 
-	it('custom collation registered on one Database is not visible from another', async () => {
+	it('a custom collation registered on one Database is invisible — and an error — on another', async () => {
 		const db1 = new Database();
 		const db2 = new Database();
 
@@ -43,10 +43,16 @@ describe('Per-database collation isolation', () => {
 		// Reversed strings: 'cba', 'zyx', 'anm' -> sorted: 'anm', 'cba', 'zyx' -> original: 'mna', 'abc', 'xyz'
 		expect(rows1.map(r => r.name)).to.deep.equal(['mna', 'abc', 'xyz']);
 
-		// db2 should NOT have REVERSE — falls back to BINARY
-		const rows2 = await collect(db2.eval('SELECT name FROM t ORDER BY name COLLATE REVERSE'));
-		// Falls back to BINARY: 'abc', 'mna', 'xyz'
-		expect(rows2.map(r => r.name)).to.deep.equal(['abc', 'mna', 'xyz']);
+		// db2 has no REVERSE — resolution must fail loudly, never fall back to BINARY,
+		// which would silently return a different (byte) ordering than db1.
+		let err: unknown;
+		try {
+			await collect(db2.eval('SELECT name FROM t ORDER BY name COLLATE REVERSE'));
+		} catch (e) {
+			err = e;
+		}
+		expect(err, 'db2 must reject an unregistered collation').to.be.instanceOf(Error);
+		expect((err as Error).message).to.match(/no such collation sequence: REVERSE/);
 
 		await db1.close();
 		await db2.close();

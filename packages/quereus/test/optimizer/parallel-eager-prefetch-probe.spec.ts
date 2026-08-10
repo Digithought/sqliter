@@ -364,7 +364,7 @@ describe('ruleEagerPrefetchProbe', () => {
 				readonly: true,
 				// column indices reference output column position; monotonicOn uses attrId.
 				ordering: [{ column: 0, desc: false }],
-				fds: [{ determinants: [0], dependents: [1] }],
+				fds: [{ determinants: [0], dependents: [1], kind: 'unique' }],
 				equivClasses: [[0, 1]],
 				monotonicOn: [{ attrId: k.id, strict: true, direction: 'asc' }],
 			},
@@ -373,7 +373,7 @@ describe('ruleEagerPrefetchProbe', () => {
 		const phys = prefetch.physical;
 
 		expect(phys.ordering, 'ordering must survive').to.deep.equal([{ column: 0, desc: false }]);
-		expect(phys.fds, 'fds must survive').to.deep.equal([{ determinants: [0], dependents: [1] }]);
+		expect(phys.fds, 'fds must survive').to.deep.equal([{ determinants: [0], dependents: [1], kind: 'unique' }]);
 		expect(phys.equivClasses, 'equivClasses must survive').to.deep.equal([[0, 1]]);
 		expect(phys.monotonicOn, 'monotonicOn must survive')
 			.to.deep.equal([{ attrId: k.id, strict: true, direction: 'asc' }]);

@@ -17,6 +17,8 @@ import {
 	type DeltaExecutorContext,
 	type SubscriptionFromChangeScopeContext,
 	type ChangeScopeTableInfo,
+	type DeltaSubscription,
+	type DeltaApplyInput,
 } from '../runtime/delta-executor.js';
 import type {
 	ChangeScope,
@@ -26,6 +28,7 @@ import type {
 } from '../planner/analysis/change-scope.js';
 import type { Database } from './database.js';
 import type { SchemaChangeEvent } from '../schema/change-events.js';
+import { splitBaseKey } from '../util/qualified-name.js';
 
 const log = createLogger('core:watchers');
 const warnLog = log.extend('warn');
@@ -49,6 +52,10 @@ interface ActiveSubscription {
 	readonly id: string;
 	/** Tables this subscription watches (lowercased `schema.table`). */
 	readonly tables: ReadonlySet<string>;
+	/** The underlying kernel subscription. Retained so external-change
+	 *  invalidation can synthesize a global `apply` directly, bypassing the
+	 *  commit change-log dependency. */
+	readonly delta: DeltaSubscription;
 	/** Removes the subscription from the kernel. */
 	disposeFromExecutor(): void;
 	/** Disposes capture-spec demand registered for this subscription. */
@@ -72,7 +79,7 @@ export class WatcherManager {
 			getChangedBaseTables: () => ctx.getChangedBaseTables(),
 			getChangedTuples: (base, cols, pk) => ctx.getChangedTuples(base, cols, pk),
 			getRowCount: (base) => {
-				const [schemaName, tableName] = base.split('.');
+				const [schemaName, tableName] = splitBaseKey(base);
 				const table = ctx._findTable(tableName, schemaName);
 				return table?.estimatedRows;
 			},
@@ -130,6 +137,7 @@ export class WatcherManager {
 		const entry: ActiveSubscription = {
 			id,
 			tables,
+			delta: subscription,
 			disposeFromExecutor,
 			captureDisposers,
 			disposed: false,
@@ -168,6 +176,56 @@ export class WatcherManager {
 		}
 	}
 
+	/**
+	 * Fire every active subscription whose scope includes `fqName` (lowercased
+	 * `schema.table`), treating the whole table as changed, WITHOUT a local
+	 * commit. For hosts whose tables are backed by an external/replicated store
+	 * (e.g. the optimystic vtab) that learns of remote writes out-of-band.
+	 *
+	 * Coarse by design: for each matching subscription, every relation that maps
+	 * to `fqName` is flagged for global re-evaluation with empty per-relation
+	 * tuples, reusing the same `apply` logic the post-commit path drives. A
+	 * `full` watch fires with empty hits; a `rows`/`rowsByGroup` watch surfaces
+	 * all its registered literal values as possibly-changed; `groups` fires with
+	 * empty hits. No-op when no subscription matches. Per-subscription `apply`
+	 * errors are logged and swallowed — same contract as {@link runPostCommit}.
+	 */
+	async notifyExternalTableChange(fqName: string): Promise<void> {
+		if (this.active.size === 0) return;
+
+		// Snapshot the matching subscriptions before firing: a handler that
+		// (un)subscribes a peer must not perturb this pass.
+		const matching = this.subscriptionsForTable(fqName);
+		if (matching.length === 0) return;
+
+		this.currentTxnId = this.mintTxnId();
+		try {
+			for (const entry of matching) {
+				if (entry.disposed) continue;
+
+				const globalRelations = new Set<string>();
+				for (const [relKey, base] of entry.delta.relationToBase) {
+					if (base === fqName) globalRelations.add(relKey);
+				}
+				if (globalRelations.size === 0) continue;
+
+				const input: DeltaApplyInput = {
+					perRelationTuples: new Map(),
+					globalRelations,
+				};
+				try {
+					await entry.delta.apply(input);
+				} catch (err) {
+					// Mirror runPostCommit: a single subscription's apply must never
+					// reject into the external caller.
+					log('External-change apply for %s threw: %O', entry.id, err);
+				}
+			}
+		} finally {
+			this.currentTxnId = '';
+		}
+	}
+
 	dispose(): void {
 		if (this.unsubscribeSchemaChanges) {
 			this.unsubscribeSchemaChanges();
@@ -190,11 +248,19 @@ export class WatcherManager {
 		entry.captureDisposers.length = 0;
 	}
 
-	private invalidateForTable(fqName: string): void {
-		const toDispose: ActiveSubscription[] = [];
+	/** Snapshot of every active subscription whose scope includes `fqName`
+	 *  (lowercased `schema.table`). Snapshotting decouples the caller's
+	 *  iteration from mutations a handler/disposer may make to `active`. */
+	private subscriptionsForTable(fqName: string): ActiveSubscription[] {
+		const out: ActiveSubscription[] = [];
 		for (const entry of this.active.values()) {
-			if (entry.tables.has(fqName)) toDispose.push(entry);
+			if (entry.tables.has(fqName)) out.push(entry);
 		}
+		return out;
+	}
+
+	private invalidateForTable(fqName: string): void {
+		const toDispose = this.subscriptionsForTable(fqName);
 		for (const entry of toDispose) {
 			warnLog('Invalidating subscription %s due to schema change on %s', entry.id, fqName);
 			this.disposeActive(entry);

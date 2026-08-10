@@ -281,3 +281,669 @@ insert into child_t values (30, 999);
 
 drop table child_t;
 drop table renamed_t;
+
+-- ===================================
+-- 9. Typo'd reserved tag on a physical declared object → hard error at apply
+-- ===================================
+
+-- The physical declarative differ now validates every declared object's
+-- quereus.* tags through the same typed registry as the lens/mutation paths
+-- (hard-error-on-unknown). A typo that the old soft-warn allow-list silently
+-- swallowed now fails the apply loudly. (`quereus.update.taget` is a typo of
+-- `target`.)
+create table gadget (id integer primary key, name text);
+
+declare schema main {
+	table gadget {
+		id integer primary key,
+		name text
+	} with tags ("quereus.update.taget" = 'gadget')
+}
+
+-- run
+
+apply schema main;
+-- error: unknown reserved tag
+
+drop table gadget;
+
+-- ===================================
+-- 10. Typo'd reserved tag on an INLINE NAMED column constraint → hard error at apply
+-- ===================================
+
+-- The differ also validates ColumnDef.constraints[].tags at the physical-constraint
+-- site, symmetric with the direct CREATE path (50-metadata-tags § inline named
+-- column-constraint). A trailing WITH TAGS lands on the constraint only when it is
+-- NAMED; a typo on an inline named CHECK constraint fails the apply just as a
+-- table-level constraint typo does (§ 9).
+create table widget (id integer primary key, qty integer);
+
+declare schema main {
+	table widget {
+		id integer primary key,
+		qty integer constraint chk_qty check (qty > 0) with tags ("quereus.bogus" = 1)
+	}
+}
+
+-- run
+
+apply schema main;
+-- error: unknown reserved tag
+
+drop table widget;
+
+-- ===================================
+-- 11. In-diff COLUMN rename reconciles a dependent view (no spurious recreate)
+-- ===================================
+
+-- A name-matched view whose declared body references a column renamed in the
+-- SAME diff must NOT recreate: the differ inverse-applies the in-diff renames
+-- before comparing canonical definitions. This is correctness-critical, not
+-- just churn — generateMigrationDDL emits view creates BEFORE the table-alter
+-- block where RENAME COLUMN lives, and CREATE VIEW plans its body at create
+-- time, so an unreconciled recreate naming the NEW column would fail at apply.
+
+create table emp (emp_id integer primary key, fullname text not null, created integer not null);
+create view emp_v as select emp_id, fullname from emp with defaults (created = 7);
+insert into emp values (1, 'Carol', 0);
+
+declare schema main {
+	table emp {
+		emp_id integer primary key,
+		full_name text not null with tags ("quereus.previous_name" = 'fullname'),
+		created integer not null
+	}
+
+	view emp_v as select emp_id, full_name from emp with defaults (created = 7)
+}
+
+-- run
+
+-- Only the rename op — no DROP VIEW / CREATE VIEW.
+diff schema main;
+→ [{"ddl": "ALTER TABLE emp RENAME COLUMN fullname TO full_name"}]
+
+apply schema main;
+
+-- run
+
+-- The live rename propagation rewrote the view body to the new column name.
+select * from emp_v order by emp_id;
+→ [{"emp_id": 1, "full_name": "Carol"}]
+
+-- Write-through via the (rename-untouched) insert-defaults clause still works.
+insert into emp_v values (2, 'Dan');
+select created from emp where emp_id = 2;
+→ [{"created": 7}]
+
+-- Converged.
+diff schema main;
+→ []
+
+drop view emp_v;
+drop table emp;
+
+-- ===================================
+-- 12. In-diff TABLE rename reconciles a dependent view (no spurious recreate)
+-- ===================================
+
+create table dept_old (id integer primary key, dname text);
+create view dept_v as select id, dname from dept_old;
+insert into dept_old values (1, 'Eng');
+
+declare schema main {
+	table dept_new {
+		id integer primary key,
+		dname text
+	} with tags ("quereus.previous_name" = 'dept_old')
+
+	view dept_v as select id, dname from dept_new
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE dept_old RENAME TO dept_new"}]
+
+apply schema main;
+
+-- run
+
+select * from dept_v;
+→ [{"id": 1, "dname": "Eng"}]
+
+diff schema main;
+→ []
+
+drop view dept_v;
+drop table dept_new;
+
+-- ===================================
+-- 13. In-diff TABLE rename reconciles a dependent MATERIALIZED VIEW (no spurious rebuild)
+-- ===================================
+
+create table inv_old (id integer primary key, qty integer not null);
+create materialized view inv_mv as select id, qty from inv_old;
+insert into inv_old values (1, 5);
+
+declare schema main {
+	table inv_new {
+		id integer primary key,
+		qty integer not null
+	} with tags ("quereus.previous_name" = 'inv_old')
+
+	materialized view inv_mv as select id, qty from inv_new
+}
+
+-- run
+
+-- Only the table rename — no DROP MATERIALIZED VIEW / re-materialization.
+diff schema main;
+→ [{"ddl": "ALTER TABLE inv_old RENAME TO inv_new"}]
+
+apply schema main;
+
+-- run
+
+-- Row-time maintenance still tracks the renamed source.
+insert into inv_new values (2, 7);
+select * from inv_mv order by id;
+→ [{"id": 1, "qty": 5}, {"id": 2, "qty": 7}]
+
+-- Converged: the rename propagation re-stamped the live bodyHash from the
+-- rewritten body, matching the declared definition's hash.
+diff schema main;
+→ []
+
+drop materialized view inv_mv;
+drop table inv_new;
+
+-- ===================================
+-- 14. require-hint: a view DEFINITION recreate is not an ambiguous rename
+-- ===================================
+
+-- A definition-change recreate emits both a view drop and a view create; the
+-- require-hint guard must not mistake that deliberate pair for an unhinted
+-- rename (mirroring the index body-recreate exclusion).
+
+create table rh_t (id integer primary key, v integer);
+create view rh_v as select id from rh_t;
+
+declare schema main {
+	table rh_t {
+		id integer primary key,
+		v integer
+	}
+
+	view rh_v as select id from rh_t where id > 0
+}
+
+-- run
+
+apply schema main options (rename_policy = 'require-hint');
+
+-- run
+
+diff schema main;
+→ []
+
+drop view rh_v;
+drop table rh_t;
+
+-- ===================================
+-- 15. In-diff COLUMN rename reconciles a dependent MATERIALIZED VIEW (no spurious rebuild)
+-- ===================================
+
+-- The MV mirror of §11: the differ's hash compare reconciles the in-diff
+-- column rename (no DROP MATERIALIZED VIEW / re-materialization), and the live
+-- column-rename propagation rewrites the MV body and re-stamps bodyHash with
+-- the same canonical-definition formula, so the re-diff converges.
+
+create table stock_t (id integer primary key, amount integer not null);
+create materialized view stock_mv as select id, amount from stock_t;
+insert into stock_t values (1, 5);
+
+declare schema main {
+	table stock_t {
+		id integer primary key,
+		qty integer not null with tags ("quereus.previous_name" = 'amount')
+	}
+
+	materialized view stock_mv as select id, qty from stock_t
+}
+
+-- run
+
+-- Only the rename op — no MV drop/create.
+diff schema main;
+→ [{"ddl": "ALTER TABLE stock_t RENAME COLUMN amount TO qty"}]
+
+apply schema main;
+
+-- run
+
+-- Row-time maintenance survived; the MV's output column followed the rename.
+insert into stock_t values (2, 7);
+select * from stock_mv order by id;
+→ [{"id": 1, "qty": 5}, {"id": 2, "qty": 7}]
+
+-- Converged: the propagation re-stamp and the differ formula agree.
+diff schema main;
+→ []
+
+drop materialized view stock_mv;
+drop table stock_t;
+
+-- ===================================
+-- 16. Hinted VIEW rename, definition unchanged → drop + recreate
+-- ===================================
+
+-- A view has no ALTER VIEW … RENAME TO primitive, so a hint-matched rename
+-- resolves to drop(old) + recreate(declared) emitted from the view buckets
+-- (previously this pair diffed empty and applied as a silent no-op).
+
+create table vr_t (id integer primary key, name text);
+create view v_old as select id, name from vr_t;
+insert into vr_t values (1, 'A');
+
+declare schema main {
+	table vr_t {
+		id integer primary key,
+		name text
+	}
+
+	view v_new as select id, name from vr_t with tags ("quereus.previous_name" = 'v_old')
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "DROP VIEW IF EXISTS v_old"}, {"ddl": "create view v_new as select id, name from vr_t with tags (\"quereus.previous_name\" = 'v_old')"}]
+
+apply schema main;
+
+-- run
+
+-- Only the new name exists.
+select name from schema() where type = 'view' order by name;
+→ [{"name": "v_new"}]
+
+select * from v_new order by id;
+→ [{"id": 1, "name": "A"}]
+
+-- Idempotent: the hint tag stored verbatim is inert (name match wins before
+-- hint resolution; the drift compare strips the hint keys).
+diff schema main;
+→ []
+
+drop view v_new;
+drop table vr_t;
+
+-- ===================================
+-- 17. Hinted INDEX rename, body unchanged → drop + recreate
+-- ===================================
+-- Lives in 50.2.1-declare-schema-index-renames (it needs standalone index DDL);
+-- the VIEW-kind twin of this case is § 16 above.
+
+-- ===================================
+-- 18. Hinted VIEW rename + non-hint tag drift → recreate carries the tags
+-- ===================================
+
+-- The in-place SET TAGS branch requires a name match, so on a rename the
+-- declared tag set must ride the recreate (no separate ALTER VIEW … SET TAGS,
+-- no double-emit).
+
+create table tv_t (id integer primary key, v integer);
+create view tv_old as select id, v from tv_t;
+
+declare schema main {
+	table tv_t {
+		id integer primary key,
+		v integer
+	}
+
+	view tv_new as select id, v from tv_t with tags ("quereus.previous_name" = 'tv_old', owner = 'team-x')
+}
+
+-- run
+
+apply schema main;
+
+-- run
+
+-- The recreate carried the declared tags, including the non-hint key.
+select json_extract(tags, '$.owner') as owner from schema() where type = 'view' and name = 'tv_new';
+→ [{"owner": "team-x"}]
+
+diff schema main;
+→ []
+
+drop view tv_new;
+drop table tv_t;
+
+-- ===================================
+-- 19. Hinted VIEW rename + in-diff COLUMN rename of its source
+-- ===================================
+
+-- The recreate must name the OLD column: creates precede RENAME COLUMN in
+-- migration order and CREATE VIEW plans its body at create time. After the
+-- create, the live column-rename propagation rewrites the fresh body, so the
+-- re-diff converges.
+
+create table cr_t (id integer primary key, fullname text not null);
+create view crv_old as select id, fullname from cr_t;
+insert into cr_t values (1, 'Carol');
+
+declare schema main {
+	table cr_t {
+		id integer primary key,
+		full_name text not null with tags ("quereus.previous_name" = 'fullname')
+	}
+
+	view crv_new as select id, full_name from cr_t with tags ("quereus.previous_name" = 'crv_old')
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "DROP VIEW IF EXISTS crv_old"}, {"ddl": "create view crv_new as select id, fullname from cr_t with tags (\"quereus.previous_name\" = 'crv_old')"}, {"ddl": "ALTER TABLE cr_t RENAME COLUMN fullname TO full_name"}]
+
+apply schema main;
+
+-- run
+
+-- Selecting through the renamed view sees the renamed column.
+select * from crv_new order by id;
+→ [{"id": 1, "full_name": "Carol"}]
+
+diff schema main;
+→ []
+
+drop view crv_new;
+drop table cr_t;
+
+-- ===================================
+-- 20. Hinted INDEX rename + in-diff COLUMN rename of its table
+-- ===================================
+-- Lives in 50.2.1-declare-schema-index-renames (it needs standalone index DDL);
+-- § 19 above is the VIEW-kind twin.
+
+-- ===================================
+-- 21. require-hint: a hinted VIEW rename applies cleanly
+-- ===================================
+
+-- A hinted rename's drop+create pair is deliberate, not an ambiguous unhinted
+-- rename — it must not trip the require-hint guard (excluded from the counts,
+-- like the body-change recreates of § 14). The same case with an index
+-- rename alongside is in 50.2.1-declare-schema-index-renames.
+
+create table rh2_t (id integer primary key, v integer);
+create view rh2_vold as select id, v from rh2_t;
+
+declare schema main {
+	table rh2_t {
+		id integer primary key,
+		v integer
+	}
+
+	view rh2_vnew as select id, v from rh2_t with tags ("quereus.previous_name" = 'rh2_vold')
+}
+
+-- run
+
+apply schema main options (rename_policy = 'require-hint');
+
+-- run
+
+diff schema main;
+→ []
+
+select name from schema() where type = 'view';
+→ [{"name": "rh2_vnew"}]
+
+drop view rh2_vnew;
+drop table rh2_t;
+
+-- ===================================
+-- 22. Hinted VIEW + INDEX rename + in-diff TABLE rename of their source
+-- ===================================
+-- Lives in 50.2.1-declare-schema-index-renames (it needs standalone index DDL).
+
+-- ===================================
+-- 23. Hinted VIEW rename + with defaults + in-diff COLUMN rename
+-- ===================================
+
+-- The recreate's `with defaults` clause must also name the OLD column (its
+-- column names a base-table column, often projected away — the body rewrite
+-- cannot catch it); after the create, RENAME COLUMN propagation rewrites it.
+
+create table emp2 (emp_id integer primary key, fullname text not null, created integer not null);
+create view ev_old as select emp_id, fullname from emp2 with defaults (created = 7);
+insert into emp2 values (1, 'Carol', 0);
+
+declare schema main {
+	table emp2 {
+		emp_id integer primary key,
+		fullname text not null,
+		created_at integer not null with tags ("quereus.previous_name" = 'created')
+	}
+
+	view ev_new as select emp_id, fullname from emp2 with defaults (created_at = 7) with tags ("quereus.previous_name" = 'ev_old')
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "DROP VIEW IF EXISTS ev_old"}, {"ddl": "create view ev_new as select emp_id, fullname from emp2 with defaults (created = 7) with tags (\"quereus.previous_name\" = 'ev_old')"}, {"ddl": "ALTER TABLE emp2 RENAME COLUMN created TO created_at"}]
+
+apply schema main;
+
+-- run
+
+-- Write-through via the recreated + propagation-rewritten defaults clause.
+insert into ev_new values (2, 'Dan');
+select created_at from emp2 where emp_id = 2;
+→ [{"created_at": 7}]
+
+diff schema main;
+→ []
+
+drop view ev_new;
+drop table emp2;
+
+-- ===================================
+-- 24. Hinted TABLE rename + another table's DEFAULT that names it
+-- ===================================
+
+-- The table-verb twin of the column-rename case pinned by
+-- `test/schema/differ-alter-column.spec.ts` ("a column rename carrying a DEFAULT").
+-- The default compare in `computeColumnAttributeChange` is not inverse-reconciled
+-- against pending TABLE renames either, so the declared default (naming the NEW
+-- table) mismatches the actual one (still naming the OLD) and one redundant
+-- SET DEFAULT rides along. This pins that it is HARMLESS: renames are emitted
+-- first, so by the time the SET DEFAULT runs the live rename propagation has
+-- already produced exactly that expression, and the re-diff is empty.
+--
+-- This route converges even WITHOUT the propagation into `columns[].defaultValue`
+-- (the redundant SET DEFAULT would repair the default on its own), so it is a
+-- differ-behaviour guard, not a second copy of the propagation guard — that one is
+-- `41.3-alter-rename-propagation.sqllogic` §38-41, on the imperative RENAME TO path
+-- where nothing re-states the default.
+
+create table dt_u (k integer primary key, v integer null);
+insert into dt_u values (1, 42);
+create table dt_t (id integer primary key, w integer null default ((select min(v) from dt_u)));
+
+declare schema main {
+	table dt_u2 {
+		k integer primary key,
+		v integer null
+	} with tags ("quereus.previous_name" = 'dt_u')
+
+	table dt_t {
+		id integer primary key,
+		w integer null default ((select min(v) from dt_u2))
+	}
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE dt_u RENAME TO dt_u2"}, {"ddl": "ALTER TABLE dt_t ALTER COLUMN w SET DEFAULT (select min(v) from dt_u2)"}]
+
+apply schema main;
+
+-- run
+
+-- The dependent table still accepts rows and its default reads the renamed table.
+insert into dt_t (id) values (1);
+select id, w from dt_t;
+→ [{"id": 1, "w": 42}]
+
+-- Convergence: the live default now names dt_u2, so the re-diff is empty.
+diff schema main;
+→ []
+
+drop table dt_t;
+drop table dt_u2;
+
+-- ===================================
+-- 25. In-diff COLUMN rename of a table called "new" vs another table's row image
+-- ===================================
+
+-- The differ reconciles a declared CHECK against the not-yet-renamed catalog by
+-- running the rename walk INVERSELY, so it inherits the same `new.` / `old.`
+-- ambiguity the forward propagation does (`41.3` §62): `new` is not a reserved
+-- word, so `dnw_t`'s `check (new.w > 0)` names dnw_t's own written row while a
+-- real table called "new" is having its column `v` renamed to `w` in the same
+-- diff. Treating that qualifier as a reference to the table would inverse-rewrite
+-- the declared body to `new.v`, mismatch the actual body, and emit a spurious
+-- constraint drop/recreate alongside the rename.
+
+create table "new" (id integer primary key, v integer);
+create table dnw_t (id integer primary key, w integer, constraint ck_dnw check (new.w > 0));
+
+declare schema main {
+	table "new" {
+		id integer primary key,
+		w integer with tags ("quereus.previous_name" = 'v')
+	}
+
+	table dnw_t {
+		id integer primary key,
+		w integer,
+		constraint ck_dnw check (new.w > 0)
+	}
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE new RENAME COLUMN v TO w"}]
+
+apply schema main;
+
+-- run
+
+-- dnw_t still writable against its own row image, and its CHECK still enforces.
+insert into dnw_t values (1, 5);
+select w from dnw_t;
+→ [{"w": 5}]
+
+insert into dnw_t values (2, -1);
+-- error: ck_dnw
+
+diff schema main;
+→ []
+
+drop table dnw_t;
+drop table "new";
+
+-- ===================================
+-- 26. A rename that PINS an untouched dependent body must converge in one apply
+-- ===================================
+-- The declared rename creates a temp.k26 where the temp-owned view's bare k26
+-- used to fall through to main.k26. The live propagation pins the view body to
+-- main.k26; the re-diff must read that pin as the rename's own artifact — NOT a
+-- body edit — or the recreate would silently re-bind the view to temp.k26.
+
+create table main.k26 (id integer primary key, x integer);
+insert into main.k26 values (1, 10);
+create table temp.o26 (id integer primary key, x integer);
+insert into temp.o26 values (99, 999);
+create view temp.v26 as select id, x from k26;
+
+declare schema temp {
+	table k26 {
+		id integer primary key,
+		x integer
+	} with tags ("quereus.previous_name" = 'o26')
+	view v26 as select id, x from k26
+}
+
+-- run
+
+diff schema temp;
+→ [{"ddl": "ALTER TABLE \"temp\".o26 RENAME TO k26"}]
+
+apply schema temp;
+
+-- run
+
+-- One pass converged: no drop+recreate of the pinned view.
+diff schema temp;
+→ []
+
+-- And the view still reads main.k26, not the table that took its name.
+select * from temp.v26;
+→ [{"id": 1, "x": 10}]
+
+drop view temp.v26;
+drop table temp.k26;
+drop table main.k26;
+
+-- ===================================
+-- 27. A rename whose propagation ALIASES a colliding FROM source re-diffs clean
+-- ===================================
+-- Single schema: the view reads t27 bare AND aliases u27 as t27's new name, so
+-- the forward rename writes `from t27_2 as t27` to keep both qualifiers bound.
+-- The declared (post-rename) body carries that alias; the diff must recognize a
+-- pure rename, and the re-diff after apply must be empty.
+
+create table t27 (id integer primary key, x integer);
+insert into t27 values (1, 10);
+create table u27 (id integer primary key, x integer);
+insert into u27 values (1, 77);
+create view v27 as select t27.x as a, t27_2.x as b from t27 join u27 as t27_2 on t27.id = t27_2.id;
+
+declare schema main {
+	table t27_2 {
+		id integer primary key,
+		x integer
+	} with tags ("quereus.previous_name" = 't27')
+	table u27 {
+		id integer primary key,
+		x integer
+	}
+	view v27 as select t27.x as a, t27_2.x as b from t27_2 as t27 inner join u27 as t27_2 on t27.id = t27_2.id
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE t27 RENAME TO t27_2"}]
+
+apply schema main;
+
+-- run
+
+diff schema main;
+→ []
+
+-- Both qualifiers still bind what they bound before the rename.
+select * from v27;
+→ [{"a": 10, "b": 77}]
+
+drop view v27;
+drop table u27;
+drop table t27_2;

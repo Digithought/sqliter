@@ -17,6 +17,7 @@ import {
   type ApplyResult,
   type SnapshotChunk,
   type SnapshotCheckpoint,
+  type SerializedChangeSet,
   siteIdFromBase64,
   siteIdEquals,
   siteIdToBase64,
@@ -35,6 +36,7 @@ import type {
   CoordinatorHooks,
 } from './types.js';
 import { StoreManager, type StoreEntry, type StoreManagerHooks, type StoreContext } from './store-manager.js';
+import { CoordinatorMaintenanceLoop } from './maintenance.js';
 import { type S3StorageConfig, createS3Client } from './s3-config.js';
 import { S3BatchStore } from './s3-batch-store.js';
 import { S3SnapshotStore, type SnapshotScheduleConfig } from './s3-snapshot-store.js';
@@ -67,6 +69,7 @@ export class CoordinatorService {
   private readonly _storeManager: StoreManager;
   private readonly s3BatchStore?: S3BatchStore;
   private readonly s3SnapshotStore?: S3SnapshotStore;
+  private readonly maintenanceLoop: CoordinatorMaintenanceLoop;
 
   /** Active WebSocket sessions by connection ID */
   private readonly sessions = new Map<string, ClientSession>();
@@ -103,7 +106,7 @@ export class CoordinatorService {
       idleTimeoutMs: 5 * 60 * 1000,
       cleanupIntervalMs: 30 * 1000,
       syncConfig: {
-        tombstoneTTL: this.config.sync.tombstoneTTL,
+        retentionHorizonMs: this.config.sync.retentionHorizonMs,
         batchSize: this.config.sync.batchSize,
       },
       hooks: options.storeHooks,
@@ -125,6 +128,10 @@ export class CoordinatorService {
     if (diskEvictionIdleMs > 0) {
       serviceLog('Disk eviction enabled: idle threshold %dms', diskEvictionIdleMs);
     }
+
+    // Sync housekeeping (tombstone / quarantine expiry, basis eviction). The
+    // library ships no timer; this is the coordinator's cadence for it.
+    this.maintenanceLoop = new CoordinatorMaintenanceLoop(this._storeManager);
   }
 
   /**
@@ -150,6 +157,8 @@ export class CoordinatorService {
       serviceLog('S3 snapshot store started');
     }
 
+    this.maintenanceLoop.start();
+
     this.initialized = true;
 
     serviceLog('CoordinatorService initialized, ready for multi-tenant connections');
@@ -167,6 +176,10 @@ export class CoordinatorService {
     if (this.s3SnapshotStore) {
       this.s3SnapshotStore.stop();
     }
+
+    // Disarm housekeeping and let any in-flight pass finish before the stores
+    // it is reading are closed below.
+    await this.maintenanceLoop.stop();
 
     // Close all WebSocket connections
     for (const session of this.sessions.values()) {
@@ -628,6 +641,12 @@ export class CoordinatorService {
   /**
    * Broadcast changes to all connected clients on the same database except the sender.
    */
+  // NOTE: fire-and-forget — a failed/dropped broadcast is only logged, never
+  // acked or retried. Correctness does not depend on it: the client applies
+  // push_changes without advancing its received watermark, so any missed
+  // broadcast is redelivered on its next get_changes catch-up. Revisit only if
+  // push-recovery latency (how fast a missed change reaches a peer) becomes a
+  // problem — then consider ack/retry/backpressure here.
   private broadcastChanges(databaseId: string, senderSiteId: SiteId, changes: ChangeSet[]): void {
     // Serialize changesets for JSON transport
     const serializedChangeSets = changes.map(cs => serializeChangeSet(cs));
@@ -741,7 +760,7 @@ export class CoordinatorService {
 
       for (const key of batchKeys) {
         const batch = await this.s3BatchStore.downloadBatch(key);
-        const changes = (batch.changes as unknown[]).map(c => deserializeChangeSet(c));
+        const changes = (batch.changes as SerializedChangeSet[]).map(c => deserializeChangeSet(c));
         await syncManager.applyChanges(changes);
       }
 

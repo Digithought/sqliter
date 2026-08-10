@@ -127,15 +127,21 @@ This repository contains multiple packages:
 - **[SQL Reference](docs/sql.md)** — Comprehensive SQL dialect guide
 - **[Built-in Functions](docs/functions.md)** — Complete function reference
 - **[Virtual Tables](docs/memory-table.md)** — Virtual table system and memory tables
+- **[Module Capability Negotiation](docs/module-capabilities.md)** — Every capability surface a virtual table module can implement, and what the engine does when it doesn't
 - **[Runtime Architecture](docs/runtime.md)** — Execution engine internals
 
 ### Storage & Sync
 - **[Persistent Store](docs/store.md)** — LevelDB/IndexedDB storage architecture
+- **[View Persistence](docs/view-persistence.md)** — How the store keeps view and materialized-view definitions across reopen
+- **[Sync Module](docs/sync.md)** — Multi-master CRDT replication: clocks, conflict resolution, tombstones, storage layout (hub for the sync topic docs)
+- **[Schema Replication](docs/sync-schema.md)** — Replicating the catalog between peers, and shipping an app's initial schema as a seed
+- **[Sync Protocol](docs/sync-protocol.md)** — Wire data structures, the `SyncManager` API, and the WebSocket message protocol
 - **[Store Plugin base README](packages/quereus-store/README.md)** — Quick start and API reference
 
 ### Advanced Topics
 - **[Query Optimizer](docs/optimizer.md)** — Query planning and optimization
 - **[Usage Examples](docs/usage.md)** — Practical examples and patterns
+- **[Documentation Conventions](docs/doc-conventions.md)** — What belongs in a design doc, and the checks that keep them honest
 
 ## Features
 
@@ -165,10 +171,12 @@ Quereus Sync provides **fully opaque CRDT replication** — your application wri
 ```typescript
 import { createSyncModule, createStoreAdapter } from '@quereus/sync';
 
-// Sync plugs into your existing Quereus database
+// Sync plugs into your existing Quereus database and store module —
+// inbound changes maintain secondary indexes, materialized views, and
+// Database.watch subscriptions just like local writes
 const { syncManager, syncEvents } = await createSyncModule(kv, storeEvents, {
-  applyToStore: createStoreAdapter({ db, getKVStore, events: storeEvents, getTableSchema }),
-  getTableSchema: (schema, table) => db.getTableSchema(schema, table),
+  applyToStore: createStoreAdapter({ db, storeModule, events: storeEvents }),
+  getTableSchema: (schema, table) => db.schemaManager.getTable(schema, table),
 });
 
 // Delta sync between replicas

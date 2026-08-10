@@ -1,16 +1,24 @@
 import { QuereusError } from '../../common/errors.js';
-import { StatusCode } from '../../common/types.js';
+import { StatusCode, type Row } from '../../common/types.js';
 import type { Database } from '../../core/database.js';
 import { type TableSchema, type IndexSchema, IndexColumnSchema } from '../../schema/table.js';
+import { generateTableDDL, generateDropTableDDL } from '../../schema/ddl-generator.js';
 import { MemoryTable } from './table.js';
-import type { VirtualTableModule, SchemaChangeInfo } from '../module.js';
+import type { VirtualTableModule, SchemaChangeInfo, EffectiveRowSource } from '../module.js';
 import { MemoryTableManager } from './layer/manager.js';
+import type { BackingHost, BackingScanRequest, MaintenanceOp, BackingRowChange } from '../backing-host.js';
+import type { VirtualTableConnection } from '../connection.js';
+import { MemoryVirtualTableConnection } from './connection.js';
+import type { MemoryTableConnection } from './layer/connection.js';
 import type { MemoryTableConfig } from './types.js';
 import { createMemoryTableLoggers } from './utils/logging.js';
-import { AccessPlanBuilder, validateAccessPlan } from '../best-access-plan.js';
+import { AccessPlanBuilder, equalitySeekKeyCount, isMultiValueEquality, validateAccessPlan } from '../best-access-plan.js';
 import type { BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, PredicateConstraint } from '../best-access-plan.js';
-import type { VTableEventEmitter } from '../events.js';
+import type { VTableEventEmitter, VTableSchemaChangeEvent } from '../events.js';
 import type { ModuleCapabilities } from '../capabilities.js';
+import type { MappingAdvertisement } from '../mapping-advertisement.js';
+import type { Schema } from '../../schema/schema.js';
+import { buildAdvertisementsFromTags } from '../../schema/mapping-advertisement-tags.js';
 
 const logger = createMemoryTableLoggers('module');
 
@@ -45,18 +53,71 @@ function estimateSortCost(rows: number): number {
 /**
  * Collect column indexes bound by an equality predicate (`=` or single-value `IN`).
  * These columns are constants for the access plan and don't contribute ordering.
+ *
+ * A runtime-valued `IN` set never qualifies: `isMultiValueEquality` reports it as
+ * multi-valued because its member count is unknown at plan time.
  */
 function collectEqualityBoundColumns(filters: readonly PredicateConstraint[]): ReadonlySet<number> {
 	const cols = new Set<number>();
 	for (const f of filters) {
 		if (!f.usable) continue;
-		if (f.op === '=') {
-			cols.add(f.columnIndex);
-		} else if (f.op === 'IN' && Array.isArray(f.value) && (f.value as unknown[]).length === 1) {
+		if (equalitySeekKeyCount(f) !== null && !isMultiValueEquality(f)) {
 			cols.add(f.columnIndex);
 		}
 	}
 	return cols.size === 0 ? EMPTY_COLUMN_SET : cols;
+}
+
+/**
+ * The memory module's {@link BackingHost} — the reference implementation of the
+ * backing-host capability (see `vtab/backing-host.ts` for the contract). A thin
+ * adapter over one {@link MemoryTableManager}, captured **by reference**: a
+ * drop+recreate of the same table name builds a fresh manager, so a host (and
+ * its `ownsConnection`) is pinned to one backing-table incarnation and never
+ * adopts a stale same-name connection from a previous one.
+ */
+class MemoryBackingHost implements BackingHost {
+	constructor(private readonly manager: MemoryTableManager) {}
+
+	ownsConnection(conn: VirtualTableConnection): boolean {
+		return conn instanceof MemoryVirtualTableConnection
+			&& conn.getMemoryConnection().tableManager === this.manager;
+	}
+
+	connect(): VirtualTableConnection {
+		const qualifiedName = `${this.manager.schemaName}.${this.manager.tableName}`;
+		return new MemoryVirtualTableConnection(qualifiedName, this.manager.connect());
+	}
+
+	applyMaintenance(conn: VirtualTableConnection, ops: readonly MaintenanceOp[]): Promise<BackingRowChange[]> {
+		return this.manager.applyMaintenanceToLayer(this.unwrap(conn), ops);
+	}
+
+	replaceContents(rows: readonly Row[], onDuplicateKey?: () => QuereusError): Promise<void> {
+		return this.manager.replaceBaseLayer(rows, onDuplicateKey);
+	}
+
+	scanEffective(conn: VirtualTableConnection, req: BackingScanRequest): AsyncIterable<Row> {
+		const memConn = this.unwrap(conn);
+		// Pending transaction state layered over committed (reads-own-writes),
+		// in PK order — the same start-layer choice a `select` from the MV makes.
+		return this.manager.scanLayer(memConn.pendingTransactionLayer ?? memConn.readLayer, {
+			indexName: 'primary',
+			descending: req.descending ?? false,
+			equalityPrefix: req.equalityPrefix,
+		});
+	}
+
+	private unwrap(conn: VirtualTableConnection): MemoryTableConnection {
+		if (!this.ownsConnection(conn)) {
+			throw new QuereusError(
+				`connection '${conn.connectionId}' does not belong to backing table `
+					+ `'${this.manager.schemaName}.${this.manager.tableName}' (or to this incarnation of it)`,
+				StatusCode.INTERNAL,
+			);
+		}
+		return (conn as MemoryVirtualTableConnection).getMemoryConnection();
+	}
 }
 
 /**
@@ -87,6 +148,59 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	 */
 	readonly concurrencyMode = 'reentrant-reads' as const;
 
+	/**
+	 * Memory tables snapshot the connection's read layer once at `query()` entry
+	 * and iterate the captured layer's immutable BTree (see `concurrencyMode`
+	 * above and `layer/connection.ts`). A `DELETE`/`UPDATE` that mutates the table
+	 * mid-scan writes a fresh child layer, leaving the in-flight scan's captured
+	 * layer untouched — so the scan cursor never observes its own statement's
+	 * writes. That is exactly per-scan snapshot isolation, so the DML executor may
+	 * STREAM predicate DELETE/UPDATE against memory tables (no eager buffering).
+	 */
+	readonly scanSnapshotIsolation = true as const;
+
+	/**
+	 * A `_readCommitted` connection on a memory table serves a stable, coherent
+	 * committed snapshot for the life of the scan, so it may be read outside the
+	 * execution mutex while another connection commits. Audited against four
+	 * points — re-verify all four before touching any of them:
+	 *
+	 * 1. **Commit publishes atomically.** Layers are immutable BTrees and a commit
+	 *    hands over by a single assignment to `_currentCommittedLayer`
+	 *    (`layer/manager.ts` — `commitTransaction`, `replaceAllRows`, `destroy`,
+	 *    `consolidateToBaseLayer`). A reader sees either the pre- or the
+	 *    post-commit root, never a mix.
+	 * 2. **The read connection is pinned and unregistered.** `_readCommitted`
+	 *    creates a fresh manager connection that is never handed to
+	 *    `Database.registerConnection` (`table.ts` — `ensureConnection`), so it
+	 *    never receives begin/commit/rollback/savepoint broadcasts and never joins
+	 *    the writer's transaction. `ensureConnection` is lazy, so its `readLayer`
+	 *    pins at the scan's first pull, not at `connect()` — within the obligation,
+	 *    which bounds the snapshot at "some commit boundary at or before the read
+	 *    began". Every later `query()` on the same instance reuses that connection,
+	 *    so two scans of one reader agree.
+	 * 3. **`query()` starts from the pinned layer.** `table.ts` reads
+	 *    `conn.readLayer` (not `pendingTransactionLayer`) in committed mode, and
+	 *    `scanLayerSync` captures the layer's BTree object once at scan start — a
+	 *    later whole-tree swap (DDL rebuild, consolidation) leaves the in-flight
+	 *    walk on its own tree: stale but coherent, which is the documented
+	 *    semantics.
+	 * 4. **Collapse cannot strand the pinned layer.** The connection IS in the
+	 *    manager's `connections` map, so `isLayerInUse` walks its `readLayer`
+	 *    chain and `promoteCommittedHead` refuses to `clearBase()` any layer that
+	 *    chain reaches; `MemoryTable.disconnect` releases it after the scan.
+	 *
+	 * Point 3 is the fragile one, and it rests on a property every DDL path in
+	 * `layer/base.ts` currently has: each rebuild REPLACES the tree object
+	 * (`rebuildPrimaryTreeFromRows`, `rebuildPrimaryTreeStrict`,
+	 * `rebuildAllSecondaryIndexes` — and `MemoryIndex.clear()` itself swaps in a
+	 * fresh BTree rather than emptying the live one). A rebuild that ever mutated a
+	 * published tree in place would empty the very structure a concurrent
+	 * index-driven committed read is walking, and the obligation requires an
+	 * index-driven plan and a full scan of one snapshot to agree.
+	 */
+	readonly readCommittedSnapshot = true as const;
+
 	public readonly tables: Map<string, MemoryTableManager> = new Map();
 	private eventEmitter?: VTableEventEmitter;
 
@@ -112,7 +226,32 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 			persistent: false,
 			secondaryIndexes: true,
 			rangeScans: true,
+			// Schema changes here escape the transaction (they survive rollback), but
+			// buffered DML still rolls back normally — the SchemaManager catalog is not
+			// transaction-scoped. See docs/memory-table.md § "DDL and transactions".
+			ddlTransactionality: 'non-transactional',
 		};
+	}
+
+	/**
+	 * Generic-module mapping advertisements: assembled from the `quereus.lens.decomp.*`
+	 * reserved tags on this basis schema's tables. Returns `[]` for a schema with no
+	 * such tags (the common case), leaving the lens default mapper on its name-match
+	 * path. See `docs/lens.md` § The Default Mapper.
+	 */
+	getMappingAdvertisements(_db: Database, basisSchema: Schema): readonly MappingAdvertisement[] {
+		return buildAdvertisementsFromTags(basisSchema);
+	}
+
+	/**
+	 * Backing-host capability (see `vtab/backing-host.ts`): resolve the
+	 * privileged surface for a table this module owns, or undefined when the
+	 * table is unknown to it. The returned host captures the table's CURRENT
+	 * {@link MemoryTableManager} by reference, pinning it to this incarnation.
+	 */
+	getBackingHost(_db: Database, schemaName: string, tableName: string): BackingHost | undefined {
+		const manager = this.tables.get(`${schemaName}.${tableName}`.toLowerCase());
+		return manager ? new MemoryBackingHost(manager) : undefined;
 	}
 
 	/**
@@ -146,12 +285,17 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		// Create the MemoryTable instance
 		const table = new MemoryTable(db, this, manager);
 
-		// Emit schema change event after table is fully created
+		// Emit schema change event after table is fully created. The `ddl` is the
+		// statement a sync peer re-executes to replicate the create; without it the
+		// migration crosses the wire as an empty statement and does nothing. Rendered
+		// lazily — optional chaining short-circuits the whole call (arguments
+		// included) when no emitter is wired.
 		this.eventEmitter?.emitSchemaChange?.({
 			type: 'create',
 			objectType: 'table',
 			schemaName: tableSchema.schemaName,
 			objectName: tableSchema.name,
+			ddl: generateTableDDL(tableSchema),
 		});
 
 		return table;
@@ -197,7 +341,12 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 
 		logger.debugLog(`[getBestAccessPlan] Selected plan: ${bestPlan.explains} (cost: ${bestPlan.cost}, rows: ${bestPlan.rows})`);
 
-		return bestPlan;
+		// The in-memory scan layer threads each index column's declared collation into
+		// the range-bound filter and early-termination (scan-plan → plan-filter /
+		// scan-layer), so a non-BINARY range/prefix seek visits the collation-correct
+		// window. Advertise this so the access-path collation-cover analysis permits a
+		// collation-matched non-BINARY range seek instead of declining to a scan.
+		return { ...bestPlan, honorsCollatedRangeBounds: true };
 	}
 
 	/**
@@ -260,7 +409,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 			if (!usesSecondaryIndex) {
 				const pkOrdering: OrderingSpec[] = tableInfo.primaryKeyDefinition.map(col => ({
 					columnIndex: col.index,
-					desc: false
+					desc: !!col.desc
 				}));
 				bestPlan = {
 					...bestPlan,
@@ -317,12 +466,13 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		request: BestAccessPlanRequest,
 		availableIndexes: IndexSchema[],
 	): Pick<BestAccessPlanResult, 'monotonicOn' | 'supportsAsofRight'> {
-		// Multi-value IN multi-seek visits values in IN-list order; OR_RANGE
-		// concatenates disjoint ranges. Neither emits in monotonic order.
+		// Multi-value IN multi-seek visits values in seek-key order (a runtime-valued
+		// set included); OR_RANGE concatenates disjoint ranges. Neither emits in
+		// monotonic order.
 		for (let i = 0; i < bestPlan.handledFilters.length; i++) {
 			if (!bestPlan.handledFilters[i]) continue;
 			const f = request.filters[i];
-			if (f.op === 'IN' && Array.isArray(f.value) && (f.value as unknown[]).length > 1) return {};
+			if (isMultiValueEquality(f)) return {};
 			if (f.op === 'OR_RANGE') return {};
 		}
 
@@ -382,8 +532,12 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		if (equalityMatches.matchCount === indexCols.length) {
 			// Perfect equality match on all index columns - index seek (or multi-seek for IN)
 			const seekCols = indexCols.slice(0, equalityMatches.matchCount).map(c => c.index);
-			const { inCardinality } = equalityMatches;
-			const isMultiSeek = inCardinality > 1;
+			const { inCardinality, isMultiSeek } = equalityMatches;
+			// NOTE: no seek-key cap and no per-seek positioning term here (the store has both:
+			// MAX_MULTI_SEEK_KEYS and inCount * INDEX_SEEK_COST), so a large multi-seek over a
+			// small memory table prices optimistically. Harmless while every seek-key list is a
+			// literal the author typed; if runtime-valued IN sets start arriving with large
+			// ceilings, add the positioning term so the two modules stay comparable.
 			return AccessPlanBuilder
 				.eqMatch(inCardinality)
 				.setHandledFilters(equalityMatches.handledFilters)
@@ -394,7 +548,15 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 				.build();
 		}
 
-		// Prefix-equality + trailing-range on composite indexes
+		// Prefix-equality + trailing-range on composite indexes.
+		//
+		// NOTE: `findEqualityMatches` counts a multi-value `IN` as a prefix match, but
+		// `rule-select-access-path` can only seek a *single-valued* prefix key, so for
+		// e.g. `a in (1, 2) and b > 15` it declines to a sequential scan and reattaches
+		// both predicates as a residual. Correct, but the cost advertised below is a
+		// range scan. If multi-value-IN prefixes with trailing ranges ever show up as
+		// slow plans, teach the rule a cross-product prefix-range seek (or stop claiming
+		// the trailing range here so the estimate matches the plan).
 		if (equalityMatches.matchCount > 0 && equalityMatches.matchCount < indexCols.length) {
 			const trailingCol = indexCols[equalityMatches.matchCount];
 			const trailingRange = this.findRangeMatch(trailingCol, request.filters);
@@ -452,16 +614,29 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 
 	/**
 	 * Find equality matches for index columns (prefix matching).
-	 * Handles `=`, single-value `IN`, and multi-value `IN` as equality constraints.
-	 * Returns the total cardinality (product of IN list sizes) for cost estimation.
+	 * Handles `=`, single-value `IN`, multi-value `IN`, and a runtime-valued `IN` set as
+	 * equality constraints — {@link equalitySeekKeyCount} is the single well-formedness
+	 * test, so the four cannot drift apart. Returns the total cardinality (the product of
+	 * the per-column seek-key counts) for cost estimation; for a runtime set that count is
+	 * its `maxCount` ceiling, the worst case the engine may deliver.
+	 *
+	 * Claims the FIRST role-filling filter per column, matching the positional pick
+	 * `rule-select-access-path` makes — so a request carrying both a runtime set and a
+	 * literal `IN` on one column seeks whichever came first in `filters` order, and the
+	 * other survives as a residual.
+	 *
+	 * `isMultiSeek` is NOT `inCardinality > 1`: a runtime set is delivered as a multi-seek
+	 * whatever its ceiling, so a `maxCount === 1` set has cardinality 1 yet still walks the
+	 * index in seek-key order. {@link isMultiValueEquality} is the authority.
 	 */
 	private findEqualityMatches(
 		indexCols: ReadonlyArray<IndexColumnSchema>,
 		filters: readonly PredicateConstraint[]
-	): { matchCount: number; handledFilters: boolean[]; inCardinality: number } {
+	): { matchCount: number; handledFilters: boolean[]; inCardinality: number; isMultiSeek: boolean } {
 		const handledFilters = new Array(filters.length).fill(false);
 		let matchCount = 0;
 		let inCardinality = 1;
+		let isMultiSeek = false;
 
 		for (const indexCol of indexCols) {
 			let foundMatch = false;
@@ -469,34 +644,36 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 				const filter = filters[i];
 				if (filter.columnIndex !== indexCol.index || !filter.usable) continue;
 
-				// Direct equality (value may be undefined for parameter bindings —
-				// the actual value is supplied at runtime via seek key expressions)
-				if (filter.op === '=') {
-					handledFilters[i] = true;
-					foundMatch = true;
-					matchCount++;
-					break;
-				}
+				// `=` (whose value may be undefined for parameter bindings — the actual
+				// value is supplied at runtime via seek key expressions), a well-formed
+				// literal `IN`, or a runtime-valued `IN` set. Anything else is null.
+				const keyCount = equalitySeekKeyCount(filter);
+				if (keyCount === null) continue;
 
-				// IN constraint — treat as equality for prefix matching
-				if (filter.op === 'IN' && Array.isArray(filter.value) && (filter.value as unknown[]).length > 0) {
-					handledFilters[i] = true;
-					foundMatch = true;
-					matchCount++;
-					inCardinality *= (filter.value as unknown[]).length;
-					break;
-				}
+				handledFilters[i] = true;
+				foundMatch = true;
+				matchCount++;
+				inCardinality *= keyCount;
+				if (isMultiValueEquality(filter)) isMultiSeek = true;
+				break;
 			}
 			if (!foundMatch) {
 				break; // Can't use remaining index columns
 			}
 		}
 
-		return { matchCount, handledFilters, inCardinality };
+		return { matchCount, handledFilters, inCardinality, isMultiSeek };
 	}
 
 	/**
-	 * Find range match for a column
+	 * Find range match for a column.
+	 *
+	 * Claims at most the FIRST lower ('>'/'>=') and the FIRST upper ('<'/'<=') bound,
+	 * matching what `rule-select-access-path` actually turns into seek bounds (it picks
+	 * per column by position). Claiming a redundant same-side bound as handled would
+	 * drop it from the residual filter without ever applying it — `where v > 10 and
+	 * v > 30` would wrongly return the `v > 10` rows. Redundant bounds stay unhandled
+	 * and survive as a residual `Filter`.
 	 */
 	private findRangeMatch(
 		indexCol: IndexColumnSchema,
@@ -508,14 +685,13 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 
 		for (let i = 0; i < filters.length; i++) {
 			const filter = filters[i];
-			if (filter.columnIndex === indexCol.index && filter.usable) {
-				if (filter.op === '>' || filter.op === '>=') {
-					handledFilters[i] = true;
-					hasLower = true;
-				} else if (filter.op === '<' || filter.op === '<=') {
-					handledFilters[i] = true;
-					hasUpper = true;
-				}
+			if (filter.columnIndex !== indexCol.index || !filter.usable) continue;
+			if (!hasLower && (filter.op === '>' || filter.op === '>=')) {
+				handledFilters[i] = true;
+				hasLower = true;
+			} else if (!hasUpper && (filter.op === '<' || filter.op === '<=')) {
+				handledFilters[i] = true;
+				hasUpper = true;
 			}
 		}
 
@@ -592,9 +768,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		);
 		const usesMultiInOnOrderedCol = request.filters.some(
 			(f, i) => plan.handledFilters[i]
-				&& f.op === 'IN'
-				&& Array.isArray(f.value)
-				&& (f.value as unknown[]).length > 1
+				&& isMultiValueEquality(f)
 				&& orderingColumns.has(f.columnIndex)
 		);
 		const planACanClaimOrdering = filterSatisfies && !usesOrRange && !usesMultiInOnOrderedCol;
@@ -656,17 +830,16 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 			// See whether this index can also serve as a filter seek/range.
 			const candidate = this.evaluateIndexAccess(index, request, estimatedTableSize);
 
-			// A useful filter pattern that breaks ordering (multi-IN multi-seek
-			// on an ordering column or OR_RANGE) cannot claim ordering — fall
-			// back to a pure scan that doesn't push those filters.
+			// A useful filter pattern that breaks ordering (multi-IN multi-seek — literal
+			// or runtime-valued — on an ordering column, or OR_RANGE) cannot claim
+			// ordering: a multi-seek visits the index in seek-key order, not column
+			// order, so claiming it would elide a Sort the plan needs. Fall back to a
+			// pure scan that doesn't push those filters.
 			const breaksOrdering = request.filters.some(
 				(f, i) => candidate.handledFilters[i]
 					&& (
 						f.op === 'OR_RANGE'
-						|| (f.op === 'IN'
-							&& Array.isArray(f.value)
-							&& (f.value as unknown[]).length > 1
-							&& orderingColumns.has(f.columnIndex))
+						|| (isMultiValueEquality(f) && orderingColumns.has(f.columnIndex))
 					)
 			);
 
@@ -713,6 +886,13 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	 * for this scan) are skipped before aligning against the required ordering
 	 * keys. The per-column direction comparison still applies to the remaining
 	 * (unbound) suffix.
+	 *
+	 * NOTE: `OrderingSpec.nullsFirst` is not compared — nothing in the planner
+	 * populates it today, so every required spec leaves it undefined. If NULLS
+	 * FIRST/LAST ever reaches requiredOrdering, this must decline the index
+	 * unless the placement matches (the store module's
+	 * `buildPkOrderingAdvertisement` already does), or the Sort gets elided
+	 * against a different NULL placement.
 	 */
 	private indexSatisfiesOrdering(
 		index: IndexSchema,
@@ -793,6 +973,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 				objectType: 'table',
 				schemaName,
 				objectName: tableName,
+				ddl: generateDropTableDDL(schemaName, tableName),
 			});
 
 			logger.operation('Destroy Table', tableName, { schema: schemaName });
@@ -803,7 +984,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	 * Renames a memory table's internal registration key.
 	 * Called by the ALTER TABLE RENAME TO emitter before the schema catalog update.
 	 */
-	async renameTable(_db: Database, schemaName: string, oldName: string, newName: string): Promise<void> {
+	async renameTable(_db: Database, schemaName: string, oldName: string, newName: string, ddl?: string): Promise<void> {
 		const oldKey = `${schemaName}.${oldName}`.toLowerCase();
 		const newKey = `${schemaName}.${newName}`.toLowerCase();
 		const manager = this.tables.get(oldKey);
@@ -812,12 +993,28 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 			this.tables.delete(oldKey);
 			this.tables.set(newKey, manager);
 		}
+
+		// Emit-iff-`ddl`, same rule as alterTable below: `ddl` set means this call IS the
+		// RENAME TO statement's action; absent means an engine-internal step that must
+		// announce nothing. No in-tree caller omits it today — the shadow-table rebuild's
+		// trailing rename is itself a RENAME TO statement and is silenced by
+		// `withPublicEventsSuppressed`, not by this gate.
+		if (ddl !== undefined) {
+			this.eventEmitter?.emitSchemaChange?.({
+				type: 'alter',
+				objectType: 'table',
+				schemaName,
+				objectName: newName,
+				oldObjectName: oldName,
+				ddl,
+			});
+		}
 	}
 
 	/**
 	 * Alters an existing memory table's structure (ADD/DROP/RENAME COLUMN).
 	 */
-	async alterTable(db: Database, schemaName: string, tableName: string, change: SchemaChangeInfo): Promise<TableSchema> {
+	async alterTable(db: Database, schemaName: string, tableName: string, change: SchemaChangeInfo, rows?: EffectiveRowSource): Promise<TableSchema> {
 		const tableKey = `${schemaName}.${tableName}`.toLowerCase();
 		const manager = this.tables.get(tableKey);
 
@@ -827,7 +1024,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 
 		switch (change.type) {
 			case 'addColumn':
-				await manager.addColumn(change.columnDef);
+				await manager.addColumn(change.columnDef, change.backfillEvaluator, change.insertAtIndex);
 				break;
 			case 'dropColumn':
 				await manager.dropColumn(change.columnName);
@@ -839,23 +1036,41 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 				await manager.renameColumn(change.oldName, change.newColumnDefAst);
 				break;
 			case 'alterPrimaryKey':
-				throw new QuereusError(
-					'MemoryTable does not support in-place primary key alteration',
-					StatusCode.UNSUPPORTED,
-				);
+				await manager.alterPrimaryKey(change.newPkColumns, rows);
+				break;
 			case 'addConstraint':
-				throw new QuereusError(
-					`MemoryTable does not support ADD CONSTRAINT ${change.constraint.type}`,
-					StatusCode.UNSUPPORTED,
-				);
+				await manager.addConstraint(change.constraint, rows);
+				break;
+			case 'dropConstraint':
+				await manager.dropConstraint(change.constraintName);
+				break;
+			case 'renameConstraint':
+				await manager.renameConstraint(change.oldName, change.newName);
+				break;
 			case 'alterColumn':
 				await manager.alterColumn({
 					columnName: change.columnName,
 					setNotNull: change.setNotNull,
 					setDataType: change.setDataType,
 					setDefault: change.setDefault,
-				});
+					setCollation: change.setCollation,
+				}, rows);
 				break;
+		}
+
+		// ONE event per statement, decided here — the single gate for every arm: emit iff
+		// the engine marked this call as the statement's own action (`change.ddl` set), and
+		// put that text on the event. Engine-internal sub-steps — the inline-constraint
+		// installs and revert calls of the engine's ADD COLUMN, the materialized-view
+		// backing reshapes, and any wrapper-driven manager call — arrive with no `ddl` and
+		// announce nothing. See `SchemaChangeInfo.ddl`; mirrors the store module's gate.
+		if (change.ddl !== undefined) {
+			this.eventEmitter?.emitSchemaChange?.({
+				...MemoryTableModule.alterEventShape(change),
+				schemaName,
+				objectName: tableName,
+				ddl: change.ddl,
+			});
 		}
 
 		return manager.tableSchema;
@@ -864,7 +1079,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	/**
 	 * Creates an index on a memory table
 	 */
-	async createIndex(db: Database, schemaName: string, tableName: string, indexSchema: IndexSchema): Promise<void> {
+	async createIndex(db: Database, schemaName: string, tableName: string, indexSchema: IndexSchema, rows?: EffectiveRowSource): Promise<void> {
 		const tableKey = `${schemaName}.${tableName}`.toLowerCase();
 		const manager = this.tables.get(tableKey);
 
@@ -873,13 +1088,40 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		}
 
 		// Delegate to the manager to create the index
-		await manager.createIndex(indexSchema);
+		await manager.createIndex(indexSchema, undefined, rows);
 
 		logger.operation('Create Index', indexSchema.name, {
 			table: tableName,
 			schema: schemaName,
 			columns: indexSchema.columns.map(col => `${col.index}${col.desc ? ' DESC' : ''}`)
 		});
+	}
+
+	/**
+	 * The per-arm event shape of an ALTER TABLE announcement — `alter`/`column` naming the
+	 * touched column for the column arms (`drop`/`column` for DROP COLUMN), `alter`/`table`
+	 * for the whole-table ones. Matches what the engine's own no-emitter path reports for
+	 * the same statements (`runtime/emit/alter-table.ts`), so a subscriber sees the same
+	 * facts regardless of backend.
+	 */
+	private static alterEventShape(
+		change: SchemaChangeInfo,
+	): Pick<VTableSchemaChangeEvent, 'type' | 'objectType' | 'columnName' | 'oldColumnName'> {
+		switch (change.type) {
+			case 'addColumn':
+				return { type: 'alter', objectType: 'column', columnName: change.columnDef.name };
+			case 'dropColumn':
+				return { type: 'drop', objectType: 'column', columnName: change.columnName };
+			case 'renameColumn':
+				return { type: 'alter', objectType: 'column', columnName: change.newName, oldColumnName: change.oldName };
+			case 'alterColumn':
+				return { type: 'alter', objectType: 'column', columnName: change.columnName };
+			case 'alterPrimaryKey':
+			case 'addConstraint':
+			case 'dropConstraint':
+			case 'renameConstraint':
+				return { type: 'alter', objectType: 'table' };
+		}
 	}
 
 	/**

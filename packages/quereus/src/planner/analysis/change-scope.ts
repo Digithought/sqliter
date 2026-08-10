@@ -15,7 +15,8 @@
  * same shape.
  */
 import type { SqlValue, SqlParameters } from '../../common/types.js';
-import type { ScalarType } from '../../common/datatype.js';
+import type { CollationSource, ScalarType } from '../../common/datatype.js';
+import { isRelationalNode } from '../nodes/plan-node.js';
 import type { PlanNode, RelationalPlanNode, ScalarPlanNode } from '../nodes/plan-node.js';
 import { TableReferenceNode, ColumnReferenceNode, ParameterReferenceNode } from '../nodes/reference.js';
 import { ScalarFunctionCallNode } from '../nodes/function.js';
@@ -55,6 +56,8 @@ export interface PortableScalarType {
 	readonly typeName: string;
 	readonly nullable: boolean;
 	readonly collationName?: string;
+	/** Provenance of `collationName` — see {@link ScalarType.collationSource}. */
+	readonly collationSource?: CollationSource;
 	readonly isReadOnly?: boolean;
 }
 
@@ -81,6 +84,7 @@ function portableFromScalarType(t: ScalarType): PortableScalarType {
 		typeName: t.logicalType.name,
 		nullable: t.nullable,
 		...(t.collationName !== undefined ? { collationName: t.collationName } : {}),
+		...(t.collationSource !== undefined ? { collationSource: t.collationSource } : {}),
 		...(t.isReadOnly !== undefined ? { isReadOnly: t.isReadOnly } : {}),
 	};
 	return result;
@@ -99,6 +103,7 @@ export function scalarTypeFromPortable(p: PortableScalarType): ScalarType {
 		logicalType: logical,
 		nullable: p.nullable,
 		...(p.collationName !== undefined ? { collationName: p.collationName } : {}),
+		...(p.collationSource !== undefined ? { collationSource: p.collationSource } : {}),
 		...(p.isReadOnly !== undefined ? { isReadOnly: p.isReadOnly } : {}),
 	};
 }
@@ -114,8 +119,11 @@ export type WatchScope =
 export interface TableWatch {
 	readonly table: QualifiedName;
 	/**
-	 * Columns of the table actually read by the plan. `'all'` is reserved for
-	 * count-style plans that read nothing column-specific.
+	 * Columns of the table actually read by the plan. `'all'` covers both
+	 * count-style plans that read nothing column-specific AND whole-row reads
+	 * (`select *`) that forward the table's entire attribute set to the output —
+	 * in either case the watch maps downstream to a row-level dep rather than a
+	 * cell dep on an enumerated column subset.
 	 */
 	readonly columns: ReadonlySet<string> | 'all';
 	readonly scope: WatchScope;
@@ -196,13 +204,37 @@ const DML_NODE_TYPES = new Set<PlanNodeType>([
 /* --- Analyzer ------------------------------------------------------------ */
 
 /**
+ * Resolves a table reference's qualified name to the source-union `ChangeScope`
+ * that should replace its watch. The sole use is projecting a materialized
+ * view's backing-table reference onto the sources whose mutations actually drive
+ * its maintenance, widening a watch on the view to a watch on its sources.
+ * Returns `undefined` for anything that is not an MV backing table (ordinary
+ * tables).
+ *
+ * This projection is **conservative, not load-bearing**: a maintained table now
+ * appears in the transaction change log in its own right, because row-time
+ * maintenance records each realized backing delta there
+ * (`MaterializedViewManager.recordMaintenanceChanges`). A direct watch on the
+ * backing would therefore fire. The projection is kept because it also widens
+ * the watch's *granularity* to the sources — removing it would change which
+ * writes a watcher observes, which is a separate decision.
+ */
+export type MaterializedViewSourceResolver = (table: QualifiedName) => ChangeScope | undefined;
+
+/**
  * Walk a (post-analysis) plan and produce its `ChangeScope`. If `params`
  * is supplied, parameter placeholders are substituted in-place and the
- * corresponding indices are dropped from `unboundParameters`.
+ * corresponding indices are dropped from `unboundParameters`. If
+ * `resolveMaterializedViewSource` is supplied, an incremental-MV backing-table
+ * reference is projected onto its cached source-union scope (see
+ * {@link MaterializedViewSourceResolver}).
  */
 export function analyzeChangeScope(
 	plan: PlanNode,
-	options?: { params?: SqlParameters | SqlValue[] },
+	options?: {
+		params?: SqlParameters | SqlValue[];
+		resolveMaterializedViewSource?: MaterializedViewSourceResolver;
+	},
 ): ChangeScope {
 	const dmlWithoutReturning = isDmlWithoutReturning(plan);
 	const { perRelation } = extractBindings(plan as RelationalPlanNode);
@@ -215,6 +247,10 @@ export function analyzeChangeScope(
 	collectNonDeterminism(plan, nonDetSources, unboundParams, perRelation);
 
 	const watches: TableWatch[] = [];
+	// Source-union scopes for any incremental-MV backing references encountered;
+	// folded into the result below so they union/dedup against direct reads of
+	// the same source table.
+	const mvSourceScopes: ChangeScope[] = [];
 	if (!dmlWithoutReturning) {
 		for (const ref of tableRefs) {
 			const relKey = relKeyFor(ref);
@@ -224,6 +260,17 @@ export function analyzeChangeScope(
 			const schemaName = ref.tableSchema.schemaName.toLowerCase();
 			const tableName = ref.tableSchema.name.toLowerCase();
 			const table: QualifiedName = { schema: schemaName, table: tableName };
+
+			// An MV's backing table is row-time maintained from its sources. Replace the
+			// backing-table watch with the MV's source-union scope so a watcher fires on
+			// a SOURCE mutation. Widening, not a prerequisite: maintenance records its
+			// realized backing deltas into the change log, so a direct backing watch
+			// would fire too (see MaterializedViewSourceResolver).
+			const mvScope = options?.resolveMaterializedViewSource?.(table);
+			if (mvScope) {
+				mvSourceScopes.push(mvScope);
+				continue;
+			}
 
 			const colIndices = columnsByRelKey.get(relKey);
 			const columns: ReadonlySet<string> | 'all' = buildColumnSet(ref, colIndices);
@@ -237,6 +284,10 @@ export function analyzeChangeScope(
 		nonDeterministicSources: normalizeNonDet(nonDetSources),
 		unboundParameters: sortedDedupParamIndices(unboundParams),
 	};
+
+	for (const mvScope of mvSourceScopes) {
+		scope = unionScopes(scope, mvScope);
+	}
 
 	if (options?.params !== undefined) {
 		scope = bindParameters(scope, options.params);
@@ -313,13 +364,18 @@ function collectTableRefs(plan: PlanNode): TableReferenceNode[] {
 
 /**
  * Walk the plan and, for each TableReference, collect the set of output
- * column indices that any scalar expression in the plan reads.
+ * column indices that any scalar expression in the plan reads. The value is
+ * either the explicit set of read column indices, or the `'all'` sentinel when
+ * the plan serves the table's whole row to its output (a `select *` /
+ * non-enumerable star — see below).
  */
-function collectColumnReads(plan: PlanNode, tableRefs: readonly TableReferenceNode[]): Map<string, Set<number>> {
-	const result = new Map<string, Set<number>>();
+function collectColumnReads(plan: PlanNode, tableRefs: readonly TableReferenceNode[]): Map<string, Set<number> | 'all'> {
+	const result = new Map<string, Set<number> | 'all'>();
 	const attrToRelKeyAndIdx = new Map<number, { relKey: string; colIdx: number }>();
+	const refByRelKey = new Map<string, TableReferenceNode>();
 	for (const ref of tableRefs) {
 		const relKey = relKeyFor(ref);
+		refByRelKey.set(relKey, ref);
 		const attrs = ref.getAttributes();
 		attrs.forEach((a, i) => attrToRelKeyAndIdx.set(a.id, { relKey, colIdx: i }));
 	}
@@ -328,19 +384,56 @@ function collectColumnReads(plan: PlanNode, tableRefs: readonly TableReferenceNo
 		if (node instanceof ColumnReferenceNode) {
 			const info = attrToRelKeyAndIdx.get(node.attributeId);
 			if (info) {
-				let s = result.get(info.relKey);
-				if (!s) {
-					s = new Set<number>();
+				const cur = result.get(info.relKey);
+				// A relKey already pinned to 'all' (whole-row read) stays 'all';
+				// individual column reads can't narrow it.
+				if (cur !== 'all') {
+					const s = cur ?? new Set<number>();
+					s.add(info.colIdx);
 					result.set(info.relKey, s);
 				}
-				s.add(info.colIdx);
 			}
 		}
 		for (const c of node.getChildren()) visit(c as unknown as PlanNode);
 	}
 	visit(plan);
 
+	// `select *` (and any unresolved/whole-row star projection) is elided by the
+	// planner to a passthrough that forwards the base table's OWN attribute ids
+	// straight to the plan output, with no intervening ColumnReferenceNode — so
+	// the scan above never records those columns and the watch would under-report
+	// its read set (typically to just the WHERE-predicate column). When an output
+	// relation forwards a table reference's ENTIRE attribute set, the whole row is
+	// served to the caller: pin that table to 'all' so it maps downstream to a
+	// row-level dep, not a cell dep on the predicate column. Under-counting here
+	// is unsound for a host that emits precise pk+column change events (it would
+	// miss changes to every non-predicate column); over-counting only costs an
+	// extra wakeup. See `docs/change-scope.md` and the binding DepSpec contract.
+	const outputAttrIds = new Set<number>();
+	for (const rel of collectOutputRelations(plan)) {
+		for (const attr of rel.getAttributes()) outputAttrIds.add(attr.id);
+	}
+	for (const [relKey, ref] of refByRelKey) {
+		const attrs = ref.getAttributes();
+		if (attrs.length > 0 && attrs.every(a => outputAttrIds.has(a.id))) {
+			result.set(relKey, 'all');
+		}
+	}
+
 	return result;
+}
+
+/**
+ * The top-level output relation(s) of a plan — the relations whose attribute
+ * lists are the query's result row(s). A `BlockNode` is not itself relational;
+ * its result statements are surfaced via `getRelations()`. A bare relational
+ * plan is its own output. Only the TOP relations are returned (not their
+ * relational descendants) so a forwarded base-table attribute id distinguishes
+ * "served to the caller" (whole-row `select *`) from "consumed internally".
+ */
+function collectOutputRelations(plan: PlanNode): readonly RelationalPlanNode[] {
+	if (isRelationalNode(plan)) return [plan];
+	return plan.getRelations();
 }
 
 /**
@@ -423,7 +516,8 @@ function extractParamId(expr: ScalarPlanNode): number | string | undefined {
 
 /* --- Scope building ------------------------------------------------------ */
 
-function buildColumnSet(ref: TableReferenceNode, indices: Set<number> | undefined): ReadonlySet<string> | 'all' {
+function buildColumnSet(ref: TableReferenceNode, indices: Set<number> | 'all' | undefined): ReadonlySet<string> | 'all' {
+	if (indices === 'all') return 'all';
 	if (indices === undefined || indices.size === 0) return 'all';
 	const attrs = ref.getAttributes();
 	const names = new Set<string>();
@@ -677,6 +771,32 @@ function sortedDedupParamIndices(set: Set<number | string>): ReadonlyArray<numbe
 }
 
 /* --- Composition helpers ------------------------------------------------- */
+
+/**
+ * Build the conservative source-union `ChangeScope` for a materialized view:
+ * one `{kind:'full'}` watch (columns `'all'`) per source table. This is the
+ * scope a materialized view reference projects to, so a watcher fires on any
+ * source mutation. A precise per-source row scope — mirroring the row-time
+ * maintenance the `MaterializedViewManager` already derives — is a future
+ * refinement.
+ *
+ * @param sourceTables Qualified lowercased `schema.table` names, as recorded on
+ *   `TableDerivation.sourceTables`.
+ */
+export function buildSourceUnionScope(sourceTables: ReadonlyArray<string>): ChangeScope {
+	const watches: TableWatch[] = [];
+	for (const qualified of sourceTables) {
+		const dot = qualified.indexOf('.');
+		const schema = dot >= 0 ? qualified.slice(0, dot) : 'main';
+		const table = dot >= 0 ? qualified.slice(dot + 1) : qualified;
+		watches.push({ table: { schema, table }, columns: 'all', scope: { kind: 'full' } });
+	}
+	return {
+		watches: normalizeWatches(watches),
+		nonDeterministicSources: [],
+		unboundParameters: [],
+	};
+}
 
 export function unionScopes(a: ChangeScope, b: ChangeScope): ChangeScope {
 	const byTable = new Map<string, TableWatch>();

@@ -1,0 +1,41 @@
+-- ALTER COLUMN SET DATA TYPE inside a transaction that has also INSERTED rows: the
+-- accepted retype must convert the transaction's own staged rows, so after COMMIT every
+-- row holds a value of the new declared type.
+--
+-- MEMORY-ONLY (listed in MEMORY_ONLY_FILES) for now: under the isolation wrapper the
+-- store backend runs behind, staged rows live in the wrapper's overlay and the overlay's
+-- ALTER migration does not yet convert them — an accepted retype commits the staged row
+-- still holding the OLD type. Fixed by bug-isolation-retype-leaves-staged-rows-unconverted,
+-- which removes this entry. The rejection/retry half of this scenario (without a staged
+-- insert surviving to commit) runs cross-module in 41.7.3 § 10.
+
+-- The UNIQUE is declared inline rather than through `create unique index`: the staged-row
+-- conversion this file is about is identical either way, and an inline constraint keeps the
+-- file runnable on backends without standalone index DDL.
+create table tx3 (id integer primary key, v text unique);
+insert into tx3 values (1, '1');
+-- run
+
+begin;
+-- run
+insert into tx3 values (2, '01');
+-- run
+
+alter table tx3 alter column v set data type integer;
+-- error: UNIQUE constraint failed
+
+-- still writable after the rejection, and the retry now passes — converting the
+-- transaction's staged insert (3, '7') along with the committed rows
+delete from tx3 where id = 2;
+-- run
+insert into tx3 values (3, '7');
+-- run
+alter table tx3 alter column v set data type integer;
+-- run
+commit;
+-- run
+
+select id, v, typeof(v) from tx3 order by id;
+→ [{"id":1,"v":1,"typeof(v)":"integer"},{"id":3,"v":7,"typeof(v)":"integer"}]
+
+drop table tx3;

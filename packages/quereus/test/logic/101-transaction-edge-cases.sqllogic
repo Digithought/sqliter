@@ -279,7 +279,117 @@ SELECT val FROM txe WHERE id = 301;
 → [{"val": "in-implicit-sp"}]
 
 -- ===================================
+-- Statement-level atomicity inside an explicit transaction (UPDATE)
+-- ===================================
+-- A multi-row UPDATE whose Nth row throws must roll back the WHOLE statement
+-- (rows 1..N-1 included), mirroring SQLite's implicit-savepoint-per-statement.
+-- The autocommit path is already atomic via implicit-transaction rollback, so
+-- this MUST wrap in begin/rollback to exercise the statement savepoint. Without
+-- it, id=1's update (x=11) would survive the aborted statement.
+
+-- The preceding section upgraded an implicit savepoint to an explicit
+-- transaction that is still open; commit it so our BEGIN starts clean
+-- (a no-op if autocommit is already active).
+COMMIT;
+-- run
+
+CREATE TABLE atom_u (id INTEGER PRIMARY KEY, x INTEGER NOT NULL);
+INSERT INTO atom_u VALUES (1, 10), (2, 20), (3, 30);
+-- run
+
+-- Row id=1 updates to x=11 first, then id=2 violates NOT NULL (x -> NULL).
+BEGIN;
+UPDATE atom_u SET x = CASE WHEN id = 2 THEN NULL ELSE x + 1 END WHERE id IN (1, 2);
+-- error: NOT NULL constraint failed: atom_u.x
+
+-- Inside the still-open transaction: id=1's update must NOT have survived.
+SELECT id, x FROM atom_u ORDER BY id;
+→ [{"id":1,"x":10},{"id":2,"x":20},{"id":3,"x":30}]
+ROLLBACK;
+-- run
+
+-- After rollback nothing persisted either.
+SELECT id, x FROM atom_u ORDER BY id;
+→ [{"id":1,"x":10},{"id":2,"x":20},{"id":3,"x":30}]
+
+-- Same guarantee when the later row trips a UNIQUE collision rather than a
+-- NOT NULL check: id=1's k moves to 15 (fine), then id=2's k -> 30 collides
+-- with id=3. The whole statement must revert id=1's move.
+CREATE TABLE atom_uq (id INTEGER PRIMARY KEY, k INTEGER UNIQUE);
+INSERT INTO atom_uq VALUES (1, 10), (2, 20), (3, 30);
+-- run
+
+BEGIN;
+UPDATE atom_uq SET k = CASE WHEN id = 1 THEN 15 WHEN id = 2 THEN 30 END WHERE id IN (1, 2);
+-- error: constraint failed
+
+SELECT id, k FROM atom_uq ORDER BY id;
+→ [{"id":1,"k":10},{"id":2,"k":20},{"id":3,"k":30}]
+ROLLBACK;
+-- run
+
+-- ===================================
+-- Statement-level atomicity inside an explicit transaction (DELETE)
+-- ===================================
+-- A multi-row DELETE whose Nth row throws (FK RESTRICT child reference) must
+-- roll back the whole statement. id=1 (unreferenced) deletes first, then id=2
+-- (referenced by a RESTRICT child) trips the parent-side FK check.
+
+CREATE TABLE atom_dp (id INTEGER PRIMARY KEY);
+CREATE TABLE atom_dc (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES atom_dp(id) ON DELETE RESTRICT);
+INSERT INTO atom_dp VALUES (1), (2), (3);
+INSERT INTO atom_dc VALUES (100, 2);
+-- run
+
+BEGIN;
+DELETE FROM atom_dp WHERE id IN (1, 2);
+-- error: constraint failed
+
+-- id=1's delete must NOT have survived the aborted statement.
+SELECT id FROM atom_dp ORDER BY id;
+→ [{"id":1},{"id":2},{"id":3}]
+ROLLBACK;
+-- run
+
+SELECT id FROM atom_dp ORDER BY id;
+→ [{"id":1},{"id":2},{"id":3}]
+
+-- ===================================
+-- Rolled-back statements must not corrupt UNIQUE enforcement state
+-- ===================================
+-- Regression (memory module): secondary-index entries are shared across
+-- inherited layer trees, so a rolled-back transaction's index mutations must
+-- be copy-on-written into the transaction's own tree, never applied in place
+-- to the shared committed entry (MemoryIndex.ownedEntries). A leaked delete
+-- silently un-enforced UNIQUE; a leaked insert left a phantom candidate.
+
+CREATE TABLE rbk (id INTEGER PRIMARY KEY, v TEXT UNIQUE);
+INSERT INTO rbk VALUES (1, 'x');
+
+-- a rolled-back DELETE must leave UNIQUE enforcement intact
+BEGIN;
+DELETE FROM rbk WHERE id = 1;
+ROLLBACK;
+
+INSERT INTO rbk VALUES (2, 'x');
+-- error: UNIQUE constraint failed
+
+-- a rolled-back INSERT must not leave a phantom that blocks the value
+BEGIN;
+INSERT INTO rbk VALUES (3, 'y');
+ROLLBACK;
+
+INSERT INTO rbk VALUES (4, 'y');
+SELECT id, v FROM rbk ORDER BY id;
+→ [{"id":1,"v":"x"},{"id":4,"v":"y"}]
+
+-- ===================================
 -- Cleanup
 -- ===================================
 
+DROP TABLE rbk;
 DROP TABLE txe;
+DROP TABLE atom_dc;
+DROP TABLE atom_dp;
+DROP TABLE atom_uq;
+DROP TABLE atom_u;

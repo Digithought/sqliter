@@ -26,6 +26,7 @@ export enum PlanNodeType {
   Update = 'Update',
   UpdateExecutor = 'UpdateExecutor',
   Delete = 'Delete',
+  ViewMutation = 'ViewMutation',  // Wraps the ordered base-table DML subtrees a view/MV mutation decomposes into
   ConstraintCheck = 'ConstraintCheck',
   CreateTable = 'CreateTable',
   DropTable = 'DropTable',
@@ -33,9 +34,13 @@ export enum PlanNodeType {
   DropIndex = 'DropIndex',
   CreateView = 'CreateView',
   DropView = 'DropView',
+  CreateMaterializedView = 'CreateMaterializedView',
+  RefreshMaterializedView = 'RefreshMaterializedView',
+  DropMaterializedView = 'DropMaterializedView',
   CreateAssertion = 'CreateAssertion',
   DropAssertion = 'DropAssertion',
   AlterTable = 'AlterTable',
+  SetObjectTags = 'SetObjectTags',  // ALTER VIEW / MATERIALIZED VIEW / INDEX ... SET TAGS
   AddConstraint = 'AddConstraint',
 
   // Physical Nodes (from optimizer)
@@ -50,6 +55,8 @@ export enum PlanNodeType {
   NestedLoopJoin = 'NestedLoopJoin',
   HashJoin = 'HashJoin',
   MergeJoin = 'MergeJoin',
+  KeySetSemiJoin = 'KeySetSemiJoin',  // Semi join that materializes the key set, then multi-seeks the target with it
+
   AsofScan = 'AsofScan',            // Streaming asof join: per left row, latest right with key ≤ left's
   OrdinalSlice = 'OrdinalSlice',    // O(log N) seek to kth row over a monotonic, ordinal-seek-capable leaf
   Materialize = 'Materialize',      // Materialize intermediate results
@@ -76,8 +83,11 @@ export enum PlanNodeType {
 
   // Special relational nodes
   Alias = 'Alias',  // Wraps a relation with an alias for relationName
+  AssertedKeys = 'AssertedKeys',  // Pass-through carrying lens-asserted declared-key FDs onto the inlined-view boundary
+  LensAuxiliaryAccess = 'LensAuxiliaryAccess',  // Pass-through carrying routable auxiliary-access advertisements onto the inlined-lens-view boundary (read-path selection)
   Values = 'Values',
 	TableLiteral = "TableLiteral",
+  EnvelopeScan = 'EnvelopeScan',  // Scans the shared-surrogate mutation envelope (multi-source view insert)
   SingleRow = 'SingleRow',  // For SELECT without FROM
   TableFunctionCall = 'TableFunctionCall',
 
@@ -89,6 +99,7 @@ export enum PlanNodeType {
   Pragma = 'Pragma',
   Analyze = 'Analyze',
   DeclareSchema = 'DeclareSchema',
+  DeclareLens = 'DeclareLens',
   DiffSchema = 'DiffSchema',
   ApplySchema = 'ApplySchema',
   ExplainSchema = 'ExplainSchema',

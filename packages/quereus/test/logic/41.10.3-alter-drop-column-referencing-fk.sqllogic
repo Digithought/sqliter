@@ -1,0 +1,288 @@
+-- ALTER TABLE DROP COLUMN vs. a foreign key in ANOTHER table pointing AT the column.
+--
+-- The parent-side counterpart to 41.10-alter-drop-column-foreign-key.sqllogic, which
+-- covers only the child side (a key that loses one of its OWN columns is removed with it).
+--
+-- A foreign key stores its PARENT columns as names (`referencedColumnNames`) and
+-- re-resolves them against the parent's current shape on every write. Dropping a named
+-- parent column therefore does not break the altered table at all — it leaves the
+-- REFERENCING table unwritable, with an error naming a column the user deliberately
+-- removed somewhere else. So the drop is refused, `StatusCode.CONSTRAINT`, naming the
+-- referencing table and key.
+--
+-- NOTE: the `-- error:` lines match the referencing constraint's auto-generated name
+-- (`_fk_<table>_<cols>`) on purpose — the name proves WHICH key blocked the drop, which a
+-- generic match would not. Same convention and rationale as 41.10's header note; the
+-- convention itself is pinned by 41.4-alter-add-column-constraints.sqllogic § 7e.
+--
+-- No `-- requires-capability:` directive (no standalone index DDL), so this runs under both
+-- the memory module (`yarn test`) and the store module (`yarn test:store`). The store leg
+-- matters: a referencing table broken this way is persisted and survives a reopen.
+
+pragma foreign_keys = true;
+
+-- ===================================================================
+-- 1. The base case — a single-column key in another table names the dropped
+--    column as its parent column. Refused, and nothing about either table moves.
+-- ===================================================================
+
+create table RefP (pid integer primary key, refd integer unique, spare text);
+create table RefC (id integer primary key, c integer references RefP(refd));
+insert into RefP values (1, 100, 'x');
+insert into RefC values (1, 100);
+
+alter table RefP drop column refd;
+-- error: _fk_refc_c
+
+-- The parent still has the column...
+select pid, refd from RefP;
+→ [{"pid":1,"refd":100}]
+
+-- ...and the referencing table is still writable, still enforcing against it.
+insert into RefC values (2, 100);
+select count(*) as c from RefC;
+→ [{"c":2}]
+insert into RefC values (3, 999);
+-- error: _fk_refc_c
+
+-- The key itself is untouched, not merely present.
+select "from", "to" from foreign_key_info('RefC');
+→ [{"from":"c","to":"refd"}]
+
+-- ===================================================================
+-- 2. A MULTI-column key: dropping EITHER of the parent columns it names is
+--    refused, since either one leaves the key unresolvable.
+-- ===================================================================
+
+create table RefP2 (id integer primary key, a integer, b integer, unique (a, b));
+create table RefC2 (id integer primary key, x integer, y integer, foreign key (x, y) references RefP2(a, b));
+insert into RefP2 values (1, 1, 2);
+insert into RefC2 values (1, 1, 2);
+
+alter table RefP2 drop column a;
+-- error: _fk_refc2_x_y
+
+alter table RefP2 drop column b;
+-- error: _fk_refc2_x_y
+
+-- Both columns survived, and the pair is still enforced.
+insert into RefC2 values (2, 9, 9);
+-- error: _fk_refc2_x_y
+select a, b from RefP2;
+→ [{"a":1,"b":2}]
+
+-- ===================================================================
+-- 3. The referencing key lives on the ALTERED table itself (self-referencing,
+--    parent column ≠ child column). The parent side still refuses; the child
+--    side is still the settled remove-with-the-column rule from 41.10.
+-- ===================================================================
+
+create table RefSelf (id integer primary key, a integer unique, b integer null references RefSelf(a));
+insert into RefSelf values (1, 10, null);
+insert into RefSelf values (2, 20, 10);
+
+-- `a` is the key's PARENT column → refused.
+alter table RefSelf drop column a;
+-- error: _fk_refself_b
+
+-- `b` is the key's CHILD column → accepted, and the key goes with it.
+alter table RefSelf drop column b;
+select count(*) as c from foreign_key_info('RefSelf');
+→ [{"c":0}]
+select id, a from RefSelf order by id;
+→ [{"id":1,"a":10},{"id":2,"a":20}]
+
+-- With the key gone, nothing points at `a` any more and it drops cleanly.
+alter table RefSelf drop column a;
+select id from RefSelf order by id;
+→ [{"id":1},{"id":2}]
+
+-- ===================================================================
+-- 4. Self-referencing where the parent column IS the child column. This same
+--    drop removes the key (child-side rule), so there is nothing left to point
+--    at the missing name — accepted. Without that skip the guard over-refuses.
+-- ===================================================================
+
+create table RefSame (id integer primary key, x integer null unique references RefSame(x));
+insert into RefSame values (1, null);
+
+alter table RefSame drop column x;
+select count(*) as c from foreign_key_info('RefSame');
+→ [{"c":0}]
+select id from RefSame;
+→ [{"id":1}]
+
+-- ===================================================================
+-- 5. The refusal is NOT gated on `pragma foreign_keys`. With enforcement off the
+--    breakage is merely latent — the schema is still wrong, and turning the
+--    pragma back on would brick the referencing table.
+-- ===================================================================
+
+pragma foreign_keys = false;
+
+create table OffP (pid integer primary key, refd integer unique);
+create table OffC (id integer primary key, c integer references OffP(refd));
+
+alter table OffP drop column refd;
+-- error: _fk_offc_c
+
+pragma foreign_keys = true;
+
+-- The column survived, so turning enforcement back on finds a coherent schema.
+insert into OffP values (1, 100);
+insert into OffC values (1, 100);
+select count(*) as c from OffC;
+→ [{"c":1}]
+
+-- ===================================================================
+-- 6. CROSS-SCHEMA: the referencing key lives in another schema and names the
+--    parent with an explicit qualifier. The guard resolves the parent the same
+--    way enforcement does, so it sees the reference across the schema boundary.
+-- ===================================================================
+
+declare schema s2 {}
+apply schema s2;
+-- run
+
+create table XP (pid integer primary key, refd integer unique);
+create table s2.xc (id integer primary key, c integer references main.XP(refd));
+insert into XP values (1, 100);
+insert into s2.xc values (1, 100);
+
+alter table XP drop column refd;
+-- error: _fk_xc_c
+
+select pid, refd from XP;
+→ [{"pid":1,"refd":100}]
+insert into s2.xc values (2, 999);
+-- error: _fk_xc_c
+
+-- ===================================================================
+-- 7. A key with NO explicit parent column list (`references Parent`) falls back
+--    to the parent's primary key. Dropping a non-PK column of the parent is
+--    accepted; dropping the PK column is refused by the pre-existing PRIMARY KEY
+--    guard, with ITS message — this guard never sees it.
+-- ===================================================================
+
+create table PkP (pid integer primary key, other integer);
+create table PkC (id integer primary key, c integer references PkP);
+insert into PkP values (1, 7);
+insert into PkC values (1, 1);
+
+alter table PkP drop column other;
+select pid from PkP;
+→ [{"pid":1}]
+
+-- Still enforced against the primary key after the drop.
+insert into PkC values (2, 99);
+-- error: _fk_pkc_c
+
+alter table PkP drop column pid;
+-- error: Cannot drop PRIMARY KEY column
+
+-- ===================================================================
+-- 8. Control: dropping a DIFFERENT column of the same parent is accepted, and
+--    the referencing table stays writable — including with enforcement on.
+-- ===================================================================
+
+create table KeepP (pid integer primary key, refd integer unique, spare text);
+create table KeepC (id integer primary key, c integer references KeepP(refd));
+insert into KeepP values (1, 100, 'z');
+insert into KeepC values (1, 100);
+
+alter table KeepP drop column spare;
+select "from", "to" from foreign_key_info('KeepC');
+→ [{"from":"c","to":"refd"}]
+
+insert into KeepC values (2, 100);
+select count(*) as c from KeepC;
+→ [{"c":2}]
+insert into KeepC values (3, 999);
+-- error: _fk_keepc_c
+
+-- ===================================================================
+-- 9. The escape hatch: drop the referencing key by its (auto-generated) name,
+--    then the parent column drops. This is what the refusal message points the
+--    user at, so it has to actually work.
+-- ===================================================================
+
+create table EscP (pid integer primary key, refd integer unique);
+create table EscC (id integer primary key, c integer references EscP(refd));
+insert into EscP values (1, 100);
+insert into EscC values (1, 100);
+
+alter table EscP drop column refd;
+-- error: _fk_escc_c
+
+alter table EscC drop constraint _fk_escc_c;
+select count(*) as c from foreign_key_info('EscC');
+→ [{"c":0}]
+
+alter table EscP drop column refd;
+select pid from EscP;
+→ [{"pid":1}]
+
+-- The referencing table is unconstrained now, so an orphan inserts cleanly.
+insert into EscC values (2, 999);
+select count(*) as c from EscC;
+→ [{"c":2}]
+
+-- ===================================================================
+-- 10. Control for the guard's OTHER half: the key must point at THIS table, not
+--     merely at a column with the same name. Two parents both own a `refd`; only
+--     one is referenced, so dropping the other's `refd` is accepted. A guard that
+--     matched parent column NAMES without resolving the parent would refuse here.
+-- ===================================================================
+
+create table TwinA (id integer primary key, refd integer unique);
+create table TwinB (id integer primary key, refd integer unique);
+create table TwinC (id integer primary key, c integer references TwinB(refd));
+insert into TwinA values (1, 100);
+insert into TwinB values (1, 200);
+insert into TwinC values (1, 200);
+
+-- Nothing points at TwinA.refd, same name notwithstanding.
+alter table TwinA drop column refd;
+select id from TwinA;
+→ [{"id":1}]
+
+-- TwinB's identically-named column is still the referenced one, and still refused.
+alter table TwinB drop column refd;
+-- error: _fk_twinc_c
+
+-- ===================================================================
+-- 11. A key whose parent table does not exist resolves to no parent at all, so it
+--     constrains nothing and blocks nothing. Dropping a same-named column of an
+--     unrelated real table is accepted.
+-- ===================================================================
+
+create table Ghost (id integer primary key, refd integer unique);
+create table GhostC (id integer primary key, c integer references NoSuchParent(refd));
+insert into Ghost values (1, 100);
+
+alter table Ghost drop column refd;
+select id from Ghost;
+→ [{"id":1}]
+
+-- ===================================================================
+-- 12. Discovery reads the cached reverse-FK index, so a key created AFTER an
+--     earlier drop already warmed that cache still has to block. Covers both ways
+--     a key appears late: `ALTER TABLE … ADD CONSTRAINT`, and a child table
+--     created after the parent was altered. § 9 covers the removal direction.
+-- ===================================================================
+
+create table LateP (pid integer primary key, refd integer unique);
+create table LateC (id integer primary key, c integer);
+
+-- Warm the cache with a lookup that finds nothing pointing at LateP.
+alter table LateP drop column refd;
+alter table LateP add column refd integer unique;
+
+alter table LateC add constraint fk_latec foreign key (c) references LateP(refd);
+alter table LateP drop column refd;
+-- error: fk_latec
+
+-- A child declared after the fact is seen the same way.
+create table LateC2 (id integer primary key, c integer references LateP(refd));
+alter table LateP drop column refd;
+-- error: fk_latec

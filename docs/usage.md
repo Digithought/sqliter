@@ -1,5 +1,7 @@
 # Quereus Usage Guide
 
+> **Stability: Stable** — see [Stability Tiers](stability.md#tiers).
+
 Quereus provides a lightweight, TypeScript-native SQL interface with a focus on virtual tables that can be backed by any data source. This document explains how to use Quereus effectively in your applications.
 
 ## Quick Start
@@ -50,6 +52,8 @@ const db = new Database();
 ### Executing Simple Statements (`db.exec`)
 
 Use `db.exec(sql)` for executing statements without fetching results, especially for DDL (`create`, `drop`), transaction control (`begin`, `commit`), or simple `insert`/`update`/`delete` statements with or without parameters.
+
+A row-returning statement (`select`, `values`, `explain`, or DML with `RETURNING`) still runs to completion under `exec` — its rows are pulled and discarded, so its side effects happen and its errors surface, but the caller never sees the rows. Use `db.eval`/`db.get` to consume them.
 
 ```typescript
 // Execute DDL
@@ -168,6 +172,79 @@ try {
 }
 ```
 
+#### Cancelling an In-Flight Query (`AbortSignal`)
+
+Every execution entry point accepts a trailing, fully-optional options bag `{ signal }`: the database-level `db.exec`, `db.eval`, and `db.get`, plus the prepared-statement methods `stmt.run`, `stmt.get`, `stmt.iterateRows`, and `stmt.all`. Aborting the signal cancels the in-flight statement cooperatively at the next yield seam: the call rejects with an `AbortError` (`instanceof QuereusError`, `code === StatusCode.ABORT`, `name === 'AbortError'`) and any implicit transaction rolls back. An already-aborted signal rejects before any work starts. Existing call sites are unaffected — omit the bag and behavior is unchanged (the 2-argument forms are preserved).
+
+> **Where cancellation is checked.** Cooperative checkpoints live at three seams:
+> the physical table-access leaf (the seq-scan / index-scan / index-seek row loop),
+> the statement's output-row boundary (where rows are streamed back to the caller),
+> and the DML drain loop (each source row of an `INSERT` / `UPDATE` / `DELETE`,
+> which covers a scan-less bulk mutation such as `INSERT … VALUES` or
+> `INSERT … SELECT` from a table-valued function or CTE with no base-table read).
+> Together these cover every long-running streaming or mutating statement.
+>
+> What remains uninterruptible by construction is work that happens *inside a
+> single instruction* with no `await` seam — a tight CPU-bound computation, an
+> in-memory sort over an already-drained array, or a single heavy DDL operation.
+> The engine deliberately does **not** poll the signal between scheduler
+> instructions: the synchronous fast path cannot observe an abort anyway (the
+> timer/microtask that calls `controller.abort()` cannot run while synchronous
+> engine code holds the thread), and a between-instruction poll cannot reach the
+> intra-instruction loops above, so it would add hot-path cost for no additional
+> coverage. Such a statement is checked at the pre-flight boundary and then runs
+> to completion once started.
+
+```typescript
+import { isAbortError } from 'quereus';
+
+const controller = new AbortController();
+setTimeout(() => controller.abort(), 1000); // cancel if it runs too long
+
+try {
+  for await (const row of db.eval("select * from big_table", undefined, { signal: controller.signal })) {
+    // …
+  }
+} catch (err) {
+  if (isAbortError(err)) {
+    console.log("query cancelled");
+  }
+}
+
+// The same options bag works on a prepared statement:
+const stmt = db.prepare("select * from big_table");
+try {
+  for await (const row of stmt.all([], { signal: controller.signal })) {
+    // …
+  }
+} finally {
+  await stmt.finalize();
+}
+```
+
+Cancellation interrupts *execution* (the row-by-row drain), not an already-started commit: an abort that races a commit is a no-op, so a cancelled write can never leave a partially-committed state. A fully-synchronous, await-free in-memory operator (e.g. an in-memory sort over an already-drained array) is uninterruptible by construction — the drain that *fills* it is interruptible, but the CPU-bound pass itself runs to completion. See [errors.md](./errors.md) for `AbortError` / `isAbortError` / `throwIfAborted`.
+
+#### Concurrent Committed Reads (`readConcurrency`)
+
+By default, every statement — reads included — queues behind the database's execution mutex. That means a read issued while another statement is stuck in a slow virtual-table commit (e.g. a network-backed store) waits for that commit to finish. The same options bag accepts an opt-out for reads that can tolerate slightly stale data:
+
+```typescript
+// Runs immediately against the last COMMITTED state, even while a write is
+// mid-commit — instead of waiting its turn behind the mutex.
+const row = await db.get("select count(*) as n from t", undefined, { readConcurrency: 'committed' });
+```
+
+- `'serialized'` (default) — queue behind the mutex, exactly as today.
+- `'committed'` — when the statement is *eligible*, run WITHOUT the mutex against each table's last committed state. An ineligible statement silently falls back to `'serialized'` — opting in is never an error.
+
+Eligibility (all must hold): the query is read-only; no explicit `BEGIN` is open (a read inside your own transaction must see the transaction's writes, so it always serializes); for `db.eval`, the SQL is a single statement (a `select; insert; select` batch falls back wholesale); every table read resolves to a module that declares `readCommittedSnapshot` (the in-memory module qualifies, as does the `@quereus/isolation` wrapper *over* a qualifying module, since it mirrors what it wraps; store-backed modules currently do not — reads on them just keep serializing); and the query calls no table-valued function, because a table-valued function reaches its data outside the module check above and some of them (the tracing ones) run arbitrary SQL of their own.
+
+**The tradeoff — read this before opting in.** `'committed'` deliberately gives up an ordering guarantee you may be relying on without realizing it: after `void db.exec(insert)` (unawaited), an opted-in `await db.get(select)` may answer from the *pre-insert* state, because the read no longer waits for the write to land. If you need read-your-writes ordering, either `await` the write first or use the default. That footgun is exactly why the opt-in is per call and there is no database-wide switch.
+
+**One prepared statement, one execution at a time.** A `Statement` holds per-execution state (its bound arguments, its busy flag), so overlapping executions of the *same* prepared statement throw `Statement busy` — the execution mutex used to make that impossible to hit, and mutex-free reads expose it. Give each concurrent caller its own statement; `db.get` and `db.eval` prepare per call and are unaffected.
+
+Honored by the row-returning entry points: `db.get`, `db.eval`, and the prepared-statement `stmt.get`, `stmt.all`, `stmt.iterateRows`, `stmt.run`. `db.exec` ignores the option (it returns no rows, and its per-statement transaction loop is exactly what the mutex-free path must not touch). A caller `signal` combines with the option normally, and `db.close()` aborts any in-flight concurrent read at its next row boundary. See [SQL Transactions § Concurrent committed reads](sql-txn.md#86-concurrent-committed-reads) for the transaction-interaction details and [Module Authoring § Committed-Snapshot Reads](module-authoring.md#4-committed-snapshot-reads-_readcommitted) for the module contract.
+
 ### Transactions
 
 Quereus supports explicit transaction control using `BEGIN`, `COMMIT`, and `ROLLBACK`. Additionally, both `db.exec()` and `statement.run()` automatically wrap their execution in implicit transactions when in autocommit mode.
@@ -177,7 +254,7 @@ Quereus supports explicit transaction control using `BEGIN`, `COMMIT`, and `ROLL
 When not in an explicit transaction (autocommit mode), both `db.exec()` and `statement.run()` automatically wrap their execution in an implicit transaction:
 
 ```typescript
-// db.exec() - wraps entire batch in one transaction
+// db.exec() - each statement is its own implicit transaction
 await db.exec("insert into users (name) values ('User 1')");
 // Automatically committed after successful execution
 
@@ -187,12 +264,14 @@ await stmt.run(["User 2"]);
 await stmt.finalize();
 // Automatically committed after successful execution
 
-// Multiple statements in db.exec() are atomic
+// Multiple statements in one db.exec() are NOT atomic as a batch: matching
+// SQLite autocommit, each statement commits or rolls back on its own.
 await db.exec(`
   insert into users (name) values ('User 3');
   insert into users (name) values ('User 4');
 `);
-// All statements commit together, or all rollback on error
+// If the second statement fails, the first stays committed.
+// Wrap the batch in begin/commit for all-or-nothing.
 
 // On error, implicit transactions automatically rollback
 try {
@@ -287,11 +366,73 @@ The `DatabaseDataChangeEvent` interface:
 | `moduleName` | `string` | The virtual table module that raised the event |
 | `schemaName` | `string` | Schema containing the table |
 | `tableName` | `string` | Table name |
-| `key` | `SqlValue[]` | Primary key values (if available) |
+| `key` | `SqlValue[]` | Primary key values projected out of the event's **own** row image (`newRow` for insert/update, `oldRow` for delete), under the primary key the table has at delivery |
 | `oldRow` | `Row` | Previous row data (for update/delete) |
 | `newRow` | `Row` | New row data (for insert/update) |
 | `changedColumns` | `string[]` | Column names that changed (for updates) |
 | `remote` | `boolean` | `true` if the change originated from a sync/remote source |
+
+`oldRow` / `newRow` are **positional**: pair value *i* with column *i* of the table's schema.
+The engine guarantees that pairing is safe **at delivery time**: every event a commit delivers
+describes its rows in the schema current at delivery — even when the transaction changed the
+table's columns (`ALTER TABLE ADD/DROP/RENAME COLUMN`, `ALTER COLUMN … SET DATA TYPE` /
+`SET NOT NULL`) *after* recording the write. Events recorded before such an ALTER are rewritten
+to the post-ALTER shape before the commit delivers them, and `changedColumns` only ever names
+columns that exist in that schema (a `RENAME COLUMN` moves no value, so only the name changes).
+
+`tableName` is as-of-delivery in the same way: a mid-transaction `ALTER TABLE … RENAME TO`
+relabels the events the transaction already recorded, so every event a commit delivers names
+the table as it exists at that moment — never a name the rename has already retired. Renames
+compose within a transaction (`t` → `t2` → `t3` delivers `t3`), and a rename that happens
+*between* transactions changes nothing about events already delivered, which correctly carry
+the name the table had when they were delivered. `key` and `oldRow`/`newRow` are untouched by
+a rename, which moves no value.
+
+`key` addresses exactly one row, and an `update` never moves it. Every producer follows the
+same two clauses, so a listener can treat `key` as the row's identity without knowing anything
+about the table's schema:
+
+1. **`key` is the primary key projected out of the event's own row image** — out of `newRow`
+   for an `insert` and an `update`, out of `oldRow` for a `delete`. An update therefore keys by
+   the row's *post*-image, which is the row the table now holds.
+2. **An `update` never moves a row.** When a statement changes a primary key such that the row
+   *relocates* — its key values differ under the primary key's own comparator, which is
+   per-column collation- and type-aware, not byte identity — the producer delivers a `delete`
+   at the old key followed by an `insert` at the new key, **in that order**, instead of one
+   `update`. A rewrite that leaves the row where it was stays a single `update`: under a
+   `NOCASE` primary key, `update t set k = 'APPLE' where k = 'apple'` moves nothing, so it is
+   one `update` whose `key` is the post-image `['APPLE']` the table now stores.
+
+The split is what lets a plain listener retire the old identity. `update t set a = 2 where a =
+1` on a table keyed by `a` delivers `delete key: [1]` then `insert key: [2]`, so a cache or a
+change log keyed by `key` drops row `1` and adds row `2` without having to know which columns
+form the key — which the event does not carry. The cost is deliberate: a relocating update
+carries no `changedColumns` and no "these two events are the same row" link. **Ordering is
+guaranteed; adjacency is not** — other events may be delivered between the `delete` and the
+`insert`, so do not pair them positionally.
+
+`key` is as-of-delivery too: it holds the values of the primary key the table has **at
+delivery**, so a consumer that addresses rows by `key` (an incremental cache, a sync change
+log) can always pair the event with a row the table now contains. A mid-transaction `ALTER
+TABLE … ALTER PRIMARY KEY` re-derives the `key` of every event the transaction already
+recorded, projecting it out of that event's own row image — widening `(a)` to `(a, b)` turns
+a recorded `[1]` into `[1, 9]`, and narrowing turns `[1, 9]` back into `[1]`. Without that,
+the delivered key would carry the retired key's arity and match no row at all. As with the
+other two families, an ALTER PRIMARY KEY *between* transactions leaves already-delivered
+events alone: they correctly carry the key the table had at the time. A `RENAME TO` still
+leaves `key` untouched (it moves no value); only an ALTER PRIMARY KEY rewrites it.
+
+One statement raises **no** data events even though it moves every row: `ALTER TABLE … ALTER
+PRIMARY KEY` on a backend that cannot re-key in place falls back to an engine-internal rebuild
+(copy every row into a shadow table with the new key, then swap it in), and that rebuild is
+deliberately silent on all three channels. A re-key changes no row, so announcing the copy as a
+row-per-`insert` would be wrong. See [`sql-alter.md`](sql-alter.md) § ALTER PRIMARY KEY. Both
+built-in modules re-key in place and never take that path.
+
+`changedColumns` is present on an update event only if the owning module supplies it — the
+memory module and the engine's auto-event path do; the store module deliberately omits it and
+leaves the per-column diff to the consumer. That per-module choice is stable: a mid-transaction
+ALTER re-derives an existing `changedColumns`, but never synthesizes one that was absent.
 
 ### Subscribing to Schema Changes
 
@@ -318,10 +459,64 @@ The `DatabaseSchemaChangeEvent` interface:
 | `moduleName` | `string` | The module that raised the event |
 | `schemaName` | `string` | Schema name |
 | `objectName` | `string` | Object name (table or index name) |
+| `oldObjectName` | `string` | Previous table name (`alter table … rename to` only) |
 | `columnName` | `string` | Column name (for column operations) |
 | `oldColumnName` | `string` | Previous column name (for renames) |
 | `ddl` | `string` | DDL statement if available |
 | `remote` | `boolean` | `true` if the change originated from a remote source |
+
+#### What each `ALTER TABLE` arm reports
+
+Every structural `ALTER TABLE` arm raises exactly **one** event, whether or not the storage
+backend ships an emitter of its own — a backend without one is covered by the engine's own
+fallback, so a subscriber sees the same facts either way:
+
+| Statement | `type` | `objectType` | `objectName` | `columnName` | `oldColumnName` |
+|---|---|---|---|---|---|
+| `rename to` | `alter` | `table` | **new** table name (`oldObjectName` = old) | — | — |
+| `rename column` | `alter` | `column` | table | **new** column name | old column name |
+| `add column` | `alter` | `column` | table | added column | — |
+| `drop column` | **`drop`** | `column` | table | dropped column | — |
+| `alter column …` (all four attribute forms) | `alter` | `column` | table | altered column | — |
+| `alter primary key` | `alter` | `table` | table | — | — |
+| `add constraint` | `alter` | `table` | table | — | — |
+| `drop constraint` | `alter` | `table` | table | — | — |
+| `rename constraint` | `alter` | `table` | table | — | — |
+
+Note `drop column` reports `type: 'drop'`, not `'alter'` — the arm removes an object.
+
+Every arm above also sets `ddl` to the statement's **canonical, schema-qualified SQL** — the
+text a replicating peer re-executes to reproduce the alteration. The engine renders it once at
+plan-build time from the *resolved* table, so `alter table orders …` on a table in schema `sales`
+announces `alter table sales.orders …` regardless of how you spelled it; statement keywords are
+lowercased, while identifier and data-type casing is preserved as written.
+
+`add column` with inline constraints (`add column w text null unique`) reports **one** event on
+either path, carrying the whole statement's text. A backend that emits for itself makes an extra
+internal `addConstraint` round-trip per inline constraint, but those calls are marked
+engine-internal and announce nothing.
+
+The event is raised on the statement's **success** path only — an ALTER that throws announces
+nothing at all, on every backend. This holds even when the failure lands *after* a
+self-emitting backend has already announced the change (an `add column` that gets past its own
+module call, then fails installing an inline constraint): the engine scopes each ALTER
+statement's schema events and retracts them as the error propagates. Like every other event,
+delivery is batched to commit and dropped on rollback.
+
+Two arm families report nothing on either path: the metadata-tag arms (`set tags`, `add tags`,
+`drop tags`) and the materialized-view lifecycle arms (`set maintained`, `drop maintained`).
+Both are catalog-only and no backend announces them.
+
+A declarative `apply schema` runs its generated migration DDL through the ordinary statement
+path, so each `alter table` the differ generates reports exactly as if you had typed it —
+alongside the `create` / `drop` events the same apply already raised.
+
+`ALTER TABLE … ALTER PRIMARY KEY` on a backend that cannot re-key in place reports its one
+`alter`/`table` event like any other backend, but stays silent about the engine-internal rebuild
+that carries it out (see above, and [`sql-alter.md`](sql-alter.md) § ALTER PRIMARY KEY): that rebuild
+runs with this channel suppressed, so a subscriber that mirrors the catalog is never told that a
+machine-named `<table>__rekey_<ms>` shadow table was created and the real one dropped — neither
+of which is a change the application made.
 
 ### Per-Table Subscription via `db.getTable(...)`
 
@@ -372,7 +567,7 @@ await db.exec("rollback");
 
 Savepoint semantics are also supported: events within a savepoint are tracked separately and discarded on `ROLLBACK TO SAVEPOINT` or merged on `RELEASE`.
 
-For module-level event integration (implementing events in custom virtual table modules), see the [Module Authoring Guide](./module-authoring.md).
+For module-level event integration (implementing events in custom virtual table modules), see [Database-Level Event System](./module-events.md).
 
 ## Database Options
 
@@ -403,14 +598,15 @@ pragma default_column_nullability;
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `schema_path` | string | `'main'` | Comma-separated schema search path for unqualified table names. Alias: `search_path` |
+| `schema_path` | string | `'main'` | Comma-separated schema search path for unqualified relation (table / view) names. Alias: `search_path` |
 | `default_column_nullability` | string | `'not_null'` | Default nullability for columns: `'not_null'` (Third Manifesto) or `'nullable'` (SQL standard). Aliases: `column_nullability_default`, `nullable_default` |
 | `default_vtab_module` | string | `'memory'` | Default virtual table module used for `create table` without `using` clause |
 | `default_vtab_args` | object | `{}` | Default arguments passed to the default virtual table module |
 | `foreign_keys` | boolean | `true` | Enable foreign key constraint enforcement. When omitted, ON DELETE / ON UPDATE default to RESTRICT. Alias: `fk_enforcement` |
 | `runtime_stats` | boolean | `false` | Enable runtime execution statistics collection. Alias: `runtime_metrics` |
 | `validate_plan` | boolean | `false` | Enable plan validation before execution. Alias: `plan_validation` |
-| `trace_plan_stack` | boolean | `false` | Enable plan stack tracing for debugging |
+| `trace_plan_stack` | boolean | `false` | Enable plan stack tracing for debugging (also disables scalar fusion) |
+| `runtime_fuse_scalars` | boolean | `true` | Compile pure synchronous scalar expression subtrees into single fused closures instead of per-row sub-programs (see `docs/runtime.md` § Scalar fusion). Kill switch for bisecting a suspected fusion bug; baked into a prepared statement at emit time, so recompile to pick up a change |
 
 ### Type-Safe Getters
 
@@ -428,23 +624,23 @@ db.getOption('foreign_keys');                    // returns OptionValue
 
 ## Database API Reference
 
-### `db.exec(sql: string, params?: SqlParameters): Promise<void>`
-Executes one or more SQL statements separated by semicolons. Primarily intended for DDL, transaction control, or DML without results. Supports optional parameters.
+### `db.exec(sql: string, params?: SqlParameters, options?: StatementOptions): Promise<void>`
+Executes one or more SQL statements separated by semicolons. Primarily intended for DDL, transaction control, or DML without results. Supports optional parameters and an optional `{ signal }` for cooperative cancellation (see [Cancelling an In-Flight Query](#cancelling-an-in-flight-query-abortsignal)).
 
 **Implicit Transaction Behavior:** When in autocommit mode (not within an explicit `BEGIN...COMMIT`), `exec()` automatically wraps the entire batch of statements in an implicit transaction. All statements commit together on success, or all rollback on error. This provides batch-level atomicity.
 
 ### `db.prepare(sql: string): Statement`
 Prepares an SQL statement for execution, returning a `Statement` object. This is the entry point for using the `Statement` API (`run`, `get`, `all`, `bind`, etc.).
 
-### `db.get(sql: string, params?: SqlParameters): Promise<Record<string, SqlValue> | undefined>`
-Convenience method to execute a query and return the first result row, or undefined if no rows. Equivalent to `db.prepare(sql).get(params)`.
+### `db.get(sql: string, params?: SqlParameters, options?: StatementOptions): Promise<Record<string, SqlValue> | undefined>`
+Convenience method to execute a query and return the first result row, or undefined if no rows. Equivalent to `db.prepare(sql).get(params, options)`. Accepts an optional `{ signal }` for cooperative cancellation (see [Cancelling an In-Flight Query](#cancelling-an-in-flight-query-abortsignal)).
 
 ```typescript
 const user = await db.get("select * from users where id = ?", [1]);
 ```
 
-### `db.eval(sql: string, params?: SqlParameters): AsyncIterable<Record<string, SqlValue>>`
-A high-level async generator for executing a query and iterating over its results. Handles statement preparation, parameter binding, and automatic finalization.
+### `db.eval(sql: string, params?: SqlParameters, options?: StatementOptions): AsyncIterable<Record<string, SqlValue>>`
+A high-level async generator for executing a query and iterating over its results. Handles statement preparation, parameter binding, and automatic finalization. Accepts an optional `{ signal }` for cooperative cancellation (see [Cancelling an In-Flight Query](#cancelling-an-in-flight-query-abortsignal)).
 
 ### `db.beginTransaction()`, `db.commit()`, `db.rollback()`
 Standard transaction control methods.
@@ -454,6 +650,24 @@ Returns a public handle to a table for inspection and per-table event subscripti
 
 ### `db.registerModule(...)`, `db.createScalarFunction(...)`, `db.createAggregateFunction(...)`, `db.registerCollation(...)`
 Methods for extending database functionality.
+
+#### `db.registerCollation(name, comparator, optionsOrNormalizer?)`
+
+Registers a comparison rule for text. `NOCASE` and `RTRIM` may be overridden; `BINARY` may not. The third argument is either a bare key normalizer (legacy positional form) or an options object:
+
+```typescript
+db.registerCollation('NOCASE', comparator, {
+  normalizer,             // (s: string) => string
+  replicable: true,       // bit-identical across peers/platforms/app-versions
+  orderPreserving: true,  // normalizer preserves ORDER, not just equality
+});
+```
+
+- **`normalizer`** — rewrites a string into a canonical form, so two strings the comparator calls equal always rewrite to the same form. Required for the collation to key a compound index or a persisted structure; `order by` and standalone comparisons work without it.
+- **`replicable`** — asserts the collation is bit-identical across peers, platforms, and app versions (not merely deterministic). Consulted by the materialized-view gate when a backing host declares `requiresReplicableDerivations`.
+- **`orderPreserving`** — asserts the normalizer preserves order: for all strings `x`, `y`, `sign(comparator(x, y))` equals `sign(memcmp(utf8(normalizer(x)), utf8(normalizer(y))))`. This is strictly stronger than the equality promise `normalizer` alone makes; a normalizer can agree with its comparator on equality and still disagree on order.
+
+Both assertions default to `false` for a custom collation and are stamped `true` on the three built-ins. `orderPreserving` matters for persistent storage: a store physically orders rows by normalized key bytes, so it may only seek a byte range — or advertise byte order as collation order — for a collation carrying the assertion. Without it, queries stay **correct** and simply run a full scan with a comparator-accurate filter instead of a seek. See [store.md § Order preservation](./store.md#order-preservation).
 
 ### `db.setInstructionTracer(tracer: InstructionTracer | undefined)`
 Sets an instruction tracer for debugging and performance analysis. The tracer receives callbacks for every instruction executed, enabling detailed visibility into query execution.
@@ -541,9 +755,9 @@ Closes the database connection and finalizes all open statements.
 
 Prepared statements provide methods for executing parameterized SQL.
 
-#### `stmt.run(params?: SqlValue[] | Record<string, SqlValue>): Promise<void>`
+#### `stmt.run(params?: SqlValue[] | Record<string, SqlValue>, options?: StatementOptions): Promise<void>`
 
-Executes the statement until completion, ignoring any result rows. Ideal for INSERT, UPDATE, or DELETE operations.
+Executes the statement until completion, ignoring any result rows. Ideal for INSERT, UPDATE, or DELETE operations. Accepts an optional `{ signal }` for cooperative cancellation (see [Cancelling an In-Flight Query](#cancelling-an-in-flight-query-abortsignal)).
 
 **Implicit Transaction Behavior:** When in autocommit mode (not within an explicit `BEGIN...COMMIT`), `run()` automatically wraps its execution in an implicit transaction. The statement commits on success, or rolls back on error.
 
@@ -552,9 +766,9 @@ await stmt.run(["param1", 42]); // Positional parameters
 await stmt.run({ ":name": "Alice", ":age": 30 }); // Named parameters
 ```
 
-#### `stmt.get(params?: SqlValue[] | Record<string, SqlValue>): Promise<Record<string, SqlValue> | undefined>`
+#### `stmt.get(params?: SqlValue[] | Record<string, SqlValue>, options?: StatementOptions): Promise<Record<string, SqlValue> | undefined>`
 
-Executes the statement and returns the first result row as an object, or undefined if no rows are returned.
+Executes the statement and returns the first result row as an object, or undefined if no rows are returned. Accepts an optional `{ signal }` for cooperative cancellation (see [Cancelling an In-Flight Query](#cancelling-an-in-flight-query-abortsignal)).
 
 ```typescript
 const user = await stmt.get([1]); // e.g., "select * from users where id = ?"
@@ -563,9 +777,9 @@ if (user) {
 }
 ```
 
-#### `stmt.all(params?: SqlValue[] | Record<string, SqlValue>): AsyncIterable<Record<string, SqlValue>>`
+#### `stmt.all(params?: SqlValue[] | Record<string, SqlValue>, options?: StatementOptions): AsyncIterable<Record<string, SqlValue>>`
 
-Returns an async iterator over all result rows. Use `for await` to stream results:
+Returns an async iterator over all result rows. Use `for await` to stream results. Accepts an optional `{ signal }` for cooperative cancellation (see [Cancelling an In-Flight Query](#cancelling-an-in-flight-query-abortsignal)). (`stmt.iterateRows` accepts the same options bag and returns raw `Row` arrays instead of objects.)
 
 ```typescript
 for await (const user of stmt.all([30])) {
@@ -601,11 +815,13 @@ Releases all resources associated with the statement. The statement cannot be us
 
 ## Change-scope introspection
 
+> **Stability: Beta** — see [Stability Tiers](stability.md#tiers).
+
 `Statement.getChangeScope(params?)` returns a JSON-serializable `ChangeScope`
 describing what base-table state and external inputs the statement reads
 from. The result is a static analysis — sound but conservative — and is
 the public projection of the binding analysis used by assertions and
-incremental view maintenance. See [Change-scope Documentation](change-scope.md)
+reactive watches. See [Change-scope Documentation](change-scope.md)
 for the full data contract.
 
 ### Analyzer-only
@@ -710,6 +926,14 @@ watchers observe). See [change-scope.md](change-scope.md) for the
 full firing semantics, schema-change invalidation policy, and the
 list of v1 limitations.
 
+For tables backed by a replicated/external store (e.g. an optimystic
+vtab) that learns of remote writes out-of-band — changes that never
+touch this `Database`'s commit change-log — call
+`db.notifyExternalChange(tableName, schemaName?)` to fire every watcher
+on that table as if the whole table changed. It is coarse by design
+(table-granular, no key narrowing); see the *External / out-of-band
+changes* section of [change-scope.md](change-scope.md).
+
 ## Virtual Tables
 
 One of Quereus's key features is its support for virtual tables, which allow you to expose any data source as a SQL table.
@@ -766,7 +990,7 @@ See the [Memory Table documentation](./memory-table.md) for more details on the 
 
 ### Working with Multiple Schemas
 
-Quereus supports organizing tables into multiple named schemas for better modularity. Unqualified table names can be resolved using a flexible search path system.
+Quereus supports organizing tables into multiple named schemas for better modularity. Unqualified relation names — tables, views and materialized views alike — are resolved using a flexible search path system.
 
 ```typescript
 import { Database } from '@quereus/quereus';
@@ -811,6 +1035,42 @@ for await (const row of db.eval(`
 2. `WITH SCHEMA` clause - Per-query explicit search path
 3. `PRAGMA schema_path` / `db.setSchemaPath()` - Session default
 4. Default schema (`main`) - Final fallback
+
+The path is walked one schema at a time, and each entry's tables **and** views are checked together, so the first schema holding an object of that name wins regardless of kind — a table named `x` in an earlier entry beats a view named `x` in a later one. (Within one schema a table and a view cannot share a name; `create table` and `create view` each reject a name the other already holds.)
+
+A **stored body** (a view or materialized-view definition) is the exception: it resolves its unqualified names against the owning object's own schema first, then the session default path — never the reading statement's `WITH SCHEMA` path. So a view declared next to its tables in a non-`main` schema reads correctly under any session path.
+
+## Views, Updatable Views, and Materialized Views
+
+For the SQL syntax and semantics see the [SQL Reference §2.8–2.11](sql-views.md#28-create-view-statement). This section covers the operational/API-level behavior.
+
+**Plain views** re-evaluate their body on every reference. **Updatable views** let you `insert` / `update` / `delete` through a view (or a non-recursive CTE, or a subquery in `from`) — the engine rewrites the DML to the underlying base table(s):
+
+```typescript
+await db.exec(`create view GreenMen as select id, name, color from Men where color = 'green'`);
+await db.exec(`insert into GreenMen (id, name) values (7, 'Bob')`);   // color defaults to 'green'
+await db.exec(`update GreenMen set name = 'Bobby' where id = 7`);     // routes to Men
+```
+
+Because the write reaches the base table, **change-scope and reactive watches report the base table, not the view** — a `Database.watch` registered against `Men` fires when you write through `GreenMen`. A non-writable column (a computed/aggregate output) is read-only and raises a `no-inverse` diagnostic on write rather than silently dropping the value.
+
+**Materialized views** store the body and keep it consistent with its sources **synchronously, inside the writing transaction**:
+
+```typescript
+await db.exec(`create materialized view mv as select id, x from t order by x`);
+await db.exec(`insert into t values (1, 10)`);
+// reads-own-writes: mv already reflects the insert within the same transaction
+const rows = await db.prepare(`select * from mv`).all();
+```
+
+Operational consequences:
+
+- A materialized view is **transactional** — a maintenance failure or a `rollback` reverts source and backing together; there is no asynchronous drift and `refresh materialized view` is not required for currency.
+- `Database.watch` on a materialized view projects to its **source** tables (the backing table is maintained off the change log, so watching it directly would never fire).
+- Only [narrow body shapes](sql-views.md#210-create-materialized-view-statement) are eligible; an ineligible body is rejected at `create`.
+- A covering materialized view (projecting a UNIQUE constraint's columns, ordered by them) makes that constraint's enforcement O(log n) and conflict-resolution-capable.
+
+These features run against persistent storage backends too — the `.sqllogic` suites for views, materialized views, and lens write-through are exercised under both the in-memory and LevelDB store backends (`yarn test:store`).
 
 ## Declarative Schema Workflow
 
@@ -908,6 +1168,40 @@ console.log(users);
 - Application clears existing data before inserting seeds.
 - Use for test fixtures, reference data, or initial configurations.
 
+### Logical Schemas and Lenses
+
+A **logical schema** describes a design free of any storage commitment; a **lens** maps each logical table onto a module-backed **basis** schema. At `apply` the lens compiles to an inline view, so the rest of the engine sees an ordinary (updatable) view over basis.
+
+```typescript
+// 1) The basis: module-backed storage
+await db.exec(`declare schema basis {
+  table men { id integer primary key, name text not null, color text not null }
+}`);
+await db.exec('apply schema basis');
+
+// 2) The logical design — no module, no indexes
+await db.exec(`declare logical schema app {
+  table Person { id integer primary key, fullName text not null, color text not null }
+}`);
+
+// 3) The lens: sparse overrides over basis (only the deviations)
+await db.exec(`declare lens for app over basis {
+  view Person as select id, name as fullName, color from men;
+}`);
+
+// 4) Deploy — compiles the lens-backed views
+await db.exec('apply schema app');
+
+// 5) Use the logical table like any view; writes propagate to basis
+await db.exec(`insert into app.Person (id, fullName, color) values (1, 'Bob', 'green')`);
+```
+
+- Columns a lens override does not cover are gap-filled by the default name-based mapper; every logical column must end up mapped to basis (an uncovered column the basis cannot back is a compile error).
+- The logical schema's constraints are enforced at the lens boundary (row-local checks, foreign keys, and uniqueness — see [Lenses](lens.md)).
+- Inspect the composed mapping with `select * from quereus_effective_lens('app', 'Person')`.
+
+The lens layer is the most recently landed feature set and is still evolving; see [Lenses and Layered Schemas](lens.md) for the current boundaries.
+
 
 ## User-Defined Functions
 
@@ -925,6 +1219,12 @@ db.createScalarFunction("reverse", { numArgs: 1, deterministic: true },
 // Use it in SQL
 const result = await db.prepare("select reverse(name) from users").all();
 ```
+
+`db.createScalarFunction` takes a **synchronous** implementation. An asynchronous one —
+or any implementation that returns a Promise — is registered by building the schema with
+`createScalarFunction` from `@quereus/quereus` and passing it to `db.registerFunction`;
+see [Plugins § Asynchronous scalar functions](plugins.md#asynchronous-scalar-functions)
+for why a promise-returning function that is not declared `async` must set `isAsync: true`.
 
 ## Error Handling
 
@@ -1381,6 +1681,7 @@ for await (const user of db.eval("select * from users")) {
 
 **Key Points:**
 - All query methods return rows as objects with column names as keys
+- Two result columns sharing a name (`select l.a, r.a from l join r …`, with or without `group by`) are numbered — the first keeps the name, later ones get a `:<n>` suffix: `a`, `a:1`. Without this the object form would drop a column; use an explicit alias when you want a stable name
 - `get()` returns a single object (or undefined)
 - `all()` and `eval()` return async iterators for streaming
 

@@ -122,4 +122,71 @@ describe('IndexedDBManager', () => {
 			expect(db2!.version).to.equal(version);
 		});
 	});
+
+	describe('Failed open recovery', () => {
+		it('clears a rejected open so a later call retries', async () => {
+			const manager = IndexedDBManager.getInstance(testDbName);
+			const originalOpen = indexedDB.open;
+
+			let rejected = false;
+			try {
+				// Force every indexedDB.open in this window to fire onerror, so doOpen rejects.
+				(indexedDB as unknown as { open: () => unknown }).open = () => {
+					const req: { error: Error; onerror: (() => void) | null } = {
+						error: new Error('forced open failure'),
+						onerror: null,
+					};
+					setTimeout(() => req.onerror?.(), 0);
+					return req;
+				};
+
+				try {
+					await manager.ensureOpen();
+				} catch {
+					rejected = true;
+				}
+				expect(rejected, 'first ensureOpen should reject').to.be.true;
+				// A rejected open must not stay cached (bug c): openPromise is reset in finally.
+				expect((manager as unknown as { openPromise: unknown }).openPromise).to.equal(null);
+			} finally {
+				(indexedDB as unknown as { open: unknown }).open = originalOpen;
+			}
+
+			// After the transient cause clears, a fresh call must succeed.
+			const db = await manager.ensureOpen();
+			expect(db).to.not.be.undefined;
+			expect(manager.getObjectStoreNames()).to.include(CATALOG_STORE_NAME);
+		});
+	});
+
+	describe('Concurrent schema mutations', () => {
+		it('serializes concurrent distinct ensureObjectStore calls without VersionError', async () => {
+			const manager = IndexedDBManager.getInstance(testDbName);
+			await manager.ensureOpen();
+
+			const N = 5;
+			await Promise.all(
+				Array.from({ length: N }, (_, i) => manager.ensureObjectStore(`concurrent.t${i}`)),
+			);
+
+			for (let i = 0; i < N; i++) {
+				expect(manager.hasObjectStore(`concurrent.t${i}`)).to.be.true;
+			}
+		});
+
+		it('bumps the version exactly once for N concurrent same-name requests', async () => {
+			const manager = IndexedDBManager.getInstance(testDbName);
+			await manager.ensureOpen();
+
+			const before = manager.getDatabase()!.version;
+			const N = 5;
+			await Promise.all(
+				Array.from({ length: N }, () => manager.ensureObjectStore('concurrent.same')),
+			);
+
+			expect(manager.hasObjectStore('concurrent.same')).to.be.true;
+			// The inside-lock re-check means only the first request creates the store.
+			expect(manager.getDatabase()!.version).to.equal(before + 1);
+		});
+	});
 });

@@ -6,9 +6,11 @@ import { formatSortKey } from '../../util/plan-formatter.js';
 import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { extractOrderingFromSortKeys } from '../framework/physical-utils.js';
-import { SortCapable } from '../framework/characteristics.js';
+import type { SortCapable } from '../framework/characteristics.js';
 import { ColumnReferenceNode } from './reference.js';
-import { isAssertedKey } from '../util/fd-utils.js';
+import { isUniqueDeterminant } from '../util/fd-utils.js';
+import { sortCost } from '../cost/index.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 
 /**
  * Represents a sort key for ordering results
@@ -30,6 +32,7 @@ export interface SortKey {
  */
 export class SortNode extends PlanNode implements UnaryRelationalNode, SortCapable {
 	override readonly nodeType = PlanNodeType.Sort;
+	readonly isSortCapable = true as const;
 
 	constructor(
 		scope: Scope,
@@ -37,13 +40,15 @@ export class SortNode extends PlanNode implements UnaryRelationalNode, SortCapab
 		public readonly sortKeys: readonly SortKey[],
 		estimatedCostOverride?: number
 	) {
-		// Cost: cost of source + cost of sorting (O(n log n) * cost of evaluating sort expressions)
-		// This is a simplified cost model - a more sophisticated one would consider the actual data size
+		// Self-cost only: getChildren() is `[source, ...sortKeys.map(k => k.expression)]`,
+		// so BOTH the source and every sort-key expression are children — their
+		// subtree costs flow in once via getTotalCost(). Self is the O(n log n)
+		// sorting overhead alone; the key-expression evaluation cost must NOT be
+		// folded in (as the prior `sortCost * keyCost` multiplier did — it would
+		// re-count the key subtrees that already arrive as children).
 		const sourceRows = source.estimatedRows ?? 1000;
-		const sortCost = sourceRows * Math.log2(sourceRows + 1);
-		const keyCost = sortKeys.reduce((sum, key) => sum + key.expression.getTotalCost(), 0);
 
-		super(scope, estimatedCostOverride ?? (source.getTotalCost() + sortCost * keyCost));
+		super(scope, estimatedCostOverride ?? sortCost(sourceRows));
 	}
 
 	getType(): RelationType {
@@ -78,8 +83,8 @@ export class SortNode extends PlanNode implements UnaryRelationalNode, SortCapab
 		const ordering = extractOrderingFromSortKeys(this.sortKeys, sourceAttributes);
 
 		// Establish monotonicOn from the leading sort key when it is a trivial
-		// column reference. Strict iff the input was unique on that single column —
-		// equivalent to `{leadIdx}` being a superkey of the source's columns.
+		// column reference. Strict iff the input is provably row-unique on that
+		// single column (`isUniqueDeterminant` — kind-aware, not mere coverage).
 		let monotonicOn: readonly MonotonicOnInfo[] | undefined;
 		if (this.sortKeys.length > 0) {
 			const leadingKey = this.sortKeys[0];
@@ -87,7 +92,7 @@ export class SortNode extends PlanNode implements UnaryRelationalNode, SortCapab
 				const leadAttrId = leadingKey.expression.attributeId;
 				const leadIdx = this.source.getAttributeIndex().get(leadAttrId) ?? -1;
 				if (leadIdx >= 0) {
-					const strict = isAssertedKey(new Set([leadIdx]), sourcePhysical?.fds, sourceAttributes.length);
+					const strict = isUniqueDeterminant(new Set([leadIdx]), sourcePhysical?.fds, sourceAttributes.length, this.source.getType().isSet);
 					monotonicOn = [{
 						attrId: leadAttrId,
 						direction: leadingKey.direction,
@@ -98,14 +103,16 @@ export class SortNode extends PlanNode implements UnaryRelationalNode, SortCapab
 		}
 
 		return {
-			estimatedRows: this.estimatedRows,
+			// Sort doesn't change the row count — relay the source's PHYSICAL count.
+			estimatedRows: physicalSourceRows(sourcePhysical, this.source),
 			ordering,
-			// Sort doesn't change which rows are in the relation — FDs/ECs/bindings
-			// propagate unchanged.
+			// Sort doesn't change which rows are in the relation — FDs/ECs/bindings/
+			// INDs propagate unchanged.
 			fds: sourcePhysical?.fds,
 			equivClasses: sourcePhysical?.equivClasses,
 			constantBindings: sourcePhysical?.constantBindings,
 			domainConstraints: sourcePhysical?.domainConstraints,
+			inds: sourcePhysical?.inds,
 			monotonicOn,
 		};
 	}

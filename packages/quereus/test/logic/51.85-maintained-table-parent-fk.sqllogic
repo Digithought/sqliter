@@ -1,0 +1,103 @@
+-- 51.85-maintained-table-parent-fk.sqllogic — parent-side FK enforcement for
+-- maintained-table maintenance writes, exercised against the LevelDB store backend.
+-- `enforceParentSideReferentialActions` is arm-agnostic; the inverse-projection arm
+-- is sufficient to cover all four declared FK actions on the store backend.
+
+pragma foreign_keys = true;
+
+-- ===================================
+-- 1. RESTRICT blocks a maintenance delete and rolls back the source write atomically
+-- ===================================
+
+create table src (id integer primary key, v text);
+create table m (id integer primary key, v text) maintained as select id, v from src;
+create table c (cid integer primary key, m_id integer,
+    foreign key (m_id) references m(id) on delete restrict);
+insert into src values (1, 'a'), (2, 'b');
+insert into c values (10, 1);
+
+-- maintenance delete of m(1) blocked by RESTRICT FK on c
+delete from src where id = 1;
+-- error: violates RESTRICT from 'c'
+
+-- atomic rollback: all three tables intact
+select * from src order by id;
+→ [{"id":1,"v":"a"},{"id":2,"v":"b"}]
+select * from m order by id;
+→ [{"id":1,"v":"a"},{"id":2,"v":"b"}]
+select count(*) as n from c;
+→ [{"n":1}]
+
+-- unreferenced row maintains cleanly
+delete from src where id = 2;
+select id from m;
+→ [{"id":1}]
+
+drop table c;
+drop table m;
+drop table src;
+
+-- ===================================
+-- 2. CASCADE removes children on a maintenance delete
+-- ===================================
+
+create table src (id integer primary key, v text);
+create table m (id integer primary key, v text) maintained as select id, v from src;
+create table c (cid integer primary key, m_id integer,
+    foreign key (m_id) references m(id) on delete cascade);
+insert into src values (1, 'a');
+insert into c values (10, 1), (11, 1);
+
+delete from src where id = 1;
+select count(*) as n from m;
+→ [{"n":0}]
+select count(*) as n from c;
+→ [{"n":0}]
+
+drop table c;
+drop table m;
+drop table src;
+
+-- ===================================
+-- 3. SET NULL clears the child FK column on a maintenance delete
+-- ===================================
+
+create table src (id integer primary key, v text);
+create table m (id integer primary key, v text) maintained as select id, v from src;
+create table c (cid integer primary key, m_id integer null,
+    foreign key (m_id) references m(id) on delete set null);
+insert into src values (1, 'a');
+insert into c values (10, 1);
+
+delete from src where id = 1;
+select count(*) as n from m;
+→ [{"n":0}]
+select * from c;
+→ [{"cid":10,"m_id":null}]
+
+drop table c;
+drop table m;
+drop table src;
+
+-- ===================================
+-- 4. SET DEFAULT resets the child FK column to its default on a maintenance delete
+--    (simple non-nested case: the default value points at the surviving parent row)
+-- ===================================
+
+create table src (id integer primary key);
+create table m (id integer primary key) maintained as select id from src;
+create table c (cid integer primary key, m_id integer default 99,
+    foreign key (m_id) references m(id) on delete set default);
+insert into src values (1), (99);
+insert into c values (10, 1);
+
+-- delete src(1): m(1) removed, SET DEFAULT resets c.m_id to 99 (which still exists in m)
+delete from src where id = 1;
+select id from m;
+→ [{"id":99}]
+select * from c;
+→ [{"cid":10,"m_id":99}]
+
+drop table c;
+drop table m;
+drop table src;

@@ -1,0 +1,348 @@
+import type { Database } from '../../core/database.js';
+import { QuereusError } from '../../common/errors.js';
+import { StatusCode } from '../../common/types.js';
+import type { TableSchema, ForeignKeyConstraintSchema } from '../../schema/table.js';
+import { columnReferencedInAst, objectRefKey } from '../../schema/rename-rewriter.js';
+import { buildColumnSourceResolver } from '../../schema/column-source-resolver.js';
+import { snapshotObjectRefResolvers } from '../../schema/object-ref-resolver.js';
+import { collectColumnRepublication } from '../../schema/column-republication.js';
+import { assertionReachesHomeSchemaFirst, describeOwnedAssertion } from '../../schema/assertion.js';
+import { describeReachPath } from '../../schema/object-dependency-closure.js';
+import {
+	findColumnExpressionDependent,
+	describeDependentTable,
+	type ColumnExpressionArm,
+	type ExpressionDependent,
+} from '../../schema/expression-dependents.js';
+
+/**
+ * The `ALTER TABLE … DROP COLUMN` guards over dependents that `runDropColumn` does not
+ * otherwise see: a column DEFAULT or `GENERATED ALWAYS AS` body that names the column, a
+ * CHECK constraint that names it, an assertion whose CHECK body names it, and a foreign
+ * key in *another* table pointing **at** the column.
+ *
+ * Whether a dependent is removed with the column or blocks the drop turns on two
+ * questions: is it defined by a *column set* or by an *expression*, and does it live on
+ * the altered table or somewhere else?
+ *
+ * - **Structural** dependents **of the altered table** (a UNIQUE over the dropped column,
+ *   the table's own FK using it as a child column) are defined by a *column set*. Losing
+ *   a column makes them a different constraint, not a narrower one, so both vtab modules
+ *   **remove them with the column**.
+ * - **Expression** dependents (a generated column's expression, a partial index's
+ *   `WHERE`, and — here — a column DEFAULT, a CHECK expression and an assertion body) are
+ *   arbitrary user-authored logic with no narrowed form at all. The only choices are
+ *   delete-it-silently and refuse, and the engine **refuses**, `StatusCode.CONSTRAINT`.
+ * - **Dependents living in another table** — a foreign key whose *parent* column is the
+ *   one being dropped, and (through a subquery) another table's CHECK / DEFAULT /
+ *   generated body — refuse regardless of shape. Removing one would silently weaken, or
+ *   outright break, a constraint on a table the user did not name in the statement.
+ *
+ * Refuse is right for all four guards here because it is what the two expression guards
+ * already inside `runDropColumn` do (so the function gains no second policy), it is
+ * SQLite's position for the whole family, and — for the assertion arm —
+ * `assertNoAssertionDependsOn` already chose refuse for the *table* verb over the same
+ * assertion. Cascading here would make `drop table f` and `alter table f drop column x`
+ * disagree about the same object.
+ *
+ * The two expression guards below scan **every table in every schema**, not just the
+ * altered one, via `schema/expression-dependents.ts` — a CHECK or DEFAULT may contain a
+ * subquery, so another table's expression can legitimately name this column, and
+ * `ALTER TABLE … RENAME COLUMN` has always rewritten exactly those. See that module for
+ * the shared walk and the seeded/unseeded probe split it turns on. All three guards follow
+ * view / materialized-view bodies through the same closure
+ * (`schema/object-dependency-closure.ts`), so a CHECK reaching the column only through a
+ * view refuses the drop and the refusal names the chain.
+ *
+ * Known cost, accepted: an **unnamed** table-level CHECK cannot be dropped
+ * (`DROP CONSTRAINT` resolves by name only), so refusing leaves such a column
+ * undroppable short of rebuilding the referencing table — again SQLite's position. The
+ * refusal message quotes the constraint's expression so the user can at least see what is
+ * in the way.
+ *
+ * All four guards must run **before** `requireVtabModule` / `module.alterTable`, so a
+ * refused statement never reaches a persisting module and the table is left untouched
+ * rather than reverted.
+ */
+
+/**
+ * Refuses the drop when a column DEFAULT or `GENERATED ALWAYS AS` body — on the altered
+ * table or on any other table in any schema — names the column.
+ *
+ * A default is evaluated against the row being written, so on the altered table it names
+ * its siblings through the row-image qualifier — `b integer default (new.a + 1)`.
+ * Dropping `a` leaves that default uncompilable and the table unable to accept any new
+ * row at all, with an error naming a column the user deliberately removed. On ANOTHER
+ * table the same expression reaches this column only through a subquery
+ * (`w integer default ((select min(v) from t))`), and the damage is worse: that table
+ * becomes unwritable and the error names neither `t`, nor the dropped column, nor the
+ * default that broke.
+ *
+ * "Names" is decided by {@link findColumnExpressionDependent}, which shares its walk with
+ * the rename propagation — so the drop refuses exactly the references a rename would have
+ * rewritten, case folding (`NEW.A`) and the `"new"`-named-table shadowing edge included,
+ * and the two definitions cannot drift. That scope-awareness is load-bearing rather than
+ * decorative: a default whose subquery reads a like-named column on another table
+ * (`default ((select min(v) from u))`) must NOT false-refuse dropping this table's own `v`.
+ *
+ * Two expressions on the altered table are deliberately skipped — the dropped column's
+ * own default (it goes away with the column) and every own-table generated body
+ * (`runDropColumn` already refuses off `generatedColumnDependencies`). See
+ * {@link findColumnExpressionDependent} for both.
+ */
+export function assertNoColumnExpressionNamesColumn(
+	db: Database,
+	tableSchema: TableSchema,
+	columnName: string,
+): void {
+	refuseColumnExpressionDependent(db, tableSchema, columnName, 'columnExpression');
+}
+
+/**
+ * Refuses the drop when a CHECK constraint — on the altered table or on any other table
+ * in any schema — names the column.
+ *
+ * Same walk, same equivalence with the rename, as
+ * {@link assertNoColumnExpressionNamesColumn}. A CHECK may contain a subquery, so a
+ * depth-blind name match (what the partial-index guard next door can afford, its
+ * predicates admitting no subqueries) would both false-refuse
+ * `check ((select min(v) from u) >= 0)` when dropping this table's own `v` AND miss
+ * another table's `check (n < (select max(v) from t))` entirely.
+ *
+ * Only the constraints on each table's `checkConstraints` at drop time are probed —
+ * the user's declared set. Lens- and FK-synthesized entries are attached to a write
+ * plan's constraint list, not to the catalog entries this reads.
+ *
+ * A CHECK naming the column through the row-image qualifiers — `check (new.a > 0)`,
+ * `check on delete (old.a > 0)` — refuses the drop just like the unqualified spelling:
+ * the seeded walk owns that namespace, shadowing edge included, so a CHECK whose subquery
+ * reads a real table named `"new"` still does not block dropping this table's own
+ * like-named column.
+ */
+export function assertNoCheckConstraintNamesColumn(
+	db: Database,
+	tableSchema: TableSchema,
+	columnName: string,
+): void {
+	refuseColumnExpressionDependent(db, tableSchema, columnName, 'check');
+}
+
+/**
+ * The shared body of the two expression guards: probe, then refuse with a message that
+ * names the dropped column, the table it is being dropped from, the offending expression,
+ * and — when the expression lives somewhere else — the table carrying it. The own-table
+ * message is unchanged from before this guard learned to scan other tables.
+ *
+ * A {@link ExpressionDependent.breaksEntirely} match gets its own spelling: the
+ * expression references a view / MV the drop breaks OUTRIGHT (an explicit column list
+ * over a `*` covering the column), so telling the user one column is referenced would
+ * send them hunting for a name no body spells.
+ */
+function refuseColumnExpressionDependent(
+	db: Database,
+	tableSchema: TableSchema,
+	columnName: string,
+	arm: ColumnExpressionArm,
+): void {
+	const dependent = findColumnExpressionDependent(db, tableSchema, columnName, arm);
+	if (!dependent) return;
+	if (dependent.breaksEntirely) {
+		throw new QuereusError(
+			`Cannot drop column '${columnName}' from '${tableSchema.name}': `
+			+ `${referencedBy(dependent, tableSchema.schemaName)} references ${dependent.breaksEntirely}, `
+			+ `whose explicit column list would no longer match its body once '*' expands without the `
+			+ `column — dropping the column breaks it outright, not just one column`,
+			StatusCode.CONSTRAINT,
+		);
+	}
+	throw new QuereusError(
+		`Cannot drop column '${columnName}' from '${tableSchema.name}': ${refersTo(dependent, tableSchema.schemaName)}`,
+		StatusCode.CONSTRAINT,
+	);
+}
+
+/**
+ * How the refusal describes the reference. A DIRECT one keeps the wording these guards
+ * have always used; an indirect one leads with the expression and names the chain, the
+ * same `… reaches it through view 'v'` split `assertNoAssertionDependsOn` uses. It is NOT
+ * the spelling {@link assertNoAssertionNamesColumn} uses next door
+ * (`it is referenced by assertion 'a' through view 'v'`) — that message was already in
+ * tests when the closure landed, and both read.
+ */
+function refersTo(dependent: ExpressionDependent, homeSchemaName: string): string {
+	const what = referencedBy(dependent, homeSchemaName);
+	return dependent.path.length === 0
+		? `it is referenced by ${what}`
+		: `${what} reaches it${describeReachPath(dependent.path)}`;
+}
+
+/** `CHECK constraint 'ck1'`, or `CHECK constraint 'ck1' on table 'x'` when it lives elsewhere. */
+function referencedBy(dependent: ExpressionDependent, homeSchemaName: string): string {
+	if (dependent.ownTable) return dependent.describe;
+	return `${dependent.describe} on table ${describeDependentTable(dependent.table, homeSchemaName)}`;
+}
+
+/**
+ * Refuses the drop when a live assertion's CHECK body, or any stored view /
+ * materialized-view body that assertion can reach, names the column.
+ *
+ * Blast radius is why this one is worth a guard at all: `AssertionEvaluator`
+ * recompiles **every** live assertion on any commit that touched any table, so a
+ * single body left naming a dropped column makes every write to the whole database
+ * fail — including writes to tables that have nothing to do with the altered one.
+ *
+ * The walk is the unseeded {@link columnReferencedInAst}: an assertion body names its
+ * tables explicitly in its own FROM clauses, so there is no implicit binding to seed
+ * (unlike a CHECK). A body that names the table but not the column — `select *`
+ * included — is not a reference and does not block the drop.
+ *
+ * The same probe runs over EVERY body in the assertion's reach, its own included, so
+ * `create view v as select id, x from t` plus `create assertion a check (… from v
+ * where x < 0)` refuses `alter table t drop column x` — the match is on `v`'s body,
+ * not the assertion's.
+ *
+ * Each body is probed against every COLUMN REPUBLICATION target
+ * (`schema/column-republication.ts`), not the base table alone: a view that
+ * re-exposes the column by a star (`create view v as select * from t`, `select t.*`,
+ * or a materialized view of either) spells the name nowhere, and a reader's
+ * `where x < 0` references the column against `v`. Targets are swept OUTER — base
+ * table first, bodies inner — so every match the base sweep finds is found at the
+ * body it always was and the existing message spellings do not move. The
+ * broken-listed arm follows the sweep: an explicit column list over a covering `*`
+ * (`create view v(a, b) as select * from t`) breaks the whole view on the drop
+ * (the star's arity changes), so an assertion whose reach names such a view at all
+ * refuses, with a message saying the view breaks outright. The fixpoint's second
+ * catalog snapshot is taken at the same pre-mutation point as
+ * `assertionReachesHomeSchemaFirst`'s, so the two answer identically.
+ *
+ * Scope is EVERY schema, matching `assertNoAssertionDependsOn`: an assertion in
+ * `temp` naming `main.t`'s column blocks the drop, while one whose bare `t` resolves
+ * to `temp.t` does not. Each body resolves its unqualified names under its own home
+ * schema path. The scan itself is {@link assertionReachesHomeSchemaFirst}, shared
+ * with the table verb.
+ */
+export function assertNoAssertionNamesColumn(
+	db: Database,
+	tableSchema: TableSchema,
+	columnName: string,
+): void {
+	const resolveColumnInSource = buildColumnSourceResolver(db);
+	const tableKey = objectRefKey(tableSchema.schemaName, tableSchema.name);
+	const republication = collectColumnRepublication(db,
+		{ targetKey: tableKey, tableName: tableSchema.name }, columnName,
+		snapshotObjectRefResolvers(db), resolveColumnInSource);
+
+	for (const { owned, reach } of assertionReachesHomeSchemaFirst(db, tableSchema.schemaName)) {
+		for (const target of republication.targets) {
+			for (const reached of reach.bodies) {
+				// Row-image mode 'none': an assertion body and every view / MV body in
+				// its reach are relations with no written row.
+				if (!columnReferencedInAst(reached.body, target.tableName, columnName,
+					reached.resolve, target.targetKey, 'none', resolveColumnInSource)) continue;
+				throw new QuereusError(
+					`Cannot drop column '${columnName}' from '${tableSchema.name}': it is referenced by `
+					+ `assertion ${describeOwnedAssertion(owned, tableSchema.schemaName)}`
+					+ `${describeReachPath(reached.path)} — drop or redefine the assertion first`,
+					StatusCode.CONSTRAINT,
+				);
+			}
+		}
+		for (const broken of republication.brokenListed) {
+			if (!reach.namerOf(broken.key)) continue;
+			throw new QuereusError(
+				`Cannot drop column '${columnName}' from '${tableSchema.name}': assertion `
+				+ `${describeOwnedAssertion(owned, tableSchema.schemaName)} references ${broken.describe}, `
+				+ `whose explicit column list would no longer match its body once '*' expands without the `
+				+ `column — dropping the column breaks it outright — drop or redefine the assertion first`,
+				StatusCode.CONSTRAINT,
+			);
+		}
+	}
+}
+
+/**
+ * Refuses the drop when some foreign key — in any schema, this table's own included —
+ * names the column among its **parent** columns.
+ *
+ * A foreign key stores its parent columns as *names* (`referencedColumnNames`) and
+ * re-resolves them against the parent's current shape on every write
+ * (`resolveReferencedColumns`, `schema/table.ts`). Dropping a named parent column therefore does not
+ * break the altered table at all — it makes the *referencing* table unwritable, with an
+ * error naming a column the user deliberately removed somewhere else. Refusing is the
+ * only way that failure stays attached to the statement that caused it.
+ *
+ * The refusal is **not** gated on `pragma foreign_keys`. The pragma decides whether the
+ * DML builders emit FK checks, so with it off the breakage is merely latent: the schema
+ * is still wrong and turning the pragma on later bricks the child table. The guards
+ * already in `runDropColumn` are likewise unconditional.
+ *
+ * Discovery goes through {@link SchemaManager.getReferencingForeignKeys} — the cached
+ * reverse index keyed by referenced `schema.table` that `DROP TABLE`'s parent-side guard
+ * already uses — rather than a fresh walk of every foreign key in every schema. Its key
+ * is `fk.referencedSchema ?? childTable.schemaName`, and `referencedSchema` is populated
+ * at build time from the declaration (`constraint-builder.ts`: `fk.schema ?? childSchemaName`),
+ * so the bucket a key lands in is the same parent
+ * `planner/building/foreign-key-builder.ts` resolves at enforcement time. That identity is
+ * what makes "the guard refuses exactly the drops enforcement would have choked on" true.
+ * An unqualified reference binds to the **child's own schema**, not through the session
+ * search path — a cross-schema key must qualify its parent (`references main.p(c)`) or it
+ * resolves to no parent at all.
+ *
+ * Two keys are skipped, both deliberately:
+ *
+ * - One with **no `referencedColumnNames`** (`references Parent` with no column list)
+ *   falls back to the parent's primary key, which no name resolution can miss and which
+ *   `runDropColumn` already refuses to drop. Not an oversight — there is no name here for
+ *   this drop to invalidate.
+ * - A **self-referencing key that this same drop removes** — one on the altered table whose
+ *   *child* columns include the dropped column (`x integer references t(x)`). The module
+ *   removes the whole key as part of the drop, so nothing is left pointing at the missing
+ *   name. Refusing there would turn away a legal drop.
+ */
+export function assertNoForeignKeyReferencesColumn(
+	db: Database,
+	tableSchema: TableSchema,
+	columnName: string,
+): void {
+	const lowerColumn = columnName.toLowerCase();
+	const droppedIndex = tableSchema.columnIndexMap.get(lowerColumn);
+
+	for (const { childTable, fk } of db.schemaManager.getReferencingForeignKeys(tableSchema.schemaName, tableSchema.name)) {
+		if (!namesParentColumn(fk, lowerColumn)) continue;
+		if (dropRemovesKeyOutright(tableSchema, childTable, fk, droppedIndex)) continue;
+
+		const fkName = fk.name ?? `_fk_${childTable.name}`;
+		throw new QuereusError(
+			`Cannot drop column '${columnName}' from '${tableSchema.name}': it is referenced by foreign key '${fkName}' on table '${childTable.name}'`,
+			StatusCode.CONSTRAINT,
+		);
+	}
+}
+
+/**
+ * Whether `fk` lists `lowerColumn` (already lowercased) among its declared parent columns.
+ * A key with no declared list targets the parent's primary key and matches nothing here —
+ * see the second skip in {@link assertNoForeignKeyReferencesColumn}'s doc comment.
+ */
+function namesParentColumn(fk: ForeignKeyConstraintSchema, lowerColumn: string): boolean {
+	const refNames = fk.referencedColumnNames;
+	if (!refNames || refNames.length === 0) return false;
+	return refNames.some(name => name.toLowerCase() === lowerColumn);
+}
+
+/**
+ * Whether this drop takes the whole key with it: a **self**-referencing key, on the table
+ * being altered, holding the dropped column among its *child* columns. The module removes
+ * such a key as part of the drop, so no reference to the missing name survives it.
+ */
+function dropRemovesKeyOutright(
+	tableSchema: TableSchema,
+	childTable: TableSchema,
+	fk: ForeignKeyConstraintSchema,
+	droppedIndex: number | undefined,
+): boolean {
+	if (droppedIndex === undefined) return false;
+	if (childTable.name.toLowerCase() !== tableSchema.name.toLowerCase()) return false;
+	if (childTable.schemaName.toLowerCase() !== tableSchema.schemaName.toLowerCase()) return false;
+	return fk.columns.includes(droppedIndex);
+}

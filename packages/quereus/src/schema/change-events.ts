@@ -1,6 +1,7 @@
 import type { TableSchema } from './table.js';
 import type { FunctionSchema } from './function.js';
 import type { IntegrityAssertionSchema } from './assertion.js';
+import type { ViewSchema } from './view.js';
 import { createLogger } from '../common/logger.js';
 
 const log = createLogger('schema:change-events');
@@ -47,6 +48,59 @@ export type AssertionAddedEvent = SchemaObjectAdded<'assertion_added', Integrity
 export type AssertionRemovedEvent = SchemaObjectRemoved<'assertion_removed', IntegrityAssertionSchema>;
 export type AssertionModifiedEvent = SchemaObjectModified<'assertion_modified', IntegrityAssertionSchema>;
 
+// ── View events ────────────────────────────────────────────────────
+
+/**
+ * Emitted after a plain `CREATE VIEW` / `DROP VIEW` (fired from the runtime
+ * emitters, NOT from `Schema.addView`/`removeView`). Scoping the event to the
+ * DDL emitters deliberately excludes internally-registered views (lens effective
+ * bodies, any other direct `schema.addView` caller) which must NOT be persisted
+ * to a store-backed catalog — they are re-derived, not stored. A store catalog
+ * subscribes to these to persist/forget a view incrementally. Mirrors how the MV
+ * emitters fire `materialized_view_added`/`_removed`.
+ */
+export type ViewAddedEvent = SchemaObjectAdded<'view_added', ViewSchema>;
+export type ViewRemovedEvent = SchemaObjectRemoved<'view_removed', ViewSchema>;
+
+/**
+ * Emitted after an in-place change to an existing (non-materialized) view. Two
+ * sources fire it: `ALTER VIEW … SET TAGS`, and an `ALTER TABLE/COLUMN RENAME`
+ * that rewrites a dependent view's body in place (propagating the new
+ * table/column name into `selectAst` + `sql`). Distinct from `view_added`
+ * (which a fresh create fires) so a cached write-through plan that recorded a
+ * `view` dependency invalidates when the view changes, and so a store-backed
+ * catalog re-persists the (re-generated) view DDL — both without re-triggering
+ * a persistence re-create.
+ */
+export type ViewModifiedEvent = SchemaObjectModified<'view_modified', ViewSchema>;
+
+// ── Materialized view events ───────────────────────────────────────
+// Keyed by the maintained table's own name (unified model: one `TableSchema`
+// carrying a `derivation`); payloads are that table. The channel survives so
+// store catalog persistence keeps re-saving the `create materialized view`
+// DDL on derivation changes, distinct from the table-bundle channel.
+
+export type MaterializedViewAddedEvent = SchemaObjectAdded<'materialized_view_added', TableSchema>;
+export type MaterializedViewRemovedEvent = SchemaObjectRemoved<'materialized_view_removed', TableSchema>;
+
+/**
+ * Emitted after an in-place change to an existing materialized view — currently
+ * only `ALTER MATERIALIZED VIEW … SET TAGS`. Deliberately **distinct** from
+ * `materialized_view_added` (which the MV maintenance manager treats as a
+ * re-registration trigger): a tag change must invalidate dependent cached
+ * write-through plans WITHOUT re-registering maintenance or rebuilding the
+ * backing. No maintenance listener subscribes to this event.
+ */
+export type MaterializedViewModifiedEvent = SchemaObjectModified<'materialized_view_modified', TableSchema>;
+
+/** Emitted after a successful `REFRESH MATERIALIZED VIEW`. Carries the current schema. */
+export interface MaterializedViewRefreshedEvent {
+	type: 'materialized_view_refreshed';
+	schemaName: string;
+	objectName: string;
+	object: TableSchema;
+}
+
 // ── Module / collation events (name-only payload) ──────────────────
 
 interface SchemaNameEvent<Type extends string> {
@@ -72,6 +126,13 @@ export type SchemaChangeEvent =
 	| AssertionAddedEvent
 	| AssertionRemovedEvent
 	| AssertionModifiedEvent
+	| ViewAddedEvent
+	| ViewRemovedEvent
+	| ViewModifiedEvent
+	| MaterializedViewAddedEvent
+	| MaterializedViewRemovedEvent
+	| MaterializedViewModifiedEvent
+	| MaterializedViewRefreshedEvent
 	| ModuleAddedEvent
 	| ModuleRemovedEvent
 	| CollationAddedEvent

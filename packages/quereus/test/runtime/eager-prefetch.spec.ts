@@ -5,7 +5,7 @@ import { createStrictRowContextMap, wrapTableContextsStrict } from '../../src/ru
 import type { RuntimeContext } from '../../src/runtime/types.js';
 import type { Row } from '../../src/common/types.js';
 import type { RowDescriptor } from '../../src/planner/nodes/plan-node.js';
-import { makeDeferred } from '../util/controllable-source.js';
+import { makeDeferred, type Deferred } from '../util/controllable-source.js';
 
 function makeRuntimeContext(): RuntimeContext {
 	return {
@@ -183,7 +183,7 @@ describe('EagerPrefetch', () => {
 			// + the in-flight row whose push blocks), so awaiting a specific pulled[i]
 			// lets us observe the pump's exact progress deterministically — no sleeps.
 			let produced = 0;
-			const pulled: Array<ReturnType<typeof makeDeferred>> = Array.from({ length: 32 }, () => makeDeferred());
+			const pulled: Array<Deferred<void>> = Array.from({ length: 32 }, () => makeDeferred());
 			const source = (_inner: RuntimeContext): AsyncIterable<Row> => (async function* () {
 				for (let i = 0; i < 1_000_000; i++) {
 					produced++;

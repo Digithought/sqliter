@@ -15,6 +15,9 @@ import {
 	createScalarFunction,
 	createTableValuedFunction,
 	FunctionFlags,
+	scalarReturn,
+	TEXT_RETURN,
+	INTEGER_RETURN,
 	TEXT_TYPE,
 	INTEGER_TYPE,
 } from '@quereus/quereus';
@@ -27,20 +30,6 @@ export const manifest = {
 	provides: {
 		functions: true,
 	},
-};
-
-const TEXT_SCALAR = {
-	typeClass: 'scalar' as const,
-	logicalType: TEXT_TYPE,
-	nullable: true,
-	isReadOnly: true,
-};
-
-const INTEGER_SCALAR = {
-	typeClass: 'scalar' as const,
-	logicalType: INTEGER_TYPE,
-	nullable: true,
-	isReadOnly: true,
 };
 
 const DETERMINISTIC_UTF8 = FunctionFlags.UTF8 | FunctionFlags.DETERMINISTIC;
@@ -119,37 +108,37 @@ export default function register(_db: Database, _config: Record<string, SqlValue
 		functions: [
 			{
 				schema: createScalarFunction(
-					{ name: 'reverse', numArgs: 1, flags: DETERMINISTIC_UTF8, returnType: TEXT_SCALAR },
+					{ name: 'reverse', numArgs: 1, flags: DETERMINISTIC_UTF8, returnType: TEXT_RETURN },
 					reverse,
 				),
 			},
 			{
 				schema: createScalarFunction(
-					{ name: 'title_case', numArgs: 1, flags: DETERMINISTIC_UTF8, returnType: TEXT_SCALAR },
+					{ name: 'title_case', numArgs: 1, flags: DETERMINISTIC_UTF8, returnType: TEXT_RETURN },
 					titleCase,
 				),
 			},
 			{
 				schema: createScalarFunction(
-					{ name: 'repeat', numArgs: 2, flags: DETERMINISTIC_UTF8, returnType: TEXT_SCALAR },
+					{ name: 'repeat', numArgs: 2, flags: DETERMINISTIC_UTF8, returnType: TEXT_RETURN },
 					repeat,
 				),
 			},
 			{
 				schema: createScalarFunction(
-					{ name: 'slugify', numArgs: 1, flags: DETERMINISTIC_UTF8, returnType: TEXT_SCALAR },
+					{ name: 'slugify', numArgs: 1, flags: DETERMINISTIC_UTF8, returnType: TEXT_RETURN },
 					slugify,
 				),
 			},
 			{
 				schema: createScalarFunction(
-					{ name: 'word_count', numArgs: 1, flags: DETERMINISTIC_UTF8, returnType: INTEGER_SCALAR },
+					{ name: 'word_count', numArgs: 1, flags: DETERMINISTIC_UTF8, returnType: INTEGER_RETURN },
 					wordCount,
 				),
 			},
 			{
 				schema: createScalarFunction(
-					{ name: 'str_concat', numArgs: -1, flags: DETERMINISTIC_UTF8, returnType: TEXT_SCALAR },
+					{ name: 'str_concat', numArgs: -1, flags: DETERMINISTIC_UTF8, returnType: TEXT_RETURN },
 					strConcat,
 				),
 			},
@@ -164,8 +153,8 @@ export default function register(_db: Database, _config: Record<string, SqlValue
 							isReadOnly: true,
 							isSet: false,
 							columns: [
-								{ name: 'metric', type: { typeClass: 'scalar' as const, logicalType: TEXT_TYPE, nullable: false, isReadOnly: true } },
-								{ name: 'value', type: { typeClass: 'scalar' as const, logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true } },
+								{ name: 'metric', type: scalarReturn(TEXT_TYPE, false) },
+								{ name: 'value', type: scalarReturn(INTEGER_TYPE, false) },
 							],
 							keys: [],
 							rowConstraints: [],

@@ -1,6 +1,7 @@
 -- adapted from SQLite test/collate1-9.test
 -- Collation propagation across query parts: ORDER BY, JOIN, DISTINCT, set operations,
--- aggregates, indexes. Quereus supports BINARY (default), NOCASE, and RTRIM on TEXT.
+-- aggregates, key ranges. Quereus supports BINARY (default), NOCASE, and RTRIM on TEXT.
+-- The index-DDL-dependent parts live in 06.4.2.1-collation-index-access-paths.
 -- Existing 06.4.1-schema-case-insensitive covers schema-name case handling.
 -- Existing 03-expressions, 03.6-type-system, 07.5-window, 07.3-group-by-extras cover
 -- basic WHERE / BETWEEN / GROUP BY / PARTITION BY usage. This file fills the gaps.
@@ -128,32 +129,19 @@ drop table set_b;
 create table coll_agg (id integer primary key, val text collate NOCASE);
 insert into coll_agg values (1, 'apple'), (2, 'APPLE'), (3, 'Banana'), (4, 'banana'), (5, 'cherry');
 
--- MIN/MAX under NOCASE: comparison is case-insensitive, so first/last by case-folded order
--- (NOCASE-equal values may resolve to any of the case-equal members; engine picks first encountered)
-select min(val) as mn, max(val) as mx from coll_agg;
+-- MIN/MAX under NOCASE: comparison is case-insensitive, so first/last by case-folded
+-- order. NOCASE-equal values ('apple' vs 'APPLE') tie, so which spelling survives is
+-- unspecified — fold through upper() to assert the extremum without pinning the
+-- representative. 'cherry' is tie-free, so it may be asserted verbatim.
+select upper(min(val)) as mn, max(val) as mx from coll_agg;
 → [{"mn":"APPLE","mx":"cherry"}]
 
 drop table coll_agg;
 
--- =============================================================================
--- INDEX with COLLATE expression: Quereus does not support indexes on expressions
--- =============================================================================
-
-create table coll_idx (id integer primary key, name text);
-insert into coll_idx values (1, 'Alice'), (2, 'BOB'), (3, 'charlie'), (4, 'Bob');
-
-create index idx_name_nc on coll_idx (name collate NOCASE);
--- error: Indices on expressions are not supported
-
--- Equality search using inline COLLATE NOCASE on the predicate (no index)
-select id from coll_idx where name = 'bob' collate NOCASE order by id;
-→ [{"id":2},{"id":4}]
-
--- Default BINARY equality (no COLLATE override) finds exact case
-select id from coll_idx where name = 'BOB' order by id;
-→ [{"id":2}]
-
-drop table coll_idx;
+-- The index-shaped sections — an explicit per-column COLLATE on a `create index`,
+-- and the seek/decline classification when a predicate's collation does not match
+-- the index's — live in 06.4.2.1-collation-index-access-paths; they need standalone
+-- CREATE INDEX.
 
 -- =============================================================================
 -- COLLATE in CASE expression
@@ -167,3 +155,318 @@ select id, case when status = 'active' collate NOCASE then 'match' else 'other' 
 → [{"id":1,"r":"match"},{"id":2,"r":"other"},{"id":3,"r":"other"},{"id":4,"r":"match"}]
 
 drop table coll_case;
+
+-- =============================================================================
+-- Simple CASE resolves its collation exactly as `=` / IN do
+-- =============================================================================
+-- `case x when v` must decide each match the way `x = v` would, resolved
+-- independently per WHEN clause through the provenance lattice (explicit COLLATE >
+-- declared column collation > defaults > BINARY). Each assertion sits next to the
+-- corresponding `=` / `in` assertion so a future divergence shows up in one place.
+-- Regression for `simple-case-comparison-collation-and-type` (previously the
+-- simple-CASE match compared raw bytes under BINARY and disagreed with `=`).
+
+create table case_nc (id integer primary key, n text collate NOCASE);
+insert into case_nc values (1, 'bob');
+
+-- The declared NOCASE column collation governs all three surfaces alike.
+select n = 'BOB' as r from case_nc;
+→ [{"r":true}]
+
+select n in ('BOB') as r from case_nc;
+→ [{"r":true}]
+
+select case n when 'BOB' then 'hit' else 'miss' end as r from case_nc;
+→ [{"r":"hit"}]
+
+-- No spurious matches: a NOCASE-distinct value still misses.
+select case n when 'bill' then 'hit' else 'miss' end as r from case_nc;
+→ [{"r":"miss"}]
+
+drop table case_nc;
+
+-- Explicit COLLATE on the base expression, and on the WHEN operand, each govern
+-- the comparison on their own (a BINARY-defaulted column must not shadow either).
+create table case_bin (id integer primary key, n text);
+insert into case_bin values (1, 'a');
+
+select case n collate NOCASE when 'A' then 'hit' else 'miss' end as r from case_bin;
+→ [{"r":"hit"}]
+
+select case n when 'A' collate NOCASE then 'hit' else 'miss' end as r from case_bin;
+→ [{"r":"hit"}]
+
+-- Desugared parity: the same operand pair under `=`.
+select (n collate NOCASE = 'A') as r from case_bin;
+→ [{"r":true}]
+
+-- Plain BINARY stays case-sensitive.
+select case n when 'A' then 'hit' else 'miss' end as r from case_bin;
+→ [{"r":"miss"}]
+
+drop table case_bin;
+
+-- Per-clause resolution: clause 1 resolves under the column's NOCASE, clause 2
+-- under its own explicit RTRIM, clause 3 under an explicit BINARY. Mirrors how
+-- BETWEEN resolves its two bounds independently.
+create table case_mix (id integer primary key, n text collate NOCASE);
+insert into case_mix values (1, 'bob'), (2, 'cat  '), (3, 'dog');
+
+select id, case n
+             when 'BOB' then 'nocase-hit'
+             when 'cat' collate RTRIM then 'rtrim-hit'
+             when 'DOG' collate BINARY then 'binary-hit'
+             else 'miss'
+           end as r
+  from case_mix order by id;
+→ [{"id":1,"r":"nocase-hit"},{"id":2,"r":"rtrim-hit"},{"id":3,"r":"miss"}]
+
+drop table case_mix;
+
+-- Collation conflict: an explicit COLLATE on the base AND a different explicit
+-- COLLATE on a WHEN operand is the same error `=` raises for that operand pair.
+create table case_conflict (id integer primary key, n text);
+insert into case_conflict values (1, 'a');
+
+select case n collate RTRIM when 'A' collate NOCASE then 'hit' else 'miss' end as r
+  from case_conflict;
+-- error: conflicting COLLATE clauses in comparison
+
+-- Same pair under `=` — identical error.
+select (n collate RTRIM = 'A' collate NOCASE) as r from case_conflict;
+-- error: conflicting COLLATE clauses in comparison
+
+-- Declared-collation conflict between two NOCASE/RTRIM columns is the ambiguity error.
+create table case_conflict2 (id integer primary key, a text collate NOCASE, b text collate RTRIM);
+insert into case_conflict2 values (1, 'x', 'x');
+
+select case a when b then 'hit' else 'miss' end as r from case_conflict2;
+-- error: ambiguous collation for comparison
+
+drop table case_conflict2;
+drop table case_conflict;
+
+-- A searched CASE is unaffected — its WHEN is an ordinary boolean expression whose
+-- own comparison already resolved through the lattice.
+create table case_searched (id integer primary key, n text collate NOCASE);
+insert into case_searched values (1, 'bob');
+
+select case when n = 'BOB' then 'hit' else 'miss' end as r from case_searched;
+→ [{"r":"hit"}]
+
+drop table case_searched;
+
+-- =============================================================================
+-- COLLATE on a BETWEEN *bound* (scan form)
+-- =============================================================================
+-- BETWEEN desugars to `expr >= lo AND expr <= hi`; each comparison resolves its
+-- collation independently through the provenance lattice (explicit COLLATE >
+-- declared column collation > defaults), so a COLLATE on a bound governs that
+-- bound's comparison. The tested column's implicit BINARY default must NOT
+-- shadow an explicit bound COLLATE. Regression for `collate-on-between-bound`.
+
+create table btw (id integer primary key, name text);
+insert into btw values (1, 'Alice'), (2, 'BOB'), (3, 'charlie'), (4, 'Bob');
+
+-- Lower bound carries COLLATE NOCASE: `name >= 'bob' (NOCASE) AND name <= 'bob' (BINARY)`.
+-- 'BOB'/'Bob' are NOCASE-equal to 'bob' (lower passes) and BINARY-less-or-equal to 'bob'
+-- (upper passes). Previously returned [] because the BINARY column collation clobbered
+-- the bound's NOCASE.
+select id from btw where name between 'bob' collate NOCASE and 'bob' order by id;
+→ [{"id":2},{"id":4}]
+
+-- expr-side COLLATE stays correct (both comparisons inherit NOCASE).
+select id from btw where name collate NOCASE between 'bob' and 'bob' order by id;
+→ [{"id":2},{"id":4}]
+
+-- Desugared parity: the two-comparison form resolves identically per-bound.
+select id from btw where name >= 'bob' collate NOCASE and name <= 'bob' order by id;
+→ [{"id":2},{"id":4}]
+
+-- Upper bound carries the COLLATE: `name >= 'BOB' (BINARY) AND name <= 'bob' (NOCASE)`.
+select id from btw where name between 'BOB' and 'bob' collate NOCASE order by id;
+→ [{"id":2},{"id":4}]
+
+-- Desugared parity for the upper-collated form.
+select id from btw where name >= 'BOB' and name <= 'bob' collate NOCASE order by id;
+→ [{"id":2},{"id":4}]
+
+-- NOT BETWEEN with a collated lower bound = `v < 'bob' (NOCASE) OR v > 'bob' (BINARY)`:
+-- the complement of the between rows, so 'Alice' (id 1) and 'charlie' (id 3).
+select id from btw where name not between 'bob' collate NOCASE and 'bob' order by id;
+→ [{"id":1},{"id":3}]
+
+drop table btw;
+
+-- The BETWEEN-bound-over-an-index classification lives in
+-- 06.4.2.1-collation-index-access-paths.
+
+-- =============================================================================
+-- Collation-matched non-BINARY range / BETWEEN over a matching-collation KEY
+-- =============================================================================
+-- A NOCASE (or RTRIM) range whose predicate collation matches the KEY collation
+-- uses a seek on BOTH backends: the in-memory vtab threads the key collation
+-- into the bound filter + early-termination, and the store compares pushed bounds
+-- under the column's declared collation in its post-fetch row filter
+-- (StoreTable.compareValues) — both advertise `honorsCollatedRangeBounds`. The seek
+-- drops the residual Filter, so these rows are produced by the module's own bound
+-- filter. Result-only here so both backends are asserted identically; plan-shape
+-- assertions live in test/optimizer/range-seek-collation-bounds.spec.ts (memory) and
+-- packages/quereus-store/test/pushdown.spec.ts (store). Regression for
+-- `memory-range-seek-collation-bounds` and `store-range-seek-collation-bounds`.
+
+-- NOCASE primary-key range. PK values are NOCASE-distinct, but their BINARY order
+-- ('Banana','CHERRY','apple','date') differs from NOCASE order ('apple','Banana',
+-- 'CHERRY','date'), so a BINARY bound filter would under-fetch.
+create table rng_pk_nc (name text collate NOCASE primary key, n integer);
+insert into rng_pk_nc values ('apple', 1), ('Banana', 2), ('CHERRY', 3), ('date', 4);
+
+select n from rng_pk_nc where name > 'banana' order by n;
+→ [{"n":3},{"n":4}]
+
+select n from rng_pk_nc where name between 'banana' and 'cherry' order by n;
+→ [{"n":2},{"n":3}]
+
+-- Mismatch negative control: an explicit BINARY bound collation does not match the
+-- NOCASE PK, so the access path still declines the seek (scan + residual) on both
+-- backends and returns the BINARY-correct rows (only 'date' is BINARY-> 'banana').
+select n from rng_pk_nc where name > 'banana' collate BINARY order by n;
+→ [{"n":4}]
+
+drop table rng_pk_nc;
+
+-- RTRIM primary-key range / BETWEEN. The bounds carry trailing spaces, so a raw
+-- BINARY bound filter would both over-fetch ('cat ' > 'cat' in bytes, but they are
+-- RTRIM-equal) and under-fetch ('cat ' < 'cat  ' in bytes, but RTRIM-equal).
+create table rng_pk_rt (val text collate RTRIM primary key, n integer);
+insert into rng_pk_rt values ('ant', 1), ('cat ', 2), ('dog', 3);
+
+-- 'cat ' RTRIM-equals the bound 'cat', so > excludes it.
+select n from rng_pk_rt where val > 'cat' order by n;
+→ [{"n":3}]
+
+-- The bound's trailing spaces are ignored: >= 'cat  ' includes the RTRIM-equal 'cat '.
+select n from rng_pk_rt where val >= 'cat  ' order by n;
+→ [{"n":2},{"n":3}]
+
+-- Both BETWEEN bounds trim: ['ant','cat'] keeps 'ant' and 'cat ', excludes 'dog'.
+select n from rng_pk_rt where val between 'ant  ' and 'cat  ' order by n;
+→ [{"n":1},{"n":2}]
+
+drop table rng_pk_rt;
+
+-- BINARY negative control: an EXPLICIT `collate BINARY` PK (explicit so the store
+-- does not reconcile the column to its NOCASE key-collation default) keeps plain
+-- BINARY range semantics on both backends — uppercase sorts before lowercase, so
+-- 'apple' and 'date' are BINARY-greater than 'CHERRY' while 'Banana' is not.
+create table rng_pk_b (name text collate BINARY primary key, n integer);
+insert into rng_pk_b values ('Banana', 1), ('apple', 2), ('CHERRY', 3), ('date', 4);
+
+select n from rng_pk_b where name > 'CHERRY' order by n;
+→ [{"n":2},{"n":4}]
+
+drop table rng_pk_b;
+
+-- The SECONDARY-index variants of these ranges (NOCASE and RTRIM) live in
+-- 06.4.2.1-collation-index-access-paths.
+
+-- min/max under the column's declared collation (not unconditional BINARY):
+-- NOCASE ranks 'a' below 'B', while BINARY would report mn=B, mx=a. The values
+-- carry no NOCASE ties, so the extrema are deterministic; under a tie ('a' vs
+-- 'A') which raw spelling survives is unspecified — same latitude as DISTINCT.
+create table mm_nc (id integer primary key, t text collate NOCASE);
+insert into mm_nc values (1, 'B'), (2, 'a');
+
+-- min/max agree with the ordering sites (order by … limit 1)
+select (min(t) = (select t from mm_nc order by t limit 1)) as min_agrees,
+       (max(t) = (select t from mm_nc order by t desc limit 1)) as max_agrees
+from mm_nc;
+→ [{"min_agrees":true,"max_agrees":true}]
+
+select min(t) as mn, max(t) as mx from mm_nc;
+→ [{"mn":"a","mx":"B"}]
+
+drop table mm_nc;
+
+-- =============================================================================
+-- nullif / greatest / least resolve their comparison exactly as `=` does
+-- =============================================================================
+-- All three builtins declare their arguments as one comparison group, so each
+-- call site resolves ONE collation through the same provenance lattice `=` uses
+-- (explicit COLLATE > declared column collation > defaults > BINARY) and
+-- compares under it. Each assertion sits next to the corresponding `=` form so
+-- a future divergence shows up in one place. Regression for
+-- `nullif-greatest-least-comparison-seam` (previously all three compared raw
+-- bytes under BINARY and disagreed with `=` on collated columns).
+
+create table nf (id integer primary key, n text collate NOCASE, m text collate NOCASE);
+insert into nf values (1, 'a', 'B');
+
+-- The declared NOCASE collation governs `=` and nullif alike.
+select (n = 'A') as r from nf;
+→ [{"r":true}]
+
+select nullif(n, 'A') as r from nf;
+→ [{"r":null}]
+
+-- A NOCASE-distinct value still comes through unchanged.
+select nullif(n, 'x') as r from nf;
+→ [{"r":"a"}]
+
+-- greatest/least rank under NOCASE: 'a' < 'B' (BINARY would rank 'B' < 'a').
+-- The values are NOCASE-distinct, so no tie-representative is pinned.
+select greatest(n, m) as g, least(n, m) as l from nf;
+→ [{"g":"B","l":"a"}]
+
+drop table nf;
+
+-- Explicit COLLATE on either operand governs the group (a BINARY-defaulted
+-- column must not shadow it) — same rule as `=`.
+create table nfx (id integer primary key, n text);
+insert into nfx values (1, 'a');
+
+select (n collate NOCASE = 'A') as r from nfx;
+→ [{"r":true}]
+
+select nullif(n collate NOCASE, 'A') as r from nfx;
+→ [{"r":null}]
+
+select nullif(n, 'A' collate NOCASE) as r from nfx;
+→ [{"r":null}]
+
+-- Plain BINARY stays case-sensitive.
+select nullif(n, 'A') as r from nfx;
+→ [{"r":"a"}]
+
+-- greatest/least under an explicit NOCASE: 'a' < 'B' (BINARY would flip both).
+select greatest(n collate NOCASE, 'B') as g, least(n collate NOCASE, 'B') as l from nfx;
+→ [{"g":"B","l":"a"}]
+
+-- An explicit-COLLATE conflict inside the group is the same error `=` raises
+-- for the same operand pair.
+select nullif(n collate NOCASE, 'A' collate RTRIM) as r from nfx;
+-- error: conflicting COLLATE clauses in comparison
+
+select greatest(n collate NOCASE, 'A' collate RTRIM) as r from nfx;
+-- error: conflicting COLLATE clauses in comparison
+
+select (n collate NOCASE = 'A' collate RTRIM) as r from nfx;
+-- error: conflicting COLLATE clauses in comparison
+
+drop table nfx;
+
+-- Declared-collation conflict between two differently-collated columns is the
+-- ambiguity error, matching `=`.
+create table nfc (id integer primary key, a text collate NOCASE, b text collate RTRIM);
+insert into nfc values (1, 'x', 'x');
+
+select (a = b) as r from nfc;
+-- error: ambiguous collation for comparison
+
+select nullif(a, b) as r from nfc;
+-- error: ambiguous collation for comparison
+
+select least(a, b) as r from nfc;
+-- error: ambiguous collation for comparison
+
+drop table nfc;

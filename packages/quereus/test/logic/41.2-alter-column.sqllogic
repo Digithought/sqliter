@@ -93,3 +93,276 @@ alter table t_pk alter column id drop not null;
 -- error: PRIMARY KEY
 
 drop table t_pk;
+
+-- ===================================
+-- 7. SET DATA TYPE text -> integer converts existing rows in place
+-- (values must be physically rewritten, not left as text, and a lookup on the
+-- column must find rows by the new numeric value; the secondary-index variant is
+-- 41.2.2-alter-column-retype-index-rebuild)
+-- ===================================
+
+create table t_conv (id integer primary key, v text);
+insert into t_conv values (1, '10'), (2, '9');
+alter table t_conv alter column v set data type integer;
+
+select id, v, typeof(v) from t_conv order by id;
+→ [{"id": 1, "v": 10, "typeof(v)": "integer"}, {"id": 2, "v": 9, "typeof(v)": "integer"}]
+
+select id from t_conv where v = 9;
+→ [{"id": 2}]
+
+drop table t_conv;
+
+-- ===================================
+-- 8. SET NOT NULL backfills existing NULL rows from the column default
+-- (no NULL may survive in the column after the ALTER succeeds)
+-- ===================================
+
+create table t_backfill (id integer primary key, v integer null default 7);
+insert into t_backfill values (1, null), (2, null), (3, 5);
+alter table t_backfill alter column v set not null;
+
+select id, v from t_backfill order by id;
+→ [{"id": 1, "v": 7}, {"id": 2, "v": 7}, {"id": 3, "v": 5}]
+
+select count(*) as n from t_backfill where v is null;
+→ [{"n": 0}]
+
+drop table t_backfill;
+
+-- ===================================
+-- 9. SET DATA TYPE conversion failure leaves ALL rows untouched
+-- (a row that converts must NOT be rewritten if a LATER row fails to
+-- convert — the ALTER is all-or-nothing, not partial)
+-- ===================================
+
+create table t_partial (id integer primary key, v text);
+insert into t_partial values (1, '10'), (2, 'abc');
+-- run
+
+alter table t_partial alter column v set data type integer;
+-- error: Cannot convert value
+
+-- Row 1 ('10') converted fine but row 2 ('abc') failed; neither may be
+-- rewritten. Both stay as their original text values under the unchanged type.
+select id, v, typeof(v) from t_partial order by id;
+→ [{"id": 1, "v": "10", "typeof(v)": "text"}, {"id": 2, "v": "abc", "typeof(v)": "text"}]
+
+drop table t_partial;
+
+-- ===================================
+-- 10. SET DATA TYPE within one storage class still validates values
+-- (text → date shares the TEXT storage class, but a value DATE cannot
+-- parse must reject the ALTER, leaving type and value untouched — the
+-- column must never declare DATE while holding 'hello')
+-- ===================================
+
+create table t_narrow (id integer primary key, v text);
+insert into t_narrow values (1, 'hello');
+-- run
+
+alter table t_narrow alter column v set data type date;
+-- error: Cannot convert value
+
+select v, typeof(v) from t_narrow;
+→ [{"v": "hello", "typeof(v)": "text"}]
+
+drop table t_narrow;
+
+-- ===================================
+-- 11. SET DATA TYPE within one storage class normalizes values
+-- (an accepted retype rewrites each value to the new type's canonical
+-- spelling — the state an INSERT would have produced. DATE compares
+-- BINARY over the stored text, so without the rewrite the row would be
+-- invisible to an equality lookup for the canonical date)
+-- ===================================
+
+create table t_norm (id integer primary key, v text);
+insert into t_norm values (1, '2024-06-05T00:00:00Z');
+alter table t_norm alter column v set data type date;
+
+select id, v from t_norm;
+→ [{"id": 1, "v": "2024-06-05"}]
+
+select id from t_norm where v = '2024-06-05';
+→ [{"id": 1}]
+
+drop table t_norm;
+
+-- ===================================
+-- 12. text → timespan normalizes human-readable durations to ISO 8601
+-- ===================================
+
+create table t_span (id integer primary key, v text);
+insert into t_span values (1, '1 hour');
+alter table t_span alter column v set data type timespan;
+
+select id, v from t_span;
+→ [{"id": 1, "v": "PT1H"}]
+
+-- TIMESPAN compares by elapsed time, so any equal-elapsed spelling finds the row.
+select id from t_span where v = 'PT60M';
+→ [{"id": 1}]
+
+drop table t_span;
+
+-- ===================================
+-- 13. Temporal → temporal narrowing: values re-parse under the new type
+-- (date → time converts as an INSERT would — a bare date carries an
+-- implicit 00:00:00; time → date rejects, a bare time holds no date)
+-- ===================================
+
+create table t_temporal (id integer primary key, v text);
+insert into t_temporal values (1, '2024-06-05');
+alter table t_temporal alter column v set data type date;
+alter table t_temporal alter column v set data type time;
+
+select id, v from t_temporal;
+→ [{"id": 1, "v": "00:00:00"}]
+
+drop table t_temporal;
+
+create table t_time (id integer primary key, v text);
+insert into t_time values (1, '14:30:00');
+alter table t_time alter column v set data type time;
+-- run
+
+alter table t_time alter column v set data type date;
+-- error: Cannot convert value
+
+select v from t_time;
+→ [{"v": "14:30:00"}]
+
+drop table t_time;
+
+-- ===================================
+-- 14. Alias retype (text → varchar(50)) stays schema-only
+-- (inferType flattens both to the same TEXT type; no value is scanned
+-- or rewritten, and declared lengths are not enforced)
+-- ===================================
+
+create table t_alias (id integer primary key, v text);
+insert into t_alias values (1, 'a value much longer than any varchar(2) would allow');
+alter table t_alias alter column v set data type varchar(2);
+
+select id, v from t_alias;
+→ [{"id": 1, "v": "a value much longer than any varchar(2) would allow"}]
+
+drop table t_alias;
+
+-- ===================================
+-- 15. Same-class retype inside a transaction: effective-row semantics
+-- (a pending illegal value the transaction can SEE rejects; the
+-- transaction's own pending rows are normalized along with the
+-- committed ones. The deleted-row half — a value only in a row the
+-- transaction DELETED does not block — is memory-only, in 41.2.1)
+-- ===================================
+
+create table t_tx (id integer primary key, v text);
+insert into t_tx values (1, '2024-01-01');
+begin;
+insert into t_tx values (2, 'bogus');
+-- run
+
+alter table t_tx alter column v set data type date;
+-- error: Cannot convert value
+
+rollback;
+begin;
+insert into t_tx values (4, '2024-06-05T00:00:00Z');
+alter table t_tx alter column v set data type date;
+
+-- The pending insert is already normalized in-transaction.
+select id, v from t_tx order by id;
+→ [{"id": 1, "v": "2024-01-01"}, {"id": 4, "v": "2024-06-05"}]
+
+commit;
+
+select id, v from t_tx order by id;
+→ [{"id": 1, "v": "2024-01-01"}, {"id": 4, "v": "2024-06-05"}]
+
+select id from t_tx where v = '2024-06-05';
+→ [{"id": 4}]
+
+drop table t_tx;
+
+-- ===================================
+-- 16. Structures keyed by the column follow the rewrite
+-- (normalization moves each value, so every index over the column must be
+-- rebuilt from the CONVERTED rows — otherwise an index-driven lookup still
+-- probes the pre-retype spelling and misses, and UNIQUE keeps enforcing on
+-- the old text)
+-- ===================================
+
+create table t_idx (id integer primary key, v text unique);
+insert into t_idx values (1, '2024-06-05T00:00:00Z'), (2, '2024-01-02');
+alter table t_idx alter column v set data type date;
+
+select id, v from t_idx order by v;
+→ [{"id": 2, "v": "2024-01-02"}, {"id": 1, "v": "2024-06-05"}]
+
+select id from t_idx where v = '2024-06-05';
+→ [{"id": 1}]
+
+-- UNIQUE now enforces over the NORMALIZED value: another spelling of a
+-- stored date is a duplicate.
+insert into t_idx values (3, '2024-06-05T00:00:00Z');
+-- error: UNIQUE constraint failed
+
+-- ...and a genuinely new date is still accepted, findable by either spelling.
+insert into t_idx values (4, '2024-07-04T00:00:00Z');
+select id, v from t_idx where v = '2024-07-04';
+→ [{"id": 4, "v": "2024-07-04"}]
+
+drop table t_idx;
+
+-- 16b. …the same inside the DDL transaction, where the structure keyed by the column
+-- is a SECONDARY INDEX, lives in 41.2.2-alter-column-retype-index-rebuild § 3.
+
+-- 16c. …and the pending-row collision the normalization creates is judged over the
+-- transaction's EFFECTIVE rows: the ALTER rejects and the transaction stays usable.
+create table t_txdup (id integer primary key, v text unique);
+insert into t_txdup values (1, '2024-06-05');
+begin;
+insert into t_txdup values (2, '2024-06-05T00:00:00Z');
+-- run
+
+alter table t_txdup alter column v set data type date;
+-- error: UNIQUE constraint failed
+
+-- the transaction survived: dropping the offending row lets the retry pass
+delete from t_txdup where id = 2;
+alter table t_txdup alter column v set data type date;
+commit;
+
+select id, v from t_txdup order by id;
+→ [{"id": 1, "v": "2024-06-05"}]
+
+drop table t_txdup;
+
+-- ===================================
+-- 17. Writes AFTER the retype, in the same transaction, see the new type
+-- (the rest of the transaction coerces and enforces under the retyped
+-- column, so a non-canonical spelling normalizes on the way in and
+-- duplicates the row it now equals)
+-- ===================================
+
+create table t_after (id integer primary key, v text unique);
+insert into t_after values (1, '2024-01-01');
+begin;
+alter table t_after alter column v set data type date;
+insert into t_after values (2, '2024-06-05T00:00:00Z');
+-- run
+
+select id, v from t_after order by id;
+→ [{"id": 1, "v": "2024-01-01"}, {"id": 2, "v": "2024-06-05"}]
+
+insert into t_after values (3, '2024-06-05');
+-- error: UNIQUE constraint failed
+
+commit;
+
+select id, v from t_after order by id;
+→ [{"id": 1, "v": "2024-01-01"}, {"id": 2, "v": "2024-06-05"}]
+
+drop table t_after;

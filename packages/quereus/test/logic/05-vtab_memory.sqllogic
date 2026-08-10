@@ -1,4 +1,4 @@
--- vtab_memory.sqllogic - Testing MemoryTable specific features, especially indexing
+-- vtab_memory.sqllogic - Testing MemoryTable specific features, especially access paths
 
 PRAGMA default_vtab_module='memory';
 
@@ -45,3 +45,6 @@ SELECT name FROM mem_t WHERE id > 1 AND age = 30;
 → [{"name":"David"}]
 
 DROP TABLE mem_t;
+
+-- Explicit unique-index collation governing enforcement lives in
+-- 05.0.1-vtab-memory-unique-index-collation (it needs standalone CREATE INDEX).

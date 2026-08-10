@@ -8,13 +8,15 @@ import {
 	type ConstantBinding,
 	type DomainConstraint,
 	type FunctionalDependency,
+	type InclusionDependency,
 } from './plan-node.js';
 import type { RelationType } from '../../common/datatype.js';
 import type { Scope } from '../scopes/scope.js';
 import { Cached } from '../../util/cached.js';
 import { StatusCode } from '../../common/types.js';
 import { quereusError } from '../../common/errors.js';
-import { propagateJoinFds } from './join-utils.js';
+import { propagateJoinFds, propagateJoinInds } from './join-utils.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 
 /**
  * The mode a FanOutLookupJoin branch contributes for one outer row:
@@ -152,8 +154,10 @@ export class FanOutLookupJoinNode extends PlanNode implements RelationalPlanNode
 		public readonly outerMode: FanOutOuterMode = 'serial',
 	) {
 		FanOutLookupJoinNode.validateConstruction(outer, branches, concurrencyCap, preserveAttributeIds, outerMode);
-		const branchCost = branches.reduce((acc, b) => acc + b.child.getTotalCost(), 0);
-		super(scope, outer.getTotalCost() + branchCost);
+		// Self-cost only: the outer and every branch child are in getChildren(), so
+		// their subtree costs flow in via getTotalCost(). The fan-out node's own
+		// overhead is negligible (it forks child sub-plans; no per-row work of its own).
+		super(scope, 0.01);
 		this.attributesCache = new Cached(() => this.buildAttributes());
 	}
 
@@ -264,6 +268,13 @@ export class FanOutLookupJoinNode extends PlanNode implements RelationalPlanNode
 		let equiv: ReadonlyArray<ReadonlyArray<number>> = outerPhys.equivClasses ?? [];
 		let bindings: ReadonlyArray<ConstantBinding> = outerPhys.constantBindings ?? [];
 		let domains: ReadonlyArray<DomainConstraint> = outerPhys.domainConstraints ?? [];
+		// INDs fold through the branch joins the same way FDs do: each fan-out
+		// branch is an inner/left join, so `propagateJoinInds` keeps the outer's
+		// seeded INDs (outer columns stay at their original indices) and unions in
+		// each inner branch's shifted INDs. Without this the FK-seeded INDs the
+		// JoinNode would have carried are lost the moment `rule-fanout-lookup-join`
+		// rewrites the join chain into this node.
+		let inds: ReadonlyArray<InclusionDependency> = outerPhys.inds ?? [];
 		let leftColCount = this.outer.getAttributes().length;
 
 		for (let i = 0; i < this.branches.length; i++) {
@@ -278,6 +289,7 @@ export class FanOutLookupJoinNode extends PlanNode implements RelationalPlanNode
 				equivClasses: equiv,
 				constantBindings: bindings,
 				domainConstraints: domains,
+				inds,
 			};
 			const merged = propagateJoinFds(
 				joinType,
@@ -293,6 +305,7 @@ export class FanOutLookupJoinNode extends PlanNode implements RelationalPlanNode
 			equiv = merged.equivClasses ?? [];
 			bindings = merged.constantBindings ?? [];
 			domains = merged.domainConstraints ?? [];
+			inds = propagateJoinInds(joinType, leftPhys, rightPhys, leftColCount) ?? [];
 			leftColCount = totalCols;
 		}
 
@@ -303,7 +316,8 @@ export class FanOutLookupJoinNode extends PlanNode implements RelationalPlanNode
 			equivClasses: equiv.length > 0 ? equiv : undefined,
 			constantBindings: bindings.length > 0 ? bindings : undefined,
 			domainConstraints: domains.length > 0 ? domains : undefined,
-			estimatedRows: this.computeEstimatedRows(),
+			inds: inds.length > 0 ? inds : undefined,
+			estimatedRows: this.computeEstimatedRows(childrenPhysical),
 		};
 	}
 
@@ -315,17 +329,25 @@ export class FanOutLookupJoinNode extends PlanNode implements RelationalPlanNode
 	 * branch preserves the outer row when empty, so its true factor is at least 1;
 	 * the child-estimate product is an upper-leaning approximation either way.)
 	 * Returns `undefined` only when the outer side itself has no estimate.
+	 *
+	 * `childrenPhysical` is supplied by `computePhysical` so the fan-out reads each
+	 * child's PHYSICAL cardinality (`getChildren()` order: outer, then one entry per
+	 * branch); the logical getter reads `undefined` through a physical access node.
+	 * Omitted by the `estimatedRows` getter, which is the pre-optimization view.
 	 */
-	private computeEstimatedRows(): number | undefined {
-		const outerEst = this.outer.estimatedRows;
+	private computeEstimatedRows(childrenPhysical?: readonly PhysicalProperties[]): number | undefined {
+		const rowsOf = (node: RelationalPlanNode, childIndex: number): number | undefined =>
+			childrenPhysical ? physicalSourceRows(childrenPhysical[childIndex], node) : node.estimatedRows;
+
+		const outerEst = rowsOf(this.outer, 0);
 		if (outerEst === undefined) return undefined;
 		let est = outerEst;
-		for (const b of this.branches) {
+		this.branches.forEach((b, i) => {
 			if (isCrossBranchMode(b.mode)) {
-				const childEst = b.child.estimatedRows;
+				const childEst = rowsOf(b.child, i + 1);
 				if (childEst !== undefined) est *= childEst;
 			}
-		}
+		});
 		return est;
 	}
 

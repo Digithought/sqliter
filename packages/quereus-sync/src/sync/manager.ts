@@ -5,9 +5,11 @@
  * Applications implement their own transport layer and call these methods.
  */
 
+import type { Database, LensDeploymentSnapshot } from '@quereus/quereus';
 import type { HLC } from '../clock/hlc.js';
 import type { SiteId } from '../clock/site.js';
 import type { ApplyResult, ChangeSet, Snapshot, SnapshotChunk, SnapshotProgress } from './protocol.js';
+import type { BasisTableLifecycleRecord } from '../metadata/basis-lifecycle.js';
 
 /**
  * Main sync manager interface.
@@ -43,7 +45,13 @@ export interface SyncManager {
    * Changes are applied atomically per transaction.
    * Conflicts are resolved using column-level LWW.
    *
-   * @param changes - Change sets received from a peer
+   * **Order-independent**: `changes` may be in any order and produces the same
+   * committed state as the HLC-ordered array — every ordering decision (which write
+   * survives, which DDL runs first, what the table row becomes) is made from the
+   * facts' HLCs, not from their position in the array. Callers assembling a batch
+   * from several senders, or passing one through an approval hook, need not sort it.
+   *
+   * @param changes - Change sets received from a peer, in any order
    * @returns Statistics about what was applied
    */
   applyChanges(changes: ChangeSet[]): Promise<ApplyResult>;
@@ -96,12 +104,147 @@ export interface SyncManager {
   getPeerSyncState(peerSiteId: SiteId): Promise<HLC | undefined>;
 
   /**
+   * Update the sent watermark for a peer — the highest HLC we have pushed to it
+   * and had acknowledged. Persisted separately from {@link updatePeerSyncState}
+   * (the received watermark) so a client can resume delta-push after a restart
+   * instead of re-sending its entire local history.
+   *
+   * @param peerSiteId - The peer we pushed to
+   * @param hlc - The HLC we have confirmed sent up to
+   */
+  updatePeerSentState(peerSiteId: SiteId, hlc: HLC): Promise<void>;
+
+  /**
+   * Get the sent watermark for a peer.
+   *
+   * @param peerSiteId - The peer to check
+   * @returns The highest HLC we have confirmed pushed, or undefined if none
+   */
+  getPeerSentState(peerSiteId: SiteId): Promise<HLC | undefined>;
+
+  /**
    * Prune expired tombstones.
    *
    * Should be called periodically to clean up old tombstones.
    * Returns the number of tombstones pruned.
    */
   pruneTombstones(): Promise<number>;
+
+  /**
+   * Prune quarantined out-of-basis straggler changes older than the retention
+   * horizon. A held change past the horizon was already outside the delivery
+   * guarantee. Call from the same periodic maintenance path as
+   * {@link pruneTombstones}. Returns the number of entries pruned.
+   */
+  pruneQuarantine(): Promise<number>;
+
+  /**
+   * Repair pass over the change log: delete every entry whose target record is
+   * already gone. Forward cleanup (`deleteRowVersionsAndLogEntries` / the change-log
+   * deletion in {@link pruneTombstones}) only stops *new* orphans — an entry whose
+   * record died before that cleanup existed is orphaned forever unless something
+   * scans the log itself. Nothing is incorrect while orphans remain (a resolved-to-
+   * `null` entry already produces no output), so this is a storage/scan-cost cleanup,
+   * safe to run at any time with no peer coordination.
+   *
+   * Host-driven — call from the same periodic maintenance path as
+   * {@link pruneTombstones} / {@link pruneQuarantine} / {@link evictExpiredBasisTables};
+   * the library adds no timer. Idempotent and cheap on a replica with nothing to
+   * repair: every entry resolves and none are deleted. Returns the number of
+   * entries removed.
+   */
+  repairChangeLog(): Promise<number>;
+
+  /**
+   * Replay held out-of-basis changes (`quarantine` + forwardable `store-and-forward`
+   * entries) into tables that have since reappeared in the local basis — the revival
+   * path of the unknown-table contract (`docs/migration.md` § 4 Contract). Each held
+   * change is resolved against the now-present table exactly like a fresh inbound
+   * change (LWW / tombstone-blocking / `allowResurrection`) and cleared from the hold
+   * on resolution, whether or not it applied.
+   *
+   * Host-driven — call from the same periodic maintenance path as
+   * {@link pruneTombstones} / {@link pruneQuarantine} / {@link evictExpiredBasisTables},
+   * or right after re-creating a table / applying an inbound `create_table`. The
+   * library adds no timer and never drains inline during {@link applyChanges}.
+   *
+   * Scope mirrors `QuarantineStore.list`: `(schema, table)` drains one table,
+   * `(schema)` a schema, `()` sweeps every held entry whose table is back. A no-op
+   * returning 0 without a `getTableSchema` oracle (a relay-only coordinator cannot
+   * tell which held tables are present). Returns the number of held entries drained
+   * (cleared from the hold). Fires `onHeldChangesDrained` once per drained table and
+   * `onRemoteChange` for the applied changes.
+   */
+  drainHeldChanges(schema?: string, table?: string): Promise<number>;
+
+  /**
+   * Cumulative unknown-table disposition stats since process start.
+   *
+   * `ignored` / `quarantined` / `forwarded` count diverted changes by
+   * disposition; `byTable` counts diverted changes per `schema.table` (the union
+   * across all dispositions — the per-disposition counters partition it).
+   * `forwarded` counts changes **held as forwardable at apply time** under the
+   * `store-and-forward` disposition (held once). `relayed` counts forwardable
+   * changes **re-offered through `getChangesSince`** — relay activity, distinct
+   * from `forwarded`: one held entry is relayed possibly many times until it GCs,
+   * so `relayed` grows with outbound relay traffic rather than with distinct
+   * stragglers. Mirrors the engine's `getMaterializedViewCollisionStats()` pattern
+   * (observe-only, in-memory).
+   */
+  getUnknownTableStats(): {
+    ignored: number;
+    quarantined: number;
+    forwarded: number;
+    relayed: number;
+    byTable: Map<string, number>;
+  };
+
+  // ============================================================================
+  // Basis-table lifecycle (legacy-table retirement bookkeeping)
+  // ============================================================================
+
+  /**
+   * Record one logical schema's lens deployment over its basis, updating the
+   * durable per-basis-table lifecycle classification (`docs/migration.md`
+   * § 2 Converge). Driven by the `notifyLensDeployment` engine hook, forwarded
+   * from the basis-backing store module.
+   *
+   * The snapshot is scoped to one logical schema, so each schema's directly-mapped
+   * contribution is stored separately (`mappedBy`) and the aggregate state ORs
+   * them — a basis table stays `directly-mapped` until the *last* mapper drops it.
+   * Transitions stamp `mappedSince` / `unmappedSince` and emit `onBasisTableLifecycle`.
+   *
+   * Advisory bookkeeping: a throwing call must never abort the deploy. The store
+   * forwarder wraps the listener in try/catch, so an exception here is logged and
+   * swallowed there.
+   */
+  recordLensDeployment(
+    db: Database,
+    logicalSchemaName: string,
+    snapshot: LensDeploymentSnapshot,
+  ): Promise<void>;
+
+  /**
+   * Read the persisted basis-table lifecycle records (survives restart — no
+   * in-memory-only state). Each record combines the static classification
+   * (`state` + `mappedSince` / `unmappedSince` / `detachedAt`) with the dynamic
+   * `lastDirectlyMappedWriteAt` signal and any captured `evictPolicy` override —
+   * the "safe to retire" reading is `state` is `derivation-source-only` /
+   * `detached` and the quiet clock is older than the effective horizon.
+   */
+  getBasisTableLifecycle(): Promise<BasisTableLifecycleRecord[]>;
+
+  /**
+   * Reclaim the local storage of every detached basis table quiet past its
+   * effective retention horizon (`docs/migration.md` § 4 Contract). Host-driven —
+   * call from the same periodic maintenance path as {@link pruneTombstones} /
+   * {@link pruneQuarantine}; the library adds no timer. A no-op when no
+   * `dropLocalTable` reclaim callback was wired (e.g. a relay-only coordinator).
+   * Returns the number of tables evicted. Fires `onBasisTableEvicted` per drop.
+   *
+   * @param now - Wall-clock ms used for horizon math (defaults to `Date.now()`).
+   */
+  evictExpiredBasisTables(now?: number): Promise<number>;
 
   // ============================================================================
   // Streaming Snapshot API
@@ -139,6 +282,31 @@ export interface SyncManager {
    * @param snapshotId - The snapshot ID to get checkpoint for
    */
   getSnapshotCheckpoint(snapshotId: string): Promise<SnapshotCheckpoint | undefined>;
+
+  /**
+   * List every saved checkpoint for an interrupted snapshot apply.
+   *
+   * A non-empty result means this replica's data is PARTIAL: a snapshot apply
+   * cleared existing sync metadata and did not reach its footer. Callers use
+   * this to discover a resumable transfer whose `snapshotId` they no longer
+   * hold (it only ever arrived in the snapshot's header chunk).
+   *
+   * Ordering is unspecified; pick by `createdAt` when more than one exists.
+   */
+  listSnapshotCheckpoints(): Promise<SnapshotCheckpoint[]>;
+
+  /**
+   * Discard a saved checkpoint without applying anything.
+   *
+   * `applySnapshotStream` already clears its own checkpoint on success; this is
+   * for callers abandoning a transfer they will not resume (e.g. discarding
+   * superseded checkpoints when several are present).
+   *
+   * Calling this for an IN-FLIGHT apply's snapshotId is not guarded: the apply
+   * simply re-saves the record at its next flush, so nothing corrupts — the
+   * transfer only loses one resume position in the interim.
+   */
+  clearSnapshotCheckpoint(snapshotId: string): Promise<void>;
 
   /**
    * Resume a snapshot transfer from a checkpoint.

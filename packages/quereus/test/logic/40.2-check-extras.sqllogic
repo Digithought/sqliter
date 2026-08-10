@@ -170,3 +170,514 @@ insert into t_compound_gen (a, b) values (1, 2);
 select g from t_compound_gen;
 → [{"g":1}]
 drop table t_compound_gen;
+
+-- ===================================
+-- 8. Deferred subquery CHECK reads the transaction's OWN writes, not a
+-- snapshot frozen at row-write time. Regression for
+-- bug-deferred-subquery-check-reads-stale-state: `x in (select …)` builds as
+-- an InNode, which the old subquery test (a list of specific scalar node
+-- types, since replaced by the structural hasRelationalDescendant) did not
+-- recognize as subquery-bearing, so the check ran immediately like an
+-- ordinary CHECK instead of deferring to COMMIT.
+-- ===================================
+
+-- read-your-own-writes: the value the check needs arrives LATER in the same
+-- transaction. Immediate (buggy) evaluation would reject this at the INSERT
+-- into zt, before zl has the row.
+create table zl (code text primary key);
+create table zt (id integer primary key, code text,
+	constraint zt_ck check (code in (select code from zl)));
+
+begin;
+insert into zt values (1, 'a');
+insert into zl values ('a');
+commit;
+
+select id, code from zt;
+→ [{"id":1,"code":"a"}]
+
+drop table zt;
+drop table zl;
+
+-- the reverse: the value the check needs is REMOVED later in the same
+-- transaction. Immediate (buggy) evaluation would pass at the INSERT and
+-- never re-check after the delete; a genuinely deferred check catches it at
+-- COMMIT.
+create table zl2 (code text primary key);
+insert into zl2 values ('a');
+create table zt2 (id integer primary key, code text,
+	constraint zt2_ck check (code in (select code from zl2)));
+
+begin;
+insert into zt2 values (1, 'a');
+delete from zl2 where code = 'a';
+commit;
+-- the full message is asserted, not merely "CHECK": a deferred violation must be
+-- attributed exactly like an immediate one (name + expression hint), which is only
+-- true because the queued evaluator throws its own message rather than falling
+-- through to DeferredConstraintQueue's generic name-only fallback.
+-- error: CHECK constraint failed: zt2_ck (code in (select code from zl2))
+
+select count(*) as cnt from zt2;
+→ [{"cnt":0}]
+
+drop table zt2;
+drop table zl2;
+
+-- negative control: a plain value-list `in (...)` has no relational child and
+-- must stay immediate — it still fails INSIDE the open transaction, at the
+-- INSERT itself, not deferred to COMMIT.
+create table zt3 (id integer primary key, code text,
+	constraint zt3_ck check (code in ('a', 'b')));
+
+begin;
+insert into zt3 values (1, 'z');
+-- the immediate half of the parity assertion above: same message shape, produced
+-- by the row-time path.
+-- error: CHECK constraint failed: zt3_ck (code in ('a', 'b'))
+rollback;
+
+select count(*) as cnt from zt3;
+→ [{"cnt":0}]
+
+drop table zt3;
+
+-- ===================================
+-- Table-qualified self-references in CHECK expressions
+-- `t.col` (or `schema.t.col`) on the owning table resolves like the
+-- unqualified column: NEW for INSERT/UPDATE, OLD for DELETE. Regression for
+-- the qualified form being accepted at DDL time but failing to resolve at
+-- the first write ("t.qty isn't a column").
+-- ===================================
+
+create table t_selfq (
+	id integer primary key,
+	qty integer,
+	constraint chk_qty check (t_selfq.qty > 0)
+);
+
+insert into t_selfq values (1, 5);
+
+select qty from t_selfq where id = 1;
+→ [{"qty":5}]
+
+insert into t_selfq values (2, -1);
+-- error: chk_qty
+
+update t_selfq set qty = 7 where id = 1;
+
+select qty from t_selfq where id = 1;
+→ [{"qty":7}]
+
+update t_selfq set qty = -3 where id = 1;
+-- error: chk_qty
+
+drop table t_selfq;
+
+-- schema-qualified self-reference
+create table t_selfq_s (
+	id integer primary key,
+	qty integer,
+	check (main.t_selfq_s.qty < 100)
+);
+
+insert into t_selfq_s values (1, 50);
+
+insert into t_selfq_s values (2, 200);
+-- error: CHECK
+
+drop table t_selfq_s;
+
+-- DELETE-op check: the qualified self-reference names the OLD row
+create table t_selfq_d (
+	id integer primary key,
+	qty integer,
+	constraint no_del_stock check on delete (t_selfq_d.qty = 0)
+);
+
+insert into t_selfq_d values (1, 0);
+insert into t_selfq_d values (2, 9);
+
+delete from t_selfq_d where id = 1;
+
+delete from t_selfq_d where id = 2;
+-- error: no_del_stock
+
+drop table t_selfq_d;
+
+-- correlated: the qualified self-reference reaches into a subquery over
+-- ANOTHER table (auto-deferred; the other table has no same-named column,
+-- so the reference still binds to the constraint row)
+create table caps (k integer primary key, cap integer);
+insert into caps values (1, 50);
+
+create table t_selfq_c (
+	id integer primary key,
+	qty integer,
+	constraint under_cap check (exists (select 1 from caps where t_selfq_c.qty <= caps.cap))
+);
+
+insert into t_selfq_c values (1, 10);
+
+select qty from t_selfq_c;
+→ [{"qty":10}]
+
+insert into t_selfq_c values (2, 99);
+-- error: under_cap
+
+drop table t_selfq_c;
+drop table caps;
+
+-- a subquery that REBINDS the owning table's name shadows the qualified
+-- self-reference (normal scoping): the inner `t_selfq_r.qty` is the
+-- subquery's row, so the max-row check accepts equal-to-max and rejects above
+create table t_selfq_r (
+	id integer primary key,
+	qty integer,
+	constraint within_max check (qty <= (select coalesce(max(t_selfq_r.qty), 10) from t_selfq_r))
+);
+
+insert into t_selfq_r values (1, 10);
+
+select qty from t_selfq_r;
+→ [{"qty":10}]
+
+drop table t_selfq_r;
+
+-- a subquery over a VIEW that exposes the same name blocks the strip, exactly as a
+-- real table exposing it would: the column-source resolver reads a view's published
+-- columns (explicit list, or the body's projection / star), so the qualified
+-- self-reference is NOT rewritten to a bare name the view would capture. The ref then
+-- stays qualified and fails to resolve at write time — loud, instead of silently
+-- comparing the view's column to itself (what the view-blind resolver used to produce).
+create table t_selfq_vsrc (k integer primary key, n integer);
+create view t_selfq_vw as select n from t_selfq_vsrc;
+insert into t_selfq_vsrc values (1, 10);
+
+create table t_selfq_v (
+	id integer primary key,
+	n integer,
+	constraint over_view check ((select count(*) from t_selfq_vw where t_selfq_vw.n > t_selfq_v.n) = 0)
+);
+
+insert into t_selfq_v values (1, 50);
+-- error: t_selfq_v.n isn't a column
+
+drop table t_selfq_v;
+
+-- ...and when the view does NOT expose the name, the strip proceeds and the
+-- self-reference correlates to the constraint row, same as the real-table case above.
+create view t_selfq_vk as select k from t_selfq_vsrc;
+
+create table t_selfq_v2 (
+	id integer primary key,
+	m integer,
+	constraint under_view check ((select count(*) from t_selfq_vk where k > t_selfq_v2.m) = 0)
+);
+
+insert into t_selfq_v2 values (1, 50);
+
+select m from t_selfq_v2;
+→ [{"m":50}]
+
+insert into t_selfq_v2 values (2, 0);
+-- error: under_view
+
+drop table t_selfq_v2;
+drop view t_selfq_vk;
+drop view t_selfq_vw;
+drop table t_selfq_vsrc;
+
+-- ===================================
+-- CHECK comparisons resolve declared column collations, exactly like read-path
+-- queries (and ALTER backfill validation / assertion enforcement, which compile
+-- plain SQL). Ticket check-extraction-collation-blind-fds. Collation resolution
+-- is the symmetric provenance lattice (explicit COLLATE > explicitly-declared
+-- column collation > defaulted collation > BINARY; ticket
+-- comparison-collation-provenance-and-precedence) — so `b = c` and `c = b`
+-- resolve identically: the declared NOCASE outranks b's defaulted BINARY from
+-- either side, matching `select ... where` of the same spelling.
+-- ===================================
+
+-- bare col = col, NOCASE declared on one operand: comparison is NOCASE.
+create table chk_coll (id integer primary key, b text, c text collate nocase, check (b = c));
+insert into chk_coll values (1, 'X', 'x');
+insert into chk_coll values (2, 'abc', 'ABC');
+select count(*) as cnt from chk_coll;
+→ [{"cnt":2}]
+-- read path agrees: the same comparison matches both rows.
+select count(*) as cnt from chk_coll where b = c;
+→ [{"cnt":2}]
+insert into chk_coll values (3, 'X', 'y');
+-- error: CHECK
+drop table chk_coll;
+
+-- flipped spelling resolves the SAME collation: the declared NOCASE wins over
+-- the plain column's defaulted BINARY regardless of operand order, so the
+-- case-variant pair is accepted, again matching the read path.
+create table chk_coll_flip (id integer primary key, b text, c text collate nocase, check (c = b));
+insert into chk_coll_flip values (1, 'x', 'x');
+insert into chk_coll_flip values (2, 'X', 'x');
+select count(*) as cnt from chk_coll_flip where c = b;
+→ [{"cnt":2}]
+insert into chk_coll_flip values (3, 'X', 'y');
+-- error: CHECK
+drop table chk_coll_flip;
+
+-- col = literal: a literal contributes no collation, so the declared NOCASE
+-- drives the comparison from either side.
+create table chk_coll_lit (id integer primary key, c text collate nocase, check (c = 'abc'));
+insert into chk_coll_lit values (1, 'ABC');
+insert into chk_coll_lit values (2, 'aBc');
+select count(*) as cnt from chk_coll_lit;
+→ [{"cnt":2}]
+insert into chk_coll_lit values (3, 'abd');
+-- error: CHECK
+drop table chk_coll_lit;
+
+-- an explicit COLLATE BINARY wrapper still overrides the declared collation.
+create table chk_coll_bin (id integer primary key, b text, c text collate nocase, check (b = c collate binary));
+insert into chk_coll_bin values (1, 'x', 'x');
+insert into chk_coll_bin values (2, 'X', 'x');
+-- error: CHECK
+drop table chk_coll_bin;
+
+-- wrapper-honored control: an explicit NOCASE wrapper over plain BINARY
+-- columns keeps accepting case-variants (unchanged behavior).
+create table chk_coll_wrap (id integer primary key, b text, c text, check (b = c collate nocase));
+insert into chk_coll_wrap values (1, 'x', 'X');
+insert into chk_coll_wrap values (2, 'x', 'y');
+-- error: CHECK
+drop table chk_coll_wrap;
+
+-- UPDATE-path: an OLD reference resolves the same declared collation.
+create table chk_coll_upd (id integer primary key, c text collate nocase, constraint same_code check on update (old.c = c));
+insert into chk_coll_upd values (1, 'ABC');
+update chk_coll_upd set c = 'abc' where id = 1;
+select c from chk_coll_upd;
+→ [{"c":"abc"}]
+update chk_coll_upd set c = 'xyz' where id = 1;
+-- error: same_code
+drop table chk_coll_upd;
+
+-- deferred CHECK (auto-deferred by the subquery) resolves the same declared
+-- collation as the immediate path.
+create table chk_coll_def (id integer primary key, c text collate nocase, check (c = (select 'abc')));
+insert into chk_coll_def values (1, 'ABC');
+select c from chk_coll_def;
+→ [{"c":"ABC"}]
+insert into chk_coll_def values (2, 'xyz');
+-- error: CHECK
+drop table chk_coll_def;
+
+-- ===================================
+-- Row-invariant gate on CHECK-derived planner facts. Ticket
+-- check-extraction-rowop-mask-transition-checks. A CHECK contributes
+-- FDs/bindings/domains to the optimizer only when its operation mask covers
+-- insert+update and it has no `old.` row-image reference — otherwise rows the
+-- check never enforced can legally violate it, and folding a matching WHERE
+-- to empty returns wrong results.
+-- ===================================
+
+-- insert-only check never sees an UPDATE: the stored row may violate it, so
+-- no fact may be minted from it.
+create table t_riv_ins (id integer primary key, status text, check on insert (status = 'a')) using memory;
+insert into t_riv_ins values (1, 'a');
+update t_riv_ins set status = 'b' where id = 1;
+select * from t_riv_ins where status = 'b';
+→ [{"id":1,"status":"b"}]
+drop table t_riv_ins;
+
+-- update-only transition check `old.a = b` must not extract as the same-row
+-- equality a = b (it never ran on these inserts at all).
+create table t_riv_upd (id integer primary key, a text, b text unique, check on update (old.a = b)) using memory;
+insert into t_riv_upd values (1, 'x', 'y1'), (2, 'x', 'y2');
+select * from t_riv_upd where a = 'x' order by id;
+→ [{"id":1,"a":"x","b":"y1"},{"id":2,"a":"x","b":"y2"}]
+drop table t_riv_upd;
+
+-- old. under the DEFAULT mask: the check runs on insert but passes because
+-- OLD is NULL there — a transition constraint, not a row invariant, so the
+-- mask gate alone is insufficient and the old.-screen must catch it.
+create table t_riv_old (id integer primary key, a text, b text, check (old.a = b)) using memory;
+insert into t_riv_old values (1, 'x', 'y1');
+select * from t_riv_old where a = 'x';
+→ [{"id":1,"a":"x","b":"y1"}]
+drop table t_riv_old;
+
+-- delete-only check constrains no stored row at all.
+create table t_riv_del (id integer primary key, v integer, check on delete (v > 0)) using memory;
+insert into t_riv_del values (1, -5);
+select * from t_riv_del where v <= 0;
+→ [{"id":1,"v":-5}]
+drop table t_riv_del;
+
+-- control: default-mask check keeps folding contradictions to empty.
+create table t_riv_def (id integer primary key, v integer, check (v > 0)) using memory;
+insert into t_riv_def values (1, 5);
+select * from t_riv_def where v <= 0;
+→ []
+drop table t_riv_def;
+
+-- control: explicit insert,update mask qualifies exactly like the default.
+create table t_riv_iu (id integer primary key, v integer, check on insert, update (v > 0)) using memory;
+insert into t_riv_iu values (1, 5);
+select * from t_riv_iu where v <= 0;
+→ []
+drop table t_riv_iu;
+
+-- control: new.-qualified check is same-row (NEW is the stored image); its
+-- facts are sound and matching rows are returned correctly.
+create table t_riv_new (id integer primary key, a text, b text, check (new.a = b)) using memory;
+insert into t_riv_new values (1, 'x', 'x');
+select * from t_riv_new where a = 'x';
+→ [{"id":1,"a":"x","b":"x"}]
+drop table t_riv_new;
+
+-- control: new.-qualified facts still fold contradictions end-to-end, same as
+-- the bare spelling.
+create table t_riv_newfold (id integer primary key, v integer, check (new.v > 0)) using memory;
+insert into t_riv_newfold values (1, 5);
+select * from t_riv_newfold where v <= 0;
+→ []
+drop table t_riv_newfold;
+
+-- ===================================
+-- CHECK truthiness must match the engine-wide isTruthy rule, not a narrower
+-- `result === false || result === 0` test. Integer literals evaluate to
+-- bigint at runtime, and CHECK must reject bigint-zero and the string '0'
+-- exactly like FilterNode / WHERE does.
+-- ===================================
+
+create table t_truthy (id integer primary key, v any, check (v));
+
+insert into t_truthy values (1, 5);
+insert into t_truthy values (2, true);
+
+select count(*) as cnt from t_truthy;
+→ [{"cnt":2}]
+
+-- bare integer literal is bigint 0n at runtime — must fail like SQLite's 0.
+insert into t_truthy values (3, 0);
+-- error: CHECK
+
+-- string '0' is falsy under isTruthy's numeric conversion — must fail too.
+insert into t_truthy values (4, '0');
+-- error: CHECK
+
+-- boolean false still fails (control, unchanged).
+insert into t_truthy values (5, false);
+-- error: CHECK
+
+select count(*) as cnt from t_truthy;
+→ [{"cnt":2}]
+
+drop table t_truthy;
+
+-- A subquery-bearing CHECK auto-defers to the DeferredConstraintQueue path,
+-- which shares the same isTruthy fix. `check ((select v))` yields the row's own
+-- v (bigint 0n for v=0) through the deferred evaluator — must reject like the
+-- immediate path, not slip past a narrow `value === false || value === 0`.
+create table t_defer (id integer primary key, v any, check ((select v)));
+
+insert into t_defer values (1, 5);
+select count(*) as cnt from t_defer;
+→ [{"cnt":1}]
+
+-- deferred CHECK result is bigint 0n → must fail.
+insert into t_defer values (2, 0);
+-- error: CHECK
+
+-- deferred CHECK result is string '0' → falsy under isTruthy → must fail.
+insert into t_defer values (3, '0');
+-- error: CHECK
+
+select count(*) as cnt from t_defer;
+→ [{"cnt":1}]
+
+drop table t_defer;
+
+-- === OR REPLACE default substitution is subject to CHECK ===
+-- A NOT NULL violation under OR REPLACE substitutes the column's DEFAULT. The
+-- CHECK verdict must be computed against the SUBSTITUTED row, not the original
+-- NULL — `null > 100` is NULL, which CHECK treats as a pass, so evaluating
+-- pre-substitution let a stored value of 5 slip past `check (v > 100)`.
+-- Regression for bug-replace-default-skips-check.
+
+create table rd_bad (id integer primary key, v integer not null default 5 check (v > 100));
+
+-- Control: the CHECK is live on a supplied value.
+insert into rd_bad values (2, 7);
+-- error: CHECK
+
+-- The substituted DEFAULT (5) is not > 100, so the row must be rejected too.
+insert or replace into rd_bad values (1, null);
+-- error: CHECK
+
+select count(*) as cnt from rd_bad;
+→ [{"cnt":0}]
+
+drop table rd_bad;
+
+-- A substituted DEFAULT that satisfies the CHECK is still stored.
+create table rd_ok (id integer primary key, v integer not null default 500 check (v > 100));
+
+insert or replace into rd_ok values (1, null);
+
+select id, v from rd_ok;
+→ [{"id":1,"v":500}]
+
+drop table rd_ok;
+
+-- UPDATE has no statement-level OR clause, so its substitution arrives through a
+-- column-level `on conflict replace`. Same rule: the CHECK sees the substituted row.
+create table rd_upd (id integer primary key, v integer not null on conflict replace default 500 check (v > 100));
+
+insert into rd_upd values (1, 700);
+
+update rd_upd set v = null where id = 1;
+
+select id, v from rd_upd;
+→ [{"id":1,"v":500}]
+
+drop table rd_upd;
+
+create table rd_upd_bad (id integer primary key, v integer not null on conflict replace default 5 check (v > 100));
+
+insert into rd_upd_bad values (1, 700);
+
+update rd_upd_bad set v = null where id = 1;
+-- error: CHECK
+
+select id, v from rd_upd_bad;
+→ [{"id":1,"v":700}]
+
+drop table rd_upd_bad;
+
+-- The deferred CHECK path reaches the same verdict.
+create table rd_defer (id integer primary key, v integer not null default 5 check ((select v > 100)));
+
+insert or replace into rd_defer values (1, null);
+-- error: CHECK
+
+select count(*) as cnt from rd_defer;
+→ [{"cnt":0}]
+
+drop table rd_defer;
+
+-- A DEFAULT that reads a sibling column of the same row still resolves: the
+-- substitution runs against the raw NEW row, and the CHECK then sees the result.
+create table rd_sib (id integer primary key, a integer, b integer not null default (new.a * 2) check (b > 10));
+
+insert or replace into rd_sib values (1, 9, null);
+
+select id, a, b from rd_sib;
+→ [{"id":1,"a":9,"b":18}]
+
+insert or replace into rd_sib values (2, 3, null);
+-- error: CHECK
+
+select count(*) as cnt from rd_sib;
+→ [{"cnt":1}]
+
+drop table rd_sib;

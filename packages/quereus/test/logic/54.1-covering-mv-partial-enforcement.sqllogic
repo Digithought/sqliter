@@ -1,0 +1,34 @@
+-- 54.1-covering-mv-partial-enforcement.sqllogic
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Carved out of 54-covering-mv-enforcement: every other section declares the UNIQUE the
+-- covering materialized view proves against inline or table-level. A PARTIAL UNIQUE has
+-- no declarative spelling in this engine — `create unique index … where …` is the only
+-- way to express it — so this section is the file's index DDL.
+--
+-- Subject: a partial covering MV enforces its partial UNIQUE only over source rows
+-- inside the predicate; rows outside it never conflict.
+
+-- ===================================
+-- Partial covering MV — a source row outside the predicate is not checked.
+-- ===================================
+
+create table p (id integer primary key, x integer not null, y integer not null, active integer not null);
+create unique index p_uq on p (x, y) where active = 1;
+create materialized view p_ix as select x, y, id from p where active = 1 order by x, y;
+
+insert into p values (1, 5, 5, 1);
+-- an out-of-scope row sharing (x,y) does NOT conflict
+insert into p values (2, 5, 5, 0);
+-- two out-of-scope rows sharing (x,y) do NOT conflict
+insert into p values (3, 8, 8, 0), (4, 8, 8, 0);
+select count(*) as n from p;
+→ [{"n":4}]
+
+-- a second in-scope row sharing (x,y) DOES conflict
+insert into p values (5, 5, 5, 1);
+-- error: UNIQUE constraint failed
+
+select count(*) as n from p;
+→ [{"n":4}]

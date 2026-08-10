@@ -1,19 +1,19 @@
 /**
  * Functional dependency (FD) and equivalence-class (EC) helpers used by
- * `computePhysical` on relational plan nodes. See `docs/optimizer.md`
- * section "Functional Dependency Tracking" for the propagation table and
- * design rationale.
+ * `computePhysical` on relational plan nodes. See `docs/optimizer-fd.md`
+ * for the propagation table and design rationale.
  */
 
 import { createLogger } from '../../common/logger.js';
-import type { ConstantBinding, ConstantValue, DomainConstraint, FunctionalDependency, GuardClause, GuardPredicate, PhysicalProperties, ScalarPlanNode } from '../nodes/plan-node.js';
+import type { ConstantBinding, ConstantValue, DomainConstraint, FunctionalDependency, GuardClause, GuardPredicate, InclusionDependency, IndTarget, PhysicalProperties, ScalarPlanNode } from '../nodes/plan-node.js';
 import type { RelationType } from '../../common/datatype.js';
 import { ColumnReferenceNode, ParameterReferenceNode } from '../nodes/reference.js';
 import { BetweenNode, BinaryOpNode, CastNode, CollateNode, LiteralNode, UnaryOpNode } from '../nodes/scalar.js';
 import { InNode } from '../nodes/subquery.js';
 import type { SqlValue } from '../../common/types.js';
-import { compareSqlValues } from '../../util/comparison.js';
+import { compareSqlValues, normalizeCollationName, semanticOrderingsAgree } from '../../util/comparison.js';
 import { flipComparison } from '../analysis/predicate-shape.js';
+import { effectiveBetweenBoundCollation, effectiveComparisonCollation, effectiveInCollation, isValueDiscriminatingEquality, operandCollation } from '../analysis/comparison-collation.js';
 
 const log = createLogger('planner:fd');
 
@@ -61,6 +61,8 @@ export function computeClosure(
  * column indices, then concatenate with the existing FDs. For a class
  * `{c0, c1, ..., ck}` this emits `{ci} → {cj}` for every distinct ordered pair
  * — enough for `computeClosure` to derive every member from any one of them.
+ * EC-derived FDs are pure value claims (`kind: 'determination'`) — an equality
+ * never implies row-uniqueness of either endpoint.
  */
 export function expandEcsToFds(
 	ecs: ReadonlyArray<ReadonlyArray<number>>,
@@ -72,7 +74,7 @@ export function expandEcsToFds(
 		for (let i = 0; i < cls.length; i++) {
 			for (let j = 0; j < cls.length; j++) {
 				if (i === j) continue;
-				out.push({ determinants: [cls[i]], dependents: [cls[j]] });
+				out.push({ determinants: [cls[i]], dependents: [cls[j]], kind: 'determination' });
 			}
 		}
 	}
@@ -125,6 +127,9 @@ export function minimalCover(
 // collapse to one in `addFd` / `mergeFds`. The first-merged source wins —
 // table references merge declared-check contributions before hoisted
 // assertion contributions, so `declared-check` is preferred on collisions.
+// `kind` and `valueEquality` are likewise NOT compared; `addFd` reconciles
+// `kind` on collisions with an "'unique' wins" rule (uniqueness is a property
+// of the determinant set, so equal-determinant claims compose).
 function fdsEqual(a: FunctionalDependency, b: FunctionalDependency): boolean {
 	if (a.determinants.length !== b.determinants.length) return false;
 	if (a.dependents.length !== b.dependents.length) return false;
@@ -236,6 +241,14 @@ export interface AddFdOptions {
  * Guard-aware: FDs with different `guard` predicates are kept side-by-side
  * even when their determinants/dependents match — they are logically distinct
  * facts and may be activated by different surrounding predicates.
+ *
+ * Kind reconciliation: on a merge between entries with equal determinants and
+ * guards, the surviving entry's `kind` is `'unique'` when EITHER side claims
+ * it — uniqueness is a property of the determinant set, so equal-determinant
+ * claims compose. This includes upgrading a kept 'determination' entry in
+ * place when the subsumed newcomer is 'unique'. Equal-determinant entries with
+ * incomparable dependent sets both survive and each keeps its own kind (a
+ * sound under-claim). Object identity is preserved when nothing changes.
  */
 export function addFd(
 	fds: ReadonlyArray<FunctionalDependency>,
@@ -246,10 +259,14 @@ export function addFd(
 
 	const result: FunctionalDependency[] = [];
 	let subsumedByExisting = false;
+	// 'unique' wins on merge: a dropped-or-subsumed 'unique' twin upgrades the survivor.
+	let nextKind = next.kind;
 	for (const existing of fds) {
 		if (fdsEqual(existing, next)) {
 			subsumedByExisting = true;
-			result.push(existing);
+			result.push(next.kind === 'unique' && existing.kind !== 'unique'
+				? { ...existing, kind: 'unique' }
+				: existing);
 			continue;
 		}
 		if (
@@ -258,16 +275,23 @@ export function addFd(
 		) {
 			// Same determinants and guard: keep whichever has the larger dependent set.
 			if (dependentsSubset(existing.dependents, next.dependents)) {
-				// existing ⊂ next, drop existing
+				// existing ⊂ next, drop existing — its uniqueness claim survives on next.
+				if (existing.kind === 'unique') nextKind = 'unique';
 				continue;
 			}
 			if (dependentsSubset(next.dependents, existing.dependents)) {
 				subsumedByExisting = true;
+				result.push(next.kind === 'unique' && existing.kind !== 'unique'
+					? { ...existing, kind: 'unique' }
+					: existing);
+				continue;
 			}
 		}
 		result.push(existing);
 	}
-	if (!subsumedByExisting) result.push(next);
+	if (!subsumedByExisting) {
+		result.push(nextKind === next.kind ? next : { ...next, kind: nextKind });
+	}
 
 	return enforceCap(result, opts);
 }
@@ -290,11 +314,19 @@ function enforceCap(
 	const preferred = fds.filter(fd => isSubsetOfAnyKey(fd.determinants));
 	const other = fds.filter(fd => !isSubsetOfAnyKey(fd.determinants));
 
+	// Quality bias within each partition: keep 'unique' FDs ahead of plain
+	// determinations. Evicting a uniqueness witness can only cause downstream
+	// under-claims (sound), but it is cheap to avoid.
+	const uniqueFirst = (list: FunctionalDependency[]): FunctionalDependency[] => [
+		...list.filter(fd => fd.kind === 'unique'),
+		...list.filter(fd => fd.kind !== 'unique'),
+	];
+
 	let kept: FunctionalDependency[];
 	if (preferred.length >= cap) {
-		kept = preferred.slice(0, cap);
+		kept = uniqueFirst(preferred).slice(0, cap);
 	} else {
-		kept = preferred.concat(other.slice(0, cap - preferred.length));
+		kept = preferred.concat(uniqueFirst(other).slice(0, cap - preferred.length));
 	}
 
 	log('FD cap reached: dropped %d FD(s) from %d', fds.length - kept.length, fds.length);
@@ -328,6 +360,14 @@ export function mergeFds(
  * Guarded FDs additionally require every column referenced in `guard.clauses`
  * to be in the mapping — if any guard column is dropped the guard becomes
  * unobservable and the FD can never be re-activated downstream.
+ *
+ * Rebuilds via spread so `kind` / `source` / `valueEquality` survive verbatim.
+ * Preserving `kind` is sound: a projection maps rows 1:1 (no merge, no
+ * duplication), so determinant row-uniqueness survives whenever the
+ * determinants survive — which the determinant-loss drop above already
+ * requires. The empty-determinant exception keeps its kind too: a 'unique'
+ * singleton stays ≤1-row under projection; a 'determination' constant pin
+ * stays a mere pin.
  */
 export function projectFds(
 	fds: ReadonlyArray<FunctionalDependency>,
@@ -359,8 +399,8 @@ export function projectFds(
 		}
 
 		result.push(newGuard
-			? { determinants: newDet, dependents: newDep, guard: newGuard }
-			: { determinants: newDet, dependents: newDep });
+			? { ...fd, determinants: newDet, dependents: newDep, guard: newGuard }
+			: { ...fd, determinants: newDet, dependents: newDep });
 	}
 	return result;
 }
@@ -418,7 +458,12 @@ function projectClause(
 	}
 }
 
-/** Shift all column indices in `fds` (including any `guard` columns) by `offset`. */
+/**
+ * Shift all column indices in `fds` (including any `guard` columns) by `offset`.
+ * Rebuilds via spread so `kind` / `source` / `valueEquality` survive verbatim —
+ * a shift is a pure column relabel, so every claim (uniqueness included) holds
+ * unchanged on the relabeled columns.
+ */
 export function shiftFds(
 	fds: ReadonlyArray<FunctionalDependency>,
 	offset: number,
@@ -426,6 +471,7 @@ export function shiftFds(
 	if (offset === 0) return fds.slice();
 	return fds.map(fd => {
 		const shifted: FunctionalDependency = {
+			...fd,
 			determinants: fd.determinants.map(d => d + offset),
 			dependents: fd.dependents.map(d => d + offset),
 		};
@@ -456,13 +502,17 @@ function shiftClause(clause: GuardClause, offset: number): GuardClause {
 }
 
 /**
- * Return the unconditional twin of `fd` — drop the guard but keep determinants
- * and dependents. Used by Filter activation when the surrounding predicate
- * entails the guard.
+ * Return the unconditional twin of `fd` — drop the guard but keep every other
+ * field (`kind` / `source` / `valueEquality` survive verbatim). Used by Filter
+ * activation when the surrounding predicate entails the guard. Preserving
+ * 'unique' is sound at the activating Filter: its rows all satisfy the guard,
+ * and filtering only shrinks the row set — fan-out hazards are handled by the
+ * join-side downgrade, not here.
  */
 export function stripGuard(fd: FunctionalDependency): FunctionalDependency {
 	if (fd.guard === undefined) return fd;
-	return { determinants: fd.determinants, dependents: fd.dependents };
+	const { guard: _guard, ...rest } = fd;
+	return rest;
 }
 
 /** Shift all column indices in `classes` by `offset`. */
@@ -531,6 +581,11 @@ export function addEquivalence(
  * way to encode "K is a unique key on a relation": K determines every other
  * output column. K = ∅ produces the "at-most-one-row" singleton FD.
  *
+ * Emits `kind: 'unique'` — every caller passes a genuine key (declared or
+ * projected keys, fan-out-aware join `preservedKeys`, the aggregate group key,
+ * the set-op data-columns key, lens key obligations, TVF-declared keys), so
+ * the relation has at most one row per determinant tuple at the minting site.
+ *
  * Returns undefined when K covers every column (the all-columns case has no
  * non-trivial encoding — that case is communicated via `RelationType.isSet`
  * instead).
@@ -545,15 +600,20 @@ export function superkeyToFd(
 		if (!keySet.has(i)) dependents.push(i);
 	}
 	if (dependents.length === 0) return undefined;
-	return { determinants: key.slice(), dependents };
+	return { determinants: key.slice(), dependents, kind: 'unique' };
 }
 
 /**
- * True iff the closure of `attrs` under `fds` covers `{0..columnCount-1}` —
- * i.e., `attrs` is a superkey of the relation. Replaces the legacy "covers a
- * `uniqueKeys` entry" check; FDs are the canonical surface now.
+ * True iff the closure of `attrs` under `fds` covers `{0..columnCount-1}`.
+ * COVERAGE ONLY — this is a pure value-determination claim and says NOTHING
+ * about row-uniqueness: over a bag, a determination-only closure path can
+ * cover every column while the relation still holds duplicate rows. For the
+ * uniqueness question ("at most one row per attrs-tuple?") use
+ * `isUniqueDeterminant`. (Renamed from `isSuperkey`, whose name read as a
+ * uniqueness claim and invited exactly that misuse — ticket
+ * `fd-determination-reader-side-rule`.)
  */
-export function isSuperkey(
+export function closureCoversAll(
 	attrs: ReadonlySet<number>,
 	fds: ReadonlyArray<FunctionalDependency> | undefined,
 	columnCount: number,
@@ -567,17 +627,60 @@ export function isSuperkey(
 }
 
 /**
- * Enumerate the minimal full-cover key sets discoverable from `fds`: for each
- * FD `K → Y` whose closure covers all columns, return `K` (greedily minimized
- * within `K`). Deduplicated by set equality.
+ * True iff `attrs` is provably row-unique on the relation: its FD closure
+ * covers every column AND uniqueness is reachable —
+ *   - the relation is a set (two rows agreeing on `attrs` would agree on all
+ *     columns = a duplicate, impossible in a set), or
+ *   - some unguarded `kind: 'unique'` FD has determinants ⊆ closure(attrs)
+ *     (rows agreeing on `attrs` agree on that unique determinant set; ≤1 row
+ *     per its tuple ⇒ ≤1 row per attrs-tuple).
  *
- * Excludes the trivial "all-columns is a superkey" tautology — only FDs with
- * `K ⊊ all_cols` are considered, since the all-cols case is encoded via
- * `RelationType.isSet`.
+ * Coverage alone (a determination-only closure path over a bag) proves
+ * nothing — that is the over-claim family the kind-aware readers exist to
+ * prevent (ticket `fd-determination-reader-side-rule`). This is the single
+ * reader-side uniqueness primitive; producers no longer gate determinations.
+ *
+ * Guarded FDs participate in neither branch: `computeClosure` skips them, and
+ * only UNguarded 'unique' FDs can witness (a guarded uniqueness claim holds
+ * only under its predicate, which this layer cannot see).
+ */
+export function isUniqueDeterminant(
+	attrs: ReadonlySet<number>,
+	fds: ReadonlyArray<FunctionalDependency> | undefined,
+	columnCount: number,
+	isSet: boolean,
+): boolean {
+	const fdList = fds ?? [];
+	const closure = computeClosure(attrs, fdList);
+	for (let i = 0; i < columnCount; i++) {
+		if (!closure.has(i)) return false;
+	}
+	if (isSet) return true;
+	return fdList.some(fd =>
+		fd.guard === undefined &&
+		fd.kind === 'unique' &&
+		fd.determinants.every(d => closure.has(d)),
+	);
+}
+
+/**
+ * Enumerate the minimal full-cover key sets discoverable from `fds`: for each
+ * FD `K → Y` where `K` is a provably row-unique determinant
+ * (`isUniqueDeterminant` — coverage AND uniqueness reachability), return `K`
+ * (greedily minimized within `K`). Deduplicated by set equality.
+ *
+ * `minimalCover` preserves the closure, so the minimized key keeps both
+ * coverage and the unique witness (witness determinants ⊆ the unchanged
+ * closure).
+ *
+ * Excludes the trivial "all-columns is a key of a set" tautology — only FDs
+ * with `K ⊊ all_cols` are considered, since the all-cols case is encoded via
+ * `RelationType.isSet` (the `keysOf` fallback).
  */
 export function deriveKeysFromFds(
 	fds: ReadonlyArray<FunctionalDependency> | undefined,
 	columnCount: number,
+	isSet: boolean,
 ): number[][] {
 	if (!fds || fds.length === 0) return [];
 	const results: number[][] = [];
@@ -586,10 +689,8 @@ export function deriveKeysFromFds(
 		if (fd.guard !== undefined) continue;
 		if (fd.determinants.length >= columnCount) continue;
 		const det = new Set(fd.determinants);
-		if (!isSuperkey(det, fds, columnCount)) continue;
+		if (!isUniqueDeterminant(det, fds, columnCount, isSet)) continue;
 		const minimal = minimalCover(det, fds);
-		// Ensure the minimal cover still covers all columns (it should — minimalCover
-		// only drops attrs whose removal doesn't change closure).
 		const sorted = Array.from(minimal).sort((a, b) => a - b);
 		const key = sorted.join(',');
 		if (seen.has(key)) continue;
@@ -601,82 +702,83 @@ export function deriveKeysFromFds(
 
 /**
  * True iff the FD set encodes any non-trivial key — i.e., there exists some
- * FD whose determinants form a superkey of `columnCount` columns with the
- * determinant set strictly smaller than all columns. This is the FD-surface
- * replacement for "the relation has a known unique key smaller than its full
- * column list" (the old `uniqueKeys.length > 0` check), excluding the
- * tautological all-columns case which carries no information.
+ * FD whose determinants are a provably row-unique determinant set
+ * (`isUniqueDeterminant`) strictly smaller than all columns. This is the
+ * FD-surface replacement for "the relation has a known unique key smaller
+ * than its full column list" (the old `uniqueKeys.length > 0` check),
+ * excluding the tautological all-columns case which carries no information.
  */
 export function hasAnyKey(
 	fds: ReadonlyArray<FunctionalDependency> | undefined,
 	columnCount: number,
+	isSet: boolean,
 ): boolean {
 	if (!fds || fds.length === 0) return false;
 	return fds.some(fd =>
 		fd.guard === undefined &&
 		fd.determinants.length < columnCount &&
-		isSuperkey(new Set(fd.determinants), fds, columnCount),
+		isUniqueDeterminant(new Set(fd.determinants), fds, columnCount, isSet),
 	);
 }
 
 /**
- * True iff the relation has at-most-one-row — i.e., some FD `∅ → Y` exists
- * whose closure covers every column. Replaces the legacy `[[]]` singleton
- * marker on `uniqueKeys`.
+ * True iff the relation is provably at-most-one-row from its FD surface —
+ * `isUniqueDeterminant(∅, …)`: the closure of the empty set covers every
+ * column AND uniqueness is reachable (the relation is a set, or an unguarded
+ * 'unique' FD witnesses). Replaces the legacy `[[]]` singleton marker on
+ * `uniqueKeys`.
+ *
+ * On a bag, constant pins (`∅ → col` determinations from `where a = 1`) no
+ * longer over-claim ≤1-row; on a set, pinning every column IS a sound ≤1-row
+ * derivation. Zero-column relations return false — the `∅ → all_cols` FD is
+ * unrepresentable there, so the ≤1-row claim rides `estimatedRows` instead
+ * (see `characteristics.guaranteesUniqueRows`).
  */
 export function hasSingletonFd(
 	fds: ReadonlyArray<FunctionalDependency> | undefined,
 	columnCount: number,
+	isSet: boolean,
 ): boolean {
-	if (!fds) return false;
-	return fds.some(fd =>
-		fd.guard === undefined &&
-		fd.determinants.length === 0 &&
-		isSuperkey(new Set<number>(), fds, columnCount),
-	);
+	if (columnCount <= 0) return false;
+	return isUniqueDeterminant(new Set<number>(), fds, columnCount, isSet);
 }
 
 /**
  * Build the singleton FD `∅ → {0..columnCount-1}` that encodes
- * "at-most-one-row". Returns undefined when `columnCount === 0` (no
- * dependents).
+ * "at-most-one-row". `kind: 'unique'` — ∅ row-unique ⟺ ≤1 row, which is
+ * exactly what every caller asserts. Returns undefined when
+ * `columnCount === 0` (no dependents).
  */
 export function singletonFd(columnCount: number): FunctionalDependency | undefined {
 	if (columnCount <= 0) return undefined;
 	const dependents: number[] = [];
 	for (let i = 0; i < columnCount; i++) dependents.push(i);
-	return { determinants: [], dependents };
+	return { determinants: [], dependents, kind: 'unique' };
 }
 
 /**
- * True iff `attrs` is asserted to be a unique key by the FD set — i.e., there
- * exists some FD whose determinants are a subset of `attrs` and whose closure
- * covers all columns. Stricter than `isSuperkey`: the trivial "all-cols is a
- * superkey of itself" tautology does NOT count, because no FD makes that claim.
+ * Fold the singleton FD `∅ → {0..columnCount-1}` ("at-most-one-row") into `fds`
+ * via `addFd`. The canonical producer-side spelling of the ≤1-row fact — every
+ * `computePhysical` site that proves a relation emits ≤1 row should reach for
+ * this rather than open-coding `singletonFd` + `addFd`.
  *
- * Use this when you need a positive uniqueness claim (e.g., the
- * sort/window strict-monotonicOn check). For "would attrs functionally
- * determine the rest of the relation under closure?" use `isSuperkey` directly.
+ * A no-op returning a copy of `fds` when `columnCount === 0` (since
+ * `singletonFd(0)` is `undefined` — a zero-column relation cannot carry the
+ * marker). Pairs with the `hasSingletonFd` / `isAtMostOneRow` read surface.
  */
-export function isAssertedKey(
-	attrs: ReadonlySet<number>,
-	fds: ReadonlyArray<FunctionalDependency> | undefined,
+export function addSingletonFd(
+	fds: ReadonlyArray<FunctionalDependency>,
 	columnCount: number,
-): boolean {
-	if (!fds || fds.length === 0) return false;
-	for (const fd of fds) {
-		if (fd.guard !== undefined) continue;
-		// Determinants must be a subset of attrs.
-		let subset = true;
-		for (const d of fd.determinants) {
-			if (!attrs.has(d)) { subset = false; break; }
-		}
-		if (!subset) continue;
-		// Determinants closure must cover all columns.
-		if (isSuperkey(new Set(fd.determinants), fds, columnCount)) return true;
-	}
-	return false;
+): FunctionalDependency[] {
+	const singleton = singletonFd(columnCount);
+	return singleton ? addFd(fds, singleton) : fds.slice();
 }
+
+// NOTE: the former `isAssertedKey` (per-FD determinant anchoring + coverage)
+// is subsumed by `isUniqueDeterminant`, which is strictly more general (the
+// closure composes multi-FD paths the per-FD anchoring missed) and genuinely a
+// uniqueness predicate. Former callers (the sort/window strict-monotonicOn
+// checks) call `isUniqueDeterminant` directly.
 
 // ---------------------------------------------------------------------------
 // Unified uniqueness read surface (keysOf / isUnique)
@@ -772,13 +874,15 @@ export function keysOf(rel: KeyRel): readonly (readonly number[])[] {
 		keys.push(key.map(ref => ref.index));
 	}
 
-	// 2. `∅ → all_cols` ⇒ at-most-one-row ⇒ the empty key.
-	if (hasSingletonFd(fds, columnCount)) {
+	// 2. Provable ≤1-row (kind-aware) ⇒ the empty key.
+	if (hasSingletonFd(fds, columnCount, type.isSet)) {
 		keys.push([]);
 	}
 
 	// 3. FD-derived keys (already bounded to FDs with det.length < columnCount).
-	for (const k of deriveKeysFromFds(fds, columnCount)) {
+	// `isSet` threads through so a determination-only covering determinant over
+	// a set (e.g. above a DISTINCT) derives a genuine key.
+	for (const k of deriveKeysFromFds(fds, columnCount, type.isSet)) {
 		keys.push(k);
 	}
 
@@ -801,14 +905,14 @@ export function keysOf(rel: KeyRel): readonly (readonly number[])[] {
  *   - `cols` is a (non-strict) superset of some `keysOf(rel)` entry (covers
  *     declared keys, the ≤1-row empty key, FD-derived keys, and the
  *     all-columns/set key), OR
- *   - `cols` is a **proper subset** of the columns whose FD closure covers all
- *     columns (`isSuperkey`) — this proves a superkey even when it is absent
- *     from the minimal `keysOf` list.
+ *   - `cols` is a provably row-unique determinant (`isUniqueDeterminant`:
+ *     closure coverage AND uniqueness reachability) — this proves a superkey
+ *     even when it is absent from the minimal `keysOf` list.
  *
- * The closure branch is deliberately restricted to proper subsets: the closure
- * of the full column set is trivially the full set, so without the guard a bag
- * would be falsely reported unique on its all-columns set. The all-columns case
- * is handled soundly by the `keysOf` branch above, which gates it on `isSet`.
+ * No all-columns guard is needed on the closure branch: an all-columns probe
+ * on a bag fails `isUniqueDeterminant` on its own (no unique FD ⇒ false; if a
+ * unique FD exists the relation cannot hold duplicate rows, so true is
+ * correct).
  */
 export function isUnique(cols: readonly number[], rel: KeyRel): boolean {
 	const type = rel.getType();
@@ -819,11 +923,25 @@ export function isUnique(cols: readonly number[], rel: KeyRel): boolean {
 		if (key.every(c => colSet.has(c))) return true;
 	}
 
-	if (colSet.size < columnCount && isSuperkey(colSet, rel.physical?.fds, columnCount)) {
-		return true;
-	}
+	return isUniqueDeterminant(colSet, rel.physical?.fds, columnCount, type.isSet);
+}
 
-	return false;
+/**
+ * The single named spelling of the node-level "at-most-one-row" predicate:
+ * true iff `rel` is provably ≤1-row. Defined as `isUnique([], rel)` — the empty
+ * key is a subset of every column set, so a relation carrying it (via a declared
+ * empty key, the `∅ → all_cols` singleton FD, or any other channel `keysOf`
+ * reconciles) reports unique on the empty column list.
+ *
+ * Use this at node / rule level. The FD-only `hasSingletonFd` is the lower-level
+ * test `keysOf` itself calls; `isAtMostOneRow` is the surface consumers (joins,
+ * sort elimination) should reach for. Note it does **not** capture the
+ * zero-column `estimatedRows === 1` case — a zero-column relation has no
+ * representable empty key — so consumers needing that fallback keep their own
+ * check (see `characteristics.guaranteesUniqueRows`).
+ */
+export function isAtMostOneRow(rel: KeyRel): boolean {
+	return isUnique([], rel);
 }
 
 /**
@@ -865,6 +983,43 @@ export interface EqualityFds {
  *     equivalence pair `[col1, col2]`.
  *
  * Non-equality conjuncts contribute nothing.
+ *
+ * **Collation gate (all shapes).** Every extracted fact is a VALUE-level claim
+ * (a pinned column has one value across rows; `col1 = col2` rows are
+ * value-equal), so a conjunct only contributes when its comparison is
+ * value-discriminating (`isValueDiscriminatingEquality`): for textual operands
+ * the effective comparison collation must be BINARY. A NOCASE/RTRIM comparison —
+ * via a `COLLATE` wrapper on either side or a non-BINARY declared column
+ * collation — passes value-DIFFERENT rows ('Bob' = 'bob' NOCASE), so its facts
+ * would over-claim (false ≤1-row keys, false EC-driven inferences, wrong insert
+ * defaults — ticket `collation-blind-equality-fact-extraction`). Declared-
+ * collation covered-key ≤1-row detection is NOT lost: it flows through the
+ * independent (and collation-sound) `extractConstraints` path in
+ * `FilterNode.computePhysical`.
+ *
+ * **Semantic-ordering gate (`col1 = col2` ONLY).** A few logical types compare
+ * by meaning rather than by stored text (`timespan`: 'PT1H' = 'PT60M'; `json`:
+ * '{"a":1}' = '{ "a" : 1 }'). For a MIXED pair — `d timespan = s text` — the
+ * mirror FDs and the equivalence class are both FALSE: two surviving rows can
+ * agree on `d` (same elapsed time) while disagreeing on `s` (distinct strings),
+ * because the two columns have no common notion of "same value". So the col=col
+ * arm additionally requires `semanticOrderingsAgree` on the two declared logical
+ * types, mirroring the two join-side extractors that mint the same kind of fact
+ * (`extractEquiPairsFromCondition` in `nodes/join-node.ts`, `extractEquiPairs`
+ * in `rules/join/equi-pair-extractor.ts`). Same-type pairs (`timespan =
+ * timespan`) stay admitted — under the type's own identity both facts hold.
+ * Invariant OPT-051; ticket `debt-filter-equality-facts-ignore-semantic-ordering`.
+ *
+ * **The constant-pin arms are deliberately NOT semantic-ordering-gated.** This is
+ * intentional, not an oversight. `where d = 'PT60M'` keeps every row whose `d` is
+ * one hour whatever text it stores, and under the engine's identity for a
+ * `timespan` column — the same identity `distinct`/`group by`/`unique` use —
+ * those rows all hold *the same value*, so `∅ → d` is true. The
+ * `ConstantBinding` claim is likewise true as defined (see its declaration in
+ * `nodes/plan-node.ts`): the column *compares equal to* the bound value under its
+ * own comparison. Gating this arm would decline EVERY constant pin on a
+ * `timespan`/`json` column (a literal never declares a semantic-ordering type),
+ * losing real optimizations to "fix" a claim that is not wrong.
  */
 export function extractEqualityFds(
 	predicate: ScalarPlanNode,
@@ -884,6 +1039,8 @@ export function extractEqualityFds(
 			continue;
 		}
 		if (op !== '=') continue;
+		// Value-level facts only from value-discriminating comparisons (see doc).
+		if (!isValueDiscriminatingEquality(n.left, n.right)) continue;
 
 		const lIsCol = n.left instanceof ColumnReferenceNode;
 		const rIsCol = n.right instanceof ColumnReferenceNode;
@@ -891,11 +1048,17 @@ export function extractEqualityFds(
 		const rConst = constantValueOf(n.right);
 
 		if (lIsCol && rIsCol) {
+			// Semantic-ordering gate — cross-COLUMN facts only (see doc). A mixed
+			// pair has no shared notion of "same value", so neither the mirror FDs
+			// nor the equivalence class hold. Symmetric, so operand order is moot.
+			if (!semanticOrderingsAgree(n.left.getType().logicalType, n.right.getType().logicalType)) continue;
 			const lIdx = attrIdToIndex.get((n.left as ColumnReferenceNode).attributeId);
 			const rIdx = attrIdToIndex.get((n.right as ColumnReferenceNode).attributeId);
 			if (lIdx !== undefined && rIdx !== undefined && lIdx !== rIdx) {
-				fds.push({ determinants: [lIdx], dependents: [rIdx] });
-				fds.push({ determinants: [rIdx], dependents: [lIdx] });
+				// Mirror FDs from `col1 = col2` are pure value claims — equality
+				// never makes either endpoint row-unique.
+				fds.push({ determinants: [lIdx], dependents: [rIdx], kind: 'determination' });
+				fds.push({ determinants: [rIdx], dependents: [lIdx], kind: 'determination' });
 				equivPairs.push([lIdx, rIdx]);
 			}
 			continue;
@@ -904,7 +1067,9 @@ export function extractEqualityFds(
 		if (lIsCol && rConst !== undefined) {
 			const lIdx = attrIdToIndex.get((n.left as ColumnReferenceNode).attributeId);
 			if (lIdx !== undefined) {
-				fds.push({ determinants: [], dependents: [lIdx] });
+				// `∅ → col` from a constant pin is deliberately 'determination': a
+				// pinned column does NOT imply the relation has at most one row.
+				fds.push({ determinants: [], dependents: [lIdx], kind: 'determination' });
 				constantBindings.push({ attrs: [lIdx], value: rConst });
 			}
 			continue;
@@ -913,7 +1078,7 @@ export function extractEqualityFds(
 		if (rIsCol && lConst !== undefined) {
 			const rIdx = attrIdToIndex.get((n.right as ColumnReferenceNode).attributeId);
 			if (rIdx !== undefined) {
-				fds.push({ determinants: [], dependents: [rIdx] });
+				fds.push({ determinants: [], dependents: [rIdx], kind: 'determination' });
 				constantBindings.push({ attrs: [rIdx], value: lConst });
 			}
 			continue;
@@ -966,10 +1131,48 @@ interface FilterRange {
 	maxInclusive: boolean;
 }
 
+/**
+ * Collect per-column facts from a filter predicate for guard discharge.
+ *
+ * **Collation gate (per conjunct).** A fact may only discharge a guard when
+ * the filter's runtime comparison keeps filter-rows ⊆ guard-scope-rows. The
+ * guard predicate is evaluated under the column's *declared* collation at
+ * enforcement time — index maintenance for partial-UNIQUE guards, write-time
+ * CHECK evaluation for implication-form CHECK guards (constraint-builder
+ * threads declared collations into the CHECK scope types) — and guard
+ * recognition (`partial-unique-extraction.ts`, `check-extraction.ts`) only
+ * accepts bare column/literal AST shapes, so guard comparisons resolve to the
+ * declared collation. Hence:
+ *
+ *  - `col = lit` / singleton-IN facts: sound when the conjunct's effective
+ *    comparison collation is BINARY (value-equality implies equality under any
+ *    collation) OR equals the column's declared collation (same comparison the
+ *    guard scope uses; the strict `sqlValueEquals` literal match at discharge
+ *    then under-claims at worst). The previous code stripped `CollateNode`
+ *    from the literal side unconditionally, so `b = 'bob' collate nocase`
+ *    discharged a BINARY `eq-literal{b,'bob'}` guard while admitting rows
+ *    outside the partial-index scope (ticket
+ *    `collation-blind-equality-fact-extraction`, repro 4).
+ *  - `col1 = col2` facts: sound when both columns' contributed collations are
+ *    equal — then any operand-resolution order (filter conjunct or guard
+ *    spelling) lands on the same collation.
+ *  - range facts over TEXT bounds: the discharge subset check
+ *    (`filterRangeSubsetOfGuardRange`) compares bounds under BINARY, so the
+ *    filter's effective collation AND the column's declared collation must
+ *    both be BINARY (a BINARY bound comparison does not bound a NOCASE-ordered
+ *    row set). Non-text bounds are collation-inert and stay ungated. This is
+ *    deliberately stricter than the equality gate — a completeness loss for
+ *    collated text ranges, never a soundness one.
+ *  - plain `col IN (lits)`: the runtime (`emitIn`) compares under the
+ *    condition operand's collation, which for the only recognized shape (a
+ *    bare column) IS the declared collation; listed values' COLLATE wrappers
+ *    are inert. Gated uniformly anyway for future-proofing.
+ */
 function buildPredicateFacts(
 	predicate: ScalarPlanNode,
 	attrIdToIndex: ReadonlyMap<number, number>,
 	isColumnNumeric: (col: number) => boolean,
+	declaredCollationOf: (col: number) => string,
 ): PredicateFacts {
 	const literalEqs = new Map<number, SqlValue>();
 	const columnEqs = new Map<number, Set<number>>();
@@ -994,6 +1197,17 @@ function buildPredicateFacts(
 		}
 		return undefined;
 	};
+
+	// Equality-fact gate: BINARY, or matching the column's declared collation
+	// (the collation guard scopes are evaluated under). See the function doc.
+	const equalityCollationOk = (col: number, effColl: string): boolean =>
+		effColl === 'BINARY' || effColl === normalizeCollationName(declaredCollationOf(col));
+
+	// Range-fact gate for TEXT bounds: the discharge subset check is BINARY, so
+	// both the filter comparison and the guard-scope (declared) collation must be.
+	const rangeCollationOk = (col: number, effColl: string, bound: SqlValue): boolean =>
+		typeof bound !== 'string'
+		|| (effColl === 'BINARY' && normalizeCollationName(declaredCollationOf(col)) === 'BINARY');
 
 	const tightenLowerBound = (col: number, value: SqlValue, inclusive: boolean): void => {
 		const cur = rangeBounds.get(col);
@@ -1066,17 +1280,30 @@ function buildPredicateFacts(
 				const lIdx = columnIndexOf(n.left);
 				const rIdx = columnIndexOf(n.right);
 				if (lIdx !== undefined && rIdx !== undefined) {
-					addColumnEq(lIdx, rIdx);
+					// Both sides are bare column refs; require their contributed
+					// collations to agree so any resolution order matches the guard's.
+					// NOTE: deliberately NOT semantic-ordering-gated, unlike the
+					// cross-column arm of `extractEqualityFds` (invariant OPT-051).
+					// A `columnEqs` fact only ever discharges an `eq-column` guard
+					// clause, which is the SAME comparison re-evaluated under the same
+					// declared types at enforcement time — so filter-rows and
+					// guard-scope-rows coincide whether or not semantic ordering is in
+					// play. Adding the gate here for symmetry would be a pure
+					// completeness loss. Do not "fix".
+					if (operandCollation(n.left) === operandCollation(n.right)) {
+						addColumnEq(lIdx, rIdx);
+					}
 					continue;
 				}
+				const effColl = effectiveComparisonCollation(n.left, n.right);
 				if (lIdx !== undefined) {
 					const lit = literalSqlValueOf(n.right);
-					if (lit !== undefined) literalEqs.set(lIdx, lit);
+					if (lit !== undefined && equalityCollationOk(lIdx, effColl)) literalEqs.set(lIdx, lit);
 					continue;
 				}
 				if (rIdx !== undefined) {
 					const lit = literalSqlValueOf(n.left);
-					if (lit !== undefined) literalEqs.set(rIdx, lit);
+					if (lit !== undefined && equalityCollationOk(rIdx, effColl)) literalEqs.set(rIdx, lit);
 				}
 				continue;
 			}
@@ -1093,13 +1320,16 @@ function buildPredicateFacts(
 			if (op === '<' || op === '<=' || op === '>' || op === '>=') {
 				const lIdx = columnIndexOf(n.left);
 				const rIdx = columnIndexOf(n.right);
+				const effColl = effectiveComparisonCollation(n.left, n.right);
 				if (lIdx !== undefined && rIdx === undefined) {
 					const lit = literalSqlValueOf(n.right);
 					if (lit === undefined || lit === null) continue;
+					if (!rangeCollationOk(lIdx, effColl, lit)) continue;
 					recordComparison(lIdx, op, lit);
 				} else if (rIdx !== undefined && lIdx === undefined) {
 					const lit = literalSqlValueOf(n.left);
 					if (lit === undefined || lit === null) continue;
+					if (!rangeCollationOk(rIdx, effColl, lit)) continue;
 					recordComparison(rIdx, flipComparison(op), lit);
 				}
 				continue;
@@ -1112,8 +1342,15 @@ function buildPredicateFacts(
 			if (cIdx === undefined) continue;
 			const lo = literalSqlValueOf(n.lower);
 			const hi = literalSqlValueOf(n.upper);
-			if (lo !== undefined && lo !== null) tightenLowerBound(cIdx, lo, true);
-			if (hi !== undefined && hi !== null) tightenUpperBound(cIdx, hi, true);
+			// Per-bound effective collation (emitBetween: bound wins over expr).
+			if (lo !== undefined && lo !== null
+				&& rangeCollationOk(cIdx, effectiveBetweenBoundCollation(n.expr, n.lower), lo)) {
+				tightenLowerBound(cIdx, lo, true);
+			}
+			if (hi !== undefined && hi !== null
+				&& rangeCollationOk(cIdx, effectiveBetweenBoundCollation(n.expr, n.upper), hi)) {
+				tightenUpperBound(cIdx, hi, true);
+			}
 			continue;
 		}
 		if (n instanceof UnaryOpNode) {
@@ -1143,6 +1380,11 @@ function buildPredicateFacts(
 			if (!n.values || n.values.length === 0) continue;
 			const cIdx = columnIndexOf(n.condition);
 			if (cIdx === undefined) continue;
+			// emitIn resolves ONE collation through the provenance lattice over the
+			// condition AND the listed values — a collate-wrapped element (folded
+			// to a literal whose type carries rank-3 NOCASE) can outrank the bare
+			// column recognized here, so this gate is load-bearing.
+			if (!equalityCollationOk(cIdx, effectiveInCollation(n))) continue;
 			const set = new Set<SqlValue>();
 			let allLiterals = true;
 			for (const v of n.values) {
@@ -1221,6 +1463,10 @@ function bindingForColumn(
  * sound for numeric columns since the consumer matches `eq-literal{col, 0}`
  * via strict `sqlValueEquals`, which treats TEXT `''`, BLOB, and boolean
  * `false` as unequal to integer 0.
+ *
+ * `declaredCollationOf(col)` reports the source's output column collation
+ * (normalized or not; `'BINARY'` when undeclared). Used by the per-conjunct
+ * collation gate in `buildPredicateFacts` — see its doc.
  */
 export function predicateImpliesGuard(
 	predicate: ScalarPlanNode,
@@ -1230,8 +1476,9 @@ export function predicateImpliesGuard(
 	attrIdToIndex: ReadonlyMap<number, number>,
 	isColumnNonNullable: (col: number) => boolean,
 	isColumnNumeric: (col: number) => boolean,
+	declaredCollationOf: (col: number) => string,
 ): boolean {
-	const facts = buildPredicateFacts(predicate, attrIdToIndex, isColumnNumeric);
+	const facts = buildPredicateFacts(predicate, attrIdToIndex, isColumnNumeric, declaredCollationOf);
 
 	for (const clause of guard.clauses) {
 		if (!clauseEntailed(clause, facts, ecs, bindings, isColumnNonNullable)) {
@@ -1686,4 +1933,137 @@ export function shiftDomainConstraints(
 ): DomainConstraint[] {
 	if (offset === 0) return domains.slice();
 	return domains.map(domain => ({ ...domain, column: domain.column + offset }));
+}
+
+// ---------------------------------------------------------------------------
+// InclusionDependency helpers
+// ---------------------------------------------------------------------------
+
+export type { InclusionDependency, IndTarget };
+
+/**
+ * Per-node cap on the number of INDs we materialize, mirroring
+ * `MAX_FDS_PER_NODE`. A safety valve for pathological plans; truncations are
+ * logged under the `quereus:planner:fd` logger like the FD/binding/domain caps.
+ */
+export const MAX_INDS_PER_NODE = 64;
+
+function sameOrderedList(a: readonly number[], b: readonly number[]): boolean {
+	if (a.length !== b.length) return false;
+	for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+	return true;
+}
+
+function indTargetsEqual(a: IndTarget, b: IndTarget): boolean {
+	if (a.kind !== b.kind) return false;
+	if (a.kind === 'table' && b.kind === 'table') {
+		return a.schema === b.schema && a.table === b.table && sameOrderedList(a.targetCols, b.targetCols);
+	}
+	if (a.kind === 'relation' && b.kind === 'relation') {
+		return a.relationId === b.relationId && sameOrderedList(a.targetCols, b.targetCols);
+	}
+	return false;
+}
+
+/**
+ * Structural equality for IND dedup. `cols` and `target.targetCols` are
+ * compared as *ordered* lists — the positional pairing between them is
+ * load-bearing (`cols[i]` is the child column matched to `targetCols[i]`), so a
+ * reordering is a different fact and must not collapse. Stricter than
+ * `fdsEqual`'s set comparison; over-keeping a reordered twin is harmless
+ * (redundancy, capped), whereas collapsing distinct facts would lose an IND.
+ */
+function indsEqual(a: InclusionDependency, b: InclusionDependency): boolean {
+	return a.nullRejecting === b.nullRejecting
+		&& sameOrderedList(a.cols, b.cols)
+		&& indTargetsEqual(a.target, b.target);
+}
+
+export interface AddIndOptions {
+	cap?: number;
+}
+
+/**
+ * Add a single IND, skipping it when a structurally-equal entry (per
+ * `indsEqual`) already exists. Enforces the per-node cap; truncations are
+ * logged. Mirrors `addFd` minus the determinant-subsumption logic (an IND has
+ * no determinant/dependent split to subsume).
+ */
+export function addInd(
+	inds: ReadonlyArray<InclusionDependency>,
+	next: InclusionDependency,
+	opts: AddIndOptions = {},
+): InclusionDependency[] {
+	const result = inds.slice();
+	if (!result.some(existing => indsEqual(existing, next))) {
+		result.push(next);
+	}
+	return enforceIndCap(result, opts);
+}
+
+function enforceIndCap(
+	inds: InclusionDependency[],
+	opts: AddIndOptions,
+): InclusionDependency[] {
+	const cap = opts.cap ?? MAX_INDS_PER_NODE;
+	if (inds.length <= cap) return inds;
+	const kept = inds.slice(0, cap);
+	log('IND cap reached: dropped %d IND(s) from %d', inds.length - kept.length, inds.length);
+	return kept;
+}
+
+/** Merge two IND lists: concat with structural dedup via `addInd`, capped. */
+export function mergeInds(
+	a: ReadonlyArray<InclusionDependency>,
+	b: ReadonlyArray<InclusionDependency>,
+	opts: AddIndOptions = {},
+): InclusionDependency[] {
+	let result: InclusionDependency[] = a.slice();
+	for (const ind of b) {
+		result = addInd(result, ind, opts);
+	}
+	return result;
+}
+
+/**
+ * Project INDs through a column mapping (oldCol → newCol). An IND's `cols` is
+ * **all-or-nothing**: drop the IND when ANY of its `cols` loses its mapping (the
+ * relation no longer carries the witnessing columns) — there is no partial-
+ * dependent survival as in `projectFds`. Survivors have their `cols` remapped to
+ * output indices; `target.targetCols` index into the *target* relation, NOT this
+ * relation's output, so they are NOT remapped. Result is deduped + capped.
+ */
+export function projectInds(
+	inds: ReadonlyArray<InclusionDependency>,
+	mapping: ReadonlyMap<number, number>,
+): InclusionDependency[] {
+	const out: InclusionDependency[] = [];
+	for (const ind of inds) {
+		const newCols: number[] = [];
+		let miss = false;
+		for (const c of ind.cols) {
+			const m = mapping.get(c);
+			if (m === undefined) { miss = true; break; }
+			newCols.push(m);
+		}
+		if (miss) continue;
+		out.push({ cols: newCols, target: ind.target, nullRejecting: ind.nullRejecting });
+	}
+	return mergeInds([], out);
+}
+
+/**
+ * Shift each IND's `cols` by `offset` (mirrors `shiftFds` for join column
+ * translation). `target.targetCols` are target-relative ⇒ NOT shifted.
+ */
+export function shiftInds(
+	inds: ReadonlyArray<InclusionDependency>,
+	offset: number,
+): InclusionDependency[] {
+	if (offset === 0) return inds.slice();
+	return inds.map(ind => ({
+		cols: ind.cols.map(c => c + offset),
+		target: ind.target,
+		nullRejecting: ind.nullRejecting,
+	}));
 }

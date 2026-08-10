@@ -1,4 +1,5 @@
 description: Progressive JIT-inspired query optimization — robust defaults, runtime feedback, tiered investment
+difficulty: hard
 prereq: optimizer framework, statistics infrastructure, runtime execution, emit layer
 files: packages/quereus/src/planner/cost/index.ts, packages/quereus/src/planner/framework/context.ts, packages/quereus/src/planner/framework/pass.ts, packages/quereus/src/planner/stats/index.ts, packages/quereus/src/planner/stats/catalog-stats.ts, packages/quereus/src/planner/analysis/expression-fingerprint.ts, packages/quereus/src/runtime/emission-context.ts, packages/quereus/src/runtime/emitters.ts, packages/quereus/src/runtime/cache/shared-cache.ts, packages/quereus/src/core/statement.ts, packages/quereus/src/planner/optimizer.ts, packages/quereus/src/planner/optimizer-tuning.ts, docs/optimizer.md, docs/progressive-optimizer.md
 ----

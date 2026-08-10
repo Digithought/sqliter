@@ -1,5 +1,6 @@
 -- schema-scale.sqllogic - Performance test for large schema operations
--- Tests schema manager with 20 tables, indexes, and cross-table queries
+-- Tests schema manager with 20 tables and cross-table queries
+-- (the many-indexes half is 10.4.1-schema-scale-indexes)
 
 -- ===================================
 -- 1. Create 20 tables with varied schemas
@@ -51,32 +52,9 @@ insert into t18 values (1, 'r1', 18), (2, 'r2', 19), (3, 'r3', 20);
 insert into t19 values (1, 's1', 4), (2, 's2', 5), (3, 's3', 6);
 insert into t20 values (1, 't1', 21), (2, 't2', 22), (3, 't3', 23);
 
--- ===================================
--- 3. Create indexes on several tables
--- ===================================
-
-create index idx_t01_name on t01 (name);
-create index idx_t01_value on t01 (value);
-create index idx_t02_code on t02 (code);
-create index idx_t03_label on t03 (label);
-create index idx_t03_active on t03 (active);
-create index idx_t04_title on t04 (title);
-create index idx_t05_details on t05 (details);
-create index idx_t06_tag on t06 (tag);
-create index idx_t07_category on t07 (category);
-create index idx_t08_type on t08 (type);
-create index idx_t09_status on t09 (status);
-create index idx_t10_role on t10 (role);
-create index idx_t11_name on t11 (name);
-create index idx_t12_code on t12 (code);
-create index idx_t13_label on t13 (label);
-create index idx_t14_title on t14 (title);
-create index idx_t15_details on t15 (details);
-create index idx_t16_tag on t16 (tag);
-create index idx_t17_category on t17 (category);
-create index idx_t18_type on t18 (type);
-create index idx_t19_status on t19 (status);
-create index idx_t20_role on t20 (role);
+-- Section 3 (22 secondary indexes over these 20 tables, the point lookups through
+-- them, and the schema() index count) lives in 10.4.1-schema-scale-indexes — it
+-- needs standalone index DDL and rebuilds this rig for itself.
 
 -- ===================================
 -- 4. Query across multiple tables using joins
@@ -142,27 +120,11 @@ from t01 cross join t02 cross join t03;
 → [{"total":27}]
 
 -- ===================================
--- 5. Verify indexes are working
--- ===================================
-
-select name from t01 where name = 'a2';
-→ [{"name":"a2"}]
-
-select code from t02 where code = 'b3';
-→ [{"code":"b3"}]
-
-select label from t03 where active = 1 order by id;
-→ [{"label":"c1"},{"label":"c3"}]
-
--- ===================================
 -- 6. Verify all tables exist in schema
 -- ===================================
 
 select count(*) as table_count from schema() where type = 'table' and name like 't%';
 → [{"table_count":20}]
-
-select count(*) as index_count from schema() where type = 'index' and tbl_name like 't%';
-→ [{"index_count":22}]
 
 -- ===================================
 -- 7. Drop all tables

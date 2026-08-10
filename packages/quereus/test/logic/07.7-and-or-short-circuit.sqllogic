@@ -1,0 +1,58 @@
+-- and-or-short-circuit.sqllogic - AND/OR short-circuit deferral end-to-end
+-- Complements test/and-or-short-circuit.spec.ts (which owns the side-effect /
+-- non-evaluation and emit-note assertions via a counting UDF). This file pins
+-- three-valued-logic parity between the eager two-param path (pure-scalar RHS)
+-- and the deferred short-circuit path (subquery-wrapped RHS) end-to-end through
+-- the SQL runner, for every {true,false,null}² operand pair.
+
+-- true=1, false=0, null=null (isTruthy maps 1->true, 0->false). Row id = combo.
+create table tv (id integer primary key, a integer null, b integer null);
+insert into tv values
+  (1, 1, 1), (2, 1, 0), (3, 1, null),
+  (4, 0, 1), (5, 0, 0), (6, 0, null),
+  (7, null, 1), (8, null, 0), (9, null, null);
+
+-- =============================================================================
+-- AND: eager (column RHS) vs deferred (correlated subquery RHS) must match
+-- =============================================================================
+
+select id, (a and b) as r from tv order by id;
+→ [{"id":1,"r":true},{"id":2,"r":false},{"id":3,"r":null},{"id":4,"r":false},{"id":5,"r":false},{"id":6,"r":false},{"id":7,"r":null},{"id":8,"r":false},{"id":9,"r":null}]
+
+select id, (a and (select b from tv t2 where t2.id = tv.id)) as r from tv order by id;
+→ [{"id":1,"r":true},{"id":2,"r":false},{"id":3,"r":null},{"id":4,"r":false},{"id":5,"r":false},{"id":6,"r":false},{"id":7,"r":null},{"id":8,"r":false},{"id":9,"r":null}]
+
+-- =============================================================================
+-- OR: eager vs deferred must match
+-- =============================================================================
+
+select id, (a or b) as r from tv order by id;
+→ [{"id":1,"r":true},{"id":2,"r":true},{"id":3,"r":true},{"id":4,"r":true},{"id":5,"r":false},{"id":6,"r":null},{"id":7,"r":true},{"id":8,"r":null},{"id":9,"r":null}]
+
+select id, (a or (select b from tv t2 where t2.id = tv.id)) as r from tv order by id;
+→ [{"id":1,"r":true},{"id":2,"r":true},{"id":3,"r":true},{"id":4,"r":true},{"id":5,"r":false},{"id":6,"r":null},{"id":7,"r":true},{"id":8,"r":null},{"id":9,"r":null}]
+
+-- =============================================================================
+-- XOR is untouched (both operands always required); subquery RHS still correct
+-- =============================================================================
+
+select id, (a xor b) as r from tv order by id;
+→ [{"id":1,"r":false},{"id":2,"r":true},{"id":3,"r":null},{"id":4,"r":true},{"id":5,"r":false},{"id":6,"r":null},{"id":7,"r":null},{"id":8,"r":null},{"id":9,"r":null}]
+
+select id, (a xor (select b from tv t2 where t2.id = tv.id)) as r from tv order by id;
+→ [{"id":1,"r":false},{"id":2,"r":true},{"id":3,"r":null},{"id":4,"r":true},{"id":5,"r":false},{"id":6,"r":null},{"id":7,"r":null},{"id":8,"r":null},{"id":9,"r":null}]
+
+-- =============================================================================
+-- Deferred RHS in a WHERE-clause OR (the headline use case), plus a nested
+-- short-circuit where the inner OR is itself the deferred right operand.
+-- =============================================================================
+
+-- true OR (subquery) short-circuits to true; false/null OR (subquery=b) resolves b.
+select id from tv where a = 1 or (select b from tv t2 where t2.id = tv.id) = 1 order by id;
+→ [{"id":1},{"id":2},{"id":3},{"id":4},{"id":7}]
+
+-- a and (b or (subquery)): outer AND defers the (b or subquery) group.
+select id, (a = 1 and (b = 1 or (select count(*) from tv t2 where t2.id = tv.id) > 5)) as r from tv order by id;
+→ [{"id":1,"r":true},{"id":2,"r":false},{"id":3,"r":null},{"id":4,"r":false},{"id":5,"r":false},{"id":6,"r":false},{"id":7,"r":null},{"id":8,"r":false},{"id":9,"r":null}]
+
+drop table tv;

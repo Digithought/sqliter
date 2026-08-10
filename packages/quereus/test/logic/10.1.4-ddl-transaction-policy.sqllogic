@@ -1,0 +1,314 @@
+-- DDL transaction policy: the `ddl_transaction_policy` pragma and its strict gate.
+--
+-- `permissive` (the default) leaves DDL-in-transaction behavior exactly as it was.
+-- `strict` refuses a module-dispatching DDL statement (CREATE/DROP TABLE/INDEX,
+-- ALTER TABLE, CREATE/DROP/REFRESH MATERIALIZED VIEW) while an explicit transaction
+-- is open, because on memory and store
+-- the schema change would escape the transaction (survive rollback). The refusal
+-- fires before any dispatch or catalog mutation, so the open transaction stays
+-- fully usable afterward.
+--
+-- Runs against every backend (memory, store). Neither declares
+-- ddlTransactionality='transactional', so strict refuses on both; the permissive
+-- sections must behave identically on both. Each statement is its own block so an
+-- expected failure is attributed to exactly one statement.
+--
+-- The gate is verb-agnostic, and every case below is asserted with a table,
+-- ALTER TABLE, materialized-view or `apply schema` statement. The CREATE/DROP INDEX
+-- instance of the same cases lives in 10.1.6-ddl-transaction-policy-index, which
+-- needs standalone index DDL.
+
+-- ===================================
+-- 1. Permissive default: DDL inside a transaction is allowed (unchanged behavior)
+-- ===================================
+
+create table perm_t (id integer primary key, v text);
+-- run
+begin;
+-- run
+insert into perm_t values (1, 'a');
+-- run
+alter table perm_t add column w text null;
+-- run
+insert into perm_t values (2, 'b', null);
+-- run
+commit;
+-- run
+
+select count(*) as cnt from perm_t;
+→ [{ "cnt": 2 }]
+
+alter table perm_t drop column w;
+-- run
+
+-- ===================================
+-- 2. strict: alter table inside begin is refused; the transaction survives
+-- ===================================
+
+pragma ddl_transaction_policy = 'strict';
+-- run
+
+create table strict_t (id integer primary key, v text);
+-- run
+insert into strict_t values (1, 'a');
+-- run
+begin;
+-- run
+insert into strict_t values (2, 'b');
+-- run
+alter table strict_t add column w text null;
+-- error: ddl_transaction_policy = strict
+
+-- The refusal left the transaction open and usable: insert again and commit.
+insert into strict_t values (3, 'c');
+-- run
+commit;
+-- run
+
+-- Both buffered rows landed and the column was never added.
+select count(*) as cnt from strict_t;
+→ [{ "cnt": 3 }]
+
+-- ===================================
+-- 3. strict: the same statement is allowed OUTSIDE a transaction (autocommit)
+-- ===================================
+
+alter table strict_t add column w text null;
+-- run
+alter table strict_t drop column w;
+-- run
+
+-- ===================================
+-- 4. strict: alter table ... add constraint is refused inside begin
+-- ===================================
+
+begin;
+-- run
+alter table strict_t add constraint strict_u unique (v);
+-- error: ddl_transaction_policy = strict
+rollback;
+-- run
+
+-- ===================================
+-- 5. strict: drop table is refused inside begin (table still present after)
+-- ===================================
+
+create table strict_t2 (id integer primary key);
+-- run
+begin;
+-- run
+drop table strict_t2;
+-- error: ddl_transaction_policy = strict
+rollback;
+-- run
+drop table strict_t2;
+-- run
+
+-- ===================================
+-- 6. strict: create table is refused inside begin
+-- ===================================
+
+begin;
+-- run
+create table strict_t2 (id integer primary key);
+-- error: ddl_transaction_policy = strict
+rollback;
+-- run
+
+-- The refused create table left nothing behind; base data intact.
+select count(*) as cnt from strict_t;
+→ [{ "cnt": 3 }]
+
+-- ===================================
+-- 6b. strict: a refusal inside a savepoint leaves the savepoint usable
+-- ===================================
+
+create table sp_t (id integer primary key, v text);
+-- run
+insert into sp_t values (1, 'a');
+-- run
+begin;
+-- run
+savepoint sp1;
+-- run
+insert into sp_t values (2, 'b');
+-- run
+create table sp_t2 (id integer primary key);
+-- error: ddl_transaction_policy = strict
+
+-- The savepoint is still usable: roll back to it (undoing row 2), continue, commit.
+rollback to savepoint sp1;
+-- run
+insert into sp_t values (3, 'c');
+-- run
+commit;
+-- run
+
+select id from sp_t order by id;
+→ [{ "id": 1 }, { "id": 3 }]
+
+drop table sp_t;
+-- run
+
+-- ===================================
+-- 6c. strict: create materialized view is refused inside begin
+-- ===================================
+
+begin;
+-- run
+create materialized view strict_mv as select id, v from strict_t;
+-- error: ddl_transaction_policy = strict
+
+-- The refusal left the transaction open and usable.
+insert into strict_t values (4, 'd');
+-- run
+commit;
+-- run
+
+select count(*) as cnt from strict_t;
+→ [{ "cnt": 4 }]
+
+-- Nothing was materialized.
+drop materialized view strict_mv;
+-- error: no such materialized view
+
+-- A no-op `if exists` drop has no target to resolve, so the gate never fires.
+begin;
+-- run
+drop materialized view if exists strict_mv;
+-- run
+rollback;
+-- run
+
+-- ===================================
+-- 6d. strict: the same create is allowed OUTSIDE a transaction (autocommit)
+-- ===================================
+
+create materialized view strict_mv as select id, v from strict_t;
+-- run
+
+select count(*) as cnt from strict_mv;
+→ [{ "cnt": 4 }]
+
+-- `if not exists` does NOT skip the gate: like CREATE TABLE, the gate keys off the
+-- statement, not off whether it would have been a no-op. (DROP differs by design —
+-- it has no target to resolve a module from; see the `if exists` case in 6c.)
+begin;
+-- run
+create materialized view if not exists strict_mv as select id, v from strict_t;
+-- error: ddl_transaction_policy = strict
+rollback;
+-- run
+
+-- ===================================
+-- 6e. strict: refresh / drop materialized view are refused inside begin
+--     (REFRESH is gated too — its reshape arm dispatches module alterTable and
+--     both arms commit contents mid-transaction; see materialized-view.ts)
+-- ===================================
+
+begin;
+-- run
+refresh materialized view strict_mv;
+-- error: ddl_transaction_policy = strict
+
+-- A refusal inside a savepoint leaves the savepoint usable (6b, for the MV verbs).
+savepoint mv_sp;
+-- run
+insert into strict_t values (5, 'e');
+-- run
+drop materialized view strict_mv;
+-- error: ddl_transaction_policy = strict
+rollback to savepoint mv_sp;
+-- run
+rollback;
+-- run
+
+-- Both refusals left the MV intact and readable.
+select count(*) as cnt from strict_mv;
+→ [{ "cnt": 4 }]
+
+-- Outside a transaction both succeed.
+refresh materialized view strict_mv;
+-- run
+drop materialized view strict_mv;
+-- run
+
+-- ===================================
+-- 7. Reset to permissive; DDL inside a transaction works again
+-- ===================================
+
+pragma ddl_transaction_policy = 'permissive';
+-- run
+
+begin;
+-- run
+create table perm_again (id integer primary key);
+-- run
+commit;
+-- run
+
+drop table perm_again;
+-- run
+
+-- Materialized-view DDL inside a transaction is likewise allowed again.
+begin;
+-- run
+create materialized view perm_mv as select id, v from strict_t;
+-- run
+refresh materialized view perm_mv;
+-- run
+commit;
+-- run
+
+select count(*) as cnt from perm_mv;
+→ [{ "cnt": 4 }]
+
+begin;
+-- run
+drop materialized view perm_mv;
+-- run
+commit;
+-- run
+
+drop table strict_t;
+-- run
+drop table perm_t;
+-- run
+
+-- ===================================
+-- 8. strict + `apply schema`: a migration is NOT gated in autocommit (its generated
+--    DDL runs inside the engine's implicit transaction), but the same migration
+--    wrapped in an explicit begin trips the gate on the first gated statement.
+--    Runs last, against an otherwise-empty main schema, so the declaration below is
+--    the whole of main and the diff generates no drops.
+-- ===================================
+
+pragma ddl_transaction_policy = 'strict';
+-- run
+
+declare schema main {
+	table ap_t (id INTEGER PRIMARY KEY, x INTEGER NOT NULL)
+	materialized view ap_mv as select id, x from ap_t
+}
+
+-- run
+
+apply schema main;
+
+-- run
+
+insert into ap_t values (1, 10);
+-- run
+
+select x from ap_mv;
+→ [{ "x": 10 }]
+
+-- Dropping only the MV leaves one statement in the next migration: its re-create.
+drop materialized view ap_mv;
+-- run
+begin;
+-- run
+apply schema main;
+-- error: ddl_transaction_policy = strict
+rollback;
+-- run

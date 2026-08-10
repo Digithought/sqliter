@@ -1,0 +1,333 @@
+import { expect } from 'chai';
+import { Database } from '../../src/core/database.js';
+import { planRows, isDescendantOf, type PlanRow } from './_helpers.js';
+
+/**
+ * A grouped query builds its final projection exactly once, over the
+ * AggregateNode output — regardless of whether the SELECT list contains an
+ * aggregate function.
+ *
+ * Regression for bug-order-by-group-key-not-in-select-list: the branch used to
+ * key off "SELECT list has an aggregate function", so a GROUP BY with no
+ * aggregate ran the aggregate phase's projection *and* the non-aggregate one,
+ * leaving a second Project whose column references pointed at pre-aggregate
+ * attributes. A bare-column ORDER BY over a grouping key then sorted underneath
+ * that stale Project and the query failed at runtime. Result-level coverage is
+ * in test/logic/07.3.1-group-by-order-by-key.sqllogic; this file pins the shape
+ * that regresses if the branch condition drifts back.
+ */
+describe('Plan shape: grouped-query final projection', () => {
+	let db: Database;
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec("CREATE TABLE gk (v INTEGER PRIMARY KEY, g TEXT) USING memory");
+		await db.exec("INSERT INTO gk VALUES (1,'a'),(2,'b'),(3,'a')");
+		await db.exec("CREATE TABLE t2 (k INTEGER PRIMARY KEY, w TEXT) USING memory");
+		await db.exec("INSERT INTO t2 VALUES (1,'p'),(2,'q'),(3,'r')");
+		// No primary key, so the functional-dependency GROUP BY reduction cannot fire
+		// and rewrite the grouping keys out from under the column-order assertions.
+		await db.exec("CREATE TABLE nk (a TEXT, b TEXT) USING memory");
+		await db.exec("INSERT INTO nk VALUES ('x','1'),('y','2'),('x','3')");
+		// Second no-PK table sharing a column name with `nk`, for the join case where
+		// the join equality (`nk.a = nj.a`) is what makes one grouping key
+		// functionally determined by another.
+		await db.exec("CREATE TABLE nj (a TEXT, c TEXT) USING memory");
+		await db.exec("INSERT INTO nj VALUES ('x','p'),('y','q')");
+		await db.exec("CREATE TABLE u (z TEXT) USING memory");
+		await db.exec("INSERT INTO u VALUES ('p'),('q')");
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	const AGGREGATE_OPS = ['STREAMAGGREGATE', 'HASHAGGREGATE'];
+
+	const single = (rows: PlanRow[], op: string): PlanRow => {
+		const matches = rows.filter(r => r.op === op);
+		expect(matches, `expected exactly one ${op} in:\n${rows.map(r => `${r.id} <- ${r.parent_id}: ${r.op} ${r.detail}`).join('\n')}`)
+			.to.have.lengthOf(1);
+		return matches[0];
+	};
+
+	const aggregateRow = (rows: PlanRow[]): PlanRow => {
+		const matches = rows.filter(r => AGGREGATE_OPS.includes(r.op));
+		expect(matches, 'expected exactly one aggregate node').to.have.lengthOf(1);
+		return matches[0];
+	};
+
+	/** Sort above the one and only Project, which sits above the aggregate. */
+	const expectSortOverProjectOverAggregate = async (sql: string) => {
+		const rows = await planRows(db, sql);
+		const project = single(rows, 'PROJECT');
+		const sort = single(rows, 'SORT');
+		const aggregate = aggregateRow(rows);
+
+		expect(isDescendantOf(rows, project.id, sort.id), `${sql}: Project should sit below the Sort`).to.be.true;
+		expect(isDescendantOf(rows, aggregate.id, project.id), `${sql}: aggregate should sit below the Project`).to.be.true;
+	};
+
+	it('emits one Project below the Sort for ORDER BY on a grouping key with no aggregates', async () => {
+		// The original repro. Two Projects here means the stale pre-aggregate
+		// projection is back.
+		await expectSortOverProjectOverAggregate("SELECT cast(v AS text) AS x FROM gk GROUP BY v ORDER BY v");
+	});
+
+	it('emits the same single-Project shape for a hash-aggregated grouping key', async () => {
+		await expectSortOverProjectOverAggregate("SELECT upper(g) AS x FROM gk GROUP BY g ORDER BY g");
+	});
+
+	it('emits the same shape when an aggregate is present (the variant that always worked)', async () => {
+		await expectSortOverProjectOverAggregate("SELECT cast(v AS text) AS x, count(*) AS c FROM gk GROUP BY v ORDER BY v");
+	});
+
+	it('projects a grouped select list even when it needs no expression rewriting', async () => {
+		// Without a forced final projection this plan is bare aggregate output:
+		// the group keys in GROUP BY order, under the wrong names.
+		//
+		// Two Projects stacked is the intended shape here, not a regression. `gk.v`
+		// is the primary key, so `rule-groupby-fd-simplification` drops `g` from the
+		// GROUP BY and re-emits it as a picker `min(g)` — which lands *after* `v`
+		// rather than before it. The rule caps that permuting rewrite with its own
+		// order-restoring Project (sitting directly on the aggregate), and the
+		// builder's select-list Project sits above that:
+		//
+		//   PROJECT SELECT v, g          <- the builder's select-list projection
+		//   PROJECT SELECT g, v          <- the rule's order-restoring cap
+		//   STREAMAGGREGATE GROUP BY v  STREAM AGG min(g) AS g
+		const rows = await planRows(db, "SELECT v, g FROM gk GROUP BY g, v");
+		const projects = rows.filter(r => r.op === 'PROJECT');
+		expect(projects, `expected the select-list Project stacked on the rule's cap in:\n${rows.map(r => `${r.id} <- ${r.parent_id}: ${r.op} ${r.detail}`).join('\n')}`)
+			.to.have.lengthOf(2);
+		const aggregate = aggregateRow(rows);
+		// The cap is whichever Project the aggregate hangs directly off of.
+		const cap = projects.find(p => aggregate.parent_id === p.id);
+		expect(cap, "the rule's cap should sit directly above the aggregate").to.not.equal(undefined);
+		const selectList = projects.find(p => p !== cap)!;
+		expect(isDescendantOf(rows, cap!.id, selectList.id), 'the select-list Project should sit above the cap').to.be.true;
+	});
+
+	it('keeps the non-grouped pre-projection sort path intact', async () => {
+		// `shouldApplyOrderByBeforeProjection` is unreachable for grouped queries
+		// now, but still drives this shape: Project above Sort, no aggregate.
+		const rows = await planRows(db, "SELECT upper(g) AS x FROM gk ORDER BY g");
+		const project = single(rows, 'PROJECT');
+		const sort = single(rows, 'SORT');
+		expect(isDescendantOf(rows, sort.id, project.id), 'Sort should sit below the Project when not grouped').to.be.true;
+		expect(rows.filter(r => AGGREGATE_OPS.includes(r.op))).to.be.empty;
+	});
+
+	describe('output column order', () => {
+		const columnNames = async (sql: string): Promise<string[]> => {
+			const stmt = db.prepare(sql);
+			try {
+				// Column names are only settled once the statement is compiled, which
+				// iterating guarantees.
+				for await (const _row of stmt.iterateRows()) { /* drain */ }
+				return stmt.getColumnNames();
+			} finally {
+				await stmt.finalize();
+			}
+		};
+
+		// Source-column order, not GROUP BY order — the aggregate's own output is
+		// (g, v) here, so a missing final projection shows up as a reordering that
+		// key-insensitive row comparisons in .sqllogic cannot catch.
+		it('SELECT * over a grouped query emits source-column order', async () => {
+			expect(await columnNames("SELECT * FROM gk GROUP BY g, v")).to.deep.equal(['v', 'g']);
+		});
+
+		it('qualified SELECT gk.* over a grouped query emits source-column order', async () => {
+			expect(await columnNames("SELECT gk.* FROM gk GROUP BY g, v")).to.deep.equal(['v', 'g']);
+		});
+
+		it('an explicit column list over a grouped query emits SELECT-list order', async () => {
+			expect(await columnNames("SELECT v, g FROM gk GROUP BY g, v")).to.deep.equal(['v', 'g']);
+			expect(await columnNames("SELECT g, v FROM gk GROUP BY g, v")).to.deep.equal(['g', 'v']);
+		});
+
+		it('a grouped SELECT-list alias survives to the output name', async () => {
+			expect(await columnNames("SELECT cast(v AS text) AS x FROM gk GROUP BY v ORDER BY v")).to.deep.equal(['x']);
+		});
+
+		// `gk` has a PK among its grouping keys, so the FD-driven GROUP BY reduction
+		// can rewrite `GROUP BY g, v` to `GROUP BY v` and hand back source order by
+		// accident. `nk` has no PK, so the aggregate really does output GROUP BY
+		// order and only the final projection can restore source order.
+		it('SELECT * restores source-column order when GROUP BY reverses it', async () => {
+			expect(await columnNames("SELECT * FROM nk GROUP BY b, a")).to.deep.equal(['a', 'b']);
+			expect(await columnNames("SELECT nk.* FROM nk GROUP BY b, a")).to.deep.equal(['a', 'b']);
+			expect(await columnNames("SELECT b, a FROM nk GROUP BY b, a")).to.deep.equal(['b', 'a']);
+		});
+
+		// Regression: the star expansion used to replay *every* expanded star column
+		// for *each* star in the SELECT list, so N stars emitted N x the columns.
+		it('expands each star in the SELECT list exactly once', async () => {
+			expect(await columnNames("SELECT gk.*, t2.* FROM gk JOIN t2 ON gk.v = t2.k GROUP BY gk.v, gk.g, t2.k, t2.w"))
+				.to.deep.equal(['v', 'g', 'k', 'w']);
+			expect(await columnNames("SELECT *, * FROM nk GROUP BY a, b")).to.deep.equal(['a', 'b', 'a:1', 'b:1']);
+		});
+
+		/**
+		 * Regression for bug-grouped-aggregate-only-select-returns-extra-column.
+		 * An AggregateNode advertises its grouping keys followed by its aggregate
+		 * results, so with no projection above it the declared result shape is the
+		 * aggregate's, not the SELECT list's. These cases all used to come back in
+		 * aggregate shape; the results themselves are pinned in
+		 * test/logic/07.3.2-grouped-select-list-shape.sqllogic.
+		 */
+		describe('with aggregates in the SELECT list', () => {
+			it('an aggregate-only SELECT list does not publish the grouping key', async () => {
+				expect(await columnNames("SELECT count(*) AS n FROM nk GROUP BY a")).to.deep.equal(['n']);
+				expect(await columnNames("SELECT count(*) FROM nk GROUP BY a")).to.deep.equal(['count(*)']);
+				expect(await columnNames("SELECT count(*) AS n FROM nk GROUP BY a HAVING count(*) > 0")).to.deep.equal(['n']);
+				expect(await columnNames("SELECT count(*) AS n FROM nk GROUP BY a, b")).to.deep.equal(['n']);
+			});
+
+			it('emits SELECT-list order, not GROUP BY order', async () => {
+				expect(await columnNames("SELECT count(*) AS c, a FROM nk GROUP BY a")).to.deep.equal(['c', 'a']);
+				expect(await columnNames("SELECT b, a, count(*) AS c FROM nk GROUP BY a, b")).to.deep.equal(['b', 'a', 'c']);
+				expect(await columnNames("SELECT a, count(*) AS c, b FROM nk GROUP BY a, b")).to.deep.equal(['a', 'c', 'b']);
+				expect(await columnNames("SELECT a, b, count(*) AS c FROM nk GROUP BY b, a")).to.deep.equal(['a', 'b', 'c']);
+			});
+
+			it('SELECT * plus an aggregate emits source-column order then the aggregate', async () => {
+				expect(await columnNames("SELECT *, count(*) AS c FROM nk GROUP BY a, b")).to.deep.equal(['a', 'b', 'c']);
+				expect(await columnNames("SELECT *, count(*) AS c FROM nk GROUP BY b, a")).to.deep.equal(['a', 'b', 'c']);
+			});
+
+			it('two aggregates over the same group do not publish the grouping key', async () => {
+				expect(await columnNames("SELECT count(*) AS c1, count(*) AS c2 FROM nk GROUP BY a")).to.deep.equal(['c1', 'c2']);
+				expect(await columnNames("SELECT count(DISTINCT b) AS c FROM nk GROUP BY a")).to.deep.equal(['c']);
+			});
+
+			it('a grouping key named twice is emitted twice', async () => {
+				// The aggregate publishes one column per *key*, so this select list is one
+				// column shorter than the aggregate output — the opposite mismatch from the
+				// leaked-key case, and equally a reason to project.
+				expect(await columnNames("SELECT a, a, count(*) AS c FROM nk GROUP BY a")).to.deep.equal(['a', 'a:1', 'c']);
+			});
+
+			it('an aggregate inside a scalar subquery is not this query\'s aggregate', async () => {
+				// `(select count(*) from u)` aggregates over `u`, not over the groups of
+				// `nk`, so it is a non-aggregate select-list item here and must not be
+				// counted against the AggregateNode's own aggregate slots.
+				expect(await columnNames("SELECT (SELECT count(*) FROM u) AS su, count(*) AS c FROM nk GROUP BY a"))
+					.to.deep.equal(['su', 'c']);
+				expect(await columnNames("SELECT a, (SELECT count(*) FROM u) AS su, count(*) AS c FROM nk GROUP BY a"))
+					.to.deep.equal(['a', 'su', 'c']);
+			});
+
+			it('a qualified reference to a bare grouping key counts as agreement', async () => {
+				expect(await columnNames("SELECT nk.a, count(*) AS c FROM nk GROUP BY a")).to.deep.equal(['a', 'c']);
+				expect(await columnNames("SELECT a, count(*) AS c FROM nk GROUP BY nk.a")).to.deep.equal(['a', 'c']);
+			});
+
+			/**
+			 * Regression for bug-grouped-key-reorder-survives-to-output.
+			 * `rule-groupby-fd-simplification` drops a grouping column that is
+			 * functionally determined by the survivors and re-emits it as a picker
+			 * `min(<col>)` aggregate. An AggregateNode's layout is fixed — grouping
+			 * keys first, then aggregate results — so the dropped key moves out of its
+			 * key slot down into the aggregate block. These select lists all agree with
+			 * the *pre-rewrite* aggregate shape, so no builder projection is forced and
+			 * the aggregate is the query root: the shift used to reach the result. The
+			 * rule now caps a permuting rewrite with an order-restoring Project.
+			 * Values are pinned in test/logic/07.3.2-grouped-select-list-shape.sqllogic.
+			 */
+			it('keeps SELECT-list order when the FD simplification drops a grouping key', async () => {
+				// Primary-key-driven: `v` determines `g`, so `g` is dropped from the
+				// GROUP BY and re-emitted as `min(g)` after `v`.
+				expect(await columnNames("SELECT g, v, count(*) AS c FROM gk GROUP BY g, v"))
+					.to.deep.equal(['g', 'v', 'c']);
+
+				// Equality-driven: `where a = b` puts both in one equivalence class, so
+				// one of them is dropped.
+				expect(await columnNames("SELECT a, b, count(*) AS c FROM nk WHERE a = b GROUP BY a, b"))
+					.to.deep.equal(['a', 'b', 'c']);
+
+				// Join-equality-driven, with the drop in the middle of the select list.
+				expect(await columnNames(
+					"SELECT nk.a, nk.b, nj.a, nj.c, count(*) AS c FROM nk JOIN nj ON nk.a = nj.a "
+					+ "GROUP BY nk.a, nk.b, nj.a, nj.c",
+				)).to.deep.equal(['a', 'b', 'a:1', 'c', 'c:1']);
+			});
+
+			/**
+			 * Regression for bug-duplicate-aggregate-output-names-collapse-row.
+			 * Same-named keys with no dependency between them: the FD simplification
+			 * cannot fire, the select list agrees with the aggregate's own layout, and
+			 * so nothing caps the aggregate — it publishes the result names itself.
+			 * A result row is delivered keyed by column name, so an undisambiguated
+			 * second `a` dropped a column's value outright. Values are pinned in
+			 * test/logic/07.3.2-grouped-select-list-shape.sqllogic.
+			 */
+			it('numbers duplicate output names on a bare aggregate root', async () => {
+				const sql = "SELECT nk.a, nj.a, count(*) AS n FROM nk JOIN nj ON nk.b = nj.c GROUP BY nk.a, nj.a";
+				const rows = await planRows(db, sql);
+				expect(rows.filter(r => r.op === 'PROJECT'), 'the aggregate itself is the root here').to.be.empty;
+				expect(await columnNames(sql)).to.deep.equal(['a', 'a:1', 'n']);
+			});
+
+			// The shape the delta-aggregate maintenance path recognises: keys in GROUP BY
+			// order, then aggregates. It agrees with the aggregate output, so no
+			// projection is built and the plan stays bare aggregate-over-scan. Widening
+			// the projection to every grouped query re-routes this body's incremental
+			// maintenance to full-rebuild — see test/incremental/delta-aggregate.spec.ts.
+			it('leaves an already-agreeing SELECT list on the bare aggregate plan', async () => {
+				const rows = await planRows(db, "SELECT a, count(*) AS c FROM nk GROUP BY a");
+				expect(rows.filter(r => r.op === 'PROJECT'), 'no projection needed when the shapes agree').to.be.empty;
+				aggregateRow(rows);
+			});
+		});
+
+		/**
+		 * Regression for bug-window-function-over-grouped-query-crashes.
+		 *
+		 * The window phase used to build its projection by re-walking the AST select
+		 * list and handling only non-star entries, so a `*` was dropped outright.
+		 * The projection is now the query's ONE select-list projection with stars
+		 * already expanded, so star position and the disambiguation of a repeated
+		 * name are the same as any other query's. Values are pinned in
+		 * test/logic/07.5-window.sqllogic.
+		 */
+		describe('with window functions', () => {
+			it('keeps the star columns around a window column, in written order', async () => {
+				expect(await columnNames("SELECT *, row_number() OVER (ORDER BY v) AS w FROM gk"))
+					.to.deep.equal(['v', 'g', 'w']);
+				expect(await columnNames("SELECT row_number() OVER (ORDER BY v) AS w, * FROM gk"))
+					.to.deep.equal(['w', 'v', 'g']);
+				expect(await columnNames("SELECT gk.*, row_number() OVER (ORDER BY v) AS w FROM gk"))
+					.to.deep.equal(['v', 'g', 'w']);
+			});
+
+			it('numbers a name the star repeats', async () => {
+				expect(await columnNames("SELECT v, row_number() OVER (ORDER BY v) AS w, * FROM gk"))
+					.to.deep.equal(['v', 'w', 'v:1', 'g']);
+			});
+
+			it('names an unaliased window column after its authored expression', async () => {
+				// The rewrite substitutes an ArrayIndexNode for the window function, whose
+				// own name is a bare index (`[2]`); the authored expression is carried
+				// across as the fallback alias.
+				expect(await columnNames("SELECT row_number() OVER (ORDER BY v) FROM gk"))
+					.to.deep.equal(['row_number() over (order by v)']);
+				expect(await columnNames("SELECT v, 1000 - row_number() OVER (ORDER BY v) FROM gk"))
+					.to.deep.equal(['v', '1000 - row_number() over (order by v)']);
+			});
+
+			it('emits SELECT-list order for a grouped, windowed query', async () => {
+				expect(await columnNames("SELECT a, count(*) AS c, row_number() OVER (ORDER BY a) AS rn FROM nk GROUP BY a"))
+					.to.deep.equal(['a', 'c', 'rn']);
+				expect(await columnNames("SELECT row_number() OVER (ORDER BY a) AS rn, a FROM nk GROUP BY a"))
+					.to.deep.equal(['rn', 'a']);
+			});
+
+			it('restores source-column order for a grouped star plus a window column', async () => {
+				expect(await columnNames("SELECT *, row_number() OVER (ORDER BY a, b) AS rn FROM nk GROUP BY b, a"))
+					.to.deep.equal(['a', 'b', 'rn']);
+			});
+		});
+	});
+});

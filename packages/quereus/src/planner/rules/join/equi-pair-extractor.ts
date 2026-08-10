@@ -10,17 +10,23 @@ import { BinaryOpNode } from '../../nodes/scalar.js';
 import { ColumnReferenceNode } from '../../nodes/reference.js';
 import { normalizePredicate } from '../../analysis/predicate-normalizer.js';
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
+import {
+	operandCollation,
+	isValueDiscriminatingEquality,
+	resolveComparisonCollation,
+} from '../../analysis/comparison-collation.js';
+import { semanticOrderingsAgree } from '../../../util/comparison.js';
 
 export interface EquiPairExtraction {
 	equiPairs: EquiJoinPair[];
 	residual: ScalarPlanNode | undefined;
 	/**
 	 * For each entry in `equiPairs`, the original `=` ScalarPlanNode it was
-	 * extracted from (or `undefined` for USING-derived pairs that have no
-	 * source node). Same length and order as `equiPairs`. Useful when a rule
+	 * extracted from. Same length and order as `equiPairs`. Useful when a rule
 	 * wants to demote a subset of equi-pairs back into the residual (e.g., the
 	 * monotonic-merge rule keeps only the monotonic-driving pair as the merge
-	 * key and pushes the rest into the residual).
+	 * key and pushes the rest into the residual). Typed optional for that
+	 * demotion path's convenience; extraction always fills every slot.
 	 */
 	equiPairNodes: Array<ScalarPlanNode | undefined>;
 }
@@ -127,6 +133,53 @@ export function combineResidual(
 /**
  * Extract equi-join pairs and residual predicates from an ON condition.
  * Returns null if no equi-pairs are found.
+ *
+ * **Collation handling — tagged, not gated.** A `l = r` column pair is
+ * extracted regardless of whether the two sides declare the same collation;
+ * every physical join algorithm this extraction feeds resolves the pair's
+ * comparison collation through the SAME symmetric provenance lattice as the
+ * canonical scalar comparison (`resolveComparisonCollation`; ticket
+ * `join-key-collation-resolution-alignment`), so a hash/bloom key over an
+ * asymmetric pair (declared NOCASE vs defaulted BINARY → resolves NOCASE)
+ * normalizes both sides identically and matches exactly what `=` matches.
+ * The two collation-derived properties that DO differ per pair travel on the
+ * pair itself (see {@link EquiJoinPair}):
+ *
+ * - `collationsMatch` — merge join's admission bit. Merge additionally needs
+ *   both inputs physically ordered under the key's comparison collation, and
+ *   `PhysicalProperties.ordering` is collation-blind (`{column, desc}` only);
+ *   a matched declared collation is what makes each input's advertised order
+ *   equal the merge comparator's order. The selection rules
+ *   (`rule-join-physical-selection`, `rule-monotonic-merge-join`) consider
+ *   merge only for matched pairs; hash/bloom take every pair.
+ * - `valueDiscriminating` — the fact-minting bit
+ *   (`isValueDiscriminatingEquality`). A non-BINARY comparison passes
+ *   value-DIFFERENT rows ('Bob' = 'bob' NOCASE), so the physical join nodes
+ *   exclude such pairs from key coverage / FD / EC / monotonicity
+ *   propagation while still keying the join on them. (Ticket
+ *   `collation-blind-equality-fact-extraction`.)
+ *
+ * One collation shape is still declined outright: a same-rank
+ * explicit/declared *conflict* (`resolveComparisonCollation` → `conflict`,
+ * e.g. declared NOCASE vs declared RTRIM). That is a plan-time user error
+ * surfaced by `BinaryOpNode.generateType`; extraction must neither throw nor
+ * admit the pair (the emitters' lattice resolution would throw), so the
+ * conjunct stays in the residual and the error surfaces at its own site.
+ *
+ * **Semantic-ordering gate.** A pair is likewise recognized only when both sides
+ * agree on semantic ordering — neither declares a semantic-ordering logical type,
+ * or both declare the SAME one ({@link semanticOrderingsAgree}). A MIXED pair
+ * (`timespan_col = text_col`) is what `=` evaluates through its generic path's
+ * runtime duration check, so it matches 'PT1H' against 'PT60M'; a physical join
+ * key comparing raw text would silently drop that row. The gate DECLINES rather
+ * than canonicalizing the key, because merge join also needs both inputs
+ * physically sorted in its comparator's order and a `timespan` side is sorted by
+ * elapsed time while a `text` side is sorted by text — no single comparator merges
+ * those two orders, so canonicalizing would fix hash join and leave merge join
+ * unsound. Declined pairs demote to the residual and the `=` operator's own
+ * semantics apply. See `docs/types.md`
+ * § "Semantic ordering"; ticket
+ * `mixed-type-equi-join-key-drops-semantic-matches`.
  */
 export function extractEquiPairs(
 	condition: ScalarPlanNode | undefined,
@@ -150,16 +203,20 @@ export function extractEquiPairs(
 
 		let isEqui = false;
 		if (n instanceof BinaryOpNode && n.expression.operator === '=') {
-			if (n.left instanceof ColumnReferenceNode && n.right instanceof ColumnReferenceNode) {
+			if (n.left instanceof ColumnReferenceNode && n.right instanceof ColumnReferenceNode
+				&& semanticOrderingsAgree(n.left.getType().logicalType, n.right.getType().logicalType)
+				&& resolveComparisonCollation(n.left.getType(), n.right.getType()).kind !== 'conflict') {
 				const lId = n.left.attributeId;
 				const rId = n.right.attributeId;
+				const collationsMatch = operandCollation(n.left) === operandCollation(n.right);
+				const valueDiscriminating = isValueDiscriminatingEquality(n.left, n.right);
 
 				if (leftAttrIds.has(lId) && rightAttrIds.has(rId)) {
-					equiPairs.push({ leftAttrId: lId, rightAttrId: rId });
+					equiPairs.push({ leftAttrId: lId, rightAttrId: rId, collationsMatch, valueDiscriminating });
 					equiPairNodes.push(n);
 					isEqui = true;
 				} else if (leftAttrIds.has(rId) && rightAttrIds.has(lId)) {
-					equiPairs.push({ leftAttrId: rId, rightAttrId: lId });
+					equiPairs.push({ leftAttrId: rId, rightAttrId: lId, collationsMatch, valueDiscriminating });
 					equiPairNodes.push(n);
 					isEqui = true;
 				}
@@ -176,27 +233,4 @@ export function extractEquiPairs(
 	const residual = combineResidual(undefined, residuals);
 
 	return { equiPairs, residual, equiPairNodes };
-}
-
-/**
- * Convert USING-column names into equi-pairs given the left/right attributes.
- * Returns null if no pairs could be matched.
- */
-export function extractEquiPairsFromUsing(
-	usingColumns: readonly string[] | undefined,
-	leftAttrs: ReadonlyArray<{ id: number; name: string }>,
-	rightAttrs: ReadonlyArray<{ id: number; name: string }>,
-): EquiPairExtraction | null {
-	if (!usingColumns || usingColumns.length === 0) return null;
-	const equiPairs: EquiJoinPair[] = [];
-	for (const colName of usingColumns) {
-		const lower = colName.toLowerCase();
-		const leftAttr = leftAttrs.find(a => a.name.toLowerCase() === lower);
-		const rightAttr = rightAttrs.find(a => a.name.toLowerCase() === lower);
-		if (leftAttr && rightAttr) {
-			equiPairs.push({ leftAttrId: leftAttr.id, rightAttrId: rightAttr.id });
-		}
-	}
-	if (equiPairs.length === 0) return null;
-	return { equiPairs, residual: undefined, equiPairNodes: equiPairs.map(() => undefined) };
 }

@@ -8,5 +8,7 @@ export function buildDropAssertionStmt(ctx: PlanningContext, stmt: AST.DropStmt)
 		quereusError('Expected DROP ASSERTION statement', undefined, undefined, stmt);
 	}
 
-	return new DropAssertionNode(ctx.scope, stmt.name.name, stmt.ifExists);
+	const sm = ctx.schemaManager;
+	const schemaName = stmt.name.schema ? sm.canonicalSchemaName(stmt.name.schema) : sm.getCurrentSchemaName();
+	return new DropAssertionNode(ctx.scope, schemaName, stmt.name.name, stmt.ifExists);
 }

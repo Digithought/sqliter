@@ -1,24 +1,30 @@
 {
   "name": "quereus-workspace",
-  "version": "3.3.0",
+  "version": "4.11.0",
   "private": true,
   "packageManager": "yarn@4.12.0",
   "description": "Quereus monorepo - Pure TypeScript SQL engine with CRDT sync. No WASM, no native bindings.",
   "workspaces": [
-    "packages/*"
+    "packages/*",
+    "packages/tools/*"
   ],
   "scripts": {
-    "clean": "rimraf -g 'packages/*/dist' 'packages/*/*.tsbuildinfo' 'packages/quereus-vscode/client/out' 'packages/quereus-vscode/server/dist' 'packages/quereus-vscode/*/*.tsbuildinfo'",
+    "clean": "rimraf -g 'packages/*/dist' 'packages/*/*.tsbuildinfo' 'tsconfig.build.tsbuildinfo' 'packages/quereus-vscode/client/out' 'packages/quereus-vscode/server/dist' 'packages/quereus-vscode/*/*.tsbuildinfo' 'packages/tools/*/dist' 'packages/tools/*/*.tsbuildinfo'",
     "bump": "bumpp --recursive",
-    "gh-release": "gh release create v$(node -p \"require('./package.json').version\") --generate-notes",
-    "check": "yarn lint && yarn build && yarn test:full && yarn test:fork-strict",
-    "release": "node -e \"console.log('\\n*** Reminder: run `yarn check` (lint + typecheck + test:full) first. Ctrl+C within 5s to abort. ***\\n');setTimeout(()=>{},5000)\" && yarn bump && yarn pub && yarn gh-release",
-    "build": "yarn clean && yarn build:engine && yarn build:loader && yarn build:isolation && yarn build:store && yarn build:plugin-indexeddb && yarn build:plugin-leveldb && yarn build:plugin-rn && yarn build:plugin-ns && yarn build:sync && yarn build:sync-client && yarn build:sync-coordinator && yarn build:ui && yarn build:plugins && yarn build:vscode && yarn build:cli && yarn build:web",
-    "lint": "yarn workspace @quereus/quereus run lint",
+    "gh-release": "node scripts/gh-release.js",
+    "docs:check": "node scripts/check-docs.mjs",
+    "//check": "NOTE: typecheck runs *after* build — packages whose typecheck spans test files (e.g. plugin-loader's tsconfig.test.json pass) resolve workspace deps through their dist .d.ts, which only exist once the build has run.",
+    "check": "yarn docs:check && yarn lint && yarn build && yarn typecheck && yarn test:full && yarn test:fork-strict && yarn test:context-strict && yarn test:repr-strict",
+    "release": "node scripts/release-guard.js && yarn bump && yarn pub && yarn gh-release",
+    "//build": "tsc -b compiles all pure-tsc library packages (class A) in dependency order via project references (see tsconfig.build.json). The three bundled apps below emit via vite/esbuild, so they run after the graph: shared-ui (build:ui) before quoomb-web (build:web) since web consumes shared-ui's dist; vscode is independent. Per-package build:* scripts are kept so other scripts/docs that call them still work.",
+    "build": "yarn clean && tsc -b tsconfig.build.json && yarn build:ui && yarn build:vscode && yarn build:web",
+    "lint": "yarn workspaces foreach -A --exclude quereus-workspace run lint",
     "test": "yarn workspaces foreach -A --exclude quereus-workspace run test",
     "test:all": "yarn workspaces foreach -A --exclude quereus-workspace run test:all",
     "test:store": "cd packages/quereus && yarn test:store",
     "test:fork-strict": "cd packages/quereus && yarn test:fork-strict",
+    "test:context-strict": "cd packages/quereus && yarn test:context-strict",
+    "test:repr-strict": "cd packages/quereus && yarn test:repr-strict",
     "test:full": "yarn test && yarn test:store",
     "dep-check": "yarn workspaces foreach -A --exclude quereus-workspace run dep-check",
     "doc": "yarn workspaces foreach -A --exclude quereus-workspace run doc",
@@ -40,6 +46,7 @@
     "build:sync-client": "cd packages/quereus-sync-client && yarn build",
     "build:plugins": "cd packages/sample-plugins && yarn build",
     "build:vscode": "cd packages/quereus-vscode && yarn build",
+    "build:planviz": "cd packages/tools/planviz && yarn build",
     "build:sync-coordinator": "cd packages/sync-coordinator && yarn build",
     "build:babel-fish": "cd packages/quereus-babel-fish && yarn build",
     "build:ui": "cd packages/shared-ui && yarn build",
@@ -57,18 +64,20 @@
     "pub:plugin-ns": "node scripts/publish-package.js quereus-plugin-nativescript-sqlite",
     "pub:ui": "node scripts/publish-package.js shared-ui",
     "pub:cli": "node scripts/publish-package.js quoomb-cli",
-    "pub": "yarn pub:quereus && yarn pub:loader && yarn pub:isolation && yarn pub:store && yarn pub:plugin-indexeddb && yarn pub:plugin-leveldb && yarn pub:plugin-rn && yarn pub:plugin-ns && yarn pub:sync && yarn pub:sync-client && yarn pub:sync-coordinator && yarn pub:ui && yarn pub:cli"
+    "pub:planviz": "node scripts/publish-package.js tools/planviz",
+    "//pub": "NOTE: this publish order is still hand-maintained and is NO LONGER kept in lockstep with the build order — `build` now derives its order from tsconfig references (tsc -b), so adding/reordering a package updates the build automatically but NOT this chain. Keep this list in dependency order (a package must publish after everything it depends on) by hand; if you add a package to tsconfig.build.json, add its pub:* step here too. scripts/check-docs.mjs parses this chain (each step must call publish-package.js) to derive which packages need a stability banner, so a new step also needs an entry in docs/.stability.json.",
+    "pub": "yarn pub:quereus && yarn pub:loader && yarn pub:isolation && yarn pub:store && yarn pub:plugin-indexeddb && yarn pub:plugin-leveldb && yarn pub:plugin-rn && yarn pub:plugin-ns && yarn pub:sync && yarn pub:sync-client && yarn pub:sync-coordinator && yarn pub:ui && yarn pub:cli && yarn pub:planviz"
   },
   "devDependencies": {
-    "bumpp": "^10.4.0",
-    "esbuild": "^0.28.0",
-    "rimraf": "^6.1.2",
+    "bumpp": "^11.1.0",
+    "esbuild": "^0.28.1",
+    "rimraf": "^6.1.3",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
   },
   "resolutions": {
     "fast-xml-parser": "^5.7.0",
-    "dompurify": "^3.4.0",
+    "dompurify": "^3.4.11",
     "serialize-javascript": "^7.0.5"
   }
 }

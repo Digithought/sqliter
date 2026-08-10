@@ -2,16 +2,17 @@ import type { SqlValue } from '../../common/types.js';
 import { createScalarFunction } from '../registration.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
-import { INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, BOOLEAN_TYPE } from '../../types/builtin-types.js';
+import { INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, BOOLEAN_TYPE, BLOB_TYPE } from '../../types/builtin-types.js';
 import { DATE_TYPE, TIME_TYPE, DATETIME_TYPE, TIMESPAN_TYPE } from '../../types/temporal-types.js';
 import { JSON_TYPE } from '../../types/json-type.js';
+import { BLOB_RETURN, BOOLEAN_RETURN, INTEGER_RETURN, JSON_RETURN, REAL_RETURN, TEXT_RETURN, scalarReturn } from './return-types.js';
 
 /**
  * integer() - Convert value to INTEGER
  * Usage: integer(value)
  */
 export const INTEGER_FUNC = createScalarFunction(
-	{ name: 'integer', numArgs: 1, deterministic: true, returnType: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: true, isReadOnly: true } },
+	{ name: 'integer', numArgs: 1, deterministic: true, returnType: INTEGER_RETURN },
 	(value: SqlValue): SqlValue => {
 		if (value === null) return null;
 
@@ -31,7 +32,7 @@ export const INTEGER_FUNC = createScalarFunction(
  * Usage: real(value)
  */
 export const REAL_FUNC = createScalarFunction(
-	{ name: 'real', numArgs: 1, deterministic: true, returnType: { typeClass: 'scalar', logicalType: REAL_TYPE, nullable: true, isReadOnly: true } },
+	{ name: 'real', numArgs: 1, deterministic: true, returnType: REAL_RETURN },
 	(value: SqlValue): SqlValue => {
 		if (value === null) return null;
 
@@ -51,7 +52,7 @@ export const REAL_FUNC = createScalarFunction(
  * Usage: text(value)
  */
 export const TEXT_FUNC = createScalarFunction(
-	{ name: 'text', numArgs: 1, deterministic: true, returnType: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true } },
+	{ name: 'text', numArgs: 1, deterministic: true, returnType: TEXT_RETURN },
 	(value: SqlValue): SqlValue => {
 		if (value === null) return null;
 
@@ -67,11 +68,31 @@ export const TEXT_FUNC = createScalarFunction(
 );
 
 /**
+ * blob() - Convert value to BLOB
+ * Usage: blob(value)
+ */
+export const BLOB_FUNC = createScalarFunction(
+	{ name: 'blob', numArgs: 1, deterministic: true, returnType: BLOB_RETURN },
+	(value: SqlValue): SqlValue => {
+		if (value === null) return null;
+
+		try {
+			return BLOB_TYPE.parse!(value);
+		} catch (e) {
+			throw new QuereusError(
+				`Cannot convert to BLOB: ${e instanceof Error ? e.message : String(e)}`,
+				StatusCode.MISMATCH
+			);
+		}
+	}
+);
+
+/**
  * boolean() - Convert value to BOOLEAN
  * Usage: boolean(value)
  */
 export const BOOLEAN_FUNC = createScalarFunction(
-	{ name: 'boolean', numArgs: 1, deterministic: true, returnType: { typeClass: 'scalar', logicalType: BOOLEAN_TYPE, nullable: true, isReadOnly: true } },
+	{ name: 'boolean', numArgs: 1, deterministic: true, returnType: BOOLEAN_RETURN },
 	(value: SqlValue): SqlValue => {
 		if (value === null) return null;
 
@@ -98,7 +119,7 @@ export const DATE_FUNC = createScalarFunction(
 		name: 'date',
 		numArgs: 1,
 		deterministic: false,
-		returnType: { typeClass: 'scalar', logicalType: DATE_TYPE, nullable: true, isReadOnly: true },
+		returnType: scalarReturn(DATE_TYPE),
 		// `date(x) = D` is equivalent to `x` falling inside the half-open day window
 		// `[D, D+1)`; the boundary computation lives on the argument's logical type
 		// via `bucketBounds('date_bucket', value)`. Only the unary form is annotated —
@@ -136,7 +157,7 @@ export const DATE_FUNC = createScalarFunction(
  * Note: This replaces the existing time() function in datetime.ts
  */
 export const TIME_FUNC = createScalarFunction(
-	{ name: 'time', numArgs: 1, deterministic: false, returnType: { typeClass: 'scalar', logicalType: TIME_TYPE, nullable: true, isReadOnly: true } },
+	{ name: 'time', numArgs: 1, deterministic: false, returnType: scalarReturn(TIME_TYPE) },
 	(value: SqlValue): SqlValue => {
 		if (value === null) return null;
 
@@ -167,7 +188,7 @@ export const TIME_FUNC = createScalarFunction(
  * Note: This replaces the existing datetime() function in datetime.ts
  */
 export const DATETIME_FUNC = createScalarFunction(
-	{ name: 'datetime', numArgs: 1, deterministic: false, returnType: { typeClass: 'scalar', logicalType: DATETIME_TYPE, nullable: true, isReadOnly: true } },
+	{ name: 'datetime', numArgs: 1, deterministic: false, returnType: scalarReturn(DATETIME_TYPE) },
 	(value: SqlValue): SqlValue => {
 		if (value === null) return null;
 
@@ -195,7 +216,7 @@ export const DATETIME_FUNC = createScalarFunction(
  * it parses it. Otherwise, it converts the value to its JSON representation.
  */
 export const JSON_FUNC = createScalarFunction(
-	{ name: 'json', numArgs: 1, deterministic: true, returnType: { typeClass: 'scalar', logicalType: JSON_TYPE, nullable: true, isReadOnly: true } },
+	{ name: 'json', numArgs: 1, deterministic: true, returnType: JSON_RETURN },
 	(value: SqlValue): SqlValue => {
 		if (value === null) return null;
 
@@ -220,7 +241,7 @@ export const JSON_FUNC = createScalarFunction(
  * - Numeric values (interpreted as seconds): 3600, 86400
  */
 export const TIMESPAN_FUNC = createScalarFunction(
-	{ name: 'timespan', numArgs: 1, deterministic: true, returnType: { typeClass: 'scalar', logicalType: TIMESPAN_TYPE, nullable: true, isReadOnly: true } },
+	{ name: 'timespan', numArgs: 1, deterministic: true, returnType: scalarReturn(TIMESPAN_TYPE) },
 	(value: SqlValue): SqlValue => {
 		if (value === null) return null;
 

@@ -1,123 +1,111 @@
-# Optimizer Conventions: Characteristics-Based Patterns
+# Optimizer Conventions: Node Discrimination & Characteristics
 
-This document establishes the **implemented patterns** for the Quereus optimizer, using characteristics-based detection to ensure robust, extensible optimization rules. This approach is **actively in use** throughout the optimizer and plan builders.
+> **Stability: Internal** — see [Stability Tiers](stability.md#tiers).
 
-## Philosophy: Characteristics Over Identity
+This document is the canonical guide for **how an optimizer rule or plan builder asks a question about a plan node** — "is this a specific class?", "can this node do X?", "what are its physical properties?" — and which mechanism answers each. It also covers the characteristics/physical-property layer that many rules reason over.
 
-The optimizer makes decisions based on **what nodes can do** (characteristics) rather than **what nodes are** (specific types). This **implemented approach**:
+## Node discrimination: three questions, three mechanisms
 
-- **Eliminates fragility**: No hard-coded assumptions about specific node types
-- **Enables extensibility**: New node types automatically work with existing rules
-- **Improves maintainability**: Rules are self-documenting about their requirements
-- **Supports symbolic refactoring**: Member names can be changed without breaking dynamic references
+A rule almost always needs one of three distinct things from a node. They are **not** interchangeable, and each has exactly one right mechanism:
 
-## Core Principles
+| Question the rule is asking | Mechanism | Where it lives |
+| --- | --- | --- |
+| "Is this *this specific class*, so I can use its API?" | `instanceof SomeNode` | the node classes themselves |
+| "Can this node do X, whatever its class?" (any join kind, any aggregate kind) | branded marker interface + `CapabilityDetectors` guard | `src/planner/framework/characteristics.ts` |
+| "What are this node's physical properties?" (readonly / ordering / FDs / determinism) | `PlanNode.physical` via `PlanNodeCharacteristics` | `src/planner/framework/characteristics.ts` |
 
-### 1. Physical Properties First
-Use the physical properties system as the primary way to understand node capabilities:
+A fourth mechanism, `node.nodeType` (a `PlanNodeType` enum value), exists but is **for dispatch and serialization only** — rule-manifest routing, the plan formatter, EXPLAIN. It is *not* a class-narrowing tool: `nodeType` is not 1:1 with classes and gives the compiler no narrowing.
+
+### The distinction rule authors need at the keyboard
+
+> **Need one class's specific API → `instanceof` that class.**
+> **Need "any node that can do X" → the capability guard.**
+
+Both are legitimate. They differ by **intent**, and that difference is not "drift." A rule that only ever works on `AggregateNode` should say `instanceof AggregateNode`; a rule that works on *any* aggregating node should ask `CapabilityDetectors.isAggregating(node)`. Choosing the narrower `instanceof` when you mean one class is correct, not a smell.
+
+## `instanceof` — concrete class identity
+
+Use `instanceof` when a rule needs a **specific class's** API. It is type-sound, narrows natively, and is the dominant idiom in the planner (hundreds of call sites). The canonical rule shape is:
 
 ```typescript
-// ❌ Fragile: Hard-coded node type check
-if (node instanceof UpdateNode || node instanceof DeleteNode) {
-  // handle mutating operations
+const ruleAggregateStreaming: RuleFn = (node, optimizer) => {
+  if (!(node instanceof AggregateNode)) return null;
+  // node is now AggregateNode — its full API is available with compiler narrowing
+  ...
+};
+```
+
+**Why `instanceof` is safe here (cross-bundle constraint).** Planner node classes are singletons within `@quereus/quereus` — there is exactly one `AggregateNode` constructor per process, and plugins never receive plan nodes across a bundle boundary. So the classic `instanceof`-across-realms hazard (two copies of a class, `instanceof` silently false) does not arise for plan nodes. `instanceof` on a planner node is as reliable as any other identity check.
+
+## Cross-class capability — branded marker interfaces
+
+When a rule accepts **any implementer of a capability** — any join kind, any aggregate kind, anything that exposes a predicate — use the branded marker interfaces in `characteristics.ts` and their `CapabilityDetectors` guards.
+
+Each capability interface declares a unique `readonly is<X>Capable: true` **brand**. Every implementer sets it, and the matching guard tests exactly that marker:
+
+```typescript
+export interface AggregationCapable extends RelationalPlanNode {
+  readonly isAggregationCapable: true;   // the brand
+  getGroupingKeys(): readonly ScalarPlanNode[];
+  ...
 }
 
-// ✅ Robust: Physical property check
-if (PlanNode.hasSideEffects(node.physical)) {
+// in CapabilityDetectors:
+static isAggregating(node: PlanNode): node is AggregationCapable {
+  return (node as Partial<Pick<AggregationCapable, 'isAggregationCapable'>>).isAggregationCapable === true;
+}
+```
+
+To make a node detectable as a capability:
+
+1. Declare `implements XCapable` on the class.
+2. Set the `is<X>Capable` brand to `true`.
+3. Add (or reuse) the guard in `CapabilityDetectors`.
+
+**The compiler enforces completeness.** `implements XCapable` fails to compile unless the class also sets the brand, so "implements the capability" and "is detected as having it" are the *same fact* — a new implementer cannot silently be missed by a guard. A unique brand name also cannot misfire on an incidental property.
+
+### The anti-pattern: duck-typed `as any` detectors
+
+The thing to **not** do — and the reason `characteristics.ts` is lint-guarded against `any` — is detect a capability by probing for a property or method with a cast to `any`:
+
+```typescript
+// ❌ Anti-pattern: duck-typed property-presence check
+function isAggregating(node: PlanNode): boolean {
+  return 'getGroupingKeys' in node
+    && typeof (node as any).getGroupingKeys === 'function';
+}
+```
+
+This misfires: it silently matches any *unrelated* node that happens to grow a `getGroupingKeys` member, and it silently *stops* matching if the method is renamed — with no compiler help either way. The brand mechanism above replaced every such detector. `characteristics.ts` carries a file-scoped `@typescript-eslint/no-explicit-any: error` override (in `packages/quereus/eslint.config.mjs`) so a reintroduced `as any` detector fails lint.
+
+## `nodeType` — dispatch and serialization only
+
+`node.nodeType` routes the rule manifest, drives the plan formatter, and labels EXPLAIN output. Use it there. Do **not** use it to narrow to a class in rule logic — it is not 1:1 with classes and the compiler cannot narrow on it. For "is this a specific class?" use `instanceof`; for "can it do X?" use the capability guard.
+
+## Physical characteristics
+
+Physical properties — readonly, ordering, functional dependencies, determinism, cardinality — are the canonical source for "what this node *does* at runtime," independent of its class. They live on `PlanNode.physical` and are read through `PlanNodeCharacteristics`.
+
+This is a genuinely different question from class identity. Detecting side effects, for example, is a physical-property question, not an `instanceof` one:
+
+```typescript
+// A node's side-effect status is a physical property, not a class fact —
+// UpdateNode, DeleteNode, and any future mutating node all answer through
+// the same surface.
+if (PlanNodeCharacteristics.hasSideEffects(node)) {
   // handle operations with side effects
 }
 ```
 
-### 2. Interface-Based Capabilities
-Define interfaces that capture what nodes can do, not what they are:
+Likewise "does this produce ordered output?" is answered by physical properties, not by enumerating the classes (`Sort`, `StreamAggregate`, …) that happen to:
 
 ```typescript
-// ❌ Fragile: Checking specific node types
-if (node instanceof FilterNode || node instanceof JoinNode) {
-  // Both have predicates, but different structures
-}
-
-// ✅ Robust: Interface for predicate capability
-interface HasPredicate {
-  getPredicate(): ScalarPlanNode | null;
-}
-
-function canPushDownPredicate(node: PlanNode): node is HasPredicate {
-  return 'getPredicate' in node && typeof node.getPredicate === 'function';
+if (PlanNodeCharacteristics.hasOrderedOutput(node)) {
+  // any node that produces ordered output
 }
 ```
 
-### 3. Utility Functions for Characteristics
-Create reusable functions that detect characteristics across node types:
-
-```typescript
-// ✅ Characteristic detection utilities
-export class PlanNodeCharacteristics {
-  static hasOrderedOutput(node: PlanNode): boolean {
-    return node.physical.ordering !== undefined && node.physical.ordering.length > 0;
-  }
-  
-  static isConstantValue(node: PlanNode): node is ConstantNode {
-    return node.physical.constant === true && 'getValue' in node;
-  }
-  
-  static estimatesRows(node: PlanNode): number {
-    return node.physical.estimatedRows ?? DEFAULT_ROW_ESTIMATE;
-  }
-}
-```
-
-## Pattern Categories
-
-### Access Path Selection
-
-**Problem**: Rules need to identify table access patterns
-**Solution**: Interface-based table access capabilities
-
-```typescript
-interface TableAccessNode extends RelationalPlanNode {
-  readonly tableSchema: TableSchema;
-  getAccessMethod(): 'sequential' | 'index-scan' | 'index-seek';
-}
-
-function isTableAccess(node: PlanNode): node is TableAccessNode {
-  return isRelationalNode(node) && 'tableSchema' in node;
-}
-```
-
-### Predicate Operations
-
-**Problem**: Rules need to work with predicates across different node types
-**Solution**: Unified predicate interface
-
-```typescript
-interface PredicateCapable {
-  getPredicate(): ScalarPlanNode | null;
-  withPredicate(newPredicate: ScalarPlanNode | null): PlanNode;
-}
-
-interface PredicateCombinable extends PredicateCapable {
-  canCombinePredicates(): boolean;
-  combineWith(other: ScalarPlanNode): ScalarPlanNode;
-}
-```
-
-### Aggregation Detection
-
-**Problem**: Multiple ways to represent aggregation operations
-**Solution**: Aggregation capability interface
-
-```typescript
-interface AggregationCapable extends RelationalPlanNode {
-  getGroupingKeys(): readonly ScalarPlanNode[];
-  getAggregateExpressions(): readonly { expr: ScalarPlanNode; alias: string }[];
-  requiresOrdering(): boolean;
-}
-
-function isAggregating(node: PlanNode): node is AggregationCapable {
-  return isRelationalNode(node) && 'getGroupingKeys' in node;
-}
-```
+The detector surface (`PlanNodeCharacteristics`) covers side effects, readonly/determinism/idempotence, ordering and monotonicity, cardinality (`estimatesRows`, `guaranteesUniqueRows`, `hasUniqueKeys`), and the relational/scalar/void type class. See `src/planner/framework/characteristics.ts` for the full list.
 
 ### Functional Dependencies, Equivalence Classes, Bindings
 
@@ -138,242 +126,116 @@ import { computeClosure } from '../util/fd-utils.js';
 const determined = computeClosure(seedCols, node.physical.fds ?? []);
 ```
 
-**Key conventions for FD-aware rules:**
+**Key conventions for FD-aware rules.** Most of these are normative — the register is where
+they are stated, and where a reviewer checks them against the code. This guide keeps only
+what a rule author needs at the keyboard.
 
-1. **Reason via `computeClosure` / `determines` / `isSuperkey` / `isAssertedKey` / `hasAnyKey` / `hasSingletonFd`.** Walking `physical.fds` by hand will miss transitive closure and forget the subsumption / cap / guard semantics that `addFd` enforces.
-2. **Guarded FDs are not closure-time facts.** All closure helpers (`computeClosure`, `determines`, `isSuperkey`, `hasAnyKey`, `hasSingletonFd`, `deriveKeysFromFds`) **skip** guarded FDs by design — a conditional uniqueness claim cannot prove a key for an unrelated subtree. If your rule needs to discharge a guard, do it at the producing `Filter`'s `computePhysical` via `predicateImpliesGuard` + `stripGuard`, never at the consumer.
-3. **Column index space.** FDs / ECs / bindings are indexed by **output-column index** on the node carrying them, not by attribute ID. When you cross a Project / Returning / Aggregate / join boundary, translate via `projectFds` / `shiftFds` (and their EC / binding / domain mirrors) instead of hand-mapping. `shiftFds` shifts guard column indices alongside determinants/dependents; `projectFds` drops a guarded FD whose guard references a column missing from the mapping.
-4. **Use `addFd` (not `Array.push`) when accumulating FDs.** `addFd` performs subsumption (drop existing same-determinant FDs whose dependent set is a subset of the new one) and enforces `MAX_FDS_PER_NODE`. Pass `{ keyHints }` listing column-index sets that are known keys so cap eviction prefers to keep them; truncations are logged on the `quereus:planner:fd` debug channel.
-5. **Equivalence-class closure for bindings.** Whenever a rule adds a `ConstantBinding` at the same site as ECs (Filter, inner join), close it with `closeConstantBindingsOverEcs` so downstream consumers see the binding on every EC peer in a single pass. This is what makes `WHERE t.k = u.k AND t.k = 5` land as one binding covering both columns.
-6. **Outer joins drop the null-padded side.** Inheriting "everything from both children" is wrong for LEFT/RIGHT/FULL: NULL padding violates source FDs/ECs/bindings on the padded side, and a guarded FD whose guard references a NULL-padded column would also become activatable for the wrong rows. Follow the per-operator table in [Optimizer § Functional Dependency Tracking](optimizer.md#functional-dependency-tracking) rather than inventing a propagation policy.
-7. **Set semantics is not an FD.** "All output columns together form a key" lives on `RelationType.isSet`, not in `fds`. Consumers asking "is this relation unique?" should check `getType().isSet` *and* `hasAnyKey(fds, columnCount)` / `hasSingletonFd(fds, columnCount)`.
-8. **Provenance is informational.** FD / `ConstantBinding` / `DomainConstraint` entries may carry a `source` tag (`'declared-check'`, `{kind: 'assertion', name}`, etc.). Dedup helpers ignore `source` by design — never branch rule logic on it.
+> **Invariant:** [OPT-030](invariants.md#opt-030--uniqueness-is-read-through-one-surface), [OPT-032](invariants.md#opt-032--coverage-is-not-uniqueness)
 
-See [Optimizer § Functional Dependency Tracking](optimizer.md#functional-dependency-tracking) for the producer/consumer catalog and the per-operator propagation table, and [Optimizer § Binding-aware Delta Planning](optimizer.md#binding-aware-delta-planning-reusable) for the `analyzeRowSpecific` / `extractBindings` analysis surface that builds on this layer.
+Reason through the helpers, never by walking `physical.fds` yourself — hand-walking misses
+transitive closure and forgets the subsumption / cap / guard semantics `addFd` enforces. And
+pick coverage vs uniqueness deliberately: `closureCoversAll` is a pure value claim (a
+determined column is redundant in an `ORDER BY` / `GROUP BY` regardless of uniqueness),
+whereas `isUniqueDeterminant` — or, at node level, `keysOf` / `isUnique` — is the only sound
+way to ask "is this set row-unique?".
 
-### Caching Eligibility
+> **Invariant:** [OPT-034](invariants.md#opt-034--closure-helpers-skip-guarded-fds), [OPT-036](invariants.md#opt-036--a-guard-is-discharged-only-at-the-producing-filter), [OPT-038](invariants.md#opt-038--projection-drops-an-fd-whose-guard-loses-a-column)
 
-**Problem**: Determining what can be cached
-**Solution**: Physical properties + interface checks
+If your rule needs a guarded FD's fact, do not discharge the guard yourself. Discharge happens
+at the producing `Filter`'s `computePhysical`, via `predicateImpliesGuard` + `stripGuard`.
+
+> **Invariant:** [OPT-048](invariants.md#opt-048--dependency-facts-index-output-columns)
+
+Crossing a Project / Returning / Aggregate / join boundary, translate via `projectFds` /
+`shiftFds` and their EC / binding / domain / IND mirrors instead of hand-mapping indices.
+
+> **Invariant:** [OPT-046](invariants.md#opt-046--addfd-is-the-only-fd-accumulation-path), [OPT-047](invariants.md#opt-047--addfd-deduplicates-by-subsumption-and-evicts-by-keykind-preference)
+
+Accumulate with `addFd`, not `Array.push`. Pass `{ keyHints }` listing column-index sets known
+to be keys so cap eviction prefers to keep them; truncations log on the `quereus:planner:fd`
+debug channel.
+
+> **Invariant:** [OPT-042](invariants.md#opt-042--an-outer-join-drops-the-null-padded-sides-facts)
+
+Do not invent a propagation policy for a new operator — follow the per-operator table in
+[Functional Dependency Tracking](optimizer-fd.md#per-operator-propagation).
+
+> **Invariant:** [OPT-054](invariants.md#opt-054--all-columns-key-ness-lives-on-isset), [OPT-052](invariants.md#opt-052--provenance-is-informational)
+
+Set-ness is not an FD, but the readers consume it: `hasAnyKey(fds, columnCount, isSet)` and
+friends take it as a parameter, while `keysOf` / `isUnique` read `getType().isSet` themselves.
+And a `source` tag is for diagnostics — never branch rule logic on it.
+
+**Not in the register** (a convention, not an invariant): whenever a rule adds a
+`ConstantBinding` at the same site as ECs (Filter, inner join), close it with
+`closeConstantBindingsOverEcs` so downstream consumers see the binding on every EC peer in one
+pass. That is what makes `WHERE t.k = u.k AND t.k = 5` land as one binding covering both
+columns.
+
+See [Functional Dependency Tracking](optimizer-fd.md#functional-dependency-tracking) for the producer/consumer catalog and the per-operator propagation table, and [Assertions § Binding-aware Delta Planning](optimizer-assertions.md#binding-aware-delta-planning-reusable) for the `analyzeRowSpecific` / `extractBindings` analysis surface that builds on this layer.
+
+## Worked example: caching eligibility
+
+Cache eligibility mixes all three questions — a physical-property check (`isRelational`, `hasSideEffects`) and a capability guard (`isCached` narrows to `CacheCapable`, so `isCached()` is callable without a cast):
 
 ```typescript
 export class CachingAnalysis {
   static isCacheable(node: PlanNode): boolean {
-    // Must be relational to cache results
-    if (!isRelationalNode(node)) return false;
-    
-    // Already cached nodes don't need re-caching
-    if (this.isAlreadyCached(node)) return false;
-    
-    // Check physical properties for side effects
-    const physical = node.physical;
-    if (PlanNode.hasSideEffects(physical)) {
-      // Only cache if execution would be expensive and repeated
+    // Physical: must be relational to cache results
+    if (!PlanNodeCharacteristics.isRelational(node)) return false;
+
+    // Capability: already-cached nodes don't need re-caching
+    if (CapabilityDetectors.isCached(node) && node.isCached()) return false;
+
+    // Physical: side effects gate cacheability
+    if (PlanNodeCharacteristics.hasSideEffects(node)) {
       return this.isExpensiveRepeatedOperation(node);
     }
-    
     return true;
   }
-  
-  private static isAlreadyCached(node: PlanNode): boolean {
-    return 'cacheStrategy' in node && node.cacheStrategy !== null;
-  }
 }
-```
-
-## Migration Patterns
-
-### From instanceof to Interface Checks
-
-```typescript
-// Before: Hard-coded type checks
-function oldRule(node: PlanNode): PlanNode | null {
-  if (node instanceof FilterNode) {
-    const filter = node as FilterNode;
-    // ... work with filter.predicate
-  } else if (node instanceof JoinNode) {
-    const join = node as JoinNode;
-    // ... work with join.condition
-  }
-  return null;
-}
-
-// After: Interface-based approach
-function newRule(node: PlanNode): PlanNode | null {
-  if (canPushDownPredicate(node)) {
-    const predicate = node.getPredicate();
-    if (predicate && canOptimizePredicate(predicate)) {
-      return optimizePredicateNode(node, predicate);
-    }
-  }
-  return null;
-}
-```
-
-### From nodeType Checks to Property Checks
-
-```typescript
-// Before: Enumeration-based checks
-if (node.nodeType === PlanNodeType.Sort || 
-    node.nodeType === PlanNodeType.StreamAggregate) {
-  // Handle ordered operations
-}
-
-// After: Property-based checks
-if (PlanNodeCharacteristics.hasOrderedOutput(node)) {
-  // Handle any node that produces ordered output
-}
-```
-
-## Framework Utilities
-
-### Core Characteristic Detectors
-
-```typescript
-export class PlanNodeCharacteristics {
-  // Physical property shortcuts
-  static hasSideEffects = PlanNode.hasSideEffects;
-  static isReadOnly(node: PlanNode): boolean {
-    return node.physical.readonly !== false;
-  }
-  static isDeterministic(node: PlanNode): boolean {
-    return node.physical.deterministic !== false;
-  }
-  static isConstant(node: PlanNode): node is ConstantNode {
-    return node.physical.constant === true && 'getValue' in node;
-  }
-  
-  // Ordering capabilities
-  static hasOrderedOutput(node: PlanNode): boolean {
-    return node.physical.ordering !== undefined && node.physical.ordering.length > 0;
-  }
-  static preservesOrdering(node: PlanNode): boolean {
-    // Check if node preserves input ordering
-    const children = node.getChildren();
-    return children.length === 1 && this.hasOrderedOutput(children[0]);
-  }
-  
-  // Cardinality analysis
-  static estimatesRows(node: PlanNode): number {
-    return node.physical.estimatedRows ?? DEFAULT_ROW_ESTIMATE;
-  }
-  static guaranteesUniqueRows(node: PlanNode): boolean {
-    return node.physical.uniqueKeys?.some(key => key.length === 0) === true;
-  }
-  
-  // Relational capabilities
-  static isRelational = isRelationalNode;
-  static producesRows(node: PlanNode): node is RelationalPlanNode {
-    return isRelationalNode(node);
-  }
-}
-```
-
-### Capability Interface Registry
-
-```typescript
-export class CapabilityRegistry {
-  private static readonly detectors = new Map<string, (node: PlanNode) => boolean>();
-  
-  static register<T extends PlanNode>(
-    capability: string,
-    detector: (node: PlanNode) => node is T
-  ): void {
-    this.detectors.set(capability, detector);
-  }
-  
-  static hasCapability(node: PlanNode, capability: string): boolean {
-    const detector = this.detectors.get(capability);
-    return detector ? detector(node) : false;
-  }
-  
-  static getCapable<T extends PlanNode>(
-    nodes: readonly PlanNode[], 
-    capability: string
-  ): T[] {
-    const detector = this.detectors.get(capability);
-    if (!detector) return [];
-    return nodes.filter(detector) as T[];
-  }
-}
-
-// Usage in rules:
-CapabilityRegistry.register('predicate-pushdown', canPushDownPredicate);
-CapabilityRegistry.register('table-access', isTableAccess);
 ```
 
 ## Rule Development Guidelines
 
-### 1. Start with Capabilities
-Before writing a rule, identify what characteristics the rule needs:
+### Decide which question you're asking first
+Before writing a rule, name what it needs from the node:
 
 ```typescript
 function ruleMyOptimization(node: PlanNode, context: OptContext): PlanNode | null {
-  // 1. Check required capabilities
-  if (!PlanNodeCharacteristics.isRelational(node)) return null;
+  // Class identity → instanceof
+  if (!(node instanceof MyTargetNode)) return null;
+  // Physical gate → PlanNodeCharacteristics
   if (PlanNodeCharacteristics.hasSideEffects(node)) return null;
-  
-  // 2. Check specific interfaces if needed
-  if (!isSpecializedCapability(node)) return null;
-  
-  // 3. Apply transformation based on characteristics
-  return transformBasedOnCharacteristics(node, context);
+  // Cross-class capability → CapabilityDetectors
+  if (!CapabilityDetectors.canPushDownPredicate(node)) return null;
+  return transform(node, context);
 }
 ```
 
-### 2. Prefer Composition over Inheritance
-Use interfaces to compose capabilities rather than relying on inheritance hierarchies:
-
-```typescript
-interface Sortable {
-  getSortKeys(): readonly SortKey[];
-  withSortKeys(keys: readonly SortKey[]): PlanNode;
-}
-
-interface Projectable {
-  getProjections(): readonly Projection[];
-  withProjections(projections: readonly Projection[]): PlanNode;
-}
-
-// Nodes implement multiple interfaces as appropriate
-class SortedProjectNode implements RelationalPlanNode, Sortable, Projectable {
-  // ... implementation
-}
-```
-
-### 3. Document Required Characteristics
-Make rule requirements explicit in documentation:
+### Document required characteristics
+Make a rule's requirements explicit in its doc comment:
 
 ```typescript
 /**
  * Rule: Predicate Pushdown
- * 
- * Required Characteristics:
- * - Node must implement PredicateCapable interface
- * - Node must be read-only (no side effects)
- * - Predicate must be deterministic
- * 
- * Applied When:
- * - Child node supports predicate pushdown
- * - Predicate references only child's output columns
+ *
+ * Required:
+ * - Node implements PredicateCapable (CapabilityDetectors.canPushDownPredicate)
+ * - Node is read-only (PlanNodeCharacteristics.hasSideEffects === false)
+ * - Predicate is deterministic
  */
 export function rulePushDownPredicate(node: PlanNode, context: OptContext): PlanNode | null {
   // Implementation follows documented requirements
 }
 ```
 
-## Benefits of This Approach
-
-1. **Symbolic Rename Safety**: Member names can be changed without breaking optimizer
-2. **Extensibility**: New node types work automatically with existing rules
-3. **Maintainability**: Clear separation between node structure and optimization logic
-4. **Testability**: Characteristics can be tested independently of specific nodes
-5. **Documentation**: Rules self-document their requirements through capability checks
-
 ## For New Developers
 
 When working with the optimizer or plan builders:
-- **DO**: Use `CapabilityDetectors` and `PlanNodeCharacteristics` utilities
-- **DON'T**: Use `instanceof` checks or hard-coded node type assumptions
-- **REFERENCE**: The capability interfaces in `src/planner/framework/characteristics.ts`
-- **FOLLOW**: The patterns established in existing optimization rules and builders 
+
+- **Need a specific class's API?** → `instanceof ThatNode`. It's type-sound, narrows natively, and is the dominant idiom. Safe here because planner nodes are singletons in `@quereus/quereus` (no cross-bundle realm hazard).
+- **Need "any node that can do X"?** → a `CapabilityDetectors` guard backed by a branded marker interface in `src/planner/framework/characteristics.ts`.
+- **Need a physical property** (readonly / ordering / FDs / determinism / cardinality)? → `PlanNodeCharacteristics` over `PlanNode.physical`.
+- **Routing / serialization / EXPLAIN?** → `nodeType`. Never for class narrowing in rule logic.
+- **DON'T** detect a capability by duck-typing — `'foo' in node && typeof (node as any).foo === 'function'`. That's the misfiring pattern the brand mechanism (and the `no-explicit-any` guard on `characteristics.ts`) exists to prevent.

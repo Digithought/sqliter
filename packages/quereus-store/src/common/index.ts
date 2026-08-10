@@ -7,12 +7,17 @@ export type {
   KVStore,
   KVEntry,
   WriteBatch,
+  WriteOptions,
   BatchOp,
+  AtomicBatch,
   IterateOptions,
   KVStoreFactory,
   KVStoreOptions,
   KVStoreProvider,
 } from './kv-store.js';
+
+// Bounded paging for backends without a streaming cursor
+export { pagedIterate, type FetchBatch } from './paged-iterate.js';
 
 // Key encoding
 export {
@@ -20,10 +25,11 @@ export {
   encodeCompositeKey,
   decodeValue,
   decodeCompositeKey,
-  registerCollationEncoder,
-  getCollationEncoder,
-  type CollationEncoder,
+  BUILTIN_KEY_NORMALIZER_RESOLVER,
+  assertNoUnpairedSurrogate,
+  findUnpairedSurrogate,
   type EncodeOptions,
+  type KeyValueTransform,
 } from './encoding.js';
 
 // Row serialization
@@ -48,9 +54,19 @@ export {
 	buildStatsKey,
 	buildDataKey,
 	buildIndexKey,
+	type IndexKeyHalf,
 	buildCatalogKey,
+	buildViewCatalogKey,
+	buildMaterializedViewCatalogKey,
+	parseMaterializedViewCatalogKey,
+	buildMetaCatalogKey,
+	CLEAN_SHUTDOWN_META_NAME,
+	STALE_MVS_META_NAME,
+	classifyCatalogKey,
+	type CatalogEntryKind,
 	buildFullScanBounds,
 	buildIndexPrefixBounds,
+	buildPkPrefixBounds,
 	buildCatalogScanBounds,
 	// Legacy exports (deprecated)
 	KEY_PREFIX,
@@ -71,13 +87,18 @@ export {
 } from './events.js';
 
 // DDL generation (canonical implementation lives in @quereus/quereus)
-export { generateTableDDL, generateIndexDDL } from '@quereus/quereus';
+export { generateTableDDL, generateIndexDDL, generateViewDDL, generateMaintainedTableDDL, generateIndexTagsDDL } from '@quereus/quereus';
 
 // Transaction support
 export {
   TransactionCoordinator,
   type TransactionCallbacks,
+  type PendingStoreOps,
+  type OrderedPendingOps,
 } from './transaction.js';
+
+// Byte helpers for encoded keys
+export { bytesToHex, bytesEqual, compareBytes } from './bytes.js';
 
 // In-memory KV store
 export { InMemoryKVStore } from './memory-store.js';
@@ -86,15 +107,30 @@ export { InMemoryKVStore } from './memory-store.js';
 export { CachedKVStore, type CacheOptions } from './cached-kv-store.js';
 
 // Generic store table and connection
+export { StoreTable, type ExternalRowOp } from './store-table.js';
+export { type StoreTableConfig, type StoreTableModule } from './store-table-base.js';
+
+// Physical key properties of primary-key / index columns
 export {
-  StoreTable,
-  type StoreTableConfig,
-  type StoreTableModule,
-} from './store-table.js';
+  resolvePkKeyCollations,
+  resolvePkKeyTransforms,
+  resolveIndexKeyCollations,
+  resolveIndexKeyTransforms,
+  storeSemanticKeyTransform,
+} from './pk-key-resolution.js';
+
+// Structural key encoding for declared-JSON key members
+export { jsonStructuralKey } from './json-key.js';
 export { StoreConnection } from './store-connection.js';
 
-// Generic store module
-export { StoreModule, type StoreModuleConfig, type RehydrationResult, type RehydrationError } from './store-module.js';
+// Materialized-view backing host (engine backing-host capability over a store table)
+export { StoreBackingHost } from './backing-host.js';
+
+// Generic store module. The class is layered across a chain of files (see the header of
+// store-module.ts); these three own the names the package exports.
+export { StoreModule } from './store-module.js';
+export { type StoreModuleConfig, type LensDeploymentListener } from './store-module-base.js';
+export { type RehydrationResult, type RehydrationError } from './store-module-schema-sync.js';
 
 // Isolation layer utilities
 export {

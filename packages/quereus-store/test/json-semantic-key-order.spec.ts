@@ -1,0 +1,624 @@
+/**
+ * JSON key order and identity in the persistent store.
+ *
+ * Under the semantic-ordering ruling (docs/types.md "Semantic ordering"), a declared
+ * JSON column orders by the structural deep-compare: type rank null < boolean <
+ * number < string < array < object, then element/key-wise recursion with a length
+ * tiebreak. The store encodes a JSON PK / index key member through the structural
+ * byte form (`jsonStructuralKey`, src/common/json-key.ts), so its physical scan
+ * order IS that order — previously the key bytes were canonical JSON text, which
+ * scanned `[10]` before `[2]` and misaligned the isolation overlay's merge (an
+ * in-transaction update surfaced a row twice, a delete left it visible — fix
+ * `bug-json-pk-store-scan-order`).
+ *
+ * A memory table is the oracle throughout (its typed BTree emits structural order).
+ * The isolation-layer section replays the original defect's repro verbatim.
+ */
+
+import { describe, it, beforeEach, afterEach } from 'mocha';
+import { expect } from 'chai';
+import { Database, asyncIterableToArray, type SqlValue } from '@quereus/quereus';
+import { StoreModule, createIsolatedStoreModule, InMemoryKVStore, type KVStoreProvider } from '../src/index.js';
+
+function createInMemoryProvider(): KVStoreProvider {
+	const stores = new Map<string, InMemoryKVStore>();
+	const get = (key: string) => {
+		if (!stores.has(key)) stores.set(key, new InMemoryKVStore());
+		return stores.get(key)!;
+	};
+	return {
+		async getStore(s, t) { return get(`${s}.${t}`); },
+		async getIndexStore(s, t, i) { return get(`${s}.${t}_idx_${i}`); },
+		async getStatsStore(s, t) { return get(`${s}.${t}.__stats__`); },
+		async getCatalogStore() { return get('__catalog__'); },
+		async closeStore() {},
+		async closeIndexStore() {},
+		async closeAll() {
+			for (const store of stores.values()) await store.close();
+			stores.clear();
+		},
+	};
+}
+
+/** Every value of `column` produced by `sql`, in emission order. */
+async function column(db: Database, sql: string, name: string): Promise<SqlValue[]> {
+	return (await asyncIterableToArray(db.eval(sql))).map(r => r[name] as SqlValue);
+}
+
+/** The JSON array of physical operator names for `query`'s plan. */
+async function planOps(db: Database, query: string): Promise<string> {
+	const rows = await asyncIterableToArray(
+		db.eval(`select json_group_array(op) as ops from query_plan(?)`, [query]),
+	);
+	expect(rows).to.have.lengthOf(1);
+	return rows[0].ops as string;
+}
+
+const SEEK = /INDEXSEEK|INDEX SEEK|IndexSeek/i;
+
+/** Runs `sql`, returning the thrown error or null. */
+async function attempt(db: Database, sql: string): Promise<Error | null> {
+	try {
+		await db.exec(sql);
+		return null;
+	} catch (e) {
+		return e as Error;
+	}
+}
+
+describe('JSON structural key order (store)', () => {
+	let db: Database;
+	let provider: KVStoreProvider;
+
+	beforeEach(() => {
+		db = new Database();
+		provider = createInMemoryProvider();
+		db.registerModule('store', new StoreModule(provider));
+	});
+
+	afterEach(async () => {
+		await provider.closeAll();
+		await db.close();
+	});
+
+	describe('plain-scan order matches the memory table', () => {
+		it('emits array keys structurally: [2] < [3] < [10], not text order', async () => {
+			await db.exec(`create table t (j json primary key) using store`);
+			await db.exec(`create table m (j json primary key)`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values ('[2]'), ('[10]'), ('[3]')`);
+			}
+			// Canonical-text bytes emitted ['[10]','[2]','[3]'] here.
+			const scan = await column(db, `select json_quote(j) as q from t`, 'q');
+			expect(scan).to.deep.equal(['[2]', '[3]', '[10]']);
+			expect(scan).to.deep.equal(await column(db, `select json_quote(j) as q from m`, 'q'));
+		});
+
+		it('ranks the non-null JSON kinds: boolean < number < string < array < object', async () => {
+			// JSON null converts to SQL NULL, and a PRIMARY KEY column is NOT NULL —
+			// see the companion test below — so the PK-scan rank covers the five
+			// non-null kinds and the null rank is pinned via ORDER BY on a nullable
+			// column.
+			await db.exec(`create table t (j json primary key) using store`);
+			await db.exec(`create table m (j json primary key)`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(
+					`insert into ${tbl} values ('{"a":1}'), ('[2]'), ('"abc"'), ('7'), ('true')`);
+			}
+			const scan = await column(db, `select json_quote(j) as q from t`, 'q');
+			expect(scan).to.deep.equal(['true', '7', '"abc"', '[2]', '{"a":1}']);
+			expect(scan).to.deep.equal(await column(db, `select json_quote(j) as q from m`, 'q'));
+
+			// Null ranks first (SQL NULL sorts before every JSON value, matching the
+			// structural rank null < boolean < ...), on both backends.
+			await db.exec(`create table tn (id integer primary key, j json null) using store`);
+			await db.exec(`create table mn (id integer primary key, j json null)`);
+			for (const tbl of ['tn', 'mn']) {
+				await db.exec(`insert into ${tbl} values (1, '{"a":1}'), (2, 'null'), (3, 'true')`);
+			}
+			const sorted = await column(db, `select json_quote(j) as q from tn order by j`, 'q');
+			expect(sorted).to.deep.equal(['null', 'true', '{"a":1}']);
+			expect(sorted).to.deep.equal(await column(db, `select json_quote(j) as q from mn order by j`, 'q'));
+		});
+
+		it('rejects JSON null in a JSON PRIMARY KEY column (converts to SQL NULL)', async () => {
+			// JSON null and SQL NULL are the same value in Quereus (JSON_TYPE.parse
+			// maps the text 'null' to null). Conversion now happens at the DML
+			// emitter (json-coerce-once-at-dml-source), so the NOT NULL check sees
+			// the converted value and fires — previously it inspected the raw text
+			// 'null', passed, and the storage layer then silently stored a NULL key
+			// in a NOT NULL PK column.
+			await db.exec(`create table pk_null (j json primary key) using store`);
+			await db.exec(`create table pk_null_m (j json primary key)`);
+			for (const tbl of ['pk_null', 'pk_null_m']) {
+				const err = await attempt(db, `insert into ${tbl} values ('null')`);
+				expect(err, `${tbl} must reject JSON null in a PK column`).to.not.be.null;
+				expect(String(err)).to.match(/not null/i);
+			}
+		});
+
+		it('orders nested structures by element-wise recursion', async () => {
+			await db.exec(`create table t (j json primary key) using store`);
+			await db.exec(`create table m (j json primary key)`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values `
+					+ `('{"a":{"b":10}}'), ('[[2]]'), ('[[1],2]'), ('{"a":{"b":2}}'), ('[[1]]')`);
+			}
+			const scan = await column(db, `select json_quote(j) as q from t`, 'q');
+			expect(scan).to.deep.equal(['[[1]]', '[[1],2]', '[[2]]', '{"a":{"b":2}}', '{"a":{"b":10}}']);
+			expect(scan).to.deep.equal(await column(db, `select json_quote(j) as q from m`, 'q'));
+		});
+
+		it('applies the length tiebreak, and keys {} apart from {"":0}', async () => {
+			await db.exec(`create table t (j json primary key) using store`);
+			await db.exec(`create table m (j json primary key)`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values ('[2,0]'), ('{"":0}'), ('[2]'), ('{}')`);
+			}
+			// A proper prefix sorts first; an empty-string key is a real (distinct) key.
+			const scan = await column(db, `select json_quote(j) as q from t`, 'q');
+			expect(scan).to.deep.equal(['[2]', '[2,0]', '{}', '{"":0}']);
+			expect(scan).to.deep.equal(await column(db, `select json_quote(j) as q from m`, 'q'));
+		});
+
+		it('keeps JSON-number-spelled string scalars distinct, in code-point order', async () => {
+			// '"9"' and '"9.0"' are both string leaves, not numbers — they must stay
+			// separate rows and scan in code-point order ('"10"' < '"9"' < '"9.0"'),
+			// not numeric order.
+			await db.exec(`create table t (j json primary key) using store`);
+			await db.exec(`create table m (j json primary key)`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values ('"9"'), ('"9.0"'), ('"10"')`);
+			}
+			const scan = await column(db, `select json_quote(j) as q from t`, 'q');
+			expect(scan).to.deep.equal(['"10"', '"9"', '"9.0"']);
+			expect(scan).to.deep.equal(await column(db, `select json_quote(j) as q from m`, 'q'));
+		});
+
+		it('iterates a DESC JSON PK in reverse structural order', async () => {
+			// DESC bit-inverts the structural blob's key bytes — variable-length, escaped,
+			// 0x00-terminated — which must still reverse cleanly.
+			await db.exec(`create table t (j json, primary key (j desc)) using store`);
+			await db.exec(`insert into t values ('[2]'), ('[10]'), ('[3]')`);
+			expect(await column(db, `select json_quote(j) as q from t`, 'q'))
+				.to.deep.equal(['[10]', '[3]', '[2]']);
+		});
+
+		it('elides the Sort for order by — the byte order IS the advertised order', async () => {
+			// What used to be a test of Sort over a declined advertisement is now a test
+			// of the store's byte order itself: `semanticKeyOrderIsFaithful` opens the
+			// PK-order advertisement for a declared-json PK, so no Sort runs.
+			await db.exec(`create table t (j json primary key) using store`);
+			await db.exec(`create table m (j json primary key)`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values ('[10]'), ('{"a":1}'), ('[2]')`);
+			}
+			expect(await column(db, `select json_quote(j) as q from t order by j`, 'q'))
+				.to.deep.equal(await column(db, `select json_quote(j) as q from m order by j`, 'q'));
+			expect(await planOps(db, `select j from t order by j`), 'structural byte order needs no Sort')
+				.to.not.match(/sort/i);
+		});
+	});
+
+	describe('primary key identity', () => {
+		it('rejects a reorder-equal object spelling as a duplicate PK, as the memory table does', async () => {
+			await db.exec(`create table t (j json primary key, v text) using store`);
+			await db.exec(`create table m (j json primary key, v text)`);
+
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values ('{"a":1,"b":2}', 'first')`);
+				const err = await attempt(db, `insert into ${tbl} values ('{"b":2,"a":1}', 'second')`);
+				expect(err, `${tbl} must reject the reorder-equal spelling`).to.not.be.null;
+				expect(String(err)).to.match(/unique/i);
+				expect((await db.get(`select count(*) as cnt from ${tbl}`))?.cnt).to.equal(1);
+			}
+		});
+
+		it('rejects a JSON-number-spelled string PK as a duplicate when it collides via a UNIQUE column, as the memory table does', async () => {
+			// Repro for bug-json-pk-equality-drops-collation: '"9"' and '"9.0"' are
+			// distinct string-scalar PKs, but the store's self-PK-exclusion check used to
+			// build its equality comparator with no collation, which made JSON_TYPE.compare
+			// re-parse both as the number 9 and call them the same row — so the second
+			// insert's own UNIQUE conflict search excluded the first row from consideration
+			// and the violation went unraised.
+			await db.exec(`create table t (j json primary key, u text unique) using store`);
+			await db.exec(`create table m (j json primary key, u text unique)`);
+
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values ('"9"', 'dup')`);
+				const err = await attempt(db, `insert into ${tbl} values ('"9.0"', 'dup')`);
+				expect(err, `${tbl} must reject the duplicate 'u' value`).to.not.be.null;
+				expect(String(err)).to.match(/unique/i);
+				expect((await db.get(`select count(*) as cnt from ${tbl}`))?.cnt).to.equal(1);
+			}
+		});
+
+		it('point-seeks a reorder-equal equality: `j = json(...)` finds the row stored the other way', async () => {
+			// The re-opened point arm. `jsonStructuralKey` sorts object keys, so both
+			// spellings key identically and the full-PK equality resolves to one
+			// data-store `get`. The probe must be written through `json(...)`: a bare TEXT
+			// literal is TEXT-class and matches no OBJECT-class row on either backend (see
+			// the note on the next test).
+			await db.exec(`create table t (j json primary key, v text) using store`);
+			await db.exec(`create table m (j json primary key, v text)`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values ('{"a":1,"b":2}', 'a'), ('[3]', 'b')`);
+			}
+			const q = (tbl: string) => `select v from ${tbl} where j = json('{"b":2,"a":1}')`;
+			expect(await column(db, q('t'), 'v')).to.deep.equal(['a']);
+			expect(await column(db, q('t'), 'v')).to.deep.equal(await column(db, q('m'), 'v'));
+			expect(await planOps(db, q('t')), 'the full-PK equality seeks rather than scanning').to.match(SEEK);
+		});
+
+		it('matches memory — and does not raise — for a blob EQ probe on a `json` PK', async () => {
+			// `jsonStructuralKey` raises INTERNAL for a blob node, so the probe gate
+			// (`jsonKeyEncodable`) has to decline it before any window is encoded. The
+			// engine folds this particular comparison to an empty result before the module
+			// is asked at all; the assertion is that nothing anywhere raises and the row
+			// set matches memory.
+			await db.exec(`create table t (j json primary key, v text) using store`);
+			await db.exec(`create table m (j json primary key, v text)`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values ('7', 'a'), ('"abc"', 'b'), ('{"a":1}', 'c')`);
+			}
+			const q = (tbl: string) => `select v from ${tbl} where j = x'01'`;
+			expect(await column(db, q('t'), 'v')).to.deep.equal(await column(db, q('m'), 'v'));
+			// Parameter-bound too: the literal-folding path above is not the only one.
+			const rows = await asyncIterableToArray(db.eval(`select v from t where j = ?`, [new Uint8Array([1])]));
+			const memRows = await asyncIterableToArray(db.eval(`select v from m where j = ?`, [new Uint8Array([1])]));
+			expect(rows).to.deep.equal(memRows);
+		});
+
+		it('seeks a reorder-equal EQ over a JSON-led SECONDARY index', async () => {
+			// The index EQ prefix addresses the TRANSFORMED (structural) bytes the index
+			// store holds; without the threaded `indexKeyTransforms` the window would
+			// address canonical text and return nothing.
+			await db.exec(`create table t (id integer primary key, j json) using store`);
+			await db.exec(`create index ix_j on t (j)`);
+			await db.exec(`create table m (id integer primary key, j json)`);
+			await db.exec(`create index ix_mj on m (j)`);
+			for (const tbl of ['t', 'm']) {
+				await db.exec(`insert into ${tbl} values (1, '{"a":1,"b":2}'), (2, '[10]'), (3, '[2]')`);
+			}
+			const q = (tbl: string) => `select id from ${tbl} where j = json('{"b":2,"a":1}') order by id`;
+			expect(await column(db, q('t'), 'id')).to.deep.equal([1]);
+			expect(await column(db, q('t'), 'id')).to.deep.equal(await column(db, q('m'), 'id'));
+			expect(await planOps(db, q('t')), 'the index EQ prefix seeks').to.match(SEEK);
+		});
+
+		it('honors `insert or ignore` and `insert or replace` across reorder-equal spellings', async () => {
+			// NOTE: rows are addressed through `v` here — a JSON column compared against a
+			// TEXT literal (`where j = '{"a":1}'`) matches nothing on the memory backend
+			// either (storage-class mismatch in the generic EQ path), so cross-spelling
+			// predicate addressing is out of this spec's scope.
+			await db.exec(`create table t (j json primary key, v text) using store`);
+			await db.exec(`insert into t values ('{"a":1,"b":2}', 'orig')`);
+
+			await db.exec(`insert or ignore into t values ('{"b":2,"a":1}', 'ignored')`);
+			expect((await db.get(`select count(*) as cnt from t`))?.cnt).to.equal(1);
+			expect((await db.get(`select v from t`))?.v).to.equal('orig');
+
+			await db.exec(`insert or replace into t values ('{"b":2,"a":1}', 'replaced')`);
+			expect((await db.get(`select count(*) as cnt from t`))?.cnt).to.equal(1);
+			expect((await db.get(`select v from t`))?.v).to.equal('replaced');
+		});
+	});
+
+	describe('secondary UNIQUE identity', () => {
+		it('rejects a reorder-equal duplicate in a UNIQUE json column', async () => {
+			await db.exec(`create table t (id integer primary key, j json unique) using store`);
+			await db.exec(`insert into t values (1, '{"a":1,"b":2}')`);
+			const err = await attempt(db, `insert into t values (2, '{"b":2,"a":1}')`);
+			expect(err, 'the enforcement seek must land on the reorder-equal entry').to.not.be.null;
+			expect(String(err)).to.match(/unique/i);
+		});
+
+		it('rejects `create unique index` over existing reorder-equal spellings', async () => {
+			await db.exec(`create table t (id integer primary key, j json) using store`);
+			await db.exec(`insert into t values (1, '{"a":1,"b":2}'), (2, '{"b":2,"a":1}')`);
+			const err = await attempt(db, `create unique index t_j on t (j)`);
+			expect(err, 'the build-time dedup must see one identity').to.not.be.null;
+			expect(String(err)).to.match(/unique/i);
+		});
+	});
+});
+
+describe('JSON structural key order (isolated store)', () => {
+	let db: Database;
+	let provider: KVStoreProvider;
+
+	beforeEach(async () => {
+		db = new Database();
+		provider = createInMemoryProvider();
+		db.registerModule('store', createIsolatedStoreModule({ provider }));
+		await db.exec(`create table t (j json primary key, v int) using store`);
+	});
+
+	afterEach(async () => {
+		await provider.closeAll();
+		await db.close();
+	});
+
+	it('an in-transaction UPDATE surfaces the row ONCE (the original repro)', async () => {
+		// With canonical-text key bytes the merge lost alignment and this select
+		// returned FOUR rows: the updated row in both its new and committed form.
+		await db.exec(`insert into t values ('[2]', 1), ('[10]', 2), ('[3]', 3)`);
+
+		await db.exec('begin');
+		await db.exec(`update t set v = 99 where v = 1`);
+		const staged = await asyncIterableToArray(db.eval(`select json_quote(j) as q, v from t`));
+		expect(staged).to.have.lengthOf(3);
+		expect(staged.map(r => `${r.q}:${r.v}`).sort())
+			.to.deep.equal(['[10]:2', '[2]:99', '[3]:3']);
+		await db.exec('commit');
+
+		const final = await asyncIterableToArray(db.eval(`select json_quote(j) as q, v from t`));
+		expect(final.map(r => `${r.q}:${r.v}`).sort())
+			.to.deep.equal(['[10]:2', '[2]:99', '[3]:3']);
+	});
+
+	it('an in-transaction DELETE hides the row (the original repro)', async () => {
+		// With canonical-text key bytes this select still returned the deleted row.
+		await db.exec(`insert into t values ('[2]', 1), ('[10]', 2), ('[3]', 3)`);
+
+		await db.exec('begin');
+		await db.exec(`delete from t where v = 1`);
+		expect(await column(db, `select json_quote(j) as q from t`, 'q'))
+			.to.deep.equal(['[3]', '[10]']);
+		await db.exec('commit');
+		expect((await db.get(`select count(*) as cnt from t`))?.cnt).to.equal(2);
+	});
+
+	it('merges a pending row into the Sort-elided ordered scan at its structural position', async () => {
+		// The underlying store stream is now ADVERTISED as ordered (the PK-order
+		// advertisement is live for a json PK), so the overlay's comparator merge must
+		// interleave the pending row rather than rely on a downstream Sort.
+		await db.exec(`insert into t values ('[2]', 1), ('[10]', 2)`);
+
+		await db.exec('begin');
+		await db.exec(`insert into t values ('[3]', 3)`);
+		expect((await column(db, `select v from t order by j`, 'v')).map(Number)).to.deep.equal([1, 3, 2]);
+		await db.exec('commit');
+		expect((await column(db, `select v from t order by j`, 'v')).map(Number)).to.deep.equal([1, 3, 2]);
+	});
+
+	it('narrows a range window over the structural bytes with pending rows merged', async () => {
+		await db.exec(`insert into t values ('[2]', 1), ('[10]', 2)`);
+
+		await db.exec('begin');
+		await db.exec(`insert into t values ('[3]', 3), ('[1]', 0)`);
+		// [3] and [10] sit above json('[2]') structurally; the pending [1] stays out.
+		expect((await column(db, `select v from t where j > json('[2]')`, 'v')).map(Number)).to.deep.equal([3, 2]);
+		await db.exec('commit');
+		expect((await column(db, `select v from t where j > json('[2]')`, 'v')).map(Number)).to.deep.equal([3, 2]);
+	});
+
+	it('an overlay rewrite spelled with reordered keys shadows the committed row', async () => {
+		await db.exec(`create table o (j json primary key, v text) using store`);
+		await db.exec(`insert into o values ('{"a":1,"b":2}', 'committed')`);
+
+		await db.exec('begin');
+		await db.exec(`insert or replace into o values ('{"b":2,"a":1}', 'staged')`);
+		const staged = await asyncIterableToArray(db.eval(`select v from o`));
+		expect(staged).to.have.lengthOf(1);
+		expect(staged[0].v).to.equal('staged');
+		await db.exec('commit');
+
+		expect((await db.get(`select count(*) as cnt from o`))?.cnt).to.equal(1);
+	});
+
+	it('answers a point lookup with the overlay row shadowing a reorder-equal committed key', async () => {
+		// The point-arm twin of the shadowing case above: both spellings key identically,
+		// so a full-PK equality inside the transaction must return the STAGED row, not the
+		// committed one, and must keep returning it after commit.
+		await db.exec(`create table o (j json primary key, v text) using store`);
+		await db.exec(`insert into o values ('{"a":1,"b":2}', 'committed')`);
+
+		await db.exec('begin');
+		await db.exec(`insert or replace into o values ('{"b":2,"a":1}', 'staged')`);
+		expect(await column(db, `select v from o where j = json('{"a":1,"b":2}')`, 'v')).to.deep.equal(['staged']);
+		await db.exec('commit');
+		expect(await column(db, `select v from o where j = json('{"b":2,"a":1}')`, 'v')).to.deep.equal(['staged']);
+	});
+
+	it('keeps a JSON-number-spelled string PK distinct from a committed row across `insert or replace`', async () => {
+		// Repro for bug-json-pk-equality-drops-collation, replayed through the isolation
+		// overlay: staging '"9.0"' as `insert or replace` must NOT be treated as a
+		// rewrite of the committed '"9"' row — they are different rows. (UPDATE and
+		// DELETE of a JSON string-scalar row are covered by their own sections below.)
+		await db.exec(`create table o (j json primary key, v text) using store`);
+		await db.exec(`insert into o values ('"9"', 'committed')`);
+
+		await db.exec('begin');
+		await db.exec(`insert or replace into o values ('"9.0"', 'staged')`);
+		const staged = await asyncIterableToArray(db.eval(`select json_quote(j) as q, v from o`));
+		expect(staged).to.have.lengthOf(2);
+		expect(staged.map(r => `${r.q}:${r.v}`).sort())
+			.to.deep.equal(['"9":committed', '"9.0":staged']);
+		await db.exec('commit');
+
+		const final = await asyncIterableToArray(db.eval(`select json_quote(j) as q, v from o`));
+		expect(final).to.have.lengthOf(2);
+		expect(final.map(r => `${r.q}:${r.v}`).sort())
+			.to.deep.equal(['"9":committed', '"9.0":staged']);
+	});
+
+	it('shadows inside an equal-integer group of a composite (int, json) PK', async () => {
+		// The leading integer members tie, so the merge's alignment hinges entirely on
+		// the JSON member's order — exactly where text-vs-structural divergence hid.
+		await db.exec(`create table c (a integer, j json, v text, primary key (a, j)) using store`);
+		await db.exec(`insert into c values (1, '[2]', 'a'), (1, '[10]', 'b'), (1, '[3]', 'c'), (2, '[2]', 'd')`);
+
+		await db.exec('begin');
+		await db.exec(`update c set v = 'X' where a = 1 and v = 'a'`);
+		const afterUpdate = await asyncIterableToArray(db.eval(`select a, json_quote(j) as q, v from c`));
+		expect(afterUpdate).to.have.lengthOf(4);
+		expect(afterUpdate.filter(r => r.v === 'X')).to.have.lengthOf(1);
+
+		await db.exec(`delete from c where a = 1 and v = 'b'`);
+		expect((await db.get(`select count(*) as cnt from c`))?.cnt).to.equal(3);
+		await db.exec('commit');
+
+		const final = await asyncIterableToArray(db.eval(`select json_quote(j) as q, v from c`));
+		expect(final.map(r => `${r.q}:${r.v}`).sort())
+			.to.deep.equal(['[2]:X', '[2]:d', '[3]:c']);
+	});
+
+	describe('DELETE of a JSON string-scalar key does not re-coerce the tombstone', () => {
+		// Repro for bug-json-tombstone-recoerces-stored-key: the delete tombstone
+		// carried the deleted row's already-converted PK back through the overlay's
+		// own coercion pass. A string-scalar key that happens to look like a JSON
+		// number ('"9"') got parsed a second time into the number 9, so the
+		// tombstone landed at the wrong key and the row stayed visible. A key
+		// whose text is not valid JSON source ('"abc"') threw instead.
+
+		it('removes exactly the targeted row in autocommit, leaving its sibling', async () => {
+			await db.exec(`create table sd (j json primary key, v text) using store`);
+			await db.exec(`insert into sd values ('"9"', 'a'), ('"9.0"', 'b')`);
+
+			await db.exec(`delete from sd where v = 'a'`);
+
+			const rows = await asyncIterableToArray(db.eval(`select json_quote(j) as q, v from sd`));
+			expect(rows).to.have.lengthOf(1);
+			expect(rows[0].q).to.equal('"9.0"');
+		});
+
+		it('removes exactly the targeted row inside an explicit transaction', async () => {
+			await db.exec(`create table sd2 (j json primary key, v text) using store`);
+			await db.exec(`insert into sd2 values ('"9"', 'a'), ('"9.0"', 'b')`);
+
+			await db.exec('begin');
+			await db.exec(`delete from sd2 where v = 'a'`);
+			const staged = await asyncIterableToArray(db.eval(`select json_quote(j) as q, v from sd2`));
+			expect(staged).to.have.lengthOf(1);
+			expect(staged[0].q).to.equal('"9.0"');
+			await db.exec('commit');
+
+			const final = await asyncIterableToArray(db.eval(`select json_quote(j) as q, v from sd2`));
+			expect(final).to.have.lengthOf(1);
+			expect(final[0].q).to.equal('"9.0"');
+		});
+
+		it('does not throw deleting a key whose text is not valid JSON source, in autocommit', async () => {
+			await db.exec(`create table sd3 (j json primary key, v text) using store`);
+			await db.exec(`insert into sd3 values ('"abc"', 'a')`);
+
+			await db.exec(`delete from sd3 where v = 'a'`);
+
+			expect((await db.get(`select count(*) as cnt from sd3`))?.cnt).to.equal(0);
+		});
+
+		it('does not throw deleting a key whose text is not valid JSON source, inside an explicit transaction', async () => {
+			await db.exec(`create table sd4 (j json primary key, v text) using store`);
+			await db.exec(`insert into sd4 values ('"abc"', 'a')`);
+
+			await db.exec('begin');
+			await db.exec(`delete from sd4 where v = 'a'`);
+			expect((await db.get(`select count(*) as cnt from sd4`))?.cnt).to.equal(0);
+			await db.exec('commit');
+
+			expect((await db.get(`select count(*) as cnt from sd4`))?.cnt).to.equal(0);
+		});
+
+		it('converts an overlay row staged earlier in the same transaction into a tombstone', async () => {
+			// The other delete cases shadow a COMMITTED row (fresh-tombstone insert). This
+			// one re-writes a row the overlay itself already holds, which takes the
+			// convert-to-tombstone update instead — a separate write that carried the same
+			// double-coercion defect.
+			await db.exec(`create table sd5 (j json primary key, v text) using store`);
+			await db.exec(`insert into sd5 values ('"9"', 'a'), ('"9.0"', 'b')`);
+
+			await db.exec('begin');
+			await db.exec(`insert or replace into sd5 values ('"9"', 'z')`);
+			await db.exec(`delete from sd5 where v = 'z'`);
+			const staged = await asyncIterableToArray(db.eval(`select json_quote(j) as q, v from sd5`));
+			expect(staged.map(r => `${r.q}:${r.v}`)).to.deep.equal(['"9.0":b']);
+			await db.exec('commit');
+
+			const final = await asyncIterableToArray(db.eval(`select json_quote(j) as q, v from sd5`));
+			expect(final.map(r => `${r.q}:${r.v}`)).to.deep.equal(['"9.0":b']);
+		});
+
+		it('converts the values of an UPDATE exactly once, at the DML emitter', async () => {
+			// See the UPDATE section below for the full matrix; this case pins the
+			// overlay path specifically: an in-transaction UPDATE of a non-key column
+			// must not re-convert the carried-over JSON key on its way into the overlay.
+			await db.exec(`create table su2 (j json primary key, v text) using store`);
+			await db.exec(`insert into su2 values ('"9"', 'a'), ('"abc"', 'b')`);
+
+			await db.exec('begin');
+			await db.exec(`update su2 set v = upper(v)`);
+			const staged = await asyncIterableToArray(db.eval(`select json_quote(j) as q, v from su2`));
+			expect(staged.map(r => `${r.q}:${r.v}`).sort()).to.deep.equal(['"9":A', '"abc":B']);
+			await db.exec('commit');
+
+			const final = await asyncIterableToArray(db.eval(`select json_quote(j) as q, v from su2`));
+			expect(final.map(r => `${r.q}:${r.v}`).sort()).to.deep.equal(['"9":A', '"abc":B']);
+		});
+
+		it('tombstones the row a UNIQUE `or replace` evicts', async () => {
+			// The eviction routes through the shared insertTombstoneForPK helper rather
+			// than the delete branch, so it exercises the third fixed tombstone write.
+			await db.exec(`create table su (j json primary key, v text unique) using store`);
+			await db.exec(`insert into su values ('"9"', 'a'), ('"7"', 'keep')`);
+
+			await db.exec('begin');
+			await db.exec(`insert or replace into su values ('"9.0"', 'a')`);
+			const staged = await asyncIterableToArray(db.eval(`select json_quote(j) as q, v from su`));
+			expect(staged.map(r => `${r.q}:${r.v}`).sort()).to.deep.equal(['"7":keep', '"9.0":a']);
+			await db.exec('commit');
+
+			const final = await asyncIterableToArray(db.eval(`select json_quote(j) as q, v from su`));
+			expect(final.map(r => `${r.q}:${r.v}`).sort()).to.deep.equal(['"7":keep', '"9.0":a']);
+		});
+	});
+
+	describe('UPDATE of a non-key column leaves a JSON string-scalar key intact', () => {
+		// Repro for the UPDATE half of json-coerce-once-at-dml-source: the row the
+		// executor hands to the storage layer on UPDATE is the SCANNED row with only
+		// the assigned columns overwritten, so every unassigned cell is already in
+		// declared form. The old pipeline converted the whole row again on the way
+		// in: the stored JSON text `9` silently became the number 9 (re-keying the
+		// row), and a key whose text is not valid JSON source (`abc`) threw a
+		// conversion error naming a column the statement never touched. The memory
+		// table runs alongside as the oracle.
+
+		it('keeps a number-spelled string key byte-identical', async () => {
+			await db.exec(`create table uj (j json primary key, v text) using store`);
+			await db.exec(`create table ujm (j json primary key, v text)`); // memory oracle
+
+			for (const tbl of ['uj', 'ujm']) {
+				await db.exec(`insert into ${tbl} values ('"9"', 'a'), ('"9.0"', 'b')`);
+				await db.exec(`update ${tbl} set v = 'X' where v = 'a'`);
+				const rows = await asyncIterableToArray(db.eval(`select json_quote(j) as q, v from ${tbl}`));
+				expect(rows.map(r => `${r.q}:${r.v}`).sort(), tbl)
+					.to.deep.equal(['"9":X', '"9.0":b']);
+			}
+		});
+
+		it('does not throw when the key text is not valid JSON source', async () => {
+			await db.exec(`create table ua (j json primary key, v text) using store`);
+			await db.exec(`create table uam (j json primary key, v text)`); // memory oracle
+
+			for (const tbl of ['ua', 'uam']) {
+				await db.exec(`insert into ${tbl} values ('"abc"', 'a')`);
+				await db.exec(`update ${tbl} set v = 'X'`);
+				const rows = await asyncIterableToArray(db.eval(`select json_quote(j) as q, v from ${tbl}`));
+				expect(rows.map(r => `${r.q}:${r.v}`), tbl).to.deep.equal(['"abc":X']);
+			}
+		});
+
+		it('still converts an assigned TEXT literal, and passes a self-assignment through', async () => {
+			await db.exec(`create table us (j json primary key, v text) using store`);
+			await db.exec(`insert into us values ('"abc"', 'a')`);
+
+			// Self-assignment reads the stored (converted) value — must be a no-op.
+			await db.exec(`update us set j = j`);
+			// A TEXT literal is JSON source and still converts.
+			await db.exec(`update us set j = '"xyz"'`);
+
+			const rows = await asyncIterableToArray(db.eval(`select json_quote(j) as q, v from us`));
+			expect(rows.map(r => `${r.q}:${r.v}`)).to.deep.equal(['"xyz":a']);
+		});
+	});
+});

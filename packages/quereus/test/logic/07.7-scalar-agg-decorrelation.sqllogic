@@ -1,0 +1,197 @@
+-- 07.7-scalar-agg-decorrelation.sqllogic
+-- Correlated scalar-aggregate subqueries in the SELECT list are decorrelated
+-- into grouped left joins (rule scalar-agg-decorrelation). These tests pin the
+-- observable semantics of both the decorrelated shapes and the shapes the rule
+-- must reject (which stay on the correlated per-row path).
+
+-- Setup
+CREATE TABLE p (id INTEGER PRIMARY KEY, k INTEGER NULL, grp TEXT);
+CREATE TABLE c (id INTEGER PRIMARY KEY, pid INTEGER NULL, v INTEGER NULL, tag TEXT);
+CREATE TABLE d (id INTEGER PRIMARY KEY, k INTEGER NULL);
+CREATE TABLE cc (id INTEGER PRIMARY KEY, pid INTEGER NULL, k INTEGER NULL, v INTEGER);
+
+INSERT INTO p VALUES (1, 10, 'a'), (2, 20, 'b'), (3, null, 'c'), (4, 10, 'd');
+INSERT INTO c VALUES (1, 1, 5, 'x'), (2, 1, 7, 'y'), (3, 2, null, 'z'), (4, null, 100, 'w');
+INSERT INTO d VALUES (1, 10), (2, 10), (3, 20), (4, null);
+INSERT INTO cc VALUES (1, 1, 10, 1), (2, 1, 99, 1), (3, 4, 10, 1);
+
+-- count(*): empty group must yield 0 (the "count bug"), not NULL
+SELECT p.id, (SELECT count(*) FROM c WHERE c.pid = p.id) AS n FROM p ORDER BY p.id;
+→ [{"id":1,"n":2},{"id":2,"n":1},{"id":3,"n":0},{"id":4,"n":0}]
+
+-- count(v): group exists but all values NULL → 0 via the aggregate itself,
+-- NOT via the empty-group marker (distinguishes join-miss from all-NULL input)
+SELECT p.id, (SELECT count(c.v) FROM c WHERE c.pid = p.id) AS n FROM p ORDER BY p.id;
+→ [{"id":1,"n":2},{"id":2,"n":0},{"id":3,"n":0},{"id":4,"n":0}]
+
+-- sum: NULL on empty group AND on all-NULL input (no marker needed)
+SELECT p.id, (SELECT sum(c.v) FROM c WHERE c.pid = p.id) AS s FROM p ORDER BY p.id;
+→ [{"id":1,"s":12},{"id":2,"s":null},{"id":3,"s":null},{"id":4,"s":null}]
+
+-- min / max: NULL on empty group
+SELECT p.id, (SELECT min(c.v) FROM c WHERE c.pid = p.id) AS mn, (SELECT max(c.v) FROM c WHERE c.pid = p.id) AS mx FROM p ORDER BY p.id;
+→ [{"id":1,"mn":5,"mx":7},{"id":2,"mn":null,"mx":null},{"id":3,"mn":null,"mx":null},{"id":4,"mn":null,"mx":null}]
+
+-- avg: NULL on empty group
+SELECT p.id, (SELECT avg(c.v) FROM c WHERE c.pid = p.id) AS a FROM p ORDER BY p.id;
+→ [{"id":1,"a":6},{"id":2,"a":null},{"id":3,"a":null},{"id":4,"a":null}]
+
+-- total: 0.0 on empty group (non-NULL empty value → marker CASE path, REAL)
+SELECT p.id, (SELECT total(c.v) FROM c WHERE c.pid = p.id) AS t FROM p ORDER BY p.id;
+→ [{"id":1,"t":12},{"id":2,"t":0},{"id":3,"t":0},{"id":4,"t":0}]
+
+-- Duplicate outer key values + NULL outer key: two outer rows share k=10 and
+-- each sees the same group; the NULL key never matches (empty value, not join junk)
+SELECT p.id, (SELECT count(*) FROM d WHERE d.k = p.k) AS n FROM p ORDER BY p.id;
+→ [{"id":1,"n":2},{"id":2,"n":1},{"id":3,"n":0},{"id":4,"n":2}]
+
+-- NULL inner keys: the d.k IS NULL row groups but can never match any outer row
+SELECT p.id, (SELECT sum(d.id) FROM d WHERE d.k = p.k) AS s FROM p ORDER BY p.id;
+→ [{"id":1,"s":3},{"id":2,"s":3},{"id":3,"s":null},{"id":4,"s":3}]
+
+-- Composite (multi-conjunct) correlation
+SELECT p.id, (SELECT count(*) FROM cc WHERE cc.pid = p.id AND cc.k = p.k) AS n FROM p ORDER BY p.id;
+→ [{"id":1,"n":1},{"id":2,"n":0},{"id":3,"n":0},{"id":4,"n":1}]
+
+-- Residual inner-only predicate alongside the correlation
+SELECT p.id, (SELECT count(*) FROM c WHERE c.pid = p.id AND c.v > 5) AS n FROM p ORDER BY p.id;
+→ [{"id":1,"n":1},{"id":2,"n":0},{"id":3,"n":0},{"id":4,"n":0}]
+
+-- Wrapped subquery: only the inner node is substituted, wrapper preserved
+SELECT p.id, coalesce((SELECT sum(c.v) FROM c WHERE c.pid = p.id), -1) AS s FROM p ORDER BY p.id;
+→ [{"id":1,"s":12},{"id":2,"s":-1},{"id":3,"s":-1},{"id":4,"s":-1}]
+
+-- Subquery inside a scalar expression
+SELECT p.id, 1 + (SELECT count(*) FROM c WHERE c.pid = p.id) AS n FROM p ORDER BY p.id;
+→ [{"id":1,"n":3},{"id":2,"n":2},{"id":3,"n":1},{"id":4,"n":1}]
+
+-- Multiple correlated subqueries in one SELECT list (independent joins)
+SELECT p.id, (SELECT count(*) FROM c WHERE c.pid = p.id) AS n, (SELECT count(*) FROM d WHERE d.k = p.k) AS m FROM p ORDER BY p.id;
+→ [{"id":1,"n":2,"m":2},{"id":2,"n":1,"m":1},{"id":3,"n":0,"m":0},{"id":4,"n":0,"m":2}]
+
+-- Outer reference in the aggregate argument (remapped to the equated inner column)
+SELECT p.id, (SELECT sum(c.v + p.id) FROM c WHERE c.pid = p.id) AS s FROM p ORDER BY p.id;
+→ [{"id":1,"s":14},{"id":2,"s":null},{"id":3,"s":null},{"id":4,"s":null}]
+
+-- group_concat: NULL on empty group (all values NULL also concatenates to NULL)
+SELECT p.id, (SELECT group_concat(c.tag) FROM c WHERE c.pid = p.id) AS g FROM p ORDER BY p.id;
+→ [{"id":1,"g":"x,y"},{"id":2,"g":"z"},{"id":3,"g":null},{"id":4,"g":null}]
+
+-- json_group_array: empty group matches the correlated/zero-row behavior
+SELECT p.id, (SELECT json_group_array(c.v) FROM c WHERE c.pid = p.id) AS j FROM p ORDER BY p.id;
+→ [{"id":1,"j":[5,7]},{"id":2,"j":[null]},{"id":3,"j":null},{"id":4,"j":null}]
+
+-- DISTINCT aggregate
+SELECT p.id, (SELECT count(DISTINCT d.k) FROM d WHERE d.k = p.k) AS n FROM p ORDER BY p.id;
+→ [{"id":1,"n":1},{"id":2,"n":1},{"id":3,"n":0},{"id":4,"n":1}]
+
+-- Rejected shapes: these stay on the correlated per-row path and must keep
+-- today's semantics.
+
+-- Non-aggregate LIMIT 1 subquery (aggregate root required)
+SELECT p.id, (SELECT c.v FROM c WHERE c.pid = p.id ORDER BY c.v DESC LIMIT 1) AS v FROM p ORDER BY p.id;
+→ [{"id":1,"v":7},{"id":2,"v":null},{"id":3,"v":null},{"id":4,"v":null}]
+
+-- Non-aggregate multi-row subquery: the >1-row runtime error is preserved
+SELECT p.id, (SELECT c.v FROM c WHERE c.pid = p.id) AS v FROM p WHERE p.id = 1;
+-- error: Scalar subquery returned more than one row
+
+-- Non-equi correlation (rejected: stays correlated, still correct)
+SELECT p.id, (SELECT count(*) FROM c WHERE c.pid < p.id) AS n FROM p ORDER BY p.id;
+→ [{"id":1,"n":0},{"id":2,"n":2},{"id":3,"n":3},{"id":4,"n":3}]
+
+-- Uncorrelated scalar subquery (untouched)
+SELECT p.id, (SELECT count(*) FROM c) AS n FROM p ORDER BY p.id;
+→ [{"id":1,"n":4},{"id":2,"n":4},{"id":3,"n":4},{"id":4,"n":4}]
+
+-- GROUP BY inside a scalar subquery. This used to be rejected at build time as a
+-- two-column subquery, because a grouped select list of only aggregates leaked
+-- the grouping key into the output (bug-grouped-aggregate-only-select-returns-extra-column).
+-- It is a legal one-column subquery; the rule still rejects it (grouped body, not
+-- a bare scalar aggregate) so it stays on the correlated per-row path.
+SELECT p.id, (SELECT count(*) FROM cc WHERE cc.pid = p.id GROUP BY cc.pid) AS n FROM p WHERE p.id = 1;
+→ [{"id":1,"n":2}]
+
+-- An outer row matching no inner row produces *no group at all*, so the scalar
+-- subquery is NULL — not the 0 the ungrouped count(*) would give (ids 2 and 3).
+SELECT p.id, (SELECT count(*) FROM cc WHERE cc.pid = p.id GROUP BY cc.pid) AS n FROM p ORDER BY p.id;
+→ [{"id":1,"n":2},{"id":2,"n":null},{"id":3,"n":null},{"id":4,"n":1}]
+
+-- Grouping on a column the correlation does not pin can yield several groups,
+-- and the >1-row runtime error still applies.
+SELECT p.id, (SELECT count(*) FROM cc WHERE cc.pid = p.id GROUP BY cc.k) AS n FROM p WHERE p.id = 1;
+-- error: Scalar subquery returned more than one row
+
+-- Weak collation on the correlation + outer ref in the aggregate argument:
+-- the remap is not value-faithful, so the rule bails; results stay correct.
+CREATE TABLE nc (id INTEGER PRIMARY KEY, t TEXT COLLATE NOCASE);
+INSERT INTO nc VALUES (1, 'A'), (2, 'a'), (3, 'B');
+SELECT p.grp, (SELECT group_concat(p.grp) FROM nc WHERE nc.t = p.grp) AS g FROM p WHERE p.id = 1;
+→ [{"grp":"a","g":"a,a"}]
+
+-- ORDER BY anchor (rule scalar-agg-decorrelation-sort): a correlated
+-- scalar-aggregate subquery in a sort key is decorrelated into the same grouped
+-- LEFT join, capped by a pass-through Project so the Sort's output shape is
+-- unchanged. These pin the ordering semantics against the correlated baseline.
+
+-- Basic: order by the correlated count (asc), id tiebreak. Empty groups (id 3,4
+-- → 0) sort first.
+SELECT p.id FROM p ORDER BY (SELECT count(*) FROM c WHERE c.pid = p.id), p.id;
+→ [{"id":3},{"id":4},{"id":2},{"id":1}]
+
+-- DESC + LIMIT above the Sort: the pass-through Project sits between Sort and
+-- Limit, so Limit still caps the correct (unchanged) row set.
+SELECT p.id FROM p ORDER BY (SELECT count(*) FROM c WHERE c.pid = p.id) DESC, p.id LIMIT 2;
+→ [{"id":1},{"id":2}]
+
+-- Empty-group NULL ordering: sum is NULL on empty/all-NULL groups (id 2,3,4).
+-- NULLS FIRST puts them ahead of id 1 (sum 12).
+SELECT p.id FROM p ORDER BY (SELECT sum(c.v) FROM c WHERE c.pid = p.id) NULLS FIRST, p.id;
+→ [{"id":2},{"id":3},{"id":4},{"id":1}]
+
+-- Same key, NULLS LAST: the NULLs move to the end.
+SELECT p.id FROM p ORDER BY (SELECT sum(c.v) FROM c WHERE c.pid = p.id) NULLS LAST, p.id;
+→ [{"id":1},{"id":2},{"id":3},{"id":4}]
+
+-- Same subquery in the SELECT list AND the ORDER BY: two distinct anchors
+-- (Project + Sort) over the same subquery shape; the inner is scanned once and
+-- both resolve correctly (no double-decorrelation / conflict).
+SELECT p.id, (SELECT count(*) FROM c WHERE c.pid = p.id) AS n FROM p ORDER BY (SELECT count(*) FROM c WHERE c.pid = p.id), p.id;
+→ [{"id":3,"n":0},{"id":4,"n":0},{"id":2,"n":1},{"id":1,"n":2}]
+
+-- Multiple ORDER BY keys, only the second correlated: p.k (plain column) then
+-- the count breaks the k=10 tie (id 1 count 2 vs id 4 count 0).
+SELECT p.id FROM p WHERE p.k IS NOT NULL ORDER BY p.k, (SELECT count(*) FROM c WHERE c.pid = p.id), p.id;
+→ [{"id":4},{"id":1},{"id":2}]
+
+-- ORDER BY an aggregate scalar subquery over a GROUP BY query. The subquery's
+-- own count() must resolve as its OWN aggregate, not fingerprint-match the outer
+-- query's count() and bind to its output alias (the scope-leak fixed by
+-- fix/order-by-aggregate-subquery-scope-leak — a nested SELECT no longer inherits
+-- the enclosing query's aggregate context).
+-- Correlated form: order groups by children-per-key. d.k matches: k=10→2, k=20→1,
+-- k=null→0 (null = null is never true), so null sorts first, then 20, then 10.
+SELECT p.k, count(*) AS cnt FROM p GROUP BY p.k ORDER BY (SELECT count(*) FROM d WHERE d.k = p.k), p.k;
+→ [{"k":null,"cnt":1},{"k":20,"cnt":1},{"k":10,"cnt":2}]
+
+-- Uncorrelated form (also broke before the fix): the subquery is a constant 4 for
+-- every group, so the sort collapses to the p.k tiebreak (NULLs first on ASC).
+SELECT p.k, count(*) AS cnt FROM p GROUP BY p.k ORDER BY (SELECT count(*) FROM d), p.k;
+→ [{"k":null,"cnt":1},{"k":10,"cnt":2},{"k":20,"cnt":1}]
+
+-- Stripping projection: p.k is not selected, so the correlation column is absent
+-- from the Sort's source and the subquery stays correlated — still correct (the
+-- runtime reads p.k from the live base scan below the Project). count(d.k=p.k):
+-- p1/p4→2, p2→1, p3(null)→0. Ascending, id tiebreak.
+SELECT p.id FROM p ORDER BY (SELECT count(*) FROM d WHERE d.k = p.k), p.id;
+→ [{"id":3},{"id":2},{"id":1},{"id":4}]
+
+-- Bail-but-correct: a non-equi correlation (c.pid < p.id) stays on the
+-- correlated per-row path; the ordering is still correct.
+SELECT p.id FROM p ORDER BY (SELECT count(*) FROM c WHERE c.pid < p.id), p.id;
+→ [{"id":1},{"id":2},{"id":3},{"id":4}]
+
+-- Shape invariance: the decorrelated Sort feeds a derived table consumed by
+-- SELECT * — only the original columns (id, grp) appear, no leaked join columns.
+SELECT * FROM (SELECT p.id, p.grp FROM p ORDER BY (SELECT count(*) FROM c WHERE c.pid = p.id)) sub ORDER BY sub.id;
+→ [{"id":1,"grp":"a"},{"id":2,"grp":"b"},{"id":3,"grp":"c"},{"id":4,"grp":"d"}]

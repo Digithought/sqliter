@@ -16,6 +16,10 @@
     "composite": true
   },
   "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist", "test"]
+  "exclude": ["node_modules", "dist", "test"],
+  "references": [
+    { "path": "../quereus" },
+    { "path": "../quereus-sync" }
+  ]
 }
 

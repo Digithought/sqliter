@@ -1,0 +1,165 @@
+-- 42.2-returning-stored-row.sqllogic — RETURNING must report the row the
+-- storage layer actually STORED, not the raw values the statement proposed.
+--
+-- Coercion happens inside vtab.update(), below the DML executor: a `json`
+-- column given the text '{"a":2}' stores a native JSON value, and an
+-- `integer`-affinity column given the text '7' stores the number 7. The
+-- executor used to build RETURNING (and change tracking, and materialized-view
+-- maintenance) from the PRE-coercion row, so the same column had two
+-- observable values depending on which door you looked through.
+--
+-- Every case below is a PARITY assertion: what `returning` reports must equal
+-- what a following `select` reports — value AND typeof. typeof() is what makes
+-- the assertion sharp; a raw '{"a":2}' would report 'text', the stored value
+-- reports 'json'.
+
+-- ===================================
+-- 1. INSERT ... RETURNING reports the coerced row
+-- ===================================
+
+create table sr_ins (id integer primary key, j json, n integer);
+
+insert into sr_ins values (1, '{"a":2}', '7')
+  returning j, typeof(j) as jt, n, typeof(n) as nt;
+→ [{"j":{"a":2},"jt":"json","n":7,"nt":"integer"}]
+
+select j, typeof(j) as jt, n, typeof(n) as nt from sr_ins where id = 1;
+→ [{"j":{"a":2},"jt":"json","n":7,"nt":"integer"}]
+
+-- RETURNING * takes the same path
+insert into sr_ins values (2, '[1,2]', '8') returning *;
+→ [{"id":2,"j":[1,2],"n":8}]
+
+select * from sr_ins where id = 2;
+→ [{"id":2,"j":[1,2],"n":8}]
+
+-- multi-row INSERT: every emitted row is its own stored row
+insert into sr_ins values (3, '{"b":1}', '9'), (4, '{"c":2}', '10')
+  returning id, j, typeof(j) as jt, n, typeof(n) as nt;
+→ [{"id":3,"j":{"b":1},"jt":"json","n":9,"nt":"integer"},{"id":4,"j":{"c":2},"jt":"json","n":10,"nt":"integer"}]
+
+select id, j, typeof(j) as jt, n, typeof(n) as nt from sr_ins where id in (3, 4) order by id;
+→ [{"id":3,"j":{"b":1},"jt":"json","n":9,"nt":"integer"},{"id":4,"j":{"c":2},"jt":"json","n":10,"nt":"integer"}]
+
+drop table sr_ins;
+
+-- ===================================
+-- 2. UPDATE ... RETURNING reports the coerced NEW row; OLD stays the stored
+--    pre-update row.
+-- ===================================
+
+create table sr_upd (id integer primary key, j json, n integer);
+insert into sr_upd values (1, '{"a":1}', 1);
+
+update sr_upd set j = '{"a":2}', n = '7' where id = 1
+  returning j, typeof(j) as jt, n, typeof(n) as nt;
+→ [{"j":{"a":2},"jt":"json","n":7,"nt":"integer"}]
+
+select j, typeof(j) as jt, n, typeof(n) as nt from sr_upd where id = 1;
+→ [{"j":{"a":2},"jt":"json","n":7,"nt":"integer"}]
+
+-- OLD image is the stored row read from the source scan; NEW is the stored row
+-- handed back by the substrate. Both sides coerced, in one projection.
+update sr_upd set j = '{"a":3}', n = '11' where id = 1
+  returning old.j as oj, typeof(old.j) as ojt, j as nj, typeof(j) as njt,
+            old.n as on_, typeof(old.n) as ont, n as nn, typeof(n) as nnt;
+→ [{"oj":{"a":2},"ojt":"json","nj":{"a":3},"njt":"json","on_":7,"ont":"integer","nn":11,"nnt":"integer"}]
+
+select j, n from sr_upd where id = 1;
+→ [{"j":{"a":3},"n":11}]
+
+-- a no-op-valued UPDATE still reports the stored row (not the raw text)
+update sr_upd set j = '{ "a" : 3 }' where id = 1 returning j, typeof(j) as jt;
+→ [{"j":{"a":3},"jt":"json"}]
+
+select j, typeof(j) as jt from sr_upd where id = 1;
+→ [{"j":{"a":3},"jt":"json"}]
+
+drop table sr_upd;
+
+-- ===================================
+-- 3. UPDATE that MOVES the primary key
+-- ===================================
+-- The key move takes the delete+insert arm of the executor; RETURNING must
+-- still project the stored NEW row and the stored OLD key.
+
+create table sr_move (id integer primary key, j json, n integer);
+insert into sr_move values (1, '{"a":1}', 1);
+
+update sr_move set id = 5, j = '{"a":9}', n = '42' where id = 1
+  returning old.id as old_id, id, j, typeof(j) as jt, n, typeof(n) as nt;
+→ [{"old_id":1,"id":5,"j":{"a":9},"jt":"json","n":42,"nt":"integer"}]
+
+select id, j, typeof(j) as jt, n, typeof(n) as nt from sr_move;
+→ [{"id":5,"j":{"a":9},"jt":"json","n":42,"nt":"integer"}]
+
+drop table sr_move;
+
+-- ===================================
+-- 4. INSERT ... ON CONFLICT DO UPDATE ... RETURNING
+-- ===================================
+
+create table sr_ups (id integer primary key, j json, n integer);
+insert into sr_ups values (1, '{"a":1}', 1);
+
+-- conflicting insert takes the DO UPDATE arm
+insert into sr_ups values (1, '{"a":2}', '7')
+  on conflict (id) do update set j = excluded.j, n = excluded.n
+  returning id, j, typeof(j) as jt, n, typeof(n) as nt;
+→ [{"id":1,"j":{"a":2},"jt":"json","n":7,"nt":"integer"}]
+
+select id, j, typeof(j) as jt, n, typeof(n) as nt from sr_ups;
+→ [{"id":1,"j":{"a":2},"jt":"json","n":7,"nt":"integer"}]
+
+-- non-conflicting insert through the same statement shape takes the plain
+-- insert arm, and is equally coerced
+insert into sr_ups values (2, '{"b":3}', '8')
+  on conflict (id) do update set j = excluded.j
+  returning id, j, typeof(j) as jt, n, typeof(n) as nt;
+→ [{"id":2,"j":{"b":3},"jt":"json","n":8,"nt":"integer"}]
+
+select id, j, typeof(j) as jt, n, typeof(n) as nt from sr_ups where id = 2;
+→ [{"id":2,"j":{"b":3},"jt":"json","n":8,"nt":"integer"}]
+
+drop table sr_ups;
+
+-- ===================================
+-- 5. INSERT OR REPLACE ... RETURNING
+-- ===================================
+
+create table sr_repl (id integer primary key, j json, n integer);
+insert into sr_repl values (1, '{"a":1}', 1);
+
+insert or replace into sr_repl values (1, '{"a":2}', '7')
+  returning id, j, typeof(j) as jt, n, typeof(n) as nt;
+→ [{"id":1,"j":{"a":2},"jt":"json","n":7,"nt":"integer"}]
+
+select id, j, typeof(j) as jt, n, typeof(n) as nt from sr_repl;
+→ [{"id":1,"j":{"a":2},"jt":"json","n":7,"nt":"integer"}]
+
+drop table sr_repl;
+
+-- ===================================
+-- 6. INSERT OR IGNORE on a conflicting row yields NO row
+-- ===================================
+-- Negative pin: the "row was not written" short-circuit runs BEFORE any of the
+-- stored-row plumbing, so an ignored conflict must still emit nothing at all.
+
+create table sr_ign (id integer primary key, j json);
+insert into sr_ign values (1, '{"a":1}');
+
+insert or ignore into sr_ign values (1, '{"a":2}') returning id, j;
+→ []
+
+-- the existing row is untouched
+select id, j from sr_ign;
+→ [{"id":1,"j":{"a":1}}]
+
+-- a non-conflicting OR IGNORE insert does emit its stored row
+insert or ignore into sr_ign values (2, '{"a":2}') returning id, j, typeof(j) as jt;
+→ [{"id":2,"j":{"a":2},"jt":"json"}]
+
+select id, j from sr_ign order by id;
+→ [{"id":1,"j":{"a":1}},{"id":2,"j":{"a":2}}]
+
+drop table sr_ign;

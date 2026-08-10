@@ -35,3 +35,139 @@ select integer(-5), integer('-10');
 -- real from integer string
 select real('42');
 → [{"real('42')":42}]
+
+-- =============================================================================
+-- blob() -- literal UTF-8, no hex sniffing
+-- =============================================================================
+
+select blob('abc') = x'616263' as r;
+→ [{"r":true}]
+
+-- Even a string that looks like hex digits still becomes its literal UTF-8 bytes.
+select blob('6162') = x'36313632' as r;
+→ [{"r":true}]
+
+select blob(null);
+→ [{"blob(null)":null}]
+
+select typeof(blob('abc'));
+→ [{"typeof(blob('abc'))":"blob"}]
+
+-- A number or boolean renders through the one value-to-text rule, then takes
+-- those bytes -- blob(42) is the two digits of '42', not the byte 0x2a.
+select blob(42) = x'3432' as r;
+→ [{"r":true}]
+
+select blob(true) = x'74727565' as r;
+→ [{"r":true}]
+
+-- A conversion function is strict where CAST is lenient: blob() rejects a JSON
+-- document, while cast(<json> as blob) yields the document's own text as bytes.
+select blob(json('{"a":1}'));
+-- error: Cannot convert to BLOB
+
+select cast(json('{"a":1}') as blob) = x'7b2261223a317d' as r;
+→ [{"r":true}]
+
+-- =============================================================================
+-- hex() / unhex()
+-- =============================================================================
+
+select hex(x'6162');
+→ [{"hex(x'6162')":"6162"}]
+
+-- hex() is uppercase, no separator.
+select hex(x'cafe');
+→ [{"hex(x'cafe')":"CAFE"}]
+
+-- A non-blob argument converts to bytes first, same path as cast(X as blob).
+select hex('abc');
+→ [{"hex('abc')":"616263"}]
+
+-- Same for a number or a boolean: the bytes are the value's text spelling, so
+-- hex(42) is the hex of '4','2' -- not the hex of the integer 42.
+select hex(42);
+→ [{"hex(42)":"3432"}]
+
+select hex(true);
+→ [{"hex(true)":"74727565"}]
+
+-- Strict like blob(), for the same reason: hex() is the blob conversion plus a
+-- spelling, so a JSON document raises rather than answering NULL.
+select hex(json('{"a":1}'));
+-- error: Cannot convert to BLOB for hex()
+
+select hex(null);
+→ [{"hex(null)":null}]
+
+-- Empty blob is a distinct non-null zero-length value, not null.
+select hex(x'');
+→ [{"hex(x'')":""}]
+
+select unhex('6162') = x'6162' as r;
+→ [{"r":true}]
+
+-- Case-insensitive input.
+select unhex('CAFE') = unhex('cafe') as r;
+→ [{"r":true}]
+
+-- Odd number of hex digits -> null, not an error.
+select unhex('616');
+→ [{"unhex('616')":null}]
+
+-- Non-hex characters -> null.
+select unhex('zz');
+→ [{"unhex('zz')":null}]
+
+select unhex(null);
+→ [{"unhex(null)":null}]
+
+-- unhex() reads text only. Anything else -- a number, a blob -- is NULL, not an
+-- error and not a conversion: unhex(x'6162') does NOT round-trip hex(x'6162').
+select unhex(42);
+→ [{"unhex(42)":null}]
+
+select unhex(x'6162');
+→ [{"unhex(x'6162')":null}]
+
+-- Empty string unhexes to the empty blob, not null.
+select unhex('') = x'' as r, unhex('') is null as isnull;
+→ [{"r":true,"isnull":false}]
+
+-- Round trip through hex()/unhex().
+select unhex(hex(x'deadbeef')) = x'deadbeef' as r;
+→ [{"r":true}]
+
+-- =============================================================================
+-- Text-into-BLOB-column write/read-back
+-- =============================================================================
+
+create table blob_write_test (id integer primary key, data blob);
+
+insert into blob_write_test values (1, cast('abc' as blob));
+select id, data = x'616263' as r from blob_write_test where id = 1;
+→ [{"id":1,"r":true}]
+
+insert into blob_write_test values (2, cast('6162' as blob));
+select id, data = x'36313632' as r from blob_write_test where id = 2;
+→ [{"id":2,"r":true}]
+
+drop table blob_write_test;
+
+-- The ALTER retype backfill converts existing rows through the same
+-- BLOB_TYPE.parse the INSERT path uses, so a hex-shaped stored string must come
+-- back as its own UTF-8 bytes rather than being decoded as hex digits.
+create table blob_retype_test (id integer primary key, v text);
+insert into blob_retype_test values (1, 'abc'), (2, '6162');
+-- run
+
+alter table blob_retype_test alter column v set data type blob;
+-- run
+
+select id, v = x'616263' as r from blob_retype_test where id = 1;
+→ [{"id":1,"r":true}]
+
+select id, v = x'36313632' as r from blob_retype_test where id = 2;
+→ [{"id":2,"r":true}]
+
+drop table blob_retype_test;

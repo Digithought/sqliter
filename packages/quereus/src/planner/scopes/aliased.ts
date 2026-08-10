@@ -27,6 +27,12 @@ export class AliasedScope extends BaseScope {
 		const parts = symbolKey.split('.');
 
 		// Handle schema-qualified symbols like "main.j.value"
+		// NOTE: for a non-empty parent name this rewrites to "main.<parentName>.value" and asks
+		// the parent, but a FROM source's RegisteredScope only holds BARE column names, so the
+		// lookup always misses. Three-part column references are unsupported today either way
+		// ("main.t.id isn't a column"). If they are ever supported, strip to the bare column name
+		// here the way the two-part branch below does — the parent no longer falls back to the
+		// enclosing query's scope (see registerColumnScope), so a miss now ends the search.
 		if (parts.length === 3 && parts[1].toLowerCase() === this._alias) {
 			// Replace alias with parent name: "main.j.value" -> "main..value" -> "main.value" (if parent name is empty)
 			if (this._parentName === '') {

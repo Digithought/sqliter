@@ -1,0 +1,417 @@
+-- json-coerce-once.sqllogic
+-- A write's values are converted to declared column types exactly once, at the
+-- DML emitter, driven by the static type of each cell's producing expression
+-- (ticket json-coerce-once-at-dml-source). A JSON value that came OUT of storage
+-- is already converted and must never be converted again: JSON's parse reads a
+-- plain JS string as JSON source, so re-converting the stored text `9` turns it
+-- into the number 9, and re-converting `abc` (not valid JSON source) throws.
+-- No `using memory`, so store mode exercises the same rules on the store path.
+-- Sibling file 06.9.1.1-json-coerce-once-index.sqllogic carries the index-DDL
+-- cases; they need the `standalone-index-ddl` capability, which is declared
+-- per file, so they cannot live here without gating this whole file.
+
+-- UPDATE of a NON-JSON column must leave an untouched JSON column byte-identical:
+-- a JSON string scalar whose text looks numeric must not silently become a number.
+create table jco_num (j json primary key, v text);
+insert into jco_num values ('"9"', 'a'), ('"9.0"', 'b');
+update jco_num set v = 'X' where v = 'a';
+-- run
+
+-- The JSON output shape pins identity: "9" (string scalar) vs 9 (number).
+select j, v from jco_num order by v;
+→ [{"j":"9","v":"X"},{"j":"9.0","v":"b"}]
+
+-- Same shape where the stored JSON text is NOT valid JSON source: before the fix
+-- this UPDATE failed with "Type conversion failed for column 'j'" even though the
+-- statement never mentions j.
+create table jco_txt (j json primary key, v text);
+insert into jco_txt values ('"abc"', 'a');
+update jco_txt set v = 'X';
+-- run
+
+select j, v from jco_txt;
+→ [{"j":"abc","v":"X"}]
+
+-- The same UPDATE-of-a-sibling-column shape for the three text scalars that
+-- would land in a DIFFERENT type if ever re-parsed: "true" (→ boolean),
+-- "null" (→ SQL NULL — a present value would vanish), "[1,2]" (→ a list).
+-- json_quote is the assertion of choice: it distinguishes the text scalar
+-- "9" from the number 9, which a bare select of the column does not.
+create table jco_shapes (j json primary key, v text);
+insert into jco_shapes values ('"true"', 'a'), ('"null"', 'b'), ('"[1,2]"', 'c');
+update jco_shapes set v = 'X' where v = 'a';
+update jco_shapes set v = 'Y' where v = 'b';
+update jco_shapes set v = 'Z' where v = 'c';
+-- run
+
+select json_quote(j) as jq, v from jco_shapes order by v;
+→ [{"jq":"\"true\"","v":"X"},{"jq":"\"null\"","v":"Y"},{"jq":"\"[1,2]\"","v":"Z"}]
+
+-- INSERT ... SELECT of a JSON column: the source cell is already a JSON value
+-- (static type JSON → skip conversion), so copying rows must neither re-parse
+-- nor throw.
+create table jco_src (id integer primary key, j json);
+create table jco_dst (id integer primary key, j json);
+insert into jco_src values (1, '"abc"'), (2, '"9"'), (3, '[2]'), (4, '{"a":1}');
+insert into jco_dst select id, j from jco_src;
+-- run
+
+select id, j from jco_dst order by id;
+→ [{"id":1,"j":"abc"},{"id":2,"j":"9"},{"id":3,"j":[2]},{"id":4,"j":{"a":1}}]
+
+-- Self-assignment: `set j = j` reads the stored (converted) value; assigning it
+-- back must be a no-op, not a re-parse.
+update jco_dst set j = j;
+-- run
+
+select id, j from jco_dst order by id;
+→ [{"id":1,"j":"abc"},{"id":2,"j":"9"},{"id":3,"j":[2]},{"id":4,"j":{"a":1}}]
+
+-- Assigning a TEXT literal to a JSON column still converts: '"abc"' is JSON
+-- source for the text value abc, and '[2]' is JSON source for a list.
+update jco_dst set j = '"xyz"' where id = 1;
+update jco_dst set j = '[5,6]' where id = 3;
+-- run
+
+select id, j from jco_dst where id in (1, 3) order by id;
+→ [{"id":1,"j":"xyz"},{"id":3,"j":[5,6]}]
+
+-- ...and a literal that is not valid JSON source still fails, naming the column.
+create table jco_err (id integer primary key, j json);
+insert into jco_err values (1, 'abc');
+-- error: Type conversion failed for column 'j'
+
+-- A CHECK constraint on a table UPDATEd without mentioning its JSON column must
+-- see the STORED JSON value, not a re-converted one. j holds the JSON text "9"
+-- (a string scalar): under JSON's type rank a string never equals a number, so
+-- `j <> 9` holds. Re-conversion would damage it into the NUMBER 9 and fail the
+-- CHECK on an UPDATE that never touches j.
+create table jco_chk (id integer primary key, j json, v text,
+	check (j <> 9));
+insert into jco_chk values (1, '"9"', 'a');
+update jco_chk set v = 'X';
+-- run
+
+select id, j, v from jco_chk;
+→ [{"id":1,"j":"9","v":"X"}]
+
+-- ON CONFLICT DO UPDATE: the assignment's TEXT literal converts; excluded./stored
+-- JSON references pass through untouched.
+create table jco_upsert (id integer primary key, j json);
+insert into jco_upsert values (1, '"abc"');
+insert into jco_upsert values (1, '"zzz"')
+	on conflict (id) do update set j = excluded.j;
+-- run
+
+select id, j from jco_upsert;
+→ [{"id":1,"j":"zzz"}]
+
+insert into jco_upsert values (1, '"proposed"')
+	on conflict (id) do update set j = '"lit"';
+-- run
+
+select id, j from jco_upsert;
+→ [{"id":1,"j":"lit"}]
+
+-- JSON null converts to SQL NULL. Now that conversion happens before the NOT
+-- NULL check, a NOT NULL JSON column rejects the text 'null' (previously the
+-- check inspected the raw text, passed, and storage silently stored NULL).
+create table jco_nn (id integer primary key, j json not null);
+insert into jco_nn values (1, 'null');
+-- error: NOT NULL constraint failed
+
+-- A nullable JSON column stores it as SQL NULL, as before.
+create table jco_nul (id integer primary key, j json null);
+insert into jco_nul values (1, 'null');
+-- run
+
+select id, j, (j is null) as isnull from jco_nul;
+→ [{"id":1,"j":null,"isnull":true}]
+
+-- A generated column must derive from the value that is actually STORED, not
+-- from the raw assignment: emitUpdate converts the regular assignments before
+-- the generated expressions read them. Otherwise `g` here would keep the
+-- assignment's TEXT and store the object's serialization as a JSON *string*.
+create table jco_gen (id integer primary key, j json, g json generated always as (j));
+insert into jco_gen values (1, '"abc"');
+update jco_gen set j = '{"k":1}';
+-- run
+
+select id, json_quote(j) as jq, json_quote(g) as gq from jco_gen;
+→ [{"id":1,"jq":"{\"k\":1}","gq":"{\"k\":1}"}]
+
+-- `insert or replace` substitutes a NOT NULL column's DEFAULT after the row was
+-- already converted, so the substituted cell converts on its own (its DEFAULT is
+-- a TEXT literal, so it is JSON source).
+create table jco_dflt (id integer primary key, j json not null default '"dflt"');
+insert or replace into jco_dflt values (1, null);
+-- run
+
+select id, j from jco_dflt;
+→ [{"id":1,"j":"dflt"}]
+
+-- ...and a DEFAULT that CONVERTS to SQL NULL (the JSON text 'null') does not
+-- satisfy NOT NULL, even though the raw text is non-null.
+create table jco_dflt_null (id integer primary key, j json not null default 'null');
+insert or replace into jco_dflt_null values (1, null);
+-- error: NOT NULL constraint failed
+
+-- A DEFAULT whose static type already IS the column's (json() returns a native
+-- value) is substituted untouched.
+create table jco_dflt_json (id integer primary key, j json not null default (json('{"a":1}')));
+insert or replace into jco_dflt_json values (1, null);
+-- run
+
+select id, j from jco_dflt_json;
+→ [{"id":1,"j":{"a":1}}]
+
+-- ---------------------------------------------------------------------------
+-- Set operations over a JSON branch and a TEXT branch (ticket
+-- union-branch-value-not-converted-on-write). The set operation merges the
+-- branch types symmetrically — the object-physical (JSON) side wins and the
+-- TEXT branch is cast (leniently) to it — so each branch stores exactly what it
+-- would have stored on its own, in EITHER arm order.
+create table jco_u_src (id integer primary key, j json);
+create table jco_u_dst (id integer primary key, j json);
+insert into jco_u_src values (1, '"abc"');
+-- run
+
+-- JSON arm on the LEFT: the TEXT literal '"9"' must still convert (it used to
+-- ride the advertised JSON type unconverted and store the raw 3-char text).
+insert into jco_u_dst select id, j from jco_u_src union all select 3, '"9"';
+-- run
+
+select id, json_quote(j) as q from jco_u_dst order by id;
+→ [{"id":1,"q":"\"abc\""},{"id":3,"q":"\"9\""}]
+
+-- JSON arm on the RIGHT: the stored JSON value must NOT be re-converted (it
+-- used to ride the advertised TEXT type into a full re-parse, which throws on
+-- the JSON string scalar abc).
+delete from jco_u_dst;
+insert into jco_u_dst select 3, '"9"' union all select id, j from jco_u_src;
+-- run
+
+select id, json_quote(j) as q from jco_u_dst order by id;
+→ [{"id":1,"q":"\"abc\""},{"id":3,"q":"\"9\""}]
+
+-- The CTE form routes through the same set operation and must agree.
+delete from jco_u_dst;
+with u as (select id, j from jco_u_src union all select 3, '"9"')
+	insert into jco_u_dst select id, j from u;
+-- run
+
+select id, json_quote(j) as q from jco_u_dst order by id;
+→ [{"id":1,"q":"\"abc\""},{"id":3,"q":"\"9\""}]
+
+-- Read side, no DML involved: both branches denote the JSON string abc, so
+-- UNION must collapse them to ONE row — in either arm order.
+select j from jco_u_src union select '"abc"';
+→ [{"j":"abc"}]
+
+select '"abc"' as j union select j from jco_u_src;
+→ [{"j":"abc"}]
+
+-- A predicate over the union output must match BOTH branches' rows.
+select json_quote(x) as q from (select j as x from jco_u_src union all select '"abc"')
+	where x = json('"abc"');
+→ [{"q":"\"abc\""},{"q":"\"abc\""}]
+
+-- The branch cast is lenient: text that is not JSON source falls back to the
+-- raw string (a legitimate JSON string scalar) instead of erroring the read.
+select j from jco_u_src union all select 'not json';
+→ [{"j":"abc"},{"j":"not json"}]
+
+-- INTERSECT / EXCEPT compare across the aligned branches too.
+select j from jco_u_src intersect select '"abc"';
+→ [{"j":"abc"}]
+
+select j from jco_u_src except select '"abc"';
+→ []
+
+-- JSON | JSON stays untouched on both sides (identical types — no cast, no
+-- conversion at the DML).
+delete from jco_u_dst;
+insert into jco_u_dst select id, j from jco_u_src union all select 9, j from jco_u_src;
+-- run
+
+select id, json_quote(j) as q from jco_u_dst order by id;
+→ [{"id":1,"q":"\"abc\""},{"id":9,"q":"\"abc\""}]
+
+-- ---------------------------------------------------------------------------
+-- Write-path coverage (ticket json-native-form-write-path-coverage). The
+-- scenarios above pin ordinary UPDATE, INSERT ... SELECT, upsert and generated
+-- columns. The paths below all rewrite EXISTING rows through a different code
+-- path — ALTER TABLE, transactions, savepoints, INSERT OR REPLACE, primary-key
+-- relocation — and are where a future regression in the "convert exactly
+-- once" invariant would actually land, because they rebuild rows rather than
+-- passing them through untouched. (standalone CREATE INDEX is covered
+-- separately, in 06.9.1.1-json-coerce-once-index.sqllogic — see the note
+-- there on why it can't live in this file.)
+
+-- ALTER TABLE ... ADD COLUMN with a plain default rewrites every row.
+create table jco_wp_addcol (id integer primary key, j json);
+insert into jco_wp_addcol values (1, '"9"'), (2, '"null"');
+alter table jco_wp_addcol add column x integer default 5;
+-- run
+
+select id, json_quote(j) as jq, x from jco_wp_addcol order by id;
+→ [{"id":1,"jq":"\"9\"","x":5},{"id":2,"jq":"\"null\"","x":5}]
+
+-- ...and with a NOT NULL default, which must also be satisfied per row.
+create table jco_wp_addcol_nn (id integer primary key, j json);
+insert into jco_wp_addcol_nn values (1, '"9"'), (2, '"null"');
+alter table jco_wp_addcol_nn add column x text not null default 'z';
+-- run
+
+select id, json_quote(j) as jq, x from jco_wp_addcol_nn order by id;
+→ [{"id":1,"jq":"\"9\"","x":"z"},{"id":2,"jq":"\"null\"","x":"z"}]
+
+-- ALTER TABLE ... ADD CONSTRAINT ... CHECK validates every existing row.
+create table jco_wp_chk (id integer primary key, j json, v integer);
+insert into jco_wp_chk values (1, '"9"', 1), (2, '"null"', 2);
+alter table jco_wp_chk add constraint jco_wp_chk_v check (v > 0);
+-- run
+
+select id, json_quote(j) as jq from jco_wp_chk order by id;
+→ [{"id":1,"jq":"\"9\""},{"id":2,"jq":"\"null\""}]
+
+-- ALTER TABLE ... ALTER COLUMN ... SET DATA TYPE on a SIBLING column rewrites
+-- every row to convert that column — the untouched JSON column must ride along.
+create table jco_wp_retype (id integer primary key, j json, v text);
+insert into jco_wp_retype values (1, '"9"', '10'), (2, '"null"', '20');
+alter table jco_wp_retype alter column v set data type integer;
+-- run
+
+select id, json_quote(j) as jq, v from jco_wp_retype order by id;
+→ [{"id":1,"jq":"\"9\"","v":10},{"id":2,"jq":"\"null\"","v":20}]
+
+-- INSERT OR REPLACE onto an existing JSON primary key deletes and re-inserts
+-- the row; the surviving key must be the CONFLICTING key, byte-identical.
+create table jco_wp_replace (j json primary key, v text);
+insert into jco_wp_replace values ('"9"', 'a');
+insert or replace into jco_wp_replace values ('"9"', 'X');
+-- run
+
+select json_quote(j) as jq, v from jco_wp_replace;
+→ [{"jq":"\"9\"","v":"X"}]
+
+-- DELETE then re-INSERT of the same JSON key exercises the same key bytes
+-- through two separate DML statements rather than one.
+create table jco_wp_delreins (j json primary key, v text);
+insert into jco_wp_delreins values ('"9"', 'a');
+delete from jco_wp_delreins where v = 'a';
+insert into jco_wp_delreins values ('"9"', 'b');
+-- run
+
+select json_quote(j) as jq, v from jco_wp_delreins;
+→ [{"jq":"\"9\"","v":"b"}]
+
+-- Two UPDATEs inside one transaction, then COMMIT.
+create table jco_wp_tx (id integer primary key, j json, v integer);
+insert into jco_wp_tx values (1, '"9"', 1), (2, '"null"', 2);
+begin;
+update jco_wp_tx set v = 10 where id = 1;
+update jco_wp_tx set v = 20 where id = 2;
+commit;
+-- run
+
+select id, json_quote(j) as jq, v from jco_wp_tx order by id;
+→ [{"id":1,"jq":"\"9\"","v":10},{"id":2,"jq":"\"null\"","v":20}]
+
+-- UPDATE, SAVEPOINT, UPDATE, ROLLBACK TO SAVEPOINT, COMMIT: the row touched
+-- before the savepoint keeps its change; the row touched after it reverts.
+create table jco_wp_savepoint (id integer primary key, j json, v integer);
+insert into jco_wp_savepoint values (1, '"9"', 1), (2, '"null"', 2);
+begin;
+update jco_wp_savepoint set v = 10 where id = 1;
+savepoint s1;
+update jco_wp_savepoint set v = 99 where id = 2;
+rollback to savepoint s1;
+commit;
+-- run
+
+select id, json_quote(j) as jq, v from jco_wp_savepoint order by id;
+→ [{"id":1,"jq":"\"9\"","v":10},{"id":2,"jq":"\"null\"","v":2}]
+
+-- Relocate a JSON primary key (changing the key value moves the row's storage
+-- position), then UPDATE the relocated row's sibling column.
+create table jco_wp_reloc (j json primary key, v text);
+insert into jco_wp_reloc values ('"9"', 'a');
+update jco_wp_reloc set j = '"null"' where v = 'a';
+-- run
+
+select json_quote(j) as jq, v from jco_wp_reloc;
+→ [{"jq":"\"null\"","v":"a"}]
+
+update jco_wp_reloc set v = 'b' where v = 'a';
+-- run
+
+select json_quote(j) as jq, v from jco_wp_reloc;
+→ [{"jq":"\"null\"","v":"b"}]
+
+-- Repeated writes: non-repeatable conversion decays PROGRESSIVELY, so
+-- checking only the last of several writes could miss a corruption introduced
+-- (and then further corrupted) partway through. Check after each of three
+-- successive UPDATEs of a sibling column, across all three shapes at once.
+create table jco_wp_repeat (id integer primary key, j json, v integer);
+insert into jco_wp_repeat values (1, '"9"', 1), (2, '"true"', 2), (3, '"[1,2]"', 3);
+
+update jco_wp_repeat set v = v + 1;
+-- run
+
+select id, json_quote(j) as jq, v from jco_wp_repeat order by id;
+→ [{"id":1,"jq":"\"9\"","v":2},{"id":2,"jq":"\"true\"","v":3},{"id":3,"jq":"\"[1,2]\"","v":4}]
+
+update jco_wp_repeat set v = v + 1;
+-- run
+
+select id, json_quote(j) as jq, v from jco_wp_repeat order by id;
+→ [{"id":1,"jq":"\"9\"","v":3},{"id":2,"jq":"\"true\"","v":4},{"id":3,"jq":"\"[1,2]\"","v":5}]
+
+update jco_wp_repeat set v = v + 1;
+-- run
+
+select id, json_quote(j) as jq, v from jco_wp_repeat order by id;
+→ [{"id":1,"jq":"\"9\"","v":4},{"id":2,"jq":"\"true\"","v":5},{"id":3,"jq":"\"[1,2]\"","v":6}]
+
+-- ALTER TABLE ... DROP COLUMN reshapes every row (one cell narrower), so the
+-- surviving JSON cell moves position — a rebuild that must copy, not reconvert.
+create table jco_wp_dropcol (id integer primary key, x integer, j json);
+insert into jco_wp_dropcol values (1, 7, '"9"'), (2, 8, '"null"');
+alter table jco_wp_dropcol drop column x;
+-- run
+
+select id, json_quote(j) as jq from jco_wp_dropcol order by id;
+→ [{"id":1,"jq":"\"9\""},{"id":2,"jq":"\"null\""}]
+
+-- ALTER COLUMN ... SET NOT NULL backfills the sibling column's NULLs from its
+-- DEFAULT, rewriting exactly the rows that held NULL.
+create table jco_wp_setnn (id integer primary key, j json, v integer null default 7);
+insert into jco_wp_setnn values (1, '"9"', null), (2, '"null"', 5);
+alter table jco_wp_setnn alter column v set not null;
+-- run
+
+select id, json_quote(j) as jq, v from jco_wp_setnn order by id;
+→ [{"id":1,"jq":"\"9\"","v":7},{"id":2,"jq":"\"null\"","v":5}]
+
+-- ALTER TABLE ... RENAME COLUMN of a sibling: schema-only in principle, but it
+-- reissues the table's schema, which is where a re-coercing rebuild would hide.
+create table jco_wp_rencol (id integer primary key, j json, v text);
+insert into jco_wp_rencol values (1, '"9"', 'a'), (2, '"null"', 'b');
+alter table jco_wp_rencol rename column v to w;
+-- run
+
+select id, json_quote(j) as jq, w from jco_wp_rencol order by id;
+→ [{"id":1,"jq":"\"9\"","w":"a"},{"id":2,"jq":"\"null\"","w":"b"}]
+
+-- Whole-transaction ROLLBACK (not just to a savepoint): the discarded staged
+-- rows must leave the committed JSON values exactly as they were.
+create table jco_wp_rollback (id integer primary key, j json, v integer);
+insert into jco_wp_rollback values (1, '"9"', 1), (2, '"[1,2]"', 2);
+begin;
+update jco_wp_rollback set v = 99;
+rollback;
+-- run
+
+select id, json_quote(j) as jq, v from jco_wp_rollback order by id;
+→ [{"id":1,"jq":"\"9\"","v":1},{"id":2,"jq":"\"[1,2]\"","v":2}]

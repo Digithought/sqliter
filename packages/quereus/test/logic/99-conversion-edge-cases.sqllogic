@@ -249,19 +249,8 @@ SELECT name, type FROM function_info('json_extract');
 SELECT count(*) > 0 as has_functions FROM function_info();
 → [{"has_functions":true}]
 
--- ============================================================
--- Schema: tables with indexes
--- ============================================================
-
-CREATE TABLE idx_test (id INTEGER PRIMARY KEY, name TEXT, score REAL);
-CREATE INDEX idx_name ON idx_test (name);
--- run
-
--- Should show both table and index in schema
-SELECT type, name FROM schema() WHERE name = 'idx_test' OR name = 'idx_name' ORDER BY type;
-→ [{"type":"index","name":"idx_name"},{"type":"table","name":"idx_test"}]
-
-DROP TABLE idx_test;
+-- schema() listing an index row alongside its table lives in
+-- 99.0.1-schema-index-listing (it needs standalone CREATE INDEX).
 
 -- ============================================================
 -- Schema: foreign keys

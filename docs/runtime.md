@@ -1,11 +1,28 @@
 # Quereus Runtime
 
+> **Stability: Internal** — see [Stability Tiers](stability.md#tiers).
+
 The Quereus runtime executes query plans through a three-phase process: **Planning** (AST → Plan Nodes), **Emission** (Plan Nodes → Instructions), and **Execution** (Instructions → Results).
+
+This document is the **overview**: value types, the plan-node and emitter authoring path, row
+context, mutation execution, and the strict test harnesses. The subsystems large enough to read
+on their own live in the topic documents below.
+
+## Topic documents
+
+<!-- NOTE: a section that moved into a satellite left a one-line stub behind under its original
+     heading, so its old anchor still resolves here. When linking real content that lives in a
+     satellite, link the satellite — not the stub. -->
+
+| Document | Covers | Written for |
+| --- | --- | --- |
+| [Runtime Caching](runtime-caching.md) | Per-execution caches on the `RuntimeContext`: inner-scan connection reuse, `CacheNode` row caches, shared-CTE materialization. | An engine developer touching a per-execution cache. |
+| [Parallel Runtime](runtime-parallel.md) | The `ParallelDriver` primitive, the fork and connection-lock contracts, and the `EagerPrefetch` / `AsyncGather` / `FanOutLookupJoin` plan nodes. | An engine developer working on the `parallel-*` track. |
 
 ## Value Types
 
 ### SqlValue
-Core SQL data types that can be stored and manipulated:
+Core SQL data types:
 ```typescript
 type SqlValue = string | number | bigint | boolean | Uint8Array | null;
 ```
@@ -23,7 +40,7 @@ type OutputValue = MaybePromise<RuntimeValue>;
 ```
 
 ### TypeClasses
-The runtime uses TypeScript's structural typing for type safety. Key classes and interfaces:
+The runtime relies on TypeScript's structural typing. Key classes and interfaces:
 - `PlanNode`: Base class for all plan nodes
 - `VoidNode`: Plan nodes that don't produce output (DDL, DML)
 - `RelationalNode`: Plan nodes that produce rows (must implement `getAttributes()`)
@@ -54,17 +71,9 @@ export class MyOperationNode extends PlanNode implements UnaryRelationalNode {
 	}
 	
 	private buildAttributes(): Attribute[] {
-		// Define how this node creates/transforms attributes
-		// Option 1: Preserve source attributes (like FilterNode, SortNode)
+		// Forward the source's attributes (FilterNode, SortNode), or mint new ones with
+		// `PlanNode.nextAttrId()` when the node originates columns (ProjectNode).
 		return this.source.getAttributes();
-		
-		// Option 2: Create new attributes (like ProjectNode)
-		// return this.projections.map((proj, index) => ({
-		//   id: PlanNode.nextAttrId(),
-		//   name: proj.alias ?? `col_${index}`,
-		//   type: proj.node.getType(),
-		//   sourceRelation: `${this.nodeType}:${this.id}`
-		// }));
 	}
 
 	getAttributes(): Attribute[] {
@@ -114,11 +123,11 @@ export function buildMyOperationStmt(ctx: PlanningContext, stmt: AST.MyOperation
 
 ## Plan Node Output Format
 
-All plan nodes follow standardized output conventions for consistent query plan display and debugging.
+Plan nodes follow standardized output conventions for query-plan display and debugging.
 
 ### Plan Node Data Structure
 
-Each plan node provides three complementary sources of information:
+Each plan node exposes:
 
 ```typescript
 {
@@ -132,64 +141,32 @@ Each plan node provides three complementary sources of information:
 
 ### toString() Guidelines
 
-**Purpose**: Provide concise, human-readable descriptions for quick plan comprehension.
+One line a reader scans, not parses. Start with the SQL keyword or principal action,
+keep it ≤ 80 characters when practical, and show only what identifies this node —
+never the node type, ID, or wrapping parentheses, and nothing already in the logical
+or physical properties.
 
-**Rules**:
-- Never include node type, ID, or parentheses
-- Keep ≤ 80 characters when practical  
-- Start with SQL keyword or principal action
-- Show only essential information (predicates, projections, etc.)
-- Don't duplicate information from logical/physical properties
-
-**Examples**:
 ```typescript
-// TableReferenceNode
-toString(): "main.users"
-
-// FilterNode
-toString(): "where age > 40"
-
-// ProjectNode
-toString(): "select name, count(*) as total"
-
-// SortNode
-toString(): "order by name desc, age asc"
-
-// AggregateNode
-toString(): "group by dept_id  agg  count(*) as count, sum(salary) as total"
+"main.users"                        // TableReferenceNode
+"where age > 40"                    // FilterNode
+"select name, count(*) as total"    // ProjectNode
+"order by name desc, age asc"       // SortNode
 ```
 
 ### getLogicalProperties() Guidelines
 
-**Purpose**: Provide comprehensive logical information for detailed plan analysis.
+Always an object, never undefined. camelCased keys, primitive JSON values (strings,
+numbers, arrays), carrying the logically important detail the description omits — and
+not the physical properties (`estimatedRows`, ordering, …), which have their own slot.
 
-**Rules**:
-- Always return an object (never undefined)
-- Use camelCased keys with semantic meaning
-- Return primitive JSON types when possible (strings, numbers, arrays)
-- Include logically important information not in description
-- Don't duplicate physical properties (estimatedRows, ordering, etc.)
-
-**Examples**:
 ```typescript
-// FilterNode
-getLogicalProperties(): {
-  predicate: "age > 40"
-}
-
-// AggregateNode  
-getLogicalProperties(): {
-  groupBy: ["dept_id"],
-  aggregates: [
-    { expression: "COUNT(*)", alias: "count" },
-    { expression: "SUM(salary)", alias: "total" }
-  ]
-}
+{ predicate: "age > 40" }                                        // FilterNode
+{ groupBy: ["dept_id"], aggregates: [{ expression: "COUNT(*)", alias: "count" }] }
 ```
 
 ### Formatting Utilities
 
-Use consistent formatting helpers from `src/util/plan-formatter.ts`:
+Use the shared helpers in `src/util/plan-formatter.ts`:
 
 ```typescript
 import { 
@@ -201,29 +178,6 @@ import {
 } from '../../util/plan-formatter.js';
 ```
 
-### Implementation Template
-
-```typescript
-export class MyOperationNode extends PlanNode {
-  // ... constructor and other methods
-
-  override toString(): string {
-    // Concise description focusing on key operation details
-    return `MY_OP ${this.operationParam}`;
-  }
-
-  override getLogicalProperties(): Record<string, unknown> {
-    return {
-      operation: this.operationParam,
-      targetColumns: this.columns.map(col => col.name),
-      // Include other logical details...
-    };
-  }
-}
-```
-
-This standardized format ensures plan viewers receive consistent, comprehensive information for both quick scanning (description) and deep analysis (logical + physical properties).
-
 ## Creating an Emitter
 
 ### 1. Create the Emitter (`src/runtime/emit/`)
@@ -232,27 +186,18 @@ This standardized format ensures plan viewers receive consistent, comprehensive 
 // src/runtime/emit/my-operation.ts
 import type { MyOperationNode } from '../../planner/nodes/my-operation-node.js';
 import type { Instruction, RuntimeContext } from '../types.js';
-import type { RowDescriptor } from '../../planner/nodes/plan-node.js';
+import { asRun } from '../types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { emitPlanNode } from '../emitters.js';
+import { buildRowDescriptor } from '../../util/row-descriptor.js';
 import { createRowSlot } from '../context-helpers.js';
 
 export function emitMyOperation(plan: MyOperationNode, ctx: EmissionContext): Instruction {
 	const sourceInstruction = emitPlanNode(plan.source, ctx);
 
-	// Create row descriptor for source attributes
-	const sourceRowDescriptor: RowDescriptor = [];
-	const sourceAttributes = plan.source.getAttributes();
-	sourceAttributes.forEach((attr, index) => {
-		sourceRowDescriptor[attr.id] = index;
-	});
-
-	// Create output row descriptor (if this node transforms attributes)
-	const outputRowDescriptor: RowDescriptor = [];
-	const outputAttributes = plan.getAttributes();
-	outputAttributes.forEach((attr, index) => {
-		outputRowDescriptor[attr.id] = index;
-	});
+	// Row descriptors for the source and, if this node transforms attributes, the output
+	const sourceRowDescriptor = buildRowDescriptor(plan.source.getAttributes());
+	const outputRowDescriptor = buildRowDescriptor(plan.getAttributes());
 
 	// Common run function pattern: streaming with row slot
 	async function* run(rctx: RuntimeContext, inputRows: AsyncIterable<Row>): AsyncIterable<Row> {
@@ -281,16 +226,86 @@ export function emitMyOperation(plan: MyOperationNode, ctx: EmissionContext): In
 	//     return undefined;
 	// }
 
-	// Emit child instructions
-	const sourceInstruction = emitPlanNode(plan.source, ctx);
-
 	return {
 		params: [sourceInstruction],
-		run,
+		run: asRun(run),
 		note: `myOperation(${plan.operationParam})`
 	};
 }
 ```
+
+Wrap `run` in `asRun(...)`: a `run` with specific parameters (`SqlValue`,
+`AsyncIterable<Row>`, fixed arity) is not assignable to `InstructionRun` —
+`strictFunctionTypes` parameter contravariance rejects it. `asRun`
+(`src/runtime/types.ts`) is the single audited home for that cast;
+`createValidatedInstruction(...)` takes it too. It checks params are
+`RuntimeValue`s and the return an `OutputValue`: an `async` `run` returns
+`Promise<RuntimeValue>`, and a sometimes-emitted `SubProgram` param is a rest tuple,
+not optional (`emit/bloom-join.ts`).
+
+#### Scalar emitters: build a `ScalarOpSpec`, don't build the `Instruction`
+
+A **scalar** emitter whose body is synchronous and takes one already-evaluated value per
+operand does not build its own `Instruction`. It splits in two: a `buildXxxSpec(plan)` —
+plus `ctx` only when it resolves collations — returning a `ScalarOpSpec`
+(`emit/scalar-op.ts`), the operand plan nodes plus the body and the note; and a one-line
+`emitXxx` that calls `emitScalarOp(spec, ctx)`. Only the `emitXxx` name is registered; the
+spec builder is the reusable half.
+
+**One spec builder per registered node type.** Where an emitter dispatches internally, the
+dispatch belongs on the spec side, not the `Instruction` side: `emitBinaryOp` is a two-liner
+over `buildBinaryOpSpec`, which owns the operator switch, so a fusion consumer never restates
+which operator routes to which body.
+
+The point is that the body has two consumers: `emitScalarOp` wraps it as an `Instruction`
+the scheduler dispatches, and the scalar-fusion compiler composes it directly into a closure
+chain with no scheduler. Keeping the body in one place is what stops the two from drifting
+as emit-time specializations accumulate (`+(numeric-fast)` vs `+(temporal-date-timespan)`,
+`=(compare-typed)` vs `=(compare-fast)`, `LIKE(like-const)` vs `LIKE(like)`).
+
+**Emit-time specializations, and what each note means.** A spec builder reads the operands'
+*declared* types and picks the narrowest body that can be correct, once, instead of
+re-deciding per row. The tag inside the note names which body was picked, so
+`scheduler_program()` / `EXPLAIN` shows whether a specialization engaged:
+
+| Note | Selected when | Per-row cost it removes |
+| --- | --- | --- |
+| `+(numeric-fast)` | both operands numeric, neither temporal | the temporal probe and arithmetic coercion |
+| `+(numeric)` | anything else non-temporal (TEXT, mixed) | — (the general body) |
+| `+(temporal-date-timespan)` | `temporalOpCaseForTypes` resolves both operand kinds **and** `types/temporal-ops.ts` has a case for `(operator, left kind, right kind)` — the same lookup the planner announced the result type from | deriving both operand kinds from the values (up to four shape probes each) before the same table lookup |
+| `+(temporal-unsupported)` | both kinds resolve and the table has **no** case (`date + date`, `date * number`, anything with `%`) | as above; the body is a NULL check plus a constant throw. The throw stays at *runtime* deliberately — a guarded, filtered-out, or empty-table occurrence must keep succeeding |
+| `+(temporal)` | at least one declared type settles nothing: TEXT, ANY, NULL, TIMESTAMP, or a plugin-registered temporal type | nothing — runtime value sniffing *is* the defined semantics there |
+| `=(compare-typed)` | both operands the same logical type with semantic ordering (TIMESPAN, JSON) | the generic compare and its temporal probe |
+| `=(compare-fast)` | both operands the same category (numeric or textual), neither temporal | the temporal probe |
+| `LIKE(like-const)` | the pattern is a literal constant | compiling (or cache-looking-up) the matcher |
+
+The temporal rows carry one trade worth knowing: `temporal-date-timespan` and its siblings
+**trust the declared type**. A DATE-declared operand actually holding a non-parseable string
+yields NULL there, where the sniffing body raised `Unsupported temporal operation`. Write-side
+coercion enforces declared logical types on every path SQL can reach (a bad INSERT is
+rejected; a failed CAST is NULL), so only a misbehaving virtual table can produce such a
+value.
+
+The comparison twin, `tryTemporalComparison`, is deliberately *not* specialized this way —
+its per-row cost is one `startsWith` per operand, and `buildComparisonOpSpec` already routes
+the hot case to `=(compare-typed)` before reaching it.
+
+`spec.operands` is what becomes `Instruction.params` — **not** the plan node's children.
+`buildLikeOpSpec`'s constant-pattern fast path bakes the pattern into its closure and declares
+one operand while the plan node still has two. The body must declare exactly one parameter per
+operand (plus the leading context); `emitScalarOp` asserts that at emit time, since a short
+body would otherwise silently ignore the values it was handed.
+
+Two shapes stay off the spec, and their builders return `undefined` (or there is no builder)
+so a fusion consumer knows to decline:
+
+- **A body that can return a `MaybePromise`.** `ScalarOpSpec.run` returns a plain `SqlValue`
+  deliberately; widening it to `OutputValue` would break fusion's contract. AND/OR's
+  short-circuit form (right operand is a `SubProgram`, not a value) and a literal holding an
+  unresolved async constant-fold result are the two live cases.
+- **A body that invokes lazy branch callbacks.** `emitCaseExpr` must not evaluate unmatched
+  branches, so it keeps its own emitter; what it shares is `buildCaseMatcher`, the per-clause
+  match test, so a fused CASE and an instruction CASE agree on which branch fires.
 
 ### 2. Register the Emitter
 
@@ -344,15 +359,94 @@ const result = await withAsyncRowContext(rctx, rowDescriptor, () => row, async (
 });
 ```
 
+`withAsyncRowContext` is the default choice. Reach for the synchronous
+`withRowContext` only when the callee is *provably* synchronous — an emitted
+scalar evaluator is not, whatever the planner validated about it. In particular
+a DDL-authored expression (column DEFAULT, `GENERATED ALWAYS AS`, `CHECK`) may
+embed a scalar subquery and return a `Promise`; validated determinism says
+nothing about synchrony (see [determinism.md](determinism.md)). As of this
+writing no `src/` site uses `withRowContext`; it is kept for callers whose
+callee is a plain value read.
+
 ### Column Reference Resolution
-Column references are resolved automatically using attribute IDs.  The runtime now searches the context **from newest → oldest**, so the most recently-pushed scope wins:
+Column references are resolved automatically using attribute IDs.  Resolution has
+two tiers (see `resolveAttribute` in `context-helpers.ts`):
+
+1. **Fast path — `attributeIndex` (authoritative).** `RowContextMap` keeps a flat
+   `attributeIndex[attrId] → { rowGetter, columnIndex }`. The winner for a given
+   attribute ID is whichever context called `context.set(descriptor, …)` **most
+   recently** for that ID — i.e. *last-`set`-wins*, **not** insertion-order
+   "newest scope wins". Note `slot.set(row)` is a cheap field write that does
+   **not** touch the index; only slot creation, `RowSlot.reactivate()`, or a
+   direct `context.set` re-claims an attribute ID.
+2. **Fallback — newest → oldest scan.** Used only when the indexed entry's row is
+   not yet populated (e.g. a slot created but not yet `set`). `resolveAttribute`
+   then walks the remaining contexts newest → oldest and returns the first whose
+   row is a populated array.
+
 ```typescript
 // In emitColumnReference (built-in):
 function run(ctx: RuntimeContext): SqlValue {
-	// Deterministic lookup: newest (innermost) scope wins
+	// O(1) attributeIndex fast path; newest→oldest scan only as a fallback
 	return resolveAttribute(ctx, plan.attributeId, plan.expression.name);
 }
 ```
+
+#### Invariant: source-attr contexts and child pulls
+
+> **A streaming operator must not leave a row context built from its source's
+> attribute IDs winning the `attributeIndex` while it pulls its child for the
+> next input row.**
+
+Because `slot.set(row)` does not reclaim the index, a child that updates its own
+slot per row (e.g. a residual `Filter` directly below the operator) cannot win
+back the shared attribute IDs while the parent's context is the most-recent
+`set`. The parent's stale row then silently **shadows** the child's current-row
+reads — the child evaluates against the parent's previous output.
+
+The mirror case is equally real: an operator whose source-attr context is
+shadowed *by* a still-running child cursor (a look-ahead peek) must re-win the
+index *before yielding* so downstream resolves through the operator's intended
+row, not the child cursor's position.
+
+There are two tools, picked by which side must win at the moment of the next pull:
+
+- **Tear-down-before-pull (`delete`)** — for the *operator-shadows-child*
+  direction. The operator drops its source-attr context after yielding and before
+  pulling the next child row, letting the deepest child reclaim the index, and
+  re-establishes it when the next row arrives. `emit/aggregate.ts` (streaming
+  GROUP BY) tears down the just-yielded group's representative-row context before
+  pulling the next source row. `emit/window.ts` (streaming variant) `demote()`s
+  its `myDesc` at the end of each iteration and `promote()`s again on the next —
+  also the canonical *stacked same-attr operator* case: `set(row)` alone does not
+  re-insert, so `promote()` does delete+set to win for its own callbacks and at
+  the yield, while `demote()` releases the index across the pull.
+- **`reactivate()` before yield** — for the *child-shadows-operator* direction.
+  The operator re-`set`s its descriptor (re-winning the index) just before it
+  yields. `emit/asof-scan.ts` (merge variant) calls `rightSlot.reactivate()`
+  before yielding the matched / null-padded row, so downstream reads the matched
+  row rather than the right scan's look-ahead cursor.
+
+The **operator-shadows-child** direction (tear-down-before-pull) is checked at
+runtime by the off-by-default `QUEREUS_CONTEXT_STRICT` harness — see § Strict
+context-shadow test mode. The mirror **child-shadows-operator** direction is
+deliberately *not* checked: recency cannot distinguish a forgotten `reactivate()`
+from a correct newest write.
+
+### Filter conjunct early exit
+
+`emitFilter` (`runtime/emit/filter.ts`) splits a conjunctive predicate into its
+top-level `AND` conjuncts (`splitConjuncts` — source order, no cost reordering),
+compiles each as its own callback, and drops the row at the first conjunct that is
+not true. So `where cheap and expensive_udf()` pays for `expensive_udf()` only on
+rows `cheap` kept.
+
+No three-valued-logic reasoning is needed at that boundary: a filter keeps a row only
+when the predicate is *true*, and under `AND` a `false` **or** `NULL` conjunct
+rejects it either way — only evaluation counts change, never the row set. Splitting
+is top-level only; a nested `AND` (under `NOT`, inside `CASE`, below `OR`) still goes
+through `emitLogicalOp`. A multi-conjunct filter is marked
+`[N conjuncts, early exit]` in the instruction note.
 
 ## Scheduler Execution Model
 
@@ -362,15 +456,114 @@ The Scheduler executes instructions in dependency order:
 2. **Dependency Resolution**: Ensures instructions execute after their dependencies
 3. **Async Handling**: Uses `Promise.all()` for concurrent dependency resolution
 4. **Memory Management**: Clears instruction arguments after execution
+5. **Error-unwind sweep**: An instruction's output is parked in `instrArgs[destination]`
+   until the consuming instruction awaits it. If an instruction throws before a
+   destination that holds a still-pending promise runs, that promise would otherwise
+   be abandoned and surface as an unhandled rejection (process-fatal under strict
+   rejection handling). On any throw, the async loop drains every remaining parked
+   promise via `Promise.allSettled` (logging rejections, not swallowing them) and
+   re-throws the original error.
+
+Dispatch is factored into one synchronous entry loop and one async continuation
+loop, parameterized by a small per-mode `RunHooks` seam (optimized / tracing /
+metrics). The sweep lives once, in the async loop: the synchronous loop hands off
+the instant an instruction returns a promise, so it never parks one. Tracing eagerly
+awaits each promise output before tracing it (ordering trace events by settlement),
+so it can never abandon a promise and the sweep there is defensive; metrics parks its
+timing-wrapped promises like the optimized path and defers awaiting to the
+destination. NOTE: `logAggregateMetrics` runs on the normal-completion path only, so
+if the final instruction returns a bare `Promise` (rare — a SELECT root is an async
+iterable, counted synchronously) that instruction's `out` count may be missing from
+the debug-only aggregate log. Not observable outside the `runtime:metrics` logger.
+
+### Scalar fusion: the second execution tier
+
+The instruction graph handles relational and asynchronous work; **pure synchronous
+scalar subtrees run as fused closures** beside it. `emitCallFromPlan`
+(`runtime/emitters.ts`) — the one front door every per-row scalar callback goes
+through (filter conjuncts, aggregate/GROUP BY arguments, CASE branches, sort and join
+keys, projections, LIMIT/OFFSET, INSERT values, CHECK predicates) — first offers the
+plan to `tryFuseScalar` (`runtime/scalar-fusion.ts`). On success the whole subtree
+becomes one closure `(rctx) => SqlValue`, invoked directly per row with no
+sub-`Scheduler`, no per-instruction argument arrays, and no `instanceof Promise`
+checks; the instruction is marked `fused(<expr>)`. On refusal (`undefined`) the plan
+takes the existing sub-program path unchanged.
+
+Fusable nodes: literals (unless holding an unresolved async constant-fold result),
+column references, parameter references, `COLLATE` (fused through, no runtime
+effect), `CAST`, unary operators, `BETWEEN`, binary operators (numeric, comparison,
+concat, `LIKE`, and the *eager* logical form — the `AND`/`OR` short-circuit form with
+a subquery right leg declines), `CASE` (all-or-nothing over base/WHEN/THEN/ELSE,
+keeping lazy branch selection via the shared `buildCaseMatcher`), and scalar function
+calls that are provably synchronous (next subsection). Every fused body is the node's
+own `ScalarOpSpec` body — or, for `CASE` and function calls, the same `buildCaseMatcher`
+/ `buildScalarFunctionRun` the instruction emitter uses — so semantics, error messages,
+and evaluation counts are identical by construction.
+Subqueries and window/aggregate/relational nodes decline as unknown node types. A
+subtree deeper than `MAX_FUSION_DEPTH` (32) declines
+whole — fused closures nest on the JS call stack where the scheduler's linearized
+loop did not — but the fallback emission still reaches nested `emitCallFromPlan` sites
+(CASE branches, an AND/OR short-circuit right leg), each of which retries fusion from
+depth 0, so a deep tree fuses in pieces below those seams.
+
+#### What makes a scalar function call fusable
+
+A fused node's contract is a plain `SqlValue`, while a `ScalarFunc` is typed
+`(...args) => MaybePromise<SqlValue>`. Admitting `MaybePromise` into the fused contract
+would put a Promise check and a `.then` path on *every* node in the chain — the
+sub-program overhead fusion exists to delete — so a call fuses only when it is provably
+synchronous, decided at emit time in this order:
+
+1. **A `customEmitter` never fuses.** It builds its own `Instruction`, possibly with
+   sub-programs or async behavior, and the compiler cannot see inside it. That is
+   `nullif`, `greatest`, `least`, `json_schema` and `mutation_ordinal` today.
+2. **`ScalarFunctionSchema.isAsync === true` never fuses** — the author's explicit
+   declaration that the implementation may return a Promise.
+3. **A declared `async function` / `async` arrow never fuses**, auto-detected via
+   `implementation instanceof AsyncFunction`, so an ordinary async UDF needs no flag.
+4. **Otherwise it fuses, with a guard.** A non-`async` function that returns a Promise
+   anyway (including a `.bind()` or wrapper around an async one) is invisible to step 3,
+   so the fused body checks and throws a `QuereusError` naming the function and telling
+   the author to declare `isAsync: true`. One `instanceof` per call, and it converts a
+   silent wrong answer — a Promise flowing on as if it were a value — into a loud error.
+
+The fused body is `buildScalarFunctionRun` (`emit/scalar-function.ts`), the same body
+`emitScalarFunctionCallDefault` gives the scheduler, so the arity assert, the
+`Function <name> failed: …` wrapping with source location, and the `REPR_STRICT` return
+check are shared rather than restated. Variadic functions (`numArgs === -1`, e.g.
+`coalesce`) need no special case: composition switches on the call site's operand count.
+A call's arguments count toward `MAX_FUSION_DEPTH` like any other operand.
+
+Fusion is off when `trace_plan_stack = true` (fused frames would silently vanish from
+`ctx.planStack`) or when the `runtime_fuse_scalars` db option (default `true`) is set
+false — the explicit kill switch for bisecting a suspected fusion bug. Both are baked
+into a prepared statement's cached emission context at emit time; recompile to pick up
+a toggle. **Debug introspection reports the unfused graph**: `scheduler_program()`,
+`execution_trace()` (which joins the former by instruction index), and
+`Statement.getDebugProgram()` all emit with fusion disabled — the faithful description
+of what the query computes — while a normal execution runs the fused form.
 
 ### Key Points for Emitter Authors
 
-- **Row Descriptors**: Always create row descriptors mapping attribute IDs to column indices
-- **Context Cleanup**: Use try/finally blocks to ensure context cleanup
-- **Return Types**: Match your function signature to expected output type
-- **Async Iterables**: Use `async function*` for row-producing operations
-- **Error Handling**: Throw `QuereusError` with appropriate `StatusCode`
-- **Attribute Preservation**: Understand whether your node preserves or creates new attributes
+Build a row descriptor mapping attribute IDs to column indices, close every context in
+a `finally`, and know whether your node forwards its source's attributes or originates
+new ones. Row-producing runs are `async function*`; failures throw `QuereusError` with
+a `StatusCode`.
+
+**Side effects must not live in a lazily-drained generator body.** A generator's body
+does not run until something iterates it. `db.exec` does iterate a row-returning
+statement's result to completion (`Database._executeSingleStatement` drains and discards
+every row), so a full, uninterrupted `exec` does run the body. But a caller that only
+partially consumes a result — `eval`/`iterateRows` stopped early with `break`, or an
+aborted signal — still leaves a lazy emitter's effect half-done, and nothing else in the
+engine guarantees full consumption. An emitter whose `run` both mutates engine state and
+yields a report should therefore still be a plain `async` function that does the work
+up front, then returns an already-materialized `AsyncIterable<Row>` — `ArrayRowIterable`
+(`src/util/array-row-iterable.ts`) exists for that. `emitAnalyze` is the worked example.
+An emitter with no side effects (a scan, a filter, `EXPLAIN SCHEMA`) is free to stay a
+generator — laziness there is the point. Statements whose effect is purely void take a
+third route: the builder wraps them in a `SinkNode`, whose emitter drains the child
+(`buildPragmaStmt` does this for `pragma x = y`).
 
 ## Schema Resolution (Build-Time)
 
@@ -378,80 +571,29 @@ Quereus resolves all schema dependencies during the planning phase and tracks th
 
 ### Early Resolution at Build Time
 
-All schema objects are resolved during planning and stored directly in plan nodes:
-
-```typescript
-// TableReferenceNode stores pre-resolved objects
-class TableReferenceNode {
-  constructor(
-    scope: Scope,
-    public readonly tableSchema: TableSchema,
-    public readonly vtabModule: VirtualTableModule,
-    public readonly vtabAuxData?: unknown
-  ) { ... }
-}
-
-// ScalarFunctionCallNode stores pre-resolved function
-class ScalarFunctionCallNode {
-  constructor(
-    scope: Scope,
-    public readonly expression: AST.FunctionExpr,
-    public readonly functionSchema: FunctionSchema,
-    public readonly operands: ScalarPlanNode[]
-  ) { ... }
-}
-```
+Schema objects are resolved during planning and stored on the plan node as readonly
+constructor fields — `TableReferenceNode` holds its `TableSchema`, `VirtualTableModule`
+and aux data; `ScalarFunctionCallNode` holds its `FunctionSchema`. The runtime never
+re-resolves a name.
 
 ### Dependency Tracking and Auto-Invalidation
 
-The planning context tracks all schema dependencies:
-
-```typescript
-// During planning
-const functionSchema = resolveFunctionSchema(ctx, 'sum', 1);
-const tableSchema = resolveTableSchema(ctx, 'users');
-const vtabModule = resolveVtabModule(ctx, 'memory');
-
-// Dependencies tracked automatically
-ctx.schemaDependencies.recordDependency({
-  type: 'function',
-  objectName: 'sum/1'
-}, functionSchema);
-```
-
-Prepared statements automatically invalidate when dependencies change:
-
-```typescript
-// Schema change triggers automatic plan invalidation
-schemaManager.createTable(...); // Emits 'table_added' event
-// → Statements using affected schema objects recompile automatically
-```
+Each `resolve*Schema(ctx, …)` call records what it resolved on
+`ctx.schemaDependencies`, keyed by type and object name (`'function'`, `'sum/1'`). A
+schema change emits an event (`table_added`, …), and every prepared statement holding
+a dependency on the affected object recompiles on its next execution.
 
 ## Attribute-Based Context System
 
-Quereus implements a robust attribute-based context system that eliminates the architectural deficiencies of traditional node-based column reference resolution.
-
-**Core Design Principles:**
-
-- **Stable Attribute IDs**: Every column is identified by a unique, stable attribute ID that persists across plan transformations and optimizations.
-- **Deterministic Resolution**: Column references use attribute IDs for lookup, eliminating the need for node type checking or fragile node-based resolution.
-- **Context Isolation**: Each row context is isolated using row descriptors that map attribute IDs to column indices.
-- **Transformation Safety**: Plan transformations (logical→physical) preserve attribute IDs, ensuring column references remain valid.
+Column references resolve through stable attribute IDs rather than node references, so
+no emitter has to type-check a node to find a column.
 
 ### Core Types
 
-**RowDescriptor**: Maps attribute IDs to column indices in a row
 ```typescript
 type RowDescriptor = number[];  // attributeId → columnIndex mapping
-```
+type RowGetter = () => Row;     // access to the current row
 
-**RowGetter**: Function that provides access to the current row
-```typescript
-type RowGetter = () => Row;
-```
-
-**RuntimeContext**: Uses attribute-based context mapping
-```typescript
 interface RuntimeContext {
   db: Database;
   stmt: Statement;
@@ -462,7 +604,8 @@ interface RuntimeContext {
 
 ### Attribute System
 
-Every relational plan node must implement `getAttributes(): Attribute[]` to define its output schema:
+Every relational plan node implements `getAttributes(): Attribute[]` — its output
+schema, one entry per column:
 
 ```typescript
 interface Attribute {
@@ -473,70 +616,39 @@ interface Attribute {
 }
 ```
 
-**Key principles:**
-- Attribute IDs are **stable** across plan transformations
-- Column references use attribute IDs for resolution, not node references
-- Optimizer preserves attribute IDs when converting logical to physical nodes
-- No node type checking required in `emitColumnReference`
+Attribute IDs are **stable** across plan transformations — the optimizer preserves them
+when it converts a logical node to a physical one, which is what keeps a reference
+built at plan time valid at runtime.
 
 ## Context Debugging and Tracing
 
-Quereus provides comprehensive debugging infrastructure for diagnosing context-related issues, which are common when developing new emitters or troubleshooting column reference resolution problems.
+Two debug namespaces cover the failure modes new emitters hit — a "no row context
+found" error and a reference resolving against the wrong row:
 
-**`quereus:runtime:context`**: General context lifecycle operations
-**`quereus:runtime:context:lookup`**: Column reference resolution attempts
+- **`quereus:runtime:context`** — context lifecycle. Watch for mismatched PUSH/POP, and
+  for a context torn down before the reference that reads it evaluates.
+- **`quereus:runtime:context:lookup`** — resolution attempts, showing which contexts are
+  live and whether the wanted attribute ID appears in any of them.
 
 ```bash
 # Enable all context tracing
 set DEBUG=quereus:runtime:context* && yarn test
 ```
 
-### Debugging Common Issues
-
-**"No row context found" Errors:**
-1. Enable `DEBUG=quereus:runtime:context:lookup` to see what contexts are available
-2. Check if the expected attribute ID is present in any context
-3. Verify context push/pop timing with `DEBUG=quereus:runtime:context`
-
-**Context Lifecycle Issues:**
-1. Enable `DEBUG=quereus:runtime:context` to trace context management
-2. Look for mismatched PUSH/POP operations
-3. Verify contexts are available when column references are evaluated
-
-**Best Practices for Emitter Authors:**
-- Always use the logging helpers: `logContextPush()` and `logContextPop()`
-- Include meaningful notes that identify the operation context
-- Log attribute information when setting up row descriptors
-- Always use context helpers (`withRowContext`, `withAsyncRowContext`, `createRowSlot`)
-- Never call `rctx.context.set/delete` directly
-- Choose the appropriate helper based on your use case
-- Include meaningful notes in your instruction's `note` field
+Log through `logContextPush()` / `logContextPop()` rather than ad-hoc logging, and give
+every instruction a `note` — both traces are only readable when the operations name
+themselves.
 
 ## Bags vs Sets (Relational Semantics)
 
-Quereus implements a precise distinction between **bags** (multisets) and **sets** in its relational model, aligning with Third Manifesto principles and enabling sophisticated query optimizations.
-
-### Core Concepts
-
-**Set**: A relation that guarantees unique rows (no duplicates)
-- All rows are distinct according to the relation's primary key(s)
-- Example: Result of `SELECT DISTINCT`, aggregation results, base tables
-
-**Bag**: A relation that can contain duplicate rows
-- Multiple identical rows are possible
-- Example: Result of `SELECT * FROM table`, table function outputs
+A **set** guarantees unique rows — every row distinct by the relation's key
+(`SELECT DISTINCT`, aggregation results, base tables). A **bag** (multiset) may repeat
+a row (`SELECT * FROM table`, table function output).
 
 ### RelationType.isSet Property
 
-Every relational plan node specifies whether it produces a set or bag via the `isSet` property:
-
-```typescript
-interface RelationType {
-  ...
-  isSet: boolean;  // true = set (unique rows), false = bag (duplicates possible)
-  ...
-}
-```
+Every relational plan node declares which it produces via `RelationType.isSet`: `true`
+for unique rows, `false` where duplicates are possible.
 
 ### Set/Bag Classification by Node Type
 
@@ -561,29 +673,14 @@ async function* run(ctx: RuntimeContext, source: AsyncIterable<Row>): AsyncItera
 
 ### Optimization Implications
 
-The bag/set distinction enables important optimizations:
-
-**Set-Specific Optimizations:**
-- Duplicate elimination can be skipped for sets
-- Certain join algorithms are more efficient with sets
-- Set operations (UNION, INTERSECT) have different complexity
-
-**Bag-Aware Planning:**
-- Streaming operations can be more efficient on bags
-- Memory usage optimizations for bag operations
-- Different sorting strategies for bags vs sets
-
-### Third Manifesto Alignment
-
-This design aligns with Third Manifesto principles:
-- **Clear Semantics**: Explicit distinction between sets and bags
-- **Type Safety**: RelationType captures bag/set information at compile time
-- **Algebraic Foundation**: Operations preserve or transform bag/set properties predictably
-- **Optimization Enabling**: Type information guides query optimization decisions
+`isSet` is what lets the optimizer drop a redundant duplicate elimination, pick a
+set-aware join or set-operation strategy, and choose sorting/memory strategy per
+input. Operations preserve or transform the property predictably, so it is
+statically known for every node.
 
 ## Mutation Operations: Always-Present OLD/NEW Model
 
-Quereus implements a uniform OLD/NEW attribute model for all mutation operations (INSERT, UPDATE, DELETE) that eliminates conditional context management and provides consistent symbol resolution.
+One uniform OLD/NEW attribute model covers all mutation operations (INSERT, UPDATE, DELETE), eliminating conditional context management and giving consistent symbol resolution.
 
 ### Core Design
 
@@ -602,9 +699,8 @@ Quereus implements a uniform OLD/NEW attribute model for all mutation operations
 During statement building, mutation operations generate:
 - `oldRowDescriptor`: Maps OLD attribute IDs to indices 0..n-1 in flat row
 - `newRowDescriptor`: Maps NEW attribute IDs to indices n..2n-1 in flat row
-- Layered scope registration where unqualified column references default to the meaningful values:
-  - INSERT/UPDATE: NEW attributes (since OLD may be NULL/irrelevant)
-  - DELETE: OLD attributes (since NEW is always NULL)
+- Layered scope registration, so an unqualified column reference defaults to the
+  meaningful side (NEW for INSERT/UPDATE, OLD for DELETE — see Symbol Resolution below)
 
 ### Runtime Execution
 
@@ -624,51 +720,22 @@ await withAsyncRowContext(rctx, flatRowDescriptor, () => flatRow, async () => {
 
 **Constraint Evaluation**: All constraints (CHECK, NOT NULL) evaluate against the flat row context without conditional logic. CHECK constraints that reference other relations automatically defer to transaction boundaries via the `DeferredConstraintQueue`, so emitters simply enqueue the evaluator and continue streaming. Deferred rows reuse a single runtime context and row slot for efficiency while preserving scope isolation.
 
-### Benefits
+### Rejected alternatives
 
-- **Eliminates Context Conflicts**: Single flat descriptor prevents attribute ID collisions
-- **Simplifies Emitters**: No conditional OLD/NEW context setup across mutation types
-- **Consistent Symbol Space**: OLD/NEW always available, always defined for all operations
-- **Easier Reasoning**: Users can reliably reference OLD/NEW in any mutation context
-- **Future-Proof**: Supports triggers, defaults, and other features that need OLD/NEW access
-
-### Don't use Conditional Model
-
-The previous model used conditional OLD/NEW descriptors with metadata properties:
-```typescript
-// OLD MODEL - conditional contexts
-if (plan.oldRowDescriptor) {
-  rctx.context.set(plan.oldRowDescriptor, () => updateData.oldRow);
-}
-// Plus hidden __updateRowData properties
-
-// CURRENT MODEL - always-present flat context with helpers
-const flatRow = composeOldNewRow(oldRow, newRow, columnCount);
-const slot = createRowSlot(rctx, flatRowDescriptor);
-try {
-	for await (const flatRow of flatRows) {
-		slot.set(flatRow);
-		yield flatRow;
-	}
-} finally {
-	slot.close();
-}
-```
-
-This eliminates the break-fix cycle where attribute ID conflicts caused unpredictable column resolution behavior.
+- **Conditional OLD/NEW descriptors** (installed only when the operation has that
+  side, plus hidden `__updateRowData` properties). Attribute IDs then collided
+  between the conditionally-present descriptors, making column resolution depend on
+  which contexts happened to be installed. One flat descriptor per mutation is
+  collision-free by construction, keeps OLD/NEW defined for every operation, and
+  removes the conditional setup from every emitter.
 
 ## Mutation Context
 
-Quereus supports table-level mutation context variables that provide per-operation parameters for default values and constraints. This feature integrates seamlessly with the existing attribute-based context system.
-
-### Overview
-
-Mutation context allows you to:
-- Define reusable parameters in table definitions
-- Pass different values for each DML operation
-- Use context in default value expressions
-- Reference context in CHECK constraints (both immediate and deferred)
-- Provide runtime-specific validation rules
+A table declares reusable parameters in its definition (`WITH CONTEXT (...)`) and each
+DML statement supplies values for them. Those values are readable from DEFAULT
+expressions and from CHECK constraints, immediate and deferred alike — which is how a
+schema states a rule that depends on a per-operation value (a timestamp, a user id)
+without a non-deterministic expression in the DDL.
 
 ### Architecture
 
@@ -676,8 +743,10 @@ Mutation context allows you to:
 - Context variables are parsed from `WITH CONTEXT (...)` clauses
 - Variables converted to attributes with unique attribute IDs
 - Context scope created using `RegisteredScope`
-- Both unqualified (`varName`) and qualified (`context.varName`) symbols registered
-- Context variables registered BEFORE OLD/NEW columns (giving them shadowing precedence)
+- Both unqualified (`varName`) and qualified (`context.varName`) symbols registered;
+  a qualified `context.varName` always resolves to context
+- Context variables registered BEFORE OLD/NEW columns, so an unqualified reference
+  resolves to context when the name matches (shadowing precedence)
 
 **Runtime Phase:**
 - Context values evaluated once per statement (not per row)
@@ -705,12 +774,6 @@ contextAttributes.forEach((attr, contextVarIndex) => {
 });
 ```
 
-**Resolution Order:**
-1. Context variables registered first (in constraint scopes)
-2. OLD/NEW columns registered after
-3. Unqualified references resolve to context if name matches
-4. Qualified `context.varName` always resolves to context
-
 ### Runtime Integration
 
 **Context Evaluation:**
@@ -719,7 +782,9 @@ contextAttributes.forEach((attr, contextVarIndex) => {
 // Evaluate context once per statement
 const contextRow: Row = [];
 for (const contextEvaluator of contextEvalFunctions) {
-  const value = await contextEvaluator(rctx) as SqlValue;
+  // Hop-free on the synchronous fast path (see Scheduler-Centric Execution Model).
+  const raw = contextEvaluator(rctx);
+  const value = (raw instanceof Promise ? await raw : raw) as SqlValue;
   contextRow.push(value);
 }
 
@@ -728,10 +793,7 @@ const contextSlot = createRowSlot(rctx, contextDescriptor);
 contextSlot.set(contextRow);
 
 try {
-  // Process rows - context available to all child operations
-  for await (const row of inputRows) {
-    // Defaults and constraints can reference context variables
-  }
+  // Process rows — defaults and constraints can reference context variables
 } finally {
   contextSlot.close();
 }
@@ -744,41 +806,18 @@ const combinedRow = [...contextRow, ...oldRow, ...newRow];
 const combinedDescriptor = composeCombinedDescriptor(contextDescriptor, flatRowDescriptor);
 ```
 
-**Descriptor Composition:**
-```typescript
-function composeCombinedDescriptor(
-  contextDescriptor: RowDescriptor, 
-  flatRowDescriptor: RowDescriptor
-): RowDescriptor {
-  const combined: RowDescriptor = [];
-  const contextLength = Object.keys(contextDescriptor).length;
-
-  // Context attributes: indices 0..contextLength-1
-  for (const attrIdStr in contextDescriptor) {
-    const attrId = parseInt(attrIdStr);
-    combined[attrId] = contextDescriptor[attrId];
-  }
-
-  // OLD/NEW attributes: offset by contextLength
-  for (const attrIdStr in flatRowDescriptor) {
-    const attrId = parseInt(attrIdStr);
-    combined[attrId] = flatRowDescriptor[attrId] + contextLength;
-  }
-
-  return combined;
-}
-```
+`composeCombinedDescriptor` keeps each context attribute at its own index and shifts
+every OLD/NEW attribute right by the context length, so one descriptor addresses the
+concatenation without renumbering either side.
 
 ### Deferred Constraints
-
-Mutation context is captured and preserved for deferred constraints:
 
 **Queueing:**
 ```typescript
 rctx.db._queueDeferredConstraintRow(
   baseTable,
   constraintName,
-  coerceNewSection(row, tableSchema),  // NEW section coerced to column logical types
+  flatRow,           // already in declared column logical types
   flatRowDescriptor,
   evaluator,
   connectionId,
@@ -787,33 +826,19 @@ rctx.db._queueDeferredConstraintRow(
 );
 ```
 
-The NEW section of the snapshotted row (indices `n..2n-1`) is coerced to the
-declared column logical types via `validateAndParse` before queueing. The insert
-pipeline otherwise defers type conversion to the storage layer's `performInsert`,
-so the row reaching the ConstraintCheck node still holds *raw* NEW values. Deferred
-CHECK subqueries compare those values against rows already stored (and therefore
-coerced) in other tables, so without this step a logical type that rewrites its
-value on parse (e.g. `datetime`) would spuriously fail equality at COMMIT (GitHub
-#25). OLD values are left untouched — they are NULL on INSERT or read from
-already-coerced stored rows on UPDATE — and a per-cell parse failure falls back to
-the raw value so the row's own `performInsert` remains the authoritative source of
-the MISMATCH error.
+The queued row is the same one the *immediate* CHECKs read: the DML emitters
+convert the NEW section to the declared column logical types at the top of the
+pipeline, driven by static types (see docs/types.md § Where coercion happens),
+so the ConstraintCheck node holds declared-form values by the time either path
+runs. Deferred CHECK subqueries compare against rows already stored (and
+therefore converted) in other tables, so a logical type that rewrites its value
+on parse (e.g. `datetime`) compares equal at COMMIT (GitHub #25). OLD values are
+NULL on INSERT or read from already-converted stored rows on UPDATE.
 
-**Evaluation at COMMIT:**
-```typescript
-// Compose context with flat row for deferred evaluation
-const evaluationRow = entry.contextRow 
-  ? [...entry.contextRow, ...entry.row] 
-  : entry.row;
-const evaluationDescriptor = entry.contextRow && entry.contextDescriptor
-  ? composeCombinedDescriptor(entry.contextDescriptor, entry.descriptor)
-  : entry.descriptor;
-
-// Evaluate with context available
-const slot = createRowSlot(runtimeCtx, evaluationDescriptor);
-slot.set(evaluationRow);
-const value = await entry.evaluator(runtimeCtx);
-```
+**Evaluation at COMMIT:** the queued entry's captured context row and descriptor are
+recomposed with its snapshotted row the same way, installed in a row slot, and the
+stored evaluator runs against them — so a deferred CHECK sees the context values the
+originating statement supplied, not whatever is current at COMMIT.
 
 ### Plan Node Structure
 
@@ -829,20 +854,240 @@ const value = await entry.evaluator(runtimeCtx);
 
 ### Integration with Existing Systems
 
-**Attribute-Based Context:**
-- Mutation context uses the same attribute ID system as OLD/NEW rows
-- Context attributes have unique, stable IDs
-- No special handling needed - integrates with existing `resolveAttribute()`
+Context attributes carry unique, stable IDs and resolve through the same
+`resolveAttribute()` path and standard row descriptors as OLD/NEW rows — no special
+handling. They are preserved across savepoints as part of the queued row data.
 
-**Row Descriptors:**
-- Context uses standard row descriptors
-- Context row composed with OLD/NEW rows for constraint evaluation
-- Single combined descriptor provides unified attribute lookup
+### Statement-Level Atomicity
 
-**Transaction Support:**
-- Context evaluated per statement
-- Captured for deferred constraints
-- Preserved across savepoints (part of queued row data)
+A multi-row `INSERT`/`UPDATE`/`DELETE` is atomic at the statement level: either
+all of its row effects apply or none do, mirroring SQLite's
+implicit-savepoint-per-statement semantics. In autocommit this is masked because
+`_finalizeImplicitTransaction` rolls back the whole implicit transaction on
+error; inside an explicit `begin … rollback` the guarantee comes from a
+statement-scope savepoint instead.
+
+All three DML generators route through one shared higher-order async generator,
+`runWithStatementSavepoints` (`runtime/emit/dml-executor.ts`), which owns the
+savepoint lifecycle and calls back a per-row `processRow` closure for the
+operation-specific body:
+
+- **non-FAIL** (ABORT default / IGNORE / REPLACE / ROLLBACK): a single
+  statement-scope savepoint (`__stmt_atomic_N`) is opened before the row loop,
+  released after it completes, and rolled-back-and-released on **any** throw
+  escaping the loop — whether from the source iterator (a `ConstraintCheckNode`
+  above the executor raising NOT NULL / CHECK / parent-side FK RESTRICT before a
+  row is yielded) or from `processRow` (a vtab-returned constraint, or the
+  runtime RESTRICT pre-check). This is what reverts rows 1..N-1 when row N fails.
+- **OR FAIL**: deliberately *skips* the statement wrap (FAIL keeps prior rows)
+  and instead opens a per-row savepoint (`__or_fail_N`), released on success and
+  rolled back on throw, so only the failing row's partial work (including a
+  row-time MV backing write that landed before a later maintenance throw) is
+  undone.
+
+At the **end-of-statement boundary** — after the row loop completes and (for
+non-FAIL) **before** the statement savepoint releases — the generator drains its
+per-statement *deferred full-rebuild set* via `Database._flushDeferredRebuilds`.
+Only the full-rebuild materialized-view arm is deferred there (the bounded-delta
+arms apply per row inside `processRow`); each source row that touched a
+full-rebuild MV marked it dirty, and the flush rebuilds each such MV exactly once.
+Inside the statement savepoint, a failed rebuild rolls the whole statement back, and
+a statement that aborts mid-loop never reaches the flush (so a dirtied-then-aborted
+MV leaves its backing untouched). FAIL mode still runs the flush after the loop, but
+having no statement savepoint, a flush failure there does not unwind the
+already-applied rows — consistent with FAIL's keep-prior-rows semantics. See
+`docs/incremental-maintenance.md` § end-of-statement flush.
+
+The savepoint helpers used are always the broadcast variants
+(`_createSavepointBroadcast` / `_releaseSavepointBroadcast` /
+`_rollbackAndReleaseSavepointBroadcast`) so per-connection savepoint stacks stay
+in lockstep with the `TransactionManager`'s stack. This covers the row-time MV
+backing connection, which registers lazily on the first maintenance call:
+`Database.registerConnection` replays the active savepoint depth (already including
+the statement savepoint) onto it, so the backing write participates in the same
+rollback/release.
+
+### DML executor: read/write phase separation (physical Halloween)
+
+A predicate `DELETE`/`UPDATE` reads its target table (the source scan) and writes
+it (the per-row `vtab.update()`). Streaming those two phases on one live cursor —
+pull a source row, apply its mutation inline, pull the next — is the classic
+**physical Halloween hazard**: the write mutates the very structure the scan
+cursor is still walking. A backing store whose scan cursor caches a path into a
+shared b-tree has that path invalidated by the first write and the next
+`cursor.next()` throws (e.g. `Path is invalid due to mutation of the tree`).
+
+Whether streaming is safe is a **module property**, so it is gated on a module
+capability flag, `VirtualTableModule.scanSnapshotIsolation` (default **false**):
+
+- **Snapshot-isolated (`true`)** — a `query()` iterator sees a stable snapshot
+  even if `update()` mutates the same table mid-scan. The memory module qualifies
+  (it captures an immutable layer at `query()` entry and writes a fresh child
+  layer), so `runUpdate`/`runDelete` **stream** the source, paying no buffering
+  cost. This is the common path.
+- **Not snapshot-isolated (default)** — `runUpdate`/`runDelete` fully **drain**
+  the source match set into an array (`drainSourceRows`), closing the scan cursor,
+  **before** applying any write. The read phase now precedes the write phase in
+  full, matching SQLite's "figure out which rows to change, then change them".
+
+The false default is correctness-first: any durable / third-party store is correct
+out of the box (it buffers) and opts into streaming only once it can prove per-scan
+snapshot isolation. Buffering costs O(match-set) memory for such a store (a
+`DELETE big WHERE rare` matching millions materializes them all) — the accepted
+price of correctness, since such a store cannot safely stream-delete anyway. The
+drain feeds the same `runWithStatementSavepoints` loop, so savepoint / FAIL-mode /
+RETURNING semantics are unchanged (RETURNING still streams per row after the
+drain). An FK cascade issues its own child `DELETE`/`UPDATE` through a fresh
+executor call, which makes its own drain-or-stream decision from the *child*
+module's flag.
+
+**Boundary — INSERT-source Halloween is out of scope here.** An
+`INSERT … SELECT` reading the same table it inserts into is a *different* Halloween
+shape (the insert node, `runInsert`), not addressed by this read/write split; it
+relies on the memory savepoint snapshot plus the existing CTE/Halloween machinery.
+
+### Per-row post-write pipeline and internal evictions
+
+After each successful `vtab.update()`, the executor's `processRow` body runs one
+**post-write pipeline** for the row: change-tracking (`_recordInsert` /
+`_recordUpdate` / `_recordDelete`, consumed by `Database.watch` / change-scope and
+the `DeltaExecutor`), row-time materialized-view backing maintenance
+(`maintainRowTimeStructures`), foreign-key `ON DELETE` / `ON UPDATE` actions
+(`executeForeignKeyActions`), and — for modules without native event support — a
+data-change auto-event. This pipeline has exactly one home; substrates do not drive
+any of it themselves.
+
+**Raw flows down, stored flows back up.** Coercion to the declared logical type
+happens *inside* `vtab.update()` (`coerceRowToSchema` in the memory manager and the
+store table; the overlay's own coercion in the isolation layer), so the row the
+executor hands **down** still carries the statement's un-converted input — a `json`
+column's `'{"a":2}'` is TEXT there, an `integer`-affinity column's `'7'` still a
+string — while a subsequent `select` reads back the coerced one. Every post-write
+consumer must therefore see the **stored** row, reported as `UpdateResult.row`: the
+executor recovers it via `storedRowOrRaw` and feeds it to change-tracking, row-time
+MV maintenance, the FK cascade, the changed-column comparison, the auto-event, and
+the row yielded downstream to `RETURNING` (`withStoredNewSection` swaps the NEW half
+of the flat OLD/NEW row). Nothing is coerced *before* the write, so the row is
+coerced exactly once and non-idempotent parses are never re-entered.
+
+`UpdateResult.row` carries two signals, and all four arms read the first. Its
+**presence** means a row really was written or removed; every arm short-circuits and
+returns nothing downstream when it is absent, which is how a key-not-found
+UPDATE/DELETE and a module-resolved IGNORE conflict are reported. Its **contents**
+are the stored row, read only by INSERT/UPDATE: `storedRowOrRaw` falls back to the
+raw row when the reported row's width is not the table's column count, covering a
+minimal test/sample module that echoes its input (raw *is* stored for one that never
+coerces). DELETE reads only the presence — its OLD image comes from the source scan
+and is already a stored row, and the isolation layer returns a synthetic PK-only
+placeholder there. See `bug-dml-downstream-uses-uncoerced-row`.
+
+A REPLACE conflict resolved inside `vtab.update()` can delete rows the executor
+never asked it to touch. Two channels on the `ok` `UpdateResult` report them so the
+pipeline still runs uniformly (`internal-eviction-reporting`):
+
+- **`replacedRow`** — the row displaced at the *same PK* by a PK-collision REPLACE,
+  modeled as an update-in-place of that PK slot (FK fired as a delete of the old
+  image).
+- **`evictedRows`** — rows at *other PKs* removed because REPLACE resolved a non-PK
+  UNIQUE conflict for this same call. The executor runs the **full delete pipeline**
+  for each (a shared `processEvictions` helper: `_recordDelete` +
+  `maintainRowTimeStructures({op:'delete'})` + `executeForeignKeyActions('delete')` +
+  a delete auto-event), fired **before** the writing row's own bookkeeping so the
+  evict-then-write order the substrate journaled is preserved. This is what makes a
+  secondary-UNIQUE REPLACE eviction fire FK cascades, change subscriptions, events,
+  and covering-MV backing maintenance — uniformly across the memory, store, and
+  isolation substrates, none of which re-drive the pipeline themselves.
+
+`processEvictions` enforces FK `RESTRICT` / `NO ACTION` for the eviction's would-be
+delete alongside the FK *actions* (`CASCADE` / `SET NULL` / `SET DEFAULT`). The substrate
+has already physically removed the evicted row inside `vtab.update()`, so there is no
+pre-mutation point at which to block; instead the helper runs the transitive RESTRICT scan
+(`assertTransitiveRestrictsForParentMutation`) **post-eviction** — the child rows the scan
+keys off remain, so `select 1 from child where fk = ?` still answers correctly — and throws
+on a violation. `runWithStatementSavepoints` then rolls back the statement-scope savepoint
+(`__stmt_atomic_N`, opened before the row loop), unwinding both the substrate's eviction and
+the writing row. (Evictions only occur under REPLACE resolution, which is never `OR FAIL`,
+so the non-FAIL statement-savepoint branch always applies.) The surfaced error is the
+`FOREIGN KEY constraint failed: DELETE on '<parent>' violates RESTRICT from '<child>'`
+form — not the plan-time `CHECK constraint failed: _fk_...` form — since the plan-time
+parent-side FK check is absent for internal evictions. Enforced on the key-based memory,
+direct-store, and isolation-wrapped substrates. Rowid-chained backends (lamina) are out of
+scope: the transitive recursion reads children at call time and, post-eviction, the parent
+value is gone, so a deeper cascade may not resolve — mirroring the documented SET-DEFAULT
+recursion gap.
+
+**Internal statement cache.** The per-row FK/DDL enforcement statements — the RESTRICT
+existence probe (`assertNoRestrictedChildrenForParentMutation` and its lens dual), the
+transitive cascade pre-walk child scan, the cascade DML (`executeSingleFKAction`'s and
+`issueLensFkAction`'s `DELETE`/`UPDATE`), and the drop-referencing check
+(`SchemaManager.assertNoReferencingChildrenForDrop`) — run through a per-`Database` LRU pool
+of compiled statements keyed by exact SQL text (`InternalStatementCache`) rather than a fresh
+`prepare`/`finalize` per affected row (the engine has no plan cache, so each fresh prepare
+pays a full parse + plan + emit). Each fixed shape compiles once and rebinds; a bulk cascade
+over N parents runs a couple of compiles, not 2N. Correctness rides existing `Statement`
+behavior: the compiled statement subscribes to schema-change notifications and lazily
+recompiles across intervening DDL, and a cascade re-entering with the same SQL text while
+that statement is mid-iteration falls back to a fresh one-shot statement (the busy-guard)
+rather than sharing a live cursor. Internal probes are prepared type-agnostically, so a
+loose-affinity FK column binding an integer key on one row and a text key on another under
+one SQL shape is neither rejected nor served a first-use-frozen plan. Deliberately internal —
+not a public statement-cache feature. The batched RESTRICT flush is a handful of compiles per
+statement, not per row, so it stays on the plain `prepare` path.
+
+### Batched RESTRICT
+
+Parent-side RESTRICT enforcement normally costs **two** probes per mutated parent row per
+inbound FK: the plan-time synthesized `NOT EXISTS(select 1 from child where fk = OLD.pk)`
+constraint (compiled once, evaluated per row by `ConstraintCheckNode`) and the runtime
+transitive pre-walk (`assertTransitiveRestrictsForParentMutation` inside
+`processDeleteRow` / `processUpdateRow`). On a high-latency store each probe is a storage
+round-trip, so a bulk parent DELETE costs O(rows × FKs) round-trips even when nothing
+references the deleted keys.
+
+For statement shapes where it is provably equivalent, both per-row probes are replaced by
+**one chunked probe per inbound FK at the end-of-statement boundary**. The shared
+batchability gate, `getBatchableRestrictFks` (`planner/building/foreign-key-builder.ts`),
+is consulted by both the plan builders (`buildDeleteStmt` / `buildUpdateStmt` skip the
+per-row `NOT EXISTS` checks) and the DML executor (`runDelete` / `runUpdate` skip the
+per-row pre-walk), so the two sides cannot disagree. A DELETE/UPDATE batches iff it is
+not lens-routed, its effective conflict resolution is default/ABORT or ROLLBACK, and
+**every** inbound FK is a non-self-referential `restrict` for the op:
+
+- **FAIL / IGNORE / REPLACE** have per-row keep/skip semantics a statement-end check
+  cannot honor (FAIL keeps prior rows; the gate excludes it, so the flush always runs
+  under the statement-scope savepoint).
+- **Any cascading / set-null / set-default inbound FK** forces the per-row transitive
+  pre-walk, which must interleave with cascade execution (a cascade could delete a
+  RESTRICT child's rows mid-statement).
+- **A self-referential FK**'s check outcome depends on which rows of the same table the
+  statement has already deleted, so it stays per-row.
+
+During the row loop the executor accumulates each affected row's OLD referenced-key tuple
+into per-execution, per-FK state (`createParentRestrictBatch` /
+`accumulateParentRestrictKeys`, `runtime/foreign-key-actions.ts`) — deduplicated on an
+injective serialization, skipping tuples containing NULL (MATCH SIMPLE) and UPDATE rows
+that change no referenced column. "Change" means the value the column will actually
+**store** differs, not that the UPDATE text differs: `anyReferencedColumnChanged` re-coerces
+a non-identical NEW value through the column's logical type (the same `validateAndParse`
+conversion `coerceRowToSchema` applies moments later) before comparing again, so rewriting a
+key as an equivalent-but-differently-spelled value (`1` as the text `'1'`, a JSON object with
+reordered keys) is not a change. The comparison is deliberately BINARY, not the column's
+collation — a `nocase` column still stores `'A'` and `'a'` distinctly. The same helper backs
+the per-row pre-walk and the lens pre-check, so all four enforcement sites agree; see its doc
+comment for the failure-direction reasoning. The state is per execution (never on the emit
+closure), so a re-run prepared statement starts empty. `flushParentRestrictBatch` fires in
+`runWithStatementSavepoints` after the row loop, **before** the deferred-maintenance flush
+(fail fast — skip wasted MV work) and before the statement savepoint releases, probing
+each FK's child table in ~500-key chunks (`fkcol in (?, …)`, or OR-of-conjunctions for a
+composite FK — plain SQL `=`/`IN` against the child column, so collation semantics match
+the per-row `NOT EXISTS` by construction). A hit throws the same
+`FOREIGN KEY constraint failed: DELETE on '<parent>' violates RESTRICT from '<child>'`
+error and the statement savepoint unwinds every row — the same final state and error class
+as a per-row abort. The REPLACE-eviction path (`processEvictions`) always stays per-row.
+
+The one observable divergence: a consumer streaming `RETURNING` rows sees **all** rows
+yielded before the violation aborts the statement, instead of only the rows preceding the
+violating one — transient output before an error that voids the statement either way.
 
 ### Implementation Guidelines for Emitter Authors
 
@@ -857,213 +1102,20 @@ const value = await entry.evaluator(runtimeCtx);
 8. Pass mutation context to plan node constructors
 9. Pass mutation context to ConstraintCheckNode
 
-**Key Points:**
-- Context is evaluated once per statement (performance)
-- Context persists for entire statement via row slot
-- Context composed with OLD/NEW for constraints
-- Deferred constraints capture and preserve context
-- Use existing context helpers - no special APIs needed
-
 ## Determinism Validation
 
-The real invariant Quereus needs in DEFAULT / CHECK / GENERATED clauses is not
-"the source expression is deterministic" — it is "the captured artifact at the
-`vtab.update()` frontier is fully resolved and replayable." That invariant is
-satisfied by construction: defaults and stored generated columns are evaluated
-per row before reaching the module, immediate row CHECKs fire at write time so
-only passing rows reach `vtab.update()`, and deferred CHECKs evaluate once at
-commit (their outcome decides commit-vs-rollback for the entire transaction,
-so replay-via-module-layer cannot disagree with the commit outcome).
-
-Because of this, the prohibition on non-deterministic expressions in DDL is a
-**stricter-than-necessary proxy** for the actual replay contract, not a
-correctness requirement. Quereus therefore defaults to strict rejection for
-backward compatibility but exposes a single opt-in to lift the gate when you
-want it.
-
-### The `nondeterministic_schema` option
-
-| Option | Type | Default | Aliases |
-| --- | --- | --- | --- |
-| `nondeterministic_schema` | boolean | `false` | `allow_nondeterministic_schema_expressions` |
-
-Set programmatically or via PRAGMA:
-
-```sql
-pragma nondeterministic_schema = true;
-pragma nondeterministic_schema;
--- → [{"name":"nondeterministic_schema","value":true}]
-```
-
-```typescript
-db.setOption('nondeterministic_schema', true);
-```
-
-When `true`, Quereus permits non-deterministic expressions in DEFAULT, CHECK,
-and `GENERATED ALWAYS AS` clauses. Capture still happens at the resolved-row
-frontier: the row stored in the table (and the literal SQL produced by
-`buildInsertStatement` / `buildUpdateStatement` / `buildDeleteStatement` in
-`util/mutation-statement.ts`) contains the concrete value the engine
-evaluated for that row.
-
-The option is not baked into any persisted schema; toggling it affects
-validation of *subsequent* DDL/DML only — already-created tables keep
-whatever expressions they were created with.
-
-### Strict-mode behaviour (default)
-
-The default `nondeterministic_schema = false` preserves the historical
-rejection paths.
-
-**Rejected in Constraints and Defaults:**
-- `random()`, `randomblob()` - Random value generation
-- `date('now')`, `time('now')`, `datetime('now')`, `julianday('now')` - Current time functions
-- User-defined functions marked as non-deterministic
-- Any expression containing non-deterministic sub-expressions
-- DML in expression position (`(insert/update/delete … returning …)` inside
-  a CHECK / DEFAULT / assertion expression). DML is non-deterministic via
-  the side-effect axis — the `DmlExecutorNode` sets `deterministic: false`,
-  which propagates through the AND-of-children physical-properties chain
-  and is rejected by the determinism enforcer.
-
-**Allowed in Constraints and Defaults:**
-- Constant literals: `42`, `'hello'`, `true`
-- Deterministic built-in functions: `upper()`, `lower()`, `abs()`, `round()`
-- Column references: `NEW.price`, `OLD.quantity`
-- Mutation context variables: `context.timestamp`, `context.user_id`
-- User-defined functions marked as deterministic (default)
-
-### Using Mutation Context for Non-Deterministic Values
-
-Instead of using non-deterministic functions directly, pass values via mutation context:
-
-```sql
--- ❌ REJECTED: Non-deterministic default
-create table orders (
-    id integer primary key,
-    created_at text default datetime('now')  -- ERROR
-);
-
--- ✅ ACCEPTED: Use mutation context
-create table orders (
-    id integer primary key,
-    created_at text default timestamp
-) with context (
-    timestamp text
-);
-
--- Pass the timestamp when inserting
-insert into orders (id)
-with context timestamp = datetime('now')
-values (1);
-```
-
-### Physical Properties System
-
-Determinism is tracked through the `PhysicalProperties` system:
-
-```typescript
-interface PhysicalProperties {
-    deterministic: boolean;  // Same inputs → same outputs
-    readonly: boolean;       // No side effects
-    idempotent: boolean;     // Safe to call multiple times
-    constant: boolean;       // Directly produces constant result
-}
-```
-
-**Propagation Rules:**
-- Function nodes check the `FunctionFlags.DETERMINISTIC` flag
-- Non-deterministic functions mark `deterministic: false`
-- Properties propagate bottom-up through the expression tree
-- Parent nodes inherit the most restrictive properties from children
-
-**User-Defined Functions:**
-```typescript
-// Non-deterministic UDF
-db.createScalarFunction("my_random",
-    { numArgs: 0, deterministic: false },
-    () => Math.random()
-);
-
-// Deterministic UDF (default)
-db.createScalarFunction("my_upper",
-    { numArgs: 1, deterministic: true },  // or omit (defaults to true)
-    (text) => String(text).toUpperCase()
-);
-```
-
-### Validation Timing
-
-All determinism rejection sites described below are skipped when
-`nondeterministic_schema = true`. The bind-parameter / column-reference
-pre-walks remain active in both modes (those are scope checks, not
-determinism checks).
-
-**CREATE TABLE:**
-- DEFAULT expressions are rejected if they reference bind parameters
-  (`?`, `:name`) or table columns; both are detected via an AST pre-walk
-  before expression building.
-- DEFAULT expressions are then built and rejected if their physical
-  `deterministic` property is false (e.g. `random()`).
-- CHECK constraints are walked at DDL time: any function call is looked up
-  against the registry and rejected unless it has the `DETERMINISTIC` flag.
-  Bind parameters (`?`, `:name`) are also rejected at DDL time. Column
-  references inside CHECK predicates are validated later, at INSERT/UPDATE
-  time, when the row scope is established.
-
-These DDL-time guards currently fire only on `CREATE TABLE`. The `ALTER
-TABLE` paths (`ADD COLUMN`, `ADD CONSTRAINT`, `ALTER COLUMN ... SET
-DEFAULT`) do not yet route through the same validators — extending them is
-a known follow-up.
-
-**INSERT/UPDATE:**
-- DEFAULT expressions validated when building row expansion
-- CHECK constraints validated when building constraint checks (full
-  column-scope resolution happens here)
-- `GENERATED ALWAYS AS` expressions validated when building the generated
-  column projection (INSERT) or assignment chain (UPDATE)
-
-**ALTER TABLE ADD CONSTRAINT:**
-- Validation deferred to first INSERT/UPDATE (constraints may reference NEW/OLD)
+Determinism enforcement in DEFAULT / CHECK / `GENERATED ALWAYS AS` clauses — the
+`nondeterministic_schema` opt-out, the physical `deterministic` property, mutation context
+for non-deterministic values, and the per-statement validation timing — is documented in
+[Determinism Validation](determinism.md).
 
 ## Common Patterns
 
-### Row Processing with Context
-```typescript
-// Streaming pattern with row slot
-async function* run(rctx: RuntimeContext, input: AsyncIterable<Row>): AsyncIterable<Row> {
-	const slot = createRowSlot(rctx, rowDescriptor);
-	try {
-		for await (const row of input) {
-			slot.set(row);
-			yield processRow(row, rctx);
-		}
-	} finally {
-		slot.close();
-	}
-}
-```
-
-### Scalar Functions
-```typescript
-function run(rctx: RuntimeContext, ...args: SqlValue[]): SqlValue {
-	// Compute result
-	return result;
-}
-```
-
-### Side Effects (DDL/DML)
-```typescript
-async function run(rctx: RuntimeContext, input: AsyncIterable<Row>): Promise<undefined> {
-	// Process each row with proper context
-	for await (const row of input) {
-		await withAsyncRowContext(rctx, rowDescriptor, () => row, async () => {
-			await performMutation(row, rctx);
-		});
-	}
-	return undefined;
-}
-```
+The three `run` shapes — streaming (`createRowSlot`), scalar (plain value in, value
+out), and void DDL/DML (`withAsyncRowContext` per row) — are shown under
+[Creating an Emitter](#creating-an-emitter) and
+[Row Context Management](#row-context-management). What follows are the patterns those
+templates do not cover.
 
 ### Impure subquery emitters: full-drain + run-once
 
@@ -1074,228 +1126,117 @@ an impure-path implementation that applies two contracts:
 - **Full drain.** The emitter iterates every row of the inner. The pure path's
   short-circuits (scalar's "first row only" / `IN`'s "first match" / `EXISTS`'s
   "first row") would skip writes past row 1, so they are dropped for impure
-  inners. Loss of the short-circuit is acceptable because (a) it only fires for
-  DML-bearing inners and (b) correctness trumps the optimization there.
+  inners — acceptable because it only affects DML-bearing inners, where
+  correctness trumps the optimization.
 - **Run-once per statement execution.** A correlated outer expression or a
-  per-row scan would re-invoke the scalar subquery's `run` function once per
-  outer row. The emitter memoizes the materialized result and the
-  scalar/`EXISTS`/`IN` answer on first call, and replays the memoized answer
-  on subsequent calls without re-driving the iterator. Closure state is
-  per-emission and `Statement` re-emits per execution, so the memoization
-  resets between prepared-statement runs.
+  per-row scan would re-invoke the scalar subquery's `run` once per outer row. The
+  emitter memoizes the materialized result and the scalar/`EXISTS`/`IN` answer on
+  first call and replays it afterwards without re-driving the iterator. The memo
+  lives on the per-execution `RuntimeContext` (`ctx.executionMemo`, keyed by a
+  symbol minted at emit time), not the emit-time closure — so a `Statement` reusing
+  its instruction tree across executions still resets the memo between runs,
+  re-driving the inner DML once per run.
 
 Both contracts are gated by `physical.readonly === false` on the inner — pure
-subqueries take the unchanged short-circuit fast path. See
-`src/runtime/emit/subquery.ts` for the emitter source.
+subqueries take a non-impure path. `IN` splits again: an uncorrelated +
+functional source is materialized once per execution into a probed lookup set
+([Runtime caching § IN-subquery set probe](runtime-caching.md#in-subquery-set-probe)
+— filter-position shapes mostly decorrelate to semi joins and skip
+`emitIn`), while correlated / non-deterministic sources keep the
+per-outer-row streaming short-circuit. Scalar / `EXISTS` pure inners keep their
+short-circuit fast path (`src/runtime/emit/subquery.ts`).
 
 DML in expression position is rejected as a view body at view-creation time
-(see `src/planner/building/create-view.ts`). A view body re-evaluates on
-every reference; a DML body would re-drive writes per read, which the
-run-once fence cannot rescue (views compose, the cache lives at one emission
-site, and a downstream consumer would observe stale state). The check is
-permanent, not pending.
+(`src/planner/building/create-view.ts`). A view body re-evaluates on every
+reference; a DML body would re-drive writes per read, which the run-once fence
+cannot rescue (views compose, the cache lives at one emission site, and a
+downstream consumer would observe stale state). The check is permanent, not pending.
+
+### Per-execution caches
+
+Inner-scan connection reuse, `CacheNode` row-cache lifetime, and shared
+(multi-reference) CTE materialization are documented in
+[Runtime Caching](runtime-caching.md).
 
 ## Query Optimizer Integration
 
-The Quereus optimizer transforms logical plan nodes into physical execution plans between the builder and runtime phases. This section covers the key aspects relevant to runtime emitter development.
-
-### Optimizer Overview
-
-The optimizer uses a single plan node hierarchy with logical-to-physical transformation:
-- **Logical nodes**: Created by the builder - may or may not have physical emitters
-- **Physical nodes**: Transformed by the optimizer with execution properties
-- **Attribute preservation**: Column references use stable attribute IDs that survive optimization
-
-Key optimizer guarantees for emitter authors:
-- Every node reaching the emitter phase has `physical` properties set
-- Attribute IDs remain stable across all transformations
-- Column references can rely on deterministic attribute ID lookup
-- The optimizer respects virtual table capabilities via `BestAccessPlan`
-
-### Physical Properties
-
-Physical properties capture execution characteristics used by both optimizer and runtime:
-```typescript
-interface PhysicalProperties {
-  ordering?: Ordering[];        // Output row ordering
-  estimatedRows?: number;       // Cardinality estimate
-  uniqueKeys?: number[][];      // Attribute IDs forming unique keys
-  deterministic: boolean;       // Pure and repeatable
-  readonly: boolean;            // No side effects
-}
-```
-
-These can be overridden through overriding the computePhysical() plan node method, otherwise these are inherited from child nodes or are defaults.
-```typescript
-computePhysical(): Partial<PhysicalProperties> {
-  return {
-    readonly: false,  // Side-effecting (should only be set if the node directly mutates)
-    estimatedRows: this.source.estimatedRows,
-    uniqueKeys: this.source.getType().keys.map(key => key.map(colRef => colRef.index)),
-  };
-}
-```
-
-### Attribute ID System
-
-The runtime's column reference resolution relies on the optimizer's attribute ID preservation:
-- Each column has a unique, stable attribute ID assigned during planning
-- The optimizer's `withChildren()` infrastructure preserves these IDs
-- Runtime column lookup uses attribute IDs, not names or positions
-- This enables robust resolution across arbitrary plan transformations
-
-For comprehensive optimizer details, see the [Optimizer Documentation](../optimizer.md).
+Between the builder and runtime phases the optimizer rewrites **logical** nodes
+into **physical** ones over a single node hierarchy, attaching
+[physical properties](determinism.md#physical-properties-system) — override `computePhysical()`
+to set them, otherwise they are inherited from children or defaulted. Every node
+reaching the emitter phase has `physical` set, and virtual-table capabilities are
+respected via `BestAccessPlan`. Column references carry stable attribute IDs that
+`withChildren()` preserves, so runtime column lookup (by attribute ID, never by
+name or position) survives arbitrary plan transformations. See the
+[Optimizer Documentation](optimizer.md).
 
 ## ParallelDriver (Runtime Primitive)
 
-`src/runtime/parallel-driver.ts` exposes a `ParallelDriver` class with two operations:
+Moved to [ParallelDriver](runtime-parallel.md#paralleldriver-runtime-primitive), along with
+the fork contract, the connection-lock contract, and the three plan nodes built on the driver.
 
-- `fork(rctx, n)` — returns `n` independent `RuntimeContext` views. Each fork has its own `RowContextMap` (seeded with a snapshot of the parent's entries) and its own `tableContexts` `Map` (seeded with a shallow copy). Writes via `createRowSlot`, `withRowContext`, or direct `tableContexts.set/delete` in one fork do not leak to siblings or to the parent. The fork's view of `context` and `tableContexts` is **snapshot-at-fork**, not read-through: parent mutations made *after* the fork is created are not visible inside the fork. Callers must therefore treat the parent's `context` and `tableContexts` as immutable for the lifetime of the forks. Read-mostly fields (`db`, `stmt`, `params`, `enableMetrics`, `tracer`, `activeConnection`, `contextTracker`, `planStack`) are shared by reference; concurrent mutation of those by branch code is the caller's responsibility (the driver makes no concurrency guarantee about them).
-- `drive(factories, forks, opts?)` — runs N `(ctx) => AsyncIterable<T>` factories concurrently with optional `concurrency` cap and `AbortSignal` cancellation, yielding `{ branch, value }` pairs in arrival order. On any branch error or signal abort, all sibling iterators are best-effort `return()`-closed before the error propagates; the same close-all path runs when a consumer breaks out of the `for-await` early.
+## Strict runtime test modes
 
-The driver is intentionally combinator-agnostic — it does not gather, zip, merge, or otherwise combine branch outputs. It has no plan-node or emitter consumers yet; it exists as the foundation primitive for the broader `parallel-*` track. Parallel use of virtual-table connections is governed by the module's declared `concurrencyMode` (see [Module Authoring § Concurrency Mode](module-authoring.md#3-concurrency-mode-parallel-runtime)); consumers call `getModuleConcurrencyMode(module)` and `acquireConnectionLock(connection)` (from `vtab/concurrency.ts`) to fall back to serial behavior when a `'serial'` module's connection is shared across sibling branches. The driver itself does not enforce the lock — enforcement belongs in the consumer that owns the vtab interaction (e.g. fan-out lookup join).
-
-### Parallel runtime fork contract
-
-Three invariants govern what code may do with a `RuntimeContext` once it has been forked. They are enforced by the test harness in `packages/quereus/test/runtime/fork-contract.spec.ts`.
-
-**1. Fork policy per RuntimeContext field.** Every field has a declared policy:
-
-| Field | Policy | Meaning |
-| --- | --- | --- |
-| `db` | `shared-frozen` | Shared by reference, immutable for fork lifetime. |
-| `stmt` | `shared-frozen` | Shared by reference. |
-| `params` | `shared-frozen` | Shared by reference (bound args). |
-| `context` | `forked` | Independent per branch (snapshot-at-fork). |
-| `tableContexts` | `forked` | Independent per branch (snapshot-at-fork). |
-| `tracer` | `shared-sink` | Shared write-only instrumentation. |
-| `activeConnection` | `shared-cooperative` | Vtab's `concurrencyMode` declares concurrent-use safety; `'serial'` (the default) requires `acquireConnectionLock`. |
-| `enableMetrics` | `shared-frozen` | Boolean flag. |
-| `contextTracker` | `shared-sink` | Diagnostics sink. |
-| `planStack` | `shared-sink` | Tracing-only stack. |
-
-Adding a new field to `RuntimeContext` requires adding it to `EXPECTED_FORK_POLICY` in `fork-contract.spec.ts` with a declared policy — the test fails compile otherwise.
-
-**2. Parent immutability during fork lifetime.** A `RuntimeContext` whose `tableContexts` or `context` has been forked must not be mutated by the parent until every fork has finished being driven. The fork snapshots are taken at `fork()` time, not read-through, so parent mutations made afterward would silently diverge between parent and forks.
-
-**3. Mutation-site allowlist.** Direct `tableContexts.set/delete` and `context.set/delete` on a `RuntimeContext` are restricted to an audited set of files (`TABLE_CONTEXTS_MUTATION_ALLOWLIST` and `ROW_CONTEXT_MUTATION_ALLOWLIST` in the spec). Prefer `createRowSlot` / `withRowContext` / `withAsyncRowContext` over direct mutation. New direct-mutation sites must be added to the allowlist deliberately after weighing the fork-contract implications.
-
-### Connection-lock contract under impure subtrees
-
-`acquireConnectionLock` (in `vtab/concurrency.ts`) serializes sibling branches that share a `'serial'` (or `'reentrant-reads'`) module connection. It governs concurrent **reads** of the same connection — write operations are *not* a supported usage of the lock; the per-connection write protocol (transactions, savepoints, statement-bumps) is not reentrant under any of the currently-defined `concurrencyMode` values. A DML subtree on a branch driven concurrently with a sibling read would interleave the write with the sibling's cursor under the same connection, violating both the lock contract and the write protocol.
-
-Because of this, the parallel-track recognition rules in the optimizer (`AsyncGather` union-all / zip-by-key, `EagerPrefetch` probe, `FanOutLookupJoin`, `FanOutBatchedOuter`) **refuse to fold** when any participating branch reports `hasSideEffects = true`. The serial plan stays in place; writes execute exactly once, in textual order, under the connection lock. See `docs/optimizer.md` § "Parallel-track side-effect refusal" for the optimizer-side discipline and the shared `PlanNodeCharacteristics.isConcurrencySafe` predicate. Once a module advertises `'fully-reentrant'`, this restriction can be relaxed for that module — at which point both the optimizer predicate and the lock policy refine in tandem.
+Three off-by-default harnesses, all gated by module-level booleans read once from the
+environment in `runtime/strict-flags.ts`, and all zero-cost when their flag is unset.
 
 ### Strict-fork test mode
 
 Set `QUEREUS_FORK_STRICT=1` (or run `yarn test:fork-strict` from `packages/quereus`, which the root `yarn check` gate also runs) to enable a Node-only proxy/subclass that wraps every `RuntimeContext.tableContexts` and `RuntimeContext.context` constructed at the five production sites (`Statement`, `Database._executeSingleStatement`, `DatabaseAssertions.executeResidualPerTuple`, `DeferredConstraintQueue.runDeferredRows`, `const-evaluator`) plus every fork's own maps. The wrapper throws a `strict-fork: parent context mutated ...` error if any `set` / `delete` / `clear` is invoked on a parent map while one of its forks is currently being driven by `ParallelDriver.drive()`.
 
-State is tracked per parent map (not globally) so concurrent unrelated drivers don't interfere and forks may freely mutate their own (fresh) maps. When the env flag is unset every helper is a no-op pass-through — production paths see vanilla `new RowContextMap()` / `new Map()`.
+State is tracked per parent map (not globally) so concurrent unrelated drivers don't interfere and forks may freely mutate their own (fresh) maps. When the env flag is unset every helper is a no-op pass-through — production paths see vanilla `new RowContextMap()` / `new Map()`. What it enforces is invariant 2 of the [parallel runtime fork contract](runtime-parallel.md#parallel-runtime-fork-contract).
 
-### EagerPrefetchNode (first ParallelDriver.fork consumer)
+### Strict context-shadow test mode
 
-`EagerPrefetchNode` is the first physical relational node that consumes `ParallelDriver.fork()` directly. It is a pass-through whose only effect is timing: **on `run()`** (emit / scheduler arg-assembly, *not* first iteration), its emitter forks the runtime context once, immediately starts a detached "pump" that drains the child sub-tree into a bounded ring buffer, and serves the consumer from that buffer. Rows, order, attribute IDs, keys, FDs, equivalence classes, orderings, and monotonicity all pass through verbatim — only `deterministic` / `idempotent` / `readonly` / `concurrencySafe` propagate via the default child-merge.
+Set `QUEREUS_CONTEXT_STRICT=1` (or run `yarn test:context-strict` from `packages/quereus`, which the root `yarn check` gate also runs alongside `test:fork-strict`) to enable an off-by-default runtime assertion that catches the **operator-shadows-child** stale-shadow described in § Invariant: source-attr contexts and child pulls.
 
-Eager-on-`run()` is the point: inside a `BloomJoinNode`, the scheduler invokes the prefetch's `run()` during arg-assembly — before the join's generator body drains the build (`right`) side — so the probe's first fetch is already in flight while the build materializes. `prefetchAsyncIterable` returns a manual `AsyncIterable<Row>` (not an async generator) whose iterator owns teardown via `next()`/`return()`/`throw()`.
+**What it asserts.** The strict `RowContextMap` subclass (in `runtime/strict-fork.ts`, shared with the fork-strict harness through the same `createStrictRowContextMap()` factory) maintains a monotonic clock, a per-descriptor `epoch` bumped on both `set()` and each `slot.set(row)` (via `noteRowSet`), and a per-attribute `winnerByAttr` map kept in lockstep with `attributeIndex`. Under the flag `resolveAttribute` calls `assertNoShadow`: if a *different* live context carries the attribute being read with a strictly-newer epoch **and a differing value at the resolved column**, it throws a `QuereusError(INTERNAL)` whose message begins `context-strict:` and points back here. The value comparison is deliberate — a wider projection (e.g. a nested-loop join output `[...left, ...right]`) legitimately re-carries a source attribute in a newer row object that agrees on the shared column, which is not an observable wrong-row.
 
-**Iterate-or-close contract.** Because the fork (and its strict-fork counter) is live from `run()`, any consumer of an EagerPrefetch MUST either iterate the stream to completion or call its iterator's `return()` — otherwise the pump leaks (fills the buffer, then blocks on back-pressure forever) and the fork counter stays bumped. `emitBloomJoin` honors this by acquiring the left iterator up front and closing it in a `finally` that wraps both the build and probe phases (covering the build-error-before-probe path).
+**What it deliberately does not assert.** The mirror **child-shadows-operator** direction is out of scope, for the reason given under § Invariant: source-attr contexts and child pulls; catching it needs per-operator declared intent (provenance threading), tracked in the backlog ticket `debt-context-shadow-reactivate-direction`.
 
-Because the emitter uses `ParallelDriver.fork()` without going through `drive()`, it is responsible for the strict-fork bookkeeping that `drive()` normally handles internally. `parallel-driver.ts` re-exports `bumpParentForkCounter` / `dropParentForkCounter` for this purpose: any caller using `fork()` manually must `bump` once per parent map after forking and `drop` the returned state in cleanup once the fork's iteration is complete. Don't import these from `strict-fork.ts` directly — that module is internal.
+**Cost & gating.** Zero-cost when off: a module-level `CONTEXT_STRICT` boolean (read once from the env in `runtime/strict-flags.ts`) guards the single leading `if (CONTEXT_STRICT) rctx.context.assertNoShadow?.(...)` in `resolveAttribute` and the per-row `noteRowSet?` bump in `createRowSlot`; the base `RowContextMap` carries no epoch side-tables and `createStrictRowContextMap()` returns a vanilla map when both strict flags are off. The per-read check is O(live contexts carrying the attr) — small in practice; if a pathological plan makes strict-mode CI slow, index the per-attr candidate list instead of scanning all live entries (a tripwire noted at the call site). Diagnostics name the attribute + column, the stale index winner and the shadowing context (by best-effort installer labels threaded through `createRowSlot` / `withRowContext` / the direct-`set` aggregate/window emitters; absent labels degrade to the descriptor's attribute-ID list), and the reading operator from `planStack` top when tracing is on.
 
-**Strict-fork interaction (eager-start).** Holding the fork live from `run()` means it is active for the entire statement, so any slot-creating ancestor (a `Project` or `Sort` above the join) mutates the same parent `rctx` while the fork is counted — tripping the strict-fork contract (invariant 2). This is the same known interaction as Sort-above-`AsyncGather`, and is a **strict-harness false-positive only**: `bumpParentForkCounter` is a no-op in production, and the probe is a self-contained relation scan whose detached snapshot never observes the parent's later mutations. Strict-mode tests over executed eager-prefetched plans are skipped accordingly; the non-strict path validates correctness.
+### Strict physical-representation test mode
 
-### AsyncGatherNode (N-ary parallel relational combinator)
+Set `QUEREUS_REPR_STRICT=1` (or run `yarn test:repr-strict` from `packages/quereus`) to enable the third off-by-default harness in `runtime/strict-flags.ts`. It verifies that every value is in the JavaScript form its declared type promises, at four seams: virtual-table scan output, DML write, scalar-UDF return, and statement row egress. The checker is `runtime/strict-representation.ts`; the rules it enforces, the per-seam table, the known coverage gaps, and why there is no module capability flag are all in [types.md § Enforcement: `QUEREUS_REPR_STRICT`](types.md#enforcement-quereus_repr_strict).
 
-`AsyncGatherNode` is a physical N-ary relational node that drives ≥ 2 independent (uncorrelated) child relations concurrently via `ParallelDriver.drive()` and combines their outputs with a per-node `AsyncGatherCombinator`. Three combinators ship:
+**Cost & gating.** Zero-cost when off, on the same pattern as the two harnesses above: a module-level `REPR_STRICT` boolean guards every call site, and each seam's supporting state (declared column type/name arrays, the resolved UDF return type) is built inside that guard so a normal emit allocates nothing for it. The scan seam's check is synchronous and sits inside the existing `for await` loop, so enabling the flag adds no microtask hop to the scan's fast path.
 
-- `unionAll` — yield every row from every branch in **arrival order** (multiset union, no dedup). All children must share a column count. Attribute IDs mirror `children[0]` so downstream `ORDER BY` references keep resolving (same convention as `SetOperationNode.buildAttributes`). Ordering, FDs, equivalence classes, constant bindings, and domain constraints are all dropped — arrival-order interleave is non-deterministic, so downstream consumers requiring a total order must wrap the gather in `Sort`. `isSet` is `false`; per-column nullability is the OR across children.
+This harness runs in the root `yarn check` chain via `test:repr-strict`, alongside `test:fork-strict` and `test:context-strict`.
 
-- `crossProduct` — drain every branch fully, then yield the full N-ary Cartesian product. Output attributes are the verbatim concatenation of children's attributes; FDs / ECs / constant bindings / domain constraints are the pairwise N-ary fold of children's properties (the same fold `JoinNode(cross)` does, applied repeatedly). Cartesian-product order is deterministic-but-unspecified — it depends on the per-branch arrival order. **Memory caveat: the runtime buffers every branch in memory before yielding the first row.** This matches the materialization profile a fully-materialized `JoinNode(cross)` would have, but it is a real cost on wide products — callers should not use `crossProduct` when any branch is large. No streaming variant exists in v1.
+## Incremental Delta Runtime
 
-- `zipByKey({ branchKeyAttrs, outputKeyAttrs })` — full N-way **outer join** on the key columns named **per branch** by `branchKeyAttrs`. `branchKeyAttrs[b]` lists the attribute IDs of branch *b*'s K key columns in key-position order (distinct per branch — each branch originates its own key id); `outputKeyAttrs` lists the K attribute IDs the gather **mints** for the merged key columns (one per key position, pairwise distinct and disjoint from every child id). For each distinct key value present in any branch, emit exactly one composed row: the K merged key columns once (carrying the `outputKeyAttrs` ids, in key-position order), then each branch's non-key columns (NULL when that branch has no row for that key). Implemented as an **eager hash-merge** over a `BTree` keyed by the key tuple — *not* a chained binary full-outer-join lowering. Output key is `[[0..K-1]]`; `isSet` is `false`; key nullability is the OR across branches (a NULL-keyed standalone row can surface) and non-key columns are forced nullable. **Provenance:** the gather genuinely *originates* the K merged key columns ("branch0's key, or branch1's key, …, whichever row is present" — `outputKeyAttrs` appear in no child) and *forwards* each branch's non-key id (each appears in exactly one child), so `validatePhysicalTree` passes by construction — no id is output by two branches. Relational invariants (FDs/ECs/bindings/domains/ordering) are dropped, same conservatism as `unionAll` (conditional non-key FDs are future work). **Memory caveat: every branch is drained before the first row is yielded.** NULL keys never merge (SQL `NULL = NULL` is unknown) — each NULL-keyed row emits standalone. Within-branch duplicate keys are unspecified in v1 (branches assumed key-unique). Manual construction only — the recognition rule is the backlog ticket `parallel-async-gather-zip-by-key-rule`.
+Quereus runs a single reusable **change-driven delta kernel** at transaction
+boundaries: it captures changed rows per base table (savepoint-aware), and at COMMIT
+executes only the affected slice of each registered consumer's query via
+binding-aware residual plans, falling back to a global re-evaluation past a cost
+threshold. Live consumers are transaction-deferred **assertions** (pre-commit) and
+**`Database.watch`** (post-commit); reactive signals, triggers, and the lens layer
+plug into the same surface.
 
-All three combinators inherit `ParallelDriver.drive()`'s cancellation, error propagation (one branch's throw is re-raised after a best-effort `return()`-close of in-flight siblings), strict-fork bookkeeping, and consumer-break cleanup. Concurrency is capped at the node's `concurrencyCap` field, which the recognition rule (see `5.5-parallel-async-gather-union-all-rule`) initialises from `tuning.parallel.concurrency`.
+The kernel — its lifecycle (capture demand → record → read at COMMIT), the
+`DeltaSubscription` contract, savepoint merge semantics, and the plug-in pattern for
+new consumers — is documented definitively in
+[Incremental Maintenance](incremental-maintenance.md). The optimizer-side analysis
+that classifies a plan's references (`'row'` / `'group'` / `'global'`) and chooses
+binding keys is in
+[Assertions § Binding-aware Delta Planning](optimizer-assertions.md#binding-aware-delta-planning-reusable).
 
-`expectedLatencyMs` and `concurrencySafe` are now defined on `PhysicalProperties`. The merge default the `PlanNode.physical` getter applies is `max` across children for `expectedLatencyMs` and `AND` across children for `concurrencySafe`. `TableReferenceNode` populates the leaf values: `concurrencySafe` from `getModuleConcurrencyMode(vtabModule) !== 'serial'`, and `expectedLatencyMs` from an optional `VirtualTableModule.expectedLatencyMs` hint (omit-implies-0 — local-only paths stay at 0 and the fan-out cost gate is inert by design until a remote plugin declares non-zero latency).
-
-**Recognition rule (unionAll).** `rule-async-gather-union-all.ts` (`PassId.PostOptimization` priority 17, after physical selection and before `materialization-advisory`) folds a chain of `SetOperationNode(unionAll)` into one `AsyncGatherNode({ kind: 'unionAll' })`. The rule fires only when every flattened child clears `physical.concurrencySafe === true` AND the slowest child meets `tuning.parallel.gatherThresholdMs` (default 25 ms). Memory-vtab leaves declare `expectedLatencyMs = 0`, so the rule is inert by design in local-only configurations and the `test/plan/` golden sweep is unaffected. The flatten step absorbs unionAll-`AsyncGatherNode` children as well as nested `SetOperationNode(unionAll)` — necessary because bottom-up traversal fires the rule on inner sub-chains first, so the outer firing must collapse the inner gather into the new one rather than nesting them. See `docs/optimizer.md` § "Async gather UNION ALL" for the full rule contract, gates, and tuning knobs. `crossProduct` recognition is opt-in only and is not on the optimizer roadmap. The `zipByKey` combinator (full N-way outer join, eager hash-merge) is implemented as a manual-construction node; its recognition rule is deferred to the backlog ticket `parallel-async-gather-zip-by-key-rule`.
-
-### FanOutLookupJoinNode (per-row fan-out lookup join)
-
-`FanOutLookupJoinNode` is a physical relational node that replaces a chain of N nested-loop LEFT/INNER joins where each branch is a key-aligned (FK→PK) lookup against an independent table — or, for `cross` branches, an unconstrained 1:n inner nested-loop join. For one outer row, the emitter forks the runtime context N times, drives the N parameterized branch sub-plans concurrently via `ParallelDriver.drive()`, collects each branch's result rows, and assembles the wide result rows (outer ++ branch[0] ++ … ++ branch[N-1] — the n-ary Cartesian product across branches).
-
-**Branch modes.** Each branch declares a `mode`:
-
-- `atMostOne-left` — like LEFT JOIN: a zero-row branch yields NULL-padded columns for that slice; the outer row is kept.
-- `atMostOne-inner` — like INNER JOIN: a zero-row branch drops the outer row entirely.
-- `cross` — like an inner nested-loop join: the branch yields *n* rows per outer row (data-driven cardinality) and the node emits one wide row per `(outer, branch-row)` combination — the Cartesian product. A zero-row branch drops the outer row (inner-drop). All product rows of one outer row are emitted contiguously, in outer order, with the right-most branch varying fastest (matching the nested-loop chain it replaces).
-- `cross-left` — like a LEFT nested-loop join with a data-driven 1:n match: same Cartesian product as `cross` when the branch matches, but a zero-row branch emits one NULL-padded factor row so the outer row is preserved (LEFT semantics). Its output columns are nullable-widened, like `atMostOne-left`.
-
-The left-preserving modes (`atMostOne-left` / `cross-left`) and the 1:n cross modes (`cross` / `cross-left`) are distinguished by the `isLeftBranchMode` / `isCrossBranchMode` predicates exported from `fanout-lookup-join-node.ts`, shared by the node's attribute/type widening, the recognition rule, and the emit composer. The `atMostOne-*` modes share an `atMostOne` invariant the runtime enforces defensively (scoped to those modes only — `cross` / `cross-left` are exempt): any such branch that yields more than one row for a single outer row throws `QuereusError(StatusCode.CONSTRAINT, "FanOutLookupJoin: branch i produced more than one row …")`. The recognition rule guarantees FK→PK alignment so this is unreachable in practice; it remains a defense against manually-constructed plans. The `array` (per-row N rows preserved) mode is deferred to a follow-up backlog ticket.
-
-**Lock policy.** Each branch declares a `concurrencySafe: boolean` (the node constructor / rule layer computes it from `getModuleConcurrencyMode` on the branch's table reference, plus a read-only-subtree check). When the flag is `true` the branch is invoked raw on its forked context; when `false`, the emitter wraps the branch in `acquireConnectionLock(target)` so sibling branches sharing the same lock target serialize. The lock target is the branch's `connectionKey` hint when present, otherwise `rctx.activeConnection`. Distinct connections never contend; sibling branches sharing a `'serial'` module connection serialize through the per-connection promise chain. When `concurrencySafe` is `false` but neither a `connectionKey` nor `rctx.activeConnection` is available (e.g. for CTE-materialization or const-evaluation paths that run without an established connection), the branch falls through raw — there is no identity to key the lock by, so serialization cannot be enforced and callers must ensure the situation is safe. v1 always reuses the outer's connection (`rctx.activeConnection`) when no explicit hint is set — opening a fresh connection per branch is deferred until a `'reentrant-reads'` plugin needs per-connection isolation.
-
-**Outer-row binding propagation.** The emitter installs the outer row's `RowSlot` on the parent `rctx.context` *before* forking, so each fork's snapshot (per `ParallelDriver.fork()`'s parent-snapshot semantics) already carries the binding. The branch sub-plan can read the outer columns from `rctx.context` inside its own emit code without further wiring.
-
-**Ordering / FDs.** Outer ordering passes through; v1 emits rows in outer order. Functional-dependency propagation is conservative: it folds the branches in left-to-right `propagateJoinFds` calls with **empty equi-pair lists** — the node does not currently carry per-branch FK→PK alignment, so it cannot derive the cross-branch FDs that the recognition rule (4.5) would otherwise see. Once a per-branch equi-pair surface is added to `FanOutBranchSpec`, the node's `computePhysical` can tighten without changing the emitter. `concurrencyCap` bounds the number of concurrently-active branches via `ParallelDriver.drive()`; the recognition rule (`rule-fanout-lookup-join.ts`) sources it from `min(tuning.parallel.concurrency, branches.length)`.
-
-**Recognition + cost gate.** The `rule-fanout-lookup-join` Structural-pass rule (priority 23, ahead of `join-elimination` at 24) clusters a Project-rooted chain of N FK→PK-aligned LEFT/INNER joins into one `FanOutLookupJoinNode`. Eligibility mirrors `ruleJoinElimination`'s checks (AND-of-column-equalities ON-clause, FK→PK alignment via `lookupCoveringFK` + `checkFkPkAlignment`, NOT-NULL FK + row-preserving path for INNER branches). The cost gate fires only when `(N − concurrencyCap) × expectedLatencyMs > N × branchSetupCost`; the formula clamps to 0 savings when `cap ≥ N` — fan-out wins only when concurrency-bound. The gate is intentionally inert for local-only chains (`expectedLatencyMs = 0`) — see `docs/optimizer.md` for the full rule contract.
-
-**Outer execution modes (`outerMode`).** The node carries `outerMode: 'serial' | 'batched'` (default `'serial'`). The serial path above overlaps the N branches of *one* outer row, then blocks on the next row — so a small per-row `branchCount` can never saturate a larger budget, and latency hiding is bounded to a single row. The `'batched'` path (run by `runFanOutLookupJoinBatched` in `runtime/emit/fanout-lookup-join.ts`) pipelines lookups *across* outer rows. `'serial'` remains the default; `rule-fanout-batched-outer` (`PassId.PostOptimization` priority 16 — see `docs/optimizer.md` § "Fan-out batched outer") flips a node to `'batched'` only when the per-row branch count under-saturates the global budget, the slowest branch is high-latency, and the outer cardinality is large — gates that are all inert on memory-vtab plans, so the golden-plan sweep stays byte-for-byte unchanged. When it flips, the rule also wraps the outer in an `EagerPrefetchNode` so the outer sub-plan runs against an isolated forked context (the batched pump then drains a pure buffer, never mutating the shared `rctx.context` the per-row forks bump — this is what makes the cross-row outer pump safe under strict-fork and against torn non-outer reads). Both modes emit rows in identical outer order, so `computePhysical`'s ordering pass-through holds for both.
-
-The batched driver:
-
-- **Global in-flight budget.** A single `AsyncSemaphore` (`runtime/async-semaphore.ts`, FIFO, single-shot idempotent release) over `tuning.parallel.outerBatchConcurrency` (default 16) caps concurrent branch lookups across *all* in-flight outer rows — distinct from `concurrency` (the per-row serial cap, default 8). A small `branchCount` saturates the budget by admitting more outer rows rather than more branches per row.
-- **Bounded outer read-ahead.** The outer pump admits at most `R = clamp(ceil(globalCap / max(1, branchCount)), 1, maxOuterReadAhead)` rows *ahead of the emit frontier* (the lowest not-yet-emitted row). `tuning.parallel.maxOuterReadAhead` (default 64) is the hard clamp so `branchCount = 1` cannot fork an unbounded number of contexts. Backpressure is measured from the consumer: a slow head-of-line row holds back at most `R` rows.
-- **Per-outer-row context isolation (load-bearing correctness point).** Each admitted row forks its own `rowCtx` from `rctx` and installs its own `RowSlot` (its own boxed `ref`), then forks the branches from `rowCtx`. The branch forks snapshot *this row's* getter — a closure over a ref that is never mutated again — so concurrently in-flight rows never share an outer binding. (The serial single-slot-on-parent approach mutates one shared `ref` per row and is unsafe under cross-row concurrency.) This is nested forking (`rctx → rowCtx → branch forks`); strict-fork counters are bumped on admit and dropped on row completion, mirroring `prefetchAsyncIterable`.
-- **Permit-before-lock ordering.** Each branch task acquires its global permit *before* the wrapped factory's first pull (where `acquireConnectionLock` is taken). A lock-holder therefore always also holds a permit, so a permit-holder blocked on a lock is always waiting on another permit-holder that will release — no deadlock. A shared `'serial'` connection still serializes across branches of *different* outer rows through the per-connection promise chain (more rows in flight just raises contention on that one connection).
-- **Order-preserving reorder buffer.** Each completed row lands in a `seq`-keyed map as the (possibly empty) list of wide rows it produced; the generator emits all of `seq = emitFrontier`'s rows contiguously as soon as they land, then advances the frontier (an empty list is a dropped outer row — an `atMostOne-inner` miss or an empty `cross` branch). Window accounting advances per `seq`, independent of product fan-out. Out-of-order completion, in-order emit. Consumer `return()`, downstream `throw`, or any branch error aborts the pump, `return()`-closes all live branch iterators, drains all per-row jobs to their teardown (drop fork counters, close slots), and re-raises the first branch error.
-
-The `composeOuterRows(outerRow, branchBuf, descriptors, padLengths) → Row[]` helper (NULL-pad + inner-drop + Cartesian-product composition) is shared by both drivers so they compose identically; an empty array signals a dropped outer row.
-
-## Incremental Delta Runtime (Design)
-
-Quereus can reuse a single incremental runtime to power multiple features that react to base-table changes: transaction-deferred assertions, materialized views, and future trigger-like facilities. The core idea is to execute only the affected slice of a registered query at transaction boundaries using binding-aware residual plans.
-
-### Goals
-- Reuse the same delta infrastructure across assertions and views
-- Execute parameterized residuals per affected key/group; fall back to global when required
-- Respect savepoints; changes rolled back via SAVEPOINT should not be visible to COMMIT-time checks
-
-### Building Blocks
-- ChangeCapture (existing): per-transaction change log tracking primary-key tuples per base table; savepoint aware
-- BindingInference: classifies a plan’s table references as row-specific, group-specific, or global (see optimizer doc) and identifies binding keys (PK/unique or group-by/partition keys)
-- ParameterizedPlanCache: per-registrant (assertion/view) and per relationKey, store prepared residual plans with parameter slots aligned to key order
-- DeltaExecutor: at COMMIT, select impacted registrants, decide global vs per-binding execution, early-exit on first violation (assertions) or produce delta rows (views)
-
-### Execution Modes
-- Assertions: run residuals and fail on first non-empty result (error → rollback)
-- Materialized Views (future): compute ΔView and merge into cached table (insert/update/delete)
-
-### Savepoints
-- On SAVEPOINT: push a new change layer
-- On ROLLBACK TO: discard the top layer
-- On RELEASE: merge the top layer into the previous one
-
-### Diagnostics
-- `explain_assertion(name)` exposes classification and prepared parameter layout for assertions
-- Future: `explain_view_delta(name)` for materialized views
-
-This design keeps runtime responsibilities focused on execution and caching, while the optimizer provides binding inference and plan shaping. See the optimizer document for analysis details.
+> Materialized views do **not** use this kernel — they are maintained synchronously
+> at the DML write boundary inside the writing transaction (row-time); see
+> [Materialized Views](materialized-views.md).
 
 ## Type Coercion Best Practices
 
-SQL requires different coercion strategies for different contexts. Quereus handles coercion at two levels:
-
-1. **Plan-time coercion** — Cross-category comparisons (numeric vs textual) are resolved by the planner, which inserts explicit `CastNode`s so the runtime never needs implicit coercion for comparisons or BETWEEN.
-2. **Runtime coercion** — Arithmetic and aggregate contexts still use centralized utilities from `src/util/coercion.ts`.
+SQL requires different coercion strategies for different contexts. Quereus coerces at two levels: **plan-time**, where the planner inserts explicit `CastNode`s for cross-category comparisons so the runtime never coerces implicitly for comparisons or BETWEEN; and **runtime**, where arithmetic and aggregate contexts use the centralized utilities in `src/util/coercion.ts`.
 
 ### Coercion Contexts
 
 **Comparison Context** (plan-time):
 - When one operand is numeric and the other textual, the planner wraps the textual operand in a CastNode targeting the numeric type
 - Example: `42 = '42'` → planner rewrites to `42 = cast('42' as INTEGER)`, both sides are numeric at runtime
-- No runtime coercion is needed; the generic comparison path only handles temporal checks
+- `IN` value lists, simple `CASE` and the comparison-group builtins share that rule through `coerceComparisonSet`; an `IN` **subquery** has no operand list to wrap and converts per row instead (`inMembershipKeys`, `runtime/emit/subquery.ts`)
+- The generic runtime comparison path only handles temporal checks
 
 **Arithmetic Context** (`coerceToNumberForArithmetic`):
 - Converts all values to numbers for arithmetic operations
@@ -1305,25 +1246,21 @@ SQL requires different coercion strategies for different contexts. Quereus handl
 
 **Aggregate Context** (`coerceForAggregate`):
 - Function-specific coercion for aggregate arguments
-- COUNT functions skip coercion, numeric aggregates (SUM/AVG) coerce strings
-- Used in: aggregate function argument processing
+- COUNT/GROUP_CONCAT/`JSON_*` skip coercion, numeric aggregates (SUM/AVG) coerce strings
+- The aggregate emitters do not call it per row: the routing decision is constant for a
+  call site, so `computeAggregateValueTransforms` (`runtime/emit/aggregate-setup.ts`)
+  resolves it once at emit time into a per-aggregate value transform — `undefined` when
+  the site never coerces (the aggregate ignores coercion, or every argument is already
+  numeric or carries semantic ordering). The transform applies the identical value-level
+  conversion; `coerceForAggregate` remains the definition and the public export
 
 ### Implementation Guidelines
 
-```typescript
-import { coerceToNumberForArithmetic, coerceForAggregate } from '../../util/coercion.js';
-
-// In arithmetic operations:
-const n1 = coerceToNumberForArithmetic(v1);
-const n2 = coerceToNumberForArithmetic(v2);
-const result = n1 + n2;
-
-// In aggregate functions:
-const coercedArg = coerceForAggregate(rawValue, functionName);
-accumulator = schema.stepFunction(accumulator, coercedArg);
-```
-
-**Critical Rule**: Never implement custom coercion logic in individual emitters. Always use centralized utilities (for arithmetic/aggregates) or rely on planner-inserted CastNodes (for comparisons) to ensure consistent behavior across the system.
+**Critical Rule**: never write coercion logic in an emitter. Coerce each operand with
+`coerceToNumberForArithmetic` before an arithmetic op, coerce an aggregate argument
+through the emit-time transform described above (whose body is `coerceForAggregate`'s,
+not a re-derivation), and for comparisons rely on the planner-inserted `CastNode` — one
+behavior, one home (`src/util/coercion.ts`).
 
 ## Uniqueness and sorting guidelines
 
@@ -1337,19 +1274,18 @@ if (seen.has(key)) continue; // Skip duplicate
 seen.add(key);
 ```
 
-**Problems**: 
-- Doesn't follow SQL comparison rules
-- `1` and `"1"` have different JSON representations but may be equal in SQL
-- Doesn't respect collation rules
+A JSON string is not a SQL comparison: it respects no collation, and `1` and `"1"`
+serialize differently though SQL may compare them equal.
 
 **Correct** — pre-resolve comparators at emit time to avoid runtime overhead:
 ```typescript
 import { BTree } from 'inheritree';
-import { createCollationRowComparator, resolveCollation, BINARY_COLLATION } from '../util/comparison.js';
+import { createCollationRowComparator, BINARY_COLLATION } from '../util/comparison.js';
 
-// At emit time: pre-resolve collation-based row comparator
+// At emit time: pre-resolve collation-based row comparator. Names resolve against the
+// EmissionContext's database (`ctx.resolveCollation`) — there is no global registry.
 const collationRowComparator = createCollationRowComparator(
-  attributes.map(attr => attr.type.collationName ? resolveCollation(attr.type.collationName) : BINARY_COLLATION)
+  attributes.map(attr => attr.type.collationName ? ctx.resolveCollation(attr.type.collationName) : BINARY_COLLATION)
 );
 
 // At runtime: use pre-resolved comparator in BTree
@@ -1366,187 +1302,109 @@ if (!existingPath.on) {
 
 For typed contexts (where runtime types are guaranteed, e.g. GROUP BY keys):
 ```typescript
-import { createTypedComparator, resolveCollation } from '../util/comparison.js';
+import { createTypedComparator } from '../util/comparison.js';
 
 // At emit time: pre-resolve typed comparator from expression type
 const exprType = expr.getType();
-const collationFunc = exprType.collationName ? resolveCollation(exprType.collationName) : undefined;
+const collationFunc = exprType.collationName ? ctx.resolveCollation(exprType.collationName) : undefined;
 const comparator = createTypedComparator(exprType.logicalType, collationFunc);
 ```
 
 ## Debugging and Common Pitfalls
 
-Based on real implementation experiences, here are key concepts and common mistakes to avoid when developing runtime emitters.
+Hard-won lessons for runtime emitter authors. Most reduce to *use the canonical
+context and scheduler helpers* — the sections above are the reference; this is the
+checklist.
 
-### Scheduler-Centric Execution Model
+### Never call instructions directly
 
-**❌ NEVER call instructions directly:**
+Route every sub-program through its scheduler callback, never a direct
+`instruction.run(...)` — direct calls bypass dependency resolution and can race. See
+[Scheduler Execution Model](#scheduler-execution-model) and
+[Key Points for Emitter Authors](#key-points-for-emitter-authors).
+
+### Avoid a per-row microtask hop on the synchronous fast path
+
+A scalar sub-program (filter predicate, projected column, join condition,
+order/partition key, constraint check) runs through a sub-scheduler that completes
+*synchronously* and returns a concrete value whenever no instruction in it is itself
+async — the overwhelmingly common case. But `await value` still schedules a microtask
+even when `value` is not a thenable (`await x` ≡ `await Promise.resolve(x)`), so a
+per-row/per-column `await callback(rctx)` pays that tick N times for nothing. Branch on
+`instanceof Promise` instead:
+
 ```typescript
-// WRONG - bypasses scheduler
-const result = await conditionInstruction.run(rctx, ...args);
-if (result) {
-    // This breaks the execution model
-}
+// Pure-extraction site — value consumed as-is:
+const raw = callback(rctx);
+const value = raw instanceof Promise ? await raw : raw;
+
+// Transform site — value mapped before use: route through resolveMaybe,
+// then await only on the rare async path (async-util.ts):
+const decision = resolveMaybe(predicate(rctx), (r) => isTruthy(r));
+if (decision instanceof Promise ? await decision : decision) { /* ... */ }
 ```
 
-**✅ ALWAYS use scheduler callbacks:**
-```typescript
-// CORRECT - scheduler handles execution and dependency resolution
-if (conditionCallback) {
-    const conditionResult = await conditionCallback(rctx);
-    conditionMet = !!conditionResult;
-}
-```
+The `await` must stay *lexical* at the extraction point — a value-returning helper the
+caller then `await`s just reintroduces the hop. `instanceof Promise` is the right test
+(not a duck-typed `.then` check): the scheduler itself decides async transitions with
+`instanceof Promise`, so instructions only ever return a native `Promise` or a concrete
+value. Genuinely-async sub-programs (e.g. a correlated scalar subquery) still work — they
+take the promise branch.
 
-**Why this matters:**
-- The scheduler manages instruction dependencies and execution order
-- Direct calls bypass dependency resolution and can cause race conditions
-- Callbacks ensure proper context setup and error handling
+#### Short-circuiting operators reuse this pattern
 
-### Scope Resolution Debugging
+`CASE` (`emit/case.ts`), `AND`/`OR` (`emit/binary.ts`), and `Filter` conjuncts
+(`emit/filter.ts`) all emit their deferrable operands as on-demand callbacks
+(`emitCallFromPlan`) and invoke only what SQL semantics require. Each `run` returns
+`MaybePromise<SqlValue>` and stays synchronous whenever the callbacks do — the
+`instanceof Promise` branch above is taken only for a genuinely async operand (e.g. a
+scalar subquery). Two consequences worth pinning:
 
-When debugging column resolution issues, understand the scope hierarchy:
+- **`CASE` always short-circuits — no cost gate.** SQL evaluates `WHEN` clauses
+  left-to-right and evaluates *only* the selected result, so every
+  `WHEN`/`THEN`/`ELSE` defers unconditionally (the simple-`CASE` base expr stays an
+  eager param). A branch that would throw or run a subquery therefore never executes
+  unless selected: `select case when 1=1 then 'ok' else throwing_udf() end` returns
+  `'ok'`. `AND`/`OR` in scalar position, by contrast, defer only a subquery-bearing
+  right operand (perf, not correctness — see `emitLogicalOp`).
+- **The synchronous return matters beyond perf.** The materialized-view row-time
+  projection gate (`compileSourceRowEvaluator` in
+  `database-materialized-views-analysis.ts`) rejects a `Promise` result for a gated
+  single-row scalar. A `CASE` in a covering-structure body qualifies for that gate, so
+  its `run` must return a concrete value synchronously — declaring the `run` `async`
+  (forcing every result into a `Promise`) would break maintenance of any view whose
+  body contains a `CASE`.
 
-**Scope Resolution Order:**
-1. `MultiScope` checks child scopes in order (first match wins)
-2. `AliasedScope` handles qualified references (`table.column`)
-3. `RegisteredScope` contains actual column-to-attribute mappings
+### Common pitfalls checklist
 
-**Common scope resolution bugs:**
-- **Missing scope in MultiScope**: Check that all relevant scopes are included
-- **Wrong scope order**: Earlier scopes shadow later ones - order matters
-- **Projection scope issues**: After `ProjectNode`, ensure both projection outputs AND original qualified columns are accessible
-
-**Debugging pattern:**
-```typescript
-// Add targeted debugging for specific symbols
-if (symbolKey === 'problematic.column') {
-    console.log('Scope resolution for', symbolKey, 'in', this.scopes.length, 'scopes');
-}
-```
-
-### Context Lifecycle Management
-
-**Context Setup Pattern:**
-```typescript
-// Always use context helpers for row context
-// Pattern 1: Streaming with row slot
-const slot = createRowSlot(rctx, rowDescriptor);
-try {
-    for await (const row of rows) {
-        slot.set(row);
-        const result = await processRow(row, rctx);
-        yield result;
-    }
-} finally {
-    slot.close();
-}
-
-// Pattern 2: One-off async evaluation
-const result = await withAsyncRowContext(rctx, rowDescriptor, () => row, async () => {
-    // Async processing with automatic cleanup
-    return await processRow(row, rctx);
-});
-
-// Pattern 3: One-off synchronous evaluation
-const slot = createRowSlot(rctx, rowDescriptor);
-try {
-    for await (const row of rows) {
-        slot.set(row);
-        yield processRow(row, rctx);
-    }
-} finally {
-    slot.close();  // CRITICAL: Always clean up
-}
-```
-
-**Common context bugs:**
-- **Forgetting cleanup**: Memory leaks and stale context references
-- **Wrong row descriptor**: Attribute IDs don't match actual row structure  
-- **Context timing**: Setting up context too late or cleaning up too early
-
-### Debugging Techniques
-
-**Effective debugging approaches:**
-
-1. **Start with scope resolution:** Most column reference errors are scope issues
-2. **Check context timing:** Verify context is available when column references execute  
-3. **Use targeted logging:** Debug specific symbols rather than everything
-4. **Verify row descriptors:** Ensure attribute IDs match actual row structure
-5. **Test instruction isolation:** Verify emitters work independently before integration
-
-**Debugging environment variables:**
-```bash
-# Context lifecycle and column resolution
-DEBUG=quereus:runtime:context* yarn test
-
-# Specific operation tracing
-DEBUG=quereus:runtime:emit:join yarn test
-
-# Full runtime tracing (verbose)
-DEBUG=quereus:runtime* yarn test
-```
-
-[Recursive CTE Execution Pattern](./recursive-cte.md)
-
-### Context Helper Functions
-
-Quereus provides helper functions in `src/runtime/context-helpers.ts` to simplify context operations and ensure consistent behavior:
-
-**`createRowSlot(rctx, descriptor)`**
-- Creates a mutable slot for efficient streaming operations
-- Installs context once, updates by reference (no Map mutations per row)
-- Used by all high-frequency streaming emitters: scan, join, filter, project, distinct
-- Must call `close()` to clean up
-
-**`resolveAttribute(rctx, attributeId, columnName?)`**
-- Looks up an attribute ID in the current context via O(1) attribute index
-- Falls back to linear scan newest → oldest when the indexed slot isn't populated yet
-- Throws descriptive error if not found
-
-**`withRowContext(rctx, descriptor, rowGetter, fn)`**
-- Executes a function with a row context
-- Executes a **synchronous** function with a row context
-- Ensures proper cleanup in finally block
-- Use for synchronous expression evaluation
-
-**`withAsyncRowContext(rctx, descriptor, rowGetter, fn)`**
-- Executes an **async** function with a row context  
-- Ensures proper cleanup in finally block
-- Use for async operations (e.g., constraint checks)
-
-**Example usage:**
-```typescript
-import { createRowSlot, withRowContext, withAsyncRowContext, resolveAttribute } from '../context-helpers.js';
-
-// Pattern 1: Streaming with row slot
-async function* run(rctx: RuntimeContext, rows: AsyncIterable<Row>): AsyncIterable<Row> {
-	const slot = createRowSlot(rctx, rowDescriptor);
-	try {
-		for await (const row of rows) {
-			slot.set(row);
-			const value = someExpression(rctx); // Column refs auto-resolve
-			yield processRow(row, value);
-		}
-	} finally {
-		slot.close();
-	}
-}
-
-// Pattern 2: Synchronous expression evaluation
-function evaluateSync(rctx: RuntimeContext, row: Row): SqlValue {
-	return withRowContext(rctx, rowDescriptor, () => row, () => {
-		// Synchronous expression evaluation
-		return someExpression(rctx);
-	});
-}
-
-// Pattern 4: Async operation with context
-async function evaluateAsync(rctx: RuntimeContext, row: Row): Promise<SqlValue> {
-	return await withAsyncRowContext(rctx, rowDescriptor, () => row, async () => {
-		// Async operation (e.g., constraint check)
-		return await someAsyncOperation(rctx);
-	});
-}
-```
-
+- **Scope resolution.** Most column-reference errors are scope issues: a scope missing
+  from its `MultiScope`, a wrong scope order (earlier scopes shadow later ones), or
+  projection outputs and original qualified columns both needing to stay reachable after a
+  `ProjectNode`. See [Column Reference Resolution](#column-reference-resolution).
+  Invariant: **a FROM source's scope holds only its own columns.** `registerColumnScope`
+  and the `subquerySource` branch of `buildFrom` parent their `RegisteredScope` on
+  `EmptyScope.instance`, so a source answers "no" for any name it does not own. The
+  fallback to the enclosing query is composed *once* by the consumer — `buildSelectStmt`'s
+  `ShadowScope([...sourceScopes, outerScope])`, `buildJoin`'s ON-condition
+  `ShadowScope([MultiScope([leftScope, rightScope]), outerScope])`, and `buildJoin`'s
+  LATERAL `ShadowScope([leftOutputScope, outerScope])` — never by chaining each source
+  scope to its parent. Every consumer owes that fallback: without it an ON condition
+  cannot name a correlated outer column or a bind parameter at all. Chaining, on the
+  other hand, breaks `MultiScope`: its first-match walk asks peer #1, which
+  forwards the miss to the outer scope and answers from there, so peer #2 is never
+  consulted and a join's own right-hand source loses to a same-named enclosing symbol
+  (silently wrong rows when an inner alias shadows an outer one; a runtime "No row
+  context found for column …" when the enclosing symbol is bound to attribute ids nothing
+  below publishes). The same rule applies to what `buildFrom`/`buildJoin` publish into
+  `ctx.outputScopes`: that entry is the node's *own* columns only, because its consumer
+  may be another join that has to consult its sibling peer first.
+- **Context lifecycle.** Manage row context only through the helpers in
+  `src/runtime/context-helpers.ts` — `createRowSlot` for streaming, `withRowContext` /
+  `withAsyncRowContext` for one-off evaluation (see
+  [Row Context Management](#row-context-management)) — and always `close()` a slot in a
+  `finally`; never call `rctx.context.set/delete` directly. Typical bugs: forgotten
+  cleanup (stale context), a row descriptor whose attribute IDs do not match the row, or
+  context set up too late / torn down too early.
+- **Tracing.** Diagnose context and resolution problems with the
+  `DEBUG=quereus:runtime:context*` environment variables — see
+  [Context Debugging and Tracing](#context-debugging-and-tracing).

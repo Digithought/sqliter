@@ -26,8 +26,8 @@ export interface AuthConfig {
  * Sync-specific settings (passed to SyncManager).
  */
 export interface SyncSettings {
-  /** Tombstone retention period in milliseconds */
-  tombstoneTTL: number;
+  /** Retention horizon in milliseconds: changes older than this are not guaranteed deliverable */
+  retentionHorizonMs: number;
   /** Maximum changes per sync batch */
   batchSize: number;
 }
@@ -87,7 +87,7 @@ export const DEFAULT_CONFIG: CoordinatorConfig = {
     mode: 'none',
   },
   sync: {
-    tombstoneTTL: 30 * 24 * 60 * 60 * 1000, // 30 days
+    retentionHorizonMs: 30 * 24 * 60 * 60 * 1000, // 30 days
     batchSize: 1000,
   },
   logging: {

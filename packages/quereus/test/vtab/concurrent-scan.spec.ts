@@ -37,7 +37,6 @@ function createTableSchema(name: string, module: MemoryTableModule): TableSchema
 		indexes: Object.freeze([]),
 		checkConstraints: Object.freeze([]),
 		vtabModule: module,
-		isTemporary: false,
 		isView: false,
 	};
 }
@@ -196,6 +195,47 @@ describe('memory vtab direct concurrent scan', () => {
 		expect(postRows.some(r => r[0] === 15), 'delete visible to new scan').to.be.false;
 
 		await table.rollback();
+	});
+
+	it('materialized-view refresh (replaceBaseLayer) is atomic: in-flight scan keeps old, fresh scan sees new', async () => {
+		// Models REFRESH MATERIALIZED VIEW at the vtab layer: the manager swaps in a
+		// wholly new base layer while a reader is mid-scan. The in-flight reader,
+		// having captured its snapshot at query entry, must observe fully-old state;
+		// a fresh scan after the swap observes fully-new state — never half-state.
+		const ROW_COUNT = 10;
+		const table = await module.create(db, createTableSchema('refresh_atomic', module));
+		await seed(table, ROW_COUNT); // rows [0,0],[1,2],...,[9,18]
+		const manager = module.tables.get('main.refresh_atomic');
+		expect(manager, 'backing manager registered').to.exist;
+
+		// Start a scan and pull a prefix so it captures the pre-refresh base layer.
+		const scan = table.query(fullScanFilter())[Symbol.asyncIterator]();
+		const observed: Row[] = [];
+		for (let i = 0; i < 3; i++) {
+			const { value, done } = await scan.next();
+			expect(done).to.be.false;
+			observed.push(value);
+		}
+
+		// Refresh: atomically replace the base with a disjoint row set.
+		const newRows: Row[] = [[100, 1000], [101, 1010], [102, 1020]];
+		await manager!.replaceBaseLayer(newRows);
+
+		// Drain the in-flight scan — it must still see the full pre-refresh snapshot.
+		for (;;) {
+			const { value, done } = await scan.next();
+			if (done) break;
+			observed.push(value);
+		}
+		expect(observed, 'in-flight scan keeps pre-refresh cardinality').to.have.length(ROW_COUNT);
+		expect(observed.some(r => (r[0] as number) >= 100), 'refresh rows leaked into in-flight scan').to.be.false;
+
+		// A scan started after the refresh sees only the new rows — fully-new.
+		const fresh: Row[] = [];
+		for await (const row of table.query(fullScanFilter())) {
+			fresh.push(row);
+		}
+		expect(fresh.map(r => r[0])).to.deep.equal([100, 101, 102]);
 	});
 
 	it('overlapping scans started before a write each keep their own snapshot', async () => {

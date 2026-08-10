@@ -1,0 +1,445 @@
+-- ALTER COLUMN ... SET DATA TYPE into a type that COMPARES differently, when the physical
+-- storage class does not change.
+--
+-- TEXT and TIMESPAN are both physically text, and every spelling below is already the new
+-- type's canonical form, so the retype leaves the stored bytes alone (the rewrite pass
+-- re-parses each value — '1 hour' WOULD become 'PT1H'; see 41.2 §12 — but ISO durations
+-- round-trip unchanged). It does change how two values compare: TIMESPAN ranks by elapsed time, so 'PT1H',
+-- 'PT60M' and 'PT3600S' are ONE value where text sees three. Every index over the column is
+-- keyed by the column's logical type, so such a retype must be treated exactly like a
+-- SET COLLATE: re-validate every uniqueness-enforcing structure covering the column BEFORE
+-- mutating anything, and re-sort those structures when the change is accepted.
+--
+-- Without that, the change was silently accepted and left the indexes sorted the old way:
+-- an index-backed lookup for another spelling of a stored duration found nothing, while an
+-- INSERT of that same spelling was rejected as a duplicate — a value simultaneously absent
+-- on SELECT and duplicate on INSERT (bug-retype-to-semantic-type-unique-and-query).
+--
+-- CROSS-MODULE (the `-memory` in the filename is historical): the store backend used to cover
+-- only the TIMESPAN/JSON halves, via its own key-transform guard. It now gates its value rewrite
+-- on logical-type identity like memory does (bug-retype-same-class-skips-value-validation), so
+-- the DATE / TIME / DATETIME retypes of section 7b re-validate and rebuild there too, and this
+-- file runs on both legs.
+
+-- ===================================
+-- 1. Colliding rows under an explicit `create unique index` → the ALTER is REJECTED.
+-- ===================================
+-- Lives in 41.7.4.1-alter-column-retype-semantic-index-memory (it needs standalone index
+-- DDL); § 2 below is the same collision through an inline `v text unique`.
+
+-- ===================================
+-- 2. Same collision through an inline `v text unique` (the auto-built covering index
+--    rather than a user-created one).
+-- ===================================
+
+create table sem2 (id integer primary key, v text unique);
+insert into sem2 values (1, 'PT1H'), (2, 'PT60M');
+-- run
+
+alter table sem2 alter column v set data type timespan;
+-- error: UNIQUE constraint failed
+
+select name, type from table_info('sem2') where name = 'v';
+→ [{"name":"v","type":"TEXT"}]
+
+select id, v from sem2 order by id;
+→ [{"id":1,"v":"PT1H"},{"id":2,"v":"PT60M"}]
+
+drop table sem2;
+
+-- ===================================
+-- 3. ACCEPTED: no collision (one hour and two hours). The change must still re-sort the
+--    index — this is the case the old code got wrong WITHOUT any uniqueness violation.
+-- ===================================
+
+create table sem3 (id integer primary key, v text, unique (v));
+insert into sem3 values (1, 'PT1H'), (2, 'PT2H');
+-- run
+
+alter table sem3 alter column v set data type timespan;
+-- run
+
+select name, type from table_info('sem3') where name = 'v';
+→ [{"name":"v","type":"TIMESPAN"}]
+
+-- the stored values survive byte-identical: both are already canonical ISO durations, so the
+-- rewrite pass re-parses them to themselves
+select id, v, typeof(v) from sem3 order by id;
+→ [{"id":1,"v":"PT1H","typeof(v)":"text"},{"id":2,"v":"PT2H","typeof(v)":"text"}]
+
+-- an index-backed lookup by ANOTHER spelling of the stored duration finds the row
+select id from sem3 where v = 'PT60M';
+→ [{"id":1}]
+
+select id from sem3 where v = 'PT3600S';
+→ [{"id":1}]
+
+-- ...and uniqueness now enforces semantically: 120 minutes duplicates the stored 'PT2H'
+insert into sem3 values (3, 'PT120M');
+-- error: UNIQUE constraint failed
+
+-- a genuinely new duration is still accepted
+insert into sem3 values (4, 'PT30M');
+select id from sem3 where v = 'PT1800S';
+→ [{"id":4}]
+
+drop table sem3;
+
+-- ===================================
+-- 4. Non-unique index: no uniqueness to violate, but the index still has to be re-sorted
+--    or the lookup misses rows.
+-- ===================================
+-- The indexed legs (4 and 4c) live in 41.7.4.1-alter-column-retype-semantic-index-memory;
+-- the unindexed leg stays here as the answer they must match.
+
+-- 4b. the identical table with no index at all
+create table sem4b (id integer primary key, v text);
+insert into sem4b values (1, 'PT1H'), (2, 'PT60M'), (3, 'PT2H');
+-- run
+
+alter table sem4b alter column v set data type timespan;
+-- run
+
+select id from sem4b where v = 'PT3600S' order by id;
+→ [{"id":1},{"id":2}]
+
+drop table sem4b;
+
+-- ===================================
+-- 5. Reverse direction, TIMESPAN → TEXT: comparison becomes textual again, so the spellings
+--    separate and a duration that was a duplicate becomes insertable.
+-- ===================================
+
+create table sem5 (id integer primary key, v timespan, unique (v));
+insert into sem5 values (1, 'PT1H'), (2, 'PT2H');
+-- run
+
+-- while TIMESPAN: another spelling finds the row and duplicates it
+select id from sem5 where v = 'PT60M';
+→ [{"id":1}]
+
+alter table sem5 alter column v set data type text;
+-- run
+
+select name, type from table_info('sem5') where name = 'v';
+→ [{"name":"v","type":"TEXT"}]
+
+-- now purely textual: 'PT60M' is a different value from the stored 'PT1H'
+select id from sem5 where v = 'PT60M';
+→ []
+
+select id from sem5 where v = 'PT1H';
+→ [{"id":1}]
+
+-- ...so it is no longer a duplicate
+insert into sem5 values (3, 'PT60M');
+select count(*) as n from sem5;
+→ [{"n":3}]
+
+drop table sem5;
+
+-- ===================================
+-- 6. A retype into a type that compares IDENTICALLY stays a metadata-only no-op — the
+--    guard must not re-validate or re-sort on every `text → varchar` widening.
+-- ===================================
+
+create table sem6 (id integer primary key, v text, unique (v));
+insert into sem6 values (1, 'PT1H'), (2, 'PT60M');
+-- run
+
+-- both spellings survive: still two distinct TEXT values
+alter table sem6 alter column v set data type varchar(50);
+-- run
+
+select id, v from sem6 order by id;
+→ [{"id":1,"v":"PT1H"},{"id":2,"v":"PT60M"}]
+
+select id from sem6 where v = 'PT60M';
+→ [{"id":2}]
+
+drop table sem6;
+
+-- 6b. integer → bigint, likewise a no-op
+create table sem6b (id integer primary key, n integer, unique (n));
+insert into sem6b values (1, 10), (2, 9);
+-- run
+
+alter table sem6b alter column n set data type bigint;
+-- run
+
+select id, n from sem6b order by id;
+→ [{"id":1,"n":10},{"id":2,"n":9}]
+
+select id from sem6b where n = 9;
+→ [{"id":2}]
+
+drop table sem6b;
+
+-- ===================================
+-- 7. SET DATA TYPE keeps the column's existing collation, so the NEW type has to accept it.
+--    DATE / TIME / DATETIME / TIMESPAN / JSON declare `supportedCollations: []` — they accept
+--    BINARY only — so retyping a `collate nocase` column into any of them is REJECTED with
+--    the same error `create table … (d date collate nocase)` gives. Otherwise the ALTER would
+--    mint `d DATE COLLATE NOCASE`, a column shape no CREATE TABLE can produce and whose
+--    canonical DDL does not re-parse (on a store-backed database the table is dropped on
+--    reopen). Remedy is one extra statement: `set collate binary` first — see 7c.
+--
+--    The rejection is uniform: it does not matter whether the collation was written by the
+--    user or inherited from `pragma default_collation`, because that distinction is not
+--    persisted and would flip on a reopen.
+-- ===================================
+
+create table sem7 (id integer primary key, d text collate nocase, unique (d));
+insert into sem7 values (1, '2024-01-01'), (2, '2024-02-01');
+-- run
+
+alter table sem7 alter column d set data type date;
+-- error: Unknown collation
+
+-- the rejection changed nothing: declared type, collation, rows and index all survive
+select name, type from table_info('sem7') where name = 'd';
+→ [{"name":"d","type":"TEXT"}]
+
+select name, collation from table_info('sem7') where name = 'd';
+→ [{"name":"d","collation":"NOCASE"}]
+
+select id, d from sem7 order by id;
+→ [{"id":1,"d":"2024-01-01"},{"id":2,"d":"2024-02-01"}]
+
+-- still writable, and the index still enforces NOCASE uniqueness under the unchanged type
+insert into sem7 values (3, '2024-03-01');
+select count(*) as n from sem7;
+→ [{"n":3}]
+
+drop table sem7;
+
+-- 7b. …and the collation-legal shape of the same retype (a plain BINARY `text` column, the
+-- only collation DATE accepts). DATE compares exactly as BINARY text does, so this one
+-- re-sorts into the order it was already in — the point is that it stays correct and stays
+-- accepted. This is the surviving re-key coverage now that section 7 rejects.
+create table sem7b (id integer primary key, d text, unique (d));
+insert into sem7b values (1, '2024-02-01'), (2, '2024-01-01');
+-- run
+
+alter table sem7b alter column d set data type date;
+-- run
+
+select id, d from sem7b order by d;
+→ [{"id":2,"d":"2024-01-01"},{"id":1,"d":"2024-02-01"}]
+
+select id from sem7b where d = '2024-02-01';
+→ [{"id":1}]
+
+drop table sem7b;
+
+-- 7c. …the remedy for section 7: drop the illegal collation first, then retype. Two statements,
+-- both accepted, and the resulting column is a shape CREATE TABLE could have produced directly.
+create table sem7c (id integer primary key, d text collate nocase, unique (d));
+insert into sem7c values (1, '2024-02-01'), (2, '2024-01-01');
+-- run
+
+alter table sem7c alter column d set collate binary;
+-- run
+alter table sem7c alter column d set data type date;
+-- run
+
+select name, type, collation from table_info('sem7c') where name = 'd';
+→ [{"name":"d","type":"DATE","collation":"BINARY"}]
+
+select id, d from sem7c order by d;
+→ [{"id":2,"d":"2024-01-01"},{"id":1,"d":"2024-02-01"}]
+
+drop table sem7c;
+
+-- 7d. Every collation-less type rejects, and the collation name is not special — RTRIM
+-- rejects exactly as NOCASE does.
+create table sem7d (id integer primary key, v text collate nocase);
+insert into sem7d values (1, 'x');
+-- run
+
+alter table sem7d alter column v set data type date;
+-- error: Unknown collation
+
+alter table sem7d alter column v set data type time;
+-- error: Unknown collation
+
+alter table sem7d alter column v set data type datetime;
+-- error: Unknown collation
+
+alter table sem7d alter column v set data type timespan;
+-- error: Unknown collation
+
+alter table sem7d alter column v set data type json;
+-- error: Unknown collation
+
+select name, type, collation from table_info('sem7d') where name = 'v';
+→ [{"name":"v","type":"TEXT","collation":"NOCASE"}]
+
+drop table sem7d;
+
+create table sem7d2 (id integer primary key, v text collate rtrim);
+insert into sem7d2 values (1, 'x');
+-- run
+
+alter table sem7d2 alter column v set data type timespan;
+-- error: Unknown collation
+
+select name, type, collation from table_info('sem7d2') where name = 'v';
+→ [{"name":"v","type":"TEXT","collation":"RTRIM"}]
+
+drop table sem7d2;
+
+-- 7e. …and the types that declare NO collation list (INTEGER / REAL / BLOB) must not regress
+-- into rejecting: they accept any registered collation, so a NOCASE column still retypes.
+create table sem7e (id integer primary key, v text collate nocase);
+insert into sem7e values (1, '10');
+-- run
+
+alter table sem7e alter column v set data type integer;
+-- run
+
+select name, type, collation from table_info('sem7e') where name = 'v';
+→ [{"name":"v","type":"INTEGER","collation":"NOCASE"}]
+
+drop table sem7e;
+
+create table sem7e2 (id integer primary key, v text collate nocase);
+insert into sem7e2 values (1, 'abc');
+-- run
+
+alter table sem7e2 alter column v set data type blob;
+-- run
+
+select name, type, collation from table_info('sem7e2') where name = 'v';
+→ [{"name":"v","type":"BLOB","collation":"NOCASE"}]
+
+drop table sem7e2;
+
+-- 7f. The rejection does not care where the collation came from: with a session default of
+-- NOCASE the user never writes COLLATE, and the retype is still rejected. (`collationExplicit`
+-- is not persisted, so keying the rule on user intent would flip on a reopen.)
+pragma default_collation = 'nocase';
+-- run
+
+create table sem7f (id integer primary key, v text);
+insert into sem7f values (1, '2024-01-01');
+-- run
+
+select name, collation from table_info('sem7f') where name = 'v';
+→ [{"name":"v","collation":"NOCASE"}]
+
+alter table sem7f alter column v set data type date;
+-- error: Unknown collation
+
+drop table sem7f;
+
+pragma default_collation = 'binary';
+-- run
+
+-- ===================================
+-- 8. EFFECTIVE rows, not committed rows: a collision involving a row the open transaction
+--    has staged but not committed MUST reject the retype, and the transaction stays usable.
+-- ===================================
+
+create table sem8 (id integer primary key, v text, unique (v));
+insert into sem8 values (1, 'PT1H');
+-- run
+
+begin;
+-- run
+insert into sem8 values (2, 'PT60M');
+-- run
+
+alter table sem8 alter column v set data type timespan;
+-- error: UNIQUE constraint failed
+
+-- the transaction survived the rejection: removing the offending row lets the retry pass
+delete from sem8 where id = 2;
+-- run
+alter table sem8 alter column v set data type timespan;
+-- run
+commit;
+-- run
+
+select id, v from sem8 order by id;
+→ [{"id":1,"v":"PT1H"}]
+
+-- committed under the new type, so the re-sorted index answers semantically
+select id from sem8 where v = 'PT3600S';
+→ [{"id":1}]
+
+drop table sem8;
+
+-- 8b. …and a collision only among rows the transaction has DELETED does NOT block it.
+create table sem8b (id integer primary key, v text, unique (v));
+insert into sem8b values (1, 'PT1H'), (2, 'PT60M'), (3, 'PT2H');
+-- run
+
+begin;
+-- run
+delete from sem8b where id = 2;
+-- run
+alter table sem8b alter column v set data type timespan;
+-- run
+commit;
+-- run
+
+select id from sem8b where v = 'PT3600S';
+→ [{"id":1}]
+
+select id from sem8b where v = 'PT120M';
+→ [{"id":3}]
+
+drop table sem8b;
+
+-- ===================================
+-- 9. JSON is the third same-storage-class type carrying its own comparison: it ranks by
+--    canonical structure, so '{"a":1}' and '{ "a" : 1 }' are one document where text sees
+--    two. Same contract as the TIMESPAN sections above.
+-- ===================================
+
+create table sem9 (id integer primary key, v text, unique (v));
+insert into sem9 values (1, '{"a":1}'), (2, '{ "a" : 1 }');
+-- run
+
+alter table sem9 alter column v set data type json;
+-- error: UNIQUE constraint failed
+
+select id, v from sem9 order by id;
+→ [{"id":1,"v":"{\"a\":1}"},{"id":2,"v":"{ \"a\" : 1 }"}]
+
+drop table sem9;
+
+-- 9b. …the accepted case: distinct documents, so the retype lands and the index enforces
+-- uniqueness by structure rather than by spelling. The retyped column must answer exactly as
+-- a column declared `json` from the start does — which is what 9c pins.
+create table sem9b (id integer primary key, v text, unique (v));
+insert into sem9b values (1, '{"a":1}'), (2, '{"b":2}');
+-- run
+
+alter table sem9b alter column v set data type json;
+-- run
+
+insert into sem9b values (3, '{  "b":2  }');
+-- error: UNIQUE constraint failed
+
+-- A differently-spaced document is one document to the INDEX and to `=` alike: the text
+-- operand is coerced to JSON at plan time, so equality compares structure. See
+-- 06.9.2-json-structural-equality.sqllogic for the full contract.
+select id from sem9b where v = '{ "a" : 1 }';
+→ [{"id":1}]
+
+drop table sem9b;
+
+-- 9c. …and the natively-declared column the retyped one has to match, spelling for spelling.
+create table sem9c (id integer primary key, v json, unique (v));
+insert into sem9c values (1, '{"a":1}'), (2, '{"b":2}');
+-- run
+
+insert into sem9c values (3, '{  "b":2  }');
+-- error: UNIQUE constraint failed
+
+select id from sem9c where v = '{ "a" : 1 }';
+→ [{"id":1}]
+
+drop table sem9c;

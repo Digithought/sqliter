@@ -10,7 +10,7 @@
  * - Skip bare column references and literals (cost 0, cheap to recompute)
  * - Require at least 2 occurrences of the same fingerprint
  *
- * Pass: Structural (top-down), priority 22
+ * Pass: Structural (top-down)
  * Node type: PlanNodeType.Project
  */
 

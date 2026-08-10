@@ -593,3 +593,825 @@ SELECT balance FROM accounts WHERE id = 1;
 DROP ASSERTION rnn_balance;
 DROP TABLE accounts;
 -- run
+
+-- ===================================
+-- ALTER TABLE ... RENAME propagates into assertion bodies
+-- ===================================
+-- A rename rewrites the stored CHECK expression (and the derived violation SQL
+-- the commit-time evaluator re-parses) the same way it rewrites a view body.
+-- Before this propagation existed, every write to the renamed table failed with
+-- "Table 't' not found" / "Column not found: x". Catalog-level invariants
+-- (event fired, dependentTables re-keyed, home-schema scoping) are covered in
+-- test/assertion-rename-propagation.spec.ts.
+
+-- --- TABLE rename, with a table-qualified self-reference in the body ---
+
+CREATE TABLE ren_t (x INTEGER PRIMARY KEY);
+CREATE ASSERTION ren_t_nonneg CHECK (NOT EXISTS (
+  SELECT 1 FROM ren_t WHERE ren_t.x < 0
+));
+INSERT INTO ren_t VALUES (1);
+COMMIT;
+ALTER TABLE ren_t RENAME TO ren_t2;
+-- run
+
+-- The stored violation SQL names the new table in both the FROM and the
+-- qualified column reference.
+SELECT violation_sql FROM assertion_info() WHERE name = 'ren_t_nonneg';
+→ [{ "violation_sql": "select 1 where not (not exists (select 1 from ren_t2 where ren_t2.x < 0))" }]
+
+-- A benign write commits (pre-fix this failed with "Table 'ren_t' not found").
+INSERT INTO ren_t2 VALUES (7);
+COMMIT;
+SELECT COUNT(*) FROM ren_t2;
+→ [{ "count(*)": 2 }]
+
+-- And the rule still enforces against the renamed table.
+BEGIN;
+INSERT INTO ren_t2 VALUES (-1);
+COMMIT;
+-- error: Integrity assertion failed: ren_t_nonneg
+
+SELECT COUNT(*) FROM ren_t2;
+→ [{ "count(*)": 2 }]
+
+DROP ASSERTION ren_t_nonneg;
+DROP TABLE ren_t2;
+-- run
+
+-- --- COLUMN rename ---
+
+CREATE TABLE ren_u (id INTEGER PRIMARY KEY, x INTEGER);
+CREATE ASSERTION ren_u_nonneg CHECK (NOT EXISTS (
+  SELECT 1 FROM ren_u WHERE x < 0
+));
+INSERT INTO ren_u VALUES (1, 10);
+COMMIT;
+ALTER TABLE ren_u RENAME COLUMN x TO y;
+-- run
+
+SELECT violation_sql FROM assertion_info() WHERE name = 'ren_u_nonneg';
+→ [{ "violation_sql": "select 1 where not (not exists (select 1 from ren_u where y < 0))" }]
+
+-- Benign write commits (pre-fix: "Column not found: x").
+INSERT INTO ren_u VALUES (2, 20);
+COMMIT;
+SELECT COUNT(*) FROM ren_u;
+→ [{ "count(*)": 2 }]
+
+BEGIN;
+INSERT INTO ren_u VALUES (3, -3);
+COMMIT;
+-- error: Integrity assertion failed: ren_u_nonneg
+
+SELECT COUNT(*) FROM ren_u;
+→ [{ "count(*)": 2 }]
+
+DROP ASSERTION ren_u_nonneg;
+DROP TABLE ren_u;
+-- run
+
+-- --- Body shapes the walk has to follow ---
+-- The rewriters are shared with the view-body path, so these shapes are covered
+-- there too; pinned here because an assertion body is walked UNSEEDED (it owns
+-- its own FROM scopes) and nothing else exercises that entry point.
+
+-- Join: only the renamed side moves, in both the FROM and the ON clause.
+CREATE TABLE ren_p (id INTEGER PRIMARY KEY);
+CREATE TABLE ren_c (id INTEGER PRIMARY KEY, pid INTEGER);
+CREATE ASSERTION ren_join CHECK (NOT EXISTS (
+  SELECT 1 FROM ren_c JOIN ren_p ON ren_c.pid = ren_p.id WHERE ren_c.id < 0
+));
+ALTER TABLE ren_p RENAME TO ren_p2;
+-- run
+
+SELECT violation_sql FROM assertion_info() WHERE name = 'ren_join';
+→ [{ "violation_sql": "select 1 where not (not exists (select 1 from ren_c inner join ren_p2 on ren_c.pid = ren_p2.id where ren_c.id < 0))" }]
+
+INSERT INTO ren_p2 VALUES (1);
+INSERT INTO ren_c VALUES (5, 1);
+COMMIT;
+BEGIN;
+INSERT INTO ren_c VALUES (-1, 1);
+COMMIT;
+-- error: Integrity assertion failed: ren_join
+
+DROP ASSERTION ren_join;
+DROP TABLE ren_c;
+DROP TABLE ren_p2;
+-- run
+
+-- Alias: the source name follows the rename, the alias does not.
+CREATE TABLE ren_a (x INTEGER PRIMARY KEY);
+CREATE ASSERTION ren_alias CHECK (NOT EXISTS (SELECT 1 FROM ren_a AS aa WHERE aa.x < 0));
+ALTER TABLE ren_a RENAME TO ren_a2;
+-- run
+
+SELECT violation_sql FROM assertion_info() WHERE name = 'ren_alias';
+→ [{ "violation_sql": "select 1 where not (not exists (select 1 from ren_a2 as aa where aa.x < 0))" }]
+
+BEGIN;
+INSERT INTO ren_a2 VALUES (-1);
+COMMIT;
+-- error: Integrity assertion failed: ren_alias
+
+DROP ASSERTION ren_alias;
+DROP TABLE ren_a2;
+-- run
+
+-- CTE: the rename reaches inside the WITH body; the CTE name is untouched.
+CREATE TABLE ren_k (x INTEGER PRIMARY KEY);
+CREATE ASSERTION ren_cte CHECK (NOT EXISTS (
+  WITH s AS (SELECT x FROM ren_k) SELECT 1 FROM s WHERE x < 0
+));
+ALTER TABLE ren_k RENAME TO ren_k2;
+-- run
+
+SELECT violation_sql FROM assertion_info() WHERE name = 'ren_cte';
+→ [{ "violation_sql": "select 1 where not (not exists (with s as (select x from ren_k2) select 1 from s where x < 0))" }]
+
+BEGIN;
+INSERT INTO ren_k2 VALUES (-1);
+COMMIT;
+-- error: Integrity assertion failed: ren_cte
+
+DROP ASSERTION ren_cte;
+DROP TABLE ren_k2;
+-- run
+
+-- RENAME COLUMN reaches a table-qualified reference, not only a bare one.
+CREATE TABLE ren_q (id INTEGER PRIMARY KEY, x INTEGER);
+CREATE ASSERTION ren_qual CHECK (NOT EXISTS (SELECT 1 FROM ren_q WHERE ren_q.x < 0));
+ALTER TABLE ren_q RENAME COLUMN x TO y;
+-- run
+
+SELECT violation_sql FROM assertion_info() WHERE name = 'ren_qual';
+→ [{ "violation_sql": "select 1 where not (not exists (select 1 from ren_q where ren_q.y < 0))" }]
+
+BEGIN;
+INSERT INTO ren_q VALUES (1, -3);
+COMMIT;
+-- error: Integrity assertion failed: ren_qual
+
+DROP ASSERTION ren_qual;
+DROP TABLE ren_q;
+-- run
+
+-- --- Rename mid-transaction, with rows already written ---
+-- The assertion evaluates at THIS commit, against the body the rename just
+-- rewrote — the rewrite has to be visible to the same transaction that made it.
+
+CREATE TABLE ren_x (x INTEGER PRIMARY KEY);
+CREATE ASSERTION ren_x_nonneg CHECK (NOT EXISTS (SELECT 1 FROM ren_x WHERE x < 0));
+COMMIT;
+BEGIN;
+INSERT INTO ren_x VALUES (3);
+ALTER TABLE ren_x RENAME TO ren_x2;
+INSERT INTO ren_x2 VALUES (4);
+COMMIT;
+SELECT COUNT(*) FROM ren_x2;
+→ [{ "count(*)": 2 }]
+
+BEGIN;
+INSERT INTO ren_x2 VALUES (-9);
+COMMIT;
+-- error: Integrity assertion failed: ren_x_nonneg
+
+DROP ASSERTION ren_x_nonneg;
+DROP TABLE ren_x2;
+-- run
+
+-- --- A fresh table reusing the freed name is not governed by the assertion ---
+-- The optimizer hoists an assertion's premises onto the tables its body names.
+-- Pre-fix the body still said `ren_z`, so a new table created under the freed
+-- name inherited a rule that was never about it — and rows it legitimately held
+-- could be optimized away.
+
+CREATE TABLE ren_z (x INTEGER PRIMARY KEY);
+CREATE ASSERTION ren_z_nonneg CHECK (NOT EXISTS (SELECT 1 FROM ren_z WHERE x < 0));
+ALTER TABLE ren_z RENAME TO ren_z2;
+CREATE TABLE ren_z (x INTEGER PRIMARY KEY);
+INSERT INTO ren_z VALUES (-5);
+COMMIT;
+
+-- The new ren_z keeps its negative row and stays visible to a matching filter.
+SELECT COUNT(*) FROM ren_z WHERE x < 0;
+→ [{ "count(*)": 1 }]
+
+-- The rule still governs the renamed table.
+BEGIN;
+INSERT INTO ren_z2 VALUES (-1);
+COMMIT;
+-- error: Integrity assertion failed: ren_z_nonneg
+
+DROP ASSERTION ren_z_nonneg;
+DROP TABLE ren_z;
+DROP TABLE ren_z2;
+-- run
+
+-- ===================================
+-- Body validation at CREATE (arm 1)
+-- ===================================
+-- The body is planned when the assertion is created, at the same strictness a
+-- view body is planned: missing table / missing column / unknown function all
+-- fail the CREATE. Before this, each was accepted and then made every later
+-- COMMIT in the whole database fail, naming the missing object but never the
+-- assertion.
+
+CREATE TABLE bv_t (x INTEGER PRIMARY KEY);
+CREATE TABLE bv_other (i INTEGER PRIMARY KEY);
+-- run
+
+CREATE ASSERTION bv_missing_table CHECK (NOT EXISTS (SELECT 1 FROM bv_nope WHERE q < 0));
+-- error: Cannot create assertion 'bv_missing_table': Table 'bv_nope' not found
+
+CREATE ASSERTION bv_missing_column CHECK (NOT EXISTS (SELECT 1 FROM bv_t WHERE zzz < 0));
+-- error: Cannot create assertion 'bv_missing_column': Column not found: zzz
+
+CREATE ASSERTION bv_missing_fn CHECK (bv_nosuchfn(1) > 0);
+-- error: Cannot create assertion 'bv_missing_fn': Function not found: bv_nosuchfn/1
+
+-- None of the three were registered.
+SELECT COUNT(*) AS n FROM assertion_info() WHERE name LIKE 'bv_%';
+→ [{ "n": 0 }]
+
+-- The database was never poisoned: an unrelated write still commits.
+INSERT INTO bv_other VALUES (1);
+COMMIT;
+SELECT COUNT(*) AS n FROM bv_other;
+→ [{ "n": 1 }]
+
+DROP TABLE bv_t;
+DROP TABLE bv_other;
+-- run
+
+-- ===================================
+-- DROP refused while an assertion refers to the object (arm 2)
+-- ===================================
+
+-- --- DROP TABLE ---
+
+CREATE TABLE dg_t (x INTEGER PRIMARY KEY);
+CREATE TABLE dg_other (i INTEGER PRIMARY KEY);
+CREATE ASSERTION dg_t_nonneg CHECK (NOT EXISTS (SELECT 1 FROM dg_t WHERE x < 0));
+-- run
+
+DROP TABLE dg_t;
+-- error: cannot drop table 'main.dg_t': assertion 'dg_t_nonneg' still refers to it
+
+-- IF EXISTS governs absence, not dependency — it does not weaken the guard.
+DROP TABLE IF EXISTS dg_t;
+-- error: cannot drop table 'main.dg_t': assertion 'dg_t_nonneg' still refers to it
+
+-- The refusal is a clean no-op: the table is still there and still enforced.
+INSERT INTO dg_t VALUES (1);
+COMMIT;
+SELECT COUNT(*) AS n FROM dg_t;
+→ [{ "n": 1 }]
+
+-- Dropping the rule first is the documented way out.
+DROP ASSERTION dg_t_nonneg;
+DROP TABLE dg_t;
+INSERT INTO dg_other VALUES (1);
+COMMIT;
+SELECT COUNT(*) AS n FROM dg_other;
+→ [{ "n": 1 }]
+
+DROP TABLE dg_other;
+-- run
+
+-- --- DROP VIEW ---
+
+CREATE TABLE dg_u (x INTEGER PRIMARY KEY);
+CREATE VIEW dg_v AS SELECT * FROM dg_u;
+CREATE ASSERTION dg_v_nonneg CHECK (NOT EXISTS (SELECT 1 FROM dg_v WHERE x < 0));
+-- run
+
+DROP VIEW dg_v;
+-- error: cannot drop view 'main.dg_v': assertion 'dg_v_nonneg' still refers to it
+
+DROP ASSERTION dg_v_nonneg;
+DROP VIEW dg_v;
+DROP TABLE dg_u;
+-- run
+
+-- --- DROP MATERIALIZED VIEW (and DROP TABLE on the same maintained table) ---
+
+CREATE TABLE dg_w (x INTEGER PRIMARY KEY);
+CREATE MATERIALIZED VIEW dg_mv AS SELECT x FROM dg_w;
+CREATE ASSERTION dg_mv_nonneg CHECK (NOT EXISTS (SELECT 1 FROM dg_mv WHERE x < 0));
+-- run
+
+DROP MATERIALIZED VIEW dg_mv;
+-- error: cannot drop materialized view 'main.dg_mv': assertion 'dg_mv_nonneg' still refers to it
+
+-- DROP TABLE on a maintained table is guarded on the same seam.
+DROP TABLE dg_mv;
+-- error: cannot drop table 'main.dg_mv': assertion 'dg_mv_nonneg' still refers to it
+
+DROP ASSERTION dg_mv_nonneg;
+DROP MATERIALIZED VIEW dg_mv;
+DROP TABLE dg_w;
+-- run
+
+-- --- Same-schema scoping ---
+-- An assertion's unqualified table names resolve against its OWN schema first,
+-- so an assertion living in `temp` must not be tripped by dropping a like-named
+-- table in `main`.
+
+CREATE TABLE main.dg_s (x INTEGER PRIMARY KEY);
+CREATE TABLE temp.dg_s (x INTEGER PRIMARY KEY);
+CREATE ASSERTION temp.dg_s_nonneg CHECK (NOT EXISTS (SELECT 1 FROM dg_s WHERE x < 0));
+-- run
+
+-- main.dg_s is not what the temp assertion names — `temp.dg_s` shadows it.
+DROP TABLE main.dg_s;
+-- run
+
+DROP TABLE temp.dg_s;
+-- error: cannot drop table 'temp.dg_s': assertion 'dg_s_nonneg' still refers to it
+
+DROP ASSERTION temp.dg_s_nonneg;
+DROP TABLE temp.dg_s;
+-- run
+
+-- --- Cross-schema scoping, the other direction ---
+-- The guard consults assertions in EVERY schema, not only the dropped object's
+-- own: a `temp` assertion naming `main.t` explicitly blocks dropping it, and the
+-- refusal qualifies the assertion so the user can find the thing to drop.
+
+CREATE TABLE main.dg_x (x INTEGER PRIMARY KEY);
+CREATE TABLE main.dg_x_other (i INTEGER PRIMARY KEY);
+CREATE ASSERTION temp.dg_x_nonneg CHECK (NOT EXISTS (SELECT 1 FROM main.dg_x WHERE x < 0));
+-- run
+
+DROP TABLE main.dg_x;
+-- error: cannot drop table 'main.dg_x': assertion 'temp.dg_x_nonneg' still refers to it
+
+-- The refusal is a clean no-op — writes to an unrelated table still commit,
+-- which is exactly what the missed drop used to break.
+INSERT INTO main.dg_x_other VALUES (1);
+COMMIT;
+SELECT COUNT(*) AS n FROM main.dg_x_other;
+→ [{ "n": 1 }]
+
+DROP ASSERTION temp.dg_x_nonneg;
+DROP TABLE main.dg_x;
+DROP TABLE main.dg_x_other;
+-- run
+
+-- A `temp` assertion whose BARE name has no `temp` table to bind resolves down
+-- its home path to `main` and blocks that drop too.
+CREATE TABLE main.dg_y (x INTEGER PRIMARY KEY);
+CREATE TABLE temp.dg_y_anchor (x INTEGER PRIMARY KEY);
+CREATE ASSERTION temp.dg_y_nonneg CHECK (NOT EXISTS (SELECT 1 FROM dg_y WHERE x < 0));
+-- run
+
+DROP TABLE main.dg_y;
+-- error: cannot drop table 'main.dg_y': assertion 'temp.dg_y_nonneg' still refers to it
+
+DROP ASSERTION temp.dg_y_nonneg;
+DROP TABLE main.dg_y;
+DROP TABLE temp.dg_y_anchor;
+-- run
+
+-- --- The assertion reaches the object THROUGH a view ---
+-- An assertion body names a view; the view's body names the table. Dropping the
+-- table used to be accepted and then made every write to the whole database fail
+-- with an error naming neither the assertion nor the view.
+
+CREATE TABLE dg_c (x INTEGER PRIMARY KEY);
+CREATE VIEW dg_cv AS SELECT * FROM dg_c;
+CREATE TABLE dg_c_other (i INTEGER PRIMARY KEY);
+CREATE ASSERTION dg_c_nonneg CHECK (NOT EXISTS (SELECT 1 FROM dg_cv WHERE x < 0));
+-- run
+
+-- The message names the chain: an assertion whose body does not mention `dg_c`
+-- is unactionable advice without it.
+DROP TABLE dg_c;
+-- error: cannot drop table 'main.dg_c': assertion 'dg_c_nonneg' reaches it through view 'dg_cv'
+
+-- Still a clean no-op, and the unrelated table is still writable.
+INSERT INTO dg_c_other VALUES (1);
+COMMIT;
+SELECT COUNT(*) AS n FROM dg_c_other;
+→ [{ "n": 1 }]
+
+DROP ASSERTION dg_c_nonneg;
+DROP TABLE dg_c;
+DROP VIEW dg_cv;
+DROP TABLE dg_c_other;
+-- run
+
+-- --- Three levels deep, and the intermediate views are guarded too ---
+-- One-hop expansion is the natural under-fix; the chain here is
+-- assertion → dg_d2 → dg_d1 → dg_d.
+
+CREATE TABLE dg_d (x INTEGER PRIMARY KEY);
+CREATE VIEW dg_d1 AS SELECT * FROM dg_d;
+CREATE VIEW dg_d2 AS SELECT * FROM dg_d1;
+CREATE ASSERTION dg_d_nonneg CHECK (NOT EXISTS (SELECT 1 FROM dg_d2 WHERE x < 0));
+-- run
+
+DROP TABLE dg_d;
+-- error: cannot drop table 'main.dg_d': assertion 'dg_d_nonneg' reaches it through view 'dg_d2' -> view 'dg_d1'
+
+-- A view reached only through a further view is refused on the same closure.
+DROP VIEW dg_d1;
+-- error: cannot drop view 'main.dg_d1': assertion 'dg_d_nonneg' reaches it through view 'dg_d2'
+
+-- The one the assertion names directly keeps the direct wording.
+DROP VIEW dg_d2;
+-- error: cannot drop view 'main.dg_d2': assertion 'dg_d_nonneg' still refers to it
+
+-- Dropping the rule is still the whole escape hatch, at any depth.
+DROP ASSERTION dg_d_nonneg;
+DROP VIEW dg_d2;
+DROP VIEW dg_d1;
+DROP TABLE dg_d;
+-- run
+
+-- --- A materialized view in the chain ---
+
+CREATE TABLE dg_e (x INTEGER PRIMARY KEY);
+CREATE MATERIALIZED VIEW dg_emv AS SELECT x FROM dg_e;
+CREATE VIEW dg_ev AS SELECT * FROM dg_emv;
+CREATE ASSERTION dg_e_nonneg CHECK (NOT EXISTS (SELECT 1 FROM dg_ev WHERE x < 0));
+-- run
+
+DROP TABLE dg_e;
+-- error: cannot drop table 'main.dg_e': assertion 'dg_e_nonneg' reaches it through view 'dg_ev' -> materialized view 'dg_emv'
+
+-- The maintained table in the middle is guarded on both of its drop verbs.
+DROP MATERIALIZED VIEW dg_emv;
+-- error: cannot drop materialized view 'main.dg_emv': assertion 'dg_e_nonneg' reaches it through view 'dg_ev'
+
+DROP TABLE dg_emv;
+-- error: cannot drop table 'main.dg_emv': assertion 'dg_e_nonneg' reaches it through view 'dg_ev'
+
+DROP ASSERTION dg_e_nonneg;
+DROP VIEW dg_ev;
+DROP MATERIALIZED VIEW dg_emv;
+DROP TABLE dg_e;
+-- run
+
+-- --- A merely SHADOWED name is still not a reference ---
+-- The closure collects every reference the traversal reports, and that traversal
+-- is scope-aware — a `with dg_f as (…)` that shadows the name binds the CTE, not
+-- the real table, so it must not turn a legal drop into an error. This is the
+-- property a collect-everything walk would silently lose.
+
+CREATE TABLE dg_f (x INTEGER PRIMARY KEY);
+CREATE TABLE dg_f_src (x INTEGER PRIMARY KEY);
+CREATE ASSERTION dg_f_nonneg CHECK (NOT EXISTS (
+  WITH dg_f AS (SELECT x FROM dg_f_src) SELECT 1 FROM dg_f WHERE x < 0));
+-- run
+
+DROP TABLE dg_f;
+-- run
+
+-- ...and the table the CTE actually reads IS still protected.
+DROP TABLE dg_f_src;
+-- error: cannot drop table 'main.dg_f_src': assertion 'dg_f_nonneg' still refers to it
+
+DROP ASSERTION dg_f_nonneg;
+DROP TABLE dg_f_src;
+-- run
+
+-- --- A plain view over a dropped table, with no assertion reading it ---
+-- The engine's stated asymmetry survives the widening: without an assertion in
+-- the picture the view just breaks and the drop stands.
+
+CREATE TABLE dg_g (x INTEGER PRIMARY KEY);
+CREATE VIEW dg_gv AS SELECT * FROM dg_g;
+-- run
+
+DROP TABLE dg_g;
+DROP VIEW dg_gv;
+-- run
+
+-- --- The two widenings composed: another schema's assertion, through a view ---
+-- Cross-schema scope and chain-following are independent mechanisms; only their
+-- composition proves the closure is driven by the ASSERTION's home schema and each
+-- reached body by its OWN. Here `temp.dg_h_nonneg` reads `main.dg_hv`, whose bare
+-- `dg_h` must bind main's — even though the root assertion lives in temp.
+
+CREATE TABLE main.dg_h (x INTEGER PRIMARY KEY);
+CREATE VIEW main.dg_hv AS SELECT * FROM dg_h;
+CREATE ASSERTION temp.dg_h_nonneg CHECK (NOT EXISTS (SELECT 1 FROM main.dg_hv WHERE x < 0));
+-- run
+
+DROP TABLE main.dg_h;
+-- error: cannot drop table 'main.dg_h': assertion 'temp.dg_h_nonneg' reaches it through view 'dg_hv'
+
+DROP ASSERTION temp.dg_h_nonneg;
+DROP VIEW main.dg_hv;
+DROP TABLE main.dg_h;
+-- run
+
+-- ...and a temp table of the same name is NOT what the main-owned view body reads,
+-- so dropping it is no business of that assertion's.
+CREATE TABLE main.dg_i (x INTEGER PRIMARY KEY);
+CREATE TABLE temp.dg_i (x INTEGER PRIMARY KEY);
+CREATE VIEW main.dg_iv AS SELECT * FROM dg_i;
+CREATE ASSERTION temp.dg_i_nonneg CHECK (NOT EXISTS (SELECT 1 FROM main.dg_iv WHERE x < 0));
+-- run
+
+DROP TABLE temp.dg_i;
+-- run
+
+DROP TABLE main.dg_i;
+-- error: cannot drop table 'main.dg_i': assertion 'temp.dg_i_nonneg' reaches it through view 'dg_iv'
+
+DROP ASSERTION temp.dg_i_nonneg;
+DROP VIEW main.dg_iv;
+DROP TABLE main.dg_i;
+-- run
+
+-- --- The guard refuses only what the assertion actually names ---
+-- A live assertion must not make every drop in its schema fail.
+
+CREATE TABLE dg_named (x INTEGER PRIMARY KEY);
+CREATE TABLE dg_unrelated (i INTEGER PRIMARY KEY);
+CREATE VIEW dg_unrelated_v AS SELECT i FROM dg_unrelated;
+CREATE ASSERTION dg_named_nonneg CHECK (NOT EXISTS (SELECT 1 FROM dg_named WHERE x < 0));
+-- run
+
+DROP VIEW dg_unrelated_v;
+DROP TABLE dg_unrelated;
+-- run
+
+-- The refusal reports the catalog's spelling of the schema, not the caller's.
+DROP TABLE MAIN.dg_named;
+-- error: cannot drop table 'main.dg_named': assertion 'dg_named_nonneg' still refers to it
+
+DROP ASSERTION dg_named_nonneg;
+DROP TABLE dg_named;
+-- run
+
+-- ===================================
+-- Assertions over MAINTAINED TABLES (materialized views) are enforced
+-- ===================================
+-- A materialized view IS a table, so an assertion body naming one compiles to a plan
+-- reading that maintained table. The COMMIT-time evaluator dispatches an assertion only
+-- when the base tables its plan reads overlap the set of base tables the transaction
+-- changed, so the maintained table has to show up in the transaction change log.
+--
+-- Row-time maintenance writes the backing through the privileged BackingHost surface,
+-- which does not touch the change log — so maintenance records each REALIZED backing
+-- delta into it explicitly (MaterializedViewManager.recordMaintenanceChanges). Without
+-- that recording, every violating commit below succeeded silently.
+--
+-- Note: `REFRESH MATERIALIZED VIEW` deliberately stays outside this — it swaps committed
+-- contents wholesale without routing through row-time maintenance, so a refresh that
+-- re-derives violating content does not trip an assertion at that commit. That is a
+-- separate, pre-existing gap, not covered here.
+
+-- --- Projection MV: a write to the SOURCE trips the assertion ---
+
+create table amv_w (x integer primary key);
+create materialized view amv_mv as select x from amv_w;
+create assertion amv_nonneg check (not exists (select 1 from amv_mv where x < 0));
+commit;
+-- run
+
+begin;
+insert into amv_w values (-1);
+commit;
+-- error: Integrity assertion failed: amv_nonneg
+
+-- The whole transaction rolled back — neither the source nor the view kept the row.
+select count(*) as c from amv_w;
+→ [{ "c": 0 }]
+
+select count(*) as c from amv_mv;
+→ [{ "c": 0 }]
+
+-- --- The same assertion fires on a LATER commit, not only the first ---
+-- The first COMMIT after CREATE ASSERTION compiles the assertion's plan and may fall back
+-- to global re-evaluation (its projection capture demand is registered too late for that
+-- transaction). A later commit takes the ordinary keyed-dispatch path; it must still fire.
+
+begin;
+insert into amv_w values (1), (2);
+commit;
+-- run
+
+select count(*) as c from amv_mv;
+→ [{ "c": 2 }]
+
+begin;
+insert into amv_w values (-5);
+commit;
+-- error: Integrity assertion failed: amv_nonneg
+
+-- --- A write-through to the MV ITSELF trips it too ---
+-- The write is rewritten onto the source, so it reaches the assertion by the same seam.
+
+begin;
+insert into amv_mv values (-3);
+commit;
+-- error: Integrity assertion failed: amv_nonneg
+
+-- --- Negative: writes that keep the view clean still commit ---
+
+begin;
+insert into amv_w values (7);
+commit;
+-- run
+
+begin;
+update amv_w set x = 8 where x = 7;
+commit;
+-- run
+
+begin;
+delete from amv_w where x = 8;
+commit;
+-- run
+
+select x from amv_mv order by x;
+→ [{ "x": 1 }, { "x": 2 }]
+
+-- --- A savepoint-discarded MV delta does not trip the assertion ---
+-- ROLLBACK TO discards the change-log layer the maintenance delta was recorded into, so
+-- the following clean COMMIT sees no violating view row.
+
+begin;
+savepoint sp1;
+insert into amv_w values (-9);
+rollback to sp1;
+insert into amv_w values (9);
+commit;
+-- run
+
+select x from amv_mv order by x;
+→ [{ "x": 1 }, { "x": 2 }, { "x": 9 }]
+
+drop assertion amv_nonneg;
+drop materialized view amv_mv;
+drop table amv_w;
+-- run
+
+-- --- Aggregate MV (residual / delta-aggregate arm, flushed end-of-statement) ---
+
+create table amv_t (id integer primary key, g text, amt integer);
+create materialized view amv_agg as select g, sum(amt) as total from amv_t group by g;
+create assertion amv_cap check (not exists (select 1 from amv_agg where total > 100));
+commit;
+-- run
+
+begin;
+insert into amv_t values (1, 'a', 40);
+commit;
+-- run
+
+select g, total from amv_agg order by g;
+→ [{ "g": "a", "total": 40 }]
+
+-- Each row is under the cap; only the maintained SUM crosses it.
+begin;
+insert into amv_t values (2, 'a', 70);
+commit;
+-- error: Integrity assertion failed: amv_cap
+
+-- An update that pushes an existing group over the cap trips it too.
+begin;
+update amv_t set amt = 200 where id = 1;
+commit;
+-- error: Integrity assertion failed: amv_cap
+
+select g, total from amv_agg order by g;
+→ [{ "g": "a", "total": 40 }]
+
+drop assertion amv_cap;
+drop materialized view amv_agg;
+drop table amv_t;
+-- run
+
+-- --- MV over MV: the chain's TAIL is what the assertion names ---
+-- The consumer's backing is written only by the cascade off its producer's realized
+-- delta, so this case needs the recording at BOTH levels.
+
+create table amv_c (x integer primary key);
+create materialized view amv_c1 as select x from amv_c;
+create materialized view amv_c2 as select x from amv_c1;
+create assertion amv_chain check (not exists (select 1 from amv_c2 where x < 0));
+commit;
+-- run
+
+begin;
+insert into amv_c values (-1);
+commit;
+-- error: Integrity assertion failed: amv_chain
+
+begin;
+insert into amv_c values (4);
+commit;
+-- run
+
+select x from amv_c2 order by x;
+→ [{ "x": 4 }]
+
+drop assertion amv_chain;
+drop materialized view amv_c2;
+drop materialized view amv_c1;
+drop table amv_c;
+-- run
+
+-- --- `create table … maintained as` reaches the same seam ---
+-- MV sugar and an explicitly-declared maintained table share one maintenance path.
+
+create table amv_src (id integer primary key, n integer);
+create table amv_mt (id integer primary key, n integer) maintained as select id, n from amv_src;
+create assertion amv_mt_pos check (not exists (select 1 from amv_mt where n < 0));
+commit;
+-- run
+
+begin;
+insert into amv_src values (1, -2);
+commit;
+-- error: Integrity assertion failed: amv_mt_pos
+
+begin;
+insert into amv_src values (1, 2);
+commit;
+-- run
+
+select id, n from amv_mt order by id;
+→ [{ "id": 1, "n": 2 }]
+
+drop assertion amv_mt_pos;
+drop table amv_mt;
+drop table amv_src;
+-- run
+
+-- --- Partial (WHERE-filtered) MV: a row LEAVING the view's scope records a DELETE ---
+-- The cases above are all driven by insert/update deltas. A row that stops satisfying the
+-- body's WHERE is evicted from the backing, and only recording that delete makes the
+-- maintained table a changed base at COMMIT.
+
+create table pw_t (id integer primary key, active integer, amt integer);
+create materialized view pw_mv as select id, amt from pw_t where active = 1;
+insert into pw_t values (1, 1, 5);
+create assertion pw_nonempty check (exists (select 1 from pw_mv));
+commit;
+-- run
+
+-- Warm-up past the CREATE-ASSERTION commit, which falls back to global re-evaluation.
+begin;
+insert into pw_t values (2, 1, 6);
+commit;
+-- run
+
+select id, amt from pw_mv order by id;
+→ [{ "id": 1, "amt": 5 }, { "id": 2, "amt": 6 }]
+
+-- Deactivating every row evicts both from the view; the realized delta is a pair of deletes.
+begin;
+update pw_t set active = 0;
+commit;
+-- error: Integrity assertion failed: pw_nonempty
+
+select id, amt from pw_mv order by id;
+→ [{ "id": 1, "amt": 5 }, { "id": 2, "amt": 6 }]
+
+drop assertion pw_nonempty;
+drop materialized view pw_mv;
+drop table pw_t;
+-- run
+
+-- --- RENAME COLUMN cascades into an assertion that reads the table THROUGH A VIEW ---
+-- Rewriting the view's body shifts the name it publishes (x → y), and the assertion
+-- reads the VIEW — one level further out. Pre-fix the assertion kept naming `x`,
+-- and because every live assertion recompiles on any commit, EVERY write to the
+-- database failed after the rename, not just writes near the view.
+
+create table arc_w (id integer primary key, x integer);
+create view arc_v1 as select id, x from arc_w;
+create assertion arc_a1 check (not exists (select 1 from arc_v1 where x < 0));
+commit;
+-- run
+
+alter table arc_w rename column x to y;
+-- run
+
+-- writes work again after the rename…
+begin;
+insert into arc_w values (1, 1);
+commit;
+-- run
+
+-- …and the assertion still enforces the same rule through the rewritten view
+begin;
+insert into arc_w values (2, -1);
+commit;
+-- error: Integrity assertion failed: arc_a1
+
+select id, y from arc_w order by id;
+→ [{ "id": 1, "y": 1 }]
+
+drop assertion arc_a1;
+drop view arc_v1;
+drop table arc_w;
+-- run

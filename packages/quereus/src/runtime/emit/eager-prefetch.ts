@@ -1,5 +1,6 @@
 import type { EagerPrefetchNode } from '../../planner/nodes/eager-prefetch-node.js';
-import type { Instruction, InstructionRun, RuntimeContext } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import type { Row } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { emitCallFromPlan } from '../emitters.js';
@@ -230,7 +231,7 @@ export function emitEagerPrefetch(plan: EagerPrefetchNode, ctx: EmissionContext)
 
 	return {
 		params: [sourceInstruction],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `eager_prefetch(buffer=${bufferSize})`,
 	};
 }

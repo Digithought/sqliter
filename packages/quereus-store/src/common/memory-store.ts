@@ -9,18 +9,24 @@
  * Keys are stored using hex encoding for correct lexicographic ordering.
  */
 
-import type { KVStore, KVEntry, WriteBatch, IterateOptions } from './kv-store.js';
+import { bytesToHex } from './bytes.js';
+import type { KVStore, KVEntry, WriteBatch, IterateOptions, WriteOptions } from './kv-store.js';
 
 /**
  * Convert Uint8Array to hex string for Map key storage.
- * Hex encoding preserves lexicographic ordering.
+ * Hex encoding preserves lexicographic ordering. Shared with the coordinator's
+ * key index via {@link bytesToHex} — same lowercase two-char-per-byte alphabet.
  */
-function keyToHex(key: Uint8Array): string {
-  return Array.from(key).map(b => b.toString(16).padStart(2, '0')).join('');
-}
+const keyToHex = bytesToHex;
 
 /**
  * Compare two hex strings lexicographically.
+ *
+ * NOTE: `localeCompare` is ICU collation, which only coincides with the `memcmp` of the
+ * underlying key bytes because `bytesToHex`'s alphabet is `[0-9a-f]` — every locale ranks
+ * digits before letters and both ascending. Widening that alphabet (upper-case hex, base64,
+ * any non-ASCII) would silently mis-order this store, and it is the oracle the whole store
+ * test suite compares against. Use a code-unit/byte compare if the encoding ever changes.
  */
 function compareHex(a: string, b: string): number {
   return a.localeCompare(b);
@@ -36,10 +42,16 @@ export class InMemoryKVStore implements KVStore {
 
   async get(key: Uint8Array): Promise<Uint8Array | undefined> {
     this.checkOpen();
-    return this.data.get(keyToHex(key))?.value;
+    // Return a COPY, not the internal buffer: a caller that mutates the read value
+    // must not corrupt stored data. LevelDB/IndexedDB hand back a fresh buffer per
+    // read (deserialize / structured-clone); the in-memory store copies to match.
+    const stored = this.data.get(keyToHex(key))?.value;
+    return stored === undefined ? undefined : new Uint8Array(stored);
   }
 
-  async put(key: Uint8Array, value: Uint8Array): Promise<void> {
+  // `_options` is accepted to satisfy the KVStore signature; an in-memory store
+  // has no crash window, so the durability hint is a no-op here.
+  async put(key: Uint8Array, value: Uint8Array, _options?: WriteOptions): Promise<void> {
     this.checkOpen();
     // Store copies to prevent external mutation
     this.data.set(keyToHex(key), {
@@ -48,7 +60,7 @@ export class InMemoryKVStore implements KVStore {
     });
   }
 
-  async delete(key: Uint8Array): Promise<void> {
+  async delete(key: Uint8Array, _options?: WriteOptions): Promise<void> {
     this.checkOpen();
     this.data.delete(keyToHex(key));
   }
@@ -61,7 +73,15 @@ export class InMemoryKVStore implements KVStore {
   async *iterate(options?: IterateOptions): AsyncIterable<KVEntry> {
     this.checkOpen();
 
-    // Sort entries by hex key for correct ordering
+    // Sort entries by hex key for correct ordering.
+    // This materializes and sorts the WHOLE map on every call, so even a `limit: 1`
+    // scan is O(n log n) and allocates an n-entry array. That does not violate
+    // KVStore.iterate's bounded-peak requirement — the requirement bounds reads from
+    // backing storage and this store's dataset is already wholly resident — and it is
+    // fine while the memory store backs test-sized data and build-time seeds.
+    // NOTE: if the memory store ever backs large tables with frequent small-limit
+    // scans, keep a sorted key index (or a sorted-insert structure) instead of
+    // re-sorting per call.
     const entries = Array.from(this.data.entries())
       .sort((a, b) => compareHex(a[0], b[0]));
 
@@ -98,7 +118,12 @@ export class InMemoryKVStore implements KVStore {
       // Check limit
       if (limit !== undefined && count >= limit) break;
 
-      yield { key, value };
+      // Yield COPIES so a consumer mutating a yielded key/value cannot corrupt the
+      // store's internal buffers — same independent-buffer read contract as get().
+      // NOTE: allocates two buffers per yielded entry; if a hot full-scan path over a
+      // large in-memory store shows up as slow, hand out views and instead copy only
+      // at the mutation boundary.
+      yield { key: new Uint8Array(key), value: new Uint8Array(value) };
       count++;
     }
   }

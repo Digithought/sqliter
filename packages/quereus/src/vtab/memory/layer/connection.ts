@@ -40,7 +40,18 @@ export class MemoryTableConnection {
 	 * a fresh child BTree" invariant, fixing mid-transaction halloween in
 	 * self-referential INSERT...SELECT.
 	 */
-	private savepointStack: Array<{ snapshot: TransactionLayer | null; readLayer: Layer }> = [];
+	private savepointStack: Array<{ snapshot: TransactionLayer | null; readLayer: Layer; readSnapshot: TransactionLayer | null }> = [];
+
+	/**
+	 * The eager savepoint snapshot currently serving as {@link readLayer}, or null when
+	 * `readLayer` is a committed layer. Non-null exactly while this connection's
+	 * uncommitted writes live in `readLayer` rather than in `pendingTransactionLayer`.
+	 *
+	 * Cannot be derived from {@link savepointStack}: `RELEASE` pops the entry that holds
+	 * the snapshot, but the snapshot stays installed as `readLayer` and its rows stay
+	 * uncommitted. See {@link hasOpenWork}.
+	 */
+	private readSnapshot: TransactionLayer | null = null;
 
 	constructor(manager: MemoryTableManager, initialReadLayer: Layer) {
 		this.connectionId = connectionCounter++;
@@ -104,6 +115,7 @@ export class MemoryTableConnection {
 	/** Helper method to clear transaction-related state */
 	private clearTransactionState(): void {
 		this.savepointStack = [];
+		this.readSnapshot = null;
 		this.explicitTransaction = false;
 	}
 
@@ -116,6 +128,7 @@ export class MemoryTableConnection {
 		// Capture readLayer BEFORE any swap so rollback to a later lazy marker
 		// can restore the pre-swap view (see the comment on `savepointStack`).
 		const savedReadLayer = this.readLayer;
+		const savedReadSnapshot = this.readSnapshot;
 
 		// Lazy-snapshot: if no pending layer exists yet, store a null snapshot
 		// marker instead of eagerly promoting. The pending layer will be created
@@ -135,7 +148,7 @@ export class MemoryTableConnection {
 			snapshot = this.pendingTransactionLayer;
 			snapshot.markCommitted();
 		}
-		this.savepointStack.push({ snapshot, readLayer: savedReadLayer });
+		this.savepointStack.push({ snapshot, readLayer: savedReadLayer, readSnapshot: savedReadSnapshot });
 
 		// Eager-snapshot path: swap the immutable snapshot in as readLayer and
 		// drop the now-stale pending layer reference, so the next mutation
@@ -146,6 +159,7 @@ export class MemoryTableConnection {
 		if (snapshot) {
 			this.readLayer = snapshot;
 			this.pendingTransactionLayer = null;
+			this.readSnapshot = snapshot;
 		}
 
 		// A SAVEPOINT implicitly puts the connection into explicit-transaction mode
@@ -193,6 +207,7 @@ export class MemoryTableConnection {
 			// happened since) and clear pending.
 			this.readLayer = entry.readLayer;
 			this.pendingTransactionLayer = null;
+			this.readSnapshot = entry.readSnapshot;
 		} else {
 			// Eager-snapshot path: createSavepoint swapped readLayer to the
 			// snapshot and dropped pendingTransactionLayer. Restore that exact
@@ -200,6 +215,7 @@ export class MemoryTableConnection {
 			// pending layer parented on the snapshot.
 			this.readLayer = entry.snapshot;
 			this.pendingTransactionLayer = null;
+			this.readSnapshot = entry.snapshot;
 		}
 
 		// Remove savepoints above the target, but preserve the target itself
@@ -209,7 +225,53 @@ export class MemoryTableConnection {
 			this.connectionId, targetDepth);
 	}
 
+	/**
+	 * Re-points every LAZY savepoint marker that captured a committed-chain view at
+	 * `committedHead`. Called by `MemoryTableManager.ensureSchemaChangeSafety` once a schema
+	 * change has drained the committed layers into the base: a marker still naming a drained
+	 * layer would, on `rollback to savepoint`, reinstate that layer's PRE-change rows as the
+	 * read view — rows in the old column shape under the new schema, which then commit as
+	 * permanent corruption.
+	 *
+	 * Only markers with `readSnapshot === null` move. A non-null `readSnapshot` means the
+	 * captured `readLayer` is this connection's OWN eager savepoint snapshot, holding
+	 * uncommitted rows that base does not have; re-pointing it would discard them. Those layers
+	 * are instead carried across the change by the manager's open-layer adopt/reshape passes.
+	 *
+	 * Eager entries (`snapshot !== null`) are left alone: their rollback path restores
+	 * `entry.snapshot` and never reads `entry.readLayer`.
+	 */
+	public repointLazySavepointsToCommittedHead(committedHead: Layer): void {
+		for (const entry of this.savepointStack) {
+			if (entry.readSnapshot !== null) continue;
+			if (entry.readLayer === committedHead) continue;
+			debugLog(`Connection %d: Re-pointing lazy savepoint marker to the current committed head`, this.connectionId);
+			entry.readLayer = committedHead;
+		}
+	}
+
+	/** Ends savepoint bookkeeping. Only called where the transaction itself is ending. */
 	public clearSavepoints(): void {
 		this.savepointStack = [];
+		this.readSnapshot = null;
+	}
+
+	/**
+	 * True when this connection holds uncommitted writes for its table — either in a
+	 * pending layer, or (after an eager savepoint swapped it into `readLayer`) in an
+	 * immutable savepoint snapshot.
+	 *
+	 * `MemoryTableManager.ensureSchemaChangeSafety` uses this twice: it refuses a schema
+	 * change while a connection OTHER than the DDL issuer has open work (those rows are
+	 * invisible to the DDL's transaction, so a new constraint cannot be validated against
+	 * them), and it leaves the DDL issuer's own read view alone rather than re-pointing it
+	 * at the base layer.
+	 *
+	 * Tracks {@link readSnapshot} rather than scanning {@link savepointStack}: `RELEASE`
+	 * pops the entry while leaving the snapshot installed as `readLayer`, so a stack scan
+	 * reports "no work" for a connection whose rows are still uncommitted.
+	 */
+	public hasOpenWork(): boolean {
+		return this.pendingTransactionLayer !== null || this.readSnapshot !== null;
 	}
 }

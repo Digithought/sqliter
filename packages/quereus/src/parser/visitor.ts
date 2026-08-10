@@ -63,7 +63,12 @@ export function traverseAst(node: AST.AstNode | undefined, callbacks: AstVisitor
 		case 'select': {
 			const stmt = node as AST.SelectStmt;
 			stmt.withClause?.ctes.forEach(cte => traverseAst(cte.query, callbacks));
-			(stmt.columns ?? []).forEach(c => c.type === 'column' && traverseAst(c.expr, callbacks));
+			(stmt.columns ?? []).forEach(c => {
+				if (c.type === 'column') {
+					traverseAst(c.expr, callbacks);
+					c.inverse?.forEach(a => traverseAst(a.expr, callbacks));
+				}
+			});
 			(stmt.from ?? []).forEach(f => traverseAst(f, callbacks));
 			traverseAst(stmt.where, callbacks);
 			(stmt.groupBy ?? []).forEach(g => traverseAst(g, callbacks));
@@ -85,6 +90,9 @@ export function traverseAst(node: AST.AstNode | undefined, callbacks: AstVisitor
 			const stmt = node as AST.UpdateStmt;
 			stmt.withClause?.ctes.forEach(cte => traverseAst(cte.query, callbacks));
 			traverseAst(stmt.table, callbacks);
+			// Inline subquery write target (`update (select …) as v …`): the real body
+			// hangs off `targetSource`; `table` is only a synthetic alias placeholder.
+			traverseAst(stmt.targetSource, callbacks);
 			stmt.assignments.forEach(a => traverseAst(a.value, callbacks));
 			traverseAst(stmt.where, callbacks);
 			break;
@@ -93,6 +101,8 @@ export function traverseAst(node: AST.AstNode | undefined, callbacks: AstVisitor
 			const stmt = node as AST.DeleteStmt;
 			stmt.withClause?.ctes.forEach(cte => traverseAst(cte.query, callbacks));
 			traverseAst(stmt.table, callbacks);
+			// See `update` above — the inline subquery write target's body is on `targetSource`.
+			traverseAst(stmt.targetSource, callbacks);
 			traverseAst(stmt.where, callbacks);
 			break;
 		}

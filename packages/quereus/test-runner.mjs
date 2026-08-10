@@ -27,6 +27,12 @@ while (i < args.length) {
 		case '--fork-strict':
 			env.QUEREUS_FORK_STRICT = '1';
 			break;
+		case '--context-strict':
+			env.QUEREUS_CONTEXT_STRICT = '1';
+			break;
+		case '--repr-strict':
+			env.QUEREUS_REPR_STRICT = '1';
+			break;
 		case '--show-plan':
 			env.QUEREUS_TEST_SHOW_PLAN = 'true';
 			break;
@@ -85,6 +91,13 @@ const testPattern = join('packages', 'quereus', 'test', '**', '*.spec.ts');
 const hasReporterFlag = testArgs.some((a, i) => a === '--reporter' || a === '-R');
 const reporterArgs = hasReporterFlag ? [] : ['--reporter', 'min'];
 
+// Default to a generous per-test timeout: the property-based suites (fast-check)
+// nominally run in well under 1s but can be starved past Mocha's 2s default when
+// the machine is under concurrent load (e.g. a background ticket runner). 10s
+// keeps real hangs detectable while absorbing contention. Overridable via --timeout.
+const hasTimeoutFlag = testArgs.some((a) => a === '--timeout' || a === '-t');
+const timeoutArgs = hasTimeoutFlag ? [] : ['--timeout', '10000'];
+
 // Build command arguments
 const cmdArgs = [
 	'--import', pathToFileURL(registerPath).href,
@@ -92,6 +105,7 @@ const cmdArgs = [
 	testPattern,
 	'--colors',
 	'--bail',
+	...timeoutArgs,
 	...reporterArgs,
 	...testArgs
 ];

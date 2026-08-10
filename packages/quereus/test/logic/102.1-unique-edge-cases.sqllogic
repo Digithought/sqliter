@@ -2,27 +2,64 @@
 -- UNIQUE constraint scenarios beyond 102-unique-constraints.sqllogic.
 
 -- ===================================
--- 1. UNIQUE with COLLATE NOCASE on TEXT is rejected at DDL
---    Quereus does not support 'nocase' collation on TEXT columns
---    (see AGENTS.md: "COLLATE NOCASE on TEXT isn't supported in
---    UNIQUE / index contexts").
+-- 1. COLLATE with the LOWERCASE spelling `nocase` is NORMALIZED at DDL.
+--    SQLite treats collation names case-insensitively; Quereus normalizes the
+--    requested name to its canonical uppercase form in columnDefToSchema and
+--    validates against TEXT_TYPE.supportedCollations = ['BINARY','NOCASE','RTRIM']
+--    case-insensitively, so lowercase `nocase` is equivalent to `NOCASE`. A
+--    `collate nocase unique` column is therefore accepted and enforces
+--    case-insensitively (see unique-constraint-honors-column-collation /
+--    102.2-unique-collation.sqllogic). An UNKNOWN collation is still rejected,
+--    now with explicit "Unknown collation" wording (pinned below).
 -- ===================================
 
 create table t_uci (id integer primary key, email text collate nocase unique);
--- error: not supported
+insert into t_uci values (1, 'abc');
 
-drop table if exists t_uci;
+-- the lowercase `nocase` spelling normalizes to NOCASE, so a case-variant
+-- duplicate is a UNIQUE violation under case-insensitive comparison
+insert into t_uci values (2, 'ABC');
+-- error: UNIQUE constraint failed: t_uci (email)
 
--- composite UNIQUE with NOCASE on a TEXT member is rejected the same way
+select count(*) as n from t_uci;
+→ [{"n":1}]
+
+-- a value that is NOT NOCASE-equal still inserts
+insert into t_uci values (3, 'abd');
+select id, email from t_uci order by id;
+→ [{"id":1,"email":"abc"},{"id":3,"email":"abd"}]
+
+drop table t_uci;
+
+-- composite UNIQUE with the lowercase `nocase` spelling on a TEXT member is
+-- likewise accepted; the `a` member folds case under the normalized NOCASE
 create table t_uci2 (
 	id integer primary key,
 	a text collate nocase,
 	b text,
 	unique (a, b)
 );
--- error: not supported
+insert into t_uci2 values (1, 'abc', 'x');
 
-drop table if exists t_uci2;
+-- 'a' matches case-insensitively and 'b' matches under BINARY -> composite conflict
+insert into t_uci2 values (2, 'ABC', 'x');
+-- error: UNIQUE constraint failed: t_uci2
+
+select count(*) as n from t_uci2;
+→ [{"n":1}]
+
+-- a genuinely distinct 'a' still inserts (proves no over-matching)
+insert into t_uci2 values (3, 'xyz', 'x');
+select count(*) as n from t_uci2;
+→ [{"n":2}]
+
+drop table t_uci2;
+
+-- an UNKNOWN collation name is still rejected at DDL, now with explicit wording
+create table t_ucbad (id integer primary key, x text collate frobnicate);
+-- error: Unknown collation
+
+drop table if exists t_ucbad;
 
 -- ===================================
 -- 2. UNIQUE constraint error message identifies the violated column
@@ -53,51 +90,8 @@ drop table t_uec;
 -- ===================================
 -- 3. CREATE UNIQUE INDEX rejected when data already has duplicates
 -- ===================================
-
-create table u2_a (k text primary key, x text not null);
-insert into u2_a values ('r1', 'dup'), ('r2', 'dup');
-
-create unique index u2_a_x on u2_a(x);
--- error: UNIQUE
-
--- after dedup, the index creates fine and rejects new duplicates
-delete from u2_a where k = 'r2';
-
-create unique index u2_a_x on u2_a(x);
-
-insert into u2_a values ('r3', 'dup');
--- error: UNIQUE
-
-drop table u2_a;
-
--- post-hoc CREATE UNIQUE INDEX on already-unique data subsequently rejects
--- inserts that would violate the new unique constraint. Use `-- run` markers
--- to run each step as its own implicit transaction; otherwise the CREATE
--- UNIQUE INDEX would land in the same implicit transaction as the prior
--- INSERTs, whose rows live in an uncommitted layer that the index's seed
--- scan does not see (a known schema-change-mid-transaction limitation).
-create table u2_b (k integer primary key, x text not null);
--- run
-insert into u2_b values (1, 'a'), (2, 'b');
--- run
-create unique index u2_b_x on u2_b(x);
--- run
-
-insert into u2_b values (3, 'a');
--- error: UNIQUE
-
-drop table u2_b;
-
--- nullable indexed columns: multiple NULL allowed
-create table u2_c (k integer primary key, y text null, z text null);
-insert into u2_c values (1, null, null), (2, null, null);
-
-create unique index u2_c_yz on u2_c(y, z);
-
-select count(*) as cnt from u2_c;
-→ [{"cnt":2}]
-
-drop table u2_c;
+-- Lives in 102.1.1-unique-index-creation-edge-cases: adding a UNIQUE after rows
+-- exist requires a standalone `create unique index`.
 
 -- ===================================
 -- 4. PRIMARY KEY / UNIQUE referencing non-existent column rejected at DDL
@@ -113,8 +107,5 @@ create table u2_bad2 (id integer primary key, a integer not null, unique (missin
 
 drop table if exists u2_bad2;
 
-create table u2_bad3 (id integer primary key, b integer not null);
-create unique index u2_bad3_idx on u2_bad3(no_such_col);
--- error: not found
-
-drop table u2_bad3;
+-- The CREATE UNIQUE INDEX form of the same rejection lives in
+-- 102.1.1-unique-index-creation-edge-cases § 2.

@@ -1,0 +1,251 @@
+-- 08.1.1-uncorrelated-in-semijoin.sqllogic — uncorrelated filter-position
+-- `col IN (subquery)` rewritten to a semi join (rule-subquery-decorrelation,
+-- uncorrelated arm).
+--
+-- All columns here are deliberately NON-indexed, so these cases ride the plain
+-- hash semi join (the sibling 08.4-key-set-semi-join.sqllogic covers the
+-- secondary-indexed KeySetSemiJoin path, including TIMESPAN semantic equality
+-- and NOCASE-indexed targets). Every answer must be identical to what the
+-- runtime set-probe path returns — the rewrite is sound under WHERE only
+-- because a filter collapses IN's NULL result to "drop the row", which is
+-- exactly what a semi join does.
+
+-- Setup: nullable non-indexed columns on both sides.
+CREATE TABLE souter (id INTEGER PRIMARY KEY, x INTEGER NULL, s TEXT NULL);
+CREATE TABLE sinner (id INTEGER PRIMARY KEY, v INTEGER NULL);
+
+INSERT INTO souter VALUES (1, 10, 'p'), (2, 20, 'q'), (3, 30, 'r'), (4, NULL, 's');
+-- 10 appears twice (fan-out check) and one member is NULL.
+INSERT INTO sinner VALUES (1, 10), (2, 10), (3, 99), (4, NULL);
+
+-- ===== NULL and emptiness =====
+
+-- Match against a non-NULL member is kept; NULL outer x (id 4) is dropped;
+-- no-match rows (ids 2, 3) are dropped even though the inner contains a NULL
+-- (IN yields NULL there — WHERE drops it, same as the semi join).
+SELECT id FROM souter WHERE x IN (SELECT v FROM sinner) ORDER BY id;
+→ [{"id":1}]
+
+-- Duplicate inner members must not fan the outer out: exactly one row.
+SELECT count(*) AS c FROM souter WHERE x IN (SELECT v FROM sinner);
+→ [{"c":1}]
+
+-- Empty inner ⇒ no rows survive.
+SELECT id FROM souter WHERE x IN (SELECT v FROM sinner WHERE v > 1000);
+→ []
+
+-- All-NULL inner ⇒ no rows survive.
+SELECT id FROM souter WHERE x IN (SELECT v FROM sinner WHERE v IS NULL);
+→ []
+
+-- ===== Inner shapes used verbatim as the join's right side =====
+
+-- Inner WHERE.
+SELECT id FROM souter WHERE x IN (SELECT v FROM sinner WHERE v < 50) ORDER BY id;
+→ [{"id":1}]
+
+-- Inner DISTINCT.
+SELECT id FROM souter WHERE x IN (SELECT DISTINCT v FROM sinner) ORDER BY id;
+→ [{"id":1}]
+
+-- Inner ORDER BY + LIMIT (deterministic subset: the two smallest non-NULL v).
+SELECT id FROM souter WHERE x IN (SELECT v FROM sinner WHERE v IS NOT NULL ORDER BY v LIMIT 2) ORDER BY id;
+→ [{"id":1}]
+
+-- VALUES list as the subquery.
+SELECT id FROM souter WHERE x IN (VALUES (10), (20)) ORDER BY id;
+→ [{"id":1},{"id":2}]
+
+-- Set operations.
+SELECT id FROM souter WHERE x IN (SELECT v FROM sinner UNION SELECT 20) ORDER BY id;
+→ [{"id":1},{"id":2}]
+
+SELECT id FROM souter WHERE x IN (SELECT v FROM sinner UNION ALL SELECT 30) ORDER BY id;
+→ [{"id":1},{"id":3}]
+
+-- CTE reference as the subquery body.
+WITH w AS (SELECT v FROM sinner) SELECT id FROM souter WHERE x IN (SELECT v FROM w) ORDER BY id;
+→ [{"id":1}]
+
+-- Computed single output column (the shape the correlated arm cannot take).
+SELECT id FROM souter WHERE x IN (SELECT v + 10 FROM sinner) ORDER BY id;
+→ [{"id":2}]
+
+-- ===== Multiple conjuncts =====
+
+-- Two uncorrelated IN conjuncts in one WHERE (two stacked semi joins).
+SELECT id FROM souter WHERE x IN (SELECT v FROM sinner) AND s IN (SELECT 'p') ORDER BY id;
+→ [{"id":1}]
+
+-- Mixed correlated + uncorrelated IN conjuncts.
+SELECT o.id FROM souter o WHERE o.x IN (SELECT v FROM sinner) AND o.x IN (SELECT i2.v FROM sinner i2 WHERE i2.v = o.x) ORDER BY o.id;
+→ [{"id":1}]
+
+-- IN conjunct next to an ordinary predicate (residual re-wrapped above the join).
+SELECT id FROM souter WHERE x IN (SELECT v FROM sinner) AND id < 10 ORDER BY id;
+→ [{"id":1}]
+
+-- ===== Shapes that must NOT rewrite (three-valued answers preserved) =====
+
+-- NOT IN with a NULL in the inner: NULL result for every non-member ⇒ no rows.
+SELECT id FROM souter WHERE x NOT IN (SELECT v FROM sinner) ORDER BY id;
+→ []
+
+-- IN under OR is not a top-level conjunct.
+SELECT id FROM souter WHERE x IN (SELECT v FROM sinner) OR id = 4 ORDER BY id;
+→ [{"id":1},{"id":4}]
+
+-- IS NULL over the IN result observes the three-valued answer:
+-- id 2, 3 (no match, inner has NULL) and id 4 (NULL x) yield NULL.
+SELECT id FROM souter WHERE (x IN (SELECT v FROM sinner)) IS NULL ORDER BY id;
+→ [{"id":2},{"id":3},{"id":4}]
+
+-- Projection position keeps the full three-valued result per row.
+SELECT id, x IN (SELECT v FROM sinner) AS m FROM souter ORDER BY id;
+→ [{"id":1,"m":true},{"id":2,"m":null},{"id":3,"m":null},{"id":4,"m":null}]
+
+-- Expression (non-column) left side stays on the set-probe path; same rows.
+SELECT id FROM souter WHERE x + 0 IN (SELECT v FROM sinner) ORDER BY id;
+→ [{"id":1}]
+
+-- ===== Types and collation =====
+
+-- NOCASE outer column against a default-BINARY inner: resolves NOCASE.
+CREATE TABLE nco (id INTEGER PRIMARY KEY, t TEXT COLLATE NOCASE);
+CREATE TABLE ncb (id INTEGER PRIMARY KEY, t TEXT);
+INSERT INTO nco VALUES (1, 'Apple'), (2, 'BANANA');
+INSERT INTO ncb VALUES (1, 'apple'), (2, 'cherry');
+
+SELECT id FROM nco WHERE t IN (SELECT t FROM ncb) ORDER BY id;
+→ [{"id":1}]
+
+-- And the reverse: default-BINARY outer against a NOCASE inner column.
+SELECT id FROM ncb WHERE t IN (SELECT t FROM nco) ORDER BY id;
+→ [{"id":1}]
+
+-- INTEGER outer against REAL inner: numeric equality, 10 matches 10.0.
+CREATE TABLE reals (id INTEGER PRIMARY KEY, r REAL);
+INSERT INTO reals VALUES (1, 10.0), (2, 20.5);
+SELECT id FROM souter WHERE x IN (SELECT r FROM reals) ORDER BY id;
+→ [{"id":1}]
+
+-- TEXT inner against INTEGER outer matches on the numeric reading, exactly as
+-- `x = '10'` does. The synthesized `=` is reconciled through the same coercion
+-- a hand-written one gets, so the cast wrapper fails the equi-pair gate and the
+-- conjunct declines to the set probe, whose own numeric ↔ textual arm answers.
+-- Pinned so the rewrite and the set probe cannot silently split.
+CREATE TABLE texts (id INTEGER PRIMARY KEY, t TEXT);
+INSERT INTO texts VALUES (1, '10'), (2, '20');
+SELECT id FROM souter WHERE x IN (SELECT t FROM texts) ORDER BY id;
+→ [{"id":1},{"id":2}]
+
+-- Mixed semantic-ordering pair (TIMESPAN outer, TEXT inner): the equi-pair
+-- gate declines, the set probe answers, and its semantic key transform still
+-- matches 'PT1H' against 'PT60M'. (Same-type TIMESPAN pairs go through the
+-- semi join and are pinned in 08.4-key-set-semi-join.sqllogic.)
+CREATE TABLE spans (id INTEGER PRIMARY KEY, d TIMESPAN);
+CREATE TABLE spantext (id INTEGER PRIMARY KEY, t TEXT);
+INSERT INTO spans VALUES (1, timespan('PT1H')), (2, timespan('P1D'));
+INSERT INTO spantext VALUES (1, 'PT60M');
+SELECT id FROM spans WHERE d IN (SELECT t FROM spantext) ORDER BY id;
+→ [{"id":1}]
+
+-- ===== FK-backed IN =====
+
+-- A declared NOT NULL FK covering the join key: rule-semi-join-fk-trivial drops
+-- the semi join (the plan shape is pinned in test/plan/subquery-decorrelation),
+-- so every child row survives without the parent ever being read.
+CREATE TABLE fkdept (id INTEGER PRIMARY KEY, dname TEXT);
+CREATE TABLE fkemp (id INTEGER PRIMARY KEY, dept_id INTEGER NOT NULL REFERENCES fkdept(id));
+INSERT INTO fkdept VALUES (1, 'eng'), (2, 'sales');
+INSERT INTO fkemp VALUES (10, 1), (20, 2);
+SELECT id FROM fkemp WHERE dept_id IN (SELECT id FROM fkdept) ORDER BY id;
+→ [{"id":10},{"id":20}]
+
+-- A nullable FK column folds to `WHERE fk IS NOT NULL` instead: a NULL never
+-- matches under `=`, so the NULL row must not survive.
+CREATE TABLE fkemp_opt (id INTEGER PRIMARY KEY, dept_id INTEGER NULL REFERENCES fkdept(id));
+INSERT INTO fkemp_opt VALUES (10, 1), (20, NULL), (30, 2);
+SELECT id FROM fkemp_opt WHERE dept_id IN (SELECT id FROM fkdept) ORDER BY id;
+→ [{"id":10},{"id":30}]
+
+-- A projection that reorders the parent's columns still folds — the equi
+-- column is translated back to the parent's own column index first.
+SELECT id FROM fkemp WHERE dept_id IN (SELECT id FROM (SELECT dname, id FROM fkdept)) ORDER BY id;
+→ [{"id":10},{"id":20}]
+
+-- ...but a filtered parent must NOT fold: the FK guarantees the parent row
+-- exists, not that it survives the subquery's WHERE.
+SELECT id FROM fkemp WHERE dept_id IN (SELECT id FROM fkdept WHERE dname = 'eng') ORDER BY id;
+→ [{"id":10}]
+
+-- Nor may an equality against a NON-referenced parent column fold. dname is the
+-- subquery's output column 0 — the same index as the referenced column
+-- fkdept.id — so an untranslated index comparison would spuriously align.
+SELECT id FROM fkemp WHERE dept_id IN (SELECT dname FROM fkdept) ORDER BY id;
+→ []
+
+-- Same hazard on the child side: the IN is on fkemp.id, which a reordering
+-- derived table puts at the index the FK column occupies in fkemp.
+SELECT e.id FROM (SELECT dept_id, id FROM fkemp) e WHERE e.id IN (SELECT id FROM fkdept) ORDER BY e.id;
+→ []
+
+-- ===== The one other place an IN decides row fate: CHECK =====
+
+-- A CHECK constraint's IN is a scalar expression on a constraint node, not a
+-- Filter predicate, so the rewrite can never reach it — and must not, because
+-- a CHECK passes on IN's three-valued "unknown". A NULL value is accepted; a
+-- non-member is rejected.
+CREATE TABLE chk_allowed (id INTEGER PRIMARY KEY, code INTEGER);
+INSERT INTO chk_allowed VALUES (1, 1), (2, 2);
+CREATE TABLE chk_t (id INTEGER PRIMARY KEY, code INTEGER NULL, CHECK (code IN (SELECT code FROM chk_allowed)));
+
+INSERT INTO chk_t VALUES (1, NULL), (2, 2);
+SELECT id, code FROM chk_t ORDER BY id;
+→ [{"id":1,"code":null},{"id":2,"code":2}]
+
+INSERT INTO chk_t VALUES (3, 9);
+-- error: CHECK constraint failed
+
+-- ===== DML with the semi join as the mutation source =====
+
+CREATE TABLE dml_t (id INTEGER PRIMARY KEY, x INTEGER NULL, mark INTEGER);
+CREATE TABLE dml_keys (id INTEGER PRIMARY KEY, k INTEGER NULL);
+INSERT INTO dml_t VALUES (1, 10, 0), (2, 20, 0), (3, 30, 0), (4, NULL, 0);
+INSERT INTO dml_keys VALUES (1, 10), (2, 30), (3, NULL);
+
+UPDATE dml_t SET mark = 1 WHERE x IN (SELECT k FROM dml_keys);
+SELECT id, mark FROM dml_t ORDER BY id;
+→ [{"id":1,"mark":1},{"id":2,"mark":0},{"id":3,"mark":1},{"id":4,"mark":0}]
+
+DELETE FROM dml_t WHERE x IN (SELECT k FROM dml_keys);
+SELECT id FROM dml_t ORDER BY id;
+→ [{"id":2},{"id":4}]
+
+-- Self-referencing DELETE on a non-indexed column: the hash build drains the
+-- inner fully before any probe, so membership is decided by the
+-- pre-statement snapshot (same semantics the set probe pinned in
+-- 07.7-in-subquery-caching.sqllogic).
+CREATE TABLE selfd (id INTEGER PRIMARY KEY, x INTEGER NULL, keep INTEGER);
+INSERT INTO selfd VALUES (1, 100, 1), (2, 200, 0), (3, 300, 1), (4, 400, 0);
+DELETE FROM selfd WHERE x IN (SELECT x FROM selfd WHERE keep = 0);
+SELECT id FROM selfd ORDER BY id;
+→ [{"id":1},{"id":3}]
+
+-- Cleanup
+DROP TABLE chk_t;
+DROP TABLE chk_allowed;
+DROP TABLE selfd;
+DROP TABLE dml_keys;
+DROP TABLE dml_t;
+DROP TABLE fkemp_opt;
+DROP TABLE fkemp;
+DROP TABLE fkdept;
+DROP TABLE spantext;
+DROP TABLE spans;
+DROP TABLE texts;
+DROP TABLE reals;
+DROP TABLE ncb;
+DROP TABLE nco;
+DROP TABLE sinner;
+DROP TABLE souter;

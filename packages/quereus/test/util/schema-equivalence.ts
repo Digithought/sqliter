@@ -22,6 +22,8 @@ import type { Database } from '../../src/core/database.js';
 import type { TableSchema, RowConstraintSchema, IndexSchema, ForeignKeyConstraintSchema, UniqueConstraintSchema, PrimaryKeyColumnDefinition, IndexColumnSchema } from '../../src/schema/table.js';
 import type { ColumnSchema } from '../../src/schema/column.js';
 import type { ViewSchema } from '../../src/schema/view.js';
+import type { MaintainedTableSchema } from '../../src/schema/derivation.js';
+import { generateMaintainedTableDDL } from '../../src/schema/ddl-generator.js';
 import type { IntegrityAssertionSchema } from '../../src/schema/assertion.js';
 import type * as AST from '../../src/parser/ast.js';
 import type { SqlValue } from '../../src/common/types.js';
@@ -54,7 +56,7 @@ import { assertAstEquivalent } from '../emit-roundtrip-comparator.js';
  *   - indexes[*]: columns + directions, unique, partial `where` predicate
  *     (structural), tags
  *   - vtabModuleName + vtabArgs
- *   - isView, isTemporary, isReadOnly
+ *   - isView, isReadOnly
  *   - tags at table level
  *
  * Not compared (deliberately):
@@ -72,7 +74,6 @@ export function assertTableSchemaEqual(direct: TableSchema, applied: TableSchema
 	eq(direct.name.toLowerCase(), applied.name.toLowerCase(), at('name'));
 	eq(direct.schemaName.toLowerCase(), applied.schemaName.toLowerCase(), at('schemaName'));
 	eq(direct.isView, applied.isView, at('isView'));
-	eq(direct.isTemporary ?? false, applied.isTemporary ?? false, at('isTemporary'));
 	eq(direct.isReadOnly ?? false, applied.isReadOnly ?? false, at('isReadOnly'));
 	eq(direct.vtabModuleName, applied.vtabModuleName, at('vtabModuleName'));
 	eqRecord(direct.vtabArgs ?? {}, applied.vtabArgs ?? {}, at('vtabArgs'));
@@ -225,7 +226,38 @@ export function assertViewSchemaEqual(direct: ViewSchema, applied: ViewSchema, l
 	eqArray(dCols, aCols, `${root}columns`);
 	// View body — structural compare via assertAstEquivalent.
 	try {
+		// The body AST compare covers the trailing `with defaults (col = expr, …)`
+		// clause too — it now rides inside `selectAst` (SelectStmt.defaults).
 		assertAstEquivalent(direct.selectAst, applied.selectAst, `${root}selectAst`);
+	} catch (e) {
+		const msg = e instanceof Error ? e.message : String(e);
+		expect.fail(msg);
+	}
+}
+
+/**
+ * Compare two maintained tables (a `TableSchema` carrying a `derivation` —
+ * what `create materialized view` produces). The body AST is compared
+ * structurally (so a divergent body surfaces here), and `derivation.bodyHash`
+ * is compared directly — it is the value the declarative differ keys rebuild
+ * detection on, so a re-emit/re-parse round-trip that perturbs the canonical
+ * body SQL would fail here even if the AST still compared equal. The canonical
+ * `create materialized view` DDL — rendered on demand from the unified record
+ * — is also compared, covering the backing-module clause and tag rendering.
+ */
+export function assertMaterializedViewSchemaEqual(direct: MaintainedTableSchema, applied: MaintainedTableSchema, label?: string): void {
+	const root = label ? `[${label}] ` : '';
+	eq(direct.name.toLowerCase(), applied.name.toLowerCase(), `${root}name`);
+	eq(direct.schemaName.toLowerCase(), applied.schemaName.toLowerCase(), `${root}schemaName`);
+	eqRecord(direct.tags ?? {}, applied.tags ?? {}, `${root}tags`);
+	const dCols = (direct.derivation.columns ?? []).map(c => c.toLowerCase());
+	const aCols = (applied.derivation.columns ?? []).map(c => c.toLowerCase());
+	eqArray(dCols, aCols, `${root}derivation.columns`);
+	eq(direct.derivation.bodyHash, applied.derivation.bodyHash, `${root}derivation.bodyHash`);
+	eq(generateMaintainedTableDDL(direct), generateMaintainedTableDDL(applied), `${root}generatedDDL`);
+	try {
+		// The body AST compare covers the trailing `with defaults (…)` clause too.
+		assertAstEquivalent(direct.derivation.selectAst, applied.derivation.selectAst, `${root}derivation.selectAst`);
 	} catch (e) {
 		const msg = e instanceof Error ? e.message : String(e);
 		expect.fail(msg);

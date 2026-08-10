@@ -253,6 +253,52 @@ describe('checkSatisfiability (unit)', () => {
 	});
 });
 
+describe('checkSatisfiability collation resolution (unit)', () => {
+	/** `x = 'a' ∧ x = 'A'` — unsat under BINARY, satisfiable under any case-folding collation. */
+	function caseConflict(): ScalarPlanNode[] {
+		const x = textCol(0, 'x', 0);
+		return [bin('=', x, lit('a')), bin('=', x, lit('A'))];
+	}
+
+	it("x = 'a' ∧ x = 'A' is unsat on a BINARY column", () => {
+		expect(checkSatisfiability(caseConflict(), [], [], identity, () => 'BINARY')).to.equal('unsat');
+	});
+
+	it("x = 'a' ∧ x = 'A' is satisfiable on a NOCASE column", () => {
+		expect(checkSatisfiability(caseConflict(), [], [], identity, () => 'NOCASE')).to.equal('sat');
+	});
+
+	it('a collation name outside the built-ins yields unknown when no resolver is supplied', () => {
+		expect(checkSatisfiability(caseConflict(), [], [], identity, () => 'REVERSE')).to.equal('unknown');
+	});
+
+	it('a supplied resolver makes the custom collation decidable', () => {
+		const reverse = (a: string, b: string) => (a < b ? 1 : a > b ? -1 : 0);
+		const resolver = (name: string) => {
+			if (name.toUpperCase() !== 'REVERSE') throw new Error(`no such collation sequence: ${name}`);
+			return reverse;
+		};
+		// Under REVERSE, 'a' and 'A' are still distinct — so the conflict stands.
+		expect(checkSatisfiability(caseConflict(), [], [], identity, () => 'REVERSE', resolver)).to.equal('unsat');
+
+		// ... but two names that the custom collation equates must not be called a conflict.
+		const x = textCol(0, 'x', 0);
+		const lengthOnly = (a: string, b: string) => a.length - b.length;
+		const lenResolver = (_name: string) => lengthOnly;
+		const conjuncts = [bin('=', x, lit('a')), bin('=', x, lit('b'))];
+		expect(checkSatisfiability(conjuncts, [], [], identity, () => 'LENGTH', lenResolver)).to.equal('sat');
+	});
+
+	it('a resolver that throws on the name degrades to unknown, not to BINARY', () => {
+		const throwing = (name: string): never => { throw new Error(`no such collation sequence: ${name}`); };
+		expect(checkSatisfiability(caseConflict(), [], [], identity, () => 'FROBNICATE', throwing)).to.equal('unknown');
+	});
+
+	it('a column with no declared collation still compares under BINARY', () => {
+		expect(checkSatisfiability(caseConflict(), [], [], identity, () => undefined)).to.equal('unsat');
+	});
+});
+
 // ---------------------------------------------------------------------------
 // End-to-end: query_plan + execution
 // ---------------------------------------------------------------------------
@@ -362,5 +408,83 @@ describe('Predicate contradiction folding (end-to-end)', () => {
 		expect(hasOp(plan, 'EMPTYRELATION')).to.equal(false);
 		const rows = await results(db, sql) as { id: number }[];
 		expect(rows).to.have.lengthOf(3);
+	});
+
+	it("WHERE x = 'a' AND x = 'A' on a NOCASE column returns the row (built-in collation)", async () => {
+		await db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT COLLATE NOCASE)');
+		await db.exec("INSERT INTO t VALUES (1, 'a')");
+		const sql = "SELECT id FROM t WHERE x = 'a' AND x = 'A'";
+		expect(hasOp(await planRows(db, sql), 'EMPTYRELATION')).to.equal(false);
+		expect(await results(db, sql)).to.have.lengthOf(1);
+	});
+
+	it("WHERE x = 'a' AND x = 'A' on a BINARY column still folds to empty", async () => {
+		await db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT)');
+		await db.exec("INSERT INTO t VALUES (1, 'a')");
+		const sql = "SELECT id FROM t WHERE x = 'a' AND x = 'A'";
+		expect(hasOp(await planRows(db, sql), 'EMPTYRELATION')).to.equal(true);
+		expect(await results(db, sql)).to.have.lengthOf(0);
+	});
+
+	it('a collation registered on the connection is honored, not degraded to BINARY', async () => {
+		// A NOCASE that equates every same-length string. The rows the runtime returns for
+		// each conjunct alone must also come back for their conjunction.
+		db.registerCollation('NOCASE', (a, b) => a.length - b.length);
+		await db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT COLLATE NOCASE)');
+		await db.exec("INSERT INTO t VALUES (1, 'a')");
+		expect(await results(db, "SELECT id FROM t WHERE x = 'a'")).to.have.lengthOf(1);
+		expect(await results(db, "SELECT id FROM t WHERE x = 'b'")).to.have.lengthOf(1);
+		const sql = "SELECT id FROM t WHERE x = 'a' AND x = 'b'";
+		expect(hasOp(await planRows(db, sql), 'EMPTYRELATION')).to.equal(false);
+		expect(await results(db, sql)).to.have.lengthOf(1);
+	});
+
+	it('a custom collation reaching the checker through a projected attribute is honored', async () => {
+		// Column DDL does not accept a custom collation name yet, but a COLLATE in a
+		// projection stamps it on the attribute's type — which is what the checker reads.
+		db.registerCollation('REVERSE', (a, b) => (a < b ? 1 : a > b ? -1 : 0));
+		await db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT)');
+		await db.exec("INSERT INTO t VALUES (1, 'AB')");
+		// Under REVERSE, 'B' sorts before 'A', so the open interval ('B','A') is non-empty
+		// and contains 'AB'. Under BINARY the same interval is empty.
+		const sql = "SELECT id FROM (SELECT id, x COLLATE REVERSE AS y FROM t) WHERE y > 'B' AND y < 'A'";
+		expect(hasOp(await planRows(db, sql), 'EMPTYRELATION')).to.equal(false);
+		expect(await results(db, sql)).to.have.lengthOf(1);
+	});
+
+	it('an explicit COLLATE on the compared column is not erased', async () => {
+		// `x COLLATE NOCASE = 'a'` compares under NOCASE even though `x` is BINARY, so the
+		// conjunction is satisfiable. Stripping the wrapper would prove a false contradiction.
+		await db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT)');
+		await db.exec("INSERT INTO t VALUES (1, 'a')");
+		const sql = "SELECT id FROM t WHERE x COLLATE NOCASE = 'a' AND x COLLATE NOCASE = 'A'";
+		expect(hasOp(await planRows(db, sql), 'EMPTYRELATION')).to.equal(false);
+		expect(await results(db, sql)).to.have.lengthOf(1);
+	});
+
+	it('a value-changing CAST on the compared column is not erased', async () => {
+		// `cast(x as integer) = 1` says nothing about `x = '1'` being false.
+		await db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT)');
+		await db.exec("INSERT INTO t VALUES (1, '1')");
+		const sql = "SELECT id FROM t WHERE x = '1' AND CAST(x AS INTEGER) = 1";
+		expect(hasOp(await planRows(db, sql), 'EMPTYRELATION')).to.equal(false);
+		expect(await results(db, sql)).to.have.lengthOf(1);
+	});
+
+	it('a custom collation on an unrelated column does not fail the query', async () => {
+		// A CHECK on a column with a non-BINARY collation publishes a DomainConstraint naming
+		// that column, so the predicate-contradiction checker must resolve the column's collation
+		// even though no emitted comparison in this query touches it. Since
+		// feat-ddl-accepts-registered-collations, an explicit COLLATE is accepted on ANY column
+		// type only when the collation is registered (an unregistered name is now rejected at
+		// CREATE), so register it first; the checker resolves it cleanly and the query plans
+		// without a false contradiction. (The checker still defensively answers `unknown` for an
+		// unresolvable collation — see sat-checker.ts `tryResolve` — but that branch is no longer
+		// reachable via DDL.)
+		db.registerCollation('MYCOLL', (a, b) => (a < b ? -1 : a > b ? 1 : 0));
+		await db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER COLLATE MYCOLL CHECK (k > 0))');
+		const sql = 'SELECT id FROM t WHERE id = 1';
+		expect(hasOp(await planRows(db, sql), 'EMPTYRELATION')).to.equal(false);
+		expect(await results(db, sql)).to.have.lengthOf(0);
 	});
 });

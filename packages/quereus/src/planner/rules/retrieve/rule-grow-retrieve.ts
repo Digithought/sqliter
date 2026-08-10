@@ -35,27 +35,13 @@ import { extractOrderingFromSortKeys } from '../../framework/physical-utils.js';
 import { LimitOffsetNode } from '../../nodes/limit-offset.js';
 import { PlanNode as _PlanNode } from '../../nodes/plan-node.js';
 import { PlanNodeType as _PlanNodeType } from '../../nodes/plan-node-type.js';
-import { LiteralNode, BinaryOpNode } from '../../nodes/scalar.js';
+import { LiteralNode } from '../../nodes/scalar.js';
 import { collectBindingsInPlan } from '../../analysis/binding-collector.js';
-import type * as AST from '../../../parser/ast.js';
-import { ExistsNode, InNode } from '../../nodes/subquery.js';
-import { isCorrelatedSubquery } from '../../cache/correlation-detector.js';
+import { splitConjuncts } from '../../analysis/predicate-conjuncts.js';
+import { combineResidualExpressions } from '../access/rule-select-access-path.js';
+import { type IndexStyleContext, isIndexStyleContext } from '../shared/index-style-context.js';
 
 const log = createLogger('optimizer:rule:grow-retrieve');
-
-/**
- * Context data stored in RetrieveNode.moduleCtx for index-style fallback
- */
-interface IndexStyleContext {
-	kind: 'index-style';
-	accessPlan: BestAccessPlanResult;
-	residualPredicate?: PlanNode;
-	originalConstraints: PredicateConstraint[];
-}
-
-function isIndexStyleContext(ctx: unknown): ctx is IndexStyleContext {
-	return !!ctx && typeof ctx === 'object' && (ctx as { kind?: string }).kind === 'index-style';
-}
 
 export function ruleGrowRetrieve(node: PlanNode, context: OptContext): PlanNode | null {
 	// This rule runs in a TOP-DOWN pass, looking for any relational operation
@@ -122,7 +108,7 @@ export function ruleGrowRetrieve(node: PlanNode, context: OptContext): PlanNode 
 	if (!assessment && vtabModule.getBestAccessPlan && typeof vtabModule.getBestAccessPlan === 'function') {
 		if (canTranslateToIndexConstraints(node)) {
 			log('Testing index-style fallback for %s', node.nodeType);
-			assessment = fallbackIndexSupports(node, candidatePipeline, context, tableRef);
+			assessment = fallbackIndexSupports(node, context, tableRef, retrieveChild.moduleCtx);
 
 			if (assessment) {
 				log('Index-style fallback supports pipeline (cost: %d)', assessment.cost);
@@ -145,6 +131,13 @@ export function ruleGrowRetrieve(node: PlanNode, context: OptContext): PlanNode 
 
 	if (isIndexStyleContext(assessment.ctx)) {
 		// Index-style fallback: only place supported fragments under Retrieve; keep residuals above
+		// NOTE: the Filter built below never executes — `ruleSelectAccessPath`'s index-style
+		// branch physicalizes from moduleCtx alone and never reads `Retrieve.source`. It is
+		// written anyway because two later readers walk it: `collectBindingsInPlan` (below)
+		// gathers correlated bindings from it, and `trySortAbsorbViaIndexOrdering` sweeps it
+		// for constraints when deciding whether a Sort can be absorbed. Any rule that writes
+		// a predicate into a committed Retrieve's `source` expecting it to EXECUTE will lose
+		// it (see rule-predicate-pushdown's guard).
 		newPipeline = candidatePipeline as RelationalPlanNode;
 		if (node instanceof FilterNode) {
 			const tableInfo: TableInfo = createTableInfoFromNode(retrieveChild.tableRef, tableSchema.name);
@@ -164,16 +157,21 @@ export function ruleGrowRetrieve(node: PlanNode, context: OptContext): PlanNode 
 		newPipeline = candidatePipeline as RelationalPlanNode;
 	}
 
-	// If index-style with a residual predicate that contains correlated subqueries,
-	// keep the residual above the Retrieve as a FilterNode so structural rules
-	// (e.g., subquery decorrelation) can still process it. Clear the residual from
-	// the context to avoid double-application in select-access-path.
+	// If index-style with a residual predicate that contains ANY subquery, keep the
+	// residual above the Retrieve as a FilterNode so the bottom-up physical pass still
+	// covers the subquery's own plan tree (and structural rules like subquery
+	// decorrelation can process it). Burying it in moduleCtx.residualPredicate leaves
+	// the subquery's inner Retrieve outside the region select-access-path visits, so it
+	// stays unphysicalized and emitRetrieve throws. Correlation is irrelevant: a
+	// self-contained IN (SELECT …)/EXISTS/scalar subquery carries an inner Retrieve just
+	// the same. Clear the residual from the context to avoid double-application in
+	// select-access-path. See tickets/complete/grow-retrieve-noncorrelated-subquery-residual.
 	let moduleCtx = assessment.ctx;
 	let residualAbove: ScalarPlanNode | undefined;
 
 	if (isIndexStyleContext(moduleCtx) && moduleCtx.residualPredicate
-		&& predicateContainsCorrelatedSubquery(moduleCtx.residualPredicate as ScalarPlanNode)) {
-		residualAbove = moduleCtx.residualPredicate as ScalarPlanNode;
+		&& predicateContainsSubquery(moduleCtx.residualPredicate)) {
+		residualAbove = moduleCtx.residualPredicate;
 		moduleCtx = { ...moduleCtx, residualPredicate: undefined };
 	}
 
@@ -243,18 +241,118 @@ function canTranslateToIndexConstraints(node: PlanNode): boolean {
 }
 
 /**
+ * Drop constraints that repeat one already present. A re-grow unions the committed
+ * context's constraints with those re-extracted from the incoming node, and the same
+ * predicate node commonly appears in both.
+ *
+ * Identity is (sourceExpression, columnIndex, op) — NOT `sourceExpression` alone: a
+ * BETWEEN decomposes into a lower and an upper bound that share one source node, so
+ * keying on the node would drop half the range (`id between 51 and 150` would delete
+ * everything from 51 up). Do not "simplify" this back to expression identity.
+ *
+ * Duplicates are not merely untidy: the module claims the first copy and the second
+ * falls through to `reattachUnconsumedConstraints`, which re-applies it as a redundant
+ * residual Filter and shifts the cost estimate enough to flip join strategies.
+ */
+function dedupeConstraints(constraints: PredicateConstraint[]): PredicateConstraint[] {
+	const rolesByExpression = new Map<ScalarPlanNode, Set<string>>();
+	return constraints.filter(constraint => {
+		let roles = rolesByExpression.get(constraint.sourceExpression);
+		if (!roles) rolesByExpression.set(constraint.sourceExpression, roles = new Set());
+		const role = `${constraint.columnIndex}:${constraint.op}`;
+		if (roles.has(role)) return false;
+		roles.add(role);
+		return true;
+	});
+}
+
+/**
+ * The predicate the physical leaf must still apply once the module has taken what it
+ * can: the extractor's own residual, plus the source expression of every constraint the
+ * module declined, plus the residual the displaced context was enforcing (nothing else
+ * re-applies that one — the new context replaces it wholesale).
+ *
+ * The committed residual is contributed conjunct-by-conjunct rather than whole, skipping
+ * any conjunct that is also a constraint's source expression: the re-probe already covers
+ * those, either by seeking them or by re-adding them here. Keeping the committed copy as
+ * well would apply the same predicate twice — correct, but a wasted evaluation per row and
+ * a cost shift of exactly the kind `dedupeConstraints` exists to avoid.
+ *
+ * `combineResidualExpressions` supplies the rest of the de-duplication by identity, which
+ * is what collapses the two bounds of a declined BETWEEN back into their one source node.
+ */
+function assembleResidual(
+	extractionResidual: ScalarPlanNode | undefined,
+	constraints: readonly PredicateConstraint[],
+	handledFilters: readonly boolean[],
+	committedResidual: ScalarPlanNode | undefined,
+): ScalarPlanNode | undefined {
+	const constraintExprs = new Set<ScalarPlanNode>(constraints.map(c => c.sourceExpression));
+
+	const parts: ScalarPlanNode[] = extractionResidual ? [extractionResidual] : [];
+	constraints.forEach((constraint, i) => {
+		if (!handledFilters[i]) parts.push(constraint.sourceExpression);
+	});
+	if (committedResidual) {
+		parts.push(...splitConjuncts(committedResidual).filter(c => !constraintExprs.has(c)));
+	}
+
+	const residual = combineResidualExpressions(parts);
+	log('Residual over %d constraint(s): %s', constraints.length, residual ? 'yes' : 'none');
+	return residual;
+}
+
+/**
  * Fallback assessment for index-style modules using getBestAccessPlan
  * Translates various operations to index constraints
+ *
+ * INVARIANT — an `IndexStyleContext` may only be replaced by one that enforces a
+ * SUPERSET of what it enforced. This function returns a brand-new context that
+ * *replaces* `existingCtx` wholesale, and once a Retrieve carries such a context it is
+ * the sole authority for what the table access applies (`ruleSelectAccessPath` never
+ * reads `Retrieve.source`). So the re-probe must request at least the constraints the
+ * committed context already claims, and must carry its residual forward — otherwise a
+ * conjunct the displaced plan was seeking is silently dropped and the query returns rows
+ * the WHERE excluded. Both halves are enforced below:
+ *  - constraints: `committedConstraints` is unioned into `request.filters` on every arm,
+ *    and anything the new plan declines is residualized instead (so correctness does not
+ *    depend on the module answering the second probe the way it answered the first);
+ *  - ordering: `equippedOrdering` is re-requested and the no-clobber guard declines a
+ *    plan that does not provide it.
  */
 function fallbackIndexSupports(
 	node: PlanNode,
-	candidatePipeline: PlanNode,
 	context: OptContext,
-	tableRef: TableReferenceNode
+	tableRef: TableReferenceNode,
+	existingCtx?: unknown
 ): SupportAssessment | undefined {
 
 	const vtabModule = tableRef.vtabModule;
 	const tableSchema = tableRef.tableSchema;
+
+	// If the RetrieveNode we are growing over already carries an index-style
+	// context that provides an ordering (e.g. a reverse plan absorbed from a
+	// Sort by trySortAbsorbViaIndexOrdering), we must re-derive a
+	// direction-matching plan here. A plain no-ordering re-probe can return an
+	// oppositely-ordered plan (a module that serves DESC by reverse-scanning an
+	// ascending index yields the forward plan when ordering is not requested);
+	// equipping that plan silently clobbers the absorbed reverse plan while the
+	// Sort has already been dropped, so rows stream in the wrong direction. See
+	// `fix/quereus-reverse-order-sort-absorb-desync`.
+	const equippedOrdering: readonly OrderingSpec[] | undefined =
+		isIndexStyleContext(existingCtx)
+			&& existingCtx.accessPlan.providesOrdering
+			&& existingCtx.accessPlan.providesOrdering.length > 0
+			? existingCtx.accessPlan.providesOrdering
+			: undefined;
+
+	// What the CURRENTLY COMMITTED plan is enforcing. A re-probe replaces moduleCtx
+	// wholesale, so anything here left out of the new request/residual is silently
+	// dropped — `Retrieve.source` is not an execution channel once a ctx exists.
+	const committedConstraints: PredicateConstraint[] =
+		isIndexStyleContext(existingCtx) ? [...existingCtx.originalConstraints] : [];
+	const committedResidual: ScalarPlanNode | undefined =
+		isIndexStyleContext(existingCtx) ? existingCtx.residualPredicate : undefined;
 
 	// Build BestAccessPlanRequest based on node type
 	const request: BestAccessPlanRequest = {
@@ -272,8 +370,8 @@ function fallbackIndexSupports(
 	};
 
 	// Extract information based on node type
-	let residualPredicate: PlanNode | undefined;
-	let plannerConstraints: PredicateConstraint[] | undefined;
+	let residualPredicate: ScalarPlanNode | undefined;
+	let plannerConstraints: PredicateConstraint[] = committedConstraints;
 
 	if (node instanceof FilterNode) {
 		// Extract constraints from filter predicate
@@ -281,15 +379,17 @@ function fallbackIndexSupports(
 		const normalizedPredicate = normalizePredicate(node.predicate);
 		const extraction = extractConstraints(normalizedPredicate, [tableInfo]);
 
+		// Declining is always safe, committed context or not: the Filter stays above the
+		// Retrieve and executes there, and the committed context is left untouched.
 		if (extraction.allConstraints.length === 0) {
 			log('No extractable constraints from filter predicate');
 			return undefined;
 		}
 
-		plannerConstraints = extraction.allConstraints;
-		request.filters = plannerConstraints;
+		plannerConstraints = dedupeConstraints([...committedConstraints, ...extraction.allConstraints]);
 		residualPredicate = extraction.residualPredicate;
-		log('Extracted %d constraints from Filter', plannerConstraints.length);
+		log('Extracted %d constraints from Filter (%d carried from committed context)',
+			extraction.allConstraints.length, committedConstraints.length);
 
 	} else if (node.nodeType === PlanNodeType.Sort) {
 		// Extract ordering requirements from Sort node
@@ -323,6 +423,14 @@ function fallbackIndexSupports(
 				} else {
 					// Non-numeric literal OFFSET — refuse to push the LIMIT,
 					// because we cannot soundly compute `limit + offset`.
+					// NOTE: a bare `LIMIT n` lands HERE, not in the branch above — the
+					// builder materializes an absent OFFSET as `Literal(null)`, so every
+					// LIMIT without an explicit numeric OFFSET is refused and no module
+					// sees `request.limit` by this route. Inert today: this arm is
+					// unreached anyway (no shape puts a LimitOffset directly above a
+					// Retrieve, and the benefit gate below requires a requested ordering).
+					// If it becomes reachable, read a null/absent OFFSET as 0 rather than
+					// refusing.
 					limitVal = undefined;
 				}
 			} else {
@@ -343,6 +451,19 @@ function fallbackIndexSupports(
 		return undefined;
 	}
 
+	// Every arm requests at least the committed context's constraints: the Filter arm
+	// unions them with its own extraction, the Sort / LimitOffset arms inherit them from
+	// the initializer. `handledFilters` is positional against this array, so it must be
+	// the same object the residual assembly below walks.
+	request.filters = plannerConstraints;
+
+	// Carry the equipped ordering into the re-probe (unless the node type already
+	// derived one, e.g. a Sort) so the module returns a direction-matching plan
+	// instead of a no-ordering one that would clobber the absorbed reverse plan.
+	if (equippedOrdering && !request.requiredOrdering) {
+		request.requiredOrdering = equippedOrdering.map(o => ({ columnIndex: o.columnIndex, desc: o.desc }));
+	}
+
 	log('Built access plan request: %d filters, ordering: %s, limit: %s',
 		request.filters.length,
 		request.requiredOrdering ? 'yes' : 'no',
@@ -351,11 +472,32 @@ function fallbackIndexSupports(
 	// Get access plan from module
 	const accessPlan = vtabModule.getBestAccessPlan!(context.db, tableSchema, request);
 
+	// No-clobber guard: never replace an equipped ordering plan with one that does
+	// not provide the same ordering (same column indexes + directions). Declining
+	// here leaves the current (correct) tree in place — a redundant Filter above a
+	// reverse Retrieve is safe because a Filter preserves row order, so rows still
+	// emerge in the absorbed direction.
+	// NOTE: the end-to-end regression that proves this guard is load-bearing lives
+	// in Lamina's cross-repo suite (ordinal-seek-range-bounds.test.ts), not here —
+	// the synthetic reverse-scan spec physicalizes before the re-grow can race in,
+	// so it exercises trySortAbsorbViaIndexOrdering's satisfaction check but not
+	// this clobber. If you refactor this branch, run Lamina's suite too, or add a
+	// Quereus-native repro that re-grows over an already-reverse-equipped Retrieve.
+	if (equippedOrdering && !orderingMatches(accessPlan.providesOrdering, equippedOrdering)) {
+		log('Re-probe would clobber equipped ordering; declining grow to preserve absorbed plan');
+		return undefined;
+	}
+
 	// Check if the plan is beneficial
 	const handlesAnyFilter = request.filters.length > 0 &&
 		accessPlan.handledFilters.some(handled => handled);
-	const providesOrdering = request.requiredOrdering &&
-		accessPlan.providesOrdering;
+	// Only count ordering as a benefit when the plan provides the SAME columns and
+	// directions that were requested — a wrong-direction (or wrong-column)
+	// providesOrdering of equal length must not let a Sort be grown into (and thus
+	// dropped by) this Retrieve. Direction-aware, not length-only.
+	const providesOrdering = request.requiredOrdering
+		? orderingMatches(accessPlan.providesOrdering, request.requiredOrdering)
+		: false;
 
 	// Calculate baseline cost
 	const estimatedRows = request.estimatedRows ?? 1000;
@@ -367,6 +509,17 @@ function fallbackIndexSupports(
 		return undefined;
 	}
 
+	// Growing a Sort or a LimitOffset SWALLOWS it — the node lands in `Retrieve.source`,
+	// which the index-style branch of `ruleSelectAccessPath` never reads. Such a grow is
+	// only sound when the plan actually provides the ordering that was requested, so a
+	// handled filter alone must not license it. Before the committed constraints were
+	// unioned into `request.filters` these arms sent no filters at all and
+	// `handlesAnyFilter` was therefore always false for them; this keeps that.
+	if (!(node instanceof FilterNode) && !providesOrdering) {
+		log('Growing %s would swallow it without the plan providing its ordering; declining', node.nodeType);
+		return undefined;
+	}
+
 	if (accessPlan.cost >= seqCost && !providesOrdering) {
 		log('Access plan cost (%d) not better than sequential scan (%d)', accessPlan.cost, seqCost);
 		return undefined;
@@ -374,45 +527,60 @@ function fallbackIndexSupports(
 
 	log('Index-style fallback beneficial: cost %d vs %d seq scan', accessPlan.cost, seqCost);
 
-	// Compute full residual: extraction residual + source expressions of unhandled constraints.
-	// The extractor marks constraints it can decompose (e.g., LIKE), but the module may not
-	// handle them.  Those unhandled constraints must be preserved as a residual filter.
-	if (plannerConstraints && plannerConstraints.length > 0) {
-		const unhandledExprs: ScalarPlanNode[] = [];
-		for (let i = 0; i < plannerConstraints.length; i++) {
-			if (!accessPlan.handledFilters[i] && plannerConstraints[i].sourceExpression) {
-				unhandledExprs.push(plannerConstraints[i].sourceExpression);
-			}
-		}
-		if (unhandledExprs.length > 0) {
-			const parts: ScalarPlanNode[] = residualPredicate ? [residualPredicate as ScalarPlanNode, ...unhandledExprs] : unhandledExprs;
-			if (parts.length === 1) {
-				residualPredicate = parts[0];
-			} else {
-				let acc: ScalarPlanNode = parts[0];
-				for (let i = 1; i < parts.length; i++) {
-					const right = parts[i];
-					const ast: AST.BinaryExpr = { type: 'binary', operator: 'AND', left: acc.expression, right: right.expression };
-					acc = new BinaryOpNode(acc.scope, ast, acc, right);
-				}
-				residualPredicate = acc;
-			}
-			log('Added %d unhandled constraint expressions to residual', unhandledExprs.length);
-		}
-	}
+	residualPredicate = assembleResidual(
+		residualPredicate, plannerConstraints, accessPlan.handledFilters, committedResidual);
 
-	// Store context for later use in ruleSelectAccessPath
+	// Store context for later use in ruleSelectAccessPath. A re-grow over a
+	// Retrieve whose ordering already absorbed a Sort must keep the
+	// load-bearing marker — the Sort is gone either way.
+	//
+	// NOTE: accepted tradeoff — the Sort arm above also drops a Sort (`select * from t
+	// order by id` reaches it: no Project or Filter between Sort and Retrieve) yet
+	// deliberately does NOT mark it, unlike `trySortAbsorbViaIndexOrdering`. Marking it is
+	// the conservative reading but costs a real optimization — the leaf under
+	// `join (select * from big order by v) z` would stop qualifying for an
+	// index-nested-loop seek, which test/optimizer/index-nested-loop.spec.ts pins as
+	// firing. Sound because the two conditions never coincide: an ordering a consumer
+	// observes has no emission-order-changing rewrite above it (nothing sits above a
+	// top-level ordered scan), and the shapes that do have one are subquery ORDER BYs,
+	// which SQL does not guarantee through a join — the LIMIT case that would make one
+	// meaningful is already refused by the peel gate in rules/join/index-nested-loop.ts.
+	// Revisit if a rewrite ever reorders a leaf whose ordering the query genuinely observes.
 	const indexCtx: IndexStyleContext = {
 		kind: 'index-style',
 		accessPlan,
 		residualPredicate,
-		originalConstraints: plannerConstraints ? [...plannerConstraints] : []
+		originalConstraints: [...plannerConstraints],
+		...(isIndexStyleContext(existingCtx) && existingCtx.orderingLoadBearing
+			? { orderingLoadBearing: true } : {}),
 	};
 
 	return {
 		cost: accessPlan.cost,
 		ctx: indexCtx
 	};
+}
+
+/**
+ * True when `provided` satisfies `required` position-for-position — same column
+ * indexes and same descending flags for every required position (the plan may
+ * provide extra trailing ordering, so `provided` need only be at least as long).
+ * Used both to gate the sort-absorb satisfaction check and to guard a re-grow
+ * from clobbering an already-equipped ordering plan. Comparing the ordering as
+ * data (columnIndex + desc) keeps a single representation — see the `OrderingSpec`
+ * shape in `best-access-plan.ts`.
+ */
+function orderingMatches(
+	provided: readonly OrderingSpec[] | undefined,
+	required: readonly OrderingSpec[],
+): boolean {
+	if (!provided || provided.length < required.length) return false;
+	for (let i = 0; i < required.length; i++) {
+		if (provided[i].columnIndex !== required[i].columnIndex || provided[i].desc !== required[i].desc) {
+			return false;
+		}
+	}
+	return true;
 }
 
 /**
@@ -493,8 +661,11 @@ function trySortAbsorbViaIndexOrdering(sort: SortNode, context: OptContext): Pla
 
 	const accessPlan = vtabModule.getBestAccessPlan(context.db, tableSchema, request) as BestAccessPlanResult;
 
-	// Only proceed if the plan actually satisfies the ordering.
-	if (!accessPlan.providesOrdering || accessPlan.providesOrdering.length < requiredOrdering.length) {
+	// Only proceed if the plan actually satisfies the ordering — every requested
+	// position must be provided by the SAME column and direction, not merely
+	// matched on length. A length-only check would let an ascending
+	// providesOrdering of equal length wrongly drop a DESC Sort.
+	if (!orderingMatches(accessPlan.providesOrdering, requiredOrdering)) {
 		log('Access plan does not satisfy required ordering; leaving Sort in place');
 		return null;
 	}
@@ -502,33 +673,20 @@ function trySortAbsorbViaIndexOrdering(sort: SortNode, context: OptContext): Pla
 	// Build residual predicate from any constraints the access plan didn't handle.
 	// rule-select-access-path's index-style branch trusts moduleCtx.residualPredicate
 	// rather than rebuilding from retrieveNode.source, so this must be set.
-	let residualPredicate: ScalarPlanNode | undefined;
-	if (constraints.length > 0) {
-		const unhandledExprs: ScalarPlanNode[] = [];
-		for (let i = 0; i < constraints.length; i++) {
-			if (!accessPlan.handledFilters[i] && constraints[i].sourceExpression) {
-				unhandledExprs.push(constraints[i].sourceExpression);
-			}
-		}
-		if (unhandledExprs.length > 0) {
-			let acc: ScalarPlanNode = unhandledExprs[0];
-			for (let i = 1; i < unhandledExprs.length; i++) {
-				const right = unhandledExprs[i];
-				const ast: AST.BinaryExpr = { type: 'binary', operator: 'AND', left: acc.expression, right: right.expression };
-				acc = new BinaryOpNode(acc.scope, ast, acc, right);
-			}
-			residualPredicate = acc;
-		}
-	}
+	const residualPredicate = assembleResidual(undefined, constraints, accessPlan.handledFilters, undefined);
 
 	// Equip the Retrieve with index-style context so rule-select-access-path
 	// uses this plan. Existing source pipeline (which may already contain
-	// pushed-down filters) is preserved.
-	const indexCtx = {
-		kind: 'index-style' as const,
+	// pushed-down filters) is preserved. The dropped Sort makes the plan's
+	// ordering load-bearing: the physical leaf's emission order is now the only
+	// thing producing the requested ORDER BY, so leaf rewrites that change
+	// emission order must see the marker and decline.
+	const indexCtx: IndexStyleContext = {
+		kind: 'index-style',
 		accessPlan,
 		residualPredicate,
 		originalConstraints: [...constraints],
+		orderingLoadBearing: true,
 	};
 	const newRetrieve = retrieveNode.withPipeline(retrieveNode.source, indexCtx, retrieveNode.bindings);
 
@@ -546,18 +704,19 @@ function trySortAbsorbViaIndexOrdering(sort: SortNode, context: OptContext): Pla
 }
 
 /**
- * Check if a scalar expression tree contains any correlated EXISTS or IN subqueries.
- * These need to remain in the plan tree for subquery decorrelation to process them.
+ * Check whether a scalar residual predicate embeds ANY subquery. Every subquery
+ * node (`IN (SELECT …)`, `EXISTS`, scalar subquery, and any future ANY/ALL/row
+ * variant) hangs a RelationalPlanNode — with its own RetrieveNode — beneath a scalar
+ * predicate, so "contains a relational descendant" is exactly "contains a subquery".
+ * Detecting it structurally rather than by node class keeps this robust as new
+ * subquery node types are added. Such a residual must stay in the region the
+ * bottom-up physical pass covers, whether or not the subquery is correlated: a
+ * self-contained subquery buries an unphysicalized Retrieve just the same as a
+ * correlated one.
  */
-function predicateContainsCorrelatedSubquery(expr: PlanNode): boolean {
-	if (expr instanceof ExistsNode) {
-		return isCorrelatedSubquery(expr.subquery);
-	}
-	if (expr instanceof InNode && expr.source) {
-		return isCorrelatedSubquery(expr.source);
-	}
+function predicateContainsSubquery(expr: PlanNode): boolean {
 	for (const child of expr.getChildren()) {
-		if (predicateContainsCorrelatedSubquery(child)) {
+		if (isRelationalNode(child) || predicateContainsSubquery(child)) {
 			return true;
 		}
 	}
