@@ -70,6 +70,8 @@ assertAggregateAlgebraLaws(mySchema, valueArb /* legal argument values, incl. NU
 
 It property-checks laws 1–5 for whichever fields are present and throws naming the violated law. Pick a `valueArb` matching the value-domain the declaration is exact for — and note that "exact for" can differ **per law**. `sum` is the live example: laws 1–3 and 5 run over integers *and* fractions, because that mixed domain is what catches an order-dependent fold; laws 4/4b use `decodeValueArb` to narrow to integers alone, because one stored value per group cannot say how a total split between `exact` and `approx`, so `decode` is observational only where `approx` is always empty — exactly the domain the write side's delta arm gates on.
 
+Each law searches for a counterexample with shrinking off, then minimizes the one it found under a one-second deadline. Minimizing three arrays of mixed integer/bigint/fractional values is not bounded by `numRuns` and is wildly seed-dependent — most seeds finish in milliseconds, a few run for minutes — so an uncapped shrink turns a law violation into a test-runner timeout that names no law. A report can therefore carry a non-minimal counterexample; it always carries the seed and path, so replaying that pair locally shrinks it the rest of the way.
+
 The fractions in `sum`'s domain are deliberately dyadic (multiples of `0.25`, bounded magnitude) so float addition over them is itself exact. Feeding a law harness ordinary decimals tests IEEE-754 rounding order, which no accumulator shape can make associative, rather than testing the declaration.
 
 ### Call-site binding (`bindArgs`)

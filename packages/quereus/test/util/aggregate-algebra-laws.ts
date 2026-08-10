@@ -53,6 +53,40 @@ export interface AggregateAlgebraLawOptions {
 const BUILTIN_PARTIALS: ReadonlyArray<AggregateFunctionSchema> =
 	[countStarFunc, countXFunc, sumFunc, minFunc, maxFunc, avgFunc];
 
+/**
+ * Wall-clock cap on MINIMIZING a counterexample (the search for one is separately
+ * bounded by `numRuns`).
+ *
+ * Shrinking a counterexample made of three arrays of up to twelve mixed
+ * integer/bigint/fractional values is not bounded by `numRuns` and is wildly
+ * seed-dependent: over these domains most seeds minimize in single-digit
+ * milliseconds, but a small fraction run for MINUTES (5+ observed). Left uncapped
+ * that turns any law violation — including the ones the negative-twin tests assert
+ * must happen — into an occasional mocha timeout whose message names a timeout
+ * instead of the violated law. Whatever the shrinker has managed by the deadline is
+ * reported, so the cap costs counterexample quality, never the failure itself.
+ */
+const SHRINK_BUDGET_MS = 1_000;
+
+/**
+ * Check one law's property, then report a failure the way `fc.assert` would.
+ *
+ * Two passes rather than one `fc.assert`: the first searches with shrinking off, so
+ * finding a counterexample costs exactly `numRuns` property evaluations; the second
+ * replays that counterexample by seed/path and minimizes it under a deadline. A
+ * replay that somehow does not reproduce falls back to reporting the raw finding.
+ */
+function assertLawProperty<Ts>(property: fc.IProperty<Ts>, numRuns: number): void {
+	const found = fc.check(property, { numRuns, endOnFailure: true });
+	if (!found.failed) return;
+	const minimized = fc.check(property, {
+		seed: found.seed,
+		path: found.counterexamplePath ?? undefined,
+		interruptAfterTimeLimit: SHRINK_BUDGET_MS,
+	});
+	throw new Error(fc.defaultReportMessage(minimized.failed ? minimized : found));
+}
+
 function defaultResolvePartial(func: string, arg: 'same-arg' | 'star'): AggregateFunctionSchema | undefined {
 	const numArgs = arg === 'star' ? 0 : 1;
 	return BUILTIN_PARTIALS.find((s) => s.name === func.toLowerCase() && s.numArgs === numArgs);
@@ -109,27 +143,27 @@ export function assertAggregateAlgebraLaws(
 
 	// Law 1a: merge associativity. Accumulators are rebuilt per expression so an
 	// impure (mutating) merge cannot alias its own inputs into a false pass.
-	check('merge-associative', () => fc.assert(fc.property(valuesArb, valuesArb, valuesArb, (xs, ys, zs) => {
+	check('merge-associative', () => assertLawProperty(fc.property(valuesArb, valuesArb, valuesArb, (xs, ys, zs) => {
 		const left = algebra.merge(algebra.merge(fold(schema, xs), fold(schema, ys)), fold(schema, zs));
 		const right = algebra.merge(fold(schema, xs), algebra.merge(fold(schema, ys), fold(schema, zs)));
 		return accEquivalent(schema, left, right);
-	}), { numRuns }));
+	}), numRuns));
 
 	// Law 1b: merge commutativity.
-	check('merge-commutative', () => fc.assert(fc.property(valuesArb, valuesArb, (xs, ys) => {
+	check('merge-commutative', () => assertLawProperty(fc.property(valuesArb, valuesArb, (xs, ys) => {
 		const ab = algebra.merge(fold(schema, xs), fold(schema, ys));
 		const ba = algebra.merge(fold(schema, ys), fold(schema, xs));
 		return accEquivalent(schema, ab, ba);
-	}), { numRuns }));
+	}), numRuns));
 
 	// Law 1c: a clone of initialValue is merge's identity, on both sides.
-	check('merge-identity', () => fc.assert(fc.property(valuesArb, (xs) => {
+	check('merge-identity', () => assertLawProperty(fc.property(valuesArb, (xs) => {
 		return accEquivalent(schema, algebra.merge(fold(schema, xs), identity()), fold(schema, xs))
 			&& accEquivalent(schema, algebra.merge(identity(), fold(schema, xs)), fold(schema, xs));
-	}), { numRuns }));
+	}), numRuns));
 
 	// Law 2: step/merge coherence — stepping x equals merging a single-row accumulator.
-	check('step-merge-coherence', () => fc.assert(fc.property(valuesArb, valueArb, (xs, x) => {
+	check('step-merge-coherence', () => assertLawProperty(fc.property(valuesArb, valueArb, (xs, x) => {
 		const stepped = schema.numArgs === 0
 			? schema.stepFunction(fold(schema, xs))
 			: schema.stepFunction(fold(schema, xs), x);
@@ -138,15 +172,15 @@ export function assertAggregateAlgebraLaws(
 			: schema.stepFunction(identity(), x);
 		const merged = algebra.merge(fold(schema, xs), singleton);
 		return accEquivalent(schema, stepped, merged);
-	}), { numRuns }));
+	}), numRuns));
 
 	// Law 3: negate is merge's inverse (retract∘insert of the same rows is a no-op).
 	const negate = algebra.negate;
 	if (negate) {
-		check('negate-inverse', () => fc.assert(fc.property(valuesArb, (xs) => {
+		check('negate-inverse', () => assertLawProperty(fc.property(valuesArb, (xs) => {
 			const cancelled = algebra.merge(fold(schema, xs), negate(fold(schema, xs)));
 			return accEquivalent(schema, cancelled, identity());
-		}), { numRuns }));
+		}), numRuns));
 	}
 
 	// Law 4: decode is observational — a stored (finalized) value reconstructs an
@@ -156,11 +190,11 @@ export function assertAggregateAlgebraLaws(
 	// why an aggregate may be observational only over a sub-domain.
 	const decode = algebra.decode;
 	if (decode) {
-		check('decode-observational', () => fc.assert(fc.property(decodeValuesArb, decodeValuesArb, (xs, ys) => {
+		check('decode-observational', () => assertLawProperty(fc.property(decodeValuesArb, decodeValuesArb, (xs, ys) => {
 			const viaStore = algebra.merge(decode(schema.finalizeFunction(fold(schema, xs))), fold(schema, ys));
 			const direct = algebra.merge(fold(schema, xs), fold(schema, ys));
 			return accEquivalent(schema, viaStore, direct);
-		}), { numRuns }));
+		}), numRuns));
 	}
 
 	// Law 4b (decodeExact only): decode stays observational under RETRACTIONS —
@@ -169,11 +203,11 @@ export function assertAggregateAlgebraLaws(
 	// contribution count) fails this for a partial retraction, which is exactly why it
 	// must not declare `decodeExact`.
 	if (decode && algebra.decodeExact && negate) {
-		check('decode-exact-retraction', () => fc.assert(fc.property(decodeValuesArb, decodeValuesArb, (xs, ys) => {
+		check('decode-exact-retraction', () => assertLawProperty(fc.property(decodeValuesArb, decodeValuesArb, (xs, ys) => {
 			const viaStore = algebra.merge(decode(schema.finalizeFunction(fold(schema, xs))), negate(fold(schema, ys)));
 			const direct = algebra.merge(fold(schema, xs), negate(fold(schema, ys)));
 			return accEquivalent(schema, viaStore, direct);
-		}), { numRuns }));
+		}), numRuns));
 	}
 
 	// Law 5: decompose — combining the partials' finalized values reproduces this
@@ -188,7 +222,7 @@ export function assertAggregateAlgebraLaws(
 			}
 			return { spec: p, schema: resolved };
 		});
-		check('decompose-combine', () => fc.assert(fc.property(valuesArb, (xs) => {
+		check('decompose-combine', () => assertLawProperty(fc.property(valuesArb, (xs) => {
 			const partialValues = partials.map(({ spec, schema: pSchema }) => {
 				let acc: AggValue = cloneInitialValue(pSchema.initialValue);
 				for (const v of xs) {
@@ -199,6 +233,6 @@ export function assertAggregateAlgebraLaws(
 				return pSchema.finalizeFunction(acc);
 			});
 			return sqlValueIdentical(decompose.combine(partialValues), schema.finalizeFunction(fold(schema, xs)));
-		}), { numRuns }));
+		}), numRuns));
 	}
 }
