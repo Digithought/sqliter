@@ -1,0 +1,111 @@
+-- ALTER COLUMN SET DEFAULT / SET DATA TYPE are checked against the column's
+-- (current, or newly-set) declared type — the same `foldDefaultToType` guard
+-- CREATE TABLE runs (see 10.1.7-create-table-default-type-check.sqllogic), so an
+-- ALTER cannot mint a column CREATE TABLE would refuse.
+
+-- ============================================================
+-- 1. SET DEFAULT: the new literal default must convert to the column's CURRENT type
+-- ============================================================
+
+create table t_sd (id integer primary key, n integer null);
+insert into t_sd (id, n) values (1, 5);
+-- run
+
+alter table t_sd alter column n set default 'abc';
+-- error: Type conversion failed
+
+-- The column keeps its previous default (none here) — a later insert relying on
+-- it still sees no default applied, and the column's type is unchanged.
+insert into t_sd (id) values (2);
+select id, n from t_sd order by id;
+→ [{"id":1,"n":5},{"id":2,"n":null}]
+
+drop table t_sd;
+-- run
+
+-- A convertible literal SET DEFAULT still succeeds, and a later insert stores it
+-- already converted.
+create table t_sd_ok (id integer primary key, n integer);
+alter table t_sd_ok alter column n set default '7';
+-- run
+
+insert into t_sd_ok (id) values (1);
+select n, typeof(n) as t from t_sd_ok where id = 1;
+→ [{"n":7,"t":"integer"}]
+
+drop table t_sd_ok;
+-- run
+
+-- ============================================================
+-- 2. SET DATA TYPE: the column's EXISTING stored default must convert to the NEW type
+--
+-- Each row below supplies `n` explicitly (a value that DOES convert to the new
+-- type) so the retype's own value-conversion never fails — the only thing under
+-- test is whether the column's DECLARED (not necessarily used) default converts.
+-- ============================================================
+
+create table t_retype (id integer primary key, n text null default 'abc');
+insert into t_retype (id, n) values (1, '99');
+-- run
+
+alter table t_retype alter column n set data type integer;
+-- error: Type conversion failed
+
+-- Neither the type nor the stored rows moved.
+select id, n, typeof(n) as t from t_retype order by id;
+→ [{"id":1,"n":"99","t":"text"}]
+
+drop table t_retype;
+-- run
+
+-- The remedy the error should leave available: DROP DEFAULT, then the same retype
+-- succeeds.
+create table t_retype_fix (id integer primary key, n text null default 'abc');
+insert into t_retype_fix (id, n) values (1, '99');
+-- run
+
+alter table t_retype_fix alter column n set data type integer;
+-- error: Type conversion failed
+
+alter table t_retype_fix alter column n drop default;
+-- run
+
+alter table t_retype_fix alter column n set data type integer;
+-- run
+
+insert into t_retype_fix (id) values (2);
+select id, n from t_retype_fix order by id;
+→ [{"id":1,"n":99},{"id":2,"n":null}]
+
+drop table t_retype_fix;
+-- run
+
+-- A retype whose EXISTING default IS convertible to the new type still succeeds,
+-- and a later insert (using the post-retype default) stores it already converted.
+create table t_retype_ok (id integer primary key, n text default '7');
+insert into t_retype_ok (id, n) values (1, '42');
+-- run
+
+alter table t_retype_ok alter column n set data type integer;
+-- run
+
+insert into t_retype_ok (id) values (2);
+select id, n, typeof(n) as t from t_retype_ok order by id;
+→ [{"id":1,"n":42,"t":"integer"},{"id":2,"n":7,"t":"integer"}]
+
+drop table t_retype_ok;
+-- run
+
+-- ============================================================
+-- 3. A PRIMARY KEY column already refuses SET DATA TYPE — that refusal must win
+-- over the new default/type fold (checked first).
+-- ============================================================
+
+create table t_pk (id integer primary key default '5');
+-- run
+
+alter table t_pk alter column id set data type integer;
+-- error: PRIMARY KEY
+
+drop table t_pk;
+-- run

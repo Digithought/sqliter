@@ -9,6 +9,7 @@ import { StatusCode, type SqlValue } from '../common/types.js';
 import type { AnyVirtualTableModule, BaseModuleConfig } from '../vtab/module.js';
 import type { VirtualTable } from '../vtab/table.js';
 import type { ColumnSchema } from './column.js';
+import { foldDefaultToType } from '../types/validation.js';
 import { buildColumnIndexMap, columnDefToSchema, findPKDefinition, opsToMask, mutationContextVarToSchema, extractGeneratedColumnDependencies, topoSortGeneratedColumns, requireVtabModule, resolveNamedConstraintClass, appendIndexToTableSchema, collectDeclaredConstraintNames, disambiguateAutoConstraintName } from './table.js';
 import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateForeignKeyCollations } from './constraint-builder.js';
 import type { ViewSchema } from './view.js';
@@ -2822,6 +2823,17 @@ export class SchemaManager {
 		const allowNonDet = this.db.options.getBooleanOption('nondeterministic_schema');
 		this.validateDefaultDeterminism(baseTableSchema.columns, tableName, hasMutationContext, allowNonDet);
 		this.validateCheckConstraintDeterminism(baseTableSchema.checkConstraints, tableName, allowNonDet);
+
+		// A literal DEFAULT must be convertible to its own column's declared type — the same
+		// check ADD COLUMN and SET NOT NULL backfill already run — so an unconvertible one is
+		// refused here rather than surfacing later as an INSERT failure blaming the insert
+		// instead of the declaration. Engine-side and pre-`module.create`, same rationale as
+		// the guards below: one gate covers every backend, and a refusal leaves no storage
+		// behind. Non-literal defaults (a function call, `new.<col>`, a bare column reference)
+		// fold to `undefined` and stay deferred to write time, unchanged.
+		for (const col of baseTableSchema.columns) {
+			foldDefaultToType(col.defaultValue, col.logicalType, col.name);
+		}
 
 		// Refuse a CREATE TABLE carrying two user-written constraint names that collide —
 		// one case-folded name space across CHECK / UNIQUE / FK, so the same-class shape

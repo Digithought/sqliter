@@ -1008,6 +1008,8 @@ create table audit_records (
 );
 ```
 
+A DEFAULT that is a literal (as opposed to a function call, a `new.<column>` reference, or a bare column) is converted to the column's declared type at the point it is declared — `CREATE TABLE`, `ALTER TABLE ... ADD COLUMN`, or `ALTER TABLE ... ALTER COLUMN ... SET DEFAULT` — and stored already converted. A literal that cannot convert (e.g. `n integer default 'abc'`) is refused right there, rather than being accepted and failing on the first INSERT that relies on it.
+
 ### 7.6 FOREIGN KEY Constraint
 
 The foreign key constraint links tables together and ensures referential integrity.

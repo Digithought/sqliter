@@ -1,0 +1,119 @@
+-- A literal DEFAULT must be convertible to its own column's declared type.
+--
+-- Before this, `create table t (n integer default 'abc')` was accepted silently,
+-- and the first INSERT relying on the default failed with a type-conversion error
+-- blaming the insert rather than the declaration. `foldDefaultToType` (the same
+-- helper ADD COLUMN / SET NOT NULL backfill already route through) now runs for
+-- every column at CREATE TABLE time, before the module creates any storage.
+
+-- ============================================================
+-- 1. An unconvertible literal default rejects CREATE TABLE, across type families
+-- ============================================================
+
+create table t_int (id integer primary key, n integer default 'abc');
+-- error: Type conversion failed
+
+select name from schema() where type = 'table' and name = 't_int';
+→ []
+
+create table t_real (id integer primary key, n real default 'x');
+-- error: Type conversion failed
+
+select name from schema() where type = 'table' and name = 't_real';
+→ []
+
+create table t_date (id integer primary key, d date default 'not-a-date');
+-- error:
+
+select name from schema() where type = 'table' and name = 't_date';
+→ []
+
+create table t_json (id integer primary key, j json default '{');
+-- error:
+
+select name from schema() where type = 'table' and name = 't_json';
+→ []
+
+-- ============================================================
+-- 2. Convertible literals are still accepted, and stored already converted
+-- ============================================================
+
+create table t_conv (id integer primary key, n integer default '7', r real default -123.0);
+insert into t_conv (id) values (1);
+select n, typeof(n) as tn, r, typeof(r) as tr from t_conv where id = 1;
+→ [{"n":7,"tn":"integer","r":-123,"tr":"integer"}]
+drop table t_conv;
+-- run
+
+-- ============================================================
+-- 3. Non-foldable defaults are untouched — deferred to write time exactly as before
+-- ============================================================
+
+-- A function call.
+create table t_fn (id integer primary key, n integer default (abs(-3)));
+insert into t_fn (id) values (1);
+select n from t_fn where id = 1;
+→ [{"n":3}]
+drop table t_fn;
+-- run
+
+-- A `new.<col>` reference to a sibling.
+create table t_newref (id integer primary key, base integer, doubled integer default (new.base * 2));
+insert into t_newref (id, base) values (1, 10);
+select doubled from t_newref where id = 1;
+→ [{"doubled":20}]
+drop table t_newref;
+-- run
+
+-- A mutation-context variable default — not a literal, folds to `undefined`, and
+-- stays deferred; must not be confused with a NULL default.
+create table t_ctx (id integer primary key, n integer default markup) using memory with context (markup integer);
+insert into t_ctx (id) with context markup = 42 values (1);
+select n from t_ctx where id = 1;
+→ [{"n":42}]
+drop table t_ctx;
+-- run
+
+-- ============================================================
+-- 4. NULL default is always acceptable, on any type, and is not confused with a
+-- non-foldable (deferred) default.
+-- ============================================================
+
+create table t_null (id integer primary key, n integer null default null, d date null default null);
+insert into t_null (id) values (1);
+select n, d from t_null where id = 1;
+→ [{"n":null,"d":null}]
+drop table t_null;
+-- run
+
+-- ============================================================
+-- 5. `any`-typed columns accept every literal — the fold must not start rejecting them.
+-- ============================================================
+
+create table t_any (id integer primary key, v any default 'abc');
+insert into t_any (id) values (1);
+select v from t_any where id = 1;
+→ [{"v":"abc"}]
+drop table t_any;
+-- run
+
+-- ============================================================
+-- 6. `apply schema` (declarative-schema DDL) routes through the same createTable
+-- guard — a migration carrying a bad default fails the migration rather than
+-- deploying it.
+-- ============================================================
+
+declare schema xd_bad {
+	table t_migrated {
+		id INTEGER PRIMARY KEY,
+		n INTEGER DEFAULT 'abc'
+	}
+}
+
+-- run
+
+apply schema xd_bad;
+-- error: Type conversion failed
+
+select name from schema() where type = 'table' and name = 't_migrated';
+→ []

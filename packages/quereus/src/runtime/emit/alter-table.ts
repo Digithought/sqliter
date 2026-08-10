@@ -1485,6 +1485,11 @@ async function runAlterColumn(
 			action.columnName,
 			(n) => rctx.db.isCollationRegistered(n),
 		);
+		// The column's EXISTING stored default must remain convertible to the NEW type —
+		// otherwise the retype mints a column CREATE TABLE would refuse. Same rationale as
+		// the collation check above: engine-side and pre-module, so a refusal touches no
+		// storage. Remedy: DROP DEFAULT first, then retype.
+		foldDefaultToType(tableSchema.columns[colIndex].defaultValue, inferType(action.setDataType), action.columnName);
 	}
 
 	// Route a SET DEFAULT through the same DDL validator CREATE TABLE uses, so the
@@ -1496,6 +1501,11 @@ async function runAlterColumn(
 		rctx.db.schemaManager.validateAlterColumnDefault(
 			action.setDefault, action.columnName, tableSchema.name, hasMutationContext,
 		);
+		// The new default must be convertible to the column's CURRENT logical type — same
+		// gate CREATE TABLE runs, engine-side and pre-module so both backends agree and a
+		// refusal touches no storage. A non-literal default folds to `undefined` and stays
+		// deferred to write time, unchanged.
+		foldDefaultToType(action.setDefault, tableSchema.columns[colIndex].logicalType, action.columnName);
 	}
 
 	const module = requireVtabModule(tableSchema);

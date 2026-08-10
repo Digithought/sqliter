@@ -1565,10 +1565,14 @@ describe('Property-Based Tests', () => {
 
 		const identArb = fc.stringMatching(/^[a-z][a-z0-9_]{2,7}$/).filter(s => !RESERVED.has(s));
 		const colTypeArb = fc.constantFrom('integer', 'text');
-		const literalArb: fc.Arbitrary<{ sql: string; jsValue: unknown }> = fc.oneof(
-			fc.integer({ min: 0, max: 1000 }).map(n => ({ sql: String(n), jsValue: n })),
-			fc.stringMatching(/^[a-z0-9 ]{1,8}$/).map(s => ({ sql: `'${s}'`, jsValue: s })),
-		);
+		// Literal DEFAULTs must convert to the column's own declared type (CREATE TABLE
+		// now folds and validates every literal default against its column — see
+		// 7.3-default-literal-checked-against-column-type), so the generator is keyed by
+		// column type rather than picking an integer-or-text literal independent of it.
+		const literalArbFor = (type: 'integer' | 'text'): fc.Arbitrary<{ sql: string; jsValue: unknown }> =>
+			type === 'integer'
+				? fc.integer({ min: 0, max: 1000 }).map(n => ({ sql: String(n), jsValue: n }))
+				: fc.stringMatching(/^[a-z0-9 ]{1,8}$/).map(s => ({ sql: `'${s}'`, jsValue: s }));
 
 		/** A simple CHECK predicate against a single column. */
 		function checkExprArb(colName: string, type: 'integer' | 'text'): fc.Arbitrary<string> {
@@ -1609,11 +1613,11 @@ describe('Property-Based Tests', () => {
 					if (i === 0) {
 						return fc.constant<ColumnShape>({ name, type: 'integer', notNull: true });
 					}
-					return fc.record({
-						type: colTypeArb,
+					return colTypeArb.chain(type => fc.record({
+						type: fc.constant(type),
 						notNull: fc.boolean(),
-						defaultOpt: fc.option(literalArb, { nil: undefined }),
-					}).map(({ type, notNull, defaultOpt }): ColumnShape => ({
+						defaultOpt: fc.option(literalArbFor(type), { nil: undefined }),
+					})).map(({ type, notNull, defaultOpt }): ColumnShape => ({
 						name,
 						type,
 						notNull,

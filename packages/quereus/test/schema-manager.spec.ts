@@ -888,5 +888,32 @@ describe('Schema Manager', () => {
 			expect(db.schemaManager.getSchemaItem('aux', 't1')).to.be.undefined;
 		});
 	});
+
+	// ─────── importCatalog: legacy catalog with an unconvertible default ───────
+	describe('importCatalog rehydration bypasses the CREATE-TABLE default/type guard', () => {
+		it('reopens a persisted table whose stored default cannot convert to its column type', async () => {
+			// `create table` itself now refuses this (the guard this ticket adds), so the
+			// only way to produce such a catalog entry is to hand the DDL straight to
+			// importCatalog — exactly what a store rehydrating a database written before
+			// the guard existed would do. Rehydration must not brick the open.
+			//
+			// `importTable` (unlike `createTable`) calls `module.connect`, not
+			// `module.create` — it re-attaches to storage that must already exist under
+			// that name. So first create the table for real (a valid default, allocating
+			// the memory module's backing storage), then importCatalog a DDL string for
+			// the SAME table carrying the unconvertible default — mirroring how the
+			// module-name-canonicalization tests exercise the connect path by re-importing
+			// an already-created table's DDL.
+			await db.exec(`create table t_legacy (id integer primary key, n integer default 5)`);
+
+			const imported = await db.schemaManager.importCatalog([
+				`create table t_legacy (id integer primary key, n integer default 'abc')`,
+			]);
+
+			expect(imported.tables).to.deep.equal(['main.t_legacy']);
+			const table = db.schemaManager.getTable('main', 't_legacy');
+			expect(table, 'table imports despite the unconvertible default').to.exist;
+		});
+	});
 });
 
