@@ -214,6 +214,71 @@ describe('walkSchemaExpressionScope', () => {
 		});
 	});
 
+	// One case per node kind the walk's `switch` descends, asserting only WHICH
+	// leaves are reached and in what order — not the frame shape, which the
+	// clause-position cases above own. A merge (or a future edit) that drops an
+	// arm makes a leaf disappear here, which is the failure these guard.
+	describe('every descended node kind reaches its leaves', () => {
+		const cases: ReadonlyArray<[sql: string, names: string[]]> = [
+			['case a when b then c else d end', ['a', 'b', 'c', 'd']],
+			['case when a > b then c end', ['a', 'b', 'c']],
+			['x in (a, b)', ['x', 'a', 'b']],
+			['x in (select k from other)', ['x', 'k']],
+			['x between a and b', ['x', 'a', 'b']],
+			['(select k from other) > a', ['k', 'a']],
+			['cast(a as integer)', ['a']],
+			['a collate nocase', ['a']],
+			['-a', ['a']],
+			['not a', ['a']],
+			['coalesce(a, b + c)', ['a', 'b', 'c']],
+			['exists (select 1 from other o join other2 p on o.k = p.k where p.v > a)', ['k', 'k', 'v', 'a']],
+			['exists (select 1 from f(a, b))', ['a', 'b']],
+			['exists (select g from other group by g having sum(v) > a order by o limit l offset f)',
+				['g', 'g', 'v', 'a', 'o', 'l', 'f']],
+			['exists (select a from s1 union select b from s2)', ['a', 'b']],
+			['exists (select 1 from (values (a)) v)', ['a']],
+		];
+
+		for (const [sql, names] of cases) {
+			it(sql, () => {
+				expect(walkExpr(sql).map(r => r.name)).to.deep.equal(names);
+			});
+		}
+
+		// A ledger of every `AST.Expression` kind and how the walk treats it. Its
+		// value is the COMPILE-TIME exhaustiveness: a new expression node kind
+		// cannot enter the union without a decision recorded here, which is the
+		// only cheap guard against the silent failure mode — a node kind the walk
+		// does not descend hides a reference, and a hidden reference in a generated
+		// body means no dependency edge and a column computed before what it reads.
+		const EXPRESSION_KINDS: Record<AST.Expression['type'], 'descend' | 'leaf' | 'terminal'> = {
+			binary: 'descend',
+			unary: 'descend',
+			function: 'descend',
+			functionSource: 'descend',
+			cast: 'descend',
+			collate: 'descend',
+			subquery: 'descend',
+			windowFunction: 'descend',
+			case: 'descend',
+			in: 'descend',
+			exists: 'descend',
+			between: 'descend',
+			column: 'leaf',
+			identifier: 'leaf',
+			literal: 'terminal',
+			parameter: 'terminal',
+		};
+
+		it('reaches no leaf at all for the terminal kinds', () => {
+			const terminals = Object.entries(EXPRESSION_KINDS)
+				.filter(([, treatment]) => treatment === 'terminal')
+				.map(([kind]) => kind);
+			expect(terminals).to.deep.equal(['literal', 'parameter']);
+			expect(walkExpr('1 + ?')).to.deep.equal([]);
+		});
+	});
+
 	// The merge's behaviour-neutrality claim, checked on the analysis that gained
 	// traversal reach: the self-qualifier strip.
 	describe('the self-qualifier strip over the merged walk', () => {

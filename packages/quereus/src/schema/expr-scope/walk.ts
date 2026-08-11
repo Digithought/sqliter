@@ -238,6 +238,12 @@ function visitResultColumns(columns: ReadonlyArray<AST.ResultColumn> | undefined
  */
 function visitDml(stmt: AST.InsertStmt | AST.UpdateStmt | AST.DeleteStmt, state: WalkState): void {
 	withScopeFrame(state.stack, opaqueScopeFrame(), () => {
+		// NOTE: a DML-attached CTE's NAME is never registered on a frame (unlike
+		// `visitSelect`'s `withFrame`), so a `from <cte>` below reads as an askable
+		// real table source of that name. Inert only because the enclosing opaque
+		// frame already makes every leaf below undecidable / unstrippable; if the
+		// DML barrier is ever narrowed to something less than the whole statement,
+		// register the names on a frame here first.
 		stmt.withClause?.ctes.forEach(cte => visitBarrier(cte.query, state));
 		switch (stmt.type) {
 			case 'insert':
