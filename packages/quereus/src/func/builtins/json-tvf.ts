@@ -4,7 +4,15 @@ import { QuereusError } from "../../common/errors.js";
 import { StatusCode } from "../../common/types.js";
 import { coerceToJsonValue, evaluateJsonPathBasic, getJsonType } from "./json-helpers.js";
 import { jsonStringify } from "../../util/serialization.js";
-import { INTEGER_TYPE, TEXT_TYPE } from "../../types/builtin-types.js";
+import { ANY_TYPE, INTEGER_TYPE, TEXT_TYPE } from "../../types/builtin-types.js";
+
+// `key`, `value` and `atom` are declared ANY, not TEXT: the walkers below emit
+// them as the raw JSON scalars they encounter — `key` is a number for an array
+// index and a string for an object member; `value`/`atom` carry numbers,
+// booleans and strings verbatim (only a container `value` is stringified). A
+// TEXT declaration would announce a value space the rows do not inhabit; ANY
+// imposes no representation constraint and every consumer converts.
+const JSON_MEMBER_COLUMN = { typeClass: 'scalar', logicalType: ANY_TYPE, nullable: true, isReadOnly: true } as const;
 
 // JSON Each table-valued function
 export const jsonEachFunc = createTableValuedFunction(
@@ -17,10 +25,10 @@ export const jsonEachFunc = createTableValuedFunction(
 			isReadOnly: true,
 			isSet: false,
 			columns: [
-				{ name: 'key', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
-				{ name: 'value', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				{ name: 'key', type: JSON_MEMBER_COLUMN, generated: true },
+				{ name: 'value', type: JSON_MEMBER_COLUMN, generated: true },
 				{ name: 'type', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
-				{ name: 'atom', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				{ name: 'atom', type: JSON_MEMBER_COLUMN, generated: true },
 				{ name: 'id', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true }, generated: true },
 				{ name: 'parent', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: true, isReadOnly: true }, generated: true },
 				{ name: 'fullkey', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
@@ -129,10 +137,10 @@ export const jsonTreeFunc = createTableValuedFunction(
 			isReadOnly: true,
 			isSet: false,
 			columns: [
-				{ name: 'key', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
-				{ name: 'value', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				{ name: 'key', type: JSON_MEMBER_COLUMN, generated: true },
+				{ name: 'value', type: JSON_MEMBER_COLUMN, generated: true },
 				{ name: 'type', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
-				{ name: 'atom', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				{ name: 'atom', type: JSON_MEMBER_COLUMN, generated: true },
 				{ name: 'id', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true }, generated: true },
 				{ name: 'parent', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: true, isReadOnly: true }, generated: true },
 				{ name: 'fullkey', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },

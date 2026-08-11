@@ -244,8 +244,8 @@ describe('Plan shape: subquery decorrelation', () => {
 			// condition tree (it fails the equi-pair gate, so it cannot be the
 			// join's hash/merge key, but it must still be evaluated).
 			expect(
-				rows.some(r => r.node_type === 'Cast' && /AS INTEGER/i.test(r.detail)),
-				'expected a CAST(... AS INTEGER) node reconciling the comparison',
+				rows.some(r => r.node_type === 'Cast' && /AS NUMERIC/i.test(r.detail)),
+				'expected a CAST(... AS NUMERIC) node reconciling the comparison',
 			).to.equal(true);
 			expect(await allRows(db, q)).to.deep.equal([{ id: 1 }]);
 		});

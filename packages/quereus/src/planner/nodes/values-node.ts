@@ -1,5 +1,6 @@
-import type { RelationType } from '../../common/datatype.js';
+import type { RelationType, ScalarType } from '../../common/datatype.js';
 import type { Scope } from '../scopes/scope.js';
+import { mergeSetOpAdvertisedType } from '../analysis/set-op-type-merge.js';
 import { PlanNode, type ScalarPlanNode, type ZeroAryRelationalNode, type Attribute, type PhysicalProperties } from './plan-node.js';
 import { PlanNodeType } from './plan-node-type.js';
 import { Cached } from '../../util/cached.js';
@@ -51,11 +52,9 @@ export class ValuesNode extends PlanNode implements ZeroAryRelationalNode {
       };
     }
 
-    // Infer column types from the first row
-    const firstRow = this.rows[0];
-    const columns = firstRow.map((expr, index) => ({
+    const columns = this.rows[0].map((_, index) => ({
       name: this.columnNames?.[index] ?? `column_${index}`,
-      type: expr.getType(),
+      type: this.mergedColumnType(index),
       generated: false,
     }));
 
@@ -69,6 +68,27 @@ export class ValuesNode extends PlanNode implements ZeroAryRelationalNode {
     };
   }
 
+  /**
+   * The type one VALUES column may honestly advertise: every row's expression
+   * contributes a value UNCONVERTED, so the column is the same shape as a set
+   * operation's output column and folds by the same rules
+   * (`mergeSetOpAdvertisedType`). Typing from the first row alone announced
+   * INTEGER for `VALUES (1), (1.5)` while the second row yields a fraction.
+   */
+  private mergedColumnType(index: number): ScalarType {
+    const first = this.rows[0][index].getType();
+    let logicalType = first.logicalType;
+    let nullable = first.nullable;
+    for (let r = 1; r < this.rows.length; r++) {
+      const rowType = this.rows[r][index]?.getType();
+      if (!rowType) continue;
+      logicalType = mergeSetOpAdvertisedType(logicalType, rowType.logicalType);
+      nullable ||= rowType.nullable;
+    }
+    if (logicalType === first.logicalType && nullable === first.nullable) return first;
+    return { ...first, logicalType, nullable };
+  }
+
   private buildAttributes(): Attribute[] {
     if (this.rows.length === 0) {
       return [];
@@ -76,10 +96,10 @@ export class ValuesNode extends PlanNode implements ZeroAryRelationalNode {
 
     // Create attributes for each column
     const firstRow = this.rows[0];
-    return firstRow.map((expr, index) => ({
+    return firstRow.map((_expr, index) => ({
       id: PlanNode.nextAttrId(),
       name: this.columnNames?.[index] ?? `column_${index}`,
-      type: expr.getType(),
+      type: this.mergedColumnType(index),
       sourceRelation: `${this.nodeType}:${this.id}`
     }));
   }

@@ -5,7 +5,7 @@ import { createAggregateFunction } from '../registration.js';
 import { compareSqlValuesFast, createSemanticValueComparator, BINARY_COLLATION } from '../../util/comparison.js';
 import { canonicalizeInteger } from '../../util/numeric-canonical.js';
 import { valueToText } from '../../util/value-text.js';
-import { INTEGER_RETURN_NOT_NULL, REAL_RETURN, REAL_RETURN_NOT_NULL, TEXT_RETURN } from './return-types.js';
+import { INTEGER_RETURN_NOT_NULL, NUMERIC_RETURN, REAL_RETURN, REAL_RETURN_NOT_NULL, TEXT_RETURN } from './return-types.js';
 
 const log = createLogger('func:builtins:aggregate');
 const warnLog = log.extend('warn');
@@ -103,7 +103,12 @@ function addSumContribution(acc: SumAccumulator, value: number | bigint): SumAcc
 export const sumFunc = createAggregateFunction(
 	{
 		name: 'sum', numArgs: 1, initialValue: null,
-		returnType: REAL_RETURN,
+		// NUMERIC (number | bigint), not REAL, and deliberately NOT narrowed by the
+		// argument's static type: the exact/approx routing below is per-VALUE
+		// (`isExactIntegerDomain`), so even a REAL-typed argument whose rows happen to
+		// hold safe integers accumulates in the exact part and can finalize a `bigint`
+		// past 2^53 (`addWithPromotion`). No static argument type promises `number`.
+		returnType: NUMERIC_RETURN,
 		// NOTE: declared unconditionally; exactness under retraction is a value-domain
 		// property (floats drift) the function cannot see, so the write-side delta arm
 		// gates on the argument's static type before exploiting negate.

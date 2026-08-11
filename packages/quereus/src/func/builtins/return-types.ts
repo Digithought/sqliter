@@ -1,6 +1,6 @@
 import type { ScalarType } from '../../common/datatype.js';
 import type { LogicalType } from '../../types/logical-type.js';
-import { ANY_TYPE, BLOB_TYPE, BOOLEAN_TYPE, INTEGER_TYPE, REAL_TYPE, TEXT_TYPE } from '../../types/builtin-types.js';
+import { ANY_TYPE, BLOB_TYPE, BOOLEAN_TYPE, INTEGER_TYPE, NUMERIC_TYPE, REAL_TYPE, TEXT_TYPE } from '../../types/builtin-types.js';
 import { JSON_TYPE } from '../../types/json-type.js';
 
 /**
@@ -34,6 +34,9 @@ export const INTEGER_RETURN = scalarReturn(INTEGER_TYPE);
 export const INTEGER_RETURN_NOT_NULL = scalarReturn(INTEGER_TYPE, false);
 export const REAL_RETURN = scalarReturn(REAL_TYPE);
 export const REAL_RETURN_NOT_NULL = scalarReturn(REAL_TYPE, false);
+/** For a function whose result inhabits `number | bigint` — REAL's physical type,
+ *  but admitting an out-of-safe-range `bigint` by name (see `NUMERIC_TYPE`). */
+export const NUMERIC_RETURN = scalarReturn(NUMERIC_TYPE);
 export const BOOLEAN_RETURN = scalarReturn(BOOLEAN_TYPE);
 export const BOOLEAN_RETURN_NOT_NULL = scalarReturn(BOOLEAN_TYPE, false);
 export const BLOB_RETURN = scalarReturn(BLOB_TYPE);

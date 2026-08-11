@@ -60,6 +60,12 @@ function isBuiltinNumeric(t: LogicalType): boolean {
  */
 export function mergeSetOpColumnType(left: LogicalType, right: LogicalType): SetOpColumnTypeMerge {
 	// 1. Identical (the registry hands out one instance per type).
+	// NOTE: a schema that round-trips through persistence (observed once on the
+	// store module's rename path) can hold a NON-singleton LogicalType, which this
+	// identity compare — and rule 3's isBuiltinNumeric — then miss; the merge
+	// degrades to NUMERIC/ANY (over-wide, never wrong). If store-backed columns
+	// ever visibly advertise ANY where the types match, switch these to
+	// name-based comparison.
 	if (left === right) return { logicalType: left };
 
 	// 2. NULL is a member of every type; the other side's claim stands.

@@ -1,6 +1,6 @@
 import type { LogicalType } from './logical-type.js';
 import { PhysicalType } from './logical-type.js';
-import { NULL_TYPE, NUMERIC_TYPE } from './builtin-types.js';
+import { INTEGER_TYPE, NULL_TYPE, NUMERIC_TYPE } from './builtin-types.js';
 
 /**
  * THE type-level decision behind every comparison-site coercion: given the
@@ -80,7 +80,11 @@ const isObject = (type: LogicalType): boolean => type.physicalType === PhysicalT
  *    the conversion would only add a runtime hop.
  *
  * 2. **Numeric vs textual.** The textual operand converts to the numeric side's
- *    type (e.g. INTEGER or REAL) so the runtime can take the fast path.
+ *    type so the runtime can take the fast path — except an INTEGER side targets
+ *    NUMERIC: text names its numeric value in full (`'1e3'` is 1000, `'1.5'` is
+ *    1.5), and `INTEGER_TYPE.parse`'s leading-digit-prefix reading (`'1e3'` → 1,
+ *    `'1.5'` → 1) turned `1000 = '1e3'` false and `int_col = '1.5'` true.
+ *    NUMERIC parses the whole spelling and compares fine against INTEGER values.
  */
 export function crossTypeCoercion(left: LogicalType, right: LogicalType): CrossTypeCoercion | null {
 	const leftObject = isObject(left);
@@ -95,9 +99,19 @@ export function crossTypeCoercion(left: LogicalType, right: LogicalType): CrossT
 		return null;
 	}
 
-	if (left.isNumeric && right.isTextual) return { side: 'right', target: left };
-	if (right.isNumeric && left.isTextual) return { side: 'left', target: right };
+	if (left.isNumeric && right.isTextual) return { side: 'right', target: textCoercionTarget(left) };
+	if (right.isNumeric && left.isTextual) return { side: 'left', target: textCoercionTarget(right) };
 	return null;
+}
+
+/**
+ * The conversion target for a TEXT operand compared against a numeric one — the
+ * numeric side's own type, except INTEGER widens to NUMERIC (rule 2 above: the
+ * prefix parse must not decide a comparison). Matched by NAME: a schema
+ * round-tripped through persistence may hold a non-singleton instance.
+ */
+function textCoercionTarget(numeric: LogicalType): LogicalType {
+	return numeric.name === INTEGER_TYPE.name ? NUMERIC_TYPE : numeric;
 }
 
 /**
@@ -178,5 +192,8 @@ export function comparisonGroupCoercions(
  */
 function commonNumericType(valueTypes: readonly LogicalType[]): LogicalType {
 	const first = valueTypes[0];
-	return valueTypes.every(type => type === first) ? first : NUMERIC_TYPE;
+	// The hoisted cast lands on the TEXTUAL probe, so an all-INTEGER list still
+	// widens to NUMERIC (textCoercionTarget) — the prefix parse must not decide
+	// `text_col in (1, 2)` any more than it may decide `text_col = 1`.
+	return valueTypes.every(type => type === first) ? textCoercionTarget(first) : NUMERIC_TYPE;
 }

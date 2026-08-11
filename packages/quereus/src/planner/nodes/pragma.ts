@@ -6,7 +6,7 @@ import { expressionToString } from '../../emit/ast-stringify.js';
 import { PlanNode } from './plan-node.js';
 import type { RelationType } from '../../common/datatype.js';
 import type { Scope } from '../scopes/scope.js';
-import { TEXT_TYPE } from '../../types/builtin-types.js';
+import { ANY_TYPE, TEXT_TYPE } from '../../types/builtin-types.js';
 import { Cached } from '../../util/cached.js';
 import { addSingletonFd } from '../util/fd-utils.js';
 
@@ -43,9 +43,12 @@ export class PragmaPlanNode extends PlanNode implements RelationalPlanNode {
 				},
 				{
 					name: "value",
+					// ANY, not TEXT: pragma values surface in their natural form — a
+					// boolean for an on/off option, text for a name-valued one — and are
+					// not converted on the way out.
 					type: {
 						typeClass: 'scalar',
-						logicalType: TEXT_TYPE,
+						logicalType: ANY_TYPE,
 						nullable: false,
 					},
 					generated: true,

@@ -80,7 +80,8 @@ describe('materialized-view maintenance under a database-registered collation', 
 		// already in the backing table). `residualRowMatchesKey` must keep that row — a byte
 		// comparison would drop it and leave the backing sum stale.
 		await db.exec('create table src (id integer primary key, k text collate nocase not null, v integer not null)');
-		await db.exec('create table agg (k text collate nocase primary key, s real null) maintained as select k, sum(v) as s from src group by k');
+		// `numeric`, matching sum()'s NUMERIC return type (value space number | bigint).
+		await db.exec('create table agg (k text collate nocase primary key, s numeric null) maintained as select k, sum(v) as s from src group by k');
 		await db.exec("insert into src values (1, 'aa', 10)");
 		expect(await results(db, 'select k, s from agg')).to.deep.equal([{ k: 'aa', s: 10 }]);
 

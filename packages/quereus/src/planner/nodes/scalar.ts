@@ -8,8 +8,10 @@ import { Cached } from "../../util/cached.js";
 import { formatExpression, formatScalarType } from "../../util/plan-formatter.js";
 import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
-import { NULL_TYPE, INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, BLOB_TYPE, BOOLEAN_TYPE, ANY_TYPE } from "../../types/builtin-types.js";
-import { JSON_TYPE } from "../../types/json-type.js";
+import { NULL_TYPE, INTEGER_TYPE, NUMERIC_TYPE, REAL_TYPE, TEXT_TYPE, BOOLEAN_TYPE, ANY_TYPE } from "../../types/builtin-types.js";
+import { inferLogicalTypeFromValue } from "../../common/type-inference.js";
+import { TIMESPAN_TYPE } from "../../types/temporal-types.js";
+import { mergeSetOpAdvertisedType } from "../analysis/set-op-type-merge.js";
 import { typeRegistry } from "../../types/registry.js";
 import { temporalOpCaseForTypes } from "../../types/temporal-ops.js";
 import { castedScalarType } from "../../types/cast-semantics.js";
@@ -50,9 +52,20 @@ export class UnaryOpNode extends PlanNode implements UnaryScalarNode {
 				nullable = false; // IS [NOT] NULL/TRUE/FALSE are total — never return null
 				break;
 			case '-':
-			case '+':
-				// Numeric unary operators preserve type
+			case '+': {
+				// A numeric or TIMESPAN operand negates/passes through in its own type.
+				// Any other operand is value-sniffed per row (`runtime/emit/unary.ts`):
+				// a duration string yields a TIMESPAN string, numeric text its number,
+				// anything else null — ANY is the honest announcement, nullable because
+				// of that null. The old rule preserved the operand's type, so
+				// `select -'42'` announced TEXT while producing the number -42.
+				const operandLogical = operandType.logicalType;
+				if (!operandLogical.isNumeric && operandLogical !== TIMESPAN_TYPE) {
+					logicalType = ANY_TYPE;
+					nullable = true;
+				}
 				break;
+			}
 			case '~':
 				// Bitwise NOT - results in integer
 				logicalType = INTEGER_TYPE;
@@ -199,6 +212,24 @@ export class BinaryOpNode extends PlanNode implements BinaryScalarNode {
 				logicalType = BOOLEAN_TYPE;
 				break;
 			case 'arithmetic': {
+				// Arithmetic can produce NULL from non-null operands: `buildNumericOpSpec`
+				// nulls any non-finite result (`1/0`, `%` by zero, REAL overflow to
+				// Infinity) and `runTemporalCase` nulls a value its kind cannot parse — so
+				// `left.nullable || right.nullable` under-claimed (`select 1/0` announced
+				// non-nullable and produced null). The one closed shape is +, -, * over
+				// two INTEGERs: the number path cannot reach Infinity from safe-integer
+				// magnitudes and the bigint path is exact, so only there does the
+				// operand-derived nullability stand (which the lens prover relies on to
+				// prove a computed `v + 1` column NOT NULL).
+				// By NAME, like the promotion checks below — a schema round-tripped
+				// through persistence may hold a non-singleton LogicalType instance.
+				const bothInteger = leftType.logicalType.name === 'INTEGER' && rightType.logicalType.name === 'INTEGER';
+				const closedOverIntegers = this.expression.operator === '+'
+					|| this.expression.operator === '-'
+					|| this.expression.operator === '*';
+				if (!(bothInteger && closedOverIntegers)) {
+					nullable = true;
+				}
 				// Temporal arithmetic first: the one table both the planner and the
 				// evaluator read (types/temporal-ops.ts) says what each supported
 				// (operator, kind, kind) combination produces — `date - date` is a
@@ -214,9 +245,26 @@ export class BinaryOpNode extends PlanNode implements BinaryScalarNode {
 				// Rules: INTEGER + INTEGER -> INTEGER, INTEGER + REAL -> REAL, REAL + REAL -> REAL
 				if (leftType.logicalType.isNumeric && rightType.logicalType.isNumeric) {
 					// Both operands are numeric
-					if (leftType.logicalType.name === 'REAL' || rightType.logicalType.name === 'REAL') {
-						// If either is REAL, result is REAL
-						logicalType = REAL_TYPE;
+					if (leftType.logicalType.name === 'NUMERIC' || rightType.logicalType.name === 'NUMERIC') {
+						// A NUMERIC operand's value space is `number | bigint`, so no
+						// arithmetic over it can promise anything narrower.
+						logicalType = NUMERIC_TYPE;
+					} else if (leftType.logicalType.name === 'REAL' || rightType.logicalType.name === 'REAL') {
+						// REAL + REAL stays REAL (both operand value spaces are `number`
+						// only, and the number path yields a number or null). A MIXED
+						// INTEGER/REAL pair announces NUMERIC: the runtime keeps a bigint
+						// INTEGER operand in the bigint domain when the REAL side holds an
+						// integral value (`mixedBigIntArithmetic`), so
+						// `int_col + real_col` over (9007199254740993, 2.0) returns a
+						// bigint — outside what REAL claims.
+						logicalType = leftType.logicalType.name === rightType.logicalType.name
+							? REAL_TYPE
+							: NUMERIC_TYPE;
+					} else if (this.expression.operator === '/') {
+						// INTEGER / INTEGER is real division on the number path (1/2 → 0.5)
+						// and truncating division on the bigint path (`buildNumericOpSpec`) —
+						// NUMERIC (number | bigint) is the only builtin space covering both.
+						logicalType = NUMERIC_TYPE;
 					} else {
 						// Both are INTEGER, result is INTEGER
 						logicalType = INTEGER_TYPE;
@@ -411,68 +459,31 @@ export class LiteralNode extends PlanNode implements ZeroAryScalarNode, Constant
 		if (this.explicitType) {
 			return this.explicitType;
 		}
+		// The ONE value⇒type mapping (common/type-inference.ts): an integral `number`
+		// is INTEGER (it inhabits INTEGER's value space as-is), a fractional one REAL,
+		// an object/array a JSON document. This method used to open-code a divergent
+		// copy that mapped every `number` to REAL, so `select 1 as v` announced REAL
+		// for an integer — and the arithmetic promotion above turned
+		// `9007199254740993 + 1` (bigint + number) into a REAL-announced bigint.
 		const value = this.expression.value;
-		if (value === null) {
+		// A folding pass may store a still-pending Promise (async subquery constant);
+		// its eventual value is unknown here, so ANY — a folder that does know the
+		// type threads `explicitType`. (The deleted mapping let a bare Promise fall
+		// into its `typeof === 'object'` arm and announced JSON.)
+		if (value instanceof Promise) {
 			return {
 				typeClass: 'scalar',
-				logicalType: NULL_TYPE,
+				logicalType: ANY_TYPE,
 				nullable: true,
 				isReadOnly: true,
 			};
 		}
-		if (typeof value === 'number') {
-			return {
-				typeClass: 'scalar',
-				logicalType: REAL_TYPE,
-				nullable: false,
-				isReadOnly: true,
-			};
-		}
-		if (typeof value === 'bigint') {
-			return {
-				typeClass: 'scalar',
-				logicalType: INTEGER_TYPE,
-				nullable: false,
-				isReadOnly: true,
-			};
-		}
-		if (typeof value === 'string') {
-			return {
-				typeClass: 'scalar',
-				logicalType: TEXT_TYPE,
-				nullable: false,
-				isReadOnly: true,
-			};
-		}
-		if (typeof value === 'boolean') {
-			return {
-				typeClass: 'scalar',
-				logicalType: BOOLEAN_TYPE,
-				nullable: false,
-				isReadOnly: true,
-			};
-		}
-		if (value instanceof Uint8Array) {
-			return {
-				typeClass: 'scalar',
-				logicalType: BLOB_TYPE,
-				nullable: false,
-				isReadOnly: true,
-			};
-		}
-		// Native object/array: the only logical type whose physical representation is
-		// PhysicalType.OBJECT is JSON, so an untyped object-valued literal is a JSON
-		// document. Reached when a rule rebuilds a literal from a plain constant value
-		// (e.g. an index seek key) without threading the source ScalarType through.
-		if (typeof value === 'object') {
-			return {
-				typeClass: 'scalar',
-				logicalType: JSON_TYPE,
-				nullable: false,
-				isReadOnly: true,
-			};
-		}
-		quereusError(`Unknown literal type ${typeof value}`, StatusCode.INTERNAL);
+		return {
+			typeClass: 'scalar',
+			logicalType: inferLogicalTypeFromValue(value),
+			nullable: value === null,
+			isReadOnly: true,
+		};
 	}
 
 	getValue(): OutputValue {
@@ -556,13 +567,18 @@ export class CaseExprNode extends PlanNode implements NaryScalarNode {
 			};
 		}
 
-		// Use the first result expression as the base type
+		// A CASE result column carries values from several branches, none of which is
+		// converted — exactly the shape of a set operation's output column, so the
+		// advertised type folds by the same rules (`mergeSetOpAdvertisedType`):
+		// identical types keep theirs, NULL yields to the other side, differing
+		// builtin numerics merge to NUMERIC, an irreconcilable pair is ANY. The old
+		// "arms differ ⇒ TEXT" rule announced TEXT for
+		// `case when 0 then 'x' else 300 end`, which produces the number 300.
 		const firstType = resultExpressions[0].getType();
 		let logicalType = firstType.logicalType;
 		let nullable = firstType.nullable;
 		let isReadOnly = firstType.isReadOnly;
 
-		// Check all other result expressions for type compatibility
 		for (let i = 1; i < resultExpressions.length; i++) {
 			const exprType = resultExpressions[i].getType();
 
@@ -576,11 +592,7 @@ export class CaseExprNode extends PlanNode implements NaryScalarNode {
 				isReadOnly = true;
 			}
 
-			// TODO: Implement proper type coercion rules for SQL
-			// For now, if types differ, default to TEXT
-			if (exprType.logicalType !== logicalType) {
-				logicalType = TEXT_TYPE;
-			}
+			logicalType = mergeSetOpAdvertisedType(logicalType, exprType.logicalType);
 		}
 
 		// Branch collations merge by provenance rank (order-independent);

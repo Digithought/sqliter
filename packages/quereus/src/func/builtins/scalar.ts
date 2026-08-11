@@ -2,7 +2,8 @@ import type { SqlValue, DeepReadonly } from '../../common/types.js';
 import { createScalarFunction } from '../registration.js';
 import { compareSqlValues, getSqlDataTypeName } from '../../util/comparison.js';
 import type { LogicalType } from '../../types/logical-type.js';
-import { ANY_TYPE, INTEGER_TYPE, NULL_TYPE, REAL_TYPE, isNumericOrUnknownType } from '../../types/builtin-types.js';
+import { ANY_TYPE, isNumericOrUnknownType } from '../../types/builtin-types.js';
+import { mergeSetOpAdvertisedType } from '../../planner/analysis/set-op-type-merge.js';
 import type { CustomEmitterHook } from '../../schema/function.js';
 import type { ScalarFunctionCallNode } from '../../planner/nodes/function.js';
 import type { EmissionContext } from '../../runtime/emission-context.js';
@@ -15,49 +16,23 @@ import type { ComparisonGroup } from '../../runtime/emit/operand-comparator.js';
 import { makeComparisonGroup, makeGroupComparator, makeOperandComparator, formatOperandCollationNote } from '../../runtime/emit/operand-comparator.js';
 
 /**
- * Find the common type among multiple logical types.
- * This implements type promotion rules for polymorphic functions.
- *
- * Rules:
- * 1. If all types are the same, return that type
- * 2. If mixing INTEGER and REAL, return REAL (numeric promotion)
- * 3. Otherwise, return the first type (conservative approach)
- *
- * @param types Array of logical types to find common type for
- * @returns The common logical type
+ * The type a value-returning polymorphic builtin (coalesce, iif, choose,
+ * greatest/least) may honestly advertise for a group of
+ * argument types: one result position carrying an UNCONVERTED value from any of
+ * several branches — the same shape as a set operation's output column — so the
+ * fold reuses the set-op merge rules (`mergeSetOpAdvertisedType`): identical
+ * types keep theirs, NULL yields to the other side, differing builtin numerics
+ * merge to NUMERIC (the value space `number | bigint` the mixed branches
+ * actually inhabit — NOT arithmetic's INTEGER + REAL → REAL, which describes one
+ * converted value), and an irreconcilable pair is ANY. The previous fallback
+ * returned the FIRST type for a mixed-category group, so
+ * `coalesce(int_col, text_col)` advertised INTEGER while returning the text —
+ * the statement-egress representation check (`QUEREUS_REPR_STRICT`) now trusts
+ * announced types, so that dishonesty is no longer benign.
  */
 function findCommonType(types: ReadonlyArray<DeepReadonly<LogicalType>>): DeepReadonly<LogicalType> {
 	if (types.length === 0) return ANY_TYPE;
-	if (types.length === 1) return types[0];
-
-	// Check if all types are the same
-	const firstType = types[0];
-	const allSame = types.every(t => t.name === firstType.name);
-	if (allSame) return firstType;
-
-	// Check for numeric type promotion (INTEGER + REAL -> REAL)
-	const allNumeric = types.every(t => t.isNumeric === true);
-	if (allNumeric) {
-		// If any type is REAL, return REAL
-		const hasReal = types.some(t => t.name === 'REAL');
-		if (hasReal) return REAL_TYPE;
-		// All INTEGER
-		return INTEGER_TYPE;
-	}
-
-	// For non-numeric types, return the first type (conservative)
-	// NOTE: this fallback is DISHONEST for a value-returning function over a
-	// mixed-category group — `coalesce(int_col, text_col)` advertises INTEGER while
-	// it can return the text. Benign today because the write path converts or
-	// rejects rather than storing the wrong storage class (`insert into int_col
-	// select coalesce(null, text_col)` converts; a VALUES insert of unconvertible
-	// text raises `Type conversion failed`), and no reader trusts the declared type
-	// over the runtime value. `greatest`/`least` opted out via `extremumReturnType`
-	// because their fix made the divergence newly *visible*. If a consumer ever
-	// starts trusting a declared type without re-checking the value — a storage
-	// encoder keyed off it, say — every caller here (coalesce, iif, choose) needs
-	// the same ANY_TYPE treatment.
-	return firstType;
+	return types.reduce((merged, t) => mergeSetOpAdvertisedType(merged as LogicalType, t as LogicalType));
 }
 
 // --- abs(X) ---
@@ -510,32 +485,10 @@ function emitExtremum(direction: 1 | -1): CustomEmitterHook {
 	};
 }
 
-/**
- * Declared return type of `greatest`/`least`. The fold returns one of its
- * arguments verbatim (`returnsArg`), so the declaration must cover every argument
- * it could pick: only an all-same or an all-numeric group has a type that does.
- * A mixed-category group (`greatest(int_col, '2')` can return the text `'2'`)
- * declares ANY rather than {@link findCommonType}'s first-argument fallback, which
- * would advertise INTEGER for a value that is text.
- *
- * A NULL-typed argument contributes no value the declaration has to cover — the
- * only thing it can win with is NULL, which `nullable: true` already allows — so
- * it is dropped before the test rather than dragged into a mixed-category ANY:
- * `greatest(int_col, null)` stays INTEGER.
- */
-function extremumReturnType(
-	argTypes: ReadonlyArray<DeepReadonly<LogicalType>>,
-): DeepReadonly<LogicalType> {
-	const valued = argTypes.filter(t => t.name !== NULL_TYPE.name);
-	// Nothing but NULLs (or no arguments at all) — findCommonType already answers
-	// NULL / ANY respectively.
-	if (valued.length === 0) return findCommonType(argTypes);
-	const allSame = valued.every(t => t.name === valued[0].name);
-	const allNumeric = valued.every(t => t.isNumeric === true);
-	return allSame || allNumeric ? findCommonType(valued) : ANY_TYPE;
-}
-
-// Greatest-of function
+// Greatest-of function. `returnsArg` — the declaration must cover every argument
+// the fold could return verbatim, which is exactly `findCommonType`'s merge (a
+// NULL-typed argument can only win with NULL, which `nullable: true` covers, and
+// the merge's NULL rule drops it the same way).
 export const greatestFunc = createScalarFunction(
 	{
 		name: 'greatest',
@@ -546,7 +499,7 @@ export const greatestFunc = createScalarFunction(
 		// Type inference: the common type when every argument shares one, else ANY
 		inferReturnType: (argTypes) => ({
 			typeClass: 'scalar',
-			logicalType: extremumReturnType(argTypes),
+			logicalType: findCommonType(argTypes),
 			nullable: true,
 			isReadOnly: true
 		})
@@ -576,7 +529,7 @@ export const leastFunc = createScalarFunction(
 		// Type inference: the common type when every argument shares one, else ANY
 		inferReturnType: (argTypes) => ({
 			typeClass: 'scalar',
-			logicalType: extremumReturnType(argTypes),
+			logicalType: findCommonType(argTypes),
 			nullable: true,
 			isReadOnly: true
 		})

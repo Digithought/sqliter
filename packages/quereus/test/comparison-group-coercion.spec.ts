@@ -25,7 +25,7 @@ import { Parser } from '../src/parser/parser.js';
 import type * as AST from '../src/parser/ast.js';
 import type { ScalarType } from '../src/common/datatype.js';
 import type { LogicalType } from '../src/types/logical-type.js';
-import { INTEGER_TYPE, TEXT_TYPE } from '../src/types/builtin-types.js';
+import { INTEGER_TYPE, NUMERIC_TYPE, TEXT_TYPE } from '../src/types/builtin-types.js';
 import { PlanNode } from '../src/planner/nodes/plan-node.js';
 import { CastNode } from '../src/planner/nodes/scalar.js';
 import { ScalarFunctionCallNode } from '../src/planner/nodes/function.js';
@@ -38,8 +38,10 @@ const scalarType = (logicalType: LogicalType): ScalarType =>
 describe('comparison group coercion', () => {
 	describe('makeComparisonGroup', () => {
 		it('converts the textual probe over an all-numeric group', () => {
+			// The hoisted probe cast targets NUMERIC even over an all-INTEGER list, so
+			// INTEGER's prefix parse ('1.9' → 1) cannot decide the comparison.
 			const group = makeComparisonGroup([scalarType(TEXT_TYPE), scalarType(INTEGER_TYPE)], [0, 1]);
-			expect(group.types[0].logicalType.name).to.equal(INTEGER_TYPE.name);
+			expect(group.types[0].logicalType.name).to.equal(NUMERIC_TYPE.name);
 			expect(group.types[1].logicalType.name).to.equal(INTEGER_TYPE.name);
 			expect(group.key(0, '3')).to.equal(3);
 			expect(group.key(1, 3)).to.equal(3);
@@ -57,7 +59,7 @@ describe('comparison group coercion', () => {
 				[scalarType(TEXT_TYPE), scalarType(TEXT_TYPE), scalarType(INTEGER_TYPE)],
 				[0, 2],
 			);
-			expect(group.types[0].logicalType.name).to.equal(INTEGER_TYPE.name);
+			expect(group.types[0].logicalType.name).to.equal(NUMERIC_TYPE.name);
 			expect(group.types[1].logicalType.name).to.equal(TEXT_TYPE.name);
 			expect(group.key(0, '3')).to.equal(3);
 			expect(group.key(1, '3')).to.equal('3');

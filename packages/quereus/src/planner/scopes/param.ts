@@ -4,13 +4,18 @@ import { BaseScope } from './base.js';
 import { Ambiguous, type Scope } from './scope.js';
 import type { ScalarType } from '../../common/datatype.js';
 import type { PlanNode } from '../nodes/plan-node.js';
-import { TEXT_TYPE } from '../../types/builtin-types.js';
+import { ANY_TYPE } from '../../types/builtin-types.js';
 import { normalizeParamKey } from '../../core/param.js';
 
-// Default type for parameters when not otherwise specified.
+// The type of a parameter with no declared type and no bind-time hint. A '?'
+// unbound at plan time has no knowable concrete type by construction, and ANY is
+// the honest announcement: it imposes no representation constraint, its `parse`
+// is pass-through, and it is never identical to a declared column type, so
+// consumers convert. (This used to be TEXT — an arbitrary guess that made
+// `select ? as v` announce TEXT and yield whatever was bound.)
 const DEFAULT_PARAMETER_TYPE: ScalarType = {
 	typeClass: 'scalar',
-	logicalType: TEXT_TYPE,
+	logicalType: ANY_TYPE,
 	nullable: true,
 };
 

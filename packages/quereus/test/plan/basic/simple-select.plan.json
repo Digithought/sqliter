@@ -202,7 +202,7 @@
                   "children": [],
                   "detail": "25",
                   "logical": {
-                    "resultType": "REAL",
+                    "resultType": "INTEGER",
                     "value": 25
                   },
                   "nodeType": "Literal",

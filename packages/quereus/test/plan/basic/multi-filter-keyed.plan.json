@@ -224,7 +224,7 @@
                       "children": [],
                       "detail": "1",
                       "logical": {
-                        "resultType": "REAL",
+                        "resultType": "INTEGER",
                         "value": 1
                       },
                       "nodeType": "Literal",
@@ -277,7 +277,7 @@
                       "children": [],
                       "detail": "20",
                       "logical": {
-                        "resultType": "REAL",
+                        "resultType": "INTEGER",
                         "value": 20
                       },
                       "nodeType": "Literal",

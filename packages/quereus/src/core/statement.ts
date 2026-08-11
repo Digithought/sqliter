@@ -482,22 +482,27 @@ export class Statement {
 		// (an arithmetic path that forgot to narrow) — the scan, write and UDF seams all
 		// sit upstream of it.
 		//
-		// R1 ONLY, deliberately — hence the empty declared-type array, which puts every
-		// cell on `assertRowConforms`'s untyped-position path. R2 is a rule about
-		// *declared* types — a column's DDL type — and a projection's `ScalarType` is not
-		// one: it is the planner's static INFERENCE, and the engine never coerces a
-		// projection's output to it. The two legitimately disagree all over the suite
-		// (`select ? as v` infers TEXT for an untyped parameter and yields a number; a
-		// comparison infers TEXT and yields a boolean; `sum(v)` infers REAL and yields a
-		// bigint past 2^53). Asserting R2 here would report the inference, not a
-		// representation defect. The declared-type checks live at the seams that actually
-		// have a declared type: the vtab scan and the DML write.
+		// R1 ONLY, for now — hence the empty declared-type array, which puts every cell
+		// on `assertRowConforms`'s untyped-position path. A result column's announced
+		// type (a `ScalarType` inference, reachable via `getColumnDefs()`) now agrees
+		// with the values the column produces everywhere the suite exercises, EXCEPT one
+		// wrong-VALUE defect this seam must not paper over: `coerceAggregateValue`
+		// (util/coercion.ts) converts numeric-looking text before min/max, so
+		// `min(text_col)` announces TEXT (correctly) and yields a number (wrongly) —
+		// tracked as `backlog/bug-text-coercion-in-arithmetic-and-aggregates` (arm B),
+		// with two suite sites (test/logic/14-utilities.sqllogic min(amount),
+		// test/logic/25-aggregate-edge-cases.sqllogic mn). Once that lands, widen this
+		// check to R2 by passing `this.columnDefCache.value.map(col => col.type.logicalType)`
+		// instead of NO_DECLARED_TYPES (and delete the constant); the rest of the suite
+		// already passes under that widening (ticket
+		// `4-remaining-scalar-result-types-and-repr-net`, measured 2026-08-11).
 		//
-		// NOTE: the inferred scalar type disagreeing with the runtime storage class is not
-		// only embedder-visible metadata — `emitInsert` builds its declared-type coercion
-		// from the source expression's static type and SKIPS a cell whose static type
-		// already equals the column's, so a disagreement there stores a non-conforming
-		// value. Tracked as `backlog/bug-inferred-scalar-type-disagrees-with-runtime-value`.
+		// The announced NULLABILITY flag is a separate axis this seam does not check:
+		// R2 admits null in every position. A measurement run asserting "announced
+		// non-nullable ⇒ no null cell" found ~28 violations across several classes
+		// (builtins whose `inferReturnType` claims non-nullable while nulling on a null
+		// argument, outer-join columns not widened, empty scalar subqueries) — see
+		// `backlog/debt-announced-nullability-disagrees-with-produced-nulls`.
 		const reprNames = REPR_STRICT ? this.columnDefCache.value.map(col => col.name) : undefined;
 		for await (const row of source) {
 			if (signal) throwIfAborted(signal);

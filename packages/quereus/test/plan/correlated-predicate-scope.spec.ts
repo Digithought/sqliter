@@ -111,7 +111,7 @@ describe('Plan shape: a correlated subquery predicate stays in its own scope', (
 	it('does not place a Filter on an inner column over the outer scan', () => {
 		const prog = topLevelProgram(db, ORDERED);
 		expect(prog, 'the hoisted copy of the inner comparison must not appear over the scan of `a`')
-			.to.not.contain('filter(cast(t.s as integer) = a.i)');
+			.to.not.contain('filter(cast(t.s as numeric) = a.i)');
 		expect(filterCount(prog), 'the only top-level filter is the EXISTS predicate itself')
 			.to.equal(1);
 		expect(prog, 'and that one filter is the EXISTS')
@@ -130,7 +130,7 @@ describe('Plan shape: a correlated subquery predicate stays in its own scope', (
 		// relation, not the original. Its rendering also pins the `wrapInCast` AST fix:
 		// the synthesized cast used to print its placeholder as `cast(null as integer)`.
 		expect(programOf(db, ORDERED), 'the inner comparison lives in the EXISTS sub-program')
-			.to.contain('filter(cast(t.s as integer) = a.i)');
+			.to.contain('filter(cast(t.s as numeric) = a.i)');
 	});
 
 	it('returns the same rows with and without the absorbed ORDER BY', async () => {
@@ -145,7 +145,7 @@ describe('Plan shape: a correlated subquery predicate stays in its own scope', (
 		// mentions `t.s`, so match on the hoisted *comparison* instruction, not on the name.
 		const sql = 'select a.id from a where not exists (select 1 from t where t.s = a.i) order by a.id';
 		const prog = topLevelProgram(db, sql);
-		expect(prog).to.not.contain('filter(cast(t.s as integer) = a.i)');
+		expect(prog).to.not.contain('filter(cast(t.s as numeric) = a.i)');
 		expect(filterCount(prog), 'only the NOT EXISTS filter').to.equal(1);
 		const rows = await collect(db, sql);
 		expect(rows.map(r => r.id)).to.deep.equal([3]);

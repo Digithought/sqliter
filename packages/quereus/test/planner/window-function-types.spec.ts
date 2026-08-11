@@ -223,8 +223,9 @@ describe('Planner: window function types', () => {
 		//   row 1 (id=1) — out-of-range → default 'X'
 		//   row 2 (id=2) — in-range → prior v = 'a'
 		//   row 3 (id=3) — in-range → prior v = 'b'
-		// Also confirms a differing-type default (integer 0) types as TEXT and
-		// returns the integer as the boundary value.
+		// Also confirms a differing-type default (integer 0) folds into the
+		// announced type — TEXT value ∪ INTEGER default merges to ANY (set-op
+		// merge rules) — and returns the integer as the boundary value.
 		const rows: Record<string, unknown>[] = [];
 		for await (const r of db.eval("select lag(v, 1, 'X') over (order by id) as lg from t")) {
 			rows.push(r);
@@ -233,9 +234,10 @@ describe('Planner: window function types', () => {
 		expect(rows[1].lg).to.equal('a');
 		expect(rows[2].lg).to.equal('b');
 
-		// Mismatched-type default: lag(v, 1, 0) — plan types TEXT, boundary yields 0
+		// Mismatched-type default: lag(v, 1, 0) — TEXT value ∪ INTEGER default has
+		// no principled common type, so the plan announces ANY; boundary yields 0.
 		const planTypes = getWindowFunctionTypesFromPlan('select lag(v, 1, 0) over (order by id) as lg from t');
-		expect(planTypes.some(t => t.fn.toLowerCase() === 'lag' && t.resultType === 'TEXT'), JSON.stringify(planTypes)).to.equal(true);
+		expect(planTypes.some(t => t.fn.toLowerCase() === 'lag' && t.resultType === 'ANY'), JSON.stringify(planTypes)).to.equal(true);
 
 		const rows2: Record<string, unknown>[] = [];
 		for await (const r of db.eval('select lag(v, 1, 0) over (order by id) as lg from t')) {

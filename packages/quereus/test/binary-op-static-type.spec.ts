@@ -134,8 +134,12 @@ describe('BinaryOpNode static type', () => {
 		});
 
 		it('keeps the numeric-promotion arm', async () => {
-			expect(findBinary('select 1 + 2 as v').getType().logicalType.isNumeric).to.equal(true);
-			expect(findBinary('select 1 + 2.5 as v').getType().logicalType.name).to.equal('REAL');
+			expect(findBinary('select 1 + 2 as v').getType().logicalType.name).to.equal('INTEGER');
+			expect(findBinary('select 1.5 + 2.5 as v').getType().logicalType.name).to.equal('REAL');
+			// Mixed INTEGER/REAL announces NUMERIC, not REAL: the runtime keeps a
+			// bigint INTEGER operand in the bigint domain when the REAL side is
+			// integral, so the result inhabits number | bigint.
+			expect(findBinary('select 1 + 2.5 as v').getType().logicalType.name).to.equal('NUMERIC');
 		});
 
 		it('keeps the temporal-operation-table arm', async () => {

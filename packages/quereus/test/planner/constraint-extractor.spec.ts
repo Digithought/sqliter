@@ -1270,8 +1270,8 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 	// CAST wrapping: a no-op cast is value-preserving and may be stripped;
 	// a converting cast changes the compared value and must block pushdown.
 	// `colRef` is INTEGER-typed, so castNode(col, 'INTEGER') is a no-op and
-	// castNode(col) (default TEXT) converts. A `lit(n)` JS number types as REAL,
-	// so its no-op cast target is 'REAL'. Regression cover for
+	// castNode(col) (default TEXT) converts. A `lit(n)` integral JS number types
+	// as INTEGER, so its no-op cast target is 'INTEGER'. Regression cover for
 	// `bug-cast-stripped-from-seek-constraints`.
 	// ===================================================================
 	describe('CAST wrapping — no-op strips, converting cast blocks extraction', () => {
@@ -1303,7 +1303,7 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 
 		it('col = no-op CAST(lit) → extracts with the literal value', () => {
 			const col = colRef(101, 'a', 1);
-			const expr = binOp('=', col, castNode(lit(42), 'REAL'));
+			const expr = binOp('=', col, castNode(lit(42), 'INTEGER'));
 			const result = extractConstraints(expr, [TABLE_A]);
 			expect(result.allConstraints).to.have.length(1);
 			expect(result.allConstraints[0].op).to.equal('=');
@@ -1324,7 +1324,7 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 
 		it('no-op CAST(col) = no-op CAST(lit) → extracts through both', () => {
 			const col = colRef(101, 'a', 1);
-			const expr = binOp('=', castNode(col, 'INTEGER'), castNode(lit(7), 'REAL'));
+			const expr = binOp('=', castNode(col, 'INTEGER'), castNode(lit(7), 'INTEGER'));
 			const result = extractConstraints(expr, [TABLE_A]);
 			expect(result.allConstraints).to.have.length(1);
 			expect(result.allConstraints[0].value).to.equal(7);
@@ -1340,7 +1340,7 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 
 		it('no-op CAST(lit) < col → flip works through cast', () => {
 			const col = colRef(101, 'a', 1);
-			const expr = binOp('<', castNode(lit(3), 'REAL'), col);
+			const expr = binOp('<', castNode(lit(3), 'INTEGER'), col);
 			const result = extractConstraints(expr, [TABLE_A]);
 			expect(result.allConstraints).to.have.length(1);
 			expect(result.allConstraints[0].op).to.equal('>');
@@ -1531,7 +1531,7 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 
 		it('col IN (no-op CAST(lit)) → extracts with the literal value', () => {
 			const col = colRef(101, 'a', 1);
-			const expr = inNode(col, [castNode(lit(1), 'REAL')]);
+			const expr = inNode(col, [castNode(lit(1), 'INTEGER')]);
 			const result = extractConstraints(expr, [TABLE_A]);
 			expect(result.allConstraints).to.have.length(1);
 			expect(result.allConstraints[0].op).to.equal('IN');
@@ -3041,7 +3041,7 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 
 		it('col(left) = no-op cast(lit)(right) → nonLiteral true but valueSide is literal', () => {
 			const col = colRef(101, 'a', 1);
-			const expr = binOp('=', col, castNode(lit(42), 'REAL'));
+			const expr = binOp('=', col, castNode(lit(42), 'INTEGER'));
 			const result = extractConstraints(expr, [TABLE_A]);
 			const c = result.allConstraints[0];
 			// nonLiteral = !isLiteral(col) || !isLiteral(cast(lit)) = true || false = true

@@ -87,13 +87,14 @@ select min(val) from n;                    -- 'aa' — a non-numeric column is u
 
 Beyond disagreeing with `ORDER BY`, this is a violation of rule R2 in `docs/types.md`
 § Physical representation at statement output: a TEXT-typed result column hands back a JS
-number. `implement/4-remaining-scalar-result-types-and-repr-net` widens the statement-egress
-representation check (`QUEREUS_REPR_STRICT=1`) from R1-only to full R2, and this is the one
-measured violation in the suite that the announcement cannot fix — announcing TEXT for
-`min(val)` is *correct*; the value is what is wrong. So
-`test/logic/25-aggregate-edge-cases.sqllogic:64` (which currently pins `{"mn":10}`) will keep
-reporting a violation under the widened check until this arm lands. That raises this arm's
-priority: it is now gating a permanent regression net, not only its own wrong answer.
+number. Ticket `4-remaining-scalar-result-types-and-repr-net` (now complete) reconciled
+every other announced-type/value disagreement and left the statement-egress representation
+check (`QUEREUS_REPR_STRICT=1`, `Statement._iterateWithSignal`) at R1-only **solely because
+of this arm** — the seam comment there says exactly how to widen it to full R2 once this
+lands (two suite sites: `test/logic/25-aggregate-edge-cases.sqllogic` `mn`, and
+`test/logic/14-utilities.sqllogic` `min(amount)`; announcing TEXT for `min(val)` is
+*correct*, the value is what is wrong). That raises this arm's priority: it is the last
+blocker for a permanent regression net, not only its own wrong answer.
 
 Also: the `NOTE:` at `src/util/coercion.ts` (above `coerceAggregateValue`) still cites the
 pre-garden slug `bug-text-minmax-numeric-coercion`. Repoint it at this ticket while you are

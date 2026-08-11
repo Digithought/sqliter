@@ -201,14 +201,25 @@ Four seams, each chosen so a violation is reported at the layer that CAUSED it:
 | statement row egress (`core/statement.ts`) | each row yielded to the caller | **R1 only** |
 
 The egress seam is the backstop for an *expression* producing a non-canonical value (an
-arithmetic path that forgot to narrow), which none of the other three sees. It checks R1
-only, on purpose: R2 is a rule about *declared* types, and a projection's `ScalarType` is
-the planner's static inference rather than a declared type — the engine never coerces a
-projection's output to it, and the two legitimately disagree (`select ? as v` infers TEXT
-for an untyped parameter and yields a number). Asserting R2 there would report inference
-imprecision, not representation drift. That imprecision is tracked separately as
-`backlog/bug-inferred-scalar-type-disagrees-with-runtime-value`; if it is fixed, this seam
-can be upgraded to full R2.
+arithmetic path that forgot to narrow), which none of the other three sees. A result
+column's ANNOUNCED type — the planner's `ScalarType` inference, reachable through
+`Statement.getColumnDefs()` / `getColumnType()` — is now held to R2 as a matter of
+correctness: every computed-column inference (literals, arithmetic promotion, CASE and
+VALUES branch merges, `sum()`'s NUMERIC, LAG/LEAD defaults, polymorphic builtins,
+untyped parameters) names a type whose value space the column's values inhabit, and
+`test/announced-result-types.spec.ts` pins each shape. A column with no principled
+concrete type announces **ANY**, which is an honest "no representation constraint —
+convert before trusting", never a guess.
+
+The seam still *asserts* R1 only. One known wrong-VALUE defect blocks the upgrade to
+full R2: `coerceAggregateValue` converts numeric-looking text before `min`/`max`, so
+`min(text_col)` announces TEXT (correctly) and can yield a number (wrongly) — tracked
+as `backlog/bug-text-coercion-in-arithmetic-and-aggregates`. Once that lands, the seam
+widens by passing the plan's output logical types instead of the empty declared-type
+array (see the comment in `Statement._iterateWithSignal`); the rest of the suite
+already passes under that widening. The announced `nullable` flag is a further axis R2
+does not cover (null is admissible in every position) — its violations are tracked as
+`backlog/debt-announced-nullability-disagrees-with-produced-nulls`.
 
 **No capability flag, and why.** A `representationFidelity` declaration on
 `VirtualTableModule` (alongside `scanSnapshotIsolation`) was considered and rejected:

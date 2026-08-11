@@ -5,18 +5,35 @@ import type { ScalarType } from '../../common/datatype.js';
 import type { DeepReadonly, SqlValue } from '../../common/types.js';
 import type { LogicalType } from '../../types/logical-type.js';
 import { BINARY_COLLATION, compareSqlValuesFast, createSemanticValueComparator } from '../../util/comparison.js';
+import { mergeSetOpAdvertisedType } from '../../planner/analysis/set-op-type-merge.js';
 
 /**
  * Shared `inferReturnType` for pass-through window functions (MIN, MAX,
- * FIRST_VALUE, LAST_VALUE, LAG, LEAD): the result follows arg[0]'s logical
- * type because the value is emitted unchanged at runtime. Only arg[0] (the
- * value expression) participates — LAG/LEAD's offset and default arguments do
- * not widen the result. Each registration's fixed `returnType` is the
- * no-arg-types fallback.
+ * FIRST_VALUE, LAST_VALUE): the result follows arg[0]'s logical type because
+ * the value is emitted unchanged at runtime. Each registration's fixed
+ * `returnType` is the no-arg-types fallback.
  */
 const passThroughArgType = (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>): ScalarType => ({
 	typeClass: 'scalar',
 	logicalType: argTypes[0],
+	nullable: true,
+	isReadOnly: true
+});
+
+/**
+ * LAG/LEAD `inferReturnType`: usually arg[0] passed through, but when the
+ * offset runs off the partition the DEFAULT argument (arg[2]) is emitted
+ * verbatim — one result column carrying values from two unconverted sources,
+ * so the announced type folds both through the set-op merge rules
+ * (`mergeSetOpAdvertisedType`: identical keeps, NULL yields, differing builtin
+ * numerics → NUMERIC, irreconcilable → ANY). arg[1] (the offset) never
+ * surfaces in the result and does not participate.
+ */
+const navigationArgType = (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>): ScalarType => ({
+	typeClass: 'scalar',
+	logicalType: argTypes.length >= 3
+		? mergeSetOpAdvertisedType(argTypes[0] as LogicalType, argTypes[2] as LogicalType)
+		: argTypes[0],
 	nullable: true,
 	isReadOnly: true
 });
@@ -115,9 +132,9 @@ export function registerBuiltinWindowFunctions(): void {
 		name: 'LAG',
 		argCount: 'variadic',
 		returnType: REAL_RETURN,
-		// LAG passes arg[0] (the value expression) through unchanged; arg[1] is the
-		// offset and arg[2] is an optional default — their types do not widen the result.
-		inferReturnType: passThroughArgType,
+		// arg[0] passed through, folded with the optional default arg[2] — see
+		// navigationArgType.
+		inferReturnType: navigationArgType,
 		requiresOrderBy: true,
 		kind: 'navigation'
 	});
@@ -126,9 +143,9 @@ export function registerBuiltinWindowFunctions(): void {
 		name: 'LEAD',
 		argCount: 'variadic',
 		returnType: REAL_RETURN,
-		// LEAD passes arg[0] (the value expression) through unchanged; arg[1] is the
-		// offset and arg[2] is an optional default — their types do not widen the result.
-		inferReturnType: passThroughArgType,
+		// arg[0] passed through, folded with the optional default arg[2] — see
+		// navigationArgType.
+		inferReturnType: navigationArgType,
 		requiresOrderBy: true,
 		kind: 'navigation'
 	});

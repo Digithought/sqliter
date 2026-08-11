@@ -56,17 +56,18 @@ select greatest(i, '2') as v from nn;
 select least(i, '2') as v from nn;
 → [{"v":1}]
 
--- The existing `=` semantics truncate on an INTEGER target (`cast('1.9' as
--- integer)` is 1) — not something this fix introduced, but every form must now
--- agree on it the same way they agree above.
+-- An INTEGER column against fractional text: the text side converts to NUMERIC
+-- (its full numeric value, 1.9), NOT to INTEGER — the prefix parse (`cast('1.9'
+-- as integer)` is 1) used to decide these comparisons and made `i = '1.9'` true
+-- for i = 1. Every form agrees on the numeric reading.
 select (i = '1.9') as v from nn;
-→ [{"v":true}]
+→ [{"v":false}]
 
 select i in ('1.9') as v from nn;
-→ [{"v":true}]
+→ [{"v":false}]
 
 select case i when '1.9' then 'hit' else 'miss' end as v from nn;
-→ [{"v":"hit"}]
+→ [{"v":"miss"}]
 
 -- ===================================
 -- 2. REAL column `r` (value 2.5) against textual operands
@@ -206,10 +207,11 @@ select nullif('abc', 1) as v;
 → [{"v":"abc"}]
 
 -- Regression guard against over-correcting: the comparison itself must still
--- coerce, so a matching numeric text still nulls out (and '1.9' still truncates
--- to 1 on the INTEGER side, exactly as `i = '1.9'` does in section 1).
+-- coerce, so a matching numeric text still nulls out — and '1.9' reads as the
+-- NUMERIC 1.9 (no INTEGER truncation), so it does NOT match i = 1, exactly as
+-- `i = '1.9'` answers false in section 1.
 select nullif(i, '1') as a, nullif(i, '1.9') as b from nn;
-→ [{"a":null,"b":null}]
+→ [{"a":null,"b":1}]
 
 -- Both orientations of the mixed pair. Argument order decides which side carries
 -- the conversion (probe cast vs value cast), so both must be covered; either way
