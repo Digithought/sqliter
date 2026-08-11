@@ -4,6 +4,7 @@ files:
   - packages/quereus/src/planner/rules/cache/rule-cte-optimization.ts      # `sourceSize > 0` — reads unknown as empty
   - packages/quereus/src/planner/cache/materialization-advisory.ts
   - packages/quereus/src/planner/rules/access/rule-select-access-path.ts   # selectPhysicalNode — the fold that deletes a read on a zero estimate
+  - packages/quereus/src/planner/rules/access/rule-key-set-seek.ts         # arm 4 — merge-arm gate 2 reads a zero key-source estimate as "tiny"
   - packages/quereus/src/vtab/best-access-plan.ts                          # the `rows` field's documented meaning
   - packages/quereus/src/vtab/memory/module.ts                             # the one shipped module that makes the zero claim; also reads `request.estimatedRows || 1000`
   - packages/quereus/src/planner/nodes/set-operation-node.ts               # no estimatedRows getter at all, and computePhysical never stamps one
@@ -109,6 +110,25 @@ for `union all` on high-latency plans), the CTE nodes (`cte-node.ts`,
 
 `debt-join-rows-from-physical-children` already moved the single-source operators and
 the join family onto `physicalSourceRows`; these four groups were left out.
+
+## Arm 4 — a key-set rewrite's "is this key source too big?" gate reads unknown as tiny (verified)
+
+`rule-key-set-seek`'s merge arm declines the rewrite when the key source's estimated row
+count exceeds the number of keys the runtime would actually seek with — the point being
+not to trade a streaming merge join for materializing an unbounded key set. The gate reads
+`node.right.physical.estimatedRows` and proceeds when it is `undefined`.
+
+It never fires. On both shipped backends a freshly-populated table's *physical* estimate
+reads `0`, not `undefined`, so `0 > threshold` is false and every key source looks tiny.
+Measured on the persistent store (`packages/quereus-store`) with 7 committed rows in the
+key-source table: the leaf and the `Project` above it both report `estimatedRows: 0`, and
+the rewrite fires. The rule's own comment already said this of the memory backend; the
+store behaves the same way.
+
+Cost is performance only — the rewritten node returns identical rows — so this is
+evidence for the representation change, not a defect to patch in place. Once "unknown" is
+spellable, this gate becomes a two-line decision like the others (its current
+absent-estimate posture, proceed, is the one it should keep for `unknown`).
 
 ## Notes for whoever picks this up
 

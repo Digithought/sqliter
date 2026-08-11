@@ -14,11 +14,16 @@
  *
  * Two facts shape every test here:
  *
- * - **No `order by` on a column the target leaf's own walk already provides.** The
- *   store advertises primary-key order, so `… order by pk` is absorbed into the leaf
- *   at plan time, which marks its emission order load-bearing and makes
- *   `rule-key-set-seek` decline (correctly — a multi-seek emits in seek-key order).
- *   Rows are therefore collected unordered and sorted in JS.
+ * - **No `order by` on a column the target leaf's own walk already provides —
+ *   EXCEPT on a primary-key target.** The store advertises primary-key order, so
+ *   `… order by pk` is absorbed into the leaf at plan time, which marks its emission
+ *   order load-bearing. For a SECONDARY-index seek that makes `rule-key-set-seek`
+ *   decline (correctly — the seek index is not the walk index, so a multi-seek could
+ *   emit in some other order), and rows are therefore collected unordered and sorted
+ *   in JS. For a `_primary_` seek the seek index IS the walk index, so
+ *   `seekPreservesTargetOrder` holds, the rewrite fires anyway, and the absorbed Sort
+ *   stays absorbed — the `primary-key target` block below pins that, asserting RAW
+ *   emission order rather than sorting in JS.
  * - **The seek is a runtime decision.** `query_plan()` shows `KeySetSemiJoin` whether
  *   the runtime ends up seeking or scanning, so seek-vs-scan is asserted from the
  *   `idxStr` the store's `query()` was handed.
@@ -219,11 +224,26 @@ describe('key-set semi join over the store backend (feat-key-set-seek-store-isol
 				.map(r => r.pk as number)
 				.sort((a, b) => a - b);
 
+		/**
+		 * `pk` of every row of `q` in RAW emission order — no JS sort. Used where the
+		 * order the target emitted in IS the assertion.
+		 */
+		const rawPks = async (q: string): Promise<number[]> =>
+			(await asyncIterableToArray(db.eval(q))).map(r => r.pk as number);
+
 		/** The `query_plan()` op names for `query`, as a JSON array string. */
 		const planOps = async (query: string): Promise<string> => {
 			const rows = await asyncIterableToArray(
 				db.eval(`select json_group_array(op) as ops from query_plan(?)`, [query]));
 			return rows[0].ops as string;
+		};
+
+		/** The single `KeySetSemiJoin`'s logical attributes for `query`. */
+		const keySetProps = async (query: string): Promise<Record<string, unknown>> => {
+			const rows = await asyncIterableToArray(db.eval(
+				`select properties from query_plan(?) where op = 'KEYSETSEMIJOIN'`, [query]));
+			expect(rows, 'exactly one KeySetSemiJoin in the plan').to.have.lengthOf(1);
+			return JSON.parse(rows[0].properties as string) as Record<string, unknown>;
 		};
 
 		describe('single-column secondary index', () => {
@@ -451,24 +471,191 @@ describe('key-set semi join over the store backend (feat-key-set-seek-store-isol
 			}
 		});
 
-		it('a runtime set on the PRIMARY KEY is served as a `_primary_` multi-seek', async () => {
+		describe('primary-key target', () => {
 			// The PK arm used to match a `'='`-only operator group, so a key set on the primary
-			// key found no claimable index and `rule-key-set-seek` kept the hash semi join it
+			// key found no claimable index and `rule-key-set-seek` kept the semi join it
 			// started from. It now claims the IN (feat-store-pk-in-list-multiseek):
 			// `scanMultiSeekPrimary` emits ascending by encoded data key — which IS primary-key
-			// order — so the rewrite fires and the store point-reads the two keys instead of
+			// order — so the rewrite fires and the store point-reads the listed keys instead of
 			// walking the table.
-			await db.exec(`create table pkt (pk integer primary key, other text) using store`);
-			await db.exec(`create table psrc (id integer primary key, k integer) using store`);
-			await db.exec(`insert into pkt values (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')`);
-			await db.exec(`insert into psrc values (1, 1), (2, 3)`);
+			//
+			// This block covers the `in (select …)` caller specifically. Two things separate it
+			// from the secondary-index block above, both settled by probe against the real
+			// planner and pinned here:
+			//
+			// - `seekPreservesTargetOrder` HOLDS. The store leaf arrives as an ordering-only
+			//   `IndexScan` over `_primary_` (`plan=0`, providing `[{column: 0, desc: false}]`),
+			//   and the pushdown's claimed index is that same single-column `_primary_` — so the
+			//   node claims the walk order, `order by pk` stays absorbed, and no `Sort`
+			//   reappears. Every assertion here therefore reads RAW emission order.
+			// - Both ARMS are reachable. `pk in (select k from …)` — the key column is an
+			//   ordinary column — plans as a hash semi join; `pk in (select id from …)` — the
+			//   key column is the SOURCE's primary key, so both sides walk in key order — plans
+			//   as a MERGE semi join and takes `rule-key-set-seek`'s merge anchor, whose two
+			//   extra gates (`seekPreservesTargetOrder`, and a key-source row estimate under
+			//   `min(maxKeys, breakEvenKeys)`) both pass on these fixtures.
+			//
+			// Fixture size: `pkt` holds 4 rows, for which the store's costs put the interpolated
+			// break-even at 6 keys — every set below it seeks. No padding needed.
+			beforeEach(async () => {
+				await db.exec(`create table pkt (pk integer primary key, tag text) using store`);
+				await db.exec(`create table psrc (id integer primary key, k integer null) using store`);
+				await db.exec(`insert into pkt values (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')`);
+			});
 
-			const q = `select pk from pkt where pk in (select k from psrc)`;
-			expect(await planOps(q), 'the rule fires on a PK set').to.match(/KEYSETSEMIJOIN/);
-			mod.reset();
-			expect(await pks(q)).to.deep.equal([1, 3]);
-			expect(mod.seen('pkt')[0], 'served as a primary-key multi-seek')
-				.to.match(multiSeekRe('_primary_'));
+			const HASH_Q = `select pk from pkt where pk in (select k from psrc)`;
+			const MERGE_Q = `select pk from pkt where pk in (select id from psrc)`;
+
+			it('a runtime set on the PRIMARY KEY is served as a `_primary_` multi-seek', async () => {
+				await db.exec(`insert into psrc values (1, 1), (2, 3), (3, 9)`);
+				expect(await planOps(HASH_Q), 'the rule fires on a PK set').to.match(/KEYSETSEMIJOIN/);
+				mod.reset();
+				expect(await rawPks(HASH_Q), 'emitted ascending by primary key').to.deep.equal([1, 3]);
+				expect(mod.seen('pkt'), 'the target was opened exactly once').to.have.lengthOf(1);
+				expect(mod.seen('pkt')[0], 'served as a primary-key multi-seek')
+					.to.match(multiSeekRe('_primary_'));
+				expect(mod.seen('pkt')[0]).to.contain('inCount=3');
+			});
+
+			it('collapses duplicate and NULL inner values before stamping inCount', async () => {
+				await db.exec(`insert into psrc values (1, 3), (2, 3), (3, null), (4, 1), (5, 3)`);
+				mod.reset();
+				expect(await rawPks(HASH_Q)).to.deep.equal([1, 3]);
+				expect(mod.seen('pkt')[0]).to.match(multiSeekRe('_primary_'));
+				expect(mod.seen('pkt')[0]).to.contain('inCount=2');
+			});
+
+			it('never opens the target when the key set is empty', async () => {
+				mod.reset();
+				expect(await rawPks(HASH_Q)).to.deep.equal([]);
+				expect(mod.seen('pkt'), 'the store was never queried').to.have.lengthOf(0);
+			});
+
+			it('seeks a single-key set as a one-window multi-seek, not a plain EQ', async () => {
+				await db.exec(`insert into psrc values (1, 2)`);
+				mod.reset();
+				expect(await rawPks(HASH_Q)).to.deep.equal([2]);
+				expect(mod.seen('pkt')[0]).to.match(multiSeekRe('_primary_'));
+				expect(mod.seen('pkt')[0]).to.contain('inCount=1');
+			});
+
+			it('a key set matching nothing returns no rows but still seeks', async () => {
+				await db.exec(`insert into psrc values (1, 77), (2, 88)`);
+				mod.reset();
+				expect(await rawPks(HASH_Q)).to.deep.equal([]);
+				expect(mod.seen('pkt')[0]).to.match(multiSeekRe('_primary_'));
+			});
+
+			it('the MERGE arm (key source ordered by its own primary key) seeks too', async () => {
+				// `psrc.id` is that table's primary key, so both sides walk in key order and
+				// `monotonic-merge-join` builds a MERGE semi join — the shape a PK target most
+				// naturally hits. That the incoming join really is a merge join is visible in
+				// the composite-key test below, where the rewrite declines and the MERGEJOIN
+				// survives on this exact query shape.
+				//
+				// Both merge-only gates pass. The first is real: the seek reproduces the walk
+				// order. The second — key-source rows under `min(maxKeys, breakEvenKeys)` —
+				// passes vacuously, because a store leaf's PHYSICAL row estimate reads 0
+				// however many rows are committed (measured: 7 rows, estimate 0). See the NOTE
+				// at that gate in `rule-key-set-seek.ts`.
+				await db.exec(`insert into psrc values (2, 0), (3, 0), (9, 0)`);
+				expect(await planOps(MERGE_Q), 'the merge join was replaced').to.not.match(/MERGEJOIN/);
+				expect(await planOps(MERGE_Q)).to.match(/KEYSETSEMIJOIN/);
+				mod.reset();
+				expect(await rawPks(MERGE_Q)).to.deep.equal([2, 3]);
+				expect(mod.seen('pkt')[0]).to.match(multiSeekRe('_primary_'));
+			});
+
+			it('`order by pk` keeps the seek and the absorbed Sort, on both arms', async () => {
+				// The ordering question this ticket exists to settle. `order by pk` is absorbed
+				// into the leaf's walk (making its emission order load-bearing), which is a
+				// DECLINE for a secondary-index target — but here the seek index IS the walk
+				// index, so the node claims the leaf's order and the Sort stays absorbed. The
+				// row order is asserted, not merely the absence of the Sort: the claim is only
+				// sound because `scanMultiSeekPrimary` emits ascending by encoded data key.
+				await db.exec(`insert into psrc values (3, 0), (1, 0), (4, 0)`); // keys out of order
+				for (const q of [
+					`select pk from pkt where pk in (select k from psrc) order by pk`,
+					`select pk from pkt where pk in (select id from psrc) order by pk`,
+				]) {
+					const ops = await planOps(q);
+					expect(ops, `the rewrite fires despite orderingLoadBearing: ${q}`).to.match(/KEYSETSEMIJOIN/);
+					expect(ops, `no Sort — the node serves the absorbed ORDER BY: ${q}`).to.not.match(/SORT/);
+					expect((await keySetProps(q)).preservesTargetOrder,
+						`the node claims the walk order: ${q}`).to.equal(true);
+				}
+				// The `id` arm's key set is {3,1,4}; the `k` arm's is {0} and matches nothing.
+				mod.reset();
+				expect(await rawPks(`select pk from pkt where pk in (select id from psrc) order by pk`),
+					'rows actually ascend').to.deep.equal([1, 3, 4]);
+				expect(mod.seen('pkt')[0], 'and it is still a seek').to.match(multiSeekRe('_primary_'));
+			});
+
+			it('a COMPOSITE primary key declines the rewrite and the merge join answers', async () => {
+				// `claimedIndex` declines any plan claiming more than one seek column, and the
+				// store's PK arm only claims a key that is pinned in FULL — so a set on the
+				// LEADING column of a composite key is claimed by neither side and the semi
+				// join survives untouched. Documented restriction, not a bug: sorting by
+				// single-column SQL value order equals index-key order only for a single key
+				// column (see `seekPreservesTargetOrder`).
+				await db.exec(`create table comp (a integer, b integer, tag text, primary key (a, b)) using store`);
+				await db.exec(`insert into comp values (1, 1, 'x'), (1, 2, 'y'), (2, 1, 'z'), (3, 1, 'w')`);
+				await db.exec(`insert into psrc values (1, 0), (3, 0)`);
+
+				const q = `select a, b from comp where a in (select id from psrc)`;
+				const ops = await planOps(q);
+				expect(ops, 'no rewrite').to.not.match(/KEYSETSEMIJOIN/);
+				expect(ops, 'the streaming merge semi join survives').to.match(/MERGEJOIN/);
+				mod.reset();
+				const rows = await asyncIterableToArray(db.eval(q));
+				expect(rows, 'and it still answers').to.deep.equal([
+					{ a: 1, b: 1 }, { a: 1, b: 2 }, { a: 3, b: 1 },
+				]);
+				expect(mod.seen('comp')[0], 'the target was walked, not seeked').to.match(SCAN_RE);
+			});
+
+			it('a DELETE driven by the key set seeks, and only the matched rows go', async () => {
+				await db.exec(`insert into psrc values (1, 2), (2, 4)`);
+				mod.reset();
+				await db.exec(`delete from pkt where pk in (select k from psrc)`);
+				expect(mod.seen('pkt')[0], 'the delete read its victims through the seek')
+					.to.match(multiSeekRe('_primary_'));
+				expect(await rawPks(`select pk from pkt`)).to.deep.equal([1, 3]);
+			});
+
+			it('an UPDATE driven by the key set seeks, and only the matched rows change', async () => {
+				// The victims are read through the `_primary_` seek and then rewritten in
+				// place — the very structure the seek is walking.
+				await db.exec(`insert into psrc values (1, 2), (2, 4)`);
+				mod.reset();
+				await db.exec(`update pkt set tag = 'hit' where pk in (select k from psrc)`);
+				expect(mod.seen('pkt')[0], 'the update read its victims through the seek')
+					.to.match(multiSeekRe('_primary_'));
+				expect(await asyncIterableToArray(db.eval(`select pk, tag from pkt`))).to.deep.equal([
+					{ pk: 1, tag: 'a' }, { pk: 2, tag: 'hit' }, { pk: 3, tag: 'c' }, { pk: 4, tag: 'hit' },
+				]);
+			});
+
+			it('reads its own uncommitted writes through the seek (store pending ops)', async () => {
+				// The `_primary_` twin of the secondary-index case below: no isolation layer,
+				// so this is StoreTable's own pending-op merge — `scanMultiSeekPrimary` resolves
+				// its sorted key list through `readEffectiveRowsByKeys`, which consults the open
+				// transaction's staged rows before the committed ones. Raw emission order, so a
+				// staged row landing out of key order would fail here too.
+				await db.exec(`insert into psrc values (1, 2), (2, 3), (3, 5)`);
+				await db.exec(`begin`);
+				await db.exec(`insert into pkt values (5, 'staged')`);      // staged insert, key IS in the set
+				await db.exec(`update pkt set tag = 'restaged' where pk = 3`); // staged in-place update
+				await db.exec(`delete from pkt where pk = 2`);               // staged delete of an in-set row
+				mod.reset();
+				expect(await asyncIterableToArray(db.eval(`select pk, tag from pkt where pk in (select k from psrc)`)))
+					.to.deep.equal([{ pk: 3, tag: 'restaged' }, { pk: 5, tag: 'staged' }]);
+				expect(mod.seen('pkt')[0], 'still a seek, not a scan').to.match(multiSeekRe('_primary_'));
+				await db.exec(`commit`);
+				mod.reset();
+				expect(await rawPks(HASH_Q)).to.deep.equal([3, 5]);
+				expect(mod.seen('pkt')[0]).to.match(multiSeekRe('_primary_'));
+			});
 		});
 
 		describe('gates that must decline (the hash semi join answers instead)', () => {
@@ -830,6 +1017,145 @@ describe('key-set semi join over the store backend (feat-key-set-seek-store-isol
 				{ pk: 3, v: 30, tag: 'c' },
 			]);
 			expectStoreSeeked();
+		});
+
+		describe('primary-key target', () => {
+			// The case `bug-isolation-multiseek-merge-order` was filed for, now reached
+			// through the store rather than the memory backend: the isolation layer merges
+			// the underlying stream with its overlay BY PRIMARY KEY, assuming both arrive
+			// ascending. `scanMultiSeekPrimary`'s ascending-encoded-data-key emission is what
+			// satisfies that assumption on the store side, and nothing re-sorts afterwards —
+			// so every assertion below reads RAW emission order. A merge slip shows up as a
+			// stale row beside its updated copy, a resurrected delete, or simply the wrong
+			// order; sorting the rows in JS first would hide all three.
+			//
+			// Unlike the secondary-index block above, the target's own walk order is the one
+			// being asserted, so `seekPreservesTargetOrder` holds and an `order by pk` (used
+			// nowhere here — the raw order already ascends) would stay absorbed.
+			beforeEach(async () => {
+				await db.exec(`create table pt (pk integer primary key, tag text) using store`);
+				await db.exec(`create table pksrc (id integer primary key, k integer) using store`);
+				await db.exec(`insert into pt values (10, 'a'), (20, 'b'), (30, 'c'), (40, 'd')`);
+				await db.exec(`insert into pksrc values (1, 20), (2, 30), (3, 50)`);
+			});
+
+			/** RAW emission order — deliberately NOT sorted (see the block comment). */
+			const pkRowsOf = async (q: string): Promise<Record<string, SqlValue>[]> =>
+				(await asyncIterableToArray(db.eval(q))) as Record<string, SqlValue>[];
+
+			const PK_QUERY = `select pk, tag from pt where pk in (select k from pksrc)`;
+
+			/** Assert the underlying store really served this read as a `_primary_` multi-seek. */
+			function expectPkSeeked(): void {
+				expect(mod.seen('pt')[0], 'the store served a primary-key multi-seek under isolation')
+					.to.match(multiSeekRe('_primary_'));
+			}
+
+			it('a staged insert whose key is in the set surfaces', async () => {
+				await db.exec(`begin`);
+				await db.exec(`insert into pt values (50, 'e')`);
+				mod.reset();
+				expect(await pkRowsOf(PK_QUERY)).to.deep.equal([
+					{ pk: 20, tag: 'b' },
+					{ pk: 30, tag: 'c' },
+					{ pk: 50, tag: 'e' },
+				]);
+				expectPkSeeked();
+				await db.exec(`rollback`);
+			});
+
+			it('a staged in-place update of an in-set row appears exactly once, in its new form', async () => {
+				// The shadowing case: the committed row is inside the seek window AND the
+				// staged row is too, so both streams carry it and a merge slip emits it twice.
+				await db.exec(`begin`);
+				await db.exec(`update pt set tag = 'rewritten' where pk = 30`);
+				mod.reset();
+				expect(await pkRowsOf(PK_QUERY)).to.deep.equal([
+					{ pk: 20, tag: 'b' },
+					{ pk: 30, tag: 'rewritten' },
+				]);
+				expectPkSeeked();
+				await db.exec(`rollback`);
+			});
+
+			it('a staged delete of an in-set row does not resurface', async () => {
+				await db.exec(`begin`);
+				await db.exec(`delete from pt where pk = 20`);
+				mod.reset();
+				expect(await pkRowsOf(PK_QUERY)).to.deep.equal([
+					{ pk: 30, tag: 'c' },
+				]);
+				expectPkSeeked();
+				await db.exec(`rollback`);
+			});
+
+			it('staged rows outside the key list are excluded by the overlay predicate', async () => {
+				// The overlay is full-scanned, so EVERY staged row reaches
+				// `buildConstraintMatcher`; only the window predicate keeps the out-of-list
+				// ones out. If the K EQ constraints failed to decompose into an IN set, either
+				// nothing would match (AND of mutually exclusive equalities) or everything would.
+				await db.exec(`begin`);
+				await db.exec(`insert into pt values (60, 'out'), (50, 'in')`);
+				mod.reset();
+				expect(await pkRowsOf(PK_QUERY)).to.deep.equal([
+					{ pk: 20, tag: 'b' },
+					{ pk: 30, tag: 'c' },
+					{ pk: 50, tag: 'in' },
+				]);
+				expectPkSeeked();
+				await db.exec(`rollback`);
+			});
+
+			it('several staged rows straddling the committed keys interleave in key order', async () => {
+				// Staged keys deliberately fall BETWEEN committed ones, so a merge that
+				// appended one stream to the other — or visited the seek windows in key-source
+				// order — would emit these out of order even though the row SET is right.
+				await db.exec(`insert into pksrc values (4, 10), (5, 25), (6, 40)`);
+				await db.exec(`begin`);
+				await db.exec(`insert into pt values (25, 'x'), (50, 'y')`);
+				await db.exec(`update pt set tag = 'z' where pk = 30`);
+				mod.reset();
+				expect(await pkRowsOf(PK_QUERY), 'ascending by primary key, each row once').to.deep.equal([
+					{ pk: 10, tag: 'a' },
+					{ pk: 20, tag: 'b' },
+					{ pk: 25, tag: 'x' },
+					{ pk: 30, tag: 'z' },
+					{ pk: 40, tag: 'd' },
+					{ pk: 50, tag: 'y' },
+				]);
+				expectPkSeeked();
+				await db.exec(`rollback`);
+			});
+
+			it('deletes through the seek inside a transaction, reads back, then commits', async () => {
+				await db.exec(`begin`);
+				mod.reset();
+				await db.exec(`delete from pt where pk in (select k from pksrc)`);
+				expect(mod.seen('pt')[0], 'the delete read its victims through the seek')
+					.to.match(multiSeekRe('_primary_'));
+				expect(await pkRowsOf(`select pk, tag from pt`), 'in-transaction read-back').to.deep.equal([
+					{ pk: 10, tag: 'a' },
+					{ pk: 40, tag: 'd' },
+				]);
+				await db.exec(`commit`);
+				expect(await pkRowsOf(`select pk, tag from pt`), 'after commit').to.deep.equal([
+					{ pk: 10, tag: 'a' },
+					{ pk: 40, tag: 'd' },
+				]);
+			});
+
+			it('a rolled-back staged change leaves the committed answer intact', async () => {
+				await db.exec(`begin`);
+				await db.exec(`insert into pt values (50, 'e')`);
+				await db.exec(`delete from pt where pk = 30`);
+				await db.exec(`rollback`);
+				mod.reset();
+				expect(await pkRowsOf(PK_QUERY)).to.deep.equal([
+					{ pk: 20, tag: 'b' },
+					{ pk: 30, tag: 'c' },
+				]);
+				expectPkSeeked();
+			});
 		});
 	});
 });

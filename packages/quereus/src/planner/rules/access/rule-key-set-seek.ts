@@ -607,9 +607,14 @@ export function ruleKeySetSeek(node: PlanNode, context: OptContext): PlanNode | 
 		// optimization, never a row. Absent estimate ⇒ proceed, the same posture
 		// the rest of the rule takes toward advisory numbers. The PHYSICAL
 		// estimate is read because the logical `estimatedRows` getter reads
-		// `undefined` through a physical access node. NOTE: inert on the memory
-		// backend today (its row estimate for a freshly-populated table reads 0)
-		// — this gate exists for modules that report real cardinality.
+		// `undefined` through a physical access node. NOTE: inert on BOTH shipped
+		// backends today — a freshly-populated table's physical row estimate reads 0
+		// on the memory backend and (measured while covering the store's primary-key
+		// arm, feat-store-pk-key-set-seek-coverage: 7 committed rows, physical
+		// estimate 0) on the persistent store too — so `0 > threshold` is never true
+		// and the gate always proceeds. That is the unknown-spelled-as-zero
+		// conflation `bug-row-estimate-conflates-unknown-and-zero` tracks, seen from
+		// this site; the gate exists for modules that report real cardinality.
 		const keyRows = node.right.physical.estimatedRows;
 		if (keyRows !== undefined && keyRows > Math.min(pushdown.maxKeys, pushdown.breakEvenKeys)) {
 			log('decline: key source estimate %d exceeds the seek threshold min(%d, %d)',

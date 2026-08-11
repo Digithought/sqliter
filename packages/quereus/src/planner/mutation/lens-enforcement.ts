@@ -739,10 +739,10 @@ function lensRowLocalRuleMessage(check: LensRowLocalLogicalCheck): string {
  * Builds the ONE deferred logical-row constraint covering EVERY row-local rule
  * of a decomposition write, for one `(relation, correlation)` of the fan-out:
  *
- *   (select case when not (<rule 1 over _lr.*>) then '<rule 1 message>'
- *                …
- *                when not (<rule n over _lr.*>) then '<rule n message>'
- *                else null end
+ *   (select min(case when not (<rule 1 over _lr.*>) then '<rule 1 message>'
+ *                    …
+ *                    when not (<rule n over _lr.*>) then '<rule n message>'
+ *                    else null end)
  *      from <logicalSchema>.<logicalTable> as _lr
  *     where <row address over <CORR>.<relationKeyColumn>>)
  *
@@ -752,10 +752,10 @@ function lensRowLocalRuleMessage(check: LensRowLocalLogicalCheck): string {
  * write happened to touch — ONCE, and decides all the rules against the row it
  * already has. The constraint is **message-valued**
  * ({@link RowConstraintSchema.messageValued}): it evaluates to NULL when every
- * rule holds (also when the address matches no row — the scalar subquery over
- * an empty selection is NULL, preserving the old `not exists` pass on a row
- * the statement did not touch) and to the FIRST violated rule's verbatim
- * message otherwise, which the runtime reports as-is. One planned subquery per
+ * rule holds (also when the address matches no row — `min` over an empty
+ * selection is NULL, preserving the old `not exists` pass on a row the
+ * statement did not touch) and to a violated rule's verbatim message
+ * otherwise, which the runtime reports as-is. One planned subquery per
  * group however many rules the table declares — where the retired
  * one-constraint-per-rule shape paid plan construction linearly in the rule
  * count (the measured cost this collapse removes).
@@ -803,9 +803,21 @@ export function synthesizeLensRowLocalDeferredConstraint(
 		whenThenClauses,
 		elseExpr: { type: 'literal', value: null } as AST.LiteralExpr,
 	};
+	// `min` over the per-row verdict, NOT a bare scalar read: the row address is a
+	// logical-key equality, and a key-changing write can transiently leave the
+	// address matching MORE THAN ONE logical row — precisely the duplicate a
+	// commit-time set-level key (`lens:pk` / `lens:unique`) is there to reject. A
+	// bare read of that multi-row selection errors `Scalar subquery returned more
+	// than one row` and preempts the uniqueness rejection with a cardinality
+	// message. `min` collapses the group to one value and keeps the row-local
+	// verdict's semantics exactly: it skips NULLs (a passing row never masks a
+	// violating one), returns NULL for the empty group (the address matched no row
+	// — the old `not exists` pass), and returns a violated rule's own verbatim
+	// message whenever any matched row violates.
+	const groupedVerdict: AST.FunctionExpr = { type: 'function', name: 'min', args: [verdict] };
 	const subquery: AST.SelectStmt = {
 		type: 'select',
-		columns: [{ type: 'column', expr: verdict }],
+		columns: [{ type: 'column', expr: groupedVerdict }],
 		from: [{
 			type: 'table',
 			table: { type: 'identifier', name: slot.logicalTable.name, schema: slot.logicalTable.schemaName },
