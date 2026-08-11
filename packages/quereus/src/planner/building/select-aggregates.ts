@@ -809,9 +809,16 @@ function createAggregateOutputScope(
 	// alias already claims (see the NOTE above), and marked ambiguous when two aliases
 	// of DIFFERENT grouping keys share one name (`select a as k, b as k … group by a, b`),
 	// which nothing else in this scope can arbitrate.
+	//
+	// The qualified keys count as "already claims" too: a quoted alias may contain a dot
+	// (`select wg.a as "wg.a" … group by wg.a`), and registering it would re-register a
+	// key this scope already holds — which `registerSymbol` rejects outright, failing a
+	// query that plans fine without the alias. See
+	// backlog/bug-scope-symbol-keys-collide-with-dotted-column-names for why a flat
+	// string key cannot tell a dotted name from a qualified one in the first place.
 	const groupKeys = indexGroupKeys(groupByExpressions);
 	for (const [aliasKey, keyIndexes] of collectAliasedGroupKeys(projections, groupKeys)) {
-		if (bareNameOwners.has(aliasKey)) continue;
+		if (bareNameOwners.has(aliasKey) || registeredQualifiedKeys.has(aliasKey)) continue;
 		if (keyIndexes.size > 1) {
 			aggregateOutputScope.markAmbiguous(aliasKey);
 			continue;

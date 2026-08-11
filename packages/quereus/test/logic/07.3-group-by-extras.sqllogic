@@ -335,6 +335,38 @@ select a, count(*) as c, c + 0 as d from wg group by a;
 select a as k, k as k2 from wg group by a;
 -- error: Column not found: k
 
+-- A quoted alias may contain a dot, which the scope's flat string key cannot tell
+-- apart from the qualified spelling of a grouping key. The alias is skipped rather
+-- than registered, so `"wg.a"` here is the grouping key `wg.a` and the query plans
+-- as it did before aliases were registered at all
+-- (bug-scope-symbol-keys-collide-with-dotted-column-names owns the underlying
+-- flat-key collision).
+select wg.a as "wg.a", count(*) as c from wg group by wg.a having "wg.a" = 'x';
+→ [{"wg.a":"x","c":2}]
+
+-- Same skip when the dotted alias names a DIFFERENT key than the qualified spelling
+-- it collides with: HAVING filters on the grouping key `a`, not on the alias of `b`.
+select wg.b as "wg.a", count(*) as c from wg group by wg.a, wg.b having "wg.a" = 'x';
+→ [{"wg.a":"1","c":1},{"wg.a":"3","c":1}]
+
+-- An alias whose grouping key came from a GROUP BY ORDINAL resolves like any other.
+select a as k, count(*) as c from wg group by 1 having k = 'x';
+→ [{"k":"x","c":2}]
+
+-- An alias colliding with a bare group-key name that is ALREADY ambiguous stays
+-- ambiguous — the skip leaves the existing marking untouched rather than resolving
+-- the name to the alias's key.
+select i.a as a, count(*) as c from wg i join wg c on i.a = c.a group by i.a, c.a having a = 'x';
+-- error: ambiguous column name: a
+
+-- A VIEW body is planned the same way, so a grouping-key alias works there too.
+create view vw_key_alias as select a as k, count(*) as c from wg group by a having k = 'x';
+
+select k, c from vw_key_alias;
+→ [{"k":"x","c":2}]
+
+drop view vw_key_alias;
+
 drop table wg;
 
 -- ---------------------------------------------------------------------------

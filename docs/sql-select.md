@@ -666,7 +666,7 @@ The condition is applied after grouping, allowing filtering on aggregate values.
 **Select-list aliases are visible here.** A grouped query's output columns can be named in `having` (and in a window specification of the same query) by their select-list alias — an aggregate's alias (`select a, count(*) as c … having c > 1`) and a grouping key's alias (`select a as k … having k = 'x'`) alike. This is SQLite-style permissiveness; strict SQL admits an alias only in the statement's top-level `order by`. Two consequences worth knowing:
 
 - An alias **shadows** a same-named base-table column: under `select a as b … group by a`, a bare `b` in `having` is the grouping key `a`, not the table's own `b`.
-- An alias is the **lowest-precedence** name there. It never outranks a grouping key's own name or an aggregate's alias, so `select a as b … group by a, b having b = '1'` filters on the grouping key `b`. Two aliases naming *different* grouping keys collide and make the shared name ambiguous.
+- An alias is the **lowest-precedence** name there. It never outranks a grouping key's own name or an aggregate's alias, so `select a as b … group by a, b having b = '1'` filters on the grouping key `b`. The same holds for a grouping key's *qualified* name, which matters only for a quoted alias containing a dot: under `select wg.a as "wg.a" … group by wg.a`, `"wg.a"` in `having` is the grouping key, not the alias. Two aliases naming *different* grouping keys collide and make the shared name ambiguous.
 
 The select list itself is **not** widened: a select-list column still cannot name a sibling column's alias (`select a as k, k as k2 … group by a` is an error), matching SQLite and PostgreSQL.
 

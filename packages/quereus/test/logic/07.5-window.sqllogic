@@ -1047,6 +1047,34 @@ select a as k, b as k, row_number() over (order by k) as rn from wg group by a, 
 select a as k, k as k2 from wg group by a;
 -- error: Column not found: k
 
+-- A quoted alias may contain a dot, which the scope's flat string key cannot tell
+-- apart from the qualified spelling of a grouping key (`wg.a`). The alias is skipped
+-- rather than registered, so this query keeps planning exactly as it did before
+-- aliases were registered at all — registering it raised the internal-sounding
+-- "Symbol 'wg.a' already exists in the same scope."
+select wg.a as "wg.a", row_number() over (order by a) as rn from wg group by wg.a order by rn;
+→ [{"wg.a":"x","rn":1},{"wg.a":"y","rn":2}]
+
+-- Same skip when the dotted alias names a DIFFERENT key than the qualified spelling
+-- it collides with: `"wg.b"` in the specification is the grouping key `b`, not the
+-- alias of `a`. Alias precedence is lowest, qualified names included.
+select wg.a as "wg.b", row_number() over (order by "wg.b") as rn from wg group by wg.a, wg.b order by rn;
+→ [{"wg.b":"x","rn":1},{"wg.b":"y","rn":2},{"wg.b":"x","rn":3}]
+
+-- An alias whose grouping key came from a GROUP BY ORDINAL resolves like any other:
+-- the ordinal is expanded to the select-list expression before the keys are indexed.
+select a as k, row_number() over (order by k) as rn from wg group by 1 order by rn;
+→ [{"k":"x","rn":1},{"k":"y","rn":2}]
+
+-- The alias survives composition: a grouped, windowed query whose specification names
+-- one is an ordinary subquery source, and a UNION arm of one.
+select * from (select a as k, count(*) over (partition by k) as c from wg group by a) z order by k;
+→ [{"k":"x","c":1},{"k":"y","c":1}]
+
+select a as k, count(*) over (partition by k) as c from wg group by a
+union all select a, 1 from wg order by k, c;
+→ [{"k":"x","c":1},{"k":"x","c":1},{"k":"x","c":1},{"k":"y","c":1},{"k":"y","c":1}]
+
 -- A grouped, windowed query composes as a subquery source: its window column is
 -- an ordinary output column to the enclosing query.
 with q as (select a, row_number() over (order by a) as rn from wg group by a)

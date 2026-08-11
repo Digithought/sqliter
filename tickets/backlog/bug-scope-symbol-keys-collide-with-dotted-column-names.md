@@ -80,6 +80,37 @@ also registers `new.<col>` resolve to the column it names.
   reference resolves to the column the SQL actually names.
 - The `NOTE:` in `generated-column-scope.ts` that points here comes out with the fix.
 
+## Another arm: a select-list ALIAS containing a dot, in a grouped query's output scope
+
+Found while reviewing `bug-window-spec-cannot-name-group-key-by-select-alias`. Same
+flat-key problem, a fifth site, and it needs no `new.`/`old.`/`excluded.` prefix — a
+plain table qualifier is enough.
+
+A grouped query's output scope (`createAggregateOutputScope` in
+`packages/quereus/src/planner/building/select-aggregates.ts`) registers a grouping key
+written qualified under `<qualifier>.<name>`, and now also registers each grouping key
+under the select-list alias of the column that selects it. An alias is a quoted
+identifier, so it may contain a dot:
+
+```sql
+create table wg (a text, b text, primary key (a, b));
+select wg.a as "wg.a", count(*) as c from wg group by wg.a;
+```
+
+Nothing distinguishes the alias `"wg.a"` from the qualified spelling of the key `a`.
+That review left the alias registration **skipping** any key the scope already holds,
+so the query above plans and runs — but the skip is the same "silently bind one of the
+two rather than the one the user wrote" workaround this ticket argues against. With a
+structured key the alias would be its own name, and `having "wg.a" = …` would mean the
+alias rather than the grouping key.
+
+Severity/likelihood are unchanged by this arm: still `wrong-result` / `contrived`.
+Verified by hand; assertions for the current (skipping) behavior live in
+`packages/quereus/test/logic/07.3-group-by-extras.sqllogic` and
+`packages/quereus/test/logic/07.5-window.sqllogic`, and should be revisited with the
+fix. Add `packages/quereus/src/planner/building/select-aggregates.ts` to `files:` when
+this is picked up.
+
 ## Out of scope
 
 Whether the engine should accept dotted identifiers at all is a separate question. It
