@@ -58,6 +58,22 @@ const RANGE_CONSTRAINT_OPS: readonly IndexConstraintOp[] = [
 ];
 
 /**
+ * Index entries per row-resolution batch: the scan arms below collect up to this many
+ * surviving index entries (or multi-seek point keys) and resolve them with ONE
+ * {@link StoreTableBase.readEffectiveRowsByKeys} call, so an indexed read of N rows
+ * costs on the order of N / 256 store round trips instead of N serialized point reads
+ * (on IndexedDB, one readonly transaction instead of N). This is the bound
+ * {@link KVStore.getMany}'s "bounded by the caller" note refers to.
+ *
+ * 256 matches the iterate pager's default page (`paged-iterate.ts` DEFAULT_BATCH_SIZE)
+ * and makes the same trade that pager already makes and the {@link KVStore.iterate}
+ * contract documents: a little early-termination cost for throughput — `limit 1`
+ * collects one batch rather than one row — while keeping peak memory independent of
+ * the range size.
+ */
+export const ROW_RESOLUTION_BATCH = 256;
+
+/**
  * Read-path layer of the generic KVStore-backed virtual table.
  *
  * Every arm below reads the EFFECTIVE row state (see
@@ -740,32 +756,49 @@ export abstract class StoreTableScan extends StoreTableBase {
 	 * Scan a secondary index over `access.bounds`, resolving each index entry to its
 	 * base row and re-filtering.
 	 *
-	 * {@link iterateEffective} yields the committed index entries merged with this
-	 * transaction's pending index puts/deletes (read-your-own-writes over the
-	 * index), in index-key byte order — the order the isolation overlay merge relies
-	 * on (`isolated-table.ts` § buildSortKey). We resolve each entry to its row via
-	 * its stored data-key value WITHOUT reordering, so index-key order is preserved.
-	 *
-	 * Defense in depth mirroring the memory layer's live-recheck: a resolved-null
-	 * row (the entry's row was deleted — a pending index delete would normally
-	 * suppress the entry, but a committed entry can lag) is skipped, and every
-	 * resolved row is re-checked by {@link matchesFilters} (the byte window is only
-	 * a superset, and a stale entry whose indexed column no longer matches is
-	 * dropped).
+	 * One window of the producer/consumer pair below: {@link produceIndexEntries}
+	 * walks the window's index entries and {@link resolveIndexEntries} resolves them
+	 * to rows in {@link ROW_RESOLUTION_BATCH}-bounded batches — one
+	 * {@link StoreTableBase.readEffectiveRowsByKeys} round trip per batch instead of
+	 * one awaited point read per entry. A multi-seek runs the SAME consumer over the
+	 * concatenation of every window's producer instead of calling this method — see
+	 * {@link scanMultiSeek}.
 	 */
 	protected async *scanIndex(
 		indexStore: KVStore,
 		access: IndexAccessPattern,
 		filterInfo: FilterInfo,
-		multi?: MultiSeekWindowContext,
 	): AsyncIterable<Row> {
 		// Re-check each resolved row under the INDEX's per-column collation (see
 		// matchesFilters): the planner dropped the residual based on the index
 		// column's collation, which an explicit index `COLLATE` can make differ from
 		// the table column's declared collation.
-		const indexCollations = multi?.collations
-			?? this.resolveFilterCollations(filterInfo, this.indexColumnCollations(access.index));
-		for await (const entry of this.iterateEffective(indexStore, access.bounds)) {
+		const indexCollations = this.resolveFilterCollations(filterInfo, this.indexColumnCollations(access.index));
+		yield* this.resolveIndexEntries(
+			this.produceIndexEntries(indexStore, access.bounds, [filterInfo]),
+			indexCollations,
+		);
+	}
+
+	/**
+	 * Producer half of the index-scan pair: walk one byte window's index entries —
+	 * {@link iterateEffective} yields the committed entries merged with this
+	 * transaction's pending index puts/deletes (read-your-own-writes over the index),
+	 * in index-key byte order, the order the isolation overlay merge relies on
+	 * (`isolated-table.ts` § buildSortKey) — and yield, per surviving entry, its data
+	 * key plus the FilterInfos a resolved row may match. Entries stay in visit order
+	 * end to end, so index-key order is preserved through the batching consumer.
+	 *
+	 * Only the defenses that need nothing but the entry itself run here, BEFORE the
+	 * row read; everything row-dependent lives in {@link resolveRowBatch}.
+	 */
+	private async *produceIndexEntries(
+		indexStore: KVStore,
+		bounds: IterateOptions,
+		infos: readonly FilterInfo[],
+		seen?: Set<string>,
+	): AsyncIterable<PendingIndexEntry> {
+		for await (const entry of this.iterateEffective(indexStore, bounds)) {
 			// NOTE: a legacy index store (written before index values carried the data
 			// key) holds EMPTY values; a zero-length data key is not a row key, so skip
 			// it rather than resolve it to the wrong row. Because the access plan marked
@@ -778,24 +811,87 @@ export abstract class StoreTableScan extends StoreTableBase {
 			// durable fix is to version-stamp the index store and rebuild on open, or to
 			// fall back to a full scan the first time an empty value is seen.
 			if (entry.value.length === 0) continue;
-			// Cross-window dedup for a multi-seek: a data key an earlier window already
+			// Cross-window dedup for a multi-seek: a data key an EARLIER window already
 			// YIELDED is skipped before the data-store read, so a duplicate costs no
-			// extra `get`. The seen-set is only ever ADDED to on a yield (below) — adding
-			// at visit time would let a stale index entry that fails its residual poison
-			// the set and suppress the row's live entry in a later window.
-			const dataKeyHex = multi ? bytesToHex(entry.value) : undefined;
-			if (dataKeyHex !== undefined && multi!.seen.has(dataKeyHex)) continue;
-			// NOTE: one extra data-store `get` per matched index entry — the row lives
-			// in the data store, not the index (the index value carries only the data
-			// key, no covering payload). Fine now; if index-covered scans ever dominate
-			// a profile, consider storing the serialized row as a covering index value,
-			// at the cost of an index rewrite on EVERY column change (not just indexed
-			// columns) — deliberately not done here.
-			const row = await this.readEffectiveRowByKey(entry.value);
+			// extra point read. This is only a PRE-check — a duplicate inside one
+			// not-yet-resolved batch is invisible to it and is caught by
+			// {@link resolveRowBatch}'s post-read re-check. The seen-set is only ever
+			// ADDED to on a yield (there) — adding at visit time would let a stale index
+			// entry that fails its residual poison the set and suppress the row's live
+			// entry in a later window.
+			const dataKeyHex = seen ? bytesToHex(entry.value) : undefined;
+			if (dataKeyHex !== undefined && seen!.has(dataKeyHex)) continue;
+			yield { dataKey: entry.value, dataKeyHex, infos };
+		}
+	}
+
+	/**
+	 * Consumer half of the index-scan pair: collect up to {@link ROW_RESOLUTION_BATCH}
+	 * produced entries and resolve each batch through {@link resolveRowBatch} — one
+	 * store round trip per batch. Batching changes the round-trip count, never the row
+	 * set or its order: batches are resolved and yielded in entry order.
+	 *
+	 * Early termination: a downstream `break` mid-batch finishes this generator, whose
+	 * `for await` closes `entries` — and the iterate cursor under it — on the way out;
+	 * no further batch is collected or read.
+	 */
+	private async *resolveIndexEntries(
+		entries: AsyncIterable<PendingIndexEntry>,
+		collations: ReadonlyMap<number, CollationFunction>,
+		seen?: Set<string>,
+	): AsyncIterable<Row> {
+		let batch: PendingIndexEntry[] = [];
+		for await (const entry of entries) {
+			batch.push(entry);
+			if (batch.length >= ROW_RESOLUTION_BATCH) {
+				yield* this.resolveRowBatch(batch, collations, seen);
+				batch = [];
+			}
+		}
+		if (batch.length > 0) {
+			yield* this.resolveRowBatch(batch, collations, seen);
+		}
+	}
+
+	/**
+	 * Resolve one bounded batch of index entries to rows — a single
+	 * {@link StoreTableBase.readEffectiveRowsByKeys} call (which applies this
+	 * transaction's pending deletes/puts BEFORE touching the committed store; the
+	 * precedence is not re-implemented here) — then run the row-dependent defenses in
+	 * entry order, mirroring the memory layer's live-recheck:
+	 *
+	 *  - a resolved-null row (the entry's row was deleted — a pending index delete
+	 *    would normally suppress the entry, but a committed entry can lag) is skipped,
+	 *    and cannot shift later positions (the read answers positionally);
+	 *  - the multi-seek `seen` set is RE-checked after the read: the producer's
+	 *    pre-check ran before this batch was collected, so two entries at one data key
+	 *    inside a single batch (a stale index entry) are only caught here — without
+	 *    the re-check the row would yield twice;
+	 *  - a row is accepted when it matches ANY of the entry's FilterInfos (the byte
+	 *    window is only a superset, and a stale entry whose indexed column no longer
+	 *    matches is dropped), and `seen` is added to on yield ALONE — a stale entry
+	 *    that fails its residual must not suppress the row's live entry later.
+	 *
+	 * NOTE: still one data-store point read per matched index entry — the row lives in
+	 * the data store, not the index (the index value carries only the data key, no
+	 * covering payload); batching collapses the reads' round trips, not their count.
+	 * If index-covered scans ever dominate a profile, consider storing the serialized
+	 * row as a covering index value, at the cost of an index rewrite on EVERY column
+	 * change (not just indexed columns) — deliberately not done here.
+	 */
+	private async *resolveRowBatch(
+		batch: readonly PendingIndexEntry[],
+		collations: ReadonlyMap<number, CollationFunction>,
+		seen?: Set<string>,
+	): AsyncIterable<Row> {
+		const rows = await this.readEffectiveRowsByKeys(batch.map(e => e.dataKey));
+		for (let i = 0; i < batch.length; i++) {
+			const row = rows[i];
 			if (!row) continue;
-			if (this.matchesFilters(row, filterInfo, indexCollations)
-				|| (multi !== undefined && multi.extraTuples.some(fi => this.matchesFilters(row, fi, indexCollations)))) {
-				if (dataKeyHex !== undefined) multi!.seen.add(dataKeyHex);
+			const { dataKeyHex, infos } = batch[i];
+			if (dataKeyHex !== undefined && seen!.has(dataKeyHex)) continue;
+			if (infos.some(fi => this.matchesFilters(row, fi, collations))) {
+				if (dataKeyHex !== undefined) seen!.add(dataKeyHex);
 				yield row;
 			}
 		}
@@ -899,16 +995,20 @@ export abstract class StoreTableScan extends StoreTableBase {
 	 * away before scanning:
 	 *   - Tuples whose encoded prefix byte-matches (duplicate bound parameters, or
 	 *     case variants under a NOCASE key collation C) share ONE window, each kept
-	 *     as a residual alternative — see {@link MultiSeekWindowContext}.
+	 *     as a residual alternative — see {@link PendingIndexEntry}.
 	 *   - A window with no finite upper bound (all-0xff prefix — see
 	 *     buildIndexPrefixBounds) contains every later-sorting window outright (any
 	 *     key ≥ an all-0xff prefix necessarily starts with it), so those windows fold
 	 *     into it instead of re-scanning an overlapping range out of order.
 	 *
-	 * Emission is lazy per window — `… in (…) limit 1` stops after the first yielded
-	 * row without materializing the remaining windows. Each window goes through
-	 * {@link scanIndex} → {@link iterateEffective}, so read-your-own-writes and the
-	 * stale-entry / deleted-row defenses hold per seek key.
+	 * Emission is lazy and batched ACROSS windows: every window's
+	 * {@link produceIndexEntries} feeds ONE {@link resolveIndexEntries} consumer, whose
+	 * batches are bounded by ENTRY count, not window count — so a hundred single-row
+	 * windows collapse into a single row-resolution round trip, and
+	 * `… in (…) limit 1` materializes at most one {@link ROW_RESOLUTION_BATCH} batch
+	 * rather than every window. Each window's entries still come from
+	 * {@link iterateEffective}, so read-your-own-writes and the stale-entry /
+	 * deleted-row defenses hold per seek key.
 	 */
 	protected async *scanMultiSeek(spec: IdxStrSpec, filterInfo: FilterInfo): AsyncIterable<Row> {
 		const { tuples, seekWidth } = this.decodeMultiSeekTuples(spec, filterInfo);
@@ -979,14 +1079,38 @@ export abstract class StoreTableScan extends StoreTableBase {
 		// Identical for every window (resolveFilterCollations dedups by column), so
 		// resolve once and thread it through.
 		const collations = this.resolveFilterCollations(filterInfo, this.indexColumnCollations(index));
+		// Data-key hexes already YIELDED, across ALL windows — the multi-seek dedup set
+		// (see produceIndexEntries / resolveRowBatch for the pre-check / add-on-yield
+		// split). NOTE: holds one hex string per row the multi-seek yields, for the
+		// whole seek — the only unbounded allocation on this path. Windows are
+		// byte-disjoint, so the only real duplicate source is a stale index entry; if a
+		// large-result `IN` ever shows up as a memory problem, the set can be scoped
+		// per window (or dropped for a consistent store).
 		const seen = new Set<string>();
-		for (const w of disjoint) {
-			yield* this.scanIndex(
-				indexStore,
-				{ index, type: 'point', bounds: w.bounds },
-				w.infos[0],
-				{ seen, collations, extraTuples: w.infos.slice(1) },
-			);
+		// ONE consumer over the concatenation of every window's producer: the windows
+		// are sorted disjoint by encoded key, so the concatenation is already the
+		// emission order, and bounding batches by entry count gives the cross-window
+		// collapse (a hundred single-row windows become one round trip).
+		yield* this.resolveIndexEntries(
+			this.produceMultiSeekEntries(indexStore, disjoint, seen),
+			collations,
+			seen,
+		);
+	}
+
+	/**
+	 * Concatenate the disjoint multi-seek windows' producers, in window (byte) order.
+	 * Each entry carries its window's full FilterInfo list — the primary tuple plus
+	 * the byte-equal merged alternatives — so acceptance stays per row, in order (see
+	 * {@link PendingIndexEntry}).
+	 */
+	private async *produceMultiSeekEntries(
+		indexStore: KVStore,
+		windows: readonly MultiSeekWindow[],
+		seen: Set<string>,
+	): AsyncIterable<PendingIndexEntry> {
+		for (const w of windows) {
+			yield* this.produceIndexEntries(indexStore, w.bounds, w.infos, seen);
 		}
 	}
 
@@ -1035,10 +1159,20 @@ export abstract class StoreTableScan extends StoreTableBase {
 		}
 
 		const collations = this.resolveFilterCollations(filterInfo);
-		for (const p of [...points.values()].sort((a, b) => compareBytes(a.key, b.key))) {
-			const row = await this.readEffectiveRowByKey(p.key);
-			if (row && p.infos.some(fi => this.matchesFilters(row, fi, collations))) {
-				yield row;
+		const sorted = [...points.values()].sort((a, b) => compareBytes(a.key, b.key));
+		// Bounded batches over the sorted, deduplicated key list — "fetch N rows by
+		// key" is exactly the shape readEffectiveRowsByKeys batches (one round trip
+		// per ROW_RESOLUTION_BATCH keys, pending overlay resolved first, positional
+		// nulls for missing keys). Emission order is unchanged (ascending encoded data
+		// key), and a downstream break mid-batch reads no further batch.
+		for (let start = 0; start < sorted.length; start += ROW_RESOLUTION_BATCH) {
+			const slice = sorted.slice(start, start + ROW_RESOLUTION_BATCH);
+			const rows = await this.readEffectiveRowsByKeys(slice.map(p => p.key));
+			for (let i = 0; i < slice.length; i++) {
+				const row = rows[i];
+				if (row && slice[i].infos.some(fi => this.matchesFilters(row, fi, collations))) {
+					yield row;
+				}
 			}
 		}
 	}
@@ -1227,34 +1361,29 @@ interface MultiSeekWindow {
 }
 
 /**
- * Per-window context a multi-seek passes to {@link StoreTableScan.scanIndex} (absent for
- * ordinary single-window scans).
+ * One surviving index entry awaiting row resolution — what
+ * {@link StoreTableScan}'s producer half (`produceIndexEntries`) hands its batching
+ * consumer (`resolveIndexEntries`).
  *
- * `seen` — data-key hexes already YIELDED by an earlier window. Checked before the
- * data-store read (a cross-window duplicate costs no extra `get`), added only on a
- * yield: adding at visit time would let a stale index entry (row re-keyed since
- * indexing) that FAILS its residual poison the set and suppress the row's live entry
- * in a later window.
- * NOTE: holds one hex string per row the multi-seek yields, for the whole seek — the
- * only unbounded allocation on this path. Windows are byte-disjoint, so the only real
- * duplicate source is a stale index entry; if a large-result `IN` ever shows up as a
- * memory problem, the set can be scoped per window (or dropped for a consistent store).
+ * `dataKey` — the entry's stored index VALUE: the encoded data-store key of the row.
  *
- * `collations` — the constraint collation map, resolved once per multi-seek (it is
- * identical for every window).
+ * `dataKeyHex` — hex of `dataKey`, computed only when a multi-seek `seen` set is
+ * tracking duplicates (it doubles as the set key, saving a re-encode at the post-read
+ * check); undefined for an ordinary single-window scan, which has no dedup to do.
  *
- * `extraTuples` — additional seek tuples whose encoded window byte-equals this
- * window's (duplicate bound parameters, or case-variant values under a NOCASE key
- * collation). A row is yielded when it matches the primary FilterInfo OR any of
- * these. Index bytes now encode under the same collation C the residual compares
- * under (`indexKeyCollations`), so byte-equal tuples are C-equal and each merged
- * tuple's residual admits the same rows — the OR is redundancy, kept because it is
- * what makes the fold safe by construction rather than by that argument, and it is
- * what a custom equality-only normalizer (byte-equal ⇏ comparator-equal order but
- * equal partition) still relies on.
+ * `infos` — the FilterInfos a resolved row may match; the row is accepted when it
+ * matches ANY. For a single-window scan this is just the scan's own FilterInfo. For a
+ * multi-seek window it is the primary tuple plus every merged alternative — seek
+ * tuples whose encoded window byte-equals it (duplicate bound parameters, or
+ * case-variant values under a NOCASE key collation). Index bytes encode under the
+ * same collation C the residual compares under (`indexKeyCollations`), so byte-equal
+ * tuples are C-equal and each merged tuple's residual admits the same rows — the OR
+ * is redundancy, kept because it is what makes the fold safe by construction rather
+ * than by that argument, and it is what a custom equality-only normalizer
+ * (byte-equal ⇏ comparator-equal order but equal partition) still relies on.
  */
-interface MultiSeekWindowContext {
-	seen: Set<string>;
-	collations: ReadonlyMap<number, CollationFunction>;
-	extraTuples: readonly FilterInfo[];
+interface PendingIndexEntry {
+	dataKey: Uint8Array;
+	dataKeyHex?: string;
+	infos: readonly FilterInfo[];
 }

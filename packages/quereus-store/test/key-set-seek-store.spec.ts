@@ -44,6 +44,7 @@ import {
 	type IterateOptions,
 	type KVEntry,
 } from '../src/index.js';
+import { ROW_RESOLUTION_BATCH } from '../src/common/store-table-scan.js';
 
 /** The engine's own ceiling on runtime seek keys (`RUNTIME_SET_MAX_KEYS`). */
 const ENGINE_SEEK_CEILING = 1000;
@@ -68,6 +69,13 @@ const SCAN_RE = /^idx=\S+;plan=0$/;
 class CountingKVStore extends InMemoryKVStore {
 	public iterateEntryCount = 0;
 	public getCount = 0;
+	public getManyCalls = 0;
+	// InMemoryKVStore.getMany delegates through this.get (defaultGetMany), so batched
+	// keys land in getCount too; getManyCalls counts the round trips.
+	override getMany(keys: readonly Uint8Array[]): Promise<(Uint8Array | undefined)[]> {
+		this.getManyCalls++;
+		return super.getMany(keys);
+	}
 	override async *iterate(options?: IterateOptions): AsyncIterable<KVEntry> {
 		for await (const entry of super.iterate(options)) {
 			this.iterateEntryCount++;
@@ -405,9 +413,12 @@ describe('key-set semi join over the store backend (feat-key-set-seek-store-isol
 			expect(await pks(`select pk from dl where v in (select k from dlsrc)`)).to.deep.equal([3]);
 		});
 
-		it('stops after the first window under `limit 1` rather than materializing all of them', async () => {
-			// Per-window emission is lazy by design. Counted on the DATA store: a drained
-			// 50-window seek resolves ~50 index entries to data rows, a stopped one ~1.
+		it('stops after the first resolution batch under `limit 1` rather than materializing all windows', async () => {
+			// Emission is lazy in ROW_RESOLUTION_BATCH-bounded batches
+			// (store-index-seek-batched-scan): `limit 1` collects and resolves ONE batch
+			// of index entries — not one row, but also not the whole seek. Counted on the
+			// DATA store: a drained 300-window seek resolves 300 index entries to data
+			// rows (two batches), a stopped one at most 256 (one batch).
 			const dataStores = new Map<string, CountingKVStore>();
 			const cprovider = createCountingProvider(dataStores);
 			const cdb = new Database();
@@ -418,19 +429,22 @@ describe('key-set semi join over the store backend (feat-key-set-seek-store-isol
 				await cdb.exec(`create index ix_lz on lz (v)`);
 				await cdb.exec(`create table lsrc (id integer primary key, k integer) using store`);
 				await cdb.exec(`insert into lz values ${
-					Array.from({ length: 50 }, (_, i) => `(${i + 1}, ${(i + 1) * 10})`).join(', ')}`);
+					Array.from({ length: 300 }, (_, i) => `(${i + 1}, ${(i + 1) * 10})`).join(', ')}`);
 				await cdb.exec(`insert into lsrc values ${
-					Array.from({ length: 50 }, (_, i) => `(${i + 1}, ${(i + 1) * 10})`).join(', ')}`);
+					Array.from({ length: 300 }, (_, i) => `(${i + 1}, ${(i + 1) * 10})`).join(', ')}`);
 
 				const store = dataStores.get('main.lz')!;
 				store.iterateEntryCount = 0;
 				store.getCount = 0;
+				store.getManyCalls = 0;
 				cmod.reset();
 				const rows = await asyncIterableToArray(cdb.eval(`select pk from lz where v in (select k from lsrc) limit 1`));
 				expect(rows).to.have.lengthOf(1);
-				expect(cmod.seen('lz')[0], 'a 50-key seek').to.match(multiSeekRe('ix_lz'));
+				expect(cmod.seen('lz')[0], 'a 300-key seek').to.match(multiSeekRe('ix_lz'));
 				expect(store.iterateEntryCount, 'no data-store full scan').to.equal(0);
-				expect(store.getCount, 'only the first window resolved a data row').to.be.at.most(3);
+				expect(store.getManyCalls, 'no second batch after the limit').to.be.at.most(1);
+				expect(store.getCount, 'bounded by one batch, not the whole seek')
+					.to.be.at.most(ROW_RESOLUTION_BATCH);
 			} finally {
 				await cprovider.closeAll();
 			}

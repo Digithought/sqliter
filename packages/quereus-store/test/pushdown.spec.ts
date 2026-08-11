@@ -30,6 +30,8 @@ import {
 class CountingKVStore extends InMemoryKVStore {
 	public iterateEntryCount = 0;
 	public getCount = 0;
+	public getManyCalls = 0;
+	public getManyKeyCount = 0;
 	override async *iterate(options?: IterateOptions): AsyncIterable<KVEntry> {
 		for await (const entry of super.iterate(options)) {
 			this.iterateEntryCount++;
@@ -39,6 +41,14 @@ class CountingKVStore extends InMemoryKVStore {
 	override async get(key: Uint8Array): Promise<Uint8Array | undefined> {
 		this.getCount++;
 		return super.get(key);
+	}
+	// InMemoryKVStore.getMany delegates through this.get (defaultGetMany), so batched
+	// keys ALSO land in getCount — assert round trips on getManyCalls, volumes on
+	// getManyKeyCount, and total keys fetched on getCount.
+	override getMany(keys: readonly Uint8Array[]): Promise<(Uint8Array | undefined)[]> {
+		this.getManyCalls++;
+		this.getManyKeyCount += keys.length;
+		return super.getMany(keys);
 	}
 }
 
@@ -1559,8 +1569,12 @@ describe('StoreModule predicate pushdown', () => {
 				expect(rows.map(r => r.id)).to.deep.equal([5, 7, 9]);
 				// No data-store scan at all (a full scan would iterate all 100 rows) …
 				expect(store.iterateEntryCount, 'no data-store iteration').to.equal(0);
-				// … and only the 3 matched index entries resolve to data-store gets.
-				expect(store.getCount, 'one get per matched entry').to.be.within(1, 6);
+				// … and only the 3 matched index entries resolve to data-store reads.
+				expect(store.getCount, 'one read per matched entry').to.be.within(1, 6);
+				// The three single-entry windows resolve in ONE getMany round trip, not one
+				// awaited read per window (store-index-seek-batched-scan).
+				expect(store.getManyCalls, 'row resolution collapses into one batch').to.equal(1);
+				expect(store.getManyKeyCount, 'exactly the matched entries are batched').to.equal(3);
 			});
 
 			// The point of the prefix-range arm: the equality prefix here is NOT selective
@@ -1581,6 +1595,8 @@ describe('StoreModule predicate pushdown', () => {
 				expect(rows.map(r => r.id)).to.deep.equal([96, 97, 98, 99]);
 				expect(store.iterateEntryCount, 'no data-store iteration').to.equal(0);
 				expect(store.getCount, 'only the in-window entries resolve to data reads').to.be.at.most(8);
+				// The 4 in-window entries resolve in one batch round trip.
+				expect(store.getManyCalls, 'row resolution collapses into one batch').to.equal(1);
 			});
 		});
 	});
