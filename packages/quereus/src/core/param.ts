@@ -31,11 +31,27 @@ export function getParameterTypes(params: SqlParameters | undefined): Map<string
 		} else {
 			Object.entries(params).forEach(([key, value]) => {
 				// For named params like ':name', ParameterScope expects 'name' as key for hints.
-				results!.set(key.startsWith(':') ? key.substring(1) : key, getParameterScalarType(value));
+				// A positional param bound after prepare (bind/bindAll) lands here too, keyed
+				// by its stringified index (`boundArgs[index + 1]`) — normalize it back to a
+				// number so it lines up with the array branch above and with ParameterScope's
+				// own key, rather than silently missing the hint lookup.
+				const name = key.startsWith(':') ? key.substring(1) : key;
+				results!.set(normalizeParamKey(name), getParameterScalarType(value));
 			});
 		}
 	}
 	return results;
+}
+
+/**
+ * Normalizes a parameter name to a number when it is the canonical decimal
+ * form of a positive integer (or zero), matching how positional params are
+ * keyed elsewhere (array index + 1, ParameterScope's `:N` handling). A
+ * numeric-looking but non-canonical name ('01', '1abc') is left as a string
+ * so it isn't silently reassigned to an unrelated positional slot.
+ */
+export function normalizeParamKey(name: string): string | number {
+	return /^(0|[1-9]\d*)$/.test(name) ? Number(name) : name;
 }
 
 /**

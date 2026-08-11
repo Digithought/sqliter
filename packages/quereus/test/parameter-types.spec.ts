@@ -1,5 +1,6 @@
 import { expect } from 'chai';
 import { Database } from '../src/core/database.js';
+import { getParameterTypes, normalizeParamKey } from '../src/core/param.js';
 import type { ScalarType } from '../src/common/datatype.js';
 import type { SqlValue } from '../src/common/types.js';
 
@@ -118,6 +119,88 @@ describe('Parameter Type System', () => {
 			}
 			expect(rows).to.have.length(1);
 			expect(rows[0].text_col).to.be.null;
+		});
+	});
+
+	describe('getParameterTypes key normalization', () => {
+		it('keys an array-supplied positional hint by number', () => {
+			const hints = getParameterTypes([9]);
+			expect([...hints!.keys()]).to.deep.equal([1]);
+			expect(typeof [...hints!.keys()][0]).to.equal('number');
+		});
+
+		it('keys a boundArgs-supplied positional hint (object with numeric-string key) by number too', () => {
+			// This is the shape `getParameterTypes` sees on the bind()/bindAll() path
+			// (Statement.boundArgs), where the key came from `boundArgs[index + 1]` and JS
+			// object indexing has already stringified it.
+			const hints = getParameterTypes({ 1: 9 });
+			expect([...hints!.keys()]).to.deep.equal([1]);
+			expect(typeof [...hints!.keys()][0]).to.equal('number');
+		});
+
+		it('does not renumber a numeric-looking but non-canonical key', () => {
+			expect([...getParameterTypes({ '1abc': 9 })!.keys()]).to.deep.equal(['1abc']);
+			expect([...getParameterTypes({ '01': 9 })!.keys()]).to.deep.equal(['01']);
+		});
+
+		it('normalizeParamKey matches the same rule directly', () => {
+			expect(normalizeParamKey('1')).to.equal(1);
+			expect(normalizeParamKey('0')).to.equal(0);
+			expect(normalizeParamKey('1abc')).to.equal('1abc');
+			expect(normalizeParamKey('01')).to.equal('01');
+			expect(normalizeParamKey('name')).to.equal('name');
+		});
+	});
+
+	describe('Positional parameters bound after prepare (bind/bindAll)', () => {
+		it('announces INTEGER for a number bound via bindAll, matching the prepare-time array path', async () => {
+			const prepared = db.prepare('select ? as v', [9]);
+			expect(prepared.getColumnDefs()[0].type.logicalType.name).to.equal('INTEGER');
+			await prepared.finalize();
+
+			const bound = db.prepare('select ? as v');
+			bound.bindAll([9]);
+			expect(bound.getColumnDefs()[0].type.logicalType.name).to.equal('INTEGER');
+			await bound.finalize();
+		});
+
+		it('announces the matching type for each JS value kind bound via bindAll', async () => {
+			const cases: ReadonlyArray<{ bound: SqlValue; expected: string }> = [
+				{ bound: 9, expected: 'INTEGER' },
+				{ bound: 'hello', expected: 'TEXT' },
+				{ bound: new Uint8Array([1, 2]), expected: 'BLOB' },
+				{ bound: true, expected: 'BOOLEAN' },
+				{ bound: 9007199254740993n, expected: 'INTEGER' },
+			];
+			for (const { bound, expected } of cases) {
+				const stmt = db.prepare('select ? as v');
+				stmt.bindAll([bound]);
+				expect(stmt.getColumnDefs()[0].type.logicalType.name, `bound=${String(bound)}`).to.equal(expected);
+				await stmt.finalize();
+			}
+		});
+
+		it('still rejects a physical-type mismatch on a positional parameter bound via bindAll', async () => {
+			const stmt = db.prepare('select ? as v');
+			stmt.bindAll([9]);
+			stmt.compile(); // Freezes parameterTypes to INTEGER from the initial bind.
+
+			let error: Error | undefined;
+			try {
+				await stmt.get([3.14]);
+			} catch (e) {
+				error = e as Error;
+			}
+			expect(error).to.exist;
+			expect(error!.message).to.include('Parameter type mismatch');
+			await stmt.finalize();
+		});
+
+		it('announces INTEGER for a named parameter bound via bindAll (already correct before this fix)', async () => {
+			const stmt = db.prepare('select :p as v');
+			stmt.bindAll({ p: 7n });
+			expect(stmt.getColumnDefs()[0].type.logicalType.name).to.equal('INTEGER');
+			await stmt.finalize();
 		});
 	});
 

@@ -5,6 +5,7 @@ import { Ambiguous, type Scope } from './scope.js';
 import type { ScalarType } from '../../common/datatype.js';
 import type { PlanNode } from '../nodes/plan-node.js';
 import { TEXT_TYPE } from '../../types/builtin-types.js';
+import { normalizeParamKey } from '../../core/param.js';
 
 // Default type for parameters when not otherwise specified.
 const DEFAULT_PARAMETER_TYPE: ScalarType = {
@@ -60,8 +61,7 @@ export class ParameterScope extends BaseScope {
 			this._nextAnonymousIndex++; // Advance the fallback counter for any index-less synthetic '?'
 		} else if (symbolKey.startsWith(':')) {
 			const nameOrIndex = symbolKey.substring(1);
-			const numIndex = parseInt(nameOrIndex, 10);
-			identifier = isNaN(numIndex) ? nameOrIndex : numIndex;
+			identifier = normalizeParamKey(nameOrIndex);
 
 			if (this._parameters.has(identifier)) {
 				parameterNode = this._parameters.get(identifier)!;
