@@ -220,6 +220,82 @@ describe('lens grouped deferred probe — the INSERT seam groups too', () => {
 	});
 });
 
+describe('lens grouped deferred probe — a multi-row address does not preempt the uniqueness rejection', () => {
+	// The probe reads its verdict out of the logical view by the written row's
+	// LOGICAL KEY. A key-changing UPDATE can transiently address MORE THAN ONE
+	// logical row — exactly the duplicate the commit-time `lens:pk` scan exists to
+	// reject. A bare (non-aggregated) scalar read of that selection errors
+	// `Scalar subquery returned more than one row` and preempts the uniqueness
+	// rejection with a cardinality message; the probe's `min` collapse is what
+	// keeps the real constraint's message the one the user sees.
+	//
+	// The split below makes the duplicate physically reachable: the members stitch
+	// on a HIDDEN surrogate (`sk`, each member's own PK — so the 1:1 stitch still
+	// holds), while the logical PK is `id`, a plain non-unique basis column. No
+	// covering basis key answers it ⇒ `lens:pk` routes to the commit-time
+	// set-level scan, and a re-keying UPDATE the basis happily accepts leaves two
+	// logical rows sharing `id`. The hidden stitch key also puts the probe on its
+	// member-hop address — the other half of the addressing seam.
+	function dupSplit(): MappingAdvertisement {
+		return {
+			id: 'D_core',
+			logicalTable: 'D',
+			role: 'primary-storage',
+			storage: {
+				anchorRelationId: 'D_core',
+				members: [
+					{ relationId: 'D_core', relation: { schema: 'main', table: 'D_core' }, presence: 'mandatory', columns: [colMap('id', 'id'), colMap('name', 'name')] },
+					{ relationId: 'D_tag', relation: { schema: 'main', table: 'D_tag' }, presence: 'optional', columns: [colMap('tag', 'tag')] },
+				],
+				sharedKey: {
+					kind: 'logical-tuple',
+					keyColumnsByRelation: new Map<string, readonly string[]>([['D_core', ['sk']], ['D_tag', ['sk']]]),
+				},
+			},
+		};
+	}
+
+	async function setupDup(db: Database): Promise<void> {
+		const mod = new GrandfatheredAdvertisingModule();
+		mod.ads = [dupSplit()];
+		db.registerModule('admod', mod);
+		await db.exec('create table D_core (sk integer primary key, id integer, name text) using admod');
+		await db.exec('create table D_tag (sk integer primary key, tag text) using admod');
+		await db.exec("declare logical schema d { table D { id integer primary key, name text, tag text not null constraint tag_rule check (tag <> 'bad') } }");
+		await db.exec('apply schema d');
+		await db.exec("insert into main.D_core values (10, 1, 'alpha'), (20, 2, 'beta')");
+		await db.exec("insert into main.D_tag values (10, 'one'), (20, 'two')");
+	}
+
+	it('a key-changing UPDATE that duplicates the logical PK reports the uniqueness violation, not a subquery cardinality error', async () => {
+		const db = new Database();
+		try {
+			await setupDup(db);
+			const message = await captureErrorMessage(() => db.exec('update d.D set id = 1 where id = 2'));
+			expect(message).to.not.match(/returned more than one row/i);
+			expect(message).to.match(/unique|constraint|duplicate|primary/i);
+			// Both logical rows survive — the duplicating update rolled back.
+			expect(await rows(db, 'select id from d.D order by id')).to.deep.equal([{ id: 1 }, { id: 2 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a row-local rule violated on a multi-row address still reports that rule', async () => {
+		const db = new Database();
+		try {
+			await setupDup(db);
+			// Same duplicating re-key, but the written row also violates the row-local
+			// CHECK: `min` skips the passing row's NULL verdict, so the violated rule's
+			// own message survives the collapse.
+			const message = await captureErrorMessage(() => db.exec("update d.D set id = 1, tag = 'bad' where id = 2"));
+			expect(message).to.equal('CHECK constraint failed: lens:tag_rule');
+		} finally {
+			await db.close();
+		}
+	});
+});
+
 describe('lens grouped deferred probe — constant plan count', () => {
 	function countGroupedConstraints(node: PlanNode): number {
 		let count = 0;
