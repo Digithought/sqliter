@@ -307,6 +307,22 @@ describe('StoreModule runtime-valued IN sets (feat-runtime-key-set-protocol)', (
 			expect(result.seekColumnIndexes).to.be.undefined;
 		});
 
+		it('plans a plain `=` and a one-element IN as the same `_primary_` point lookup', async () => {
+			// The point arm names its seek columns, which routes it through
+			// `rule-select-access-path`'s index-aware arm — the arm whose `eqBySeekCol`
+			// accepts a one-element IN. Losing `seekColumnIndexes` here would send the plan
+			// back to the legacy PK arm, which matches `'='` only, and the claimed IN would
+			// be seeked nowhere (feat-store-pk-in-list-multiseek).
+			await db.exec('create table pkpoint (k integer primary key, other text) using store');
+			const eq = plan('pkpoint', [{ columnIndex: 0, op: '=', usable: true, value: 7 }]);
+			expect(eq.indexName).to.equal('_primary_');
+			expect(eq.seekColumnIndexes, 'the point arm names its seek columns').to.deep.equal([0]);
+			expect(eq.isSet, 'a point lookup IS a set').to.be.true;
+			expect(eq.handledFilters).to.deep.equal([true]);
+			expect(plan('pkpoint', [literalInFilter(0, 1)]), 'a one-element IN plans identically')
+				.to.deep.equal(eq);
+		});
+
 		it(`declines a primary-key runtime set above the ${STORE_SEEK_CAP}-seek cap`, async () => {
 			await db.exec('create table pkcap (k integer primary key, other text) using store');
 			expect(plan('pkcap', [runtimeSetFilter(0, STORE_SEEK_CAP)]).seekColumnIndexes).to.deep.equal([0]);

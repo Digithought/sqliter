@@ -1832,6 +1832,23 @@ describe('StoreModule predicate pushdown', () => {
 
 			it('IN plus limit 1 returns a single row', async () =>
 				expect(await pks(`select pk from t where pk in (1, 3, 5) limit 1`)).to.have.lengthOf(1));
+
+			it('a predicate on a non-key column stays a residual over the seek', async () => {
+				const q = `select pk from t where pk in (1, 3, 5) and v > 15`;
+				expect(await planProperties(q)).to.match(/idx=_primary_\(0\);plan=5;inCount=3/);
+				expect(await planOps(q), 'the `v` predicate survives above the seek').to.match(/FILTER/);
+				expect(await pks(q)).to.deep.equal([3, 5]);
+			});
+
+			it('a range on the SAME pk column loses to the multi-seek and stays a residual', async () => {
+				// Arm order: the multi-seek is tried BEFORE the leading-PK range arm, so the IN
+				// is what narrows and the `>` comes back as a residual. Both claim the same
+				// column, which is why the claim has to be per-ROLE rather than per-column.
+				const q = `select pk from t where pk in (1, 3, 5) and pk > 2`;
+				expect(await planProperties(q)).to.match(/idx=_primary_\(0\);plan=5;inCount=3/);
+				expect(await planOps(q)).to.match(/FILTER/);
+				expect(await pks(q)).to.deep.equal([3, 5]);
+			});
 		});
 
 		// The one claim in this arm that can hand back WRONG-ORDER rows rather than merely

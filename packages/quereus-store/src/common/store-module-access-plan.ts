@@ -214,16 +214,10 @@ function equalityRoles(colIdxs: readonly number[]): SeekRole[] {
 	return colIdxs.map(colIdx => ({ colIdx, ops: EQ_OR_IN_OPS }));
 }
 
-/**
- * The equality pins covering the WHOLE primary key, or null when a member is unpinned.
- *
- * Per PK column the pin is the FIRST filter that can fill an equality role
- * ({@link equalitySeekKeyCount} — a `'='`, a non-empty literal `IN`, or a runtime-valued
- * `IN` set). That is the same predicate and the same positional pick the secondary arm
- * and `rule-select-access-path`'s `eqBySeekCol` make, so this module's claim and the
- * rule's pick cannot disagree.
- */
-interface PrimaryKeyPins {
+/** The equality-pinned leading run of a key column list, with its seek arithmetic. */
+interface EqualityPins {
+	/** The pinned leading columns, in the order they were asked for. */
+	readonly cols: readonly number[];
 	/** Cross-product of the per-column seek-key counts (1 for a plain '='). */
 	readonly seekKeyCount: number;
 	/** true ⇒ delivered as a `plan=5` multi-seek, not a single point read. */
@@ -231,34 +225,61 @@ interface PrimaryKeyPins {
 }
 
 /**
- * Resolve {@link PrimaryKeyPins} for `pkColumns`, or null when any member carries no
- * equality-role filter.
+ * The longest LEADING run of `colIdxs` whose every column carries a filter that can fill
+ * an equality role, and what that run costs to seek.
  *
- * A per-column `find` rather than a set of pinned column indexes: `a = 1 and a = 2` on a
- * composite PK `(a, b)` finds a filter for `a`, none for `b`, and correctly reports the
- * key unpinned. Counting raw equality filters instead would read that predicate as "both
- * PK columns pinned", claim both filters handled, then — with no complete PK equality set
- * to seek — degrade to a sequential scan whose residual has already been discarded,
- * returning the whole table.
+ * Per column the pin is the FIRST such filter ({@link equalitySeekKeyCount} — a `'='`, a
+ * non-empty literal `IN`, or a runtime-valued `IN` set). That is the same positional pick
+ * {@link claimFirstPerRole} claims and `rule-select-access-path`'s `eqBySeekCol` seeks on,
+ * so this module's claim and the rule's pick cannot disagree. A runtime-valued set
+ * contributes its `maxCount` ceiling — the worst case the engine may deliver — so every
+ * gate downstream judges the largest multi-seek it could ever be asked to perform.
  *
- * `isMultiSeek` is NOT `seekKeyCount > 1`: a runtime-valued set is delivered as a
- * `plan=5` multi-seek even at `maxCount === 1`, so it must be judged as one rather than
- * as the plain point read its ceiling arithmetic would otherwise suggest.
+ * ONE helper for both the primary-key arms ({@link resolvePrimaryKeyPins}, which needs the
+ * run to cover the whole key) and the secondary-index arm (which takes whatever prefix it
+ * gets): separate copies of this loop are how a `'='`-only PK arm and an IN-claiming index
+ * arm drifted apart in the first place — see the note on {@link EQ_OR_IN_OPS}.
+ *
+ * `isMultiSeek` is NOT `seekKeyCount > 1`: a runtime-valued set is delivered as a `plan=5`
+ * multi-seek even at `maxCount === 1`, so it must be judged as one rather than as the plain
+ * point read its ceiling arithmetic would otherwise suggest. (`seekKeyCount > 1` implies
+ * the flag — every factor above 1 is a multi-value equality — so the flag only ever *adds*
+ * the `maxCount === 1` runtime-set case.)
+ */
+function resolveEqualityPins(
+	filters: readonly PredicateConstraint[],
+	colIdxs: readonly number[],
+): EqualityPins {
+	const cols: number[] = [];
+	let seekKeyCount = 1;
+	let isMultiSeek = false;
+	for (const colIdx of colIdxs) {
+		const pin = filters.find(f => f.columnIndex === colIdx && equalitySeekKeyCount(f) !== null);
+		if (!pin) break;
+		cols.push(colIdx);
+		seekKeyCount *= equalitySeekKeyCount(pin)!;
+		if (isMultiValueEquality(pin)) isMultiSeek = true;
+	}
+	return { cols, seekKeyCount, isMultiSeek };
+}
+
+/**
+ * The equality pins covering the WHOLE primary key, or null when a member is unpinned.
+ *
+ * A per-column pin rather than a count of pinned columns: `a = 1 and a = 2` on a composite
+ * PK `(a, b)` pins `a`, finds nothing for `b`, and correctly reports the key unpinned.
+ * Counting raw equality filters instead would read that predicate as "both PK columns
+ * pinned", claim both filters handled, then — with no complete PK equality set to seek —
+ * degrade to a sequential scan whose residual has already been discarded, returning the
+ * whole table.
  */
 function resolvePrimaryKeyPins(
 	filters: readonly PredicateConstraint[],
 	pkColumns: readonly number[],
-): PrimaryKeyPins | null {
+): EqualityPins | null {
 	if (pkColumns.length === 0) return null;
-	let seekKeyCount = 1;
-	let isMultiSeek = false;
-	for (const colIdx of pkColumns) {
-		const pin = filters.find(f => f.columnIndex === colIdx && equalitySeekKeyCount(f) !== null);
-		if (!pin) return null;
-		seekKeyCount *= equalitySeekKeyCount(pin)!;
-		if (isMultiValueEquality(pin)) isMultiSeek = true;
-	}
-	return { seekKeyCount, isMultiSeek };
+	const pins = resolveEqualityPins(filters, pkColumns);
+	return pins.cols.length === pkColumns.length ? pins : null;
 }
 
 /**
@@ -318,6 +339,15 @@ export function computeBestAccessPlan(
 	//    than under-fetching.
 	// The multi-seek is exactly the point arm run N times, so its collation exposure is
 	// the point arm's, unchanged.
+	//
+	// The one divergence neither reason covers is PREDICATE-side and invisible from here:
+	// `where pk collate nocase in (…)` over a BINARY key column would seek exact-case
+	// windows and UNDER-fetch. `PredicateConstraint` carries no collation, so this module
+	// cannot see it and always claims; `rule-select-access-path`'s `classifyCollationCover`
+	// (which reads the predicate's effective collation off the source expression) is what
+	// declines that shape to a scan + residual. A new PK arm inherits that protection only
+	// by going through the rule's index-aware path — one more reason `setSeekColumns` on
+	// the point arm below is load-bearing.
 	const pkPins = resolvePrimaryKeyPins(request.filters, pkColumns);
 	if (pkPins && !pkPins.isMultiSeek) {
 		// Full PK match - point lookup (single row; no monotonic advertisement).
@@ -488,7 +518,7 @@ function primaryKeyMultiSeekPlan(
 	tableInfo: TableSchema,
 	request: BestAccessPlanRequest,
 	pkColumns: readonly number[],
-	pins: PrimaryKeyPins,
+	pins: EqualityPins,
 	estimatedRows: number,
 	pkOrderPreservingPrefix: number,
 ): BestAccessPlanResult | null {
@@ -593,32 +623,12 @@ function tryIndexAccessPlan(
 
 	const indexColIndexes = index.columns.map(c => c.index);
 
-	// Contiguous leading-prefix equality → point/prefix seek. An IN filter counts as
-	// an equality here (it is N equalities, served as one multi-seek by
-	// StoreTable.scanMultiSeek); `inCount` is the cross-product of the per-column
-	// seek-key counts (1 for a plain '='), matching the rule's seek-key count. The
-	// FIRST role-filling filter per column is what the rule seeks on, so its
-	// cardinality is the one that counts.
-	//
-	// A runtime-valued IN set contributes its `maxCount` ceiling — the worst case the
-	// engine may deliver — so every gate below (the MAX_MULTI_SEEK_KEYS cap, the
-	// semantic-ordering decline) judges it against the largest multi-seek it could
-	// ever be asked to perform.
-	const eqCols: number[] = [];
-	let inCount = 1;
-	// `isMultiSeek` is NOT `inCount > 1`: a runtime set is delivered as a `plan=5`
-	// multi-seek even at `maxCount === 1`, so the gates below must judge it as one
-	// rather than as the plain EQ its ceiling arithmetic would otherwise suggest.
-	// (`inCount > 1` implies this flag — every factor above 1 is a multi-value
-	// equality — so the flag only ever *adds* the maxCount-1 runtime-set case.)
-	let isMultiSeek = false;
-	for (const colIdx of indexColIndexes) {
-		const eqFilter = request.filters.find(f => f.columnIndex === colIdx && equalitySeekKeyCount(f) !== null);
-		if (!eqFilter) break;
-		eqCols.push(colIdx);
-		inCount *= equalitySeekKeyCount(eqFilter)!;
-		if (isMultiValueEquality(eqFilter)) isMultiSeek = true;
-	}
+	// Contiguous leading-prefix equality → point/prefix seek. An IN filter counts as an
+	// equality here (it is N equalities, served as one multi-seek by
+	// StoreTable.scanMultiSeek); `inCount` is the cross-product of the per-column seek-key
+	// counts, matching the rule's seek-key count. See {@link resolveEqualityPins} for the
+	// positional pick and the runtime-set ceiling both arms share.
+	const { cols: eqCols, seekKeyCount: inCount, isMultiSeek } = resolveEqualityPins(request.filters, indexColIndexes);
 	const leadingCol = indexColIndexes[0];
 	const hasLeadingRange = request.filters.some(
 		f => f.columnIndex === leadingCol && RANGE_OPS.includes(f.op),
@@ -641,7 +651,7 @@ function tryIndexAccessPlan(
 		? nextCol
 		: undefined;
 
-	let seekCols: number[];
+	let seekCols: readonly number[];
 	let arm: IndexArm;
 	if (trailingRangeCol !== undefined) {
 		seekCols = [...eqCols, trailingRangeCol];
