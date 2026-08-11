@@ -118,6 +118,32 @@ for the input-scaled budget
 (`max(maxOptimizationDepth, planInputDepth + optimizationDepthHeadroom)`) and
 the `maxRulesFired` cap.
 
+## Analysis walks need their own dedup
+
+The tracking above governs *rule application*. A plain analysis walk — one that reads
+the plan and answers a question without transforming anything — gets none of it and must
+dedupe itself.
+
+The trap is that a relational node exposes its inputs through **two** accessors, and they
+overlap. `JoinNode.getChildren()` returns `[left, right, condition]` while
+`JoinNode.getRelations()` returns `[left, right]`. A walk that descends both — which it
+must, since `getRelations()` is not always a subset of `getChildren()` — visits each input
+twice per level, so its cost is 2^depth down a join spine, not O(nodes).
+
+So: **descend both lists, and carry a `Set<PlanNode>` of already-visited nodes for the
+duration of one top-level call.** Dedupe, do not prune — dropping the `getRelations()`
+descent changes the answer on nodes where the two lists differ. Do not cache the set across
+calls either: plan nodes are rebuilt during optimization, and answers like "which attributes
+are defined here" depend on where the walk started.
+
+`planner/cache/correlation-detector.ts` is the worked example: each of its three walkers
+takes a `seen` set, and each top-level entry point mints a fresh one per walk, since the
+walks answer different questions. Its sentinel is the `Correlation detection over a deep
+join spine` describe in `test/performance-sentinels.spec.ts`. `collectTableRefs` in
+`planner/analysis/change-scope.ts` (the two-accessor descent
+[change-scope.md](change-scope.md) describes) carries the same `visited` set for the same
+reason; the other walks in that file descend `getChildren()` only and so need none.
+
 ## Performance Characteristics
 
 **Memory**: O(nodes × rules) per context, garbage collected when context ends

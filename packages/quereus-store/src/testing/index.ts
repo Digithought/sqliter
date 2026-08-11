@@ -15,6 +15,13 @@
  * a guard).
  */
 
-export { runKVStoreConformance, assertBoundedIterate, type KVBackend, type ReadMeter, type PointReadMeter } from './kv-conformance.js';
+export {
+	runKVStoreConformance,
+	assertBoundedIterate,
+	assertBatchPointRead,
+	type KVBackend,
+	type ReadMeter,
+	type PointReadMeter,
+} from './kv-conformance.js';
 export { runKVProviderConformance, type KVProviderBackend } from './kv-provider-conformance.js';
 export { runStoreNameDistinctness, assertStoreNamesDistinct, type KVNamingBackend } from './kv-naming-conformance.js';

@@ -18,6 +18,11 @@ import { testBuiltinCollationResolver } from './util/builtin-collation-resolver.
 import { createDefaultColumnSchema } from '../src/schema/column.js';
 import { INTEGER_TYPE } from '../src/types/builtin-types.js';
 import type { TableSchema } from '../src/schema/table.js';
+import type * as AST from '../src/parser/ast.js';
+import type { PlanNode, RelationalPlanNode } from '../src/planner/nodes/plan-node.js';
+import { PlanNodeType } from '../src/planner/nodes/plan-node-type.js';
+import type { JoinNode } from '../src/planner/nodes/join-node.js';
+import { isCorrelatedSubquery, readsColumnsOf } from '../src/planner/cache/correlation-detector.js';
 
 /** Collect an async iterable into an array. */
 async function collect<T>(iter: AsyncIterable<T>): Promise<T[]> {
@@ -107,6 +112,63 @@ describe('Performance sentinels', function () {
 				// O(conjuncts × columns_mentioned) — 50 × 1 column each = trivial.
 				// Generous budget for CI headroom.
 				expect(elapsed).to.be.below(10000, `50 plans of 50-col WHERE took ${elapsed.toFixed(1)} ms`);
+			} finally {
+				await db.close();
+			}
+		});
+	});
+
+	// ------------------------------- Correlation walk over a deep join spine
+	// Regression sentinel for planner-correlation-walk-doubles-per-join-level. The
+	// three walkers in `planner/cache/correlation-detector.ts` descend BOTH
+	// `getChildren()` and `getRelations()`, which for a join name the same two
+	// inputs. Undeduped, that visits every node twice per level — 2^depth down a
+	// join spine — and the join physical-selection rules call `readsColumnsOf` per
+	// join per optimizer pass, so the whole plan build inherits it.
+	//
+	// The spine is built LOGICALLY (`_buildPlan`, no optimizer) precisely so this
+	// test measures the walkers alone: nothing in the logical builder calls them,
+	// only optimizer rules and `runtime/emit/subquery` do.
+	//
+	// Measured on this machine by disabling the dedup: depth 24 took 267_725 ms
+	// undeduped versus 47 ms deduped. Depth is 20 rather than 24 only so a
+	// regression goes red in ~17 s instead of ~4.5 min — that still leaves the
+	// deduped walk ~25× under the 1 s budget and the undeduped one ~17× over it.
+	describe('Correlation detection over a deep join spine', function () {
+		this.timeout(60_000);
+
+		it('walks a 20-deep join spine in linear, not exponential, time', async () => {
+			const SPINE_DEPTH = 20;
+			const db = new Database();
+			try {
+				await db.exec('create table spine_t (id integer primary key, v integer) using memory');
+
+				// `spine_t a0 join spine_t a1 on a1.id = a0.id join ...` — a left-deep
+				// spine of SPINE_DEPTH JoinNodes, each correlating to its own left input.
+				const joins = Array.from({ length: SPINE_DEPTH }, (_, i) =>
+					`join spine_t a${i + 1} on a${i + 1}.id = a${i}.id`).join(' ');
+				const sql = `select a0.v from spine_t a0 ${joins}`;
+
+				const ast = new Parser().parse(sql) as AST.Statement;
+				const { plan } = db._buildPlan([ast]);
+
+				// Topmost JoinNode in a pre-order walk = the spine root.
+				const joinNodes: JoinNode[] = [];
+				plan.visit((node: PlanNode) => {
+					if (node.nodeType === PlanNodeType.Join) joinNodes.push(node as JoinNode);
+				});
+				expect(joinNodes.length, 'the logical plan is a full join spine').to.equal(SPINE_DEPTH);
+				const root = joinNodes[0];
+
+				const start = performance.now();
+				// Both shapes the join rules ask on every pass.
+				isCorrelatedSubquery(root as RelationalPlanNode);
+				readsColumnsOf(root.right, root.left);
+				readsColumnsOf(root.left, root.right);
+				const elapsed = performance.now() - start;
+
+				expect(elapsed).to.be.below(1000,
+					`correlation walks over a ${SPINE_DEPTH}-deep join spine took ${elapsed.toFixed(1)} ms`);
 			} finally {
 				await db.close();
 			}

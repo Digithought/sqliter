@@ -193,6 +193,11 @@ export class CachedKVStore implements KVStore {
 		return new CachedWriteBatch(this.store.batch(), this);
 	}
 
+	/**
+	 * Dropping the cache BEFORE closing the underlying store is load-bearing, not tidiness:
+	 * a warm entry left behind would let `get`/`getMany` keep answering from memory after
+	 * close, where every real backend rejects. Conformance tiers 1 and 8 pin that rejection.
+	 */
 	async close(): Promise<void> {
 		this.invalidateAll();
 		return this.store.close();

@@ -96,6 +96,12 @@ export class LevelDBStore implements KVStore {
 	 *
 	 * The empty case is short-circuited rather than handed down: `getMany([])` is legal on
 	 * abstract-level but there is no reason to cross the binding for it.
+	 *
+	 * NOTE: a key repeated in `keys` must come back as INDEPENDENT buffers (the contract's
+	 * buffer ownership across positions). That holds today because classic-level
+	 * deserializes per key, but abstract-level does not promise it — if a binding ever
+	 * shares one buffer across duplicate positions, conformance tier 8 goes red and the fix
+	 * belongs here (copy at the boundary), not in the test.
 	 */
 	async getMany(keys: readonly Uint8Array[]): Promise<(Uint8Array | undefined)[]> {
 		this.checkOpen();

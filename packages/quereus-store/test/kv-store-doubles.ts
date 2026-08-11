@@ -1,9 +1,10 @@
 /**
- * KVStore test doubles shared by the bounded-iteration specs.
+ * KVStore test doubles shared by the bounded-iteration and batch-point-read specs.
  *
  * Not a `*.spec.ts`, so Mocha's glob does not pick it up as a suite.
  */
 
+import { bytesToHex, compareBytes } from '../src/common/bytes.js';
 import type { IterateOptions, KVEntry, KVStore, WriteBatch, WriteOptions } from '../src/common/kv-store.js';
 
 /**
@@ -120,5 +121,45 @@ export class BufferingKVStore extends DelegatingKVStore {
 		for await (const entry of this.inner.iterate(bounds)) all.push(entry);
 		const limit = options?.limit ?? all.length;
 		for (let i = 0; i < Math.min(limit, all.length); i++) yield all[i];
+	}
+}
+
+/**
+ * DELIBERATELY SORTED: reads the keys in byte order and answers in THAT order — the shape
+ * of a backend whose native multi-get sorts internally (or whose results are filled in
+ * arrival order) and whose adapter forgets to map back to argument order. Every value it
+ * returns is correct; only the positions are wrong.
+ */
+export class SortingGetManyKVStore extends DelegatingKVStore {
+	getMany(keys: readonly Uint8Array[]): Promise<(Uint8Array | undefined)[]> {
+		return this.inner.getMany([...keys].sort(compareBytes));
+	}
+}
+
+/**
+ * DELIBERATELY COMPACTING: drops absent keys instead of leaving `undefined` at their
+ * position — the shape of a backend that returns "the rows it found". The result is
+ * shorter than the key list and everything after a miss has slid down one index.
+ */
+export class CompactingGetManyKVStore extends DelegatingKVStore {
+	async getMany(keys: readonly Uint8Array[]): Promise<(Uint8Array | undefined)[]> {
+		return (await this.inner.getMany(keys)).filter(value => value !== undefined);
+	}
+}
+
+/**
+ * DELIBERATELY ALIASING: reads each DISTINCT key once and files the SAME buffer object at
+ * every position that key occupies — the shape of a backend that dedups its key list to
+ * save a read. Positions and values all look right; a caller that scribbles on one
+ * position silently rewrites the other.
+ */
+export class AliasingGetManyKVStore extends DelegatingKVStore {
+	async getMany(keys: readonly Uint8Array[]): Promise<(Uint8Array | undefined)[]> {
+		const distinct = new Map<string, Uint8Array>();
+		for (const key of keys) distinct.set(bytesToHex(key), key);
+		const hexes = [...distinct.keys()];
+		const values = await this.inner.getMany([...distinct.values()]);
+		const byHex = new Map(hexes.map((hex, i) => [hex, values[i]]));
+		return keys.map(key => byHex.get(bytesToHex(key)));
 	}
 }

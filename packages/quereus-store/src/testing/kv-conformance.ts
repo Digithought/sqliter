@@ -77,6 +77,12 @@ export interface PointReadMeter {
 	 * "Round trip" is whatever costs the backend a crossing: an `abstract-level` binding
 	 * call, an IndexedDB transaction. It is NOT the number of keys asked for — the whole
 	 * point of the tier is that K keys cost one trip.
+	 *
+	 * NOTE: the tier proves the meter is live by checking that a single `get` moves it, so
+	 * a store that can serve a read WITHOUT touching backing storage — anything with an
+	 * in-process cache in front, `CachedKVStore` included — cannot supply this meter as
+	 * written. If such a backend ever needs its batching pinned, the wiring guard has to
+	 * read a key the cache cannot have.
 	 */
 	roundTrips(): number;
 }
@@ -157,6 +163,91 @@ export async function assertBoundedIterate(
 	assert.ok(read <= allowed,
 		`bounded iteration: consuming ${take} entr${take === 1 ? 'y' : 'ies'} read ${read} from backing storage, ` +
 		`allowance is ${allowed} (take + maxReadAhead - 1, maxReadAhead=${meter.maxReadAhead})`);
+}
+
+/**
+ * Assert the POSITIONAL half of {@link KVStore.getMany}'s contract: answers by position
+ * for an unsorted key list, a miss that stays at its own index, the empty list, a repeated
+ * key in independent buffers, and an interleave of already-read and never-read keys.
+ *
+ * Seeds keys 1..5 itself, so pass a store the caller has NOT seeded.
+ *
+ * The other half of the contract — K keys cost ONE round trip — is not checked here: it
+ * needs a {@link PointReadMeter}, which only a backend's own adapter can supply, so the
+ * tier registers it separately.
+ *
+ * Exported standalone so a spec can drive it against store doubles built to violate the
+ * contract and prove it REJECTS (see `batch-point-read.spec.ts`), the same way
+ * {@link assertBoundedIterate} is driven against a buffering double.
+ */
+export async function assertBatchPointRead(store: KVStore): Promise<void> {
+	await seed1to5(store);
+	await assertPositionalOverUnsortedKeys(store);
+	await assertMissKeepsItsPosition(store);
+	await assertEmptyKeyList(store);
+	await assertDuplicateKeysGetIndependentBuffers(store);
+	await assertWarmAndColdKeysInterleave(store);
+}
+
+/**
+ * Deliberately unsorted: a backend that sorts its keys internally, or that fills results
+ * in arrival order, must still answer by POSITION.
+ */
+async function assertPositionalOverUnsortedKeys(store: KVStore): Promise<void> {
+	const keys = [b(4), b(1), b(5), b(2)];
+	const got = await store.getMany(keys);
+	assert.strictEqual(got.length, keys.length, 'getMany must answer one value per key');
+	assertBytes(got[0], b(40), 'unsorted key list: position 0');
+	assertBytes(got[1], b(10), 'unsorted key list: position 1');
+	assertBytes(got[2], b(50), 'unsorted key list: position 2');
+	assertBytes(got[3], b(20), 'unsorted key list: position 3');
+}
+
+/**
+ * The miss is in the MIDDLE: a backend that omits absent keys would return a SHORTER array
+ * whose tail has slid down one position.
+ */
+async function assertMissKeepsItsPosition(store: KVStore): Promise<void> {
+	const got = await store.getMany([b(1), b(99), b(3)]);
+	assert.strictEqual(got.length, 3, 'a miss must not shorten the result');
+	assertBytes(got[0], b(10), 'the key before the miss keeps its own position');
+	assert.strictEqual(got[1], undefined, 'the absent key reads as undefined');
+	assertBytes(got[2], b(30), 'the key after the miss keeps its own position');
+}
+
+async function assertEmptyKeyList(store: KVStore): Promise<void> {
+	assert.deepStrictEqual(await store.getMany([]), [], 'getMany([]) must resolve to []');
+}
+
+/**
+ * Buffer ownership extends ACROSS positions: one buffer filed at two indices would pass
+ * the value checks and fail the scribble.
+ */
+async function assertDuplicateKeysGetIndependentBuffers(store: KVStore): Promise<void> {
+	const got = await store.getMany([b(2), b(3), b(2)]);
+	assert.strictEqual(got.length, 3, 'a repeated key must not collapse the result');
+	assertBytes(got[0], b(20), 'repeated key: first position');
+	assertBytes(got[1], b(30), 'repeated key: the key between the repeats');
+	assertBytes(got[2], b(20), 'a repeated key must be answered at every position');
+	(got[0] as Uint8Array)[0] = 99;
+	assertBytes(got[2], b(20), 'the duplicate position must be its own buffer');
+}
+
+/**
+ * A cache in front of the store (`CachedKVStore`) serves the warm keys from memory and
+ * batches only the cold ones, remembering where each miss belongs. Interleaving hits,
+ * misses, and an absent key catches a re-derived mapping.
+ */
+async function assertWarmAndColdKeysInterleave(store: KVStore): Promise<void> {
+	await store.get(b(2));
+	await store.get(b(4));
+	const got = await store.getMany([b(1), b(4), b(99), b(2), b(5)]);
+	assert.strictEqual(got.length, 5, 'a warm/cold mix must answer one value per key');
+	assertBytes(got[0], b(10), 'warm/cold mix: cold key at position 0');
+	assertBytes(got[1], b(40), 'warm/cold mix: warm key at position 1');
+	assert.strictEqual(got[2], undefined, 'warm/cold mix: absent key at position 2');
+	assertBytes(got[3], b(20), 'warm/cold mix: warm key at position 3');
+	assertBytes(got[4], b(50), 'warm/cold mix: cold key at position 4');
 }
 
 // ============================================================================
@@ -734,50 +825,15 @@ export function runKVStoreConformance(name: string, makeBackend: () => KVBackend
 		// Tier 8 — batch point-read (see KVStore.getMany's contract)
 		//
 		// The correctness cases run everywhere: positional results, misses in place,
-		// independent buffers. The round-trip case needs the adapter to supply a
-		// PointReadMeter, because a KVStore handle cannot see its own round trips.
+		// independent buffers — see `assertBatchPointRead`. The round-trip case needs the
+		// adapter to supply a PointReadMeter, because a KVStore handle cannot see its own
+		// round trips.
 		// ------------------------------------------------------------------
 		describe('tier 8: batch point-read', () => {
-			it('answers positionally for a key list that is not in sorted order', async () => {
-				// Deliberately unsorted: a backend that sorts its keys internally, or that
-				// fills results in arrival order, must still answer by POSITION.
-				await seed1to5(store);
-				const keys = [b(4), b(1), b(5), b(2)];
-				const got = await store.getMany(keys);
-				assert.strictEqual(got.length, keys.length);
-				assertBytes(got[0], b(40));
-				assertBytes(got[1], b(10));
-				assertBytes(got[2], b(50));
-				assertBytes(got[3], b(20));
-			});
-
-			it('a missing key is undefined at its own position and does not shift the rest', async () => {
-				// The miss is in the MIDDLE: a backend that omits absent keys would return a
-				// SHORTER array whose tail has slid down one position.
-				await seed1to5(store);
-				const got = await store.getMany([b(1), b(99), b(3)]);
-				assert.strictEqual(got.length, 3, 'a miss must not shorten the result');
-				assertBytes(got[0], b(10));
-				assert.strictEqual(got[1], undefined, 'the absent key reads as undefined');
-				assertBytes(got[2], b(30), 'the key after the miss keeps its own position');
-			});
-
-			it('getMany([]) resolves to an empty array', async () => {
-				await seed1to5(store);
-				assert.deepStrictEqual(await store.getMany([]), []);
-			});
-
-			it('a repeated key yields its value at every position, in INDEPENDENT buffers', async () => {
-				await seed1to5(store);
-				const got = await store.getMany([b(2), b(3), b(2)]);
-				assert.strictEqual(got.length, 3);
-				assertBytes(got[0], b(20));
-				assertBytes(got[1], b(30));
-				assertBytes(got[2], b(20), 'a repeated key must be answered at every position');
-				// One buffer filed at two indices would fail here — buffer ownership extends
-				// ACROSS positions, so scribbling on one must not rewrite the other.
-				(got[0] as Uint8Array)[0] = 99;
-				assertBytes(got[2], b(20), 'the duplicate position must be its own buffer');
+			it('answers positionally: unsorted keys, misses in place, duplicates, empty list', async () => {
+				// Every assertion lives in the exported helper, which `batch-point-read.spec.ts`
+				// drives against deliberately-wrong doubles to prove these cases bite.
+				await assertBatchPointRead(store);
 			});
 
 			it('mutating a returned value does not corrupt the store', async () => {
@@ -787,22 +843,6 @@ export function runKVStoreConformance(name: string, makeBackend: () => KVBackend
 				(got[0] as Uint8Array)[0] = 99;
 				assertBytes(await store.get(b(1)), b(10), 'a later get must be unaffected');
 				assertBytes((await store.getMany([b(1)]))[0], b(10), 'a later getMany must be unaffected');
-			});
-
-			it('answers positionally over a mix of already-read and never-read keys', async () => {
-				// A cache in front of the store (`CachedKVStore`) serves the warm keys from
-				// memory and batches only the cold ones, remembering where each miss belongs.
-				// Interleaving hits, misses, and an absent key catches a re-derived mapping.
-				await seed1to5(store);
-				await store.get(b(2));
-				await store.get(b(4));
-				const got = await store.getMany([b(1), b(4), b(99), b(2), b(5)]);
-				assert.strictEqual(got.length, 5);
-				assertBytes(got[0], b(10));
-				assertBytes(got[1], b(40));
-				assert.strictEqual(got[2], undefined);
-				assertBytes(got[3], b(20));
-				assertBytes(got[4], b(50));
 			});
 
 			it('getMany rejects after close()', async () => {

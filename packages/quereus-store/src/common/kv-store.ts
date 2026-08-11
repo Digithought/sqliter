@@ -256,6 +256,12 @@ export interface KVStore {
  * the path, which is what lets `CachedKVStore` and the counting test doubles keep working.
  *
  * `Promise.all([])` resolves to `[]`, satisfying the empty-input rule without a special case.
+ *
+ * NOTE: because no `get` is issued for an empty key list, a backend delegating here answers
+ * `getMany([])` with `[]` even after `close()`, where LevelDB and IndexedDB check open first
+ * and reject. Unspecified rather than wrong — every caller guards the empty case before it
+ * reaches a store (`StoreTableBase.readEffectiveRowsByKeys`). Pin one behavior in tier 8 if
+ * a caller ever hands an empty batch to a closed store.
  */
 export function defaultGetMany(
 	store: Pick<KVStore, 'get'>,

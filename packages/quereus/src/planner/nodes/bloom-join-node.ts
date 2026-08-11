@@ -69,6 +69,13 @@ export class BloomJoinNode extends PlanNode implements BinaryRelationalNode, Joi
 		return valueFactPairs(this.equiPairs);
 	}
 
+	// NOTE: uncached and recursive — unlike `getAttributes()`, which reads through
+	// `attributesCache`, this recomputes from both children's `getType()` on every
+	// call, so a deep join spine re-derives the whole subtree's types repeatedly. It
+	// showed as 11.9% of samples in a profile of a 12-column lens read, but measured
+	// flat from 2 to 16 columns once `planner/cache/correlation-detector.ts` stopped
+	// double-walking each join's inputs, so it is not worth a cache today. Revisit if
+	// plan build over a deep join spine ever shows up in a profile again.
 	getType(): RelationType {
 		const leftType = this.left.getType();
 		const rightType = this.right.getType();
