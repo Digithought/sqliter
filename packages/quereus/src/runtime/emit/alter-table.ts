@@ -741,12 +741,10 @@ async function runAddColumn(
 			const evaluated = (valueRaw instanceof Promise ? await valueRaw : valueRaw) as SqlValue;
 			// Convert to the new column's declared type BEFORE the CHECK predicates see it,
 			// matching the write path (`emitInsert` coerces at the top of the DML pipeline, so
-			// constraint checking and storage both see the declared form). `coerceTo` is unset
-			// when the expression's static type already IS the column's type — see
-			// `AddColumnBackfill.coerceTo` for why re-converting there would be destructive.
-			const value = backfill.coerceTo
-				? validateAndParse(evaluated, backfill.coerceTo, columnDef.name)
-				: evaluated;
+			// constraint checking and storage both see the declared form). `coerce` is unset only
+			// when there is provably nothing to do — see `AddColumnBackfill.coerce`, which also
+			// covers why the conversion it carries is guarded rather than unconditional.
+			const value = backfill.coerce ? backfill.coerce(evaluated) : evaluated;
 			if (checkSlot && checkPredicates.length > 0 && checkCbs) {
 				checkSlot.set([...row, value]);
 				for (let i = 0; i < checkPredicates.length; i++) {

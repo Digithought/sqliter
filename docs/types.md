@@ -183,7 +183,11 @@ The flag is read once at module load. With it off, every check is a single alrea
 branch and nothing is built at emit time on the checker's behalf; the checker itself lives
 in `runtime/strict-representation.ts` and throws `QuereusError(INTERNAL)` naming the seam,
 the column or argument, the declared type, the value's JavaScript form and a truncated
-rendering of the value.
+rendering of the value. R2's predicate itself lives one layer down, in
+`types/representation.ts` (`conformsToType` / `buildConformanceCheck`), because the DML
+write path guards its conversion skip with the same question — see § Where coercion
+happens. One definition, so the checker and the write path cannot drift apart on what
+"conforms" means.
 
 Four seams, each chosen so a violation is reported at the layer that CAUSED it:
 
@@ -600,12 +604,33 @@ for every type:
 > indistinguishable at runtime from unparsed JSON source, so "convert again just
 > in case" is not safe.
 
-What decides whether a cell converts is therefore the **static type of the
-expression that produced it**, which the planner already knows. The rule
-(`buildRowCoercion` in `types/validation.ts`): convert cell *i* iff the
-producing expression's `LogicalType` is not — by object identity — the target
-column's type. A SQL literal `'"abc"'` is TEXT → into a JSON column, convert; a
+What primarily decides whether a cell converts is therefore the **static type of
+the expression that produced it**, which the planner already knows. The rule
+(`buildCellCoercion` / `buildRowCoercion` in `types/validation.ts`): convert
+cell *i* **unless** the producing expression's `LogicalType` is — by object
+identity — the target column's type **and** the value in hand already inhabits
+that type. A SQL literal `'"abc"'` is TEXT → into a JSON column, convert; a
 reference to a JSON column is JSON → already declared form, leave alone.
+
+The second half is a guard, not a second opinion. An announced type is an
+*inference* the engine does not otherwise enforce, and the skip trusted it
+alone: `sum()` announces REAL but returns a `bigint` past 2^53, and an untyped
+positional `?` announces TEXT but can be bound to a number, a blob, a boolean or
+a `bigint`. Both landed a value outside the column's declared value space in
+storage (rule R2 of § Physical representation — the rule the write path exists to
+uphold). The guard asks the value itself, via `conformsToType`
+(`types/representation.ts`) — the same predicate the `QUEREUS_REPR_STRICT`
+checker enforces, so the two can never disagree about what conforms.
+
+It is a **conjunction** with the identity test, deliberately: a TEXT-announced
+expression feeding a DATE column produces a string, which conforms to DATE's
+TEXT physical type, yet still needs converting so the spelling is canonicalized.
+And the JSON case above stays safe, because a value read out of a JSON column —
+a native object/array, or a JSON scalar such as the string `abc` or the string
+`9` — *conforms* to JSON's OBJECT physical type, so `parse` is never re-applied.
+A column whose physical type constrains nothing (`ANY`) needs no guard at all, so
+an all-`ANY` row still allocates nothing per row.
+
 Concretely:
 
 - `emitInsert` masks each cell by the source relation's attribute type at that
@@ -618,10 +643,13 @@ Concretely:
   stored values are never re-converted. `update t set v = 'X'` leaves a JSON
   key column byte-identical.
 - Two paths inject a value *after* that pass and convert their one cell by the
-  same rule: the `OR REPLACE` NOT NULL DEFAULT substitution
-  (`runtime/row-constraints.ts`, reached both from the `ConstraintCheckNode`
-  emitter and from the `ON CONFLICT … DO UPDATE` arm's own validation) and
-  `ON CONFLICT … DO UPDATE` assignments (the DML executor).
+  same rule, calling the same `buildCellCoercion` helper: the `OR REPLACE` NOT
+  NULL DEFAULT substitution (`runtime/row-constraints.ts`, reached both from the
+  `ConstraintCheckNode` emitter and from the `ON CONFLICT … DO UPDATE` arm's own
+  validation) and `ON CONFLICT … DO UPDATE` assignments (the DML executor).
+- `ALTER TABLE … ADD COLUMN`'s per-row backfill (a non-foldable DEFAULT or a
+  GENERATED ALWAYS AS expression) converts its one cell through the same helper
+  too, so a backfilled cell is what an INSERT under the same DEFAULT would store.
 
 The DML executor then passes `preCoerced: true` on its `vtab.update` calls, and
 every conversion-performing layer below honors it: the memory module

@@ -8,6 +8,7 @@ import { StatusCode, type SqlValue, type OutputValue } from '../../common/types.
 import { QuereusError } from '../../common/errors.js';
 import { withAsyncRowContext, createRowSlot } from '../context-helpers.js';
 import { composeCombinedDescriptor } from '../descriptor-helpers.js';
+import { buildCellCoercion } from '../../types/validation.js';
 import {
 	buildConstraintMetadata,
 	evaluateRowConstraints,
@@ -52,12 +53,13 @@ export function emitConstraintCheck(plan: ConstraintCheckNode, ctx: EmissionCont
 	const notNullDefaultPlans: ReadonlyArray<NotNullDefaultPlan> = plan.notNullDefaults ?? [];
 	const notNullDefaultInstructions = notNullDefaultPlans.map(d => emitCallFromPlan(d.defaultNode, ctx));
 
-	// Which substitutions need conversion — the emitters' static-type rule
-	// applied to the DEFAULT expression (see NotNullDefaultRuntime.coerceColumn).
-	const notNullDefaultCoercions = notNullDefaultPlans.map(d =>
-		d.defaultNode.getType().logicalType !== tableSchema.columns[d.columnIndex].logicalType
-			? tableSchema.columns[d.columnIndex]
-			: undefined);
+	// How each substitution converts — the write path's own per-cell decision, from the
+	// shared helper, applied to the DEFAULT expression (see NotNullDefaultRuntime.coerce).
+	const notNullDefaultCoercions = notNullDefaultPlans.map(d => buildCellCoercion(
+		d.defaultNode.getType().logicalType,
+		tableSchema.columns[d.columnIndex].logicalType,
+		tableSchema.columns[d.columnIndex].name,
+	));
 
 	const constraintMetadata = buildConstraintMetadata(
 		plan.constraintChecks,
@@ -107,7 +109,7 @@ export function emitConstraintCheck(plan: ConstraintCheckNode, ctx: EmissionCont
 		const defaultsRuntime: NotNullDefaultRuntime[] = notNullDefaultPlans.map((d, i) => ({
 			columnIndex: d.columnIndex,
 			evaluator: defaultEvalFunctions[i],
-			coerceColumn: notNullDefaultCoercions[i],
+			coerce: notNullDefaultCoercions[i],
 		}));
 
 		// Pre-compute the combined descriptor (constant across rows)

@@ -1,6 +1,7 @@
 import { QuereusError } from '../common/errors.js';
-import { StatusCode, type DeepReadonly, type Row, type SqlValue } from '../common/types.js';
-import { PhysicalType, type LogicalType } from '../types/logical-type.js';
+import { StatusCode, type Row, type SqlValue } from '../common/types.js';
+import { PhysicalType } from '../types/logical-type.js';
+import { conformsToType, type DeclaredType } from '../types/representation.js';
 import { isCanonicalNumeric } from '../util/numeric-canonical.js';
 import { valueToText } from '../util/value-text.js';
 
@@ -33,6 +34,12 @@ import { valueToText } from '../util/value-text.js';
  * `null` is always admissible: nullability is `not null` constraint enforcement's
  * job and lives elsewhere.
  *
+ * R2's predicate itself lives one layer down, in `types/representation.ts`
+ * ({@link conformsToType}), because the DML write path needs the same answer: its
+ * static-type skip is guarded by "does the value actually inhabit the column's type"
+ * (see `buildCellCoercion` in `types/validation.ts`). This checker and that guard must
+ * never come to disagree about what conforms, so there is one definition.
+ *
  * **No capability flag.** A `representationFidelity` declaration on
  * `VirtualTableModule` was considered and rejected — nothing would BEHAVE differently
  * based on it, since the engine tolerates both numeric forms everywhere and will
@@ -45,11 +52,10 @@ import { valueToText } from '../util/value-text.js';
  */
 
 /**
- * A declared type as this checker reads it. Only `name` and `physicalType` are
- * consulted, and the parameter is `DeepReadonly` so both a raw `LogicalType` (column
- * schema) and the frozen one a `ScalarType` carries are accepted without a cast.
+ * A declared type as this checker reads it. Defined alongside the R2 predicate in
+ * `types/representation.ts` and re-exported here for the checker's existing importers.
  */
-export type DeclaredType = DeepReadonly<LogicalType>;
+export type { DeclaredType };
 
 /** A violation of R1/R2. Distinct class so a seam inside a re-wrapping `catch`
  *  (the vtab scan) can rethrow it unchanged instead of burying it in a generic
@@ -107,51 +113,6 @@ function admissibleForms(type: DeclaredType): string {
 		case PhysicalType.BOOLEAN: return 'a boolean';
 		case PhysicalType.OBJECT: return 'a JSON object/array, or a JSON scalar (string/number/boolean)';
 		default: return 'any value in canonical form';
-	}
-}
-
-/**
- * R2 for one non-null value that has already passed R1.
- *
- * Keyed on `physicalType` rather than the type's identity so plugin-registered types
- * are covered too. Two arms need the type NAME as well:
- *
- * - **NUMERIC** shares REAL's `physicalType` (see the NOTE on `NUMERIC_TYPE` in
- *   `types/builtin-types.ts`) but its value space includes `bigint`.
- *   NOTE: matched by NAME, not by identity against the `NUMERIC_TYPE` singleton the way
- *   `isSeekKeySpaceNumeric` matches, because the surrounding switch is deliberately keyed
- *   on `physicalType` so plugin-registered types are covered. The cost is that a
- *   plugin-registered REAL-physical type *named* `NUMERIC` would silently inherit
- *   bigint admission. No such type exists in tree; if one is ever registered, give
- *   `LogicalType` an explicit "admits bigint" property and switch on that instead.
- * - **`ANY`/NULL** (`PhysicalType.NULL`) impose no R2 constraint at all — R1 already
- *   passed, and an `ANY` position may legitimately hold any storage class.
- *
- * TIMESTAMP needs no special case: it declares `physicalType` INTEGER because it IS an
- * integer instant, so it takes INTEGER's rule. The string temporals (DATE / TIME /
- * DATETIME / TIMESPAN) declare TEXT and take TEXT's — R2 must not demand a `Temporal`
- * object for them.
- */
-function conformsToType(value: Exclude<SqlValue, null>, type: DeclaredType): boolean {
-	switch (type.physicalType) {
-		case PhysicalType.INTEGER:
-			return typeof value === 'bigint' || (typeof value === 'number' && Number.isSafeInteger(value));
-		case PhysicalType.REAL:
-			return typeof value === 'number' || (typeof value === 'bigint' && type.name === 'NUMERIC');
-		case PhysicalType.TEXT:
-			return typeof value === 'string';
-		case PhysicalType.BLOB:
-			return value instanceof Uint8Array;
-		case PhysicalType.BOOLEAN:
-			return typeof value === 'boolean';
-		case PhysicalType.OBJECT:
-			// Mirrors JSON_TYPE.validate: a native object/array (a blob is not one), or a
-			// JSON scalar — a JSON string scalar is physically a plain `string`.
-			return (typeof value === 'object' && !(value instanceof Uint8Array))
-				|| typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean';
-		default:
-			// PhysicalType.NULL (ANY / NULL) and any unrecognized plugin code: R1 only.
-			return true;
 	}
 }
 

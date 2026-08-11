@@ -4,7 +4,6 @@ import { PlanNodeType } from './plan-node-type.js';
 import type { TableReferenceNode } from './reference.js';
 import type * as AST from '../../parser/ast.js';
 import type { SqlValue } from '../../common/types.js';
-import type { LogicalType } from '../../types/logical-type.js';
 
 /**
  * The per-row backfill of an ADD COLUMN that carries a per-row value source: a DEFAULT
@@ -20,17 +19,22 @@ export interface AddColumnBackfill {
 	readonly node: ScalarPlanNode;
 	readonly rowDescriptor: RowDescriptor;
 	/**
-	 * The new column's logical type, applied to each evaluated value so a backfilled cell
-	 * matches what an INSERT under the same DEFAULT / GENERATED ALWAYS AS would store.
-	 * Undefined when the expression's static type already IS that type — conversion is
-	 * skipped there, exactly as
-	 * {@link import('../../types/validation.js').buildRowCoercion} skips an identity match,
-	 * because re-converting is destructive for some types: JSON's `parse` reads a plain JS
-	 * string as JSON *source*, so re-parsing an already-stored JSON value either changes it
-	 * (stored text `9` becomes the number 9) or throws (stored text `abc` is not valid JSON).
-	 * `add column k json default (new.j)` over an existing `json` column is exactly that case.
+	 * Converts each evaluated value to the new column's logical type, so a backfilled cell
+	 * matches what an INSERT under the same DEFAULT / GENERATED ALWAYS AS would store. Built
+	 * by {@link import('../../types/validation.js').buildCellCoercion}, the same helper the
+	 * DML write path uses, so both sites make one decision:
+	 *
+	 * - Undefined when there is provably nothing to do — the expression's static type already
+	 *   IS the new column's type and that type constrains no value space (`ANY`).
+	 * - Otherwise the closure either always converts, or converts only when the value does not
+	 *   already inhabit the column's type. That guard is why an unconditional re-convert is
+	 *   avoided: re-converting is destructive for some types — JSON's `parse` reads a plain JS
+	 *   string as JSON *source*, so re-parsing an already-stored JSON value either changes it
+	 *   (stored text `9` becomes the number 9) or throws (stored text `abc` is not valid JSON).
+	 *   `add column k json default (new.j)` over an existing `json` column is exactly that
+	 *   case, and a value read out of a JSON column conforms, so it passes through untouched.
 	 */
-	readonly coerceTo?: LogicalType;
+	readonly coerce?: (value: SqlValue) => SqlValue;
 }
 
 /**

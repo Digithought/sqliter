@@ -6,6 +6,7 @@ import type { ColumnSchema } from '../schema/column.js';
 import type { Expression } from '../parser/ast.js';
 import { tryFoldLiteral } from '../parser/utils.js';
 import { inferType } from './registry.js';
+import { buildConformanceCheck } from './representation.js';
 
 /**
  * Validate a value against a logical type.
@@ -116,45 +117,103 @@ export function coerceRowToSchema(row: Row, columns: readonly ColumnSchema[], la
 }
 
 /**
- * Build the per-statement conversion step for a DML write. Given the static
- * logical type of the expression producing each cell (index-aligned with
- * `columns`) and the target columns, returns a closure that converts exactly
- * the cells whose producing type is not already the target column's logical
- * type — or `undefined` when no cell needs converting, so the caller can skip
- * the per-row work entirely.
+ * Build the write-path conversion for ONE cell: the shared decision every DML write site
+ * makes about a value on its way into a declared column. Returns `undefined` when there
+ * is provably nothing to do, so the caller can skip the cell entirely.
  *
- * Types are compared by object identity: the type registry hands out one
- * shared `LogicalType` instance per type, so an expression whose static type
- * IS the column's type (a reference to a same-typed column — an unassigned
- * column in an UPDATE, or `insert into b select j from a`) produces values
- * already in declared form, and those MUST be left alone: conversion is not
- * repeatable for every type. JSON's `parse` reads a plain JS string as JSON
- * source, so re-converting a stored JSON text value either changes it (the
- * text `9` becomes the number 9) or throws (`abc` is not valid JSON source).
- * An unknown source type (`undefined` entry) converts — the safe historical
- * behavior for values of unproven provenance.
+ * Two dispositions, and which one applies is decided at emit/plan time:
  *
- * The returned closure copies the row and converts via {@link validateAndParse},
- * so conversion failures carry the same message text the storage layer used to
- * produce. Cells at or beyond the row's length are left for the storage width
- * guard, mirroring {@link coerceRowToSchema}'s map-over-present-cells behavior.
+ * - **Always convert** — `sourceType` is not (by object identity) `target`, or is
+ *   `undefined` (unknown provenance). The type registry hands out one shared
+ *   `LogicalType` instance per type, so a differing object means a differing type.
+ * - **Convert only if the value does not already inhabit `target`** — `sourceType` IS
+ *   `target`. Values reaching such a cell are *claimed* to be in declared form already,
+ *   and re-converting them would be destructive: JSON's `parse` reads a plain JS string
+ *   as JSON *source*, so re-converting a stored JSON text value either changes it (the
+ *   text `9` becomes the number 9) or throws (`abc` is not valid JSON source). But the
+ *   claim is a static INFERENCE the engine does not otherwise enforce — `sum()` announces
+ *   REAL and can produce a `bigint`; an untyped positional `?` announces TEXT and can be
+ *   bound to anything — so it is checked against the value in hand rather than trusted.
+ *   `conformsToType` (`types/representation.ts`) answers "does this value inhabit this
+ *   type" — the same predicate
+ *   the `QUEREUS_REPR_STRICT` checker enforces (rule R2 of docs/types.md § Physical
+ *   representation), so the guard and the checker cannot drift apart. A value read out of
+ *   a JSON column — native object/array, or a JSON scalar such as the string `abc` or the
+ *   number 9 — conforms, so the JSON case that motivates the skip still never re-parses.
+ *
+ * The guard is a *conjunction*, not a replacement for the identity test: a TEXT-announced
+ * expression feeding a DATE column produces a string, which conforms to DATE's TEXT
+ * physical type, yet still needs converting so the spelling is canonicalized. The static
+ * difference stays the primary trigger.
+ *
+ * Conversion goes through {@link validateAndParse}, so failures carry the same message
+ * text the storage layer used to produce.
+ *
+ * NOTE: the guard is R2-level — it asks which JS storage class the value is, NOT the
+ * target type's own `validate`. So it catches "a number reached a TEXT column" but not
+ * "a badly-spelled string reached a DATE column" (a DATE-announced expression producing a
+ * non-canonical date string still passes through: a string DOES inhabit DATE's TEXT
+ * physical type). That is deliberate — it keeps this predicate identical to the one the
+ * strict checker enforces — and the known instance of the spelling hole is tracked as
+ * `debt-variadic-datetime-functions-not-temporally-typed` (see docs/types.md § Special
+ * Types, the two date/time function families). If that class needs closing at this seam,
+ * switching the guard to `target.validate` is the change to weigh; JSON survives it
+ * (`JSON_TYPE.validate` accepts any string, so a JSON string scalar still passes), but
+ * every temporal announcement would then have to be exact or writes would start failing.
+ */
+export function buildCellCoercion(
+	sourceType: LogicalType | undefined,
+	target: LogicalType,
+	columnName: string,
+): ((value: SqlValue) => SqlValue) | undefined {
+	if (sourceType !== target) {
+		return (value: SqlValue): SqlValue => validateAndParse(value, target, columnName);
+	}
+	// Identity match: guard rather than skip. A type imposing no value-space constraint
+	// (ANY / NULL) has nothing to guard, so that cell really is free.
+	const conforms = buildConformanceCheck(target);
+	if (conforms === undefined) return undefined;
+	return (value: SqlValue): SqlValue =>
+		value === null || conforms(value) ? value : validateAndParse(value, target, columnName);
+}
+
+/**
+ * Build the per-statement conversion step for a DML write. Given the static logical type
+ * of the expression producing each cell (index-aligned with `columns`) and the target
+ * columns, returns a closure applying {@link buildCellCoercion}'s decision to every cell
+ * that needs one — or `undefined` when no cell does (no column needs converting AND none
+ * needs guarding), so the caller can skip the per-row work entirely. A row of all-`ANY`
+ * columns fed from `ANY` expressions therefore still allocates nothing.
+ *
+ * The returned closure copies the row. Cells at or beyond the row's length are left for
+ * the storage width guard, mirroring {@link coerceRowToSchema}'s map-over-present-cells
+ * behavior.
+ *
+ * NOTE: a guarded cell costs one pre-selected `typeof`/`instanceof` per row where it used
+ * to cost nothing. Unmeasured; if it ever shows up in `test/performance-sentinels.spec.ts`,
+ * note it there rather than reverting the guard — the skip is unsound without it.
  */
 export function buildRowCoercion(
 	sourceTypes: ReadonlyArray<LogicalType | undefined>,
 	columns: readonly ColumnSchema[],
 ): ((row: Row) => Row) | undefined {
-	const convertIndices: number[] = [];
+	const indices: number[] = [];
+	const converters: Array<(value: SqlValue) => SqlValue> = [];
 	for (let i = 0; i < columns.length; i++) {
-		if (sourceTypes[i] !== columns[i].logicalType) {
-			convertIndices.push(i);
+		const convert = buildCellCoercion(sourceTypes[i], columns[i].logicalType, columns[i].name);
+		if (convert) {
+			indices.push(i);
+			converters.push(convert);
 		}
 	}
-	if (convertIndices.length === 0) return undefined;
+	if (indices.length === 0) return undefined;
 	return (row: Row): Row => {
 		const out = row.slice() as Row;
-		for (const i of convertIndices) {
+		for (let k = 0; k < indices.length; k++) {
+			const i = indices[k];
+			// Indices ascend, so the first out-of-range one ends the pass.
 			if (i >= out.length) break;
-			out[i] = validateAndParse(out[i] as SqlValue, columns[i].logicalType, columns[i].name);
+			out[i] = converters[k](out[i] as SqlValue);
 		}
 		return out;
 	};

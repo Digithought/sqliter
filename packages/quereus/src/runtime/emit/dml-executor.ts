@@ -15,8 +15,7 @@ import { isMaintainedTable } from '../../schema/derivation.js';
 import { hasNativeEventSupport } from '../../util/event-support.js';
 import { sqlValueIdentical, compareSqlValuesFast, BINARY_COLLATION } from '../../util/comparison.js';
 import { uniqueEnforcementComparators } from '../../schema/unique-enforcement.js';
-import { validateAndParse } from '../../types/validation.js';
-import type { ColumnSchema } from '../../schema/column.js';
+import { buildCellCoercion } from '../../types/validation.js';
 import { withAsyncRowContext } from '../context-helpers.js';
 import { REPR_STRICT } from '../strict-flags.js';
 import { assertRowConforms } from '../strict-representation.js';
@@ -81,12 +80,12 @@ interface RuntimeUpsertClause {
 	 */
 	generatedRowDescriptor?: RowDescriptor;
 	/**
-	 * Columns whose DO UPDATE assignment value needs conversion to the declared
-	 * type before it is written — the same static-type rule emitUpdate applies
-	 * (assignment expression type vs column type, compared by identity). Keyed
-	 * by column index; a column absent here is assigned as evaluated.
+	 * How each DO UPDATE assignment value converts to the declared type before it is
+	 * written — the same per-cell decision emitUpdate makes, from the shared helper
+	 * `buildCellCoercion`. Keyed by column index; a column absent here has provably
+	 * nothing to do and is assigned as evaluated.
 	 */
-	assignmentCoercions?: Map<number, ColumnSchema>;
+	assignmentCoercions?: Map<number, (value: SqlValue) => SqlValue>;
 	/** Index into the evaluators array for WHERE condition, or -1 if no WHERE */
 	whereIndex: number;
 	/** Row descriptor for NEW references */
@@ -456,12 +455,14 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 					} else {
 						runtime.assignmentIndices.set(colIndex, evaluatorIndex);
 					}
-					// Same static-type rule as emitUpdate: convert only when the
-					// assignment expression's type is not the column's declared type.
-					// Applies to a generated value too — it is written to the same cell.
+					// Same decision as emitUpdate, from the same helper: convert unless the
+					// assignment expression's type IS the column's declared type AND the
+					// value already inhabits it. Applies to a generated value too — it is
+					// written to the same cell.
 					const column = tableSchema.columns[colIndex];
-					if (valueNode.getType().logicalType !== column.logicalType) {
-						runtime.assignmentCoercions.set(colIndex, column);
+					const coerce = buildCellCoercion(valueNode.getType().logicalType, column.logicalType, column.name);
+					if (coerce) {
+						runtime.assignmentCoercions.set(colIndex, coerce);
 					}
 				}
 				// Keep topological order (drive off the plan's list, not map order).
@@ -505,7 +506,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		checkStart: number;
 		checkCount: number;
 		/** NOT NULL DEFAULT evaluators, already resolved to their `upsertEvaluators` position. */
-		notNullDefaults: Array<{ columnIndex: number; evaluatorIndex: number; coerceColumn?: ColumnSchema }>;
+		notNullDefaults: Array<{ columnIndex: number; evaluatorIndex: number; coerce?: (value: SqlValue) => SqlValue }>;
 		/** Flat OLD|NEW descriptor, used when the statement has no mutation context. */
 		flatDescriptor: RowDescriptor;
 		/** Context-prefixed descriptor, used when it does. */
@@ -541,11 +542,13 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			notNullDefaults: upsertValidation.notNullDefaults.map((d, i) => ({
 				columnIndex: d.columnIndex,
 				evaluatorIndex: defaultStart + i,
-				// Same static-type rule as everywhere else a DEFAULT is substituted after
-				// the emitters' conversion pass — see NotNullDefaultRuntime.coerceColumn.
-				coerceColumn: d.defaultNode.getType().logicalType !== tableSchema.columns[d.columnIndex].logicalType
-					? tableSchema.columns[d.columnIndex]
-					: undefined,
+				// Same decision as everywhere else a DEFAULT is substituted after the
+				// emitters' conversion pass — see NotNullDefaultRuntime.coerce.
+				coerce: buildCellCoercion(
+					d.defaultNode.getType().logicalType,
+					tableSchema.columns[d.columnIndex].logicalType,
+					tableSchema.columns[d.columnIndex].name,
+				),
 			})),
 			flatDescriptor: upsertValidation.flatRowDescriptor,
 			combinedDescriptor: plan.contextDescriptor
@@ -644,7 +647,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		const notNullDefaults: NotNullDefaultRuntime[] = validation.notNullDefaults.map(d => ({
 			columnIndex: d.columnIndex,
 			evaluator: upsertEvaluators[d.evaluatorIndex],
-			coerceColumn: d.coerceColumn,
+			coerce: d.coerce,
 		}));
 
 		const useContext = contextRow !== undefined && validation.combinedDescriptor !== undefined;
@@ -727,12 +730,12 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 						return await evaluator(rctx);
 					});
 				}) as SqlValue;
-				// Convert to the declared column type when the assignment's static
-				// type requires it (see assignmentCoercions) — `existingRow` is a
-				// stored row, so the composed updatedRow is then fully declared-form.
-				const coerceColumn = clause.assignmentCoercions?.get(colIndex);
-				if (coerceColumn) {
-					value = validateAndParse(value, coerceColumn.logicalType, coerceColumn.name);
+				// Convert to the declared column type as the assignment requires (see
+				// assignmentCoercions) — `existingRow` is a stored row, so the composed
+				// updatedRow is then fully declared-form.
+				const coerce = clause.assignmentCoercions?.get(colIndex);
+				if (coerce) {
+					value = coerce(value);
 				}
 				updatedRow[colIndex] = value;
 			}
@@ -761,9 +764,9 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			await withAsyncRowContext(rctx, clause.generatedRowDescriptor, () => updatedRow, async () => {
 				for (const { colIndex, evaluatorIndex } of clause.generatedAssignments!) {
 					let value = await upsertEvaluators[evaluatorIndex](rctx) as SqlValue;
-					const coerceColumn = clause.assignmentCoercions?.get(colIndex);
-					if (coerceColumn) {
-						value = validateAndParse(value, coerceColumn.logicalType, coerceColumn.name);
+					const coerce = clause.assignmentCoercions?.get(colIndex);
+					if (coerce) {
+						value = coerce(value);
 					}
 					updatedRow[colIndex] = value;
 				}

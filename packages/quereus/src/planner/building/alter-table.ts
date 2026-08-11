@@ -13,6 +13,7 @@ import { validateDeterministicDefault } from '../validation/determinism-validato
 import { buildGeneratedColumnExpr } from './generated-column-scope.js';
 import { tryFoldLiteral } from '../../parser/utils.js';
 import { inferType } from '../../types/registry.js';
+import { buildCellCoercion } from '../../types/validation.js';
 import { columnSchemaToScalarType } from '../type-utils.js';
 import { astToString, expressionToString } from '../../emit/ast-stringify.js';
 import { validateReservedTags, type TagSite } from '../../schema/reserved-tags.js';
@@ -340,13 +341,13 @@ function buildAddColumnBackfill(
   rowAttrs.forEach((attr, index) => { rowDescriptor[attr.id] = index; });
 
   // The evaluated value has to reach storage in the new column's declared form, exactly as an
-  // INSERT's would. Skip the conversion when the expression's static type already IS that type
-  // (identity comparison — the registry hands out one shared LogicalType instance per type),
-  // mirroring `buildRowCoercion`: re-converting an already-converted value is destructive for
-  // JSON. See `AddColumnBackfill.coerceTo`.
+  // INSERT's would — so it takes the same decision, from the same helper the DML write path
+  // uses (`buildCellCoercion`), rather than an open-coded copy the two sites could drift on.
+  // Convert unless the expression's static type already IS the new column's type AND the
+  // value in hand already inhabits it. See `AddColumnBackfill.coerce`.
   const newColumnType = inferType(columnDef.dataType);
-  const coerceTo = node.getType().logicalType === newColumnType ? undefined : newColumnType;
-  return { node, rowDescriptor, coerceTo };
+  const coerce = buildCellCoercion(node.getType().logicalType, newColumnType, columnDef.name);
+  return { node, rowDescriptor, coerce };
 }
 
 /**

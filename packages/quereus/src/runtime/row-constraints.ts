@@ -3,13 +3,11 @@ import type { RuntimeContext } from './types.js';
 import type { Row, SqlValue, OutputValue } from '../common/types.js';
 import { ConstraintError, FailConflictError, RollbackConflictError } from '../common/errors.js';
 import type { RowConstraintSchema, TableSchema } from '../schema/table.js';
-import type { ColumnSchema } from '../schema/column.js';
 import type { RowDescriptor } from '../planner/nodes/plan-node.js';
 import { RowOpFlag } from '../schema/table.js';
 import { ConflictResolution } from '../common/constants.js';
 import { expressionToString } from '../emit/ast-stringify.js';
 import { sqlValueIdentical, isTruthy } from '../util/comparison.js';
-import { validateAndParse } from '../types/validation.js';
 
 /**
  * Row validation shared by every site that must enforce a table's CHECK / NOT NULL /
@@ -56,13 +54,14 @@ export interface NotNullDefaultRuntime {
 	columnIndex: number;
 	evaluator: (ctx: RuntimeContext) => OutputValue;
 	/**
-	 * Set when the DEFAULT expression's static type is not the column's declared
-	 * type: the substituted value must then be converted before it is written
-	 * into the (already-converted) NEW section — the same static-type rule the
-	 * DML emitters applied to the rest of the row, which the substitution
-	 * bypasses by injecting a value after that pass.
+	 * Converts the substituted value before it is written into the (already-converted)
+	 * NEW section — the substitution injects a value AFTER the DML emitters' conversion
+	 * pass, so it takes that pass's decision from the same helper
+	 * ({@link import('../types/validation.js').buildCellCoercion}): convert unless the
+	 * DEFAULT expression's static type IS the column's type AND the value already
+	 * inhabits it. Unset only when there is provably nothing to do.
 	 */
-	coerceColumn?: ColumnSchema;
+	coerce?: (value: SqlValue) => SqlValue;
 }
 
 /**
@@ -276,13 +275,11 @@ async function checkNotNullConstraints(
 				// DEFAULT itself is NULL — substitution does not satisfy NOT NULL.
 				throw new ConstraintError(message);
 			}
-			if (defaultEntry.coerceColumn) {
+			if (defaultEntry.coerce) {
 				// The substituted value is injected AFTER the emitters' conversion
-				// pass, so convert it here by the same static-type rule. Conversion
-				// itself can produce NULL (JSON's text 'null'), which still violates
-				// NOT NULL.
-				defaultValue = validateAndParse(
-					defaultValue, defaultEntry.coerceColumn.logicalType, defaultEntry.coerceColumn.name);
+				// pass, so convert it here by the same rule. Conversion itself can
+				// produce NULL (JSON's text 'null'), which still violates NOT NULL.
+				defaultValue = defaultEntry.coerce(defaultValue);
 				if (defaultValue === null) {
 					throw new ConstraintError(message);
 				}
