@@ -1,15 +1,15 @@
 import type * as AST from '../../parser/ast.js';
 
 // ──────────────────────────────────────────────────────────────────────
-// Conservative FROM-frame model shared by the schema-time expression walks
-// that must answer "could this inner FROM bind a name before it reaches the
-// walk's implicit seed?" — the self-qualifier strip (`self-qualifier-strip.ts`)
-// and the generated-column reference collector
-// (`../generated-column-refs.ts`). Unlike the column-rename walker's richer
-// `ScopeFrame` (`./column-rename.ts`), this model does not resolve sources to
-// object keys; it only distinguishes analysable real-table sources (askable
-// via `ResolveColumnInSource`) from opaque ones (subquery / function / CTE
-// sources), which conservatively could bind anything.
+// Conservative FROM-frame model used by the schema-time expression scope
+// walk (`./walk.ts`) and the two analyses layered on it — the self-qualifier
+// strip (`../rename/self-qualifier-strip.ts`) and the generated-column
+// reference collector (`../generated-column-refs.ts`). Unlike the column-rename
+// walker's richer `ScopeFrame` (`../rename/column-rename.ts`), this model does
+// not resolve sources to object keys; it only distinguishes analysable
+// real-table sources (askable via `ResolveColumnInSource`) from opaque ones
+// (subquery / function / CTE sources), which conservatively could bind
+// anything.
 // ──────────────────────────────────────────────────────────────────────
 
 /** One FROM nesting level for a conservative scope walk. */

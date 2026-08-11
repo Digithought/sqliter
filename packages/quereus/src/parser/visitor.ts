@@ -38,6 +38,13 @@ export interface AstVisitorCallbacks {
 /**
  * Performs a depth-first traversal of the AST.
  *
+ * NOTE: `schema/expr-scope/walk.ts` is a second traversal over these same node
+ * kinds — scope-aware, and used only by the schema-time expression analyses
+ * (the CHECK self-qualifier strip and the generated-column reference
+ * collector). The two are deliberately NOT unified: its FROM-frame stack has
+ * no place in a generic visitor. But a change to the AST node shapes has to be
+ * reflected in both. Grep either file's `NOTE:` to find the other.
+ *
  * @param node The starting AST node.
  * @param callbacks An object containing visitor functions for different node types.
  */

@@ -1,12 +1,7 @@
 import type * as AST from '../parser/ast.js';
 import { eq, type ResolveColumnInSource } from './rename/shared.js';
-import {
-	buildScopeFrame,
-	emptyScopeFrame,
-	opaqueScopeFrame,
-	withScopeFrame,
-	type ScopeFrame,
-} from './rename/scope-frame.js';
+import type { ScopeFrame } from './expr-scope/frame.js';
+import { walkSchemaExpressionScope } from './expr-scope/walk.js';
 
 // ──────────────────────────────────────────────────────────────────────
 // Scope-aware reference collection for GENERATED ALWAYS AS bodies.
@@ -15,10 +10,12 @@ import {
 // extraction (`extractGeneratedColumnDependencies`) and the ALTER ADD COLUMN
 // pre-flight (`validateAddColumnGeneratedRefs`), both in `./table.ts` — need
 // one shared answer to "does this name bind the owning table's row?". The
-// walk uses the same conservative frame model as the CHECK self-qualifier
-// strip (`./rename/scope-frame.ts`): real-table FROM sources are asked via
+// walk is the shared schema-time scope traversal (`./expr-scope/walk.ts`) the
+// CHECK self-qualifier strip also runs on, with its conservative frame model
+// (`./expr-scope/frame.ts`): real-table FROM sources are asked via
 // `ResolveColumnInSource`; subquery / function / CTE sources are opaque and
-// make the answer undecidable rather than wrong.
+// make the answer undecidable rather than wrong. This file supplies only the
+// per-leaf classification.
 //
 // A qualified reference whose qualifier no frame binds is `'unbound'`: nothing
 // in the body, and nothing at write time, can ever resolve it. Both consumers
@@ -69,8 +66,6 @@ interface CollectState {
 	/** Lowercase owning schema name. */
 	schemaName: string;
 	resolve: ResolveColumnInSource;
-	/** Index 0 is the implicit seed frame binding the owning table. */
-	stack: ScopeFrame[];
 	refs: GeneratedColumnRef[];
 }
 
@@ -92,12 +87,16 @@ export function collectGeneratedColumnRefs(
 		tableName: tableName.toLowerCase(),
 		schemaName: schemaName.toLowerCase(),
 		resolve: resolveColumnInSource,
-		stack: [],
 		refs: [],
 	};
-	const seed = emptyScopeFrame();
-	seed.bound.add(state.tableName);
-	withScopeFrame(state.stack, seed, () => visitCollect(expr, state));
+	walkSchemaExpressionScope(
+		expr,
+		{ defaultSchema: state.schemaName, seedBindings: [state.tableName] },
+		{
+			onColumn: (col, stack) => recordColumnRef(col, stack, state),
+			onIdentifier: (ident, stack) => recordIdentifierRef(ident, stack, state),
+		},
+	);
 	return state.refs;
 }
 
@@ -106,11 +105,15 @@ export function collectGeneratedColumnRefs(
  * innermost-first: a real source exposing the name binds it there
  * (`'foreign'`); an opaque frame reached before any such source could bind
  * anything (`'unknown'`); falling through every frame reaches the seed
- * (`'own'`).
+ * (`'own'`). `stack[0]` IS that seed, which is why the loop stops at index 1.
  */
-function classifyUnqualified(state: CollectState, nameLower: string): RefBinding {
-	for (let i = state.stack.length - 1; i >= 1; i--) {
-		const frame = state.stack[i];
+function classifyUnqualified(
+	state: CollectState,
+	stack: ReadonlyArray<ScopeFrame>,
+	nameLower: string,
+): RefBinding {
+	for (let i = stack.length - 1; i >= 1; i--) {
+		const frame = stack[i];
 		for (const src of frame.realSources) {
 			if (state.resolve(src.schema, src.name, nameLower)) return 'foreign';
 		}
@@ -130,12 +133,16 @@ function classifyUnqualified(state: CollectState, nameLower: string): RefBinding
  * `'unbound'` (nothing binds it) unless an opaque frame was crossed on the
  * way out, in which case the walk cannot tell and defers to `'unknown'`.
  */
-function classifyQualified(state: CollectState, col: AST.ColumnExpr): RefBinding {
+function classifyQualified(
+	state: CollectState,
+	stack: ReadonlyArray<ScopeFrame>,
+	col: AST.ColumnExpr,
+): RefBinding {
 	const qualifier = col.table!.toLowerCase();
 	let opaque = false;
-	for (let i = state.stack.length - 1; i >= 1; i--) {
-		if (state.stack[i].bound.has(qualifier)) return 'foreign';
-		if (state.stack[i].hasOpaque) opaque = true;
+	for (let i = stack.length - 1; i >= 1; i--) {
+		if (stack[i].bound.has(qualifier)) return 'foreign';
+		if (stack[i].hasOpaque) opaque = true;
 	}
 	if (col.schema === undefined) {
 		if (qualifier === 'new') return 'own';
@@ -146,11 +153,15 @@ function classifyQualified(state: CollectState, col: AST.ColumnExpr): RefBinding
 	return opaque ? 'unknown' : 'unbound';
 }
 
-function recordColumnRef(col: AST.ColumnExpr, state: CollectState): void {
+function recordColumnRef(
+	col: AST.ColumnExpr,
+	stack: ReadonlyArray<ScopeFrame>,
+	state: CollectState,
+): void {
 	const nameLower = col.name.toLowerCase();
 	const binding = col.table === undefined
-		? classifyUnqualified(state, nameLower)
-		: classifyQualified(state, col);
+		? classifyUnqualified(state, stack, nameLower)
+		: classifyQualified(state, stack, col);
 	state.refs.push({
 		name: nameLower,
 		originalName: col.name,
@@ -160,7 +171,11 @@ function recordColumnRef(col: AST.ColumnExpr, state: CollectState): void {
 	});
 }
 
-function recordIdentifierRef(ident: AST.IdentifierExpr, state: CollectState): void {
+function recordIdentifierRef(
+	ident: AST.IdentifierExpr,
+	stack: ReadonlyArray<ScopeFrame>,
+	state: CollectState,
+): void {
 	// A schema-qualified identifier can never be a column of the table being
 	// defined — same skip the previous traverseAst-based analysis applied.
 	if (ident.schema) return;
@@ -169,161 +184,6 @@ function recordIdentifierRef(ident: AST.IdentifierExpr, state: CollectState): vo
 		name: nameLower,
 		originalName: ident.name,
 		shape: 'identifier',
-		binding: classifyUnqualified(state, nameLower),
+		binding: classifyUnqualified(state, stack, nameLower),
 	});
-}
-
-/** Visit a node whose scope cannot be analyzed (CTE / derived-table / DML bodies). */
-function visitCollectBarrier(node: AST.AstNode | undefined, state: CollectState): void {
-	withScopeFrame(state.stack, opaqueScopeFrame(), () => visitCollect(node, state));
-}
-
-function visitCollect(node: AST.AstNode | undefined, state: CollectState): void {
-	if (!node) return;
-
-	switch (node.type) {
-		case 'select': {
-			const stmt = node as AST.SelectStmt;
-			const withFrame = emptyScopeFrame();
-			withScopeFrame(state.stack, withFrame, () => {
-				for (const cte of stmt.withClause?.ctes ?? []) {
-					// A CTE body's scope is not analyzed — refs inside classify
-					// conservatively through the barrier.
-					visitCollectBarrier(cte.query, state);
-					withFrame.cteNames.add(cte.name.toLowerCase());
-				}
-				const frame = buildScopeFrame(stmt.from, state.schemaName, state.stack);
-				withScopeFrame(state.stack, frame, () => {
-					(stmt.columns ?? []).forEach(c => {
-						if (c.type === 'column') visitCollect(c.expr, state);
-					});
-					(stmt.from ?? []).forEach(f => visitCollect(f, state));
-					visitCollect(stmt.where, state);
-					(stmt.groupBy ?? []).forEach(g => visitCollect(g, state));
-					visitCollect(stmt.having, state);
-					(stmt.orderBy ?? []).forEach(o => visitCollect(o.expr, state));
-					visitCollect(stmt.limit, state);
-					visitCollect(stmt.offset, state);
-					visitCollect(stmt.union, state);
-					if (stmt.compound) visitCollect(stmt.compound.select, state);
-				});
-			});
-			break;
-		}
-		// DML bodies (reachable via a subquery source / scalar subquery over
-		// `insert … returning` etc.) bind names against their target table in
-		// ways this walk does not model — descend under a barrier so their refs
-		// classify 'unknown' rather than falsely 'own'.
-		case 'insert': {
-			const stmt = node as AST.InsertStmt;
-			withScopeFrame(state.stack, opaqueScopeFrame(), () => {
-				stmt.withClause?.ctes.forEach(cte => visitCollectBarrier(cte.query, state));
-				visitCollect(stmt.source, state);
-			});
-			break;
-		}
-		case 'update': {
-			const stmt = node as AST.UpdateStmt;
-			withScopeFrame(state.stack, opaqueScopeFrame(), () => {
-				stmt.withClause?.ctes.forEach(cte => visitCollectBarrier(cte.query, state));
-				visitCollect(stmt.targetSource, state);
-				stmt.assignments.forEach(a => visitCollect(a.value, state));
-				visitCollect(stmt.where, state);
-			});
-			break;
-		}
-		case 'delete': {
-			const stmt = node as AST.DeleteStmt;
-			withScopeFrame(state.stack, opaqueScopeFrame(), () => {
-				stmt.withClause?.ctes.forEach(cte => visitCollectBarrier(cte.query, state));
-				visitCollect(stmt.targetSource, state);
-				visitCollect(stmt.where, state);
-			});
-			break;
-		}
-		case 'values': {
-			(node as AST.ValuesStmt).values.forEach(row => row.forEach(v => visitCollect(v, state)));
-			break;
-		}
-		case 'join': {
-			const join = node as AST.JoinClause;
-			visitCollect(join.left, state);
-			visitCollect(join.right, state);
-			visitCollect(join.condition, state);
-			break;
-		}
-		case 'functionSource': {
-			(node as AST.FunctionSource).args.forEach(a => visitCollect(a, state));
-			break;
-		}
-		case 'subquerySource': {
-			// A derived table's body scope is not analyzed — barrier.
-			visitCollectBarrier((node as AST.SubquerySource).subquery, state);
-			break;
-		}
-		case 'binary': {
-			const e = node as AST.BinaryExpr;
-			visitCollect(e.left, state);
-			visitCollect(e.right, state);
-			break;
-		}
-		case 'unary':
-		case 'cast':
-		case 'collate':
-			visitCollect((node as AST.UnaryExpr | AST.CastExpr | AST.CollateExpr).expr, state);
-			break;
-		case 'function':
-			(node as AST.FunctionExpr).args.forEach(a => visitCollect(a, state));
-			break;
-		case 'subquery':
-			visitCollect((node as AST.SubqueryExpr).query, state);
-			break;
-		case 'windowFunction': {
-			const wf = node as AST.WindowFunctionExpr;
-			visitCollect(wf.function, state);
-			visitCollect(wf.window, state);
-			break;
-		}
-		case 'windowDefinition': {
-			const wd = node as AST.WindowDefinition;
-			(wd.partitionBy ?? []).forEach(p => visitCollect(p, state));
-			(wd.orderBy ?? []).forEach(o => visitCollect(o.expr, state));
-			break;
-		}
-		case 'case': {
-			const ce = node as AST.CaseExpr;
-			visitCollect(ce.baseExpr, state);
-			ce.whenThenClauses.forEach(wt => {
-				visitCollect(wt.when, state);
-				visitCollect(wt.then, state);
-			});
-			visitCollect(ce.elseExpr, state);
-			break;
-		}
-		case 'in': {
-			const ie = node as AST.InExpr;
-			visitCollect(ie.expr, state);
-			(ie.values ?? []).forEach(v => visitCollect(v, state));
-			visitCollect(ie.subquery, state);
-			break;
-		}
-		case 'exists':
-			visitCollect((node as AST.ExistsExpr).subquery, state);
-			break;
-		case 'between': {
-			const be = node as AST.BetweenExpr;
-			visitCollect(be.expr, state);
-			visitCollect(be.lower, state);
-			visitCollect(be.upper, state);
-			break;
-		}
-		case 'column':
-			recordColumnRef(node as AST.ColumnExpr, state);
-			break;
-		case 'identifier':
-			recordIdentifierRef(node as AST.IdentifierExpr, state);
-			break;
-		default:
-			break;
-	}
 }
