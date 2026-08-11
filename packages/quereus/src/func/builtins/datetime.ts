@@ -468,9 +468,14 @@ function formatDateTime(dt: Temporal.ZonedDateTime, subsec: boolean): string {
 // display spelling verbatim into a DATETIME column — where `compare` is binary text, so
 // the row would stop matching the canonical spelling every other write produces.
 // `date()` alone is canonical (YYYY-MM-DD either way), but typing it apart from its two
-// siblings is a worse trap than typing all three the same. Reconciling the two families
-// (canonicalize the output, or teach the write path) is tracked by
-// `debt-variadic-datetime-functions-not-temporally-typed`.
+// siblings is a worse trap than typing all three the same.
+// NOTE: accepted tradeoff — reconciling the two families (canonicalize the display output,
+// or teach the write path to canonicalize a temporal spelling) was filed as
+// `debt-variadic-datetime-functions-not-temporally-typed` and closed unworked in a backlog
+// triage pass, so this comment is the record, not a queued ticket. The write path's
+// conformance guard does NOT cover it: a display-spelled string still inhabits DATETIME's
+// TEXT physical form. Revisit if a caller is found relying on `datetime(x, …)` being
+// storable into a DATETIME column without an explicit conversion.
 export const dateFunc = createScalarFunction(
 	{ name: 'date', numArgs: -1, deterministic: false, returnType: TEXT_RETURN },
 	(...args: SqlValue[]): SqlValue => {

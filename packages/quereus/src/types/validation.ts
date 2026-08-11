@@ -154,12 +154,23 @@ export function coerceRowToSchema(row: Row, columns: readonly ColumnSchema[], la
  * "a badly-spelled string reached a DATE column" (a DATE-announced expression producing a
  * non-canonical date string still passes through: a string DOES inhabit DATE's TEXT
  * physical type). That is deliberate — it keeps this predicate identical to the one the
- * strict checker enforces — and the known instance of the spelling hole is tracked as
- * `debt-variadic-datetime-functions-not-temporally-typed` (see docs/types.md § Special
- * Types, the two date/time function families). If that class needs closing at this seam,
+ * strict checker enforces — and the known instance of the spelling hole is the variadic
+ * `date`/`time`/`datetime` functions, which declare TEXT for exactly this reason (see the
+ * NOTE on `dateFunc` in `func/builtins/datetime.ts` and docs/types.md § Special Types —
+ * an accepted tradeoff, not open work). If that class needs closing at this seam,
  * switching the guard to `target.validate` is the change to weigh; JSON survives it
  * (`JSON_TYPE.validate` accepts any string, so a JSON string scalar still passes), but
  * every temporal announcement would then have to be exact or writes would start failing.
+ *
+ * NOTE: rule R1 (canonical numeric form — a `bigint` only outside the safe-integer range)
+ * is deliberately NOT part of the guard, even though the strict checker asserts R1 and R2
+ * at the same seam. R1 is upheld where values are BORN (literal lexing, parameter bind,
+ * bigint arithmetic — see util/numeric-canonical.ts); silently re-canonicalizing here
+ * would repair an upstream contract violation instead of letting `QUEREUS_REPR_STRICT`
+ * report the seam that caused it. Consequence, accepted: a safe-range `bigint` from a
+ * source announcing INTEGER/NUMERIC still passes the guard and reaches storage as-is.
+ * Revisit if such a value is ever observed in storage from an in-tree path — that would
+ * mean a birth site is missing its canonicalization, and the fix belongs there.
  */
 export function buildCellCoercion(
 	sourceType: LogicalType | undefined,
@@ -185,9 +196,14 @@ export function buildCellCoercion(
  * needs guarding), so the caller can skip the per-row work entirely. A row of all-`ANY`
  * columns fed from `ANY` expressions therefore still allocates nothing.
  *
- * The returned closure copies the row. Cells at or beyond the row's length are left for
- * the storage width guard, mirroring {@link coerceRowToSchema}'s map-over-present-cells
- * behavior.
+ * The returned closure copies the row ONLY when a cell actually changes, and returns the
+ * caller's own row otherwise — so a bulk copy whose cells all conform (`insert into b
+ * select * from a` between same-typed tables) still allocates nothing per row, as it did
+ * before every constrained column started carrying a guard. Callers must therefore treat
+ * the result as the input row unless they own it; both do today (`emitInsert` reads cells
+ * out of it, `emitUpdate` hands in a row it just copied). Cells at or beyond the row's
+ * length are left for the storage width guard, mirroring {@link coerceRowToSchema}'s
+ * map-over-present-cells behavior.
  *
  * NOTE: a guarded cell costs one pre-selected `typeof`/`instanceof` per row where it used
  * to cost nothing. Unmeasured; if it ever shows up in `test/performance-sentinels.spec.ts`,
@@ -208,14 +224,23 @@ export function buildRowCoercion(
 	}
 	if (indices.length === 0) return undefined;
 	return (row: Row): Row => {
-		const out = row.slice() as Row;
+		let out: Row | undefined;
 		for (let k = 0; k < indices.length; k++) {
 			const i = indices[k];
 			// Indices ascend, so the first out-of-range one ends the pass.
-			if (i >= out.length) break;
-			out[i] = converters[k](out[i] as SqlValue);
+			if (i >= row.length) break;
+			// Each index is visited once, so the copy (if any) still holds the input's cell.
+			const original = row[i] as SqlValue;
+			const converted = converters[k](original);
+			// Identity, not equality: a conversion that returns the value it was given
+			// changed nothing, and anything else (including a fresh object holding the
+			// same content, or NaN) copies — conservative in the safe direction.
+			if (converted !== original) {
+				out ??= row.slice() as Row;
+				out[i] = converted;
+			}
 		}
-		return out;
+		return out ?? row;
 	};
 }
 

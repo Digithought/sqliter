@@ -73,9 +73,12 @@ export function mergeSetOpColumnType(left: LogicalType, right: LogicalType): Set
 	//
 	// Do NOT "restore consistency" with `BinaryOpNode.generateType` / `findCommonType`,
 	// which promote INTEGER + REAL to REAL — correct there (one value in one form),
-	// wrong here (a stream mixing both). Advertising REAL makes `buildRowCoercion`
-	// skip conversion on the identity match, landing a bigint unconverted in a
-	// REAL-declared column (ticket `set-op-numeric-promotion-skips-conversion`).
+	// wrong here (a stream mixing both). Advertising REAL used to land a bigint
+	// unconverted in a REAL-declared column, because `buildRowCoercion` skipped the
+	// identity match outright (ticket `set-op-numeric-promotion-skips-conversion`).
+	// Its conformance guard now catches that, but the merge still must not claim
+	// REAL: the guard would convert the INTEGER branch's bigints to doubles, trading
+	// a representation violation for silent precision loss.
 	if (left.isNumeric && right.isNumeric) {
 		if (isBuiltinNumeric(left) && isBuiltinNumeric(right)) return { logicalType: NUMERIC_TYPE };
 		return { logicalType: ANY_TYPE };

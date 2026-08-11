@@ -175,6 +175,27 @@ describe('DML write representation', () => {
 		});
 	});
 
+	// Every guarded cell on a same-typed bulk copy is now asked to prove it conforms, so
+	// the arms with a non-`typeof` test (BLOB's `instanceof Uint8Array`) and the ones the
+	// repro cases never touch are pinned at the engine level, not only in the unit tests.
+	describe('same-typed bulk copy leaves conforming values alone', () => {
+		it('copies blob, boolean and integer columns unchanged', async () => {
+			await db.exec('create table a (id integer primary key, b blob, f boolean, i integer)');
+			await db.exec('create table c (id integer primary key, b blob, f boolean, i integer)');
+			await db.exec(`insert into a values (1, x'4142', true, 9007199254740993)`);
+			await db.exec('insert into c select id, b, f, i from a');
+
+			const rows = await collect('select b, f, i from c');
+			expect(rows).to.have.lengthOf(1);
+			const { b, f, i } = rows[0];
+			expect(b).to.be.instanceOf(Uint8Array);
+			expect(Array.from(b as Uint8Array)).to.deep.equal([0x41, 0x42]);
+			expect(f).to.equal(true);
+			// Past 2^53 an INTEGER value is a bigint (rule R1), and it must stay one.
+			expect(i).to.equal(9007199254740993n);
+		});
+	});
+
 	// ADD COLUMN's per-row backfill takes the same decision from the same helper. No
 	// non-conforming instance of it is known — the arm is shared so the two sites cannot
 	// drift, not because a failure was observed — so these pin the two reachable shapes.

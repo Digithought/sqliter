@@ -531,8 +531,12 @@ which is not canonical — `datetime()` separates date and time with a space rat
 Declaring the temporal type on those would make the write path treat the value as already
 in declared form (see "Where coercion happens (and why exactly once)") and store the
 display spelling into a temporal column, where comparison is binary text — so the row
-would stop matching canonically-written values. Reconciling the two families is tracked by
-`debt-variadic-datetime-functions-not-temporally-typed`.
+would stop matching canonically-written values. The split is therefore deliberate:
+reconciling the two families (canonicalize the display output, or teach the write path to
+canonicalize a temporal spelling) was raised as its own ticket and closed unworked in a
+backlog triage pass, so this paragraph — not a queued ticket — is the record. Revisit if a
+caller is found relying on `datetime(x, …)` being storable into a DATETIME column without
+an explicit conversion.
 
 ### Special Types
 
@@ -629,7 +633,16 @@ And the JSON case above stays safe, because a value read out of a JSON column �
 a native object/array, or a JSON scalar such as the string `abc` or the string
 `9` — *conforms* to JSON's OBJECT physical type, so `parse` is never re-applied.
 A column whose physical type constrains nothing (`ANY`) needs no guard at all, so
-an all-`ANY` row still allocates nothing per row.
+its cell is skipped outright; and a row whose guarded cells all conform is
+returned as-is rather than copied, so a bulk copy between same-typed tables still
+allocates nothing per row.
+
+The guard converts where the skip used to store, so an announcement the value
+contradicts can now surface as a `Type conversion failed for column '…'` error
+instead of silently landing a non-conforming value — e.g. a NaN reaching an
+INTEGER column from an INTEGER-announced expression. That is the intent: an
+inaccurate announcement is a planner bug, and failing the write names it rather
+than burying it in storage.
 
 Concretely:
 
@@ -693,13 +706,14 @@ null` write existing rows outside the DML pipeline, so they convert explicitly:
   data. Note the deliberate asymmetry with `CREATE TABLE`, which still accepts an
   unconvertible literal DEFAULT and only fails at the first INSERT.
 - A non-foldable DEFAULT (`default (new.<col>)`) is evaluated per existing row, and
-  its result converts only when the default expression's static type is not already
-  the new column's type — the same object-identity check `buildRowCoercion` makes,
-  for the same reason (`add column k json default (new.j)` over an existing JSON
-  column must copy, not re-parse). The conversion runs before the per-row CHECK
-  predicates, matching `emitInsert`.
-- A `generated always as (<x>)` expression takes that same identity-guarded
-  `coerceTo` path — one `AddColumnBackfill` serves both kinds — so a backfilled
+  its result takes the write path's own per-cell decision, built by the same
+  `buildCellCoercion` helper: it converts unless the default expression's static
+  type already IS the new column's type *and* the value in hand inhabits it
+  (`add column k json default (new.j)` over an existing JSON column must copy, not
+  re-parse — and a value read out of a JSON column conforms, so it does). The
+  conversion runs before the per-row CHECK predicates, matching `emitInsert`.
+- A `generated always as (<x>)` expression takes that same guarded
+  `AddColumnBackfill.coerce` path — one `AddColumnBackfill` serves both kinds — so a backfilled
   generated cell holds what an INSERT computing the same expression would store
   (`add column g integer generated always as (v || '0')` over a text `v` stores the
   integer). It differs from the DEFAULT arm in one respect: it is *never* folded to a
@@ -712,8 +726,12 @@ never re-parsed: `compare('9', 9)` ranks the number first (number < string)
 instead of calling them equal.
 
 The rule is only as sound as the static types it reads, so an expression node
-that advertises a logical type it does not actually produce becomes a write-path
-defect. Known cases:
+that advertises a logical type it does not actually produce is still a write-path
+defect — narrowed, but not closed, by the conformance guard above. The guard sees
+only which JS storage class a value is, so it catches an announcement contradicted
+by the *representation* (a number announced as TEXT) and misses one contradicted
+only by the *content*: serialized JSON text and a date spelled the wrong way both
+inhabit their declared type's physical form. Known cases:
 
 - A scalar function whose schema *declares* a JSON return type must return
   native (parsed) JSON values, never serialized text — the skip rule takes the

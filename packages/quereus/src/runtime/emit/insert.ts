@@ -19,7 +19,8 @@ export function emitInsert(plan: InsertNode, ctx: EmissionContext): Instruction 
 	// table-column order (buildExpandedSource), so source attributes align
 	// positionally with table columns. A cell whose source type already IS the
 	// column's type (e.g. `insert into b select j from a` for a JSON column) is
-	// left alone — see buildRowCoercion.
+	// left alone — provided the value in hand also inhabits that type, since the
+	// source's announcement is an inference, not a guarantee. See buildRowCoercion.
 	const sourceAttrs = plan.source.getAttributes();
 	const coerceNewRow = buildRowCoercion(
 		tableSchema.columns.map((_, i) => sourceAttrs[i]?.type.logicalType),

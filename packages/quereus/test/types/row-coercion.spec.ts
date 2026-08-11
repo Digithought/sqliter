@@ -124,6 +124,26 @@ describe('write-path cell coercion', () => {
 			const out = buildRowCoercion([TEXT_TYPE], columns)!(row);
 			expect(row[0]).to.equal(9);
 			expect(out[0]).to.equal('9');
+			expect(out).to.not.equal(row);
+		});
+
+		it('does not copy a row whose every guarded cell conforms', () => {
+			// The guard made every constrained column carry a closure, so the all-identity
+			// bulk-copy path (`insert into b select * from a`) reaches here on every row.
+			// It must stay allocation-free, as it was when that path got no closure at all.
+			const columns = [column('t', TEXT_TYPE), column('i', INTEGER_TYPE)];
+			const coerce = buildRowCoercion([TEXT_TYPE, INTEGER_TYPE], columns)!;
+			const row = ['x', 42] as Row;
+			expect(coerce(row)).to.equal(row);
+		});
+
+		it('copies once when only a later cell converts', () => {
+			const columns = [column('t', TEXT_TYPE), column('u', TEXT_TYPE)];
+			const row = ['x', 9] as Row;
+			const out = buildRowCoercion([TEXT_TYPE, TEXT_TYPE], columns)!(row);
+			expect(out).to.not.equal(row);
+			expect(out).to.deep.equal(['x', '9']);
+			expect(row).to.deep.equal(['x', 9]);
 		});
 
 		it('leaves cells past the row length to the storage width guard', () => {

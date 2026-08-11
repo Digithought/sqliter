@@ -45,9 +45,9 @@ export function emitUpdate(plan: UpdateNode, ctx: EmissionContext): Instruction 
 	// declared form exactly once. An assigned column's source type is its
 	// assignment expression's type; an unassigned column keeps whatever the
 	// source relation reports at that position — for the ordinary target-table
-	// scan that is the declared column type itself (identity match ⇒ leave
-	// alone: the scanned value is already converted, and e.g. JSON conversion
-	// is not repeatable — see buildRowCoercion). Never assume "unassigned ⇒
+	// scan that is the declared column type itself (identity match ⇒ leave a
+	// CONFORMING value alone: the scanned value is already converted, and e.g.
+	// JSON conversion is not repeatable — see buildRowCoercion). Never assume "unassigned ⇒
 	// converted": a non-scan source (view decomposition, member insert) reports
 	// its own types and converts by the same rule.
 	//

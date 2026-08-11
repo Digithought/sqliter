@@ -213,6 +213,11 @@ export class AlterTableNode extends VoidNode {
 
 		const action = this.action as Extract<AlterTableAction, { type: 'addColumn' }>;
 		let cursor = 0;
+		// NOTE: `coerce` was decided from the PRE-rewrite node's announced type and is carried
+		// over unchanged. Harmless today — no rule rewrites a backfill expression into one
+		// announcing a different logical type — and a stale "guard" decision cannot corrupt
+		// (it re-checks the value). If a rule ever does change that announcement, a stale
+		// "always convert" could double-convert a JSON backfill; rebuild it here then.
 		const backfill = action.backfill ? { ...action.backfill, node: rewritten[cursor++] } : undefined;
 		const checks = action.checks
 			? { ...action.checks, predicates: action.checks.predicates.map(p => ({ ...p, node: rewritten[cursor++] })) }
