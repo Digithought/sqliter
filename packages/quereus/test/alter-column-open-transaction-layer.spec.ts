@@ -613,6 +613,8 @@ describe('ALTER TABLE ADD COLUMN at a position (memory module)', () => {
 		// FK child columns are indices into THIS table and shift; the parent-side indices have
 		// no stored slot and are resolved from names at enforcement time.
 		expect(updated.foreignKeys?.map(fk => [...fk.columns])).to.deep.equal([[2]]);
+		expect(updated.foreignKeys?.map(fk => [...(fk.referencedColumnNames ?? [])]), 'parent names do not shift')
+			.to.deep.equal([['pid']]);
 		// `g` (2 → 3) is generated from `id` (0 → 1).
 		expect([...(updated.generatedColumnDependencies ?? [])].map(([col, deps]) => [col, [...deps]]))
 			.to.deep.equal([[3, [1]]]);
