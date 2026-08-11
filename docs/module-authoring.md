@@ -859,6 +859,21 @@ index seek, `O(k + log n)` for an index scan returning `k` rows. Push filtering 
 you can: what you decline stays a residual above the boundary, so a pushed filter costs
 nothing and saves transfer.
 
+Charge the work your seek actually does. `AccessPlanBuilder.eqMatch` / `.rangeScan` price
+walking a matched window and nothing more, so a module whose secondary index stores row
+IDENTIFIERS rather than rows — it must read each matched row out of a second place — pays a
+per-row term those shapes do not model. Add it with `addCost(rows * yourPerRowCost)` rather
+than recomputing the factory's formula, so your arm cannot drift from the shape it started
+from. The store module does exactly this (`ROW_RESOLUTION_COST` in
+`store-module-access-plan.ts`).
+
+**Nothing compares your plan with an alternative.** `rule-select-access-path` takes the
+single plan you return and uses it, so an index seek priced ABOVE your own sequential scan
+still wins unless you reject it yourself: compare the seek's cost against the scan's and
+return the scan when the seek loses. Losing that way is safe — a scan that claims no
+filters leaves every predicate in the residual, so the rows are identical and only the
+speed changes.
+
 ### 2. Report capabilities conservatively
 
 If `supports()` returns a result, the module must execute that pipeline correctly; if

@@ -1675,14 +1675,27 @@ describe('StoreModule predicate pushdown', () => {
 				});
 			}
 
-			it('a cost-only decline pays no resolution term (it resolves nothing)', async () => {
-				// A partial index is never seeked, so `costed`'s arms are out of the way here:
-				// the plan is the plain full scan, whose cost is the sequential 1.0 per row.
+			it('a cost-only decline pays no resolution term (it resolves nothing)', () => {
+				// A real cost-only plan, not a plain scan: an IN above the 1000-seek cap declines
+				// to cost-only on `ix_a`, so it keeps the arm's SHAPE (eq, 0.3 + 0.3 per row over
+				// 10% of the table) while performing a sequential scan that resolves no index
+				// entry. 30.3, not the 130.3 a seeking eq arm on the same 100 rows would price.
+				const plan = planFor('costed', [{
+					columnIndex: 1, op: 'IN', usable: true, runtimeSet: { maxCount: 1001 },
+				}], 1000);
+				expect(plan.explains, 'declined by the seek cap').to.match(/cost-only; IN cross-product/);
+				expect(plan.indexName, 'so it advertises no seek').to.be.undefined;
+				expect(plan.handledFilters).to.deep.equal([false]);
+				expect(plan.rows).to.equal(100);
+				expect(plan.cost).to.be.closeTo(0.3 + 100 * 0.3, 1e-9);
+			});
+
+			it('a partial index is never seeked, so nothing pays the resolution term', async () => {
 				await db.exec(`create table parti (id integer primary key, v integer) using store`);
 				await db.exec(`create index ix_pos on parti (v) where v > 0`);
 				const plan = planFor('parti', [eq(1, 7)], 1000);
 				expect(plan.handledFilters).to.deep.equal([false]);
-				expect(plan.cost).to.equal(1000);
+				expect(plan.cost, 'the plain sequential 1.0 per row').to.equal(1000);
 			});
 
 			it('a selective indexed predicate still beats the sequential scan', async () => {

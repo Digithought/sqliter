@@ -1439,6 +1439,7 @@ class AccessPlanBuilder {
   static rangeScan(estimatedRows: number, indexCost?: number): AccessPlanBuilder;
   
   setCost(cost: number): this;
+  addCost(delta: number): this;   // add to a factory's cost (throws if no cost set yet)
   setRows(rows: number | undefined): this;
   setHandledFilters(handledFilters: readonly boolean[]): this;
   setOrdering(ordering: readonly OrderingSpec[]): this;

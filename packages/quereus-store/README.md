@@ -86,6 +86,17 @@ semantically-ordered type. A bound on a *later* index column than the one right 
 prefix is not seeked at all. No ordering is advertised for this path, so an `ORDER BY` on the
 bounded column keeps its `Sort`.
 
+**A seek priced above a full scan is dropped.** A secondary-index seek reads two things per
+matched row — the index entry, then the row it names — while a scan reads one, so the module
+charges that second read and then compares the arm against its own sequential-scan cost,
+returning the scan when the seek prices higher. The predicate stays as a residual either
+way, so the rows are identical and only the speed differs. The module keeps no per-column
+statistics, so how many rows a predicate matches is guessed as a fixed fraction of the table
+(10% for an equality, 30% for a range); that makes the comparison per-*index-shape* rather
+than per-query, and today it only fires where the guess is the whole table. Multi-seeks are
+exempt from the comparison — the engine reads their cost as a curve to decide its own key-set
+rewrites, and answering it with a scan would switch that feature off.
+
 **`IN`-list index seeks ("multi-seek").** An `IN`-list on an indexed column
 (`where v in (1, 2, 3)`, including parameter-bound lists) is served from the index as one
 deduplicated, key-ordered point seek per distinct list value, instead of a full scan with

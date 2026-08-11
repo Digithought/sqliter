@@ -90,9 +90,13 @@ import { reconcilePkCollations } from './store-module-schema-rewrite.js';
  *
  * NOTE: a prepared `Statement` holds its compiled plan and recompiles only on a schema
  * change, so a long-lived prepared statement keeps the costs derived from the size the
- * table had at first compile. Harmless while this only moves costs, not plan shape; if a
- * prepared statement is ever seen picking a plan wrong for the table's current size, the
- * fix belongs at the statement's recompile trigger, not here.
+ * table had at first compile. This now moves plan SHAPE, not only costs: the seek-versus-
+ * scan comparison in `computeBestAccessPlan` rejects an index seek that prices above a
+ * sequential read of `estimatedRows` rows, so a statement compiled against a one-row table
+ * keeps its scan after the table grows. It stays a performance question, never a wrong
+ * answer — the scan claims no filters, so the residual keeps the predicate. If a prepared
+ * statement is ever seen picking a plan wrong for the table's current size, the fix belongs
+ * at the statement's recompile trigger, not here.
  */
 function sizeRequestFromLiveCount(
 	request: BestAccessPlanRequest,

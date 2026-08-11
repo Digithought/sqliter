@@ -305,17 +305,19 @@ export function computeBestAccessPlan(
 	// unhandled, residual retained" behavior.
 	//
 	// The sequential scan this module would otherwise fall back to, built up-front so the
-	// seek arms can be PRICED AGAINST it below: `rule-select-access-path` takes whatever
-	// single plan this function returns and never compares it with an alternative, so a
-	// seek that costs more than reading the table start to finish is only rejected if the
-	// module rejects it here.
-	const fullScan = (why: string): BestAccessPlanResult => {
-		const plan = AccessPlanBuilder
+	// seek arms can be PRICED AGAINST its cost below: `rule-select-access-path` takes
+	// whatever single plan this function returns and never compares it with an alternative,
+	// so a seek that costs more than reading the table start to finish is only rejected if
+	// the module rejects it here. Built once and re-explained on the way out rather than
+	// re-deriving `AccessPlanBuilder.fullScan`'s cost formula for the comparison — the
+	// drift {@link AccessPlanBuilder.addCost} exists to prevent.
+	const scanPlan: BestAccessPlanResult = {
+		...AccessPlanBuilder
 			.fullScan(estimatedRows)
 			.setHandledFilters(new Array(request.filters.length).fill(false))
-			.setExplanation(why)
-			.build();
-		return { ...plan, ...buildPkOrderingAdvertisement(tableInfo, request, pkOrderPreservingPrefix) };
+			.setExplanation('Store full table scan')
+			.build(),
+		...buildPkOrderingAdvertisement(tableInfo, request, pkOrderPreservingPrefix),
 	};
 
 	const indexes = tableInfo.indexes || [];
@@ -338,7 +340,6 @@ export function computeBestAccessPlan(
 		if (!costOnlyFallback) costOnlyFallback = plan;
 	}
 	if (bestSeekPlan) {
-		const scanCost = estimatedRows * 1.0; // AccessPlanBuilder.fullScan's sequential-read cost
 		//
 		// The MULTI-SEEK arm is exempt, and that is a measured decision rather than an
 		// oversight. `rule-key-set-seek` (engine side) does not consume this arm as a PLAN —
@@ -355,13 +356,22 @@ export function computeBestAccessPlan(
 		// this exemption skips, off the same numbers.
 		//
 		// Ties keep the seek: it returns fewer rows for the rest of the plan to carry.
-		if (bestSeekPlan.isMultiSeek || bestSeekPlan.plan.cost <= scanCost) return bestSeekPlan.plan;
+		if (bestSeekPlan.isMultiSeek || bestSeekPlan.plan.cost <= scanPlan.cost) return bestSeekPlan.plan;
 		// Losing the seek is SAFE, never a wrong answer: the scan claims no filters, so the
 		// engine keeps every one of them as a residual Filter and the row set is identical.
 		// Deliberately returns the scan rather than falling through to `costOnlyFallback`
 		// below — a cost-only plan performs this same sequential scan while advertising an
 		// index arm's (cheaper) cost, so falling through would undo the comparison.
-		return fullScan('Store full table scan (cheaper than the best index seek)');
+		//
+		// NOTE: a vetoed seek is indistinguishable from a DECLINE to the engine, and
+		// `rule-key-set-seek` reads a probe answer that names no index as "the module
+		// declined" and abandons its rewrite. Harmless while the veto is reachable only
+		// where an arm's estimate is the whole table (a one-row table, per the arithmetic on
+		// {@link ROW_RESOLUTION_COST}) — a key-set seek there is worthless anyway. If real
+		// per-column statistics ever make the veto fire on tables worth seeking, the
+		// comparison has to exempt any request carrying a runtime-valued set, not just the
+		// arm this module happens to pick for it.
+		return { ...scanPlan, explains: 'Store full table scan (cheaper than the best index seek)' };
 	}
 	// NOTE: a cost-only plan carries no PK-order advertisement even though the store still
 	// iterates in PK key order for it (`StoreTable.query` full-scans), so `... where v > 'x'
@@ -380,10 +390,10 @@ export function computeBestAccessPlan(
 
 	// Fallback to full scan. The store iterates rows in PK key order
 	// (see StoreTable.query / store.iterate over buildFullScanBounds), so
-	// the scan is monotonic on the leading PK column. `fullScan` advertises that so
+	// the scan is monotonic on the leading PK column. `scanPlan` advertises that so
 	// downstream rules (merge-join, asof-scan) can fire on store-backed
 	// tables, matching memory-mode behavior.
-	return fullScan('Store full table scan');
+	return scanPlan;
 }
 
 /**
@@ -521,13 +531,12 @@ function tryIndexAccessPlan(
 	const isRange = arm !== 'eq';
 	const rows = Math.max(1, Math.floor(estimatedRows * ARM_SELECTIVITY[arm]));
 	/** The arm's shape — `AccessPlanBuilder`'s per-row index-entry term, no resolution. */
-	const armShape = (armRows: number, indexCost: number): AccessPlanBuilder =>
-		isRange ? AccessPlanBuilder.rangeScan(armRows, indexCost) : AccessPlanBuilder.eqMatch(armRows, indexCost);
+	const armShape = (): AccessPlanBuilder =>
+		isRange ? AccessPlanBuilder.rangeScan(rows, 0.2) : AccessPlanBuilder.eqMatch(rows, 0.3);
 	/** The arm's shape plus the per-fetched-row {@link ROW_RESOLUTION_COST}. */
-	const seekingArm = (armRows: number, indexCost: number): AccessPlanBuilder =>
-		armShape(armRows, indexCost).addCost(armRows * ROW_RESOLUTION_COST);
+	const seekingArm = (): AccessPlanBuilder => armShape().addCost(rows * ROW_RESOLUTION_COST);
 	const costOnly = (why: string): IndexPlanCandidate => ({
-		plan: armShape(rows, isRange ? 0.2 : 0.3)
+		plan: armShape()
 			.setHandledFilters(new Array(request.filters.length).fill(false))
 			.setExplanation(`Store index scan on ${index.name} (${why})`)
 			.build(),
@@ -622,7 +631,7 @@ function tryIndexAccessPlan(
 		? `prefix-range seek(prefix=${eqCols.length})`
 		: arm === 'range' ? 'range scan' : 'seek';
 	return {
-		plan: seekingArm(rows, isRange ? 0.2 : 0.3)
+		plan: seekingArm()
 			.setHandledFilters(handledFilters)
 			.setIndexName(index.name)
 			.setSeekColumns(seekCols)

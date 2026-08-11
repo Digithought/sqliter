@@ -94,6 +94,21 @@ describe('AccessPlanBuilder', () => {
 			expect(() => new AccessPlanBuilder().build()).to.throw();
 		});
 
+		it('addCost adds to a shape factory\'s cost without restating its formula', () => {
+			const plan = AccessPlanBuilder.eqMatch(10, 0.3).addCost(10 * 1.0).build();
+			expect(plan.cost).to.be.closeTo(0.3 + 10 * 0.3 + 10, 1e-9);
+			expect(plan.rows, 'and leaves the shape otherwise untouched').to.equal(10);
+		});
+
+		it('addCost accumulates and follows setCost', () => {
+			const plan = new AccessPlanBuilder().setCost(5).addCost(2).addCost(3).build();
+			expect(plan.cost).to.equal(10);
+		});
+
+		it('addCost throws when no cost has been set yet', () => {
+			expect(() => new AccessPlanBuilder().addCost(1)).to.throw(/cost/);
+		});
+
 		it('should default handledFilters to empty array', () => {
 			const plan = new AccessPlanBuilder().setCost(1).build();
 			expect(plan.handledFilters).to.deep.equal([]);
