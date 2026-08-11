@@ -17,6 +17,10 @@ export class DelegatingKVStore implements KVStore {
 		return this.inner.get(key);
 	}
 
+	getMany(keys: readonly Uint8Array[]): Promise<(Uint8Array | undefined)[]> {
+		return this.inner.getMany(keys);
+	}
+
 	put(key: Uint8Array, value: Uint8Array, options?: WriteOptions): Promise<void> {
 		return this.inner.put(key, value, options);
 	}

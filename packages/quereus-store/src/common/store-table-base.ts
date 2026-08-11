@@ -30,7 +30,7 @@ import {
 import type { IterateOptions, KVEntry, KVStore } from './kv-store.js';
 import { bytesToHex, compareBytes } from './bytes.js';
 import type { DataChangeEvent, StoreEventEmitter } from './events.js';
-import type { TransactionCoordinator } from './transaction.js';
+import type { PendingStoreOps, TransactionCoordinator } from './transaction.js';
 import { StoreConnection } from './store-connection.js';
 import {
 	buildDataKey,
@@ -833,23 +833,84 @@ export abstract class StoreTableBase extends VirtualTable {
 	}
 
 	/**
+	 * This transaction's decision about `key`, without touching the committed store:
+	 * `null` for a pending delete, the staged row for a pending put, and `undefined`
+	 * when the overlay has nothing to say and the committed store must be read.
+	 *
+	 * The precedence both effective reads below implement, in one place — a pending
+	 * delete must never fall through to a committed value, and a pending put must win
+	 * over one.
+	 */
+	private pendingRowFor(pending: PendingStoreOps | null, key: Uint8Array): Row | null | undefined {
+		if (!pending) return undefined;
+		const hex = bytesToHex(key);
+		if (pending.deletes.has(hex)) return null;
+		const overlay = pending.puts.get(hex);
+		return overlay ? deserializeRow(overlay.value) : undefined;
+	}
+
+	/** Pending ops for THIS table's data store handle — see findUniqueConflict. */
+	private pendingDataOps(store: KVStore): PendingStoreOps | null {
+		return this.coordinator?.isInTransaction()
+			? this.coordinator.getPendingOpsForStore(store)
+			: null;
+	}
+
+	/**
 	 * Effective (pending-over-committed) point read by encoded data key: a pending
 	 * delete ⇒ null, a pending put ⇒ its value, else the committed store entry.
 	 */
 	async readEffectiveRowByKey(key: Uint8Array): Promise<Row | null> {
 		const store = await this.ensureStore();
-		// Pending ops for THIS table's data store handle — see findUniqueConflict.
-		const pending = this.coordinator?.isInTransaction()
-			? this.coordinator.getPendingOpsForStore(store)
-			: null;
-		if (pending) {
-			const hex = bytesToHex(key);
-			if (pending.deletes.has(hex)) return null;
-			const overlay = pending.puts.get(hex);
-			if (overlay) return deserializeRow(overlay.value);
-		}
+		const overlay = this.pendingRowFor(this.pendingDataOps(store), key);
+		if (overlay !== undefined) return overlay;
 		const value = await store.get(key);
 		return value ? deserializeRow(value) : null;
+	}
+
+	/**
+	 * Batch twin of {@link readEffectiveRowByKey}: resolve MANY encoded data keys in one
+	 * store round trip, applying the same pending-over-committed precedence per key.
+	 *
+	 * `result[i]` corresponds to `keys[i]` and is null when that key resolves to no row
+	 * (absent, or deleted in this transaction). Duplicate keys are read once each and are
+	 * fine — nothing here dedups, because the CALLER's ordering and dedup rules differ per
+	 * scan shape (see `StoreTableScan`).
+	 *
+	 * The overlay is resolved BEFORE the batch is issued, so a key this transaction deleted
+	 * is never fetched from the committed store and a pending put never pays a round trip.
+	 * Only the remainder reaches `getMany`, and their positions are remembered rather than
+	 * re-derived so an interleaved overlay hit cannot shift the result.
+	 *
+	 * The caller owns the batch SIZE — see {@link KVStore.getMany}'s bounded-by-the-caller
+	 * note.
+	 */
+	async readEffectiveRowsByKeys(keys: readonly Uint8Array[]): Promise<(Row | null)[]> {
+		if (keys.length === 0) return [];
+		const store = await this.ensureStore();
+		const pending = this.pendingDataOps(store);
+
+		const rows: (Row | null)[] = new Array(keys.length);
+		const missPositions: number[] = [];
+		const missKeys: Uint8Array[] = [];
+		for (let i = 0; i < keys.length; i++) {
+			const overlay = this.pendingRowFor(pending, keys[i]);
+			if (overlay !== undefined) {
+				rows[i] = overlay;
+			} else {
+				missPositions.push(i);
+				missKeys.push(keys[i]);
+			}
+		}
+
+		if (missKeys.length > 0) {
+			const values = await store.getMany(missKeys);
+			for (let j = 0; j < missPositions.length; j++) {
+				const value = values[j];
+				rows[missPositions[j]] = value ? deserializeRow(value) : null;
+			}
+		}
+		return rows;
 	}
 
 	/**

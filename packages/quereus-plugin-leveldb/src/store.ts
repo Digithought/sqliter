@@ -89,6 +89,20 @@ export class LevelDBStore implements KVStore {
 		return await this.level.get(key);
 	}
 
+	/**
+	 * Batch point-read via abstract-level's native `getMany`, which takes one trip through
+	 * the binding for the whole key list and answers positionally (`undefined` for a
+	 * missing key) — exactly this method's contract, so no re-ordering is needed.
+	 *
+	 * The empty case is short-circuited rather than handed down: `getMany([])` is legal on
+	 * abstract-level but there is no reason to cross the binding for it.
+	 */
+	async getMany(keys: readonly Uint8Array[]): Promise<(Uint8Array | undefined)[]> {
+		this.checkOpen();
+		if (keys.length === 0) return [];
+		return await this.level.getMany(keys as Uint8Array[]);
+	}
+
 	async put(key: Uint8Array, value: Uint8Array, options?: WriteOptions): Promise<void> {
 		this.checkOpen();
 		// classic-level forwards `sync` to the underlying LevelDB write, fsync'ing the

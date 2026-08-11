@@ -702,11 +702,16 @@ function lensRowLocalDecompositionUpdateConstraints(
 	if (checks.length === 0) return [];
 	const { address } = requireLensLogicalRowAddress(ctx, view, slot, shape.storage, checks[0].name);
 
-	// NOTE: each written row costs one logical-view probe per check at commit, and a row
-	// two ops both touch enqueues the same probe twice (idempotent — same post-image).
-	// If commit cost ever shows up in a profile, dedup the deferred queue by
-	// (constraint, key) rather than trimming the per-op threading, which is what makes
-	// the seam total.
+	// NOTE: this seam is a MEASURED performance problem, tracked as lamina ticket
+	// `lens-decomposition-update-probe-cost`. Each written row costs one logical-view
+	// probe per check per touched member relation at commit. That was ~free while
+	// checks were only explicit logical CHECKs (usually none), but every undefaulted
+	// `not null` column now contributes one. Measured on a Lamina per-column
+	// decomposition, single-column UPDATE, 10-column table: 38.7 ms/update with the
+	// columns declared nullable vs 16694.6 ms/update with them declared `not null`.
+	// The fix is to collapse the per-(relation, correlation) probe set into ONE probe
+	// evaluating the conjunction, recovering per-check attribution only on failure —
+	// not to trim the per-op threading, which is what makes the seam total.
 	const constraints: RowConstraintSchema[] = [];
 	const seen = new Set<string>();
 	for (const op of baseOps) {

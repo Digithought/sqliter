@@ -92,6 +92,45 @@ export class CachedKVStore implements KVStore {
 		return value;
 	}
 
+	/**
+	 * Serve whatever the cache already holds from memory and batch ONLY the misses to the
+	 * underlying store, so a partially-warm batch costs one round trip for the cold part
+	 * instead of one for everything.
+	 *
+	 * The miss positions are remembered rather than re-derived, so the result stays
+	 * positional even when hits and misses interleave. Buffer discipline is the same as
+	 * `get`: a hit hands out a copy of the cached buffer, and a miss caches its own copy
+	 * of what the underlying handed back.
+	 */
+	async getMany(keys: readonly Uint8Array[]): Promise<(Uint8Array | undefined)[]> {
+		if (!this.enabled) return this.store.getMany(keys);
+
+		const out: (Uint8Array | undefined)[] = new Array(keys.length);
+		const missPositions: number[] = [];
+		const missKeys: Uint8Array[] = [];
+		for (let i = 0; i < keys.length; i++) {
+			const node = this.map.get(bytesToHex(keys[i]));
+			if (node) {
+				this.moveToHead(node);
+				out[i] = copyValue(node.value);
+			} else {
+				missPositions.push(i);
+				missKeys.push(keys[i]);
+			}
+		}
+
+		if (missKeys.length > 0) {
+			const values = await this.store.getMany(missKeys);
+			for (let j = 0; j < missPositions.length; j++) {
+				const key = missKeys[j];
+				const value = values[j];
+				this.addEntry(bytesToHex(key), copyValue(value), key.length + (value?.length ?? 0));
+				out[missPositions[j]] = value;
+			}
+		}
+		return out;
+	}
+
 	async has(key: Uint8Array): Promise<boolean> {
 		if (!this.enabled) return this.store.has(key);
 

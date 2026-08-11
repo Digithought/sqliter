@@ -16,6 +16,9 @@ export type {
   KVStoreProvider,
 } from './kv-store.js';
 
+// Shared `getMany` fallback for backends without a native batch point-read
+export { defaultGetMany } from './kv-store.js';
+
 // Bounded paging for backends without a streaming cursor
 export { pagedIterate, type FetchBatch } from './paged-iterate.js';
 

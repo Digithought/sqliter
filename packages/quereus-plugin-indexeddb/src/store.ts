@@ -259,6 +259,54 @@ export class IndexedDBStore implements KVStore {
     });
   }
 
+  /**
+   * Point-read every key on ONE readonly transaction.
+   *
+   * This is the whole reason `getMany` exists on the interface. `get` opens its own
+   * transaction, so awaiting it per key costs one transaction per key — which is what made
+   * resolving the rows behind an index scan roughly an order of magnitude slower than
+   * reading the table sequentially. Here every `store.get()` is issued SYNCHRONOUSLY into
+   * one transaction (nothing is awaited between requests, so the transaction cannot
+   * auto-commit part way) and the promise settles when the last request lands.
+   *
+   * `getAll` is deliberately not used: it takes a key RANGE, and these keys are scattered
+   * data keys named by index entries, not a contiguous span. N requests on one transaction
+   * is the available win.
+   *
+   * Results are filled by request POSITION, not by arrival order — IDB delivers success
+   * events in request order, but relying on that would make a positional guarantee depend
+   * on event scheduling.
+   */
+  async getMany(keys: readonly Uint8Array[]): Promise<(Uint8Array | undefined)[]> {
+    this.checkOpen();
+    if (keys.length === 0) return [];
+    const db = await this.manager.ensureOpen();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(this.storeName, 'readonly');
+      const store = tx.objectStore(this.storeName);
+      const results: (Uint8Array | undefined)[] = new Array(keys.length);
+      let outstanding = keys.length;
+      let failed = false;
+      for (let i = 0; i < keys.length; i++) {
+        const request = store.get(toKey(keys[i]));
+        const position = i;
+        request.onerror = () => {
+          // First error wins; later ones are ignored rather than re-rejecting a settled
+          // promise. The transaction aborts on its own once a request errors unhandled.
+          if (failed) return;
+          failed = true;
+          reject(request.error);
+        };
+        request.onsuccess = () => {
+          if (failed) return;
+          const result = request.result;
+          results[position] = result === undefined ? undefined : toBytes(result);
+          if (--outstanding === 0) resolve(results);
+        };
+      }
+    });
+  }
+
   async put(key: Uint8Array, value: Uint8Array, options?: WriteOptions): Promise<void> {
     this.checkOpen();
     const db = await this.manager.ensureOpen();

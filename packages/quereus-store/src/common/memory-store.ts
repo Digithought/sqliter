@@ -10,6 +10,7 @@
  */
 
 import { bytesToHex } from './bytes.js';
+import { defaultGetMany } from './kv-store.js';
 import type { KVStore, KVEntry, WriteBatch, IterateOptions, WriteOptions } from './kv-store.js';
 
 /**
@@ -47,6 +48,13 @@ export class InMemoryKVStore implements KVStore {
     // read (deserialize / structured-clone); the in-memory store copies to match.
     const stored = this.data.get(keyToHex(key))?.value;
     return stored === undefined ? undefined : new Uint8Array(stored);
+  }
+
+  // Delegates to `this.get` rather than reading `data` directly: there is no round trip
+  // to save here, and going through the method keeps a subclass's overridden `get` (the
+  // counting doubles several specs subclass this with) in the path.
+  getMany(keys: readonly Uint8Array[]): Promise<(Uint8Array | undefined)[]> {
+    return defaultGetMany(this, keys);
   }
 
   // `_options` is accepted to satisfy the KVStore signature; an in-memory store

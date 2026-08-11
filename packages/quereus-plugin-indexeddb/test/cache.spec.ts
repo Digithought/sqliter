@@ -11,12 +11,18 @@ import { InMemoryKVStore, CachedKVStore, type KVStore } from '@quereus/store';
 /** Helper to create a spy-wrapped InMemoryKVStore that counts underlying calls. */
 function createSpyStore(): { store: KVStore; calls: Record<string, number> } {
 	const inner = new InMemoryKVStore();
-	const calls: Record<string, number> = { get: 0, has: 0, put: 0, delete: 0, iterate: 0 };
+	const calls: Record<string, number> = { get: 0, getMany: 0, has: 0, put: 0, delete: 0, iterate: 0 };
 
 	const store: KVStore = {
 		async get(key: Uint8Array) {
 			calls.get++;
 			return inner.get(key);
+		},
+		// Counted as ONE underlying call however many keys it carries — that is the property
+		// the cache's batch path exists to produce, so the spy has to be able to see it.
+		async getMany(keys: readonly Uint8Array[]) {
+			calls.getMany++;
+			return inner.getMany(keys);
 		},
 		async has(key: Uint8Array) {
 			calls.has++;

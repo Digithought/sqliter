@@ -5,7 +5,7 @@
  * Keys and values are stored as BLOBs for correct lexicographic ordering.
  */
 
-import { pagedIterate, type KVStore, type KVEntry, type WriteBatch, type IterateOptions } from '@quereus/store';
+import { defaultGetMany, pagedIterate, type KVStore, type KVEntry, type WriteBatch, type IterateOptions } from '@quereus/store';
 
 /**
  * Entries per `select` when {@link SQLiteStore.iterate} pages a range.
@@ -113,6 +113,20 @@ export class SQLiteStore implements KVStore {
     }
 
     return toUint8Array(rows[0].value);
+  }
+
+  /**
+   * The shared fallback: `SQLiteDatabase.select` is synchronous and in-process, so a batch
+   * is N local statement executions with no round trip to collapse.
+   *
+   * NOTE: a single `select key, value from … where key in (?, ?, …)` would replace those N
+   * statements with one, but it needs a per-batch-size SQL string (or a rebuilt statement
+   * each call) and a key→value re-ordering pass, since `in` answers in table order rather
+   * than argument order. Not worth it while the reads are local; do it if a SQLite-backed
+   * mobile profile ever shows the per-statement overhead.
+   */
+  getMany(keys: readonly Uint8Array[]): Promise<(Uint8Array | undefined)[]> {
+    return defaultGetMany(this, keys);
   }
 
   async put(key: Uint8Array, value: Uint8Array): Promise<void> {

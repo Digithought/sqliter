@@ -610,6 +610,11 @@ export type LensLogicalRowAddress =
 function memberSharedKeyColumnResolver(slot: LensSlot): (rel: BasisRelationRef) => string | undefined {
 	const storage = slot.advertisement?.storage;
 	if (!storage) return () => undefined;
+	// NOTE: keyed by `schema.table` because the caller only has a BasisRelationRef,
+	// not the member's relationId. Two members over the SAME basis relation would
+	// collapse here (last one wins). No decomposition shape produces that today
+	// (a per-column decomposition gives each column its own store); revisit if a
+	// member ever advertises the same relation twice with different key columns.
 	const byRelation = new Map<string, string>();
 	for (const m of storage.members) {
 		if (m.presence !== 'mandatory') continue;
@@ -661,15 +666,20 @@ export function resolveLensLogicalRowAddress(
 }
 
 /** The member alias inside a member-hop subquery (implausible as a user FROM alias). */
-const ANCHOR_HOP_ALIAS = '__lra';
+const MEMBER_HOP_ALIAS = '__lra';
 
-/** The per-address row-locating predicate of the deferred re-read's WHERE. */
+/**
+ * The per-address row-locating predicate of the deferred re-read's WHERE.
+ * `ridingKeyColumn` is the shared-key column of the relation the constraint
+ * RIDES (what `<CORR>.…` exposes); each hop leg reads its own member's key
+ * column, which may be spelled differently — hence the two names.
+ */
 function buildLogicalRowAddressPredicate(
 	address: LensLogicalRowAddress,
-	relationKeyColumn: string,
+	ridingKeyColumn: string,
 	correlation: 'NEW' | 'OLD',
 ): AST.Expression {
-	const corrKey = { type: 'column', name: relationKeyColumn, table: correlation } as AST.ColumnExpr;
+	const corrKey = { type: 'column', name: ridingKeyColumn, table: correlation } as AST.ColumnExpr;
 	if (address.kind === 'shared-key') {
 		return {
 			type: 'binary',
@@ -678,19 +688,19 @@ function buildLogicalRowAddressPredicate(
 			right: corrKey,
 		} as AST.BinaryExpr;
 	}
-	const legs: AST.Expression[] = address.pkColumns.map(({ logicalColumn, basisColumn, relation, relationKeyColumn }) => {
+	const legs: AST.Expression[] = address.pkColumns.map(({ logicalColumn, basisColumn, relation, relationKeyColumn: memberKeyColumn }) => {
 		const hop: AST.SelectStmt = {
 			type: 'select',
-			columns: [{ type: 'column', expr: { type: 'column', name: basisColumn, table: ANCHOR_HOP_ALIAS } as AST.ColumnExpr }],
+			columns: [{ type: 'column', expr: { type: 'column', name: basisColumn, table: MEMBER_HOP_ALIAS } as AST.ColumnExpr }],
 			from: [{
 				type: 'table',
 				table: { type: 'identifier', name: relation.table, schema: relation.schema },
-				alias: ANCHOR_HOP_ALIAS,
+				alias: MEMBER_HOP_ALIAS,
 			} as AST.TableSource],
 			where: {
 				type: 'binary',
 				operator: '=',
-				left: { type: 'column', name: relationKeyColumn, table: ANCHOR_HOP_ALIAS } as AST.ColumnExpr,
+				left: { type: 'column', name: memberKeyColumn, table: MEMBER_HOP_ALIAS } as AST.ColumnExpr,
 				right: corrKey,
 			} as AST.BinaryExpr,
 		};

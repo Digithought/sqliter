@@ -8,7 +8,7 @@
 // `compareBytes` is the ordering oracle the KVStore contract and its conformance battery
 // are written against — the bound checks below must use that exact definition, not a
 // re-derived copy that could drift from it.
-import { compareBytes, type KVStore, type KVEntry, type WriteBatch, type IterateOptions } from '@quereus/store';
+import { compareBytes, defaultGetMany, type KVStore, type KVEntry, type WriteBatch, type IterateOptions } from '@quereus/store';
 
 /**
  * Type definition for rn-leveldb write batch.
@@ -177,6 +177,15 @@ export class ReactNativeLevelDBStore implements KVStore {
 		this.checkOpen();
 		const result = this.db.getBuf(toArrayBuffer(key));
 		return result === null ? undefined : toUint8Array(result);
+	}
+
+	/**
+	 * The shared fallback is the right answer here: rn-leveldb's `getBuf` is a SYNCHRONOUS
+	 * native call with no multi-get in its surface, so there is no round trip to collapse —
+	 * a batch is already just N in-process reads.
+	 */
+	getMany(keys: readonly Uint8Array[]): Promise<(Uint8Array | undefined)[]> {
+		return defaultGetMany(this, keys);
 	}
 
 	async put(key: Uint8Array, value: Uint8Array): Promise<void> {

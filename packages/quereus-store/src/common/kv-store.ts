@@ -137,6 +137,35 @@ export interface KVStore {
 	get(key: Uint8Array): Promise<Uint8Array | undefined>;
 
 	/**
+	 * Point-read several keys at once.
+	 *
+	 * POSITIONAL. `result[i]` is the value for `keys[i]`, `undefined` when that key is
+	 * absent. The result array is always exactly `keys.length` long — a missing key must
+	 * never shorten it or shift the ones after it — and a key repeated in `keys` yields
+	 * its value at every position it occupies. `getMany([])` resolves to `[]` without
+	 * touching backing storage.
+	 *
+	 * ONE ROUND TRIP WHERE THE BACKEND HAS ONE. This exists because the caller-side
+	 * alternative — awaiting `get` per key — serializes N round trips, and on IndexedDB
+	 * each `get` opens its own readonly transaction, so resolving the rows behind an
+	 * index scan cost one transaction PER ROW. A backend with a native multi-get
+	 * (`abstract-level`) or a way to issue every request on one transaction (IndexedDB)
+	 * must override; everything else delegates to {@link defaultGetMany}, which is
+	 * correct but no faster than the loop it replaces.
+	 *
+	 * BOUNDED BY THE CALLER. Unlike {@link iterate} there is no internal paging: the
+	 * implementation reads exactly the keys it was handed, so the CALLER owns peak
+	 * memory and must pass a bounded batch (`StoreTableScan` pages at
+	 * `ROW_RESOLUTION_BATCH`).
+	 *
+	 * Same buffer-ownership rule as {@link get}: the caller may scribble on what it gets
+	 * back without corrupting stored data. That extends ACROSS positions — a key repeated
+	 * in `keys` must come back as two independent buffers, not one object at two indices,
+	 * or scribbling on one silently rewrites the other.
+	 */
+	getMany(keys: readonly Uint8Array[]): Promise<(Uint8Array | undefined)[]>;
+
+	/**
 	 * Put a key-value pair.
 	 * @param options - Optional per-write durability hint (see {@link WriteOptions}).
 	 */
@@ -214,6 +243,25 @@ export interface KVStore {
 	 * Used for query planning cost estimation.
 	 */
 	approximateCount(options?: IterateOptions): Promise<number>;
+}
+
+/**
+ * The {@link KVStore.getMany} every backend without a real batch point-read delegates to:
+ * one `get` per key, issued together and awaited as a group.
+ *
+ * Concurrency is all it buys — the reads still cost one round trip each — but it is the
+ * CORRECT default everywhere, so adding `getMany` to the interface cannot break a backend
+ * and each one opts into a genuine batch when it has one to opt into. Reading through
+ * `store.get` (rather than the backend's internals) also keeps a wrapper's own `get` in
+ * the path, which is what lets `CachedKVStore` and the counting test doubles keep working.
+ *
+ * `Promise.all([])` resolves to `[]`, satisfying the empty-input rule without a special case.
+ */
+export function defaultGetMany(
+	store: Pick<KVStore, 'get'>,
+	keys: readonly Uint8Array[],
+): Promise<(Uint8Array | undefined)[]> {
+	return Promise.all(keys.map(key => store.get(key)));
 }
 
 /**
