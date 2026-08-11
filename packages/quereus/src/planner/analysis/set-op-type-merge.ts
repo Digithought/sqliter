@@ -9,15 +9,21 @@
  * comparator keys off it, predicate coercion decides casts from it). The merge is
  * order-independent: swapping the operands can never change the result.
  *
+ * Every result position with that same shape — one column, several branches, no
+ * branch converted — folds through {@link mergeSetOpAdvertisedType} rather than
+ * inventing its own rule: CASE arms (`CaseExprNode`), VALUES rows across ALL rows
+ * (`ValuesNode`), the value-returning polymorphic builtins (`findCommonType` for
+ * coalesce/iif/choose/greatest/least) and LAG/LEAD's default argument. Arithmetic
+ * is NOT one of them — it produces ONE converted value, so it promotes separately
+ * (see docs/types-inference.md § Binary operator result types).
+ *
  * Rules, first match wins (see docs/types.md § Where coercion happens):
  *  1. Identical logical types → that type (registry singletons, identity compare).
  *  2. Either side is NULL → the other side's type (a `select null` branch is a
  *     valid member of every type and must not poison a well-typed union).
  *  3. Both builtin numeric (and differing) → NUMERIC, whose value space
  *     (`number | bigint`) covers both branches as they actually are — no branch
- *     conversion needed. NOT the CASE rule ("arms differ ⇒ TEXT") — `1 union all
- *     2.5` must stay numeric; and NOT arithmetic's INTEGER + REAL → REAL, which
- *     describes one value, not a stream mixing both forms.
+ *     conversion needed. `1 union all 2.5` must stay numeric.
  *  4. Exactly one side object-physical (JSON today) → the object side's type,
  *     with the other operand marked `convert` — the same rule and direction
  *     `insertCrossTypeCoercion` applies to comparisons (casting the JSON side to
@@ -77,14 +83,13 @@ export function mergeSetOpColumnType(left: LogicalType, right: LogicalType): Set
 	// space the unconverted mixed stream inhabits. A non-builtin numeric type has
 	// no principled promotion — fall through to ANY (rule 5) rather than guess.
 	//
-	// Do NOT "restore consistency" with `BinaryOpNode.generateType` / `findCommonType`,
-	// which promote INTEGER + REAL to REAL — correct there (one value in one form),
-	// wrong here (a stream mixing both). Advertising REAL used to land a bigint
-	// unconverted in a REAL-declared column, because `buildRowCoercion` skipped the
-	// identity match outright (ticket `set-op-numeric-promotion-skips-conversion`).
-	// Its conformance guard now catches that, but the merge still must not claim
-	// REAL: the guard would convert the INTEGER branch's bigints to doubles, trading
-	// a representation violation for silent precision loss.
+	// Do NOT "simplify" this to INTEGER + REAL → REAL. Advertising REAL used to land
+	// a bigint unconverted in a REAL-declared column, because `buildRowCoercion`
+	// skipped the identity match outright (ticket
+	// `set-op-numeric-promotion-skips-conversion`). Its conformance guard now catches
+	// that, but the merge still must not claim REAL: the guard would convert the
+	// INTEGER branch's bigints to doubles, trading a representation violation for
+	// silent precision loss.
 	if (left.isNumeric && right.isNumeric) {
 		if (isBuiltinNumeric(left) && isBuiltinNumeric(right)) return { logicalType: NUMERIC_TYPE };
 		return { logicalType: ANY_TYPE };

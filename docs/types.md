@@ -211,10 +211,17 @@ untyped parameters) names a type whose value space the column's values inhabit, 
 concrete type announces **ANY**, which is an honest "no representation constraint —
 convert before trusting", never a guess.
 
-The seam still *asserts* R1 only. One known wrong-VALUE defect blocks the upgrade to
-full R2: `coerceAggregateValue` converts numeric-looking text before `min`/`max`, so
-`min(text_col)` announces TEXT (correctly) and can yield a number (wrongly) — tracked
-as `backlog/bug-text-coercion-in-arithmetic-and-aggregates`. Once that lands, the seam
+The seam still *asserts* R1 only. Two known wrong-VALUE defects block the upgrade to
+full R2 — both runtime bugs, not inference imprecision. `coerceAggregateValue` converts
+numeric-looking text before `min`/`max`, so `min(text_col)` announces TEXT (correctly)
+and can yield a number (wrongly) — tracked as
+`backlog/bug-text-coercion-in-arithmetic-and-aggregates`; this is the one the suite
+trips. And binary arithmetic over two safe-integer operands returns the raw double when
+the exact answer escapes the safe range (`9007199254740991 * 3`), which the announced
+INTEGER does not admit — tracked as
+`backlog/bug-integer-arithmetic-silently-leaves-the-exact-integer-range`; no suite site
+trips it today, so it does not block the widening, but a boundary case added later
+would. Once those land, the seam
 widens by passing the plan's output logical types instead of the empty declared-type
 array (see the comment in `Statement._iterateWithSignal`); the rest of the suite
 already passes under that widening. The announced `nullable` flag is a further axis R2
@@ -631,11 +638,15 @@ reference to a JSON column is JSON → already declared form, leave alone.
 
 The second half is a guard, not a second opinion. An announced type is an
 *inference* the engine does not otherwise enforce, and the skip trusted it
-alone: `sum()` announces REAL but returns a `bigint` past 2^53, and an untyped
-positional `?` announces TEXT but can be bound to a number, a blob, a boolean or
-a `bigint`. Both landed a value outside the column's declared value space in
-storage (rule R2 of § Physical representation — the rule the write path exists to
-uphold). The guard asks the value itself, via `conformsToType`
+alone. Two historical examples, both since corrected at the source: `sum()`
+announced REAL but returned a `bigint` past 2^53 (it announces `NUMERIC` now),
+and an untyped positional `?` announced TEXT but could be bound to a number, a
+blob, a boolean or a `bigint` (it announces `ANY` now). Both landed a value
+outside the column's declared value space in storage (rule R2 of § Physical
+representation — the rule the write path exists to uphold). Fixing the inferences
+does not retire the guard: an inference is still not an enforcement, and a
+misbehaving virtual table or UDF can produce a non-conforming value under any
+announcement. The guard asks the value itself, via `conformsToType`
 (`types/representation.ts`) — the same predicate the `QUEREUS_REPR_STRICT`
 checker enforces, so the two can never disagree about what conforms.
 
@@ -762,10 +773,9 @@ arms cannot change the result), OR-merging nullability alongside:
 2. **Either side NULL** → the other side's type — a `select null` branch is a
    valid member of every type and must not poison a well-typed union.
 3. **Both builtin numeric** (and differing — rule 1 already took the identical
-   pairs) → `NUMERIC`, whatever the pair. Deliberately *not* CASE's "arms differ
-   ⇒ TEXT": `1 union all 2.5` stays numeric. Also deliberately *not* the
-   `INTEGER + REAL → REAL` promotion arithmetic (`BinaryOpNode.generateType`) and
-   polymorphic builtins (`findCommonType`) use — because unlike rule 4, rule 3
+   pairs) → `NUMERIC`, whatever the pair: `1 union all 2.5` stays numeric.
+   Deliberately *not* the `REAL + REAL → REAL` promotion arithmetic
+   (`BinaryOpNode.generateType`) uses — because unlike rule 4, rule 3
    converts **neither branch**. Arithmetic yields one value in one form, which
    `REAL` describes exactly; a set operation yields a *stream mixing both* forms
    (`number` from the REAL arm, `bigint` from the INTEGER arm), and only
@@ -799,6 +809,16 @@ pair over such a branch stays unconverted and honestly advertises `ANY`
 instead. `AsyncGatherNode`'s `unionAll` combinator folds the same merge across
 its children, so the physical rewrite of a union-all chain advertises the same
 types the logical node did.
+
+Rules 1–5 are not set-op-specific — they are the answer for **any** result
+position that carries values from several branches with no branch converted, so
+every such site folds through the same `mergeSetOpAdvertisedType` rather than
+inventing its own: `CASE` arms plus its `ELSE`, a `VALUES` column across *all* its
+rows (not just the first), the value-returning polymorphic builtins
+(`coalesce`/`iif`/`choose`/`greatest`/`least`), and `LAG`/`LEAD` folded with their
+optional default argument. Arithmetic is deliberately excluded — it produces one
+converted value, so it promotes by its own table
+([Binary operator result types](types-inference.md#binary-operator-result-types)).
 
 `CAST` is the settled case, and states the rule the others must meet: it stays
 lenient — it never throws — but it never produces a value outside the type it

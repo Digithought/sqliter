@@ -485,16 +485,25 @@ export class Statement {
 		// R1 ONLY, for now — hence the empty declared-type array, which puts every cell
 		// on `assertRowConforms`'s untyped-position path. A result column's announced
 		// type (a `ScalarType` inference, reachable via `getColumnDefs()`) now agrees
-		// with the values the column produces everywhere the suite exercises, EXCEPT one
-		// wrong-VALUE defect this seam must not paper over: `coerceAggregateValue`
-		// (util/coercion.ts) converts numeric-looking text before min/max, so
-		// `min(text_col)` announces TEXT (correctly) and yields a number (wrongly) —
-		// tracked as `backlog/bug-text-coercion-in-arithmetic-and-aggregates` (arm B),
-		// with two suite sites (test/logic/14-utilities.sqllogic min(amount),
-		// test/logic/25-aggregate-edge-cases.sqllogic mn). Once that lands, widen this
-		// check to R2 by passing `this.columnDefCache.value.map(col => col.type.logicalType)`
-		// instead of NO_DECLARED_TYPES (and delete the constant); the rest of the suite
-		// already passes under that widening (ticket
+		// with the values the column produces everywhere the suite exercises, EXCEPT two
+		// wrong-VALUE defects this seam must not paper over. Both are runtime bugs, not
+		// inference imprecision:
+		//  - `coerceAggregateValue` (util/coercion.ts) converts numeric-looking text
+		//    before min/max, so `min(text_col)` announces TEXT (correctly) and yields a
+		//    number (wrongly) — `backlog/bug-text-coercion-in-arithmetic-and-aggregates`
+		//    (arm B). This is the one the SUITE trips, at two sites
+		//    (test/logic/14-utilities.sqllogic min(amount),
+		//    test/logic/25-aggregate-edge-cases.sqllogic mn).
+		//  - binary arithmetic over two safe-integer operands returns the raw double when
+		//    the exact answer escapes the safe range (`9007199254740991 * 3`), which the
+		//    announced INTEGER does not admit —
+		//    `backlog/bug-integer-arithmetic-silently-leaves-the-exact-integer-range`.
+		//    No suite site trips it today, so it does not block the widening, but a
+		//    boundary case added later would.
+		// Once those land, widen this check to R2 by passing
+		// `this.columnDefCache.value.map(col => col.type.logicalType)` instead of
+		// NO_DECLARED_TYPES (and delete the constant); the rest of the suite already
+		// passes under that widening (ticket
 		// `4-remaining-scalar-result-types-and-repr-net`, measured 2026-08-11).
 		//
 		// The announced NULLABILITY flag is a separate axis this seam does not check:

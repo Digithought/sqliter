@@ -80,6 +80,8 @@ export class ValuesNode extends PlanNode implements ZeroAryRelationalNode {
     let logicalType = first.logicalType;
     let nullable = first.nullable;
     for (let r = 1; r < this.rows.length; r++) {
+      // A ragged row is a user error, but `emitValues` is what reports it (with a
+      // location); typing must not crash on the way there.
       const rowType = this.rows[r][index]?.getType();
       if (!rowType) continue;
       logicalType = mergeSetOpAdvertisedType(logicalType, rowType.logicalType);

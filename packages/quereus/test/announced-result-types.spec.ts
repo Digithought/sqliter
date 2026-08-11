@@ -56,6 +56,12 @@ describe('Announced result-column types match produced values', () => {
 		it('announces INTEGER for bigint-literal arithmetic (bigint + integral number)', async () => {
 			expect(await announcedType('select 9007199254740993 + 1 as v')).to.equal('INTEGER');
 		});
+
+		// The split is `Number.isSafeInteger`, not `Number.isInteger`: a whole double
+		// past 2^53 inhabits REAL's value space, not INTEGER's.
+		it('announces REAL for a whole literal past the safe-integer range', async () => {
+			expect(await announcedType('select 1e308 as v')).to.equal('REAL');
+		});
 	});
 
 	describe('arithmetic promotion', () => {
@@ -80,6 +86,12 @@ describe('Announced result-column types match produced values', () => {
 
 		it('preserves a numeric operand type', async () => {
 			expect(await announcedType('select -i as v from t')).to.equal('INTEGER');
+		});
+
+		// TIMESPAN is the one non-numeric operand `-` stays closed over — the planner
+		// and `runtime/emit/unary.ts` select that arm off the same type check.
+		it('preserves a TIMESPAN operand type', async () => {
+			expect(await announcedType(`select -cast('P1D' as timespan) as v`)).to.equal('TIMESPAN');
 		});
 	});
 
@@ -119,6 +131,31 @@ describe('Announced result-column types match produced values', () => {
 		it('announces NUMERIC for coalesce over mixed numerics', async () => {
 			expect(await announcedType('select coalesce(i, r) as v from t')).to.equal('NUMERIC');
 		});
+
+		// greatest/least return an argument verbatim, so the same merge covers them.
+		it('announces ANY for greatest over mixed categories', async () => {
+			expect(await announcedType('select greatest(i, s) as v from t')).to.equal('ANY');
+		});
+
+		// The merge's NULL rule is what keeps a NULL argument from widening the group:
+		// the only value it can win with is NULL, which `nullable` already admits.
+		it('keeps the valued argument type when another argument is NULL-typed', async () => {
+			expect(await announcedType('select least(i, null) as v from t')).to.equal('INTEGER');
+		});
+	});
+
+	describe('window navigation defaults', () => {
+		it('folds a differing LAG default into the announced type', async () => {
+			expect(await announcedType('select lag(s, 1, 5) over (order by id) as v from t')).to.equal('ANY');
+		});
+
+		it('keeps the value type when the default agrees with it', async () => {
+			expect(await announcedType(`select lag(s, 1, 'x') over (order by id) as v from t`)).to.equal('TEXT');
+		});
+
+		it('ignores the offset argument, which never surfaces in the result', async () => {
+			expect(await announcedType('select lag(s, 1) over (order by id) as v from t')).to.equal('TEXT');
+		});
 	});
 
 	describe('VALUES (merge across rows, not first-row typing)', () => {
@@ -134,6 +171,20 @@ describe('Announced result-column types match produced values', () => {
 	describe('parameters', () => {
 		it('announces ANY for a ? with no binding at plan time (TEXT was an arbitrary guess)', async () => {
 			expect(await announcedType('select ? as v')).to.equal('ANY');
+		});
+	});
+
+	describe('pragma', () => {
+		// A pragma value surfaces in its natural form — a boolean for an on/off
+		// option, text for a name-valued one — and is not converted on the way out.
+		it('announces ANY for the pragma value column', async () => {
+			const stmt = db.prepare('pragma default_vtab_module');
+			try {
+				const defs = stmt.getColumnDefs();
+				expect(defs.map(d => d.type.logicalType.name)).to.deep.equal(['TEXT', 'ANY']);
+			} finally {
+				await stmt.finalize();
+			}
 		});
 	});
 

@@ -22,13 +22,25 @@ When you pass parameter values, Quereus automatically infers the logical type ba
 | JavaScript Type | Logical Type | Example |
 |----------------|--------------|---------|
 | `null` | NULL | `null` |
-| `number` (integer) | INTEGER | `42`, `0`, `-100` |
-| `number` (float) | REAL | `3.14`, `2.5`, `-0.5` |
+| `number` (safe integer) | INTEGER | `42`, `0`, `-100` |
+| `number` (fractional, or whole past 2^53−1) | REAL | `3.14`, `-0.5`, `1e308` |
 | `bigint` | INTEGER | `9007199254740991n` |
 | `boolean` | BOOLEAN | `true`, `false` |
 | `string` | TEXT | `'hello'`, `''` |
 | `Uint8Array` | BLOB | `new Uint8Array([1, 2, 3])` |
 | `object` (plain) | JSON | `{ x: 1 }`, `[1, 2, 3]` |
+| *(no value and no hint)* | ANY | `db.prepare('select ? as v')` |
+
+The integer split is `Number.isSafeInteger`, not `Number.isInteger`: INTEGER's value space
+is a safe-integer `number` or an out-of-range `bigint`, so a whole double past 2^53 − 1
+inhabits REAL's space as bound — calling it INTEGER would rewrite it as an exact `bigint`
+the caller never passed. The single mapping lives in `inferLogicalTypeFromValue`
+(`common/type-inference.ts`) and is shared with literal typing.
+
+A parameter with neither a bound value nor an explicit hint at plan time announces **ANY**,
+not a guess: `ANY` imposes no representation constraint, its `parse` is pass-through, and it
+is never identical to a declared column type, so every consumer converts. (It announced TEXT
+before, which made `select ? as v` report TEXT while yielding whatever was bound.)
 
 **Note**: Strings are always inferred as TEXT type. Plain objects and arrays are inferred as JSON type. To use date/time types, either:
 - Use conversion functions in your query: `date(:param)`, `time(:param)`, `datetime(:param)`

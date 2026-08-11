@@ -140,6 +140,12 @@ function buildCoercingArithmeticRun(
 				try {
 					const result = inner(n1, n2);
 					if (!Number.isFinite(result)) return null;
+					// NOTE: the result is returned unchecked, so two safe-integer operands
+					// whose exact answer escapes the safe range yield an inexact double
+					// (`9007199254740991 * 3` is off by one) that also falls outside the
+					// INTEGER this shape is announced as. Fixing it means a boundary check
+					// (or exact retry) in this per-row loop — tracked as
+					// `backlog/bug-integer-arithmetic-silently-leaves-the-exact-integer-range`.
 					return result;
 				} catch {
 					return null;
