@@ -239,13 +239,29 @@ describe('walkSchemaExpressionScope', () => {
 			expect(recs[1].realSources).to.deep.equal(['main.src']);
 		});
 
-		it('classifies every reference under a seal as undecidable, including `new.`', () => {
+		it("classifies every reference under a seal `'foreign'`, including `new.`", () => {
 			// The whole point of the seal: `new.a` here names the WRITTEN VIEW row, so
 			// claiming `'own'` would invent a dependency on the table being defined.
 			const refs = collectGeneratedColumnRefs(
 				parseExpressionString('exists (select a with inverse (b = new.a) from other)'),
 				't', 'main', () => false);
-			expect(refs.map(r => `${r.name}:${r.binding}`)).to.deep.equal(['a:own', 'a:unknown']);
+			expect(refs.map(r => `${r.name}:${r.binding}`)).to.deep.equal(['a:own', 'a:foreign']);
+		});
+
+		it("does not classify a sealed reference `'unknown'`, which would record a false edge", () => {
+			// `'unknown'` means "an opaque source MIGHT be this row" and makes both
+			// consumers record a dependency edge; under a seal that edge is spurious and
+			// turns a legal declaration into `Cyclic dependency in generated columns`.
+			// Bare and qualified spellings of the OWN column name, both sealed.
+			const owning = (_schema: string, name: string) => name === 't';
+			for (const sql of [
+				'exists (select a with inverse (b = g) from other)',
+				'exists (select a with inverse (b = t.g) from other)',
+				'exists (select a from other with defaults (c = g))',
+			]) {
+				const refs = collectGeneratedColumnRefs(parseExpressionString(sql), 't', 'main', owning);
+				expect(refs.filter(r => r.name === 'g').map(r => r.binding), sql).to.deep.equal(['foreign']);
+			}
 		});
 
 		it('rewrites nothing inside a sealed subtree', () => {

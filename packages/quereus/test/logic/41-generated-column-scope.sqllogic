@@ -290,3 +290,40 @@ select id, g, b from cs;
 drop table cs;
 drop table cs_probe;
 drop table cs_src;
+
+-- ===================================
+-- 14. View write-through metadata inside a generated body records NO dependency
+--     edge. `with inverse (…)` on a result column and a trailing `with defaults (…)`
+--     are evaluated against the row written THROUGH A VIEW — an inverse expression
+--     may only name that select's OWN output columns as `new.<column>` — so nothing
+--     in them can name the row being computed here, and in a read-only generated
+--     body they are never evaluated at all. Both bodies below spell a name that is
+--     ALSO the generated column being defined; classifying a sealed reference as
+--     undecidable instead would record a self-edge and raise a false
+--     `Cyclic dependency in generated columns: 'g'`.
+-- ===================================
+
+create table gi_src (k integer primary key, x integer);
+insert into gi_src values (1, 5);
+
+create table gi (
+	id integer primary key,
+	g integer generated always as ((select x as g with inverse (x = new.g) from gi_src limit 1))
+);
+insert into gi (id) values (2);
+
+select id, g from gi;
+→ [{"id":2,"g":5}]
+
+create table gd (
+	id integer primary key,
+	g integer generated always as ((select x from gi_src limit 1 with defaults (x = g)))
+);
+insert into gd (id) values (3);
+
+select id, g from gd;
+→ [{"id":3,"g":5}]
+
+drop table gd;
+drop table gi;
+drop table gi_src;

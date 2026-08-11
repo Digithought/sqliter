@@ -45,9 +45,14 @@ export interface AstVisitorCallbacks {
  * no place in a generic visitor. But a change to the AST node shapes has to be
  * reflected in both. Grep either file's `NOTE:` to find the other.
  *
- * Their reach is not identical: the scope walk descends window frame bound
- * expressions (`rows between <expr> preceding …`), this traversal still does not
- * (see the `TODO` at the `windowDefinition` arm below).
+ * Their reach is not identical, and this traversal is the narrower one: it skips
+ * window frame bound expressions (the `TODO` at the `windowDefinition` arm below),
+ * `SelectStmt.defaults`, and a DML's `returning` / `upsertClauses` /
+ * `contextValues`. That is a live defect, not a shrug — `../schema/manager.ts`'s
+ * declaration-time determinism gate walks with this traversal, so a
+ * non-deterministic call hiding in any of those subtrees is accepted at
+ * `CREATE TABLE`. Owned by `bug-ast-traversal-misses-expression-subtrees`; do not
+ * widen piecemeal without pricing what the four `manager.ts` callers then see.
  *
  * @param node The starting AST node.
  * @param callbacks An object containing visitor functions for different node types.

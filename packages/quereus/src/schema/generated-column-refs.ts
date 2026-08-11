@@ -36,8 +36,10 @@ export type RefBinding =
 	/** Binds the owning table's row: bare name captured by the seed, `<table>.<col>`,
 	 *  `<own-schema>.<table>.<col>`, or an unrebound `new.<col>`. */
 	| 'own'
-	/** Binds something else: an analysable inner FROM source exposes the name, or the
-	 *  qualifier resolves to another object. */
+	/** Binds something else — an analysable inner FROM source exposes the name, the
+	 *  qualifier resolves to another object, or the reference sits under a sealed
+	 *  frame (view write-through metadata, resolved against the written view row).
+	 *  Ignored by both consumers: no dependency edge, no error. */
 	| 'foreign'
 	/** Qualified, and NOTHING binds the qualifier — no inner FROM, and it does not
 	 *  name the owning table (or `new`). There is nothing for it to resolve against
@@ -101,22 +103,34 @@ export function collectGeneratedColumnRefs(
 }
 
 /**
+ * How every reference under a sealed frame classifies — see
+ * {@link ScopeFrame.sealed}. Not `'unknown'`: that binding means "an opaque
+ * source MIGHT be this row", and both consumers hedge by recording a dependency
+ * edge for it. A sealed subtree is view write-through metadata, inert wherever a
+ * schema expression can hold it and resolved against the written view row if
+ * ever evaluated — it is DEFINITELY not this row, so an edge there is spurious
+ * and can raise a false `Cyclic dependency in generated columns` at DDL time.
+ * `'foreign'` says "binds something else" and is the one binding both consumers
+ * ignore outright.
+ */
+const sealedBinding: RefBinding = 'foreign';
+
+/**
  * Classify an unqualified name against the frames above the seed,
  * innermost-first: a real source exposing the name binds it there
  * (`'foreign'`); an opaque frame reached before any such source could bind
  * anything (`'unknown'`); falling through every frame reaches the seed
  * (`'own'`). `stack[0]` IS that seed, which is why the loop stops at index 1.
  *
- * A sealed frame anywhere above the seed short-circuits to `'unknown'`: the
- * subtree's names resolve in a naming environment this walk does not model
- * (view write-through metadata), so nothing there may reach the seed.
+ * A sealed frame anywhere above the seed short-circuits to `'foreign'` — see
+ * {@link sealedBinding}.
  */
 function classifyUnqualified(
 	state: CollectState,
 	stack: ReadonlyArray<ScopeFrame>,
 	nameLower: string,
 ): RefBinding {
-	if (hasSealedFrame(stack)) return 'unknown';
+	if (hasSealedFrame(stack)) return sealedBinding;
 	for (let i = stack.length - 1; i >= 1; i--) {
 		const frame = stack[i];
 		for (const src of frame.realSources) {
@@ -138,7 +152,7 @@ function classifyUnqualified(
  * `'unbound'` (nothing binds it) unless an opaque frame was crossed on the
  * way out, in which case the walk cannot tell and defers to `'unknown'`.
  *
- * A sealed frame short-circuits to `'unknown'` BEFORE any of that: `new.a`
+ * A sealed frame short-circuits to `'foreign'` BEFORE any of that: `new.a`
  * inside a `with inverse (…)` clause names the written view row, not the row of
  * the table being defined, so the `'new'` arm below must never see it.
  */
@@ -147,7 +161,7 @@ function classifyQualified(
 	stack: ReadonlyArray<ScopeFrame>,
 	col: AST.ColumnExpr,
 ): RefBinding {
-	if (hasSealedFrame(stack)) return 'unknown';
+	if (hasSealedFrame(stack)) return sealedBinding;
 	const qualifier = col.table!.toLowerCase();
 	let opaque = false;
 	for (let i = stack.length - 1; i >= 1; i--) {

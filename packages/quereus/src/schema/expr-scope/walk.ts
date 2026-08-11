@@ -20,10 +20,13 @@ import { buildScopeFrame, emptyScopeFrame, opaqueScopeFrame, sealedScopeFrame, w
 // scope model. The two are deliberately NOT unified — this walk's frame stack
 // has no place in a generic visitor — but a change to the AST node shapes has
 // to be reflected in both. Grep either file's `NOTE:` to find the other. The two
-// are not equal in reach: this walk descends window frame bound expressions
-// (`rows between <expr> preceding …`), `traverseAst` still does not (it carries
-// that gap as a `TODO` at its `windowDefinition` arm, left alone deliberately —
-// widening it would change what `../manager.ts` sees).
+// are not equal in reach: this walk descends five expression-bearing subtrees
+// `traverseAst` does not — window frame bounds, `SelectStmt.defaults`, and a DML's
+// `returning` / `upsertClauses` / `contextValues`. Those gaps were left alone
+// deliberately (widening `traverseAst` changes what `../manager.ts` sees, which
+// needs its own blast-radius pass) and they are not inert there: `manager.ts`'s
+// declaration-time determinism gate misses a non-deterministic call inside any of
+// them. Owned by `bug-ast-traversal-misses-expression-subtrees`.
 //
 // Deliberately not descended, and why:
 //   - `InsertStmt.table` / `UpdateStmt.table` / `DeleteStmt.table` /
@@ -316,6 +319,13 @@ function visitWindowDefinition(wd: AST.WindowDefinition, state: WalkState): void
 	// and `WindowFrameBound` do not extend `AstNode` (a frame's `type` is
 	// `'rows' | 'range'`, not a node kind), so they cannot go through `visit`'s
 	// switch; only the bound kinds that CARRY an expression have a `value`.
+	// NOTE: no schema-time analysis of a frame bound is observable today — the planner
+	// rejects any bound that is not a constant numeric literal ("Window frame offsets
+	// must be constant numeric literals"), so a bound naming a column never executes
+	// whether or not an edge was recorded for it. Reaching them is completeness, and
+	// the walk-level spec is the only place it can be asserted. If constant-foldable or
+	// correlated bounds are ever accepted, that changes and SQL-level cases become
+	// writable — the same shape as § 13 of `test/logic/41-generated-column-scope.sqllogic`.
 	visitWindowFrameBound(wd.frame?.start, state);
 	visitWindowFrameBound(wd.frame?.end ?? undefined, state);
 }

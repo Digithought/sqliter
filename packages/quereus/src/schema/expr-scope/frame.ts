@@ -49,7 +49,17 @@ export function opaqueScopeFrame(): ScopeFrame {
 	return frame;
 }
 
-/** A frame nothing below can see past — see {@link ScopeFrame.sealed}. */
+/**
+ * A frame nothing below can see past — see {@link ScopeFrame.sealed}.
+ *
+ * NOTE: nothing forces a NEW view write-through clause to be sealed. The two that
+ * exist (`with inverse`, `with defaults`) are sealed by hand in `./walk.ts`; a third
+ * would default to ordinary scope rules and its `new.<col>` refs would come back
+ * `'own'`, inventing a dependency on the table being defined. Unlike the expression
+ * node kinds — which the walk spec's `EXPRESSION_KINDS` ledger forces a decision for —
+ * "clauses resolved in the written-row environment" is not an enumerable set on the
+ * AST. If a third one lands, give it a ledger of its own here.
+ */
 export function sealedScopeFrame(): ScopeFrame {
 	const frame = opaqueScopeFrame();
 	frame.sealed = true;

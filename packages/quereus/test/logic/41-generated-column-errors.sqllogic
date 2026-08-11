@@ -192,3 +192,34 @@ select count(*) as n, count(x) as non_null_x from t_nondet_relaxed;
 drop table t_nondet_relaxed;
 
 pragma nondeterministic_schema = false;
+
+-- ===================================
+-- 6. A generated body that names the column being added inside an inner DML is a
+--    self-cycle. Everything under a DML is undecidable — the walk cannot tell
+--    whether that DML's target is this very table — and an undecidable reference
+--    records a dependency edge, so a reference to the new column's own name is a
+--    self-edge whichever way it would have resolved. `ALTER TABLE ADD COLUMN`
+--    reports it up front; the emitter's own re-analysis reaches the same answer.
+-- ===================================
+
+create table dml_src (k integer primary key, g integer);
+create table dml_t (id integer primary key);
+insert into dml_t values (1);
+
+-- 6a. Named inside the DML's RETURNING list.
+alter table dml_t add column g integer generated always as
+	((select k from (insert into dml_src values (1, 2) returning g) q limit 1));
+-- error: Cyclic dependency in generated columns
+
+-- 6b. Named inside an UPSERT assignment.
+alter table dml_t add column g integer generated always as
+	((select k from (insert into dml_src values (1, 2)
+		on conflict (k) do update set g = g + 1 returning k) q limit 1));
+-- error: Cyclic dependency in generated columns
+
+-- The rejections leave the table untouched: no `g` column was added.
+select * from dml_t;
+→ [{"id":1}]
+
+drop table dml_t;
+drop table dml_src;
