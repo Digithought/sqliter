@@ -200,7 +200,53 @@ describe('batched index-scan row resolution (store-index-seek-batched-scan)', ()
 		expect(rows.map(r => r.id)).to.deep.equal([1, 3]);
 	});
 
+	it('a stale duplicate entry in a LATER batch than its row is still yielded once', async () => {
+		// The in-batch case above pins the post-read re-check. This pins the other half:
+		// `seen` must be fully populated by the time the NEXT batch is collected, so the
+		// producer's pre-check catches a duplicate that lands past the batch boundary.
+		// (`resolveIndexEntries` yields each batch to completion before pulling more
+		// entries, which is what makes that true.)
+		await db.exec(`create table t (id integer primary key, v integer) using store`);
+		await db.exec(`create index ix_v on t (v)`);
+		const n = ROW_RESOLUTION_BATCH + 10;
+		await db.exec(`insert into t values ${
+			Array.from({ length: n }, (_, i) => `(${i}, ${i})`).join(', ')}`);
+
+		// Re-point the LAST row's index entry at row 0's data key: row 0 yields from the
+		// first batch, its duplicate is visited while collecting the second.
+		const ixStore = stores.get('main.t_idx_ix_v')!;
+		const entries: KVEntry[] = [];
+		for await (const e of ixStore.iterate()) entries.push(e);
+		expect(entries).to.have.lengthOf(n);
+		await ixStore.put(entries[n - 1].key, entries[0].value);
+
+		const list = Array.from({ length: n }, (_, i) => i).join(', ');
+		const rows = await asyncIterableToArray(db.eval(`select id from t where v in (${list})`));
+		// Row 0 once, at its own position; the last row is unreachable (its only entry
+		// was corrupted away).
+		expect(rows.map(r => r.id)).to.deep.equal(Array.from({ length: n - 1 }, (_, i) => i));
+	});
+
 	describe('round-trip counts (counting store double)', () => {
+		it('a multi-seek drain past the batch boundary keeps order and pays one trip per batch', async () => {
+			await db.exec(`create table t (id integer primary key, v integer) using store`);
+			await db.exec(`create index ix_v on t (v)`);
+			const n = 300; // > ROW_RESOLUTION_BATCH: one full batch plus a partial tail
+			await db.exec(`insert into t values ${
+				Array.from({ length: n }, (_, i) => `(${i}, ${i})`).join(', ')}`);
+			const dataStore = stores.get('main.t')!;
+			dataStore.reset();
+
+			const list = Array.from({ length: n }, (_, i) => i).join(', ');
+			const rows = await asyncIterableToArray(db.eval(`select id from t where v in (${list})`));
+			// Batches are bound by ENTRY count across windows, so 300 single-row windows
+			// cost ceil(300 / 256) trips — not 300, and not one per window.
+			expect(rows.map(r => r.id)).to.deep.equal(Array.from({ length: n }, (_, i) => i));
+			expect(dataStore.getManyCalls, 'ceil(300 / 256) batches').to.equal(2);
+			expect(dataStore.getManyKeyCount).to.equal(n);
+			expect(dataStore.iterateEntryCount, 'no data-store scan').to.equal(0);
+		});
+
 		it('a multi-seek over many single-row windows collapses row resolution into one round trip', async () => {
 			await db.exec(`create table t (id integer primary key, v integer) using store`);
 			await db.exec(`create index ix_v on t (v)`);

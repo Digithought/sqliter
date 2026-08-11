@@ -145,7 +145,7 @@ export abstract class StoreTableConstraints extends StoreTableScan {
 				// recoverable to SqlValues (a NOCASE/RTRIM PK column encodes lossily)
 				// and its length varies per entry in a range scan — so a scan resolves
 				// each entry back to its base row via this stored data key
-				// (`scanIndex` → `readEffectiveRowByKey(entry.value)`), never by
+				// (`scanIndex` → `resolveRowBatch` → `readEffectiveRowsByKeys`), never by
 				// decoding the suffix. `newPk` is the PK the entry is keyed under, so
 				// its data key byte-matches the data store's key for this row.
 				const dataKeyValue = this.encodeDataKey(newPk);
@@ -499,10 +499,10 @@ export abstract class StoreTableConstraints extends StoreTableScan {
 
 		for await (const entry of this.iterateEffective(indexStore, bounds)) {
 			// A legacy index store (written before index values carried the data key)
-			// holds EMPTY values. `scanIndex` may skip such an entry — a read that
+			// holds EMPTY values. The scan path may skip such an entry — a read that
 			// returns too few rows. Skipping here would instead ACCEPT a duplicate, so
 			// abandon the index and let the caller full-scan. See the NOTE in
-			// `scanIndex` for the durable fix.
+			// `produceIndexEntries` (store-table-scan.ts) for the durable fix.
 			if (entry.value.length === 0) return INDEX_UNUSABLE;
 
 			// Resolve to the LIVE row: a pending index delete normally suppresses the

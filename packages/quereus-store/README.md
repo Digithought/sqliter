@@ -46,10 +46,16 @@ The store module uses separate logical stores for different data types:
 - **Data keys**: Encoded primary key (no prefix)
 - **Index keys**: Encoded index columns + encoded PK
 - **Index values**: The row's encoded **data key**. A secondary-index scan resolves each
-  matched entry back to its base row with one data-store read at this key, rather than
-  decoding the index key's PK suffix (that suffix is encoded lossily for a NOCASE/RTRIM
-  PK column, so it is not recoverable to SQL values). Entries are not covering — the row
-  itself always lives in the data store.
+  matched entry back to its base row by reading this key, rather than decoding the index
+  key's PK suffix (that suffix is encoded lossily for a NOCASE/RTRIM PK column, so it is
+  not recoverable to SQL values). Entries are not covering — the row itself always lives
+  in the data store. The resolution is **batched**: the scan collects surviving index
+  entries (across every window of an `IN`-list seek, not just one) up to
+  `ROW_RESOLUTION_BATCH` = 256 and resolves each batch with a single `KVStore.getMany`,
+  so an indexed read of *N* rows costs about *N*/256 data-store round trips rather than
+  *N* serialized point reads — on IndexedDB, one readonly transaction per batch instead
+  of one per row. The trade is early termination: a `limit 1` collects one batch rather
+  than one row (the same trade `iterate`'s pager already makes).
 - **Catalog keys**:
   - Tables: `{schema}.{table}` as a string (the `CREATE TABLE` bundle, with its index DDL and any exposed-implicit-index tag DDL)
   - Views: `\x00view\x00{schema}.{view}` (reserved-prefix; `generateViewDDL`)

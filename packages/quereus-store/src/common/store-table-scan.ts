@@ -70,6 +70,15 @@ const RANGE_CONSTRAINT_OPS: readonly IndexConstraintOp[] = [
  * contract documents: a little early-termination cost for throughput — `limit 1`
  * collects one batch rather than one row — while keeping peak memory independent of
  * the range size.
+ *
+ * NOTE: that early-termination cost is bounded but not free — `limit 1` deserializes up
+ * to 256 rows to yield one, and holds them all at once. It is charged against ROUND
+ * TRIPS, which is what dominates on the backends this exists for (the index side already
+ * pages 256 entries per read, so a stopped scan costs one data round trip either way),
+ * so it is accepted as-is. Revisit if a `limit`-shaped query (a correlated `EXISTS`, a
+ * semi-join probe) shows up in a profile as row-decode or allocation cost: the fix is a
+ * SMALLER FIRST batch that ramps toward this bound, which keeps a drain's round-trip
+ * count within a log factor while making a stopped scan cost ~one row again.
  */
 export const ROW_RESOLUTION_BATCH = 256;
 
@@ -819,8 +828,11 @@ export abstract class StoreTableScan extends StoreTableBase {
 			// ADDED to on a yield (there) — adding at visit time would let a stale index
 			// entry that fails its residual poison the set and suppress the row's live
 			// entry in a later window.
-			const dataKeyHex = seen ? bytesToHex(entry.value) : undefined;
-			if (dataKeyHex !== undefined && seen!.has(dataKeyHex)) continue;
+			let dataKeyHex: string | undefined;
+			if (seen) {
+				dataKeyHex = bytesToHex(entry.value);
+				if (seen.has(dataKeyHex)) continue;
+			}
 			yield { dataKey: entry.value, dataKeyHex, infos };
 		}
 	}
@@ -889,9 +901,9 @@ export abstract class StoreTableScan extends StoreTableBase {
 			const row = rows[i];
 			if (!row) continue;
 			const { dataKeyHex, infos } = batch[i];
-			if (dataKeyHex !== undefined && seen!.has(dataKeyHex)) continue;
+			if (seen && dataKeyHex !== undefined && seen.has(dataKeyHex)) continue;
 			if (infos.some(fi => this.matchesFilters(row, fi, collations))) {
-				if (dataKeyHex !== undefined) seen!.add(dataKeyHex);
+				if (seen && dataKeyHex !== undefined) seen.add(dataKeyHex);
 				yield row;
 			}
 		}

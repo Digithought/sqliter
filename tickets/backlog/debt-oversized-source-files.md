@@ -9,8 +9,8 @@ files:
   - packages/quereus-isolation/src/isolation-module.ts       # 1,825 lines
   - scripts/check-docs.mjs                                   # 1,325 lines
   - packages/quoomb-cli/src/commands/dot-commands.ts         # 1,189 lines
-  - packages/quereus-store/src/common/store-table-base.ts    # 1,033 lines
-  - packages/quereus-store/src/common/store-table-scan.ts    # 1,251 lines (`wc -l`, 2026-08-10; 1,023 when this ticket was filed) — the prefix-range seek window builders added ~230
+  - packages/quereus-store/src/common/store-table-base.ts    # 1,120 lines (`wc -l`, 2026-08-11; 1,033 when this ticket was filed)
+  - packages/quereus-store/src/common/store-table-scan.ts    # 1,401 lines (`wc -l`, 2026-08-11; 1,023 when this ticket was filed) — prefix-range seek window builders added ~230, batched row resolution another ~150
   - packages/quereus/src/schema/rename/table-rename.ts       # 1,063 lines (`wc -l`, 2026-08-07) — the other half of the same split; crossed 1,000 when the qualifier-collision predicate landed
   - packages/quereus/src/schema/rename/column-rename.ts      # 1,370 lines (`wc -l`, 2026-08-06; 1,057 when this ticket was filed) — residue of the 1,759-line rename-rewriter.ts split (table/column/strip); the column walk alone is still over, and still growing
   - packages/quereus-store/src/common/store-table.ts         # update() alone is ~315 lines (~252-565)
@@ -145,18 +145,33 @@ formatting code. `bug-cli-corrupt-plugins-file-silently-wipes-plugins` (still op
 targets the record store inside the same file. Its plugin-side suite,
 `packages/quoomb-cli/test/plugin-commands.spec.ts`, splits the same way.
 
-### `packages/quereus-store/src/common/store-table-base.ts` (1,033) and `store-table-scan.ts` (1,023)
+### `packages/quereus-store/src/common/store-table-base.ts` (1,120) and `store-table-scan.ts` (1,401)
 
 These two have a **documented** threshold, not an invented one. `docs/store.md` records:
 
-> NOTE: the two largest `StoreTable` layers sit near 900 lines each. If either passes
-> ~1,000, split it the same way — the scan layer's natural next seam is the multi-seek
-> group (`decodeMultiSeekTuples` / `orderTupleValues` / `scanMultiSeek` /
-> `scanMultiSeekPrimary`), and the base's is the statistics block.
+> NOTE: the two largest `StoreTable` layers have both passed the ~1,000-line seam …
+> Scan-layer seams — the multi-seek group (`decodeMultiSeekTuples` / `orderTupleValues` /
+> `scanMultiSeek` / `scanMultiSeekPrimary`) and the row-resolution group
+> (`produceIndexEntries` / `resolveIndexEntries` / `resolveRowBatch`); the base's is the
+> statistics block. Until it lands, put new scan-side logic in a collaborator … rather
+> than growing these two.
 
-Both have passed it. Full chain measured with `wc -l` from `packages/quereus-store`:
-1,023 `store-table-scan.ts`, 1,033 `store-table-base.ts`, 711 `store-table-constraints.ts`,
-722 `store-table.ts`. The doc already names the seam for each file, so this is mechanical.
+Both have passed it. Full chain measured with `wc -l` from `packages/quereus-store`
+(2026-08-11): 1,401 `store-table-scan.ts`, 1,120 `store-table-base.ts`,
+711 `store-table-constraints.ts`, 722 `store-table.ts`. The doc already names the seam for
+each file, so this is mechanical.
+
+The scan layer is the one still moving, and it is now the largest file in the package —
+it has taken two features since this ticket was filed (the prefix-range seek window
+builders, then the batched row-resolution producer/consumer of
+`store-index-seek-batched-scan`), each landing in the file rather than in a collaborator,
+against the "prefer a collaborator" guidance the same NOTE gives. Both features are
+cohesive with the scan arms they serve, so neither is a wrong placement — the point is
+that nothing stops the pattern, which is exactly what the ratchet above is for. Its seams
+are now two, not one: the multi-seek group, and the row-resolution group
+(`produceIndexEntries` / `resolveIndexEntries` / `resolveRowBatch` — these need only
+`iterateEffective`, `readEffectiveRowsByKeys` and `matchesFilters`, so a collaborator
+taking a narrow interface would lift out cleanly).
 
 ### `packages/quereus-store/src/common/store-table.ts` — `update()` is ~315 lines
 
