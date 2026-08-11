@@ -2,6 +2,7 @@ import type { Scope } from '../scopes/scope.js';
 import { PlanNode, type RelationalPlanNode, type ScalarPlanNode, type PhysicalProperties, type TableDescriptor, type RowDescriptor, type Attribute, isRelationalNode } from './plan-node.js';
 import { PlanNodeType } from './plan-node-type.js';
 import type { RelationType, ScalarType } from '../../common/datatype.js';
+import type { ConflictResolution } from '../../common/constants.js';
 import { INTEGER_TYPE } from '../../types/builtin-types.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
@@ -80,6 +81,48 @@ export interface MutationEnvelope {
 	 * self-contained and the optimizer cannot dangle it.
 	 */
 	readonly keyDefaultRowDescriptor?: RowDescriptor;
+	/**
+	 * Per-row logical CHECKs evaluated once per produced logical row, at the
+	 * envelope — BEFORE the shared key is minted and before any member op runs.
+	 * This is the row-local lens constraint seam for a decomposition INSERT
+	 * (docs/lens.md § Constraint Attachment): the envelope row IS the produced
+	 * logical row, so a check here fires regardless of which member ops the
+	 * fan-out plans (an omitted / explicit-NULL column suppresses the member
+	 * write, never the check). Subquery-free checks only — a subquery-bearing
+	 * row-local check rides the anchor op as a deferred logical-view constraint
+	 * instead (`buildDecompositionInsert`).
+	 */
+	readonly rowChecks?: ReadonlyArray<EnvelopeRowCheck>;
+	/**
+	 * The row descriptor over the supplied envelope columns the {@link rowChecks}
+	 * expressions' column refs resolve through — installed as a row slot over each
+	 * source row for the duration of the per-row evaluation (the check-side dual of
+	 * {@link keyDefaultRowDescriptor}, with its own fresh attribute ids). Present
+	 * exactly when `rowChecks` is.
+	 */
+	readonly rowCheckRowDescriptor?: RowDescriptor;
+	/**
+	 * The statement-level OR clause governing a failing {@link rowChecks} row:
+	 * IGNORE skips the envelope row (the whole logical row — no member op sees it),
+	 * FAIL / ROLLBACK throw their conflict subclass, ABORT / REPLACE throw a plain
+	 * constraint error (REPLACE never masks a CHECK — SQLite parity, matching
+	 * `runtime/row-constraints.ts`).
+	 */
+	readonly rowCheckOnConflict?: ConflictResolution;
+}
+
+/** One per-row logical CHECK evaluated at the mutation envelope. */
+export interface EnvelopeRowCheck {
+	/** The routed-constraint name (`lens:<name>` / `lens:check`). */
+	readonly name: string;
+	/** Compiled predicate over the supplied envelope columns (NULL passes; only definite FALSE fails). */
+	readonly expression: ScalarPlanNode;
+	/**
+	 * Pre-formatted violation text (`CHECK constraint failed: <name>[ (<expr>)]`),
+	 * derived at plan time with the same shape `runtime/row-constraints.ts` derives,
+	 * so the envelope seam reports identically to the constraint pipeline.
+	 */
+	readonly message: string;
 }
 
 /**
@@ -227,12 +270,13 @@ export class ViewMutationNode extends PlanNode {
 		return this.resultRelation()?.getAttributes() ?? [];
 	}
 
-	/** Extra (non-base-op) plan children: the envelope source + optional key-default expr. */
+	/** Extra (non-base-op) plan children: the envelope source + optional key-default expr + per-row check exprs. */
 	private envelopeChildren(): PlanNode[] {
 		if (!this.envelope) return [];
-		return this.envelope.keyDefault
-			? [this.envelope.source, this.envelope.keyDefault]
-			: [this.envelope.source];
+		const children: PlanNode[] = [this.envelope.source];
+		if (this.envelope.keyDefault) children.push(this.envelope.keyDefault);
+		for (const check of this.envelope.rowChecks ?? []) children.push(check.expression);
+		return children;
 	}
 
 	getChildren(): readonly PlanNode[] {
@@ -301,12 +345,29 @@ export class ViewMutationNode extends PlanNode {
 		if (this.envelope) {
 			const newSource = newChildren[cursor] as RelationalPlanNode;
 			cursor += 1;
-			const newKeyDefault = this.envelope.keyDefault ? newChildren[cursor] as ScalarPlanNode : undefined;
+			let newKeyDefault: ScalarPlanNode | undefined;
+			if (this.envelope.keyDefault) {
+				newKeyDefault = newChildren[cursor] as ScalarPlanNode;
+				cursor += 1;
+			}
+			// Rebuild each per-row check with its new expression, preserving name/message
+			// (sliced back in the same order envelopeChildren laid them out).
+			let newRowChecks = this.envelope.rowChecks;
+			if (this.envelope.rowChecks && this.envelope.rowChecks.length > 0) {
+				newRowChecks = this.envelope.rowChecks.map(check => {
+					const expression = newChildren[cursor] as ScalarPlanNode;
+					cursor += 1;
+					return { ...check, expression };
+				});
+			}
 			newEnvelope = {
 				source: newSource,
 				descriptor: this.envelope.descriptor,
 				keyDefault: newKeyDefault,
 				keyDefaultRowDescriptor: this.envelope.keyDefaultRowDescriptor,
+				rowChecks: newRowChecks,
+				rowCheckRowDescriptor: this.envelope.rowCheckRowDescriptor,
+				rowCheckOnConflict: this.envelope.rowCheckOnConflict,
 			};
 		}
 
@@ -316,7 +377,8 @@ export class ViewMutationNode extends PlanNode {
 			&& (!this.identityCapture || newCapture!.source === this.identityCapture.source)
 			&& (!this.nestedCaptures || this.nestedCaptures.every((c, i) => newNestedCaptures![i].source === c.source))
 			&& (!this.envelope || (newEnvelope!.source === this.envelope.source
-				&& newEnvelope!.keyDefault === this.envelope.keyDefault));
+				&& newEnvelope!.keyDefault === this.envelope.keyDefault
+				&& (!this.envelope.rowChecks || this.envelope.rowChecks.every((c, i) => newEnvelope!.rowChecks![i].expression === c.expression))));
 		if (unchanged) {
 			return this;
 		}

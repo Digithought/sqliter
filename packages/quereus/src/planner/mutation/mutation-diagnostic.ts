@@ -37,6 +37,7 @@ export type MutationDiagnosticReason =
 	| 'returning-through-view'     // RETURNING projected through a view — Phase 6
 	| 'lens-read-only'             // logical table whose PK is not reconstructible at the lens boundary
 	| 'lens-set-level-conflict-resolution' // or replace / or ignore / upsert against a commit-time set-level lens key (needs a covering structure)
+	| 'lens-row-local-unenforceable' // a row-local logical CHECK on a decomposition write cannot be evaluated on the logical row (the shared key is hidden/composite, so the post-write logical row cannot be addressed) — refuse loudly rather than skip enforcement
 	// --- decomposition (lens multi-source put) fan-out, advertisement-driven ---
 	| 'unsupported-decomposition-insert'    // internal guard: a decomposition INSERT is built via buildDecompositionInsert (envelope), not propagate
 	| 'unsupported-decomposition-update'    // UPDATE targets a decomposition shared-key (identity) column, or assigns an optional/EAV member a non-constant value (which would need the per-row capture substrate) — the optional/EAV constant-value materialization itself is supported

@@ -14,7 +14,23 @@ import { needsSelfCapture } from './dml-target.js';
 import { FilterNode } from '../nodes/filter.js';
 import { RegisteredScope } from '../scopes/registered.js';
 import { validateMutationTags } from '../mutation/mutation-tags.js';
-import { collectLensRowLocalConstraints, collectLensForeignKeyConstraints, collectLensParentSideForeignKeyConstraints, collectLensSetLevelConstraints, hasCommitTimeSetLevelObligation } from '../mutation/lens-enforcement.js';
+import {
+	collectLensRowLocalConstraints,
+	collectLensForeignKeyConstraints,
+	collectLensParentSideForeignKeyConstraints,
+	collectLensSetLevelConstraints,
+	hasCommitTimeSetLevelObligation,
+	collectLensRowLocalLogicalChecks,
+	resolveLensLogicalRowAddress,
+	synthesizeLensRowLocalDeferredConstraint,
+	type LensLogicalRowAddress,
+	type LensRowLocalLogicalCheck,
+} from '../mutation/lens-enforcement.js';
+import type { LensSlot } from '../../schema/lens.js';
+import type { StorageShape, BasisRelationRef } from '../../vtab/mapping-advertisement.js';
+import { cloneExpr, transformExpr } from '../mutation/scope-transform.js';
+import { expressionToString } from '../../emit/ast-stringify.js';
+import type { EnvelopeRowCheck } from '../nodes/view-mutation-node.js';
 import { ConflictResolution } from '../../common/constants.js';
 import { buildInsertStmt } from './insert.js';
 import { buildUpdateStmt } from './update.js';
@@ -31,7 +47,7 @@ import { parseExpressionString } from '../../parser/index.js';
 import { firstDataModifyingCte } from '../../parser/utils.js';
 import { INTEGER_TYPE } from '../../types/builtin-types.js';
 import { raiseMutationDiagnostic } from '../mutation/mutation-diagnostic.js';
-import { validateDeterministicDefault } from '../validation/determinism-validator.js';
+import { validateDeterministicDefault, validateDeterministicConstraint } from '../validation/determinism-validator.js';
 import { buildRowDefaultScope } from './default-scope.js';
 import { schemaAuthoredContext } from './schema-authored-context.js';
 import { createLogger } from '../../common/logger.js';
@@ -268,10 +284,22 @@ export function buildViewMutation(ctxIn: PlanningContext, viewIn: MutableViewLik
 	// routed through the same seam — gated on `foreign_keys`. It fires on DELETE and
 	// UPDATE (the only ops that can orphan a child), so it is the *sole* extra for a
 	// delete and joins the row-local/child-FK/set-level list (UPDATE-masked) otherwise.
+	// Row-local CHECKs take a spine-dependent seam. The single-source spine (and the
+	// multi-source join spine, whose base ops carry every basis column of their side)
+	// keeps the routed basis-term form: its ops always see the written value, NULL
+	// included. A DECOMPOSITION UPDATE must not — a per-member op may legitimately not
+	// happen for a row whose value is NULL (an all-null assignment lowers to a member
+	// DELETE, which an INSERT|UPDATE-masked check never evaluates on), so its row-local
+	// checks are instead synthesized as deferred logical-row re-reads riding every op of
+	// the fan-out (`lensRowLocalDecompositionUpdateConstraints`) — never both seams, so
+	// no check is evaluated twice.
+	const rowLocalConstraints = decompShape && req.op === 'update'
+		? lensRowLocalDecompositionUpdateConstraints(ctx, view, decompShape, baseOps)
+		: lensRowLocalConstraints(ctx, view);
 	const extraConstraints = req.op === 'delete'
 		? lensParentSideForeignKeyConstraints(ctx, view, RowOpFlag.DELETE)
 		: [
-			...lensRowLocalConstraints(ctx, view),
+			...rowLocalConstraints,
 			...lensForeignKeyConstraints(ctx, view),
 			...lensSetLevelConstraints(ctx, view),
 			...lensParentSideForeignKeyConstraints(ctx, view, RowOpFlag.UPDATE),
@@ -547,6 +575,266 @@ function lensSetLevelConstraints(ctx: PlanningContext, view: MutableViewLike): R
 	return slot ? collectLensSetLevelConstraints(slot, ctx.schemaManager) : [];
 }
 
+// --- Row-local CHECKs on the LOGICAL row (decomposition write paths) ---------
+//
+// A row-local logical CHECK is a predicate over the logical row, but a
+// decomposition write may plan NO per-member op for the checked column (an
+// omitted / explicit-NULL insert value suppresses the optional member's write;
+// an all-null assignment lowers to a member DELETE) — so routing the basis-term
+// form onto the member ops silently skipped the check exactly when the written
+// value was NULL. These helpers move the evaluation onto the logical row:
+// once per produced row at the insert envelope (subquery-free checks), or as a
+// deferred commit-time re-read of the logical view addressed by the shared key
+// (the UPDATE fan-out, and any subquery-bearing insert check).
+
+/** Whether an AST expression embeds a relation-reading subquery anywhere. */
+function astContainsSubquery(expr: AST.Expression): boolean {
+	let found = false;
+	const walk = (node: unknown): void => {
+		if (found) return;
+		if (Array.isArray(node)) { node.forEach(walk); return; }
+		if (!node || typeof node !== 'object' || !('type' in (node as object))) return;
+		const n = node as { type: string };
+		if (n.type === 'subquery' || n.type === 'select' || n.type === 'exists') { found = true; return; }
+		for (const v of Object.values(n)) walk(v);
+	};
+	walk(expr);
+	return found;
+}
+
+/**
+ * The {@link LensLogicalRowAddress} the deferred logical-row re-read addresses a
+ * written row by — a direct shared-key correlation (logical-tuple key), or the
+ * anchor-hop through the logical PK when the shared key is a hidden surrogate —
+ * plus the anchor's own key column (for the anchor-riding INSERT variant). LOUD
+ * refusal (`lens-row-local-unenforceable`) when neither addressing works (a
+ * composite/absent shared key, a PK spread across members): per the enforcement
+ * contract, a row-local CHECK that cannot be evaluated on the logical row
+ * refuses the write rather than silently skipping the check.
+ */
+function requireLensLogicalRowAddress(
+	ctx: PlanningContext,
+	view: MutableViewLike,
+	slot: LensSlot,
+	storage: StorageShape,
+	checkName: string,
+): { address: LensLogicalRowAddress; anchorRelation: BasisRelationRef; anchorKeyColumn: string } {
+	const anchor = storage.members.find(m => m.relationId === storage.anchorRelationId);
+	const keys = anchor ? (storage.sharedKey.keyColumnsByRelation.get(anchor.relationId) ?? []) : [];
+	const anchorKeyColumn = keys.length === 1 ? keys[0] : undefined;
+	const address = anchor && anchorKeyColumn !== undefined
+		? resolveLensLogicalRowAddress(slot, ctx.schemaManager, anchor.relation, anchorKeyColumn)
+		: undefined;
+	if (!anchor || anchorKeyColumn === undefined || address === undefined) {
+		raiseMutationDiagnostic({
+			reason: 'lens-row-local-unenforceable',
+			table: view.name,
+			message: `cannot write through logical table '${view.name}': its row-local CHECK '${checkName}' must be evaluated on the logical row, but the written row cannot be addressed in the logical view — the decomposition's shared key is ${anchorKeyColumn === undefined ? 'composite or absent' : 'hidden and the logical primary key does not map to plain anchor columns'}`,
+			suggestion: 'Expose the shared key as a logical column, keep the logical primary key on plain anchor columns, or drop the CHECK from the logical declaration.',
+		});
+	}
+	return { address, anchorRelation: anchor.relation, anchorKeyColumn };
+}
+
+/**
+ * The single shared-key column of the decomposition member backing `relation`,
+ * for the deferred re-read's `<CORR>.<key>` correlation — or the same LOUD
+ * refusal when the member carries no single-column key.
+ */
+function decompositionRelationKeyColumn(
+	view: MutableViewLike,
+	storage: StorageShape,
+	relation: BasisRelationRef,
+	checkName: string,
+): string {
+	const member = storage.members.find(m =>
+		m.relation.schema.toLowerCase() === relation.schema.toLowerCase()
+		&& m.relation.table.toLowerCase() === relation.table.toLowerCase());
+	const keys = member ? (storage.sharedKey.keyColumnsByRelation.get(member.relationId) ?? []) : [];
+	if (keys.length !== 1) {
+		raiseMutationDiagnostic({
+			reason: 'lens-row-local-unenforceable',
+			table: view.name,
+			message: `cannot write through logical table '${view.name}': its row-local CHECK '${checkName}' must be evaluated on the logical row, but decomposition member '${relation.schema}.${relation.table}' carries no single-column shared key to address the written row by`,
+		});
+	}
+	return keys[0];
+}
+
+/**
+ * The row-local constraints for a decomposition UPDATE fan-out: each check
+ * becomes a deferred `not exists (… from <logical view> _lr where _lr.<key> =
+ * <CORR>.<memberKey> and not (<check>))` re-read of the written row's POST-write
+ * logical image, synthesized once per distinct `(target relation, op shape)` of
+ * the emitted base ops — `NEW`-correlated (INSERT|UPDATE-masked) for the
+ * insert/update-shaped ops, `OLD`-correlated (DELETE-masked) for a member DELETE
+ * (the all-null assignment lowering, the shape the old member-riding seam could
+ * never evaluate on). The per-op gate then threads each variant onto exactly the
+ * ops targeting its relation, so every row the statement physically touches gets
+ * the check; a row NO op processes (an absent optional member assigned NULL —
+ * already NULL, image unchanged) is not re-checked, which is exactly the
+ * grandfathering read-side contract (the write introduced no new violation).
+ *
+ * At commit the contained subquery evaluates against post-mutation state, so a
+ * row two ops both touch (matched UPDATE + `do nothing` materialize INSERT)
+ * enqueues the same re-read twice but both evaluations see the same final image
+ * — idempotent, one failure message. Returns `[]` for a non-lens / check-free
+ * decomposition. Replaces (never doubles) the routed basis-term form on this path.
+ */
+function lensRowLocalDecompositionUpdateConstraints(
+	ctx: PlanningContext,
+	view: MutableViewLike,
+	shape: DecompShape,
+	baseOps: readonly BaseOp[],
+): RowConstraintSchema[] {
+	const slot = ctx.schemaManager.getSchema(view.schemaName)?.getLensSlot(view.name);
+	if (!slot) return [];
+	const checks = collectLensRowLocalLogicalChecks(slot);
+	if (checks.length === 0) return [];
+	const { address } = requireLensLogicalRowAddress(ctx, view, slot, shape.storage, checks[0].name);
+
+	const constraints: RowConstraintSchema[] = [];
+	const seen = new Set<string>();
+	for (const op of baseOps) {
+		const schema = op.table.tableSchema;
+		const relation: BasisRelationRef = { schema: schema.schemaName, table: schema.name };
+		const corr = op.op === 'delete' ? 'OLD' as const : 'NEW' as const;
+		const dedupeKey = `${relation.schema.toLowerCase()}.${relation.table.toLowerCase()}:${corr}`;
+		if (seen.has(dedupeKey)) continue;
+		seen.add(dedupeKey);
+		const keyColumn = decompositionRelationKeyColumn(view, shape.storage, relation, checks[0].name);
+		const mask = op.op === 'delete' ? RowOpFlag.DELETE : (RowOpFlag.INSERT | RowOpFlag.UPDATE);
+		for (const check of checks) {
+			constraints.push(synthesizeLensRowLocalDeferredConstraint(
+				ctx, slot, check, address, relation, keyColumn, corr, mask));
+		}
+	}
+	return constraints;
+}
+
+/**
+ * Substitute the logical columns an INSERT does not supply into a row-local
+ * CHECK, so the envelope form evaluates the produced logical row: an unsupplied
+ * column reads as its declared LOGICAL default when one exists, else NULL (under
+ * a decomposition an absent cell IS NULL — an optional member simply gets no
+ * row). Supplied columns stay as (dequalified) refs over the envelope. Purely
+ * structural — the check reaching the envelope seam is subquery-free (a
+ * substituted default introducing one re-routes the check to the deferred seam),
+ * so no scope-aware descent is needed.
+ *
+ * NOTE: a MANDATORY member's unsupplied basis column takes its BASIS default at
+ * the member insert; if that basis default differs from the logical declaration
+ * (or exists with none declared logically), the envelope form evaluates NULL /
+ * the logical default instead of the stored value — a corner this substitution
+ * accepts. Under the per-column optional-member decompositions the lens
+ * generator emits, an unsupplied column always reads back NULL, so NULL is exact.
+ */
+function substituteUnsuppliedLogicalColumns(
+	slot: LensSlot,
+	expr: AST.Expression,
+	supplied: ReadonlySet<string>,
+): AST.Expression {
+	const logicalTable = slot.logicalTable.name.toLowerCase();
+	const defaults = new Map<string, AST.Expression | undefined>();
+	for (const col of slot.logicalTable.columns) {
+		const dv = col.defaultValue;
+		const asExpr = dv && typeof dv === 'object' && 'type' in dv
+			? dv as AST.Expression
+			: dv !== null && dv !== undefined
+				? { type: 'literal', value: dv } as AST.LiteralExpr
+				: undefined;
+		defaults.set(col.name.toLowerCase(), asExpr);
+	}
+	return transformExpr(expr, col => {
+		// Only a bare ref or one qualified by the logical table is a write-row ref
+		// (the prover restricts a top-level CHECK to logical columns).
+		if (col.table && col.table.toLowerCase() !== logicalTable) return undefined;
+		const name = col.name.toLowerCase();
+		if (!defaults.has(name)) return undefined;
+		if (supplied.has(name)) {
+			// Dequalify so the ref resolves against the envelope row scope.
+			return col.table ? { type: 'column', name: col.name } as AST.ColumnExpr : undefined;
+		}
+		const dflt = defaults.get(name);
+		return dflt ? cloneExpr(dflt) : { type: 'literal', value: null } as AST.LiteralExpr;
+	});
+}
+
+/**
+ * Build the row-local CHECK enforcement for a decomposition INSERT: every
+ * `enforced-row-local` CHECK of the slot, split by shape —
+ *
+ *  - **subquery-free** (after unsupplied-column substitution) ⇒ an
+ *    {@link EnvelopeRowCheck}: compiled over the supplied envelope columns
+ *    (fresh attributes + row descriptor, the check-side dual of the key
+ *    default's), evaluated once per produced logical row at the envelope —
+ *    row-time, before any member op, independent of which member ops the
+ *    fan-out plans;
+ *  - **subquery-bearing** ⇒ a deferred logical-row re-read constraint
+ *    (`synthesizeLensRowLocalDeferredConstraint`) riding the ANCHOR member op
+ *    (which an INSERT always plans, whatever the row's NULL shape), keeping the
+ *    commit-time evaluation the constraint pipeline gives every
+ *    relation-reading check.
+ *
+ * Returns empty parts for a non-lens / check-free decomposition — the common
+ * case pays nothing.
+ */
+function buildDecompositionRowLocalChecks(
+	ctx: PlanningContext,
+	view: MutableViewLike,
+	storage: StorageShape,
+	suppliedColumns: readonly { readonly name: string; readonly type: ScalarType }[],
+): { rowChecks: EnvelopeRowCheck[]; rowCheckRowDescriptor: RowDescriptor; deferredConstraints: RowConstraintSchema[] } {
+	const rowCheckRowDescriptor: RowDescriptor = [];
+	const slot = ctx.schemaManager.getSchema(view.schemaName)?.getLensSlot(view.name);
+	if (!slot) return { rowChecks: [], rowCheckRowDescriptor, deferredConstraints: [] };
+	const checks = collectLensRowLocalLogicalChecks(slot);
+	if (checks.length === 0) return { rowChecks: [], rowCheckRowDescriptor, deferredConstraints: [] };
+
+	const supplied = new Set(suppliedColumns.map(c => c.name.toLowerCase()));
+	const envelope: Array<{ check: LensRowLocalLogicalCheck; substituted: AST.Expression }> = [];
+	const deferredConstraints: RowConstraintSchema[] = [];
+	for (const check of checks) {
+		const substituted = substituteUnsuppliedLogicalColumns(slot, check.expr, supplied);
+		if (astContainsSubquery(substituted)) {
+			// Deferred logical-row re-read riding the anchor op — NEW-correlated,
+			// INSERT-masked (the anchor insert always runs, whatever the row's NULLs).
+			const { address, anchorRelation, anchorKeyColumn } =
+				requireLensLogicalRowAddress(ctx, view, slot, storage, check.name);
+			deferredConstraints.push(synthesizeLensRowLocalDeferredConstraint(
+				ctx, slot, check, address, anchorRelation, anchorKeyColumn, 'NEW', RowOpFlag.INSERT));
+			continue;
+		}
+		envelope.push({ check, substituted });
+	}
+	if (envelope.length === 0) return { rowChecks: [], rowCheckRowDescriptor, deferredConstraints };
+
+	// Fresh attributes over the supplied columns (self-contained, like the key
+	// default's) + a scope resolving each as `<col>` / `new.<col>`.
+	const attrs: Attribute[] = suppliedColumns.map(col => ({
+		id: PlanNode.nextAttrId(),
+		name: col.name,
+		type: col.type,
+		sourceRelation: 'envelope-row-check',
+	}));
+	const scope = buildRowDefaultScope(ctx.scope, suppliedColumns, attrs);
+	const checkCtx = { ...ctx, scope };
+	const rowChecks: EnvelopeRowCheck[] = envelope.map(({ check, substituted }) => {
+		const expression = buildExpression(checkCtx, substituted) as ScalarPlanNode;
+		// Same determinism rule (and same opt-out) the constraint pipeline applies.
+		if (!ctx.db.options.getBooleanOption('nondeterministic_schema')) {
+			validateDeterministicConstraint(expression, check.name, view.name);
+		}
+		// Same message shape `runtime/row-constraints.ts` derives, hinting the
+		// AUTHORED (logical-term) expression — the one the user wrote.
+		const exprText = expressionToString(check.expr);
+		const hint = exprText.length <= 60 ? ` (${exprText})` : '';
+		return { name: check.name, expression, message: `CHECK constraint failed: ${check.name}${hint}` };
+	});
+	attrs.forEach((attr, index) => { rowCheckRowDescriptor[attr.id] = index; });
+	return { rowChecks, rowCheckRowDescriptor, deferredConstraints };
+}
+
 /**
  * Reject a conflict-resolution write the commit-time set-level scan cannot honor.
  * The detection-only count scan (no basis covering structure) can only ABORT on a
@@ -819,18 +1107,24 @@ function buildDecompositionInsert(ctx: PlanningContext, view: MutableViewLike, s
 
 	// Lens enforcement on the decomposition INSERT fan-out — the dual of the per-op gate the
 	// decomposition UPDATE path runs in `buildViewMutation` (the `extraConstraints` /
-	// `constraintsForOp` seam). Collect the three INSERT-applicable lens constraint classes —
-	// row-local CHECK, child-side FK existence, and commit-time set-level uniqueness —
-	// synthesized in *basis* terms. Parent-side FK is DELETE/UPDATE-only (an INSERT cannot
-	// orphan a logical child), so it is deliberately NOT collected here. Each constraint is
-	// gated per member op by `constraintsForOp`: a single-member-resolvable obligation (every
-	// write-row column it references lives on one member's table) rides that member insert and
-	// fires; a cross-member obligation resolves on no single member op ⇒ rides none ⇒ stays
-	// deferred (the documented, deliberately-weaker contract — the same boundary the UPDATE
-	// fan-out draws). For a plain (non-lens) decomposition all three collectors return `[]`,
-	// so this path pays nothing.
+	// `constraintsForOp` seam). The child-side FK and commit-time set-level classes are
+	// synthesized in *basis* terms and gated per member op by `constraintsForOp`: a
+	// single-member-resolvable obligation rides the member that owns its write-row columns; a
+	// cross-member one resolves on no single member op ⇒ rides none ⇒ stays deferred (the
+	// documented, deliberately-weaker contract). Parent-side FK is DELETE/UPDATE-only (an
+	// INSERT cannot orphan a logical child), so it is deliberately NOT collected here.
+	//
+	// The ROW-LOCAL CHECK class deliberately does NOT ride the member ops on this path: a
+	// member write may legitimately not happen for a row whose value is NULL (an optional
+	// member's presence gate, an omitted column planning no op at all), which silently skipped
+	// the check. Instead each row-local CHECK is evaluated once per produced LOGICAL row:
+	// a subquery-free check at the shared envelope (`buildDecompositionRowLocalChecks` →
+	// `MutationEnvelope.rowChecks`, row-time), a subquery-bearing one as a deferred
+	// logical-row re-read riding the anchor op (which an INSERT always plans) — never both
+	// seams, so no check is evaluated twice.
+	const rowLocal = buildDecompositionRowLocalChecks(ctx, view, storage, plan.suppliedColumns);
 	const extraConstraints = [
-		...lensRowLocalConstraints(ctx, view),
+		...rowLocal.deferredConstraints,
 		...lensForeignKeyConstraints(ctx, view),
 		...lensSetLevelConstraints(ctx, view),
 	];
@@ -858,6 +1152,9 @@ function buildDecompositionInsert(ctx: PlanningContext, view: MutableViewLike, s
 		descriptor,
 		keyDefault: keyDefault?.node,
 		keyDefaultRowDescriptor: keyDefault?.rowDescriptor,
+		rowChecks: rowLocal.rowChecks.length > 0 ? rowLocal.rowChecks : undefined,
+		rowCheckRowDescriptor: rowLocal.rowChecks.length > 0 ? rowLocal.rowCheckRowDescriptor : undefined,
+		rowCheckOnConflict: rowLocal.rowChecks.length > 0 ? stmt.onConflict : undefined,
 	});
 }
 

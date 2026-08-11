@@ -8,6 +8,9 @@ import { emitCallFromPlan } from '../emitters.js';
 import { isAsyncIterable } from '../utils.js';
 import { createRowSlot } from '../context-helpers.js';
 import type { RowDescriptor, TableDescriptor } from '../../planner/nodes/plan-node.js';
+import { ConflictResolution } from '../../common/constants.js';
+import { ConstraintError, FailConflictError, RollbackConflictError } from '../../common/errors.js';
+import { isTruthy } from '../../util/comparison.js';
 
 
 /**
@@ -128,6 +131,14 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 	if (envelope) { envSourceIdx = cursor++; params.push(emitCallFromPlan(envelope.source, ctx)); }
 	let keyDefaultIdx = -1;
 	if (envelope?.keyDefault) { keyDefaultIdx = cursor++; params.push(emitCallFromPlan(envelope.keyDefault, ctx)); }
+	// One param slot per envelope row check (in list order, after the key default) —
+	// matching `ViewMutationNode.envelopeChildren`.
+	const rowChecks = envelope?.rowChecks ?? [];
+	const rowCheckIdxs: number[] = [];
+	for (const check of rowChecks) {
+		rowCheckIdxs.push(cursor++);
+		params.push(emitCallFromPlan(check.expression, ctx));
+	}
 
 	async function drainBaseOps(rctx: RuntimeContext, baseCbs: RuntimeValue[]): Promise<void> {
 		for (const cb of baseCbs) {
@@ -156,6 +167,7 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 		sourceCb: SubProgram,
 		keyDefaultCb: SubProgram | undefined,
 		keyDefaultRowDescriptor: RowDescriptor | undefined,
+		rowCheckCbs: readonly SubProgram[],
 	): Promise<Row[]> {
 		const rows: Row[] = [];
 		const sourceResult = sourceCb(rctx);
@@ -171,9 +183,34 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 			const keySlot = keyDefaultCb && keyDefaultRowDescriptor
 				? createRowSlot(rctx, keyDefaultRowDescriptor)
 				: undefined;
+			// The per-row logical CHECK slot (the row-local lens seam for a decomposition
+			// insert): the check expressions resolve the supplied columns through their own
+			// descriptor, evaluated BEFORE the key default so a rejected/skipped row never
+			// mints a key or consumes an ordinal.
+			const checkSlot = rowCheckCbs.length > 0 && envelope?.rowCheckRowDescriptor
+				? createRowSlot(rctx, envelope.rowCheckRowDescriptor)
+				: undefined;
 			let ordinal = 0;
 			try {
-				for await (const row of resolved as AsyncIterable<Row>) {
+				outer: for await (const row of resolved as AsyncIterable<Row>) {
+					if (checkSlot) {
+						checkSlot.set(row as Row);
+						for (let i = 0; i < rowCheckCbs.length; i++) {
+							// Resolve without a per-row microtask hop (see runtime/async-util.ts).
+							const raw = rowCheckCbs[i](rctx);
+							const value = (raw instanceof Promise ? await raw : raw) as SqlValue;
+							// CHECK passes if truthy or NULL; fails otherwise (shared isTruthy
+							// semantics, matching runtime/row-constraints.ts).
+							if (value === null || isTruthy(value)) continue;
+							const action = envelope?.rowCheckOnConflict ?? ConflictResolution.ABORT;
+							if (action === ConflictResolution.IGNORE) continue outer; // skip the whole logical row
+							const message = rowChecks[i].message;
+							if (action === ConflictResolution.FAIL) throw new FailConflictError(message);
+							if (action === ConflictResolution.ROLLBACK) throw new RollbackConflictError(message);
+							// ABORT — and REPLACE, which never masks a CHECK (SQLite parity).
+							throw new ConstraintError(message);
+						}
+					}
 					ordinal += 1;
 					if (keyDefaultCb) {
 						// Evaluate the anchor key column's `default` once for THIS row, with
@@ -193,6 +230,7 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 			} finally {
 				rctx.mutationOrdinal = savedOrdinal;
 				keySlot?.close();
+				checkSlot?.close();
 			}
 		}
 		return rows;
@@ -288,7 +326,8 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 
 		const sourceCb = args[envSourceIdx] as SubProgram;
 		const keyDefaultCb = hasKeyDefault ? (args[keyDefaultIdx] as SubProgram) : undefined;
-		const rows = await materializeEnvelope(rctx, sourceCb, keyDefaultCb, envelope?.keyDefaultRowDescriptor);
+		const rowCheckCbs = rowCheckIdxs.map(i => args[i] as SubProgram);
+		const rows = await materializeEnvelope(rctx, sourceCb, keyDefaultCb, envelope?.keyDefaultRowDescriptor, rowCheckCbs);
 		rctx.tableContexts.set(descriptor, () => arrayIterable(rows));
 		try {
 			await drainBaseOps(rctx, baseCbs);

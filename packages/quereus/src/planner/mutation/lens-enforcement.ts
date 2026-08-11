@@ -398,6 +398,313 @@ export function collectLensRowLocalConstraints(ctx: PlanningContext, slot: LensS
 	return constraints;
 }
 
+// --- Row-local enforcement on the LOGICAL row (decomposition spines) ---------
+//
+// A row-local logical CHECK is a predicate over the logical row, but the routed
+// basis-term form above rides a per-member physical write — which, under a
+// decomposition, may legitimately not happen for a row whose written value is
+// NULL (an optional member's presence gate suppresses the member insert; an
+// all-null assignment lowers to a member DELETE, which an INSERT|UPDATE-masked
+// check never evaluates on; an omitted column plans no member op at all). The
+// two collectors below are the decomposition write paths' replacement seam:
+// the check is evaluated against the LOGICAL row — immediately at the insert
+// envelope ({@link collectLensRowLocalLogicalChecks}, consumed by
+// `buildDecompositionInsert`), or as a deferred commit-time re-read of the
+// logical view addressed by the shared key
+// ({@link synthesizeLensRowLocalDeferredConstraint}) — so enforcement no longer
+// depends on which member writes a row happens to produce. The single-source
+// spine keeps the routed basis-term form: its one base op always carries every
+// basis column, so a NULL write still produces the write row and the routed
+// check sees it (pinned by test/lens-row-local-null-write.spec.ts).
+
+/** One row-local logical CHECK in authored (logical-column) terms. */
+export interface LensRowLocalLogicalCheck {
+	/** The routed-constraint name (`lens:<name>` / `lens:check`) — error text stays stable. */
+	readonly name: string;
+	/** The authored CHECK expression over logical columns (shared, never mutated). */
+	readonly expr: AST.Expression;
+}
+
+/**
+ * The slot's `enforced-row-local` CHECK obligations in their authored (logical)
+ * terms — the raw material for the logical-row seam, before any basis rewrite.
+ * Returns `[]` for an un-proved / check-free slot (the common case).
+ */
+export function collectLensRowLocalLogicalChecks(slot: LensSlot): LensRowLocalLogicalCheck[] {
+	if (!slot.obligations || slot.obligations.length === 0) return [];
+	const checks: LensRowLocalLogicalCheck[] = [];
+	for (const obligation of slot.obligations) {
+		if (obligation.kind !== 'enforced-row-local') continue;
+		if (obligation.constraint.kind !== 'check') continue;
+		const source = obligation.constraint.constraint;
+		checks.push({ name: source.name ? `lens:${source.name}` : 'lens:check', expr: source.expr });
+	}
+	return checks;
+}
+
+/**
+ * The logical column (declared spelling) that maps to `basisColumn` on `relation`,
+ * or `undefined` when no logical column exposes it. Used by the decomposition
+ * write paths to find the logical spelling of the shared key (the anchor's key
+ * column), so the deferred logical-view re-read can address the written row:
+ * `_lr.<logicalKey> = NEW.<memberKey>`. A surrogate (hidden) shared key maps to
+ * no logical column ⇒ `undefined` ⇒ the caller must refuse loudly rather than
+ * skip enforcement.
+ */
+export function findLogicalColumnForBasis(
+	slot: LensSlot,
+	schemaManager: SchemaManager | undefined,
+	relation: BasisRelationRef,
+	basisColumn: string,
+): string | undefined {
+	const map = logicalToBasisColumnMap(slot);
+	const owningRelation = makeOwningRelationResolver(slot, schemaManager);
+	const want = basisColumn.toLowerCase();
+	for (const col of slot.logicalTable.columns) {
+		const lc = col.name.toLowerCase();
+		const basis = map.get(lc);
+		if (basis === undefined || basis.toLowerCase() !== want) continue;
+		const rel = owningRelation(lc);
+		if (!rel) continue;
+		if (rel.schema.toLowerCase() === relation.schema.toLowerCase()
+			&& rel.table.toLowerCase() === relation.table.toLowerCase()) {
+			return col.name;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * The FROM alias the deferred logical-row re-read binds the logical view under.
+ * Like `NEW` / `__lens_new__…`, not a reserved word but vanishingly implausible
+ * as a user-written subquery-FROM alias, so it is not shadow-captured in practice.
+ */
+const LOGICAL_ROW_ALIAS = '_lr';
+
+/**
+ * The {@link ScopeContext} rewriting a row-local CHECK's write-row logical
+ * columns to `_lr.<col>` — the logical-row-alias dual of {@link makeLensRewriteScope}
+ * (which rewrites to basis terms). The scope-aware descent keeps a subquery-local
+ * ref (one a nested FROM introduces) untouched while a correlated write-row
+ * logical column — bare or qualified by the logical table — binds to the aliased
+ * logical view row the deferred re-read scans.
+ */
+function makeLogicalRowRewriteScope(slot: LensSlot): ScopeContext {
+	const logicalTableName = slot.logicalTable.name;
+	const lcTable = logicalTableName.toLowerCase();
+	// lowercased logical column name → declared spelling (the projection alias the
+	// registered logical view resolves).
+	const declared = new Map<string, string>();
+	for (const col of slot.logicalTable.columns) declared.set(col.name.toLowerCase(), col.name);
+	const resolve = (name: string): AST.Expression | undefined => {
+		const spelling = declared.get(name);
+		if (spelling === undefined) return undefined;
+		return { type: 'column', name: spelling, table: LOGICAL_ROW_ALIAS };
+	};
+	return {
+		makeSubstitute: (shadowed, tainted) => (col) => {
+			const name = col.name.toLowerCase();
+			if (col.table) {
+				return col.table.toLowerCase() === lcTable ? resolve(name) : undefined;
+			}
+			if (shadowed.has(name)) return undefined;
+			if (!declared.has(name)) return undefined;
+			if (tainted) {
+				raiseMutationDiagnostic({
+					reason: 'unsupported-subquery-correlation',
+					table: logicalTableName,
+					column: col.name,
+					message: `cannot enforce the logical CHECK on '${logicalTableName}': the reference '${col.name}' inside a subquery cannot be proven correlated to the written row because the subquery's source columns are not statically resolvable (a 'select *' / table-valued function / unresolved source); qualify the reference with the logical table, or restructure the CHECK`,
+				});
+			}
+			return resolve(name);
+		},
+		unresolvableScope: 'taint',
+		rejectDmlSubquery: () => raiseMutationDiagnostic({
+			reason: 'unsupported-subquery-correlation',
+			table: logicalTableName,
+			message: `cannot enforce the logical CHECK on '${logicalTableName}': a data-modifying subquery (INSERT/UPDATE/DELETE) within it cannot be analysed for write-row correlation`,
+		}),
+	};
+}
+
+/**
+ * How the deferred logical-row re-read addresses the written row in the logical
+ * view, given only the riding base op's own key column (`<CORR>.<memberKey>`):
+ *
+ *  - `shared-key` — the decomposition's shared key IS a logical column (a
+ *    logical-tuple key): correlate directly, `_lr.<logicalKeyColumn> = <CORR>.<memberKey>`.
+ *  - `anchor-hop` — the shared key is hidden (a surrogate): hop through the
+ *    ANCHOR basis relation to reconstruct the logical PK,
+ *    `_lr.<pk_i> = (select __lra.<pkBasis_i> from <anchor> as __lra where __lra.<anchorKey> = <CORR>.<memberKey>)`
+ *    per PK column. Every member's key column carries the same shared-key value
+ *    (the decomposition equi-join), so the hop lands on the written row's anchor
+ *    whichever member op the constraint rides.
+ */
+export type LensLogicalRowAddress =
+	| { readonly kind: 'shared-key'; readonly logicalKeyColumn: string }
+	| {
+		readonly kind: 'anchor-hop';
+		readonly anchorRelation: BasisRelationRef;
+		readonly anchorKeyColumn: string;
+		readonly pkColumns: ReadonlyArray<{ readonly logicalColumn: string; readonly anchorBasisColumn: string }>;
+	};
+
+/**
+ * Resolves how a decomposition write can address the written logical row —
+ * preferring the direct shared-key correlation, falling back to the anchor-hop
+ * when the shared key is hidden but every logical PK column maps to a plain
+ * basis column ON THE ANCHOR. Returns `undefined` when neither addressing works
+ * (a keyless logical table over a hidden surrogate, a PK spread across members)
+ * — the caller must then refuse the write loudly rather than skip enforcement.
+ */
+export function resolveLensLogicalRowAddress(
+	slot: LensSlot,
+	schemaManager: SchemaManager | undefined,
+	anchorRelation: BasisRelationRef,
+	anchorKeyColumn: string,
+): LensLogicalRowAddress | undefined {
+	const direct = findLogicalColumnForBasis(slot, schemaManager, anchorRelation, anchorKeyColumn);
+	if (direct !== undefined) return { kind: 'shared-key', logicalKeyColumn: direct };
+
+	const pkDef = slot.logicalTable.primaryKeyDefinition;
+	if (pkDef.length === 0) return undefined;
+	const map = logicalToBasisColumnMap(slot);
+	const owningRelation = makeOwningRelationResolver(slot, schemaManager);
+	const pkColumns: Array<{ logicalColumn: string; anchorBasisColumn: string }> = [];
+	for (const def of pkDef) {
+		const col = slot.logicalTable.columns[def.index];
+		if (!col) return undefined;
+		const lc = col.name.toLowerCase();
+		const basis = map.get(lc);
+		if (basis === undefined) return undefined;
+		const rel = owningRelation(lc);
+		if (!rel
+			|| rel.schema.toLowerCase() !== anchorRelation.schema.toLowerCase()
+			|| rel.table.toLowerCase() !== anchorRelation.table.toLowerCase()) {
+			return undefined;
+		}
+		pkColumns.push({ logicalColumn: col.name, anchorBasisColumn: basis });
+	}
+	return { kind: 'anchor-hop', anchorRelation, anchorKeyColumn, pkColumns };
+}
+
+/** The anchor alias inside an anchor-hop subquery (implausible as a user FROM alias). */
+const ANCHOR_HOP_ALIAS = '__lra';
+
+/** The per-address row-locating predicate of the deferred re-read's WHERE. */
+function buildLogicalRowAddressPredicate(
+	address: LensLogicalRowAddress,
+	relationKeyColumn: string,
+	correlation: 'NEW' | 'OLD',
+): AST.Expression {
+	const corrKey = { type: 'column', name: relationKeyColumn, table: correlation } as AST.ColumnExpr;
+	if (address.kind === 'shared-key') {
+		return {
+			type: 'binary',
+			operator: '=',
+			left: { type: 'column', name: address.logicalKeyColumn, table: LOGICAL_ROW_ALIAS } as AST.ColumnExpr,
+			right: corrKey,
+		} as AST.BinaryExpr;
+	}
+	const legs: AST.Expression[] = address.pkColumns.map(({ logicalColumn, anchorBasisColumn }) => {
+		const hop: AST.SelectStmt = {
+			type: 'select',
+			columns: [{ type: 'column', expr: { type: 'column', name: anchorBasisColumn, table: ANCHOR_HOP_ALIAS } as AST.ColumnExpr }],
+			from: [{
+				type: 'table',
+				table: { type: 'identifier', name: address.anchorRelation.table, schema: address.anchorRelation.schema },
+				alias: ANCHOR_HOP_ALIAS,
+			} as AST.TableSource],
+			where: {
+				type: 'binary',
+				operator: '=',
+				left: { type: 'column', name: address.anchorKeyColumn, table: ANCHOR_HOP_ALIAS } as AST.ColumnExpr,
+				right: corrKey,
+			} as AST.BinaryExpr,
+		};
+		return {
+			type: 'binary',
+			operator: '=',
+			left: { type: 'column', name: logicalColumn, table: LOGICAL_ROW_ALIAS } as AST.ColumnExpr,
+			right: { type: 'subquery', query: hop } as AST.SubqueryExpr,
+		} as AST.BinaryExpr;
+	});
+	return legs.reduce((acc, leg) => ({ type: 'binary', operator: 'AND', left: acc, right: leg } as AST.BinaryExpr));
+}
+
+/**
+ * Builds the deferred logical-row form of one row-local CHECK for a decomposition
+ * write:
+ *
+ *   not exists (select 1 from <logicalSchema>.<logicalTable> as _lr
+ *               where <row address over <CORR>.<relationKeyColumn>>
+ *                 and not (<check over _lr.*>))
+ *
+ * The subquery FROM is the registered **logical view**, so at commit (the
+ * contained subquery auto-defers the constraint) it re-reads the written row's
+ * POST-write logical image — independent of which member relations the row's
+ * write happened to touch. The row address ({@link LensLogicalRowAddress})
+ * correlates from the base op the constraint rides: `NEW` for an
+ * insert/update-shaped op, `OLD` for a member DELETE (the all-null assignment
+ * lowering, where no NEW row exists). NULL semantics carry for free: a NULL
+ * check result makes the inner `not (<check>)` NULL ⇒ the row is not selected ⇒
+ * the constraint passes — exactly SQL's NULL-passes CHECK rule — while a
+ * definite FALSE selects the row and ABORTs.
+ *
+ * `operations` masks the constraint to the op shape it rides (INSERT|UPDATE with
+ * `NEW`, DELETE with `OLD`); `referencedWriteRowRelations` carries the single
+ * `(relation, key column)` pair so the per-op gate (`constraintsForOp`) threads
+ * it onto exactly the ops targeting that member. Named identically to the routed
+ * basis-term form (`lens:<name>`), so error text is stable across the seams.
+ *
+ * Because the re-read evaluates the WHOLE logical row image, a cross-member
+ * CHECK (one the per-member gate could never thread) is enforced here too — the
+ * decomposition write paths that use this seam therefore close the documented
+ * cross-member deferral as a side effect (docs/lens.md § Constraint Attachment).
+ */
+export function synthesizeLensRowLocalDeferredConstraint(
+	ctx: PlanningContext,
+	slot: LensSlot,
+	check: LensRowLocalLogicalCheck,
+	address: LensLogicalRowAddress,
+	relation: BasisRelationRef,
+	relationKeyColumn: string,
+	correlation: 'NEW' | 'OLD',
+	operations: RowOpFlag,
+): RowConstraintSchema {
+	const rewritten = transformScopedExpr(ctx, makeLogicalRowRewriteScope(slot), check.expr);
+	const locate = buildLogicalRowAddressPredicate(address, relationKeyColumn, correlation);
+	const violates: AST.UnaryExpr = { type: 'unary', operator: 'NOT', expr: rewritten };
+	const where: AST.BinaryExpr = { type: 'binary', operator: 'AND', left: locate, right: violates };
+	const subquery: AST.SelectStmt = {
+		type: 'select',
+		columns: [{ type: 'column', expr: { type: 'literal', value: 1 } as AST.LiteralExpr }],
+		from: [{
+			type: 'table',
+			table: { type: 'identifier', name: slot.logicalTable.name, schema: slot.logicalTable.schemaName },
+			alias: LOGICAL_ROW_ALIAS,
+		} as AST.TableSource],
+		where,
+	};
+	const expr: AST.UnaryExpr = {
+		type: 'unary',
+		operator: 'NOT',
+		expr: { type: 'exists', subquery } as AST.ExistsExpr,
+	};
+	return {
+		name: check.name,
+		expr,
+		operations,
+		referencedWriteRowRelations: [{
+			schema: relation.schema,
+			table: relation.table,
+			column: relationKeyColumn.toLowerCase(),
+		}],
+		tags: { [LENS_BOUNDARY_ATTACHED_TAG]: true },
+	};
+}
+
 /**
  * Whether the lens body is a faithful, **non-row-reducing** projection of its
  * single basis source — every basis row maps 1:1 to a logical row, so the logical
