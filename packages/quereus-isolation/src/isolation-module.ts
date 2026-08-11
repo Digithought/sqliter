@@ -966,6 +966,28 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	}
 
 	/**
+	 * Rewrites a QuereusError raised directly by the overlay's own module — reached only by
+	 * the PRIMARY-KEY re-key arm's pre-flight `alterSchema(change, true)` dry run above — so
+	 * its message names the user's table instead of the internal `_overlay_<table>_<id>`
+	 * staging table the error actually originates in. Every other overlay-sourced refusal is
+	 * caught and re-described by this module (see {@link issuerOverlayDriftError} and the
+	 * poison-message builders); this pre-flight call is the one spot where an overlay
+	 * module's own error text reaches the caller verbatim, so it is the one spot that needs
+	 * the substitution.
+	 */
+	private renameOverlayInError(e: unknown, overlaySchema: TableSchema | undefined, tableName: string): unknown {
+		if (!(e instanceof QuereusError) || !overlaySchema || !e.message.includes(overlaySchema.name)) return e;
+		const cause = (e as { cause?: unknown }).cause;
+		return new QuereusError(
+			e.message.split(overlaySchema.name).join(tableName),
+			e.code,
+			cause instanceof Error ? cause : undefined,
+			e.line,
+			e.column,
+		);
+	}
+
+	/**
 	 * The INTERNAL raised when the DDL-ISSUING connection's own overlay rejects the change the
 	 * DDL just made (routed through {@link applyInPlaceOverlayChange} by the index paths and
 	 * every ALTER TABLE forward).
@@ -1519,7 +1541,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 				await ownOverlayState.overlayTable.alterSchema!(change, true);
 			} catch (e) {
 				await reinsertPkRekeyMarkers(ownOverlayState, droppedMarkerRows);
-				throw e;
+				throw this.renameOverlayInError(e, ownOverlayState.overlayTable.tableSchema, tableName);
 			}
 		}
 

@@ -2615,6 +2615,29 @@ describe('IsolationModule', () => {
 			expect(underlyingCollation('ecp_cmt', 'k'), 'underlying untouched').to.equal('BINARY');
 			await db.exec(`ROLLBACK`);
 		});
+
+		it('names the user\'s table, not the internal overlay staging table, when the collision is confined to rows this transaction both inserted and deleted', async () => {
+			// Unlike 'raises BUSY when the only colliding rows are ones this transaction
+			// deleted' above (a committed pair, hidden from the transaction's own view but
+			// physically present on the shared underlying), this pair never reaches the
+			// underlying at all: both the insert and the delete are staged in THIS
+			// connection's overlay. The BUSY refusal is then raised by the overlay's own
+			// pre-flight `alterSchema(change, true)` dry run — regression coverage for
+			// bug-overlay-table-name-leaks-into-rekey-error.
+			await db.exec(`CREATE TABLE ecp_own (k TEXT PRIMARY KEY, v TEXT) USING isolated`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`INSERT INTO ecp_own VALUES ('A', 'x'), ('a', 'y')`);
+			await db.exec(`DELETE FROM ecp_own WHERE k IN ('A', 'a')`);
+
+			const err = await expectAlterError(`ALTER TABLE ecp_own ALTER COLUMN k SET COLLATE NOCASE`);
+			expect(err.code).to.equal(StatusCode.BUSY);
+			expect(err.message).to.match(/commit\/rollback and retry/i);
+			expect(err.message, 'names the real table').to.contain('table ecp_own:');
+			expect(err.message, 'must not leak the internal overlay staging table name').to.not.match(/_overlay_/);
+
+			await db.exec(`ROLLBACK`);
+		});
 	});
 
 	describe('SET COLLATE on a PRIMARY KEY column collapses overlay deletion markers', () => {
