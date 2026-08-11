@@ -40,9 +40,9 @@ export interface ModuleCapabilities {
 	// path. They are asserted only in tests, and the isolation layer augments
 	// `isolation` / `savepoints` for its own bookkeeping — nothing reads them as a
 	// gate. Toggling one changes no engine behavior. Only `delegatesNotNullBackfill`,
-	// `permitsGrandfatheredCheckViolators`, `permitsOrphanedForeignKeyRows`, and
-	// `ddlTransactionality` (below) are live capability gates. See
-	// docs/module-capabilities.md § "Surface inventory".
+	// `permitsGrandfatheredCheckViolators`, `permitsOrphanedForeignKeyRows`,
+	// `permitsGrandfatheredNotNullViolators`, and `ddlTransactionality` (below)
+	// are live capability gates. See docs/module-capabilities.md § "Surface inventory".
 
 	/** Advisory: module provides transaction isolation (read-your-own-writes, snapshot reads). Not engine-consulted. */
 	isolation?: boolean;
@@ -133,9 +133,44 @@ export interface ModuleCapabilities {
 	permitsOrphanedForeignKeyRows?: boolean;
 
 	/**
-	 * Declares how this module's DDL behaves inside a transaction — the fourth LIVE
+	 * Module may carry a row that lacks a value for a currently-declared NOT NULL
+	 * column (a "grandfathered" NULL) — the third member of the grandfathering
+	 * family alongside `permitsGrandfatheredCheckViolators` and
+	 * `permitsOrphanedForeignKeyRows`. Typical sources: `ALTER TABLE … ADD COLUMN
+	 * <NOT NULL>` / `… SET NOT NULL` succeeding against existing rows and
+	 * declaring NOT NULL on the new schema only (forward writes enforced), or a
+	 * replicated backend admitting a row from a peer whose older schema epoch
+	 * never had the column.
+	 *
+	 * Default/absent ⇒ the lens prover treats a `not null` logical column whose
+	 * basis-derived expression is nullable (and that has no total default) as the
+	 * deploy-blocking error `lens.nullability-mismatch` — sound for a declarant
+	 * that can actually promise totality.
+	 *
+	 * When true (checked against every basis table the compiled body reads —
+	 * mixed-module bodies stay strict), that diagnostic is demoted to a
+	 * non-blocking warning-severity advisory: still emitted, surfaced in the
+	 * deploy report and `quereus_lens_advisories`, and ack-governable
+	 * (`quereus.lens.ack.nullability-mismatch`), but it no longer blocks the
+	 * deploy. Reads through the lens may then yield NULL in a declared NOT NULL
+	 * column for grandfathered rows. This flag changes NOTHING about writes: it
+	 * neither adds nor removes enforcement. Note that a logical column's NOT NULL
+	 * is not attached to the basis write by the lens enforcement rewrite in the
+	 * first place (`planner/mutation/lens-enforcement.ts
+	 * collectLensRowLocalConstraints` rewrites CHECK obligations only), so a write
+	 * through a deployed lens is NOT-NULL-enforced only to the extent the BASIS
+	 * columns it decomposes onto declare it — do not read this flag's advisory as
+	 * a promise that forward writes are guarded. Native modules (memory, store)
+	 * leave this off, so their behavior — and Quereus's own conformance suite — is
+	 * unchanged.
+	 */
+	permitsGrandfatheredNotNullViolators?: boolean;
+
+	/**
+	 * Declares how this module's DDL behaves inside a transaction — the fifth LIVE
 	 * capability gate alongside `delegatesNotNullBackfill`,
-	 * `permitsGrandfatheredCheckViolators`, and `permitsOrphanedForeignKeyRows`.
+	 * `permitsGrandfatheredCheckViolators`, `permitsOrphanedForeignKeyRows`, and
+	 * `permitsGrandfatheredNotNullViolators`.
 	 * See {@link DdlTransactionality} for the three tiers.
 	 *
 	 * Default/absent ⇒ `'non-transactional'`. A module must EXPLICITLY claim

@@ -234,7 +234,9 @@ function collectTableAcks(tags: Record<string, SqlValue> | undefined): ParsedAck
 
 /** Collects every ack on one constraint's tags (scoped to that constraint's columns). */
 function collectConstraintAcks(constraint: LogicalConstraint, columnNames: ReadonlyMap<number, string>): ParsedAck[] {
-	if (constraint.kind === 'primaryKey') return []; // a PK carries no tag surface
+	// A PK / column NOT NULL carries no constraint-level tag surface (column-level
+	// tags are validated separately; table-level acks can still target the column).
+	if (constraint.kind === 'primaryKey' || constraint.kind === 'notNull') return [];
 	const tags = constraint.constraint.tags;
 	const cols = constraintColumns(constraint, columnNames);
 	return getReservedTagByTemplate(tags, ACK_TEMPLATE).map(inst => {
@@ -255,6 +257,7 @@ function constraintColumns(constraint: LogicalConstraint, columnNames: ReadonlyM
 		case 'unique': return constraint.constraint.columns.map(idx);
 		case 'foreignKey': return constraint.constraint.columns.map(idx);
 		case 'check': return [];
+		case 'notNull': return [idx(constraint.columnIndex)];
 	}
 }
 

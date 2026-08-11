@@ -1,45 +1,25 @@
-description: On the persistent storage backend, a query matching a column against a list of values gets a fast per-value lookup for most columns but still reads the whole table for a primary key, and for duration or JSON columns.
+description: On the persistent storage backend, a query matching a duration or JSON column against a list of values reads the whole table instead of fetching just the matching rows, which every other column type already gets.
 prereq: feat-store-semantic-key-point-seeks
 files:
-  - packages/quereus-store/src/common/store-module-access-plan.ts   # tryIndexAccessPlan — the primary-key equality arm (`=` only) and the isMultiSeek semantic-ordering decline
+  - packages/quereus-store/src/common/store-module-access-plan.ts   # tryIndexAccessPlan — the isMultiSeek semantic-ordering decline
   - packages/quereus-store/src/common/store-module.ts               # the access-plan entry point
-  - packages/quereus-store/src/common/store-table.ts                # the multi-seek runtime arm, including its primary-key branch
   - packages/quereus-store/src/common/store-table-scan.ts           # scanMultiSeek / scanMultiSeekPrimary — the two multiSeekMalformed throws
-  - packages/quereus-store/src/common/pk-key-resolution.ts          # semanticProbeIsKeyFaithful — the per-value predicate arm B would reuse
-  - packages/quereus-isolation/src/merge-iterator.ts                # mergeStreams — the ordering constraint that held arm A back
-tradeoffs: Both arms are speed-only against a plan that already returns correct rows, and arm B in particular has no safe runtime fallback — so a maintainer may reasonably leave both until an actual query is measured to be slow.
+  - packages/quereus-store/src/common/pk-key-resolution.ts          # semanticProbeIsKeyFaithful — the per-value predicate this arm would reuse
+tradeoffs: Speed-only against a plan that already returns correct rows, and this is the one multi-seek shape with no safe runtime fallback — so a maintainer may reasonably leave it until a query is measured to be slow.
 ----
 
-# Two shapes the store's multi-seek still refuses
+# The shape the store's multi-seek still refuses
 
 The persistent store serves `where col in (a, b, c)` as a **multi-seek**: one deduplicated,
 key-ordered byte window per distinct list value, instead of a full table scan.
 `feat-store-in-list-index-pushdown` built that for secondary indexes and deliberately left
-two shapes out. Both live in the same access-plan arm and the same scan functions; whoever
-picks one has already read the other.
+two shapes out.
 
-Arm A is the cheap one and is a reasonable first cut on its own.
+The other one — the primary key never planning a multi-seek at all — was promoted to
+`implement/feat-store-pk-in-list-multiseek` after a downstream user hit it. This ticket is
+what remains.
 
-## Arm A — the primary key still full-scans
-
-`select … from t where pk in (1, 2, 3)` full-scans on the store. The **runtime half
-already exists**: `StoreTable`'s multi-seek arm has a primary-key branch (one point lookup
-per tuple, deduplicated and emitted in primary-key order). What is missing is the planner
-half — `StoreModule`'s primary-key equality arm still matches only `=`, so it never names a
-primary-key multi-seek plan.
-
-*Why it was held back, and why that no longer applies:* when the isolation layer wraps the
-store, a primary-key scan is merged row-by-row with the transaction's staged writes by
-walking two streams that must be in the same key order (`mergeStreams`,
-`packages/quereus-isolation/src/merge-iterator.ts`). A list lookup emits rows in list
-order, not key order, and the two sides did not agree — which could surface a stale row
-alongside its updated copy, or resurrect a deleted one. That defect was filed as
-`bug-isolation-multiseek-merge-order` and has since been fixed.
-
-Re-confirm the merge behaves under an open transaction when this is picked up, but expect
-the remaining change to be small: it is the planner half only.
-
-## Arm B — a duration or JSON column falls back to a full scan
+## A duration or JSON column falls back to a full scan
 
 For a column whose declared type is `timespan` or `json`, the store declines the multi-seek
 plan and reads the whole table, then filters each row.
@@ -60,3 +40,11 @@ is chosen, for every value in the list, not discovered mid-scan.
 
 The two `multiSeekMalformed` throws in `scanMultiSeek` / `scanMultiSeekPrimary` are where
 today's "this should not have been planned" assertions live.
+
+## Related work in flight
+
+Even where a list lookup *does* plan, the store drives one byte window at a time and
+resolves each row with its own store read — on IndexedDB, one database transaction per
+row. That is `store-index-seek-batched-row-resolution` (in `implement/`). It makes every
+multi-seek faster but does not change which shapes plan one, so it neither blocks nor is
+blocked by this ticket.

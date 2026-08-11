@@ -54,6 +54,15 @@ export interface CoveringFKMatch {
  * inclusion dependency and must not produce the ≥1-match existence claim.
  * Undefined module (logical lens-slot tables) ⇒ not gated, same as the CHECK
  * precedent in `analysis/check-extraction.ts`.
+ *
+ * NOTE: the two producers can read the capability off *different* module
+ * objects — `lookupCoveringFK`'s callers all take the schema's `vtabModule`,
+ * while `TableReferenceNode` hands `seedTableForeignKeyInds` the module it
+ * resolved by name at construction. Both come from `SchemaManager.getModule`,
+ * so they are the same object unless a module is re-registered under a live
+ * name after its tables were created; if that ever becomes reachable, thread
+ * the node-resolved module into `lookupCoveringFK`'s callers too, or the
+ * structural path can still trust an FK the IND path has already declined.
  */
 function permitsOrphans(module: CapabilityProvider | undefined): boolean {
 	return module?.getCapabilities?.().permitsOrphanedForeignKeyRows === true;

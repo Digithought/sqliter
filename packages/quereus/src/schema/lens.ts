@@ -44,7 +44,15 @@ export type LogicalConstraint =
 	| { kind: 'primaryKey'; columns: ReadonlyArray<PrimaryKeyColumnDefinition> }
 	| { kind: 'check'; constraint: RowConstraintSchema }
 	| { kind: 'unique'; constraint: UniqueConstraintSchema }
-	| { kind: 'foreignKey'; constraint: ForeignKeyConstraintSchema };
+	| { kind: 'foreignKey'; constraint: ForeignKeyConstraintSchema }
+	/**
+	 * A logical column's NOT NULL declaration, collected as an ordinary member of
+	 * the obligation list so the write-enforcement pipeline sees it like any other
+	 * constraint class (it was previously never collected — a lens write could
+	 * persist NULL into a `not null` logical column). Only collected when no total
+	 * default supplies the value ({@link buildLogicalConstraints}).
+	 */
+	| { kind: 'notNull'; columnIndex: number; columnName: string };
 
 /**
  * Where one logical column's effective-body mapping came from, in logical
@@ -263,5 +271,15 @@ export function buildLogicalConstraints(logicalTable: TableSchema): LogicalConst
 	for (const c of logicalTable.foreignKeys ?? []) {
 		result.push({ kind: 'foreignKey', constraint: c });
 	}
+	logicalTable.columns.forEach((col, i) => {
+		// A NOT NULL declaration is an obligation only when no total default fills
+		// the value — the same condition the prover's read-side conformance check
+		// (`checkTypeAndNullability`) uses. NOTE: an explicit NULL written to a
+		// defaulted NOT NULL column is therefore not lens-enforced (the default is
+		// not substituted for an explicit NULL); revisit if that write shape shows up.
+		if (col.notNull && col.defaultValue === null) {
+			result.push({ kind: 'notNull', columnIndex: i, columnName: col.name });
+		}
+	});
 	return result;
 }

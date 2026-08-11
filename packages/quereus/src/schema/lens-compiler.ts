@@ -563,7 +563,9 @@ function validateLensTags(slot: LensSlot): void {
 		if (col.tags) diagnostics.push(...validateReservedTags(col.tags, 'logical-column'));
 	}
 	for (const constraint of slot.attachedConstraints) {
-		const tags = constraint.kind === 'primaryKey' ? undefined : constraint.constraint.tags;
+		const tags = constraint.kind === 'primaryKey' || constraint.kind === 'notNull'
+			? undefined
+			: constraint.constraint.tags;
 		if (tags) diagnostics.push(...validateReservedTags(tags, 'logical-constraint'));
 	}
 

@@ -360,11 +360,14 @@ describe('lens ack: escalation policy', () => {
 });
 
 describe('lens ack: advisory vocabulary (drift guard)', () => {
-	it('ACKNOWLEDGEABLE_ADVISORY_CODES is exactly the six governable warning codes', () => {
+	it('ACKNOWLEDGEABLE_ADVISORY_CODES is exactly the seven governable warning codes', () => {
 		expect([...ACKNOWLEDGEABLE_ADVISORY_CODES].sort()).to.deep.equal([
 			'lens.getput-lossy',
 			'lens.no-answering-structure',
 			'lens.no-backing-index',
+			// Dual-severity: hard error by default, governable advisory only over
+			// a basis module declaring `permitsGrandfatheredNotNullViolators`.
+			'lens.nullability-mismatch',
 			'lens.over-restrictive-basis-key',
 			'lens.partial-override',
 			'lens.pk-not-reconstructible',

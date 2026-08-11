@@ -202,7 +202,8 @@ export function buildConstraintChecks(
         deferrable: needsDeferred,
         initiallyDeferred: needsDeferred,
         needsDeferred,
-        kind: 'check'
+        kind: 'check',
+        violationMessage: constraint.violationMessage
       } satisfies ConstraintCheck;
     } finally {
       // Restore original schema context

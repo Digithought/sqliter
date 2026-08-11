@@ -908,6 +908,15 @@ export interface RowConstraintSchema {
 	/** Arbitrary metadata tags (informational only) */
 	tags?: Readonly<Record<string, SqlValue>>;
 	/**
+	 * Verbatim violation text for a SYNTHESIZED constraint whose expression the
+	 * user never wrote (e.g. the lens NOT NULL obligation's `<col> is not null`),
+	 * carried onto the built {@link import('../planner/nodes/constraint-check-node.js').ConstraintCheck}
+	 * so the failure reads as its real class (`NOT NULL constraint failed: t.col`)
+	 * instead of an anonymous CHECK. Unset for user-written constraints. Transient —
+	 * set only on a write-plan-time constraint, never persisted to the catalog.
+	 */
+	violationMessage?: string;
+	/**
 	 * Lens-synthesized **row-local CHECK only**: the lowercased basis-column names this
 	 * constraint depends on, supplied by the prover (`collectLensRowLocalConstraints`)
 	 * rather than re-derived from the AST. Superseded for the per-op decomposition gate by

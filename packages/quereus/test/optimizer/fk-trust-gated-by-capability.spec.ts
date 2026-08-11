@@ -273,6 +273,22 @@ describe('FK trust gated by permitsOrphanedForeignKeyRows', () => {
 			expect(seedTableForeignKeyInds(chi, findParent)).to.deep.equal([]);
 		});
 
+		it('one gated parent among several: only that FK is skipped, the rest still seed', async () => {
+			// Pins the per-FK `continue` in the seeder against the whole-function
+			// short-circuit — indistinguishable on a single-FK child.
+			await db.exec('create table pok (id integer primary key) using memory');
+			await db.exec('create table pbad (id integer primary key) using orphanmem');
+			await db.exec(`create table cmix (
+				id integer primary key,
+				ok_id integer not null references pok(id),
+				bad_id integer not null references pbad(id)
+			) using memory`);
+			const cmix = db.schemaManager.findTable('cmix', 'main')!;
+			const inds = seedTableForeignKeyInds(cmix, findParent);
+			expect(inds, 'the ungated FK still seeds').to.have.lengthOf(1);
+			expect(inds[0].target).to.deep.include({ kind: 'table', table: 'pok' });
+		});
+
 		it('logical (module-less) schemas are never gated — and never throw', async () => {
 			// Lens-slot logical tables carry no vtabModule (schema/table.ts). The
 			// gate must treat an absent module as ungated, exactly like the CHECK

@@ -24,6 +24,7 @@ import { MemoryTableModule } from '../src/vtab/memory/module.js';
 import type { Database as DatabaseType } from '../src/core/database.js';
 import type { Schema } from '../src/schema/schema.js';
 import type { MappingAdvertisement, LogicalColumnMapping } from '../src/vtab/mapping-advertisement.js';
+import type { ModuleCapabilities } from '../src/vtab/capabilities.js';
 
 async function rows(db: Database, sql: string): Promise<Array<Record<string, unknown>>> {
 	const out: Array<Record<string, unknown>> = [];
@@ -48,6 +49,24 @@ class AdvertisingModule extends MemoryTableModule {
 	ads: MappingAdvertisement[] = [];
 	override getMappingAdvertisements(_db: DatabaseType, _basis: Schema): readonly MappingAdvertisement[] {
 		return this.ads;
+	}
+}
+
+/**
+ * The grandfathered-basis duals: a module declaring
+ * `permitsGrandfatheredNotNullViolators` demotes `lens.nullability-mismatch` to
+ * an advisory, so a `not null` logical column over a nullable-derived expression
+ * DEPLOYS — and its NOT NULL obligation classifies `enforced-row-local`, the
+ * shape the NOT NULL write-enforcement suites below exercise.
+ */
+class GrandfatheredAdvertisingModule extends AdvertisingModule {
+	override getCapabilities(): ModuleCapabilities {
+		return { ...super.getCapabilities(), permitsGrandfatheredNotNullViolators: true };
+	}
+}
+class GrandfatheredMemoryModule extends MemoryTableModule {
+	override getCapabilities(): ModuleCapabilities {
+		return { ...super.getCapabilities(), permitsGrandfatheredNotNullViolators: true };
 	}
 }
 
@@ -410,6 +429,235 @@ describe('lens row-local CHECK on an unaddressable decomposition — loud refusa
 			await setupUnaddressable(db);
 			await expectThrows(() => db.exec("insert into x.W (id, name, tag) values (2, 'beta', 'bad')"), CONSTRAINT);
 			await db.exec("insert into x.W (id, name, tag) values (3, 'gamma', 'ok')");
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+// ---------------------------------------------------------------------------
+// NOT NULL as a row-local obligation (ticket lens-logical-not-null-never-
+// enforced-on-write): the second axis of the constraint-class × value-shape
+// matrix. Same seams as the CHECK cases above, same value shapes, but the rule
+// comes from the column's `not null` declaration — previously never collected,
+// so every write below persisted NULL into a `not null` column. Requires a
+// grandfathered basis (the nullable-derived shape), since over a strict basis
+// the declaration either proves (non-nullable derived) or blocks the deploy.
+// ---------------------------------------------------------------------------
+
+const NOT_NULL_VIOLATION = /NOT NULL constraint failed: W\.tag/;
+
+describe('lens logical NOT NULL on a write — decomposition over a grandfathered basis', () => {
+	/**
+	 * The Lamina shape: per-column optional member, so `tag` derives nullable
+	 * through the outer join and the logical `not null` demotes to an advisory at
+	 * deploy — while its write-time obligation classifies `enforced-row-local`.
+	 * Row 1 is fully populated; row 2 is grandfathered (anchor only, `tag` reads
+	 * NULL — seeded straight into the basis, past the lens).
+	 */
+	async function setupNotNull(db: Database): Promise<void> {
+		const mod = new GrandfatheredAdvertisingModule();
+		mod.ads = [split()];
+		db.registerModule('admod', mod);
+		await db.exec('create table W_core (id integer primary key, name text) using admod');
+		await db.exec('create table W_tag (id integer primary key, tag text) using admod');
+		await db.exec('declare logical schema x { table W { id integer primary key, name text, tag text not null } }');
+		await db.exec('apply schema x');
+		await db.exec("insert into main.W_core values (1, 'alpha')");
+		await db.exec("insert into main.W_tag values (1, 'seed')");
+		await db.exec("insert into main.W_core values (2, 'beta')");
+	}
+
+	const INSERT_NN: readonly WriteCase[] = [
+		{ label: 'A: explicit NULL', sql: "insert into x.W (id, name, tag) values (4, 'delta', null)", rejected: true },
+		{ label: 'B: column omitted', sql: "insert into x.W (id, name) values (5, 'epsilon')", rejected: true },
+		{ label: 'satisfying value', sql: "insert into x.W (id, name, tag) values (8, 'theta', 'ok')", rejected: false },
+	];
+
+	for (const c of INSERT_NN) {
+		it(`insert — ${c.label} ${c.rejected ? 'rejects as a NOT NULL violation' : 'succeeds'}`, async () => {
+			const db = new Database();
+			try {
+				await setupNotNull(db);
+				if (c.rejected) {
+					await expectThrows(() => db.exec(c.sql), NOT_NULL_VIOLATION);
+					// Atomic: no partial member rows behind the rejected logical row.
+					expect(await rows(db, 'select id from main.W_core where id > 2')).to.deep.equal([]);
+					expect(await rows(db, 'select id from main.W_tag where id > 1')).to.deep.equal([]);
+				} else {
+					await db.exec(c.sql);
+				}
+			} finally {
+				await db.close();
+			}
+		});
+	}
+
+	it('update — C: set to NULL rejects at commit as a NOT NULL violation', async () => {
+		const db = new Database();
+		try {
+			await setupNotNull(db);
+			// The all-null assignment lowers to a member DELETE; the deferred
+			// logical-row re-read (OLD-correlated) still sees the emptied image.
+			await expectThrows(() => db.exec('update x.W set tag = null where id = 1'), NOT_NULL_VIOLATION);
+			expect(await rows(db, 'select tag from main.W_tag where id = 1')).to.deep.equal([{ tag: 'seed' }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('update — filling the grandfathered cell in succeeds (and reads back)', async () => {
+		const db = new Database();
+		try {
+			await setupNotNull(db);
+			await db.exec("update x.W set tag = 'filled' where id = 2");
+			expect(await rows(db, 'select id, tag from x.W order by id')).to.deep.equal([
+				{ id: 1, tag: 'seed' },
+				{ id: 2, tag: 'filled' },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('update — a sibling column of a grandfathered row rejects (whole-row semantics, the write-side boundary of grandfathering)', async () => {
+		const db = new Database();
+		try {
+			await setupNotNull(db);
+			// Same posture the CHECK class pins above: the deferred re-read evaluates
+			// the whole post-write logical image, and row 2's `tag` is still NULL.
+			// Fill the column in (or combine the assignments) to update such a row.
+			await expectThrows(() => db.exec("update x.W set name = 'renamed' where id = 2"), NOT_NULL_VIOLATION);
+			expect(await rows(db, 'select name from main.W_core where id = 2')).to.deep.equal([{ name: 'beta' }]);
+			// The combined assignment repairs the row and passes.
+			await db.exec("update x.W set name = 'renamed', tag = 'filled' where id = 2");
+			expect(await rows(db, 'select id, name, tag from x.W where id = 2')).to.deep.equal([
+				{ id: 2, name: 'renamed', tag: 'filled' },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('update — a sibling column of a VALID row succeeds', async () => {
+		const db = new Database();
+		try {
+			await setupNotNull(db);
+			await db.exec("update x.W set name = 'renamed' where id = 1");
+			expect(await rows(db, 'select name, tag from x.W where id = 1')).to.deep.equal([{ name: 'renamed', tag: 'seed' }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('`insert or ignore` skips the NULL row and keeps the satisfying one (physical NOT NULL parity)', async () => {
+		const db = new Database();
+		try {
+			await setupNotNull(db);
+			await db.exec("insert or ignore into x.W (id, name, tag) values (4, 'delta', null), (8, 'theta', 'ok')");
+			expect(await rows(db, 'select id from main.W_core order by id')).to.deep.equal([{ id: 1 }, { id: 2 }, { id: 8 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('reads are untouched: the grandfathered row stays readable (NULL), deletable, and the deploy carries the advisory', async () => {
+		const db = new Database();
+		try {
+			await setupNotNull(db);
+			expect(await rows(db, 'select id, tag from x.W order by id')).to.deep.equal([
+				{ id: 1, tag: 'seed' },
+				{ id: 2, tag: null },
+			]);
+			const report = db.declaredSchemaManager.getDeployedLensReport('x');
+			expect(
+				report?.warnings.some(w => w.code === 'lens.nullability-mismatch' && w.site.column === 'tag'),
+				'nullability advisory demoted, not silenced',
+			).to.equal(true);
+			await db.exec('delete from x.W where id = 2');
+			expect(await rows(db, 'select id from x.W')).to.deep.equal([{ id: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+describe('lens logical NOT NULL on a write — single-source over a grandfathered basis', () => {
+	/** Name-match single-source: the routed basis-term seam (`NEW.tag is not null`). */
+	async function setupSingleNotNull(db: Database): Promise<void> {
+		db.registerModule('gfmem', new GrandfatheredMemoryModule());
+		await db.exec('create table W (id integer primary key, name text, tag text null) using gfmem');
+		await db.exec('declare logical schema x { table W { id integer primary key, name text, tag text not null } }');
+		await db.exec('apply schema x');
+		await db.exec("insert into main.W values (1, 'alpha', 'seed')");
+		await db.exec("insert into main.W (id, name, tag) values (2, 'beta', null)"); // grandfathered
+	}
+
+	const SINGLE_NN: readonly WriteCase[] = [
+		{ label: 'A: explicit NULL insert', sql: "insert into x.W (id, name, tag) values (4, 'delta', null)", rejected: true },
+		{ label: 'B: column omitted insert', sql: "insert into x.W (id, name) values (5, 'epsilon')", rejected: true },
+		{ label: 'C: update to NULL', sql: 'update x.W set tag = null where id = 1', rejected: true },
+		{ label: 'satisfying insert', sql: "insert into x.W (id, name, tag) values (8, 'theta', 'ok')", rejected: false },
+		{ label: 'fill-in of the grandfathered row', sql: "update x.W set tag = 'filled' where id = 2", rejected: false },
+	];
+
+	for (const c of SINGLE_NN) {
+		it(`${c.label} ${c.rejected ? 'rejects as a NOT NULL violation' : 'succeeds'}`, async () => {
+			const db = new Database();
+			try {
+				await setupSingleNotNull(db);
+				if (c.rejected) {
+					await expectThrows(() => db.exec(c.sql), NOT_NULL_VIOLATION);
+				} else {
+					await db.exec(c.sql);
+				}
+			} finally {
+				await db.close();
+			}
+		});
+	}
+
+	it('a sibling-column update of the grandfathered row rejects (the single base op carries the whole row)', async () => {
+		const db = new Database();
+		try {
+			await setupSingleNotNull(db);
+			await expectThrows(() => db.exec("update x.W set name = 'renamed' where id = 2"), NOT_NULL_VIOLATION);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('the grandfathered row stays readable through the lens', async () => {
+		const db = new Database();
+		try {
+			await setupSingleNotNull(db);
+			expect(await rows(db, 'select id, tag from x.W order by id')).to.deep.equal([
+				{ id: 1, tag: 'seed' },
+				{ id: 2, tag: null },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a non-nullable derived column classifies `proved`: no advisory, and the BASIS rejects the NULL itself', async () => {
+		const db = new Database();
+		try {
+			// Same capability module, but the basis column IS `not null` — the derived
+			// output is non-nullable, so the lens attaches nothing and the basis
+			// write's own NOT NULL does the rejecting (named after the basis table).
+			db.registerModule('gfmem', new GrandfatheredMemoryModule());
+			await db.exec('create table P (id integer primary key, tag text) using gfmem');
+			await db.exec('declare logical schema x { table P { id integer primary key, tag text not null } }');
+			await db.exec('apply schema x');
+			const report = db.declaredSchemaManager.getDeployedLensReport('x');
+			expect(
+				report?.warnings.some(w => w.code === 'lens.nullability-mismatch'),
+				'no nullability advisory for a proved NOT NULL',
+			).to.equal(false);
+			await expectThrows(
+				() => db.exec("insert into x.P (id, tag) values (1, null)"),
+				/NOT NULL constraint failed: P\.tag/);
 		} finally {
 			await db.close();
 		}

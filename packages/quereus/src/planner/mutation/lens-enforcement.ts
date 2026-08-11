@@ -4,7 +4,7 @@ import type { RowConstraintSchema, ForeignKeyConstraintSchema, TableSchema, Refe
 import { RowOpFlag, writeRowRelationCorrelation } from '../../schema/table.js';
 import type { SchemaManager } from '../../schema/manager.js';
 import type { BasisRelationRef } from '../../vtab/mapping-advertisement.js';
-import { resolveSlotBasisSource, collectColumnRefNames, authoredForwardMap } from '../../schema/lens-prover.js';
+import { resolveSlotBasisSource, collectColumnRefNames, authoredForwardMap, type ConstraintObligation } from '../../schema/lens-prover.js';
 import {
 	logicalToBasisColumnMap,
 	resolveLogicalReferencedColumns,
@@ -380,18 +380,20 @@ export function collectLensRowLocalConstraints(ctx: PlanningContext, slot: LensS
 	const constraints: RowConstraintSchema[] = [];
 	for (const obligation of slot.obligations) {
 		if (obligation.kind !== 'enforced-row-local') continue;
-		if (obligation.constraint.kind !== 'check') continue;
-		const source = obligation.constraint.constraint;
+		// The CHECK verbatim, or the synthesized `<col> is not null` for a NOT NULL
+		// obligation; an unhandled kind refuses loudly (see rowLocalObligationSource).
+		const source = rowLocalObligationSource(slot, obligation);
 		const writeRow = rowLocalReferencedWriteRow(source.expr, map, forwards);
 		constraints.push({
-			name: source.name ? `lens:${source.name}` : 'lens:check',
+			name: source.name,
 			expr: rewriteToBasisTerms(ctx, source.expr, map, forwards, logicalTableName, owningRelation, relationQualify),
-			// A logical CHECK guards the row being written: insert and update only.
+			// A row-local check guards the row being written: insert and update only.
 			operations: RowOpFlag.INSERT | RowOpFlag.UPDATE,
 			// Prover-supplied write-row dependency set for the per-op decomposition gate
 			// (bare names for introspection; relation-qualified for the gate itself).
 			referencedWriteRowColumns: [...new Set(writeRow.flatMap(e => e.basisColumns))],
 			referencedWriteRowRelations: buildWriteRowRelations(owningRelation, writeRow),
+			violationMessage: source.violationMessage,
 			tags: { [LENS_BOUNDARY_ATTACHED_TAG]: true },
 		});
 	}
@@ -417,12 +419,56 @@ export function collectLensRowLocalConstraints(ctx: PlanningContext, slot: LensS
 // basis column, so a NULL write still produces the write row and the routed
 // check sees it (pinned by test/lens-row-local-null-write.spec.ts).
 
-/** One row-local logical CHECK in authored (logical-column) terms. */
+/** One row-local logical check in authored (logical-column) terms. */
 export interface LensRowLocalLogicalCheck {
-	/** The routed-constraint name (`lens:<name>` / `lens:check`) — error text stays stable. */
+	/** The routed-constraint name (`lens:<name>` / `lens:check` / `lens:notnull:<col>`) — error text stays stable. */
 	readonly name: string;
-	/** The authored CHECK expression over logical columns (shared, never mutated). */
+	/** The check expression over logical columns (authored, or synthesized for NOT NULL; shared, never mutated). */
 	readonly expr: AST.Expression;
+	/**
+	 * Verbatim violation text for a synthesized check (the NOT NULL obligation) —
+	 * the user never wrote the expression, so the failure must read as its real
+	 * class (`NOT NULL constraint failed: t.col`), not an anonymous CHECK.
+	 * Undefined for an authored CHECK, which keeps the derived message.
+	 */
+	readonly violationMessage?: string;
+}
+
+/**
+ * The authored-terms source of one `enforced-row-local` obligation: the CHECK
+ * verbatim, or the synthesized `<col> is not null` for a NOT NULL declaration
+ * (named + messaged as a NOT NULL violation on the logical column). Any other
+ * constraint kind under a row-local obligation refuses the write LOUDLY — a
+ * silent `continue` here is exactly how the NOT NULL class went un-enforced, so
+ * a future class the rewrite does not know how to attach must fail, not skip.
+ */
+function rowLocalObligationSource(
+	slot: LensSlot,
+	obligation: ConstraintObligation & { kind: 'enforced-row-local' },
+): LensRowLocalLogicalCheck {
+	const c = obligation.constraint;
+	switch (c.kind) {
+		case 'check': {
+			const source = c.constraint;
+			return { name: source.name ? `lens:${source.name}` : 'lens:check', expr: source.expr };
+		}
+		case 'notNull':
+			return {
+				name: `lens:notnull:${c.columnName}`,
+				expr: {
+					type: 'unary',
+					operator: 'IS NOT NULL',
+					expr: { type: 'column', name: c.columnName } as AST.ColumnExpr,
+				} as AST.UnaryExpr,
+				violationMessage: `NOT NULL constraint failed: ${slot.logicalTable.name}.${c.columnName}`,
+			};
+		default:
+			raiseMutationDiagnostic({
+				reason: 'lens-row-local-unenforceable',
+				table: slot.logicalTable.name,
+				message: `cannot write through logical table '${slot.logicalTable.name}': its row-local '${c.kind}' obligation has no write-time attachment (internal: a new obligation class reached the rewrite unhandled); refusing rather than skipping enforcement`,
+			});
+	}
 }
 
 /**
@@ -435,9 +481,7 @@ export function collectLensRowLocalLogicalChecks(slot: LensSlot): LensRowLocalLo
 	const checks: LensRowLocalLogicalCheck[] = [];
 	for (const obligation of slot.obligations) {
 		if (obligation.kind !== 'enforced-row-local') continue;
-		if (obligation.constraint.kind !== 'check') continue;
-		const source = obligation.constraint.constraint;
-		checks.push({ name: source.name ? `lens:${source.name}` : 'lens:check', expr: source.expr });
+		checks.push(rowLocalObligationSource(slot, obligation));
 	}
 	return checks;
 }
@@ -701,6 +745,7 @@ export function synthesizeLensRowLocalDeferredConstraint(
 			table: relation.table,
 			column: relationKeyColumn.toLowerCase(),
 		}],
+		violationMessage: check.violationMessage,
 		tags: { [LENS_BOUNDARY_ATTACHED_TAG]: true },
 	};
 }

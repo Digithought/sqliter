@@ -72,7 +72,12 @@ const log = createLogger('schema:lens-prover');
 /**
  * Error-severity diagnostic codes — already hard errors that block the deploy
  * before ack/escalation governance runs, so they are *not* valid escalation
- * policy targets (see `docs/lens.md` § Coverage checklist).
+ * policy targets (see `docs/lens.md` § Coverage checklist). One code is
+ * dual-severity: `lens.nullability-mismatch` is a hard error by default but is
+ * demoted to a governable advisory when every basis module the body reads
+ * declares `permitsGrandfatheredNotNullViolators` (see
+ * {@link basisPermitsGrandfatheredNotNull}), so it also appears in
+ * {@link ADVISORY_CODE_LIST}.
  */
 export type LensErrorCode =
 	| 'lens.uncovered-column'
@@ -98,6 +103,10 @@ const ADVISORY_CODE_LIST = [
 	'lens.partial-override',
 	'lens.getput-lossy',
 	'lens.over-restrictive-basis-key',
+	// Dual-severity: a hard error by default, an advisory only over a basis
+	// module declaring `permitsGrandfatheredNotNullViolators` — listed here so
+	// the demoted form is ack/escalation-governable like any other advisory.
+	'lens.nullability-mismatch',
 ] as const;
 
 /** An advisory (warning-severity) code — see {@link ADVISORY_CODE_LIST}. */
@@ -245,7 +254,7 @@ export function proveLens(slot: LensSlot, db: Database): LensProveResult {
 	const warnings: LensDiagnostic[] = [];
 
 	checkColumnCoverage(ctx, errors);
-	checkTypeAndNullability(ctx, errors);
+	checkTypeAndNullability(ctx, errors, warnings);
 
 	// Run the round-trip enumeration ONCE, up front: it produces both the
 	// proven-bijection verdict per authored column (the same `{proved, injective}`
@@ -434,13 +443,46 @@ function familiesCompatible(a: AffinityFamily, b: AffinityFamily): boolean {
 }
 
 /**
+ * Whether EVERY basis table the compiled body's FROM reads belongs to a module
+ * declaring `permitsGrandfatheredNotNullViolators` (and at least one resolved).
+ * Such a declarant may legitimately hold rows lacking a value for a declared
+ * NOT NULL column — grandfathered by a structurally-total schema change, or
+ * replicated from a peer at an older schema epoch — so a nullable basis-derived
+ * expression under a `not null` logical column is the EXPECTED seam shape
+ * there, not a contradiction. Conservative on anything unclear: an opaque FROM
+ * node (subquery/function), an unqualified table name (a CTE shadow — see
+ * {@link resolveSingleBasisSource}), an unresolvable table, or any one
+ * non-declaring module keeps the strict error.
+ */
+function basisPermitsGrandfatheredNotNull(ctx: ProveContext): boolean {
+	let sawAny = false;
+	const walk = (node: AST.FromClause): boolean => {
+		if (node.type === 'join') return walk(node.left) && walk(node.right);
+		if (node.type !== 'table' || node.table.schema === undefined) return false;
+		const table = ctx.db.schemaManager.getSchema(node.table.schema)?.getTable(node.table.name);
+		if (table?.vtabModule?.getCapabilities?.().permitsGrandfatheredNotNullViolators !== true) return false;
+		sawAny = true;
+		return true;
+	};
+	const from = ctx.slot.compiledBody.from;
+	if (!from || from.length === 0) return false;
+	return from.every(walk) && sawAny;
+}
+
+/**
  * Each mapped column's basis-derived type & nullability satisfy the logical
  * declaration. A nullable basis expression under a `not null` logical column
- * errors unless the logical column supplies a total default. Read off the
- * optimized body's output relation; skipped when the body did not plan.
+ * errors unless the logical column supplies a total default — except over a
+ * basis whose module declares `permitsGrandfatheredNotNullViolators`
+ * ({@link basisPermitsGrandfatheredNotNull}), where the same diagnostic is
+ * demoted to a warning-severity advisory (governable, non-blocking): the
+ * declarant has told us grandfathered/older-epoch rows may lack the value, so
+ * a read may yield NULL there by design. Read off the optimized body's output
+ * relation; skipped when the body did not plan.
  */
-function checkTypeAndNullability(ctx: ProveContext, errors: LensDiagnostic[]): void {
+function checkTypeAndNullability(ctx: ProveContext, errors: LensDiagnostic[], warnings: LensDiagnostic[]): void {
 	if (!ctx.root) return;
+	const grandfatheredNotNull = basisPermitsGrandfatheredNotNull(ctx);
 	const outCols = ctx.root.getType().columns;
 	for (const col of ctx.table.columns) {
 		const oi = ctx.outputIndex.get(col.name.toLowerCase());
@@ -463,14 +505,25 @@ function checkTypeAndNullability(ctx: ProveContext, errors: LensDiagnostic[]): v
 		}
 
 		// Nullability: not-null logical column over a nullable basis expression with
-		// no total default is unsound (a NULL could be read into a not-null column).
+		// no total default is unsound (a NULL could be read into a not-null column) —
+		// unless the basis module declared it may grandfather NOT NULL violators,
+		// where the read-side NULL is the declared, expected shape: advisory only.
 		if (col.notNull && outType.nullable === true && col.defaultValue === null) {
-			errors.push({
-				code: 'lens.nullability-mismatch',
-				severity: 'error',
-				site: { table: ctx.table.name, column: col.name },
-				message: `lens: logical column '${ctx.table.name}.${col.name}' is declared NOT NULL but its basis-derived expression is nullable and no default supplies a value`,
-			});
+			if (grandfatheredNotNull) {
+				warnings.push({
+					code: 'lens.nullability-mismatch',
+					severity: 'warning',
+					site: { table: ctx.table.name, column: col.name },
+					message: `lens: logical column '${ctx.table.name}.${col.name}' is declared NOT NULL but its basis-derived expression is nullable (the basis module permits grandfathered NOT NULL violators — rows predating the declaration, or replicated from an older schema epoch, may read NULL here). Forward writes through the lens still enforce the declared NOT NULL; only already-stored rows read NULL.`,
+				});
+			} else {
+				errors.push({
+					code: 'lens.nullability-mismatch',
+					severity: 'error',
+					site: { table: ctx.table.name, column: col.name },
+					message: `lens: logical column '${ctx.table.name}.${col.name}' is declared NOT NULL but its basis-derived expression is nullable and no default supplies a value`,
+				});
+			}
 		}
 	}
 }
@@ -1400,6 +1453,8 @@ function classifyConstraint(
 			return classifyCheckConstraint(ctx, constraint, errors);
 		case 'foreignKey':
 			return { constraint, kind: 'enforced-fk' };
+		case 'notNull':
+			return classifyNotNullConstraint(ctx, constraint, errors);
 	}
 }
 
@@ -1410,6 +1465,7 @@ function constraintLabel(constraint: LogicalConstraint): string {
 		case 'check': return constraint.constraint.name ? `check '${constraint.constraint.name}'` : 'check';
 		case 'unique': return constraint.constraint.name ? `unique '${constraint.constraint.name}'` : 'unique';
 		case 'foreignKey': return constraint.constraint.name ? `foreign key '${constraint.constraint.name}'` : 'foreign key';
+		case 'notNull': return `not null on '${constraint.columnName}'`;
 	}
 }
 
@@ -1880,6 +1936,49 @@ function classifyCheckConstraint(
 			});
 			return { constraint, kind: 'enforced-row-local' };
 		}
+	}
+	return { constraint, kind: 'enforced-row-local' };
+}
+
+/**
+ * Classifies a logical column's NOT NULL declaration ({@link buildLogicalConstraints}
+ * collects one per undefaulted `not null` column). Three outcomes:
+ *
+ *  - `proved` — the body's derived output for the column is non-nullable, so no
+ *    read can yield NULL and a NULL write already fails the basis write's own
+ *    NOT NULL. Every native-basis lens lands here; those writes pay nothing new.
+ *  - `enforced-row-local` — the derived output is nullable (the grandfathered-
+ *    basis shape, or an unplanned body): the lens write boundary must reject a
+ *    NULL written to the column. Realized on the same seams as a row-local CHECK
+ *    (`planner/mutation/lens-enforcement.ts` synthesizes `<col> is not null`)
+ *    but reported as a NOT NULL violation naming the logical column. Forward
+ *    writes only — the seams see rows being written, never stored rows, so
+ *    read-side grandfathering (`permitsGrandfatheredNotNullViolators`) is
+ *    untouched.
+ *  - `lens.unrealizable-constraint` — computed lineage with no authored forward:
+ *    the write seam never sees the column's value, so the declaration cannot be
+ *    enforced — the same posture {@link classifyCheckConstraint} takes. (A
+ *    column absent from the body output is left to `checkColumnCoverage`.)
+ */
+function classifyNotNullConstraint(
+	ctx: ProveContext,
+	constraint: LogicalConstraint & { kind: 'notNull' },
+	errors: LensDiagnostic[],
+): ConstraintObligation {
+	const lc = constraint.columnName.toLowerCase();
+	const oi = ctx.outputIndex.get(lc);
+	if (oi === undefined) return { constraint, kind: 'enforced-row-local' }; // uncovered — checkColumnCoverage owns the diagnostic
+	const outType = ctx.root?.getType().columns[oi]?.type;
+	if (outType && outType.typeClass === 'scalar' && outType.nullable !== true) {
+		return { constraint, kind: 'proved' };
+	}
+	if (!isReconstructibleColumn(ctx, constraint.columnName) && !authoredForwardMap(ctx.slot).has(lc)) {
+		errors.push({
+			code: 'lens.unrealizable-constraint',
+			severity: 'error',
+			site: { table: ctx.table.name, constraint: constraintLabel(constraint), column: constraint.columnName },
+			message: `lens: not null on '${ctx.table.name}.${constraint.columnName}' cannot be enforced: the column has computed lineage (no write path), so the write boundary never sees its value; declare the column nullable, supply a default, or give the column an inverse`,
+		});
 	}
 	return { constraint, kind: 'enforced-row-local' };
 }

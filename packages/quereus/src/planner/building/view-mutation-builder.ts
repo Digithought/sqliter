@@ -872,10 +872,13 @@ function buildDecompositionRowLocalChecks(
 			validateDeterministicConstraint(expression, check.name, view.name);
 		}
 		// Same message shape `runtime/row-constraints.ts` derives, hinting the
-		// AUTHORED (logical-term) expression — the one the user wrote.
+		// AUTHORED (logical-term) expression — the one the user wrote. A synthesized
+		// check (the NOT NULL obligation) instead carries its own verbatim text, so
+		// the failure reads as its real class, not an anonymous CHECK.
 		const exprText = expressionToString(check.expr);
 		const hint = exprText.length <= 60 ? ` (${exprText})` : '';
-		return { name: check.name, expression, message: `CHECK constraint failed: ${check.name}${hint}` };
+		const message = check.violationMessage ?? `CHECK constraint failed: ${check.name}${hint}`;
+		return { name: check.name, expression, message };
 	});
 	attrs.forEach((attr, index) => { rowCheckRowDescriptor[attr.id] = index; });
 	return { rowChecks, rowCheckRowDescriptor, deferredConstraints };
