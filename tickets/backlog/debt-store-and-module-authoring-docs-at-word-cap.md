@@ -2,6 +2,7 @@ description: Two of the project's design documents have grown to the maximum len
 files:
   - docs/module-authoring.md     # 12001 words — 1 over the cap, fails today
   - docs/store.md                # 11985 words — 15 under the cap, fails on the next paragraph
+  - docs/optimizer.md            # 11977 words — 23 under the cap, same squeeze
   - scripts/check-docs.mjs       # the gate; `--update-ratchet --force` is the escape hatch
   - docs/doc-conventions.md      # where the cap and the ratchet are described
 difficulty: medium
@@ -45,3 +46,16 @@ not run into the gate. Either outcome is acceptable and the choice is the mainta
 - **Ratchet.** Record the current sizes with `--update-ratchet --force` and state in the
   commit message why these two documents are worth their length. This buys headroom without
   reorganizing anything, at the cost of raising the ceiling rather than lowering the content.
+
+## Content already waiting on this
+
+Found while reviewing the store's prefix-equality + trailing-range index seek (`plan=7`):
+
+- `docs/module-authoring.md` documents the runtime shape of the `plan=5` multi-seek
+  `FilterInfo` a module gets back after accepting an `IN` — how many constraints arrive, in
+  what order — but says nothing equivalent for the prefix-range plan, which delivers a
+  `prefixLen` parameter the runtime must honour rather than re-derive. A module author
+  accepting that shape has to read the engine rule to learn its contract. Writing it down
+  is a paragraph, and the document cannot take a paragraph today.
+- `docs/optimizer.md` is now **11977 words** (23 from the cap) — close enough that it
+  belongs in this ticket's scope even though it was not listed when the ticket was filed.

@@ -158,6 +158,24 @@ describe('StoreModule predicate pushdown', () => {
 		return rows[0].details as string;
 	}
 
+	/**
+	 * The `query_plan()` `properties` blobs for `query`, as a JSON array string. Carries
+	 * `filterInfo.usableIndex` — the `idxStr` the planner handed the module — so a test can
+	 * assert WHICH access arm fired, not merely that some seek did. Row assertions cannot:
+	 * every arm returns the same rows, so a silently-lost narrowing is invisible from the
+	 * outside.
+	 */
+	async function planProperties(query: string): Promise<string> {
+		const rows = await asyncIterableToArray(
+			db.eval(`select json_group_array(properties) as props from query_plan(?)`, [query]),
+		);
+		expect(rows).to.have.lengthOf(1);
+		// `properties` is itself JSON, so the group array comes back as a parsed structure
+		// rather than the text `detail` yields. Re-serialize so callers can regex it.
+		const props = rows[0].props;
+		return typeof props === 'string' ? props : JSON.stringify(props);
+	}
+
 	describe('explicit PRIMARY KEY (id)', () => {
 		beforeEach(async () => {
 			await db.exec(`
@@ -1037,6 +1055,26 @@ describe('StoreModule predicate pushdown', () => {
 					expect(ops).to.not.match(/SEQSCAN|SEQ SCAN|SeqScan/i);
 				});
 
+				// The arm itself, not just "a seek happened": falling back to the plain prefix
+				// seek (`plan=2`) answers every row assertion in this describe identically, so
+				// the idxStr is the only thing that tells the two apart.
+				it('hands the module a prefixRangeSeek idxStr, not a plain prefix seek', async () => {
+					expect(await planProperties(`select id from t where a = 5 and b >= 20 and b <= 30`))
+						.to.match(/idx=ix_ab\(0\);plan=7;prefixLen=1/);
+				});
+
+				// A DEGRADED arm must be visible too: the second lower bound is unclaimed, but
+				// the plan is still the prefix-range one.
+				it('redundant same-side bounds keep the prefixRangeSeek arm', async () => {
+					expect(await planProperties(`select id from t where a = 5 and b > 10 and b > 30`))
+						.to.match(/plan=7;prefixLen=1/);
+				});
+
+				it('a multi-value IN prefix does not emit a prefixRangeSeek', async () => {
+					expect(await planProperties(`select id from t where a in (5, 6) and b >= 30`))
+						.to.not.match(/plan=7/);
+				});
+
 				it('two-sided inclusive window', async () =>
 					expect(await ids(`select id from t where a = 5 and b >= 20 and b <= 30 order by id`))
 						.to.deep.equal([2, 3]));
@@ -1117,6 +1155,40 @@ describe('StoreModule predicate pushdown', () => {
 				await db.exec(`insert into t3 values (1,1,1,10), (2,1,1,20), (3,1,1,30), (4,1,2,20), (5,2,1,20)`);
 				expect(await ids(`select id from t3 where a = 1 and b = 1 and c >= 20 order by id`))
 					.to.deep.equal([2, 3]);
+				expect(await planProperties(`select id from t3 where a = 1 and b = 1 and c >= 20`))
+					.to.match(/plan=7;prefixLen=2/);
+			});
+
+			// A bound on a column PAST the one right after the prefix is not seekable: the
+			// window would have to skip over `b`, which the single-column bound cannot express.
+			// The prefix seek serves and `c` stays residual.
+			it('a bound on a LATER column than the prefix successor stays residual', async () => {
+				await db.exec(`create table t4 (id integer primary key, a integer, b integer, c integer) using store`);
+				await db.exec(`create index ix_a_bc on t4 (a, b, c)`);
+				await db.exec(`insert into t4 values (1,1,1,10), (2,1,1,30), (3,1,2,10), (4,2,1,30)`);
+				expect(await ids(`select id from t4 where a = 1 and c >= 30 order by id`)).to.deep.equal([2]);
+				expect(await planProperties(`select id from t4 where a = 1 and c >= 30`))
+					.to.not.match(/plan=7/);
+			});
+
+			// A trailing bound whose VALUE has no faithful byte position under the column's
+			// semantic type (a numeric probe against TIMESPAN) is dropped from the window.
+			// The prefix window — a strict superset — still serves and `matchesFilters`
+			// re-applies the bound under the type's own compare, so the rows must not move.
+			it('an unfaithful semantic trailing bound widens to the prefix window, rows unchanged', async () => {
+				const seed = async (name: string, using: string) => {
+					await db.exec(`create table ${name} (id integer primary key, a integer, d timespan) ${using}`);
+					await db.exec(`create index ix_${name} on ${name} (a, d)`);
+					await db.exec(`insert into ${name} values
+						(1, 1, 'PT5S'), (2, 1, 'PT30M'), (3, 1, 'PT2H'), (4, 2, 'PT1M')`);
+				};
+				await seed('tsstore', 'using store');
+				await seed('tsmem', '');
+				for (const where of [`a = 1 and d > 'PT10M'`, `a = 1 and d > 5`, `a = 1 and d <= 'PT2H'`]) {
+					const q = (t: string) => `select id from ${t} where ${where} order by id`;
+					expect(await asyncIterableToArray(db.eval(q('tsstore'))), where)
+						.to.deep.equal(await asyncIterableToArray(db.eval(q('tsmem'))));
+				}
 			});
 
 			it('results match the memory-module oracle', async () => {

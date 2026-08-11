@@ -10,7 +10,7 @@ files:
   - scripts/check-docs.mjs                                   # 1,325 lines
   - packages/quoomb-cli/src/commands/dot-commands.ts         # 1,189 lines
   - packages/quereus-store/src/common/store-table-base.ts    # 1,033 lines
-  - packages/quereus-store/src/common/store-table-scan.ts    # 1,023 lines
+  - packages/quereus-store/src/common/store-table-scan.ts    # 1,251 lines (`wc -l`, 2026-08-10; 1,023 when this ticket was filed) — the prefix-range seek window builders added ~230
   - packages/quereus/src/schema/rename/table-rename.ts       # 1,063 lines (`wc -l`, 2026-08-07) — the other half of the same split; crossed 1,000 when the qualifier-collision predicate landed
   - packages/quereus/src/schema/rename/column-rename.ts      # 1,370 lines (`wc -l`, 2026-08-06; 1,057 when this ticket was filed) — residue of the 1,759-line rename-rewriter.ts split (table/column/strip); the column walk alone is still over, and still growing
   - packages/quereus-store/src/common/store-table.ts         # update() alone is ~315 lines (~252-565)

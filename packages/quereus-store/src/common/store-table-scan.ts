@@ -521,6 +521,15 @@ export abstract class StoreTableScan extends StoreTableBase {
 		if (trailingCol === undefined) return null;
 		if (!this.indexRangeIsOrderSafe(index, position)) return null;
 
+		// NOTE: a `plan=7` with NO bound on the trailing column is as structurally impossible
+		// as a bad `prefixLen` — `rule-select-access-path` only emits the plan once it has
+		// found a lower or upper bound, and `seekColumns` is advertised in index-column
+		// order, so `index.columns[prefixLen]` IS the column the rule bounded. It stays SOFT
+		// anyway because the two impossibilities fail differently: a wrong `prefixLen` would
+		// address the wrong columns (an under-fetch, a wrong answer), while a missing bound
+		// only fails to narrow. If a plan source ever does hand this over, the symptom is a
+		// slow query, not a wrong one — make it loud only if that silence starts hiding a
+		// real disagreement.
 		const rangeConstraints = this.rangeConstraintsOn(filterInfo, trailingCol);
 		if (rangeConstraints.length === 0) return null;
 

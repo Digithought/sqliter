@@ -649,9 +649,10 @@ Which seek-family filters the rule *can* consume is further shaped by the seek e
 Seek keys are positional, so a standalone range bound is only ever seeked on the
 **leading** seek column; a range on a later seek column requires the prefix-range
 encoding, which needs every preceding seek column pinned by a single-valued equality. A
-multi-value `IN` is not a single-valued prefix key, so `a in (1, 2) and b > 15` over an
-index on `(a, b)` declines to a sequential scan with both predicates as residuals rather
-than seeking `b`'s bound against `a`.
+multi-value `IN` is not a single-valued prefix key: a module that advertised `a in (1, 2)
+and b > 15` over `(a, b)` as a prefix-range seek would get a sequential scan with both
+predicates as residuals, so the built-in modules decline that arm and keep the `IN`
+multi-seek with `b` residual.
 
 ### Debugging and Tracing
 
