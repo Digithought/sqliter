@@ -192,6 +192,15 @@ export class Statement {
 
 			// On first compilation, establish the parameter types
 			// Use explicit types if provided, otherwise infer from bound args
+			// NOTE: this freezes on the FIRST compile, and empty bound args yield an empty
+			// (but established) map — so compiling before any bind (getColumnDefs()/isQuery()
+			// on a freshly prepared statement) permanently leaves every parameter at the
+			// default TEXT type, while binding first types them from the values. The
+			// execution paths bind before compiling, so this only shows through pre-bind
+			// introspection. Deliberate: re-inferring per bind would recompile the plan on
+			// every execution and defeat validateParameterTypes' frozen-type check. Revisit
+			// (invalidate the plan on a type-changing bind) if pre-bind introspection ever
+			// needs to agree with the executed plan.
 			if (this.parameterTypes === undefined) {
 				// Infer types from current bound args
 				this.parameterTypes = getParameterTypes(this.boundArgs);

@@ -44,14 +44,18 @@ export function getParameterTypes(params: SqlParameters | undefined): Map<string
 }
 
 /**
- * Normalizes a parameter name to a number when it is the canonical decimal
- * form of a positive integer (or zero), matching how positional params are
- * keyed elsewhere (array index + 1, ParameterScope's `:N` handling). A
- * numeric-looking but non-canonical name ('01', '1abc') is left as a string
- * so it isn't silently reassigned to an unrelated positional slot.
+ * Normalizes a parameter name to a number when it is an all-digits index,
+ * matching how positional params are keyed elsewhere (array index + 1,
+ * ParameterScope's `:N` handling). Leading zeros are part of that convention —
+ * `:007` names positional slot 7 — so they normalize too. A name that merely
+ * starts with digits ('1abc') stays a string, so it can't be silently
+ * reassigned to an unrelated positional slot.
  */
 export function normalizeParamKey(name: string): string | number {
-	return /^(0|[1-9]\d*)$/.test(name) ? Number(name) : name;
+	if (!/^\d+$/.test(name)) return name;
+	const index = Number(name);
+	// Past 2^53 distinct names would collapse onto one key; keep those as names.
+	return Number.isSafeInteger(index) ? index : name;
 }
 
 /**

@@ -805,6 +805,12 @@ stmt.bindAll([1, "text", null]); // Positional
 stmt.bindAll({ ":id": 1, ":name": "John" }); // Named
 ```
 
+Parameter types are inferred from the values bound (or supplied to `db.prepare(sql, params)`)
+and are frozen at the statement's first compilation — later binds must stay type-compatible
+or they are rejected. Inspecting a freshly prepared statement before binding anything (e.g.
+`stmt.getColumnDefs()`) compiles it with no values to infer from, leaving its parameters at
+the default `TEXT` type; bind first if you need the announced types to reflect the values.
+
 #### `stmt.reset(): Promise<void>`
 
 Resets the statement to its initial state, ready to be re-executed with new parameters.

@@ -138,17 +138,27 @@ describe('Parameter Type System', () => {
 			expect(typeof [...hints!.keys()][0]).to.equal('number');
 		});
 
-		it('does not renumber a numeric-looking but non-canonical key', () => {
+		it('keys a leading-zero index by its number, matching the `:007` slot convention', () => {
+			expect([...getParameterTypes({ '01': 9 })!.keys()]).to.deep.equal([1]);
+			expect([...getParameterTypes({ '007': 9 })!.keys()]).to.deep.equal([7]);
+		});
+
+		it('does not renumber a name that merely starts with digits', () => {
 			expect([...getParameterTypes({ '1abc': 9 })!.keys()]).to.deep.equal(['1abc']);
-			expect([...getParameterTypes({ '01': 9 })!.keys()]).to.deep.equal(['01']);
 		});
 
 		it('normalizeParamKey matches the same rule directly', () => {
 			expect(normalizeParamKey('1')).to.equal(1);
 			expect(normalizeParamKey('0')).to.equal(0);
+			expect(normalizeParamKey('01')).to.equal(1);
+			expect(normalizeParamKey('007')).to.equal(7);
 			expect(normalizeParamKey('1abc')).to.equal('1abc');
-			expect(normalizeParamKey('01')).to.equal('01');
 			expect(normalizeParamKey('name')).to.equal('name');
+		});
+
+		it('leaves an index past 2^53 as a string so distinct names cannot collide', () => {
+			expect(normalizeParamKey('9007199254740993')).to.equal('9007199254740993');
+			expect(normalizeParamKey('9007199254740994')).to.equal('9007199254740994');
 		});
 	});
 
@@ -201,6 +211,45 @@ describe('Parameter Type System', () => {
 			stmt.bindAll({ p: 7n });
 			expect(stmt.getColumnDefs()[0].type.logicalType.name).to.equal('INTEGER');
 			await stmt.finalize();
+		});
+
+		it('announces INTEGER for a single-key bind() too, not just bindAll', async () => {
+			const stmt = db.prepare('select ? as v');
+			stmt.bind(1, 9);
+			expect(stmt.getColumnDefs()[0].type.logicalType.name).to.equal('INTEGER');
+			await stmt.finalize();
+		});
+
+		it('types each positional slot independently when several are bound', async () => {
+			const stmt = db.prepare('select ? as a, ? as b, ? as c');
+			stmt.bindAll([9, 'x', new Uint8Array([1])]);
+			expect(stmt.getColumnDefs().map(c => c.type.logicalType.name)).to.deep.equal(['INTEGER', 'TEXT', 'BLOB']);
+			await stmt.finalize();
+		});
+
+		it('announces INTEGER for a `:`-prefixed named key in the bound object', async () => {
+			const stmt = db.prepare('select :p as v');
+			stmt.bindAll({ ':p': 9 });
+			expect(stmt.getColumnDefs()[0].type.logicalType.name).to.equal('INTEGER');
+			await stmt.finalize();
+		});
+	});
+
+	describe('`:N` named-index parameters', () => {
+		it('resolves a leading-zero index to its positional slot', async () => {
+			expect(await db.get('select :01 as v', [9])).to.deep.equal({ v: 9 });
+			expect(await db.get('select :002 as v', [8, 9])).to.deep.equal({ v: 9 });
+		});
+
+		it('announces the bound value type for a leading-zero index', async () => {
+			const stmt = db.prepare('select :01 as v');
+			stmt.bindAll([9]);
+			expect(stmt.getColumnDefs()[0].type.logicalType.name).to.equal('INTEGER');
+			await stmt.finalize();
+		});
+
+		it('resolves a plain numeric index to its positional slot', async () => {
+			expect(await db.get('select :2 as v', [8, 9])).to.deep.equal({ v: 9 });
 		});
 	});
 

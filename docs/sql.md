@@ -188,7 +188,7 @@ While Quereus supports similar SQL syntax, it has evolved into a distinct system
 - Core DML (select, insert, update, delete) support
 - Transaction and savepoint support
 - Similar built-in function set
-- Parameter binding with `?`, `:name`, and `$name`
+- Parameter binding with `?`, `:name`, and `$name` (an all-digit name — `:1`, `:007` — names a 1-based positional slot, so it binds from the same array position a `?` would)
 
 ### 11.2 Key Differences
 
