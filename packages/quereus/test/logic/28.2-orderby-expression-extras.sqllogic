@@ -430,6 +430,26 @@ select count(*) as c from g order by 1;
 select count(*) as c from g order by g.a;
 → [{"c":3}]
 
+-- Two select-list columns claiming the same alias: the routing predicate only asks
+-- whether the name is mentioned and leaves resolution to the scope, which rejects it.
+-- Deliberate divergence: SQLite binds the first match (returns `3|q`), and Quereus's
+-- own non-aggregate and grouped paths accept the duplicate too; only the aggregate
+-- output scope treats it as ambiguous. Erroring on a genuinely ambiguous name is the
+-- behaviour we want here — this pins it so a change is a decision, not an accident.
+select count(*) as c, max(a) as c from g order by c;
+-- error: ambiguous column name: c
+
+-- An alias that is neither a select-list alias nor a source column still fails
+select count(*) as c from g order by cc;
+-- error: Column not found: cc
+
+-- DISTINCT and a compound select take the same alias route
+select distinct count(*) as c from g order by c;
+→ [{"c":3}]
+
+select count(*) as c from g union all select count(*) from g order by c;
+→ [{"c":3},{"c":3}]
+
 -- Non-regressions: the grouped forms, which never took the pre-aggregate path
 select a, count(*) as c from g group by a order by c;
 → [{"a":"q","c":1},{"a":"p","c":2}]

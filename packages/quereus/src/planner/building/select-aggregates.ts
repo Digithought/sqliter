@@ -113,7 +113,7 @@ export function buildAggregatePhase(
 	const preAggregateSort = Boolean(
 		hasAggregates && !hasGroupBy && stmt.orderBy && stmt.orderBy.length > 0 && !needsPostAggregateSort
 	);
-	currentInput = handlePreAggregateSort(currentInput, stmt, selectContext, hasAggregates, !!hasGroupBy, needsPostAggregateSort, selectList);
+	currentInput = handlePreAggregateSort(currentInput, stmt, selectContext, preAggregateSort, selectList);
 
 	// Build GROUP BY expressions, resolving 1-based positional references against the SELECT list.
 	const groupByExpressions = stmt.groupBy ?
@@ -192,37 +192,28 @@ export function buildAggregatePhase(
 }
 
 /**
- * Handles pre-aggregate sorting for special cases
+ * Sorts the per-input rows BELOW the AggregateNode when the caller decided this
+ * query takes the pre-aggregate sort (see the `preAggregateSort` computation in
+ * {@link buildAggregatePhase}); otherwise passes `input` through untouched.
  */
 function handlePreAggregateSort(
 	input: RelationalPlanNode,
 	stmt: AST.SelectStmt,
 	selectContext: PlanningContext,
-	hasAggregates: boolean,
-	hasGroupBy: boolean,
-	needsPostAggregateSort: boolean,
+	preAggregateSort: boolean,
 	selectList: readonly SelectListEntry[]
 ): RelationalPlanNode {
-	// Special handling for ORDER BY with aggregates but no GROUP BY.
-	// Skip when ORDER BY references an aggregate or a SELECT-list alias — those must
-	// run post-aggregation, not on the per-row input.
-	if (hasAggregates && !hasGroupBy && stmt.orderBy && stmt.orderBy.length > 0 && !needsPostAggregateSort) {
-		// Apply ORDER BY before aggregation. This sort sits BELOW the AggregateNode,
-		// so a positional reference resolves through the select list (no output
-		// attributes exist yet to bind to).
-		const sortKeys: SortKey[] = stmt.orderBy.map(orderByClause => {
-			const expression = buildOrdinalAwareExpression(selectContext, orderByClause.expr, selectList, 'ORDER BY');
-			return {
-				expression,
-				direction: orderByClause.direction,
-				nulls: orderByClause.nulls
-			};
-		});
+	if (!preAggregateSort) return input;
 
-		return new SortNode(selectContext.scope, input, sortKeys);
-	}
+	// This sort sits BELOW the AggregateNode, so a positional reference resolves
+	// through the select list (no output attributes exist yet to bind to).
+	const sortKeys: SortKey[] = stmt.orderBy!.map(orderByClause => ({
+		expression: buildOrdinalAwareExpression(selectContext, orderByClause.expr, selectList, 'ORDER BY'),
+		direction: orderByClause.direction,
+		nulls: orderByClause.nulls
+	}));
 
-	return input;
+	return new SortNode(selectContext.scope, input, sortKeys);
 }
 
 /**
@@ -1262,7 +1253,7 @@ function selectListAliases(selectList: readonly SelectListEntry[]): Set<string> 
  * result; a subquery-aware walk is not worth hand-rolling for it.
  *
  * `type: 'column'` is not unique to {@link AST.ColumnExpr}: a subquery's SELECT-list
- * {@link AST.ResultColumn} carries the same tag with an `expr`/`alias` shape and no
+ * {@link AST.ResultColumnExpr} carries the same tag with an `expr`/`alias` shape and no
  * `name`, and the reflective walk reaches those too. Match on the `name` string rather
  * than on the tag alone.
  */

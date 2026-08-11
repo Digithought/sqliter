@@ -226,6 +226,11 @@ export function buildSelectStmt(
 		// (`count(*) + 1 as c`, whose aggregate entry is aliased `count(*)`) is named.
 		// Also skipped when window functions are present (window output isn't
 		// available yet) or when pre-aggregate sort already handled ordering.
+		//
+		// The two scopes are mutually exclusive, so an ORDER BY that needs BOTH loses:
+		// `select count(*) + 1 as c from t order by max(a), c` takes this branch for
+		// `max(a)` and then cannot see `c`. Tracked as
+		// backlog/bug-order-by-alias-lost-when-order-by-adds-its-own-aggregate.
 		if (
 			aggregateResult.orderByNeedsPostAggregateSort &&
 			aggregateResult.hasOrderByOnlyAggregates &&
