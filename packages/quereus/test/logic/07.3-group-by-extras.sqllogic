@@ -283,6 +283,58 @@ select a, sum(B) as s from wg group by a having sum(b) > 3;
 select a, sum(w.b) as s from wg w group by a having sum(b) > 3;
 → [{"a":"x","s":4}]
 
+-- ---------------------------------------------------------------------------
+-- HAVING may name a GROUPING KEY by the SELECT-list alias of the column that
+-- selects it, just as it can name an aggregate by its alias (the control above).
+-- Both are ordinary output columns of the grouped query and both are registered
+-- in the aggregate output scope
+-- (bug-window-spec-cannot-name-group-key-by-select-alias).
+-- ---------------------------------------------------------------------------
+
+select a as k, count(*) as c from wg group by a having k = 'x';
+→ [{"k":"x","c":2}]
+
+-- A COMPUTED grouping key's alias resolves too — the select-list column is
+-- matched to its key by expression identity rather than by attribute.
+select upper(a) as k, count(*) as c from wg group by upper(a) having k = 'X';
+→ [{"k":"X","c":2}]
+
+-- The alias reaches inside a SUBQUERY in the predicate, where it correlates back to
+-- the grouping key. Two rows have a='x', one has a='y'.
+select a as k, count(*) as c from wg group by a having (select count(*) from wg t where t.a = k) > 1;
+→ [{"k":"x","c":2}]
+
+-- Beside an aggregate alias, both resolving through the same scope.
+select a as k, sum(b) as s from wg group by a having k = 'x' and s > 3;
+→ [{"k":"x","s":4}]
+
+-- DELIBERATE: the alias SHADOWS a same-named base-table column. `b` is a real
+-- column of `wg`, but in HAVING the alias wins and `b` is the grouping key `a`.
+-- Same rule an aggregate alias already had.
+select a as b, count(*) as c from wg group by a having b = 'x';
+→ [{"b":"x","c":2}]
+
+-- DELIBERATE, the other way: an alias is the LOWEST-precedence name in that
+-- scope and does not outrank a GROUPING KEY of the same name. `b` is both the
+-- alias of the `a` key and a grouping key here; HAVING `b = '1'` filters on the
+-- grouping key (one row survives), not on the alias (which would match nothing).
+select a as b, count(*) as c from wg group by a, b having b = '1';
+→ [{"b":"x","c":1}]
+
+-- Two aliases naming DIFFERENT grouping keys collide, and nothing in the scope
+-- can arbitrate, so a bare reference to the shared name is ambiguous.
+select a as k, b as k, count(*) as c from wg group by a, b having k = 'x';
+-- error: ambiguous column name: k
+
+-- The SELECT list itself is NOT widened by any of this: a select-list column
+-- still cannot name a sibling's alias, aggregate or grouping key alike. It is
+-- built against the pre-aggregate scope, before the aggregate output scope exists.
+select a, count(*) as c, c + 0 as d from wg group by a;
+-- error: Column not found: c
+
+select a as k, k as k2 from wg group by a;
+-- error: Column not found: k
+
 drop table wg;
 
 -- ---------------------------------------------------------------------------

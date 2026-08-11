@@ -128,7 +128,8 @@ export function buildAggregatePhase(
 		selectContext.scope,
 		currentInput,
 		groupByExpressions,
-		aggregates
+		aggregates,
+		projections
 	);
 
 	// Build the aggregates planning context entries so downstream builders
@@ -668,13 +669,44 @@ function findUngroupedColumnRef(
 }
 
 /**
- * Creates a scope that includes the aggregate output columns
+ * The names a grouped query's OUTPUT row can be referred to by, as a scope. This is
+ * what a HAVING predicate and (for a grouped, windowed query) a window specification
+ * resolve against, so everything registered here is a name those clauses may use:
+ *
+ * - each GROUP BY key under its own column name, plus its qualified name when the key
+ *   was written qualified (`group by i.id, c.id` registers `i.id` and `c.id`; the bare
+ *   `id` they share becomes ambiguous);
+ * - each aggregate under its SELECT-list alias;
+ * - each grouping key ALSO under the SELECT-list alias of the column that selects it —
+ *   `select a as k … group by a` makes `k` name the group key, in `over (order by k)`
+ *   and in `HAVING` alike. Bare, qualified and computed keys all qualify
+ *   (`select upper(a) as k … group by upper(a)`). This is SQLite-style permissiveness
+ *   rather than strict SQL, and it matches how an aggregate's alias already behaves.
+ *
+ * A registered name SHADOWS a same-named base-table column, because anything not
+ * registered here falls through to the pre-aggregate select scope (window specs) or to
+ * the source-column fallback in {@link buildHavingFilter} (HAVING). So under
+ * `select a as b … group by a`, a bare `b` in either clause is the group key, not the
+ * table's own `b` column. Deliberate, and the same rule aggregate aliases already had.
+ *
+ * NOTE: a select-list alias is the LOWEST-precedence name here — it is skipped when a
+ * grouping key's own name or an aggregate's alias already claims it. `select a as b,
+ * b, count(*) … group by a, b` therefore keeps resolving a bare `b` to the grouping
+ * key `b`, matching both SQLite and PostgreSQL (where an alias never outranks a real
+ * column outside ORDER BY). Marking such a collision ambiguous instead was considered
+ * and rejected: the grouped SELECT list is itself rebuilt against this scope by
+ * {@link buildFinalAggregateProjections}, so an ambiguity minted here would reject the
+ * bare `b` in the select list too — and a select-list column must never be affected by
+ * a sibling's alias. Revisit only if select-list rebuilding stops going through this
+ * scope.
  */
 function createAggregateOutputScope(
 	parentScope: Scope,
 	aggregateNode: RelationalPlanNode,
 	groupByExpressions: ScalarPlanNode[],
-	aggregates: { expression: ScalarPlanNode; alias: string }[]
+	aggregates: { expression: ScalarPlanNode; alias: string }[],
+	/** Non-aggregate SELECT-list columns (stars expanded), each carrying its alias. */
+	projections: readonly Projection[]
 ): RegisteredScope {
 	const aggregateOutputScope = new RegisteredScope(parentScope);
 	const aggregateAttributes = aggregateNode.getAttributes();
@@ -771,12 +803,78 @@ function createAggregateOutputScope(
 		}
 	});
 
+	// Register each grouping key under the SELECT-list alias of the column that selects
+	// it, so `select a as k … group by a` can say `k` in HAVING and in a window
+	// specification. Skipped for any alias a grouping key's own name or an aggregate
+	// alias already claims (see the NOTE above), and marked ambiguous when two aliases
+	// of DIFFERENT grouping keys share one name (`select a as k, b as k … group by a, b`),
+	// which nothing else in this scope can arbitrate.
+	const groupKeys = indexGroupKeys(groupByExpressions);
+	for (const [aliasKey, keyIndexes] of collectAliasedGroupKeys(projections, groupKeys)) {
+		if (bareNameOwners.has(aliasKey)) continue;
+		if (keyIndexes.size > 1) {
+			aggregateOutputScope.markAmbiguous(aliasKey);
+			continue;
+		}
+		const [index] = keyIndexes;
+		const attr = aggregateAttributes[index];
+		const keyExpr = groupByExpressions[index];
+		aggregateOutputScope.registerSymbol(aliasKey, (exp, s) =>
+			new ColumnReferenceNode(s, exp as AST.ColumnExpr, keyExpr.getType(), attr.id, index));
+	}
+
 	// Note: the aggregate node advertises exactly its GROUP BY + aggregate columns.
 	// Source columns for HAVING / correlated access are resolved through the runtime
 	// row-descriptor context and the source-column fallback in buildHavingFilter's
 	// hybrid scope — not through extra output attributes on the aggregate.
 
 	return aggregateOutputScope;
+}
+
+/**
+ * Every SELECT-list alias that names a grouping key, mapped to the GROUP BY position(s)
+ * it could mean. More than one position means two aliases of different keys collide on
+ * one name.
+ *
+ * A projection is matched to its key the same two ways {@link redirectToGroupKeys}
+ * matches a window expression: by base attribute id for a column reference (so
+ * `select wg.a as k … group by a` and the reverse both land), else by identity
+ * fingerprint of the whole expression (so `select upper(a) as k … group by upper(a)`
+ * lands). A projection matching no key is skipped — in a grouped query it is an
+ * ungrouped SELECT column, which `validateAggregateProjections` has already rejected.
+ *
+ * Aliases are keyed lowercased, matching every other name in the aggregate output scope.
+ * Note that an unaliased `select a` carries no alias and contributes nothing, while a
+ * star-expanded column carries the source column's name as its alias — which for a
+ * grouping key is the name that key already registers, so it costs nothing.
+ */
+function collectAliasedGroupKeys(
+	projections: readonly Projection[],
+	groupKeys: GroupKeyIndex,
+): Map<string, Set<number>> {
+	const aliasTargets = new Map<string, Set<number>>();
+	for (const projection of projections) {
+		if (!projection.alias) continue;
+		const index = groupKeyIndexOf(projection.node, groupKeys);
+		if (index === undefined) continue;
+		const aliasKey = projection.alias.toLowerCase();
+		let targets = aliasTargets.get(aliasKey);
+		if (!targets) {
+			targets = new Set<number>();
+			aliasTargets.set(aliasKey, targets);
+		}
+		targets.add(index);
+	}
+	return aliasTargets;
+}
+
+/** Which GROUP BY key this SELECT-list expression IS, if any. */
+function groupKeyIndexOf(node: ScalarPlanNode, groupKeys: GroupKeyIndex): number | undefined {
+	if (CapabilityDetectors.isColumnReference(node)) {
+		const byAttrId = groupKeys.byBaseAttrId.get((node as ColumnReferenceNode).attributeId);
+		if (byAttrId !== undefined) return byAttrId;
+	}
+	return groupKeys.byFingerprint.get(expressionToIdentityString(node.expression));
 }
 
 /**

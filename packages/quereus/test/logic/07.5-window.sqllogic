@@ -977,10 +977,74 @@ select a, row_number() over (order by wg.b) as rn from wg group by a;
 select a || '!' as k, row_number() over (order by b || '!') as rn from wg group by a || '!';
 -- error: Column 'b' must appear in the GROUP BY clause or be used in an aggregate function
 
--- Referencing a grouping key by its SELECT-list alias is NOT one of the spellings
--- that works (an *aggregate* alias does — see above). Different root cause,
--- tracked as bug-window-spec-cannot-name-group-key-by-select-alias.
-select a as k, row_number() over (order by k) as rn from wg group by a;
+-- A grouping key may ALSO be named by the SELECT-list alias of the column that
+-- selects it, exactly as an *aggregate* alias can (see above). The alias is
+-- registered in the aggregate output scope beside the key's own name, so it
+-- resolves straight to the aggregate's group output column — the redirect above
+-- never has to see it.
+select a as k, row_number() over (order by k) as rn from wg group by a order by rn;
+→ [{"k":"x","rn":1},{"k":"y","rn":2}]
+
+-- In PARTITION BY as well. Each group is its own partition, so every count is 1.
+select a as k, count(*) over (partition by k) as c from wg group by a order by k;
+→ [{"k":"x","c":1},{"k":"y","c":1}]
+
+-- The alias may be defined AFTER the window function that names it: the scope is
+-- built from the whole select list before any window specification is.
+select count(*) over (partition by k) as w, a as k from wg group by a order by k;
+→ [{"w":1,"k":"x"},{"w":1,"k":"y"}]
+
+-- The GROUP BY key written qualified, the select-list column bare.
+select a as k, row_number() over (order by k) as rn from wg group by wg.a order by rn;
+→ [{"k":"x","rn":1},{"k":"y","rn":2}]
+
+-- A COMPUTED grouping key's alias resolves the same way — the select-list column is
+-- matched to its key by expression identity rather than by attribute.
+select upper(a) as k, row_number() over (order by k) as rn from wg group by upper(a) order by rn;
+→ [{"k":"X","rn":1},{"k":"Y","rn":2}]
+
+select a || '!' as k, row_number() over (order by k) as rn from wg group by a || '!' order by rn;
+→ [{"k":"x!","rn":1},{"k":"y!","rn":2}]
+
+-- Beside an aggregate alias, both resolving through the same scope.
+select a as k, count(*) as c, row_number() over (order by k) as rn from wg group by a order by rn;
+→ [{"k":"x","c":2,"rn":1},{"k":"y","c":1,"rn":2}]
+
+-- Identifier case is immaterial, in either direction.
+select a as k, row_number() over (order by K) as rn from wg group by a order by rn;
+→ [{"k":"x","rn":1},{"k":"y","rn":2}]
+
+-- The alias reaches inside a SUBQUERY in the specification, where it correlates back
+-- to the grouping key like any other spelling of it. `wg` has 2 rows with a='x' and 1
+-- with a='y', so y sorts first.
+select a as k, row_number() over (order by (select count(*) from wg t where t.a = k)) as rn
+from wg group by a order by rn;
+→ [{"k":"y","rn":1},{"k":"x","rn":2}]
+
+-- DELIBERATE: the alias SHADOWS a same-named base-table column. `b` is a real
+-- column of `wg`, but inside the specification the alias wins and `b` is the
+-- grouping key `a`. This is the rule an aggregate alias already had; it is not an
+-- accident of registration order.
+select a as b, row_number() over (order by b) as rn from wg group by a order by rn;
+→ [{"b":"x","rn":1},{"b":"y","rn":2}]
+
+-- DELIBERATE, the other way: an alias is the LOWEST-precedence name in that scope,
+-- so it does not outrank a GROUPING KEY of the same name. Here `b` is both the
+-- alias of the `a` key and a grouping key in its own right; `partition by b`
+-- partitions on the grouping key `b` (three distinct values → three partitions of
+-- one row), not on the alias (which would give two partitions of 2 and 1).
+select a as b, count(*) over (partition by b) as c from wg group by a, b order by b;
+→ [{"b":"x","c":1},{"b":"x","c":1},{"b":"y","c":1}]
+
+-- Two aliases naming DIFFERENT grouping keys collide, and nothing in the scope can
+-- arbitrate, so a bare reference to the shared name is ambiguous.
+select a as k, b as k, row_number() over (order by k) as rn from wg group by a, b;
+-- error: ambiguous column name: k
+
+-- The SELECT list itself is NOT widened: a select-list column still cannot name a
+-- sibling column's alias. The list is built against the pre-aggregate scope, before
+-- the aggregate output scope exists.
+select a as k, k as k2 from wg group by a;
 -- error: Column not found: k
 
 -- A grouped, windowed query composes as a subquery source: its window column is
