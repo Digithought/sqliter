@@ -39,6 +39,7 @@ import type { LogicalType } from '../../types/logical-type.js';
 import { isCollationAware, normalizeCollationName } from '../../util/comparison.js';
 import { PhysicalType } from '../../types/logical-type.js';
 import { collectCollateNames, collectColumnNames, columnIndexFromExpr } from './predicate-shape.js';
+import { classifyBinaryOperator } from './binary-operator-class.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 
@@ -299,14 +300,24 @@ export function resolveSetOpColumnCollation(left: ScalarType, right: ScalarType)
 
 /**
  * Binary operators that compare their operands under a collation, and so must
- * validate the lattice in `generateType`. The parser currently produces only
- * unary `IS [NOT] NULL/TRUE/FALSE` forms — binary `IS`/`IS NOT` are listed so
- * validation comes for free if it ever grows them.
+ * validate the lattice in `generateType`. Read off the shared operator
+ * classification ({@link classifyBinaryOperator}) rather than a second literal
+ * list, so a newly added comparison spelling gets collation validation for free
+ * — a `==` whose collation conflict went unreported was exactly the failure mode
+ * a private list produces. The parser currently produces only unary
+ * `IS [NOT] NULL/TRUE/FALSE` forms; the `'is'` class is accepted so validation
+ * comes for free if it ever grows the binary forms.
+ *
+ * NOTE: `LIKE` is deliberately NOT included, even though it is a two-operand
+ * predicate over text. `buildLikeOpSpec` (runtime/emit/binary.ts) ignores
+ * collation entirely — matching is `simpleLike`'s own case folding — so raising
+ * an "ambiguous collation" error here would report a conflict about a collation
+ * the operator never applies. If LIKE ever becomes collation-aware, accept the
+ * `'like'` class here in the same breath.
  */
-const COMPARISON_OPERATORS = new Set(['=', '==', '!=', '<>', '<', '<=', '>', '>=', 'IS', 'IS NOT']);
-
 export function isComparisonOperator(op: string): boolean {
-	return COMPARISON_OPERATORS.has(op.toUpperCase());
+	const opClass = classifyBinaryOperator(op);
+	return opClass === 'comparison' || opClass === 'is';
 }
 
 /**

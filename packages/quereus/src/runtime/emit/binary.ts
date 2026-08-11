@@ -19,6 +19,7 @@ import type { EmissionContext } from "../emission-context.js";
 import { tryTemporalArithmetic, tryTemporalComparison } from "./temporal-arithmetic.js";
 import { runTemporalCase, temporalOpCaseForTypes, unsupportedTemporalOp } from "../../types/temporal-ops.js";
 import { effectiveComparisonCollation } from "../../planner/analysis/comparison-collation.js";
+import { classifyBinaryOperator } from "../../planner/analysis/binary-operator-class.js";
 import { emitScalarOp, type ScalarOpSpec } from "./scalar-op.js";
 
 /**
@@ -31,36 +32,28 @@ import { emitScalarOp, type ScalarOpSpec } from "./scalar-op.js";
  *
  * An unsupported operator throws here rather than returning `undefined` — that is an
  * unimplemented operator, not a node that declines to fuse.
+ *
+ * Which spelling routes where is NOT decided here: it comes from
+ * {@link classifyBinaryOperator}, the one classification `BinaryOpNode.generateType` also
+ * announces its result type from, so the announced type and the evaluated value cannot
+ * describe different operators.
  */
 export function buildBinaryOpSpec(plan: BinaryOpNode, ctx: EmissionContext): ScalarOpSpec | undefined {
-	// Normalize operator to uppercase for case-insensitive matching of keywords
-	const operator = plan.expression.operator.toUpperCase();
-
-	switch (operator) {
-		case '+':
-		case '-':
-		case '*':
-		case '/':
-		case '%':
+	switch (classifyBinaryOperator(plan.expression.operator)) {
+		case 'arithmetic':
 			return buildNumericOpSpec(plan);
-		case '=':
-		case '==':
-		case '!=':
-		case '<>':
-		case '<':
-		case '<=':
-		case '>':
-		case '>=':
+		case 'comparison':
 			return buildComparisonOpSpec(plan, ctx);
-		case '||':
+		case 'concat':
 			return buildConcatOpSpec(plan);
-		case 'AND':
-		case 'OR':
-		case 'XOR':
+		case 'logical':
 			return buildLogicalOpSpec(plan);
-		case 'LIKE':
+		case 'like':
 			return buildLikeOpSpec(plan);
-		// TODO: bitwise operators
+		// 'is' and 'in' are classified for the planner (they have an announced result type)
+		// but never reach a BinaryOpNode emit: the parser produces only the unary
+		// `IS [NOT] NULL/TRUE/FALSE` forms, and `IN` builds its own InNode. They fall to the
+		// throw below alongside genuinely unimplemented spellings.
 		default:
 			quereusError(`Unsupported binary operator: ${plan.expression.operator}`, StatusCode.UNSUPPORTED, undefined, plan.expression);
 	}

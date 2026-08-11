@@ -1342,14 +1342,50 @@ The following built-in functions use type inference:
 - **Aggregate functions**: `MIN()`, `MAX()`
 - **Arithmetic operators**: `+`, `-`, `*`, `/`, `%` with numeric type promotion (INTEGER + INTEGER → INTEGER, INTEGER + REAL → REAL, etc.)
 
-### Type Promotion Rules
+---
 
-Arithmetic operators follow these type promotion rules:
+## Binary operator result types
 
-- `INTEGER op INTEGER` → `INTEGER`
-- `INTEGER op REAL` → `REAL`
-- `REAL op INTEGER` → `REAL`
-- `REAL op REAL` → `REAL`
+**One classification, read by the planner and the evaluator.** Which operator spellings
+behave which way lives in a single table, `classifyBinaryOperator` in
+`src/planner/analysis/binary-operator-class.ts`. Both `BinaryOpNode.generateType` (which
+announces the result type) and `buildBinaryOpSpec` (`runtime/emit/binary.ts`, which builds
+the per-row body) dispatch on it, so an operator cannot be *evaluated* as one thing and
+*announced* as another. Matching is case-insensitive — internally synthesized ASTs do not
+always uppercase keyword operators (`util/mutation-statement.ts` builds `operator: 'and'`).
+
+| Class | Operators | Announced result type |
+|---|---|---|
+| comparison | `=` `==` `!=` `<>` `<` `<=` `>` `>=` | `BOOLEAN` |
+| is | `IS` `IS NOT` | `BOOLEAN`, never NULL |
+| in | `IN` | `BOOLEAN` |
+| logical | `AND` `OR` `XOR` | `BOOLEAN` |
+| like | `LIKE` | `BOOLEAN` |
+| concat | `\|\|` | `TEXT` |
+| arithmetic | `+` `-` `*` `/` `%` | see below |
+| *(unclassified)* | anything else | `ANY` — `buildBinaryOpSpec` raises `UNSUPPORTED`, so no value exists to describe |
+
+Only the comparison and `IS` classes resolve a collation across their operands
+(`isComparisonOperator`, [Comparison collation resolution](#comparison-collation-resolution)).
+`LIKE` is deliberately excluded: `buildLikeOpSpec` ignores collation entirely, so a conflict
+raised there would be about a collation the operator never applies.
+
+Arithmetic takes the first of three arms:
+
+1. **A temporal operation table case** — `date - date` → `TIMESPAN`, `timespan / timespan`
+   → `REAL`. See [Temporal arithmetic](#temporal-types) for the table.
+2. **Both operands numeric** — promotion: `INTEGER op INTEGER` → `INTEGER`, any `REAL`
+   operand → `REAL`.
+3. **Otherwise** → `ANY`. The declared types settle nothing, so
+   `buildCoercingArithmeticRun` decides per row: a TEXT operand holding a duration string
+   yields a TIMESPAN string, an ordinary string coerces to a number (`'123' + 0` → `123`,
+   `'abc' + 0` → `0`). No concrete type describes both. `ANY` is the same answer
+   `mergeSetOpAdvertisedType` gives an irreconcilable operand pair, for the same reason: it
+   imposes no R2 constraint, its `parse` is pass-through, and it is never identical to a
+   declared column type, so every consumer converts rather than trusting it. Ordering is
+   unaffected: neither `ANY` nor the concrete types this arm could otherwise name carries
+   [semantic ordering](#semantic-ordering), so `order by ('123' + 0)` ranks by storage
+   class and collation either way.
 
 ---
 
@@ -1529,6 +1565,7 @@ The parameter type system provides significant performance benefits:
 - `src/func/builtins/conversion.ts` - Type conversion functions
 
 **Type Inference**:
+- `src/planner/analysis/binary-operator-class.ts` - The binary-operator classification (`classifyBinaryOperator`), read by `BinaryOpNode.generateType`, `buildBinaryOpSpec` and `isComparisonOperator`
 - `src/common/type-inference.ts` - Type inference utilities (`findCommonType`, `promoteNumericTypes`)
 - `src/planner/build-function-call.ts` - Planning-time type inference for function calls
 

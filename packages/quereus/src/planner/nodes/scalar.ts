@@ -8,12 +8,13 @@ import { Cached } from "../../util/cached.js";
 import { formatExpression, formatScalarType } from "../../util/plan-formatter.js";
 import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
-import { NULL_TYPE, INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, BLOB_TYPE, BOOLEAN_TYPE } from "../../types/builtin-types.js";
+import { NULL_TYPE, INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, BLOB_TYPE, BOOLEAN_TYPE, ANY_TYPE } from "../../types/builtin-types.js";
 import { JSON_TYPE } from "../../types/json-type.js";
 import { typeRegistry } from "../../types/registry.js";
 import { temporalOpCaseForTypes } from "../../types/temporal-ops.js";
 import { castedScalarType } from "../../types/cast-semantics.js";
 import { collationConflictError, isComparisonOperator, mergePropagatedCollation, resolveComparisonCollation } from "../analysis/comparison-collation.js";
+import { classifyBinaryOperator } from "../analysis/binary-operator-class.js";
 
 export class UnaryOpNode extends PlanNode implements UnaryScalarNode {
 	readonly nodeType = PlanNodeType.UnaryOp;
@@ -176,33 +177,28 @@ export class BinaryOpNode extends PlanNode implements BinaryScalarNode {
 		const leftType = this.left.getType();
 		const rightType = this.right.getType();
 
-		let logicalType = leftType.logicalType;
+		let logicalType: ScalarType['logicalType'];
 		let nullable = leftType.nullable || rightType.nullable;
 
-		switch (this.expression.operator) {
-			case 'IS':
-			case 'IS NOT':
+		// Which operator behaves how comes from the ONE shared classification
+		// (analysis/binary-operator-class.ts) that `buildBinaryOpSpec` also dispatches on,
+		// so the type announced here always describes the body that will evaluate it. A
+		// hand-maintained list here is what let `==`, `XOR` and `LIKE` be announced as
+		// their left operand's type while the runtime returned a boolean.
+		switch (classifyBinaryOperator(this.expression.operator)) {
+			case 'is':
 				// IS/IS NOT are null-safe comparisons, never return NULL
 				logicalType = BOOLEAN_TYPE;
 				nullable = false;
 				break;
-			case 'OR':
-			case 'AND':
-			case '=':
-			case '!=':
-			case '<':
-			case '<=':
-			case '>':
-			case '>=':
-			case 'IN':
-				// Comparison and logical operators return boolean
+			case 'comparison':
+			case 'in':
+			case 'logical':
+			case 'like':
+				// Comparison, membership, logical and pattern-matching operators return boolean
 				logicalType = BOOLEAN_TYPE;
 				break;
-			case '+':
-			case '-':
-			case '*':
-			case '/':
-			case '%': {
+			case 'arithmetic': {
 				// Temporal arithmetic first: the one table both the planner and the
 				// evaluator read (types/temporal-ops.ts) says what each supported
 				// (operator, kind, kind) combination produces — `date - date` is a
@@ -226,14 +222,30 @@ export class BinaryOpNode extends PlanNode implements BinaryScalarNode {
 						logicalType = INTEGER_TYPE;
 					}
 				} else {
-					// Non-numeric operands - use left operand type (fallback)
-					logicalType = leftType.logicalType;
+					// Neither a temporal case nor two numeric operands, so the declared types
+					// settle nothing — and `buildCoercingArithmeticRun` decides per row: a TEXT
+					// operand holding a duration string yields a TIMESPAN string, an ordinary
+					// string yields the number it coerces to (`'123' + 0` → 123, `'abc' + 0` →
+					// 0). The left operand's type is simply not one of the answers.
+					//
+					// ANY is the honest announcement, and the same conclusion
+					// `mergeSetOpAdvertisedType` reaches for an irreconcilable operand pair:
+					// it imposes no R2 representation constraint, its `parse` is pass-through,
+					// and it is never identical to a declared column type, so a DML write
+					// sourced from such an expression converts rather than trusting it.
+					logicalType = ANY_TYPE;
 				}
 				break;
 			}
-			case '||':
+			case 'concat':
 				// String concatenation
 				logicalType = TEXT_TYPE;
+				break;
+			default:
+				// A spelling no consumer implements — `buildBinaryOpSpec` raises UNSUPPORTED
+				// for the same node, so no value is ever produced to describe. ANY rather
+				// than the left operand's type keeps the unknown honest.
+				logicalType = ANY_TYPE;
 				break;
 		};
 
