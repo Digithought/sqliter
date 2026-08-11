@@ -917,6 +917,18 @@ export interface RowConstraintSchema {
 	 */
 	violationMessage?: string;
 	/**
+	 * When true, this constraint's expression evaluates to NULL when SATISFIED and
+	 * to the violation-message TEXT when VIOLATED — inverting the pipeline's usual
+	 * truthy-passes test. `runtime/row-constraints.ts` then fails the row iff the
+	 * evaluated value is non-NULL and reports that value verbatim as the failure
+	 * message. Lets one planned expression decide SEVERAL rules while keeping exact
+	 * per-rule attribution (the lens decomposition writes' grouped deferred
+	 * logical-row re-read — see `synthesizeLensRowLocalDeferredConstraint`).
+	 * Transient — set only on a write-plan-time constraint, never persisted to the
+	 * catalog.
+	 */
+	messageValued?: boolean;
+	/**
 	 * Lens-synthesized **row-local CHECK only**: the lowercased basis-column names this
 	 * constraint depends on, supplied by the prover (`collectLensRowLocalConstraints`)
 	 * rather than re-derived from the AST. Superseded for the per-op decomposition gate by

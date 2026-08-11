@@ -671,18 +671,23 @@ function decompositionRelationKeyColumn(
 }
 
 /**
- * The row-local constraints for a decomposition UPDATE fan-out: each check
- * becomes a deferred `not exists (… from <logical view> _lr where _lr.<key> =
- * <CORR>.<memberKey> and not (<check>))` re-read of the written row's POST-write
- * logical image, synthesized once per distinct `(target relation, op shape)` of
- * the emitted base ops — `NEW`-correlated (INSERT|UPDATE-masked) for the
- * insert/update-shaped ops, `OLD`-correlated (DELETE-masked) for a member DELETE
- * (the all-null assignment lowering, the shape the old member-riding seam could
- * never evaluate on). The per-op gate then threads each variant onto exactly the
- * ops targeting its relation, so every row the statement physically touches gets
- * the check; a row NO op processes (an absent optional member assigned NULL —
- * already NULL, image unchanged) is not re-checked, which is exactly the
- * grandfathering read-side contract (the write introduced no new violation).
+ * The row-local constraints for a decomposition UPDATE fan-out: ONE grouped
+ * deferred re-read of the written row's POST-write logical image per distinct
+ * `(target relation, op shape)` of the emitted base ops, covering EVERY
+ * row-local rule of the table in a single planned probe (see
+ * `synthesizeLensRowLocalDeferredConstraint` for the message-valued CASE shape
+ * that keeps exact per-rule failure attribution) — `NEW`-correlated
+ * (INSERT|UPDATE-masked) for the insert/update-shaped ops, `OLD`-correlated
+ * (DELETE-masked) for a member DELETE (the all-null assignment lowering, the
+ * shape the old member-riding seam could never evaluate on). The per-op gate
+ * then threads each variant onto exactly the ops targeting its relation, so
+ * every row the statement physically touches gets the checks; a row NO op
+ * processes (an absent optional member assigned NULL — already NULL, image
+ * unchanged) is not re-checked, which is exactly the grandfathering read-side
+ * contract (the write introduced no new violation). Plan-construction cost is
+ * therefore proportional to the member relations the write touches and
+ * independent of how many rules the table declares — the collapse that fixed
+ * the measured per-rule cost (one planned probe per rule per relation).
  *
  * At commit the contained subquery evaluates against post-mutation state, so a
  * row two ops both touch (matched UPDATE + `do nothing` materialize INSERT)
@@ -702,16 +707,6 @@ function lensRowLocalDecompositionUpdateConstraints(
 	if (checks.length === 0) return [];
 	const { address } = requireLensLogicalRowAddress(ctx, view, slot, shape.storage, checks[0].name);
 
-	// NOTE: this seam is a MEASURED performance problem, tracked as lamina ticket
-	// `lens-decomposition-update-probe-cost`. Each written row costs one logical-view
-	// probe per check per touched member relation at commit. That was ~free while
-	// checks were only explicit logical CHECKs (usually none), but every undefaulted
-	// `not null` column now contributes one. Measured on a Lamina per-column
-	// decomposition, single-column UPDATE, 10-column table: 38.7 ms/update with the
-	// columns declared nullable vs 16694.6 ms/update with them declared `not null`.
-	// The fix is to collapse the per-(relation, correlation) probe set into ONE probe
-	// evaluating the conjunction, recovering per-check attribution only on failure —
-	// not to trim the per-op threading, which is what makes the seam total.
 	const constraints: RowConstraintSchema[] = [];
 	const seen = new Set<string>();
 	for (const op of baseOps) {
@@ -723,10 +718,8 @@ function lensRowLocalDecompositionUpdateConstraints(
 		seen.add(dedupeKey);
 		const keyColumn = decompositionRelationKeyColumn(view, shape.storage, relation, checks[0].name);
 		const mask = op.op === 'delete' ? RowOpFlag.DELETE : (RowOpFlag.INSERT | RowOpFlag.UPDATE);
-		for (const check of checks) {
-			constraints.push(synthesizeLensRowLocalDeferredConstraint(
-				ctx, slot, check, address, relation, keyColumn, corr, mask));
-		}
+		constraints.push(synthesizeLensRowLocalDeferredConstraint(
+			ctx, slot, checks, address, relation, keyColumn, corr, mask));
 	}
 	return constraints;
 }
@@ -809,11 +802,12 @@ function rejectRowLocalDeferredConflictResolution(
  *    default's), evaluated once per produced logical row at the envelope —
  *    row-time, before any member op, independent of which member ops the
  *    fan-out plans;
- *  - **subquery-bearing** ⇒ a deferred logical-row re-read constraint
- *    (`synthesizeLensRowLocalDeferredConstraint`) riding the ANCHOR member op
- *    (which an INSERT always plans, whatever the row's NULL shape), keeping the
- *    commit-time evaluation the constraint pipeline gives every
- *    relation-reading check.
+ *  - **subquery-bearing** ⇒ ONE grouped deferred logical-row re-read constraint
+ *    (`synthesizeLensRowLocalDeferredConstraint`) covering every such check,
+ *    riding the ANCHOR member op (which an INSERT always plans, whatever the
+ *    row's NULL shape), keeping the commit-time evaluation the constraint
+ *    pipeline gives every relation-reading check — one planned probe with
+ *    per-rule failure attribution via its message-valued CASE.
  *
  * A non-ABORT statement OR clause is rejected up front for the deferred shape:
  * `runtime/row-constraints.ts` forces a deferrable constraint to ROW time when
@@ -843,20 +837,26 @@ function buildDecompositionRowLocalChecks(
 
 	const supplied = new Set(suppliedColumns.map(c => c.name.toLowerCase()));
 	const envelope: Array<{ check: LensRowLocalLogicalCheck; substituted: AST.Expression }> = [];
-	const deferredConstraints: RowConstraintSchema[] = [];
+	const deferredChecks: LensRowLocalLogicalCheck[] = [];
 	for (const check of checks) {
 		const substituted = substituteUnsuppliedLogicalColumns(slot, check.expr, supplied);
 		if (astContainsSubquery(substituted)) {
 			// Deferred logical-row re-read riding the anchor op — NEW-correlated,
 			// INSERT-masked (the anchor insert always runs, whatever the row's NULLs).
 			rejectRowLocalDeferredConflictResolution(view, check.name, onConflict);
-			const { address, anchorRelation, anchorKeyColumn } =
-				requireLensLogicalRowAddress(ctx, view, slot, storage, check.name);
-			deferredConstraints.push(synthesizeLensRowLocalDeferredConstraint(
-				ctx, slot, check, address, anchorRelation, anchorKeyColumn, 'NEW', RowOpFlag.INSERT));
+			deferredChecks.push(check);
 			continue;
 		}
 		envelope.push({ check, substituted });
+	}
+	// All deferred checks share one grouped re-read (one planned probe, per-rule
+	// attribution via the message-valued CASE) — same collapse as the UPDATE path.
+	const deferredConstraints: RowConstraintSchema[] = [];
+	if (deferredChecks.length > 0) {
+		const { address, anchorRelation, anchorKeyColumn } =
+			requireLensLogicalRowAddress(ctx, view, slot, storage, deferredChecks[0].name);
+		deferredConstraints.push(synthesizeLensRowLocalDeferredConstraint(
+			ctx, slot, deferredChecks, address, anchorRelation, anchorKeyColumn, 'NEW', RowOpFlag.INSERT));
 	}
 	if (envelope.length === 0) return { rowChecks: [], rowCheckRowDescriptor, deferredConstraints };
 

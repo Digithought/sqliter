@@ -28,6 +28,13 @@ export interface ConstraintCheck {
    * derived message.
    */
   violationMessage?: string;
+  /**
+   * Mirrors {@link RowConstraintSchema.messageValued}: the expression evaluates
+   * to NULL when satisfied and to the violation-message text when violated, so
+   * the runtime inverts its pass test (failure iff non-NULL) and reports the
+   * evaluated value itself — on both the immediate and the deferred path.
+   */
+  messageValued?: boolean;
 }
 
 /**

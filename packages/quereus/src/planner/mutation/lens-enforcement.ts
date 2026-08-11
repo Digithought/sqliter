@@ -715,29 +715,64 @@ function buildLogicalRowAddressPredicate(
 }
 
 /**
- * Builds the deferred logical-row form of one row-local CHECK for a decomposition
- * write:
+ * The stable name of the grouped deferred logical-row constraint. Bookkeeping
+ * only — the deferred queue keys its rows by it and the "constraint rode no base
+ * op" trace log prints it. It never reaches a user-visible failure message: the
+ * constraint is message-valued, so its evaluated VALUE (the failing rule's own
+ * verbatim text) is what the runtime reports.
+ */
+export const LENS_ROW_LOCAL_DEFERRED_NAME = 'lens:rowlocal';
+
+/**
+ * The verbatim failure text of one row-local rule, fixed at plan time: the
+ * synthesized NOT NULL obligation carries its own class message
+ * (`NOT NULL constraint failed: <table>.<col>`); an authored CHECK derives the
+ * exact string the per-rule constraint form used to produce — the runtime's
+ * `constraintViolationMessage` with no expression hint, since the deferred
+ * re-read expression always stringifies far past the 60-character hint cutoff.
+ */
+function lensRowLocalRuleMessage(check: LensRowLocalLogicalCheck): string {
+	return check.violationMessage ?? `CHECK constraint failed: ${check.name}`;
+}
+
+/**
+ * Builds the ONE deferred logical-row constraint covering EVERY row-local rule
+ * of a decomposition write, for one `(relation, correlation)` of the fan-out:
  *
- *   not exists (select 1 from <logicalSchema>.<logicalTable> as _lr
- *               where <row address over <CORR>.<relationKeyColumn>>
- *                 and not (<check over _lr.*>))
+ *   (select case when not (<rule 1 over _lr.*>) then '<rule 1 message>'
+ *                …
+ *                when not (<rule n over _lr.*>) then '<rule n message>'
+ *                else null end
+ *      from <logicalSchema>.<logicalTable> as _lr
+ *     where <row address over <CORR>.<relationKeyColumn>>)
  *
  * The subquery FROM is the registered **logical view**, so at commit (the
  * contained subquery auto-defers the constraint) it re-reads the written row's
  * POST-write logical image — independent of which member relations the row's
- * write happened to touch. The row address ({@link LensLogicalRowAddress})
- * correlates from the base op the constraint rides: `NEW` for an
- * insert/update-shaped op, `OLD` for a member DELETE (the all-null assignment
- * lowering, where no NEW row exists). NULL semantics carry for free: a NULL
- * check result makes the inner `not (<check>)` NULL ⇒ the row is not selected ⇒
- * the constraint passes — exactly SQL's NULL-passes CHECK rule — while a
- * definite FALSE selects the row and ABORTs.
+ * write happened to touch — ONCE, and decides all the rules against the row it
+ * already has. The constraint is **message-valued**
+ * ({@link RowConstraintSchema.messageValued}): it evaluates to NULL when every
+ * rule holds (also when the address matches no row — the scalar subquery over
+ * an empty selection is NULL, preserving the old `not exists` pass on a row
+ * the statement did not touch) and to the FIRST violated rule's verbatim
+ * message otherwise, which the runtime reports as-is. One planned subquery per
+ * group however many rules the table declares — where the retired
+ * one-constraint-per-rule shape paid plan construction linearly in the rule
+ * count (the measured cost this collapse removes).
  *
- * `operations` masks the constraint to the op shape it rides (INSERT|UPDATE with
- * `NEW`, DELETE with `OLD`); `referencedWriteRowRelations` carries the single
- * `(relation, key column)` pair so the per-op gate (`constraintsForOp`) threads
- * it onto exactly the ops targeting that member. Named identically to the routed
- * basis-term form (`lens:<name>`), so error text is stable across the seams.
+ * Per-rule NULL semantics carry inside the CASE: a rule evaluating to NULL
+ * makes its `when not (<rule>)` branch NULL ⇒ the branch is not taken ⇒ that
+ * rule passes (SQL's NULL-passes-a-CHECK convention, exactly what the per-rule
+ * form gave), while a later definitely-false rule still selects its own branch
+ * and ABORTs.
+ *
+ * The row address ({@link LensLogicalRowAddress}) correlates from the base op
+ * the constraint rides: `NEW` for an insert/update-shaped op, `OLD` for a
+ * member DELETE (the all-null assignment lowering, where no NEW row exists).
+ * `operations` masks the constraint to the op shape it rides (INSERT|UPDATE
+ * with `NEW`, DELETE with `OLD`); `referencedWriteRowRelations` carries the
+ * single `(relation, key column)` pair so the per-op gate (`constraintsForOp`)
+ * threads it onto exactly the ops targeting that member.
  *
  * Because the re-read evaluates the WHOLE logical row image, a cross-member
  * CHECK (one the per-member gate could never thread) is enforced here too — the
@@ -747,42 +782,47 @@ function buildLogicalRowAddressPredicate(
 export function synthesizeLensRowLocalDeferredConstraint(
 	ctx: PlanningContext,
 	slot: LensSlot,
-	check: LensRowLocalLogicalCheck,
+	checks: readonly LensRowLocalLogicalCheck[],
 	address: LensLogicalRowAddress,
 	relation: BasisRelationRef,
 	relationKeyColumn: string,
 	correlation: 'NEW' | 'OLD',
 	operations: RowOpFlag,
 ): RowConstraintSchema {
-	const rewritten = transformScopedExpr(ctx, makeLogicalRowRewriteScope(slot), check.expr);
-	const locate = buildLogicalRowAddressPredicate(address, relationKeyColumn, correlation);
-	const violates: AST.UnaryExpr = { type: 'unary', operator: 'NOT', expr: rewritten };
-	const where: AST.BinaryExpr = { type: 'binary', operator: 'AND', left: locate, right: violates };
+	const scope = makeLogicalRowRewriteScope(slot);
+	const whenThenClauses: AST.CaseExprWhenThenClause[] = checks.map(check => ({
+		when: {
+			type: 'unary',
+			operator: 'NOT',
+			expr: transformScopedExpr(ctx, scope, check.expr),
+		} as AST.UnaryExpr,
+		then: { type: 'literal', value: lensRowLocalRuleMessage(check) } as AST.LiteralExpr,
+	}));
+	const verdict: AST.CaseExpr = {
+		type: 'case',
+		whenThenClauses,
+		elseExpr: { type: 'literal', value: null } as AST.LiteralExpr,
+	};
 	const subquery: AST.SelectStmt = {
 		type: 'select',
-		columns: [{ type: 'column', expr: { type: 'literal', value: 1 } as AST.LiteralExpr }],
+		columns: [{ type: 'column', expr: verdict }],
 		from: [{
 			type: 'table',
 			table: { type: 'identifier', name: slot.logicalTable.name, schema: slot.logicalTable.schemaName },
 			alias: LOGICAL_ROW_ALIAS,
 		} as AST.TableSource],
-		where,
-	};
-	const expr: AST.UnaryExpr = {
-		type: 'unary',
-		operator: 'NOT',
-		expr: { type: 'exists', subquery } as AST.ExistsExpr,
+		where: buildLogicalRowAddressPredicate(address, relationKeyColumn, correlation),
 	};
 	return {
-		name: check.name,
-		expr,
+		name: LENS_ROW_LOCAL_DEFERRED_NAME,
+		expr: { type: 'subquery', query: subquery } as AST.SubqueryExpr,
 		operations,
 		referencedWriteRowRelations: [{
 			schema: relation.schema,
 			table: relation.table,
 			column: relationKeyColumn.toLowerCase(),
 		}],
-		violationMessage: check.violationMessage,
+		messageValued: true,
 		tags: { [LENS_BOUNDARY_ATTACHED_TAG]: true },
 	};
 }

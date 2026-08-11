@@ -47,6 +47,9 @@ export interface ConstraintMetadataEntry {
 	/** Verbatim violation text carried from a synthesized {@link ConstraintCheck}
 	 *  (see {@link constraintViolationMessage}). */
 	violationMessage?: string;
+	/** Carried from {@link ConstraintCheck.messageValued}: the expression yields NULL when
+	 *  satisfied and the violation message when violated (see {@link constraintFailed}). */
+	messageValued?: boolean;
 }
 
 export interface NotNullDefaultRuntime {
@@ -88,11 +91,29 @@ export interface RowConstraintResult {
  * expression hint is engine-authored there, so quoting it back at the user
  * explains nothing (see the absent-parent branch of `buildChildSideFKChecks`).
  * Overrides keep the shared prefix themselves.
+ *
+ * A **message-valued** constraint (see {@link ConstraintMetadataEntry.messageValued})
+ * computed its own message as its evaluation result — `value` is that result,
+ * reported verbatim. The synthesizer bakes the per-rule text (each carrying the
+ * appropriate class prefix) into the expression, so nothing is derived here.
  */
-function constraintViolationMessage(metadata: ConstraintMetadataEntry): string {
+function constraintViolationMessage(metadata: ConstraintMetadataEntry, value?: SqlValue): string {
+	if (metadata.messageValued && value !== null && value !== undefined) return String(value);
 	if (metadata.violationMessage) return metadata.violationMessage;
 	const exprHint = metadata.constraintExpr.length <= 60 ? ` (${metadata.constraintExpr})` : '';
 	return `CHECK constraint failed: ${metadata.constraintName}${exprHint}`;
+}
+
+/**
+ * Whether an evaluated constraint value is a violation. An ordinary CHECK
+ * passes if truthy or NULL (shared isTruthy semantics); a message-valued
+ * constraint inverts the test — it evaluates to NULL when satisfied and to the
+ * (non-NULL) violation message when violated.
+ */
+function constraintFailed(metadata: ConstraintMetadataEntry, result: SqlValue): boolean {
+	return metadata.messageValued
+		? result !== null && result !== undefined
+		: result !== null && !isTruthy(result);
 }
 
 /**
@@ -155,6 +176,7 @@ export function buildConstraintMetadata(
 		kind: check.kind ?? 'check',
 		referencedColumnIndices: check.referencedColumnIndices,
 		violationMessage: check.violationMessage,
+		messageValued: check.messageValued,
 	}));
 }
 
@@ -333,17 +355,19 @@ async function checkCheckConstraints(
 			// attributed message as the immediate path below, instead of the queue's
 			// generic name-only fallback — matches the pattern derived-row-validator.ts
 			// already uses for maintained tables. The wrapper always throws before
-			// returning falsy, so the queue's own generic message never fires here.
+			// returning a failing value, so the queue's own generic message never fires
+			// here (a message-valued pass IS NULL, which the queue treats as a pass).
 			// Only ABORT reaches this branch (see mustEvaluateNow), so throwing is the
 			// whole of the deferred failure contract — no IGNORE/REPLACE leg needed.
-			const message = constraintViolationMessage(metadata);
+			// The message is computed at evaluation time: a message-valued constraint's
+			// message IS its evaluated value, unknowable before commit.
 			const deferredEvaluator = async (dctx: RuntimeContext): Promise<SqlValue> => {
 				const rawResult = evaluator(dctx);
 				const result = (rawResult instanceof Promise ? await rawResult : rawResult) as SqlValue;
-				if (result !== null && !isTruthy(result)) {
-					throw new ConstraintError(message);
+				if (constraintFailed(metadata, result)) {
+					throw new ConstraintError(constraintViolationMessage(metadata, result));
 				}
-				return result;
+				return result ?? null;
 			};
 			rctx.db._queueDeferredConstraintRow(
 				metadata.baseTable,
@@ -362,9 +386,8 @@ async function checkCheckConstraints(
 		const rawResult = evaluator(rctx);
 		const result = (rawResult instanceof Promise ? await rawResult : rawResult) as SqlValue;
 
-		// CHECK passes if truthy or NULL; fails otherwise (shared isTruthy semantics).
-		if (result !== null && !isTruthy(result)) {
-			const baseMessage = constraintViolationMessage(metadata);
+		if (constraintFailed(metadata, result)) {
+			const baseMessage = constraintViolationMessage(metadata, result);
 
 			if (effectiveAction === ConflictResolution.IGNORE) {
 				return { skip: true };
