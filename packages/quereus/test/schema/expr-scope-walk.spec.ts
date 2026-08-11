@@ -10,9 +10,10 @@
  * once instead of twice, and a classification bug in one analysis cannot mask a
  * traversal bug in the shared walk.
  *
- * Records are `{ shape, name, qualifier, depth, sawOpaque }` — `depth` counts
- * the whole stack including the seed at index 0, and `sawOpaque` asks only
- * about frames ABOVE the seed (the classifiers' own convention).
+ * Records are `{ shape, name, qualifier, depth, sawOpaque, sawSealed }` —
+ * `depth` counts the whole stack including the seed at index 0, and
+ * `sawOpaque` / `sawSealed` ask only about frames ABOVE the seed (the
+ * classifiers' own convention).
  */
 
 import { expect } from 'chai';
@@ -21,6 +22,7 @@ import type * as AST from '../../src/parser/ast.js';
 import { walkSchemaExpressionScope, type ScopeWalkHandlers } from '../../src/schema/expr-scope/walk.js';
 import type { ScopeFrame } from '../../src/schema/expr-scope/frame.js';
 import { stripSelfQualifierInSchemaExpression } from '../../src/schema/rename-rewriter.js';
+import { collectGeneratedColumnRefs } from '../../src/schema/generated-column-refs.js';
 import { expressionToString } from '../../src/emit/ast-stringify.js';
 
 interface Record_ {
@@ -31,6 +33,8 @@ interface Record_ {
 	depth: number;
 	/** Any frame ABOVE the seed marked opaque. */
 	sawOpaque: boolean;
+	/** Any frame ABOVE the seed sealed — write-through metadata, unreachable from the seed. */
+	sawSealed: boolean;
 	/** `<schema>.<name>` of every askable real source above the seed, outermost-first. */
 	realSources: string[];
 	/** Lowercase qualifiers bound above the seed, outermost-first per frame. */
@@ -42,6 +46,7 @@ function record(stack: ReadonlyArray<ScopeFrame>): Omit<Record_, 'shape' | 'name
 	return {
 		depth: stack.length,
 		sawOpaque: above.some(f => f.hasOpaque),
+		sawSealed: above.some(f => f.sealed),
 		realSources: above.flatMap(f => f.realSources.map(s => `${s.schema}.${s.name}`)),
 		bound: above.map(f => [...f.bound]),
 	};
@@ -153,33 +158,101 @@ describe('walkSchemaExpressionScope', () => {
 		// frame, so no reference there can be attributed to the written row.
 		it('descends an INSERT source under a barrier', () => {
 			const recs = walkExpr('exists (insert into other select qty from src returning k)');
-			expect(recs.map(r => r.name)).to.deep.equal(['qty']);
-			expect(recs[0].sawOpaque).to.equal(true);
+			expect(recs.map(r => r.name)).to.deep.equal(['qty', 'k']);
+			expect(recs.every(r => r.sawOpaque)).to.equal(true);
 		});
 
 		it('descends UPDATE assignments and WHERE under a barrier', () => {
 			const recs = walkExpr('exists (update other set v = qty where qty > 0 returning v)');
-			expect(recs.map(r => r.name)).to.deep.equal(['qty', 'qty']);
+			expect(recs.map(r => r.name)).to.deep.equal(['qty', 'qty', 'v']);
 			expect(recs.every(r => r.sawOpaque)).to.equal(true);
 		});
 
 		it('descends a DELETE WHERE under a barrier', () => {
 			const recs = walkExpr('exists (delete from other where qty > 0 returning v)');
-			expect(recs.map(r => r.name)).to.deep.equal(['qty']);
-			expect(recs[0].sawOpaque).to.equal(true);
+			expect(recs.map(r => r.name)).to.deep.equal(['qty', 'v']);
+			expect(recs.every(r => r.sawOpaque)).to.equal(true);
 		});
 
 		it('descends a DML-attached WITH clause under an extra barrier', () => {
 			const recs = walkExpr('exists (with c as (select z from src) insert into other select 1 from c returning k)');
-			expect(recs.map(r => r.name)).to.deep.equal(['z']);
-			expect(recs[0].sawOpaque).to.equal(true);
+			expect(recs.map(r => r.name)).to.deep.equal(['z', 'k']);
+			expect(recs.every(r => r.sawOpaque)).to.equal(true);
 		});
 
-		it('does NOT descend a RETURNING list (owned by debt-schema-scope-walk-uncovered-subtrees)', () => {
-			// Pinned as the CURRENT contract, not as desirable behaviour: both
-			// hand-written walks this one merged had the same gap, and closing it is
-			// the follow-on ticket's job. That ticket flips this assertion.
-			expect(walkExpr('exists (insert into other values (1) returning k)')).to.deep.equal([]);
+		it('descends a RETURNING list under the barrier', () => {
+			// A reference the walk cannot see is a reference the generated-column
+			// analysis records no dependency edge for, so `returning` must be reached
+			// even though everything under the DML barrier is undecidable.
+			const recs = walkExpr('exists (insert into other values (1) returning k)');
+			expect(recs.map(r => r.name)).to.deep.equal(['k']);
+			expect(recs[0]).to.deep.include({ shape: 'column', sawOpaque: true, sawSealed: false });
+		});
+
+		it('descends UPSERT assignments and WHERE under the barrier', () => {
+			const recs = walkExpr(
+				'exists (insert into other values (1) on conflict (k) do update set v = a where b > 0 returning k)');
+			expect(recs.map(r => r.name)).to.deep.equal(['a', 'b', 'k']);
+			expect(recs.every(r => r.sawOpaque)).to.equal(true);
+		});
+
+		it('descends WITH CONTEXT assignments under the barrier', () => {
+			const recs = walkExpr('exists (insert into other with context c = qty values (1) returning k)');
+			expect(recs.map(r => r.name)).to.deep.equal(['k', 'qty']);
+			expect(recs.every(r => r.sawOpaque)).to.equal(true);
+		});
+	});
+
+	// View write-through metadata: expressions evaluated against the WRITTEN view
+	// row, whose naming environment this walk does not model at all. A sealed frame
+	// is stronger than a barrier — not even `new.<col>` may reach the seed from
+	// inside one, since the classifiers check the `new.` / owning-table spellings
+	// AFTER the frame loop and an opaque frame binds nothing.
+	describe('sealed subtrees', () => {
+		it("seals a result column's WITH INVERSE clause, leaving the projection alone", () => {
+			const recs = walkExpr('exists (select a with inverse (b = new.a) from other)');
+			expect(recs.map(r => r.name)).to.deep.equal(['a', 'a']);
+			expect(recs[0]).to.deep.include({ qualifier: undefined, sawSealed: false, sawOpaque: false });
+			expect(recs[1]).to.deep.include({ qualifier: 'new', sawSealed: true, sawOpaque: true });
+		});
+
+		it("seals a select's trailing WITH DEFAULTS clause", () => {
+			const recs = walkExpr('exists (select a from other with defaults (c = d))');
+			expect(recs.map(r => r.name)).to.deep.equal(['a', 'd']);
+			expect(recs[0].sawSealed).to.equal(false);
+			expect(recs[1]).to.deep.include({ sawSealed: true, sawOpaque: true });
+		});
+
+		it('does not leak the seal to a sibling reference in the same column list', () => {
+			const recs = walkExpr('exists (select a with inverse (b = new.a) from other) and t.v > 0');
+			expect(recs.map(r => `${r.name}:${r.sawSealed}`)).to.deep.equal(['a:false', 'a:true', 'v:false']);
+			expect(recs[2].depth).to.equal(1);
+		});
+
+		it('stacks a seal on top of an enclosing barrier without disturbing it', () => {
+			// The `with inverse` clause sits inside a CTE body, which is already opaque.
+			const recs = walkExpr('exists (with c as (select z with inverse (b = new.z) from src) select 1 from c)');
+			expect(recs.map(r => r.name)).to.deep.equal(['z', 'z']);
+			expect(recs[0]).to.deep.include({ sawOpaque: true, sawSealed: false });
+			expect(recs[1]).to.deep.include({ sawOpaque: true, sawSealed: true });
+			// Frames stack, never replace: the CTE body's own askable source survives.
+			expect(recs[1].realSources).to.deep.equal(['main.src']);
+		});
+
+		it('classifies every reference under a seal as undecidable, including `new.`', () => {
+			// The whole point of the seal: `new.a` here names the WRITTEN VIEW row, so
+			// claiming `'own'` would invent a dependency on the table being defined.
+			const refs = collectGeneratedColumnRefs(
+				parseExpressionString('exists (select a with inverse (b = new.a) from other)'),
+				't', 'main', () => false);
+			expect(refs.map(r => `${r.name}:${r.binding}`)).to.deep.equal(['a:own', 'a:unknown']);
+		});
+
+		it('rewrites nothing inside a sealed subtree', () => {
+			const expr = parseExpressionString('exists (select a with inverse (b = t.a) from other)');
+			const before = expressionToString(expr);
+			expect(stripSelfQualifierInSchemaExpression(expr, 't', 'main', () => false)).to.equal(false);
+			expect(expressionToString(expr)).to.equal(before);
 		});
 	});
 
@@ -211,6 +284,69 @@ describe('walkSchemaExpressionScope', () => {
 			const recs = walkExpr('exists (select sum(v) over (partition by p order by o) from other)');
 			expect(recs.map(r => r.name)).to.deep.equal(['v', 'p', 'o']);
 			expect(recs.every(r => r.realSources.join() === 'main.other')).to.equal(true);
+		});
+
+		it('reaches a window frame bound expression in the enclosing frame', () => {
+			// A frame bound is an ordinary correlated expression — same frame as
+			// `partition by` / `order by`, no barrier and no seal.
+			const recs = walkExpr('exists (select sum(x) over (rows between y preceding and current row) from other)');
+			expect(recs.map(r => r.name)).to.deep.equal(['x', 'y']);
+			expect(recs.every(r => !r.sawOpaque && !r.sawSealed)).to.equal(true);
+			expect(recs[1].realSources).to.deep.equal(['main.other']);
+		});
+
+		it('reaches BOTH frame bounds, START before END', () => {
+			const recs = walkExpr('exists (select sum(x) over (rows between y preceding and z following) from other)');
+			expect(recs.map(r => r.name)).to.deep.equal(['x', 'y', 'z']);
+		});
+
+		it('records nothing for frame bounds that carry no expression', () => {
+			// `currentRow` / `unboundedPreceding` / `unboundedFollowing` have no `value`
+			// field at all, and a literal bound is a terminal.
+			expect(walkExpr('exists (select sum(x) over (rows between unbounded preceding and current row) from other)')
+				.map(r => r.name)).to.deep.equal(['x']);
+			expect(walkExpr('exists (select sum(x) over (rows between 1 preceding and 2 following) from other)')
+				.map(r => r.name)).to.deep.equal(['x']);
+		});
+
+		it('handles an END-less frame (`end` is explicitly null)', () => {
+			const recs = walkExpr('exists (select sum(x) over (rows y preceding) from other)');
+			expect(recs.map(r => r.name)).to.deep.equal(['x', 'y']);
+		});
+	});
+
+	// Each leg of a compound is a self-contained relation that builds its OWN FROM
+	// frame. Visiting a later leg inside the LEADING leg's frame would let that
+	// leg's sources capture a bare name that should fall through to the seed —
+	// `'foreign'` instead of `'own'`, which costs the generated-column analysis a
+	// dependency edge and can compute a column before what it reads.
+	describe('compound legs', () => {
+		it("does not carry the leading leg's FROM frame into the second leg", () => {
+			const recs = walkExpr('exists (select a from s1 union select b from s2)');
+			expect(recs.map(r => r.name)).to.deep.equal(['a', 'b']);
+			expect(recs[0].realSources).to.deep.equal(['main.s1']);
+			expect(recs[1].realSources).to.deep.equal(['main.s2']);
+			expect(recs[1].bound.flat()).to.not.include('s1');
+		});
+
+		it('still scopes a leading WITH clause over every leg', () => {
+			// A `with` clause binds to the whole compound, so `c` must read as an opaque
+			// CTE source in the SECOND leg too, not as an askable real table.
+			const recs = walkExpr('exists (with c as (select z from src) select a from s1 union select b from c)');
+			expect(recs.map(r => r.name)).to.deep.equal(['z', 'a', 'b']);
+			expect(recs[2].realSources).to.deep.equal([]);
+			expect(recs[2].sawOpaque).to.equal(true);
+		});
+
+		it('lets a bare name in the second leg fall through to the seed', () => {
+			// `s1` exposes `qty`, `s2` does not: with the leading leg's frame still on
+			// the stack the second leg's `qty` would classify `'foreign'`.
+			const refs = collectGeneratedColumnRefs(
+				parseExpressionString('exists (select 1 from s1 union select qty from s2)'),
+				't', 'main',
+				(_schema, name) => name === 's1',
+			);
+			expect(refs.map(r => `${r.name}:${r.binding}`)).to.deep.equal(['qty:own']);
 		});
 	});
 
@@ -301,6 +437,14 @@ describe('walkSchemaExpressionScope', () => {
 				expect(changed, sql).to.equal(false);
 				expect(expressionToString(expr), sql).to.equal(before);
 			}
+		});
+
+		it('rewrites a self-qualifier inside a window frame bound', () => {
+			// Intended, and consistent with how the strip already treats `partition by` /
+			// `order by`: a frame bound is an ordinary correlated expression.
+			const expr = parseExpressionString('sum(v) over (rows between t.y preceding and current row)');
+			expect(stripSelfQualifierInSchemaExpression(expr, 't', 'main', () => false)).to.equal(true);
+			expect(expressionToString(expr)).to.not.contain('t.y');
 		});
 
 		it('still strips a self-qualifier the walk can prove nothing rebinds', () => {

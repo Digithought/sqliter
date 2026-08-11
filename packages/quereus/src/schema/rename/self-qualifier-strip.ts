@@ -1,6 +1,6 @@
 import type * as AST from '../../parser/ast.js';
 import { eq, type ResolveColumnInSource } from './shared.js';
-import type { ScopeFrame } from '../expr-scope/frame.js';
+import { hasSealedFrame, type ScopeFrame } from '../expr-scope/frame.js';
 import { walkSchemaExpressionScope } from '../expr-scope/walk.js';
 
 // ──────────────────────────────────────────────────────────────────────
@@ -74,6 +74,9 @@ function stripColumnQualifier(
 	stack: ReadonlyArray<ScopeFrame>,
 	state: StripState,
 ): void {
+	// View write-through metadata (`with inverse (…)` / `with defaults (…)`) resolves
+	// against the written view row, not this expression's scope — never rewrite there.
+	if (hasSealedFrame(stack)) return;
 	if (!col.table) return;
 	const qualifier = col.table.toLowerCase();
 	// Innermost-first: a qualifier rebound by any inner FROM resolves there.

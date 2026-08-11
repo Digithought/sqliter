@@ -1,6 +1,6 @@
 import type * as AST from '../parser/ast.js';
 import { eq, type ResolveColumnInSource } from './rename/shared.js';
-import type { ScopeFrame } from './expr-scope/frame.js';
+import { hasSealedFrame, type ScopeFrame } from './expr-scope/frame.js';
 import { walkSchemaExpressionScope } from './expr-scope/walk.js';
 
 // ──────────────────────────────────────────────────────────────────────
@@ -106,12 +106,17 @@ export function collectGeneratedColumnRefs(
  * (`'foreign'`); an opaque frame reached before any such source could bind
  * anything (`'unknown'`); falling through every frame reaches the seed
  * (`'own'`). `stack[0]` IS that seed, which is why the loop stops at index 1.
+ *
+ * A sealed frame anywhere above the seed short-circuits to `'unknown'`: the
+ * subtree's names resolve in a naming environment this walk does not model
+ * (view write-through metadata), so nothing there may reach the seed.
  */
 function classifyUnqualified(
 	state: CollectState,
 	stack: ReadonlyArray<ScopeFrame>,
 	nameLower: string,
 ): RefBinding {
+	if (hasSealedFrame(stack)) return 'unknown';
 	for (let i = stack.length - 1; i >= 1; i--) {
 		const frame = stack[i];
 		for (const src of frame.realSources) {
@@ -132,12 +137,17 @@ function classifyUnqualified(
  * schema exactly, matching the self-qualifier strip's rule. Anything else is
  * `'unbound'` (nothing binds it) unless an opaque frame was crossed on the
  * way out, in which case the walk cannot tell and defers to `'unknown'`.
+ *
+ * A sealed frame short-circuits to `'unknown'` BEFORE any of that: `new.a`
+ * inside a `with inverse (…)` clause names the written view row, not the row of
+ * the table being defined, so the `'new'` arm below must never see it.
  */
 function classifyQualified(
 	state: CollectState,
 	stack: ReadonlyArray<ScopeFrame>,
 	col: AST.ColumnExpr,
 ): RefBinding {
+	if (hasSealedFrame(stack)) return 'unknown';
 	const qualifier = col.table!.toLowerCase();
 	let opaque = false;
 	for (let i = stack.length - 1; i >= 1; i--) {

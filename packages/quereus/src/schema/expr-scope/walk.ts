@@ -1,5 +1,5 @@
 import type * as AST from '../../parser/ast.js';
-import { buildScopeFrame, emptyScopeFrame, opaqueScopeFrame, withScopeFrame, type ScopeFrame } from './frame.js';
+import { buildScopeFrame, emptyScopeFrame, opaqueScopeFrame, sealedScopeFrame, withScopeFrame, type ScopeFrame } from './frame.js';
 
 // ──────────────────────────────────────────────────────────────────────
 // The one scope-aware walk over a schema-authored expression — a `CHECK`
@@ -19,19 +19,16 @@ import { buildScopeFrame, emptyScopeFrame, opaqueScopeFrame, withScopeFrame, typ
 // these same AST node kinds (consumed by `../manager.ts`), generic and with no
 // scope model. The two are deliberately NOT unified — this walk's frame stack
 // has no place in a generic visitor — but a change to the AST node shapes has
-// to be reflected in both. Grep either file's `NOTE:` to find the other.
+// to be reflected in both. Grep either file's `NOTE:` to find the other. The two
+// are not equal in reach: this walk descends window frame bound expressions
+// (`rows between <expr> preceding …`), `traverseAst` still does not (it carries
+// that gap as a `TODO` at its `windowDefinition` arm, left alone deliberately —
+// widening it would change what `../manager.ts` sees).
 //
 // Deliberately not descended, and why:
 //   - `InsertStmt.table` / `UpdateStmt.table` / `DeleteStmt.table` /
 //     `TableSource.table` / `FunctionSource.name` — object names, not column
 //     references. The frame model already accounts for what they bind.
-//   - `ResultColumnExpr.inverse` (a result column's `with inverse (…)` clause),
-//     `SelectStmt.defaults` (a select's trailing `with defaults (…)` clause),
-//     window frame bound expressions (`WindowDefinition.frame`), and the DML
-//     sub-parts `returning` / `upsertClauses` / `contextValues` — not reached
-//     yet. Owned by ticket `debt-schema-scope-walk-uncovered-subtrees`; both
-//     hand-written predecessors of this walk had the same gaps and this file
-//     preserved them exactly, so the merge stayed behaviour-neutral.
 // ──────────────────────────────────────────────────────────────────────
 
 /** What a scope walk does when it reaches a name-bearing leaf. */
@@ -94,6 +91,16 @@ export function walkSchemaExpressionScope(
 /** Visit a node whose scope cannot be analyzed (CTE / derived-table / DML bodies). */
 function visitBarrier(node: AST.AstNode | undefined, state: WalkState): void {
 	withScopeFrame(state.stack, opaqueScopeFrame(), () => visit(node, state));
+}
+
+/**
+ * Visit a node whose names resolve in a naming environment this walk does not
+ * model at all — view write-through metadata (`with inverse (…)` /
+ * `with defaults (…)`), evaluated against the written view row. Stronger than a
+ * barrier: not even `new.<col>` may reach the seed from in here.
+ */
+function visitSealed(node: AST.AstNode | undefined, state: WalkState): void {
+	withScopeFrame(state.stack, sealedScopeFrame(), () => visit(node, state));
 }
 
 function visit(node: AST.AstNode | undefined, state: WalkState): void {
@@ -211,22 +218,47 @@ function visitSelect(stmt: AST.SelectStmt, state: WalkState): void {
 		const frame = buildScopeFrame(stmt.from, state.options.defaultSchema, state.stack);
 		withScopeFrame(state.stack, frame, () => {
 			visitResultColumns(stmt.columns, state);
+			// Trailing `with defaults (col = expr, …)` — view write-through metadata,
+			// sealed like a result column's `with inverse (…)`. Position in this list is
+			// semantically irrelevant (the seal blocks everything); kept next to the
+			// result-column visit so the two write-through clauses read together.
+			(stmt.defaults ?? []).forEach(d => visitSealed(d.expr, state));
 			(stmt.from ?? []).forEach(f => visit(f, state));
 			visit(stmt.where, state);
 			(stmt.groupBy ?? []).forEach(g => visit(g, state));
 			visit(stmt.having, state);
+			// NOTE: on a compound these bind to the WHOLE compound, not the leading
+			// leg, so visiting them inside the leading leg's FROM frame can let that
+			// leg's sources capture a name that should fall through. Left as-is: it is
+			// conditional, not wrong for a non-compound select, and untangling it needs
+			// the AST to distinguish leg-level from compound-level clauses, which it
+			// does not (the parser folds a compound's trailing ORDER BY / LIMIT onto the
+			// leading leg — see `parseTrailingOrderLimit`).
 			(stmt.orderBy ?? []).forEach(o => visit(o.expr, state));
 			visit(stmt.limit, state);
 			visit(stmt.offset, state);
-			visit(stmt.union, state);
-			if (stmt.compound) visit(stmt.compound.select, state);
 		});
+		// Each compound leg is a self-contained relation that builds its OWN FROM
+		// frame, so the legs are visited outside the leading leg's frame — otherwise a
+		// bare name in the second leg could be captured by the first leg's sources and
+		// come back `'foreign'`, costing the generated-column analysis a dependency
+		// edge. Still inside `withFrame`: a leading `with` clause scopes over the whole
+		// compound, a `from` clause does not.
+		visit(stmt.union, state);
+		if (stmt.compound) visit(stmt.compound.select, state);
 	});
 }
 
+/**
+ * Result columns of a select or of a DML `returning` list. A column's
+ * `with inverse (col = expr, …)` clause is view write-through metadata — visited
+ * under a seal, since it resolves against the written view row.
+ */
 function visitResultColumns(columns: ReadonlyArray<AST.ResultColumn> | undefined, state: WalkState): void {
 	(columns ?? []).forEach(c => {
-		if (c.type === 'column') visit(c.expr, state);
+		if (c.type !== 'column') return;
+		visit(c.expr, state);
+		(c.inverse ?? []).forEach(inv => visitSealed(inv.expr, state));
 	});
 }
 
@@ -235,6 +267,14 @@ function visitResultColumns(columns: ReadonlyArray<AST.ResultColumn> | undefined
  * `insert … returning` etc.) bind names against their target table in ways this
  * walk does not model — everything below descends under one barrier, so refs
  * inside are undecidable rather than falsely attributed to the written row.
+ *
+ * The barrier makes every leaf here `'unknown'`, which is NOT inert for the
+ * generated-column pre-flight: `validateAddColumnGeneratedRefs` (`../table.ts`)
+ * treats an `'unknown'` binding of the column being added as a self-cycle, same
+ * as an `'own'` one. So `alter table t add column g generated always as (…)`
+ * whose body names `g` inside an inner DML's `returning` / upsert / context
+ * assignments is a cyclic-dependency error rather than silently accepted — the
+ * same answer the emitter's own re-analysis reaches once it sees the reference.
  */
 function visitDml(stmt: AST.InsertStmt | AST.UpdateStmt | AST.DeleteStmt, state: WalkState): void {
 	withScopeFrame(state.stack, opaqueScopeFrame(), () => {
@@ -248,6 +288,10 @@ function visitDml(stmt: AST.InsertStmt | AST.UpdateStmt | AST.DeleteStmt, state:
 		switch (stmt.type) {
 			case 'insert':
 				visit(stmt.source, state);
+				(stmt.upsertClauses ?? []).forEach(u => {
+					(u.assignments ?? []).forEach(a => visit(a.value, state));
+					visit(u.where, state);
+				});
 				break;
 			case 'update':
 				visit(stmt.targetSource, state);
@@ -259,10 +303,24 @@ function visitDml(stmt: AST.InsertStmt | AST.UpdateStmt | AST.DeleteStmt, state:
 				visit(stmt.where, state);
 				break;
 		}
+		visitResultColumns(stmt.returning, state);
+		(stmt.contextValues ?? []).forEach(cv => visit(cv.value, state));
 	});
 }
 
 function visitWindowDefinition(wd: AST.WindowDefinition, state: WalkState): void {
 	(wd.partitionBy ?? []).forEach(p => visit(p, state));
 	(wd.orderBy ?? []).forEach(o => visit(o.expr, state));
+	// A frame bound is an ordinary correlated expression, so it belongs in the same
+	// frame as `partition by` / `order by` — no barrier and no seal. `WindowFrame`
+	// and `WindowFrameBound` do not extend `AstNode` (a frame's `type` is
+	// `'rows' | 'range'`, not a node kind), so they cannot go through `visit`'s
+	// switch; only the bound kinds that CARRY an expression have a `value`.
+	visitWindowFrameBound(wd.frame?.start, state);
+	visitWindowFrameBound(wd.frame?.end ?? undefined, state);
+}
+
+function visitWindowFrameBound(bound: AST.WindowFrameBound | undefined, state: WalkState): void {
+	if (!bound) return;
+	if (bound.type === 'preceding' || bound.type === 'following') visit(bound.value, state);
 }

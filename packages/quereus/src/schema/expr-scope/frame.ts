@@ -24,12 +24,22 @@ export interface ScopeFrame {
 	 * treated as categorically unanalysable (CTE / derived-table bodies).
 	 */
 	hasOpaque: boolean;
+	/**
+	 * Marks a subtree whose names resolve in a naming environment this walk does not
+	 * model at all (view write-through metadata: a result column's `with inverse`
+	 * clause, a select's trailing `with defaults` clause, both evaluated against the
+	 * written view row where `new.<output column>` is the naming environment).
+	 * NOTHING below a sealed frame can reach the seed — not even the `new.` /
+	 * owning-table spellings that an opaque frame still lets through, since the
+	 * classifiers check those AFTER the frame loop. Implies {@link hasOpaque}.
+	 */
+	sealed: boolean;
 	/** Lowercase CTE names declared at this level (consulted by nested FROMs). */
 	cteNames: Set<string>;
 }
 
 export function emptyScopeFrame(): ScopeFrame {
-	return { bound: new Set(), realSources: [], hasOpaque: false, cteNames: new Set() };
+	return { bound: new Set(), realSources: [], hasOpaque: false, sealed: false, cteNames: new Set() };
 }
 
 /** A frame that binds nothing but blocks every unqualified-capture question. */
@@ -37,6 +47,26 @@ export function opaqueScopeFrame(): ScopeFrame {
 	const frame = emptyScopeFrame();
 	frame.hasOpaque = true;
 	return frame;
+}
+
+/** A frame nothing below can see past — see {@link ScopeFrame.sealed}. */
+export function sealedScopeFrame(): ScopeFrame {
+	const frame = opaqueScopeFrame();
+	frame.sealed = true;
+	return frame;
+}
+
+/**
+ * Whether any frame above the seed is sealed. A flat scan of `stack[1..]` rather
+ * than a position-relative check, which is correct precisely because a sealed
+ * frame blocks UNCONDITIONALLY: it is only ever on the stack while the walk is
+ * inside such a subtree.
+ */
+export function hasSealedFrame(stack: ReadonlyArray<ScopeFrame>): boolean {
+	for (let i = 1; i < stack.length; i++) {
+		if (stack[i].sealed) return true;
+	}
+	return false;
 }
 
 /** Whether any frame on the stack declares `name` (lowercase) as a CTE. */

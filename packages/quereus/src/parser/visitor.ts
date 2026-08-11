@@ -45,6 +45,10 @@ export interface AstVisitorCallbacks {
  * no place in a generic visitor. But a change to the AST node shapes has to be
  * reflected in both. Grep either file's `NOTE:` to find the other.
  *
+ * Their reach is not identical: the scope walk descends window frame bound
+ * expressions (`rows between <expr> preceding …`), this traversal still does not
+ * (see the `TODO` at the `windowDefinition` arm below).
+ *
  * @param node The starting AST node.
  * @param callbacks An object containing visitor functions for different node types.
  */

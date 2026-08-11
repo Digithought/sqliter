@@ -257,3 +257,36 @@ create table sop (
 
 drop table sop;
 drop table dop;
+
+-- ===================================
+-- 13. Each leg of a compound builds its OWN FROM scope: a bare name in the second
+--     leg is NOT captured by the first leg's sources. Here `cs_src` exposes a
+--     column named `b` and the second leg's source does not, so the second leg's
+--     bare `b` binds the row being computed — which means `g` depends on `b` and
+--     must be computed after it. `g` is declared FIRST, so declaration order alone
+--     would compute it while `b` is still null; only the recorded dependency edge
+--     gets the right value. (Before the compound legs were split out of the
+--     leading leg's frame, `b` read as `cs_src`'s column, no edge was recorded,
+--     `g` computed against `b`'s NULL placeholder, and the insert failed
+--     `NOT NULL constraint failed: cs.g` — verified by reverting the split.)
+-- ===================================
+
+create table cs_src (k integer primary key, b integer);
+insert into cs_src values (1, 999);
+
+create table cs_probe (k integer primary key);
+insert into cs_probe values (1);
+
+create table cs (
+	id integer primary key,
+	g integer generated always as ((select b from cs_src where 1 = 0 union all select b from cs_probe where k = 1)),
+	b integer generated always as (id * 10)
+);
+insert into cs (id) values (7);
+
+select id, g, b from cs;
+→ [{"id":7,"g":70,"b":70}]
+
+drop table cs;
+drop table cs_probe;
+drop table cs_src;
