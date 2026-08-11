@@ -6,7 +6,7 @@ How `@quereus/store` durably persists engine-level views and materialized views:
 reserved-prefix catalog keys, the schema-change subscription that writes them, the pre-flight
 veto that stops an unencodable definition from being created, and the phased rehydrate that
 imports them on reopen. Schema management itself is [schema.md](schema.md); the table-side
-catalog format is [store.md § Catalog persistence](store.md#catalog-persistence-bundled-index-ddl).
+catalog format is [Store catalog persistence](store-catalog-persistence.md).
 
 Views and materialized views are engine-level catalog objects that never pass
 through a vtab-module hook, so the store persists them by subscribing to their

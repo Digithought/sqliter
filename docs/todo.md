@@ -282,7 +282,7 @@ The logical type system enables significant runtime performance improvements by 
 - [ ] **Materialized Views**: Views with cached results
 - [ ] **Atomic store catalog rename**: fold the old-entry delete and every dependent
   rewrite into one `provider.beginAtomicBatch` commit, removing the crash residues
-  documented in [`store.md` § Catalog persistence](store.md#catalog-persistence-bundled-index-ddl).
+  documented in [`store.md` § Catalog persistence](store-catalog-persistence.md).
   Needs an atomic provider and a larger engine↔module change.
 
 **Runtime — parallel and validation follow-ups**
