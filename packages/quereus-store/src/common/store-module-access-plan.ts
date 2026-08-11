@@ -71,6 +71,33 @@ const MAX_MULTI_SEEK_KEYS = 1000;
 /** Cost of positioning one index seek, in the same unit as the per-row fetch cost. */
 const INDEX_SEEK_COST = 0.5;
 
+/**
+ * Cost of resolving ONE secondary-index entry to its row, in the same unit as the full
+ * scan's 1.0-per-row sequential read.
+ *
+ * A secondary-index path reads TWO stores per matched row — the index entry, then the row
+ * it names — where a sequential scan reads one row per row. `AccessPlanBuilder.eqMatch` /
+ * `.rangeScan` charge only the first (0.3 / 0.5 per row), so the `eq`, `prefixRange` and
+ * `range` seek arms add this term on top of the shape's own cost. The MULTI-SEEK arm does
+ * not; the measured reason is at that arm in {@link tryIndexAccessPlan}.
+ *
+ * Why 1.0: `StoreTableScan` resolves entries in `ROW_RESOLUTION_BATCH`-sized `getMany`
+ * batches (`store-table-scan.ts`: one store round trip per 256 entries, not per row), so a resolved row
+ * costs about what a sequentially-iterated row costs — the index path simply pays it ON TOP
+ * OF the entry read. Nothing here has been measured against real storage; it is a shape
+ * constant like {@link ARM_SELECTIVITY}, chosen for parity rather than from a benchmark.
+ *
+ * The constant is not freely tunable upward. Because {@link ARM_SELECTIVITY} is a fixed
+ * FRACTION of the table, every arm's cost is linear in `estimatedRows` and so is the full
+ * scan's — an arm either always prices above a sequential scan or never does, for a given
+ * constant. The switch-over points: the `range` arm (0.3 × N × (0.5 + R) > N) flips at
+ * R > 2.83, `prefixRange` at R > 6.17, `eq` at R > 9.7. So raising this past ~2.8 does not
+ * make range seeks "more expensive", it DISABLES them outright. Real per-column statistics
+ * (see the NOTE on {@link ARM_SELECTIVITY}) are what would make the comparison
+ * discriminate per query rather than per arm.
+ */
+const ROW_RESOLUTION_COST = 1.0;
+
 /** Which shape of window a secondary index can serve for a given predicate. */
 type IndexArm =
 	/** Contiguous leading-prefix equality — one prefix window (`plan=2`, or `plan=5` for an IN). */
@@ -89,6 +116,20 @@ type IndexArm =
  * bound) and wider than the pure-equality estimate, which stands for a prefix pinning
  * every column the predicate names.
  *
+ * NOTE: these are the store's biggest cost-model gap, and no per-row cost term closes it.
+ * They are shape constants, so `where col = ?` is modelled at 10% of the table whatever
+ * the predicate actually matches, and `request.estimatedRows` is the table's row count,
+ * not a selectivity-adjusted estimate. A predicate matching MOST of the table therefore
+ * still prices as an index seek returning 10% of it, and the full-scan comparison in
+ * {@link computeBestAccessPlan} cannot rescue it — the fix is real per-column statistics,
+ * not another constant here. Two things have to land for that: the store has to KEEP a
+ * value distribution (`StoreTableBase.getStatistics` reports the row count only — a
+ * distinct count or histogram would cost a scan, which is why `ANALYZE` collects the
+ * per-column half itself), and `BestAccessPlanRequest` has to CARRY it, which it does not
+ * today — the module sees `estimatedRows` and the filters, nothing else, so even an
+ * analyzed table plans identically. Until then every cost decision this file makes is
+ * per-ARM, never per-PREDICATE.
+ *
  * NOTE: the arms are exclusive per index, but two INDEXES compete on cost — and an index
  * on the equality prefix ALONE prices its `eq` arm cheaper (0.1) than the composite index
  * prices its `prefixRange` arm (0.15), so a schema carrying both `(a)` and `(a, b)` picks
@@ -103,6 +144,22 @@ const ARM_SELECTIVITY: Readonly<Record<IndexArm, number>> = {
 	prefixRange: 0.15,
 	range: 0.3,
 };
+
+/**
+ * One index's advertisement, plus what {@link computeBestAccessPlan} needs to rank it
+ * against the sequential scan it does not itself build.
+ */
+interface IndexPlanCandidate {
+	plan: BestAccessPlanResult;
+	/**
+	 * True for the `plan=5` multi-seek arm, which is EXEMPT from that comparison. Reasoning
+	 * in full at the comparison site; the short of it is that this module cannot tell a
+	 * user's `col in (…)` from the SYNTHETIC probes `rule-key-set-seek` sends it, which read
+	 * the arm's cost as a curve at 2 and 1000 keys and decline outright if either answer
+	 * stops naming an index.
+	 */
+	isMultiSeek: boolean;
+}
 
 /** One (column, operator-group) slot that the access-path rule fills from a single filter. */
 interface SeekRole {
@@ -246,25 +303,66 @@ export function computeBestAccessPlan(
 	// {@link tryIndexAccessPlan}. A cost-only plan (no seek) is kept as a fallback
 	// when no index yields a sound seek, preserving the prior "cheaper cost, filters
 	// unhandled, residual retained" behavior.
+	//
+	// The sequential scan this module would otherwise fall back to, built up-front so the
+	// seek arms can be PRICED AGAINST it below: `rule-select-access-path` takes whatever
+	// single plan this function returns and never compares it with an alternative, so a
+	// seek that costs more than reading the table start to finish is only rejected if the
+	// module rejects it here.
+	const fullScan = (why: string): BestAccessPlanResult => {
+		const plan = AccessPlanBuilder
+			.fullScan(estimatedRows)
+			.setHandledFilters(new Array(request.filters.length).fill(false))
+			.setExplanation(why)
+			.build();
+		return { ...plan, ...buildPkOrderingAdvertisement(tableInfo, request, pkOrderPreservingPrefix) };
+	};
+
 	const indexes = tableInfo.indexes || [];
-	let bestSeekPlan: BestAccessPlanResult | null = null;
+	let bestSeekPlan: IndexPlanCandidate | null = null;
 	let costOnlyFallback: BestAccessPlanResult | null = null;
 	for (const index of indexes) {
 		if (index.columns.length === 0) continue;
-		const plan = tryIndexAccessPlan(db, tableInfo, request, index, estimatedRows);
-		if (!plan) continue;
+		const candidate = tryIndexAccessPlan(db, tableInfo, request, index, estimatedRows);
+		if (!candidate) continue;
+		const { plan } = candidate;
 		// A fully-handled seek (indexName + seekColumns set) is a candidate: keep the
 		// cheapest one seen so far rather than the first, so declaration order of the
 		// indexes doesn't decide the plan. Strict '<' so ties keep the first candidate,
 		// matching MemoryTableModule.findBestAccessPlan's `indexPlan.cost < bestPlan.cost`.
 		if (plan.seekColumnIndexes && plan.seekColumnIndexes.length > 0) {
-			if (!bestSeekPlan || plan.cost < bestSeekPlan.cost) bestSeekPlan = plan;
+			if (!bestSeekPlan || plan.cost < bestSeekPlan.plan.cost) bestSeekPlan = candidate;
 			continue;
 		}
 		// Otherwise remember the first cost-only advertisement as a fallback.
 		if (!costOnlyFallback) costOnlyFallback = plan;
 	}
-	if (bestSeekPlan) return bestSeekPlan;
+	if (bestSeekPlan) {
+		const scanCost = estimatedRows * 1.0; // AccessPlanBuilder.fullScan's sequential-read cost
+		//
+		// The MULTI-SEEK arm is exempt, and that is a measured decision rather than an
+		// oversight. `rule-key-set-seek` (engine side) does not consume this arm as a PLAN —
+		// it probes `getBestAccessPlan` with SYNTHESIZED runtime-set filters at 2 and 1000
+		// keys, reads the two costs as a straight line, and interpolates the key count at
+		// which the seek would overtake a scan. A probe answer that stops naming an index is
+		// read as "the module declined" and the whole rewrite is abandoned. Since nothing
+		// here distinguishes a probe from a user's own `col in (…)`, substituting this
+		// module's own scan verdict at 1000 keys silently switches key-set semi joins off:
+		// MEASURED, it fails 11 tests in `key-set-seek-store.spec.ts` on tables of 200 and
+		// 300 rows where the seek is unambiguously the right plan at the key counts actually
+		// used. The arm's brakes stay `inCount × INDEX_SEEK_COST` (which is what the engine
+		// interpolates) and {@link MAX_MULTI_SEEK_KEYS}; the engine makes the scan comparison
+		// this exemption skips, off the same numbers.
+		//
+		// Ties keep the seek: it returns fewer rows for the rest of the plan to carry.
+		if (bestSeekPlan.isMultiSeek || bestSeekPlan.plan.cost <= scanCost) return bestSeekPlan.plan;
+		// Losing the seek is SAFE, never a wrong answer: the scan claims no filters, so the
+		// engine keeps every one of them as a residual Filter and the row set is identical.
+		// Deliberately returns the scan rather than falling through to `costOnlyFallback`
+		// below — a cost-only plan performs this same sequential scan while advertising an
+		// index arm's (cheaper) cost, so falling through would undo the comparison.
+		return fullScan('Store full table scan (cheaper than the best index seek)');
+	}
 	// NOTE: a cost-only plan carries no PK-order advertisement even though the store still
 	// iterates in PK key order for it (`StoreTable.query` full-scans), so `... where v > 'x'
 	// order by <pk>` picks up a Sort it did not need. Still true, just rarer than it was: an
@@ -282,15 +380,10 @@ export function computeBestAccessPlan(
 
 	// Fallback to full scan. The store iterates rows in PK key order
 	// (see StoreTable.query / store.iterate over buildFullScanBounds), so
-	// the scan is monotonic on the leading PK column. Advertise that so
+	// the scan is monotonic on the leading PK column. `fullScan` advertises that so
 	// downstream rules (merge-join, asof-scan) can fire on store-backed
 	// tables, matching memory-mode behavior.
-	const plan = AccessPlanBuilder
-		.fullScan(estimatedRows)
-		.setHandledFilters(new Array(request.filters.length).fill(false))
-		.setExplanation('Store full table scan')
-		.build();
-	return { ...plan, ...buildPkOrderingAdvertisement(tableInfo, request, pkOrderPreservingPrefix) };
+	return fullScan('Store full table scan');
 }
 
 /**
@@ -322,6 +415,13 @@ export function computeBestAccessPlan(
  * `StoreTable.analyzeIndexAccess` gates its windows on the same two helpers, so the "mark
  * handled" and "build a window" decisions cannot disagree. A decline returns a cost-only
  * plan: cheaper cost, filters unhandled, residual retained; correct, just not sped up.
+ *
+ * **Cost.** Each single-window seek arm pays {@link ROW_RESOLUTION_COST} per row it expects
+ * to return, on top of the `AccessPlanBuilder` shape's own per-row term: the shape prices
+ * reading the index ENTRY, and the store must then read the ROW that entry names out of the
+ * data store. Two arms deliberately do NOT pay it — a cost-only decline (it resolves
+ * nothing; the scan reads rows directly) and the multi-seek, for the measured reason
+ * recorded at that arm below.
  */
 function tryIndexAccessPlan(
 	db: Database,
@@ -329,7 +429,7 @@ function tryIndexAccessPlan(
 	request: BestAccessPlanRequest,
 	index: TableIndexSchema,
 	estimatedRows: number,
-): BestAccessPlanResult | null {
+): IndexPlanCandidate | null {
 	// Exclude PARTIAL indexes from access planning: neither the engine nor this
 	// module checks that the query's WHERE implies the index predicate, so seeking
 	// a partial index for a query it doesn't cover would silently drop the rows the
@@ -420,11 +520,21 @@ function tryIndexAccessPlan(
 
 	const isRange = arm !== 'eq';
 	const rows = Math.max(1, Math.floor(estimatedRows * ARM_SELECTIVITY[arm]));
-	const costOnly = (why: string): BestAccessPlanResult =>
-		(isRange ? AccessPlanBuilder.rangeScan(rows, 0.2) : AccessPlanBuilder.eqMatch(rows, 0.3))
+	/** The arm's shape — `AccessPlanBuilder`'s per-row index-entry term, no resolution. */
+	const armShape = (armRows: number, indexCost: number): AccessPlanBuilder =>
+		isRange ? AccessPlanBuilder.rangeScan(armRows, indexCost) : AccessPlanBuilder.eqMatch(armRows, indexCost);
+	/** The arm's shape plus the per-fetched-row {@link ROW_RESOLUTION_COST}. */
+	const seekingArm = (armRows: number, indexCost: number): AccessPlanBuilder =>
+		armShape(armRows, indexCost).addCost(armRows * ROW_RESOLUTION_COST);
+	const costOnly = (why: string): IndexPlanCandidate => ({
+		plan: armShape(rows, isRange ? 0.2 : 0.3)
 			.setHandledFilters(new Array(request.filters.length).fill(false))
 			.setExplanation(`Store index scan on ${index.name} (${why})`)
-			.build();
+			.build(),
+		// Cost-only never reaches the comparison (it claims no seek columns), so the flag
+		// is immaterial; false states the fact — this plan seeks nothing at all.
+		isMultiSeek: false,
+	});
 
 	if (arm === 'range') {
 		if (!indexRangeAtPositionIsOrderSafe(db, tableInfo.columns, index, indexKeyCollations, 0)) {
@@ -473,25 +583,53 @@ function tryIndexAccessPlan(
 		// below a full scan and issuing 500 seeks to read 10 rows. `isSet` false mirrors
 		// MemoryTableModule.evaluateIndexAccess's setIsSet(!isMultiSeek). No ordering is
 		// advertised — window emission order is encoded-key order, not any column order.
+		//
+		// NOTE: this arm alone does NOT pay {@link ROW_RESOLUTION_COST}, though it resolves
+		// every entry it matches exactly like the single-window arms do. The reason is
+		// `multiRows`, not the physics: `inCount × rows` reaches `estimatedRows` at ten seek
+		// keys (`rows` is the fixed 0.1 × N equality shape constant) and at two or three on a
+		// handful-of-rows table, so beyond that the figure is a CLAMP — "the whole table" —
+		// rather than an estimate of what the keys match. Charging a per-row term against a
+		// clamp prices the estimator's artifact:
+		//   - MEASURED: it fails 16 tests in `key-set-seek-store.spec.ts`, every one a
+		//     runtime key-set semi join over a 3-to-4-row table that stops seeking.
+		//   - The engine's `rule-key-set-seek` interpolates a break-even from THIS cost at 2
+		//     and 1000 keys. With the term, `cost(1000 keys) = 500 + 1.3 × N` exceeds a scan's
+		//     `N` for every N, so the break-even can never reach the engine's 1000-key ceiling
+		//     — key sets above ~710 keys would stop seeking on a table of ANY size, including
+		//     the 10M-row tables where an index seek is the entire point.
+		// The price of leaving it off is a narrower mis-ranking: against another index's `eq`
+		// arm (which does pay the term) a small-key IN now looks relatively cheaper than it
+		// is — `where a in (x, y) and b = ?` over a 1000-row table prices ix_a at 61 and ix_b
+		// at 130 and picks ix_a, though ix_a's own estimate says it fetches 200 rows to ix_b's
+		// 100. Charging the term everywhere fixes that ranking and breaks the feature above;
+		// the union estimate has to stop clamping before both can hold. See
+		// backlog/debt-store-multi-seek-union-row-estimate.
 		const multiRows = Math.min(estimatedRows, inCount * rows);
-		return AccessPlanBuilder.eqMatch(multiRows, inCount * INDEX_SEEK_COST)
-			.setIsSet(false)
-			.setHandledFilters(handledFilters)
-			.setIndexName(index.name)
-			.setSeekColumns(seekCols)
-			.setExplanation(`Store index multi-seek(${inCount}) on ${index.name}`)
-			.build();
+		return {
+			plan: AccessPlanBuilder.eqMatch(multiRows, inCount * INDEX_SEEK_COST)
+				.setIsSet(false)
+				.setHandledFilters(handledFilters)
+				.setIndexName(index.name)
+				.setSeekColumns(seekCols)
+				.setExplanation(`Store index multi-seek(${inCount}) on ${index.name}`)
+				.build(),
+			isMultiSeek: true,
+		};
 	}
 
 	const armLabel = arm === 'prefixRange'
 		? `prefix-range seek(prefix=${eqCols.length})`
 		: arm === 'range' ? 'range scan' : 'seek';
-	return (isRange ? AccessPlanBuilder.rangeScan(rows, 0.2) : AccessPlanBuilder.eqMatch(rows, 0.3))
-		.setHandledFilters(handledFilters)
-		.setIndexName(index.name)
-		.setSeekColumns(seekCols)
-		.setExplanation(`Store index ${armLabel} on ${index.name}`)
-		.build();
+	return {
+		plan: seekingArm(rows, isRange ? 0.2 : 0.3)
+			.setHandledFilters(handledFilters)
+			.setIndexName(index.name)
+			.setSeekColumns(seekCols)
+			.setExplanation(`Store index ${armLabel} on ${index.name}`)
+			.build(),
+		isMultiSeek: false,
+	};
 }
 
 /**

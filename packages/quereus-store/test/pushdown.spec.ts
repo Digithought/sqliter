@@ -11,7 +11,14 @@
 
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
-import { Database, asyncIterableToArray, IndexConstraintOp, type SqlValue } from '@quereus/quereus';
+import {
+	Database,
+	asyncIterableToArray,
+	IndexConstraintOp,
+	type BestAccessPlanResult,
+	type PredicateConstraint,
+	type SqlValue,
+} from '@quereus/quereus';
 import {
 	StoreModule,
 	StoreTable,
@@ -1597,6 +1604,136 @@ describe('StoreModule predicate pushdown', () => {
 				expect(store.getCount, 'only the in-window entries resolve to data reads').to.be.at.most(8);
 				// The 4 in-window entries resolve in one batch round trip.
 				expect(store.getManyCalls, 'row resolution collapses into one batch').to.equal(1);
+			});
+		});
+
+		// A secondary-index path reads the index ENTRY and then the ROW it names, while a
+		// sequential scan reads one row per row. These pin that the second read is priced
+		// (ROW_RESOLUTION_COST, 1.0 per fetched row) and that the module now returns the
+		// sequential scan when a seek prices above it.
+		describe('row-resolution cost and the seek-versus-scan comparison', () => {
+			/** The module's own plan for `filters` against `table`, at a stated table size. */
+			function planFor(
+				tableName: string,
+				filters: PredicateConstraint[],
+				estimatedRows: number,
+			): BestAccessPlanResult {
+				const table = db.schemaManager.getTable('main', tableName);
+				expect(table, `table ${tableName} should exist`).to.exist;
+				return storeModule.getBestAccessPlan(db, table!, {
+					columns: table!.columns.map((col, index) => ({
+						index,
+						name: col.name,
+						type: col.logicalType,
+						isPrimaryKey: col.primaryKey || false,
+						isUnique: col.primaryKey || false,
+					})),
+					filters,
+					estimatedRows,
+				});
+			}
+
+			const eq = (columnIndex: number, value: SqlValue): PredicateConstraint =>
+				({ columnIndex, op: '=', value, usable: true });
+			const gte = (columnIndex: number, value: SqlValue): PredicateConstraint =>
+				({ columnIndex, op: '>=', value, usable: true });
+
+			beforeEach(async () => {
+				// One index per table: an `a = ?` predicate suits BOTH `ix_a` and the leading
+				// prefix of a composite `(a, b)`, and the two price identically, so a shared
+				// table would leave the winner to declaration order rather than to the arm.
+				await db.exec(`create table costed (id integer primary key, a integer, b integer) using store`);
+				await db.exec(`create index ix_a on costed (a)`);
+				await db.exec(`create table costed_r (id integer primary key, a integer, b integer) using store`);
+				await db.exec(`create index ix_b on costed_r (b)`);
+				await db.exec(`create table costed_p (id integer primary key, a integer, b integer) using store`);
+				await db.exec(`create index ix_ab on costed_p (a, b)`);
+			});
+
+			// Each arm: `AccessPlanBuilder`'s own shape (0.3 per row for an equality seek,
+			// 0.5 for a range) PLUS 1.0 per row for resolving each entry to its row.
+			for (const { arm, table, filters, selectivity, indexCost, perRow, indexName } of [
+				{
+					arm: 'eq', table: 'costed', filters: [eq(1, 7)],
+					selectivity: 0.1, indexCost: 0.3, perRow: 0.3, indexName: 'ix_a',
+				},
+				{
+					arm: 'range', table: 'costed_r', filters: [gte(2, 7)],
+					selectivity: 0.3, indexCost: 0.2, perRow: 0.5, indexName: 'ix_b',
+				},
+				{
+					arm: 'prefixRange', table: 'costed_p', filters: [eq(1, 7), gte(2, 7)],
+					selectivity: 0.15, indexCost: 0.2, perRow: 0.5, indexName: 'ix_ab',
+				},
+			] as const) {
+				it(`the ${arm} arm charges 1.0 per fetched row on top of its index-entry cost`, () => {
+					const plan = planFor(table, [...filters], 1000);
+					expect(plan.indexName, 'the arm under test was chosen').to.equal(indexName);
+					const rows = Math.floor(1000 * selectivity);
+					expect(plan.rows).to.equal(rows);
+					expect(plan.cost).to.be.closeTo(indexCost + rows * (perRow + 1.0), 1e-9);
+				});
+			}
+
+			it('a cost-only decline pays no resolution term (it resolves nothing)', async () => {
+				// A partial index is never seeked, so `costed`'s arms are out of the way here:
+				// the plan is the plain full scan, whose cost is the sequential 1.0 per row.
+				await db.exec(`create table parti (id integer primary key, v integer) using store`);
+				await db.exec(`create index ix_pos on parti (v) where v > 0`);
+				const plan = planFor('parti', [eq(1, 7)], 1000);
+				expect(plan.handledFilters).to.deep.equal([false]);
+				expect(plan.cost).to.equal(1000);
+			});
+
+			it('a selective indexed predicate still beats the sequential scan', async () => {
+				await db.exec(`insert into costed values ${
+					Array.from({ length: 50 }, (_, i) => `(${i + 1}, ${i + 1}, ${i + 1})`).join(', ')}`);
+				const q = `select id from costed where a = 7 order by id`;
+				expect(await planDetails(q)).to.match(/USING ix_a\b/);
+				expect((await asyncIterableToArray(db.eval(q))).map(r => r.id)).to.deep.equal([7]);
+			});
+
+			it('a seek the model prices above a sequential scan loses it, and returns the same rows', async () => {
+				// The reachable case today: the arm estimates the WHOLE table. `ARM_SELECTIVITY`
+				// is a fixed fraction with a `max(1, …)` floor, so that means a one-row table —
+				// where an index seek really does cost more (index entry + row) than reading the
+				// single row. A predicate matching most of a LARGE table is still priced at the
+				// arm's 10%, and no per-row term can flip it; see the NOTE on ARM_SELECTIVITY.
+				await db.exec(`create table lone (id integer primary key, v integer) using store`);
+				await db.exec(`create index ix_lv on lone (v)`);
+				await db.exec(`insert into lone values (1, 7)`);
+
+				// eq arm at N=1: 0.3 + 1 × (0.3 + 1.0) = 1.6, against a 1.0 sequential scan.
+				const plan = planFor('lone', [eq(1, 7)], 1);
+				expect(plan.indexName, 'the seek lost').to.be.undefined;
+				expect(plan.handledFilters, 'so the predicate goes back to the residual').to.deep.equal([false]);
+				expect(plan.cost).to.equal(1);
+				expect(plan.explains).to.match(/cheaper than the best index seek/);
+
+				// Through SQL the size has to come from ANALYZE: an un-analyzed table reaches
+				// the module carrying the catalog's 1000-row placeholder (the planner's hint
+				// WINS over the live count the store keeps — see `StoreModule`), so without
+				// this the arm is priced for a 1000-row table and the seek is the right plan.
+				await db.exec(`analyze lone`);
+				const q = `select id from lone where v = 7`;
+				expect(await planDetails(q), 'the plan walks the table').to.not.match(/USING ix_lv\b/);
+				expect((await asyncIterableToArray(db.eval(q))).map(r => r.id),
+					'the residual keeps the answer identical').to.deep.equal([1]);
+				expect((await asyncIterableToArray(db.eval(`select id from lone where v = 99`))).map(r => r.id))
+					.to.deep.equal([]);
+			});
+
+			it('the multi-seek arm is exempt: it keeps naming its index however it prices', () => {
+				// `rule-key-set-seek` probes this module at 2 and 1000 keys to read the arm's
+				// cost SLOPE, and abandons the rewrite if a probe stops naming an index — so the
+				// comparison must not answer a synthesized 1000-key probe with a scan.
+				const in1000: PredicateConstraint = {
+					columnIndex: 1, op: 'IN', usable: true, runtimeSet: { maxCount: 1000 },
+				};
+				const plan = planFor('costed', [in1000], 200);
+				expect(plan.cost, 'priced above a 200-row scan').to.be.greaterThan(200);
+				expect(plan.indexName, 'and still advertised as a seek').to.equal('ix_a');
+				expect(plan.seekColumnIndexes).to.deep.equal([1]);
 			});
 		});
 	});

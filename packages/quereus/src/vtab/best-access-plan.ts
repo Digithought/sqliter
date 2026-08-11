@@ -333,6 +333,23 @@ export class AccessPlanBuilder {
 	}
 
 	/**
+	 * Add to the cost already set — by a static shape constructor above, or by an
+	 * earlier {@link setCost}.
+	 *
+	 * For a module that pays a per-row term one of the standard shapes does not model:
+	 * a secondary-index path resolves every index entry to its row in a second store,
+	 * which {@link eqMatch} / {@link rangeScan} do not charge for. Adding to the shape's
+	 * cost keeps that module from restating (and drifting from) the shape's own formula.
+	 */
+	addCost(delta: number): this {
+		if (this.result.cost === undefined) {
+			quereusError('addCost requires a cost to have been set first', StatusCode.INTERNAL);
+		}
+		this.result.cost += delta;
+		return this;
+	}
+
+	/**
 	 * Set the estimated number of rows
 	 */
 	setRows(rows: number | undefined): this {
