@@ -1,9 +1,10 @@
+---
 description: When a transaction changes the sorting rule of a primary-key column on a persistent table and the change is refused, the error message named an internal bookkeeping table instead of the table the user actually wrote — now fixed and covered by a regression test.
 files:
   - packages/quereus-isolation/src/isolation-module.ts    # new private renameOverlayInError() helper (~line 978); wired into the PK re-key pre-flight catch in alterTable() (~line 1541)
   - packages/quereus-isolation/test/isolation-layer.spec.ts  # regression test at line 2619, inside the "SET COLLATE on a PRIMARY KEY column judges the transaction's effective rows" describe block
 difficulty: easy
-----
+---
 
 # Re-key refusal named the internal staging table — fix verified, ready for review
 
