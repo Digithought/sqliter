@@ -602,7 +602,9 @@ const dispose = deltaExecutor.register({
 - Externally-applied writes → this pipeline: [External row-change ingestion](mv-ingestion.md#external-row-change-ingestion)
 - Layered schemas / lenses: [Lenses and Layered Schemas](lens.md)
 - Source: `src/planner/analysis/binding-extractor.ts`,
-  `src/planner/analysis/key-filter.ts`, `src/runtime/delta-executor.ts`,
+  `src/planner/analysis/relation-key.ts` (the one owner of the `relationKey` label
+  every map in this pipeline is keyed by), `src/planner/analysis/key-filter.ts`,
+  `src/runtime/delta-executor.ts`,
   `src/core/database-transaction.ts`, `src/core/database-assertions.ts`,
   `src/core/database-watchers.ts`
 - Cross-process reactive transport: out of scope here; see the sync packages under

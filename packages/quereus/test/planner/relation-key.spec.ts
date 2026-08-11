@@ -5,7 +5,8 @@ import { GlobalScope } from '../../src/planner/scopes/global.js';
 import { ParameterScope } from '../../src/planner/scopes/param.js';
 import { BuildTimeDependencyTracker, type PlanningContext } from '../../src/planner/planning-context.js';
 import { buildBlock } from '../../src/planner/building/block.js';
-import type { PlanNode, RelationalPlanNode } from '../../src/planner/nodes/plan-node.js';
+import { isRelationalNode, type PlanNode, type RelationalPlanNode } from '../../src/planner/nodes/plan-node.js';
+import { TableReferenceNode } from '../../src/planner/nodes/reference.js';
 import type * as AST from '../../src/parser/ast.js';
 import {
 	collectTableReferences,
@@ -14,9 +15,10 @@ import {
 	relationKeyFrom,
 	relationKeyHasNodeId,
 	relationKeyOf,
+	relationKeyOfRelation,
 	relationKeyWithBase,
 } from '../../src/planner/analysis/relation-key.js';
-import { analyzeRowSpecific } from '../../src/planner/analysis/constraint-extractor.js';
+import { analyzeRowSpecific, createTableInfoFromNode } from '../../src/planner/analysis/constraint-extractor.js';
 import { extractBindings } from '../../src/planner/analysis/binding-extractor.js';
 
 /**
@@ -50,6 +52,24 @@ function analyzedPlan(db: Database, sql: string): PlanNode {
 }
 
 const sorted = (keys: Iterable<string>): string[] => [...keys].sort();
+
+/** The single `TableReferenceNode` in a one-table plan. */
+function soleRef(plan: PlanNode): TableReferenceNode {
+	const refs = [...collectTableReferences(plan).values()];
+	expect(refs, 'expected exactly one table reference').to.have.lengthOf(1);
+	return refs[0].node;
+}
+
+/** The shallowest relational node in `plan` that is NOT a `TableReferenceNode`. */
+function firstNonTableRelation(plan: PlanNode): RelationalPlanNode {
+	const queue: PlanNode[] = [plan];
+	while (queue.length > 0) {
+		const node = queue.shift()!;
+		if (isRelationalNode(node) && !(node instanceof TableReferenceNode)) return node;
+		queue.push(...(node.getChildren() as unknown as PlanNode[]));
+	}
+	throw new Error('no non-table relational node in plan');
+}
 
 describe('relation key', () => {
 	describe('spelling', () => {
@@ -142,6 +162,9 @@ describe('relation key', () => {
 				'select id from Orders o where not exists (select 1 from Items i where i.oid = o.id)',
 				'select cust, sum(amt) from Orders group by cust',
 				'select id from Orders where id = 7',
+				// `committed.` is a pseudo-schema, not a real one: it resolves to the same
+				// `main` table and must key identically.
+				'select id from committed.Orders where id = 7',
 			]) {
 				const plan = analyzedPlan(db, sql);
 				const walk = sorted(collectTableReferences(plan).keys());
@@ -150,6 +173,29 @@ describe('relation key', () => {
 				expect(classified, `classifications disagree with the walk for: ${sql}`).to.deep.equal(walk);
 				expect(bound, `bindings disagree with the walk for: ${sql}`).to.deep.equal(walk);
 			}
+		});
+
+		it('ignores the committed. pseudo-schema prefix a table reference prints', () => {
+			// `TableReferenceNode.toString()` prefixes `committed.` for a committed read.
+			// The two callers that pass NO display name to `createTableInfoFromNode`
+			// (`nodes/filter.ts`, `rules/access/rule-monotonic-range-access.ts`) used to
+			// key off that string, so their key base was `committed.main.orders`. The owner
+			// canonicalizes off the table schema instead, so every caller agrees.
+			const ref = soleRef(analyzedPlan(db, 'select id from committed.Orders where id = 7'));
+			expect(ref.readCommitted, 'expected a committed read').to.equal(true);
+			expect(ref.toString().toLowerCase()).to.equal('committed.main.orders');
+			expect(relationKeyBase(relationKeyOf(ref))).to.equal('main.orders');
+			expect(createTableInfoFromNode(ref).relationKey).to.equal(relationKeyOf(ref));
+		});
+
+		it('falls back to the display string for a non-table relational node', () => {
+			// Only a TableReferenceNode has a schema-qualified name to canonicalize on;
+			// anything else keys off the name it is given, lowercased.
+			const rel = firstNonTableRelation(analyzedPlan(db, 'select id from Orders'));
+			expect(relationKeyOfRelation(rel)).to.equal(relationKeyFrom(rel.toString().toLowerCase(), rel.id));
+			expect(relationKeyOfRelation(rel, 'MyLabel')).to.equal(relationKeyFrom('mylabel', rel.id));
+			expect(relationKeyOfRelation(rel, ''), 'empty display name falls back, never keys on ""')
+				.to.equal(relationKeyOfRelation(rel));
 		});
 
 		it('keys a table whose quoted name contains a # and recovers the base', async () => {

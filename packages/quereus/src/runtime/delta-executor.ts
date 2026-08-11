@@ -18,6 +18,7 @@ import { createLogger } from '../common/logger.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode, type SqlValue } from '../common/types.js';
 import type { BindingMode } from '../planner/analysis/binding-extractor.js';
+import { relationKeyFrom, type RelationKey } from '../planner/analysis/relation-key.js';
 import type {
 	ChangeScope,
 	MatchedWatch,
@@ -292,9 +293,13 @@ export interface SubscriptionFromChangeScopeResult {
 	captureDisposers: Array<() => void>;
 }
 
-/** Synthetic relation key for the i-th watch in a scope. */
-function relKeyForWatch(table: QualifiedName, watchIndex: number): string {
-	return `${baseKeyFor(table)}#watch_${watchIndex}`;
+/**
+ * Synthetic relation key for the i-th watch in a scope. A watch has no plan node
+ * behind it, so `watch_<i>` stands in for the node id — composed through
+ * `relation-key.ts` so the key still parses like every other one.
+ */
+function relKeyForWatch(table: QualifiedName, watchIndex: number): RelationKey {
+	return relationKeyFrom(baseKeyFor(table), `watch_${watchIndex}`);
 }
 
 function baseKeyFor(table: QualifiedName): string {

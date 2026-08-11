@@ -20,7 +20,7 @@
  * `binding-extractor.ts`.
  */
 
-import { PlanNode, type RelationalPlanNode } from '../nodes/plan-node.js';
+import type { PlanNode, RelationalPlanNode } from '../nodes/plan-node.js';
 import { TableReferenceNode } from '../nodes/reference.js';
 
 /**
@@ -69,13 +69,14 @@ export function relationKeyOf(ref: TableReferenceNode): RelationKey {
  *
  * A `TableReferenceNode` always canonicalizes to {@link relationKeyOf}, regardless
  * of the display name the caller passed, so two callers naming the same read cannot
- * disagree. Anything else falls back to `displayName ?? node.toString()`, lowercased
- * — preserving today's behaviour for non-table relational nodes, which have no
- * schema-qualified name to canonicalize on.
+ * disagree. Anything else falls back to `node.toString()`, lowercased — preserving
+ * today's behaviour for non-table relational nodes, which have no schema-qualified
+ * name to canonicalize on. An empty `displayName` falls back too, rather than
+ * producing a base-less key.
  */
 export function relationKeyOfRelation(node: RelationalPlanNode, displayName?: string): RelationKey {
 	if (node instanceof TableReferenceNode) return relationKeyOf(node);
-	const base = (displayName ?? node.toString()).toLowerCase();
+	const base = (displayName || node.toString()).toLowerCase();
 	return relationKeyFrom(base, node.id);
 }
 
@@ -125,6 +126,11 @@ export function relationKeyHasNodeId(key: RelationKey, nodeId: string | null | u
  * (`Optimizer.optimizeForAnalysis`). Full physical optimization leaves several
  * distinct `TableReferenceNode` instances per table, so the same table comes back
  * more than once under different node ids.
+ *
+ * NOTE: re-walks the whole plan on every call, and several consumers call it over the
+ * same plan (assertion creation, the MV bounded-delta and full-rebuild arms). Plan
+ * trees are small and this has never shown up in a profile; if it ever does, memoize
+ * per plan-node instance (a WeakMap keyed on the root) rather than caching by key.
  */
 export function collectTableReferences(plan: PlanNode): Map<RelationKey, PlanTableReference> {
 	const out = new Map<RelationKey, PlanTableReference>();

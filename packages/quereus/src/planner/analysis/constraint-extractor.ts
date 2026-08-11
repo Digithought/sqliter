@@ -166,6 +166,11 @@ export function extractConstraints(
   // Compute covered keys per table: collect equality constraints and check against table unique keys
   const coveredKeysByTable = new Map<string, number[][]>();
   for (const [rel, constraints] of constraintsByTable) {
+    // NOTE: the `relationName` arm looks unreachable in tree — every producer of
+    // `targetRelation` sets it to `tableInfo.relationKey` (~412, ~493, ~502, ~540, ~581)
+    // and `relationKey` is always populated. Kept because `TableInfo` is exported and an
+    // out-of-tree caller may still key on the display name; dropping it is a behaviour
+    // change, not a cleanup. Revisit if `TableInfo` ever stops being public.
     const tInfo = tableInfos.find(t => t.relationKey === rel || t.relationName === rel);
     // Prefer candidateKeys (unified keysOf surface) over declared uniqueKeys so
     // FD-derived and ≤1-row empty keys are not skipped by the old guard.

@@ -6,6 +6,7 @@ import { ParameterScope } from '../../src/planner/scopes/param.js';
 import { BuildTimeDependencyTracker, type PlanningContext } from '../../src/planner/planning-context.js';
 import { buildBlock } from '../../src/planner/building/block.js';
 import { analyzeRowSpecific, type RowSpecificResult } from '../../src/planner/analysis/constraint-extractor.js';
+import { relationKeyBase } from '../../src/planner/analysis/relation-key.js';
 import type { RelationalPlanNode } from '../../src/planner/nodes/plan-node.js';
 import type * as AST from '../../src/parser/ast.js';
 
@@ -40,7 +41,7 @@ function analyze(db: Database, sql: string): RowSpecificResult {
 /** Find the single classification entry for the given table base name (e.g. 'main.t'). */
 function findFor(result: RowSpecificResult, baseLower: string): { cls: string; groupKeys: number[] | undefined } {
 	for (const [relKey, cls] of result.classifications) {
-		if (relKey.split('#')[0] === baseLower) {
+		if (relationKeyBase(relKey) === baseLower) {
 			return { cls, groupKeys: result.groupKeys.get(relKey) };
 		}
 	}

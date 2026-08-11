@@ -109,6 +109,29 @@ describe('assertion rename propagation: stored body, derived SQL, and events', (
 		}
 	});
 
+	it('TABLE rename re-keys a table whose quoted name contains a #', async () => {
+		// `relationKey` is `<base>#<nodeId>` and a quoted base may legally contain '#',
+		// so the re-key must split at the LAST '#'. Splitting at the first one left the
+		// tail of the old base stranded in the new key (`main.tame#ird#<id>`).
+		const db = new Database();
+		try {
+			await db.exec('create table "we#ird" (x integer primary key)');
+			await db.exec('create assertion a1 check (not exists (select 1 from "we#ird" where x < 0))');
+			const before = getAssertion(db, 'main', 'a1').dependentTables ?? [];
+			expect(before.map(d => d.base)).to.deep.equal(['main.we#ird']);
+			const nodeId = before[0].relationKey.slice('main.we#ird'.length);
+
+			await db.exec('alter table "we#ird" rename to tame');
+
+			const after = getAssertion(db, 'main', 'a1').dependentTables ?? [];
+			expect(after.map(d => d.base)).to.deep.equal(['main.tame']);
+			expect(after[0].relationKey, 'the whole old base is replaced, node id carried over')
+				.to.equal(`main.tame${nodeId}`);
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('COLUMN rename rewrites the CHECK expression and regenerates violationSql', async () => {
 		const db = new Database();
 		try {
