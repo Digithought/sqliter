@@ -130,6 +130,15 @@ evidence for the representation change, not a defect to patch in place. Once "un
 spellable, this gate becomes a two-line decision like the others (its current
 absent-estimate posture, proceed, is the one it should keep for `unknown`).
 
+Running `analyze` first does not rescue the gate, so it cannot be covered by a test today.
+Measured on the store while reviewing `feat-store-pk-key-set-seek-coverage`: with a
+30-row key source, `analyze` makes the optimizer abandon the semi join altogether and pick
+an index-nested-loop join instead (the target is walked, `idx=_primary_;plan=0`, and the
+key source is seeked per outer row), so `rule-key-set-seek` never runs and its gate is
+never consulted. Before `analyze` the rewrite fires with the estimate still reading 0.
+Any test that tries to exercise this gate therefore pins an unrelated plan choice — which
+is why the review recorded the measurement here rather than adding one.
+
 ## Notes for whoever picks this up
 
 - Arm 3 is a *producer* gap and arms 1–2 are *consumer* gaps. Filling arm 3 without

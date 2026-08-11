@@ -573,7 +573,10 @@ describe('key-set semi join over the store backend (feat-key-set-seek-store-isol
 				// index, so the node claims the leaf's order and the Sort stays absorbed. The
 				// row order is asserted, not merely the absence of the Sort: the claim is only
 				// sound because `scanMultiSeekPrimary` emits ascending by encoded data key.
-				await db.exec(`insert into psrc values (3, 0), (1, 0), (4, 0)`); // keys out of order
+				// `k` mirrors `id` so BOTH arms carry the same non-trivial key set {3,1,4} and
+				// both can assert rows; the source rows are stored out of key order so an arm
+				// that emitted in key-source order would be caught.
+				await db.exec(`insert into psrc values (3, 3), (1, 1), (4, 4)`);
 				for (const q of [
 					`select pk from pkt where pk in (select k from psrc) order by pk`,
 					`select pk from pkt where pk in (select id from psrc) order by pk`,
@@ -583,12 +586,70 @@ describe('key-set semi join over the store backend (feat-key-set-seek-store-isol
 					expect(ops, `no Sort — the node serves the absorbed ORDER BY: ${q}`).to.not.match(/SORT/);
 					expect((await keySetProps(q)).preservesTargetOrder,
 						`the node claims the walk order: ${q}`).to.equal(true);
+					mod.reset();
+					expect(await rawPks(q), `rows actually ascend: ${q}`).to.deep.equal([1, 3, 4]);
+					expect(mod.seen('pkt')[0], `and it is still a seek: ${q}`).to.match(multiSeekRe('_primary_'));
 				}
-				// The `id` arm's key set is {3,1,4}; the `k` arm's is {0} and matches nothing.
+			});
+
+			it('`limit`/`offset` over the ordered seek trims after the seek, not before', async () => {
+				// The seek window is the whole key set — the limit is applied above the node, so
+				// `inCount` stays 3 while only the first rows are emitted. Pins that the ordered
+				// PK seek composes with a limit, which is what makes `order by pk limit N` cheap.
+				await db.exec(`insert into psrc values (1, 4), (2, 1), (3, 3)`);
+				const ordered = (tail: string) =>
+					`select pk from pkt where pk in (select k from psrc) order by pk ${tail}`;
 				mod.reset();
-				expect(await rawPks(`select pk from pkt where pk in (select id from psrc) order by pk`),
-					'rows actually ascend').to.deep.equal([1, 3, 4]);
-				expect(mod.seen('pkt')[0], 'and it is still a seek').to.match(multiSeekRe('_primary_'));
+				expect(await rawPks(ordered(`limit 2`))).to.deep.equal([1, 3]);
+				expect(mod.seen('pkt')[0], 'one seek over all three keys').to.match(multiSeekRe('_primary_'));
+				expect(mod.seen('pkt')[0]).to.contain('inCount=3');
+				expect(await rawPks(ordered(`limit 2 offset 1`))).to.deep.equal([3, 4]);
+			});
+
+			it('a DESC primary key seeks, emits descending, and keeps its own `order by`', async () => {
+				// `scanMultiSeekPrimary` sorts ascending by ENCODED data key, and per-column DESC
+				// inversion is baked into those bytes — so the identical code emits DESCENDING
+				// SQL values here, which is exactly this leaf's walk order.
+				// `seekPreservesTargetOrder` compares the advertised direction against the index
+				// key column's rather than assuming ascending, so it holds on a DESC key too.
+				await db.exec(`create table dpk (pk integer, tag text, primary key (pk desc)) using store`);
+				await db.exec(`insert into dpk values (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')`);
+				await db.exec(`insert into psrc values (1, 3), (2, 1), (3, 4)`);
+				const bare = `select pk from dpk where pk in (select k from psrc)`;
+
+				mod.reset();
+				expect(await rawPks(bare), 'descending — the DESC walk order').to.deep.equal([4, 3, 1]);
+				expect(mod.seen('dpk')[0]).to.match(multiSeekRe('_primary_'));
+
+				expect(await planOps(`${bare} order by pk desc`),
+					'the absorbed DESC Sort stays absorbed').to.not.match(/SORT/);
+				mod.reset();
+				expect(await rawPks(`${bare} order by pk desc`)).to.deep.equal([4, 3, 1]);
+				expect(mod.seen('dpk')[0]).to.match(multiSeekRe('_primary_'));
+
+				// ASC over a DESC key is NOT the walk order, so that Sort was never absorbed and
+				// survives as a real Sort — with the seek still taken underneath it.
+				expect(await planOps(`${bare} order by pk asc`),
+					'a real Sort, not an absorbed one').to.match(/SORT/);
+				mod.reset();
+				expect(await rawPks(`${bare} order by pk asc`)).to.deep.equal([1, 3, 4]);
+				expect(mod.seen('dpk')[0], 'still a seek, just re-sorted above').to.match(multiSeekRe('_primary_'));
+			});
+
+			it('a TEXT primary key under COLLATE NOCASE seeks and matches case-insensitively', async () => {
+				// The seek keys are encoded under the primary key's OWN key collation, so a
+				// key-source value differing only in case still lands on the row's byte key —
+				// the property a BINARY-encoded seek over a NOCASE key would silently lose,
+				// returning no rows where the walk would have matched.
+				await db.exec(`create table tpk (pk text primary key collate nocase, tag text) using store`);
+				await db.exec(`create table tsrc (id integer primary key, k text) using store`);
+				await db.exec(`insert into tpk values ('Alpha', 'a'), ('beta', 'b'), ('Gamma', 'c')`);
+				await db.exec(`insert into tsrc values (1, 'ALPHA'), (2, 'gamma'), (3, 'missing')`);
+				mod.reset();
+				expect(await asyncIterableToArray(db.eval(`select pk from tpk where pk in (select k from tsrc)`)),
+					'case-insensitive hits, in key order').to.deep.equal([{ pk: 'Alpha' }, { pk: 'Gamma' }]);
+				expect(mod.seen('tpk')[0]).to.match(multiSeekRe('_primary_'));
+				expect(mod.seen('tpk')[0]).to.contain('inCount=3');
 			});
 
 			it('a COMPOSITE primary key declines the rewrite and the merge join answers', async () => {
@@ -1034,7 +1095,7 @@ describe('key-set semi join over the store backend (feat-key-set-seek-store-isol
 			// nowhere here — the raw order already ascends) would stay absorbed.
 			beforeEach(async () => {
 				await db.exec(`create table pt (pk integer primary key, tag text) using store`);
-				await db.exec(`create table pksrc (id integer primary key, k integer) using store`);
+				await db.exec(`create table pksrc (id integer primary key, k integer null) using store`);
 				await db.exec(`insert into pt values (10, 'a'), (20, 'b'), (30, 'c'), (40, 'd')`);
 				await db.exec(`insert into pksrc values (1, 20), (2, 30), (3, 50)`);
 			});
@@ -1155,6 +1216,45 @@ describe('key-set semi join over the store backend (feat-key-set-seek-store-isol
 					{ pk: 30, tag: 'c' },
 				]);
 				expectPkSeeked();
+			});
+
+			it('NULL and duplicate key-source values collapse before the seek, overlay included', async () => {
+				// The engine builds the key set before the target opens, so the overlay never
+				// sees the NULL or the duplicates — but the staged row still has to survive the
+				// collapsed set. `inCount` pins that the set really was deduplicated.
+				await db.exec(`insert into pksrc values (4, null), (5, 30), (6, 20)`);
+				await db.exec(`begin`);
+				await db.exec(`insert into pt values (50, 'staged')`);
+				mod.reset();
+				expect(await pkRowsOf(PK_QUERY)).to.deep.equal([
+					{ pk: 20, tag: 'b' },
+					{ pk: 30, tag: 'c' },
+					{ pk: 50, tag: 'staged' },
+				]);
+				expect(mod.seen('pt')[0], 'three distinct non-null keys').to.contain('inCount=3');
+				expectPkSeeked();
+				await db.exec(`rollback`);
+			});
+
+			it('a DESC primary key merges with the overlay in DESCENDING key order', async () => {
+				// The isolation merge follows the key's own direction, and the seek supplies it
+				// for free: ascending-encoded-key emission IS descending SQL order on a DESC key.
+				// A merge that assumed ascending VALUES would interleave the staged rows wrong
+				// even though the row SET came out right — so the order here is the assertion.
+				await db.exec(`create table dpt (pk integer, tag text, primary key (pk desc)) using store`);
+				await db.exec(`insert into dpt values (10, 'a'), (20, 'b'), (30, 'c'), (40, 'd')`);
+				await db.exec(`begin`);
+				await db.exec(`insert into dpt values (50, 'e')`);
+				await db.exec(`update dpt set tag = 'rewritten' where pk = 30`);
+				mod.reset();
+				expect(await pkRowsOf(`select pk, tag from dpt where pk in (select k from pksrc)`)).to.deep.equal([
+					{ pk: 50, tag: 'e' },
+					{ pk: 30, tag: 'rewritten' },
+					{ pk: 20, tag: 'b' },
+				]);
+				expect(mod.seen('dpt')[0], 'the store served a primary-key multi-seek under isolation')
+					.to.match(multiSeekRe('_primary_'));
+				await db.exec(`rollback`);
 			});
 		});
 	});

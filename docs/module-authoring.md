@@ -225,8 +225,12 @@ sets exist today.
 Declining is always correct; only the speed-up is lost. A module predating `runtimeSet`
 declines automatically, since `Array.isArray(f.value) && f.value.length > 0` is false.
 
-If you accept one: never claim `providesOrdering` or `monotonicOn` over its column (a
-multi-seek walks in seek-key order, so the planner would elide a `Sort` it needs), and
+If you accept one: claim `providesOrdering` or `monotonicOn` over its column only if your
+multi-seek emits in the index's own KEY order — which the hard requirement below obliges
+it to anyway. A multi-seek that walks in seek-argument order must claim neither, or the
+planner elides a `Sort` it needs. The store's `_primary_` arm is the worked example: it
+sorts its points by encoded key and so does advertise primary-key order, which is what
+lets `where pk in (select …) order by pk` drop its Sort. Also
 apply your existing safety gates — collation windows that may under-fetch, semantically
 compared seek columns, your own cross-product cap — against `maxCount`, the worst case you
 could be handed. Use the exported `equalitySeekKeyCount(filter)` (seek keys it contributes
