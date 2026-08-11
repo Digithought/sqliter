@@ -276,10 +276,11 @@ describe('key-set semi join through the isolation layer (feat-key-set-seek-store
 	});
 
 	describe('primary-key merge (mergeStreams)', () => {
-		// The memory backend DOES serve a runtime key set on the primary key as a
-		// `_primary_` `plan=5` multi-seek, so the order-sensitive primary merge is
-		// reachable through this feature (the persistent store is not — its primary-key
-		// arm claims `=` only, see backlog/feat-store-pk-in-list-multiseek).
+		// The memory backend serves a runtime key set on the primary key as a `_primary_`
+		// `plan=5` multi-seek, so the order-sensitive primary merge is reachable through
+		// this feature. (The persistent store now does too — feat-store-pk-in-list-multiseek
+		// — but these tests drive the memory backend; the store's own coverage of the same
+		// shape is in `quereus-store`'s `key-set-seek-store.spec.ts`.)
 		//
 		// `mergeStreams` requires both streams in ascending primary-key order. The
 		// literal form of the same plan (`where pk in (3, 1, 2)`) used to visit windows

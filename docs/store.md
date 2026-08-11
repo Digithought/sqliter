@@ -412,6 +412,7 @@ The module implements `getBestAccessPlan()` to communicate capabilities:
 | Access Pattern | Cost Model | Provides Ordering |
 |----------------|------------|-------------------|
 | PK equality | O(1) | Yes (single row) |
+| PK `IN` multi-seek (`IN` covering every PK column) | O(k) point reads, k = distinct key tuples (capped at 1000) | Yes (PK order) |
 | PK range | O(k) where k = matched rows | Yes (BINARY only) |
 | Secondary index eq | O(1) + PK lookup | No |
 | Secondary index range | O(k) + PK lookups | No |

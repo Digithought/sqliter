@@ -5,8 +5,9 @@
  *
  * The engine rewrites the target leaf's `FilterInfo` at runtime into an ordinary
  * single-column `plan=5` multi-seek — byte-identical to what a literal `in (1,2,3)`
- * produces — so `StoreTable.scanMultiSeek` and `IsolatedTable`'s merged secondary
- * read serve it without knowing where the values came from. These tests prove that
+ * produces — so `StoreTable.scanMultiSeek` (or `scanMultiSeekPrimary`, when the set is
+ * on the primary key) and `IsolatedTable`'s merged read serve it without knowing where
+ * the values came from. These tests prove that
  * for the real store: the seek actually happens (the `idxStr` the store receives is
  * captured, not inferred), uncommitted rows are visible through it, and every gate
  * that must decline still does.
@@ -450,25 +451,27 @@ describe('key-set semi join over the store backend (feat-key-set-seek-store-isol
 			}
 		});
 
+		it('a runtime set on the PRIMARY KEY is served as a `_primary_` multi-seek', async () => {
+			// The PK arm used to match a `'='`-only operator group, so a key set on the primary
+			// key found no claimable index and `rule-key-set-seek` kept the hash semi join it
+			// started from. It now claims the IN (feat-store-pk-in-list-multiseek):
+			// `scanMultiSeekPrimary` emits ascending by encoded data key — which IS primary-key
+			// order — so the rewrite fires and the store point-reads the two keys instead of
+			// walking the table.
+			await db.exec(`create table pkt (pk integer primary key, other text) using store`);
+			await db.exec(`create table psrc (id integer primary key, k integer) using store`);
+			await db.exec(`insert into pkt values (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')`);
+			await db.exec(`insert into psrc values (1, 1), (2, 3)`);
+
+			const q = `select pk from pkt where pk in (select k from psrc)`;
+			expect(await planOps(q), 'the rule fires on a PK set').to.match(/KEYSETSEMIJOIN/);
+			mod.reset();
+			expect(await pks(q)).to.deep.equal([1, 3]);
+			expect(mod.seen('pkt')[0], 'served as a primary-key multi-seek')
+				.to.match(multiSeekRe('_primary_'));
+		});
+
 		describe('gates that must decline (the hash semi join answers instead)', () => {
-			it('a runtime set on the PRIMARY KEY declines: the store claims IN for secondary indexes only', async () => {
-				// `computeBestAccessPlan`'s primary-key arm matches EQ_OPS, which excludes IN,
-				// so no index is claimed and `rule-key-set-seek` keeps the join it found.
-				// PK coverage arrives with backlog/feat-store-pk-in-list-multiseek — no change
-				// to this feature is needed for it.
-				await db.exec(`create table pkt (pk integer primary key, other text) using store`);
-				await db.exec(`create table psrc (id integer primary key, k integer) using store`);
-				await db.exec(`insert into pkt values (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')`);
-				await db.exec(`insert into psrc values (1, 1), (2, 3)`);
-
-				const q = `select pk from pkt where pk in (select k from psrc)`;
-				expect(await planOps(q), 'no key-set rewrite on a PK set').to.not.match(/KEYSETSEMIJOIN/);
-				mod.reset();
-				expect(await pks(q), 'the surviving semi join still answers').to.deep.equal([1, 3]);
-				expect(mod.seen('pkt')[0] ?? '', 'the store was never handed a multi-seek')
-					.to.not.match(/plan=5/);
-			});
-
 			it('an `any` column with a declared COLLATE multi-seeks, and the answer is unchanged', async () => {
 				// `ANY_TYPE.compare` honors the collation it is handed
 				// (any-type-compare-honors-collation), so an `any collate nocase` index keys

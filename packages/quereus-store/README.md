@@ -70,6 +70,7 @@ that also *narrow the bytes read*:
 | Shape | Served by |
 |-------|-----------|
 | Equality on every primary-key column | one data-store point read |
+| `IN` on every primary-key column | one data-store point read per distinct key tuple (`plan=5`, see below) |
 | `<` / `<=` / `>` / `>=` on the **leading** primary-key column | one data-store byte window |
 | Equality on a contiguous **leading prefix** of a secondary index | one index byte window (`plan=2`) |
 | `IN` on a contiguous leading prefix of a secondary index | one index window per distinct list value (`plan=5`, see below) |
@@ -104,18 +105,27 @@ a residual filter. `NULL` list values match nothing and are skipped, duplicate v
 yield their rows once, and a composite index serves the cross-product of per-column lists
 (`a in (1,2) and b in (10,20)` is four seeks). Very large lists (over 1000 seek keys) and
 lists on semantically-ordered column types (TIMESPAN, JSON) fall back to the scan path —
-still correct, just not accelerated. `IN` on the primary key currently scans (see backlog
-`feat-store-pk-in-list-multiseek`). When several secondary indexes can serve the same
+still correct, just not accelerated. When several secondary indexes can serve the same
 predicate, the lowest-cost seek wins (equal costs keep the first-declared index), so
 declaration order no longer decides whether a query does one seek or hundreds. The primary-key
 arms still take precedence over any secondary index whenever they apply.
+
+An `IN` covering the **whole primary key** takes the same path against the data store
+itself: `where pk in (1, 2, 3)`, or `a in (…) and b in (…)` on a composite key, becomes one
+deduplicated point read per distinct key tuple rather than a scan. Every gate above applies
+(the 1000-key cap, the semantic-ordering decline, NULL-skip and dedup), and a key only
+*partly* pinned — `a in (…)` alone on a `(a, b)` key — still scans with the predicate as a
+residual. Unlike a secondary multi-seek, this one **advertises primary-key order**: the point
+reads are emitted ascending by encoded data key, which is primary-key order (a `DESC` key
+member's inversion is baked into its bytes), so `where pk in (…) order by pk` needs no `Sort`.
 
 The same multi-seek path also serves an `IN` whose values only exist once the query runs
 — `where v in (select … )`, which the engine may materialize into a set and hand down as
 a seek (its `KeySetSemiJoin`). **Nothing in this module distinguishes the two.** The
 engine stamps a `FilterInfo` byte-identical in shape to a literal list's, so every gate
 above applies unchanged: the 1000-key cap, the semantic-ordering decline, the key-collation
-guard, the partial-index exclusion, and the primary-key arm's refusal of any `IN`. At plan
+guard, and the partial-index exclusion — on the primary-key arm as well as the secondary
+one, so `where pk in (select …)` is served as a `_primary_` multi-seek too. At plan
 time such a set describes itself only by a ceiling (`PredicateConstraint.runtimeSet.maxCount`),
 which is what the cost and cap arithmetic judges. The engine also re-checks every row the
 seek returns, so an over-fetching window costs only time.

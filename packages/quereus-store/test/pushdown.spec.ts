@@ -1750,4 +1750,301 @@ describe('StoreModule predicate pushdown', () => {
 			});
 		});
 	});
+
+	// Primary-key IN-list multi-seek (feat-store-pk-in-list-multiseek): an IN covering the
+	// WHOLE primary key is served as one deduplicated, key-ordered point read per distinct
+	// key tuple (`_primary_` `plan=5`) instead of a full scan + residual. The secondary-index
+	// block above is the twin; what is different here is that the point reads ARE the row
+	// reads (no index-entry indirection) and that the arm advertises primary-key ORDER, which
+	// a secondary multi-seek cannot.
+	//
+	// Rows are asserted in EMISSION order throughout — never re-sorted in JS — because a
+	// wrong ordering advertisement elides a Sort the query needed and a re-sort would hide it.
+	describe('primary-key IN-list multi-seek (feat-store-pk-in-list-multiseek)', () => {
+		/** `pk` column of `q`, in emission order. */
+		const pks = async (q: string, params?: SqlValue[]) =>
+			(await asyncIterableToArray(db.eval(q, params))).map(r => r.pk as number);
+
+		/** `a`/`b` of a composite-key query as `'a/b'`, in emission order. */
+		const abs = async (q: string) =>
+			(await asyncIterableToArray(db.eval(q))).map(r => `${r.a}/${r.b}`);
+
+		describe('single-column primary key', () => {
+			beforeEach(async () => {
+				await db.exec(`create table t (pk integer primary key, v integer) using store`);
+				await db.exec(`insert into t values (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)`);
+			});
+
+			// The arm, not merely "a seek happened": every row assertion below is answered
+			// identically by a scan + residual, so the idxStr is what tells them apart.
+			it('takes the `_primary_` multi-seek arm, not a scan', async () => {
+				const q = `select pk from t where pk in (1, 3)`;
+				expect(await planOps(q)).to.match(/INDEXSEEK/);
+				expect(await planOps(q)).to.not.match(/INDEXSCAN|SEQSCAN/);
+				expect(await planProperties(q)).to.match(/idx=_primary_\(0\);plan=5;inCount=2/);
+			});
+
+			it('the claimed IN leaves no residual Filter behind', async () =>
+				expect(await planOps(`select pk from t where pk in (1, 3)`)).to.not.match(/FILTER/));
+
+			it('basic list returns exactly the matching rows', async () =>
+				expect(await pks(`select pk from t where pk in (1, 3)`)).to.deep.equal([1, 3]));
+
+			it('duplicate literal values yield each row once', async () =>
+				expect(await pks(`select pk from t where pk in (3, 3, 1)`)).to.deep.equal([1, 3]));
+
+			it('a NULL member is dropped, the rest still match', async () =>
+				expect(await pks(`select pk from t where pk in (1, null, 3)`)).to.deep.equal([1, 3]));
+
+			it('a list matching nothing yields no rows', async () =>
+				expect(await pks(`select pk from t where pk in (99, 123)`)).to.deep.equal([]));
+
+			it('an empty list never reaches the table at all', async () => {
+				// Folded to an EmptyRelation before access planning — no seek, no scan.
+				const q = `select pk from t where pk in ()`;
+				expect(await planOps(q)).to.match(/EMPTYRELATION/);
+				expect(await planOps(q)).to.not.match(/INDEXSEEK|INDEXSCAN|SEQSCAN/);
+				expect(await pks(q)).to.deep.equal([]);
+			});
+
+			it('a parameter-bound list seeks and returns the right rows (runtime dedup)', async () =>
+				expect(await pks(`select pk from t where pk in (?, ?, ?)`, [3, 1, 3])).to.deep.equal([1, 3]));
+
+			it('a parameter list with a NULL among the values ignores the NULL', async () =>
+				expect(await pks(`select pk from t where pk in (?, ?)`, [null, 2])).to.deep.equal([2]));
+
+			it('an all-NULL parameter list yields no rows', async () =>
+				expect(await pks(`select pk from t where pk in (?, ?)`, [null, null])).to.deep.equal([]));
+
+			// The point arm and the multi-seek arm both claim these; which one fires is the
+			// `setSeekColumns` routing change this feature made to the point arm, so pin both.
+			it('a single-element list routes through the point arm, not the multi-seek', async () => {
+				expect(await planProperties(`select pk from t where pk in (2)`))
+					.to.match(/idx=_primary_\(0\);plan=2/);
+				expect(await pks(`select pk from t where pk in (2)`)).to.deep.equal([2]);
+			});
+
+			it('a plain `=` still plans as the `_primary_` point lookup', async () => {
+				expect(await planProperties(`select pk from t where pk = 2`))
+					.to.match(/idx=_primary_\(0\);plan=2/);
+				expect(await pks(`select pk from t where pk = 2`)).to.deep.equal([2]);
+			});
+
+			it('IN plus limit 1 returns a single row', async () =>
+				expect(await pks(`select pk from t where pk in (1, 3, 5) limit 1`)).to.have.lengthOf(1));
+		});
+
+		// The one claim in this arm that can hand back WRONG-ORDER rows rather than merely
+		// slow ones: `scanMultiSeekPrimary` sorts its point reads ascending by encoded data
+		// key (per-column DESC inversion baked into the bytes), and the plan advertises that
+		// as primary-key order. Assert the elision AND the emitted order together — either
+		// alone would pass with the other broken.
+		describe('ordering advertisement', () => {
+			it('ASC key: `order by pk` elides its Sort and rows arrive in key order', async () => {
+				await db.exec(`create table o (pk integer primary key, v integer) using store`);
+				await db.exec(`insert into o values (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)`);
+				const q = `select pk from o where pk in (5, 1, 3) order by pk`;
+				expect(await planOps(q), 'the Sort is absorbed into the seek').to.not.match(/SORT/);
+				expect(await pks(q), 'and the seek really emits in key order').to.deep.equal([1, 3, 5]);
+			});
+
+			it('DESC key: `order by pk desc` elides its Sort and rows arrive descending', async () => {
+				await db.exec(`create table od (pk integer, v integer, primary key (pk desc)) using store`);
+				await db.exec(`insert into od values (1, 10), (2, 20), (3, 30), (4, 40)`);
+				const q = `select pk from od where pk in (1, 4, 3) order by pk desc`;
+				expect(await planOps(q)).to.not.match(/SORT/);
+				expect(await pks(q)).to.deep.equal([4, 3, 1]);
+			});
+
+			it('DESC key: an ASC `order by` keeps its Sort and still answers ascending', async () => {
+				// The advertisement is direction-matched, so the opposite order is NOT claimed.
+				await db.exec(`create table oa (pk integer, v integer, primary key (pk desc)) using store`);
+				await db.exec(`insert into oa values (1, 10), (2, 20), (3, 30), (4, 40)`);
+				const q = `select pk from oa where pk in (1, 4, 3) order by pk`;
+				expect(await planOps(q), 'the Sort survives').to.match(/SORT/);
+				expect(await pks(q)).to.deep.equal([1, 3, 4]);
+			});
+
+			it('composite key: `order by a, b` elides its Sort and rows arrive in key order', async () => {
+				await db.exec(`create table oc (a integer, b integer, primary key (a, b)) using store`);
+				await db.exec(`insert into oc values (1, 10), (1, 20), (2, 10), (2, 20), (3, 10)`);
+				const q = `select a, b from oc where a in (2, 1) and b in (20, 10) order by a, b`;
+				expect(await planOps(q)).to.not.match(/SORT/);
+				expect(await abs(q)).to.deep.equal(['1/10', '1/20', '2/10', '2/20']);
+			});
+
+			it('composite key with a DESC member emits in that mixed key order', async () => {
+				// Each column's direction is baked into its own key bytes, so a per-column mix
+				// is the case a single shared direction would silently misorder.
+				await db.exec(`create table om (a integer, b integer, primary key (a, b desc)) using store`);
+				await db.exec(`insert into om values (1, 10), (1, 20), (2, 10), (2, 20), (3, 10)`);
+				const q = `select a, b from om where a in (1, 2) and b in (10, 20) order by a, b desc`;
+				expect(await planOps(q)).to.not.match(/SORT/);
+				expect(await abs(q)).to.deep.equal(['1/20', '1/10', '2/20', '2/10']);
+			});
+		});
+
+		describe('composite primary key (a, b)', () => {
+			beforeEach(async () => {
+				await db.exec(`create table c (a integer, b integer, z text, primary key (a, b)) using store`);
+				await db.exec(`insert into c values (1, 10, 'x'), (1, 20, 'y'), (2, 10, 'z'), (2, 20, 'w'), (3, 10, 'q')`);
+			});
+
+			it('IN × IN cross-products into one multi-seek over the whole key', async () => {
+				const q = `select a, b from c where a in (1, 3) and b in (10, 20) order by a, b`;
+				expect(await planProperties(q)).to.match(/idx=_primary_\(0\);plan=5;inCount=4;seekWidth=2/);
+				// The (3, 20) tuple has no row; the seek simply finds nothing for it.
+				expect(await abs(q)).to.deep.equal(['1/10', '1/20', '3/10']);
+			});
+
+			it('IN × EQ seeks the whole key too', async () => {
+				const q = `select a, b from c where a in (1, 2) and b = 10 order by a, b`;
+				expect(await planProperties(q)).to.match(/plan=5;inCount=2;seekWidth=2/);
+				expect(await abs(q)).to.deep.equal(['1/10', '2/10']);
+			});
+
+			it('a no-match cross-product yields no rows', async () =>
+				expect(await abs(`select a, b from c where a in (9) and b in (10, 20)`)).to.deep.equal([]));
+
+			it('a PARTIAL pin keeps the pre-existing scan + residual', async () => {
+				// Only the leading key column is pinned, so there is no whole-key tuple to
+				// point-read. Unchanged by this feature — pinned so a later widening is a
+				// deliberate change rather than a silent one.
+				const q = `select a, b from c where a in (1, 2) order by a, b`;
+				expect(await planProperties(q)).to.match(/idx=_primary_\(0\);plan=0/);
+				expect(await planOps(q), 'the IN survives as a residual').to.match(/FILTER/);
+				expect(await abs(q)).to.deep.equal(['1/10', '1/20', '2/10', '2/20']);
+			});
+		});
+
+		describe('gates that decline, and stay correct', () => {
+			it('a list over the seek cap declines to a scan + residual', async () => {
+				await db.exec(`create table big (pk integer primary key, v integer) using store`);
+				await db.exec(`insert into big values (1, 5), (2, 500), (3, 2000)`);
+				const q = `select pk from big where pk in (${Array.from({ length: 1001 }, (_, i) => i).join(', ')}) order by pk`;
+				expect(await planProperties(q)).to.match(/idx=_primary_\(0\);plan=0/);
+				expect(await planOps(q)).to.match(/FILTER/);
+				expect(await pks(q), 'the residual keeps the answer').to.deep.equal([1, 2, 3]);
+			});
+
+			it('a list of exactly the cap still seeks (the cap is exclusive)', async () => {
+				await db.exec(`create table cap (pk integer primary key, v integer) using store`);
+				await db.exec(`insert into cap values (1, 5), (2, 500), (3, 2000)`);
+				const q = `select pk from cap where pk in (${Array.from({ length: 1000 }, (_, i) => i).join(', ')}) order by pk`;
+				expect(await planProperties(q)).to.match(/idx=_primary_\(0\);plan=5;inCount=1000/);
+				expect(await pks(q)).to.deep.equal([1, 2, 3]);
+			});
+
+			it('a TIMESPAN primary key declines the multi-seek but keeps the answer', async () => {
+				// N merged point windows ARE the whole access with the residual dropped, and a
+				// semantic-ordering key has no faithful byte position for every member — so the
+				// arm declines per SCHEMA and falls through to the scan, whose residual compares
+				// by elapsed time ('PT60M' matches the listed 'PT1H').
+				await db.exec(`create table ts (d timespan primary key, v integer) using store`);
+				await db.exec(`insert into ts values ('PT60M', 1), ('PT2H', 2)`);
+				const q = `select v from ts where d in ('PT1H', 'PT3H')`;
+				expect(await planProperties(q)).to.match(/idx=_primary_\(0\);plan=0/);
+				expect(await planOps(q)).to.match(/FILTER/);
+				expect((await asyncIterableToArray(db.eval(q))).map(r => r.v)).to.deep.equal([1]);
+			});
+		});
+
+		it('a text primary key seeks under the table key collation, each row once', async () => {
+			// The store's default key collation is NOCASE and `reconcilePkCollations` rewrites an
+			// undecorated text PK member to it, so 'alice' and 'ALICE' encode to ONE key: three
+			// listed values, two distinct keys, two rows.
+			await db.exec(`create table s (name text primary key, v integer) using store`);
+			await db.exec(`insert into s values ('Alice', 1), ('bob', 2), ('carol', 3)`);
+			const q = `select name from s where name in ('alice', 'ALICE', 'BOB') order by name`;
+			expect(await planProperties(q)).to.match(/idx=_primary_\(0\);plan=5;inCount=3/);
+			expect((await asyncIterableToArray(db.eval(q))).map(r => r.name)).to.deep.equal(['Alice', 'bob']);
+		});
+
+		it('reads-own-writes: uncommitted inserts surface and uncommitted deletes do not', async () => {
+			await db.exec(`create table rw (pk integer primary key, v integer) using store`);
+			await db.exec(`insert into rw values (1, 10), (2, 20)`);
+			await db.exec('begin');
+			await db.exec(`insert into rw values (3, 30)`);
+			await db.exec(`delete from rw where pk = 1`);
+			const q = `select pk from rw where pk in (1, 2, 3) order by pk`;
+			const idxStr = await planProperties(q);
+			const rows = await pks(q);
+			await db.exec('commit');
+			expect(idxStr, 'still a seek, not a scan').to.match(/idx=_primary_\(0\);plan=5;inCount=3/);
+			expect(rows).to.deep.equal([2, 3]);
+		});
+
+		it('PK IN-list results match the memory-module oracle', async () => {
+			const seed = async (name: string, using: string) => {
+				await db.exec(`create table ${name} (a integer, b integer, s text, primary key (a, b)) ${using}`);
+				await db.exec(`insert into ${name} values (1, 10, 'ant'), (1, 20, 'bee'), (2, 10, 'cat'), (2, 20, 'dog')`);
+			};
+			await seed('ostore', 'using store');
+			await seed('omem', '');
+			for (const where of [
+				`a in (1, 2) and b in (10, 20)`,
+				`a in (1) and b in (20)`,
+				`a in (1, 1, 2) and b = 10`,
+				`a in (1, null) and b in (10, 20)`,
+				`a in (9) and b in (10)`,
+			]) {
+				const q = (t: string) => `select a, b, s from ${t} where ${where} order by a, b`;
+				const storeRows = await asyncIterableToArray(db.eval(q('ostore')));
+				const memRows = await asyncIterableToArray(db.eval(q('omem')));
+				expect(storeRows, where).to.deep.equal(memRows);
+			}
+		});
+
+		// Rows alone cannot distinguish a multi-seek from a full scan + residual, so count the
+		// DATA store's operations: the PK seek point-reads exactly the listed keys and never
+		// iterates. (The secondary arm's twin of this test resolves index ENTRIES to rows; here
+		// the point read IS the row read.)
+		describe('narrowing (counting data store)', () => {
+			let cdb: Database;
+			let cprovider: KVStoreProvider;
+			let dataStores: Map<string, CountingKVStore>;
+
+			beforeEach(async () => {
+				dataStores = new Map();
+				cprovider = createCountingProvider(dataStores);
+				cdb = new Database();
+				cdb.registerModule('store', new StoreModule(cprovider));
+				await cdb.exec(`create table nums (pk integer primary key, v integer) using store`);
+				await cdb.exec(`insert into nums values ${
+					Array.from({ length: 100 }, (_, i) => `(${i}, ${i * 10})`).join(', ')}`);
+			});
+
+			afterEach(async () => {
+				await cprovider.closeAll();
+			});
+
+			/** The data store for `main.nums`, with its counters zeroed after seeding. */
+			const counted = (): CountingKVStore => {
+				const store = dataStores.get('main.nums')!;
+				store.iterateEntryCount = 0;
+				store.getCount = 0;
+				store.getManyCalls = 0;
+				store.getManyKeyCount = 0;
+				return store;
+			};
+
+			it('point-reads only the listed keys, in one `getMany` round trip', async () => {
+				const store = counted();
+				const rows = await asyncIterableToArray(cdb.eval(`select pk from nums where pk in (5, 7, 9) order by pk`));
+				expect(rows.map(r => r.pk)).to.deep.equal([5, 7, 9]);
+				expect(store.iterateEntryCount, 'no data-store iteration at all').to.equal(0);
+				expect(store.getManyCalls, 'the three points collapse into one batch').to.equal(1);
+				expect(store.getManyKeyCount, 'exactly the listed keys are batched').to.equal(3);
+				expect(store.getCount, 'and nothing beyond them is read').to.equal(3);
+			});
+
+			it('an all-NULL list touches the data store not at all', async () => {
+				const store = counted();
+				const rows = await asyncIterableToArray(cdb.eval(`select pk from nums where pk in (?, ?)`, [null, null]));
+				expect(rows).to.deep.equal([]);
+				expect(store.iterateEntryCount, 'no scan').to.equal(0);
+				expect(store.getCount, 'and no point read either').to.equal(0);
+			});
+		});
+	});
 });
