@@ -47,7 +47,7 @@ A secondary index: name plus an ordered list of column references (by index into
 
 ### RowConstraintSchema
 
-A CHECK constraint with an AST expression, an operation bitmask (insert/update/delete), and deferral settings.
+A CHECK constraint with an AST expression, an operation bitmask (insert/update/delete), and deferral settings. The expression normally *passes* when truthy or NULL. A write-plan-time synthesizer may instead set the transient `messageValued` flag (never persisted to the catalog), which inverts that test: the expression yields NULL when satisfied and the violation-message text when violated, so one planned expression can decide several rules and still name the one that failed — see [Lens § Constraint Attachment](lens.md).
 
 ### UniqueConstraintSchema
 

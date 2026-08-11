@@ -87,6 +87,13 @@ function split(): MappingAdvertisement {
  * satisfying row (id 1, name 'alpha', tag 'seed').
  */
 async function setup(db: Database, tableBody: string): Promise<void> {
+	await deploy(db, tableBody);
+	await db.exec("insert into main.W_core values (1, 'alpha')");
+	await db.exec("insert into main.W_tag values (1, 'seed')");
+}
+
+/** Deploys the split with `tableBody` as the logical W declaration, seeding nothing. */
+async function deploy(db: Database, tableBody: string): Promise<void> {
 	const mod = new GrandfatheredAdvertisingModule();
 	mod.ads = [split()];
 	db.registerModule('admod', mod);
@@ -94,10 +101,13 @@ async function setup(db: Database, tableBody: string): Promise<void> {
 	// and the NULL-rule case below needs a NULL name the basis itself accepts.
 	await db.exec('create table W_core (id integer primary key, name text null) using admod');
 	await db.exec('create table W_tag (id integer primary key, tag text) using admod');
+	// Allow-lists for the subquery-bearing checks, deliberately NOT named `name` /
+	// `tag`: a bare reference inside the subquery would resolve to the inner
+	// relation's own column and the check would be vacuous.
+	await db.exec('create table AllowName (av text primary key) using admod');
+	await db.exec('create table AllowTag (bv text primary key) using admod');
 	await db.exec(`declare logical schema x { table W { ${tableBody} } }`);
 	await db.exec('apply schema x');
-	await db.exec("insert into main.W_core values (1, 'alpha')");
-	await db.exec("insert into main.W_tag values (1, 'seed')");
 }
 
 /** Both rule classes: an authored CHECK on `name` and a NOT NULL obligation on `tag`. */
@@ -143,12 +153,67 @@ describe('lens grouped deferred probe — exact per-rule failure attribution', (
 		}
 	});
 
+	it('two rules violated at once: the FIRST in obligation order is reported', async () => {
+		const db = new Database();
+		try {
+			await setup(db, "id integer primary key, name text null constraint r_name check (name <> 'bad'), "
+				+ "tag text null constraint r_tag check (tag <> 'bad')");
+			// Both branches of the one CASE are live; the CASE takes the first taken
+			// branch, which is the first rule in obligation order.
+			const message = await captureErrorMessage(() => db.exec("update x.W set name = 'bad', tag = 'bad' where id = 1"));
+			expect(message).to.equal('CHECK constraint failed: lens:r_name');
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('a satisfying multi-column update passes', async () => {
 		const db = new Database();
 		try {
 			await setup(db, TWO_CLASS_BODY);
 			await db.exec("update x.W set name = 'ok', tag = 'fine' where id = 1");
 			expect(await rows(db, 'select name, tag from x.W where id = 1')).to.deep.equal([{ name: 'ok', tag: 'fine' }]);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+describe('lens grouped deferred probe — the INSERT seam groups too', () => {
+	// The INSERT deferred branch (subquery-bearing checks riding the anchor op)
+	// uses the same synthesizer, so several such checks now share ONE probe. Each
+	// must still be attributed to itself, whichever one the row violates.
+	const TWO_SUBQUERY_BODY =
+		'id integer primary key, name text null, tag text null, '
+		+ 'constraint a_rule check (exists (select 1 from AllowName where AllowName.av = name)), '
+		+ 'constraint b_rule check (exists (select 1 from AllowTag where AllowTag.bv = tag))';
+
+	async function setupAllowed(db: Database): Promise<void> {
+		await deploy(db, TWO_SUBQUERY_BODY);
+		await db.exec("insert into main.AllowName values ('ok')");
+		await db.exec("insert into main.AllowTag values ('fine')");
+	}
+
+	it('a row satisfying both grouped checks inserts', async () => {
+		const db = new Database();
+		try {
+			await setupAllowed(db);
+			await db.exec("insert into x.W (id, name, tag) values (1, 'ok', 'fine')");
+			expect(await rows(db, 'select id from x.W')).to.deep.equal([{ id: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('either grouped check, violated alone, rejects with its own message', async () => {
+		const db = new Database();
+		try {
+			await setupAllowed(db);
+			expect(await captureErrorMessage(() => db.exec("insert into x.W (id, name, tag) values (2, 'nope', 'fine')")))
+				.to.equal('CHECK constraint failed: lens:a_rule');
+			expect(await captureErrorMessage(() => db.exec("insert into x.W (id, name, tag) values (3, 'ok', 'nope')")))
+				.to.equal('CHECK constraint failed: lens:b_rule');
+			expect(await rows(db, 'select id from x.W')).to.deep.equal([]);
 		} finally {
 			await db.close();
 		}

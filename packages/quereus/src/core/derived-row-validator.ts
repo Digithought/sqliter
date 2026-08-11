@@ -180,6 +180,12 @@ function compileDerivedRowCheck(
 		const value = await scheduler.run(rctx) as SqlValue;
 		// The constraint-check truthy/NULL-pass rule (shared isTruthy semantics):
 		// NULL passes, everything else fails unless truthy.
+		// NOTE: ignores `ConstraintCheck.messageValued` (the inverted, message-as-value
+		// form runtime/row-constraints.ts honors). Unreachable today — the flag is set
+		// only on write-plan-time lens constraints, never on the persisted declarations
+		// this validator compiles. If a message-valued constraint ever reaches here it
+		// would still REJECT (a message string coerces falsy) but report `violation()`'s
+		// generic text instead of the rule's own; teach this evaluator the flag then.
 		if (value !== null && !isTruthy(value)) throw violation();
 		return value;
 	};

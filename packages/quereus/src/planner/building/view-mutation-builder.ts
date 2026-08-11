@@ -707,6 +707,12 @@ function lensRowLocalDecompositionUpdateConstraints(
 	if (checks.length === 0) return [];
 	const { address } = requireLensLogicalRowAddress(ctx, view, slot, shape.storage, checks[0].name);
 
+	// NOTE: the collapse is per WRITTEN ROW — each row a statement touches still
+	// enqueues one deferred logical-view probe per touched member relation, so a
+	// bulk update pays O(rows) point re-reads at commit. Fine at today's scale
+	// (the rule-count multiplier was the measured problem); if bulk lens writes
+	// ever show up hot, the next step is a set-level probe over the written keys,
+	// not further trimming here.
 	const constraints: RowConstraintSchema[] = [];
 	const seen = new Set<string>();
 	for (const op of baseOps) {
