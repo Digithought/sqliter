@@ -57,6 +57,29 @@ The store module uses separate logical stores for different data types:
 
 This design eliminates redundant prefixes and groups related stores together by table name. The leading-`0x00` view/MV prefixes never collide with an unprefixed table key, so a view/MV may safely share a name with a table; a full catalog scan returns all three kinds intermixed and rehydrate classifies each by its key prefix.
 
+**Which predicate shapes become a seek.** Everything else is answered by a full scan plus
+a re-check of the pushed predicate, which is always correct — the shapes below are the ones
+that also *narrow the bytes read*:
+
+| Shape | Served by |
+|-------|-----------|
+| Equality on every primary-key column | one data-store point read |
+| `<` / `<=` / `>` / `>=` on the **leading** primary-key column | one data-store byte window |
+| Equality on a contiguous **leading prefix** of a secondary index | one index byte window (`plan=2`) |
+| `IN` on a contiguous leading prefix of a secondary index | one index window per distinct list value (`plan=5`, see below) |
+| `<` / `<=` / `>` / `>=` on the **leading** column of a secondary index | one index byte window (`plan=3`) |
+| Equality on a **strict** leading prefix of a secondary index **plus** a bound on the very next index column | one index byte window covering just the bounded slice inside the prefix (`plan=7`) |
+
+The last row is what makes `where entity = ? and date between ? and ?` over an index on
+`(entity, date)` read only the dated slice rather than every row of the entity. It needs the
+prefix pinned to a **single** value per column — a multi-value `IN` prefix keeps the
+multi-seek above and leaves the bound as a residual — and it gives up the narrowing (falling
+back to the plain prefix window, answer unchanged) when the bounded column's key bytes do not
+reproduce its collation's order, or when its bound value has no faithful key position under a
+semantically-ordered type. A bound on a *later* index column than the one right after the
+prefix is not seeked at all. No ordering is advertised for this path, so an `ORDER BY` on the
+bounded column keeps its `Sort`.
+
 **`IN`-list index seeks ("multi-seek").** An `IN`-list on an indexed column
 (`where v in (1, 2, 3)`, including parameter-bound lists) is served from the index as one
 deduplicated, key-ordered point seek per distinct list value, instead of a full scan with

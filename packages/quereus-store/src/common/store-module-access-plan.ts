@@ -8,7 +8,7 @@
  * advertise, and the scan layer there executes it. A plan that claims a filter the scan
  * cannot honor drops the residual Filter and returns wrong rows, so every soundness
  * predicate the two share lives in `pk-key-resolution.ts` (`keyOrderMatchesCollation`,
- * `indexLeadingRangeIsOrderSafe`, `pkOrderPreservingPrefixLength`) rather than being
+ * `indexRangeAtPositionIsOrderSafe`, `pkOrderPreservingPrefixLength`) rather than being
  * restated here. The declines that are NOT shared — partial indexes, the multi-seek cap,
  * and the semantic-ordering column ban on multi-seeks specifically — are stated in both
  * files, and changing one means changing the other.
@@ -28,8 +28,8 @@ import type {
 } from '@quereus/quereus';
 import { AccessPlanBuilder, equalitySeekKeyCount, hasSemanticOrdering, isMultiValueEquality } from '@quereus/quereus';
 import {
-	indexLeadingRangeIsOrderSafe,
 	indexPrefixSeekIsCollationExact,
+	indexRangeAtPositionIsOrderSafe,
 	pkOrderPreservingPrefixLength,
 	resolveIndexKeyCollations,
 	resolvePkKeyCollations,
@@ -70,6 +70,39 @@ const MAX_MULTI_SEEK_KEYS = 1000;
 
 /** Cost of positioning one index seek, in the same unit as the per-row fetch cost. */
 const INDEX_SEEK_COST = 0.5;
+
+/** Which shape of window a secondary index can serve for a given predicate. */
+type IndexArm =
+	/** Contiguous leading-prefix equality — one prefix window (`plan=2`, or `plan=5` for an IN). */
+	| 'eq'
+	/** LT/LE/GT/GE on the LEADING index column, no equality ahead of it (`plan=3`). */
+	| 'range'
+	/** Equality on a strict leading prefix plus a bound on the NEXT column (`plan=7`). */
+	| 'prefixRange';
+
+/**
+ * Estimated rows each arm returns, as a fraction of the request's `estimatedRows`. The
+ * store keeps no per-column histograms, so these are shape constants, not statistics.
+ *
+ * `prefixRange` sits between the two pre-existing factors, as its window does: it is
+ * narrower than a bare leading-column range (the prefix pins every column ahead of the
+ * bound) and wider than the pure-equality estimate, which stands for a prefix pinning
+ * every column the predicate names.
+ *
+ * NOTE: the arms are exclusive per index, but two INDEXES compete on cost — and an index
+ * on the equality prefix ALONE prices its `eq` arm cheaper (0.1) than the composite index
+ * prices its `prefixRange` arm (0.15), so a schema carrying both `(a)` and `(a, b)` picks
+ * `(a)` for `a = ? and b > ?` and leaves the `b` bound residual. Answers are unaffected.
+ * Fine while redundant prefix indexes are rare; if one shows up as a slow plan, either
+ * scale the `eq` factor by how many index columns the prefix actually pins, or drop
+ * `prefixRange` below `eq` — do not just swap the two constants, which would then mis-rank
+ * a genuine leading-column range.
+ */
+const ARM_SELECTIVITY: Readonly<Record<IndexArm, number>> = {
+	eq: 0.1,
+	prefixRange: 0.15,
+	range: 0.3,
+};
 
 /** One (column, operator-group) slot that the access-path rule fills from a single filter. */
 interface SeekRole {
@@ -206,7 +239,8 @@ export function computeBestAccessPlan(
 	}
 
 	// Check for secondary index usage. `StoreTable.query` now implements the
-	// secondary-index scan arm (leading-prefix EQ point / leading-column range),
+	// secondary-index scan arm (leading-prefix EQ point / leading-column range /
+	// prefix-equality + trailing-column range),
 	// so we advertise the index with `indexName` + `seekColumns` and mark the
 	// covered filters handled — subject to the range arm's order-safety gate in
 	// {@link tryIndexAccessPlan}. A cost-only plan (no seek) is kept as a fallback
@@ -264,8 +298,9 @@ export function computeBestAccessPlan(
  * the index is not usable for this predicate.
  *
  * Usable = a contiguous leading-prefix EQ on the index columns (an index seek /
- * point), or a LT/LE/GT/GE range on the LEADING index column. These mirror the
- * two windows `StoreTable.analyzeIndexAccess` can build.
+ * point), a LT/LE/GT/GE range on the LEADING index column, or a strict leading-prefix EQ
+ * plus a LT/LE/GT/GE range on the NEXT index column (`prefixRange`, `plan=7`). These
+ * mirror the three windows `StoreTable.analyzeIndexAccess` can build.
  *
  * **Collation safety.** Index-column key bytes are encoded under each column's own key
  * collation (`resolveIndexKeyCollations`); `StoreTable.matchesFilters` re-checks a fetched
@@ -278,9 +313,11 @@ export function computeBestAccessPlan(
  *    the same resolution the residual uses); a collation-blind column (`json`, the
  *    temporal types) under an index column with an explicit non-BINARY COLLATE does not
  *    (its key bytes are hard-BINARY) and declines.
- *  - RANGE — {@link indexLeadingRangeIsOrderSafe}: the same agreement PLUS the collation's
- *    `orderPreserving` assertion, because a byte window also equates memcmp of the key
- *    bytes with the residual comparator's order.
+ *  - RANGE — {@link indexRangeAtPositionIsOrderSafe}: the same agreement PLUS the
+ *    collation's `orderPreserving` assertion, because a byte window also equates memcmp of
+ *    the key bytes with the residual comparator's order. Asked at position 0 for a
+ *    leading-column range, and at the prefix length for a `prefixRange` trailing bound —
+ *    whose PREFIX additionally passes the EQUALITY gate above.
  *
  * `StoreTable.analyzeIndexAccess` gates its windows on the same two helpers, so the "mark
  * handled" and "build a window" decisions cannot disagree. A decline returns a cost-only
@@ -334,35 +371,68 @@ function tryIndexAccessPlan(
 		f => f.columnIndex === leadingCol && RANGE_OPS.includes(f.op),
 	);
 
+	// Prefix-equality + trailing-range: the equality prefix is a STRICT, non-empty prefix
+	// of the index columns and the NEXT index column carries a bound. `StoreTable
+	// .analyzeIndexAccess` builds the matching one-window `[prefix||bound]` range.
+	//
+	// A multi-value prefix is EXCLUDED: `rule-select-access-path` can only seek a
+	// single-valued prefix key, so `a in (1, 2) and b > 15` over `(a, b)` would come back
+	// as a sequential scan with both predicates residual — worse than the multi-seek this
+	// index can still serve on the IN alone. MemoryTableModule.evaluateIndexAccess records
+	// the same restriction for the same reason.
+	const nextCol = eqCols.length > 0 && eqCols.length < indexColIndexes.length
+		? indexColIndexes[eqCols.length]
+		: undefined;
+	const trailingRangeCol = (!isMultiSeek && nextCol !== undefined
+		&& request.filters.some(f => f.columnIndex === nextCol && RANGE_OPS.includes(f.op)))
+		? nextCol
+		: undefined;
+
 	let seekCols: number[];
-	let isRange: boolean;
-	if (eqCols.length > 0) {
+	let arm: IndexArm;
+	if (trailingRangeCol !== undefined) {
+		seekCols = [...eqCols, trailingRangeCol];
+		arm = 'prefixRange';
+	} else if (eqCols.length > 0) {
 		seekCols = eqCols;
-		isRange = false;
+		arm = 'eq';
 	} else if (hasLeadingRange) {
 		seekCols = [leadingCol];
-		isRange = true;
+		arm = 'range';
 	} else {
 		return null; // this index cannot serve this predicate
 	}
 
-	const rows = isRange
-		? Math.max(1, Math.floor(estimatedRows * 0.3))
-		: Math.max(1, Math.floor(estimatedRows * 0.1));
+	// Collation gates — see the doc comment above. `StoreTable.analyzeIndexAccess` declines
+	// exactly the same windows through the same two helpers, at the same positions.
+	const indexKeyCollations = resolveIndexKeyCollations(index, tableInfo.columns);
+
+	// A trailing bound whose byte order does not reproduce its residual comparator's order
+	// costs only the bound, not the whole plan: DEGRADE to the equality-prefix seek and
+	// leave the bound unclaimed, so it survives in the residual Filter. The scan side makes
+	// the same move (a `plan=2` eqSeek arrives and it windows the prefix), and keeping the
+	// prefix seek is strictly better than the cost-only fallback below.
+	if (arm === 'prefixRange'
+		&& !indexRangeAtPositionIsOrderSafe(db, tableInfo.columns, index, indexKeyCollations, eqCols.length)) {
+		arm = 'eq';
+		seekCols = eqCols;
+	}
+
+	const isRange = arm !== 'eq';
+	const rows = Math.max(1, Math.floor(estimatedRows * ARM_SELECTIVITY[arm]));
 	const costOnly = (why: string): BestAccessPlanResult =>
 		(isRange ? AccessPlanBuilder.rangeScan(rows, 0.2) : AccessPlanBuilder.eqMatch(rows, 0.3))
 			.setHandledFilters(new Array(request.filters.length).fill(false))
 			.setExplanation(`Store index scan on ${index.name} (${why})`)
 			.build();
 
-	// Collation gates — see the doc comment above. `StoreTable.analyzeIndexAccess` declines
-	// exactly the same windows through the same two helpers.
-	const indexKeyCollations = resolveIndexKeyCollations(index, tableInfo.columns);
-	if (isRange) {
-		if (!indexLeadingRangeIsOrderSafe(db, tableInfo.columns, index, indexKeyCollations)) {
+	if (arm === 'range') {
+		if (!indexRangeAtPositionIsOrderSafe(db, tableInfo.columns, index, indexKeyCollations, 0)) {
 			return costOnly('cost-only; index range needs an order-preserving key collation');
 		}
-	} else if (!indexPrefixSeekIsCollationExact(tableInfo.columns, index, indexKeyCollations, seekCols.length)) {
+	} else if (!indexPrefixSeekIsCollationExact(tableInfo.columns, index, indexKeyCollations, eqCols.length)) {
+		// Covers the `prefixRange` arm's PREFIX too: its pinned columns need exactly the
+		// equality arm's guarantee, and its trailing column was gated just above.
 		return costOnly('cost-only; index key collation differs from the comparison collation');
 	}
 
@@ -383,10 +453,18 @@ function tryIndexAccessPlan(
 		return costOnly('cost-only; semantic-ordering seek column cannot multi-seek');
 	}
 
-	// Claim positionally — see {@link claimFirstPerRole}.
+	// Claim positionally — see {@link claimFirstPerRole}. The `prefixRange` arm claims the
+	// prefix equalities AND the first lower/upper bound on the trailing column; a redundant
+	// same-side bound (`date > a and date > b`) stays unclaimed and survives in the residual.
+	// A prefixRange DEGRADED to 'eq' above claims the prefix only, so its trailing bounds
+	// likewise survive.
 	const handledFilters = claimFirstPerRole(
 		request.filters,
-		isRange ? rangeRoles(leadingCol) : equalityRoles(eqCols, EQ_OR_IN_OPS),
+		arm === 'range'
+			? rangeRoles(leadingCol)
+			: arm === 'prefixRange'
+				? [...equalityRoles(eqCols, EQ_OR_IN_OPS), ...rangeRoles(trailingRangeCol!)]
+				: equalityRoles(eqCols, EQ_OR_IN_OPS),
 	);
 
 	if (isMultiSeek) {
@@ -405,11 +483,14 @@ function tryIndexAccessPlan(
 			.build();
 	}
 
+	const armLabel = arm === 'prefixRange'
+		? `prefix-range seek(prefix=${eqCols.length})`
+		: arm === 'range' ? 'range scan' : 'seek';
 	return (isRange ? AccessPlanBuilder.rangeScan(rows, 0.2) : AccessPlanBuilder.eqMatch(rows, 0.3))
 		.setHandledFilters(handledFilters)
 		.setIndexName(index.name)
 		.setSeekColumns(seekCols)
-		.setExplanation(`Store index ${isRange ? 'range scan' : 'seek'} on ${index.name}`)
+		.setExplanation(`Store index ${armLabel} on ${index.name}`)
 		.build();
 }
 

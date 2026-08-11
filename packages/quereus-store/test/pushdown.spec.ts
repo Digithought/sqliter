@@ -1013,6 +1013,173 @@ describe('StoreModule predicate pushdown', () => {
 			expect(await ids(`select id from t where a > 5 order by id`)).to.deep.equal([3]);
 		});
 
+		// Prefix-equality + trailing-range seek (`plan=7`). `a = ? and b < ?` over an index
+		// on `(a, b)` used to seek only the `a` prefix and re-filter every entry under it;
+		// it now seeks `prefix || bound`. Correctness was never at stake (the residual was
+		// retained), so every case below asserts ROWS as well as the plan, and the last two
+		// prove the window actually narrowed and that the degraded paths still widen.
+		describe('prefix-equality + trailing-range seek', () => {
+			const ids = async (q: string) =>
+				(await asyncIterableToArray(db.eval(q))).map(r => r.id as number);
+
+			describe('ASC trailing column', () => {
+				beforeEach(async () => {
+					await db.exec(`create table t (id integer primary key, a integer, b integer) using store`);
+					await db.exec(`create index ix_ab on t (a, b)`);
+					await db.exec(`insert into t values
+						(1, 5, 10), (2, 5, 20), (3, 5, 30), (4, 5, 40),
+						(5, 6, 20), (6, 6, 30)`);
+				});
+
+				it('picks the index seek, not a scan', async () => {
+					const ops = await planOps(`select id from t where a = 5 and b >= 20 and b <= 30`);
+					expect(ops).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+					expect(ops).to.not.match(/SEQSCAN|SEQ SCAN|SeqScan/i);
+				});
+
+				it('two-sided inclusive window', async () =>
+					expect(await ids(`select id from t where a = 5 and b >= 20 and b <= 30 order by id`))
+						.to.deep.equal([2, 3]));
+
+				it('two-sided exclusive window', async () =>
+					expect(await ids(`select id from t where a = 5 and b > 10 and b < 40 order by id`))
+						.to.deep.equal([2, 3]));
+
+				it('between behaves as the inclusive two-sided window', async () =>
+					expect(await ids(`select id from t where a = 5 and b between 20 and 30 order by id`))
+						.to.deep.equal([2, 3]));
+
+				it('lower bound only', async () =>
+					expect(await ids(`select id from t where a = 5 and b > 20 order by id`))
+						.to.deep.equal([3, 4]));
+
+				it('upper bound only', async () =>
+					expect(await ids(`select id from t where a = 5 and b <= 20 order by id`))
+						.to.deep.equal([1, 2]));
+
+				it('the prefix still confines the window (rows of the other group never leak)', async () =>
+					expect(await ids(`select id from t where a = 6 and b >= 20 order by id`))
+						.to.deep.equal([5, 6]));
+
+				it('an empty window yields no rows', async () =>
+					expect(await ids(`select id from t where a = 5 and b > 40 and b < 100`)).to.deep.equal([]));
+
+				it('a bound below every stored value still confines to the prefix group', async () =>
+					expect(await ids(`select id from t where a = 5 and b >= 0 order by id`))
+						.to.deep.equal([1, 2, 3, 4]));
+
+				// Only the FIRST bound per role may be claimed handled; a later duplicate must
+				// survive in the residual Filter (see claimFirstPerRole).
+				it('two lower bounds: the tighter one is not dropped', async () =>
+					expect(await ids(`select id from t where a = 5 and b > 10 and b > 30 order by id`))
+						.to.deep.equal([4]));
+
+				it('two upper bounds: the tighter one is not dropped', async () =>
+					expect(await ids(`select id from t where a = 5 and b < 40 and b < 20 order by id`))
+						.to.deep.equal([1]));
+
+				it('mixed same-side ops (> and >=) keep both', async () =>
+					expect(await ids(`select id from t where a = 5 and b > 10 and b >= 30 order by id`))
+						.to.deep.equal([3, 4]));
+
+				// The rule can only seek a SINGLE-valued prefix key, so this arm must decline
+				// and let the IN take the multi-seek path with `b` residual.
+				it('a multi-value IN prefix does not take the arm, and stays correct', async () =>
+					expect(await ids(`select id from t where a in (5, 6) and b >= 30 order by id`))
+						.to.deep.equal([3, 4, 6]));
+			});
+
+			it('DESC trailing column seeks under byte inversion', async () => {
+				await db.exec(`create table d (id integer primary key, a integer, b integer) using store`);
+				await db.exec(`create index ix_d on d (a asc, b desc)`);
+				await db.exec(`insert into d values (1, 5, 10), (2, 5, 20), (3, 5, 30), (4, 5, 40), (5, 6, 20)`);
+				expect(await planOps(`select id from d where a = 5 and b >= 20 and b <= 30`))
+					.to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+				expect(await ids(`select id from d where a = 5 and b >= 20 and b <= 30 order by id`))
+					.to.deep.equal([2, 3]);
+				expect(await ids(`select id from d where a = 5 and b > 30 order by id`)).to.deep.equal([4]);
+				expect(await ids(`select id from d where a = 5 and b < 20 order by id`)).to.deep.equal([1]);
+			});
+
+			it('a DESC PREFIX column does not swap the trailing assignment', async () => {
+				// A DESC prefix column inverts bytes INSIDE a prefix that stays fixed, so only
+				// the bounded column's direction may drive the lower/upper swap.
+				await db.exec(`create table dp (id integer primary key, a integer, b integer) using store`);
+				await db.exec(`create index ix_dp on dp (a desc, b asc)`);
+				await db.exec(`insert into dp values (1, 5, 10), (2, 5, 20), (3, 5, 30), (4, 6, 20)`);
+				expect(await ids(`select id from dp where a = 5 and b >= 20 order by id`)).to.deep.equal([2, 3]);
+				expect(await ids(`select id from dp where a = 5 and b < 20 order by id`)).to.deep.equal([1]);
+			});
+
+			it('a three-column index bounds the THIRD column under a two-column prefix', async () => {
+				await db.exec(`create table t3 (id integer primary key, a integer, b integer, c integer) using store`);
+				await db.exec(`create index ix_abc on t3 (a, b, c)`);
+				await db.exec(`insert into t3 values (1,1,1,10), (2,1,1,20), (3,1,1,30), (4,1,2,20), (5,2,1,20)`);
+				expect(await ids(`select id from t3 where a = 1 and b = 1 and c >= 20 order by id`))
+					.to.deep.equal([2, 3]);
+			});
+
+			it('results match the memory-module oracle', async () => {
+				const seed = async (name: string, using: string) => {
+					await db.exec(`create table ${name} (id integer primary key, a integer, b integer) ${using}`);
+					await db.exec(`create index ix_${name} on ${name} (a, b)`);
+					await db.exec(`insert into ${name} values
+						(1, 5, 10), (2, 5, 20), (3, 5, 30), (4, 6, 20), (5, 7, 5)`);
+				};
+				await seed('pstore', 'using store');
+				await seed('pmem', '');
+				for (const where of [
+					`a = 5 and b >= 20`,
+					`a = 5 and b between 10 and 20`,
+					`a = 5 and b < 30`,
+					`a = 5 and b > 10 and b > 25`,
+					`a in (5, 6) and b >= 20`,
+					`a = 7 and b >= 0`,
+				]) {
+					const q = (t: string) => `select id from ${t} where ${where} order by id`;
+					expect(await asyncIterableToArray(db.eval(q('pstore'))), where)
+						.to.deep.equal(await asyncIterableToArray(db.eval(q('pmem'))));
+				}
+			});
+
+			it('reads-own-writes: pending rows inside the narrowed window surface, outside ones do not', async () => {
+				await db.exec(`create table rw2 (id integer primary key, a integer, b integer) using store`);
+				await db.exec(`create index ix_rw2 on rw2 (a, b)`);
+				await db.exec(`insert into rw2 values (1, 5, 10), (2, 5, 20), (3, 5, 90), (4, 6, 25)`);
+				await db.exec('begin');
+				await db.exec(`insert into rw2 values (5, 5, 25), (6, 5, 95), (7, 6, 26)`);
+				await db.exec(`delete from rw2 where id = 2`);
+				const inWindow = await ids(`select id from rw2 where a = 5 and b >= 20 and b <= 30 order by id`);
+				const outOfWindow = await ids(`select id from rw2 where a = 5 and b >= 90 order by id`);
+				await db.exec('rollback');
+				expect(inWindow, 'pending insert inside the window is visible; pending delete is applied')
+					.to.deep.equal([5]);
+				expect(outOfWindow).to.deep.equal([3, 6]);
+			});
+
+			// A trailing column whose key bytes do not reproduce its comparator's ORDER cannot
+			// be windowed. The plan degrades to the plain prefix seek and leaves the bound
+			// unclaimed, so the residual Filter decides the rows.
+			it('a non-order-preserving trailing collation degrades to the prefix seek, residual intact', async () => {
+				// Lowercase-equal but SHORTER-first: 'aa' > 'b' by comparator, 'aa' < 'b' in bytes.
+				db.registerCollation('NOCASE', (x: string, y: string) => {
+					if (x.length !== y.length) return x.length - y.length;
+					const [lx, ly] = [x.toLowerCase(), y.toLowerCase()];
+					return lx < ly ? -1 : lx > ly ? 1 : 0;
+				}, { normalizer: (s: string) => s.toLowerCase() });
+
+				await db.exec(`create table nc (id integer primary key, a integer, s text collate nocase) using store`);
+				await db.exec(`create index ix_nc on nc (a, s)`);
+				await db.exec(`insert into nc values (1, 1, 'aa'), (2, 1, 'b'), (3, 2, 'aa')`);
+
+				// A byte window at `> 'b'` would start past 'aa' and lose row 1.
+				expect(await ids(`select id from nc where a = 1 and s > 'b' order by id`)).to.deep.equal([1]);
+				// The equality prefix still seeks — only the trailing bound was given up.
+				expect(await planOps(`select id from nc where a = 1 and s > 'b'`))
+					.to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+			});
+		});
+
 		// IN-list multi-seek (feat-store-in-list-index-pushdown): an IN on an indexed
 		// column is served as one deduplicated, key-ordered point seek per distinct
 		// list value (`plan=5`) instead of a full scan + residual. The runtime is the
@@ -1322,6 +1489,26 @@ describe('StoreModule predicate pushdown', () => {
 				expect(store.iterateEntryCount, 'no data-store iteration').to.equal(0);
 				// … and only the 3 matched index entries resolve to data-store gets.
 				expect(store.getCount, 'one get per matched entry').to.be.within(1, 6);
+			});
+
+			// The point of the prefix-range arm: the equality prefix here is NOT selective
+			// (every row shares `a = 1`), so a prefix-only window resolves all 100 entries to
+			// 100 data-store reads. The narrowed window resolves only the in-range slice.
+			it('prefix-range seek reads only the in-range rows, not the whole prefix group', async () => {
+				await cdb.exec(`create table ab (id integer primary key, a integer, b integer) using store`);
+				await cdb.exec(`create index ix_ab on ab (a, b)`);
+				const vals = Array.from({ length: 100 }, (_, i) => `(${i}, 1, ${i})`).join(', ');
+				await cdb.exec(`insert into ab values ${vals}`);
+				const store = dataStores.get('main.ab')!;
+				store.iterateEntryCount = 0;
+				store.getCount = 0;
+
+				const rows = await asyncIterableToArray(
+					cdb.eval(`select id from ab where a = 1 and b >= 96 order by id`),
+				);
+				expect(rows.map(r => r.id)).to.deep.equal([96, 97, 98, 99]);
+				expect(store.iterateEntryCount, 'no data-store iteration').to.equal(0);
+				expect(store.getCount, 'only the in-window entries resolve to data reads').to.be.at.most(8);
 			});
 		});
 	});

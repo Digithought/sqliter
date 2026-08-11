@@ -40,9 +40,22 @@ import {
 import {
 	deserializeRow,
 } from './serialization.js';
-import { indexLeadingRangeIsOrderSafe, indexPrefixSeekIsCollationExact, pkOrderPreservingPrefixLength, resolveIndexKeyCollations, resolveIndexKeyTransforms, semanticProbeIsKeyFaithful, storeSemanticKeyTransform } from './pk-key-resolution.js';
+import { indexPrefixSeekIsCollationExact, indexRangeAtPositionIsOrderSafe, pkOrderPreservingPrefixLength, resolveIndexKeyCollations, resolveIndexKeyTransforms, semanticProbeIsKeyFaithful, storeSemanticKeyTransform } from './pk-key-resolution.js';
 
 import { StoreTableBase } from './store-table-base.js';
+
+/**
+ * The pushed constraint ops that bound a byte window from one side. The scan-side twin of
+ * `store-module-access-plan.ts`'s `RANGE_OPS` (which names the same four in the planner's
+ * `PredicateConstraint` spelling), shared by all three window builders below so a new
+ * bound operator cannot reach one arm and not the others.
+ */
+const RANGE_CONSTRAINT_OPS: readonly IndexConstraintOp[] = [
+	IndexConstraintOp.LT,
+	IndexConstraintOp.LE,
+	IndexConstraintOp.GT,
+	IndexConstraintOp.GE,
+];
 
 /**
  * Read-path layer of the generic KVStore-backed virtual table.
@@ -199,9 +212,8 @@ export abstract class StoreTableScan extends StoreTableBase {
 
 		// Check for range constraints on first PK column
 		const firstPkCol = pkColumns[0];
-		const rangeOps = [IndexConstraintOp.LT, IndexConstraintOp.LE, IndexConstraintOp.GT, IndexConstraintOp.GE];
 		const rangeConstraints = filterInfo.constraints?.filter(
-			c => c.constraint.iColumn === firstPkCol && rangeOps.includes(c.constraint.op)
+			c => c.constraint.iColumn === firstPkCol && RANGE_CONSTRAINT_OPS.includes(c.constraint.op)
 		) || [];
 
 		// A range window is only sound when the leading PK column's key bytes order the way
@@ -348,24 +360,32 @@ export abstract class StoreTableScan extends StoreTableBase {
 	 * Analyze filter info to determine a secondary-index access pattern, mirroring
 	 * {@link analyzePKAccess} but over the index chosen in `idxStr`.
 	 *
-	 * A contiguous leading-prefix EQ on the index columns yields a `point` window
-	 * (the prefix covers every entry sharing those leading values — an index seek
-	 * is a PREFIX scan, not a single row, since the index need not be unique and
-	 * the PK suffix varies); otherwise a range (LT/LE/GT/GE) on the LEADING index
-	 * column yields a `range` window. Returns null when neither applies or when the
-	 * index is unresolved. {@link matchesFilters} stays the authoritative row filter,
-	 * so the window need only be a SUPERSET.
+	 * Three window shapes, in the order they are tried:
+	 *
+	 *  - a contiguous leading-prefix EQ plus a LT/LE/GT/GE bound on the NEXT index column
+	 *    (the `prefixRangeSeek` / `plan=7` plan) — one `range` window covering just the
+	 *    bounded slice INSIDE the prefix;
+	 *  - a contiguous leading-prefix EQ alone → a `point` window (the prefix covers every
+	 *    entry sharing those leading values — an index seek is a PREFIX scan, not a single
+	 *    row, since the index need not be unique and the PK suffix varies);
+	 *  - otherwise a range (LT/LE/GT/GE) on the LEADING index column → a `range` window.
+	 *
+	 * Returns null when none applies or when the index is unresolved.
+	 * {@link matchesFilters} stays the authoritative row filter, so the window need only be
+	 * a SUPERSET — which is why every degraded path below WIDENS (a prefix-range that
+	 * cannot narrow falls back to the prefix window, a prefix that cannot encode a member
+	 * stops short) rather than declining outright.
 	 *
 	 * Index-column bytes are encoded under each column's own key collation
 	 * ({@link indexKeyCollations}); {@link matchesFilters} re-checks a fetched row under the
 	 * index column's `COLLATE` else the table column's declared collation. The EQ/prefix
 	 * window is EXACTLY the qualifying set when those two agree, which
-	 * {@link indexPrefixSeekIsCollationExact} decides; the RANGE window additionally equates
-	 * memcmp of the key bytes with the residual's comparison ORDER, which
-	 * {@link indexRangeIsOrderSafe} decides. `tryIndexAccessPlan`
-	 * (store-module-access-plan.ts) consults the SAME two predicates before claiming the
-	 * filters handled, so the two decisions cannot disagree. Either failing returns null and
-	 * the caller full-scans, where the residual is authoritative.
+	 * {@link indexPrefixSeekIsCollationExact} decides; a RANGE window additionally equates
+	 * memcmp of the key bytes with the residual's comparison ORDER at the bounded column's
+	 * position, which {@link indexRangeIsOrderSafe} decides. `tryIndexAccessPlan`
+	 * (store-module-access-plan.ts) consults the SAME two predicates, at the same positions,
+	 * before claiming the filters handled, so the two decisions cannot disagree. An EQ-prefix
+	 * failure returns null and the caller full-scans, where the residual is authoritative.
 	 */
 	protected analyzeIndexAccess(filterInfo: FilterInfo): IndexAccessPattern | null {
 		const index = this.resolveIndexFromIdxStr(filterInfo.idxStr);
@@ -401,6 +421,20 @@ export abstract class StoreTableScan extends StoreTableBase {
 			if (!indexPrefixSeekIsCollationExact(this.tableSchema!.columns, index, indexCollations, eqValues.length)) {
 				return null;
 			}
+
+			// Prefix-equality + trailing-range. `prefixLen` comes from the idxStr rather
+			// than being re-inferred from the constraint list, so a plan that meant a
+			// different prefix length is caught instead of silently windowing the wrong
+			// columns. `prefixLen > eqValues.length` means an unfaithful semantic probe cut
+			// the prefix short above; the bound then belongs to a column the window no
+			// longer reaches, so it is dropped and the shorter prefix window (a strict
+			// superset) serves — {@link matchesFilters} still applies it.
+			const prefixLen = this.prefixRangeSeekLength(filterInfo, index);
+			if (prefixLen !== null && prefixLen <= eqValues.length) {
+				const bounds = this.buildPrefixRangeWindow(filterInfo, index, eqValues.slice(0, prefixLen));
+				if (bounds) return { index, type: 'range', bounds };
+			}
+
 			const bounds = buildIndexPrefixBounds(
 				eqValues,
 				this.encodeOptions,
@@ -413,25 +447,92 @@ export abstract class StoreTableScan extends StoreTableBase {
 
 		// Else a range on the LEADING index column.
 		const leadingCol = indexCols[0];
-		const rangeOps = [IndexConstraintOp.LT, IndexConstraintOp.LE, IndexConstraintOp.GT, IndexConstraintOp.GE];
-		const rangeConstraints = (filterInfo.constraints ?? []).filter(
-			c => c.constraint.iColumn === leadingCol && rangeOps.includes(c.constraint.op),
-		);
-		if (rangeConstraints.length > 0 && this.indexRangeIsOrderSafe(index)) {
+		const rangeConstraints = this.rangeConstraintsOn(filterInfo, leadingCol);
+		if (rangeConstraints.length > 0 && this.indexRangeIsOrderSafe(index, 0)) {
 			const bounds = this.buildIndexRangeBounds(
-				rangeConstraints.map(c => ({
-					op: c.constraint.op,
-					value: c.argvIndex > 0 ? filterInfo.args[c.argvIndex - 1] : undefined,
-				})),
-				indexDirections[0],
-				indexCollations[0],
+				[],
+				rangeConstraints,
+				indexDirections.slice(0, 1),
+				indexCollations.slice(0, 1),
 				this.tableSchema!.columns[leadingCol]?.logicalType,
-				this.indexKeyTransforms(index)[0],
+				this.indexKeyTransforms(index).slice(0, 1),
 			);
 			return { index, type: 'range', bounds };
 		}
 
 		return null;
+	}
+
+	/**
+	 * The prefix length a `prefixRangeSeek` (`plan=7`) FilterInfo declares, or null when
+	 * this FilterInfo is not one.
+	 *
+	 * Honoring the plan's own `prefixLen` — rather than re-deriving it from the constraint
+	 * list — is what makes a plan/scan disagreement LOUD: a value outside `1 …
+	 * index.columns.length - 1` cannot describe a window over this index, and the plan
+	 * already dropped the residual for the filters it claimed, so guessing a length would
+	 * silently address the wrong columns.
+	 */
+	private prefixRangeSeekLength(filterInfo: FilterInfo, index: TableIndexSchema): number | null {
+		const spec = decodeIdxStr(filterInfo.idxStr);
+		if (!spec || planKindFromCode(spec.plan) !== 'prefixRangeSeek') return null;
+		const raw = spec.params.get('prefixLen');
+		const prefixLen = Number.parseInt(raw ?? '', 10);
+		if (!Number.isInteger(prefixLen) || prefixLen < 1 || prefixLen >= index.columns.length) {
+			this.malformedFilterInfo('prefix-range seek', filterInfo,
+				`prefixLen=${raw} against ${index.name}'s ${index.columns.length} columns`);
+		}
+		return prefixLen;
+	}
+
+	/** The pushed LT/LE/GT/GE constraints on `columnIndex`, paired with their bound values. */
+	private rangeConstraintsOn(
+		filterInfo: FilterInfo,
+		columnIndex: number,
+	): Array<{ op: IndexConstraintOp; value?: SqlValue }> {
+		return (filterInfo.constraints ?? [])
+			.filter(c => c.constraint.iColumn === columnIndex && RANGE_CONSTRAINT_OPS.includes(c.constraint.op))
+			.map(c => ({
+				op: c.constraint.op,
+				value: c.argvIndex > 0 ? filterInfo.args[c.argvIndex - 1] : undefined,
+			}));
+	}
+
+	/**
+	 * The narrowed window for a prefix-equality + trailing-range seek: the equality prefix
+	 * bytes, further bounded by the LT/LE/GT/GE constraints on the index column right after
+	 * it. Null when the trailing bound cannot be used, in which case the caller falls back
+	 * to the plain prefix window — a strict SUPERSET, so the answer is unchanged and only
+	 * the narrowing is lost. Two reasons for that:
+	 *
+	 *  - the trailing column's key bytes do not reproduce its residual comparator's ORDER
+	 *    ({@link indexRangeIsOrderSafe}) — `tryIndexAccessPlan` degrades to the plain prefix
+	 *    seek through the same predicate, so this is the matching scan-side move rather than
+	 *    a disagreement;
+	 *  - no bound constraint survived on that column at all (nothing to narrow with).
+	 */
+	private buildPrefixRangeWindow(
+		filterInfo: FilterInfo,
+		index: TableIndexSchema,
+		prefixValues: SqlValue[],
+	): IterateOptions | null {
+		const position = prefixValues.length;
+		const trailingCol = index.columns[position]?.index;
+		if (trailingCol === undefined) return null;
+		if (!this.indexRangeIsOrderSafe(index, position)) return null;
+
+		const rangeConstraints = this.rangeConstraintsOn(filterInfo, trailingCol);
+		if (rangeConstraints.length === 0) return null;
+
+		const width = position + 1;
+		return this.buildIndexRangeBounds(
+			prefixValues,
+			rangeConstraints,
+			index.columns.slice(0, width).map(c => !!c.desc),
+			this.indexKeyCollations(index).slice(0, width),
+			this.tableSchema!.columns[trailingCol]?.logicalType,
+			this.indexKeyTransforms(index).slice(0, width),
+		);
 	}
 
 	/**
@@ -531,26 +632,39 @@ export abstract class StoreTableScan extends StoreTableBase {
 	}
 
 	/**
-	 * True when a byte window over the LEADING column of `index` reproduces the order the
-	 * residual comparison uses. Delegates to {@link indexLeadingRangeIsOrderSafe} — the SAME
-	 * call the range arm of `tryIndexAccessPlan` (store-module-access-plan.ts) makes before
-	 * it marks the range filters handled, so the "build a window" and "mark handled"
-	 * decisions cannot disagree. The memoized {@link indexKeyCollations} is passed as the
-	 * key side, so the predicate judges the bytes this scan actually addresses.
+	 * True when a byte window bounded on index column `position` reproduces the order the
+	 * residual comparison uses there. Delegates to {@link indexRangeAtPositionIsOrderSafe} —
+	 * the SAME call `tryIndexAccessPlan` (store-module-access-plan.ts) makes, at the same
+	 * position, before it marks the range filters handled, so the "build a window" and "mark
+	 * handled" decisions cannot disagree. The memoized {@link indexKeyCollations} is passed
+	 * as the key side, so the predicate judges the bytes this scan actually addresses.
+	 *
+	 * `position` is 0 for a standalone leading-column range and the prefix length for a
+	 * prefix-equality + trailing-range window.
 	 */
-	protected indexRangeIsOrderSafe(index: TableIndexSchema): boolean {
-		return indexLeadingRangeIsOrderSafe(this.db, this.tableSchema!.columns, index, this.indexKeyCollations(index));
+	protected indexRangeIsOrderSafe(index: TableIndexSchema, position: number): boolean {
+		return indexRangeAtPositionIsOrderSafe(
+			this.db, this.tableSchema!.columns, index, this.indexKeyCollations(index), position);
 	}
 
 	/**
-	 * Convert leading-index-column LT/LE/GT/GE constraints into one encoded-byte
-	 * `gte`/`lt` window — the secondary-index analogue of {@link buildPKRangeBounds}.
+	 * Convert LT/LE/GT/GE constraints on ONE index column into a single encoded-byte
+	 * `gte`/`lt` window, optionally nested inside a fixed equality prefix — the
+	 * secondary-index analogue of {@link buildPKRangeBounds}.
 	 *
-	 * Each bound value is encoded under the leading index column's own key `collation`
-	 * ({@link indexKeyCollations}) and DESC `dir` — exactly as {@link buildIndexKey}
-	 * encodes that column — via {@link buildIndexPrefixBounds}, giving the byte region
-	 * `[lo, hi)` whose leading column equals that value. The op maps that region's
-	 * endpoints onto `gte`/`lt`, with the same DESC lower/upper SWAP as the PK path:
+	 * The bounded column sits at position `prefixValues.length`; `directions`,
+	 * `collations` and `transforms` are the index's own per-column arrays sliced to cover
+	 * the prefix AND that column. An empty `prefixValues` is the standalone leading-column
+	 * range; a non-empty one is the trailing bound of a `prefixRangeSeek`.
+	 *
+	 * Each bound value is encoded BEHIND the prefix, under the bounded column's own key
+	 * collation ({@link indexKeyCollations}) and DESC direction — exactly as
+	 * {@link buildIndexKey} encodes that column — via {@link buildIndexPrefixBounds},
+	 * giving the byte region `[lo, hi)` whose prefix columns equal `prefixValues` and whose
+	 * bounded column equals that value. The op maps that region's endpoints onto
+	 * `gte`/`lt`, with the same DESC lower/upper SWAP as the PK path — driven by the BOUNDED
+	 * column's direction alone, since a DESC prefix column merely inverts bytes *inside* a
+	 * prefix that stays fixed:
 	 *
 	 *   | op | ASC      | DESC     |
 	 *   |----|----------|----------|
@@ -559,34 +673,47 @@ export abstract class StoreTableScan extends StoreTableBase {
 	 *   | LE | lt  = hi | gte = lo |
 	 *   | LT | lt  = lo | gte = hi |
 	 *
-	 * Across constraints keep the MAX lower and MIN upper. An `undefined` upper (an
-	 * `hi` whose increment overflowed all-0xff) leaves that side unbounded — a safe
-	 * SUPERSET. A NULL/missing bound value is skipped (the planner never pushes
-	 * `= NULL`, and a range op against NULL rejects every row in matchesFilters).
-	 * A bound over a semantic-ordering leading column (`logicalType`) whose VALUE has
-	 * no faithful byte position ({@link semanticProbeIsKeyFaithful}) is skipped the
-	 * same way — a dropped RANGE bound only widens the window, and matchesFilters
-	 * reproduces the predicate under the type's compare; see the widen-vs-decline
-	 * note on {@link buildPKRangeBounds}. `transform` is the leading column's key
-	 * value transform ({@link indexKeyTransforms}), so a surviving bound addresses
-	 * the same transformed bytes the index store holds.
+	 * Both sides START at the prefix's own window (`[P, incr(P))`, or unbounded for an
+	 * empty prefix) and are then tightened: keep the MAX lower and MIN upper across
+	 * constraints. So every degraded path lands back on the prefix window, never wider:
+	 * an `undefined` upper (an `hi` whose increment overflowed all-0xff), a NULL/missing
+	 * bound value (the planner never pushes `= NULL`, and a range op against NULL rejects
+	 * every row in matchesFilters), and a bound over a semantic-ordering column
+	 * (`logicalType`) whose VALUE has no faithful byte position
+	 * ({@link semanticProbeIsKeyFaithful}) are all simply skipped — a dropped RANGE bound
+	 * only widens the window, and matchesFilters reproduces the predicate under the type's
+	 * compare; see the widen-vs-decline note on {@link buildPKRangeBounds}. `transforms`
+	 * carry each column's key value transform ({@link indexKeyTransforms}), so a surviving
+	 * bound addresses the same transformed bytes the index store holds.
 	 */
 	protected buildIndexRangeBounds(
+		prefixValues: readonly SqlValue[],
 		constraints: Array<{ op: IndexConstraintOp; value?: SqlValue }>,
-		dir: boolean,
-		collation: string | undefined,
+		directions: ReadonlyArray<boolean>,
+		collations: ReadonlyArray<string | undefined>,
 		logicalType: LogicalType | undefined,
-		transform: KeyValueTransform | undefined,
+		transforms: ReadonlyArray<KeyValueTransform | undefined>,
 	): IterateOptions {
-		const full = buildFullScanBounds();
-		let gte: Uint8Array = full.gte;
-		let lt: Uint8Array | undefined;
+		const position = prefixValues.length;
+		const dir = directions[position];
+		// The prefix's own window is the fallback for BOTH sides: `buildIndexPrefixBounds`
+		// answers full-scan bounds for an empty prefix, reproducing the leading-column arm.
+		const base = buildIndexPrefixBounds(
+			[...prefixValues],
+			this.encodeOptions,
+			directions.slice(0, position),
+			collations.slice(0, position),
+			transforms.slice(0, position),
+		);
+		let gte: Uint8Array = base.gte;
+		let lt: Uint8Array | undefined = base.lt;
 
 		for (const c of constraints) {
 			if (c.value === undefined || c.value === null) continue;
 			// Widen, don't decline — see the doc comment above.
 			if (!semanticProbeIsKeyFaithful(logicalType, c.value)) continue;
-			const { gte: lo, lt: hi } = buildIndexPrefixBounds([c.value], this.encodeOptions, [dir], [collation], [transform]);
+			const { gte: lo, lt: hi } = buildIndexPrefixBounds(
+				[...prefixValues, c.value], this.encodeOptions, directions, collations, transforms);
 			const lower = !dir
 				? (c.op === IndexConstraintOp.GE ? lo : c.op === IndexConstraintOp.GT ? hi : undefined)
 				: (c.op === IndexConstraintOp.LE ? lo : c.op === IndexConstraintOp.LT ? hi : undefined);
@@ -666,16 +793,26 @@ export abstract class StoreTableScan extends StoreTableBase {
 	}
 
 	/**
+	 * Fail loudly on a structurally impossible FilterInfo — one whose own idxStr describes
+	 * an access this table's schema cannot express. Not a soundness fallback: everything
+	 * that is merely UNSERVEABLE degrades to a wider window plus the {@link matchesFilters}
+	 * residual instead of raising. `kind` names the plan shape for the message.
+	 */
+	private malformedFilterInfo(kind: string, filterInfo: FilterInfo, why: string): never {
+		throw new QuereusError(
+			`Malformed ${kind} FilterInfo (idxStr '${filterInfo.idxStr}') on ${this.schemaName}.${this.tableName}: ${why}`,
+			StatusCode.INTERNAL,
+		);
+	}
+
+	/**
 	 * Fail loudly on a multi-seek FilterInfo this table cannot serve. The plan already
 	 * dropped the residual Filter, and {@link matchesFilters} ANDs every pushed
 	 * constraint — so falling through to the scan arm would AND N mutually-exclusive
 	 * equalities and return zero rows: a silent wrong answer, not a slow one.
 	 */
 	private multiSeekMalformed(filterInfo: FilterInfo, why: string): never {
-		throw new QuereusError(
-			`Malformed multi-seek FilterInfo (idxStr '${filterInfo.idxStr}') on ${this.schemaName}.${this.tableName}: ${why}`,
-			StatusCode.INTERNAL,
-		);
+		this.malformedFilterInfo('multi-seek', filterInfo, why);
 	}
 
 	/**
@@ -1051,9 +1188,10 @@ interface PKAccessPattern {
 /**
  * Secondary-index access pattern analysis result: the chosen index plus the
  * encoded byte window {@link StoreTableScan.scanIndex} iterates. `point` is a
- * leading-prefix EQ window, `range` a leading-column LT/LE/GT/GE window; both
- * resolve to a `bounds` scan (an index seek is always a prefix scan, never a
- * single entry).
+ * leading-prefix EQ window; `range` is an LT/LE/GT/GE window, either on the leading
+ * column or nested inside an equality prefix (`prefixRangeSeek`). Both resolve to a
+ * `bounds` scan (an index seek is always a prefix scan, never a single entry) — nothing
+ * downstream branches on the tag, which is descriptive only.
  */
 interface IndexAccessPattern {
 	index: TableIndexSchema;

@@ -361,20 +361,24 @@ describe('lens row-local CHECK seam routing — subquery-bearing checks defer to
 	}
 });
 
-describe('lens row-local CHECK on an unaddressable decomposition — loud refusal', () => {
+describe('lens row-local CHECK row addressing — member-hop vs loud refusal', () => {
 	/**
-	 * The enforcement contract's fallback: a decomposition whose written logical
-	 * row cannot be located in the logical view — hidden (surrogate) shared key
-	 * AND a logical primary key that does not live on the anchor — refuses the
-	 * write with `lens-row-local-unenforceable` rather than silently skipping the
-	 * check. Here `sid` is the surrogate (no logical column exposes it) and the
-	 * logical PK `id` is backed by the NON-anchor member U_key.
+	 * A hidden (surrogate) shared key with the logical PK `id` on the NON-anchor
+	 * member U_key. With `presence: 'mandatory'` the deferred re-read addresses
+	 * the written row by hopping through U_key (the member-hop — every member's
+	 * key column carries the same surrogate), so the UPDATE seam ENFORCES. With
+	 * `presence: 'optional'` the hop could be legitimately empty (an absent
+	 * member row would make the re-read pass vacuously), so the write refuses
+	 * with `lens-row-local-unenforceable` rather than silently skipping the
+	 * check — the optional shape deploys only because the logical `id` carries a
+	 * default (an undefaulted `not null` over a nullable-derived column blocks
+	 * at deploy on this capability-less basis).
 	 *
 	 * Only the seams that need to ADDRESS the written row are affected: the
 	 * subquery-free INSERT rides the envelope, which needs no address and keeps
-	 * enforcing; the UPDATE fan-out needs the deferred re-read and so refuses.
+	 * enforcing in both shapes.
 	 */
-	function unaddressable(): MappingAdvertisement {
+	function pkOffAnchor(pkMemberPresence: 'mandatory' | 'optional'): MappingAdvertisement {
 		return {
 			id: 'U_core',
 			logicalTable: 'W',
@@ -383,7 +387,7 @@ describe('lens row-local CHECK on an unaddressable decomposition — loud refusa
 				anchorRelationId: 'U_core',
 				members: [
 					{ relationId: 'U_core', relation: { schema: 'main', table: 'U_core' }, presence: 'mandatory', columns: [colMap('name', 'name')] },
-					{ relationId: 'U_key', relation: { schema: 'main', table: 'U_key' }, presence: 'mandatory', columns: [colMap('id', 'id')] },
+					{ relationId: 'U_key', relation: { schema: 'main', table: 'U_key' }, presence: pkMemberPresence, columns: [colMap('id', 'id')] },
 					{ relationId: 'U_tag', relation: { schema: 'main', table: 'U_tag' }, presence: 'optional', columns: [colMap('tag', 'tag')] },
 				],
 				sharedKey: {
@@ -394,27 +398,46 @@ describe('lens row-local CHECK on an unaddressable decomposition — loud refusa
 		};
 	}
 
-	async function setupUnaddressable(db: Database): Promise<void> {
+	async function setupPkOffAnchor(db: Database, pkMemberPresence: 'mandatory' | 'optional'): Promise<void> {
 		const mod = new AdvertisingModule();
-		mod.ads = [unaddressable()];
+		mod.ads = [pkOffAnchor(pkMemberPresence)];
 		db.registerModule('admod', mod);
 		await db.exec('create table U_core (sid integer primary key default (coalesce((select max(sid) from U_core), 0) + mutation_ordinal()), name text) using admod');
 		await db.exec('create table U_key (key_sid integer primary key, id integer) using admod');
 		await db.exec('create table U_tag (tag_sid integer primary key, tag text) using admod');
-		await db.exec("declare logical schema x { table W { id integer primary key, name text, tag text null constraint tag_rule check (tag is not null and tag <> 'bad') } }");
+		const idDecl = pkMemberPresence === 'optional' ? 'id integer primary key default 0' : 'id integer primary key';
+		await db.exec(`declare logical schema x { table W { ${idDecl}, name text, tag text null constraint tag_rule check (tag is not null and tag <> 'bad') } }`);
 		await db.exec('apply schema x');
 		await db.exec("insert into main.U_core values (1, 'alpha')");
 		await db.exec('insert into main.U_key values (1, 1)');
 		await db.exec("insert into main.U_tag values (1, 'seed')");
 	}
 
-	it('refuses an UPDATE naming the unenforceable check instead of skipping it', async () => {
+	it('a PK on a mandatory non-anchor member is addressed via the member-hop: UPDATE enforces', async () => {
 		const db = new Database();
 		try {
-			await setupUnaddressable(db);
+			await setupPkOffAnchor(db, 'mandatory');
+			// Filtered on the ANCHOR (`name`) so the fan-out's own non-anchor-predicate
+			// guard does not preempt the seam under test.
 			await expectThrows(
-				// Filtered on the ANCHOR (`name`) so the fan-out's own non-anchor-predicate
-				// guard does not preempt the row-local refusal under test.
+				() => db.exec("update x.W set tag = 'bad' where name = 'alpha'"),
+				CONSTRAINT);
+			await expectThrows(
+				() => db.exec('update x.W set tag = null where name = \'alpha\''),
+				CONSTRAINT);
+			expect(await rows(db, 'select tag from main.U_tag where tag_sid = 1')).to.deep.equal([{ tag: 'seed' }]);
+			await db.exec("update x.W set tag = 'ok' where name = 'alpha'");
+			expect(await rows(db, 'select tag from x.W')).to.deep.equal([{ tag: 'ok' }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a PK on an OPTIONAL member cannot be addressed: the UPDATE refuses loudly instead of skipping', async () => {
+		const db = new Database();
+		try {
+			await setupPkOffAnchor(db, 'optional');
+			await expectThrows(
 				() => db.exec("update x.W set tag = 'ok' where name = 'alpha'"),
 				/cannot be addressed in the logical view/i);
 			expect(await rows(db, 'select tag from main.U_tag where tag_sid = 1')).to.deep.equal([{ tag: 'seed' }]);
@@ -423,16 +446,18 @@ describe('lens row-local CHECK on an unaddressable decomposition — loud refusa
 		}
 	});
 
-	it('the INSERT envelope needs no row address, so it still enforces', async () => {
-		const db = new Database();
-		try {
-			await setupUnaddressable(db);
-			await expectThrows(() => db.exec("insert into x.W (id, name, tag) values (2, 'beta', 'bad')"), CONSTRAINT);
-			await db.exec("insert into x.W (id, name, tag) values (3, 'gamma', 'ok')");
-		} finally {
-			await db.close();
-		}
-	});
+	for (const presence of ['mandatory', 'optional'] as const) {
+		it(`the INSERT envelope needs no row address, so it still enforces (${presence} PK member)`, async () => {
+			const db = new Database();
+			try {
+				await setupPkOffAnchor(db, presence);
+				await expectThrows(() => db.exec("insert into x.W (id, name, tag) values (2, 'beta', 'bad')"), CONSTRAINT);
+				await db.exec("insert into x.W (id, name, tag) values (3, 'gamma', 'ok')");
+			} finally {
+				await db.close();
+			}
+		});
+	}
 });
 
 // ---------------------------------------------------------------------------

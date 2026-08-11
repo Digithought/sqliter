@@ -578,29 +578,57 @@ function makeLogicalRowRewriteScope(slot: LensSlot): ScopeContext {
  *
  *  - `shared-key` — the decomposition's shared key IS a logical column (a
  *    logical-tuple key): correlate directly, `_lr.<logicalKeyColumn> = <CORR>.<memberKey>`.
- *  - `anchor-hop` — the shared key is hidden (a surrogate): hop through the
- *    ANCHOR basis relation to reconstruct the logical PK,
- *    `_lr.<pk_i> = (select __lra.<pkBasis_i> from <anchor> as __lra where __lra.<anchorKey> = <CORR>.<memberKey>)`
+ *  - `member-hop` — the shared key is hidden (a surrogate): hop through the
+ *    MANDATORY member owning each logical PK column to reconstruct the PK,
+ *    `_lr.<pk_i> = (select __lra.<pkBasis_i> from <member_i> as __lra where __lra.<memberKey_i> = <CORR>.<memberKey>)`
  *    per PK column. Every member's key column carries the same shared-key value
- *    (the decomposition equi-join), so the hop lands on the written row's anchor
- *    whichever member op the constraint rides.
+ *    (the decomposition equi-join), so each hop lands on the written row's
+ *    member row whichever member op the constraint rides — including a
+ *    per-column decomposition whose compound PK spreads across several member
+ *    stores (none of them the anchor).
  */
 export type LensLogicalRowAddress =
 	| { readonly kind: 'shared-key'; readonly logicalKeyColumn: string }
 	| {
-		readonly kind: 'anchor-hop';
-		readonly anchorRelation: BasisRelationRef;
-		readonly anchorKeyColumn: string;
-		readonly pkColumns: ReadonlyArray<{ readonly logicalColumn: string; readonly anchorBasisColumn: string }>;
+		readonly kind: 'member-hop';
+		readonly pkColumns: ReadonlyArray<{
+			readonly logicalColumn: string;
+			readonly basisColumn: string;
+			readonly relation: BasisRelationRef;
+			readonly relationKeyColumn: string;
+		}>;
 	};
 
 /**
+ * The single-column shared-key column of each MANDATORY decomposition member,
+ * keyed by `schema.table`. Optional members are excluded on purpose: their row
+ * may be legitimately absent for a written logical row, so a hop through one
+ * would yield NULL, the address would match nothing, and the re-read would
+ * trivially pass — a silent enforcement hole. Refusing (undefined) is the safe
+ * verdict.
+ */
+function memberSharedKeyColumnResolver(slot: LensSlot): (rel: BasisRelationRef) => string | undefined {
+	const storage = slot.advertisement?.storage;
+	if (!storage) return () => undefined;
+	const byRelation = new Map<string, string>();
+	for (const m of storage.members) {
+		if (m.presence !== 'mandatory') continue;
+		const keys = storage.sharedKey.keyColumnsByRelation.get(m.relationId) ?? [];
+		if (keys.length !== 1) continue;
+		byRelation.set(`${m.relation.schema.toLowerCase()}.${m.relation.table.toLowerCase()}`, keys[0]);
+	}
+	return rel => byRelation.get(`${rel.schema.toLowerCase()}.${rel.table.toLowerCase()}`);
+}
+
+/**
  * Resolves how a decomposition write can address the written logical row —
- * preferring the direct shared-key correlation, falling back to the anchor-hop
+ * preferring the direct shared-key correlation, falling back to the member-hop
  * when the shared key is hidden but every logical PK column maps to a plain
- * basis column ON THE ANCHOR. Returns `undefined` when neither addressing works
- * (a keyless logical table over a hidden surrogate, a PK spread across members)
- * — the caller must then refuse the write loudly rather than skip enforcement.
+ * basis column on a single-key MANDATORY member (the anchor, or — under a
+ * per-column decomposition — the member store backing that PK column). Returns
+ * `undefined` when neither addressing works (a keyless logical table over a
+ * hidden surrogate, a PK column on an optional / composite-key member) — the
+ * caller must then refuse the write loudly rather than skip enforcement.
  */
 export function resolveLensLogicalRowAddress(
 	slot: LensSlot,
@@ -615,7 +643,8 @@ export function resolveLensLogicalRowAddress(
 	if (pkDef.length === 0) return undefined;
 	const map = logicalToBasisColumnMap(slot);
 	const owningRelation = makeOwningRelationResolver(slot, schemaManager);
-	const pkColumns: Array<{ logicalColumn: string; anchorBasisColumn: string }> = [];
+	const keyColumnFor = memberSharedKeyColumnResolver(slot);
+	const pkColumns: Array<{ logicalColumn: string; basisColumn: string; relation: BasisRelationRef; relationKeyColumn: string }> = [];
 	for (const def of pkDef) {
 		const col = slot.logicalTable.columns[def.index];
 		if (!col) return undefined;
@@ -623,17 +652,15 @@ export function resolveLensLogicalRowAddress(
 		const basis = map.get(lc);
 		if (basis === undefined) return undefined;
 		const rel = owningRelation(lc);
-		if (!rel
-			|| rel.schema.toLowerCase() !== anchorRelation.schema.toLowerCase()
-			|| rel.table.toLowerCase() !== anchorRelation.table.toLowerCase()) {
-			return undefined;
-		}
-		pkColumns.push({ logicalColumn: col.name, anchorBasisColumn: basis });
+		if (!rel) return undefined;
+		const relationKeyColumn = keyColumnFor(rel);
+		if (relationKeyColumn === undefined) return undefined;
+		pkColumns.push({ logicalColumn: col.name, basisColumn: basis, relation: rel, relationKeyColumn });
 	}
-	return { kind: 'anchor-hop', anchorRelation, anchorKeyColumn, pkColumns };
+	return { kind: 'member-hop', pkColumns };
 }
 
-/** The anchor alias inside an anchor-hop subquery (implausible as a user FROM alias). */
+/** The member alias inside a member-hop subquery (implausible as a user FROM alias). */
 const ANCHOR_HOP_ALIAS = '__lra';
 
 /** The per-address row-locating predicate of the deferred re-read's WHERE. */
@@ -651,19 +678,19 @@ function buildLogicalRowAddressPredicate(
 			right: corrKey,
 		} as AST.BinaryExpr;
 	}
-	const legs: AST.Expression[] = address.pkColumns.map(({ logicalColumn, anchorBasisColumn }) => {
+	const legs: AST.Expression[] = address.pkColumns.map(({ logicalColumn, basisColumn, relation, relationKeyColumn }) => {
 		const hop: AST.SelectStmt = {
 			type: 'select',
-			columns: [{ type: 'column', expr: { type: 'column', name: anchorBasisColumn, table: ANCHOR_HOP_ALIAS } as AST.ColumnExpr }],
+			columns: [{ type: 'column', expr: { type: 'column', name: basisColumn, table: ANCHOR_HOP_ALIAS } as AST.ColumnExpr }],
 			from: [{
 				type: 'table',
-				table: { type: 'identifier', name: address.anchorRelation.table, schema: address.anchorRelation.schema },
+				table: { type: 'identifier', name: relation.table, schema: relation.schema },
 				alias: ANCHOR_HOP_ALIAS,
 			} as AST.TableSource],
 			where: {
 				type: 'binary',
 				operator: '=',
-				left: { type: 'column', name: address.anchorKeyColumn, table: ANCHOR_HOP_ALIAS } as AST.ColumnExpr,
+				left: { type: 'column', name: relationKeyColumn, table: ANCHOR_HOP_ALIAS } as AST.ColumnExpr,
 				right: corrKey,
 			} as AST.BinaryExpr,
 		};

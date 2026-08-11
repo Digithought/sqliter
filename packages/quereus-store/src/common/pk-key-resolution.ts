@@ -479,15 +479,23 @@ export function indexPrefixSeekIsCollationExact(
 }
 
 /**
- * True when a byte RANGE window over the LEADING column of secondary `index` is SOUND.
+ * True when a byte RANGE window over index-column `position` of secondary `index` is SOUND.
  *
- * Strictly stronger than {@link indexPrefixSeekIsCollationExact} at position 0: the same
- * key-vs-residual collation agreement, PLUS the collation's `orderPreserving` assertion,
- * because a range window also equates memcmp of the key bytes with the residual
+ * Strictly stronger than {@link indexPrefixSeekIsCollationExact} at the same position: the
+ * same key-vs-residual collation agreement, PLUS the collation's `orderPreserving`
+ * assertion, because a range window also equates memcmp of the key bytes with the residual
  * comparator's ORDER. Both halves are {@link keyOrderMatchesCollation}, which admits a
  * semantic-ordering column only when {@link semanticKeyOrderIsFaithful} asserts its key
  * bytes order as the type's `compare` does (and the collation sides agree — a `collate`
  * decoration on the index column still declines it).
+ *
+ * `position` is 0 for a standalone leading-column range (see
+ * {@link indexLeadingRangeIsOrderSafe}) and `prefixLength` for the trailing bound of a
+ * prefix-equality + trailing-range seek. The question is identical at either position: the
+ * columns BEFORE it are pinned to one value each, so the window is a contiguous byte region
+ * whose ordering within the prefix is governed solely by this column's key bytes. What the
+ * pinned columns need is the (weaker) EXACTNESS test — {@link indexPrefixSeekIsCollationExact}
+ * over the prefix — which the callers apply alongside this one.
  *
  * THE shared predicate for the two decision sites: `tryIndexAccessPlan`
  * (store-module-access-plan.ts) marks the range filters handled only when it holds, and
@@ -495,20 +503,34 @@ export function indexPrefixSeekIsCollationExact(
  * a plan that claims a filter the scan then declines to window loses the residual Filter and
  * returns the whole table — so they call this rather than each restating it.
  */
+export function indexRangeAtPositionIsOrderSafe(
+	db: Database,
+	columns: ReadonlyArray<ColumnSchema>,
+	index: TableIndexSchema,
+	keyCollations: ReadonlyArray<string | undefined>,
+	position: number,
+): boolean {
+	const spec = index.columns[position];
+	if (!spec) return false;
+	return keyOrderMatchesCollation(
+		db,
+		columns[spec.index],
+		keyCollations[position] ?? 'BINARY',
+		indexResidualCollation(columns, index, position),
+	);
+}
+
+/**
+ * {@link indexRangeAtPositionIsOrderSafe} at position 0 — the standalone leading-column
+ * range window, which needs no equality prefix ahead of it.
+ */
 export function indexLeadingRangeIsOrderSafe(
 	db: Database,
 	columns: ReadonlyArray<ColumnSchema>,
 	index: TableIndexSchema,
 	keyCollations: ReadonlyArray<string | undefined>,
 ): boolean {
-	const leading = index.columns[0];
-	if (!leading) return false;
-	return keyOrderMatchesCollation(
-		db,
-		columns[leading.index],
-		keyCollations[0] ?? 'BINARY',
-		indexResidualCollation(columns, index, 0),
-	);
+	return indexRangeAtPositionIsOrderSafe(db, columns, index, keyCollations, 0);
 }
 
 /**

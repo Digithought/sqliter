@@ -614,7 +614,7 @@ function astContainsSubquery(expr: AST.Expression): boolean {
 /**
  * The {@link LensLogicalRowAddress} the deferred logical-row re-read addresses a
  * written row by — a direct shared-key correlation (logical-tuple key), or the
- * anchor-hop through the logical PK when the shared key is a hidden surrogate —
+ * member-hop through the logical PK when the shared key is a hidden surrogate —
  * plus the anchor's own key column (for the anchor-riding INSERT variant). LOUD
  * refusal (`lens-row-local-unenforceable`) when neither addressing works (a
  * composite/absent shared key, a PK spread across members): per the enforcement
@@ -638,8 +638,8 @@ function requireLensLogicalRowAddress(
 		raiseMutationDiagnostic({
 			reason: 'lens-row-local-unenforceable',
 			table: view.name,
-			message: `cannot write through logical table '${view.name}': its row-local CHECK '${checkName}' must be evaluated on the logical row, but the written row cannot be addressed in the logical view — the decomposition's shared key is ${anchorKeyColumn === undefined ? 'composite or absent' : 'hidden and the logical primary key does not map to plain anchor columns'}`,
-			suggestion: 'Expose the shared key as a logical column, keep the logical primary key on plain anchor columns, or drop the CHECK from the logical declaration.',
+			message: `cannot write through logical table '${view.name}': its row-local CHECK '${checkName}' must be evaluated on the logical row, but the written row cannot be addressed in the logical view — the decomposition's shared key is ${anchorKeyColumn === undefined ? 'composite or absent' : 'hidden and the logical primary key does not map to plain single-key mandatory-member columns'}`,
+			suggestion: 'Expose the shared key as a logical column, keep each logical primary-key column on a plain, single-key, mandatory member, or drop the CHECK from the logical declaration.',
 		});
 	}
 	return { address, anchorRelation: anchor.relation, anchorKeyColumn };
