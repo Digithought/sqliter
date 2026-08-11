@@ -6,7 +6,9 @@ files:
   - packages/quereus/src/planner/nodes/function.ts             # ScalarFunctionCallNode.getType — aggregate/window return types
   - packages/quereus/src/runtime/emit/binary.ts                # arithmetic/comparison results whose runtime class differs from the inferred type
   - packages/quereus/src/runtime/emit/insert.ts                # ARM 2 — builds the declared-type coercion from the SOURCE's announced type
-  - packages/quereus/src/types/validation.ts                   # ARM 2 — buildRowCoercion, which skips a cell whose announced type already matches
+  - packages/quereus/src/types/validation.ts                   # ARM 2 + ARM 4 — buildRowCoercion, which skips a cell whose announced type already matches
+  - packages/quereus/src/core/param.ts                         # ARM 4 — getParameterTypes keys positional hints by STRING when inferred from boundArgs
+  - packages/quereus/src/planner/scopes/param.ts               # ARM 4 — DEFAULT_PARAMETER_TYPE (TEXT), and the NUMERIC-keyed hint lookup that misses
   - docs/types.md                                              # § Physical representation — states what IS promised (R1/R2 over DECLARED types)
 repro: verified
 severity: wrong-result
@@ -132,3 +134,93 @@ raises `Unsupported temporal operation` instead of returning null, and ordering 
 a difference expression (`order by (a - b)`, `min`/`max`, `distinct`, materialized views)
 switched from text order to semantic elapsed-time order. Everything else in this ticket
 still reproduces.
+
+# Arm 4 — an untyped positional `?` bound after prepare stores the raw JS value (from lamina board)
+
+Same site as arm 2 (`buildRowCoercion`'s identity skip), reached by a different and much
+more ordinary route: the everyday `prepare(sql)` → `run([value])` write. Verified against
+`16ff5ab9` with `QUEREUS_REPR_STRICT` **off**, using only `MemoryTable`:
+
+```js
+await db.exec(`create table t (id integer primary key, v text)`);
+const s = db.prepare(`insert into t values (1, ?)`);
+await s.run([9]);
+// stored: the JS number 9, in a TEXT-declared column
+```
+
+Bind a `Uint8Array` instead and a TEXT column holds a `Uint8Array`. Both are R2 violations
+of *stored* data, in the engine's own storage module — `MemoryTable` never gets a chance to
+correct them, because `dml-executor` tells it `preCoerced`.
+
+Which write shapes are affected, all verified in one script:
+
+| write | stored in a `text` column |
+|---|---|
+| `values (1, ?)` + `run([9])` | **number 9** — skipped |
+| `values (1, ?)` + `run([Uint8Array])` | **Uint8Array** — skipped |
+| `values (1, :v)` + `run({v: 9})` | `'9'` — coerced |
+| `values (1, 9)` (literal) | `'9'` — coerced |
+| `prepare(sql, [9])` then `run()` | `'9'` — coerced |
+
+So it is exactly: **an untyped positional `?`, into a column whose declared type is TEXT.**
+
+## Root cause — two independent links, both needed
+
+1. **The hint is dropped by a key-type mismatch.** Compilation happens *after* `bindAll`
+   (`_iterateRowsRawInternal` binds, then `compile()`), so the engine does know the bound
+   value's type at plan time and infers a hint from it — but `getParameterTypes`
+   (`core/param.ts`) walks `boundArgs`, a plain object, with `Object.entries`, so a
+   positional parameter's hint is keyed by the **string** `"1"`. `ParameterScope`
+   (`planner/scopes/param.ts`) looks that hint up by the parser's **numeric** index `1`,
+   misses, and falls back to `DEFAULT_PARAMETER_TYPE`. Confirmed directly:
+
+   ```
+   getParameterTypes([9])      -> key 1   (number) INTEGER   // prepare(sql, params): array path
+   getParameterTypes({1: 9})   -> key "1" (string) INTEGER   // boundArgs path: same type, unusable key
+   ```
+
+   The array path is why `prepare(sql, [9])` coerces and `prepare(sql)` + `run([9])` does
+   not. Named parameters are unaffected — both sides key by the same string.
+
+2. **The fallback is a concrete type, and it collides.** `DEFAULT_PARAMETER_TYPE` is TEXT.
+   Into a TEXT column that is an identity match, so `buildRowCoercion` skips the cell and
+   the raw JS value reaches the vtab. Into any other column type the fallback is wrong but
+   harmless — the types differ, the coercion runs, the value is converted.
+
+Fixing link 1 alone closes the reported cases but leaves the class open: a `?` that carries
+no hint at all still defaults to TEXT and still skips against a TEXT column. That is the
+same "no correct answer at plan time by construction" this ticket's `tradeoffs:` line
+already names.
+
+## Recommended fix
+
+The representation-driven option this ticket's `tradeoffs:` line contemplates, narrowed to
+something cheap: treat a cell sourced from a `ParameterReferenceNode` as **unknown
+provenance** for `buildRowCoercion` (pass `undefined` rather than the announced type), so a
+parameter-sourced cell always converts. Safe against the re-conversion hazard the identity
+skip exists for: TEXT's `parse` is `valueToText`, which is identity on a string, and every
+non-TEXT column already converts parameter cells today — this changes only the case that is
+currently wrong. Announcing `ANY` for an untyped `?` (this ticket's "Expected behavior")
+reaches the same place from the other side, since `ANY` ≠ any column type.
+
+Either way, fix link 1 too — a hint that exists and is silently unusable will bite
+something else.
+
+## Use cases to add
+
+- `prepare('insert into t values (1, ?)')` + `run([9])` into a `text` column stores `'9'`.
+- Same with a `Uint8Array`, a boolean, and a `bigint` past 2^53.
+- The four already-correct rows of the table above keep their current results.
+- `insert into b select j from a` for a JSON column still skips (the identity guard's
+  original purpose) — a parameter-provenance rule must not widen into column references.
+- With `QUEREUS_REPR_STRICT=1`, the DML-write seam stays quiet across the whole suite.
+
+## Downstream
+
+lamina excludes `packages/lamina-quereus-test/src/retype-insert-equivalence.test.ts` from
+its `QUEREUS_REPR_STRICT=1` lane over exactly this — thirteen grid cells bind a stored
+non-string into a `text` column as a positional parameter. That exclusion lifts when this
+arm lands. lamina's own plugin-side coercion
+(`packages/lamina-quereus/src/affinity-coercion.ts`) masks the defect for lamina-backed
+tables today, which is why it surfaced as a strict-mode failure rather than a wrong stored
+value there; `MemoryTable` has no such backstop.
