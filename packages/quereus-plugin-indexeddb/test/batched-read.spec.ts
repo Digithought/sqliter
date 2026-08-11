@@ -1,11 +1,16 @@
 /**
- * IndexedDB batched forward range reads.
+ * IndexedDB batched reads — both shapes, measured by request count.
  *
- * `IndexedDBStore.iterate` pages a range in 256-entry batches. Forward pages come from
- * ONE `getAllKeys` + `getAll` pair per page; reverse (and any engine lacking `getAll`)
- * steps a cursor once per row. These specs pin all three properties that makes load-bearing:
- * the round-trip count, that the batched and cursor paths agree entry-for-entry, and that
- * the cursor fallback still runs when `getAll` is missing.
+ * RANGE reads: `IndexedDBStore.iterate` pages a range in 256-entry batches. Forward pages
+ * come from ONE `getAllKeys` + `getAll` pair per page; reverse (and any engine lacking
+ * `getAll`) steps a cursor once per row. These specs pin all three properties that makes
+ * load-bearing: the round-trip count, that the batched and cursor paths agree
+ * entry-for-entry, and that the cursor fallback still runs when `getAll` is missing.
+ *
+ * POINT reads: `IndexedDBStore.getMany` issues one `get` request per key into a SINGLE
+ * transaction, where awaiting `get` per key opens one transaction PER KEY. The shared
+ * conformance battery's tier 8 pins "one transaction, whatever K is"; the spec here is the
+ * sharper version that also counts the requests and measures the per-key path beside it.
  *
  * Runs under `fake-indexeddb/auto` in Node/Mocha, like every other IndexedDB spec here.
  */
@@ -33,7 +38,7 @@ const BATCH = 256;
  * each install-and-restore would clobber whichever patched first. Wrapping permanently
  * composes cleanly whatever order Mocha loads the files in.
  */
-const counts = { getAll: 0, cursorContinue: 0 };
+const counts = { getAll: 0, cursorContinue: 0, get: 0, transaction: 0 };
 
 function installRequestCounters(): void {
 	const storeProto = IDBObjectStore.prototype as IDBObjectStore & { __quereusCallCounted?: boolean };
@@ -46,11 +51,31 @@ function installRequestCounters(): void {
 		return getAll.apply(this, args);
 	};
 
+	// Point reads: one request per key. Deliberately NOT folded into the conformance
+	// spec's read meter — that one counts entries an ITERATION yields, and a point read
+	// is not iteration.
+	const get = storeProto.get;
+	storeProto.get = function (this: IDBObjectStore, ...args: Parameters<IDBObjectStore['get']>) {
+		counts.get++;
+		return get.apply(this, args);
+	};
+
 	const cursorProto = IDBCursor.prototype;
 	const continueFn = cursorProto.continue;
 	cursorProto.continue = function (this: IDBCursor, ...args: Parameters<IDBCursor['continue']>) {
 		counts.cursorContinue++;
 		return continueFn.apply(this, args);
+	};
+
+	// Separate install guard: a different prototype, so it needs its own flag.
+	const dbProto = IDBDatabase.prototype as IDBDatabase & { __quereusTxCounted?: boolean };
+	if (dbProto.__quereusTxCounted) return;
+	dbProto.__quereusTxCounted = true;
+
+	const transaction = dbProto.transaction;
+	dbProto.transaction = function (this: IDBDatabase, ...args: Parameters<IDBDatabase['transaction']>) {
+		counts.transaction++;
+		return transaction.apply(this, args);
 	};
 }
 
@@ -136,6 +161,49 @@ describe('IndexedDB batched range reads', () => {
 
 			expect(seen).to.equal(COUNT);
 			expect(counts.cursorContinue - baseContinue).to.be.greaterThanOrEqual(COUNT);
+		});
+	});
+
+	describe('batch point-read round trips', () => {
+		const N = 20;
+		/** Scattered present keys — what an index scan hands `getMany`, not a contiguous span. */
+		const pointKeys = Array.from({ length: N }, (_, i) => enc(i * 3));
+
+		it('getMany issues one get per key on ONE transaction', async () => {
+			await seed(100);
+
+			const baseGet = counts.get;
+			const baseTx = counts.transaction;
+			const batched = await store.getMany(pointKeys);
+
+			expect(batched).to.have.length(N);
+			expect(counts.get - baseGet, 'one request per key').to.equal(N);
+			expect(counts.transaction - baseTx, 'all of them on a single transaction').to.equal(1);
+		});
+
+		it('the same keys read one at a time cost one transaction EACH, and agree', async () => {
+			// The negative control: this is the cost `getMany` exists to collapse, and the
+			// two paths must return identical bytes.
+			await seed(100);
+			const batched = await store.getMany(pointKeys);
+
+			const baseGet = counts.get;
+			const baseTx = counts.transaction;
+			const oneByOne: Array<Uint8Array | undefined> = [];
+			for (const key of pointKeys) oneByOne.push(await store.get(key));
+
+			expect(counts.get - baseGet).to.equal(N);
+			expect(counts.transaction - baseTx, 'per-key reads each open their own transaction').to.equal(N);
+			expect(batched).to.deep.equal(oneByOne);
+		});
+
+		it('getMany over an empty key list touches storage not at all', async () => {
+			await seed(100);
+			const baseGet = counts.get;
+			const baseTx = counts.transaction;
+			expect(await store.getMany([])).to.deep.equal([]);
+			expect(counts.get - baseGet).to.equal(0);
+			expect(counts.transaction - baseTx).to.equal(0);
 		});
 	});
 

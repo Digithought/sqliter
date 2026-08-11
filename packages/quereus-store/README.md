@@ -175,10 +175,13 @@ await db.exec(`
 Implement `KVStore` and `KVStoreProvider` to create custom storage backends:
 
 ```typescript
-import type { KVStore, KVStoreProvider } from '@quereus/store';
+import { defaultGetMany, type KVStore, type KVStoreProvider } from '@quereus/store';
 
 class MyCustomStore implements KVStore {
   async get(key: Uint8Array) { /* ... */ }
+  // Positional batch point-read. Override it when the backend has a native multi-get or a
+  // way to issue every request on one round trip; otherwise `defaultGetMany(this, keys)`.
+  getMany(keys: readonly Uint8Array[]) { return defaultGetMany(this, keys); }
   async put(key: Uint8Array, value: Uint8Array) { /* ... */ }
   async delete(key: Uint8Array) { /* ... */ }
   async has(key: Uint8Array) { /* ... */ }
@@ -214,8 +217,8 @@ db.registerModule('store', module);
 exports `runKVStoreConformance(name, makeBackend)` — one parameterized battery of
 behavioral tests written against the `KVStore` contract (point ops, ordering, range
 iteration, streaming across page boundaries, batch semantics, optional persistence,
-cross-backend encoded-key ordering, and bounded iteration). Wire a tiny lifecycle adapter
-and run it under Mocha so any drift from the contract fails a test:
+cross-backend encoded-key ordering, bounded iteration, and the batch point-read). Wire a
+tiny lifecycle adapter and run it under Mocha so any drift from the contract fails a test:
 
 ```typescript
 import { runKVStoreConformance } from '@quereus/store/testing';
@@ -230,6 +233,12 @@ runKVStoreConformance('MyCustomStore', () => ({
   // backend's batch size, and the bounded-iteration tier also measures reads. Omit it
   // and that tier still checks that abandoning an iteration releases resources.
   readMeter: { entriesRead: () => myBackingReads, maxReadAhead: 1 },
+  // Also optional, and a DIFFERENT counter: `readMeter` counts entries an iteration
+  // yields, so it cannot see a point read. Supply this — trips to backing storage, one
+  // per `get`, one per native multi-get — and the batch point-read tier additionally
+  // asserts that `getMany` over K keys costs exactly ONE trip. Omit it on a backend whose
+  // `getMany` is the shared fallback; that tier's correctness cases still run.
+  pointReadMeter: { roundTrips: () => myBackingRoundTrips },
 }));
 ```
 
@@ -297,6 +306,10 @@ The `KVStore` interface is the foundation for all storage backends:
 ```typescript
 interface KVStore {
   get(key: Uint8Array): Promise<Uint8Array | undefined>;
+  // Positional: result[i] belongs to keys[i], `undefined` for an absent key, the array is
+  // always keys.length long, and a repeated key is answered at every position it occupies
+  // in its own buffer. No internal paging — the CALLER sizes the batch.
+  getMany(keys: readonly Uint8Array[]): Promise<(Uint8Array | undefined)[]>;
   put(key: Uint8Array, value: Uint8Array): Promise<void>;
   delete(key: Uint8Array): Promise<void>;
   has(key: Uint8Array): Promise<boolean>;

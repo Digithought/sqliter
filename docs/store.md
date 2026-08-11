@@ -170,6 +170,7 @@ The store module provides persistent table storage while maintaining Quereus's k
 ```typescript
 interface KVStore {
   get(key: Uint8Array): Promise<Uint8Array | undefined>;
+  getMany(keys: readonly Uint8Array[]): Promise<(Uint8Array | undefined)[]>;
   put(key: Uint8Array, value: Uint8Array): Promise<void>;
   delete(key: Uint8Array): Promise<void>;
   has(key: Uint8Array): Promise<boolean>;
@@ -178,6 +179,34 @@ interface KVStore {
   close(): Promise<void>;
 }
 ```
+
+**The batch point-read is positional and bounded by the caller.** `getMany` reads several
+keys at once, and the full contract lives on the interface in `kv-store.ts`. In short:
+`result[i]` is the value for `keys[i]` and the array is always exactly `keys.length` long,
+so an absent key is `undefined` *at its own position* rather than something that shortens
+the result or shifts the keys after it; a key repeated in the input is answered at every
+position it occupies, in *independent* buffers (the same read-buffer ownership `get` has,
+extended across positions); and `getMany([])` resolves to `[]` without touching backing
+storage. Unlike `iterate` there is no internal paging — the implementation reads exactly
+the keys it was handed, so the **caller** owns peak memory and must pass a bounded batch
+(`StoreTableScan` pages at `ROW_RESOLUTION_BATCH`).
+
+A backend with a native multi-get, or any way to issue every request on one round trip,
+must override it; everything else delegates to `defaultGetMany` (one `get` per key, awaited
+as a group), which is correct but no faster than the loop it replaces. Today LevelDB
+delegates to `abstract-level`'s native `getMany` and IndexedDB issues every `get`
+synchronously into ONE readonly transaction — the case that motivated the method, since
+`get` opens its own transaction and resolving the rows behind an index scan otherwise cost
+one transaction *per row*. `CachedKVStore` serves its hits from memory and batches only the
+misses to the store beneath it.
+
+Tier 8 of `runKVStoreConformance` enforces the correctness half on every backend. For the
+round-trip half a backend's test adapter may supply a `pointReadMeter` — a counter over
+trips to backing storage (one per `get`, one per native multi-get) — and the tier then also
+asserts that K keys cost exactly ONE trip, so deleting a native override goes red instead of
+silently costing a trip per key. This is deliberately a separate meter from `readMeter`,
+which counts entries yielded by *iteration* and cannot see a point read at all. LevelDB
+(counting calls on the level handle) and IndexedDB (counting transactions opened) supply it.
 
 **Iteration is bounded, not snapshotted.** `iterate` is a streaming read, and the full
 contract lives on the interface in `kv-store.ts`. In short: peak memory must not grow with

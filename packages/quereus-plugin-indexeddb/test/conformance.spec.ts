@@ -35,6 +35,12 @@ const BATCH = 256;
 let idbEntriesRead = 0;
 
 /**
+ * Transactions opened against IndexedDB across the whole process, counted below.
+ * Monotonic; tier 8 baselines it, so transactions from other specs do not interfere.
+ */
+let idbTransactions = 0;
+
+/**
  * Count entries IndexedDB hands back, by patching the object-store prototype once.
  *
  * `IndexedDBStore` is built from an `IndexedDBManager` singleton, so unlike the LevelDB
@@ -80,7 +86,34 @@ function installReadMeter(): void {
 	}
 }
 
+/**
+ * Count transactions opened on the database — the point-read round trip on IndexedDB.
+ *
+ * A transaction is what a read costs here: `get` opens its own, so awaiting it per key
+ * costs one PER KEY, while `getMany` issues every request into ONE. That is the whole
+ * reason the batch point-read exists, so tier 8 asserts it directly — delete
+ * `IndexedDBStore.getMany`'s override and this goes from 1 to K.
+ *
+ * NOTE: accepted tradeoff — like the read meter above, a process-global prototype patch
+ * kept because there is no per-store handle to wrap. Same caveats: it relies on Mocha
+ * running specs serially and on every assertion measuring a delta from a baseline.
+ * `batched-read.spec.ts` wraps this same property for its own counter; two permanent
+ * wrappers compose in whatever order Mocha loads the files.
+ */
+function installTransactionMeter(): void {
+	const proto = IDBDatabase.prototype as IDBDatabase & { __quereusTxMetered?: boolean };
+	if (proto.__quereusTxMetered) return;
+	proto.__quereusTxMetered = true;
+
+	const transaction = proto.transaction;
+	proto.transaction = function (this: IDBDatabase, ...args: Parameters<IDBDatabase['transaction']>) {
+		idbTransactions++;
+		return transaction.apply(this, args);
+	};
+}
+
 installReadMeter();
+installTransactionMeter();
 
 // Per-test unique database name. A counter (not Date.now/random) keeps names stable
 // and collision-free across the suite's many tests within one process.
@@ -133,6 +166,9 @@ runKVStoreConformance('IndexedDBStore', () => {
 			// NOTE: if `readBatch` changes again, re-measure by temporarily setting this to
 			// 1 and reading the failure message, rather than reasoning about it.
 			maxReadAhead: BATCH + 1,
+		},
+		pointReadMeter: {
+			roundTrips: () => idbTransactions,
 		},
 	};
 });

@@ -55,12 +55,20 @@ function countingIterator(inner: LevelIterator, bump: () => void): LevelIterator
 	};
 }
 
+/** Handle methods that each cost ONE trip through the binding for a point read. */
+const POINT_READ_METHODS: ReadonlySet<string | symbol> = new Set(['get', 'getMany']);
+
 /**
- * A pass-through view of `db` whose `iterator()` counts entries. Everything else is
- * forwarded to the real handle — methods are bound to it because abstract-level uses
- * private class fields, which throw when invoked with the proxy as `this`.
+ * A pass-through view of `db` whose `iterator()` counts entries and whose point reads
+ * count round trips. Everything else is forwarded to the real handle — methods are bound
+ * to it because abstract-level uses private class fields, which throw when invoked with
+ * the proxy as `this`.
+ *
+ * `get` and `getMany` each count ONE trip: `getMany` is a single native multi-get however
+ * many keys it carries, so a `getMany` that fell back to one `get` per key would count K
+ * and fail tier 8.
  */
-function meteredLevel(db: ViewLevel, bump: () => void): ViewLevel {
+function meteredLevel(db: ViewLevel, bump: () => void, bumpPointRead: () => void): ViewLevel {
 	return new Proxy(db, {
 		get(target, prop) {
 			if (prop === 'iterator') {
@@ -68,7 +76,13 @@ function meteredLevel(db: ViewLevel, bump: () => void): ViewLevel {
 				return (options?: unknown) => countingIterator(level.iterator(options), bump);
 			}
 			const value = Reflect.get(target, prop) as unknown;
-			return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+			if (typeof value !== 'function') return value;
+			const bound = (value as (...args: unknown[]) => unknown).bind(target);
+			if (!POINT_READ_METHODS.has(prop)) return bound;
+			return (...args: unknown[]) => {
+				bumpPointRead();
+				return bound(...args);
+			};
 		},
 	});
 }
@@ -77,6 +91,7 @@ runKVStoreConformance('LevelDBStore', () => {
 	const dir = path.join(os.tmpdir(), `quereus-kv-conf-lvl-${process.pid}-${seq++}`);
 	let store: LevelDBStore | undefined;
 	let reads = 0;
+	let pointReads = 0;
 
 	async function openStore(): Promise<KVStore> {
 		fs.mkdirSync(dir, { recursive: true });
@@ -86,7 +101,11 @@ runKVStoreConformance('LevelDBStore', () => {
 			createIfMissing: true,
 		});
 		await db.open();
-		store = LevelDBStore.overSublevel(meteredLevel(db as unknown as ViewLevel, () => { reads++; }));
+		store = LevelDBStore.overSublevel(meteredLevel(
+			db as unknown as ViewLevel,
+			() => { reads++; },
+			() => { pointReads++; },
+		));
 		return store;
 	}
 
@@ -105,6 +124,11 @@ runKVStoreConformance('LevelDBStore', () => {
 			entriesRead: () => reads,
 			// abstract-level yields one entry per awaited next() — no read-ahead above it.
 			maxReadAhead: 1,
+		},
+		pointReadMeter: {
+			// Goes red if `LevelDBStore.getMany`'s native-getMany override is ever deleted:
+			// the shared fallback issues one `level.get` per key, so K keys would count K.
+			roundTrips: () => pointReads,
 		},
 	};
 });

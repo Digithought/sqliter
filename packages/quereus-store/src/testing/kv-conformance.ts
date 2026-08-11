@@ -61,6 +61,27 @@ export interface ReadMeter {
 }
 
 /**
+ * Round-trip instrumentation for the batch point-read tier.
+ *
+ * Deliberately separate from {@link ReadMeter}, which counts entries yielded by
+ * ITERATION and therefore cannot see a point read at all — a `getMany` assertion wired
+ * to it would pass vacuously. A backend supplies this the same way: by wrapping whatever
+ * its store reads FROM inside its own adapter's closure.
+ */
+export interface PointReadMeter {
+	/**
+	 * Trips to backing storage for POINT reads so far — one per `get`, one per native
+	 * multi-get — monotonically increasing over the adapter's lifetime. Callers take a
+	 * baseline and measure the delta, so this never needs an explicit reset.
+	 *
+	 * "Round trip" is whatever costs the backend a crossing: an `abstract-level` binding
+	 * call, an IndexedDB transaction. It is NOT the number of keys asked for — the whole
+	 * point of the tier is that K keys cost one trip.
+	 */
+	roundTrips(): number;
+}
+
+/**
  * Per-backend lifecycle adapter. The suite drives its own per-test lifecycle and
  * calls {@link makeBackend} fresh for every test, so state never leaks between tests.
  */
@@ -81,6 +102,13 @@ export interface KVBackend {
 	 * break and throw mid-iteration — still run). See {@link ReadMeter}.
 	 */
 	readMeter?: ReadMeter;
+	/**
+	 * Optional point-read instrumentation for the batch point-read tier. Omit it and that
+	 * tier's one-round-trip case is not registered for this backend (its correctness cases
+	 * still run). Supply it on any backend whose `getMany` is meant to collapse K reads
+	 * into one trip, so deleting that override goes red. See {@link PointReadMeter}.
+	 */
+	pointReadMeter?: PointReadMeter;
 }
 
 /**
@@ -212,6 +240,7 @@ export function runKVStoreConformance(name: string, makeBackend: () => KVBackend
 	const probe = makeBackend();
 	const supportsReopen = typeof probe.reopen === 'function';
 	const supportsReadMeter = probe.readMeter !== undefined;
+	const supportsPointReadMeter = probe.pointReadMeter !== undefined;
 
 	describe(name, () => {
 		let backend: KVBackend;
@@ -697,6 +726,110 @@ export function runKVStoreConformance(name: string, makeBackend: () => KVBackend
 						// its FIRST batch is bounded, and only the total goes quadratic.
 						await assertBoundedIterate(store, meter, undefined, count);
 					});
+				});
+			}
+		});
+
+		// ------------------------------------------------------------------
+		// Tier 8 — batch point-read (see KVStore.getMany's contract)
+		//
+		// The correctness cases run everywhere: positional results, misses in place,
+		// independent buffers. The round-trip case needs the adapter to supply a
+		// PointReadMeter, because a KVStore handle cannot see its own round trips.
+		// ------------------------------------------------------------------
+		describe('tier 8: batch point-read', () => {
+			it('answers positionally for a key list that is not in sorted order', async () => {
+				// Deliberately unsorted: a backend that sorts its keys internally, or that
+				// fills results in arrival order, must still answer by POSITION.
+				await seed1to5(store);
+				const keys = [b(4), b(1), b(5), b(2)];
+				const got = await store.getMany(keys);
+				assert.strictEqual(got.length, keys.length);
+				assertBytes(got[0], b(40));
+				assertBytes(got[1], b(10));
+				assertBytes(got[2], b(50));
+				assertBytes(got[3], b(20));
+			});
+
+			it('a missing key is undefined at its own position and does not shift the rest', async () => {
+				// The miss is in the MIDDLE: a backend that omits absent keys would return a
+				// SHORTER array whose tail has slid down one position.
+				await seed1to5(store);
+				const got = await store.getMany([b(1), b(99), b(3)]);
+				assert.strictEqual(got.length, 3, 'a miss must not shorten the result');
+				assertBytes(got[0], b(10));
+				assert.strictEqual(got[1], undefined, 'the absent key reads as undefined');
+				assertBytes(got[2], b(30), 'the key after the miss keeps its own position');
+			});
+
+			it('getMany([]) resolves to an empty array', async () => {
+				await seed1to5(store);
+				assert.deepStrictEqual(await store.getMany([]), []);
+			});
+
+			it('a repeated key yields its value at every position, in INDEPENDENT buffers', async () => {
+				await seed1to5(store);
+				const got = await store.getMany([b(2), b(3), b(2)]);
+				assert.strictEqual(got.length, 3);
+				assertBytes(got[0], b(20));
+				assertBytes(got[1], b(30));
+				assertBytes(got[2], b(20), 'a repeated key must be answered at every position');
+				// One buffer filed at two indices would fail here — buffer ownership extends
+				// ACROSS positions, so scribbling on one must not rewrite the other.
+				(got[0] as Uint8Array)[0] = 99;
+				assertBytes(got[2], b(20), 'the duplicate position must be its own buffer');
+			});
+
+			it('mutating a returned value does not corrupt the store', async () => {
+				// Same read-buffer contract tier 1 pins for `get`.
+				await seed1to5(store);
+				const got = await store.getMany([b(1)]);
+				(got[0] as Uint8Array)[0] = 99;
+				assertBytes(await store.get(b(1)), b(10), 'a later get must be unaffected');
+				assertBytes((await store.getMany([b(1)]))[0], b(10), 'a later getMany must be unaffected');
+			});
+
+			it('answers positionally over a mix of already-read and never-read keys', async () => {
+				// A cache in front of the store (`CachedKVStore`) serves the warm keys from
+				// memory and batches only the cold ones, remembering where each miss belongs.
+				// Interleaving hits, misses, and an absent key catches a re-derived mapping.
+				await seed1to5(store);
+				await store.get(b(2));
+				await store.get(b(4));
+				const got = await store.getMany([b(1), b(4), b(99), b(2), b(5)]);
+				assert.strictEqual(got.length, 5);
+				assertBytes(got[0], b(10));
+				assertBytes(got[1], b(40));
+				assert.strictEqual(got[2], undefined);
+				assertBytes(got[3], b(20));
+				assertBytes(got[4], b(50));
+			});
+
+			it('getMany rejects after close()', async () => {
+				await store.close();
+				await assert.rejects(() => store.getMany([b(1)]), /closed/i);
+			});
+
+			if (supportsPointReadMeter) {
+				it('costs exactly ONE round trip to backing storage, whatever K is', async () => {
+					const meter = backend.pointReadMeter as PointReadMeter;
+					await seed1to5(store);
+
+					// Guard against a vacuous pass: a meter wired to the wrong thing reports
+					// zero however the store behaves, so prove one `get` moves it first.
+					const beforeGet = meter.roundTrips();
+					await store.get(b(1));
+					assert.ok(meter.roundTrips() - beforeGet >= 1,
+						'the point-read meter counted nothing for a single get() — it is not wired to what this store reads from');
+
+					const baseline = meter.roundTrips();
+					const keys = [b(4), b(1), b(5), b(2), b(99)];
+					const got = await store.getMany(keys);
+					const trips = meter.roundTrips() - baseline;
+					assert.strictEqual(got.length, keys.length);
+					assert.strictEqual(trips, 1,
+						`getMany over ${keys.length} keys took ${trips} round trips to backing storage, expected exactly 1 ` +
+						'(a backend that fell back to one get per key takes one per key)');
 				});
 			}
 		});
