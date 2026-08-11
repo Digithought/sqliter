@@ -98,6 +98,13 @@ describe('BinaryOpNode static type', () => {
 			expect(await expectAnnouncedAndInhabited(`0 or 1`, 'BOOLEAN')).to.equal(true);
 		});
 
+		it('announces BOOLEAN under a NOT wrapper', async () => {
+			// `NOT LIKE` is parsed as unary NOT over a LIKE BinaryOpNode, so the inner
+			// node's announcement is what `findBinary` sees; the statement column type is
+			// the NOT's. Both must be BOOLEAN.
+			expect(await expectAnnouncedAndInhabited(`'ab' not like 'a%'`, 'BOOLEAN')).to.equal(false);
+		});
+
 		it('classifies a lowercase keyword operator, as internally built ASTs spell it', () => {
 			// util/mutation-statement.ts synthesizes `operator: 'and'`; a case-sensitive
 			// switch announced such a node as its left operand's type.
@@ -120,8 +127,9 @@ describe('BinaryOpNode static type', () => {
 		});
 
 		it('leaves nested arithmetic over such an expression unchanged', async () => {
-			// The outer `+` now sees an ANY left operand rather than TEXT, so it takes the
-			// generic coercing path instead of the temporal-fallback path. Same answer.
+			// The outer `+` sees an ANY left operand rather than TEXT. Neither is temporal
+			// and neither is numeric, so both spellings selected the same generic coercing
+			// body in `buildNumericOpSpec` before and after. Same answer.
 			expect(await expectAnnouncedAndInhabited(`('123' + 0) + 1`, 'ANY')).to.equal(124);
 		});
 
@@ -134,6 +142,18 @@ describe('BinaryOpNode static type', () => {
 			await db.exec('create table dts (id integer primary key, a date not null, b date not null)');
 			// `date - date` is a TIMESPAN per types/temporal-ops.ts, not ANY.
 			expect(findBinary('select a - b as v from dts').getType().logicalType.name).to.equal('TIMESPAN');
+		});
+	});
+
+	describe('an ANY-announced source on the DML write path', () => {
+		// ANY is never identical to a declared column type, so the write path's
+		// static-type skip cannot fire and the coercion to the declared type must run.
+		it('coerces to the declared column type instead of storing the raw value', async () => {
+			await db.exec('create table w (id integer primary key, c text not null)');
+			await db.exec(`insert into w values (1, '123' + 0)`);
+			const stored = await firstValue('select c as v from w');
+			expect(typeof stored, 'declared TEXT column must hold a string').to.equal('string');
+			expect(stored).to.equal('123');
 		});
 	});
 

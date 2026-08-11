@@ -1,15 +1,18 @@
 /**
  * The single operator vocabulary for `AST.BinaryExpr` / `BinaryOpNode`.
  *
- * Three consumers used to each restate which operator spellings they recognize, and drifted:
+ * Consumers used to each restate which operator spellings they recognize, and drifted. They
+ * now all dispatch on {@link classifyBinaryOperator}:
  *  - `BinaryOpNode.generateType` (planner/nodes/scalar.ts) — the announced result type,
  *  - `buildBinaryOpSpec` (runtime/emit/binary.ts) — the evaluator body,
- *  - {@link isComparisonOperator} (analysis/comparison-collation.ts) — collation validation.
+ *  - {@link isComparisonOperator} (analysis/comparison-collation.ts) — collation validation,
+ *  - `needsComparisonCoercion` (building/expression.ts) — cross-type coercion insertion,
+ *  - `isScalarComparisonOperator` (analysis/scalar-param-usage.ts) — the object-valued
+ *    parameter guard.
  *
- * They now all dispatch on {@link classifyBinaryOperator}, so a newly added operator is
- * either classified for everyone or unknown to everyone — it cannot be evaluated as a
- * comparison while being announced as its left operand's type (which is exactly what `==`,
- * `XOR` and `LIKE` did).
+ * So a newly added operator is either classified for everyone or unknown to everyone — it
+ * cannot be evaluated as a comparison while being announced as its left operand's type
+ * (which is exactly what `==`, `XOR` and `LIKE` did).
  *
  * Operator spellings are matched case-insensitively. That matters: the parser emits keyword
  * operators uppercased, but internally synthesized ASTs do not always

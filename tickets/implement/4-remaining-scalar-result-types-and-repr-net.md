@@ -164,6 +164,34 @@ That comment also points at `backlog/bug-inferred-scalar-type-disagrees-with-run
 a path that no longer exists (the ticket moved to `fix/` and was split into this one and its
 siblings). Fix or drop the reference.
 
+## I. Adjacent axis — the announced *nullability* disagrees too
+
+Appended by the review of `binary-op-result-types-match-runtime` (arms A–H are about which
+logical type is announced; this is the same announced-vs-produced theme on the other field of
+`ScalarType`, and it resolves at the same two sites, so it is recorded here rather than as its
+own ticket).
+
+Measured on the post-`binary-op-result-types-match-runtime` tree, via `getColumnDefs()`:
+
+| statement | announced | produced |
+|---|---|---|
+| `select 1/0 as v` | `REAL`, `nullable: false` | `null` |
+| `select 'abc' + 0 as v` | `ANY`, `nullable: false` | `0` (fine) |
+
+`BinaryOpNode.generateType` computes `nullable` as `left.nullable \|\| right.nullable`, but
+`buildNumericOpSpec` returns `null` for any non-finite result — so every arithmetic node over
+two non-nullable operands can produce a null it says it cannot.
+
+No wrong query result was found: `select * from (select 1/0 as v) where v is null` still
+returns the row (checked — nothing elides the null test off the announced flag). The damage is
+to an embedder reading `getColumnDefs()[i].type.nullable`. R2 admits `null` in every position,
+so arm H's widened check will **not** catch this class; catching it needs a separate assertion
+("a column announced non-nullable produced a null cell") at the same egress seam.
+
+Decide the scope when you get here: either add that assertion alongside arm H and fix the
+nullability derivations it flags, or note explicitly in the handoff that the nullability axis
+is deferred and why. Do not silently leave it unmentioned.
+
 # Not in scope — the one violation an announcement cannot fix
 
 `select min(val)` over a TEXT column holding `'10'`, `'20'`, `'hello'` returns the JS
@@ -207,6 +235,8 @@ handoff rather than skipping or loosening the sqllogic assertion.
       obsolete comment and the stale ticket path.
 - [ ] Add explicit announced-type assertions for each arm so a regression fails as a type
       assertion, not only under the strict flag.
+- [ ] I: decide the nullability axis — add the "announced non-nullable, produced null"
+      assertion at the same seam and fix what it flags, or defer it explicitly in the handoff.
 - [ ] Update `docs/types.md` § Physical representation to state that a result column's
       announced type is now subject to R2, and what `ANY` means as an announcement.
 - [ ] Run `yarn test`, `yarn test:store`, `yarn test:repr-strict`, `yarn lint`,

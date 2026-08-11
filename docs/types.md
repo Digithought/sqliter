@@ -1267,7 +1267,7 @@ Moved to [Parameter Types](types-parameters.md#parameter-types).
 - `src/func/builtins/conversion.ts` - Type conversion functions
 
 **Type Inference**:
-- `src/planner/analysis/binary-operator-class.ts` - The binary-operator classification (`classifyBinaryOperator`), read by `BinaryOpNode.generateType`, `buildBinaryOpSpec` and `isComparisonOperator`
+- `src/planner/analysis/binary-operator-class.ts` - The binary-operator classification (`classifyBinaryOperator`), read by `BinaryOpNode.generateType`, `buildBinaryOpSpec`, `isComparisonOperator`, `building/expression.ts` and `analysis/scalar-param-usage.ts`
 - `src/common/type-inference.ts` - Type inference utilities (`findCommonType`, `promoteNumericTypes`)
 - `src/planner/build-function-call.ts` - Planning-time type inference for function calls
 

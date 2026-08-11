@@ -17,6 +17,7 @@ import { buildDeleteStmt } from './delete.js';
 import { resolveWindowFunction } from '../../schema/window-function.js';
 import { buildFunctionCall } from './function-call.js';
 import { createLogger } from '../../common/logger.js';
+import { classifyBinaryOperator } from '../analysis/binary-operator-class.js';
 
 /**
  * Plans a `QueryExpr` in scalar / IN / EXISTS expression position.
@@ -50,8 +51,15 @@ function buildExpressionPositionQueryExpr(
 
 const logger = createLogger('planner:expression');
 
-/** Comparison operators that should trigger cross-category coercion insertion */
-const COMPARISON_OPS = new Set(['=', '==', '!=', '<>', '<', '<=', '>', '>=']);
+/**
+ * Comparison operators that should trigger cross-category coercion insertion.
+ * Read off the shared classification (`analysis/binary-operator-class.ts`) rather
+ * than a private list, so a newly added comparison spelling gets its coercion
+ * casts without a second edit here.
+ */
+function needsComparisonCoercion(operator: string): boolean {
+	return classifyBinaryOperator(operator) === 'comparison';
+}
 
 /**
  * Build a comparison `BinaryOpNode` the ONE way every comparison site must: insert
@@ -133,7 +141,7 @@ export function buildExpression(ctx: PlanningContext, expr: AST.Expression, allo
 		case 'binary': {
       const left = buildExpression(ctx, expr.left, allowAggregates);
       const right = buildExpression(ctx, expr.right, allowAggregates);
-      return COMPARISON_OPS.has(expr.operator)
+      return needsComparisonCoercion(expr.operator)
         ? buildComparison(ctx.scope, expr, left, right)
         : new BinaryOpNode(ctx.scope, expr, left, right);
 		}

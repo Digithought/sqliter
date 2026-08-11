@@ -3,15 +3,23 @@ import { BinaryOpNode, CastNode, BetweenNode } from '../nodes/scalar.js';
 import { InNode } from '../nodes/subquery.js';
 import { ParameterReferenceNode } from '../nodes/reference.js';
 import { PhysicalType } from '../../types/logical-type.js';
+import { classifyBinaryOperator } from './binary-operator-class.js';
 
 /**
- * Comparison operators whose runtime compares operands by storage class
+ * True for the operators whose runtime compares operands by storage class
  * (`emitComparisonOp` in runtime/emit/binary.ts). An array/object value on one
  * side and a scalar on the other can never be equal/ordered — the OBJECT
  * storage class sorts above every scalar — so the predicate silently matches
- * nothing. `IS` / `IS NOT` are null-safe and intentionally excluded.
+ * nothing. `IS` / `IS NOT` are null-safe and intentionally excluded, which is
+ * why this asks for the `comparison` class rather than `isComparisonOperator`
+ * (that one also accepts the `is` class, for collation validation).
+ *
+ * Read off the shared classification rather than a private list — see
+ * `analysis/binary-operator-class.ts`.
  */
-const SCALAR_COMPARISON_OPS = new Set(['=', '==', '!=', '<>', '<', '<=', '>', '>=']);
+function isScalarComparisonOperator(operator: string): boolean {
+	return classifyBinaryOperator(operator) === 'comparison';
+}
 
 /** A non-object scalar physical type — INTEGER / REAL / TEXT / BLOB / BOOLEAN. */
 function isScalarPhysical(pt: PhysicalType | undefined): boolean {
@@ -66,7 +74,7 @@ export function collectScalarRequiredParams(plan: PlanNode): Set<string | number
 	const out = new Set<string | number>();
 	plan.visit((node) => {
 		if (node instanceof BinaryOpNode) {
-			if (!SCALAR_COMPARISON_OPS.has(node.expression.operator.toUpperCase())) return;
+			if (!isScalarComparisonOperator(node.expression.operator)) return;
 			consider(node.left, [node.right], out);
 			consider(node.right, [node.left], out);
 		} else if (node instanceof BetweenNode) {

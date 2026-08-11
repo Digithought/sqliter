@@ -118,11 +118,14 @@ The following built-in functions use type inference:
 
 **One classification, read by the planner and the evaluator.** Which operator spellings
 behave which way lives in a single table, `classifyBinaryOperator` in
-`src/planner/analysis/binary-operator-class.ts`. Both `BinaryOpNode.generateType` (which
-announces the result type) and `buildBinaryOpSpec` (`runtime/emit/binary.ts`, which builds
-the per-row body) dispatch on it, so an operator cannot be *evaluated* as one thing and
-*announced* as another. Matching is case-insensitive — internally synthesized ASTs do not
-always uppercase keyword operators (`util/mutation-statement.ts` builds `operator: 'and'`).
+`src/planner/analysis/binary-operator-class.ts`. Every consumer dispatches on it — the
+announced result type (`BinaryOpNode.generateType`), the per-row body (`buildBinaryOpSpec`,
+`runtime/emit/binary.ts`), collation-lattice validation (`isComparisonOperator`),
+cross-type coercion insertion (`building/expression.ts`) and the object-valued parameter
+guard (`analysis/scalar-param-usage.ts`) — so an operator cannot be *evaluated* as one thing
+and *announced* as another, nor be recognized by one analysis and missed by the next.
+Matching is case-insensitive — internally synthesized ASTs do not always uppercase keyword
+operators (`util/mutation-statement.ts` builds `operator: 'and'`).
 
 | Class | Operators | Announced result type |
 |---|---|---|
