@@ -338,3 +338,103 @@ select v as z from ocol order by z;
 → [{"z":"a"},{"z":"B"}]
 
 drop table ocol;
+
+-- =============================================================================
+-- An UNGROUPED aggregate query's ORDER BY can name the query's own output
+-- columns by SELECT-list alias. The alias only exists above the aggregation, so
+-- the sort has to run there rather than on the per-input rows.
+-- =============================================================================
+
+create table g (id integer primary key, a text, b text);
+insert into g values (1,'p','1'), (2,'p','2'), (3,'q','1');
+
+-- The whole query is one row; naming its own column just returns it
+select count(*) as c from g order by c;
+→ [{"c":3}]
+
+select count(*) as c from g order by c desc;
+→ [{"c":3}]
+
+-- The alias of the SECOND aggregate, not the first
+select count(*) as c, max(a) as m from g order by m;
+→ [{"c":3,"m":"q"}]
+
+-- A WRAPPED aggregate: the aggregate entry is aliased `count(*)`, so `c` names
+-- the final projection's output column, not the AggregateNode's
+select count(*) + 1 as c from g order by c;
+→ [{"c":4}]
+
+-- The alias inside a larger ORDER BY expression, and under COLLATE
+select count(*) as c from g order by c + 1;
+→ [{"c":3}]
+
+select max(a) as c from g order by c collate nocase;
+→ [{"c":"q"}]
+
+-- Alias matching is case-insensitive
+select count(*) as "C" from g order by c;
+→ [{"C":3}]
+
+-- Composes with a second sort key and with LIMIT
+select count(*) as c from g order by c, id;
+→ [{"c":3}]
+
+select count(*) as c from g order by c limit 1;
+→ [{"c":3}]
+
+-- ...and with HAVING
+select count(*) as c from g having count(*) > 0 order by c;
+→ [{"c":3}]
+
+-- A SELECT-list alias OUTRANKS a same-named source column, matching SQLite and
+-- the non-aggregate / grouped paths. Observable through an order-sensitive
+-- aggregate: `a` names the one-row output, so the sort is a no-op and the
+-- concatenation keeps insertion order.
+select group_concat(b) as a from g order by a desc;
+→ [{"a":"1,2,1"}]
+
+-- Control: with no alias to claim the name, `a` is still g.a and the
+-- pre-aggregate sort extension still orders the input before concatenating.
+-- The `, id` tiebreak keeps the two a='p' rows in a fixed order.
+select group_concat(b) as gc from g order by a desc, id;
+→ [{"gc":"1,1,2"}]
+
+select group_concat(b) as gc from g order by a, id;
+→ [{"gc":"1,2,1"}]
+
+-- Same control spelled with a table qualifier: `g.a` is never an alias, so the
+-- input sort survives even though a select-list alias `a` exists
+select group_concat(b) as a from g order by g.a desc, id;
+→ [{"a":"1,1,2"}]
+
+-- A scalar subquery's ProjectNode does not forward the aggregate's own output
+-- column, yet both spellings still resolve
+select (select count(*) + 1 as c from g order by c) as v;
+→ [{"v":4}]
+
+select (select count(*) + 1 as c from g order by count(*)) as v;
+→ [{"v":4}]
+
+-- A subquery in ORDER BY: the alias scan walks into it, so it must not trip over
+-- the subquery's own SELECT-list result columns
+select count(*) as zz from g order by (select 1);
+→ [{"zz":3}]
+
+-- Non-regressions: the spelled-out aggregate, the ordinal, and a qualified name
+select count(*) as c from g order by count(*);
+→ [{"c":3}]
+
+select count(*) as c from g order by 1;
+→ [{"c":3}]
+
+select count(*) as c from g order by g.a;
+→ [{"c":3}]
+
+-- Non-regressions: the grouped forms, which never took the pre-aggregate path
+select a, count(*) as c from g group by a order by c;
+→ [{"a":"q","c":1},{"a":"p","c":2}]
+
+select a, count(*) as c from g group by a order by c + 1;
+→ [{"a":"q","c":1},{"a":"p","c":2}]
+
+drop table g;

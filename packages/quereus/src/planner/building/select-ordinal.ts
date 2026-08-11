@@ -23,6 +23,12 @@ export interface SelectListEntry {
 	readonly expr: AST.Expression;
 	/** Star-expanded entries only: the exact input attribute this column came from. */
 	readonly sourceAttribute?: { readonly attr: Attribute; readonly index: number };
+	/**
+	 * The `as` alias this column was written with, if any. Star-expanded entries
+	 * never carry one, so a star column's name cannot shadow a source column when
+	 * a caller matches ORDER BY names against select-list aliases.
+	 */
+	readonly alias?: string;
 }
 
 /**
@@ -46,7 +52,7 @@ export function buildSelectListEntries(
 				result.push({ expr: colExpr, sourceAttribute: { attr, index } });
 			});
 		} else if (column.type === 'column') {
-			result.push({ expr: column.expr });
+			result.push({ expr: column.expr, alias: column.alias });
 		}
 	}
 	return result;

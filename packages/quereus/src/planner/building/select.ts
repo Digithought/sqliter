@@ -216,13 +216,19 @@ export function buildSelectStmt(
 			aggregates: aggregateResult.aggregatesContext,
 		};
 
-		// When ORDER BY references aggregate functions, apply it now — *before*
-		// any stripping final projection — so it can resolve against the full
-		// AggregateNode output (which still includes ORDER-BY-only aggregates).
-		// Skipped when window functions are present (window output isn't
+		// Applying ORDER BY here — *before* any stripping final projection — is the
+		// EXCEPTION, taken only when ORDER BY introduced aggregates the select list
+		// does not have. Those exist solely for the sort and the final projection
+		// strips them, so the sort must see the full AggregateNode output while they
+		// are still there. Every other aggregate ORDER BY falls through to the
+		// applyOrderBy at the bottom of this function, which gets the final
+		// projection's output scope — the only place an alias of a *wrapped* aggregate
+		// (`count(*) + 1 as c`, whose aggregate entry is aliased `count(*)`) is named.
+		// Also skipped when window functions are present (window output isn't
 		// available yet) or when pre-aggregate sort already handled ordering.
 		if (
-			aggregateResult.orderByHasAggregates &&
+			aggregateResult.orderByNeedsPostAggregateSort &&
+			aggregateResult.hasOrderByOnlyAggregates &&
 			!preAggregateSort &&
 			!hasWindowFunctions &&
 			stmt.orderBy && stmt.orderBy.length > 0

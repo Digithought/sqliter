@@ -18,6 +18,7 @@ import { isAggregateFunctionSchema } from '../../schema/function.js';
 import { expressionToString, expressionToIdentityString } from '../../emit/ast-stringify.js';
 import { buildOrdinalAwareExpression, resolveOrdinalReference, type SelectListEntry } from './select-ordinal.js';
 import { collectDefinedAttrIds } from '../analysis/equi-correlation.js';
+import { walkAstNodes } from '../analysis/predicate-shape.js';
 import { PlanNodeType } from '../nodes/plan-node-type.js';
 
 /**
@@ -42,7 +43,7 @@ export function buildAggregatePhase(
 	groupByExpressions?: ScalarPlanNode[];
 	hasHavingOnlyAggregates?: boolean;
 	hasOrderByOnlyAggregates?: boolean;
-	orderByHasAggregates?: boolean;
+	orderByNeedsPostAggregateSort?: boolean;
 	aggregatesContext?: PlanningContext['aggregates'];
 } {
 	const hasGroupBy = stmt.groupBy && stmt.groupBy.length > 0;
@@ -60,14 +61,17 @@ export function buildAggregatePhase(
 		}
 	}
 
-	// Detect aggregate function references in ORDER BY. They are only legal when
-	// the query is otherwise an aggregate query (has aggregates in SELECT/HAVING
-	// or has a GROUP BY). When legal, any ORDER BY aggregate not already present
-	// in the SELECT or HAVING aggregate list must be added to the AggregateNode
-	// so it is computed and available to the post-aggregate sort.
-	const orderByHasAggregates = orderByContainsAggregates(stmt.orderBy, selectContext, selectList);
+	// Decide where this query's ORDER BY has to run (see
+	// `orderByNeedsPostAggregateSort`). Aggregate function references in ORDER BY are
+	// only legal when the query is otherwise an aggregate query (has aggregates in
+	// SELECT/HAVING or has a GROUP BY). When legal, any ORDER BY aggregate not already
+	// present in the SELECT or HAVING aggregate list must be added to the AggregateNode
+	// so it is computed and available to the post-aggregate sort. An ORDER BY that only
+	// names a SELECT-list alias adds nothing here — the alias resolves through a scope
+	// later — so `hasOrderByOnlyAggregates` stays false for it.
+	const needsPostAggregateSort = orderByNeedsPostAggregateSort(stmt.orderBy, selectContext, selectList);
 	let hasOrderByOnlyAggregates = false;
-	if (orderByHasAggregates && (hasAggregates || hasGroupBy)) {
+	if (needsPostAggregateSort && (hasAggregates || hasGroupBy)) {
 		const orderByAggs = collectOrderByAggregates(stmt.orderBy!, selectContext, aggregates);
 		if (orderByAggs.length > 0) {
 			aggregates.push(...orderByAggs);
@@ -104,12 +108,12 @@ export function buildAggregatePhase(
 	// After (optional) early HAVING filter we continue with the existing pipeline
 	// ----------------------------------------------------------------------------
 	// Handle pre-aggregate sorting for ORDER BY without GROUP BY. Skip when the
-	// ORDER BY contains aggregates — those need to run against the post-aggregate
-	// row(s), not the per-input rows.
+	// ORDER BY names an aggregate or a SELECT-list alias — neither can be evaluated
+	// against the per-input rows; they need the post-aggregate row(s).
 	const preAggregateSort = Boolean(
-		hasAggregates && !hasGroupBy && stmt.orderBy && stmt.orderBy.length > 0 && !orderByHasAggregates
+		hasAggregates && !hasGroupBy && stmt.orderBy && stmt.orderBy.length > 0 && !needsPostAggregateSort
 	);
-	currentInput = handlePreAggregateSort(currentInput, stmt, selectContext, hasAggregates, !!hasGroupBy, orderByHasAggregates, selectList);
+	currentInput = handlePreAggregateSort(currentInput, stmt, selectContext, hasAggregates, !!hasGroupBy, needsPostAggregateSort, selectList);
 
 	// Build GROUP BY expressions, resolving 1-based positional references against the SELECT list.
 	const groupByExpressions = stmt.groupBy ?
@@ -182,7 +186,7 @@ export function buildAggregatePhase(
 		groupByExpressions,
 		hasHavingOnlyAggregates,
 		hasOrderByOnlyAggregates,
-		orderByHasAggregates,
+		orderByNeedsPostAggregateSort: needsPostAggregateSort,
 		aggregatesContext,
 	};
 }
@@ -196,13 +200,13 @@ function handlePreAggregateSort(
 	selectContext: PlanningContext,
 	hasAggregates: boolean,
 	hasGroupBy: boolean,
-	orderByHasAggregates: boolean,
+	needsPostAggregateSort: boolean,
 	selectList: readonly SelectListEntry[]
 ): RelationalPlanNode {
 	// Special handling for ORDER BY with aggregates but no GROUP BY.
-	// Skip when ORDER BY itself references aggregates — those must run
-	// post-aggregation, not on the per-row input.
-	if (hasAggregates && !hasGroupBy && stmt.orderBy && stmt.orderBy.length > 0 && !orderByHasAggregates) {
+	// Skip when ORDER BY references an aggregate or a SELECT-list alias — those must
+	// run post-aggregation, not on the per-row input.
+	if (hasAggregates && !hasGroupBy && stmt.orderBy && stmt.orderBy.length > 0 && !needsPostAggregateSort) {
 		// Apply ORDER BY before aggregation. This sort sits BELOW the AggregateNode,
 		// so a positional reference resolves through the select list (no output
 		// attributes exist yet to bind to).
@@ -1205,25 +1209,72 @@ function collectOrderByAggregates(
 }
 
 /**
- * Returns true if any ORDER BY clause expression contains an aggregate function call.
+ * Decides whether an ungrouped aggregate query's ORDER BY must be sorted ABOVE the
+ * AggregateNode rather than below it (the pre-aggregate sort extension, which is what
+ * makes `select group_concat(b) from t order by a` concatenate in `a` order).
  *
- * A positional reference is resolved against the SELECT list FIRST: the literal `1`
- * in `select count(*) as c from t order by 1` contains no aggregate itself, but it
- * stands for one. Without this the query would take the pre-aggregate sort path and
- * fail with "Aggregate function count not allowed in this context"; with it, it
- * routes to the post-aggregate ORDER BY exactly like the spelled-out
- * `order by count(*)`.
+ * Three spellings need the post-aggregate placement, because none of them can be
+ * evaluated against the per-input rows the pre-aggregate sort sees:
+ *
+ * - a spelled-out aggregate call (`order by count(*)`);
+ * - a positional reference standing for one — the literal `1` in `select count(*) as c
+ *   from t order by 1` contains no aggregate itself, so it is resolved against the
+ *   SELECT list FIRST. Without that the query fails with "Aggregate function count not
+ *   allowed in this context";
+ * - a bare (unqualified) column name that is a SELECT-list alias (`select count(*) as c
+ *   from t order by c`). The alias only ever exists in the aggregate/projection output
+ *   scope, so a pre-aggregate sort fails with "Column not found: c".
+ *
+ * The alias arm makes a select-list alias outrank a same-named source column in an
+ * aggregate ORDER BY, matching SQLite and what the non-aggregate and grouped paths
+ * already do. Qualified names (`order by t.c`) are excluded and keep resolving to the
+ * table's column.
  */
-function orderByContainsAggregates(
+function orderByNeedsPostAggregateSort(
 	orderBy: AST.OrderByClause[] | undefined,
 	selectContext: PlanningContext,
 	selectList: readonly SelectListEntry[]
 ): boolean {
 	if (!orderBy || orderBy.length === 0) return false;
+	const aliases = selectListAliases(selectList);
 	return orderBy.some(clause => {
 		const entry = resolveOrdinalReference(clause.expr, selectList, 'ORDER BY');
-		return containsAggregateFunction(entry?.expr ?? clause.expr, selectContext);
+		if (containsAggregateFunction(entry?.expr ?? clause.expr, selectContext)) return true;
+		return mentionsSelectListAlias(clause.expr, aliases);
 	});
+}
+
+/** Lower-cased set of the `as` aliases the SELECT list wrote (stars contribute none). */
+function selectListAliases(selectList: readonly SelectListEntry[]): Set<string> {
+	const aliases = new Set<string>();
+	for (const entry of selectList) {
+		if (entry.alias) aliases.add(entry.alias.toLowerCase());
+	}
+	return aliases;
+}
+
+/**
+ * True when `expr` mentions any of `aliases` as an unqualified column reference.
+ *
+ * NOTE: `walkAstNodes` descends into subquery operands, so `order by (select … where x
+ * = c)` counts as mentioning `c` even when that `c` is the subquery's own column. The
+ * over-approximation only costs the pre-aggregate ordering extension on a one-row
+ * result; a subquery-aware walk is not worth hand-rolling for it.
+ *
+ * `type: 'column'` is not unique to {@link AST.ColumnExpr}: a subquery's SELECT-list
+ * {@link AST.ResultColumn} carries the same tag with an `expr`/`alias` shape and no
+ * `name`, and the reflective walk reaches those too. Match on the `name` string rather
+ * than on the tag alone.
+ */
+function mentionsSelectListAlias(expr: AST.Expression, aliases: ReadonlySet<string>): boolean {
+	if (aliases.size === 0) return false;
+	for (const node of walkAstNodes(expr)) {
+		if (node.type !== 'column') continue;
+		const col = node as Partial<AST.ColumnExpr>;
+		if (typeof col.name !== 'string' || col.table) continue;
+		if (aliases.has(col.name.toLowerCase())) return true;
+	}
+	return false;
 }
 
 /**
