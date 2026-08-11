@@ -966,25 +966,26 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	}
 
 	/**
-	 * Rewrites a QuereusError raised directly by the overlay's own module — reached only by
-	 * the PRIMARY-KEY re-key arm's pre-flight `alterSchema(change, true)` dry run above — so
-	 * its message names the user's table instead of the internal `_overlay_<table>_<id>`
-	 * staging table the error actually originates in. Every other overlay-sourced refusal is
-	 * caught and re-described by this module (see {@link issuerOverlayDriftError} and the
-	 * poison-message builders); this pre-flight call is the one spot where an overlay
-	 * module's own error text reaches the caller verbatim, so it is the one spot that needs
-	 * the substitution.
+	 * Rewrites a QuereusError raised directly by the overlay's own module so its message names
+	 * the user's table instead of the internal `_overlay_<table>_<id>` staging table the error
+	 * actually originates in — an internal name means nothing to the caller.
+	 *
+	 * Every point where an overlay's own error text can reach a user must route through here.
+	 * There are two: the PRIMARY-KEY re-key arm's pre-flight `alterSchema(change, true)` dry
+	 * run in {@link alterTable}, whose refusal is thrown verbatim, and
+	 * {@link applyInPlaceOverlayChange}, which quotes the text into a foreign overlay's poison
+	 * message and into {@link issuerOverlayDriftError}. Returns `e` so a `throw` site can wrap
+	 * the call; the rewrite is in place, so the poison sites can ignore the return.
 	 */
 	private renameOverlayInError(e: unknown, overlaySchema: TableSchema | undefined, tableName: string): unknown {
 		if (!(e instanceof QuereusError) || !overlaySchema || !e.message.includes(overlaySchema.name)) return e;
-		const cause = (e as { cause?: unknown }).cause;
-		return new QuereusError(
-			e.message.split(overlaySchema.name).join(tableName),
-			e.code,
-			cause instanceof Error ? cause : undefined,
-			e.line,
-			e.column,
-		);
+		// Rewritten in place, not reconstructed: a fresh `new QuereusError(...)` would flatten the
+		// concrete subclass (ConstraintError and friends) to the base class, discard the original
+		// stack, and — because the constructor appends `(at line …, column …)` when both are given
+		// — duplicate that suffix onto a message that already carries it. The error was raised by
+		// the call this catch wraps and is referenced nowhere else, so mutating it is safe.
+		e.message = e.message.split(overlaySchema.name).join(tableName);
+		return e;
 	}
 
 	/**
@@ -1350,6 +1351,10 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 			// per-overlay DATA conditions — CONSTRAINT, and the BUSY the overlay module's own
 			// primary-key re-key representability check raises — are routed below instead.
 			if (!(e instanceof QuereusError) || (e.code !== StatusCode.CONSTRAINT && e.code !== StatusCode.BUSY)) throw e;
+			// Both routings below surface this error's text to a user — quoted into the poison
+			// message, or rethrown — and it was raised BY the overlay, so it names the overlay's
+			// staging table. Rename before either reads it.
+			this.renameOverlayInError(e, overlayState.overlayTable.tableSchema, tableName);
 			if (isIssuer) {
 				// A BUSY out of the issuer's own overlay is a representability refusal its
 				// validation pass never claimed to judge — not drift. The tier-2 pre-flight

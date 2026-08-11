@@ -2544,6 +2544,11 @@ describe('IsolationModule', () => {
 			let err: unknown;
 			try { await db.exec(sql); } catch (e) { err = e; }
 			expect(err, `${sql} must throw`).to.be.instanceOf(QuereusError);
+			// Class invariant for every refusal in this block, whichever layer raises it: the
+			// message names the table the user wrote, never the internal `_overlay_<table>_<id>`
+			// staging table (bug-overlay-table-name-leaks-into-rekey-error).
+			expect((err as QuereusError).message, `${sql} must not leak the internal overlay staging table name`)
+				.to.not.match(/_overlay_/);
 			return err as QuereusError;
 		}
 
@@ -2633,8 +2638,9 @@ describe('IsolationModule', () => {
 			const err = await expectAlterError(`ALTER TABLE ecp_own ALTER COLUMN k SET COLLATE NOCASE`);
 			expect(err.code).to.equal(StatusCode.BUSY);
 			expect(err.message).to.match(/commit\/rollback and retry/i);
+			// The no-`_overlay_` half of this assertion lives in expectAlterError, which applies it
+			// to every refusal in this block; here we also pin the positive form.
 			expect(err.message, 'names the real table').to.contain('table ecp_own:');
-			expect(err.message, 'must not leak the internal overlay staging table name').to.not.match(/_overlay_/);
 
 			await db.exec(`ROLLBACK`);
 		});
@@ -3737,6 +3743,11 @@ describe('IsolationModule', () => {
 			expect(bState.poison, 'B overlay must be poisoned, not silently truncated').to.not.be.undefined;
 			expect(bState.poison!.message).to.match(/UNIQUE constraint failed/);
 			expect(bState.poison!.message).to.match(/roll back this transaction/i);
+			// The quoted cause comes from the overlay module, which names its own staging table —
+			// same class as bug-overlay-table-name-leaks-into-rekey-error, different site.
+			expect(bState.poison!.message, 'names the user table, not the internal overlay staging table')
+				.to.not.match(/_overlay_/);
+			expect(bState.poison!.message, 'names the user table').to.contain('main.t');
 
 			// The poisoned overlay keeps BOTH staged rows — the rejection fired in the
 			// pre-validation pass, before the overlay's index map or layers were touched.
