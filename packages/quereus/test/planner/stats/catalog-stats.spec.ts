@@ -546,7 +546,7 @@ describe('CatalogStatsProvider', () => {
 				columns: [{ name: 'order_id' }] as any,
 				columnIndexMap: new Map([['order_id', 0]]),
 				primaryKeyDefinition: [{ index: 0, desc: false }],
-				foreignKeys: [{ columns: [0], referencedTable: 'orders', referencedColumns: [0], onDelete: 'restrict', onUpdate: 'restrict', deferred: false }],
+				foreignKeys: [{ columns: [0], referencedTable: 'orders', onDelete: 'restrict', onUpdate: 'restrict', deferred: false }],
 			});
 			const cond = mockBinaryOp('=', mockColumnRef('order_id'), mockColumnRef('id'));
 			expect(provider.joinSelectivity(child, parent, cond)).to.equal(1 / 1000);
@@ -563,7 +563,7 @@ describe('CatalogStatsProvider', () => {
 				columns: [{ name: 'order_id' }] as any,
 				columnIndexMap: new Map([['order_id', 0]]),
 				primaryKeyDefinition: [{ index: 0, desc: false }],
-				foreignKeys: [{ columns: [0], referencedTable: 'orders', referencedColumns: [0], onDelete: 'restrict', onUpdate: 'restrict', deferred: false }],
+				foreignKeys: [{ columns: [0], referencedTable: 'orders', onDelete: 'restrict', onUpdate: 'restrict', deferred: false }],
 			});
 			// Swap left/right: parent is left, child is right
 			const cond = mockBinaryOp('=', mockColumnRef('id'), mockColumnRef('order_id'));
@@ -581,7 +581,7 @@ describe('CatalogStatsProvider', () => {
 				columns: [{ name: 'ref' }] as any,
 				columnIndexMap: new Map([['ref', 0]]),
 				primaryKeyDefinition: [{ index: 0, desc: false }],
-				foreignKeys: [{ columns: [0], referencedTable: 't', referencedColumns: [0], onDelete: 'restrict', onUpdate: 'restrict', deferred: false }],
+				foreignKeys: [{ columns: [0], referencedTable: 't', onDelete: 'restrict', onUpdate: 'restrict', deferred: false }],
 			});
 			const cond = mockBinaryOp('=', mockColumnRef('ref'), mockColumnRef('a'));
 			const sel = provider.joinSelectivity(child, parent, cond);

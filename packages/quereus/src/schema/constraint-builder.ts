@@ -107,7 +107,6 @@ export function buildForeignKeyConstraintSchema(
 		columns: Object.freeze(childColIndices),
 		referencedTable: fk.table,
 		referencedSchema: fk.schema ?? childSchemaName,
-		referencedColumns: Object.freeze([]), // resolved at enforcement time
 		referencedColumnNames: fk.columns, // deferred resolution via resolveReferencedColumns
 		onDelete: fk.onDelete ?? 'restrict',
 		onUpdate: fk.onUpdate ?? 'restrict',

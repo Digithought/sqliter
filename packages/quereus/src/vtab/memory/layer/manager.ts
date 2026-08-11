@@ -113,11 +113,10 @@ const shiftForInsert = (index: number, at: number): number => index >= at ? inde
  * and need nothing. `statistics.columnStats` is keyed by column name. `columnIndexMap` is
  * rebuilt from the new column list by the caller.
  *
- * A foreign key's `columns` are indices into THIS table and always shift. Its
- * `referencedColumns` are NOT touched: every constructor of a foreign key leaves that
- * array empty (`constraint-builder.ts`, `schema/manager.ts`) and enforcement resolves the
- * parent indices on demand from `referencedColumnNames` against the parent's CURRENT
- * schema (`resolveReferencedColumns`) — so even a self-referential key needs no shift here.
+ * A foreign key's `columns` are indices into THIS table and always shift. It has no stored
+ * parent-column-index field to shift: enforcement resolves the parent indices on demand
+ * from `referencedColumnNames` against the parent's CURRENT schema
+ * (`resolveReferencedColumns`) — so even a self-referential key needs no shift here.
  *
  * `derivation.logicalKey` / `derivation.ordering` also hold indices into this table and are
  * NOT shifted, in either direction: they exist only on a maintained table (a materialized

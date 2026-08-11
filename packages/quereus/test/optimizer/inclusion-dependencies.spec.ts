@@ -169,7 +169,6 @@ function makeFk(columns: number[], referencedTable: string, referencedColumnName
 	return {
 		columns,
 		referencedTable,
-		referencedColumns: [],
 		referencedColumnNames,
 		onDelete: 'restrict',
 		onUpdate: 'restrict',

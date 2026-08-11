@@ -35,7 +35,6 @@ function fk(columns: number[], name?: string): ForeignKeyConstraintSchema {
 		name,
 		columns: Object.freeze(columns),
 		referencedTable: 'parent',
-		referencedColumns: Object.freeze(columns.map((_, i) => i)),
 		referencedColumnNames: Object.freeze(columns.map((_, i) => `p${i}`)),
 		onDelete: 'restrict',
 		onUpdate: 'restrict',
@@ -142,11 +141,11 @@ describe('shiftSchemaIndicesForDrop', () => {
 			expect(foreignKeys![0].columns).to.deep.equal([2]);
 		});
 
-		it('leaves referencedColumns alone (resolved by name against the parent at enforcement time)', () => {
+		it('leaves referencedColumnNames alone (resolved by name against the parent at enforcement time)', () => {
 			const schema = schemaFixture({ foreignKeys: Object.freeze([fk([2, 3], 'fk_cd')]) });
 			const { foreignKeys } = shiftSchemaIndicesForDrop(schema, 1);
 			expect(foreignKeys![0].columns, 'child indices shift').to.deep.equal([1, 2]);
-			expect(foreignKeys![0].referencedColumns, 'parent indices do not').to.deep.equal([0, 1]);
+			expect(foreignKeys![0].referencedColumnNames, 'parent names do not').to.deep.equal(['p0', 'p1']);
 		});
 
 		it('is undefined when every key was removed, and when the schema had none', () => {

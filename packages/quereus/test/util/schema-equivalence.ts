@@ -156,8 +156,7 @@ function assertFkListEqual(direct: ReadonlyArray<ForeignKeyConstraintSchema>, ap
 		eqOptional(lowercase(a.referencedSchema), lowercase(b.referencedSchema), `${path}[${i}].referencedSchema`);
 		// Compare child column indices in order
 		eqArray(a.columns, b.columns, `${path}[${i}].columns`);
-		// Parent column resolution may happen at enforcement time — compare what's stored
-		eqArray(a.referencedColumns ?? [], b.referencedColumns ?? [], `${path}[${i}].referencedColumns`);
+		// Parent column indices are resolved at enforcement time, not stored — compare names instead
 		eqArray(
 			(a.referencedColumnNames ?? []).map(n => n.toLowerCase()),
 			(b.referencedColumnNames ?? []).map(n => n.toLowerCase()),

@@ -659,9 +659,9 @@ export function appendIndexToTableSchema(tableSchema: TableSchema, indexSchema: 
  * likewise left to the caller: the engine recomputes them from column names right after DROP
  * COLUMN returns (`withGeneratedColumnGraph` in `runDropColumn`), so only a caller driving a
  * module's API directly ever observes a stale map — mirroring the same carve-out on the insert
- * side. `referencedColumns` on a foreign key is not touched, for the same reason as on the insert
- * side: enforcement resolves the parent indices on demand from `referencedColumnNames` against
- * the parent's CURRENT schema.
+ * side. A foreign key has no stored parent-column-index field to touch, for the same reason as on
+ * the insert side: enforcement resolves the parent indices on demand from `referencedColumnNames`
+ * against the parent's CURRENT schema.
  */
 export function shiftSchemaIndicesForDrop(schema: TableSchema, colIndex: number): {
 	columns: ReadonlyArray<ColumnSchema>;
@@ -1007,8 +1007,6 @@ export interface ForeignKeyConstraintSchema {
 	referencedTable: string;
 	/** Referenced schema (default: same schema) */
 	referencedSchema?: string;
-	/** Column indices in the parent table */
-	referencedColumns: ReadonlyArray<number>;
 	/**
 	 * Referenced column names for deferred resolution.
 	 * Parent column indices can't be resolved at schema creation time because

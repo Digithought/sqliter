@@ -379,7 +379,6 @@ describe('CatalogStatsProvider selectivity', () => {
 			foreignKeys: [{
 				columns: [0],
 				referencedTable: 'orders',
-				referencedColumns: [0],
 				onDelete: 'restrict',
 				onUpdate: 'restrict',
 				deferred: false,

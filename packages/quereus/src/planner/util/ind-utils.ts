@@ -84,12 +84,13 @@ function permitsOrphans(module: CapabilityProvider | undefined): boolean {
  * different column whenever a projection sits between the table and the join.
  *
  * Alignment is *positional*: for each `i`, the equi-pair partner of
- * `fk.columns[i]` must equal `fk.referencedColumns[i]`. A composite FK
- * `(fa, fb) REFERENCES p(a, b)` guarantees `fa → a` and `fb → b` in that
- * pairing only; a permuted equi-pair set (e.g. `fa = b AND fb = a`) is NOT
- * covered by the FK and must not fold. A defensive cross-check additionally
- * requires every `fk.referencedColumns[i]` to be a PK column so a malformed FK
- * referencing non-PK columns never produces an IND on the PK.
+ * `fk.columns[i]` must equal the resolved parent column at index `i` (see
+ * {@link resolveReferencedColumns}). A composite FK `(fa, fb) REFERENCES
+ * p(a, b)` guarantees `fa → a` and `fb → b` in that pairing only; a permuted
+ * equi-pair set (e.g. `fa = b AND fb = a`) is NOT covered by the FK and must
+ * not fold. A defensive cross-check additionally requires every resolved
+ * parent column to be a PK column so a malformed FK referencing non-PK
+ * columns never produces an IND on the PK.
  *
  * **Capability gate (OPT-059).** Returns `undefined` when either side's owning
  * module declares `permitsOrphanedForeignKeyRows`: an orphan-permitting child
@@ -125,8 +126,8 @@ export function lookupCoveringFK(
 		if (fk.columns.length !== parentSchema.primaryKeyDefinition.length) continue;
 		if (fk.columns.length !== childEquiCols.length) continue;
 
-		// FK schemas store an empty referencedColumns at CREATE TABLE time;
-		// indices are resolved against the parent via resolveReferencedColumns.
+		// Parent column indices aren't stored on the FK schema; resolve them
+		// against the parent via resolveReferencedColumns.
 		let refCols: ReadonlyArray<number>;
 		try {
 			refCols = resolveReferencedColumns(fk, parentSchema);

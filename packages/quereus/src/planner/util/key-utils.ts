@@ -571,13 +571,13 @@ function walkToTableSchema(node: RelationalPlanNode, strict: boolean): TableSche
  * column has no base-table origin.
  *
  * Alignment is *positional*: for each declared FK column at index `i`, the
- * equi-pair partner must equal the FK's declared `referencedColumns[i]`. A
- * composite FK `(fa, fb) REFERENCES p(a, b)` only covers the pairing
- * `fa = a AND fb = b`; a permuted equi-pair set (`fa = b AND fb = a`) is NOT
- * guaranteed by the FK and must not be reported as aligned. A defensive
- * cross-check additionally requires every `fk.referencedColumns[i]` to be a
- * PK column so a malformed FK referencing non-PK columns is never reported as
- * an IND on the PK.
+ * equi-pair partner must equal the resolved parent column at index `i` (see
+ * {@link resolveReferencedColumns}). A composite FK `(fa, fb) REFERENCES
+ * p(a, b)` only covers the pairing `fa = a AND fb = b`; a permuted equi-pair
+ * set (`fa = b AND fb = a`) is NOT guaranteed by the FK and must not be
+ * reported as aligned. A defensive cross-check additionally requires every
+ * resolved parent column to be a PK column so a malformed FK referencing
+ * non-PK columns is never reported as an IND on the PK.
  */
 export function checkFkPkAlignment(
 	fkTable: TableSchema,
@@ -593,8 +593,8 @@ export function checkFkPkAlignment(
 		const pkDef = pkTable.primaryKeyDefinition;
 		if (pkDef.length === 0 || fk.columns.length !== pkDef.length) continue;
 
-		// FK schemas store an empty referencedColumns at CREATE TABLE time; the
-		// real indices are resolved against the parent here.
+		// Parent column indices aren't stored on the FK schema; resolve them
+		// against the parent here.
 		let refCols: ReadonlyArray<number>;
 		try {
 			refCols = resolveReferencedColumns(fk, pkTable);

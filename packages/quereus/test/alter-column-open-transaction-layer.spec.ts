@@ -610,10 +610,9 @@ describe('ALTER TABLE ADD COLUMN at a position (memory module)', () => {
 
 		expect(updated.columns.map(c => c.name)).to.deep.equal(['w', 'id', 'pref', 'g']);
 		expect(updated.primaryKeyDefinition.map(d => d.index)).to.deep.equal([1]);
-		// FK child columns are indices into THIS table and shift; the parent-side indices are
-		// left empty by every builder and resolved from names at enforcement time.
+		// FK child columns are indices into THIS table and shift; the parent-side indices have
+		// no stored slot and are resolved from names at enforcement time.
 		expect(updated.foreignKeys?.map(fk => [...fk.columns])).to.deep.equal([[2]]);
-		expect(updated.foreignKeys?.map(fk => [...fk.referencedColumns])).to.deep.equal([[]]);
 		// `g` (2 → 3) is generated from `id` (0 → 1).
 		expect([...(updated.generatedColumnDependencies ?? [])].map(([col, deps]) => [col, [...deps]]))
 			.to.deep.equal([[3, [1]]]);
