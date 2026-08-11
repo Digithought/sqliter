@@ -587,16 +587,25 @@ function lensSetLevelConstraints(ctx: PlanningContext, view: MutableViewLike): R
 // deferred commit-time re-read of the logical view addressed by the shared key
 // (the UPDATE fan-out, and any subquery-bearing insert check).
 
-/** Whether an AST expression embeds a relation-reading subquery anywhere. */
+/**
+ * Whether an AST expression embeds a relation-reading subquery anywhere.
+ *
+ * Descends through EVERY object, not only ones carrying a `type` discriminant:
+ * several AST containers are plain records (`CaseExpr.whenThenClauses`'
+ * `{ when, then }` pairs, `WindowDefinition`'s frame bounds), so a `type`-gated
+ * walk stops short of them and reports a CASE-nested `exists (…)` as
+ * subquery-free — which routed the check to the row-time envelope seam instead
+ * of the deferred commit-time one (pinned by the CASE case in
+ * test/lens-row-local-null-write.spec.ts).
+ */
 function astContainsSubquery(expr: AST.Expression): boolean {
 	let found = false;
 	const walk = (node: unknown): void => {
-		if (found) return;
+		if (found || !node || typeof node !== 'object') return;
 		if (Array.isArray(node)) { node.forEach(walk); return; }
-		if (!node || typeof node !== 'object' || !('type' in (node as object))) return;
-		const n = node as { type: string };
-		if (n.type === 'subquery' || n.type === 'select' || n.type === 'exists') { found = true; return; }
-		for (const v of Object.values(n)) walk(v);
+		const type = (node as { type?: unknown }).type;
+		if (type === 'subquery' || type === 'select' || type === 'exists') { found = true; return; }
+		for (const v of Object.values(node)) walk(v);
 	};
 	walk(expr);
 	return found;
@@ -693,6 +702,11 @@ function lensRowLocalDecompositionUpdateConstraints(
 	if (checks.length === 0) return [];
 	const { address } = requireLensLogicalRowAddress(ctx, view, slot, shape.storage, checks[0].name);
 
+	// NOTE: each written row costs one logical-view probe per check at commit, and a row
+	// two ops both touch enqueues the same probe twice (idempotent — same post-image).
+	// If commit cost ever shows up in a profile, dedup the deferred queue by
+	// (constraint, key) rather than trimming the per-op threading, which is what makes
+	// the seam total.
 	const constraints: RowConstraintSchema[] = [];
 	const seen = new Set<string>();
 	for (const op of baseOps) {
@@ -761,6 +775,26 @@ function substituteUnsuppliedLogicalColumns(
 }
 
 /**
+ * Refuse an INSERT whose statement OR clause would force a deferred logical-row
+ * re-read to row-time evaluation, where it reads a logical image the row has not
+ * joined yet and so cannot detect the violation. Only ABORT (and a plain insert)
+ * leave the constraint deferred; see {@link buildDecompositionRowLocalChecks}.
+ */
+function rejectRowLocalDeferredConflictResolution(
+	view: MutableViewLike,
+	checkName: string,
+	onConflict: ConflictResolution | undefined,
+): void {
+	if (onConflict === undefined || onConflict === ConflictResolution.ABORT) return;
+	raiseMutationDiagnostic({
+		reason: 'lens-row-local-unenforceable',
+		table: view.name,
+		message: `cannot insert with a conflict clause through logical table '${view.name}': its row-local CHECK '${checkName}' reads other relations, so it is evaluated at commit against the written row's logical image — a non-ABORT conflict clause forces row-time evaluation, where that image does not yet include the row and the check cannot detect a violation`,
+		suggestion: 'Use a plain insert (or `insert or abort`), or restate the CHECK so it references only the logical row.',
+	});
+}
+
+/**
  * Build the row-local CHECK enforcement for a decomposition INSERT: every
  * `enforced-row-local` CHECK of the slot, split by shape —
  *
@@ -776,6 +810,16 @@ function substituteUnsuppliedLogicalColumns(
  *    commit-time evaluation the constraint pipeline gives every
  *    relation-reading check.
  *
+ * A non-ABORT statement OR clause is rejected up front for the deferred shape:
+ * `runtime/row-constraints.ts` forces a deferrable constraint to ROW time when
+ * the effective action is not ABORT (it must be able to skip/replace the
+ * offending row), and this constraint reads the written row back OUT of the
+ * logical view — at row time that row does not exist yet, so the re-read
+ * trivially passes and a violating row would persist silently. Refusing is the
+ * same posture {@link rejectLensSetLevelConflictResolution} takes for the other
+ * commit-time class. The envelope shape is unaffected: it evaluates the row
+ * image directly and honors every OR clause itself.
+ *
  * Returns empty parts for a non-lens / check-free decomposition — the common
  * case pays nothing.
  */
@@ -784,6 +828,7 @@ function buildDecompositionRowLocalChecks(
 	view: MutableViewLike,
 	storage: StorageShape,
 	suppliedColumns: readonly { readonly name: string; readonly type: ScalarType }[],
+	onConflict: ConflictResolution | undefined,
 ): { rowChecks: EnvelopeRowCheck[]; rowCheckRowDescriptor: RowDescriptor; deferredConstraints: RowConstraintSchema[] } {
 	const rowCheckRowDescriptor: RowDescriptor = [];
 	const slot = ctx.schemaManager.getSchema(view.schemaName)?.getLensSlot(view.name);
@@ -799,6 +844,7 @@ function buildDecompositionRowLocalChecks(
 		if (astContainsSubquery(substituted)) {
 			// Deferred logical-row re-read riding the anchor op — NEW-correlated,
 			// INSERT-masked (the anchor insert always runs, whatever the row's NULLs).
+			rejectRowLocalDeferredConflictResolution(view, check.name, onConflict);
 			const { address, anchorRelation, anchorKeyColumn } =
 				requireLensLogicalRowAddress(ctx, view, slot, storage, check.name);
 			deferredConstraints.push(synthesizeLensRowLocalDeferredConstraint(
@@ -1122,7 +1168,7 @@ function buildDecompositionInsert(ctx: PlanningContext, view: MutableViewLike, s
 	// `MutationEnvelope.rowChecks`, row-time), a subquery-bearing one as a deferred
 	// logical-row re-read riding the anchor op (which an INSERT always plans) — never both
 	// seams, so no check is evaluated twice.
-	const rowLocal = buildDecompositionRowLocalChecks(ctx, view, storage, plan.suppliedColumns);
+	const rowLocal = buildDecompositionRowLocalChecks(ctx, view, storage, plan.suppliedColumns, stmt.onConflict);
 	const extraConstraints = [
 		...rowLocal.deferredConstraints,
 		...lensForeignKeyConstraints(ctx, view),

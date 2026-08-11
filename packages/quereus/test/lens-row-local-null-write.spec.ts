@@ -169,6 +169,39 @@ describe('lens row-local CHECK on a NULL write — decomposition', () => {
 		}
 	});
 
+	it('`or ignore` skips the whole logical row, not just the violating member', async () => {
+		const db = new Database();
+		try {
+			await setup(db);
+			// The envelope seam evaluates before any member op, so an ignored row leaves
+			// NOTHING behind — the pre-fix member-riding seam could skip only the violating
+			// member's row and still write its siblings (a partial-row hazard).
+			await db.exec("insert or ignore into x.W (id, name, tag) values (4, 'delta', null), (8, 'theta', 'ok')");
+			expect(await rows(db, 'select id from main.W_core order by id')).to.deep.equal([{ id: 1 }, { id: 8 }]);
+			expect(await rows(db, 'select id from main.W_tag order by id')).to.deep.equal([{ id: 1 }, { id: 8 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a grandfathered violating row stays readable but is not writable through the lens', async () => {
+		const db = new Database();
+		try {
+			await setup(db);
+			// Seeded straight into the basis, so the lens never gated it: id 9 has no W_tag
+			// row at all ⇒ its logical `tag` is NULL ⇒ the stored image violates the CHECK.
+			await db.exec("insert into main.W_core values (9, 'iota')");
+			expect(await rows(db, 'select id, tag from x.W where id = 9')).to.deep.equal([{ id: 9, tag: null }]);
+			// Assigning an UNRELATED column still re-reads the whole logical row, whose
+			// post-write image is still violating — standard CHECK-on-UPDATE semantics, and
+			// the boundary of read-side grandfathering.
+			await expectThrows(() => db.exec("update x.W set name = 'renamed' where id = 9"), CONSTRAINT);
+			expect(await rows(db, 'select name from main.W_core where id = 9')).to.deep.equal([{ name: 'iota' }]);
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('the read path is untouched — a stored violating row stays readable', async () => {
 		const db = new Database();
 		try {
@@ -223,4 +256,162 @@ describe('lens row-local CHECK on a NULL write — single-source', () => {
 			}
 		});
 	}
+});
+
+describe('lens row-local CHECK seam routing — subquery-bearing checks defer to commit', () => {
+	/**
+	 * A relation-reading row-local CHECK must take the DEFERRED (commit-time)
+	 * logical-row re-read, not the row-time envelope — the timing every
+	 * relation-reading check gets from the constraint pipeline. The two shapes
+	 * below differ only in where the subquery sits in the AST, so they pin that
+	 * the subquery-detection walk descends through container nodes that carry no
+	 * `type` discriminant of their own (a CASE's when/then pairs) rather than
+	 * stopping at them and mis-routing the check to the envelope.
+	 */
+	async function setupSubquery(db: Database, checkSql: string): Promise<void> {
+		const mod = new AdvertisingModule();
+		mod.ads = [split()];
+		db.registerModule('admod', mod);
+		await db.exec('create table W_core (id integer primary key, name text) using admod');
+		await db.exec('create table W_tag (id integer primary key, tag text) using admod');
+		await db.exec('create table Allowed (name text primary key) using admod');
+		await db.exec(`declare logical schema x { table W { id integer primary key, name text, tag text null, ${checkSql} } }`);
+		await db.exec('apply schema x');
+	}
+
+	const SUBQUERY_SHAPES: ReadonlyArray<{ label: string; check: string }> = [
+		{
+			label: 'bare exists(…)',
+			check: "constraint tag_rule check (exists (select 1 from Allowed where Allowed.name = tag))",
+		},
+		{
+			label: 'exists(…) nested in a CASE',
+			check: "constraint tag_rule check (case when exists (select 1 from Allowed where Allowed.name = tag) then 1 else 0 end = 1)",
+		},
+	];
+
+	for (const shape of SUBQUERY_SHAPES) {
+		it(`${shape.label}: a row made legal later in the same transaction is accepted`, async () => {
+			const db = new Database();
+			try {
+				await setupSubquery(db, shape.check);
+				// The allow-list entry lands AFTER the lens write, in the same transaction:
+				// only a commit-time evaluation sees it. A row-time evaluation rejects here.
+				await db.exec('begin');
+				await db.exec("insert into x.W (id, name, tag) values (1, 'alpha', 'late')");
+				await db.exec("insert into main.Allowed values ('late')");
+				await db.exec('commit');
+				expect(await rows(db, 'select id, tag from x.W')).to.deep.equal([{ id: 1, tag: 'late' }]);
+			} finally {
+				await db.close();
+			}
+		});
+
+		it(`${shape.label}: a non-ABORT conflict clause is refused rather than silently skipped`, async () => {
+			const db = new Database();
+			try {
+				await setupSubquery(db, shape.check);
+				await db.exec("insert into main.Allowed values ('ok')");
+				// A non-ABORT OR clause forces the deferred re-read to row time, where the
+				// written row is not yet in the logical image and the check cannot see the
+				// violation. Refuse the statement instead of accepting a violating row.
+				for (const clause of ['or ignore', 'or fail', 'or rollback', 'or replace']) {
+					await expectThrows(
+						() => db.exec(`insert ${clause} into x.W (id, name, tag) values (2, 'beta', 'nope')`),
+						/non-ABORT conflict clause forces row-time evaluation/i);
+				}
+				expect(await rows(db, 'select id from x.W')).to.deep.equal([]);
+				// The plain form still works for a satisfying row.
+				await db.exec("insert into x.W (id, name, tag) values (3, 'gamma', 'ok')");
+			} finally {
+				await db.close();
+			}
+		});
+
+		it(`${shape.label}: a genuinely disallowed value still rejects`, async () => {
+			const db = new Database();
+			try {
+				await setupSubquery(db, shape.check);
+				await db.exec("insert into main.Allowed values ('ok')");
+				await expectThrows(() => db.exec("insert into x.W (id, name, tag) values (2, 'beta', 'nope')"), CONSTRAINT);
+				expect(await rows(db, 'select id from x.W')).to.deep.equal([]);
+			} finally {
+				await db.close();
+			}
+		});
+	}
+});
+
+describe('lens row-local CHECK on an unaddressable decomposition — loud refusal', () => {
+	/**
+	 * The enforcement contract's fallback: a decomposition whose written logical
+	 * row cannot be located in the logical view — hidden (surrogate) shared key
+	 * AND a logical primary key that does not live on the anchor — refuses the
+	 * write with `lens-row-local-unenforceable` rather than silently skipping the
+	 * check. Here `sid` is the surrogate (no logical column exposes it) and the
+	 * logical PK `id` is backed by the NON-anchor member U_key.
+	 *
+	 * Only the seams that need to ADDRESS the written row are affected: the
+	 * subquery-free INSERT rides the envelope, which needs no address and keeps
+	 * enforcing; the UPDATE fan-out needs the deferred re-read and so refuses.
+	 */
+	function unaddressable(): MappingAdvertisement {
+		return {
+			id: 'U_core',
+			logicalTable: 'W',
+			role: 'primary-storage',
+			storage: {
+				anchorRelationId: 'U_core',
+				members: [
+					{ relationId: 'U_core', relation: { schema: 'main', table: 'U_core' }, presence: 'mandatory', columns: [colMap('name', 'name')] },
+					{ relationId: 'U_key', relation: { schema: 'main', table: 'U_key' }, presence: 'mandatory', columns: [colMap('id', 'id')] },
+					{ relationId: 'U_tag', relation: { schema: 'main', table: 'U_tag' }, presence: 'optional', columns: [colMap('tag', 'tag')] },
+				],
+				sharedKey: {
+					kind: 'surrogate',
+					keyColumnsByRelation: new Map<string, readonly string[]>([['U_core', ['sid']], ['U_key', ['key_sid']], ['U_tag', ['tag_sid']]]),
+				},
+			},
+		};
+	}
+
+	async function setupUnaddressable(db: Database): Promise<void> {
+		const mod = new AdvertisingModule();
+		mod.ads = [unaddressable()];
+		db.registerModule('admod', mod);
+		await db.exec('create table U_core (sid integer primary key default (coalesce((select max(sid) from U_core), 0) + mutation_ordinal()), name text) using admod');
+		await db.exec('create table U_key (key_sid integer primary key, id integer) using admod');
+		await db.exec('create table U_tag (tag_sid integer primary key, tag text) using admod');
+		await db.exec("declare logical schema x { table W { id integer primary key, name text, tag text null constraint tag_rule check (tag is not null and tag <> 'bad') } }");
+		await db.exec('apply schema x');
+		await db.exec("insert into main.U_core values (1, 'alpha')");
+		await db.exec('insert into main.U_key values (1, 1)');
+		await db.exec("insert into main.U_tag values (1, 'seed')");
+	}
+
+	it('refuses an UPDATE naming the unenforceable check instead of skipping it', async () => {
+		const db = new Database();
+		try {
+			await setupUnaddressable(db);
+			await expectThrows(
+				// Filtered on the ANCHOR (`name`) so the fan-out's own non-anchor-predicate
+				// guard does not preempt the row-local refusal under test.
+				() => db.exec("update x.W set tag = 'ok' where name = 'alpha'"),
+				/cannot be addressed in the logical view/i);
+			expect(await rows(db, 'select tag from main.U_tag where tag_sid = 1')).to.deep.equal([{ tag: 'seed' }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('the INSERT envelope needs no row address, so it still enforces', async () => {
+		const db = new Database();
+		try {
+			await setupUnaddressable(db);
+			await expectThrows(() => db.exec("insert into x.W (id, name, tag) values (2, 'beta', 'bad')"), CONSTRAINT);
+			await db.exec("insert into x.W (id, name, tag) values (3, 'gamma', 'ok')");
+		} finally {
+			await db.close();
+		}
+	});
 });
