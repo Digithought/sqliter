@@ -72,6 +72,33 @@ Two problems in one:
 `computeAggregateSkipCoercion` (`emit/aggregate-setup.ts`) is the list of aggregates that
 opt out of the conversion, and both the stream and hash aggregate paths apply it per value.
 
+### Arm B is also blocking a permanent guard (added 2026-08 from the scalar-type-inference fix)
+
+Re-verified at `61637588` with a third value present, so the wrong row and the wrong type are
+separable:
+
+```sql
+create table m (id integer primary key, val text null);
+insert into m values (1,'10'), (2,'20'), (3,'hello');
+select min(val) from m;                    -- the NUMBER 10
+select val from m order by val limit 1;    -- the STRING '10'
+select min(val) from n;                    -- 'aa' — a non-numeric column is untouched
+```
+
+Beyond disagreeing with `ORDER BY`, this is a violation of rule R2 in `docs/types.md`
+§ Physical representation at statement output: a TEXT-typed result column hands back a JS
+number. `implement/4-remaining-scalar-result-types-and-repr-net` widens the statement-egress
+representation check (`QUEREUS_REPR_STRICT=1`) from R1-only to full R2, and this is the one
+measured violation in the suite that the announcement cannot fix — announcing TEXT for
+`min(val)` is *correct*; the value is what is wrong. So
+`test/logic/25-aggregate-edge-cases.sqllogic:64` (which currently pins `{"mn":10}`) will keep
+reporting a violation under the widened check until this arm lands. That raises this arm's
+priority: it is now gating a permanent regression net, not only its own wrong answer.
+
+Also: the `NOTE:` at `src/util/coercion.ts` (above `coerceAggregateValue`) still cites the
+pre-garden slug `bug-text-minmax-numeric-coercion`. Repoint it at this ticket while you are
+in the file.
+
 ## Notes for whoever picks this up
 
 - The two arms pull in opposite directions on the same helper: arm A wants the conversion
