@@ -22,6 +22,7 @@ import { resolveBaseSite } from "../../planner/analysis/update-lineage.js";
 import type { LensSlot } from "../../schema/lens.js";
 import { createLogger } from "../../common/logger.js";
 import { splitBaseKey } from "../../util/qualified-name.js";
+import { relationKeyBase } from "../../planner/analysis/relation-key.js";
 
 const log = createLogger('func:builtins:explain');
 
@@ -1025,7 +1026,7 @@ export const explainAssertionFunc = createIntegratedTableValuedFunction(
 		const { classifications, groupKeys } = analyzeRowSpecific(analyzed);
 
 		for (const [relationKey, cls] of classifications) {
-			const base = `${relationKey.split('#')[0]}`;
+			const base = relationKeyBase(relationKey);
 			let prepared: string | null = null;
 			if (base) {
 				const [schemaName, tableName] = splitBaseKey(base);

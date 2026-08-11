@@ -35,7 +35,8 @@ export interface IntegrityAssertionSchema {
    * Base-table references in the body — informational only; it feeds
    * `assertion_info().dependent_tables` and enforcement never reads it (the
    * commit-time evaluator derives its own set when it compiles the body, from
-   * the same `planAssertionBodyForAnalysis` + `collectTableReferences` pair).
+   * the same `planAssertionBodyForAnalysis` + `collectTableReferences` pair — see
+   * `planner/analysis/relation-key.ts`).
    *
    * NOTE: recorded once at CREATE, and after that only string-re-keyed by the
    * `ALTER TABLE … RENAME` propagation — no other schema change re-derives it.

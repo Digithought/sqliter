@@ -24,6 +24,7 @@ import { SequenceNode } from '../nodes/sequence-node.js';
 import { PlanNodeType } from '../nodes/plan-node-type.js';
 import { FunctionFlags } from '../../common/constants.js';
 import { extractBindings, type BindingMode } from './binding-extractor.js';
+import { relationKeyOf } from './relation-key.js';
 import { extractConstraintsForTable } from './constraint-extractor.js';
 import { compareSqlValues } from '../../util/comparison.js';
 import { getTypeOrDefault } from '../../types/registry.js';
@@ -254,7 +255,7 @@ export function analyzeChangeScope(
 	const mvSourceScopes: ChangeScope[] = [];
 	if (!dmlWithoutReturning) {
 		for (const ref of tableRefs) {
-			const relKey = relKeyFor(ref);
+			const relKey = relationKeyOf(ref);
 			const mode = perRelation.get(relKey);
 			if (!mode) continue;
 
@@ -342,11 +343,13 @@ function isDmlWithoutReturning(plan: PlanNode): boolean {
 
 /* --- Plan walking helpers ------------------------------------------------ */
 
-function relKeyFor(ref: TableReferenceNode): string {
-	const base = `${ref.tableSchema.schemaName}.${ref.tableSchema.name}`.toLowerCase();
-	return `${base}#${ref.id ?? 'unknown'}`;
-}
-
+/**
+ * Deliberately NOT `relation-key.ts`'s `collectTableReferences`: this walk also
+ * follows `getRelations()` (see the DML write-target note in the body) and carries a
+ * cycle guard. Only the walk differs — the keys it is compared against come from
+ * `extractBindings`, so the relation-key *label* must stay the shared one
+ * (`relationKeyOf`).
+ */
 function collectTableRefs(plan: PlanNode): TableReferenceNode[] {
 	const out: TableReferenceNode[] = [];
 	const seen = new Set<TableReferenceNode>();
@@ -384,7 +387,7 @@ function collectColumnReads(plan: PlanNode, tableRefs: readonly TableReferenceNo
 	const attrToRelKeyAndIdx = new Map<number, { relKey: string; colIdx: number }>();
 	const refByRelKey = new Map<string, TableReferenceNode>();
 	for (const ref of tableRefs) {
-		const relKey = relKeyFor(ref);
+		const relKey = relationKeyOf(ref);
 		refByRelKey.set(relKey, ref);
 		const attrs = ref.getAttributes();
 		attrs.forEach((a, i) => attrToRelKeyAndIdx.set(a.id, { relKey, colIdx: i }));

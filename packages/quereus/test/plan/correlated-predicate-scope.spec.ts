@@ -7,7 +7,8 @@ import { GlobalScope } from '../../src/planner/scopes/global.js';
 import { ParameterScope } from '../../src/planner/scopes/param.js';
 import { BuildTimeDependencyTracker, type PlanningContext } from '../../src/planner/planning-context.js';
 import { buildBlock } from '../../src/planner/building/block.js';
-import { createTableInfoFromNode, extractConstraintsForTable, type PredicateConstraint } from '../../src/planner/analysis/constraint-extractor.js';
+import { extractConstraintsForTable, type PredicateConstraint } from '../../src/planner/analysis/constraint-extractor.js';
+import { relationKeyOf } from '../../src/planner/analysis/relation-key.js';
 import { TableReferenceNode } from '../../src/planner/nodes/reference.js';
 import type { PlanNode, RelationalPlanNode } from '../../src/planner/nodes/plan-node.js';
 import type * as AST from '../../src/parser/ast.js';
@@ -88,7 +89,7 @@ function soleTableRef(plan: PlanNode, tableName: string): TableReferenceNode {
 function constraintsFor(db: Database, sql: string, tableName: string): PredicateConstraint[] {
 	const plan = analyzedPlan(db, sql);
 	const ref = soleTableRef(plan, tableName);
-	const key = createTableInfoFromNode(ref, `${ref.tableSchema.schemaName}.${ref.tableSchema.name}`).relationKey;
+	const key = relationKeyOf(ref);
 	return extractConstraintsForTable(plan as RelationalPlanNode, key);
 }
 

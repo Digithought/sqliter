@@ -636,9 +636,10 @@ function trySortAbsorbViaIndexOrdering(sort: SortNode, context: OptContext): Pla
 	}
 
 	// Collect filters anywhere in the subtree below Sort (chain Filters or
-	// Filters already pushed into Retrieve.source). The relation key here must
-	// match what createTableInfosFromPlan emits for this table reference —
-	// schema-qualified name plus the TableReferenceNode id.
+	// Filters already pushed into Retrieve.source). The second argument is a display
+	// name only — `createTableInfoFromNode` canonicalizes the relation KEY for a
+	// TableReferenceNode through `planner/analysis/relation-key.ts` regardless, so this
+	// agrees with `createTableInfosFromPlan` by construction.
 	const tInfo: TableInfo = createTableInfoFromNode(
 		tableRef,
 		`${tableRef.tableSchema.schemaName}.${tableRef.tableSchema.name}`

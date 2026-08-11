@@ -14,14 +14,15 @@
  * - 'global' bindings carry no extra metadata — the consumer evaluates its
  *   plan once for any dependency change.
  *
- * Also the home of {@link collectTableReferences}, the plan walk `extractBindings`
- * is built on — exported because any consumer asking "which base tables does this
- * plan read" must get the same answer this one does, keyed the same way.
+ * The plan walk `extractBindings` is built on — {@link collectTableReferences} —
+ * and the relation-key spelling both live in `relation-key.ts`, so every consumer
+ * asking "which base tables does this plan read" gets the same answer keyed the
+ * same way.
  */
 
-import { PlanNode, type RelationalPlanNode } from '../nodes/plan-node.js';
-import { TableReferenceNode } from '../nodes/reference.js';
+import type { PlanNode, RelationalPlanNode } from '../nodes/plan-node.js';
 import { analyzeRowSpecific, extractCoveredKeysForTable } from './constraint-extractor.js';
+import { collectTableReferences, type RelationKey } from './relation-key.js';
 
 /**
  * The way one plan instance binds to its changes.
@@ -39,25 +40,14 @@ export type BindingMode =
 	| { kind: 'group'; groupColumns: number[] };
 
 /**
- * One `TableReferenceNode` instance found in a plan, paired with the base
- * table it reads.
- */
-export interface PlanTableReference {
-	/** The plan-node instance the reference was found at. */
-	node: TableReferenceNode;
-	/** Qualified base table name, lowercased `schema.table`. */
-	base: string;
-}
-
-/**
  * Per-`TableReferenceNode` binding info for a plan, plus a quick lookup
  * from `relationKey` to the qualified base table name (lowercased).
  */
 export interface PlanBindings {
 	/** For each TableReference instance in the plan, how this plan is bound to its changes. */
-	perRelation: Map<string /* relationKey */, BindingMode>;
+	perRelation: Map<RelationKey, BindingMode>;
 	/** Convenience: relationKey → base table name (lowercased `schema.table`). */
-	relationToBase: Map<string, string>;
+	relationToBase: Map<RelationKey, string>;
 }
 
 /**
@@ -145,35 +135,3 @@ function chooseRowKey(pkIndices: number[], coveredKeys: readonly number[][]): nu
 	return sorted[0];
 }
 
-/**
- * Every `TableReferenceNode` instance reachable from `plan`, keyed by
- * `relationKey` — `<schema>.<table>#<nodeId>`, the one spelling of that key in
- * the codebase.
- *
- * The walk descends `getChildren()`, NOT `getRelations()`: a table reference
- * under a scalar subquery expression (`not exists (select … from t …)`, the
- * shape almost every assertion body has) hangs off a scalar child and is
- * invisible to the relational-only walk.
- *
- * Callers that care about reference *identity* — one entry per reference, two
- * for a self-join — must hand in a plan that has only been optimized for
- * analysis (`Optimizer.optimizeForAnalysis`). Full physical optimization leaves
- * several distinct `TableReferenceNode` instances per table, so the same table
- * comes back more than once under different node ids.
- */
-export function collectTableReferences(plan: PlanNode): Map<string, PlanTableReference> {
-	const out = new Map<string, PlanTableReference>();
-	collectInto(plan, out);
-	return out;
-}
-
-function collectInto(node: PlanNode, out: Map<string, PlanTableReference>): void {
-	if (node instanceof TableReferenceNode) {
-		const schema = node.tableSchema;
-		const base = `${schema.schemaName}.${schema.name}`.toLowerCase();
-		out.set(`${base}#${node.id ?? 'unknown'}`, { node, base });
-	}
-	for (const child of node.getChildren()) {
-		collectInto(child as unknown as PlanNode, out);
-	}
-}

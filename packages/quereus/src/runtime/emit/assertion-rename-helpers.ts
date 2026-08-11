@@ -6,6 +6,7 @@ import { buildAssertionViolationSql } from '../../schema/assertion.js';
 import { renameTableInAst, renameColumnInAst } from '../../schema/rename-rewriter.js';
 import type { ResolveColumnInSource, ResolveObjectRef, TableRenameTarget } from '../../schema/rename-rewriter.js';
 import { createLogger } from '../../common/logger.js';
+import { relationKeyWithBase } from '../../planner/analysis/relation-key.js';
 
 const log = createLogger('runtime:emit:assertion-rename');
 
@@ -139,10 +140,8 @@ function remapDependentTables(
 	const mapped = deps.map(dep => {
 		if (dep.base !== oldBase) return dep;
 		changed = true;
-		// relationKey is `<base>#<nodeId>`; a base never contains '#'.
-		const hash = dep.relationKey.indexOf('#');
 		return {
-			relationKey: hash >= 0 ? `${newBase}${dep.relationKey.slice(hash)}` : newBase,
+			relationKey: relationKeyWithBase(dep.relationKey, newBase),
 			base: newBase,
 		};
 	});

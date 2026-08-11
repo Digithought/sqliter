@@ -18,6 +18,7 @@ import { PlanNode, type RelationalPlanNode, type ScalarPlanNode } from '../nodes
 import { FilterNode } from '../nodes/filter.js';
 import { BinaryOpNode, UnaryOpNode } from '../nodes/scalar.js';
 import { ParameterReferenceNode, ColumnReferenceNode, TableReferenceNode } from '../nodes/reference.js';
+import { relationKeyOf } from './relation-key.js';
 
 /**
  * Inject a key-equality filter onto the `TableReferenceNode` matching
@@ -69,10 +70,8 @@ function tryWrapTableReference(
 	const tableSchema = node.tableSchema;
 	const schemaName = tableSchema.schemaName;
 	const tableName = tableSchema.name;
-	const relName = `${schemaName}.${tableName}`.toLowerCase();
-	const relKey = `${relName}#${node.id ?? 'unknown'}`;
 
-	if (relKey !== targetRelationKey) return null;
+	if (relationKeyOf(node) !== targetRelationKey) return null;
 
 	const relational = node as RelationalPlanNode;
 	const scope = relational.scope;

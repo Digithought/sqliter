@@ -13,7 +13,7 @@ import { QuereusError } from '../common/errors.js';
 import { StatusCode, type SqlValue, type Row } from '../common/types.js';
 import { BlockNode } from '../planner/nodes/block.js';
 import { PlanNode, type ScalarPlanNode, type RowDescriptor, type RelationalPlanNode, isRelationalNode, isScalarNode } from '../planner/nodes/plan-node.js';
-import { ColumnReferenceNode, TableReferenceNode } from '../planner/nodes/reference.js';
+import { ColumnReferenceNode, type TableReferenceNode } from '../planner/nodes/reference.js';
 import { FilterNode } from '../planner/nodes/filter.js';
 import { AggregateNode } from '../planner/nodes/aggregate-node.js';
 import { TableFunctionCallNode } from '../planner/nodes/table-function-call.js';
@@ -268,16 +268,6 @@ export function findTableFunctionCall(node: PlanNode): TableFunctionCallNode | u
 		if (found) return found;
 	}
 	return undefined;
-}
-
-/** Collect `relationKey → TableReferenceNode` over a plan. */
-export function collectTableRefs(node: PlanNode, out = new Map<string, TableReferenceNode>()): Map<string, TableReferenceNode> {
-	if (node instanceof TableReferenceNode) {
-		const base = `${node.tableSchema.schemaName}.${node.tableSchema.name}`.toLowerCase();
-		out.set(`${base}#${node.id ?? 'unknown'}`, node);
-	}
-	for (const child of node.getChildren()) collectTableRefs(child as unknown as PlanNode, out);
-	return out;
 }
 
 /** Minimal duck-type for nodes (aggregates) that expose attribute provenance. */

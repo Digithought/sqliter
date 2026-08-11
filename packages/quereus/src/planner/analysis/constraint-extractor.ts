@@ -20,6 +20,7 @@ import { CapabilityDetectors } from '../framework/characteristics.js';
 import { computeClosure, expandEcsToFds, keysOf, type KeyRel } from '../util/fd-utils.js';
 import { effectiveBetweenBoundCollation, effectiveComparisonCollation, effectiveInCollation, operandCollation } from './comparison-collation.js';
 import { isNoOpCast } from './scalar-invertibility.js';
+import { relationKeyHasNodeId, relationKeyOf, relationKeyOfRelation } from './relation-key.js';
 
 const log = createLogger('planner:analysis:constraint-extractor');
 
@@ -1059,9 +1060,9 @@ export function extractConstraintsForTable(
  * target legitimately collects its own correlated predicate — but a predicate is
  * never attributed to a table outside its input.
  *
- * The target is matched on the instance-unique `#<nodeId>` suffix that
- * {@link createTableInfoFromNode} appends, so callers that build the key with a
- * bare table name and callers that schema-qualify it both work.
+ * The target is matched on the instance-unique `#<nodeId>` segment of the relation
+ * key (see `planner/analysis/relation-key.ts`), so the base half is not compared
+ * here — a key naming this node id is this node's key.
  *
  * @returns whether the target table reference sits in this node's relational input
  */
@@ -1083,8 +1084,7 @@ function walkPredicatesConstraining(
 	// so the old unguarded sweep found nothing for them either, and `binding-extractor` falls
 	// back to `{kind: 'global'}` on an empty covered-key set. If a caller ever needs
 	// constraints for a DML target reference, walk `getRelations()` here too.
-	const idSuffix = `#${plan.id ?? 'unknown'}`;
-	let inScope = plan instanceof TableReferenceNode && targetTableRelationKey.endsWith(idSuffix);
+	let inScope = plan instanceof TableReferenceNode && relationKeyHasNodeId(targetTableRelationKey, plan.id);
 
 	// Only a RELATIONAL child of a RELATIONAL node feeds that node's input. A relational node
 	// reached through a scalar expression is a subquery body — a different scope — so what it
@@ -1362,9 +1362,7 @@ function collectRelationKeysBeneath(node: PlanNode): Set<string> {
     const keys = new Set<string>();
     function walk(n: PlanNode): void {
         if (n instanceof TableReferenceNode) {
-            const schema = n.tableSchema;
-            const baseName = `${schema.schemaName}.${schema.name}`.toLowerCase();
-            keys.add(`${baseName}#${n.id ?? 'unknown'}`);
+            keys.add(relationKeyOf(n));
         }
         for (const child of n.getChildren()) {
             walk(child as unknown as PlanNode);
@@ -1548,6 +1546,8 @@ function createTableInfosFromPlan(plan: RelationalPlanNode | PlanNode): TableInf
     }
 
     if (node instanceof TableReferenceNode) {
+      // Display name only — the instance key is canonicalized by `relationKeyOfRelation`
+      // inside `createTableInfoFromNode`, regardless of what is passed here.
       const tr = node as unknown as { tableSchema: { schemaName: string; name: string } };
       tableInfos.push(createTableInfoFromNode(node as unknown as RelationalPlanNode, `${tr.tableSchema.schemaName}.${tr.tableSchema.name}`));
     }
@@ -1599,17 +1599,12 @@ export function createTableInfoFromNode(node: RelationalPlanNode, relationName?:
 	// `node` already satisfies KeyRel (getType() + physical?).
 	const candidateKeys = keysOf(node as unknown as KeyRel).map(k => [...k]);
 
+	// `relationName` stays whatever display string the caller passed (see
+	// `TableInfo.relationName`, which `extractConstraints` also matches on); only the
+	// *key* is canonicalized, by `planner/analysis/relation-key.ts` — the one owner of
+	// that spelling.
 	const relName = relationName || node.toString();
-	// Canonicalize the instance key to lowercase. SQL identifiers are
-	// case-insensitive, and every other relation-key builder in the
-	// change-scope pipeline lowercases (`change-scope.ts` relKeyFor,
-	// `binding-extractor.ts` collectTableReferences, `collectRelationKeysBeneath`,
-	// `key-filter.ts`). Leaving this one un-lowercased meant a table whose
-	// name isn't already lowercase (e.g. `Entity`) produced a relationKey
-	// that no other site matched — so `analyzeRowSpecific`'s classification
-	// and `extractConstraintsForTable`'s filter both missed, silently
-	// widening every single-PK equality select to a whole-table scope.
-	const relationKey = `${relName.toLowerCase()}#${node.id ?? 'unknown'}`;
+	const relationKey = relationKeyOfRelation(node, relName);
 
 	return {
 		relationName: relName,

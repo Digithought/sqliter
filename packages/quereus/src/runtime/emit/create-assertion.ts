@@ -9,7 +9,7 @@ import { createLogger } from '../../common/logger.js';
 import type { IntegrityAssertionSchema, AssertionDependentTable } from '../../schema/assertion.js';
 import { buildAssertionViolationSql } from '../../schema/assertion.js';
 import { planAssertionBodyForAnalysis } from '../../planner/analysis/assertion-plan.js';
-import { collectTableReferences } from '../../planner/analysis/binding-extractor.js';
+import { collectTableReferences } from '../../planner/analysis/relation-key.js';
 
 const log = createLogger('runtime:emit:create-assertion');
 const warnLog = log.extend('warn');

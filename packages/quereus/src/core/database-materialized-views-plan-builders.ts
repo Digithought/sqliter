@@ -22,6 +22,7 @@ import { EmissionContext } from '../runtime/emission-context.js';
 import { Scheduler } from '../runtime/scheduler.js';
 import { PlanNodeType } from '../planner/nodes/plan-node-type.js';
 import { injectKeyFilter } from '../planner/analysis/key-filter.js';
+import { collectTableReferences, relationKeyOf, type RelationKey } from '../planner/analysis/relation-key.js';
 import { keysOf } from '../planner/util/fd-utils.js';
 import { deriveCoarsenedBackingKey, resolveValuePreservingSourceCol } from '../planner/analysis/coarsened-key.js';
 import { proveOneToOneJoin } from '../planner/analysis/coverage-prover.js';
@@ -53,7 +54,6 @@ import {
 	countNodeType,
 	countJoins,
 	findTableFunctionCall,
-	collectTableRefs,
 	collectProducingExprs,
 	resolveTransitiveSourceCol,
 	bodyWhereReferencesLookup,
@@ -292,7 +292,7 @@ function computeNullGuardColumns(
 export function tryBuildBoundedDeltaArm(ctx: MaterializedViewManagerContext, mv: MaintainedTableSchema, analyzed: BlockNode): MaintenancePlan | null {
 	// A body that reads no source table has no bounded-delta arm → floor (which rejects
 	// a sourceless body). (A self-join / TVF fan-out surfaces ≥2 refs or a TVF node.)
-	const tableRefs = [...collectTableRefs(analyzed).values()];
+	const tableRefs = [...collectTableReferences(analyzed).values()].map(r => r.node);
 	if (tableRefs.length === 0) return null;
 
 	// Shapes no bounded-delta arm models — a window function reads across the partition,
@@ -607,7 +607,7 @@ export function buildAggregateResidualPlan(
 
 	// Compile + cache the group-keyed residual once (the body with `g1 = :gk0 AND …`
 	// injected on T). Re-run per affected group key against the live transaction.
-	const relKey = `${sourceBase}#${tableRef.id ?? 'unknown'}`;
+	const relKey = relationKeyOf(tableRef);
 	const residualScheduler = compileResidual(ctx, analyzed, relKey, groupColumns, 'gk');
 	if (!residualScheduler) return null; // could not parameterize the residual → floor
 
@@ -1111,7 +1111,7 @@ export function buildJoinResidualPlan(
 
 	// Forward (`T`) residual: the body with `T.pk = :pk0 AND …` injected on `T`. Recomputes
 	// the one joined row for a changed `T` row (delegated to `applyForwardResidual`).
-	const tRelKey = `${sourceBase}#${tRef.id ?? 'unknown'}`;
+	const tRelKey = relationKeyOf(tRef);
 	const forwardResidual = compileResidual(ctx, analyzed, tRelKey, tPkCols, 'pk');
 	if (!forwardResidual) return null;
 
@@ -1120,7 +1120,7 @@ export function buildJoinResidualPlan(
 	// row referencing a changed `P` row.
 	const pPkCols = pSchema.primaryKeyDefinition.map(d => d.index);
 	if (pPkCols.length === 0) return null;
-	const pRelKey = `${lookupBase}#${pRef.id ?? 'unknown'}`;
+	const pRelKey = relationKeyOf(pRef);
 	const reverseResidual = compileResidual(ctx, analyzed, pRelKey, pPkCols, 'pk');
 	if (!reverseResidual) return null;
 
@@ -1208,9 +1208,9 @@ export function compileLookupMembershipResidual(
 	});
 	// Re-locate `P` in the WHERE-stripped plan by base name (fresh node ids) to build the
 	// injection target key the way `compileResidual`'s callers do.
-	let pRelKey: string | undefined;
-	for (const [relKey, ref] of collectTableRefs(stripped)) {
-		if (`${ref.tableSchema.schemaName}.${ref.tableSchema.name}`.toLowerCase() === lookupBase) {
+	let pRelKey: RelationKey | undefined;
+	for (const [relKey, ref] of collectTableReferences(stripped)) {
+		if (ref.base === lookupBase) {
 			pRelKey = relKey;
 			break;
 		}
@@ -1287,10 +1287,9 @@ export function buildFullRebuildPlan(ctx: MaterializedViewManagerContext, mv: Ma
 	// them triggers a rebuild. Collected from the (pre-physical) analyzed plan, where every
 	// source is a bare `TableReferenceNode` — the optimized plan may have wrapped them in
 	// physical access nodes.
-	const tableRefs = [...collectTableRefs(analyzed).values()];
-	const sourceBases = [...new Set(
-		tableRefs.map(ref => `${ref.tableSchema.schemaName}.${ref.tableSchema.name}`.toLowerCase()),
-	)];
+	const planRefs = [...collectTableReferences(analyzed).values()];
+	const tableRefs = planRefs.map(r => r.node);
+	const sourceBases = [...new Set(planRefs.map(r => r.base))];
 	if (sourceBases.length === 0) throw cannotMaterialize(mv.name, 'its body reads no source table');
 
 	const backing = ctx._findTable(mv.name, mv.schemaName);
@@ -1537,7 +1536,7 @@ export function buildLateralTvfPrefixDeletePlan(
 	// Compile + cache the base-PK-keyed residual once (the body with `T.pk = :pk0 AND …`
 	// injected on T). Re-run per affected base key against the live transaction; it
 	// re-runs the lateral join + TVF for that single base row, fanning out to N rows.
-	const relKey = `${sourceBase}#${tableRef.id ?? 'unknown'}`;
+	const relKey = relationKeyOf(tableRef);
 	const residualScheduler = compileResidual(ctx, analyzed, relKey, sourcePkCols, 'pk');
 	if (!residualScheduler) return null; // could not parameterize the residual → floor
 

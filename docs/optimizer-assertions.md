@@ -19,7 +19,7 @@ Global transaction‑deferred integrity assertions are expressed as violation qu
 
 ### Core Definitions
 
-- relationKey: Unique identifier for a table reference instance within a plan. Format: `schema.table#<nodeId>` or `schema.table@alias#<nodeId>`.
+- relationKey: Unique identifier for a table reference instance within a plan. Format: `schema.table#<nodeId>`, all lowercase (SQL identifiers are case-insensitive, so a table declared `Entity` in schema `MAIN` keys as `main.entity#<nodeId>`). `planner/analysis/relation-key.ts` owns this format end to end — building the key, parsing it back apart, and the plan walk (`collectTableReferences`) that collects every one of them. Nothing outside that module composes or splits the string; a key is never keyed on an alias.
 - unique key: A set of column indices on a node's output that uniquely identifies each row. Encoded as the FD `key → (all_cols \ key)` in `PhysicalProperties.fds`. The empty set (`∅ → all_cols`) is the singleton/"at-most-one-row" form.
 - coveredKey: A unique key that is fully constrained by equality predicates at a node boundary, **or whose columns lie in the FD-closure of the equality-covered column set**. Presence of a covered key implies `estimatedRows ≤ 1`. Closure expansion uses the table reference's physical FDs/ECs — so equality on a UNIQUE column closes to the PK via the table's `unique → other-columns` FD, and equality on column `a` plus an EC `{a, b}` closes to include `b`.
 - Row‑specific: A table reference instance classified as producing at most one row for any given unique key binding at COMMIT time (covered-key holds and no identity-breaking node above demotes it).
