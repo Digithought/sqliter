@@ -40,16 +40,15 @@ import {
  * them. Kept as one source of truth for the access-plan code below: {@link computeBestAccessPlan}
  * classifies each pushed filter with these, and {@link tryIndexAccessPlan} claims a filter as
  * handled only when it falls in the group the engine's access-path rule will consume.
- */
-const EQ_OPS = ['='] as const;
-
-/**
- * Secondary-index arm ONLY: an IN is N equalities served as one multi-seek (`plan=5`),
- * whether its members are a literal list or a runtime-valued set. The primary-key arms
- * deliberately keep {@link EQ_OPS} — a `_primary_` multi-seek's emission order would
- * break the isolation layer's primary-key merge — so an IN on the PK declines here,
- * runtime-valued or not. PK IN support is deferred; see
- * tickets/backlog/feat-store-pk-in-list-multiseek.
+ *
+ * An IN is N equalities served as one multi-seek (`plan=5`), whether its members are a
+ * literal list or a runtime-valued set — so EVERY equality arm here, primary key and
+ * secondary index alike, fills its equality roles from this group. (The primary-key arms
+ * used to keep a `'='`-only group, on the reasoning that a `_primary_` multi-seek's
+ * emission order would break the isolation layer's primary-key merge. Both halves of that
+ * are now false: the merge bug was fixed as `bug-isolation-multiseek-merge-order`, and
+ * `StoreTableScan.scanMultiSeekPrimary` emits ascending by encoded data key — which IS
+ * primary-key order — specifically to satisfy it.)
  */
 const EQ_OR_IN_OPS = ['=', 'IN'] as const;
 
@@ -207,12 +206,59 @@ function rangeRoles(colIdx: number): SeekRole[] {
 }
 
 /**
- * The one equality role each seek column of an equality/prefix seek fills. `ops` is
- * explicit so the PK arm ({@link EQ_OPS}) and the secondary-index arm
- * ({@link EQ_OR_IN_OPS}) cannot drift into each other — see the note on EQ_OR_IN_OPS.
+ * The one equality role each seek column of an equality/prefix seek fills — filled by a
+ * `'='` or a well-formed `IN` alike, on the primary-key arms and the secondary-index arm
+ * identically (see the note on {@link EQ_OR_IN_OPS}).
  */
-function equalityRoles(colIdxs: readonly number[], ops: readonly string[]): SeekRole[] {
-	return colIdxs.map(colIdx => ({ colIdx, ops }));
+function equalityRoles(colIdxs: readonly number[]): SeekRole[] {
+	return colIdxs.map(colIdx => ({ colIdx, ops: EQ_OR_IN_OPS }));
+}
+
+/**
+ * The equality pins covering the WHOLE primary key, or null when a member is unpinned.
+ *
+ * Per PK column the pin is the FIRST filter that can fill an equality role
+ * ({@link equalitySeekKeyCount} — a `'='`, a non-empty literal `IN`, or a runtime-valued
+ * `IN` set). That is the same predicate and the same positional pick the secondary arm
+ * and `rule-select-access-path`'s `eqBySeekCol` make, so this module's claim and the
+ * rule's pick cannot disagree.
+ */
+interface PrimaryKeyPins {
+	/** Cross-product of the per-column seek-key counts (1 for a plain '='). */
+	readonly seekKeyCount: number;
+	/** true ⇒ delivered as a `plan=5` multi-seek, not a single point read. */
+	readonly isMultiSeek: boolean;
+}
+
+/**
+ * Resolve {@link PrimaryKeyPins} for `pkColumns`, or null when any member carries no
+ * equality-role filter.
+ *
+ * A per-column `find` rather than a set of pinned column indexes: `a = 1 and a = 2` on a
+ * composite PK `(a, b)` finds a filter for `a`, none for `b`, and correctly reports the
+ * key unpinned. Counting raw equality filters instead would read that predicate as "both
+ * PK columns pinned", claim both filters handled, then — with no complete PK equality set
+ * to seek — degrade to a sequential scan whose residual has already been discarded,
+ * returning the whole table.
+ *
+ * `isMultiSeek` is NOT `seekKeyCount > 1`: a runtime-valued set is delivered as a
+ * `plan=5` multi-seek even at `maxCount === 1`, so it must be judged as one rather than
+ * as the plain point read its ceiling arithmetic would otherwise suggest.
+ */
+function resolvePrimaryKeyPins(
+	filters: readonly PredicateConstraint[],
+	pkColumns: readonly number[],
+): PrimaryKeyPins | null {
+	if (pkColumns.length === 0) return null;
+	let seekKeyCount = 1;
+	let isMultiSeek = false;
+	for (const colIdx of pkColumns) {
+		const pin = filters.find(f => f.columnIndex === colIdx && equalitySeekKeyCount(f) !== null);
+		if (!pin) return null;
+		seekKeyCount *= equalitySeekKeyCount(pin)!;
+		if (isMultiValueEquality(pin)) isMultiSeek = true;
+	}
+	return { seekKeyCount, isMultiSeek };
 }
 
 /**
@@ -234,27 +280,71 @@ export function computeBestAccessPlan(
 ): BestAccessPlanResult {
 	const estimatedRows = request.estimatedRows ?? 1000;
 
-	// Check for primary key equality constraints. Count DISTINCT pinned PK columns:
-	// counting raw '=' filters would read `a = 1 and a = 2` on a composite PK (a, b)
-	// as "both PK columns pinned", claim both filters handled, then — with no
-	// complete PK equality set to seek — degrade to a sequential scan whose residual
-	// has already been discarded, returning the whole table.
 	const pkColumns = tableInfo.primaryKeyDefinition.map(pk => pk.index);
-	const pinnedPkColumns = new Set(
-		request.filters
-			.filter(f => f.columnIndex !== undefined && pkColumns.includes(f.columnIndex) && f.op === '=')
-			.map(f => f.columnIndex)
+
+	// Hoisted ABOVE both primary-key arms: the multi-seek arm's ordering advertisement
+	// needs it, and it is cheap (a short loop over the PK members). Its other consumer is
+	// the leading-PK range arm below, which declines when the leading PK column's key
+	// bytes do not order the way its comparator does (`pkOrderPreservingPrefix === 0`):
+	// `StoreTable.analyzePKAccess` declines the byte window under exactly that condition,
+	// so claiming the range filters handled would drop the residual Filter and return the
+	// whole table.
+	const pkOrderPreservingPrefix = pkOrderPreservingPrefixLength(
+		db,
+		tableInfo,
+		resolvePkKeyCollations(tableInfo.primaryKeyDefinition, tableInfo.columns, tableKeyCollation),
+		tableKeyCollation,
 	);
 
-	if (pinnedPkColumns.size === pkColumns.length && pkColumns.length > 0) {
-		// Full PK match - point lookup (single row; no monotonic advertisement)
+	// Primary-key equality arms. Both live INSIDE this branch — the multi-seek is tried
+	// BEFORE the leading-PK range arm below, which is what keeps a full-primary-key IN
+	// list from being shadowed by a range on the leading column (the general
+	// arm-competition problem is backlog `bug-store-pk-range-preempts-cheaper-index`; do
+	// not fix it here).
+	//
+	// **No collation gate, and that is not an oversight.** The secondary-index arm gates
+	// its equality window on `indexPrefixSeekIsCollationExact`; the PK arms need no
+	// equivalent, for two independent reasons:
+	//  - `reconcilePkCollations` (store-module-schema-rewrite.ts) rewrites an undecorated
+	//    text PK column's declared collation to the table key collation K at CREATE time,
+	//    so for every PK member the key collation, the declared collation, and the
+	//    collation `matchesFilters` re-compares under are the same name. The divergent
+	//    shape the secondary arm declines — a collation-blind `json`/temporal column under
+	//    an index column carrying an explicit non-BINARY `COLLATE` — cannot occur on a PK:
+	//    column DDL type-gates that `COLLATE` out, and those types are declined by the
+	//    semantic-ordering gate below anyway.
+	//  - `StoreTableScan.scanMultiSeekPrimary` re-applies `matchesFilters` per resolved
+	//    row, so even a hypothetical coarser window over-fetches and is trimmed rather
+	//    than under-fetching.
+	// The multi-seek is exactly the point arm run N times, so its collation exposure is
+	// the point arm's, unchanged.
+	const pkPins = resolvePrimaryKeyPins(request.filters, pkColumns);
+	if (pkPins && !pkPins.isMultiSeek) {
+		// Full PK match - point lookup (single row; no monotonic advertisement).
+		//
+		// `setSeekColumns` is load-bearing now that this arm also claims a single-element
+		// `IN`: it routes the plan through `rule-select-access-path`'s INDEX-AWARE arm,
+		// whose `eqBySeekCol` accepts a one-element IN as an equality seek key. The legacy
+		// PK arm it would otherwise take matches `op === '='` only, so the claimed IN would
+		// be seeked nowhere and come back as a reattached residual over a full scan — the
+		// right rows at the wrong cost. For a plain `'='` the two arms build an identical
+		// `_primary_` `plan=2` seek under an identical collation-cover lookup.
 		return AccessPlanBuilder
 			.eqMatch(1, 0.1)
-			.setHandledFilters(claimFirstPerRole(request.filters, equalityRoles(pkColumns, EQ_OPS)))
+			.setHandledFilters(claimFirstPerRole(request.filters, equalityRoles(pkColumns)))
 			.setIsSet(true)
 			.setIndexName('_primary_')
+			.setSeekColumns(pkColumns)
 			.setExplanation('Store primary key lookup')
 			.build();
+	}
+	if (pkPins) {
+		const plan = primaryKeyMultiSeekPlan(tableInfo, request, pkColumns, pkPins, estimatedRows, pkOrderPreservingPrefix);
+		// A gate decline FALLS THROUGH to the arms below rather than returning cost-only.
+		// That is safe: an `IN` is not in {@link RANGE_OPS}, so the leading-PK-range arm
+		// cannot grab it, and it lands on the secondary-index arms / full scan exactly as
+		// it did before this arm existed.
+		if (plan) return plan;
 	}
 
 	// Check for range constraints on the leading PK column.
@@ -262,17 +352,6 @@ export function computeBestAccessPlan(
 	// range bounds for primaryKeyDefinition[0]; ranges on later PK columns
 	// are silently dropped if marked handled. So only claim handled=true
 	// when the range is on the first PK column.
-	//
-	// The seek is also declined when the leading PK column's key bytes do not order the
-	// way its comparator does (`pkOrderPreservingPrefix === 0`): `StoreTable.analyzePKAccess`
-	// declines the byte window under exactly that condition, so claiming the range filters
-	// handled here would drop the residual Filter and return the whole table.
-	const pkOrderPreservingPrefix = pkOrderPreservingPrefixLength(
-		db,
-		tableInfo,
-		resolvePkKeyCollations(tableInfo.primaryKeyDefinition, tableInfo.columns, tableKeyCollation),
-		tableKeyCollation,
-	);
 	const firstPkColumn = tableInfo.primaryKeyDefinition[0]?.index;
 	const hasLeadingPkRange = firstPkColumn !== undefined
 		&& pkOrderPreservingPrefix >= 1
@@ -394,6 +473,70 @@ export function computeBestAccessPlan(
 	// downstream rules (merge-join, asof-scan) can fire on store-backed
 	// tables, matching memory-mode behavior.
 	return scanPlan;
+}
+
+/**
+ * The `_primary_` multi-seek advertisement for a WHOLE-primary-key IN (`where pk in (…)`,
+ * or a runtime-valued set on the PK), or null when a gate declines it.
+ *
+ * `StoreTableScan.scanMultiSeekPrimary` is the runtime twin: it encodes one data key per
+ * tuple, deduplicates, sorts ascending by encoded key, and point-reads each in bounded
+ * batches. Both gates below mirror one of its `multiSeekMalformed` throws, which stay in
+ * place as the assertion that the plan never produced a shape it cannot serve.
+ */
+function primaryKeyMultiSeekPlan(
+	tableInfo: TableSchema,
+	request: BestAccessPlanRequest,
+	pkColumns: readonly number[],
+	pins: PrimaryKeyPins,
+	estimatedRows: number,
+	pkOrderPreservingPrefix: number,
+): BestAccessPlanResult | null {
+	if (pins.seekKeyCount > MAX_MULTI_SEEK_KEYS) return null;
+	// Mirrors `StoreTableScan.pkHasSemanticOrderingMember`, which `scanMultiSeekPrimary`
+	// throws `multiSeekMalformed` on: N merged point windows ARE the whole access, with
+	// the residual already dropped, so an IN member with no faithful byte position would
+	// silently lose its tuple's rows. The single-value point arm has an escape this does
+	// not (it can decline to the scan arm per PROBE), which is why only this one declines
+	// per SCHEMA. Re-opening it is backlog `feat-store-semantic-key-multiseek`.
+	if (pkColumns.some(colIdx => hasSemanticOrdering(tableInfo.columns[colIdx]?.logicalType))) return null;
+
+	// The PK is unique, so each seek key matches at most one row — no `multiRows` clamp
+	// artifact (contrast the secondary arm's), and no ROW_RESOLUTION_COST: the point read
+	// IS the row read, with no index-entry → row indirection to charge for.
+	//
+	// `Math.max(1, …)` is LOAD-BEARING, not defensive. `rows: 0` on a plan that claims
+	// every filter makes `rule-select-access-path` replace the whole table access with an
+	// `EmptyResultNode` (its "the module proved the predicate unsatisfiable" fold), so a
+	// table that is empty at PLAN time would return nothing for rows written by the same
+	// statement.
+	const rows = Math.max(1, Math.min(estimatedRows, pins.seekKeyCount));
+	const plan = AccessPlanBuilder
+		// `setIsSet(false)` is likewise load-bearing: `eqMatch` defaults `isSet` to
+		// `rows <= 1`, which a one-key runtime set would satisfy.
+		.eqMatch(rows, pins.seekKeyCount * INDEX_SEEK_COST)
+		.setIsSet(false)
+		.setIndexName('_primary_')
+		// EVERY primary-key column, in `primaryKeyDefinition` order: `scanMultiSeekPrimary`
+		// throws when `seekWidth` does not cover the whole key, and the rule derives
+		// `seekWidth` from this list.
+		.setSeekColumns(pkColumns)
+		.setHandledFilters(claimFirstPerRole(request.filters, equalityRoles(pkColumns)))
+		.setExplanation(`Store primary key multi-seek(${pins.seekKeyCount})`)
+		.build();
+
+	// This arm returns straight out of the PK branch, so it never reaches the
+	// seek-versus-scan comparison further down `computeBestAccessPlan` — the same
+	// exemption the secondary multi-seek arm gets explicitly, for the same reason:
+	// `rule-key-set-seek` reads this cost as a straight line at 2 and 1000 keys and
+	// abandons its rewrite if either probe stops naming an index. Do not "fix" this by
+	// adding the comparison.
+	//
+	// `scanMultiSeekPrimary` sorts its points ascending by encoded data key, which IS
+	// primary-key order (per-column DESC inversion is baked into the bytes), so the plan
+	// goes through the same ordering gate every other primary-key arm uses and
+	// `… where pk in (…) order by pk` elides its Sort.
+	return { ...plan, ...buildPkOrderingAdvertisement(tableInfo, request, pkOrderPreservingPrefix) };
 }
 
 /**
@@ -582,8 +725,8 @@ function tryIndexAccessPlan(
 		arm === 'range'
 			? rangeRoles(leadingCol)
 			: arm === 'prefixRange'
-				? [...equalityRoles(eqCols, EQ_OR_IN_OPS), ...rangeRoles(trailingRangeCol!)]
-				: equalityRoles(eqCols, EQ_OR_IN_OPS),
+				? [...equalityRoles(eqCols), ...rangeRoles(trailingRangeCol!)]
+				: equalityRoles(eqCols),
 	);
 
 	if (isMultiSeek) {

@@ -8,7 +8,7 @@
  * contract under test: the store treats a runtime set as a multi-seek of at most
  * `maxCount` keys, so every gate it already applies to a literal IN list — the 1000-key
  * cap, the semantic-ordering decline, the key-collation guard, the partial-index
- * exclusion, the primary-key arm's refusal of any IN — applies unchanged.
+ * exclusion — applies unchanged, on the primary-key arm as well as the secondary one.
  */
 
 import { describe, it, beforeEach, afterEach } from 'mocha';
@@ -281,15 +281,38 @@ describe('StoreModule runtime-valued IN sets (feat-runtime-key-set-protocol)', (
 			expect(result.indexName).to.be.undefined;
 		});
 
-		it('declines a runtime set on the primary key (the PK arm takes `=` only)', async () => {
-			// A `_primary_` multi-seek's emission order would break the isolation layer's
-			// primary-key merge, so an IN on the PK declines today — literal or runtime.
+		it('claims a runtime set on the primary key as a `_primary_` multi-seek', async () => {
+			// `scanMultiSeekPrimary` emits ascending by encoded data key — which IS primary
+			// key order — so the isolation layer's primary-key merge holds and the arm no
+			// longer has to decline (feat-store-pk-in-list-multiseek).
 			await db.exec('create table pk (k integer primary key, other text) using store');
 			const result = plan('pk', [runtimeSetFilter(0, 4)]);
-			expect(result.handledFilters).to.deep.equal([false]);
-			expect(result.seekColumnIndexes).to.be.undefined;
+			expect(result.handledFilters).to.deep.equal([true]);
+			expect(result.indexName).to.equal('_primary_');
+			expect(result.seekColumnIndexes).to.deep.equal([0]);
+			expect(result.isSet, 'a multi-seek is not a set').to.be.false;
+			expect(result.explains).to.match(/primary key multi-seek\(4\)/);
+			// The runtime-set and literal-IN forms must still plan identically.
 			expect({ ...result, explains: '' })
 				.to.deep.equal({ ...plan('pk', [literalInFilter(0, 4)]), explains: '' });
+		});
+
+		it('declines a runtime set on a semantic-ordering (TIMESPAN) primary key', async () => {
+			// Mirrors `StoreTableScan.pkHasSemanticOrderingMember`: N merged point windows
+			// are the whole access, so an unfaithful member would silently lose rows. The
+			// decline falls through to the scan, which keeps the residual.
+			await db.exec('create table tspk (d timespan primary key, v integer) using store');
+			const result = plan('tspk', [runtimeSetFilter(0, 4)]);
+			expect(result.handledFilters).to.deep.equal([false]);
+			expect(result.seekColumnIndexes).to.be.undefined;
+		});
+
+		it(`declines a primary-key runtime set above the ${STORE_SEEK_CAP}-seek cap`, async () => {
+			await db.exec('create table pkcap (k integer primary key, other text) using store');
+			expect(plan('pkcap', [runtimeSetFilter(0, STORE_SEEK_CAP)]).seekColumnIndexes).to.deep.equal([0]);
+			const over = plan('pkcap', [runtimeSetFilter(0, STORE_SEEK_CAP + 1)]);
+			expect(over.handledFilters).to.deep.equal([false]);
+			expect(over.seekColumnIndexes).to.be.undefined;
 		});
 	});
 

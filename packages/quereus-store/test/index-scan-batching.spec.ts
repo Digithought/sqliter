@@ -307,9 +307,11 @@ describe('batched index-scan row resolution (store-index-seek-batched-scan)', ()
 	});
 
 	describe('primary-key multi-seek (scanMultiSeekPrimary)', () => {
-		// Not reachable from the module's own plans today (computeBestAccessPlan claims
-		// IN-lists only for secondary indexes), so drive the protected method directly —
-		// the same probe idiom pushdown.spec.ts uses for buildPKRangeBounds.
+		// `computeBestAccessPlan` now plans this arm for a whole-primary-key IN, and
+		// pushdown.spec.ts covers it end to end through SQL. These drive the protected
+		// method directly — the same probe idiom pushdown.spec.ts uses for
+		// buildPKRangeBounds — to pin the BATCHING shape (round trips, no scan), which a
+		// row assertion through SQL cannot see.
 		interface PrimaryMultiSeekProbe {
 			scanMultiSeekPrimary(
 				tuples: Array<{

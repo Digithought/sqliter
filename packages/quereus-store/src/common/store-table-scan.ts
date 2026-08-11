@@ -1130,11 +1130,16 @@ export abstract class StoreTableScan extends StoreTableBase {
 	 * Multi-seek over the PRIMARY key: each tuple is a full PK, resolved by a point
 	 * read in ascending encoded-data-key order (the table's native emission order).
 	 *
-	 * NOT reachable from this module's own plans today: `computeBestAccessPlan` (store-module-access-plan.ts)
-	 * claims IN-list filters only for secondary indexes (see its EQ_OPS vs EQ_OR_IN_OPS
-	 * split and tickets/backlog/feat-store-pk-in-list-multiseek). The branch exists so
-	 * a `_primary_` multi-seek arriving from a future plan gets a correct answer rather
-	 * than the scan arm's silent zero rows, and it is what PK-IN enablement will build on.
+	 * Reached from `computeBestAccessPlan`'s primary-key multi-seek arm
+	 * (store-module-access-plan.ts), which claims a whole-primary-key `IN` — literal list
+	 * or runtime-valued set — through `EQ_OR_IN_OPS` and advertises `_primary_` with every
+	 * PK column as its seek columns. That arm declines exactly the two shapes the
+	 * {@link multiSeekMalformed} throws below assert against (over the seek cap, and a
+	 * semantic-ordering PK member), so a throw here means the plan and the scan disagreed.
+	 *
+	 * The ascending-encoded-key emission order is a contract, not an implementation
+	 * detail: the isolation layer merges this stream with its overlay by primary key
+	 * (`bug-isolation-multiseek-merge-order`), and the arm advertises PK ordering off it.
 	 */
 	protected async *scanMultiSeekPrimary(
 		tuples: MultiSeekTuple[],
