@@ -35,8 +35,10 @@ Key features:
 | --- | --- |
 | [SELECT, clauses & expressions](sql-select.md) | Query expressions, `SELECT`, `FROM` / `WHERE` / `GROUP BY` / `HAVING` / `ORDER BY` / `LIMIT` / `OFFSET`, CTEs (`WITH`), operators and functions-in-expressions. |
 | [Data manipulation (DML)](sql-dml.md) | `INSERT`, `UPDATE`, `DELETE`, conflict resolution (`OR` clause), UPSERT (`ON CONFLICT`), and `RETURNING` with `NEW` / `OLD`. |
-| [Schema definition (DDL)](sql-ddl.md) | Declarative schema, `CREATE TABLE`, assertions, mutation context, metadata tags, virtual tables, constraints and indexes. |
+| [Schema definition (DDL)](sql-ddl.md) | Declarative schema, `CREATE TABLE`, assertions, mutation context, metadata tags. |
 | [Schema modification (ALTER)](sql-alter.md) | `ALTER TABLE` — rename, add / drop / alter column, constraints, primary key, maintained lifecycle — and the tag verbs on views, materialized views, and indexes. |
+| [Virtual tables](sql-vtab.md) | `CREATE VIRTUAL TABLE`, the built-in modules, and indexes on virtual tables. |
+| [Constraints & indexes](sql-constraints.md) | `PRIMARY KEY`, `NOT NULL`, `UNIQUE`, `CHECK`, `FOREIGN KEY`, `DEFAULT`, and `CREATE` / `DROP INDEX`. |
 | [Views & materialized views](sql-views.md) | `CREATE VIEW`, updatable views, `CREATE MATERIALIZED VIEW`, logical schemas and lenses. |
 | [Functions](sql-functions.md) | Scalar, aggregate, JSON, date/time, window, and table-valued functions. |
 | [Transactions & PRAGMA](sql-txn.md) | `BEGIN` / `COMMIT` / `ROLLBACK`, savepoints, and `PRAGMA` statements. |
@@ -64,12 +66,12 @@ Moved to [SQL Functions](sql-functions.md#5-functions).
 
 ## 6. Virtual Tables
 
-Moved to [SQL Schema Definition — DDL](sql-ddl.md#6-virtual-tables).
+Moved to [SQL Virtual Tables](sql-vtab.md#6-virtual-tables).
 
 
 ## 7. Constraints and Indexes
 
-Moved to [SQL Schema Definition — DDL](sql-ddl.md#7-constraints-and-indexes).
+Moved to [SQL Constraints and Indexes](sql-constraints.md#7-constraints-and-indexes).
 
 
 ## 8. Transactions and Savepoints

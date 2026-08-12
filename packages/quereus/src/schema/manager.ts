@@ -2497,7 +2497,7 @@ export class SchemaManager {
 			throw new QuereusError(`Index ${indexName} already exists on table ${tableName}`, StatusCode.CONSTRAINT, undefined, stmt.index.loc?.start.line, stmt.index.loc?.start.column);
 		}
 
-		// Index names are unique per schema, not per table (docs/sql-ddl.md §6.3).
+		// Index names are unique per schema, not per table (docs/sql-vtab.md §6.3).
 		// Every by-name index resolver — `dropIndex`, `updateIndexTags`, sync's
 		// `findIndexOwner` — locates the owning table by first-match scan over the
 		// schema's tables, and "first" is registration order, which is not stable
@@ -2602,7 +2602,7 @@ export class SchemaManager {
 	 * schema-wide name-uniqueness check ({@link findIndexNameOwnerElsewhere}) and
 	 * `@quereus/sync`'s replicated index DDL all funnel here.
 	 *
-	 * Index names are unique per schema, not per table (docs/sql-ddl.md §6.3), and
+	 * Index names are unique per schema, not per table (docs/sql-vtab.md §6.3), and
 	 * {@link createIndex} rejects a name already taken elsewhere in the schema, so
 	 * first-match is unambiguous by construction. That invariant is what makes
 	 * replication safe: a replicated `drop index "main"."idx"` carries no table name

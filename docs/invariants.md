@@ -1062,7 +1062,7 @@ Reserved.
 - code: `packages/quereus/src/schema/catalog.ts` — `isImplicitCoveringIndex`
 - code: `packages/quereus/src/schema/schema-differ.ts` — `computeSchemaDiff`
 - guard: `packages/quereus/test/schema-manager.spec.ts` — `Index names are unique per schema`
-- doc: [SQL DDL § 6.3 Indexes on Virtual Tables](sql-ddl.md#63-indexes-on-virtual-tables)
+- doc: [SQL Virtual Tables § 6.3 Indexes on Virtual Tables](sql-vtab.md#63-indexes-on-virtual-tables)
 
 Within one schema at most one table carries a **user** index of a given name, matched
 case-insensitively. `createIndex` rejects a name already held by a user index on another
@@ -1129,7 +1129,7 @@ engine none the wiser, and stays invisible until a later read returns wrong rows
 - code: `packages/quereus/src/schema/catalog.ts` — `assertUniqueConstraintIndexNameFree`, `assertUniqueConstraintBackingNamesDistinct`
 - code: `packages/quereus/src/schema/manager.ts` — `createTable`
 - guard: `packages/quereus/test/index-ddl-roundtrip.spec.ts` — `CREATE TABLE refuses two UNIQUE constraints that derive one structure name`
-- doc: [SQL DDL § 6.3 Indexes on Virtual Tables](sql-ddl.md#63-indexes-on-virtual-tables)
+- doc: [SQL Virtual Tables § 6.3 Indexes on Virtual Tables](sql-vtab.md#63-indexes-on-virtual-tables)
 
 A UNIQUE constraint's implicit backing structure is named after the constraint, or
 `_uc_<covered columns joined by _>` when unnamed. Within one table that name is held by at

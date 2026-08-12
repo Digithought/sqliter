@@ -1066,7 +1066,7 @@ The gate takes the `Database`, not a bare `SchemaManager`, because it answers tw
 that must not be split across callers: it reports "not batchable" whenever `pragma
 foreign_keys` is off (nothing is enforced on either route, so the executor builds no batch),
 and it **raises** on an inbound FK whose child column count does not match the parent key it
-references (see [DDL § 7.6 FOREIGN KEY](sql-ddl.md#76-foreign-key-constraint)) — the
+references (see [Constraints § 7.6 FOREIGN KEY](sql-constraints.md#76-foreign-key-constraint)) — the
 batch is that FK's only enforcement on this route, so skipping it would leave the key
 unenforced here alone. The executor calls the gate on every DELETE/UPDATE and has no other
 pragma check in front of it.

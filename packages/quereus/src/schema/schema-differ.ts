@@ -326,7 +326,7 @@ function duplicateDeclaredNameError(dup: DuplicateDeclaredName, schemaName: stri
 		);
 	}
 	if (kind === 'index') {
-		// Pinned wording — documented in docs/sql-ddl.md § 6.3 and SCH-001.
+		// Pinned wording — documented in docs/sql-vtab.md § 6.3 and SCH-001.
 		return new QuereusError(
 			`Index '${name}' is declared more than once in schema '${schemaName}'`
 				+ ` (on '${firstTable}' and '${secondTable}') — index names are unique per schema`,
