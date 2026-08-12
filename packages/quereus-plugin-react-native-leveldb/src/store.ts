@@ -134,6 +134,17 @@ export interface LevelDBIterator {
 export type LevelDBOpenFn = (name: string, createIfMissing: boolean, errorIfExists: boolean) => LevelDB;
 
 /**
+ * Keys read-then-deleted per pass by {@link ReactNativeLevelDBStore.clear}.
+ *
+ * Emptying the keyspace in bounded chunks — rather than reading every key into one
+ * `WriteBatch` — keeps peak memory at a chunk however large the store is, the same
+ * bounded-peak rule {@link KVStore.iterate} is held to. The size is the usual peak-memory /
+ * round-trip tradeoff; it is a judgement call, not a measurement (nothing has profiled a
+ * drop on device).
+ */
+const CLEAR_CHUNK_SIZE = 512;
+
+/**
  * LevelDB implementation of KVStore for React Native.
  *
  * Keys and values are stored as ArrayBuffers. LevelDB provides correct
@@ -307,6 +318,59 @@ export class ReactNativeLevelDBStore implements KVStore {
 	batch(): WriteBatch {
 		this.checkOpen();
 		return new ReactNativeLevelDBWriteBatch(this.db, this.WriteBatchCtor);
+	}
+
+	/**
+	 * Delete every entry in the store, leaving the database itself open and usable — the
+	 * erase behind the provider's reclaim of a dropped table (`LevelDBStore.clear`'s
+	 * counterpart, which its sublevel can do natively).
+	 *
+	 * rn-leveldb exposes no range delete, so the erase is a bounded walk that deletes what
+	 * it reads: each pass takes at most {@link CLEAR_CHUNK_SIZE} keys and deletes them in
+	 * one `WriteBatch`, then resumes strictly PAST the last key it saw. Resuming — rather
+	 * than re-reading from the start — is what makes the walk terminate after exactly one
+	 * pass over the keyspace even if a delete did not land, instead of spinning forever.
+	 *
+	 * NOTE: chunked, therefore not crash-atomic — a process death partway through leaves a
+	 * tail of keys behind, which a store re-opened under the same name would then see. Same
+	 * exposure as `@quereus/plugin-leveldb`'s sublevel clear. If DDL crash-consistency is
+	 * ever tightened, a cleared store needs a tombstone the next open honors rather than a
+	 * best-effort walk.
+	 */
+	async clear(): Promise<void> {
+		this.checkOpen();
+		let cursor: Uint8Array | undefined;
+
+		for (;;) {
+			const keys = await this.readKeyChunk(cursor);
+			if (keys.length === 0) break;
+
+			cursor = keys[keys.length - 1];
+			// A fresh batch per pass: `WriteBatch` is documented single-use, so reusing one
+			// across writes would lean on backend-specific behavior this store happens to
+			// have and `@quereus/plugin-leveldb` does not.
+			const batch = this.batch();
+			for (const key of keys) {
+				batch.delete(key);
+			}
+			await batch.write();
+
+			// A short chunk means the walk reached the end of the keyspace.
+			if (keys.length < CLEAR_CHUNK_SIZE) break;
+		}
+	}
+
+	/** At most {@link CLEAR_CHUNK_SIZE} keys, starting strictly past `after`. */
+	private async readKeyChunk(after: Uint8Array | undefined): Promise<Uint8Array[]> {
+		const range: IterateOptions = after === undefined
+			? { limit: CLEAR_CHUNK_SIZE }
+			: { gt: after, limit: CLEAR_CHUNK_SIZE };
+
+		const keys: Uint8Array[] = [];
+		for await (const entry of this.iterate(range)) {
+			keys.push(entry.key);
+		}
+		return keys;
 	}
 
 	async close(): Promise<void> {

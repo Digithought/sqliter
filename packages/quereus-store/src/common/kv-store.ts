@@ -389,8 +389,11 @@ export interface KVStoreProvider {
 	deleteIndexStore?(schemaName: string, tableName: string, indexName: string): Promise<void>;
 
 	/**
-	 * Delete all stores for a table (data, indexes, stats).
-	 * Called when dropping a table.
+	 * Delete a table's data store and the named index stores. Called when dropping a table.
+	 *
+	 * NOT the table's row-count statistics: those live as one ENTRY in the unified
+	 * `__stats__` store (see {@link getStatsStore}), which a provider must leave alone —
+	 * removing that entry is the caller's business, not a store deletion.
 	 *
 	 * "Delete" means ERASE the physical storage, not merely drop a cached handle. Three
 	 * requirements, all of them behavioral:

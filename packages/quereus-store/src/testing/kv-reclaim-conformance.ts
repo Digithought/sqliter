@@ -20,7 +20,11 @@
  *
  * The battery needs nothing beyond the public {@link KVStoreProvider} surface, so it runs
  * for every backend: it writes a marker into each store, deletes, and re-opens by the same
- * name. Both delete hooks are OPTIONAL in {@link KVStoreProvider}; a provider that omits one
+ * name. One case seeds {@link BULK_ROW_COUNT} rows instead of a marker, because a provider
+ * with no native "empty this store" has to walk the keyspace in bounded chunks and only a
+ * store bigger than one chunk exercises resuming between passes.
+ *
+ * Both delete hooks are OPTIONAL in {@link KVStoreProvider}; a provider that omits one
  * is skipped rather than crashed — but the skip is printed, so a provider cannot silently
  * opt out of the property.
  *
@@ -65,6 +69,19 @@ const MARKER_KEY = b(0x01);
 
 /** A second key, written into a store RE-CREATED after a delete. */
 const REUSE_KEY = b(0x02);
+
+/**
+ * Rows seeded into one store by the bulk case, chosen to exceed the largest per-pass chunk
+ * any shipped provider erases in (`@quereus/plugin-react-native-leveldb` walks the keyspace
+ * 512 keys at a time), so a chunked erase has to make several passes and resume correctly
+ * between them. A provider that erases natively is unaffected by the size.
+ */
+const BULK_ROW_COUNT = 1100;
+
+/** The `i`-th bulk key — two bytes, so it can never collide with the 1-byte markers. */
+function bulkKey(i: number): Uint8Array {
+	return b((i >> 8) & 0xff, i & 0xff);
+}
 
 /** The two delete hooks this battery drives. Both are optional in `KVStoreProvider`. */
 type ReclaimHook = 'deleteTableStores' | 'deleteIndexStore';
@@ -126,6 +143,13 @@ async function dump(store: KVStore): Promise<string[]> {
 		entries.push(`${hex(key)}=${decoder.decode(value)}`);
 	}
 	return entries;
+}
+
+/** How many entries a store yields on a full scan. */
+async function countEntries(store: KVStore): Promise<number> {
+	let count = 0;
+	for await (const _entry of store.iterate()) count++;
+	return count;
 }
 
 /** Read a store's marker back, or `undefined` when the key is absent. */
@@ -232,6 +256,29 @@ export function runStoreReclaimConformance(name: string, makeReclaimBackend: () 
 			);
 		});
 
+		it('erases a store holding more rows than a provider clears in one pass', async () => {
+			if (!hasHook(name, provider, 'deleteTableStores')) return;
+
+			// A provider with no native "empty this store" has to walk the keyspace in bounded
+			// chunks, so the whole resume-between-passes path only runs above its chunk size —
+			// a walk that restarts (or stops early) after each pass is invisible below it.
+			const data = await provider.getStore(SCHEMA, 't');
+			const seed = data.batch();
+			for (let i = 0; i < BULK_ROW_COUNT; i++) {
+				seed.put(bulkKey(i), encoder.encode(String(i)));
+			}
+			await seed.write();
+			assert.strictEqual(await countEntries(data), BULK_ROW_COUNT, 'the bulk seed itself did not land');
+
+			await deleteTableStores(provider, 't', []);
+
+			assert.strictEqual(
+				await countEntries(await provider.getStore(SCHEMA, 't')),
+				0,
+				`the data store of main.t still holds rows after a delete of ${BULK_ROW_COUNT} of them — a chunked erase that does not resume past its last key leaves a tail behind`,
+			);
+		});
+
 		it('erases only the named index store on deleteIndexStore', async () => {
 			if (!hasHook(name, provider, 'deleteIndexStore')) return;
 
@@ -283,6 +330,26 @@ export function runStoreReclaimConformance(name: string, makeReclaimBackend: () 
 			await assertMarkerIntact(
 				await provider.getStore(SCHEMA, 't_idx_y'),
 				buildDataStoreName(SCHEMA, 't_idx_y'),
+			);
+		});
+
+		it('leaves an index store the caller did not name untouched', async () => {
+			if (!hasHook(name, provider, 'deleteTableStores')) return;
+
+			// `indexNames` is the authoritative list, and reclaiming anything outside it means
+			// the provider found the store some other way — a `{table}_idx_` prefix scan being
+			// the way that also destroys a sibling table's data (the case above). Storage for
+			// an index left out of the list leaks; that is the caller's bug to fix, not licence
+			// for the provider to guess.
+			await seedTable(provider, 't', ['x', 'unnamed']);
+
+			await deleteTableStores(provider, 't', ['x']);
+
+			await assertEmpty(await provider.getStore(SCHEMA, 't'), 'the data store of main.t');
+			await assertEmpty(await provider.getIndexStore(SCHEMA, 't', 'x'), 'index x of main.t');
+			await assertMarkerIntact(
+				await provider.getIndexStore(SCHEMA, 't', 'unnamed'),
+				buildIndexStoreName(SCHEMA, 't', 'unnamed'),
 			);
 		});
 

@@ -103,20 +103,6 @@ function encodeDatabaseName(name: string): string {
 }
 
 /**
- * Keys read-then-deleted per pass when {@link ReactNativeLevelDBProvider} clears a store's
- * keyspace.
- *
- * Each logical store is its own on-device database and the provider is handed only an
- * `openFn`, so the portable erase is to empty the keyspace rather than to destroy a file.
- * Emptying it in bounded chunks — rather than reading every key into one `WriteBatch` —
- * keeps peak memory at a chunk however large the dropped table was, the same bounded-peak
- * rule `KVStore.iterate` is held to. The size is the usual peak-memory / round-trip
- * tradeoff; it is a judgement call, not a measurement (nothing has profiled a drop on
- * device).
- */
-const CLEAR_CHUNK_SIZE = 512;
-
-/**
  * Options for creating a React Native LevelDB provider.
  */
 export interface ReactNativeLevelDBProviderOptions {
@@ -231,8 +217,10 @@ export class ReactNativeLevelDBProvider implements KVStoreProvider {
 		// Erase the data store's keyspace.
 		await this.clearAndDropStore(buildDataStoreName(schemaName, tableName));
 
-		// Stats are in the unified __stats__ store, so no need to clear a separate store
-		// The individual stats entry will be removed by the calling code if needed
+		// Stats live in the unified __stats__ store, so there is no per-table stats store to
+		// clear here. (The table's ENTRY in that store is not reclaimed by anyone today —
+		// tracked as `bug-drop-table-leaves-stale-stats-entry`; it is a stale row-count
+		// estimate, not stale rows.)
 
 		// Erase exactly the table's index stores (by name), not every store matching
 		// the `{table}_idx_` prefix — that prefix also matches a sibling table
@@ -283,13 +271,8 @@ export class ReactNativeLevelDBProvider implements KVStoreProvider {
 	 * Erase a store's keyspace and drop its cached handle, so a store re-opened later under
 	 * the same name is EMPTY — the reclaim contract on
 	 * {@link KVStoreProvider.deleteTableStores}. Same shape as `@quereus/plugin-leveldb`'s
-	 * `clearAndDropStore`; there is no native "delete database" in the `openFn`-only surface
-	 * this provider is given, so the erase is a bounded walk that deletes what it reads.
-	 *
-	 * Each pass reads at most {@link CLEAR_CHUNK_SIZE} keys and deletes them in one
-	 * `WriteBatch`, then resumes strictly PAST the last key it saw. Resuming (rather than
-	 * re-reading from the start) is what makes the walk terminate on exactly one pass over
-	 * the keyspace even if a delete did not land, instead of spinning forever.
+	 * `clearAndDropStore`: the store owns the erase ({@link ReactNativeLevelDBStore.clear}),
+	 * the provider owns the handle.
 	 */
 	private async clearAndDropStore(storeName: string): Promise<void> {
 		// NOTE: opening the store first means clearing a store that never existed CREATES an
@@ -297,34 +280,7 @@ export class ReactNativeLevelDBProvider implements KVStoreProvider {
 		// — the operation is still a no-op for data, which is what the reclaim contract asks
 		// of an absent store — and it leaves the same empty-database residue described below.
 		const store = this.getOrCreateStore(storeName);
-
-		let cursor: Uint8Array | undefined;
-		for (;;) {
-			const keys: Uint8Array[] = [];
-			const range = cursor === undefined
-				? { limit: CLEAR_CHUNK_SIZE }
-				: { gt: cursor, limit: CLEAR_CHUNK_SIZE };
-			for await (const entry of store.iterate(range)) {
-				keys.push(entry.key);
-			}
-			if (keys.length === 0) break;
-
-			cursor = keys[keys.length - 1];
-			const batch = store.batch();
-			for (const key of keys) {
-				batch.delete(key);
-			}
-			await batch.write();
-
-			// A short chunk means the walk reached the end of the keyspace.
-			if (keys.length < CLEAR_CHUNK_SIZE) break;
-		}
-		// NOTE: the clear is chunked, so it is not crash-atomic — a process death partway
-		// through leaves the tail of a dropped store's keys behind, and a table later created
-		// under that name would see them. Same exposure as `@quereus/plugin-leveldb`'s
-		// sublevel clear, and strictly better than the previous behavior (which erased
-		// nothing at all). If DDL crash-consistency is ever tightened here, a dropped store
-		// needs a tombstone the next open honors rather than a best-effort walk.
+		await store.clear();
 
 		// NOTE: this empties the database but leaves the on-device LevelDB DIRECTORY in place
 		// (a few KB of MANIFEST/LOG/CURRENT per dropped store). The row data — the leak that

@@ -30,6 +30,13 @@
  * LevelDB file per name". Re-opening a name after closing it therefore hands back a fresh,
  * usable handle over the same data, exactly as rn-leveldb does on device. A handle that owns
  * its own data (`new MockLevelDB()`) is the single-store case and behaves as before.
+ *
+ * NOTE: what the file/handle split does NOT model is LevelDB's single-writer lock — a real
+ * database directory admits ONE open handle at a time, while `MockLevelDBFiles.open` hands
+ * out as many as asked. The provider keeps one handle per name today (its cache evicts a
+ * closed handle before re-opening), so nothing exercises the difference; if a provider path
+ * ever holds two handles to one name, it will pass here and fail on device. Make `open`
+ * refuse a second live handle at that point.
  */
 
 // The same ordering oracle the store and the conformance battery use — the mock's whole
@@ -85,11 +92,6 @@ export class MockLevelDBFiles {
 			this.files.set(name, data);
 		}
 		return new MockLevelDB({ data });
-	}
-
-	/** Names of every database opened so far — the on-device file listing. */
-	names(): string[] {
-		return [...this.files.keys()];
 	}
 
 	/** Drop every database. */

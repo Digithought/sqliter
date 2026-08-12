@@ -335,9 +335,11 @@ table's rows — a defect two of the four shipped providers had. The battery del
 re-opens by the same names, checking each store reads back empty through both a point `get`
 and a scan, that a store re-created under a dropped name holds only its own new rows, that
 `deleteIndexStore` touches only that one index, that sibling tables (including one literally
-named `{table}_idx_<x>`) and the reserved `__stats__` / `__catalog__` stores survive, that
-deleting a store that was never created is a no-op rather than a throw, and that a store
-whose handle the caller already closed is still erased (the order every `drop index` takes):
+named `{table}_idx_<x>`), an index store the caller did not name, and the reserved
+`__stats__` / `__catalog__` stores all survive, that deleting a store that was never created
+is a no-op rather than a throw, that a store whose handle the caller already closed is still
+erased (the order every `drop index` takes), and that a store holding more rows than a
+provider erases in one pass comes back empty to the last key:
 
 ```typescript
 import { runStoreReclaimConformance } from '@quereus/store/testing';

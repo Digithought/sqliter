@@ -164,8 +164,10 @@ export class SQLiteProvider implements KVStoreProvider {
 		// Drop the data store's backing table.
 		await this.dropStoreByName(buildDataStoreName(schemaName, tableName));
 
-		// Stats are in the unified __stats__ store, so no need to drop a separate store
-		// The individual stats entry will be removed by the calling code if needed
+		// Stats live in the unified __stats__ store, so there is no per-table stats store to
+		// drop here. (The table's ENTRY in that store is not reclaimed by anyone today —
+		// tracked as `bug-drop-table-leaves-stale-stats-entry`; it is a stale row-count
+		// estimate, not stale rows.)
 
 		// Drop exactly the table's index stores (by name), not every store matching
 		// the `{table}_idx_` prefix — that prefix also matches a sibling table
@@ -218,8 +220,9 @@ export class SQLiteProvider implements KVStoreProvider {
 	 * store that was never created a no-op that creates nothing, as that contract also asks.
 	 *
 	 * The table name is interpolated rather than bound because SQLite cannot parameterize an
-	 * identifier; {@link encodeSqliteName} restricts every produced name to `[a-z0-9_]`, so
-	 * there is no quoting or injection surface — the same reason `SQLiteStore` interpolates it.
+	 * identifier; {@link encodeSqliteName} restricts every produced name to `[0-9a-z_]` plus
+	 * the uppercase hex of its escapes, so there is no quoting or injection surface — the
+	 * same reason `SQLiteStore` interpolates it.
 	 */
 	private async dropStoreByName(storeName: string): Promise<void> {
 		await this.closeStoreByName(storeName);
