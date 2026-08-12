@@ -543,6 +543,20 @@ function readsOnlyAggregateInput(node: PlanNode, context: GroupedRedirectContext
 }
 
 /**
+ * True when `node` names one of THIS query's pre-grouping columns and the AggregateNode's
+ * output row does not carry it — the exact condition that makes a reference above the
+ * aggregate either redirectable ({@link referencesAggregateInput}) or, once the redirect
+ * has run, an ungrouped column ({@link findUngroupedWindowColumnRef}). The two callers ask
+ * it of different subtrees for different purposes, but the predicate is one thing and must
+ * stay one thing: a reference the redirect rewrites is by definition one the coverage check
+ * would otherwise have rejected.
+ */
+function isPreGroupingReference(node: ColumnReferenceNode, context: GroupedRedirectContext): boolean {
+	const attrId = node.attributeId;
+	return context.aggregateInputAttrIds.has(attrId) && !context.outputAttrIds.has(attrId);
+}
+
+/**
  * True when ANY column reference in `node`'s subtree is a pre-grouping column of this
  * query — i.e. the expression reads something the AggregateNode's output row does not
  * carry, and therefore needs {@link redirectToGroupKeys} run over it.
@@ -554,15 +568,13 @@ function readsOnlyAggregateInput(node: PlanNode, context: GroupedRedirectContext
  * references all resolved through the projection / window-output / aggregate-output
  * scopes contains none, and must be left alone.
  *
- * Attribute ids already on the AggregateNode's output row are excluded: a bare-column
- * grouping key whose id survives into the aggregate output is not a pre-grouping
- * reference in need of redirection. CTE definition bodies are skipped for the same
- * reason {@link redirectToGroupKeys} skips them (see {@link isCteDefinition}).
+ * Per reference the test is {@link isPreGroupingReference}. CTE definition bodies are
+ * skipped for the same reason {@link redirectToGroupKeys} skips them (see
+ * {@link isCteDefinition}).
  */
 export function referencesAggregateInput(node: PlanNode, context: GroupedRedirectContext): boolean {
 	if (CapabilityDetectors.isColumnReference(node)) {
-		const attrId = (node as ColumnReferenceNode).attributeId;
-		return context.aggregateInputAttrIds.has(attrId) && !context.outputAttrIds.has(attrId);
+		return isPreGroupingReference(node as ColumnReferenceNode, context);
 	}
 	for (const child of node.getChildren()) {
 		if (isCteDefinition(child)) continue;
@@ -621,9 +633,7 @@ function findUngroupedWindowColumnRef(
 	}
 
 	if (CapabilityDetectors.isColumnReference(node)) {
-		const attrId = (node as ColumnReferenceNode).attributeId;
-		const ungrouped = context.aggregateInputAttrIds.has(attrId) && !context.outputAttrIds.has(attrId);
-		return ungrouped ? node as ColumnReferenceNode : null;
+		return isPreGroupingReference(node as ColumnReferenceNode, context) ? node as ColumnReferenceNode : null;
 	}
 
 	for (const child of node.getChildren()) {

@@ -1501,15 +1501,35 @@ select a, count(*) as c from wg group by a order by 1;
 → [{"a":"x","c":2},{"a":"y","c":1}]
 
 -- An ORDER BY naming a genuinely UNGROUPED column is ACCEPTED today, windowed and not:
--- it sorts by an arbitrary representative row's `b`. The redirect leaves it exactly as
--- it was — nothing matches a grouping key, so nothing is rewritten. Pinned with today's
--- rows so that making this an error becomes a deliberate, visible change rather than a
--- silent one.
+-- it sorts by an arbitrary representative row's `b`, and the two paths pick a different
+-- representative. Neither of these goes through the redirect at all: the windowed one is
+-- a bare column name absent from the select list, which `select.ts` diverts to a sort
+-- BELOW the window phase (`preWindowSort`), and the unwindowed one finds no grouping-key
+-- match. Pinned with today's rows so that making this an error becomes a deliberate,
+-- visible change rather than a silent one.
 select a, row_number() over (order by a) as rn from wg group by a order by b;
 → [{"a":"x","rn":1},{"a":"y","rn":2}]
 
 select a, count(*) as c from wg group by a order by b;
 → [{"a":"x","c":2},{"a":"y","c":1}]
+
+-- The grouping key is NOT in the select list, so no projection output column carries it
+-- and the redirect is the only thing that can bind the sort key. A non-column ORDER BY
+-- expression, so `preWindowSort` does not divert it either — this reaches the redirect
+-- and reads the AggregateNode's group column through the WindowNode's passthrough.
+select count(*) as c, row_number() over (order by count(*)) as rn from wg group by a order by upper(wg.a) desc;
+→ [{"c":1,"rn":1},{"c":2,"rn":2}]
+
+select count(*) as c from wg group by a order by upper(wg.a) desc;
+→ [{"c":1},{"c":2}]
+
+-- DISTINCT sits between the projection and the sort, so the redirected key is read
+-- through one more operator than the cases above.
+select distinct a, row_number() over (order by a) as rn from wg group by a order by wg.a desc;
+→ [{"a":"y","rn":2},{"a":"x","rn":1}]
+
+select distinct a, count(*) as c from wg group by a order by wg.a desc;
+→ [{"a":"y","c":1},{"a":"x","c":2}]
 
 -- =============================================================================
 -- SELECT LIST of a grouped query, continued.

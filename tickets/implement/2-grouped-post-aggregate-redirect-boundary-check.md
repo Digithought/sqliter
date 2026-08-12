@@ -93,6 +93,16 @@ AggregateNode itself — it would have caught the ORDER BY case, the SELECT-list
 any future post-aggregate operator, at build time with the user-facing GROUP BY message
 instead of an internal runtime error.
 
+### Arm 1a — while you are in `applyOrderBy`, fix its call signature
+
+Added by the prereq's review. `applyOrderBy` (`select-modifiers.ts`) now takes **nine**
+positional parameters, three of them optional and two of them bare booleans
+(`preAggregateSort`, `allowAggregates`). Its three call sites in `select.ts` (~lines 241,
+386, 406) differ only in their trailing arguments, so a mis-ordered or omitted argument is
+invisible at the call site and type-checks. The choke point this ticket introduces makes
+one more parameter likely; convert the tail to a single options object at that point
+rather than adding a tenth positional.
+
 ### The one behaviour change, and its measured size
 
 An ORDER BY naming a genuinely **ungrouped** column is accepted today:

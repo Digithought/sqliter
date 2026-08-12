@@ -462,11 +462,14 @@ window phase, so `order by wg.a` against `group by a` died the same way. It is g
 attribute is rewritten; a key that already resolved through the projection,
 window-output or aggregate-output scope is left exactly as it bound.
 
-HAVING is the remaining clause that still binds a qualified or computed grouping key to
-a base attribute. It is correct today only because its `Filter` sits directly on the
-aggregate's yield — the adjacency this corollary is about. The same rule applies to it,
-and to any future operator that wants to read a grouped query's pre-grouping columns:
-bind to what the row actually carries.
+Two sites still bind a qualified or computed grouping key to a base attribute, and both
+are correct today only because of the adjacency this corollary is about — not by design.
+HAVING's `Filter` sits directly on the aggregate's yield. And a bare-column ORDER BY
+naming a column the select list does not contain never reaches `applyOrderBy` at all:
+`buildSelectStmt` diverts it to a `Sort` placed *below* the window phase, likewise
+directly on that yield. The same rule applies to both, and to any future operator that
+wants to read a grouped query's pre-grouping columns: bind to what the row actually
+carries.
 
 ### Filter conjunct early exit
 
