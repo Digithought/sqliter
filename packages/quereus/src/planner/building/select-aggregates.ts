@@ -255,7 +255,7 @@ function handlePreAggregateSort(
  * {@link expressionToIdentityString}), so `group by A || '!'` covers a later
  * `a || '!'`; quoted literals stay byte-exact, so `a || 'X'` does not.
  */
-export interface GroupByCoverage {
+interface GroupByCoverage {
 	readonly attrIds: ReadonlySet<number>;
 	readonly fingerprints: ReadonlySet<string>;
 }
@@ -266,7 +266,7 @@ export interface GroupByCoverage {
  * needed only when the expressions to be checked were built against the aggregate
  * output scope.
  */
-export function buildGroupByCoverage(
+function buildGroupByCoverage(
 	groupByExpressions: readonly ScalarPlanNode[],
 	groupedOutputAttributes: readonly Attribute[] = []
 ): GroupByCoverage {
@@ -289,7 +289,7 @@ export function buildGroupByCoverage(
  * grouped rows do not carry. Used by the SELECT-list check below; the finished-plan
  * check raises the same message from {@link assertGroupedPlanCoverage}.
  */
-export function assertGroupByCoverage(node: PlanNode, coverage: GroupByCoverage): void {
+function assertGroupByCoverage(node: PlanNode, coverage: GroupByCoverage): void {
 	const ungrouped = findUngroupedColumnRef(node, coverage);
 	if (!ungrouped) return;
 	throw new QuereusError(
@@ -367,7 +367,7 @@ export interface GroupKeyIndex {
  * column index is the key's position in that list, which is its position on the
  * AggregateNode's output row.
  */
-export function indexGroupKeys(groupByExpressions: readonly ScalarPlanNode[]): GroupKeyIndex {
+function indexGroupKeys(groupByExpressions: readonly ScalarPlanNode[]): GroupKeyIndex {
 	const byFingerprint = new Map<string, number>();
 	const byBaseAttrId = new Map<number, number>();
 
@@ -640,6 +640,20 @@ function referencesAggregateInput(node: PlanNode, context: GroupedRedirectContex
  * GROUP BY message at plan time — the SELECT-list and ORDER BY escapes both shipped
  * exactly that way. It also rejects, at plan time, a post-aggregate expression that
  * genuinely reads an ungrouped column (directly, or correlated through a subquery).
+ *
+ * NOTE: the stop condition is node IDENTITY, so it holds only while `buildSelectStmt`
+ * *wraps* the aggregate rather than rebuilding it. A future post-aggregate step that
+ * rebuilds the spine through `withChildren` would mint a new AggregateNode, the walk
+ * would run straight past it into the aggregate's own input, and every legal
+ * pre-grouping reference down there (a WHERE conjunct, a join condition) would be
+ * rejected with a user-facing GROUP BY error. If such a step is ever added, locate
+ * the aggregate by node id instead of by reference.
+ *
+ * NOTE: one extra walk of the post-aggregate plan per grouped query per prepare, on
+ * top of the redirect's own walk (see {@link redirectNode}). Measured end-to-end, not
+ * isolated: compiling a six-column grouped query costs ~0.6-0.8 ms against ~0.5 ms for
+ * a comparable ungrouped one, so this walk is bounded well below the surrounding
+ * planning cost. Revisit if preparing grouped queries ever shows up as slow.
  */
 export function assertGroupedPlanCoverage(
 	node: PlanNode,

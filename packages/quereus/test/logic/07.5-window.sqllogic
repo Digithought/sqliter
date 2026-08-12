@@ -1531,6 +1531,27 @@ select a, row_number() over (order by a) as rn from wg group by a order by b;
 select a, count(*) as c from wg group by a order by b;
 -- error: Column 'b' must appear in the GROUP BY clause or be used in an aggregate function
 
+-- A COMPUTED grouping key is matched by the whole expression's TEXT, so a qualifier
+-- the GROUP BY did not use makes it a different expression — and what is left is a
+-- bare reference to the ungrouped `a`. (A bare-column key is matched by attribute id
+-- instead, which is why `group by a order by wg.a` further down works under any
+-- qualifier.) The SELECT list has always rejected this spelling; ORDER BY used to
+-- accept it and sort by an arbitrary representative row, so the pin below is the
+-- ORDER BY half becoming consistent with the select-list half above it. Tracked as
+-- backlog/debt-group-key-match-by-attribute-identity.
+select upper(a) as k, count(*) as c from wg group by upper(a) order by upper(wg.a);
+-- error: Column 'wg.a' must appear in the GROUP BY clause or be used in an aggregate function
+
+select upper(wg.a) as k, count(*) as c from wg group by upper(a);
+-- error: Column 'wg.a' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- Control: one spelling on both sides matches, windowed and not.
+select upper(a) as k, count(*) as c from wg group by upper(a) order by upper(a);
+→ [{"k":"X","c":2},{"k":"Y","c":1}]
+
+select upper(a) as k, row_number() over (order by upper(a)) as rn from wg group by upper(a);
+→ [{"k":"X","rn":1},{"k":"Y","rn":2}]
+
 -- The `preWindowSort` placement (an ORDER BY column absent from the select list gets
 -- its sort BELOW the window projection) with a QUALIFIED spelling of a grouping key:
 -- that sort still sits ABOVE the AggregateNode, so its key is redirected onto the
@@ -1618,6 +1639,23 @@ select a, (select count(*) from wg t where t.b = wg.b) as c, row_number() over (
 
 select a, count(*) as c from wg group by a order by (select count(*) from wg t where t.b = wg.b);
 -- error: Column 'wg.b' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- The check walks the finished PLAN, not any one clause, so the other correlated
+-- shapes reject identically: an EXISTS and an IN, each correlated on the ungrouped
+-- `wg.b`. (HAVING's own bare-column rejection never sees these — its check does not
+-- descend into a subquery.)
+select a, count(*) as c from wg group by a having exists (select 1 from wg t where t.a = wg.b);
+-- error: Column 'wg.b' must appear in the GROUP BY clause or be used in an aggregate function
+
+select a from wg group by a having a in (select t.a from wg t where t.b = wg.b);
+-- error: Column 'wg.b' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- Control: the same two shapes correlated on the GROUPING KEY are redirected and run.
+select a, count(*) as c from wg group by a having exists (select 1 from wg t where t.a = wg.a) order by wg.a;
+→ [{"a":"x","c":2},{"a":"y","c":1}]
+
+select a from wg group by a having a in (select t.a from wg t where t.a = wg.a) order by wg.a;
+→ [{"a":"x"},{"a":"y"}]
 
 -- NOTE: the correlated SCALAR-AGGREGATE spelling of the case above
 -- (`(select count(*) from wg t where t.a = wg.a)`) now plans and runs under a window
