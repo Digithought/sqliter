@@ -248,47 +248,36 @@ export class WindowNode extends PlanNode implements UnaryRelationalNode {
 	computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
 		const sourcePhysical = childrenPhysical[0];
 
-		// Window emit order is determined by [PARTITION BY, ORDER BY]. BOTH the
-		// advertised `ordering` (the exact emit order) and `monotonicOn` (the
-		// stronger per-attribute claim) come out of the same four-case split, so
-		// they are derived together — they must never disagree about what
-		// `runtime/emit/window.ts` actually yields:
-		//   - streaming set: the runtime walks the source in source order and emits
-		//     in source order (`runStreaming`) — windowing is row-pass-through. The
-		//     source's ordering AND monotonicOn both survive unchanged.
-		//   - PARTITION BY non-empty (buffered): the runtime groups rows by partition
-		//     key in insertion order then sorts within each partition
-		//     (`groupByPartitions` → `processPartition`), so neither the source's
-		//     ordering nor a single-attribute monotonicOn survives at the relation
-		//     level — advertise neither.
-		//   - PARTITION BY empty, ORDER BY present (buffered): output is sorted by
-		//     the window's ORDER BY (`sortRows`) — derive the ordering from those
-		//     keys and monotonicOn from the leading key (both mirror SortNode).
-		//   - PARTITION BY empty, ORDER BY empty (buffered): `sortRows` returns the
-		//     rows unchanged, so they pass through in source order; preserve the
-		//     source's ordering and monotonicOn unchanged.
-		// `extractOrderingFromSortKeys` reports column indices as positions in the
-		// SOURCE row. The window only APPENDS columns, so those are the same
-		// positions in the window's output row and need no shifting.
+		// `ordering` (the exact emit order) and `monotonicOn` (the stronger
+		// per-attribute claim) come out of ONE split over [streaming, PARTITION BY,
+		// ORDER BY], so they cannot drift apart from each other or from what
+		// `runtime/emit/window.ts` yields. The four cases and the emitter function
+		// behind each are tabulated in docs/window-functions.md § "What the
+		// WindowNode advertises as its emit order".
+		// Column indices from `extractOrderingFromSortKeys` are positions in the
+		// SOURCE row; the window only APPENDS columns, so they need no shifting.
 		// NOTE: like SortNode, the derived `ordering` carries no NULLS FIRST/LAST
-		// information — `Ordering` is `{ column, desc }` only. Harmless while every
-		// ordering consumer uses one null convention; if a consumer (merge join,
-		// sort elision) is ever taught to honour an explicit `nulls` on a sort key,
-		// both this derivation and SortNode's must start withholding the ordering
-		// when `windowSpec.orderBy[i].nulls` contradicts that convention.
+		// information — it is `{ column, desc }` only. Harmless while every ordering
+		// consumer is null-placement-blind (merge join skips NULL keys wherever they
+		// land); if one is ever taught to honour an explicit `nulls`, this derivation
+		// and SortNode's must both withhold the ordering when `windowSpec.orderBy[i]
+		// .nulls` contradicts that consumer's convention.
 		// TODO: the partitioned case can be tightened (e.g. when the partition keys
 		// themselves are functionally determined by the candidate attribute) — out
 		// of scope for the carrier ticket.
 		let ordering: { column: number; desc: boolean }[] | undefined;
 		let monotonicOn: readonly MonotonicOnInfo[] | undefined;
 		if (this.streaming) {
+			// Row pass-through: emitted in source order.
 			ordering = sourcePhysical?.ordering;
 			monotonicOn = sourcePhysical?.monotonicOn;
 		} else if (this.partitionExpressions.length === 0) {
 			if (this.orderByExpressions.length === 0) {
+				// Buffered, but nothing to sort by — still source order.
 				ordering = sourcePhysical?.ordering;
 				monotonicOn = sourcePhysical?.monotonicOn;
 			} else {
+				// Sorted by the window's ORDER BY; the source's order is gone.
 				const sourceAttrs = this.source.getAttributes();
 				ordering = extractOrderingFromSortKeys(this.windowSortKeys(), sourceAttrs);
 
@@ -304,6 +293,8 @@ export class WindowNode extends PlanNode implements UnaryRelationalNode {
 				}
 			}
 		}
+		// Buffered with a PARTITION BY falls through: whole partitions emit in
+		// first-seen order, so neither claim survives and both stay undefined.
 
 		return {
 			// Window functions don't change the row count — relay the PHYSICAL one.

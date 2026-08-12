@@ -23,20 +23,33 @@ describe('Window ordering advertisement', () => {
 		await db.close();
 	});
 
-	/** Physical properties of every `Window` node in the optimized plan for `sql`. */
-	async function windowPhysical(sql: string): Promise<Record<string, unknown>[]> {
-		const rows: Record<string, unknown>[] = [];
-		for await (const r of db.eval("select physical from query_plan(?) where node_type = 'Window'", [sql])) {
-			const physical = (r as { physical?: string | null }).physical ?? null;
-			rows.push(physical ? JSON.parse(physical) as Record<string, unknown> : {});
+	interface PlanRow { id: number; parentId: number | null; nodeType: string; ordering?: OrderingEntry[] }
+
+	/** Every node of the optimized plan for `sql`, with its advertised ordering. */
+	async function planNodes(sql: string): Promise<PlanRow[]> {
+		const rows: PlanRow[] = [];
+		for await (const r of db.eval("select id, parent_id, node_type, physical from query_plan(?)", [sql])) {
+			const raw = r as { id: number; parent_id: number | null; node_type: string; physical?: string | null };
+			const physical = raw.physical ? JSON.parse(raw.physical) as { ordering?: OrderingEntry[] } : {};
+			rows.push({ id: raw.id, parentId: raw.parent_id, nodeType: raw.node_type, ordering: physical.ordering });
 		}
 		return rows;
 	}
 
-	async function soleWindowOrdering(sql: string): Promise<OrderingEntry[] | undefined> {
-		const windows = await windowPhysical(sql);
+	/** The plan's `Window` nodes, innermost first (a stacked window is the parent of its input). */
+	async function windowNodes(sql: string): Promise<PlanRow[]> {
+		const nodes = await planNodes(sql);
+		return nodes.filter(n => n.nodeType === 'Window').reverse();
+	}
+
+	async function soleWindow(sql: string): Promise<PlanRow> {
+		const windows = await windowNodes(sql);
 		expect(windows.length, 'expected exactly one Window node in the plan').to.equal(1);
-		return windows[0].ordering as OrderingEntry[] | undefined;
+		return windows[0];
+	}
+
+	async function soleWindowOrdering(sql: string): Promise<OrderingEntry[] | undefined> {
+		return (await soleWindow(sql)).ordering;
 	}
 
 	it('advertises a DESC ordering for a desc-ordered unpartitioned window', async () => {
@@ -86,20 +99,40 @@ describe('Window ordering advertisement', () => {
 		// No PARTITION BY and no ORDER BY: `sortRows` returns the rows unchanged,
 		// so whatever the source advertised still holds.
 		const sql = 'select k, g, count(*) over () as c from wo';
-		const sourceOrderings: OrderingEntry[][] = [];
-		for await (const r of db.eval(
-			"select node_type, physical from query_plan(?) where physical is not null", [sql])) {
-			const row = r as { node_type: string; physical: string };
-			if (row.node_type === 'Window') continue;
-			const parsed = JSON.parse(row.physical) as { ordering?: OrderingEntry[] };
-			if (parsed.ordering) sourceOrderings.push(parsed.ordering);
-		}
-		const ordering = await soleWindowOrdering(sql);
-		if (sourceOrderings.length === 0) {
-			// Nothing below advertised an ordering; the window must not invent one.
-			expect(ordering).to.equal(undefined);
-		} else {
-			expect(ordering).to.deep.equal(sourceOrderings[0]);
-		}
+		const nodes = await planNodes(sql);
+		const windows = nodes.filter(n => n.nodeType === 'Window');
+		expect(windows.length, 'expected exactly one Window node in the plan').to.equal(1);
+
+		// `getChildren()` puts the relational source first, so the window's
+		// lowest-id child is the node whose order is being passed through.
+		const source = nodes.filter(n => n.parentId === windows[0].id)
+			.sort((a, b) => a.id - b.id)[0];
+		expect(source, 'window has no child in the plan').to.not.equal(undefined);
+		// The scan walks the primary key, so there IS an ordering to relay — if this
+		// ever goes undefined the assertion below stops proving anything.
+		expect(source.ordering, `${source.nodeType} advertised no ordering to pass through`)
+			.to.deep.equal([{ column: 0, desc: false }]);
+		expect(windows[0].ordering).to.deep.equal(source.ordering);
+	});
+
+	it('feeds a truthful ordering to a window stacked on another window', async () => {
+		// The inner window sorts desc; the outer one neither partitions nor orders,
+		// so it relays what the inner actually emits — a DESC order, not the scan's
+		// ascending k. Column indices differ between the two: the projection in
+		// between renumbers them, so compare each window against its own child.
+		const sql = 'select k, v, rn, count(*) over () as c from ' +
+			'(select k, v, row_number() over (order by v desc) as rn from wo)';
+		const nodes = await planNodes(sql);
+		const windows = nodes.filter(n => n.nodeType === 'Window').reverse();
+		expect(windows.length, 'expected two Window nodes in the plan').to.equal(2);
+
+		// Inner: `v` is source column index 2 (k, g, v), sorted descending.
+		expect(windows[0].ordering, 'inner window').to.deep.equal([{ column: 2, desc: true }]);
+
+		const outerSource = nodes.filter(n => n.parentId === windows[1].id)
+			.sort((a, b) => a.id - b.id)[0];
+		expect(windows[1].ordering, 'outer window').to.deep.equal(outerSource.ordering);
+		expect(windows[1].ordering?.[0].desc, 'the inner desc order must reach the outer window')
+			.to.equal(true);
 	});
 });

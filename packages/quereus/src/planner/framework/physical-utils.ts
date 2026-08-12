@@ -20,6 +20,12 @@ export interface Ordering {
 /**
  * Extract ordering from sort keys if they are trivial column references
  * Returns undefined if any sort key is not a simple column reference
+ *
+ * NOTE: all-or-nothing. `order by a, b * 2` yields nothing, though the leading
+ * `a` prefix alone would be a sound (weaker) claim that merge join and the
+ * ordering-prefix rules could still use. Cheap to relax — return the prefix
+ * collected before the first non-column key — if a plan ever needs an ordering
+ * above a computed secondary sort key.
  */
 export function extractOrderingFromSortKeys(
 	sortKeys: readonly { expression: ScalarPlanNode; direction: 'asc' | 'desc' }[],
