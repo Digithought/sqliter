@@ -1224,7 +1224,216 @@ select n, row_number() over (order by (select count(*) from r z), n) as rn
 from r group by n order by rn;
 → [{"n":1,"rn":1},{"n":2,"rn":2},{"n":3,"rn":3}]
 
+-- =============================================================================
+-- The SELECT LIST of a grouped query names a grouping key.
+--
+-- Same claim as the window-specification cases above, one clause over: a
+-- select-list reference to a grouping key must resolve to the AggregateNode's own
+-- group output column, whatever spelling it used. The aggregate output scope only
+-- holds a grouping key under the names the query literally wrote, so a qualifier
+-- the GROUP BY did not use, a FROM-alias qualifier, or a key nested inside a
+-- bigger expression all fall through to a BASE-TABLE attribute the grouped row
+-- does not carry. `buildFinalAggregateProjections` now runs the same
+-- `redirectToGroupKeys` rewrite the window phase does
+-- (bug-qualified-group-key-in-select-list-breaks-window-query).
+--
+-- Each windowed case below is paired with its NON-window twin. The twin answers
+-- correctly today only because `emit/aggregate.ts` publishes a representative
+-- source row of the group around each yield and the projection sits directly on
+-- that yield (docs/runtime.md § Corollary: a published source row reaches only the
+-- adjacent consumer) — the window function is simply the operator that buffers in
+-- between and exposes the mis-binding. Both spellings must bind the same way, so
+-- both are pinned.
+-- =============================================================================
+
+-- The reported shape: table-qualified select-list key, bare GROUP BY. The output
+-- column is named `a`, not `wg.a` — the alias comes from the written column name
+-- and the redirect must not change it.
+select wg.a, row_number() over (order by a) as rn from wg group by a order by rn;
+→ [{"a":"x","rn":1},{"a":"y","rn":2}]
+
+select wg.a, count(*) as c from wg group by a order by a;
+→ [{"a":"x","c":2},{"a":"y","c":1}]
+
+-- Qualified through a FROM ALIAS rather than the table name. Attribute ids are
+-- minted per relation instance, so `w.a` and `wg.a` and bare `a` all land on the
+-- same base attribute and the match is qualifier-independent.
+select w.a, row_number() over (order by a) as rn from wg w group by a order by rn;
+→ [{"a":"x","rn":1},{"a":"y","rn":2}]
+
+select w.a, count(*) as c from wg w group by a order by a;
+→ [{"a":"x","c":2},{"a":"y","c":1}]
+
+-- With an explicit alias, which the redirect leaves alone.
+select wg.a as k, row_number() over (order by a) as rn from wg group by a order by rn;
+→ [{"k":"x","rn":1},{"k":"y","rn":2}]
+
+-- Alongside an aggregate, with the window ordered by that aggregate's alias.
+select wg.a, count(*) as c, row_number() over (order by c) as rn from wg group by a order by rn;
+→ [{"a":"y","c":1,"rn":1},{"a":"x","c":2,"rn":2}]
+
+-- Window specification qualified as well, so both redirects run on one query.
+select wg.a, row_number() over (order by wg.a) as rn from wg group by a order by rn;
+→ [{"a":"x","rn":1},{"a":"y","rn":2}]
+
+-- A qualified grouping key NESTED inside a larger select-list expression: the walk
+-- recurses, so only the `wg.a` reference is rewritten.
+select upper(wg.a) as k, row_number() over (order by a) as rn from wg group by a order by rn;
+→ [{"k":"X","rn":1},{"k":"Y","rn":2}]
+
+select upper(wg.a) as k from wg group by a order by k;
+→ [{"k":"X"},{"k":"Y"}]
+
+-- A COMPUTED grouping key nested inside a larger select-list expression. The
+-- whole-expression fingerprint fast path cannot see this one (`upper(a || '!')` is
+-- not the key `a || '!'`); the redirect matches the inner subtree instead.
+select upper(a || '!') as k, row_number() over (order by a || '!') as rn from wg group by a || '!' order by rn;
+→ [{"k":"X!","rn":1},{"k":"Y!","rn":2}]
+
+select upper(a || '!') as k from wg group by a || '!' order by k;
+→ [{"k":"X!"},{"k":"Y!"}]
+
+-- A qualified key inside an ordinary binary expression.
+select wg.a || '?' as k, row_number() over (order by a) as rn from wg group by a order by rn;
+→ [{"k":"x?","rn":1},{"k":"y?","rn":2}]
+
+select wg.a || '?' as k from wg group by a order by k;
+→ [{"k":"x?"},{"k":"y?"}]
+
+-- NON-WINDOW REGRESSIONS. These all worked before the select-list redirect existed
+-- and must return exactly the same rows with it in place.
+
+-- Bare key — already bound to the group column through the aggregate output scope.
+select a, count(*) as c from wg group by a order by a;
+→ [{"a":"x","c":2},{"a":"y","c":1}]
+
+-- Whole-expression fingerprint fast path, which runs BEFORE the redirect and is
+-- left untouched by it.
+select a || '!' as k, count(*) as c from wg group by a || '!' order by k;
+→ [{"k":"x!","c":2},{"k":"y!","c":1}]
+
+-- The `SELECT *` arm emits group-column references of its own and is untouched.
+select * from wg group by a, b order by a, b;
+→ [{"a":"x","b":"1"},{"a":"x","b":"3"},{"a":"y","b":"2"}]
+
+select *, row_number() over (order by a, b) as rn from wg group by a, b order by rn;
+→ [{"a":"x","b":"1","rn":1},{"a":"x","b":"3","rn":2},{"a":"y","b":"2","rn":3}]
+
+-- A GROUP BY ORDINAL is expanded to the select-list expression before the keys are
+-- indexed, so the redirect sees an ordinary bare key.
+select a, count(*) as c from wg group by 1 order by a;
+→ [{"a":"x","c":2},{"a":"y","c":1}]
+
+select a, count(*) as c, row_number() over (order by a) as rn from wg group by 1 order by rn;
+→ [{"a":"x","c":2,"rn":1},{"a":"y","c":1,"rn":2}]
+
+-- TWO projections onto the SAME grouping key. Both now carry the same input
+-- attribute id; the duplicate output name is disambiguated as `a:1`, exactly as a
+-- bare `select a, a` already was.
+select wg.a, a from wg group by a order by 1;
+→ [{"a":"x","a:1":"x"},{"a":"y","a:1":"y"}]
+
+select wg.a, a, row_number() over (order by a) as rn from wg group by a order by rn;
+→ [{"a":"x","a:1":"x","rn":1},{"a":"y","a:1":"y","rn":2}]
+
+-- HAVING resolves through its own hybrid scope and is not part of this rewrite;
+-- this pins that the two do not interact.
+select wg.a, count(*) as c, row_number() over (order by a) as rn from wg group by a having count(*) > 1;
+→ [{"a":"x","c":2,"rn":1}]
+
+-- An UNGROUPED select-list column is still rejected at plan time, with the same
+-- message and the same wording, window function or not. `validateAggregateProjections`
+-- runs on the pre-aggregate projections and never sees the redirect.
+select wg.b, row_number() over (order by a) as rn from wg group by a;
+-- error: Column 'wg.b' must appear in the GROUP BY clause or be used in an aggregate function
+
+select wg.b from wg group by a;
+-- error: Column 'wg.b' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- A SUBQUERY in the select list whose text spells the grouping key but resolves to
+-- its OWN column keeps the inner meaning: inside a subquery the fingerprint rule is
+-- guarded by "does this subtree read only pre-grouping columns of THIS query", and
+-- `t.a` is the subquery's. So the predicate is the tautology `t.a = t.a` and every
+-- group counts all 3 rows.
+select a, (select count(*) from wg t where t.a = a) as c from wg group by a order by a;
+→ [{"a":"x","c":3},{"a":"y","c":3}]
+
+select a, (select count(*) from wg t where t.a = a) as c, row_number() over (order by a) as rn from wg group by a order by a;
+→ [{"a":"x","c":3,"rn":1},{"a":"y","c":3,"rn":2}]
+
+-- A genuinely CORRELATED select-list subquery naming the grouping key is redirected
+-- through the subquery, by attribute id, at any depth — it used to die with an
+-- internal "No row context found for column a".
+select a, (select count(*) from wg t where t.a = wg.a) as c from wg group by a order by a;
+→ [{"a":"x","c":2},{"a":"y","c":1}]
+
+select a, (select t.b from wg t where t.a = wg.a and t.b = '1') as c, row_number() over (order by a) as rn
+from wg group by a order by rn;
+→ [{"a":"x","c":"1","rn":1},{"a":"y","c":null,"rn":2}]
+
+-- NOTE: the correlated SCALAR-AGGREGATE spelling of the case above
+-- (`(select count(*) from wg t where t.a = wg.a)`) now plans and runs under a window
+-- function too, but its window column comes back wrong — `rule-scalar-agg-decorrelation`
+-- puts a join above the WindowNode and the window result is addressed positionally.
+-- That is a separate, pre-existing defect (it reproduces with a bare grouping key and
+-- with this redirect reverted); tracked as
+-- fix/bug-window-column-read-by-position-hits-wrong-row. Pin it there, not here.
+
+-- Composition: the fixed shape as a subquery source, inside a CTE, and as a
+-- `union all` arm.
+select * from (select wg.a, row_number() over (order by a) as rn from wg group by a) z order by rn;
+→ [{"a":"x","rn":1},{"a":"y","rn":2}]
+
+with q as (select wg.a, row_number() over (order by a) as rn from wg group by a)
+select * from q where rn > 1;
+→ [{"a":"y","rn":2}]
+
+select wg.a as k, row_number() over (order by a) as rn from wg group by a
+union all select b, 9 from wg order by k, rn;
+→ [{"k":"1","rn":9},{"k":"2","rn":9},{"k":"3","rn":9},{"k":"x","rn":1},{"k":"y","rn":2}]
+
+-- An EMPTY grouped, windowed query: no group ever yields, so no representative
+-- source row is ever published. Exercises the path with the fallback absent.
+delete from wg;
+select wg.a, row_number() over (order by a) as rn from wg group by a;
+→ []
+
 drop table wg;
+
+-- A NULL grouping key forms one group of its own and must appear exactly once.
+create table wn (id integer primary key, a text null);
+insert into wn values (1,'x'),(2,null),(3,'x');
+
+select wn.a, row_number() over (order by a) as rn from wn group by a order by rn;
+→ [{"a":null,"rn":1},{"a":"x","rn":2}]
+
+select wn.a, count(*) as c from wn group by a order by c;
+→ [{"a":null,"c":1},{"a":"x","c":2}]
+
+drop table wn;
+
+-- Two grouping keys sharing a bare name across a join. Their QUALIFIED names are
+-- registered by the aggregate output scope, so those references resolve there and
+-- never reach the redirect; the bare name stays ambiguous. Pinned windowed and
+-- unwindowed so the redirect is proved not to have disturbed the ambiguity.
+create table ji (id text, v text);
+create table jc (id text, w text);
+insert into ji values ('k1','a'),('k2','b');
+insert into jc values ('k1','p'),('k2','q');
+
+select i.id, c.id, row_number() over (order by i.id) as rn
+from ji i join jc c on i.id = c.id group by i.id, c.id order by rn;
+→ [{"id":"k1","id:1":"k1","rn":1},{"id":"k2","id:1":"k2","rn":2}]
+
+select i.id, c.id from ji i join jc c on i.id = c.id group by i.id, c.id order by 1;
+→ [{"id":"k1","id:1":"k1"},{"id":"k2","id:1":"k2"}]
+
+select id, row_number() over (order by i.id) as rn
+from ji i join jc c on i.id = c.id group by i.id, c.id;
+-- error: ambiguous column name: id
+
+drop table ji;
+drop table jc;
 
 -- =============================================================================
 -- `*` in a window query.

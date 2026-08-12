@@ -37,7 +37,7 @@ export function isEquiCorrelation(
  *
  * `shouldDescend`, when supplied, prunes the walk: a child it rejects contributes
  * neither its own attributes nor its subtree's. Callers use it to stop at a subtree
- * whose attributes their query could never name — see `buildGroupedWindowContext`
+ * whose attributes their query could never name — see `buildGroupedRedirectContext`
  * (planner/building/select-aggregates.ts) and CTE definitions.
  */
 export function collectDefinedAttrIds(

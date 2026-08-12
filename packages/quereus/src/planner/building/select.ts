@@ -37,7 +37,7 @@ import { buildWithContext, enterStoredBodyEnv } from './select-context.js';
 import { storedBodyContext } from '../stored-body-context.js';
 import { buildCompoundSelect } from './select-compound.js';
 import { analyzeSelectColumns, buildStarProjections } from './select-projections.js';
-import { buildAggregatePhase, buildFinalAggregateProjections, buildGroupedWindowContext, type GroupedWindowContext } from './select-aggregates.js';
+import { buildAggregatePhase, buildFinalAggregateProjections, buildGroupedRedirectContext, type GroupedRedirectContext } from './select-aggregates.js';
 import { buildWindowPhase } from './select-window.js';
 import { buildFinalProjections, applyDistinct, applyOrderBy, applyLimitOffset, createProjectionOutputScope } from './select-modifiers.js';
 import { SortNode, type SortKey } from '../nodes/sort.js';
@@ -194,10 +194,10 @@ export function buildSelectStmt(
 	// Set when the query is BOTH grouped and windowed: the grouped select-list
 	// projection list, to be projected above the window phase's WindowNode.
 	let windowSelectProjections: Projection[] | undefined;
-	// Also set only for a grouped, windowed query: what the aggregate's rows carry,
-	// so the window phase can redirect a window specification onto them and reject
-	// one that reads anything else.
-	let windowGroupedContext: GroupedWindowContext | undefined;
+	// Set for every GROUPED query: what the aggregate's rows carry, so the select-list
+	// rebuild and (when present) the window phase can redirect a grouping-key reference
+	// onto them — and so the window phase can reject one that reads anything else.
+	let groupedRedirectContext: GroupedRedirectContext | undefined;
 	// The node whose output attributes ARE this SELECT's result columns, once one
 	// exists. A positional ORDER BY binds to its Nth attribute (see applyOrderBy).
 	let orderByOutputRelation: RelationalPlanNode | undefined;
@@ -242,23 +242,26 @@ export function buildSelectStmt(
 			orderByAppliedEarly = true;
 		}
 
-		// A grouped, windowed query's window specifications and function arguments are
-		// built against the aggregate-output scope but fall through to the pre-aggregate
-		// select scope for anything the aggregate does not carry. Some of what falls
-		// through is a legal grouping key under another spelling and some is a genuinely
-		// ungrouped column, so hand the window phase both halves: the maps that redirect
-		// the former onto the aggregate's own output columns, and the strict coverage
-		// test that rejects the latter at plan time. The aggregate's source relation goes
-		// along so both halves can tell which references belong to THIS query — a window
-		// specification may contain a subquery, whose own columns and whose correlated
-		// references to an enclosing query are neither redirected nor rejected.
+		// A grouped query's post-aggregate expressions — the rebuilt SELECT list, and a
+		// window query's specifications and function arguments — are built against the
+		// aggregate-output scope but fall through to the pre-aggregate select scope for
+		// anything the aggregate does not carry. Some of what falls through is a legal
+		// grouping key under another spelling and some is a genuinely ungrouped column,
+		// so build both halves once: the maps that redirect the former onto the
+		// aggregate's own output columns, and the strict coverage test that rejects the
+		// latter at plan time (the window phase's, only). The aggregate's source relation
+		// goes along so both halves can tell which references belong to THIS query — a
+		// post-aggregate expression may contain a subquery, whose own columns and whose
+		// correlated references to an enclosing query are neither redirected nor rejected.
+		//
+		// One context per prepare, shared by both consumers. An aggregate query with no
+		// GROUP BY has no grouping keys to redirect onto and gets none.
 		if (
-			hasWindowFunctions &&
 			aggregateResult.aggregateNode &&
 			aggregateResult.groupByExpressions &&
 			aggregateResult.groupByExpressions.length > 0
 		) {
-			windowGroupedContext = buildGroupedWindowContext(
+			groupedRedirectContext = buildGroupedRedirectContext(
 				aggregateResult.groupByExpressions,
 				aggregateResult.aggregateNode.getAttributes(),
 				aggregateResult.aggregateNode.getRelations()[0],
@@ -277,7 +280,8 @@ export function buildSelectStmt(
 				aggregateResult.aggregateNode,
 				aggregates,
 				aggregateResult.groupByExpressions,
-				starProjectionsByColumn
+				starProjectionsByColumn,
+				groupedRedirectContext
 			);
 			if (hasWindowFunctions) {
 				// Hand the grouped select list to the window phase instead of projecting it
@@ -337,7 +341,7 @@ export function buildSelectStmt(
 			}
 		}
 
-		input = buildWindowPhase(input, windowFunctions, selectContext, windowSelectProjections ?? projections, windowGroupedContext);
+		input = buildWindowPhase(input, windowFunctions, selectContext, windowSelectProjections ?? projections, groupedRedirectContext);
 		// The window phase ends in a ProjectNode over the SELECT list, so that node's
 		// attributes are this query's result columns.
 		orderByOutputRelation = input;

@@ -433,6 +433,30 @@ context-shadow test mode. The mirror **child-shadows-operator** direction is
 deliberately *not* checked: recency cannot distinguish a forgotten `reactivate()`
 from a correct newest write.
 
+##### Corollary: a published source row reaches only the adjacent consumer
+
+Tear-down-before-pull bounds *how long* such a context lives, and therefore **who can
+see it**: only an operator that consumes the yield directly. `emit/aggregate.ts`
+publishes a representative source row of the current group — `groupSourceRowDescriptor`
+/ `scanRowDescriptor` set to the group's `previousGroupSourceRow` /
+`currentSourceRow` — immediately around each `yield`, and tears it down in the `finally`
+right after. A `Project` sitting straight on the aggregate can still resolve base-table
+attribute ids through it. Put *any* buffering operator in between and it cannot:
+`emit/window.ts`'s buffered path does `for await (const row of source)
+allRows.push(row)`, draining the aggregate to completion before it yields anything, by
+which point every representative-row context is long gone.
+
+**So plan-time binding must never depend on it.** A grouped query's select list that
+binds a grouping key to a *base-table* attribute happens to read the right value off the
+representative row when the projection is adjacent to the aggregate — the group key's
+value on any row of the group is by definition the group key — but it is right by
+accident, and it dies with `No row context found for column <name>` the moment a
+WindowNode lands in between. `buildFinalAggregateProjections`
+(`planner/building/select-aggregates.ts`) therefore redirects such a reference onto the
+AggregateNode's own group output column at build time, for every grouped query rather
+than only the windowed ones. The same rule applies to any future operator that wants to
+read a grouped query's pre-grouping columns: bind to what the row actually carries.
+
 ### Filter conjunct early exit
 
 `emitFilter` (`runtime/emit/filter.ts`) splits a conjunctive predicate into its

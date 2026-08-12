@@ -287,21 +287,24 @@ export function assertGroupByCoverage(node: PlanNode, coverage: GroupByCoverage)
 }
 
 /**
- * What the window phase of a GROUPED query needs in order to run its window
- * specifications and function arguments over the AggregateNode's own rows.
+ * What a GROUPED query's two post-aggregate builders need in order to run their
+ * expressions over the AggregateNode's own rows: the SELECT-list rebuild
+ * ({@link buildFinalAggregateProjections}) and the window phase's specifications and
+ * function arguments.
  *
- * The WindowNode sits ABOVE the AggregateNode, so it can read only what the
- * aggregate's output row carries: the grouping keys and the aggregate results.
- * But the scope those expressions are built against falls through to the
- * pre-aggregate select scope, so several perfectly legal spellings of a grouping
- * key (`wg.a` against `group by a`, or the whole `a || '!'` against `group by a
- * || '!'`) bind to a *base-table* attribute the aggregate row never had. This
- * context supplies both halves of the answer: the two maps let
- * {@link redirectToGroupKeys} rewrite such a subtree onto the aggregate's own
+ * Both sit ABOVE the AggregateNode, so both can read only what the aggregate's output
+ * row carries: the grouping keys and the aggregate results. But the scope those
+ * expressions are built against falls through to the pre-aggregate select scope, so
+ * several perfectly legal spellings of a grouping key (`wg.a` against `group by a`, or
+ * the whole `a || '!'` against `group by a || '!'`) bind to a *base-table* attribute
+ * the aggregate row never had. This context supplies both halves of the answer: the two
+ * maps let {@link redirectToGroupKeys} rewrite such a subtree onto the aggregate's own
  * output column, and the two attribute-id sets let
- * {@link assertGroupedWindowCoverage} reject what survives.
+ * {@link assertGroupedWindowCoverage} reject what survives (window phase only — the
+ * SELECT list has already been checked, against the pre-aggregate projections, by
+ * {@link validateAggregateProjections}).
  */
-export interface GroupedWindowContext {
+export interface GroupedRedirectContext {
 	/** Where each GROUP BY key lives on the AggregateNode's output row. */
 	readonly groupKeys: GroupKeyIndex;
 	/** AggregateNode output attributes: group keys in GROUP BY order, then aggregate results. */
@@ -367,17 +370,17 @@ export function indexGroupKeys(groupByExpressions: readonly ScalarPlanNode[]): G
 }
 
 /**
- * Builds the {@link GroupedWindowContext} for a grouped, windowed query.
+ * Builds the {@link GroupedRedirectContext} for a grouped query.
  * `outputAttributes` is the AggregateNode's attribute list (group keys in GROUP BY
  * order, then the aggregate results); `aggregateInput` is the AggregateNode's
  * source relation, whose whole subtree defines
- * {@link GroupedWindowContext.aggregateInputAttrIds}.
+ * {@link GroupedRedirectContext.aggregateInputAttrIds}.
  */
-export function buildGroupedWindowContext(
+export function buildGroupedRedirectContext(
 	groupByExpressions: readonly ScalarPlanNode[],
 	outputAttributes: readonly Attribute[],
 	aggregateInput: PlanNode,
-): GroupedWindowContext {
+): GroupedRedirectContext {
 	return {
 		groupKeys: indexGroupKeys(groupByExpressions),
 		outputAttributes,
@@ -456,7 +459,7 @@ function isCteDefinition(node: PlanNode): boolean {
  */
 export function redirectToGroupKeys(
 	node: ScalarPlanNode,
-	context: GroupedWindowContext,
+	context: GroupedRedirectContext,
 	scope: Scope,
 ): ScalarPlanNode {
 	return redirectNode(node, context, scope) as ScalarPlanNode;
@@ -478,7 +481,7 @@ export function redirectToGroupKeys(
  */
 function redirectNode(
 	node: PlanNode,
-	context: GroupedWindowContext,
+	context: GroupedRedirectContext,
 	scope: Scope,
 	insideSubquery = false,
 ): PlanNode {
@@ -520,7 +523,7 @@ function redirectNode(
  * query rather than to a subquery inside it or to an enclosing query. A subtree with
  * no column references at all (a constant) trivially qualifies.
  */
-function readsOnlyAggregateInput(node: PlanNode, context: GroupedWindowContext): boolean {
+function readsOnlyAggregateInput(node: PlanNode, context: GroupedRedirectContext): boolean {
 	if (CapabilityDetectors.isColumnReference(node)) {
 		return context.aggregateInputAttrIds.has((node as ColumnReferenceNode).attributeId);
 	}
@@ -547,7 +550,7 @@ function readsOnlyAggregateInput(node: PlanNode, context: GroupedWindowContext):
  * The aggregate exemption is likewise narrowed to this query's OWN aggregates; see
  * {@link findUngroupedWindowColumnRef}.
  */
-export function assertGroupedWindowCoverage(node: PlanNode, context: GroupedWindowContext): void {
+export function assertGroupedWindowCoverage(node: PlanNode, context: GroupedRedirectContext): void {
 	const ungrouped = findUngroupedWindowColumnRef(node, context);
 	if (!ungrouped) return;
 	throw new QuereusError(
@@ -572,7 +575,7 @@ export function assertGroupedWindowCoverage(node: PlanNode, context: GroupedWind
  */
 function findUngroupedWindowColumnRef(
 	node: PlanNode,
-	context: GroupedWindowContext,
+	context: GroupedRedirectContext,
 	insideSubquery = false,
 ): ColumnReferenceNode | null {
 	if (!insideSubquery && CapabilityDetectors.isAggregateFunction(node)) {
@@ -632,6 +635,18 @@ function validateAggregateProjections(
  * subtree (inner column refs are aggregated), a relational subtree (subqueries
  * resolve their own scope), or any subtree whose AST fingerprint matches a GROUP BY
  * expression (the whole subtree is grouped, e.g. SELECT id+1 ... GROUP BY id+1).
+ *
+ * NOTE: not descending into relational children means a correlated subquery in a
+ * grouped SELECT list that reads a genuinely UNGROUPED column of this query
+ * (`select a, (select count(*) from wg t where t.b = wg.b) … group by a`) is not
+ * rejected here. It resolves through the group's representative source row instead
+ * (docs/runtime.md § Invariant: source-attr contexts and child pulls), and with a
+ * buffering operator such as a WindowNode in between it dies at run time with "No row
+ * context found for column b". Invalid SQL either way and loud in both shapes, so it
+ * is left alone. Rejecting it at plan time means a subquery-aware walk that can tell a
+ * correlated reference to THIS query from the subquery's own columns — which is what
+ * {@link findUngroupedWindowColumnRef} already does for the window phase, off
+ * {@link GroupedRedirectContext}; the two checks would merge.
  */
 function findUngroupedColumnRef(
 	node: PlanNode,
@@ -1305,7 +1320,13 @@ function dedupeNewAggregates(
 }
 
 /**
- * Builds final projections for the complete SELECT list in aggregate context
+ * Builds final projections for the complete SELECT list in aggregate context.
+ *
+ * `groupedContext` is supplied whenever the query HAS a GROUP BY (it is `undefined`
+ * for an aggregate query without one, which has no grouping keys to redirect onto).
+ * It is what makes a select-list reference to a grouping key name the AggregateNode's
+ * OWN group output column, whatever spelling the reference used — see
+ * {@link redirectToGroupKeys} and the note on the rebuild below.
  */
 export function buildFinalAggregateProjections(
 	stmt: AST.SelectStmt,
@@ -1314,7 +1335,8 @@ export function buildFinalAggregateProjections(
 	aggregateNode: RelationalPlanNode,
 	aggregates: { expression: ScalarPlanNode; alias: string }[],
 	groupByExpressions: ScalarPlanNode[],
-	starProjectionsByColumn: ReadonlyMap<AST.ResultColumn, readonly Projection[]> = new Map()
+	starProjectionsByColumn: ReadonlyMap<AST.ResultColumn, readonly Projection[]> = new Map(),
+	groupedContext?: GroupedRedirectContext
 ): Projection[] {
 	const finalProjections: Projection[] = [];
 	const aggregateAttributes = aggregateNode.getAttributes();
@@ -1393,7 +1415,30 @@ export function buildFinalAggregateProjections(
 				scope: aggregateOutputScope,
 				aggregates: aggregatesContext
 			};
-			const scalarNode = buildExpression(finalContext, column.expr, true);
+			const builtNode = buildExpression(finalContext, column.expr, true);
+
+			// `aggregateOutputScope` holds a grouping key only under the names it was
+			// literally written with, so every other legal spelling — a qualifier the
+			// GROUP BY did not use (`select wg.a … group by a`), a FROM-alias qualifier
+			// (`w.a`), a key nested inside a bigger expression (`upper(wg.a)`,
+			// `upper(a || '!')`) — falls through to the pre-aggregate scope and binds to
+			// a BASE-TABLE attribute the AggregateNode's output row does not carry.
+			// Redirect each such subtree onto the aggregate's own group output column,
+			// exactly as the window phase does for a window specification.
+			//
+			// This runs for every grouped query, not only windowed ones. Reading such a
+			// reference off the group's representative source row happens to give the
+			// right answer when the operator consuming the aggregate's yield is this
+			// projection itself (see docs/runtime.md § Invariant: source-attr contexts and
+			// child pulls), but that context is gone the moment anything buffers in
+			// between — a WindowNode's buffered path drains its source before yielding,
+			// and the query dies with an internal "No row context found for column a".
+			// Binding to the aggregate's own column is correct in both shapes, and keeps
+			// one query shape from binding two different ways depending on an unrelated
+			// clause.
+			const scalarNode = groupedContext
+				? redirectToGroupKeys(builtNode, groupedContext, aggregateOutputScope)
+				: builtNode;
 
 			let attrId: number | undefined = undefined;
 			if (CapabilityDetectors.isColumnReference(scalarNode)) {

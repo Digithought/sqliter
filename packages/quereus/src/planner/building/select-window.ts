@@ -8,7 +8,7 @@ import { ProjectNode, type Projection } from '../nodes/project-node.js';
 import { ArrayIndexNode } from '../nodes/array-index-node.js';
 import { LiteralNode } from '../nodes/scalar.js';
 import { buildExpression } from './expression.js';
-import { assertGroupedWindowCoverage, collectAggregateFunctionExprs, redirectToGroupKeys, type GroupedWindowContext } from './select-aggregates.js';
+import { assertGroupedWindowCoverage, collectAggregateFunctionExprs, redirectToGroupKeys, type GroupedRedirectContext } from './select-aggregates.js';
 import { findMatchingAggregate } from './function-call.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
@@ -33,7 +33,7 @@ export function buildWindowPhase(
 	windowFunctions: { func: WindowFunctionCallNode; alias?: string }[],
 	selectContext: PlanningContext,
 	selectListProjections: readonly Projection[],
-	groupedWindowContext?: GroupedWindowContext
+	groupedWindowContext?: GroupedRedirectContext
 ): RelationalPlanNode {
 	if (windowFunctions.length === 0) {
 		return input;
