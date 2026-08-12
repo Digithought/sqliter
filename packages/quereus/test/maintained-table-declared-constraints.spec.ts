@@ -16,7 +16,12 @@ import { Database } from '../src/index.js';
  *    orphan fails the commit with the maintained-table attribution and rolls
  *    the whole transaction back);
  *  - cascade attribution: a two-level chain (base → mt1 → mt2) attributes a
- *    violation to the CONSUMER that declares the constraint, not the producer.
+ *    violation to the CONSUMER that declares the constraint, not the producer;
+ *  - constraint-dependency DDL invalidation: rename/drop/re-create of an FK
+ *    parent or subquery-CHECK target rebuilds the once-compiled validator. Two
+ *    arms of that rebuild are no longer reachable from SQL at all (the drop is
+ *    refused) and are driven through `SchemaManager.dropTable` directly — see
+ *    the comment on `subquery-CHECK target dropped out of band` below.
  */
 describe('Maintained-table declared-constraint validation', () => {
 	let db: Database;
@@ -64,19 +69,13 @@ describe('Maintained-table declared-constraint validation', () => {
 				create table mt (id integer primary key, v text not null) maintained as select id, v from src;
 			`);
 			let prepares = 0;
-			let deferred = 0;
+			let deferred: number;
 			const origPrepare = db.prepare.bind(db);
-			const origQueue = db._queueDeferredConstraintRow.bind(db);
 			db.prepare = ((sql: string) => { prepares++; return origPrepare(sql); }) as typeof db.prepare;
-			db._queueDeferredConstraintRow = ((...args: Parameters<typeof origQueue>) => {
-				deferred++;
-				return origQueue(...args);
-			}) as typeof db._queueDeferredConstraintRow;
 			try {
-				await db.exec(`insert into src values (1, 'a')`);
+				deferred = await withDeferredCount(() => db.exec(`insert into src values (1, 'a')`));
 			} finally {
 				db.prepare = origPrepare;
-				db._queueDeferredConstraintRow = origQueue;
 			}
 			expect(prepares, 'no validation prepare on the write path').to.equal(0);
 			expect(deferred, 'no deferred-constraint enqueue').to.equal(0);
@@ -88,17 +87,7 @@ describe('Maintained-table declared-constraint validation', () => {
 				create table src (id integer primary key, v text not null);
 				create materialized view mv1 as select id, v from src;
 			`);
-			let deferred = 0;
-			const origQueue = db._queueDeferredConstraintRow.bind(db);
-			db._queueDeferredConstraintRow = ((...args: Parameters<typeof origQueue>) => {
-				deferred++;
-				return origQueue(...args);
-			}) as typeof db._queueDeferredConstraintRow;
-			try {
-				await db.exec(`insert into src values (1, 'a')`);
-			} finally {
-				db._queueDeferredConstraintRow = origQueue;
-			}
+			const deferred = await withDeferredCount(() => db.exec(`insert into src values (1, 'a')`));
 			expect(deferred).to.equal(0);
 			expect(await readAll('select count(*) as n from mv1')).to.deep.equal([{ n: 1 }]);
 		});
@@ -111,17 +100,7 @@ describe('Maintained-table declared-constraint validation', () => {
 					maintained as select id, ref from src;
 				insert into parent values (1);
 			`);
-			let deferred = 0;
-			const origQueue = db._queueDeferredConstraintRow.bind(db);
-			db._queueDeferredConstraintRow = ((...args: Parameters<typeof origQueue>) => {
-				deferred++;
-				return origQueue(...args);
-			}) as typeof db._queueDeferredConstraintRow;
-			try {
-				await db.exec(`insert into src values (1, 1)`);
-			} finally {
-				db._queueDeferredConstraintRow = origQueue;
-			}
+			const deferred = await withDeferredCount(() => db.exec(`insert into src values (1, 1)`));
 			expect(deferred, 'one FK existence check queued for the one derived image').to.equal(1);
 		});
 	});
@@ -296,12 +275,20 @@ describe('Maintained-table declared-constraint validation', () => {
 		// The two recovery arms `rebuildConstraintValidatorsFor` carries for a dropped
 		// subquery-CHECK target — degrade to a poisoned validator, self-heal on re-create
 		// (folded into `self-heal on dependency re-create` below) — can no longer be driven
-		// from SQL: the drop above is refused. They are not dead code — internal drop paths
-		// (transaction rollback, catalog import on store reopen) still drop a table without
-		// going through the DROP emitter that carries the refusal (`assertNoExpressionDependsOn`
-		// is wired into the emitters only, never into `SchemaManager.dropTable` itself) — so
-		// this drives the same code path directly, bypassing the emitter exactly as those
-		// internal callers do.
+		// from SQL: the drop above is refused. They are not dead code. The refusal
+		// (`assertNoExpressionDependsOn`) is wired into the DROP emitters only, never into
+		// `SchemaManager.dropTable`, and two internal callers reach the manager directly:
+		// catalog import on store reopen drops a pre-existing colliding backing before
+		// re-materializing it under the same name (`SchemaManager.importMaterializedView`),
+		// and a half-built maintained table is dropped when its create/import fails partway
+		// (`materializeView`). Either can remove a table some OTHER maintained table's CHECK
+		// reads. So these tests drive the manager directly, bypassing the emitter exactly as
+		// those callers do — do not "fix" them back to `drop table`, which only re-tests the
+		// refusal and silently drops this coverage.
+		// NOTE: this rests on the refusal staying at the emitter layer. If
+		// `assertNoExpressionDependsOn` is ever moved into `SchemaManager.dropTable` itself,
+		// these two arms become genuinely unreachable — retire the arms and this block
+		// together rather than reaching past the guard to keep them green.
 		describe('subquery-CHECK target dropped out of band (poisoned validator)', () => {
 			beforeEach(async () => {
 				await db.exec(`
