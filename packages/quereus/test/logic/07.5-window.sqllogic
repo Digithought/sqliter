@@ -1355,22 +1355,165 @@ select wg.a, count(*) as c, row_number() over (order by a) as rn from wg group b
 select wg.a, count(*) as c, row_number() over (order by a) as rn from wg group by a having upper(wg.a) = 'X';
 → [{"a":"x","c":2,"rn":1}]
 
--- ORDER BY of a grouped, windowed query gets NO redirect either, and unlike HAVING it
--- sits ABOVE the window phase, so it carries exactly the defect this change removed
--- from the SELECT list. The spellings the projection output scope does hold — the bare
--- key, an output alias, an ordinal — resolve there and work; they are pinned here.
--- `order by wg.a` and `order by a || '!'` still die with "No row context found for
--- column a"; that is tracked as
--- fix/bug-order-by-grouping-key-spelling-breaks-window-query and is pinned there, not
--- here.
+-- =============================================================================
+-- The ORDER BY of a grouped query names a grouping key.
+--
+-- The same claim as the SELECT-list cases above, one clause over. A sort key spelled
+-- in a way the projection output scope does not publish — a qualifier the GROUP BY did
+-- not use, a FROM-alias qualifier, the key nested inside a bigger expression, a
+-- computed key written out again — falls through to a BASE-TABLE attribute the grouped
+-- row does not carry. `applyOrderBy` now runs the same `redirectToGroupKeys` rewrite,
+-- gated on "this key actually references a pre-grouping attribute"
+-- (bug-order-by-grouping-key-spelling-breaks-window-query).
+--
+-- Each windowed case is paired with its NON-window twin. The twin answered correctly
+-- before this fix only because its sort consumed the aggregate's yield through
+-- streaming operators, and `emit/aggregate.ts` publishes a representative source row of
+-- the group around each yield. A WindowNode drains its whole source before yielding, so
+-- by the time a sort above it runs every representative row is gone — which is what
+-- turned the mis-binding into "No row context found for column a".
+-- =============================================================================
+
+-- The reported shape: table-qualified sort key, bare GROUP BY, both directions.
+select a, row_number() over (order by a) as rn from wg group by a order by wg.a;
+→ [{"a":"x","rn":1},{"a":"y","rn":2}]
+
+select a, count(*) as c from wg group by a order by wg.a;
+→ [{"a":"x","c":2},{"a":"y","c":1}]
+
+select a, row_number() over (order by a) as rn from wg group by a order by wg.a desc;
+→ [{"a":"y","rn":2},{"a":"x","rn":1}]
+
+select a, count(*) as c from wg group by a order by wg.a desc;
+→ [{"a":"y","c":1},{"a":"x","c":2}]
+
+-- Qualified through a FROM ALIAS rather than the table name — same base attribute, so
+-- the match is qualifier-independent.
+select w.a, row_number() over (order by a) as rn from wg w group by a order by w.a desc;
+→ [{"a":"y","rn":2},{"a":"x","rn":1}]
+
+select w.a, count(*) as c from wg w group by a order by w.a desc;
+→ [{"a":"y","c":1},{"a":"x","c":2}]
+
+-- The grouping key NESTED under a scalar function: the walk recurses, so only the
+-- `wg.a` reference is rewritten and the sort still evaluates `upper()` above it.
+select a, row_number() over (order by a) as rn from wg group by a order by upper(wg.a);
+→ [{"a":"x","rn":1},{"a":"y","rn":2}]
+
+select a, count(*) as c from wg group by a order by upper(wg.a);
+→ [{"a":"x","c":2},{"a":"y","c":1}]
+
+select a, row_number() over (order by a) as rn from wg group by a order by upper(wg.a) desc;
+→ [{"a":"y","rn":2},{"a":"x","rn":1}]
+
+select a, count(*) as c from wg group by a order by upper(wg.a) desc;
+→ [{"a":"y","c":1},{"a":"x","c":2}]
+
+-- The SELECT list and the ORDER BY both spell the key the same wrong way, so the
+-- select-list redirect and the ORDER BY redirect run on one query.
+select upper(wg.a) as k, row_number() over (order by a) as rn from wg group by a order by upper(wg.a) desc;
+→ [{"k":"Y","rn":2},{"k":"X","rn":1}]
+
+select upper(wg.a) as k, count(*) as c from wg group by a order by upper(wg.a) desc;
+→ [{"k":"Y","c":1},{"k":"X","c":2}]
+
+-- A COMPUTED grouping key repeated verbatim in ORDER BY — matched by the whole-subtree
+-- fingerprint rather than by attribute id.
+select a || '!' as k, row_number() over (order by a || '!') as rn from wg group by a || '!' order by a || '!';
+→ [{"k":"x!","rn":1},{"k":"y!","rn":2}]
+
+select a || '!' as k, count(*) as c from wg group by a || '!' order by a || '!';
+→ [{"k":"x!","c":2},{"k":"y!","c":1}]
+
+-- ...and the same computed key nested inside a bigger ORDER BY expression, which the
+-- whole-expression match cannot see (`upper(a || '!')` is not the key `a || '!'`).
+select a || '!' as k, row_number() over (order by a || '!') as rn from wg group by a || '!' order by upper(a || '!') desc;
+→ [{"k":"y!","rn":2},{"k":"x!","rn":1}]
+
+select a || '!' as k, count(*) as c from wg group by a || '!' order by upper(a || '!') desc;
+→ [{"k":"y!","c":1},{"k":"x!","c":2}]
+
+-- The select list ALIASES the key, so the alias is what the projection scope publishes
+-- and the qualified spelling still has to be redirected.
+select a as k, row_number() over (order by a) as rn from wg group by a order by wg.a desc;
+→ [{"k":"y","rn":2},{"k":"x","rn":1}]
+
+select a as k, count(*) as c from wg group by a order by wg.a desc;
+→ [{"k":"y","c":1},{"k":"x","c":2}]
+
+-- Alongside an aggregate in the select list.
+select wg.a, count(*) as c, row_number() over (order by a) as rn from wg group by a order by wg.a desc;
+→ [{"a":"y","c":1,"rn":2},{"a":"x","c":2,"rn":1}]
+
+select wg.a, count(*) as c from wg group by a order by wg.a desc;
+→ [{"a":"y","c":1},{"a":"x","c":2}]
+
+-- MIXED sort: a window output column (which resolves through the window output scope
+-- and gets no redirect) and a redirected grouping key in the same ORDER BY. The
+-- non-window twin does the same with an aggregate alias.
+select a, row_number() over (order by a) as rn from wg group by a order by rn desc, wg.a;
+→ [{"a":"y","rn":2},{"a":"x","rn":1}]
+
+select a, count(*) as c from wg group by a order by c desc, wg.a;
+→ [{"a":"x","c":2},{"a":"y","c":1}]
+
+-- A CORRELATED subquery as the sort key, naming the grouping key at depth. Redirected
+-- by the base-attribute rule inside the subquery, so `x` (2 rows) sorts after `y` (1).
+select a, row_number() over (order by a) as rn from wg group by a order by (select count(*) from wg t where t.a = wg.a);
+→ [{"a":"y","rn":2},{"a":"x","rn":1}]
+
+select a, count(*) as c from wg group by a order by (select count(*) from wg t where t.a = wg.a);
+→ [{"a":"y","c":1},{"a":"x","c":2}]
+
+-- TWO grouping keys, sorting on the qualified spelling of the second one.
+select a, b, row_number() over (order by a) as rn from wg group by a, b order by wg.b desc;
+→ [{"a":"x","b":"3","rn":2},{"a":"y","b":"2","rn":3},{"a":"x","b":"1","rn":1}]
+
+select a, b, count(*) as c from wg group by a, b order by wg.b desc;
+→ [{"a":"x","b":"3","c":1},{"a":"y","b":"2","c":1},{"a":"x","b":"1","c":1}]
+
+-- HAVING (which resolves through its own hybrid scope, no redirect) and a redirected
+-- ORDER BY on the same query.
+select wg.a, count(*) as c, row_number() over (order by a) as rn from wg group by a having count(*) > 1 order by wg.a desc;
+→ [{"a":"x","c":2,"rn":1}]
+
+select wg.a, count(*) as c from wg group by a having count(*) > 1 order by wg.a desc;
+→ [{"a":"x","c":2}]
+
+-- REGRESSION PINS. The spellings the projection output scope already publishes — the
+-- bare key, an output alias, a window output column, an ordinal — resolve there and
+-- must keep resolving there. The redirect's gate is what protects them: an ungated
+-- fingerprint match would rewrite a correctly-bound `order by a` onto the
+-- AggregateNode's attribute and break a query that worked before this fix.
 select wg.a, row_number() over (order by a) as rn from wg group by a order by a;
 → [{"a":"x","rn":1},{"a":"y","rn":2}]
 
 select wg.a as k, row_number() over (order by a) as rn from wg group by a order by k;
 → [{"k":"x","rn":1},{"k":"y","rn":2}]
 
+select a, row_number() over (order by a) as rn from wg group by a order by rn;
+→ [{"a":"x","rn":1},{"a":"y","rn":2}]
+
 select wg.a, row_number() over (order by a) as rn from wg group by a order by 1;
 → [{"a":"x","rn":1},{"a":"y","rn":2}]
+
+select a, count(*) as c from wg group by a order by 1;
+→ [{"a":"x","c":2},{"a":"y","c":1}]
+
+-- An ORDER BY naming a genuinely UNGROUPED column is ACCEPTED today, windowed and not:
+-- it sorts by an arbitrary representative row's `b`. The redirect leaves it exactly as
+-- it was — nothing matches a grouping key, so nothing is rewritten. Pinned with today's
+-- rows so that making this an error becomes a deliberate, visible change rather than a
+-- silent one.
+select a, row_number() over (order by a) as rn from wg group by a order by b;
+→ [{"a":"x","rn":1},{"a":"y","rn":2}]
+
+select a, count(*) as c from wg group by a order by b;
+→ [{"a":"x","c":2},{"a":"y","c":1}]
+
+-- =============================================================================
+-- SELECT LIST of a grouped query, continued.
+-- =============================================================================
 
 -- An UNGROUPED select-list column is still rejected at plan time, with the same
 -- message and the same wording, window function or not. `validateAggregateProjections`

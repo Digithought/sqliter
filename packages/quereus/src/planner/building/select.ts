@@ -394,7 +394,16 @@ export function buildSelectStmt(
 		if (!orderByAppliedEarly) {
 			// In the aggregate path, ORDER BY may legally reference aggregates; in the
 			// window path it may reference window outputs. Both are now in selectContext.
-			input = applyOrderBy(input, stmt, selectContext, preAggregateSort, aggregateProjectionScope, hasAggregates, selectListEntries, orderByOutputRelation);
+			// `groupedRedirectContext` is passed so a sort key naming a grouping key by a
+			// spelling the output scopes do not publish (`order by wg.a`, `order by
+			// upper(wg.a)`, a repeated computed key) is redirected onto the AggregateNode's
+			// own output column. Without it the key binds to a base-table attribute and the
+			// sort dies at run time whenever a buffering operator — a WindowNode — sits
+			// between the aggregate and this sort. Only this call site needs it: the early
+			// ORDER BY above runs before the context exists (and only for window-free
+			// aggregate queries, which the representative source row still covers), and the
+			// non-aggregate path has no grouping keys at all.
+			input = applyOrderBy(input, stmt, selectContext, preAggregateSort, aggregateProjectionScope, hasAggregates, selectListEntries, orderByOutputRelation, groupedRedirectContext);
 		}
 		input = applyLimitOffset(input, stmt, selectContext, aggregateProjectionScope);
 	}

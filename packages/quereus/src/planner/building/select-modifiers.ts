@@ -13,6 +13,7 @@ import { ColumnReferenceNode } from '../nodes/reference.js';
 import { buildExpression } from './expression.js';
 import { CapabilityDetectors } from '../framework/characteristics.js';
 import { buildOrdinalAwareExpression, resolveOrdinalOutputColumn, type SelectListEntry } from './select-ordinal.js';
+import { redirectToGroupKeys, referencesAggregateInput, type GroupedRedirectContext } from './select-aggregates.js';
 
 /**
  * Creates final output projections and applies result column aliases
@@ -100,6 +101,14 @@ export function applyDistinct(
  * identity `select *`). A positional ORDER BY reference then binds to output
  * position N directly — see {@link resolveOrdinalOutputColumn}. The sort this
  * builds sits ABOVE that relation, so the reference resolves at runtime.
+ *
+ * `groupedRedirect`, when supplied, is a GROUPED query's
+ * {@link GroupedRedirectContext}. A sort key that fell through the output scopes and
+ * bound to a *pre-aggregate* attribute (`order by wg.a` or `order by upper(wg.a)`
+ * against `group by a`) is rewritten onto the AggregateNode's own output column, so
+ * the key reads the grouped row rather than a base-table column that row never
+ * carried. Only the grouped/window call site passes it — see the comment at the
+ * rewrite below for why the gate is load-bearing.
  */
 export function applyOrderBy(
 	input: RelationalPlanNode,
@@ -109,7 +118,8 @@ export function applyOrderBy(
 	projectionScope?: RegisteredScope,
 	allowAggregates: boolean = false,
 	selectList: readonly SelectListEntry[] = [],
-	outputRelation?: RelationalPlanNode
+	outputRelation?: RelationalPlanNode,
+	groupedRedirect?: GroupedRedirectContext
 ): RelationalPlanNode {
 	if (stmt.orderBy && stmt.orderBy.length > 0 && !preAggregateSort) {
 		// Merge projection scope if available so ORDER BY can reference output column aliases
@@ -135,8 +145,18 @@ export function applyOrderBy(
 			const positional = alignedOutput
 				? resolveOrdinalOutputColumn(orderByClause.expr, alignedOutput, orderByContext.scope)
 				: null;
-			const expression = positional
+			const built = positional
 				?? buildOrdinalAwareExpression(orderByContext, orderByClause.expr, selectList, 'ORDER BY', allowAggregates);
+			// The gate is load-bearing, not an optimization. `redirectToGroupKeys`
+			// matches a subtree by AST text, so under `group by a` an ungated pass
+			// would also fingerprint a plain `order by a` — which already bound
+			// correctly to the projection's output attribute — and rewrite it onto
+			// the AggregateNode's attribute, breaking a query that works today. Only
+			// a key that fell through to the pre-aggregate scope needs redirecting,
+			// and only such a key carries a pre-grouping attribute id.
+			const expression = groupedRedirect && referencesAggregateInput(built, groupedRedirect)
+				? redirectToGroupKeys(built, groupedRedirect, orderByContext.scope)
+				: built;
 			return {
 				expression,
 				direction: orderByClause.direction,

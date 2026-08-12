@@ -454,8 +454,19 @@ accident, and it dies with `No row context found for column <name>` the moment a
 WindowNode lands in between. `buildFinalAggregateProjections`
 (`planner/building/select-aggregates.ts`) therefore redirects such a reference onto the
 AggregateNode's own group output column at build time, for every grouped query rather
-than only the windowed ones. The same rule applies to any future operator that wants to
-read a grouped query's pre-grouping columns: bind to what the row actually carries.
+than only the windowed ones. `applyOrderBy`
+(`planner/building/select-modifiers.ts`) runs the same redirect over a grouped query's
+sort keys, which have the identical exposure — the post-aggregate sort sits above the
+window phase, so `order by wg.a` against `group by a` died the same way. It is gated on
+`referencesAggregateInput`, so only a key that actually fell through to a pre-grouping
+attribute is rewritten; a key that already resolved through the projection,
+window-output or aggregate-output scope is left exactly as it bound.
+
+HAVING is the remaining clause that still binds a qualified or computed grouping key to
+a base attribute. It is correct today only because its `Filter` sits directly on the
+aggregate's yield — the adjacency this corollary is about. The same rule applies to it,
+and to any future operator that wants to read a grouped query's pre-grouping columns:
+bind to what the row actually carries.
 
 ### Filter conjunct early exit
 

@@ -543,6 +543,35 @@ function readsOnlyAggregateInput(node: PlanNode, context: GroupedRedirectContext
 }
 
 /**
+ * True when ANY column reference in `node`'s subtree is a pre-grouping column of this
+ * query — i.e. the expression reads something the AggregateNode's output row does not
+ * carry, and therefore needs {@link redirectToGroupKeys} run over it.
+ *
+ * The opposite question to its neighbour {@link readsOnlyAggregateInput} ("does the
+ * WHOLE subtree belong to this query's pre-grouping input", which guards a fingerprint
+ * match from hijacking a subquery's own identically-spelled column). This one is a
+ * *gate*: it answers "is there anything here to redirect at all". A subtree whose
+ * references all resolved through the projection / window-output / aggregate-output
+ * scopes contains none, and must be left alone.
+ *
+ * Attribute ids already on the AggregateNode's output row are excluded: a bare-column
+ * grouping key whose id survives into the aggregate output is not a pre-grouping
+ * reference in need of redirection. CTE definition bodies are skipped for the same
+ * reason {@link redirectToGroupKeys} skips them (see {@link isCteDefinition}).
+ */
+export function referencesAggregateInput(node: PlanNode, context: GroupedRedirectContext): boolean {
+	if (CapabilityDetectors.isColumnReference(node)) {
+		const attrId = (node as ColumnReferenceNode).attributeId;
+		return context.aggregateInputAttrIds.has(attrId) && !context.outputAttrIds.has(attrId);
+	}
+	for (const child of node.getChildren()) {
+		if (isCteDefinition(child)) continue;
+		if (referencesAggregateInput(child, context)) return true;
+	}
+	return false;
+}
+
+/**
  * Raises the GROUP BY coverage error for a window specification / window-function
  * argument of a GROUPED query that still reads a pre-grouping column after
  * {@link redirectToGroupKeys} has run.
