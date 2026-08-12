@@ -13,6 +13,14 @@ This enables module authors to implement simple read/write logic while getting f
 
 ---
 
+## Topic documents
+
+| Document | Covers |
+| --- | --- |
+| [Isolation Layer — Challenges and Mitigations](design-isolation-challenges.md) | The six hard problems this design has to solve, and what the layer does about each: merge iteration, cursor validity during mutation, commit failure recovery, per-read overlay overhead, large-transaction storage, and DDL against a table other connections hold overlays on (including the overlay poison rules). |
+
+---
+
 ## Motivation
 
 ### Current State
@@ -822,9 +830,7 @@ PK that has a tombstone in the overlay.
 
 ---
 
-The six known hard problems in this design — merge iteration, cursor invalidation during mutation,
-commit failure recovery, performance overhead, large transaction storage, and schema operations
-(DDL, including the overlay poison rules) — and how each is handled live in
+The six hard problems this design has to solve — and how each is handled — live in
 [Isolation Layer — Challenges and Mitigations](design-isolation-challenges.md).
 
 ---

@@ -32,6 +32,14 @@
 //                                                  ...also allow raising / adding entries
 //
 // See docs/doc-conventions.md for what belongs in a doc and how to lower a ratchet entry.
+//
+// NOTE: nothing here enforces the satellite convention in docs/doc-conventions.md — that a
+// `docs/<hub>-<topic>.md` satellite is listed in `docs/<hub>.md`'s `## Topic documents` table.
+// The docs-split-isolation-design split shipped a satellite with no such entry (and no table on
+// its hub) with this script green; the review pass caught it by hand. Every other satellite in
+// the tree complies today, so one miss did not justify a check. If a second split misses it,
+// add one: for each `docs/<name>.md` whose longest `<hub>-` prefix names another doc, fail
+// unless that hub's text contains `](<name>.md)`.
 
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve, relative, sep } from 'node:path';
