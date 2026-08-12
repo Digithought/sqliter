@@ -285,9 +285,28 @@ The streaming emitter:
   buffering for RANGE-mode frames.
 - Skips the sort entirely — `O(N log N)` per partition saved.
 - Skips materialization — `O(N)` memory saved.
-- Preserves the source's `monotonicOn` on the `WindowNode`'s output so
-  downstream rules (`monotonic-limit-pushdown`, `monotonic-merge-join`,
-  `monotonic-range-access`) compose cleanly above streaming windows.
+- Preserves the source's `ordering` *and* `monotonicOn` on the `WindowNode`'s
+  output so downstream rules (`monotonic-limit-pushdown`,
+  `monotonic-merge-join`, `monotonic-range-access`) compose cleanly above
+  streaming windows.
+
+#### What the `WindowNode` advertises as its emit order
+
+`ordering` is the exact emit order (a list of `{ column, desc }`); `monotonicOn`
+is the stronger per-attribute claim. `WindowNode.computePhysical` derives both
+from one four-case split, because a consumer that trusts either one and gets a
+stream in a different order silently returns wrong rows — a merge join above a
+`desc`-ordered window used to stop matching after its first row.
+
+| Case | What the emitter yields | `ordering` | `monotonicOn` |
+| --- | --- | --- | --- |
+| `streaming` config set | source order, row pass-through (`runStreaming`) | source's | source's |
+| buffered, no PARTITION BY, no ORDER BY | source order (`sortRows` returns rows unchanged) | source's | source's |
+| buffered, no PARTITION BY, ORDER BY present | sorted by the window's ORDER BY (`sortRows`) | derived from the window ORDER BY keys, via `extractOrderingFromSortKeys` — `undefined` if any key is not a plain column reference | leading key only |
+| buffered, PARTITION BY present | partitions in first-seen order, sorted within each (`groupByPartitions` → `processPartition`) | none | none |
+
+Column indices are positions in the *source* row, which are also their positions
+in the window's output row: the window only appends columns.
 
 **Recognized functions** (the rule fires only when *all* functions in a single
 WindowNode are individually recognized):

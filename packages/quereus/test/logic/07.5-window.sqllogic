@@ -1771,3 +1771,64 @@ select v, 1000 - row_number() over (order by v) from sw order by v;
 → [{"v":1,"1000 - row_number() over (order by v)":999},{"v":2,"1000 - row_number() over (order by v)":998}]
 
 drop table sw;
+
+-- =============================================================================
+-- The window node's advertised row order must describe what the window emitter
+-- actually yields (bug-window-node-advertises-source-row-order). A window that
+-- sorts its own rows used to keep advertising the SOURCE's order, and a merge
+-- join above it walked the reordered stream as if it were still in that order —
+-- silently dropping every row after the first mismatch.
+-- =============================================================================
+
+create table wmj (a text, b text);
+insert into wmj values ('x','p'),('y','q'),('x','r'),('z','s');
+
+-- The repro: `order by a desc` inside the window reverses the grouped rows, so
+-- the join above it must not assume ascending `a`. All four rows must survive.
+select z.a, z.rn, w2.b
+from (select a, row_number() over (order by a desc) as rn from wmj group by a) z
+join wmj w2 on w2.a = z.a
+order by z.a, w2.b;
+→ [{"a":"x","rn":3,"b":"p"},{"a":"x","rn":3,"b":"r"},{"a":"y","rn":2,"b":"q"},{"a":"z","rn":1,"b":"s"}]
+
+-- The ascending twin, which was already correct and must stay correct: here the
+-- window's emit order genuinely does match the source's.
+select z.a, z.rn, w2.b
+from (select a, row_number() over (order by a) as rn from wmj group by a) z
+join wmj w2 on w2.a = z.a
+order by z.a, w2.b;
+→ [{"a":"x","rn":1,"b":"p"},{"a":"x","rn":1,"b":"r"},{"a":"y","rn":2,"b":"q"},{"a":"z","rn":3,"b":"s"}]
+
+-- Same shape as a LEFT JOIN: a lost match would show up as NULL fill rather
+-- than as a missing row.
+select z.a, z.rn, w2.b
+from (select a, row_number() over (order by a desc) as rn from wmj group by a) z
+left join wmj w2 on w2.a = z.a
+order by z.a, w2.b;
+→ [{"a":"x","rn":3,"b":"p"},{"a":"x","rn":3,"b":"r"},{"a":"y","rn":2,"b":"q"},{"a":"z","rn":1,"b":"s"}]
+
+drop table wmj;
+
+-- A PARTITION BY window buffers the source and re-emits it a whole partition at
+-- a time, so the scan's key order does NOT survive it. The outer ORDER BY must
+-- be honoured rather than elided against the source's ordering.
+create table wpo (k integer primary key, g text, v integer);
+insert into wpo values (1,'a',10),(2,'b',20),(3,'a',30),(4,'b',40);
+
+select k, g, sum(v) over (partition by g) as s from wpo order by k;
+→ [{"k":1,"g":"a","s":40},{"k":2,"g":"b","s":60},{"k":3,"g":"a","s":40},{"k":4,"g":"b","s":60}]
+
+-- Same, joined against the partition column: the join above the partitioned
+-- window may not assume the window preserved the scan's order either.
+select w.k, w.s, o.g
+from (select k, g, sum(v) over (partition by g) as s from wpo) w
+join wpo o on o.k = w.k
+order by w.k;
+→ [{"k":1,"s":40,"g":"a"},{"k":2,"s":60,"g":"b"},{"k":3,"s":40,"g":"a"},{"k":4,"s":60,"g":"b"}]
+
+-- An unpartitioned window with a descending ORDER BY, consumed by an outer
+-- ascending ORDER BY: the outer sort must survive, since the window emits desc.
+select k, v, row_number() over (order by v desc) as rn from wpo order by k;
+→ [{"k":1,"v":10,"rn":4},{"k":2,"v":20,"rn":3},{"k":3,"v":30,"rn":2},{"k":4,"v":40,"rn":1}]
+
+drop table wpo;

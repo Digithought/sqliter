@@ -10,6 +10,7 @@ import { StatusCode } from '../../common/types.js';
 import { ColumnReferenceNode } from './reference.js';
 import { isUniqueDeterminant } from '../util/fd-utils.js';
 import { physicalSourceRows } from '../util/row-estimates.js';
+import { extractOrderingFromSortKeys } from '../framework/physical-utils.js';
 
 export interface WindowSpec {
 	partitionBy: AST.Expression[];
@@ -231,34 +232,68 @@ export class WindowNode extends PlanNode implements UnaryRelationalNode {
 		return [this.source];
 	}
 
+	/**
+	 * The window's ORDER BY expressed as sort keys, in the shape
+	 * `extractOrderingFromSortKeys` expects. `AST.OrderByClause.direction` is
+	 * optional; anything that is not `'desc'` is ascending — the same reading
+	 * `rule-monotonic-window` and the `monotonicOn` derivation use.
+	 */
+	private windowSortKeys(): { expression: ScalarPlanNode; direction: 'asc' | 'desc' }[] {
+		return this.orderByExpressions.map((expression, i) => ({
+			expression,
+			direction: this.windowSpec.orderBy[i]?.direction === 'desc' ? 'desc' : 'asc',
+		}));
+	}
+
 	computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
 		const sourcePhysical = childrenPhysical[0];
 
-		// Window output ordering is determined by [PARTITION BY, ORDER BY]:
+		// Window emit order is determined by [PARTITION BY, ORDER BY]. BOTH the
+		// advertised `ordering` (the exact emit order) and `monotonicOn` (the
+		// stronger per-attribute claim) come out of the same four-case split, so
+		// they are derived together — they must never disagree about what
+		// `runtime/emit/window.ts` actually yields:
 		//   - streaming set: the runtime walks the source in source order and emits
-		//     in source order — windowing is row-pass-through. Source's monotonicOn
-		//     survives unchanged.
+		//     in source order (`runStreaming`) — windowing is row-pass-through. The
+		//     source's ordering AND monotonicOn both survive unchanged.
 		//   - PARTITION BY non-empty (buffered): the runtime groups rows by partition
-		//     key in insertion order then sorts within each partition, so a
-		//     single-attribute monotonicOn does not survive at the relation level.
+		//     key in insertion order then sorts within each partition
+		//     (`groupByPartitions` → `processPartition`), so neither the source's
+		//     ordering nor a single-attribute monotonicOn survives at the relation
+		//     level — advertise neither.
 		//   - PARTITION BY empty, ORDER BY present (buffered): output is sorted by
-		//     the window's ORDER BY — derive monotonicOn from the leading key
-		//     (mirrors SortNode).
-		//   - PARTITION BY empty, ORDER BY empty: rows pass through in source order;
-		//     preserve source's monotonicOn unchanged.
+		//     the window's ORDER BY (`sortRows`) — derive the ordering from those
+		//     keys and monotonicOn from the leading key (both mirror SortNode).
+		//   - PARTITION BY empty, ORDER BY empty (buffered): `sortRows` returns the
+		//     rows unchanged, so they pass through in source order; preserve the
+		//     source's ordering and monotonicOn unchanged.
+		// `extractOrderingFromSortKeys` reports column indices as positions in the
+		// SOURCE row. The window only APPENDS columns, so those are the same
+		// positions in the window's output row and need no shifting.
+		// NOTE: like SortNode, the derived `ordering` carries no NULLS FIRST/LAST
+		// information — `Ordering` is `{ column, desc }` only. Harmless while every
+		// ordering consumer uses one null convention; if a consumer (merge join,
+		// sort elision) is ever taught to honour an explicit `nulls` on a sort key,
+		// both this derivation and SortNode's must start withholding the ordering
+		// when `windowSpec.orderBy[i].nulls` contradicts that convention.
 		// TODO: the partitioned case can be tightened (e.g. when the partition keys
 		// themselves are functionally determined by the candidate attribute) — out
 		// of scope for the carrier ticket.
+		let ordering: { column: number; desc: boolean }[] | undefined;
 		let monotonicOn: readonly MonotonicOnInfo[] | undefined;
 		if (this.streaming) {
+			ordering = sourcePhysical?.ordering;
 			monotonicOn = sourcePhysical?.monotonicOn;
 		} else if (this.partitionExpressions.length === 0) {
 			if (this.orderByExpressions.length === 0) {
+				ordering = sourcePhysical?.ordering;
 				monotonicOn = sourcePhysical?.monotonicOn;
 			} else {
+				const sourceAttrs = this.source.getAttributes();
+				ordering = extractOrderingFromSortKeys(this.windowSortKeys(), sourceAttrs);
+
 				const leadExpr = this.orderByExpressions[0];
 				if (leadExpr instanceof ColumnReferenceNode) {
-					const sourceAttrs = this.source.getAttributes();
 					const leadAttrId = leadExpr.attributeId;
 					const leadIdx = this.source.getAttributeIndex().get(leadAttrId) ?? -1;
 					if (leadIdx >= 0) {
@@ -273,7 +308,7 @@ export class WindowNode extends PlanNode implements UnaryRelationalNode {
 		return {
 			// Window functions don't change the row count — relay the PHYSICAL one.
 			estimatedRows: physicalSourceRows(sourcePhysical, this.source),
-			ordering: sourcePhysical?.ordering,
+			ordering,
 			monotonicOn,
 			// Window functions append columns but don't change the source row stream;
 			// FDs, equivalence classes, and constant bindings pass through on the
