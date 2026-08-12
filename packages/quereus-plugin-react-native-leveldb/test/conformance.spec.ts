@@ -12,18 +12,18 @@
  * the persistence tier is not registered for this backend — same as the in-memory store.
  * Real on-device persistence is LevelDB's own and is not exercised here.
  *
- * Also runs the shared store-name distinctness battery over `ReactNativeLevelDBProvider`.
- * That battery needs to observe whether two logical stores land on ONE on-device database,
- * so its `openFn` memoizes a MockLevelDB per database NAME: same name → same mock (the
- * stores genuinely share storage, exactly as they would on device), different name →
- * different mock.
+ * Also runs the two shared provider batteries over `ReactNativeLevelDBProvider` — store-name
+ * distinctness, and store reclaim. Both drive the same adapter below, whose `openFn` reads
+ * from a `MockLevelDBFiles` registry: data persists per database NAME (same name → same
+ * bytes, exactly as one on-device file would), while each open hands back a FRESH handle so
+ * a store closed by a delete can be re-opened afterwards.
  */
 
 import type { KVStore, KVStoreProvider } from '@quereus/store';
-import { runKVStoreConformance, runStoreNameDistinctness } from '@quereus/store/testing';
+import { runKVStoreConformance, runStoreNameDistinctness, runStoreReclaimConformance, type KVProviderLifecycle } from '@quereus/store/testing';
 import { ReactNativeLevelDBStore } from '../src/store.js';
 import { createReactNativeLevelDBProvider, type ReactNativeLevelDBProvider } from '../src/provider.js';
-import { MockLevelDB, MockLevelDBWriteBatch } from './mock-leveldb.js';
+import { MockLevelDB, MockLevelDBFiles, MockLevelDBWriteBatch } from './mock-leveldb.js';
 
 runKVStoreConformance('ReactNativeLevelDBStore', () => {
 	let store: ReactNativeLevelDBStore | undefined;
@@ -55,22 +55,18 @@ runKVStoreConformance('ReactNativeLevelDBStore', () => {
 	};
 });
 
-runStoreNameDistinctness('ReactNativeLevelDBProvider store names', () => {
-	// One mock per database name — the in-process stand-in for "one LevelDB file per name".
-	const dbsByName = new Map<string, MockLevelDB>();
+/**
+ * Lifecycle adapter for the provider-level batteries: a provider over one registry of mock
+ * on-device databases. Called fresh per test, so each test gets its own empty registry.
+ */
+function providerBackend(): KVProviderLifecycle {
+	const files = new MockLevelDBFiles();
 	let provider: ReactNativeLevelDBProvider | undefined;
 
 	return {
 		async open(): Promise<KVStoreProvider> {
 			provider = createReactNativeLevelDBProvider({
-				openFn: (name) => {
-					let db = dbsByName.get(name);
-					if (!db) {
-						db = new MockLevelDB();
-						dbsByName.set(name, db);
-					}
-					return db;
-				},
+				openFn: (name) => files.open(name),
 				WriteBatch: MockLevelDBWriteBatch,
 			});
 			return provider;
@@ -78,7 +74,11 @@ runStoreNameDistinctness('ReactNativeLevelDBProvider store names', () => {
 		async teardown(): Promise<void> {
 			if (provider) await provider.closeAll();
 			provider = undefined;
-			dbsByName.clear();
+			files.clear();
 		},
 	};
-});
+}
+
+runStoreNameDistinctness('ReactNativeLevelDBProvider store names', providerBackend);
+
+runStoreReclaimConformance('ReactNativeLevelDBProvider store reclaim', providerBackend);

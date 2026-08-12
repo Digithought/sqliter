@@ -23,6 +23,13 @@
  *
  * An iterator is a SNAPSHOT taken at `newIterator()`, matching LevelDB's snapshot
  * semantics: writes committed after that point are invisible to the walk.
+ *
+ * FILE vs HANDLE. A `MockLevelDB` is a HANDLE, and `close()` closes only that handle. The
+ * bytes live in a {@link MockLevelDBData} map owned by whoever opened it — normally a
+ * {@link MockLevelDBFiles} registry keyed by database name, the stand-in for "one on-device
+ * LevelDB file per name". Re-opening a name after closing it therefore hands back a fresh,
+ * usable handle over the same data, exactly as rn-leveldb does on device. A handle that owns
+ * its own data (`new MockLevelDB()`) is the single-store case and behaves as before.
  */
 
 // The same ordering oracle the store and the conformance battery use — the mock's whole
@@ -34,6 +41,12 @@ import type {
 	LevelDBWriteBatch,
 } from '../src/store.js';
 
+/**
+ * The persistent bytes of one mock database — the "file", as opposed to the handle a
+ * {@link MockLevelDB} is. Keys are latin1-encoded (see the module header for why).
+ */
+export type MockLevelDBData = Map<string, Uint8Array>;
+
 /** Options for {@link MockLevelDB}. */
 export interface MockLevelDBOptions {
 	/**
@@ -43,6 +56,46 @@ export interface MockLevelDBOptions {
 	 * does, once per position however many times it is read there.
 	 */
 	onEntryRead?: () => void;
+
+	/**
+	 * The bytes this handle reads and writes. Supplied by {@link MockLevelDBFiles} so the
+	 * data outlives `close()` and a re-opened name sees what was written before; omitted,
+	 * the handle owns a fresh empty map.
+	 */
+	data?: MockLevelDBData;
+}
+
+/**
+ * The set of on-device LevelDB "files" for one test — persistent data per database NAME,
+ * with each {@link open} handing back a FRESH handle over it.
+ *
+ * This is what a provider spec drives its `openFn` from. Memoizing one HANDLE per name
+ * instead would wedge every provider path that closes a store and re-opens it (deleting a
+ * table, then creating one under the same name), because a closed handle stays closed —
+ * whereas on device that sequence re-opens the same file with a new handle.
+ */
+export class MockLevelDBFiles {
+	private readonly files = new Map<string, MockLevelDBData>();
+
+	/** Open a fresh handle over the named database, creating it empty if it is new. */
+	open(name: string): MockLevelDB {
+		let data = this.files.get(name);
+		if (!data) {
+			data = new Map<string, Uint8Array>();
+			this.files.set(name, data);
+		}
+		return new MockLevelDB({ data });
+	}
+
+	/** Names of every database opened so far — the on-device file listing. */
+	names(): string[] {
+		return [...this.files.keys()];
+	}
+
+	/** Drop every database. */
+	clear(): void {
+		this.files.clear();
+	}
 }
 
 /** Encode key bytes as a latin1 string — lossless, and string order matches byte order. */
@@ -108,13 +161,15 @@ export class MockLevelDBWriteBatch implements LevelDBWriteBatch {
  * Mock LevelDB database — synchronous, like rn-leveldb's real API.
  */
 export class MockLevelDB implements LevelDB {
-	private data = new Map<string, Uint8Array>();
+	/** The file's bytes — shared with every other handle opened over the same name. */
+	private readonly data: MockLevelDBData;
 	private closed = false;
 	private readonly onEntryRead?: () => void;
 	private readonly liveIterators = new Set<LevelDBIterator>();
 
 	constructor(options?: MockLevelDBOptions) {
 		this.onEntryRead = options?.onEntryRead;
+		this.data = options?.data ?? new Map<string, Uint8Array>();
 	}
 
 	/**
@@ -155,6 +210,7 @@ export class MockLevelDB implements LevelDB {
 		}
 	}
 
+	/** Close THIS handle. The file's data survives, for the next handle opened over it. */
 	close(): void {
 		this.closed = true;
 	}

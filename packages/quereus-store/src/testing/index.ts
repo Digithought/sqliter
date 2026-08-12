@@ -7,7 +7,13 @@
  *   - {@link runKVProviderConformance} — the provider-level atomic multi-store commit
  *     ({@link KVStoreProvider.beginAtomicBatch}), for the backends that have one;
  *   - {@link runStoreNameDistinctness} — that a provider never folds two distinct logical
- *     stores onto one physical store (all backends with a provider).
+ *     stores onto one physical store (all backends with a provider);
+ *   - {@link runStoreReclaimConformance} — that a provider's delete hooks actually ERASE a
+ *     dropped table's stores, leaving every other store intact (all backends with a
+ *     provider).
+ *
+ * The last two take the same {@link KVProviderLifecycle} adapter, so a plugin's spec builds
+ * one closure and hands it to both.
  *
  * {@link assertBoundedIterate} and {@link assertStoreNamesDistinct} are the core assertions
  * of two of those batteries, exported standalone so a spec can drive them directly
@@ -25,3 +31,5 @@ export {
 } from './kv-conformance.js';
 export { runKVProviderConformance, type KVProviderBackend } from './kv-provider-conformance.js';
 export { runStoreNameDistinctness, assertStoreNamesDistinct, type KVNamingBackend } from './kv-naming-conformance.js';
+export { runStoreReclaimConformance, type KVReclaimBackend } from './kv-reclaim-conformance.js';
+export type { KVProviderLifecycle } from './kv-lifecycle.js';

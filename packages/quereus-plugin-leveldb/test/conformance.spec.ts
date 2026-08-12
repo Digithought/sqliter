@@ -12,10 +12,11 @@
  * point: `LevelDBStore.open` constructs its own ClassicLevel internally. That factory
  * keeps its own coverage in `standalone-open.spec.ts`.
  *
- * Also runs the shared store-name distinctness battery over `LevelDBProvider`. This
- * provider is one of the two reference implementations of that property (its
- * `encodeSublevelName` percent-escapes, so the mapping is injective), so a failure there
- * means the battery is wrong rather than the plugin.
+ * Also runs the two shared provider batteries over `LevelDBProvider` — store-name
+ * distinctness and store reclaim. This provider is one of the two reference implementations
+ * of both properties (its `encodeSublevelName` percent-escapes, so the mapping is injective;
+ * its `clearAndDropStore` empties a dropped store's sublevel), so a failure in either means
+ * the battery is wrong rather than the plugin.
  */
 
 import * as fs from 'fs';
@@ -23,7 +24,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { ClassicLevel } from 'classic-level';
 import type { KVStore, KVStoreProvider } from '@quereus/store';
-import { runKVStoreConformance, runStoreNameDistinctness } from '@quereus/store/testing';
+import { runKVStoreConformance, runStoreNameDistinctness, runStoreReclaimConformance, type KVProviderLifecycle } from '@quereus/store/testing';
 import { LevelDBStore, type ViewLevel } from '../src/store.js';
 import { createLevelDBProvider, type LevelDBProvider } from '../src/provider.js';
 
@@ -133,8 +134,12 @@ runKVStoreConformance('LevelDBStore', () => {
 	};
 });
 
-runStoreNameDistinctness('LevelDBProvider store names', () => {
-	const dir = path.join(os.tmpdir(), `quereus-kv-naming-lvl-${process.pid}-${seq++}`);
+/**
+ * Lifecycle adapter for the provider-level batteries: a provider over its own temp
+ * directory. Called fresh per test, so each test gets its own empty database.
+ */
+function providerBackend(): KVProviderLifecycle {
+	const dir = path.join(os.tmpdir(), `quereus-kv-provider-lvl-${process.pid}-${seq++}`);
 	let provider: LevelDBProvider | undefined;
 
 	return {
@@ -157,4 +162,8 @@ runStoreNameDistinctness('LevelDBProvider store names', () => {
 			fs.rmSync(dir, { recursive: true, force: true });
 		},
 	};
-});
+}
+
+runStoreNameDistinctness('LevelDBProvider store names', providerBackend);
+
+runStoreReclaimConformance('LevelDBProvider store reclaim', providerBackend);

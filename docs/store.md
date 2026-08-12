@@ -337,6 +337,18 @@ a physical check, and nothing in the type system enforces it — so `@quereus/st
 exports `runStoreNameDistinctness`, registered by every plugin's `test/conformance.spec.ts`,
 which opens a corpus of adversarial names and checks each store reads back its own marker.
 
+**Deleting a store must erase it.** `deleteTableStores` / `deleteIndexStore` are how the
+engine reclaims a dropped table's storage (`drop table`, and the generic rename fallback
+after it has copied the rows to the new name). Because handles are re-opened lazily by name,
+a provider that only closes its cached handle leaves the data in place and the next table
+created under that name reads the dropped table's rows. What an implementation has to
+accomplish: the named stores read back empty when re-opened under the same names, deleting a
+store that was never created is a no-op rather than an error, and every other store — sibling
+tables and the reserved `__stats__` / `__catalog__` stores included — is untouched. Releasing
+bytes on disk is a per-provider concern and is not part of the contract. Pinned behaviorally
+by `runStoreReclaimConformance` (`@quereus/store/testing`), registered alongside the naming
+battery in every plugin's `test/conformance.spec.ts`.
+
 ### Key Formats
 
 **Data Keys** (in `{schema}.{table}` store):

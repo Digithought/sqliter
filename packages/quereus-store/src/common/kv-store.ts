@@ -376,6 +376,12 @@ export interface KVStoreProvider {
 
 	/**
 	 * Delete an index store entirely (when dropping an index).
+	 *
+	 * "Delete" means ERASE, not "close the handle": see {@link deleteTableStores} for
+	 * exactly what an implementation has to accomplish. Closing a cached handle is not
+	 * enough — stores are re-opened lazily by name, so the next index created under this
+	 * name would read the dropped index's entries.
+	 *
 	 * @param schemaName - The schema name
 	 * @param tableName - The table name
 	 * @param indexName - The index name
@@ -385,6 +391,28 @@ export interface KVStoreProvider {
 	/**
 	 * Delete all stores for a table (data, indexes, stats).
 	 * Called when dropping a table.
+	 *
+	 * "Delete" means ERASE the physical storage, not merely drop a cached handle. Three
+	 * requirements, all of them behavioral:
+	 *
+	 *   - Each named store, RE-OPENED afterwards under the same name via
+	 *     `getStore`/`getIndexStore`, must read back EMPTY — no entry from a point `get`,
+	 *     none from `iterate`. Handles are re-opened lazily by name, so a provider that
+	 *     only closes its handle leaves the bytes in place and the next table created
+	 *     under that name comes back holding the dropped table's rows.
+	 *   - Deleting a store that was never created is a NO-OP, not an error. The engine
+	 *     calls these speculatively on its reclaim paths (see
+	 *     `StoreModuleBase.reclaimDetachedTable`), including with index names whose stores
+	 *     never materialized.
+	 *   - Every OTHER store must be untouched — sibling tables, the table's own index
+	 *     stores that were not named, and the reserved `__stats__` / `__catalog__` stores.
+	 *
+	 * Reclaiming bytes on disk is a separate, per-provider concern: a provider may leave an
+	 * emptied database directory or an unshrunk file behind and still be correct here.
+	 *
+	 * Pinned behaviorally by the shared `runStoreReclaimConformance` battery
+	 * (`@quereus/store/testing`), which every plugin's `test/conformance.spec.ts`
+	 * registers — the way `runStoreNameDistinctness` pins the naming property.
 	 *
 	 * `indexNames` is the authoritative list of the table's secondary-index names
 	 * (from `tableSchema.indexes`). Implementations MUST build exact index store

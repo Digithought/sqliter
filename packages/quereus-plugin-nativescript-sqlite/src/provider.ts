@@ -157,23 +157,33 @@ export class SQLiteProvider implements KVStoreProvider {
 	}
 
 	async deleteIndexStore(schemaName: string, tableName: string, indexName: string): Promise<void> {
-		await this.closeStoreByName(buildIndexStoreName(schemaName, tableName, indexName));
-		// Note: SQLite doesn't need explicit store deletion - table is dropped when closed
+		await this.dropStoreByName(buildIndexStoreName(schemaName, tableName, indexName));
 	}
 
 	async deleteTableStores(schemaName: string, tableName: string, indexNames: readonly string[]): Promise<void> {
-		// Close data store
-		await this.closeStoreByName(buildDataStoreName(schemaName, tableName));
+		// Drop the data store's backing table.
+		await this.dropStoreByName(buildDataStoreName(schemaName, tableName));
 
-		// Stats are in the unified __stats__ store, so no need to close a separate store
+		// Stats are in the unified __stats__ store, so no need to drop a separate store
 		// The individual stats entry will be removed by the calling code if needed
 
-		// Close exactly the table's index stores (by name), not every store matching
+		// Drop exactly the table's index stores (by name), not every store matching
 		// the `{table}_idx_` prefix — that prefix also matches a sibling table
 		// literally named `{table}_idx_<x>`.
 		for (const indexName of indexNames) {
-			await this.closeStoreByName(buildIndexStoreName(schemaName, tableName, indexName));
+			await this.dropStoreByName(buildIndexStoreName(schemaName, tableName, indexName));
 		}
+	}
+
+	/**
+	 * The SQLite table backing a logical store.
+	 *
+	 * The ONE derivation, shared by every caller: a second hand-derived spelling of this is
+	 * precisely the defect class the naming work had to remove from this file once (a store
+	 * opened under one name and reclaimed under another leaves the rows in place).
+	 */
+	private physicalTableName(storeName: string): string {
+		return `${this.tablePrefix}${encodeSqliteName(storeName)}`;
 	}
 
 	/**
@@ -186,7 +196,7 @@ export class SQLiteProvider implements KVStoreProvider {
 		let store = this.stores.get(storeName);
 
 		if (!store) {
-			store = SQLiteStore.create(this.db, `${this.tablePrefix}${encodeSqliteName(storeName)}`);
+			store = SQLiteStore.create(this.db, this.physicalTableName(storeName));
 			this.stores.set(storeName, store);
 		}
 
@@ -199,6 +209,25 @@ export class SQLiteProvider implements KVStoreProvider {
 			await store.close();
 			this.stores.delete(storeName);
 		}
+	}
+
+	/**
+	 * Erase a store by dropping its backing table, after closing and evicting any cached
+	 * handle — so a store re-opened later under the same name is EMPTY, which is the reclaim
+	 * contract on {@link KVStoreProvider.deleteTableStores}. `if exists` makes deleting a
+	 * store that was never created a no-op that creates nothing, as that contract also asks.
+	 *
+	 * The table name is interpolated rather than bound because SQLite cannot parameterize an
+	 * identifier; {@link encodeSqliteName} restricts every produced name to `[a-z0-9_]`, so
+	 * there is no quoting or injection surface — the same reason `SQLiteStore` interpolates it.
+	 */
+	private async dropStoreByName(storeName: string): Promise<void> {
+		await this.closeStoreByName(storeName);
+		// NOTE: dropping a table returns its pages to this SQLite file's freelist for reuse,
+		// but does not shrink the file on disk — that needs a `vacuum`, which is not run here.
+		// If a mobile app's database file growing and never shrinking becomes a complaint,
+		// that is the thread to pull.
+		this.db.execute(`drop table if exists ${this.physicalTableName(storeName)}`);
 	}
 }
 

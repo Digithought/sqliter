@@ -10,15 +10,16 @@
  * deleting the database and re-opens it, so persisted data survives — driving the
  * persistence tier.
  *
- * Also runs the shared store-name distinctness battery over `IndexedDBProvider`. This
- * provider is one of the two reference implementations of that property (it uses the
- * built store name verbatim as the object-store name), so a failure there means the
- * battery is wrong rather than the plugin.
+ * Also runs the two shared provider batteries over `IndexedDBProvider` — store-name
+ * distinctness and store reclaim. This provider is one of the two reference implementations
+ * of both properties (it uses the built store name verbatim as the object-store name, and
+ * deletes the object store outright on drop), so a failure in either means the battery is
+ * wrong rather than the plugin.
  */
 
 import 'fake-indexeddb/auto';
 import type { KVStore, KVStoreProvider } from '@quereus/store';
-import { runKVStoreConformance, runStoreNameDistinctness } from '@quereus/store/testing';
+import { runKVStoreConformance, runStoreNameDistinctness, runStoreReclaimConformance, type KVProviderLifecycle } from '@quereus/store/testing';
 import { IndexedDBStore } from '../src/store.js';
 import { IndexedDBManager } from '../src/manager.js';
 import { createIndexedDBProvider, type IndexedDBProvider } from '../src/provider.js';
@@ -173,8 +174,12 @@ runKVStoreConformance('IndexedDBStore', () => {
 	};
 });
 
-runStoreNameDistinctness('IndexedDBProvider store names', () => {
-	const dbName = `quereus-kv-naming-idb-${seq++}`;
+/**
+ * Lifecycle adapter for the provider-level batteries: a provider over its own database.
+ * Called fresh per test, so each test gets its own empty database.
+ */
+function providerBackend(): KVProviderLifecycle {
+	const dbName = `quereus-kv-provider-idb-${seq++}`;
 	let provider: IndexedDBProvider | undefined;
 
 	return {
@@ -197,4 +202,8 @@ runStoreNameDistinctness('IndexedDBProvider store names', () => {
 			await deleteDatabase(dbName);
 		},
 	};
-});
+}
+
+runStoreNameDistinctness('IndexedDBProvider store names', providerBackend);
+
+runStoreReclaimConformance('IndexedDBProvider store reclaim', providerBackend);

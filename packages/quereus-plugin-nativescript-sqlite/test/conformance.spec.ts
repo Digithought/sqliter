@@ -13,17 +13,19 @@
  * `SQLiteStore.close()` deliberately leaves the underlying database open (it may be
  * shared), so teardown closes the database itself and removes the file.
  *
- * Also runs the shared store-name distinctness battery over `SQLiteProvider` — the check
- * that `encodeSqliteName` never folds two logical stores onto one SQLite table. Driven
- * against real SQLite (better-sqlite3), so it also proves every produced identifier is a
- * legal bare identifier: an illegal one fails at `create table`, not as a silent share.
+ * Also runs the two shared provider batteries over `SQLiteProvider`: store-name
+ * distinctness (that `encodeSqliteName` never folds two logical stores onto one SQLite
+ * table) and store reclaim (that dropping a table's stores actually drops their backing
+ * tables). Both are driven against real SQLite (better-sqlite3), so they also prove every
+ * produced identifier is a legal bare identifier: an illegal one fails at `create table` or
+ * `drop table`, not as a silent share.
  */
 
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import type { KVStore, KVStoreProvider } from '@quereus/store';
-import { runKVStoreConformance, runStoreNameDistinctness } from '@quereus/store/testing';
+import { runKVStoreConformance, runStoreNameDistinctness, runStoreReclaimConformance, type KVProviderLifecycle } from '@quereus/store/testing';
 import { SQLiteStore, ITERATE_BATCH_SIZE, type SQLiteDatabase } from '../src/store.js';
 import { createSQLiteProvider, type SQLiteProvider } from '../src/provider.js';
 import { createTestDatabase } from './better-sqlite3-adapter.js';
@@ -97,8 +99,12 @@ runKVStoreConformance('SQLiteStore', () => {
   };
 });
 
-runStoreNameDistinctness('SQLiteProvider store names', () => {
-  const file = path.join(os.tmpdir(), `quereus-kv-naming-ns-sqlite-${process.pid}-${seq++}.db`);
+/**
+ * Lifecycle adapter for the provider-level batteries: a provider over its own temp file
+ * database. Called fresh per test, so each test gets its own empty database.
+ */
+function providerBackend(): KVProviderLifecycle {
+  const file = path.join(os.tmpdir(), `quereus-kv-provider-ns-sqlite-${process.pid}-${seq++}.db`);
   let provider: SQLiteProvider | undefined;
 
   return {
@@ -117,4 +123,8 @@ runStoreNameDistinctness('SQLiteProvider store names', () => {
       }
     },
   };
-});
+}
+
+runStoreNameDistinctness('SQLiteProvider store names', providerBackend);
+
+runStoreReclaimConformance('SQLiteProvider store reclaim', providerBackend);

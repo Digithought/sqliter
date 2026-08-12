@@ -326,6 +326,34 @@ rather than the plugin. `assertStoreNamesDistinct` — its core assertion — is
 standalone; `test/store-name-distinctness.spec.ts` drives it against provider doubles built
 to fold, truncate, and over-reject, so the guard itself is watched failing.
 
+**Every provider runs the store-reclaim battery too.** `runStoreReclaimConformance(name,
+makeReclaimBackend)` holds a provider to the other rule the engine depends on: when it is
+told to delete a table's stores, those stores must be *erased*, not merely closed. Store
+handles are re-opened lazily by name, so a provider that only drops its cached handle leaves
+the bytes in place and the next table created under that name comes back holding the dropped
+table's rows — a defect two of the four shipped providers had. The battery deletes and
+re-opens by the same names, checking each store reads back empty through both a point `get`
+and a scan, that a store re-created under a dropped name holds only its own new rows, that
+`deleteIndexStore` touches only that one index, that sibling tables (including one literally
+named `{table}_idx_<x>`) and the reserved `__stats__` / `__catalog__` stores survive, that
+deleting a store that was never created is a no-op rather than a throw, and that a store
+whose handle the caller already closed is still erased (the order every `drop index` takes):
+
+```typescript
+import { runStoreReclaimConformance } from '@quereus/store/testing';
+
+runStoreReclaimConformance('MyCustomProvider store reclaim', () => ({
+  open: async () => new MyCustomProvider(/* fresh, empty keyspace */),
+  teardown: async () => { /* close the provider, remove backing storage */ },
+}));
+```
+
+It takes the same `KVProviderLifecycle` adapter as the naming battery, so a plugin's spec
+builds one closure and registers both. Both delete hooks are optional on `KVStoreProvider`;
+a provider that omits one is skipped for those cases, and the skip is printed rather than
+silent. Reclaiming bytes *on disk* is deliberately not asserted — a provider may leave an
+emptied database directory or an unshrunk file behind and still be correct.
+
 ## KVStore Interface
 
 The `KVStore` interface is the foundation for all storage backends:

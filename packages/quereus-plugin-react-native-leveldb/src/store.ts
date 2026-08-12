@@ -316,6 +316,16 @@ export class ReactNativeLevelDBStore implements KVStore {
 		}
 	}
 
+	/**
+	 * True once {@link close} has run. Lets the provider notice a handle a caller closed
+	 * out-of-band (`StoreTableBase.releaseIndexStore` closes an index handle just before
+	 * `dropIndex` asks the provider to delete that store) and re-open instead of handing
+	 * back a dead one.
+	 */
+	isClosed(): boolean {
+		return this.closed;
+	}
+
 	async approximateCount(options?: IterateOptions): Promise<number> {
 		this.checkOpen();
 		// LevelDB doesn't have a native count, so we iterate and count

@@ -47,6 +47,7 @@
 
 import assert from 'node:assert/strict';
 import type { KVStore, KVStoreProvider } from '../common/kv-store.js';
+import type { KVProviderLifecycle } from './kv-lifecycle.js';
 import { assertBytes, b } from './kv-assert.js';
 
 // Module-local Mocha globals — see the same block in kv-conformance.ts for why these
@@ -57,15 +58,12 @@ declare const beforeEach: (fn: () => void | Promise<void>) => void;
 declare const afterEach: (fn: () => void | Promise<void>) => void;
 
 /**
- * Per-backend lifecycle adapter. The suite drives its own per-test lifecycle and calls
- * {@link makeNamingBackend} fresh for every test, so state never leaks between tests.
+ * Per-backend lifecycle adapter — the shared provider-battery shape, so a plugin's spec can
+ * hand one closure to this battery and to {@link runStoreReclaimConformance} alike. The
+ * suite drives its own per-test lifecycle and calls {@link makeNamingBackend} fresh for
+ * every test, so state never leaks between tests.
  */
-export interface KVNamingBackend {
-	/** Open a provider over a fresh, EMPTY physical keyspace. Called once per test. */
-	open(): Promise<KVStoreProvider>;
-	/** Release everything open() created (close the provider, rm dirs / delete dbs). */
-	teardown(): Promise<void>;
-}
+export type KVNamingBackend = KVProviderLifecycle;
 
 /**
  * One logical store in the corpus — a table's data store, or (when `index` is set) one of
