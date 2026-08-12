@@ -18,7 +18,7 @@ This list reflects the current and upcoming work for Quereus. Completed items an
 
 ## Stand-alone isolation layer optimizations
 
-See `docs/design-isolation-layer.md`
+See `tickets/backlog/feat-isolation-overlay-fast-paths.md`
 
 ## 🔄 Current Development Focus
 

@@ -457,7 +457,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * fallible data work (constraint re-checks, injected/IO write errors) happens in
 	 * Phase 1 before any commit, a data-driven abort is always clean. Full
 	 * crash-atomicity across the commit phase itself is contingent on the underlying
-	 * exposing a shared atomic commit domain (see docs/design-isolation-layer.md
+	 * exposing a shared atomic commit domain (see docs/design-isolation-challenges.md
 	 * § "Commit Failure Recovery").
 	 *
 	 * A poisoned overlay aborts the whole commit before any apply — mirroring the
