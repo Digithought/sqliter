@@ -52,6 +52,16 @@ import type { RuntimeContext } from '../types.js';
  * {@link DatabaseEventEmitter.discardSchemaEventsSince} for why touching the data channel here
  * would swallow earlier statements' committed writes.
  *
+ * NOTE: retraction is the right answer only while a failed statement's catalog change does not
+ * OUTLIVE the failure — the same condition the `apply schema` carve-out above turns on. It
+ * holds today by placement: every engine auto emit sits at the tail of its catalog mutation
+ * (`SchemaManager.createTable` / `createIndex` / `dropIndex` / `dropTable` / `createBackingTable`),
+ * and the only post-emit work any DDL emitter still does — `dropMaintainedTable`'s
+ * `materialized_view_removed` notify — cannot throw, because `SchemaChangeNotifier.notifyChange`
+ * swallows listener errors. If a DDL emitter ever gains work that runs AFTER a catalog change
+ * landed and can throw, this scope would un-announce a change the catalog kept; that arm needs
+ * the carve-out treatment (its own inner scope, or no scope), not a wider one.
+ *
  * NOTE: nothing nests these scopes today (`apply schema` is unwrapped, and the one ALTER arm
  * that runs nested SQL — the ALTER PRIMARY KEY shadow rebuild — does it under
  * `withPublicEventsSuppressed`, so it batches no events at all). If an arm ever did nest one,

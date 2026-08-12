@@ -138,9 +138,11 @@ export function emitRefreshMaterializedView(plan: RefreshMaterializedViewNode, _
 
 		await rctx.db._ensureTransaction();
 
-		// Statement-scoped schema-event scope (see ddl-event-scope.ts): the reshape arm
-		// drives module `alterTable` ops — announced by an emitter-backed module from
-		// inside the call — before the recomputed rows can still reject the refresh.
+		// Statement-scoped schema-event scope (see ddl-event-scope.ts). No demonstrated leak
+		// on either path today: the reshape arm does drive module `alterTable` ops before the
+		// recomputed rows can reject the refresh, but `reshapeOpToChange` never sets `ddl`, so
+		// an emitter-backed module stays silent for them. The scope is the invariant every DDL
+		// emitter holds, and the guard if a reshape ever announces.
 		return withStatementScopedSchemaEvents(rctx, async () => {
 			const db = rctx.db;
 			const sm = db.schemaManager;

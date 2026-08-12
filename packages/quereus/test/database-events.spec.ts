@@ -736,10 +736,11 @@ describe('DatabaseEventEmitter.withPublicEventsSuppressed', () => {
 });
 
 /**
- * `beginSchemaEventScope` / `discardSchemaEventsSince` — the mark/discard pair a failed
- * `ALTER TABLE` statement uses to retract the schema event a self-emitting backend already
- * batched from inside its own `alterTable` (see `runtime/emit/alter-schema-event.ts` §
- * `withStatementScopedSchemaEvents`; alter-table-schema-events.spec.ts drives that
+ * `beginSchemaEventScope` / `discardSchemaEventsSince` — the mark/discard pair a failed DDL
+ * statement uses to retract the schema event a self-emitting backend already batched from
+ * inside its own `create` / `alterTable` / `destroy` (see `runtime/emit/ddl-event-scope.ts` §
+ * `withStatementScopedSchemaEvents`, which every DDL emitter runs under;
+ * alter-table-schema-events.spec.ts and ddl-schema-event-atomicity.spec.ts drive that
  * end-to-end). Here: the mechanics the SQL-level tests cannot reach — savepoint layers
  * pushed, rolled back, or released between the mark and the discard, which is the whole
  * reason each event carries a stamp rather than the scope remembering an array length.
