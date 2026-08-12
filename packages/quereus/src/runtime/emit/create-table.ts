@@ -5,6 +5,7 @@ import { type SqlValue } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { createMaintainedTable } from './materialized-view-helpers.js';
 import { assertDdlTransactionPolicy } from './ddl-transaction-policy.js';
+import { withStatementScopedSchemaEvents } from './ddl-event-scope.js';
 
 export function emitCreateTable(plan: CreateTableNode, _ctx: EmissionContext): Instruction {
 	async function run(rctx: RuntimeContext): Promise<SqlValue> {
@@ -24,18 +25,27 @@ export function emitCreateTable(plan: CreateTableNode, _ctx: EmissionContext): I
 		// Ensure we're in a transaction before DDL (lazy/JIT transaction start)
 		await rctx.db._ensureTransaction();
 
-		if (plan.statementAst.maintained) {
-			// `create table … maintained as <body>` — the declared-shape maintained
-			// form: shape-verify against the body BEFORE registration, then create +
-			// attach-to-empty through the shared attach core (all-or-nothing).
-			await createMaintainedTable(rctx.db, plan.statementAst);
-			return null;
-		}
+		// Both arms run under the statement-scoped schema-event scope (see
+		// ddl-event-scope.ts). The maintained arm creates the backing table — announced —
+		// and fills it afterwards, so a fill that violates a declared constraint would
+		// otherwise announce a create and a drop for a statement that did nothing. The
+		// plain arm can fail after `module.create` too (the FK-collation check in
+		// SchemaManager.createTable), by which point an emitter-backed module has already
+		// announced.
+		return withStatementScopedSchemaEvents(rctx, async () => {
+			if (plan.statementAst.maintained) {
+				// `create table … maintained as <body>` — the declared-shape maintained
+				// form: shape-verify against the body BEFORE registration, then create +
+				// attach-to-empty through the shared attach core (all-or-nothing).
+				await createMaintainedTable(rctx.db, plan.statementAst);
+				return null;
+			}
 
-		await rctx.db.schemaManager.createTable(plan.statementAst);
-		// The specific error handling for IF NOT EXISTS is within SchemaManager.defineTable.
+			await rctx.db.schemaManager.createTable(plan.statementAst);
+			// The specific error handling for IF NOT EXISTS is within SchemaManager.defineTable.
 
-		return null; // Explicitly return null for successful void operations
+			return null; // Explicitly return null for successful void operations
+		});
 	}
 
 	return { params: [], run: asRun(run), note: `createTable(${plan.statementAst.table.name})` };

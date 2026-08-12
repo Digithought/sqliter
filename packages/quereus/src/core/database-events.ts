@@ -325,8 +325,9 @@ export class DatabaseEventEmitter {
 	 * That is a guard against under-matching only. `discardSchemaEventsSince` drops
 	 * everything from its watermark ON, so a watermark held past its own scope would also
 	 * retract events batched after it — which is why the only caller
-	 * (`withStatementScopedSchemaEvents` in `runtime/emit/alter-schema-event.ts`) takes one
-	 * and spends it inside a single try/catch, never storing it.
+	 * (`withStatementScopedSchemaEvents` in `runtime/emit/ddl-event-scope.ts`, which every DDL
+	 * statement emitter runs under) takes one and spends it inside a single try/catch, never
+	 * storing it.
 	 */
 	private schemaEventSeq = 0;
 
@@ -713,7 +714,7 @@ export class DatabaseEventEmitter {
 	 * Take a watermark identifying "every schema event batched from here on" — the mark half
 	 * of the mark/discard pair {@link discardSchemaEventsSince} completes. Used to make one
 	 * statement's schema events retractable when the statement then fails; see
-	 * `runtime/emit/alter-schema-event.ts` § `withStatementScopedSchemaEvents`.
+	 * `runtime/emit/ddl-event-scope.ts` § `withStatementScopedSchemaEvents`.
 	 */
 	beginSchemaEventScope(): number {
 		return this.schemaEventSeq;

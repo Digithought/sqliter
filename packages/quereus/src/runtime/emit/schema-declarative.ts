@@ -206,6 +206,14 @@ export function emitDiffSchema(plan: PlanNode, _ctx: EmissionContext): Instructi
 	};
 }
 
+/**
+ * Deliberately NOT wrapped in `withStatementScopedSchemaEvents` (see ddl-event-scope.ts),
+ * which every other DDL emitter opens around its `run()` body. A failure on the Nth generated
+ * migration statement leaves statements 1..N-1 *applied* — there is no catalog rollback, and
+ * inside an explicit transaction the user may still commit — so those really happened and must
+ * stay announced. Each generated sub-statement runs its own emitter and so carries its own
+ * scope: the ones that landed keep their events, the one that failed retracts its own.
+ */
 export function emitApplySchema(plan: PlanNode, _ctx: EmissionContext): Instruction {
 	const applyStmt = (plan as unknown as { statementAst: AST.ApplySchemaStmt }).statementAst;
 

@@ -25,7 +25,8 @@ import { isTruthy } from '../../util/comparison.js';
 import { assertDdlTransactionPolicy, isExplicitTransactionOpen } from './ddl-transaction-policy.js';
 import { buildColumnSourceResolver } from '../../schema/column-source-resolver.js';
 import { assertNoColumnExpressionNamesColumn, assertNoCheckConstraintNamesColumn, assertNoAssertionNamesColumn, assertNoForeignKeyReferencesColumn } from './drop-column-guards.js';
-import { emitAlterSchemaEvent, withStatementScopedSchemaEvents } from './alter-schema-event.js';
+import { emitAlterSchemaEvent } from './alter-schema-event.js';
+import { withStatementScopedSchemaEvents } from './ddl-event-scope.js';
 import { foldDefaultToType, validateAndParse } from '../../types/validation.js';
 import {
 	snapshotStaleMaterializedViews,

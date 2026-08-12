@@ -181,23 +181,36 @@ class MyTable extends VirtualTable {
 }
 ```
 
-#### A failed ALTER announces nothing, even from a native emitter
+#### A failed DDL statement announces nothing, even from a native emitter
 
-A module emits its `ALTER TABLE` schema event from inside its own `alterTable`, which is not
-the end of the statement — the engine may still install inline constraints through further
-module calls and unwind the whole ALTER if one fails. Your module does not have to detect
-that: the engine scopes each ALTER statement's batched schema events and **retracts** them
-when the statement throws (`withStatementScopedSchemaEvents` in
-`runtime/emit/alter-schema-event.ts`, over the emitter's
+A module emits its schema event from inside its own `create` / `alterTable` / `destroy`, which
+is not the end of the statement — the engine may still do work that fails and unwinds
+everything. Two cases in the tree today:
+
+- `alter table … add column <inline constraint>` installs each constraint through further
+  module calls after the `alterTable` that announced.
+- `create table … maintained as` (and `create materialized view`) creates the backing table —
+  your `create` announces it — and fills it afterwards; a body that violates the declaration
+  drops the table again.
+
+Your module does not have to detect that: the engine scopes **every** DDL statement's batched
+schema events and **retracts** them when the statement throws
+(`withStatementScopedSchemaEvents` in `runtime/emit/ddl-event-scope.ts`, over the emitter's
 `beginSchemaEventScope`/`discardSchemaEventsSince` pair). Emit as usual; a statement that
 unwound delivers no schema event on either path. Data events are not retracted — a module
 that flushes earlier buffered writes during a DDL call would otherwise lose them.
 
 The retraction reaches only events the module has already handed to the engine (the store and
-memory modules emit theirs synchronously from inside `alterTable`). A module that instead
-holds its schema events in its own queue and emits them at commit is past the scope by then,
-and must drop a failed statement's own events itself — the same division of responsibility as
-the row-image contract above.
+memory modules emit theirs synchronously from inside the call). A module that instead holds
+its schema events in its own queue and emits them at commit is past the scope by then, and
+must drop a failed statement's own events itself — the same division of responsibility as the
+row-image contract above.
+
+**Carve-out: a partially-applied migration keeps what landed.** A declarative `apply schema`
+is not scoped as one unit — it runs each generated migration statement through the ordinary
+statement path, and a failure on the Nth leaves statements 1..N-1 applied with no catalog
+rollback. Those really happened, so their events stay; each generated sub-statement carries
+its own scope, so only the failing one retracts.
 
 ### For Modules without Native Events
 
@@ -209,7 +222,9 @@ If your module doesn't need custom event logic (e.g., remote change tracking), s
 
 #### DDL coverage of the auto path
 
-The engine's fallback raises a schema-change event for:
+The engine's fallback raises a schema-change event for the statements below — and, like every
+other producer, **only when the statement succeeds** (see § [A failed DDL statement announces
+nothing, even from a native emitter](#a-failed-ddl-statement-announces-nothing-even-from-a-native-emitter)):
 
 - `CREATE TABLE` / `DROP TABLE` / `CREATE INDEX` / `DROP INDEX`
 - **every structural `ALTER TABLE` arm** — `RENAME TO`, `RENAME COLUMN`, `ADD COLUMN`, `DROP COLUMN`, all four `ALTER COLUMN` attribute forms, `ALTER PRIMARY KEY`, `ADD CONSTRAINT`, `DROP CONSTRAINT`, `RENAME CONSTRAINT`

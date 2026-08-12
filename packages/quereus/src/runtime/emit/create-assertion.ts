@@ -10,6 +10,7 @@ import type { IntegrityAssertionSchema, AssertionDependentTable } from '../../sc
 import { buildAssertionViolationSql } from '../../schema/assertion.js';
 import { planAssertionBodyForAnalysis } from '../../planner/analysis/assertion-plan.js';
 import { collectTableReferences } from '../../planner/analysis/relation-key.js';
+import { withStatementScopedSchemaEvents } from './ddl-event-scope.js';
 
 const log = createLogger('runtime:emit:create-assertion');
 const warnLog = log.extend('warn');
@@ -60,50 +61,55 @@ export function emitCreateAssertion(plan: CreateAssertionNode, _ctx: EmissionCon
 		// Ensure we're in a transaction before DDL (lazy/JIT transaction start)
 		await rctx.db._ensureTransaction();
 
-		// Convert the CHECK expression to SQL text for storage. Shared with the
-		// `ALTER TABLE … RENAME` propagation, which regenerates this same text from
-		// the rewritten expression (see `buildAssertionViolationSql`).
-		let violationSql: string;
-		try {
-			violationSql = buildAssertionViolationSql(plan.checkExpression);
-		} catch (e) {
-			throw new QuereusError(
-				`Cannot create assertion '${plan.name}': failed to convert check expression to SQL`,
-				StatusCode.ERROR,
-				e instanceof Error ? e : undefined
-			);
-		}
+		// Statement-scoped schema-event scope. Assertions raise nothing on the public
+		// schema channel today, so the scope is a no-op — it is here so the invariant
+		// holds by construction: see ddl-event-scope.ts.
+		return withStatementScopedSchemaEvents(rctx, async () => {
+			// Convert the CHECK expression to SQL text for storage. Shared with the
+			// `ALTER TABLE … RENAME` propagation, which regenerates this same text from
+			// the rewritten expression (see `buildAssertionViolationSql`).
+			let violationSql: string;
+			try {
+				violationSql = buildAssertionViolationSql(plan.checkExpression);
+			} catch (e) {
+				throw new QuereusError(
+					`Cannot create assertion '${plan.name}': failed to convert check expression to SQL`,
+					StatusCode.ERROR,
+					e instanceof Error ? e : undefined
+				);
+			}
 
-		// Everything that can reject the statement runs before any discovery work:
-		// a name clash must not pay for a plan it then throws away.
-		const schemaManager = rctx.db.schemaManager;
-		const schema = schemaManager.getSchema(plan.schemaName);
-		if (!schema) {
-			throw new QuereusError(`Schema not found: ${plan.schemaName}`, StatusCode.ERROR);
-		}
+			// Everything that can reject the statement runs before any discovery work:
+			// a name clash must not pay for a plan it then throws away.
+			const schemaManager = rctx.db.schemaManager;
+			const schema = schemaManager.getSchema(plan.schemaName);
+			if (!schema) {
+				throw new QuereusError(`Schema not found: ${plan.schemaName}`, StatusCode.ERROR);
+			}
 
-		// Assertion names are unique per schema.
-		if (schema.getAssertion(plan.name)) {
-			throw new QuereusError(
-				`Assertion ${plan.name} already exists`,
-				StatusCode.CONSTRAINT
-			);
-		}
+			// Assertion names are unique per schema.
+			if (schema.getAssertion(plan.name)) {
+				throw new QuereusError(
+					`Assertion ${plan.name} already exists`,
+					StatusCode.CONSTRAINT
+				);
+			}
 
-		const assertionSchema: IntegrityAssertionSchema = {
-			name: plan.name,
-			schemaName: plan.schemaName,
-			violationSql,
-			deferrable: true, // Auto-deferred for multi-table constraints
-			initiallyDeferred: true,
-			dependentTables: discoverDependentTables(rctx.db, violationSql, plan.schemaName, plan.name),
-			checkExpression: plan.checkExpression,
-		};
+			const assertionSchema: IntegrityAssertionSchema = {
+				name: plan.name,
+				schemaName: plan.schemaName,
+				violationSql,
+				deferrable: true, // Auto-deferred for multi-table constraints
+				initiallyDeferred: true,
+				dependentTables: discoverDependentTables(rctx.db, violationSql, plan.schemaName, plan.name),
+				checkExpression: plan.checkExpression,
+			};
 
-		schemaManager.addAssertion(schema.name, assertionSchema);
+			schemaManager.addAssertion(schema.name, assertionSchema);
 
-		log('Created assertion %s.%s with violationSql: %s', plan.schemaName, plan.name, violationSql);
-		return null;
+			log('Created assertion %s.%s with violationSql: %s', plan.schemaName, plan.name, violationSql);
+			return null;
+		});
 	}
 
 	return {

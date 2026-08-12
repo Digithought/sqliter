@@ -465,6 +465,33 @@ The `DatabaseSchemaChangeEvent` interface:
 | `ddl` | `string` | DDL statement if available |
 | `remote` | `boolean` | `true` if the change originated from a remote source |
 
+#### Every DDL statement announces on its success path only
+
+A schema-change event is raised **only** for a statement that succeeded. A DDL statement that
+throws announces nothing at all, on every backend — no matter how far it got before failing.
+
+This is not free, and it is worth knowing why the engine has to work for it. Some statements
+do their announcing part-way through, so a later failure has to take the announcement back:
+
+- `create table … maintained as <body>` (and `create materialized view`) creates the backing
+  table first and fills it afterwards. If the body's rows violate a `CHECK` the declaration
+  itself asked for, or produce duplicate keys, the statement fails and the engine drops the
+  backing table again. Without retraction you would be told a table was created and then
+  dropped — and a peer device replicating those events would build and destroy a real table
+  for a statement that did nothing.
+- `alter table … add column <inline constraint>` on a backend that emits for itself announces
+  from inside its own storage call, before the engine installs the inline constraint. A
+  constraint that the backfilled rows violate unwinds the whole column.
+
+The engine scopes each DDL statement's schema events and retracts them as the error
+propagates, so both cases announce nothing. Like every other event, delivery of a successful
+statement's event is batched to commit and dropped on rollback.
+
+One deliberate exception: a declarative `apply schema` runs its generated migration DDL as
+ordinary statements, and a migration that fails part-way leaves the statements before the
+failure **applied**. Those really happened, so they stay announced; only the statement that
+failed retracts its own. See § [Declarative Schema Workflow](#declarative-schema-workflow).
+
 #### What each `ALTER TABLE` arm reports
 
 Every structural `ALTER TABLE` arm raises exactly **one** event, whether or not the storage
@@ -497,11 +524,10 @@ internal `addConstraint` round-trip per inline constraint, but those calls are m
 engine-internal and announce nothing.
 
 The event is raised on the statement's **success** path only — an ALTER that throws announces
-nothing at all, on every backend. This holds even when the failure lands *after* a
-self-emitting backend has already announced the change (an `add column` that gets past its own
-module call, then fails installing an inline constraint): the engine scopes each ALTER
-statement's schema events and retracts them as the error propagates. Like every other event,
-delivery is batched to commit and dropped on rollback.
+nothing at all, on every backend, including when the failure lands *after* a self-emitting
+backend has already announced the change. That is the general DDL rule above (§ [Every DDL
+statement announces on its success
+path only](#every-ddl-statement-announces-on-its-success-path-only)), not an ALTER-specific one.
 
 Two arm families report nothing on either path: the metadata-tag arms (`set tags`, `add tags`,
 `drop tags`) and the materialized-view lifecycle arms (`set maintained`, `drop maintained`).

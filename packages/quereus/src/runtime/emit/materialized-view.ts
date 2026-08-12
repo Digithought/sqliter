@@ -13,6 +13,7 @@ import type { MaintainedTableSchema } from '../../schema/derivation.js';
 import { requireVtabModule } from '../../schema/table.js';
 import { normalizeBackingModuleName } from '../../schema/view.js';
 import { assertDdlTransactionPolicy, isDdlPolicyStrict } from './ddl-transaction-policy.js';
+import { withStatementScopedSchemaEvents } from './ddl-event-scope.js';
 import { assertNoAssertionDependsOn } from './assertion-drop-guard.js';
 import { assertNoExpressionDependsOn } from './expression-drop-guard.js';
 import {
@@ -64,51 +65,58 @@ export function emitCreateMaterializedView(plan: CreateMaterializedViewNode, _ct
 		}
 
 		await rctx.db._ensureTransaction();
-		const db = rctx.db;
-		const sm = db.schemaManager;
 
-		const existing = sm.getMaintainedTable(plan.schemaName, plan.viewName);
-		if (existing) {
-			if (plan.ifNotExists) return null;
-			throw new QuereusError(
-				`Materialized view '${plan.schemaName}.${plan.viewName}' already exists`,
-				StatusCode.ERROR,
-			);
-		}
-		// One namespace now: a plain table occupies the same name a maintained
-		// table would. Keep the dedicated diagnostic for both directions.
-		if (sm.getTable(plan.schemaName, plan.viewName) || sm.getView(plan.schemaName, plan.viewName)) {
-			throw new QuereusError(
-				`Cannot create materialized view '${plan.schemaName}.${plan.viewName}': a table or view with the same name already exists`,
-				StatusCode.CONSTRAINT,
-			);
-		}
+		// Statement-scoped schema-event scope (see ddl-event-scope.ts): `materializeView`
+		// creates the backing table — announced — and fills it afterwards, so a fill that
+		// fails drops the table again. Without the scope the statement announces a create
+		// and a drop for a table the application never got.
+		return withStatementScopedSchemaEvents(rctx, async () => {
+			const db = rctx.db;
+			const sm = db.schemaManager;
 
-		// The materialize core (derive backing shape → create + fill the
-		// maintained table under the MV's own name in the declared host module →
-		// attach derivation + register row-time maintenance, rolling back on any
-		// throw) is shared with the catalog-import path — see materializeView.
-		const mv = await materializeView(db, {
-			schemaName: plan.schemaName,
-			viewName: plan.viewName,
-			// Any `with defaults (…)` rides inside plan.selectStmt (→ selectAst).
-			selectAst: plan.selectStmt,
-			bodySql: plan.bodySql,
-			columns: plan.columns,
-			tags: plan.tags,
-			backingModuleName: plan.backingModuleName,
-			backingModuleArgs: plan.backingModuleArgs,
+			const existing = sm.getMaintainedTable(plan.schemaName, plan.viewName);
+			if (existing) {
+				if (plan.ifNotExists) return null;
+				throw new QuereusError(
+					`Materialized view '${plan.schemaName}.${plan.viewName}' already exists`,
+					StatusCode.ERROR,
+				);
+			}
+			// One namespace now: a plain table occupies the same name a maintained
+			// table would. Keep the dedicated diagnostic for both directions.
+			if (sm.getTable(plan.schemaName, plan.viewName) || sm.getView(plan.schemaName, plan.viewName)) {
+				throw new QuereusError(
+					`Cannot create materialized view '${plan.schemaName}.${plan.viewName}': a table or view with the same name already exists`,
+					StatusCode.CONSTRAINT,
+				);
+			}
+
+			// The materialize core (derive backing shape → create + fill the
+			// maintained table under the MV's own name in the declared host module →
+			// attach derivation + register row-time maintenance, rolling back on any
+			// throw) is shared with the catalog-import path — see materializeView.
+			const mv = await materializeView(db, {
+				schemaName: plan.schemaName,
+				viewName: plan.viewName,
+				// Any `with defaults (…)` rides inside plan.selectStmt (→ selectAst).
+				selectAst: plan.selectStmt,
+				bodySql: plan.bodySql,
+				columns: plan.columns,
+				tags: plan.tags,
+				backingModuleName: plan.backingModuleName,
+				backingModuleArgs: plan.backingModuleArgs,
+			});
+
+			sm.getChangeNotifier().notifyChange({
+				type: 'materialized_view_added',
+				// Stored names of the registered MV — see
+				// SchemaManager.canonicalSchemaName for the emitter/stored-name invariant.
+				schemaName: mv.schemaName,
+				objectName: mv.name,
+				newObject: mv,
+			});
+			return null;
 		});
-
-		sm.getChangeNotifier().notifyChange({
-			type: 'materialized_view_added',
-			// Stored names of the registered MV — see
-			// SchemaManager.canonicalSchemaName for the emitter/stored-name invariant.
-			schemaName: mv.schemaName,
-			objectName: mv.name,
-			newObject: mv,
-		});
-		return null;
 	}
 
 	return { params: [], run, note: `createMaterializedView(${plan.schemaName}.${plan.viewName})` };
@@ -129,22 +137,28 @@ export function emitRefreshMaterializedView(plan: RefreshMaterializedViewNode, _
 		);
 
 		await rctx.db._ensureTransaction();
-		const db = rctx.db;
-		const sm = db.schemaManager;
 
-		const mv = sm.getMaintainedTable(plan.schemaName, plan.viewName);
-		if (!mv) {
-			if (sm.getTable(plan.schemaName, plan.viewName)) {
-				throw new QuereusError(
-					`'${plan.viewName}' is a table, not a materialized view`,
-					StatusCode.ERROR,
-				);
+		// Statement-scoped schema-event scope (see ddl-event-scope.ts): the reshape arm
+		// drives module `alterTable` ops — announced by an emitter-backed module from
+		// inside the call — before the recomputed rows can still reject the refresh.
+		return withStatementScopedSchemaEvents(rctx, async () => {
+			const db = rctx.db;
+			const sm = db.schemaManager;
+
+			const mv = sm.getMaintainedTable(plan.schemaName, plan.viewName);
+			if (!mv) {
+				if (sm.getTable(plan.schemaName, plan.viewName)) {
+					throw new QuereusError(
+						`'${plan.viewName}' is a table, not a materialized view`,
+						StatusCode.ERROR,
+					);
+				}
+				throw new QuereusError(`no such materialized view: ${plan.viewName}`, StatusCode.ERROR);
 			}
-			throw new QuereusError(`no such materialized view: ${plan.viewName}`, StatusCode.ERROR);
-		}
 
-		await refreshMaintainedTable(db, mv);
-		return null;
+			await refreshMaintainedTable(db, mv);
+			return null;
+		});
 	}
 
 	return { params: [], run, note: `refreshMaterializedView(${plan.schemaName}.${plan.viewName})` };
@@ -273,36 +287,43 @@ export function emitDropMaterializedView(plan: DropMaterializedViewNode, _ctx: E
 		);
 
 		await rctx.db._ensureTransaction();
-		const db = rctx.db;
-		const sm = db.schemaManager;
 
-		const mv = sm.getMaintainedTable(plan.schemaName, plan.viewName);
-		if (!mv) {
-			if (plan.ifExists) return null;
-			if (sm.getTable(plan.schemaName, plan.viewName)) {
-				throw new QuereusError(
-					`'${plan.viewName}' is a table, not a materialized view — use DROP TABLE`,
-					StatusCode.ERROR,
-				);
+		// Statement-scoped schema-event scope (see ddl-event-scope.ts): `dropMaintainedTable`
+		// drops the backing table — announced — and then does more work (the
+		// `materialized_view_removed` notify and its listeners), so a failure past the drop
+		// must not leave the drop announced.
+		return withStatementScopedSchemaEvents(rctx, async () => {
+			const db = rctx.db;
+			const sm = db.schemaManager;
+
+			const mv = sm.getMaintainedTable(plan.schemaName, plan.viewName);
+			if (!mv) {
+				if (plan.ifExists) return null;
+				if (sm.getTable(plan.schemaName, plan.viewName)) {
+					throw new QuereusError(
+						`'${plan.viewName}' is a table, not a materialized view — use DROP TABLE`,
+						StatusCode.ERROR,
+					);
+				}
+				if (sm.getView(plan.schemaName, plan.viewName)) {
+					throw new QuereusError(
+						`'${plan.viewName}' is a view, not a materialized view — use DROP VIEW`,
+						StatusCode.ERROR,
+					);
+				}
+				throw new QuereusError(`no such materialized view: ${plan.viewName}`, StatusCode.ERROR);
 			}
-			if (sm.getView(plan.schemaName, plan.viewName)) {
-				throw new QuereusError(
-					`'${plan.viewName}' is a view, not a materialized view — use DROP VIEW`,
-					StatusCode.ERROR,
-				);
-			}
-			throw new QuereusError(`no such materialized view: ${plan.viewName}`, StatusCode.ERROR);
-		}
 
-		// Same guard DROP TABLE applies — a maintained table is a table to an
-		// assertion body. `dropMaintainedTable` itself stays unguarded: internal
-		// rollback / catalog-cleanup paths call it and must not be vetoed.
-		assertNoAssertionDependsOn(db, plan.schemaName, plan.viewName, 'materialized view');
-		// …and a table to another table's CHECK / DEFAULT / generated subquery too.
-		assertNoExpressionDependsOn(db, plan.schemaName, plan.viewName, 'materialized view');
+			// Same guard DROP TABLE applies — a maintained table is a table to an
+			// assertion body. `dropMaintainedTable` itself stays unguarded: internal
+			// rollback / catalog-cleanup paths call it and must not be vetoed.
+			assertNoAssertionDependsOn(db, plan.schemaName, plan.viewName, 'materialized view');
+			// …and a table to another table's CHECK / DEFAULT / generated subquery too.
+			assertNoExpressionDependsOn(db, plan.schemaName, plan.viewName, 'materialized view');
 
-		await dropMaintainedTable(db, mv);
-		return null;
+			await dropMaintainedTable(db, mv);
+			return null;
+		});
 	}
 
 	return { params: [], run, note: `dropMaterializedView(${plan.schemaName}.${plan.viewName})` };

@@ -5,6 +5,7 @@ import type { EmissionContext } from '../emission-context.js';
 import type { SqlValue } from '../../common/types.js';
 import { requireVtabModule } from '../../schema/table.js';
 import { assertDdlTransactionPolicy, isDdlPolicyStrict } from './ddl-transaction-policy.js';
+import { withStatementScopedSchemaEvents } from './ddl-event-scope.js';
 
 export function emitDropIndex(plan: DropIndexNode, _ctx: EmissionContext): Instruction {
 	async function run(rctx: RuntimeContext): Promise<SqlValue> {
@@ -29,9 +30,13 @@ export function emitDropIndex(plan: DropIndexNode, _ctx: EmissionContext): Instr
 		// Ensure we're in a transaction before DDL (lazy/JIT transaction start)
 		await rctx.db._ensureTransaction();
 
-		await rctx.db.schemaManager.dropIndex(plan.schemaName, plan.indexName, plan.ifExists);
+		// Statement-scoped schema-event scope — the invariant every DDL emitter holds; see
+		// ddl-event-scope.ts.
+		return withStatementScopedSchemaEvents(rctx, async () => {
+			await rctx.db.schemaManager.dropIndex(plan.schemaName, plan.indexName, plan.ifExists);
 
-		return null;
+			return null;
+		});
 	}
 
 	return {

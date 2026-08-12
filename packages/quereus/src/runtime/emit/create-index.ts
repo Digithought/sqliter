@@ -5,6 +5,7 @@ import { type SqlValue } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { requireVtabModule } from '../../schema/table.js';
 import { assertDdlTransactionPolicy } from './ddl-transaction-policy.js';
+import { withStatementScopedSchemaEvents } from './ddl-event-scope.js';
 
 export function emitCreateIndex(plan: CreateIndexNode, _ctx: EmissionContext): Instruction {
 	async function run(rctx: RuntimeContext): Promise<SqlValue> {
@@ -23,10 +24,14 @@ export function emitCreateIndex(plan: CreateIndexNode, _ctx: EmissionContext): I
 		// Ensure we're in a transaction before DDL (lazy/JIT transaction start)
 		await rctx.db._ensureTransaction();
 
-		await rctx.db.schemaManager.createIndex(plan.statementAst);
-		// The specific error handling for IF NOT EXISTS is within SchemaManager.createIndex.
+		// Statement-scoped schema-event scope — the invariant every DDL emitter holds; see
+		// ddl-event-scope.ts.
+		return withStatementScopedSchemaEvents(rctx, async () => {
+			await rctx.db.schemaManager.createIndex(plan.statementAst);
+			// The specific error handling for IF NOT EXISTS is within SchemaManager.createIndex.
 
-		return null; // Explicitly return null for successful void operations
+			return null; // Explicitly return null for successful void operations
+		});
 	}
 
 	return { params: [], run: asRun(run), note: `createIndex(${plan.statementAst.index.name})` };

@@ -7,6 +7,7 @@ import type { EmissionContext } from '../emission-context.js';
 import { dropMaintainedTable } from './materialized-view.js';
 import { requireVtabModule } from '../../schema/table.js';
 import { assertDdlTransactionPolicy } from './ddl-transaction-policy.js';
+import { withStatementScopedSchemaEvents } from './ddl-event-scope.js';
 import { assertNoAssertionDependsOn } from './assertion-drop-guard.js';
 import { assertNoExpressionDependsOn } from './expression-drop-guard.js';
 
@@ -47,19 +48,24 @@ export function emitDropTable(plan: DropTableNode, ctx: EmissionContext): Instru
 		// Ensure we're in a transaction before DDL (lazy/JIT transaction start)
 		await rctx.db._ensureTransaction();
 
-		// A maintained table (materialized view) is one record: DROP TABLE drops
-		// the table AND its derivation — detach maintenance, unlink any covering
-		// link, and fire materialized_view_removed so persisted catalogs forget
-		// the `create materialized view` entry.
-		const maintained = rctx.db.schemaManager.getMaintainedTable(targetSchemaName, objectName);
-		if (maintained) {
-			await dropMaintainedTable(rctx.db, maintained);
+		// Statement-scoped schema-event scope (see ddl-event-scope.ts). The maintained
+		// branch does post-drop work (`materialized_view_removed` and its listeners), and
+		// the drop itself is already announced by then.
+		return withStatementScopedSchemaEvents(rctx, async () => {
+			// A maintained table (materialized view) is one record: DROP TABLE drops
+			// the table AND its derivation — detach maintenance, unlink any covering
+			// link, and fire materialized_view_removed so persisted catalogs forget
+			// the `create materialized view` entry.
+			const maintained = rctx.db.schemaManager.getMaintainedTable(targetSchemaName, objectName);
+			if (maintained) {
+				await dropMaintainedTable(rctx.db, maintained);
+				return null;
+			}
+
+			await rctx.db.schemaManager.dropTable(targetSchemaName, objectName, stmt.ifExists);
+
 			return null;
-		}
-
-		await rctx.db.schemaManager.dropTable(targetSchemaName, objectName, stmt.ifExists);
-
-		return null;
+		});
 	}
 
 	return { params: [], run: asRun(run), note: `dropTable(${targetSchemaName}.${objectName})` };
