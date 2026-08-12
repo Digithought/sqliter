@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-08-12T18:49:30.860Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\2-grouped-post-aggregate-redirect-boundary-check.implement.2026-08-12T18-49-30-860Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 ---
 description: Three separate parts of the query planner each have to remember, on their own, to translate a summary query's grouping columns into the summarised row's columns — and one of them forgetting has now caused two user-visible bugs. Route them all through one place and add a build-time check that catches the next omission.
 prereq: bug-order-by-grouping-key-spelling-breaks-window-query

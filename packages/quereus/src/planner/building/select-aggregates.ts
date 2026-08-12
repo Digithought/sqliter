@@ -45,6 +45,7 @@ export function buildAggregatePhase(
 	hasOrderByOnlyAggregates?: boolean;
 	orderByNeedsPostAggregateSort?: boolean;
 	aggregatesContext?: PlanningContext['aggregates'];
+	groupedRedirectContext?: GroupedRedirectContext;
 } {
 	const hasGroupBy = stmt.groupBy && stmt.groupBy.length > 0;
 
@@ -127,6 +128,19 @@ export function buildAggregatePhase(
 	const aggregateNode = new AggregateNode(selectContext.scope, currentInput, groupByExpressions, aggregates);
 	currentInput = aggregateNode;
 
+	// A GROUPED query's post-aggregate expressions — HAVING below, the rebuilt SELECT
+	// list, a window phase's specifications and function arguments, the sort keys —
+	// are all built against scopes that fall through to the pre-aggregate select scope,
+	// so a legal spelling of a grouping key can bind to a base-table attribute the
+	// grouped row does not carry. Every such expression reaches the fix through ONE
+	// entry point, {@link redirectPostAggregate}, off this one context — built here,
+	// the moment the AggregateNode exists, so no post-aggregate site can run before it
+	// does. An aggregate query with no GROUP BY has no grouping keys to redirect onto
+	// and gets none.
+	const groupedRedirectContext = groupByExpressions.length > 0
+		? buildGroupedRedirectContext(groupByExpressions, aggregateNode.getAttributes(), aggregateNode.getRelations()[0])
+		: undefined;
+
 	// Create aggregate output scope
 	const aggregateOutputScope = createAggregateOutputScope(
 		selectContext.scope,
@@ -154,7 +168,7 @@ export function buildAggregatePhase(
 	// Handle HAVING clause *after* aggregation only when we did not already push
 	// it below the AggregateNode.
 	if (stmt.having && !shouldPushHavingBelowAggregate) {
-		currentInput = buildHavingFilter(currentInput, stmt.having, selectContext, aggregateOutputScope, aggregates, groupByExpressions);
+		currentInput = buildHavingFilter(currentInput, stmt.having, selectContext, aggregateOutputScope, aggregates, groupByExpressions, groupedRedirectContext);
 	}
 
 	// Determine if final projection is needed.
@@ -188,6 +202,7 @@ export function buildAggregatePhase(
 		hasOrderByOnlyAggregates,
 		orderByNeedsPostAggregateSort: needsPostAggregateSort,
 		aggregatesContext,
+		groupedRedirectContext,
 	};
 }
 
@@ -229,8 +244,8 @@ function handlePreAggregateSort(
  * own output attributes or, via the source-column fallback, base ones — so the
  * output ids must be admitted too, passed in `groupedOutputAttributes`.
  *
- * The window phase of a grouped query has its own check
- * ({@link assertGroupedWindowCoverage}); it needs to descend into subqueries and to
+ * The finished plan of a grouped query gets a second, subquery-aware check
+ * ({@link assertGroupedPlanCoverage}); it needs to descend into subqueries and to
  * tell a correlated reference from an ungrouped local one, neither of which this
  * coverage set can express.
  *
@@ -287,22 +302,21 @@ export function assertGroupByCoverage(node: PlanNode, coverage: GroupByCoverage)
 }
 
 /**
- * What a GROUPED query's two post-aggregate builders need in order to run their
- * expressions over the AggregateNode's own rows: the SELECT-list rebuild
- * ({@link buildFinalAggregateProjections}) and the window phase's specifications and
- * function arguments.
+ * What a GROUPED query's post-aggregate builders need in order to run their
+ * expressions over the AggregateNode's own rows: the rebuilt SELECT list
+ * ({@link buildFinalAggregateProjections}), the window phase's specifications and
+ * function arguments, the HAVING predicate, and the sort keys.
  *
- * Both sit ABOVE the AggregateNode, so both can read only what the aggregate's output
- * row carries: the grouping keys and the aggregate results. But the scope those
- * expressions are built against falls through to the pre-aggregate select scope, so
- * several perfectly legal spellings of a grouping key (`wg.a` against `group by a`, or
- * the whole `a || '!'` against `group by a || '!'`) bind to a *base-table* attribute
- * the aggregate row never had. This context supplies both halves of the answer: the two
- * maps let {@link redirectToGroupKeys} rewrite such a subtree onto the aggregate's own
- * output column, and the two attribute-id sets let
- * {@link assertGroupedWindowCoverage} reject what survives (window phase only — the
- * SELECT list has already been checked, against the pre-aggregate projections, by
- * {@link validateAggregateProjections}).
+ * All of them sit ABOVE the AggregateNode, so all of them can read only what the
+ * aggregate's output row carries: the grouping keys and the aggregate results. But the
+ * scope those expressions are built against falls through to the pre-aggregate select
+ * scope, so several perfectly legal spellings of a grouping key (`wg.a` against
+ * `group by a`, or the whole `a || '!'` against `group by a || '!'`) bind to a
+ * *base-table* attribute the aggregate row never had. This context supplies both halves
+ * of the answer: the two maps let {@link redirectPostAggregate} — the ONE entry point
+ * every such expression goes through — rewrite such a subtree onto the aggregate's own
+ * output column, and the two attribute-id sets let {@link assertGroupedPlanCoverage}
+ * reject what survives, once, over the finished plan.
  */
 export interface GroupedRedirectContext {
 	/** Where each GROUP BY key lives on the AggregateNode's output row. */
@@ -413,10 +427,39 @@ function isCteDefinition(node: PlanNode): boolean {
 }
 
 /**
- * Rewrites every subtree of a window specification / window-function argument that
- * IS a grouping key into a reference to the AggregateNode's output column for that
- * key, so the expression reads the grouped row instead of a base-table column that
- * row does not carry.
+ * The ONE entry point through which every post-aggregate expression of a GROUPED
+ * query reaches the grouping-key redirect: the rebuilt SELECT list, the window
+ * phase's specifications and function arguments, the HAVING predicate, and every
+ * post-aggregate sort key. A builder that constructs an expression above the
+ * AggregateNode calls this rather than remembering the rewrite itself — forgetting
+ * is how the SELECT-list and ORDER BY bugs shipped
+ * (complete/bug-qualified-group-key-in-select-list-breaks-window-query,
+ * complete/bug-order-by-grouping-key-spelling-breaks-window-query).
+ *
+ * A pass-through when `context` is absent (the query has no GROUP BY keys), and when
+ * the expression contains nothing to redirect. That gate is load-bearing, not an
+ * optimization: {@link redirectToGroupKeys} matches a subtree by AST text, so under
+ * `group by a` an ungated pass would also fingerprint a plain `order by a` that
+ * already bound correctly to a projection/window/aggregate OUTPUT attribute — the
+ * clearest hazard being an alias that shadows a grouping key (`select upper(a) as a …
+ * group by a order by a` must sort by the projected `upper(a)`). Only an expression
+ * that actually fell through to a pre-grouping attribute has anything to fix, and
+ * only such an expression is walked.
+ */
+export function redirectPostAggregate(
+	expr: ScalarPlanNode,
+	context: GroupedRedirectContext | undefined,
+	scope: Scope,
+): ScalarPlanNode {
+	if (!context || !referencesAggregateInput(expr, context)) return expr;
+	return redirectToGroupKeys(expr, context, scope);
+}
+
+/**
+ * Rewrites every subtree of a post-aggregate expression that IS a grouping key into
+ * a reference to the AggregateNode's output column for that key, so the expression
+ * reads the grouped row instead of a base-table column that row does not carry.
+ * Reached only through {@link redirectPostAggregate}.
  *
  * Two match rules, in order at each node:
  *
@@ -457,7 +500,7 @@ function isCteDefinition(node: PlanNode): boolean {
  * fixing it means comparing resolved attribute identity rather than text, for both
  * callers at once.
  */
-export function redirectToGroupKeys(
+function redirectToGroupKeys(
 	node: ScalarPlanNode,
 	context: GroupedRedirectContext,
 	scope: Scope,
@@ -546,7 +589,7 @@ function readsOnlyAggregateInput(node: PlanNode, context: GroupedRedirectContext
  * True when `node` names one of THIS query's pre-grouping columns and the AggregateNode's
  * output row does not carry it — the exact condition that makes a reference above the
  * aggregate either redirectable ({@link referencesAggregateInput}) or, once the redirect
- * has run, an ungrouped column ({@link findUngroupedWindowColumnRef}). The two callers ask
+ * has run, an ungrouped column ({@link findUngroupedPostAggregateRef}). The two callers ask
  * it of different subtrees for different purposes, but the predicate is one thing and must
  * stay one thing: a reference the redirect rewrites is by definition one the coverage check
  * would otherwise have rejected.
@@ -563,16 +606,16 @@ function isPreGroupingReference(node: ColumnReferenceNode, context: GroupedRedir
  *
  * The opposite question to its neighbour {@link readsOnlyAggregateInput} ("does the
  * WHOLE subtree belong to this query's pre-grouping input", which guards a fingerprint
- * match from hijacking a subquery's own identically-spelled column). This one is a
- * *gate*: it answers "is there anything here to redirect at all". A subtree whose
- * references all resolved through the projection / window-output / aggregate-output
- * scopes contains none, and must be left alone.
+ * match from hijacking a subquery's own identically-spelled column). This one is
+ * {@link redirectPostAggregate}'s *gate*: it answers "is there anything here to
+ * redirect at all". A subtree whose references all resolved through the projection /
+ * window-output / aggregate-output scopes contains none, and must be left alone.
  *
  * Per reference the test is {@link isPreGroupingReference}. CTE definition bodies are
  * skipped for the same reason {@link redirectToGroupKeys} skips them (see
  * {@link isCteDefinition}).
  */
-export function referencesAggregateInput(node: PlanNode, context: GroupedRedirectContext): boolean {
+function referencesAggregateInput(node: PlanNode, context: GroupedRedirectContext): boolean {
 	if (CapabilityDetectors.isColumnReference(node)) {
 		return isPreGroupingReference(node as ColumnReferenceNode, context);
 	}
@@ -584,12 +627,43 @@ export function referencesAggregateInput(node: PlanNode, context: GroupedRedirec
 }
 
 /**
- * Raises the GROUP BY coverage error for a window specification / window-function
- * argument of a GROUPED query that still reads a pre-grouping column after
- * {@link redirectToGroupKeys} has run.
+ * Boundary check over a GROUPED query's finished plan: no node ABOVE the
+ * AggregateNode may reference an aggregate-input attribute id that is absent from
+ * the aggregate's output. Called once per grouped query, from the end of
+ * `buildSelectStmt`, walking the operator spine from the query root down to — and
+ * stopping at — the AggregateNode itself (whose own input subtree legally reads
+ * pre-grouping columns). Each scalar expression hanging off a spine operator gets
+ * the subquery-aware per-expression check ({@link assertPostAggregateCoverage}).
+ *
+ * This is what turns "a builder forgot to call {@link redirectPostAggregate}" from a
+ * runtime `No row context found for column …` internal error into the user-facing
+ * GROUP BY message at plan time — the SELECT-list and ORDER BY escapes both shipped
+ * exactly that way. It also rejects, at plan time, a post-aggregate expression that
+ * genuinely reads an ungrouped column (directly, or correlated through a subquery).
+ */
+export function assertGroupedPlanCoverage(
+	node: PlanNode,
+	aggregateNode: PlanNode,
+	context: GroupedRedirectContext,
+): void {
+	if (node === aggregateNode) return;
+	for (const child of node.getChildren()) {
+		if (child === aggregateNode || isCteDefinition(child)) continue;
+		if (isRelationalNode(child)) {
+			assertGroupedPlanCoverage(child, aggregateNode, context);
+		} else {
+			assertPostAggregateCoverage(child, context);
+		}
+	}
+}
+
+/**
+ * Raises the GROUP BY coverage error for a post-aggregate expression of a GROUPED
+ * query that still reads a pre-grouping column after {@link redirectPostAggregate}
+ * has run.
  *
  * Distinct from {@link assertGroupByCoverage} in exactly two ways, both required by
- * the fact that a window expression may contain a subquery:
+ * the fact that a post-aggregate expression may contain a subquery:
  *
  * - it descends into relational children, so a correlated reference buried in a
  *   subquery is checked rather than skipped;
@@ -598,10 +672,10 @@ export function referencesAggregateInput(node: PlanNode, context: GroupedRedirec
  *   or a correlated reference to an enclosing query — is legal here and is left alone.
  *
  * The aggregate exemption is likewise narrowed to this query's OWN aggregates; see
- * {@link findUngroupedWindowColumnRef}.
+ * {@link findUngroupedPostAggregateRef}.
  */
-export function assertGroupedWindowCoverage(node: PlanNode, context: GroupedRedirectContext): void {
-	const ungrouped = findUngroupedWindowColumnRef(node, context);
+function assertPostAggregateCoverage(node: PlanNode, context: GroupedRedirectContext): void {
+	const ungrouped = findUngroupedPostAggregateRef(node, context);
 	if (!ungrouped) return;
 	throw new QuereusError(
 		`Column '${expressionToString(ungrouped.expression)}' must appear in the GROUP BY clause or be used in an aggregate function`,
@@ -623,7 +697,7 @@ export function assertGroupedWindowCoverage(node: PlanNode, context: GroupedRedi
  * (select max(wg.b) from wg t))` reads an ungrouped column of this query and must say
  * so at plan time, not die at runtime with "No row context found for column b".
  */
-function findUngroupedWindowColumnRef(
+function findUngroupedPostAggregateRef(
 	node: PlanNode,
 	context: GroupedRedirectContext,
 	insideSubquery = false,
@@ -638,7 +712,7 @@ function findUngroupedWindowColumnRef(
 
 	for (const child of node.getChildren()) {
 		if (isCteDefinition(child)) continue;
-		const found = findUngroupedWindowColumnRef(child, context, insideSubquery || isRelationalNode(child));
+		const found = findUngroupedPostAggregateRef(child, context, insideSubquery || isRelationalNode(child));
 		if (found) return found;
 	}
 	return null;
