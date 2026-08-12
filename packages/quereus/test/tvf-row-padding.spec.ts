@@ -6,8 +6,8 @@ import type { Row } from '../src/common/types.js';
 
 // Declares 5 columns but only yields rows with 2 values.
 // This exercises the TVF row-padding fix: the engine must pad short rows
-// to the declared width so downstream ArrayIndex (e.g. row_number() slot)
-// lands at the correct offset.
+// to the declared width so downstream attribute resolution (resolveAttribute
+// requires columnIndex < row.length) lands at the correct offset.
 function makeShortRowTvf(data: Array<[number, string]>) {
 	return createTableValuedFunction(
 		{

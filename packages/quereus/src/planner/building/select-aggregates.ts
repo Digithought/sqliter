@@ -524,12 +524,12 @@ function redirectToGroupKeys(
  *
  * NOTE: the SELECT-list caller hands us its window-function subtrees too, and the window
  * phase then throws each of them away — `rewriteWindowFunctions` (select-window.ts)
- * replaces the whole node with an `ArrayIndexNode` into the WindowNode's output. The
- * rewrite inside such a subtree is therefore wasted, and harmless only because
- * `findWindowColumnIndex` matches on the raw `expression.window` AST, which this walk
- * never touches. If that match ever becomes plan-shape-based, skip window-function nodes
- * here (`CapabilityDetectors.isWindowFunction` → return the node) — the window phase
- * redirects its specification expressions itself and never passes one in.
+ * replaces the whole node with a column reference to the WindowNode's output, looked up
+ * by the `AST.WindowFunctionExpr`'s object identity. A `WindowFunctionCallNode` is
+ * zero-ary, so this walk could never rebuild one anyway — but it is skipped explicitly
+ * below so that lookup's key can never be disturbed and rule 1 can never fingerprint a
+ * window function itself. The window phase redirects its specification expressions
+ * itself and never passes one in.
  */
 function redirectNode(
 	node: PlanNode,
@@ -537,6 +537,10 @@ function redirectNode(
 	scope: Scope,
 	insideSubquery = false,
 ): PlanNode {
+	if (CapabilityDetectors.isWindowFunction(node)) {
+		return node;
+	}
+
 	if ('expression' in node) {
 		const expression = (node as ScalarPlanNode).expression;
 		const fingerprintIndex = context.groupKeys.byFingerprint.get(expressionToIdentityString(expression));

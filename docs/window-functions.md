@@ -44,8 +44,12 @@ window_function([arguments]) OVER (
 - Identifies window functions in SELECT lists (via `analyzeSelectColumns`)
 - Emits one `WindowNode` per window specification group, then ONE projection above them all
 - That projection is the query's select list — stars already expanded, in written order —
-  rewritten so each window-function subtree becomes an `ArrayIndexNode` pointing at its
-  computed window-output column. Everything else passes through untouched, so `select *,
+  rewritten so each window-function subtree becomes a `ColumnReferenceNode` bound to the
+  `WindowNode`'s own output attribute for that function (matched by the identity of the
+  `AST.WindowFunctionExpr` the parser produced, recorded as each node is built). The
+  reference resolves by attribute id at runtime like every other column read, so it stays
+  correct no matter what operators the optimizer later places between the WindowNode and
+  the projection. Everything else passes through untouched, so `select *,
   row_number() over (…)` keeps the star's columns and an unaliased window column is named
   after the expression the user wrote.
 
@@ -249,16 +253,16 @@ FROM test_results;
 
 ## Performance Optimizations
 
-### Window Specification Grouping (not currently effective)
+### Window Specification Grouping
 
-`groupWindowFunctionsBySpec` is *meant* to put window functions with identical
-specifications under one `WindowNode` — a single sort pass and shared partition
-processing per unique specification. It does not do so today: the grouping key is
-`JSON.stringify` over raw AST fragments, which carry each fragment's source-location
-data, so two textually identical `over (…)` clauses never key equal and every window
-function gets its own node. Fixing that also requires teaching `findWindowColumnIndex`
-to match a function to its output column by identity or position rather than by
-name + specification; see the `NOTE:` comments in `select-window.ts`.
+`groupWindowFunctionsBySpec` puts window functions with identical specifications under
+one `WindowNode` — a single sort pass and shared partition processing per unique
+specification. The grouping key is the raw AST spec fragments with source-location data
+stripped, so two textually identical `over (…)` clauses share a node wherever they were
+written. Matching a function to its output *column* is independent of the grouping: each
+function's window attribute is recorded under its `AST.WindowFunctionExpr` identity as
+its node is built, so same-named functions sharing one node still resolve to their own
+columns.
 
 ### Efficient Execution
 

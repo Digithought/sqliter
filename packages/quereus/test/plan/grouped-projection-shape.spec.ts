@@ -308,9 +308,9 @@ describe('Plan shape: grouped-query final projection', () => {
 			});
 
 			it('names an unaliased window column after its authored expression', async () => {
-				// The rewrite substitutes an ArrayIndexNode for the window function, whose
-				// own name is a bare index (`[2]`); the authored expression is carried
-				// across as the fallback alias.
+				// The rewrite substitutes a column reference to the WindowNode's output
+				// for the window function; the authored expression is carried across as
+				// the fallback alias.
 				expect(await columnNames("SELECT row_number() OVER (ORDER BY v) FROM gk"))
 					.to.deep.equal(['row_number() over (order by v)']);
 				expect(await columnNames("SELECT v, 1000 - row_number() OVER (ORDER BY v) FROM gk"))

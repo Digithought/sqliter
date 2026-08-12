@@ -11,7 +11,6 @@ import type { LiteralNode, BinaryOpNode, UnaryOpNode, CaseExprNode, CastNode, Co
 import type { ColumnReferenceNode, ParameterReferenceNode } from '../nodes/reference.js';
 import type { ScalarFunctionCallNode } from '../nodes/function.js';
 import type { AggregateFunctionCallNode } from '../nodes/aggregate-function.js';
-import type { ArrayIndexNode } from '../nodes/array-index-node.js';
 import type { WindowFunctionCallNode } from '../nodes/window-function.js';
 import type { JSONValue } from '../../common/json-types.js';
 import { canonicalJsonString } from '../../util/json-canonical.js';
@@ -87,9 +86,6 @@ export function fingerprintExpression(node: ScalarPlanNode): string {
 			const neg = bw.expression.not ? '!' : '';
 			return `BW:${neg}(${fingerprintExpression(bw.expr)},${fingerprintExpression(bw.lower)},${fingerprintExpression(bw.upper)})`;
 		}
-
-		case PlanNodeType.ArrayIndex:
-			return `AI:${(node as unknown as ArrayIndexNode).index}`;
 
 		case PlanNodeType.WindowFunctionCall: {
 			const wf = node as unknown as WindowFunctionCallNode;

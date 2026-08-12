@@ -1657,13 +1657,84 @@ select a, count(*) as c from wg group by a having exists (select 1 from wg t whe
 select a from wg group by a having a in (select t.a from wg t where t.a = wg.a) order by wg.a;
 → [{"a":"x"},{"a":"y"}]
 
--- NOTE: the correlated SCALAR-AGGREGATE spelling of the case above
--- (`(select count(*) from wg t where t.a = wg.a)`) now plans and runs under a window
--- function too, but its window column comes back wrong — `rule-scalar-agg-decorrelation`
--- puts a join above the WindowNode and the window result is addressed positionally.
--- That is a separate, pre-existing defect (it reproduces with a bare grouping key and
--- with this redirect reverted); tracked as
--- fix/bug-window-column-read-by-position-hits-wrong-row. Pin it there, not here.
+-- =============================================================================
+-- A WINDOW RESULT COLUMN IS ADDRESSED BY ATTRIBUTE IDENTITY, NOT POSITION.
+-- Regression for bug-window-column-read-by-position-hits-wrong-row: the window
+-- phase used to hand the projection a POSITIONAL read of the WindowNode's row,
+-- which silently read whatever row context was newest. Whenever decorrelation
+-- placed a join between the WindowNode and its projection, the window column
+-- came back as a verbatim copy of the subquery's value. Non-numeric text values
+-- ('p','q','r') on purpose: numeric-looking text picks up numeric affinity on
+-- the way through and muddies WHICH column is wrong.
+-- =============================================================================
+create table wsq (a text, b text);
+insert into wsq values ('x','p'),('y','q'),('x','r');
+
+-- Correlated scalar-aggregate subquery (routes through rule-scalar-agg-decorrelation,
+-- which puts a grouped LEFT JOIN above the WindowNode) alongside each window shape.
+-- `n` used to come back as a copy of `c`.
+select k, (select min(t.b) from wsq t where t.a = k) as c, count(*) over () as n from (select a as k from wsq) group by k;
+→ [{"k":"x","c":"p","n":2},{"k":"y","c":"q","n":2}]
+
+select k, (select min(t.b) from wsq t where t.a = k) as c, row_number() over (order by k) as rn from (select a as k from wsq) group by k;
+→ [{"k":"x","c":"p","rn":1},{"k":"y","c":"q","rn":2}]
+
+-- The desc spelling additionally needs the window's honest ordering advertisement
+-- (bug-window-node-advertises-source-row-order) so the merge join above it does
+-- not drop rows.
+select k, (select min(t.b) from wsq t where t.a = k) as c, row_number() over (order by k desc) as rn from (select a as k from wsq) group by k;
+→ [{"k":"y","c":"q","rn":1},{"k":"x","c":"p","rn":2}]
+
+-- The same three shapes with an EXISTS and with an IN correlated subquery, which
+-- route through rule-subquery-decorrelation instead.
+select a, exists (select 1 from wsq t where t.a = wsq.a and t.b = 'p') as e, count(*) over () as n from wsq group by a;
+→ [{"a":"x","e":true,"n":2},{"a":"y","e":false,"n":2}]
+
+select a, exists (select 1 from wsq t where t.a = wsq.a and t.b = 'p') as e, row_number() over (order by a) as rn from wsq group by a;
+→ [{"a":"x","e":true,"rn":1},{"a":"y","e":false,"rn":2}]
+
+select a, exists (select 1 from wsq t where t.a = wsq.a and t.b = 'p') as e, row_number() over (order by a desc) as rn from wsq group by a;
+→ [{"a":"y","e":false,"rn":1},{"a":"x","e":true,"rn":2}]
+
+select a, 'p' in (select t.b from wsq t where t.a = wsq.a) as i, count(*) over () as n from wsq group by a;
+→ [{"a":"x","i":true,"n":2},{"a":"y","i":false,"n":2}]
+
+select a, 'p' in (select t.b from wsq t where t.a = wsq.a) as i, row_number() over (order by a) as rn from wsq group by a;
+→ [{"a":"x","i":true,"rn":1},{"a":"y","i":false,"rn":2}]
+
+select a, 'p' in (select t.b from wsq t where t.a = wsq.a) as i, row_number() over (order by a desc) as rn from wsq group by a;
+→ [{"a":"y","i":false,"rn":1},{"a":"x","i":true,"rn":2}]
+
+-- UNGROUPED windowed query with a correlated subquery — was already correct (the
+-- streaming window path keeps the window's own row newest); regression guard.
+select a, (select min(t.b) from wsq t where t.a = wsq.a) as c, row_number() over (order by a) as rn from wsq order by rn;
+→ [{"a":"x","c":"p","rn":1},{"a":"x","c":"p","rn":2},{"a":"y","c":"q","rn":3}]
+
+-- Two window functions with DIFFERENT specifications alongside the decorrelated
+-- subquery, so a mis-addressed read cannot be masked by both columns holding the
+-- same value.
+select k, (select min(t.b) from wsq t where t.a = k) as c, count(*) over () as n, row_number() over (order by k) as rn from (select a as k from wsq) group by k;
+→ [{"k":"x","c":"p","n":2,"rn":1},{"k":"y","c":"q","n":2,"rn":2}]
+
+-- Two window functions with the SAME specification now genuinely share one
+-- WindowNode; each must still resolve to its own distinct output column — the
+-- case the old source-location accident in the spec grouping was protecting.
+select a, row_number() over (order by a) as rn, count(*) over (order by a) as rc from wsq group by a;
+→ [{"a":"x","rn":1,"rc":1},{"a":"y","rn":2,"rc":2}]
+
+-- Same-NAME functions sharing one specification (and so one WindowNode) keep
+-- their own argument expressions.
+select b, sum(length(b)) over (order by b) as s1, sum(length(b) * 10) over (order by b) as s2 from wsq order by b;
+→ [{"b":"p","s1":1,"s2":10},{"b":"q","s1":2,"s2":20},{"b":"r","s1":3,"s2":30}]
+
+-- A filter over a window output column through a subquery. The filter references
+-- a real window attribute the window's SOURCE does not carry, so the availability
+-- check must keep it above the WindowNode — a future pushdown rule that loses
+-- this returns [{"a":"x",...}] too.
+select * from (select a, row_number() over (order by a) as rn from wsq group by a) where rn > 1;
+→ [{"a":"y","rn":2}]
+
+drop table wsq;
 
 -- Composition: the fixed shape as a subquery source, inside a CTE, and as a
 -- `union all` arm.

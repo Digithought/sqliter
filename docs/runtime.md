@@ -433,6 +433,12 @@ context-shadow test mode. The mirror **child-shadows-operator** direction is
 deliberately *not* checked: recency cannot distinguish a forgotten `reactivate()`
 from a correct newest write.
 
+Every scalar row read goes through `resolveAttribute` — there is no recency-based
+read left that this invariant cannot be stated for. (The last one was the window
+phase's positional read of the WindowNode's output row, which resolved against
+whatever live context was newest; window results are now addressed by attribute
+id like every other column.)
+
 ##### Corollary: a published source row reaches only the adjacent consumer
 
 Tear-down-before-pull bounds *how long* such a context lives, and therefore **who can

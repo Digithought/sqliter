@@ -66,7 +66,6 @@ export enum PlanNodeType {
   Literal = 'Literal',
   ColumnReference = 'ColumnReference',
   ParameterReference = 'ParameterReference',
-  ArrayIndex = 'ArrayIndex',
   UnaryOp = 'UnaryOp',
   BinaryOp = 'BinaryOp',
   CaseExpr = 'CaseExpr',

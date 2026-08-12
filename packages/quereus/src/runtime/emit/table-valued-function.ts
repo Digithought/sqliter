@@ -19,8 +19,9 @@ export function emitTableValuedFunctionCall(plan: TableFunctionCallNode, ctx: Em
 	const declaredColumnCount = plan.getAttributes().length;
 
 	// Normalize yielded rows to the declared column count: pad short rows with null,
-	// truncate over-wide rows. Keeps positional access (ArrayIndex) consistent with
-	// the declared schema regardless of what the TVF implementation actually yields.
+	// truncate over-wide rows. Keeps attribute resolution (`resolveAttribute` checks
+	// `columnIndex < row.length`) consistent with the declared schema regardless of
+	// what the TVF implementation actually yields.
 	// A TVF that declares no columns (e.g. `split_string`, registered without a
 	// `returnType`) opts out entirely — it has no positional slots to align, so
 	// truncating to zero width would silently drop the row payload.

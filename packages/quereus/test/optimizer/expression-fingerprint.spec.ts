@@ -12,7 +12,6 @@ import { TEXT_TYPE, INTEGER_TYPE } from '../../src/types/builtin-types.js';
 import { FunctionFlags } from '../../src/common/constants.js';
 import type { ScalarType } from '../../src/common/datatype.js';
 import { WindowFunctionCallNode } from '../../src/planner/nodes/window-function.js';
-import { ArrayIndexNode } from '../../src/planner/nodes/array-index-node.js';
 
 const scope = EmptyScope.instance;
 
@@ -516,19 +515,6 @@ describe('Expression fingerprinting', () => {
 				expect(fingerprintExpression(a)).to.match(/^LI:\?/);
 				expect(fingerprintExpression(a)).to.not.equal(fingerprintExpression(b));
 			});
-		});
-	});
-
-	describe('ArrayIndex fingerprint (mutation-killing)', () => {
-		it('includes the index value', () => {
-			const ai = new ArrayIndexNode(scope, 3, textType);
-			expect(fingerprintExpression(ai)).to.equal('AI:3');
-		});
-
-		it('different indices produce different fingerprints', () => {
-			const ai0 = new ArrayIndexNode(scope, 0, textType);
-			const ai1 = new ArrayIndexNode(scope, 1, textType);
-			expect(fingerprintExpression(ai0)).to.not.equal(fingerprintExpression(ai1));
 		});
 	});
 

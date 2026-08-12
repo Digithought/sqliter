@@ -82,8 +82,15 @@ export class WindowNode extends PlanNode implements UnaryRelationalNode {
 		public readonly orderByExpressions: ScalarPlanNode[],
 		public readonly functionArguments: ScalarPlanNode[][],
 		estimatedCostOverride?: number,
-		/** Optional predefined attributes for preserving IDs during optimization */
-		public readonly predefinedAttributes?: Attribute[],
+		/**
+		 * The WINDOW-GENERATED output attributes (one per function), supplied by
+		 * `withChildren`/`withStreaming` so a window result column keeps ONE attribute
+		 * id for the whole life of the plan. Only these are carried — the pass-through
+		 * source attributes are always taken from the CURRENT source, so an optimizer
+		 * rewrite of the source (AggregateNode → HashAggregate, an inserted Retrieve)
+		 * cannot orphan the ids the projection above references.
+		 */
+		public readonly predefinedWindowAttributes?: Attribute[],
 		/** Set by `rule-monotonic-window` when the source streams in window order. */
 		public readonly streaming?: StreamingWindowConfig,
 	) {
@@ -110,19 +117,16 @@ export class WindowNode extends PlanNode implements UnaryRelationalNode {
 		});
 
 		this.attributesCache = new Cached(() => {
-			// If predefined attributes are provided, use them (for optimization)
-			if (this.predefinedAttributes) {
-				return this.predefinedAttributes.slice(); // Return a copy
-			}
-
-			// Preserve source attributes and add window function attributes
+			// Pass-through attributes always come from the CURRENT source; only the
+			// window-generated tail is preserved (or minted once, at build time).
 			const sourceAttrs = this.source.getAttributes();
-			const windowAttrs = this.functions.map((func) => ({
-				id: PlanNode.nextAttrId(),
-				name: func.alias || func.functionName.toLowerCase(),
-				type: func.getType(),
-				sourceRelation: `${this.nodeType}:${this.id}`
-			}));
+			const windowAttrs = this.predefinedWindowAttributes
+				?? this.functions.map((func) => ({
+					id: PlanNode.nextAttrId(),
+					name: func.alias || func.functionName.toLowerCase(),
+					type: func.getType(),
+					sourceRelation: `${this.nodeType}:${this.id}`
+				}));
 
 			return [...sourceAttrs, ...windowAttrs];
 		});
@@ -134,6 +138,17 @@ export class WindowNode extends PlanNode implements UnaryRelationalNode {
 
 	getAttributes(): Attribute[] {
 		return this.attributesCache.value;
+	}
+
+	/**
+	 * The window-generated output attributes (one per function, parallel to
+	 * `functions`), excluding the pass-through source attributes. This is the list
+	 * `withChildren`/`withStreaming` carry across rebuilds, and the list the window
+	 * phase records so the projection above addresses each window result by
+	 * attribute id.
+	 */
+	getWindowAttributes(): Attribute[] {
+		return this.getAttributes().slice(this.source.getAttributes().length);
 	}
 
 	getChildren(): readonly PlanNode[] {
@@ -192,9 +207,6 @@ export class WindowNode extends PlanNode implements UnaryRelationalNode {
 			return this;
 		}
 
-		// **CRITICAL**: Preserve original attribute IDs to maintain column reference stability
-		const originalAttributes = this.getAttributes();
-
 		return new WindowNode(
 			this.scope,
 			newSource,
@@ -204,10 +216,11 @@ export class WindowNode extends PlanNode implements UnaryRelationalNode {
 			newOrderByExpressions,
 			newFunctionArguments,
 			undefined,
-			// Preserve attributes only when the source is unchanged so that column IDs
-			// stay consistent. If the source relation changed, let the WindowNode rebuild
-			// its attribute list so that descriptors match the new underlying schema.
-			sourceChanged ? undefined : originalAttributes,
+			// **CRITICAL**: always carry the window-generated attribute ids — the
+			// projection above references them, so they must survive even (especially)
+			// when the optimizer replaces the source. Pass-through attributes are
+			// recomputed from the new source.
+			this.getWindowAttributes(),
 			this.streaming,
 		);
 	}
@@ -223,7 +236,7 @@ export class WindowNode extends PlanNode implements UnaryRelationalNode {
 			this.orderByExpressions,
 			this.functionArguments,
 			undefined,
-			this.getAttributes() as Attribute[],
+			this.getWindowAttributes(),
 			config,
 		);
 	}

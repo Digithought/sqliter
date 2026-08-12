@@ -1,20 +1,39 @@
-import type { PlanNode, RelationalPlanNode, ScalarPlanNode } from '../nodes/plan-node.js';
+import type { Attribute, PlanNode, RelationalPlanNode, ScalarPlanNode } from '../nodes/plan-node.js';
 import type { PlanningContext } from '../planning-context.js';
-import type { RelationType } from '../../common/datatype.js';
+import type { ScalarType } from '../../common/datatype.js';
 import type { Scope } from '../scopes/scope.js';
 import { WindowNode, type WindowSpec } from '../nodes/window-node.js';
 import { WindowFunctionCallNode } from '../nodes/window-function.js';
 import { ProjectNode, type Projection } from '../nodes/project-node.js';
-import { ArrayIndexNode } from '../nodes/array-index-node.js';
+import { ColumnReferenceNode } from '../nodes/reference.js';
 import { LiteralNode } from '../nodes/scalar.js';
 import { buildExpression } from './expression.js';
 import { collectAggregateFunctionExprs, redirectPostAggregate, type GroupedRedirectContext } from './select-aggregates.js';
 import { findMatchingAggregate } from './function-call.js';
-import { QuereusError } from '../../common/errors.js';
+import { QuereusError, quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { expressionToString } from '../../emit/ast-stringify.js';
 import type * as AST from '../../parser/ast.js';
 import { CapabilityDetectors } from '../framework/characteristics.js';
+
+/**
+ * Where one collected window function's result lives on the window phase's
+ * output row: the WindowNode-minted attribute (stable for the life of the plan)
+ * plus its position on the OUTERMOST window node's row at build time.
+ *
+ * Keyed by the `AST.WindowFunctionExpr` the parser produced. That object is the
+ * one identity shared by every build of the select list: a grouped query builds
+ * its select list twice (`analyzeSelectColumns`, then
+ * `buildFinalAggregateProjections`), producing distinct `WindowFunctionCallNode`
+ * instances — but both builds walk the same `stmt.columns` AST, so the two
+ * instances carry the SAME `expression` object.
+ */
+interface WindowColumnEntry {
+	attrId: number;
+	columnIndex: number;
+	type: ScalarType;
+	name: string;
+}
 
 /**
  * Processes window functions and creates WindowNode(s) with proper projections.
@@ -43,6 +62,10 @@ export function buildWindowPhase(
 
 	// Group window functions by their window specification
 	const windowGroups = groupWindowFunctionsBySpec(windowFunctions);
+
+	// Each collected function's window-output attribute, recorded as its node is
+	// built; resolved to a WindowColumnEntry against the outermost node below.
+	const windowAttributes = new Map<AST.WindowFunctionExpr, Attribute>();
 
 	// Create WindowNode for each unique window specification
 	for (const [_windowSpecKey, functions] of windowGroups) {
@@ -108,7 +131,7 @@ export function buildWindowPhase(
 		);
 
 		// Now create the WindowNode with pre-compiled expressions
-		currentInput = new WindowNode(
+		const windowNode = new WindowNode(
 			selectContext.scope,
 			currentInput,
 			windowSpec,
@@ -117,10 +140,35 @@ export function buildWindowPhase(
 			orderByExpressions,
 			functionArguments
 		);
+
+		// Record each function's freshly minted window-output attribute under the
+		// AST identity the select-list rewrite will look it up by.
+		const windowAttrs = windowNode.getWindowAttributes();
+		functions.forEach(({ func }, i) => {
+			windowAttributes.set(func.expression, windowAttrs[i]);
+		});
+
+		currentInput = windowNode;
 	}
 
-	// Create projections that select only the requested columns using direct array indexing
-	const windowProjections = buildWindowProjections(selectListProjections, currentInput, selectContext, windowFunctions);
+	// Resolve each window attribute's position against the OUTERMOST window node —
+	// stacked WindowNodes pass inner window columns through, so one lookup covers
+	// every group without index arithmetic.
+	const outerAttrIndex = currentInput.getAttributeIndex();
+	const windowColumns = new Map<AST.WindowFunctionExpr, WindowColumnEntry>();
+	for (const [expr, attr] of windowAttributes) {
+		windowColumns.set(expr, {
+			attrId: attr.id,
+			// Present by construction: every window attribute is on the outermost node's row.
+			columnIndex: outerAttrIndex.get(attr.id)!,
+			type: attr.type,
+			name: attr.name,
+		});
+	}
+
+	// Rewrite the select list into the projection above the WindowNode(s), with each
+	// window function replaced by a reference to its window-output column.
+	const windowProjections = buildWindowProjections(selectListProjections, windowColumns, selectContext.scope);
 
 	if (windowProjections.length > 0) {
 		currentInput = new ProjectNode(selectContext.scope, currentInput, windowProjections);
@@ -184,18 +232,19 @@ function rejectUncollectedAggregates(
 }
 
 /**
- * Groups window functions by their window specification
+ * Groups window functions by their window specification, so functions sharing a
+ * specification share one WindowNode — one sort and one buffering/streaming pass
+ * per unique specification.
  *
- * NOTE: the key is `JSON.stringify` over raw AST fragments, which include each
- * fragment's source-location (`loc`) data — so two textually identical `over (…)`
- * clauses at different source positions never key equal and this never actually
- * groups anything; every window function gets its own WindowNode. That accident is
- * currently load-bearing: {@link findWindowColumnIndex} matches a window function by
- * name + spec only, so two same-named functions genuinely sharing one WindowNode
- * would both resolve to the first one's output column. Stripping `loc` here (or
- * comparing structurally) makes the grouping work and breaks the column matching —
- * that change has to teach `findWindowColumnIndex` to match by node identity or
- * position first.
+ * The key is `JSON.stringify` over the raw AST spec fragments with every
+ * source-location (`loc`) field stripped, so two textually identical `over (…)`
+ * clauses key equal wherever they were written. Spelling differences that the
+ * scope would resolve identically (a different identifier case, an unused
+ * qualifier) still key apart — that only costs a duplicate WindowNode, never a
+ * wrong merge, because within one select list the same spelling always resolves
+ * to the same thing. Matching a function to its output COLUMN is independent of
+ * this grouping: each function's window attribute is recorded under its
+ * `AST.WindowFunctionExpr` identity as its node is built (see buildWindowPhase).
  */
 function groupWindowFunctionsBySpec(
 	windowFunctions: { func: WindowFunctionCallNode; alias?: string }[]
@@ -203,12 +252,15 @@ function groupWindowFunctionsBySpec(
 	const windowGroups = new Map<string, { func: WindowFunctionCallNode; alias?: string }[]>();
 
 	for (const { func, alias } of windowFunctions) {
-		// Create a key based on the window specification
-		const windowSpecKey = JSON.stringify({
-			partitionBy: func.expression.window?.partitionBy || [],
-			orderBy: func.expression.window?.orderBy || [],
-			frame: func.expression.window?.frame
-		});
+		// Structural key: the spec fragments minus source locations.
+		const windowSpecKey = JSON.stringify(
+			{
+				partitionBy: func.expression.window?.partitionBy || [],
+				orderBy: func.expression.window?.orderBy || [],
+				frame: func.expression.window?.frame ?? null
+			},
+			(key, value) => (key === 'loc' ? undefined : value)
+		);
 
 		if (!windowGroups.has(windowSpecKey)) {
 			windowGroups.set(windowSpecKey, []);
@@ -263,29 +315,20 @@ function buildWindowFunctionArguments(
  */
 function buildWindowProjections(
 	selectListProjections: readonly Projection[],
-	windowNode: RelationalPlanNode,
-	selectContext: PlanningContext,
-	windowFunctions: { func: WindowFunctionCallNode; alias?: string }[]
+	windowColumns: ReadonlyMap<AST.WindowFunctionExpr, WindowColumnEntry>,
+	scope: Scope
 ): Projection[] {
-	const windowType = windowNode.getType();
-	const sourceColumnCount = windowType.columns.length - windowFunctions.length;
-
 	return selectListProjections.map(projection => {
-		// Rewrite each window-function descendant into an ArrayIndexNode pointing
-		// at its computed window-output column, preserving any surrounding
-		// arithmetic / scalar wrapper (e.g. `1000 - row_number() over (...)`).
-		const rewritten = rewriteWindowFunctions(
-			projection.node,
-			windowFunctions,
-			sourceColumnCount,
-			windowType,
-			selectContext.scope
-		);
+		// Rewrite each window-function descendant into a column reference to its
+		// computed window-output column, preserving any surrounding arithmetic /
+		// scalar wrapper (e.g. `1000 - row_number() over (...)`).
+		const rewritten = rewriteWindowFunctions(projection.node, windowColumns, scope);
 		if (rewritten === projection.node) return projection;
-		// The rewrite replaces the authored expression with an ArrayIndexNode, whose
-		// own name is a bare index (`[2]`). An unaliased window column must keep the
-		// expression the user wrote as its output name, like every other unaliased
-		// select-list column (`select count(*) from t group by g` yields `count(*)`).
+		// The rewrite replaces the authored expression with a column reference whose
+		// own name is the window column's synthetic name. An unaliased window column
+		// must keep the expression the user wrote as its output name, like every
+		// other unaliased select-list column (`select count(*) from t group by g`
+		// yields `count(*)`).
 		return {
 			...projection,
 			node: rewritten,
@@ -297,8 +340,12 @@ function buildWindowProjections(
 
 /**
  * Recursively rewrites every WindowFunctionCallNode descendant of a scalar
- * expression into an ArrayIndexNode referencing that function's window-output
- * column, leaving the surrounding expression structure intact.
+ * expression into a ColumnReferenceNode bound to that function's window-output
+ * attribute, leaving the surrounding expression structure intact.
+ *
+ * The reference resolves by attribute id at runtime (`resolveAttribute`), exactly
+ * like every other column read — so it stays correct no matter what operators the
+ * optimizer later places between the WindowNode and this projection.
  *
  * Mirrors the aggregate path (collectInnerAggregates): the whole outer
  * expression is preserved and the inner window results are substituted back in.
@@ -307,18 +354,30 @@ function buildWindowProjections(
  */
 function rewriteWindowFunctions(
 	node: ScalarPlanNode,
-	windowFunctions: { func: WindowFunctionCallNode; alias?: string }[],
-	sourceColumnCount: number,
-	windowType: RelationType,
+	windowColumns: ReadonlyMap<AST.WindowFunctionExpr, WindowColumnEntry>,
 	scope: Scope
 ): ScalarPlanNode {
 	if (CapabilityDetectors.isWindowFunction(node)) {
-		const index = findWindowColumnIndex(node as WindowFunctionCallNode, windowFunctions, sourceColumnCount);
-		if (index >= 0) {
-			return new ArrayIndexNode(scope, index, windowType.columns[index].type);
+		const windowFunc = node as WindowFunctionCallNode;
+		const entry = windowColumns.get(windowFunc.expression);
+		if (!entry) {
+			// Every window function in the select list was collected by
+			// analyzeSelectColumns and keyed here by its AST node; a miss means the
+			// two walks diverged, and silently keeping the raw node would reach the
+			// runtime as an unevaluable call.
+			quereusError(
+				`Window function ${windowFunc.functionName} was not collected into any WindowNode`,
+				StatusCode.INTERNAL
+			);
 		}
-		// No match (shouldn't happen for a window node we collected) — leave as-is.
-		return node;
+		// Synthetic column expression; only plan display and error text read it
+		// (ColumnReferenceNode.toString() / getLogicalAttributes()).
+		const columnExpr: AST.ColumnExpr = {
+			type: 'column',
+			name: entry.name,
+			loc: windowFunc.expression.loc,
+		};
+		return new ColumnReferenceNode(scope, columnExpr, entry.type, entry.attrId, entry.columnIndex);
 	}
 
 	const children = node.getChildren();
@@ -328,13 +387,7 @@ function rewriteWindowFunctions(
 	for (const child of children) {
 		// Only scalar children participate in window rewriting; pass others through.
 		if ('expression' in child) {
-			const rewrittenChild = rewriteWindowFunctions(
-				child as ScalarPlanNode,
-				windowFunctions,
-				sourceColumnCount,
-				windowType,
-				scope
-			);
+			const rewrittenChild = rewriteWindowFunctions(child as ScalarPlanNode, windowColumns, scope);
 			if (rewrittenChild !== child) {
 				changed = true;
 			}
@@ -345,55 +398,4 @@ function rewriteWindowFunctions(
 	}
 
 	return changed ? (node.withChildren(newChildren) as ScalarPlanNode) : node;
-}
-
-/**
- * Finds the window-output column index for a single window-function node by
- * matching it (name + window spec) against the collected window functions.
- */
-function findWindowColumnIndex(
-	windowNode: WindowFunctionCallNode,
-	windowFunctions: { func: WindowFunctionCallNode; alias?: string }[],
-	sourceColumnCount: number
-): number {
-	const matchingWindowFuncIndex = windowFunctions.findIndex(({ func }) => {
-		// Match based on function name and window specification
-		if (func.functionName.toLowerCase() !== windowNode.functionName.toLowerCase()) {
-			return false;
-		}
-
-		return compareWindowSpecs(windowNode.expression.window, func.expression.window);
-	});
-
-	return matchingWindowFuncIndex >= 0 ? sourceColumnCount + matchingWindowFuncIndex : -1;
-}
-
-/**
- * Compares two window specifications for equality
- *
- * NOTE: like {@link groupWindowFunctionsBySpec}, this compares `JSON.stringify` of
- * raw AST fragments including their source-location (`loc`) data, so two textually
- * identical `over (…)` clauses written at different positions never compare equal.
- * That is what keeps `sum(v) over (order by v) a, sum(v*10) over (order by v) b`
- * resolving to two different window columns despite matching on function name.
- * Making this comparison structural without also teaching
- * {@link findWindowColumnIndex} to match by node identity or position collapses
- * both onto the first function's column.
- */
-function compareWindowSpecs(originalWindow?: AST.WindowDefinition, funcWindow?: AST.WindowDefinition): boolean {
-	// Compare partition expressions
-	const originalPartition = JSON.stringify(originalWindow?.partitionBy || []);
-	const funcPartition = JSON.stringify(funcWindow?.partitionBy || []);
-
-	// Compare order expressions
-	const originalOrder = JSON.stringify(originalWindow?.orderBy || []);
-	const funcOrder = JSON.stringify(funcWindow?.orderBy || []);
-
-	// Compare frame specifications
-	const originalFrame = JSON.stringify(originalWindow?.frame || null);
-	const funcFrame = JSON.stringify(funcWindow?.frame || null);
-
-	return originalPartition === funcPartition &&
-		   originalOrder === funcOrder &&
-		   originalFrame === funcFrame;
 }

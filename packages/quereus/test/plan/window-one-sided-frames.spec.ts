@@ -106,8 +106,9 @@ describe('Window one-sided sliding frames', () => {
 
 	/**
 	 * Assert the plan's WindowNodes stream with exactly `modes` (one entry per
-	 * node — functions sharing a window spec still land in separate nodes), and
-	 * that disabling the rule drops all of them to the buffered path.
+	 * node — functions sharing a window specification share one node, so their
+	 * mode kinds appear together in that node's entry), and that disabling the
+	 * rule drops all of them to the buffered path.
 	 */
 	async function expectStreamingModes(sql: string, modes: string[][]): Promise<void> {
 		expect(await windowModes(streamingDb, sql), `streaming modes for: ${sql}`)
@@ -175,7 +176,8 @@ describe('Window one-sided sliding frames', () => {
 				+ ' avg(v) over (order by id rows between 1 preceding and current row) as a,'
 				+ ' count(v) over (order by id rows between 1 preceding and current row) as c'
 				+ ' from s order by id';
-			await expectStreamingModes(sql, [['slidingAgg'], ['slidingAgg'], ['slidingAgg'], ['slidingAgg']]);
+			// One shared window specification ⇒ one WindowNode computing all four.
+			await expectStreamingModes(sql, [['slidingAgg', 'slidingAgg', 'slidingAgg', 'slidingAgg']]);
 			expect(await bothShapes(sql)).to.deep.equal([
 				{ id: 1, mn: 10, mx: 10, a: 10, c: 1 },
 				{ id: 2, mn: 10, mx: 20, a: 15, c: 2 },
@@ -205,7 +207,7 @@ describe('Window one-sided sliding frames', () => {
 				+ ' min(v) over (order by id rows between 1 preceding and current row) as mn,'
 				+ ' sum(v) over (order by id rows between 1 preceding and current row) as s'
 				+ ' from sn order by id';
-			await expectStreamingModes(sql, [['slidingAgg'], ['slidingAgg']]);
+			await expectStreamingModes(sql, [['slidingAgg', 'slidingAgg']]);
 			expect(await bothShapes(sql)).to.deep.equal([
 				{ id: 1, mn: 10, s: 10 },
 				{ id: 2, mn: 10, s: 10 },
@@ -254,7 +256,7 @@ describe('Window one-sided sliding frames', () => {
 				+ ' sum(v) over (order by k range between current row and current row) as s,'
 				+ ' count(*) over (order by k range between current row and current row) as c'
 				+ ' from r order by k, id';
-			await expectStreamingModes(sql, [['slidingAgg'], ['slidingAgg']]);
+			await expectStreamingModes(sql, [['slidingAgg', 'slidingAgg']]);
 			expect(await bothShapes(sql)).to.deep.equal([
 				{ k: 10, s: 3, c: 2 },
 				{ k: 10, s: 3, c: 2 },
