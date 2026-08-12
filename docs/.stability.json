@@ -26,6 +26,7 @@
 		"docs/optimizer-assertions.md": "Internal",
 		"docs/optimizer-const.md": "Internal",
 		"docs/optimizer-conventions.md": "Internal",
+		"docs/optimizer-costing.md": "Internal",
 		"docs/optimizer-fd.md": "Internal",
 		"docs/optimizer-joins.md": "Internal",
 		"docs/optimizer-parallel.md": "Internal",

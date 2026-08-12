@@ -179,7 +179,7 @@ the same ID, or one node listing an ID twice, is a genuine bug and throws
 - code: `packages/quereus/src/planner/nodes/plan-node.ts` — `getTotalCost`
 - code: `packages/quereus/src/planner/validation/plan-validator.ts` — `validateCostAdditivity`
 - guard: `packages/quereus/test/planner/cost-additivity.spec.ts` — `Cost model: self-cost-only additivity`
-- doc: [Optimizer § Self-cost-only convention](optimizer.md#self-cost-only-convention)
+- doc: [Optimizer Cost and Statistics § Self-cost-only convention](optimizer-costing.md#self-cost-only-convention)
 
 `PlanNode.estimatedCost` holds the node's own incremental cost, excluding its children.
 `getTotalCost()` is the sole place child costs are summed. A constructor that folds
@@ -194,7 +194,7 @@ transform that changes a node's shape recomputes rather than inherits. The one l
 
 - code: `packages/quereus/src/planner/nodes/plan-node.ts` — `invalidateTotalCostCache`
 - guard: `packages/quereus/test/planner/cost-additivity.spec.ts` — `total invalidates when the recursive case is swapped`
-- doc: [Optimizer § Self-cost-only convention](optimizer.md#self-cost-only-convention)
+- doc: [Optimizer Cost and Statistics § Self-cost-only convention](optimizer-costing.md#self-cost-only-convention)
 
 `getTotalCost()` is memoized per instance. That is sound only because nodes are immutable
 (OPT-008) and no constructor calls it, so the first call always happens after the subtree is
