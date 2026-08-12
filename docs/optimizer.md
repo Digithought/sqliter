@@ -709,7 +709,7 @@ above the `Retrieve` boundary. See
 computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
   return {
     // Physical count first, logical getter only as fallback — see
-    // "The number the selectivity multiplies" above.
+    // "The number the selectivity multiplies" in docs/optimizer-costing.md.
     estimatedRows: physicalSourceRows(childrenPhysical[0], this.source),
     // Keys propagate as FDs in `fds`. TableReferenceNode emits `{pk} → other-cols`
     // FDs; physical access nodes pass them through unchanged.

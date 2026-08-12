@@ -743,7 +743,7 @@ describe('ANALYZE over a size-only getStatistics()', () => {
 // TableReferenceNode.estimatedRows (and every physical access node built on
 // top of it) must prefer ANALYZE-collected statistics over the static schema
 // estimate, which SchemaManager hardcodes to 0 at CREATE TABLE and never
-// updates. See docs/optimizer.md "Base-table row estimates".
+// updates. See docs/optimizer-costing.md "Base-table row estimates".
 
 describe('base-table cardinality from catalog statistics', () => {
 	function walk(node: PlanNode, fn: (n: PlanNode) => void): void {

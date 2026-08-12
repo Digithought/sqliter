@@ -91,6 +91,23 @@ here — sharpening the third open design question above, and adding a fourth: w
 banner inside a fenced code block is markable at all, or whether the marker should be rewritten
 to name the enclosing heading (`§ Sync API`) instead.
 
+### Fourth data point — the `docs-split-optimizer-costing` split, and a marker form with no `§`
+
+That split moved `### Cost Model Integration` and `### Statistics Abstraction` out of
+`docs/optimizer.md` into `docs/optimizer-costing.md`. Its sweep grepped for `§`-prefixed
+markers and found all of them — and still missed one, because the marker carries **no `§` at
+all**: the section name simply follows the file name in quotes.
+
+| Site | Marker | Should name |
+| --- | --- | --- |
+| `packages/quereus/test/optimizer/statistics.spec.ts:746` | `See docs/optimizer.md "Base-table row estimates"` | `optimizer-costing.md` |
+
+(The review pass repointed it; recorded here as corpus.) Two things this adds to the design:
+the extractor cannot key on `§` — a quoted or backticked name immediately after a
+`docs/<name>.md` reference is the same construct — and the target here is a **bold-lead prose
+paragraph**, not a heading, which is the third open design question above showing up a second
+time.
+
 ## Expected behavior
 
 `node scripts/check-docs.mjs` fails, with the usual `path:line: message` shape, when a prose

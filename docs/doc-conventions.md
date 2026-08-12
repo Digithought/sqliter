@@ -192,6 +192,15 @@ not another 500 words.
 Word count is whitespace-separated tokens over the whole file, fenced code included. A doc
 whose bulk is code samples is just as unreviewable as one whose bulk is prose.
 
+**When you split, sweep for relative cross-references.** Prose that says "see Pass 3.7
+*above*", "the multi-relation path *below*", or "as described *earlier*" resolves only while
+both halves share a file. Nothing checks it — `scripts/check-docs.mjs` validates link targets
+and anchors, not positional words. Grep the moved block and the text left behind for
+`above|below|earlier|later in this document` and turn any reference that now crosses the file
+boundary into a real link. The same sweep has to cover prose section markers pointing *into*
+the moved sections from elsewhere in the tree, in both the `§ Section` and the bare-quoted
+`docs/foo.md "Section"` form — see `debt-check-docs-validate-section-markers`.
+
 **The grace band is for the 40-word clarification.** Without it, adding a sentence to a
 ratcheted doc fails the build, and a gate that fails on every honest edit trains everyone to
 reach for `--force`. Drift inside the band never re-baselines the entry, so it is not a
