@@ -1341,6 +1341,37 @@ select wg.a, a, row_number() over (order by a) as rn from wg group by a order by
 select wg.a, count(*) as c, row_number() over (order by a) as rn from wg group by a having count(*) > 1;
 → [{"a":"x","c":2,"rn":1}]
 
+-- HAVING may itself name the grouping key under a spelling its scope does not hold.
+-- It gets no redirect, and does not need one: the HAVING filter sits directly on the
+-- AggregateNode's yield — below any WindowNode — so the representative source row is
+-- still published when it evaluates. Pinned windowed and unwindowed so a later change
+-- that moves the filter above the window phase fails here rather than at run time.
+select wg.a, count(*) as c from wg group by a having wg.a = 'x';
+→ [{"a":"x","c":2}]
+
+select wg.a, count(*) as c, row_number() over (order by a) as rn from wg group by a having wg.a = 'x';
+→ [{"a":"x","c":2,"rn":1}]
+
+select wg.a, count(*) as c, row_number() over (order by a) as rn from wg group by a having upper(wg.a) = 'X';
+→ [{"a":"x","c":2,"rn":1}]
+
+-- ORDER BY of a grouped, windowed query gets NO redirect either, and unlike HAVING it
+-- sits ABOVE the window phase, so it carries exactly the defect this change removed
+-- from the SELECT list. The spellings the projection output scope does hold — the bare
+-- key, an output alias, an ordinal — resolve there and work; they are pinned here.
+-- `order by wg.a` and `order by a || '!'` still die with "No row context found for
+-- column a"; that is tracked as
+-- fix/bug-order-by-grouping-key-spelling-breaks-window-query and is pinned there, not
+-- here.
+select wg.a, row_number() over (order by a) as rn from wg group by a order by a;
+→ [{"a":"x","rn":1},{"a":"y","rn":2}]
+
+select wg.a as k, row_number() over (order by a) as rn from wg group by a order by k;
+→ [{"k":"x","rn":1},{"k":"y","rn":2}]
+
+select wg.a, row_number() over (order by a) as rn from wg group by a order by 1;
+→ [{"a":"x","rn":1},{"a":"y","rn":2}]
+
 -- An UNGROUPED select-list column is still rejected at plan time, with the same
 -- message and the same wording, window function or not. `validateAggregateProjections`
 -- runs on the pre-aggregate projections and never sees the redirect.

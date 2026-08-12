@@ -474,10 +474,19 @@ export function redirectToGroupKeys(
  *
  * NOTE: this renders an identity fingerprint at every scalar node it visits, and a
  * fingerprint hit inside a subquery then walks that node's subtree again for the guard
- * — so a window specification containing a large subquery costs more to build than
- * before, once per prepare of the query. Not measured; if preparing such queries ever
- * shows up as slow, memoize the fingerprint per node or bail out of the walk for
- * subtrees that contain no `aggregateInputAttrIds` reference at all.
+ * — so every grouped query pays a walk of its whole SELECT list, plus its window
+ * specifications when it has them, once per prepare. Not measured; if preparing grouped
+ * queries ever shows up as slow, memoize the fingerprint per node or bail out of the
+ * walk for subtrees that contain no `aggregateInputAttrIds` reference at all.
+ *
+ * NOTE: the SELECT-list caller hands us its window-function subtrees too, and the window
+ * phase then throws each of them away — `rewriteWindowFunctions` (select-window.ts)
+ * replaces the whole node with an `ArrayIndexNode` into the WindowNode's output. The
+ * rewrite inside such a subtree is therefore wasted, and harmless only because
+ * `findWindowColumnIndex` matches on the raw `expression.window` AST, which this walk
+ * never touches. If that match ever becomes plan-shape-based, skip window-function nodes
+ * here (`CapabilityDetectors.isWindowFunction` → return the node) — the window phase
+ * redirects its specification expressions itself and never passes one in.
  */
 function redirectNode(
 	node: PlanNode,
@@ -1368,7 +1377,11 @@ export function buildFinalAggregateProjections(
 	// The same index also maps bare source columns that are themselves group keys
 	// straight to the aggregate's group output column, which is what expands
 	// `SELECT *` in a grouped query in source-column order rather than GROUP BY order.
-	const groupKeys = indexGroupKeys(groupByExpressions);
+	//
+	// A grouped query's `groupedContext` already carries this index; deriving it twice
+	// for one query is how the two copies drift. Only an aggregate query with no GROUP BY
+	// reaches the fallback, and its `groupByExpressions` is empty.
+	const groupKeys = groupedContext?.groupKeys ?? indexGroupKeys(groupByExpressions);
 
 	for (const column of stmt.columns) {
 		if (column.type === 'all') {
@@ -1417,25 +1430,20 @@ export function buildFinalAggregateProjections(
 			};
 			const builtNode = buildExpression(finalContext, column.expr, true);
 
-			// `aggregateOutputScope` holds a grouping key only under the names it was
-			// literally written with, so every other legal spelling — a qualifier the
-			// GROUP BY did not use (`select wg.a … group by a`), a FROM-alias qualifier
-			// (`w.a`), a key nested inside a bigger expression (`upper(wg.a)`,
-			// `upper(a || '!')`) — falls through to the pre-aggregate scope and binds to
-			// a BASE-TABLE attribute the AggregateNode's output row does not carry.
+			// `aggregateOutputScope` holds a grouping key only under the names the query
+			// literally wrote, so every other legal spelling — a qualifier the GROUP BY did
+			// not use (`select wg.a … group by a`), a FROM-alias qualifier, a key nested in
+			// a bigger expression (`upper(wg.a)`) — falls through to the pre-aggregate
+			// scope and binds to a BASE-TABLE attribute the grouped row does not carry.
 			// Redirect each such subtree onto the aggregate's own group output column,
 			// exactly as the window phase does for a window specification.
 			//
-			// This runs for every grouped query, not only windowed ones. Reading such a
-			// reference off the group's representative source row happens to give the
-			// right answer when the operator consuming the aggregate's yield is this
-			// projection itself (see docs/runtime.md § Invariant: source-attr contexts and
-			// child pulls), but that context is gone the moment anything buffers in
-			// between — a WindowNode's buffered path drains its source before yielding,
-			// and the query dies with an internal "No row context found for column a".
-			// Binding to the aggregate's own column is correct in both shapes, and keeps
-			// one query shape from binding two different ways depending on an unrelated
-			// clause.
+			// For EVERY grouped query, not only windowed ones: reading the base attribute
+			// off the group's representative source row is right only while this projection
+			// is the aggregate's adjacent consumer, and a WindowNode buffering in between
+			// removes that (docs/runtime.md § Corollary: a published source row reaches only
+			// the adjacent consumer). One query shape must not bind two ways depending on
+			// an unrelated clause.
 			const scalarNode = groupedContext
 				? redirectToGroupKeys(builtNode, groupedContext, aggregateOutputScope)
 				: builtNode;
