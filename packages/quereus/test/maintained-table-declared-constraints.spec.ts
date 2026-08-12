@@ -39,6 +39,24 @@ describe('Maintained-table declared-constraint validation', () => {
 		expect.fail(`expected '${sql}' to fail with: ${messagePart}`);
 	}
 
+	/** Runs `fn`, counting `db._queueDeferredConstraintRow` calls made during it — the
+	 *  discriminator between a healthy auto-deferred CHECK (1 per written image) and a
+	 *  poisoned validator's inline throw (0, it never reaches the deferred queue). */
+	async function withDeferredCount(fn: () => Promise<void>): Promise<number> {
+		let deferred = 0;
+		const origQueue = db._queueDeferredConstraintRow.bind(db);
+		db._queueDeferredConstraintRow = ((...args: Parameters<typeof origQueue>) => {
+			deferred++;
+			return origQueue(...args);
+		}) as typeof db._queueDeferredConstraintRow;
+		try {
+			await fn();
+		} finally {
+			db._queueDeferredConstraintRow = origQueue;
+		}
+		return deferred;
+	}
+
 	describe('zero-overhead gate', () => {
 		it('a source write to a constraint-less maintained table prepares nothing and defers nothing', async () => {
 			await db.exec(`
@@ -275,6 +293,69 @@ describe('Maintained-table declared-constraint validation', () => {
 			});
 		});
 
+		// The two recovery arms `rebuildConstraintValidatorsFor` carries for a dropped
+		// subquery-CHECK target — degrade to a poisoned validator, self-heal on re-create
+		// (folded into `self-heal on dependency re-create` below) — can no longer be driven
+		// from SQL: the drop above is refused. They are not dead code — internal drop paths
+		// (transaction rollback, catalog import on store reopen) still drop a table without
+		// going through the DROP emitter that carries the refusal (`assertNoExpressionDependsOn`
+		// is wired into the emitters only, never into `SchemaManager.dropTable` itself) — so
+		// this drives the same code path directly, bypassing the emitter exactly as those
+		// internal callers do.
+		describe('subquery-CHECK target dropped out of band (poisoned validator)', () => {
+			beforeEach(async () => {
+				await db.exec(`
+					create table quota (k integer primary key, lim integer not null);
+					insert into quota values (1, 100);
+					create table qsrc (id integer primary key, n integer not null);
+					create table mq (id integer primary key, n integer not null
+						check (n <= (select lim from quota where k = 1)))
+						maintained as select id, n from qsrc;
+				`);
+			});
+
+			it('baseline: a healthy subquery-CHECK auto-defers, one enqueue per written image', async () => {
+				const deferred = await withDeferredCount(() => db.exec(`insert into qsrc values (1, 5)`));
+				expect(deferred).to.equal(1);
+			});
+
+			it('the out-of-band drop resolves without throwing, and an unrelated statement afterwards still succeeds', async () => {
+				const removed = await db.schemaManager.dropTable('main', 'quota');
+				expect(removed).to.equal(true);
+				// the schema-change listener swallowed the rebuild failure rather than
+				// propagating it into this unrelated statement
+				await db.exec(`create table unrelated (id integer primary key); insert into unrelated values (1)`);
+			});
+
+			it('a conforming source write is rejected by the poisoned validator with the sited planning error', async () => {
+				await db.schemaManager.dropTable('main', 'quota');
+				let message = '';
+				const deferred = await withDeferredCount(async () => {
+					try {
+						await db.exec(`insert into qsrc values (1, 5)`); // 5 <= 100 — conforming, if quota still existed
+						expect.fail('expected the poisoned validator to reject the write');
+					} catch (e) {
+						message = (e as Error).message;
+					}
+				});
+				expect(message).to.contain(`Table 'quota' not found in schema path: main`);
+				// NOT the stale-validator internal module-connect failure
+				expect(message).to.not.contain('connect failed');
+				expect(message).to.not.contain('Cannot connect');
+				expect(deferred, 'poisoned validator throws inline, before any deferred enqueue').to.equal(0);
+				expect(await readAll('select count(*) as n from qsrc')).to.deep.equal([{ n: 0 }]);
+				expect(await readAll('select count(*) as n from mq')).to.deep.equal([{ n: 0 }]);
+			});
+
+			it('a delete after poisoning still succeeds (no row image, so no CHECK is validated)', async () => {
+				await db.exec(`insert into qsrc values (1, 5)`);
+				await db.schemaManager.dropTable('main', 'quota');
+				await db.exec(`delete from qsrc where id = 1`);
+				expect(await readAll('select count(*) as n from qsrc')).to.deep.equal([{ n: 0 }]);
+				expect(await readAll('select count(*) as n from mq')).to.deep.equal([{ n: 0 }]);
+			});
+		});
+
 		describe('subquery-CHECK target rename', () => {
 			beforeEach(async () => {
 				await db.exec(`
@@ -300,11 +381,13 @@ describe('Maintained-table declared-constraint validation', () => {
 			});
 		});
 
-		// No subquery-CHECK arm here any more: the drop half is refused (see
-		// `subquery-CHECK target drop` above) and the maintained table cannot be declared
-		// against an absent CHECK target either, so there is no SQL sequence that reaches
-		// the `table_added` rebuild through a CHECK. The FK-parent arm still works — a
-		// parent drop with no referencing rows is allowed and only rebuilds the validator.
+		// The subquery-CHECK arm below drives the `table_added` rebuild the same way
+		// `subquery-CHECK target dropped out of band` drives the poisoned-validator arm:
+		// directly through `SchemaManager.dropTable`, since SQL can no longer produce the
+		// drop half (see `subquery-CHECK target drop` above) and a maintained table cannot
+		// be declared against an absent CHECK target either. The FK-parent arm needs no
+		// such workaround — a parent drop with no referencing rows is allowed through SQL
+		// and only rebuilds the validator.
 		describe('self-heal on dependency re-create', () => {
 			it('re-creating a dropped FK parent restores existence validation', async () => {
 				await db.exec(`
@@ -322,6 +405,30 @@ describe('Maintained-table declared-constraint validation', () => {
 				// …and an orphan still fails against the re-created parent
 				await expectError(`insert into src values (2, 99)`,
 					`row derived into maintained table 'main.mt' references a missing 'main.parent'`);
+			});
+
+			it('re-creating a dropped subquery-CHECK target restores CHECK validation', async () => {
+				await db.exec(`
+					create table quota (k integer primary key, lim integer not null);
+					insert into quota values (1, 100);
+					create table qsrc (id integer primary key, n integer not null);
+					create table mq (id integer primary key, n integer not null
+						check (n <= (select lim from quota where k = 1)))
+						maintained as select id, n from qsrc;
+				`);
+				await db.schemaManager.dropTable('main', 'quota');
+				await db.exec(`
+					create table quota (k integer primary key, lim integer not null);
+					insert into quota values (1, 100);
+				`);
+				// validator self-healed: a conforming write flows into mq again, auto-deferring
+				// exactly as a never-poisoned validator would…
+				const deferred = await withDeferredCount(() => db.exec(`insert into qsrc values (1, 5)`));
+				expect(await readAll('select * from mq')).to.deep.equal([{ id: 1, n: 5 }]);
+				expect(deferred, 'healed validator auto-defers again').to.equal(1);
+				// …and a violating write is rejected with the maintained-table attribution
+				await expectError(`insert into qsrc values (2, 500)`,
+					`row derived into maintained table 'main.mq'`);
 			});
 		});
 
