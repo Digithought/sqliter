@@ -237,8 +237,8 @@ export function buildChildSideFKChecks(
 				(acc, guard) => ({ type: 'binary', operator: 'OR', left: guard, right: acc } as AST.BinaryExpr),
 				{ type: 'literal', value: 0 } as AST.LiteralExpr,
 			);
-			// An unqualified parent name binds to the CHILD's own schema (docs/sql-ddl.md
-			// § FOREIGN KEY), so naming the schema is what makes a cross-schema mistake
+			// An unqualified parent name binds to the CHILD's own schema
+			// (docs/sql-constraints.md §7.6), so naming the schema is what makes a cross-schema mistake
 			// visible: the fix is to qualify the parent.
 			violationMessage = `CHECK constraint failed: ${constraintName} — referenced table `
 				+ `'${parentQualified}' does not exist`;

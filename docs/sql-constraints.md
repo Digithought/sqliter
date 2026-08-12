@@ -268,7 +268,7 @@ Cascade cycle detection prevents infinite recursion when cascading actions chain
 
 **When a foreign key cannot be enforced:**
 
-Parent resolution happens **per plan**, not once at `CREATE TABLE` — that is what makes forward references (§ *Order Independence*) work, and it means a key can become unenforceable long after it was declared. Two cases, and what each reports:
+Parent resolution happens **per plan**, not once at `CREATE TABLE` — that is what makes forward references ([sql-ddl.md § *Order Independence*](sql-ddl.md#semantics-and-features)) work, and it means a key can become unenforceable long after it was declared. Two cases, and what each reports:
 
 - **The parent table does not exist** (never created, dropped since, or — see the note on unqualified parents under *Syntax* above — named without a qualifier from a child in another schema). MATCH SIMPLE still applies: a row with any NULL FK column is accepted. Every other row is rejected with
 

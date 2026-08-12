@@ -172,7 +172,7 @@ apply schema main to version '1.0.0' options (
   -- error: Table 't1' is declared more than once in schema 'main'
   -- error: 'dual' is declared as both a table and a view in schema 'main'
   ```
-- `index` has its own namespace (unique per schema — see §6.3), as does `assertion`. An index or assertion may share a table's name; only a duplicate *within* its own namespace is rejected.
+- `index` has its own namespace (unique per schema — see [sql-vtab.md §6.3](sql-vtab.md#63-indexes-on-virtual-tables)), as does `assertion`. An index or assertion may share a table's name; only a duplicate *within* its own namespace is rejected.
 - A repeated `seed` block for one table is rejected when the declaration is stored, not at diff time — two blocks for one table have no defined meaning, and the second used to discard the first's rows:
   ```sql
   -- error: Seed data for table 't1' is declared more than once in schema 'main'
@@ -376,7 +376,7 @@ Generated columns are computed from an expression over other columns in the same
 - Cannot have both `DEFAULT` and `GENERATED ALWAYS AS` on the same column.
 - Cannot INSERT into or UPDATE a generated column directly.
 - `ALTER TABLE ... ADD COLUMN ... GENERATED ALWAYS AS (...)` **backfills the existing rows**: each one's value is computed from that row, exactly as `CREATE TABLE` with the same declaration and a subsequent INSERT would produce it. This holds for the `STORED`, `VIRTUAL` and unspecified spellings alike, and for an expression that reads another generated column (already materialized in the stored row). Determinism is checked at declaration time — `CREATE TABLE` and `ALTER TABLE ... ADD COLUMN` alike, before any row is touched — so `GENERATED ALWAYS AS (random())` is rejected there rather than at the next INSERT, whichever statement declares it (unless `nondeterministic_schema` is on). If the new column is `NOT NULL` and the expression yields NULL for some existing row, or an inline `CHECK` on it fails for some existing row, the whole `ALTER` is rejected and the table is left exactly as it was.
-- `ALTER TABLE ... DROP COLUMN` of a column referenced by another generated column's expression is rejected; drop the referencing generated column first. (A column that a foreign key in another table points at is rejected the same way — see §7.6.)
+- `ALTER TABLE ... DROP COLUMN` of a column referenced by another generated column's expression is rejected; drop the referencing generated column first. (A column that a foreign key in another table points at is rejected the same way — see [sql-constraints.md §7.6](sql-constraints.md#76-foreign-key-constraint).)
 
 **CHECK Constraints:**
 

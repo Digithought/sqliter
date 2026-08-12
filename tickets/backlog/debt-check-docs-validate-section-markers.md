@@ -108,6 +108,39 @@ the extractor cannot key on `§` — a quoted or backticked name immediately aft
 paragraph**, not a heading, which is the third open design question above showing up a second
 time.
 
+### Fifth data point — the `docs-split-sql-ddl-vtab-constraints` split, and markers with no file half
+
+That split moved `## 6. Virtual Tables` and `## 7. Constraints and Indexes` out of
+`docs/sql-ddl.md` into `docs/sql-vtab.md` and `docs/sql-constraints.md`. Its sweep grepped
+`grep -rn 'sql-ddl.md §' packages/quereus/src docs` — a file-name-anchored pattern over two
+directories — and missed seven markers. The review pass repointed all seven; recorded here as
+corpus, not as outstanding work.
+
+| Site | Marker | Should name |
+| --- | --- | --- |
+| `docs/sql-ddl.md:175` | `(unique per schema — see §6.3)` | `sql-vtab.md` §6.3 |
+| `docs/sql-ddl.md:379` | `rejected the same way — see §7.6.` | `sql-constraints.md` §7.6 |
+| `docs/sql-vtab.md:186` | `see §2.0 *Declaration Syntax*` | `sql-ddl.md` §2.0 |
+| `docs/sql-constraints.md:271` | `forward references (§ *Order Independence*)` | `sql-ddl.md`, and the target is **bold prose, not a heading** |
+| `packages/quereus/src/planner/building/foreign-key-builder.ts:240` | `docs/sql-ddl.md § FOREIGN KEY` | `sql-constraints.md` §7.6 |
+| `packages/quereus/test/logic/41.16-fk-unenforceable.sqllogic:147` | `docs/sql-ddl.md § FOREIGN KEY` | `sql-constraints.md` §7.6 |
+| `packages/quereus/test/logic/10.5.5-index-name-uniqueness.sqllogic:5` | `docs/sql-ddl.md §6.3` | `sql-vtab.md` §6.3 |
+
+Two new things for the design:
+
+- **A marker with no file half at all.** The first four rows are bare `§6.3` / `§7.6` / `§2.0` /
+  `§ *Order Independence*` markers that meant "a section of *this* document" and were correct until
+  the section left the document. No file-name-anchored grep can see them, and `bareDocRefs()` —
+  which starts from a `.md` file name — cannot either. Resolving a bare `§N.N` against the
+  *containing* document's own headings is the check that would have caught the three numbered ones,
+  and it is cheaper than the cross-document case: no delimiter question, the number is the whole
+  name. The fourth is again a bold-lead prose target (`**Order Independence:**`, `sql-ddl.md:165`),
+  so it also needs the bold-paragraph decision from the second data point.
+- **Markers live outside `*.md` and `*.ts`.** Two of the six are in `.sqllogic` test fixtures. The
+  corpus grep at the end of this ticket (and the sweeps every split has run) restricts to
+  `--include=*.md --include=*.ts` and therefore cannot see them. Whatever file set the check walks
+  has to include test fixtures, or those markers stay unvalidated forever.
+
 ## Expected behavior
 
 `node scripts/check-docs.mjs` fails, with the usual `path:line: message` shape, when a prose

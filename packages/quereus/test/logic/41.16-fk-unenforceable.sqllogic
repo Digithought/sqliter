@@ -144,7 +144,7 @@ drop table fwd_c;
 -- A7. cross-schema: an UNQUALIFIED parent name binds to the CHILD's OWN schema
 --
 -- That rule is deliberate and matches SQLite, where a foreign key cannot cross
--- databases (docs/sql-ddl.md § FOREIGN KEY). The failure mode it produces is nasty:
+-- databases (docs/sql-constraints.md §7.6). The failure mode it produces is nasty:
 -- the parent plainly exists — in `main` — and the child in another schema silently
 -- refuses every row. Naming the schema in the message is what makes it diagnosable,
 -- and it points straight at the remedy: qualify the parent.
