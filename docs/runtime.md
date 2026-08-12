@@ -451,25 +451,36 @@ binds a grouping key to a *base-table* attribute happens to read the right value
 representative row when the projection is adjacent to the aggregate — the group key's
 value on any row of the group is by definition the group key — but it is right by
 accident, and it dies with `No row context found for column <name>` the moment a
-WindowNode lands in between. `buildFinalAggregateProjections`
-(`planner/building/select-aggregates.ts`) therefore redirects such a reference onto the
-AggregateNode's own group output column at build time, for every grouped query rather
-than only the windowed ones. `applyOrderBy`
-(`planner/building/select-modifiers.ts`) runs the same redirect over a grouped query's
-sort keys, which have the identical exposure — the post-aggregate sort sits above the
-window phase, so `order by wg.a` against `group by a` died the same way. It is gated on
-`referencesAggregateInput`, so only a key that actually fell through to a pre-grouping
-attribute is rewritten; a key that already resolved through the projection,
-window-output or aggregate-output scope is left exactly as it bound.
+WindowNode lands in between.
 
-Two sites still bind a qualified or computed grouping key to a base attribute, and both
-are correct today only because of the adjacency this corollary is about — not by design.
-HAVING's `Filter` sits directly on the aggregate's yield. And a bare-column ORDER BY
-naming a column the select list does not contain never reaches `applyOrderBy` at all:
-`buildSelectStmt` diverts it to a `Sort` placed *below* the window phase, likewise
-directly on that yield. The same rule applies to both, and to any future operator that
-wants to read a grouped query's pre-grouping columns: bind to what the row actually
-carries.
+This is enforced, in two halves, both in `planner/building`:
+
+- **One redirect choke point.** Every post-aggregate expression of a grouped query —
+  the rebuilt select list, the window phase's specifications and function arguments,
+  the HAVING predicate, and every post-aggregate sort key (including the sort
+  `buildSelectStmt` places below the window phase, and the early ORDER BY placement
+  for order-by-only aggregates) — is passed through `redirectPostAggregate`
+  (`select-aggregates.ts`), which rewrites any spelling of a grouping key that fell
+  through to a pre-grouping attribute onto the AggregateNode's own group output
+  column. It is gated on `referencesAggregateInput`, so a reference that already
+  resolved through the projection, window-output or aggregate-output scope is left
+  exactly as it bound.
+- **One boundary check over the finished plan.** At the end of `buildSelectStmt`,
+  `assertGroupedPlanCoverage` walks a grouped query's plan from the root down to (and
+  stopping at) the AggregateNode and rejects any remaining reference to a
+  pre-grouping attribute the aggregate's output does not carry, with the user-facing
+  "must appear in the GROUP BY clause or be used in an aggregate function" message.
+  The walk is subquery-aware: a subquery's own columns and correlated references to
+  an enclosing query pass through; a correlated reference to *this* query's ungrouped
+  column is rejected. A builder that forgets the redirect now fails at plan time
+  instead of shipping the accident above.
+
+The check is deliberately strict — there is no escape hatch. A query that genuinely
+reads an ungrouped column above the aggregate (`select a from t group by a order by
+b`) is rejected even though the adjacent-consumer accident used to let it run; it
+sorted by an arbitrary representative row, which was a wrong-result bug. The revisit
+condition and the weaker buffering-only alternative are recorded in the NOTE at the
+`assertGroupedPlanCoverage` call in `select.ts`.
 
 ### Filter conjunct early exit
 

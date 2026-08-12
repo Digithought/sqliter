@@ -1233,8 +1233,8 @@ from r group by n order by rn;
 -- holds a grouping key under the names the query literally wrote, so a qualifier
 -- the GROUP BY did not use, a FROM-alias qualifier, or a key nested inside a
 -- bigger expression all fall through to a BASE-TABLE attribute the grouped row
--- does not carry. `buildFinalAggregateProjections` now runs the same
--- `redirectToGroupKeys` rewrite the window phase does
+-- does not carry. `buildFinalAggregateProjections` runs the same grouping-key
+-- redirect the window phase does — both through `redirectPostAggregate`
 -- (bug-qualified-group-key-in-select-list-breaks-window-query).
 --
 -- Each windowed case below is paired with its NON-window twin. The twin answers
@@ -1336,24 +1336,44 @@ select wg.a, a from wg group by a order by 1;
 select wg.a, a, row_number() over (order by a) as rn from wg group by a order by rn;
 → [{"a":"x","a:1":"x","rn":1},{"a":"y","a:1":"y","rn":2}]
 
--- HAVING resolves through its own hybrid scope and is not part of this rewrite;
--- this pins that the two do not interact.
+-- HAVING resolves through its own hybrid scope; an aggregate reference resolves to
+-- the AggregateNode's output column and needs no redirect.
 select wg.a, count(*) as c, row_number() over (order by a) as rn from wg group by a having count(*) > 1;
 → [{"a":"x","c":2,"rn":1}]
 
 -- HAVING may itself name the grouping key under a spelling its scope does not hold.
--- It gets no redirect, and does not need one: the HAVING filter sits directly on the
--- AggregateNode's yield — below any WindowNode — so the representative source row is
--- still published when it evaluates. Pinned windowed and unwindowed so a later change
--- that moves the filter above the window phase fails here rather than at run time.
+-- Such a reference used to bind to the base-table attribute and read correctly only
+-- because the HAVING filter sits directly on the AggregateNode's yield, where the
+-- representative source row is still published. It now goes through the same
+-- grouping-key redirect as every other post-aggregate clause and reads the
+-- aggregate's own output column, so the predicate stays correct wherever the filter
+-- ends up relative to a buffering operator. Pinned windowed and unwindowed.
 select wg.a, count(*) as c from wg group by a having wg.a = 'x';
 → [{"a":"x","c":2}]
 
 select wg.a, count(*) as c, row_number() over (order by a) as rn from wg group by a having wg.a = 'x';
 → [{"a":"x","c":2,"rn":1}]
 
+select wg.a, count(*) as c from wg group by a having upper(wg.a) = 'X';
+→ [{"a":"x","c":2}]
+
 select wg.a, count(*) as c, row_number() over (order by a) as rn from wg group by a having upper(wg.a) = 'X';
 → [{"a":"x","c":2,"rn":1}]
+
+-- A COMPUTED grouping key written out again in HAVING — matched by the whole-subtree
+-- fingerprint, redirected onto the aggregate's group output column.
+select a || '!' as k, count(*) as c from wg group by a || '!' having a || '!' = 'x!';
+→ [{"k":"x!","c":2}]
+
+select a || '!' as k, count(*) as c, row_number() over (order by a || '!') as rn from wg group by a || '!' having a || '!' = 'x!';
+→ [{"k":"x!","c":2,"rn":1}]
+
+-- A genuinely ungrouped HAVING column keeps its dedicated rejection, windowed or not.
+select wg.a, count(*) as c from wg group by a having b = '1';
+-- error: HAVING references non-grouped column 'b'
+
+select wg.a, count(*) as c, row_number() over (order by a) as rn from wg group by a having b = '1';
+-- error: HAVING references non-grouped column 'b'
 
 -- =============================================================================
 -- The ORDER BY of a grouped query names a grouping key.
@@ -1362,9 +1382,9 @@ select wg.a, count(*) as c, row_number() over (order by a) as rn from wg group b
 -- in a way the projection output scope does not publish — a qualifier the GROUP BY did
 -- not use, a FROM-alias qualifier, the key nested inside a bigger expression, a
 -- computed key written out again — falls through to a BASE-TABLE attribute the grouped
--- row does not carry. `applyOrderBy` now runs the same `redirectToGroupKeys` rewrite,
--- gated on "this key actually references a pre-grouping attribute"
--- (bug-order-by-grouping-key-spelling-breaks-window-query).
+-- row does not carry. `applyOrderBy` runs the same grouping-key redirect through
+-- `redirectPostAggregate`, gated on "this key actually references a pre-grouping
+-- attribute" (bug-order-by-grouping-key-spelling-breaks-window-query).
 --
 -- Each windowed case is paired with its NON-window twin. The twin answered correctly
 -- before this fix only because its sort consumed the aggregate's yield through
@@ -1472,8 +1492,7 @@ select a, b, row_number() over (order by a) as rn from wg group by a, b order by
 select a, b, count(*) as c from wg group by a, b order by wg.b desc;
 → [{"a":"x","b":"3","c":1},{"a":"y","b":"2","c":1},{"a":"x","b":"1","c":1}]
 
--- HAVING (which resolves through its own hybrid scope, no redirect) and a redirected
--- ORDER BY on the same query.
+-- HAVING and a redirected ORDER BY on the same query.
 select wg.a, count(*) as c, row_number() over (order by a) as rn from wg group by a having count(*) > 1 order by wg.a desc;
 → [{"a":"x","c":2,"rn":1}]
 
@@ -1500,18 +1519,38 @@ select wg.a, row_number() over (order by a) as rn from wg group by a order by 1;
 select a, count(*) as c from wg group by a order by 1;
 → [{"a":"x","c":2},{"a":"y","c":1}]
 
--- An ORDER BY naming a genuinely UNGROUPED column is ACCEPTED today, windowed and not:
--- it sorts by an arbitrary representative row's `b`, and the two paths pick a different
--- representative. Neither of these goes through the redirect at all: the windowed one is
--- a bare column name absent from the select list, which `select.ts` diverts to a sort
--- BELOW the window phase (`preWindowSort`), and the unwindowed one finds no grouping-key
--- match. Pinned with today's rows so that making this an error becomes a deliberate,
--- visible change rather than a silent one.
+-- An ORDER BY naming a genuinely UNGROUPED column is now REJECTED at plan time,
+-- windowed and not. It used to be accepted and sorted by an arbitrary representative
+-- row's `b` — a wrong-result bug, and inconsistent with the SELECT list and HAVING,
+-- which already reject ungrouped columns. The finished-plan boundary check
+-- (`assertGroupedPlanCoverage`, see the NOTE at its call in select.ts) is what
+-- rejects it, with the same user-facing message the SELECT list uses.
 select a, row_number() over (order by a) as rn from wg group by a order by b;
-→ [{"a":"x","rn":1},{"a":"y","rn":2}]
+-- error: Column 'b' must appear in the GROUP BY clause or be used in an aggregate function
 
 select a, count(*) as c from wg group by a order by b;
-→ [{"a":"x","c":2},{"a":"y","c":1}]
+-- error: Column 'b' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- The `preWindowSort` placement (an ORDER BY column absent from the select list gets
+-- its sort BELOW the window projection) with a QUALIFIED spelling of a grouping key:
+-- that sort still sits ABOVE the AggregateNode, so its key is redirected onto the
+-- aggregate's own output column like every other post-aggregate sort key. (The
+-- window's own ordering wins on output — pre-existing preWindowSort semantics; what
+-- these pin is that the qualified key plans and evaluates instead of dying.)
+select a, row_number() over (order by a) as rn from wg group by a, b order by wg.b;
+→ [{"a":"x","rn":1},{"a":"x","rn":2},{"a":"y","rn":3}]
+
+select a, row_number() over (order by a) as rn from wg group by a, b order by wg.b desc;
+→ [{"a":"x","rn":1},{"a":"x","rn":2},{"a":"y","rn":3}]
+
+-- The EARLY ORDER BY placement (taken when ORDER BY introduces an aggregate the
+-- select list does not have) alongside a qualified grouping-key spelling: both keys
+-- of one sort, one resolved through the aggregates context, one redirected.
+select a from wg group by a order by count(*) desc, wg.a;
+→ [{"a":"x"},{"a":"y"}]
+
+select a from wg group by a order by count(*), wg.a;
+→ [{"a":"y"},{"a":"x"}]
 
 -- The grouping key is NOT in the select list, so no projection output column carries it
 -- and the redirect is the only thing that can bind the sort key. A non-column ORDER BY
@@ -1564,6 +1603,21 @@ select a, (select count(*) from wg t where t.a = wg.a) as c from wg group by a o
 select a, (select t.b from wg t where t.a = wg.a and t.b = '1') as c, row_number() over (order by a) as rn
 from wg group by a order by rn;
 → [{"a":"x","c":"1","rn":1},{"a":"y","c":null,"rn":2}]
+
+-- A correlated subquery reading a genuinely UNGROUPED column of this query is
+-- rejected at plan time by the finished-plan boundary check — it used to plan and
+-- then read an arbitrary representative row (or die at run time with an internal
+-- "No row context found" error once a WindowNode sat in between). The subquery's own
+-- `t.b` is a different attribute instance and stays legal; only the correlated
+-- `wg.b` is flagged.
+select a, (select count(*) from wg t where t.b = wg.b) as c from wg group by a;
+-- error: Column 'wg.b' must appear in the GROUP BY clause or be used in an aggregate function
+
+select a, (select count(*) from wg t where t.b = wg.b) as c, row_number() over (order by a) as rn from wg group by a;
+-- error: Column 'wg.b' must appear in the GROUP BY clause or be used in an aggregate function
+
+select a, count(*) as c from wg group by a order by (select count(*) from wg t where t.b = wg.b);
+-- error: Column 'wg.b' must appear in the GROUP BY clause or be used in an aggregate function
 
 -- NOTE: the correlated SCALAR-AGGREGATE spelling of the case above
 -- (`(select count(*) from wg t where t.a = wg.a)`) now plans and runs under a window

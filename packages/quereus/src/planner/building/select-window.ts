@@ -8,7 +8,7 @@ import { ProjectNode, type Projection } from '../nodes/project-node.js';
 import { ArrayIndexNode } from '../nodes/array-index-node.js';
 import { LiteralNode } from '../nodes/scalar.js';
 import { buildExpression } from './expression.js';
-import { assertGroupedWindowCoverage, collectAggregateFunctionExprs, redirectToGroupKeys, type GroupedRedirectContext } from './select-aggregates.js';
+import { collectAggregateFunctionExprs, redirectPostAggregate, type GroupedRedirectContext } from './select-aggregates.js';
 import { findMatchingAggregate } from './function-call.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
@@ -70,10 +70,11 @@ export function buildWindowPhase(
 		// nonetheless bind to a base-table attribute, because the scope these are built
 		// against falls through to the pre-aggregate select scope: a qualified `wg.a`
 		// against `group by a`, or the whole expression against `group by a || '!'`.
-		// Redirect every such subtree onto the aggregate's own output column.
-		const redirect = (expr: ScalarPlanNode) => groupedWindowContext
-			? redirectToGroupKeys(expr, groupedWindowContext, selectContext.scope)
-			: expr;
+		// Redirect every such subtree onto the aggregate's own output column. Anything a
+		// redirect leaves on a pre-grouping attribute is a genuinely ungrouped reference,
+		// rejected over the finished plan by `assertGroupedPlanCoverage` (select.ts).
+		const redirect = (expr: ScalarPlanNode) =>
+			redirectPostAggregate(expr, groupedWindowContext, selectContext.scope);
 
 		// CRITICAL: Build window specification expressions using the INPUT scope
 		// This ensures expressions reference the correct input attribute IDs,
@@ -93,21 +94,6 @@ export function buildWindowPhase(
 			functions.map(({ func }) => func),
 			selectContext
 		).map(args => args.map(redirect));
-
-		// After redirection, anything still naming one of this query's pre-grouping
-		// columns is a genuinely ungrouped reference, illegal for exactly the reason a
-		// bare column in the select list is, and must say so at plan time — otherwise it
-		// reaches the runtime as an attribute the aggregate row never had, and the query
-		// dies with an internal "no row context" error instead. A reference belonging to
-		// a subquery inside the specification, or correlated out to an ENCLOSING query,
-		// is not this query's business and passes through.
-		if (groupedWindowContext) {
-			for (const expr of partitionExpressions) assertGroupedWindowCoverage(expr, groupedWindowContext);
-			for (const expr of orderByExpressions) assertGroupedWindowCoverage(expr, groupedWindowContext);
-			for (const args of functionArguments) {
-				for (const arg of args) assertGroupedWindowCoverage(arg, groupedWindowContext);
-			}
-		}
 
 		// Create new WindowFunctionCallNode instances with alias + argument-type info
 		const windowFuncsWithAlias = functions.map(({ func, alias }, i) =>

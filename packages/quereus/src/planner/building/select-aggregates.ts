@@ -286,8 +286,8 @@ export function buildGroupByCoverage(
 
 /**
  * Raises the standard GROUP BY coverage error when `node` reads a column the
- * grouped rows do not carry. Used by the SELECT-list check below; the window
- * phase raises the same message from {@link assertGroupedWindowCoverage}.
+ * grouped rows do not carry. Used by the SELECT-list check below; the finished-plan
+ * check raises the same message from {@link assertGroupedPlanCoverage}.
  */
 export function assertGroupByCoverage(node: PlanNode, coverage: GroupByCoverage): void {
 	const ungrouped = findUngroupedColumnRef(node, coverage);
@@ -340,8 +340,8 @@ export interface GroupedRedirectContext {
 	readonly aggregateInputAttrIds: ReadonlySet<number>;
 	/**
 	 * Legal AFTER redirection: AggregateNode output attribute ids ONLY. Once
-	 * {@link redirectToGroupKeys} has run, an aggregate-input attribute id still
-	 * present anywhere in a window expression is an ungrouped reference.
+	 * {@link redirectPostAggregate} has run, an aggregate-input attribute id still
+	 * present anywhere in a post-aggregate expression is an ungrouped reference.
 	 */
 	readonly outputAttrIds: ReadonlySet<number>;
 }
@@ -351,9 +351,9 @@ export interface GroupedRedirectContext {
  * later expression may reach it by: the whole grouped expression written out again, or
  * (for a bare-column key) the base column under any qualifier.
  *
- * Shared by the window phase's {@link redirectToGroupKeys} and by the select list's
- * {@link buildFinalAggregateProjections}, which resolve the same question about
- * different expressions.
+ * Shared by {@link redirectToGroupKeys} (via {@link redirectPostAggregate}) and by
+ * the select list's {@link buildFinalAggregateProjections}, which resolve the same
+ * question about different expressions.
  */
 export interface GroupKeyIndex {
 	/** Identity fingerprint of each GROUP BY expression → its output column index. */
@@ -390,7 +390,7 @@ export function indexGroupKeys(groupByExpressions: readonly ScalarPlanNode[]): G
  * source relation, whose whole subtree defines
  * {@link GroupedRedirectContext.aggregateInputAttrIds}.
  */
-export function buildGroupedRedirectContext(
+function buildGroupedRedirectContext(
 	groupByExpressions: readonly ScalarPlanNode[],
 	outputAttributes: readonly Attribute[],
 	aggregateInput: PlanNode,
@@ -758,17 +758,13 @@ function validateAggregateProjections(
  * resolve their own scope), or any subtree whose AST fingerprint matches a GROUP BY
  * expression (the whole subtree is grouped, e.g. SELECT id+1 ... GROUP BY id+1).
  *
- * NOTE: not descending into relational children means a correlated subquery in a
- * grouped SELECT list that reads a genuinely UNGROUPED column of this query
+ * Not descending into relational children means a correlated subquery in a grouped
+ * SELECT list that reads a genuinely UNGROUPED column of this query
  * (`select a, (select count(*) from wg t where t.b = wg.b) … group by a`) is not
- * rejected here. It resolves through the group's representative source row instead
- * (docs/runtime.md § Invariant: source-attr contexts and child pulls), and with a
- * buffering operator such as a WindowNode in between it dies at run time with "No row
- * context found for column b". Invalid SQL either way and loud in both shapes, so it
- * is left alone. Rejecting it at plan time means a subquery-aware walk that can tell a
- * correlated reference to THIS query from the subquery's own columns — which is what
- * {@link findUngroupedWindowColumnRef} already does for the window phase, off
- * {@link GroupedRedirectContext}; the two checks would merge.
+ * rejected here. That is fine: the finished-plan check
+ * ({@link assertGroupedPlanCoverage}) IS subquery-aware — it can tell a correlated
+ * reference to THIS query from the subquery's own columns, off
+ * {@link GroupedRedirectContext} — and rejects it at plan time with the same message.
  */
 function findUngroupedColumnRef(
 	node: PlanNode,
@@ -1017,7 +1013,16 @@ function groupKeyIndexOf(node: ScalarPlanNode, groupKeys: GroupKeyIndex): number
 }
 
 /**
- * Builds HAVING filter clause
+ * Builds HAVING filter clause.
+ *
+ * `groupedRedirectContext` is supplied for a GROUPED query. A HAVING reference to a
+ * grouping key under a spelling the hybrid scope does not hold (`having wg.a = 'x'`
+ * against `group by a`, the key nested in `upper(wg.a)`, a computed key written out
+ * again) falls through to a base-table attribute, which happened to read correctly
+ * only because this FilterNode sits directly on the AggregateNode's yield where the
+ * representative source row is still published. {@link redirectPostAggregate} lands
+ * it on the aggregate's own output column instead, so the predicate stays correct
+ * wherever the filter ends up relative to a buffering operator.
  */
 function buildHavingFilter(
 	input: RelationalPlanNode,
@@ -1025,7 +1030,8 @@ function buildHavingFilter(
 	selectContext: PlanningContext,
 	aggregateOutputScope: RegisteredScope,
 	aggregates: { expression: ScalarPlanNode; alias: string }[],
-	groupByExpressions: ScalarPlanNode[]
+	groupByExpressions: ScalarPlanNode[],
+	groupedRedirectContext?: GroupedRedirectContext
 ): RelationalPlanNode {
 	const aggregateAttributes = input.getAttributes();
 
@@ -1078,7 +1084,11 @@ function buildHavingFilter(
 		})
 	};
 
-	const havingExpression = buildExpression(havingContext, havingClause, true);
+	const havingExpression = redirectPostAggregate(
+		buildExpression(havingContext, havingClause, true),
+		groupedRedirectContext,
+		hybridScope,
+	);
 
 	// Reject HAVING references to non-grouped, non-aggregated columns.
 	// With GROUP BY: only GROUP BY columns/expressions and aggregates are allowed.
@@ -1448,7 +1458,7 @@ function dedupeNewAggregates(
  * for an aggregate query without one, which has no grouping keys to redirect onto).
  * It is what makes a select-list reference to a grouping key name the AggregateNode's
  * OWN group output column, whatever spelling the reference used — see
- * {@link redirectToGroupKeys} and the note on the rebuild below.
+ * {@link redirectPostAggregate} and the note on the rebuild below.
  */
 export function buildFinalAggregateProjections(
 	stmt: AST.SelectStmt,
@@ -1557,9 +1567,7 @@ export function buildFinalAggregateProjections(
 			// removes that (docs/runtime.md § Corollary: a published source row reaches only
 			// the adjacent consumer). One query shape must not bind two ways depending on
 			// an unrelated clause.
-			const scalarNode = groupedContext
-				? redirectToGroupKeys(builtNode, groupedContext, aggregateOutputScope)
-				: builtNode;
+			const scalarNode = redirectPostAggregate(builtNode, groupedContext, aggregateOutputScope);
 
 			let attrId: number | undefined = undefined;
 			if (CapabilityDetectors.isColumnReference(scalarNode)) {

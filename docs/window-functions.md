@@ -58,15 +58,19 @@ restriction as the rest of the select list.
 Those expressions are built against a scope that falls through to the *pre-aggregate*
 select scope, so a grouping key spelled any way other than the one the aggregate output
 scope registered (`wg.a` against `group by a`, or a non-bare key written out again)
-binds to a base-table column the grouped row does not carry. The window phase therefore
-runs two passes over each built window specification and argument:
+binds to a base-table column the grouped row does not carry. Two passes fix and police
+this, shared with every other post-aggregate clause of a grouped query:
 
-1. `redirectToGroupKeys` rewrites every subtree that *is* a grouping key onto the
-   AggregateNode's own output column for that key, matching either by identity
-   fingerprint or, for a bare-column key, by base attribute id (so any qualifier
-   spelling works);
-2. `assertGroupedWindowCoverage` then rejects anything still naming a pre-grouping
-   column, with the same plan-time message a select-list entry gets.
+1. the window phase passes each built specification and argument through
+   `redirectPostAggregate` (`select-aggregates.ts`, the one entry point every
+   post-aggregate expression uses), which rewrites every subtree that *is* a grouping
+   key onto the AggregateNode's own output column for that key, matching either by
+   identity fingerprint or, for a bare-column key, by base attribute id (so any
+   qualifier spelling works);
+2. `assertGroupedPlanCoverage` then walks the grouped query's **finished plan** (from
+   the end of `buildSelectStmt`, stopping at the AggregateNode) and rejects anything
+   still naming a pre-grouping column, with the same plan-time message a select-list
+   entry gets.
 
 Both passes descend through **relational** children too, because a window specification
 may contain a subquery that correlates back to the grouping key (`over (order by (select

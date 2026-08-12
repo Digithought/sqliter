@@ -37,7 +37,7 @@ import { buildWithContext, enterStoredBodyEnv } from './select-context.js';
 import { storedBodyContext } from '../stored-body-context.js';
 import { buildCompoundSelect } from './select-compound.js';
 import { analyzeSelectColumns, buildStarProjections } from './select-projections.js';
-import { buildAggregatePhase, buildFinalAggregateProjections, buildGroupedRedirectContext, type GroupedRedirectContext } from './select-aggregates.js';
+import { buildAggregatePhase, buildFinalAggregateProjections, assertGroupedPlanCoverage, redirectPostAggregate } from './select-aggregates.js';
 import { buildWindowPhase } from './select-window.js';
 import { buildFinalProjections, applyDistinct, applyOrderBy, applyLimitOffset, createProjectionOutputScope } from './select-modifiers.js';
 import { SortNode, type SortKey } from '../nodes/sort.js';
@@ -194,10 +194,13 @@ export function buildSelectStmt(
 	// Set when the query is BOTH grouped and windowed: the grouped select-list
 	// projection list, to be projected above the window phase's WindowNode.
 	let windowSelectProjections: Projection[] | undefined;
-	// Set for every GROUPED query: what the aggregate's rows carry, so the select-list
-	// rebuild and (when present) the window phase can redirect a grouping-key reference
-	// onto them — and so the window phase can reject one that reads anything else.
-	let groupedRedirectContext: GroupedRedirectContext | undefined;
+	// Set for every GROUPED query (built by buildAggregatePhase the moment the
+	// AggregateNode exists, so no post-aggregate site here can run before it): what
+	// the aggregate's rows carry, so every post-aggregate expression built below —
+	// sort keys, the rebuilt select list, the window phase's specifications and
+	// arguments — reaches the grouping-key redirect through redirectPostAggregate,
+	// and so the finished plan can be boundary-checked once at the bottom.
+	const groupedRedirectContext = aggregateResult.groupedRedirectContext;
 	// The node whose output attributes ARE this SELECT's result columns, once one
 	// exists. A positional ORDER BY binds to its Nth attribute (see applyOrderBy).
 	let orderByOutputRelation: RelationalPlanNode | undefined;
@@ -238,34 +241,12 @@ export function buildSelectStmt(
 			!hasWindowFunctions &&
 			stmt.orderBy && stmt.orderBy.length > 0
 		) {
-			input = applyOrderBy(input, stmt, selectContext, preAggregateSort, undefined, true, selectListEntries);
+			input = applyOrderBy(input, stmt, selectContext, {
+				allowAggregates: true,
+				selectList: selectListEntries,
+				groupedRedirect: groupedRedirectContext,
+			});
 			orderByAppliedEarly = true;
-		}
-
-		// A grouped query's post-aggregate expressions — the rebuilt SELECT list, and a
-		// window query's specifications and function arguments — are built against the
-		// aggregate-output scope but fall through to the pre-aggregate select scope for
-		// anything the aggregate does not carry. Some of what falls through is a legal
-		// grouping key under another spelling and some is a genuinely ungrouped column,
-		// so build both halves once: the maps that redirect the former onto the
-		// aggregate's own output columns, and the strict coverage test that rejects the
-		// latter at plan time (the window phase's, only). The aggregate's source relation
-		// goes along so both halves can tell which references belong to THIS query — a
-		// post-aggregate expression may contain a subquery, whose own columns and whose
-		// correlated references to an enclosing query are neither redirected nor rejected.
-		//
-		// One context per prepare, shared by both consumers. An aggregate query with no
-		// GROUP BY has no grouping keys to redirect onto and gets none.
-		if (
-			aggregateResult.aggregateNode &&
-			aggregateResult.groupByExpressions &&
-			aggregateResult.groupByExpressions.length > 0
-		) {
-			groupedRedirectContext = buildGroupedRedirectContext(
-				aggregateResult.groupByExpressions,
-				aggregateResult.aggregateNode.getAttributes(),
-				aggregateResult.aggregateNode.getRelations()[0],
-			);
 		}
 
 		// Build final projections if needed. A window function in the select list also
@@ -327,9 +308,16 @@ export function buildSelectStmt(
 					if (!selectedColumns.has(orderColumn)) {
 						// Apply ORDER BY before window projections. This sort sits BELOW the
 						// window projection, so a positional reference resolves through the
-						// select list (no output attributes exist yet to bind to).
+						// select list (no output attributes exist yet to bind to). In a
+						// grouped query this SortNode sits ABOVE the AggregateNode, so a key
+						// naming a grouping key by a spelling the aggregate output scope does
+						// not publish must land on the aggregate's own output column.
 						const sortKeys: SortKey[] = stmt.orderBy.map(orderBy => ({
-							expression: buildOrdinalAwareExpression(selectContext, orderBy.expr, selectListEntries, 'ORDER BY'),
+							expression: redirectPostAggregate(
+								buildOrdinalAwareExpression(selectContext, orderBy.expr, selectListEntries, 'ORDER BY'),
+								groupedRedirectContext,
+								selectContext.scope,
+							),
 							direction: orderBy.direction,
 							nulls: orderBy.nulls
 						}));
@@ -383,7 +371,12 @@ export function buildSelectStmt(
 
 		// Apply final modifiers with projection scope for column alias resolution
 		input = applyDistinct(input, stmt, selectScope);
-		input = applyOrderBy(input, stmt, selectContext, preAggregateSort, finalResult.projectionScope, false, selectListEntries, orderByOutputRelation);
+		input = applyOrderBy(input, stmt, selectContext, {
+			preAggregateSort,
+			projectionScope: finalResult.projectionScope,
+			selectList: selectListEntries,
+			outputRelation: orderByOutputRelation,
+		});
 		input = applyLimitOffset(input, stmt, selectContext, finalResult.projectionScope);
 	} else {
 		// Apply final modifiers. For the aggregate path, expose the final-projection
@@ -394,18 +387,45 @@ export function buildSelectStmt(
 		if (!orderByAppliedEarly) {
 			// In the aggregate path, ORDER BY may legally reference aggregates; in the
 			// window path it may reference window outputs. Both are now in selectContext.
-			// `groupedRedirectContext` is passed so a sort key naming a grouping key by a
-			// spelling the output scopes do not publish (`order by wg.a`, `order by
-			// upper(wg.a)`, a repeated computed key) is redirected onto the AggregateNode's
-			// own output column. Without it the key binds to a base-table attribute and the
-			// sort dies at run time whenever a buffering operator — a WindowNode — sits
-			// between the aggregate and this sort. Only this call site needs it: the early
-			// ORDER BY above runs before the context exists (and only for window-free
-			// aggregate queries, which the representative source row still covers), and the
-			// non-aggregate path has no grouping keys at all.
-			input = applyOrderBy(input, stmt, selectContext, preAggregateSort, aggregateProjectionScope, hasAggregates, selectListEntries, orderByOutputRelation, groupedRedirectContext);
+			// `groupedRedirect` makes a sort key naming a grouping key by a spelling the
+			// output scopes do not publish (`order by wg.a`, `order by upper(wg.a)`, a
+			// repeated computed key) land on the AggregateNode's own output column.
+			// Without it the key binds to a base-table attribute and the sort dies at run
+			// time whenever a buffering operator — a WindowNode — sits between the
+			// aggregate and this sort.
+			input = applyOrderBy(input, stmt, selectContext, {
+				preAggregateSort,
+				projectionScope: aggregateProjectionScope,
+				allowAggregates: hasAggregates,
+				selectList: selectListEntries,
+				outputRelation: orderByOutputRelation,
+				groupedRedirect: groupedRedirectContext,
+			});
 		}
 		input = applyLimitOffset(input, stmt, selectContext, aggregateProjectionScope);
+	}
+
+	// Boundary check over the finished plan of a GROUPED query: nothing above the
+	// AggregateNode may still reference a pre-grouping column, which is the invariant
+	// docs/runtime.md § "Corollary: a published source row reaches only the adjacent
+	// consumer" states. A post-aggregate builder that skipped redirectPostAggregate now
+	// fails here, at plan time, with the user-facing GROUP BY message — instead of
+	// shipping a plan that dies at run time with an internal "No row context found"
+	// error once a buffering operator separates it from the aggregate (how both the
+	// SELECT-list and ORDER BY escapes shipped).
+	//
+	// NOTE: deliberately STRICT — this also rejects a query that genuinely reads an
+	// ungrouped column above the aggregate (`select a from wg group by a order by b`,
+	// or a correlated subquery reading an ungrouped column), which previously ran and
+	// read an arbitrary representative row of each group. That was a wrong-result bug,
+	// no test asserted it (measured across the full engine suite: zero hand-written
+	// occurrences; 18 fuzz-generated sort keys, all in error-tolerant harnesses), and
+	// rejecting it matches what the SELECT list and HAVING already do. Revisit only if
+	// SQLite-style bare-column ORDER BY tolerance becomes a compatibility requirement;
+	// the weaker alternative is checking only above buffering operators (WindowNode),
+	// where the representative source row genuinely dies.
+	if (groupedRedirectContext && aggregateResult.aggregateNode) {
+		assertGroupedPlanCoverage(input, aggregateResult.aggregateNode, groupedRedirectContext);
 	}
 
 	return input;
