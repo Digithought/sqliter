@@ -63,11 +63,11 @@ of 9, one Windows box — ratios are the finding, absolutes are one machine's):
 | 62.9 KB | 3.40 ms | 2.84 ms | ~1.1 ms | ~1.7 ms |
 | 112.7 KB | 5.21 ms | 4.65 ms | ~2.0 ms | ~2.6 ms |
 
-The check is not free on a cold start: rendering the *declaration* costs roughly what the sibling
-ticket measures at ~1.26 ms for the 112.7 KB case (inferred at plan stage; the sibling ticket
-records the real number when it lands). That rendering has to happen on every start, since there is
-nothing in memory to compare against, which is why the saving is roughly half the removable work
-rather than all of it.
+The check is not free on a cold start: rendering the *declaration* has to happen on every start,
+since there is nothing in memory to compare against, which is why the saving is roughly half the
+removable work rather than all of it. The sibling ticket has now landed and measured that rendering
+directly — **0.84 ms** at the 112.7 KB case, not the ~1.26 ms inferred here at plan stage — so the
+estimated savings above are, if anything, slightly pessimistic.
 
 So: single-digit milliseconds off application start-up, growing with schema size. Worth filing;
 not obviously worth the durability invariant. That call is a maintainer's.

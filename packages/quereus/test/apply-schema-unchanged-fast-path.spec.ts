@@ -492,6 +492,57 @@ describe('APPLY SCHEMA unchanged fast path', () => {
 		});
 	});
 
+	describe('exposed implicit indexes', () => {
+		// The secondary BTree behind a UNIQUE constraint tagged
+		// `quereus.expose_implicit_index` reaches the catalog as a `CatalogIndex` with
+		// `implicit: true` — a shape the differ excludes from its standalone-index
+		// buckets. The renderer has an arm for it; these pin that the arm is reached.
+		const EXPOSED = `
+			declare schema main {
+				table vehicles {
+					id integer primary key,
+					vin text not null,
+					constraint uq_vin unique (vin) with tags ("quereus.expose_implicit_index" = true)
+				}
+			}
+		`;
+
+		it('renders the implicit marker', async () => {
+			db = await settledDb(EXPOSED);
+			const rendering = renderCatalogForComparison(collectSchemaCatalog(db, 'main'));
+			expect(rendering, 'the exposed implicit index reaches the rendering')
+				.to.match(/^index .* on vehicles implicit$/m);
+		});
+
+		it('takes the fast path — an implicit index is not spurious drift', async () => {
+			db = await settledDb(EXPOSED);
+			expect(db.declaredSchemaManager.getAppliedSnapshot('main'),
+				'an index the differ never manages must not keep the plan non-empty').to.exist;
+
+			await db.exec('drop table vehicles');
+			plantSnapshot(db);
+			await db.exec('apply schema main');
+			expect(db.schemaManager.getTable('main', 'vehicles'),
+				'the planted snapshot fired, so the diff was skipped').to.be.undefined;
+		});
+	});
+
+	describe('logical schemas', () => {
+		it('record no snapshot — the logical branch returns before catalog collection', async () => {
+			db = new Database();
+			await db.exec(`declare schema basis { table people { id integer primary key, name text not null } }`);
+			await db.exec('apply schema basis');
+			await db.exec('apply schema basis');
+			await db.exec(`declare logical schema design { table person { id integer, name text } }`);
+			await db.exec(`declare lens for design over basis { view person as select id, name from people }`);
+
+			await db.exec('apply schema design');
+			await db.exec('apply schema design');
+			expect(db.declaredSchemaManager.getAppliedSnapshot('design'),
+				'no physical catalog to snapshot; every apply re-deploys the lens').to.be.undefined;
+		});
+	});
+
 	describe('per-schema keying', () => {
 		it('is case-insensitive across applies', async () => {
 			db = new Database();

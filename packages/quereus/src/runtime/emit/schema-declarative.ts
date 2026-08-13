@@ -506,6 +506,10 @@ export function emitExplainSchema(plan: PlanNode, _ctx: EmissionContext): Instru
  * `diff schema` stops seeing the drift it should report.
  * `declarative-equivalence.spec.ts` § "apply executes the plan AST" pins both halves:
  * the apply itself leaves the declaration untouched, and so does a later rename.
+ * The applied-state fast path now leans on the same invariant from the other side:
+ * `DeclaredSchemaManager.getDeclaredRendering` memoizes the declaration's rendering
+ * and re-derives it only on `setDeclaredSchema`, so an in-place edit of a stored
+ * declaration would leave a stale rendering and could skip a real reconcile.
  *
  * NOTE: the clone costs about what the parse it replaces costs, because it copies the
  * WHOLE statement while the catalog retains only a few subtrees of it. Measured over

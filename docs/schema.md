@@ -487,7 +487,7 @@ Measured on the synthetic 54-table / 14-view declaration of `bench/apply-schema-
 | 62.9 KB | 3.13 ms | 1.14 ms | 64% off |
 | 112.7 KB | 5.64 ms | 1.52 ms | 73% off |
 
-The fast path removes `computeSchemaDiff` (0.86 / 2.30 / 4.35 ms) and adds a catalog render plus a string compare (0.17 / 0.40 / 0.56 ms and 0.004 / 0.012 / 0.017 ms); `collectSchemaCatalog` (0.26 / 0.46 / 0.67 ms) is still paid on both paths. Storing the rendered strings rather than hashing them is what makes the comparison exact — the cost is memory proportional to the schema's DDL (309 KB catalog + 109 KB declaration at the top size measured).
+The fast path removes `computeSchemaDiff` (0.86 / 2.30 / 4.35 ms) and adds a catalog render plus a string compare (0.17 / 0.40 / 0.56 ms and 0.004 / 0.012 / 0.017 ms); `collectSchemaCatalog` (0.26 / 0.46 / 0.67 ms) is still paid on both paths. Storing the rendered strings rather than hashing them is what removes hash-collision risk from the comparison — the cost is memory proportional to the schema's DDL (309 KB catalog + 109 KB declaration at the top size measured). The *encoding* is still separator-delimited rather than uniquely decodable: a tag value or string `DEFAULT` containing a raw newline reaches the rendering verbatim, so text crafted to imitate another item's rendering can in principle make two different catalogs render alike. See the `NOTE:` on `renderCatalogForComparison` and `tickets/backlog/debt-catalog-rendering-injective-encoding`.
 
 ### Logical schemas and lenses
 

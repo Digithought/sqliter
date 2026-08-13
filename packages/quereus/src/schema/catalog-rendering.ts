@@ -12,7 +12,21 @@ import type { SchemaCatalog, CatalogTable, CatalogView, CatalogIndex, CatalogAss
  * no-op `apply schema`?* Two catalogs that render to the same string must be
  * indistinguishable to `computeSchemaDiff`. It is deliberately NOT a
  * hash — an exact string compare is both cheaper (measured 0.003–0.008 ms vs
- * 1.46 ms to FNV-1a hash 119 KB of rendered text) and collision-free.
+ * 1.46 ms to FNV-1a hash 119 KB of rendered text) and carries no hash-collision
+ * risk.
+ *
+ * NOTE: the *encoding* is not provably injective, though. Fields and items are
+ * separated by literal spaces / tabs / newlines, and a leaf value can contain
+ * any of them — a tag value or a DEFAULT holding a raw newline reaches the
+ * output verbatim (via `sqlValueToLiteral` / `expressionToString`, and via the
+ * `ddl` text that embeds the same literal). So a value crafted to imitate the
+ * rendering of a *different* catalog item makes two distinct catalogs render
+ * alike, and an out-of-band change between exactly those two catalogs would be
+ * skipped. It takes deliberately hostile tag/DEFAULT text to build one, so it is
+ * left open; the fix that retires the class is a uniquely-decodable encoding
+ * (JSON-frame each part instead of joining on separators — measured ~+0.25 ms on
+ * the 308.8 KB rendering of `bench/apply-schema-unchanged.mjs 30`, against a
+ * 1.50 ms fast-pathed apply). See `tickets/backlog/debt-catalog-rendering-injective-encoding`.
  *
  * It is also NOT the schema *version* hash. `computeSchemaHash` strips tags
  * before hashing, because tags must not affect versioning; the differ, by
