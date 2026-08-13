@@ -464,6 +464,16 @@ On the next apply the physical branch collects the catalog as before, re-renders
 
 **Why skipping is sound.** `computeSchemaDiff(declared, catalog, renamePolicy, defaultCollation)` reads nothing but its four arguments. On a hit, two of them render identically to the recorded strings and the third is compared directly; the remaining one, `renamePolicy`, is inert when there are no differences — there are no name-change pairs for a policy to police. (`allow_destructive` likewise only gates a non-empty `diff.maintainedModuleMigrations`.) So the diff would again be empty.
 
+**Duplicate-name checks are among the skipped work.** `computeSchemaDiff` is also where the
+`table`/`view`/`materialized view` and `assertion` duplicate-declared-name rejection
+([SCH-003](invariants.md#sch-003--a-declared-schema-names-each-object-once)) and the declared-index-name
+arm of the per-schema index-name-uniqueness check ([SCH-001](invariants.md#sch-001--index-names-are-unique-per-schema))
+live, so the fast path skips them too. That is safe rather than a hole for the same reason as above:
+a snapshot is recorded only after a diff that *succeeded*, so it can never describe a
+duplicate-bearing declaration, and adding a duplicate changes the declared rendering — which makes
+the fast path miss and the diff run. Any future declaration-shape guard added to the differ
+inherits the same requirement: it must be defeated by a change the declared rendering shows.
+
 **Why it is recorded only after a verified-empty plan.** At write time this process has *observed*, via a real diff, that the catalog matches the declaration. Two consequences are features rather than accidents:
 
 - The very first apply on a fresh database migrates, so it records nothing; the *second* apply diffs, finds the plan empty, and records; the third and later are fast. This preserves `apply schema`'s self-healing property — if DDL generation were ever imperfect, a repeat apply still re-diffs rather than being told by a cache that everything is fine.
