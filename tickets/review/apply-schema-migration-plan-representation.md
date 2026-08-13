@@ -1,7 +1,7 @@
 <!-- resume-note -->
 RESUME: A prior agent run on this ticket did not complete.
-  Prior run: 2026-08-13T00:35:24.757Z (agent: claude)
-  Log file: C:\projects\quereus\tickets\.logs\apply-schema-migration-plan-representation.review.2026-08-13T00-35-24-757Z.log
+  Prior run: 2026-08-13T02:39:22.604Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\apply-schema-migration-plan-representation.review.2026-08-13T02-39-22-603Z.log
 Read the log to see what was done. Resume where it left off.
 If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
 <!-- /resume-note -->
