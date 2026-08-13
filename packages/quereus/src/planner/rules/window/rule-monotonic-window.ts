@@ -389,6 +389,12 @@ export function ruleMonotonicWindow(node: PlanNode, _context: OptContext): PlanN
 	}
 
 	// Per-function recognition, against the node's one shared frame classification.
+	// NOTE: all-or-nothing — one unrecognized function drops the whole node to the
+	// buffered path, and since `groupWindowFunctionsBySpec` puts every function with
+	// the same `over (…)` on one node, they share that fate. Costs nothing today (the
+	// unrecognized function forces a sort and a materialization regardless); if a
+	// mixed node ever needs the recognized functions streamed, the split has to happen
+	// here — build two nodes rather than widen the grouping key.
 	const frameShape = classifyFrame(frame, node.orderByExpressions);
 	const modes: StreamingWindowFunctionMode[] = [];
 	for (let fi = 0; fi < node.functions.length; fi++) {

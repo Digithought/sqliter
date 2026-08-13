@@ -1,6 +1,5 @@
 import type { Attribute, PlanNode, RelationalPlanNode, ScalarPlanNode } from '../nodes/plan-node.js';
 import type { PlanningContext } from '../planning-context.js';
-import type { ScalarType } from '../../common/datatype.js';
 import type { Scope } from '../scopes/scope.js';
 import { WindowNode, type WindowSpec } from '../nodes/window-node.js';
 import { WindowFunctionCallNode } from '../nodes/window-function.js';
@@ -29,10 +28,8 @@ import { CapabilityDetectors } from '../framework/characteristics.js';
  * instances carry the SAME `expression` object.
  */
 interface WindowColumnEntry {
-	attrId: number;
+	attr: Attribute;
 	columnIndex: number;
-	type: ScalarType;
-	name: string;
 }
 
 /**
@@ -158,11 +155,9 @@ export function buildWindowPhase(
 	const windowColumns = new Map<AST.WindowFunctionExpr, WindowColumnEntry>();
 	for (const [expr, attr] of windowAttributes) {
 		windowColumns.set(expr, {
-			attrId: attr.id,
+			attr,
 			// Present by construction: every window attribute is on the outermost node's row.
 			columnIndex: outerAttrIndex.get(attr.id)!,
-			type: attr.type,
-			name: attr.name,
 		});
 	}
 
@@ -374,10 +369,10 @@ function rewriteWindowFunctions(
 		// (ColumnReferenceNode.toString() / getLogicalAttributes()).
 		const columnExpr: AST.ColumnExpr = {
 			type: 'column',
-			name: entry.name,
+			name: entry.attr.name,
 			loc: windowFunc.expression.loc,
 		};
-		return new ColumnReferenceNode(scope, columnExpr, entry.type, entry.attrId, entry.columnIndex);
+		return new ColumnReferenceNode(scope, columnExpr, entry.attr.type, entry.attr.id, entry.columnIndex);
 	}
 
 	const children = node.getChildren();

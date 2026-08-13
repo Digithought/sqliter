@@ -264,6 +264,14 @@ function's window attribute is recorded under its `AST.WindowFunctionExpr` ident
 its node is built, so same-named functions sharing one node still resolve to their own
 columns.
 
+Grouping also makes the streaming decision (below) a shared fate: `rule-monotonic-window`
+recognizes streaming modes per function but tags the node only when *every* function on it
+is recognized, so `ntile(2) over (order by b), row_number() over (order by b)` — one
+specification, one node — runs the whole node on the buffered path. That costs nothing
+relative to one node per function (the unrecognized function forced a sort and a
+materialization either way); it does mean adding a function to an existing `over (…)` can
+turn streaming off for the ones already there.
+
 ### Efficient Execution
 
 - **O(n) ranking pre-computation**: After sorting each partition, a single linear pass (`precomputeRankings`) detects peer group boundaries and computes RANK, DENSE_RANK, PERCENT_RANK, and CUME_DIST for all rows at once. Per-row ranking lookups are then O(1).

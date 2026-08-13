@@ -1727,6 +1727,18 @@ select a, row_number() over (order by a) as rn, count(*) over (order by a) as rc
 select b, sum(length(b)) over (order by b) as s1, sum(length(b) * 10) over (order by b) as s2 from wsq order by b;
 → [{"b":"p","s1":1,"s2":10},{"b":"q","s1":2,"s2":20},{"b":"r","s1":3,"s2":30}]
 
+-- A PARTITIONED window beside the decorrelated subquery: the partitioned buffered
+-- path emits whole partitions in first-seen order and advertises neither ordering
+-- nor monotonicity, so the join above it sees a different shape than the sorted
+-- cases above.
+select a, (select min(t.b) from wsq t where t.a = wsq.a) as c, count(*) over (partition by a) as n from wsq group by a;
+→ [{"a":"x","c":"p","n":1},{"a":"y","c":"q","n":1}]
+
+-- Two functions with ARGUMENTS sharing one specification (so one WindowNode, whose
+-- per-function argument arrays must stay aligned with its output columns).
+select a, (select min(t.b) from wsq t where t.a = wsq.a) as c, lag(a) over (order by a) as lg, lead(a) over (order by a) as ld from wsq group by a;
+→ [{"a":"x","c":"p","lg":null,"ld":"y"},{"a":"y","c":"q","lg":"x","ld":null}]
+
 -- A filter over a window output column through a subquery. The filter references
 -- a real window attribute the window's SOURCE does not carry, so the availability
 -- check must keep it above the WindowNode — a future pushdown rule that loses
@@ -1833,8 +1845,8 @@ select distinct row_number() over (order by v) as w from sw order by w;
 → [{"w":1},{"w":2}]
 
 -- An UNALIASED window column keeps its authored expression as its output name,
--- like every other unaliased select-list column. (It used to be named after the
--- array-index node the rewrite substitutes in — `[2]`.)
+-- like every other unaliased select-list column, rather than the name of the
+-- window-output column the rewrite substitutes in.
 select row_number() over (order by v) from sw order by v;
 → [{"row_number() over (order by v)":1},{"row_number() over (order by v)":2}]
 

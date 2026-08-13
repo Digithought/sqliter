@@ -96,6 +96,16 @@ export class WindowNode extends PlanNode implements UnaryRelationalNode {
 	) {
 		super(scope, estimatedCostOverride);
 
+		// The preserved list is positional against `functions`: a wrong length silently
+		// yields a mis-shaped attribute row (window results addressed to the wrong id),
+		// so reject it at construction rather than at some later read.
+		if (predefinedWindowAttributes && predefinedWindowAttributes.length !== functions.length) {
+			quereusError(
+				`WindowNode expects ${functions.length} preserved window attributes, got ${predefinedWindowAttributes.length}`,
+				StatusCode.INTERNAL
+			);
+		}
+
 		this.outputTypeCache = new Cached(() => {
 			const sourceType = this.source.getType();
 
