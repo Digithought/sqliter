@@ -976,6 +976,19 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	}
 
 	/**
+	 * @internal
+	 * Executes an already-parsed statement batch inside the caller's transaction.
+	 * The AST-taking twin of {@link _execWithinTransaction}; same no-mutex,
+	 * no-implicit-transaction contract. Used by `APPLY SCHEMA`, whose migration plan
+	 * already holds the statement it rendered its DDL from — re-lexing that text is
+	 * pure overhead (see `generateMigrationPlan`).
+	 */
+	async _execAstWithinTransaction(batch: AST.Statement[], params?: SqlParameters): Promise<void> {
+		if (batch.length === 0) return;
+		await this._executeStatementBatch(batch, params);
+	}
+
+	/**
 	 * Execute a function with mutex held.
 	 * Transaction management is handled by the executor if needed.
 	 * @internal

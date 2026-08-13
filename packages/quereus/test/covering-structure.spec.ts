@@ -1007,7 +1007,7 @@ describe('declarative idempotency — exposed implicit covering index', () => {
 			const diff = computeSchemaDiff(declared, catalog, 'require-hint');
 			expect(diff.indexesToDrop, 'exposed implicit index not dropped').to.deep.equal([]);
 			expect(diff.indexesToCreate.length, 'exactly the one genuine index create').to.equal(1);
-			expect(diff.indexesToCreate[0], 'the genuine index, not the implicit one').to.contain('idx_expo_extra');
+			expect(diff.indexesToCreate[0].sql, 'the genuine index, not the implicit one').to.contain('idx_expo_extra');
 		} finally {
 			await db.close();
 		}

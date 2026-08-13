@@ -4,8 +4,8 @@
  */
 
 import { expect } from 'chai';
-import { generateMigrationDDL, computeSchemaDiff } from '../src/schema/schema-differ.js';
-import type { SchemaDiff } from '../src/schema/schema-differ.js';
+import { generateMigrationDDL, generateMigrationPlan, computeSchemaDiff } from '../src/schema/schema-differ.js';
+import type { SchemaDiff, MigrationCreate } from '../src/schema/schema-differ.js';
 import type * as AST from '../src/parser/ast.js';
 import type { SchemaCatalog, CatalogTable, CatalogView, CatalogAssertion } from '../src/schema/catalog.js';
 import { QuereusError } from '../src/common/errors.js';
@@ -602,7 +602,7 @@ describe('Schema Differ', () => {
 			);
 			const diff = computeSchemaDiff(declared, catalog);
 			expect(diff.viewsToDrop).to.deep.equal(['v']);
-			expect(diff.viewsToCreate).to.deep.equal(['create view v as select id from t with defaults (created = 222)']);
+			expect(diff.viewsToCreate.map(c => c.sql)).to.deep.equal(['create view v as select id from t with defaults (created = 222)']);
 			expect(diff.viewTagsChanges, 'a recreate carries the declared tags — no separate SET TAGS').to.deep.equal([]);
 		});
 
@@ -616,7 +616,7 @@ describe('Schema Differ', () => {
 			);
 			const diff = computeSchemaDiff(declared, catalog);
 			expect(diff.viewsToDrop).to.deep.equal([]);
-			expect(diff.viewsToCreate).to.deep.equal([]);
+			expect(diff.viewsToCreate.map(c => c.sql)).to.deep.equal([]);
 			expect(diff.viewTagsChanges).to.deep.equal([{ name: 'v', tags: { owner: 'a' } }]);
 		});
 
@@ -654,7 +654,7 @@ describe('Schema Differ', () => {
 			);
 			const diff = computeSchemaDiff(declared, catalog);
 			expect(diff.viewsToDrop).to.deep.equal([]);
-			expect(diff.viewsToCreate).to.deep.equal([]);
+			expect(diff.viewsToCreate.map(c => c.sql)).to.deep.equal([]);
 			expect(diff.tablesToAlter[0]?.columnsToRename).to.deep.equal([{ oldName: 'oldc', newName: 'newc' }]);
 		});
 
@@ -677,7 +677,7 @@ describe('Schema Differ', () => {
 			);
 			const diff = computeSchemaDiff(declared, catalog);
 			expect(diff.viewsToDrop).to.deep.equal([]);
-			expect(diff.viewsToCreate).to.deep.equal([]);
+			expect(diff.viewsToCreate.map(c => c.sql)).to.deep.equal([]);
 		});
 
 		it('an unrelated table\'s column rename does NOT rewrite the clause target (FROM-scoped lookup)', () => {
@@ -703,7 +703,7 @@ describe('Schema Differ', () => {
 			);
 			const diff = computeSchemaDiff(declared, catalog);
 			expect(diff.viewsToDrop).to.deep.equal([]);
-			expect(diff.viewsToCreate).to.deep.equal([]);
+			expect(diff.viewsToCreate.map(c => c.sql)).to.deep.equal([]);
 		});
 
 		it('an in-diff rename whose NEW name collides with a clause-subquery FROM table\'s column reconciles scope-aware (declared-side resolver)', () => {
@@ -732,7 +732,7 @@ describe('Schema Differ', () => {
 			);
 			const diff = computeSchemaDiff(declared, catalog);
 			expect(diff.viewsToDrop, 'inner subquery ref not falsely inverse-captured — no recreate').to.deep.equal([]);
-			expect(diff.viewsToCreate).to.deep.equal([]);
+			expect(diff.viewsToCreate.map(c => c.sql)).to.deep.equal([]);
 		});
 
 		it('a hinted view rename renders its recreate DDL with the resolver-guarded inverse (inner subquery ref preserved)', () => {
@@ -762,8 +762,8 @@ describe('Schema Differ', () => {
 			const diff = computeSchemaDiff(declared, catalog);
 			expect(diff.viewsToDrop, 'hinted rename drops the old name').to.deep.equal(['v']);
 			expect(diff.viewsToCreate).to.have.length(1);
-			expect(diff.viewsToCreate[0], 'outer ref inverse-renamed to the OLD column name').to.match(/extra = qty \+/);
-			expect(diff.viewsToCreate[0], 'inner subquery ref NOT falsely inverse-captured').to.match(/max\(cap\)/);
+			expect(diff.viewsToCreate[0].sql, 'outer ref inverse-renamed to the OLD column name').to.match(/extra = qty \+/);
+			expect(diff.viewsToCreate[0].sql, 'inner subquery ref NOT falsely inverse-captured').to.match(/max\(cap\)/);
 		});
 
 		it('a non-FROM table\'s column rename referenced in a clause-expr subquery reconciles — pure rename, no recreate', () => {
@@ -791,7 +791,7 @@ describe('Schema Differ', () => {
 			);
 			const diff = computeSchemaDiff(declared, catalog);
 			expect(diff.viewsToDrop).to.deep.equal([]);
-			expect(diff.viewsToCreate).to.deep.equal([]);
+			expect(diff.viewsToCreate.map(c => c.sql)).to.deep.equal([]);
 			expect(diff.tablesToAlter.find(t => t.tableName === 'audit')?.columnsToRename,
 				'only the RENAME COLUMN op remains').to.deep.equal([{ oldName: 'c', newName: 'c2' }]);
 		});
@@ -850,7 +850,7 @@ describe('Schema Differ', () => {
 			);
 			const diff = computeSchemaDiff(declared, catalog);
 			expect(diff.viewsToDrop).to.deep.equal([]);
-			expect(diff.viewsToCreate).to.deep.equal([]);
+			expect(diff.viewsToCreate.map(c => c.sql)).to.deep.equal([]);
 			expect(diff.renames).to.deep.include({ kind: 'table', oldName: 'audit', newName: 'audit2' });
 		});
 
@@ -881,7 +881,7 @@ describe('Schema Differ', () => {
 			const diff = computeSchemaDiff(declared, catalog);
 			expect(diff.viewsToDrop, 'hinted rename drops the old name').to.deep.equal(['v']);
 			expect(diff.viewsToCreate).to.have.length(1);
-			expect(diff.viewsToCreate[0], 'non-FROM clause-expr subquery ref spelled under the OLD name').to.match(/max\(c\)/);
+			expect(diff.viewsToCreate[0].sql, 'non-FROM clause-expr subquery ref spelled under the OLD name').to.match(/max\(c\)/);
 		});
 
 		it('a genuine definition edit layered on an in-diff rename still recreates', () => {
@@ -900,7 +900,7 @@ describe('Schema Differ', () => {
 			);
 			const diff = computeSchemaDiff(declared, catalog);
 			expect(diff.viewsToDrop).to.deep.equal(['v']);
-			expect(diff.viewsToCreate).to.deep.equal(['create view v as select id, newc from t where id > 0']);
+			expect(diff.viewsToCreate.map(c => c.sql)).to.deep.equal(['create view v as select id, newc from t where id > 0']);
 		});
 	});
 
@@ -922,7 +922,7 @@ describe('Schema Differ', () => {
 			);
 			const diff = computeSchemaDiff(declared, catalog);
 			expect(diff.viewsToDrop, 'the pin is an engine artifact, not an edit').to.deep.equal([]);
-			expect(diff.viewsToCreate).to.deep.equal([]);
+			expect(diff.viewsToCreate.map(c => c.sql)).to.deep.equal([]);
 		});
 
 		it('a forward-rename FROM alias reconciles as a pure rename (no recreate)', () => {
@@ -946,7 +946,7 @@ describe('Schema Differ', () => {
 			const diff = computeSchemaDiff(declared, catalog);
 			expect(diff.renames).to.deep.include({ kind: 'table', oldName: 't', newName: 't2' });
 			expect(diff.viewsToDrop, 'pure rename — the alias is the propagation\'s own artifact').to.deep.equal([]);
-			expect(diff.viewsToCreate).to.deep.equal([]);
+			expect(diff.viewsToCreate.map(c => c.sql)).to.deep.equal([]);
 		});
 
 		it('a declared qualifier naming the diff\'s own schema equals the bare live spelling', () => {
@@ -962,7 +962,7 @@ describe('Schema Differ', () => {
 			);
 			const diff = computeSchemaDiff(declared, catalog);
 			expect(diff.viewsToDrop).to.deep.equal([]);
-			expect(diff.viewsToCreate).to.deep.equal([]);
+			expect(diff.viewsToCreate.map(c => c.sql)).to.deep.equal([]);
 		});
 
 		it('an author-written qualifier naming ANOTHER schema still recreates', () => {
@@ -1008,7 +1008,7 @@ describe('Schema Differ', () => {
 			);
 			const diff = computeSchemaDiff(declared, catalog);
 			expect(diff.assertionsToDrop, 'recreating would re-bind the bare name').to.deep.equal([]);
-			expect(diff.assertionsToCreate).to.deep.equal([]);
+			expect(diff.assertionsToCreate.map(c => c.sql)).to.deep.equal([]);
 		});
 
 		it('MV twin: a live engine-pinned qualifier does not force a re-attach', () => {
@@ -1046,7 +1046,7 @@ describe('Schema Differ', () => {
 			);
 			const diff = computeSchemaDiff(declared, catalog);
 			expect(diff.assertionsToDrop).to.deep.equal([]);
-			expect(diff.assertionsToCreate).to.deep.equal([]);
+			expect(diff.assertionsToCreate.map(c => c.sql)).to.deep.equal([]);
 		});
 
 		it('changed CHECK body on a name-matched assertion → one drop + one create', () => {
@@ -1063,7 +1063,7 @@ describe('Schema Differ', () => {
 			);
 			const diff = computeSchemaDiff(declared, catalog);
 			expect(diff.assertionsToDrop).to.deep.equal(['a1']);
-			expect(diff.assertionsToCreate).to.deep.equal(['create assertion a1 check (not exists (select 1 from t where x < 100))']);
+			expect(diff.assertionsToCreate.map(c => c.sql)).to.deep.equal(['create assertion a1 check (not exists (select 1 from t where x < 100))']);
 		});
 
 		it('only the drifted one of several name-matched assertions churns', () => {
@@ -1084,7 +1084,7 @@ describe('Schema Differ', () => {
 			);
 			const diff = computeSchemaDiff(declared, catalog);
 			expect(diff.assertionsToDrop).to.deep.equal(['moved']);
-			expect(diff.assertionsToCreate).to.deep.equal(['create assertion moved check (not exists (select 1 from t where x < 100))']);
+			expect(diff.assertionsToCreate.map(c => c.sql)).to.deep.equal(['create assertion moved check (not exists (select 1 from t where x < 100))']);
 		});
 
 		it('undeclared assertion → drop only, no create', () => {
@@ -1100,7 +1100,7 @@ describe('Schema Differ', () => {
 			);
 			const diff = computeSchemaDiff(declared, catalog);
 			expect(diff.assertionsToDrop).to.deep.equal(['a1']);
-			expect(diff.assertionsToCreate).to.deep.equal([]);
+			expect(diff.assertionsToCreate.map(c => c.sql)).to.deep.equal([]);
 		});
 
 		it('whitespace/formatting-only difference in the declared source → no diff', () => {
@@ -1122,7 +1122,7 @@ describe('Schema Differ', () => {
 			);
 			const diff = computeSchemaDiff(declared, catalog);
 			expect(diff.assertionsToDrop).to.deep.equal([]);
-			expect(diff.assertionsToCreate).to.deep.equal([]);
+			expect(diff.assertionsToCreate.map(c => c.sql)).to.deep.equal([]);
 		});
 	});
 });
@@ -1182,5 +1182,114 @@ describe('Schema Differ — maintained-table transitions', () => {
 		);
 		expect(alter?.tableTagsChange, 'tag drift rides the table-alter channel').to.deep.equal({ owner: 'x' });
 		expect(alter?.setMaintained, 'a tag-only change must not re-attach').to.be.undefined;
+	});
+});
+
+describe('generateMigrationPlan / generateMigrationDDL parity', () => {
+	/** A create-bucket entry whose paired AST is the parse of its own DDL text. */
+	function migrationCreate(sql: string): MigrationCreate {
+		return { sql, ast: new Parser().parse(sql) };
+	}
+
+	/** The body QueryExpr of a `create view` — a convenient source of an AST.QueryExpr. */
+	function selectOf(sql: string): AST.QueryExpr {
+		const stmt = new Parser().parse(sql);
+		if (stmt.type !== 'createView') throw new Error(`Expected createView, got ${stmt.type}`);
+		return (stmt as AST.CreateViewStmt).select;
+	}
+
+	/** A diff touching EVERY bucket generateMigrationPlan reads. */
+	function everyBucketDiff(): SchemaDiff {
+		return {
+			...makeEmptySchemaDiff(),
+			renames: [
+				{ kind: 'table', oldName: 'old_t', newName: 'new_t' },
+				{ kind: 'view', oldName: 'old_v', newName: 'new_v' },
+			],
+			tablesToCreate: [migrationCreate('create table fresh (id integer primary key, name text)')],
+			tablesToDrop: ['gone_t'],
+			viewsToCreate: [migrationCreate('create view fresh_v as select id from fresh')],
+			viewsToDrop: ['gone_v'],
+			indexesToCreate: [migrationCreate('create index idx_fresh on fresh (name)')],
+			indexesToDrop: ['gone_idx'],
+			assertionsToCreate: [migrationCreate('create assertion a1 check (not exists (select 1 from fresh where id < 0))')],
+			assertionsToDrop: ['gone_a'],
+			viewTagsChanges: [{ name: 'fresh_v', tags: { owner: 'x' } }],
+			indexTagsChanges: [{ name: 'idx_fresh', tags: { owner: 'y' } }],
+			tablesToAlter: [{
+				tableName: 'new_t',
+				columnsToAdd: ['extra integer'],
+				columnsToDrop: ['stale'],
+				columnsToAlter: [{
+					columnName: 'name',
+					notNull: true,
+					dataType: 'text',
+					collation: 'BINARY',
+					defaultValue: { type: 'literal', value: 'x' },
+					tags: { pii: 'true' },
+				}],
+				columnsToRename: [{ oldName: 'a', newName: 'b' }],
+				constraintsToRename: [{ oldName: 'ck_old', newName: 'ck_new' }],
+				constraintsToDrop: ['ck_stale'],
+				constraintsToAdd: ['constraint ck_fresh check (extra > 0)'],
+				primaryKeyChange: { oldPkColumns: ['id'], newPkColumns: [{ name: 'id' }, { name: 'b', direction: 'desc' }] },
+				tableTagsChange: { owner: 'z' },
+				constraintTagsChanges: [{ constraintName: 'ck_new', tags: { severity: 'high' } }],
+				dropMaintained: true,
+				setMaintained: { columns: ['b'], select: selectOf('create view tmp as select id from fresh') },
+			}],
+		};
+	}
+
+	it('the plan renders exactly the DDL — same statements, same order', () => {
+		const diff = everyBucketDiff();
+		expect(generateMigrationPlan(diff, 'main').map(s => s.sql)).to.deep.equal(generateMigrationDDL(diff, 'main'));
+	});
+
+	it('parity holds under a non-main schema prefix too', () => {
+		const diff = everyBucketDiff();
+		expect(generateMigrationPlan(diff, 'analytics').map(s => s.sql)).to.deep.equal(generateMigrationDDL(diff, 'analytics'));
+	});
+
+	it('every create step carries the AST its DDL was rendered from', () => {
+		const plan = generateMigrationPlan(everyBucketDiff(), 'main');
+		const withAst = plan.filter(s => s.ast !== undefined);
+		// The four create buckets (1 each) + the `set maintained as` re-attach.
+		expect(withAst.map(s => s.sql), 'AST-carrying steps').to.deep.equal([
+			'create table fresh (id integer primary key, name text)',
+			'create view fresh_v as select id from fresh',
+			'create index idx_fresh on fresh (name)',
+			'alter table new_t set maintained (b) as select id from fresh',
+			'create assertion a1 check (not exists (select 1 from fresh where id < 0))',
+		]);
+	});
+
+	it('template-built steps carry no AST (they take the parsing path)', () => {
+		const plan = generateMigrationPlan(everyBucketDiff(), 'main');
+		const textOnly = plan.filter(s => s.ast === undefined);
+		expect(textOnly.length, 'renames / drops / alters / SET TAGS stay text-only').to.be.greaterThan(0);
+		for (const step of textOnly) {
+			expect(step.sql, 'no create statement should have lost its AST').to.not.match(/^create /i);
+		}
+	});
+
+	it('a real computed diff pairs each create with the statement it rendered', () => {
+		const declared = parseDeclaredSchema(`declare schema main {
+			table t { id INTEGER PRIMARY KEY, name TEXT }
+			view v as select id from t
+			index idx_t on t (name)
+			assertion a1 check (not exists (select 1 from t where id < 0))
+		}`);
+		const diff = computeSchemaDiff(declared, makeCatalog());
+		const buckets = [diff.tablesToCreate, diff.viewsToCreate, diff.indexesToCreate, diff.assertionsToCreate];
+		for (const bucket of buckets) {
+			expect(bucket.length, 'every bucket populated').to.equal(1);
+			for (const create of bucket) {
+				// The parse of the rendered text must be the same statement KIND the AST is —
+				// the cheap structural check that the pairing is not crossed.
+				expect(new Parser().parse(create.sql).type).to.equal(create.ast.type);
+			}
+		}
+		expect(generateMigrationPlan(diff, 'main').map(s => s.sql)).to.deep.equal(generateMigrationDDL(diff, 'main'));
 	});
 });

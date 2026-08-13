@@ -437,9 +437,11 @@ Errors carry source location (`line`, `column`) when the AST node has it. See [E
 
 ## Declarative Schema
 
-The `declare schema` / `diff schema` / `apply schema` workflow provides order-independent, end-state schema declarations: the engine diffs against the current catalog (`computeSchemaDiff`) and generates migration DDL (`generateMigrationDDL`). Key diff types:
+The `declare schema` / `diff schema` / `apply schema` workflow provides order-independent, end-state schema declarations: the engine diffs against the current catalog (`computeSchemaDiff`) and builds an ordered migration plan (`generateMigrationPlan`). Key diff types:
 
 - `SchemaDiff` — tables/views/indexes/assertions to create, drop, alter, or rename
+- `MigrationCreate` — one entry of a create bucket: the rendered DDL text (`sql`) paired with the exact statement AST it was rendered from (`ast`)
+- `MigrationStep` — one statement of the plan: `sql` always, plus `ast` when the step came from a statement rather than a template string
 - `TableAlterDiff` — columns to rename, add, alter, or drop within an existing table; named-constraint rename / drop / add (`constraintsToRename` / `constraintsToDrop` / `constraintsToAdd`)
 - `ColumnAttributeChange` — per-column attribute drift within `columnsToAlter`: nullability, data type, default, **collation**, and tags. Each surfaces as the matching `ALTER COLUMN … SET …` statement. Column collation is projected into the diff catalog (`CatalogTable.columns[].collation`, default `'BINARY'`) so the differ detects a `COLLATE` change as it does a type or default change; an absent `COLLATE` and an explicit `COLLATE BINARY` compare equal (no spurious diff). Unlike tags, collation is **behavioral** and participates in the schema hash.
 
@@ -488,7 +490,11 @@ The deploy summary tallies `acknowledged: N` (`LensDeployReport.acknowledged.len
 
 ### Migration Order
 
-`generateMigrationDDL` produces DDL in a fixed order:
+`generateMigrationPlan` is the single ordering authority; `generateMigrationDDL` is a thin wrapper over it (`plan.map(s => s.sql)`). `diff schema` shows the wrapper's strings; `apply schema` walks the plan. Because the preview text and the executed statement are two fields of one object, the two can never disagree.
+
+A create step (and the `set maintained as` re-attach) carries the statement AST its DDL was rendered from, so `apply schema` executes it directly instead of re-lexing text the differ just produced. Template-built steps (renames, drops, column/constraint alters, `SET TAGS`) carry no AST and are parsed as before. Either way the log line and the `Failed to execute DDL: …` wrapper name `step.sql`, so error text is identical on both branches. One consequence: an error raised while executing a create now carries the source location of the **declaration**, not of the generated DDL string.
+
+The plan produces DDL in a fixed order:
 
 1. **Renames first** — `ALTER TABLE ... RENAME TO` for **tables** with a stable identity hint (`quereus.id` / `quereus.previous_name`). This frees the old name before any create reuses it and lets the engine's rename rewriter propagate references through dependents. Hinted **view / index** renames emit no DDL here (no rename primitive exists) — they are realized as drop(old) + recreate(declared) in the phases below; the non-table `RenameOp`s on `SchemaDiff.renames` are metadata only.
 2. **Drops second** — `DROP TABLE`, `DROP VIEW`, `DROP INDEX` for objects neither declared nor consumed by a rename.

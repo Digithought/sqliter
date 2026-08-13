@@ -5,7 +5,7 @@ import { createLogger } from '../../common/logger.js';
 import { StatusCode, type Row, type SqlValue } from '../../common/types.js';
 import { QuereusError } from '../../common/errors.js';
 import { collectSchemaCatalog } from '../../schema/catalog.js';
-import { computeSchemaDiff, generateMigrationDDL } from '../../schema/schema-differ.js';
+import { computeSchemaDiff, generateMigrationDDL, generateMigrationPlan, type MigrationStep } from '../../schema/schema-differ.js';
 import { computeShortSchemaHash } from '../../schema/schema-hasher.js';
 import { deployLogicalSchema } from '../../schema/lens-compiler.js';
 import type * as AST from '../../parser/ast.js';
@@ -293,8 +293,10 @@ export function emitApplySchema(plan: PlanNode, _ctx: EmissionContext): Instruct
 			);
 		}
 
-		// Generate migration DDL
-		const migrationStatements = generateMigrationDDL(diff, schemaName);
+		// Build the migration plan. Same ordering (and same DDL text) `diff schema`
+		// previews; the create steps additionally carry the statement they were
+		// rendered from, so the loop below skips re-parsing them.
+		const migrationStatements = generateMigrationPlan(diff, schemaName);
 
 		// Run the migration loop. When there are no statements we keep the
 		// idempotency fast-path: no module batch hooks fire.
@@ -429,15 +431,34 @@ export function emitExplainSchema(plan: PlanNode, _ctx: EmissionContext): Instru
 async function runBatchedMigrationLoop(
 	db: Database,
 	schemaName: string,
-	migrationStatements: readonly string[],
+	migrationStatements: readonly MigrationStep[],
 ): Promise<void> {
 	const startedModules = await beginSchemaBatchAll(db, schemaName);
 	let loopError: unknown;
 	try {
-		for (const ddl of migrationStatements) {
+		for (const step of migrationStatements) {
+			const ddl = step.sql;
 			log('Executing migration DDL: %s', ddl);
 			try {
-				await db._execWithinTransaction(ddl);
+				// A step that carries its AST is executed directly — the differ rendered
+				// `ddl` FROM that statement, so re-lexing it would rebuild the same tree.
+				// Template-built steps (renames, drops, alters, SET TAGS) carry no AST and
+				// take the parsing path. Both branches report `step.sql` on failure, so the
+				// error text is identical either way.
+				//
+				// NOTE: for a `main`-schema apply the AST handed to the executor is the very
+				// node `DeclaredSchemaManager` holds (the `applyTableDefaults` /
+				// `applyViewSchemaDefault` / `applyAssertionSchemaDefault` qualifiers return
+				// the input unchanged when there is nothing to qualify), so the executor
+				// shares it with the stored declaration rather than getting a fresh parse.
+				// That is safe today — the planner/builder treat statement ASTs as read-only,
+				// and `declarative-equivalence.spec.ts` § "apply executes the plan AST" asserts
+				// the stored declaration is byte-identical after an apply. If a builder ever
+				// starts mutating statement nodes in place, clone per step here (still far
+				// cheaper than parsing).
+
+				if (step.ast) await db._execAstWithinTransaction([step.ast]);
+				else await db._execWithinTransaction(ddl);
 			} catch (e) {
 				log('Migration failed for DDL: %s', ddl);
 				const errorMessage = e instanceof Error ? e.message : String(e);

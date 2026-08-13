@@ -570,7 +570,7 @@ describe('CREATE INDEX DDL round-trip: declarative differ stability', () => {
 		const diff = await diffIndexEdit(`${TABLE}\nindex ix_email on t (email)`, `${TABLE}\nunique index ix_email on t (email)`);
 		expect(diff.indexesToDrop).to.deep.equal(['ix_email']);
 		expect(diff.indexesToCreate).to.have.length(1);
-		expect(diff.indexesToCreate[0]).to.match(/^create unique index/i);
+		expect(diff.indexesToCreate[0].sql).to.match(/^create unique index/i);
 		expect(diff.indexTagsChanges, 'no separate SET TAGS').to.deep.equal([]);
 		expect(diff.tablesToAlter, 'no table churn').to.deep.equal([]);
 	});
@@ -579,29 +579,29 @@ describe('CREATE INDEX DDL round-trip: declarative differ stability', () => {
 		const diff = await diffIndexEdit(`${TABLE}\nunique index ix_email on t (email)`, `${TABLE}\nindex ix_email on t (email)`);
 		expect(diff.indexesToDrop).to.deep.equal(['ix_email']);
 		expect(diff.indexesToCreate).to.have.length(1);
-		expect(diff.indexesToCreate[0]).to.match(/^create index/i);
-		expect(diff.indexesToCreate[0], 'recreate drops the UNIQUE keyword').to.not.match(/unique/i);
+		expect(diff.indexesToCreate[0].sql).to.match(/^create index/i);
+		expect(diff.indexesToCreate[0].sql, 'recreate drops the UNIQUE keyword').to.not.match(/unique/i);
 	});
 
 	it('adding a partial WHERE predicate recreates the index', async () => {
 		const diff = await diffIndexEdit(`${TABLE}\nindex ix_active on t (active)`, `${TABLE}\nindex ix_active on t (active) where active = 1`);
 		expect(diff.indexesToDrop).to.deep.equal(['ix_active']);
 		expect(diff.indexesToCreate).to.have.length(1);
-		expect(diff.indexesToCreate[0]).to.match(/where active = 1/i);
+		expect(diff.indexesToCreate[0].sql).to.match(/where active = 1/i);
 	});
 
 	it('removing a partial WHERE predicate recreates the index', async () => {
 		const diff = await diffIndexEdit(`${TABLE}\nindex ix_active on t (active) where active = 1`, `${TABLE}\nindex ix_active on t (active)`);
 		expect(diff.indexesToDrop).to.deep.equal(['ix_active']);
 		expect(diff.indexesToCreate).to.have.length(1);
-		expect(diff.indexesToCreate[0], 'recreate drops the WHERE').to.not.match(/where/i);
+		expect(diff.indexesToCreate[0].sql, 'recreate drops the WHERE').to.not.match(/where/i);
 	});
 
 	it('changing a partial WHERE predicate recreates the index', async () => {
 		const diff = await diffIndexEdit(`${TABLE}\nindex ix_active on t (active) where active = 1`, `${TABLE}\nindex ix_active on t (active) where active = 0`);
 		expect(diff.indexesToDrop).to.deep.equal(['ix_active']);
 		expect(diff.indexesToCreate).to.have.length(1);
-		expect(diff.indexesToCreate[0]).to.match(/where active = 0/i);
+		expect(diff.indexesToCreate[0].sql).to.match(/where active = 0/i);
 	});
 
 	it('a semantically-identical partial predicate does not churn', async () => {
@@ -630,7 +630,7 @@ describe('CREATE INDEX DDL round-trip: declarative differ stability', () => {
 		const diff = await diffIndexEdit(`${TABLE}\nindex ix_comp on t (name, active)`, `${TABLE}\nindex ix_comp on t (name, active desc)`);
 		expect(diff.indexesToDrop).to.deep.equal(['ix_comp']);
 		expect(diff.indexesToCreate).to.have.length(1);
-		expect(diff.indexesToCreate[0]).to.match(/active desc/i);
+		expect(diff.indexesToCreate[0].sql).to.match(/active desc/i);
 	});
 
 	it('a desc index re-declared unchanged does not churn (actual-side desc lift is symmetric)', async () => {
@@ -649,7 +649,7 @@ describe('CREATE INDEX DDL round-trip: declarative differ stability', () => {
 		const diff = await diffIndexEdit(`${TABLE}\nindex ix_one on t (name)`, `${TABLE}\nindex ix_one on t (email)`);
 		expect(diff.indexesToDrop).to.deep.equal(['ix_one']);
 		expect(diff.indexesToCreate).to.have.length(1);
-		expect(diff.indexesToCreate[0]).to.match(/\(\s*"?email"?\s*\)/i);
+		expect(diff.indexesToCreate[0].sql).to.match(/\(\s*"?email"?\s*\)/i);
 	});
 
 	// An index reference whose case diverges from the column DEFINITION case must not
@@ -697,8 +697,8 @@ describe('CREATE INDEX DDL round-trip: declarative differ stability', () => {
 		const diff = await diffIndexEdit(`${TABLE}\nindex ix_name on t (name) with tags (purpose = 'a')`, `${TABLE}\nunique index ix_name on t (name) with tags (purpose = 'b')`);
 		expect(diff.indexesToDrop).to.deep.equal(['ix_name']);
 		expect(diff.indexesToCreate).to.have.length(1);
-		expect(diff.indexesToCreate[0]).to.match(/^create unique index/i);
-		expect(diff.indexesToCreate[0], 'recreate carries the declared tags').to.match(/purpose = 'b'/i);
+		expect(diff.indexesToCreate[0].sql).to.match(/^create unique index/i);
+		expect(diff.indexesToCreate[0].sql, 'recreate carries the declared tags').to.match(/purpose = 'b'/i);
 		expect(diff.indexTagsChanges, 'no separate SET TAGS').to.deep.equal([]);
 	});
 
@@ -767,7 +767,7 @@ describe('CREATE INDEX DDL round-trip: declarative differ stability', () => {
 		const diff = await diffIndexEdit(`${TABLE}\nindex ix on t (email)`, `${TABLE}\nindex ix on t (email collate nocase)`);
 		expect(diff.indexesToDrop).to.deep.equal(['ix']);
 		expect(diff.indexesToCreate).to.have.length(1);
-		expect(diff.indexesToCreate[0], 'recreate carries the declared collation').to.match(/collate nocase/i);
+		expect(diff.indexesToCreate[0].sql, 'recreate carries the declared collation').to.match(/collate nocase/i);
 	});
 
 	it('applying an added explicit index COLLATE converges and the catalog index carries the collation', async () => {
@@ -891,7 +891,7 @@ describe('CREATE INDEX DDL round-trip: declarative differ stability', () => {
 		const diff = await diffIndexEdit(`${TABLE}\nindex ix_comp on t (name, email)`, `${TABLE}\nindex ix_comp on t (name, email collate nocase)`);
 		expect(diff.indexesToDrop).to.deep.equal(['ix_comp']);
 		expect(diff.indexesToCreate).to.have.length(1);
-		expect(diff.indexesToCreate[0]).to.match(/collate nocase/i);
+		expect(diff.indexesToCreate[0].sql).to.match(/collate nocase/i);
 	});
 
 	it('a desc index inheriting a non-BINARY collation, re-declared verbatim, does not churn', async () => {
@@ -950,7 +950,7 @@ describe('CREATE INDEX DDL round-trip: declarative differ stability', () => {
 		const diff = await diffIndexEdit(base, mod);
 		expect(diff.indexesToDrop, 'body edit recreates under the rename').to.deep.equal(['ix_email']);
 		expect(diff.indexesToCreate).to.have.length(1);
-		expect(diff.indexesToCreate[0], 'recreate carries the NEW column name + desc').to.match(/email_addr desc/i);
+		expect(diff.indexesToCreate[0].sql, 'recreate carries the NEW column name + desc').to.match(/email_addr desc/i);
 		expect(diff.tablesToAlter[0].columnsToRename).to.deep.equal([{ oldName: 'email', newName: 'email_addr' }]);
 	});
 
@@ -1014,7 +1014,7 @@ describe('CREATE INDEX DDL round-trip: declarative differ stability', () => {
 		const diff = await diffIndexEdit(base, mod);
 		expect(diff.indexesToDrop, 'genuine predicate edit still recreates').to.deep.equal(['ix_active']);
 		expect(diff.indexesToCreate).to.have.length(1);
-		expect(diff.indexesToCreate[0]).to.match(/where is_active = 0/i);
+		expect(diff.indexesToCreate[0].sql).to.match(/where is_active = 0/i);
 		expect(diff.tablesToAlter[0].columnsToRename).to.deep.equal([{ oldName: 'active', newName: 'is_active' }]);
 	});
 
@@ -1108,8 +1108,8 @@ describe('CREATE INDEX DDL round-trip: declarative differ stability', () => {
 		const diff = await diffIndexEdit(base, mod);
 		expect(diff.indexesToDrop, 'drop targets the actual (old) index name').to.deep.equal(['ix_old']);
 		expect(diff.indexesToCreate, 'one recreate under the declared name').to.have.length(1);
-		expect(diff.indexesToCreate[0], 'recreate names the OLD column (RENAME COLUMN has not run yet)').to.match(/\(email\)/i);
-		expect(diff.indexesToCreate[0], 'recreate does not name the NEW column').to.not.match(/email_addr/i);
+		expect(diff.indexesToCreate[0].sql, 'recreate names the OLD column (RENAME COLUMN has not run yet)').to.match(/\(email\)/i);
+		expect(diff.indexesToCreate[0].sql, 'recreate does not name the NEW column').to.not.match(/email_addr/i);
 		expect(diff.renames, 'index rename op still recorded (metadata)').to.deep.include({ kind: 'index', oldName: 'ix_old', newName: 'ix_new' });
 		expect(diff.tablesToAlter[0].columnsToRename).to.deep.equal([{ oldName: 'email', newName: 'email_addr' }]);
 	});
@@ -1125,9 +1125,9 @@ describe('CREATE INDEX DDL round-trip: declarative differ stability', () => {
 		const diff = await diffIndexEdit(base, mod);
 		expect(diff.indexesToDrop, 'drop targets the actual (old) index name').to.deep.equal(['ix_old']);
 		expect(diff.indexesToCreate, 'one recreate under the declared name').to.have.length(1);
-		expect(diff.indexesToCreate[0], 'collate-folded indexed column maps back to the OLD name').to.match(/email collate nocase/i);
-		expect(diff.indexesToCreate[0], 'WHERE predicate names the OLD column').to.match(/where active = 1/i);
-		expect(diff.indexesToCreate[0], 'no NEW names leak into the recreate').to.not.match(/email_addr|is_active/i);
+		expect(diff.indexesToCreate[0].sql, 'collate-folded indexed column maps back to the OLD name').to.match(/email collate nocase/i);
+		expect(diff.indexesToCreate[0].sql, 'WHERE predicate names the OLD column').to.match(/where active = 1/i);
+		expect(diff.indexesToCreate[0].sql, 'no NEW names leak into the recreate').to.not.match(/email_addr|is_active/i);
 	});
 
 	it('a table rename with stable columns does not churn the index body', async () => {
@@ -1199,7 +1199,7 @@ describe('CREATE INDEX DDL round-trip: declarative differ stability', () => {
 		const diff = await diffIndexEdit(base, mod);
 		expect(diff.indexesToDrop, 'genuine predicate edit recreates').to.deep.equal(['ix']);
 		expect(diff.indexesToCreate).to.have.length(1);
-		expect(diff.indexesToCreate[0], 'recreate carries the NEW qualifier + edited literal').to.match(/where t_new\.active = 0/i);
+		expect(diff.indexesToCreate[0].sql, 'recreate carries the NEW qualifier + edited literal').to.match(/where t_new\.active = 0/i);
 		expect(diff.renames, 'table rename op still emitted').to.deep.include({ kind: 'table', oldName: 't_old', newName: 't_new' });
 	});
 

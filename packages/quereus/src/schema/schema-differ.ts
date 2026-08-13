@@ -37,10 +37,31 @@ export interface ColumnRenameOp {
 }
 
 /**
+ * A create-bucket entry: the DDL text (what `diff schema` shows and what an error
+ * names) paired with the AST it was rendered from, so `apply schema` can execute
+ * the statement without re-lexing the text it just produced.
+ */
+export interface MigrationCreate {
+	readonly sql: string;
+	readonly ast: AST.Statement;
+}
+
+/**
+ * One statement of a migration. `sql` is always present — it is the preview text
+ * and the text an error names. `ast` is present when the step was built from a
+ * statement AST rather than a template string; the apply path executes it directly
+ * and falls back to parsing `sql` when it is absent.
+ */
+export interface MigrationStep {
+	readonly sql: string;
+	readonly ast?: AST.Statement;
+}
+
+/**
  * Represents the difference between a declared schema and actual database state
  */
 export interface SchemaDiff {
-	tablesToCreate: string[];
+	tablesToCreate: MigrationCreate[];
 	tablesToDrop: string[];
 	tablesToAlter: TableAlterDiff[];
 	/**
@@ -55,11 +76,11 @@ export interface SchemaDiff {
 	 * incarnation. See `docs/materialized-views.md` § Declarative-schema integration.
 	 */
 	maintainedModuleMigrations: Array<{ name: string; fromModule: string; toModule: string }>;
-	viewsToCreate: string[];
+	viewsToCreate: MigrationCreate[];
 	viewsToDrop: string[];
-	indexesToCreate: string[];
+	indexesToCreate: MigrationCreate[];
 	indexesToDrop: string[];
-	assertionsToCreate: string[];
+	assertionsToCreate: MigrationCreate[];
 	assertionsToDrop: string[];
 	/**
 	 * In-place metadata-tag changes on name-matched views / indexes (whole-set
@@ -646,7 +667,7 @@ export function computeSchemaDiff(
 				// two names are identical.
 				const dropName = matchedActual.name.toLowerCase() !== name ? name : matchedActual.name.toLowerCase();
 				dropSet.add(dropName);
-				diff.tablesToCreate.push(renderFreshTableCreate(name, tableStmt, declaredMaterializedViews, targetSchemaName, defaultVtabModule, defaultVtabArgs));
+				diff.tablesToCreate.push(freshTableCreate(name, tableStmt, declaredMaterializedViews, targetSchemaName, defaultVtabModule, defaultVtabArgs));
 				diff.maintainedModuleMigrations.push({
 					name: tableStmt.table.name,
 					fromModule: alterDiff.maintainedModuleMigration.fromModule,
@@ -676,7 +697,7 @@ export function computeSchemaDiff(
 				diff.tablesToAlter.push(alterDiff);
 			}
 		} else {
-			diff.tablesToCreate.push(renderFreshTableCreate(name, tableStmt, declaredMaterializedViews, targetSchemaName, defaultVtabModule, defaultVtabArgs));
+			diff.tablesToCreate.push(freshTableCreate(name, tableStmt, declaredMaterializedViews, targetSchemaName, defaultVtabModule, defaultVtabArgs));
 		}
 	}
 
@@ -720,7 +741,7 @@ export function computeSchemaDiff(
 	for (const [name, declaredView] of declaredViews) {
 		const matchedActual = viewRenames.pairs.get(name);
 		if (!matchedActual) {
-			diff.viewsToCreate.push(createViewToString(applyViewSchemaDefault(declaredView.viewStmt, targetSchemaName)));
+			diff.viewsToCreate.push(viewCreate(applyViewSchemaDefault(declaredView.viewStmt, targetSchemaName)));
 			continue;
 		}
 		const stmt = declaredView.viewStmt;
@@ -742,7 +763,7 @@ export function computeSchemaDiff(
 		}
 		if (definitionDrifted) {
 			diff.viewsToDrop.push(matchedActual.name);
-			diff.viewsToCreate.push(createViewToString(applyViewSchemaDefault(stmt, targetSchemaName)));
+			diff.viewsToCreate.push(viewCreate(applyViewSchemaDefault(stmt, targetSchemaName)));
 			viewRecreates++;
 			continue;
 		}
@@ -750,7 +771,7 @@ export function computeSchemaDiff(
 			// Hinted rename, definition unchanged → drop(old) + recreate(declared),
 			// rendered with in-diff column renames inverse-applied (NEW→OLD).
 			diff.viewsToDrop.push(matchedActual.name);
-			diff.viewsToCreate.push(createViewToString(applyViewSchemaDefault(columnReconciledViewStmt(stmt, columnRenamesByTable, targetSchemaName, resolveDeclaredColumn), targetSchemaName)));
+			diff.viewsToCreate.push(viewCreate(applyViewSchemaDefault(columnReconciledViewStmt(stmt, columnRenamesByTable, targetSchemaName, resolveDeclaredColumn), targetSchemaName)));
 			viewRecreates++;
 			continue;
 		}
@@ -795,7 +816,7 @@ export function computeSchemaDiff(
 		const matchedActual = indexRenames.pairs.get(name);
 		if (!matchedActual) {
 			const effectiveStmt = applyIndexDefaults(declaredIndex.indexStmt, targetSchemaName);
-			diff.indexesToCreate.push(createIndexToString(effectiveStmt));
+			diff.indexesToCreate.push(indexCreate(effectiveStmt));
 			continue;
 		}
 		// Body comparison (canonical: name / tags excluded; per-column collation
@@ -823,7 +844,7 @@ export function computeSchemaDiff(
 		if (declaredBody !== matchedActual.definition) {
 			diff.indexesToDrop.push(matchedActual.name);
 			const effectiveStmt = applyIndexDefaults(declaredIndex.indexStmt, targetSchemaName);
-			diff.indexesToCreate.push(createIndexToString(effectiveStmt));
+			diff.indexesToCreate.push(indexCreate(effectiveStmt));
 			indexRecreates++;
 			continue;
 		}
@@ -832,7 +853,7 @@ export function computeSchemaDiff(
 			// rendered with in-diff column renames inverse-applied (NEW→OLD).
 			diff.indexesToDrop.push(matchedActual.name);
 			const reconciledStmt = columnReconciledIndexStmt(declaredIndex.indexStmt, indexColRenames, columnRenamesByTable, targetSchemaName);
-			diff.indexesToCreate.push(createIndexToString(applyIndexDefaults(reconciledStmt, targetSchemaName)));
+			diff.indexesToCreate.push(indexCreate(applyIndexDefaults(reconciledStmt, targetSchemaName)));
 			indexRecreates++;
 			continue;
 		}
@@ -933,7 +954,7 @@ export function computeSchemaDiff(
 		// Drift on a name match: drop the old one first (creates run later, see
 		// `generateMigrationDDL`), then recreate from the declaration.
 		if (matchedActual) diff.assertionsToDrop.push(matchedActual.name);
-		diff.assertionsToCreate.push(createAssertionToString(
+		diff.assertionsToCreate.push(assertionCreate(
 			applyAssertionSchemaDefault(declaredAssertion.assertionStmt, targetSchemaName)));
 	}
 
@@ -1128,28 +1149,53 @@ function enforceRequireHint(kind: string, creates: number, drops: number): void 
 }
 
 /**
- * Renders the fresh-create DDL for a declared table — shared by the create branch
+ * Builds the fresh-create step for a declared table — shared by the create branch
  * and the destructive backing-module move's recreate, so both re-materialize a
  * maintained body into the declared module through one renderer. A maintained
  * table declared via the `materialized view` sugar renders that sugar (its
  * column-less normalized table form has no parseable `create table` DDL); a
  * declared-shape maintained table and a plain table render the `create table …`
  * form (carrying any `maintained as` clause).
+ *
+ * The returned {@link MigrationCreate} pairs the rendered text with the SAME
+ * post-qualification statement it was rendered from, so `apply schema` executes
+ * exactly what `diff schema` previews.
  */
-function renderFreshTableCreate(
+function freshTableCreate(
 	name: string,
 	tableStmt: AST.CreateTableStmt,
 	declaredMaterializedViews: ReadonlyMap<string, AST.DeclaredMaterializedView>,
 	targetSchemaName: string,
 	defaultVtabModule: string | undefined,
 	defaultVtabArgs: string | undefined,
-): string {
+): MigrationCreate {
 	const declaredMv = declaredMaterializedViews.get(name);
 	if (declaredMv) {
-		return createMaterializedViewToString(applyViewSchemaDefault(declaredMv.viewStmt, targetSchemaName));
+		const mvStmt = applyViewSchemaDefault(declaredMv.viewStmt, targetSchemaName);
+		return { sql: createMaterializedViewToString(mvStmt), ast: mvStmt };
 	}
 	const effectiveStmt = applyTableDefaults(tableStmt, targetSchemaName, defaultVtabModule, defaultVtabArgs);
-	return createTableToString(effectiveStmt);
+	return { sql: createTableToString(effectiveStmt), ast: effectiveStmt };
+}
+
+/**
+ * Pairs a view create's rendered DDL with the exact (already schema-qualified,
+ * already rename-reconciled) statement it was rendered from. Taking one statement
+ * and rendering it here — rather than accepting a pre-rendered string — is what
+ * makes text/AST disagreement unrepresentable.
+ */
+function viewCreate(stmt: AST.CreateViewStmt): MigrationCreate {
+	return { sql: createViewToString(stmt), ast: stmt };
+}
+
+/** The index analogue of {@link viewCreate}. */
+function indexCreate(stmt: AST.CreateIndexStmt): MigrationCreate {
+	return { sql: createIndexToString(stmt), ast: stmt };
+}
+
+/** The assertion analogue of {@link viewCreate}. */
+function assertionCreate(stmt: AST.CreateAssertionStmt): MigrationCreate {
+	return { sql: createAssertionToString(stmt), ast: stmt };
 }
 
 /**
@@ -2766,7 +2812,13 @@ function pkSequencesEqual(
 }
 
 /**
- * Serializes a schema diff to JSON string
+ * Serializes a schema diff to JSON string.
+ *
+ * NOTE: the four create buckets serialize as `{ sql, ast }` objects (see
+ * {@link MigrationCreate}), so the output embeds a full statement AST per create
+ * and is far more verbose than the old bare-string form. No caller in the repo
+ * consumes this today; a caller that only wants the DDL should read `.sql` (or
+ * call {@link generateMigrationDDL}) rather than this whole-diff dump.
  */
 export function serializeSchemaDiff(diff: SchemaDiff): string {
 	return JSON.stringify(diff, null, 2);
@@ -2830,11 +2882,31 @@ function comparisonDomainAlters(quotedTable: string, quotedCol: string, change: 
 }
 
 /**
- * Generates migration DDL statements from a schema diff
+ * Generates migration DDL statements from a schema diff.
+ *
+ * Thin wrapper over {@link generateMigrationPlan} — the single ordering authority.
+ * `diff schema` previews exactly this text, and `apply schema` executes the plan
+ * these strings come from, so the two can never disagree.
  */
 export function generateMigrationDDL(diff: SchemaDiff, schemaName?: string): string[] {
-	const statements: string[] = [];
+	return generateMigrationPlan(diff, schemaName).map(s => s.sql);
+}
+
+/**
+ * Builds the ordered migration plan for a schema diff.
+ *
+ * Every step carries its `sql` (the preview text, and the text an execution error
+ * names). Steps built from a statement AST — the four create buckets and the
+ * `set maintained as` re-attach — also carry that AST, so `apply schema` can run
+ * them without re-lexing the text this function just produced. The remaining steps
+ * are short template-built strings (renames, drops, column/constraint alters,
+ * `SET TAGS`) and stay text-only.
+ */
+export function generateMigrationPlan(diff: SchemaDiff, schemaName?: string): MigrationStep[] {
+	const statements: MigrationStep[] = [];
 	const schemaPrefix = (schemaName && schemaName !== 'main') ? `${quoteIdentifier(schemaName)}.` : '';
+	/** Appends a template-built step — text-only, so the apply path parses it as before. */
+	const pushText = (sql: string): void => { statements.push({ sql }); };
 
 	// Renames first — they free old names for subsequent creates and re-target
 	// dependents (handled inside ALTER TABLE ... RENAME by the rename rewriter).
@@ -2846,14 +2918,14 @@ export function generateMigrationDDL(diff: SchemaDiff, schemaName?: string): str
 	// the table-alter channel (RENAME CONSTRAINT below).
 	for (const r of diff.renames) {
 		if (r.kind === 'table') {
-			statements.push(`ALTER TABLE ${schemaPrefix}${quoteIdentifier(r.oldName)} RENAME TO ${quoteIdentifier(r.newName)}`);
+			pushText(`ALTER TABLE ${schemaPrefix}${quoteIdentifier(r.oldName)} RENAME TO ${quoteIdentifier(r.newName)}`);
 		}
 		// Non-table rename ops emit no DDL here — see the note above.
 	}
 
 	// Drop assertions first (they may reference tables)
 	for (const name of diff.assertionsToDrop) {
-		statements.push(`DROP ASSERTION IF EXISTS ${schemaPrefix}${quoteIdentifier(name)}`);
+		pushText(`DROP ASSERTION IF EXISTS ${schemaPrefix}${quoteIdentifier(name)}`);
 	}
 
 	// Detach maintained tables (`drop maintained`) EARLY — where MV drops ran
@@ -2863,21 +2935,21 @@ export function generateMigrationDDL(diff: SchemaDiff, schemaName?: string): str
 	// flip's cross-table detach-v2 / attach-v1 pair falls out of this ordering.
 	for (const alter of diff.tablesToAlter) {
 		if (alter.dropMaintained) {
-			statements.push(`ALTER TABLE ${schemaPrefix}${quoteIdentifier(alter.tableName)} DROP MAINTAINED`);
+			pushText(`ALTER TABLE ${schemaPrefix}${quoteIdentifier(alter.tableName)} DROP MAINTAINED`);
 		}
 	}
 
 	// Drop items (reverse order)
 	for (const tableName of diff.tablesToDrop) {
-		statements.push(`DROP TABLE IF EXISTS ${schemaPrefix}${quoteIdentifier(tableName)}`);
+		pushText(`DROP TABLE IF EXISTS ${schemaPrefix}${quoteIdentifier(tableName)}`);
 	}
 
 	for (const viewName of diff.viewsToDrop) {
-		statements.push(`DROP VIEW IF EXISTS ${schemaPrefix}${quoteIdentifier(viewName)}`);
+		pushText(`DROP VIEW IF EXISTS ${schemaPrefix}${quoteIdentifier(viewName)}`);
 	}
 
 	for (const indexName of diff.indexesToDrop) {
-		statements.push(`DROP INDEX IF EXISTS ${schemaPrefix}${quoteIdentifier(indexName)}`);
+		pushText(`DROP INDEX IF EXISTS ${schemaPrefix}${quoteIdentifier(indexName)}`);
 	}
 
 	// Create new items. A fresh maintained table rides `tablesToCreate` (rendered
@@ -2906,33 +2978,33 @@ export function generateMigrationDDL(diff: SchemaDiff, schemaName?: string): str
 	for (const alter of diff.tablesToAlter) {
 		const quotedTable = `${schemaPrefix}${quoteIdentifier(alter.tableName)}`;
 		for (const r of alter.columnsToRename) {
-			statements.push(`ALTER TABLE ${quotedTable} RENAME COLUMN ${quoteIdentifier(r.oldName)} TO ${quoteIdentifier(r.newName)}`);
+			pushText(`ALTER TABLE ${quotedTable} RENAME COLUMN ${quoteIdentifier(r.oldName)} TO ${quoteIdentifier(r.newName)}`);
 		}
 		for (const colDef of alter.columnsToAdd) {
-			statements.push(`ALTER TABLE ${quotedTable} ADD COLUMN ${colDef}`);
+			pushText(`ALTER TABLE ${quotedTable} ADD COLUMN ${colDef}`);
 		}
 		for (const colAlter of alter.columnsToAlter) {
 			const quotedCol = quoteIdentifier(colAlter.columnName);
 			// A default the retype would choke on and this migration replaces anyway is
 			// cleared BEFORE the comparison-domain phase (see `dropStaleDefaultFirst`).
 			if (colAlter.dropStaleDefaultFirst) {
-				statements.push(`ALTER TABLE ${quotedTable} ALTER COLUMN ${quotedCol} DROP DEFAULT`);
+				pushText(`ALTER TABLE ${quotedTable} ALTER COLUMN ${quotedCol} DROP DEFAULT`);
 			}
 			// SET DATA TYPE / SET COLLATE lead the per-column phase (both are
 			// comparison-domain changes), before DEFAULT / NOT NULL.
-			statements.push(...comparisonDomainAlters(quotedTable, quotedCol, colAlter));
+			for (const s of comparisonDomainAlters(quotedTable, quotedCol, colAlter)) pushText(s);
 			if (colAlter.defaultValue !== undefined) {
 				if (colAlter.defaultValue === null) {
 					// Already dropped above when it preceded the retype.
 					if (!colAlter.dropStaleDefaultFirst) {
-						statements.push(`ALTER TABLE ${quotedTable} ALTER COLUMN ${quotedCol} DROP DEFAULT`);
+						pushText(`ALTER TABLE ${quotedTable} ALTER COLUMN ${quotedCol} DROP DEFAULT`);
 					}
 				} else {
-					statements.push(`ALTER TABLE ${quotedTable} ALTER COLUMN ${quotedCol} SET DEFAULT ${expressionToString(colAlter.defaultValue)}`);
+					pushText(`ALTER TABLE ${quotedTable} ALTER COLUMN ${quotedCol} SET DEFAULT ${expressionToString(colAlter.defaultValue)}`);
 				}
 			}
 			if (colAlter.notNull !== undefined) {
-				statements.push(colAlter.notNull
+				pushText(colAlter.notNull
 					? `ALTER TABLE ${quotedTable} ALTER COLUMN ${quotedCol} SET NOT NULL`
 					: `ALTER TABLE ${quotedTable} ALTER COLUMN ${quotedCol} DROP NOT NULL`);
 			}
@@ -2941,10 +3013,10 @@ export function generateMigrationDDL(diff: SchemaDiff, schemaName?: string): str
 		// conflicting constraint), both BEFORE re-adds and before the PK change so a
 		// dropped UNIQUE can't strand a PK dependency.
 		for (const r of alter.constraintsToRename ?? []) {
-			statements.push(`ALTER TABLE ${quotedTable} RENAME CONSTRAINT ${quoteIdentifier(r.oldName)} TO ${quoteIdentifier(r.newName)}`);
+			pushText(`ALTER TABLE ${quotedTable} RENAME CONSTRAINT ${quoteIdentifier(r.oldName)} TO ${quoteIdentifier(r.newName)}`);
 		}
 		for (const name of alter.constraintsToDrop ?? []) {
-			statements.push(`ALTER TABLE ${quotedTable} DROP CONSTRAINT ${quoteIdentifier(name)}`);
+			pushText(`ALTER TABLE ${quotedTable} DROP CONSTRAINT ${quoteIdentifier(name)}`);
 		}
 		if (alter.primaryKeyChange) {
 			const pkCols = alter.primaryKeyChange.newPkColumns
@@ -2954,16 +3026,16 @@ export function generateMigrationDDL(diff: SchemaDiff, schemaName?: string): str
 					return s;
 				})
 				.join(', ');
-			statements.push(`ALTER TABLE ${quotedTable} ALTER PRIMARY KEY (${pkCols})`);
+			pushText(`ALTER TABLE ${quotedTable} ALTER PRIMARY KEY (${pkCols})`);
 		}
 		// ADD CONSTRAINT after the PK change (a new UNIQUE / FK may align with the new
 		// key) and after the column adds it may reference. CHECK adds apply in-place;
 		// UNIQUE / FK adds depend on module ADD CONSTRAINT support (see constraintsToAdd).
 		for (const frag of alter.constraintsToAdd ?? []) {
-			statements.push(`ALTER TABLE ${quotedTable} ADD ${frag}`);
+			pushText(`ALTER TABLE ${quotedTable} ADD ${frag}`);
 		}
 		for (const colName of alter.columnsToDrop) {
-			statements.push(`ALTER TABLE ${quotedTable} DROP COLUMN ${quoteIdentifier(colName)}`);
+			pushText(`ALTER TABLE ${quotedTable} DROP COLUMN ${quoteIdentifier(colName)}`);
 		}
 		// Tags phase — last, so a SET TAGS lands on the post-structural column /
 		// constraint set (a tag set emitted alongside a RENAME COLUMN targets the
@@ -2974,14 +3046,14 @@ export function generateMigrationDDL(diff: SchemaDiff, schemaName?: string): str
 			// TABLE handler rejects a tag action on a maintained table). See
 			// `TableAlterDiff.maintainedTags`.
 			const tagVerb = alter.maintainedTags ? 'ALTER MATERIALIZED VIEW' : 'ALTER TABLE';
-			statements.push(`${tagVerb} ${quotedTable} SET TAGS ${tagsBodyToString(alter.tableTagsChange)}`);
+			pushText(`${tagVerb} ${quotedTable} SET TAGS ${tagsBodyToString(alter.tableTagsChange)}`);
 		}
 		for (const colAlter of alter.columnsToAlter) {
 			if (colAlter.tags === undefined) continue;
-			statements.push(`ALTER TABLE ${quotedTable} ALTER COLUMN ${quoteIdentifier(colAlter.columnName)} SET TAGS ${tagsBodyToString(colAlter.tags)}`);
+			pushText(`ALTER TABLE ${quotedTable} ALTER COLUMN ${quoteIdentifier(colAlter.columnName)} SET TAGS ${tagsBodyToString(colAlter.tags)}`);
 		}
 		for (const ctc of alter.constraintTagsChanges ?? []) {
-			statements.push(`ALTER TABLE ${quotedTable} ALTER CONSTRAINT ${quoteIdentifier(ctc.constraintName)} SET TAGS ${tagsBodyToString(ctc.tags)}`);
+			pushText(`ALTER TABLE ${quotedTable} ALTER CONSTRAINT ${quoteIdentifier(ctc.constraintName)} SET TAGS ${tagsBodyToString(ctc.tags)}`);
 		}
 	}
 
@@ -2989,8 +3061,10 @@ export function generateMigrationDDL(diff: SchemaDiff, schemaName?: string): str
 	// creates ran — after every table create/alter, so the target's final shape and
 	// the body's sources already exist (and any reshape leg's `drop maintained` +
 	// column ops have run). A same-shape re-attach reconciles content in place (a
-	// refresh, not a recreate). Rendered via `astToString` over a synthetic
-	// `set maintained as` action so the body QueryExpr round-trips exactly.
+	// refresh, not a recreate). Built as a synthetic `set maintained as` action and
+	// rendered via `astToString`, so the body QueryExpr round-trips exactly — and
+	// carried on the step so `apply schema` executes that statement rather than
+	// re-parsing the render.
 	for (const alter of diff.tablesToAlter) {
 		if (!alter.setMaintained) continue;
 		const stmt: AST.AlterTableStmt = {
@@ -3007,7 +3081,7 @@ export function generateMigrationDDL(diff: SchemaDiff, schemaName?: string): str
 				select: alter.setMaintained.select,
 			},
 		};
-		statements.push(astToString(stmt));
+		statements.push({ sql: astToString(stmt), ast: stmt });
 	}
 
 	// Assertion creates LAST — after every table alter and maintained re-attach, so
@@ -3026,10 +3100,10 @@ export function generateMigrationDDL(diff: SchemaDiff, schemaName?: string): str
 	// table's tag-only change rides the table-alter block above (`SET TAGS`), not a
 	// separate bucket.
 	for (const vtc of diff.viewTagsChanges ?? []) {
-		statements.push(`ALTER VIEW ${schemaPrefix}${quoteIdentifier(vtc.name)} SET TAGS ${tagsBodyToString(vtc.tags)}`);
+		pushText(`ALTER VIEW ${schemaPrefix}${quoteIdentifier(vtc.name)} SET TAGS ${tagsBodyToString(vtc.tags)}`);
 	}
 	for (const itc of diff.indexTagsChanges ?? []) {
-		statements.push(`ALTER INDEX ${schemaPrefix}${quoteIdentifier(itc.name)} SET TAGS ${tagsBodyToString(itc.tags)}`);
+		pushText(`ALTER INDEX ${schemaPrefix}${quoteIdentifier(itc.name)} SET TAGS ${tagsBodyToString(itc.tags)}`);
 	}
 
 	return statements;

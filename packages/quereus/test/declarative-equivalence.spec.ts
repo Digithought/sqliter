@@ -26,7 +26,7 @@
 
 import { expect } from 'chai';
 import { Database } from '../src/core/database.js';
-import { StatusCode } from '../src/common/types.js';
+import { StatusCode, type SqlValue } from '../src/common/types.js';
 import { computeSchemaHash } from '../src/schema/schema-hasher.js';
 import { computeSchemaDiff, generateMigrationDDL } from '../src/schema/schema-differ.js';
 import { collectSchemaCatalog } from '../src/schema/catalog.js';
@@ -1597,7 +1597,7 @@ describe('declarative-equivalence: materialized views', () => {
 			);
 			expect(diff.tablesToAlter.find(a => a.tableName === 'mv'), 'no alter — the recreate subsumes it').to.be.undefined;
 			expect(diff.tablesToDrop, 'mv dropped for the recreate').to.deep.equal(['mv']);
-			expect(diff.tablesToCreate.some(s => /create\s+materialized\s+view\s+mv\b/i.test(s) && /mem2/i.test(s)), 'mv recreated using mem2').to.be.true;
+			expect(diff.tablesToCreate.map(c => c.sql).some(s => /create\s+materialized\s+view\s+mv\b/i.test(s) && /mem2/i.test(s)), 'mv recreated using mem2').to.be.true;
 			expect(diff.maintainedModuleMigrations, 'one module migration recorded').to.deep.equal([
 				{ name: 'mv', fromModule: 'memory', toModule: 'mem2' },
 			]);
@@ -1656,7 +1656,7 @@ describe('declarative-equivalence: materialized views', () => {
 			);
 			expect(diff.tablesToAlter.find(a => a.tableName === 'mv'), 'no alter — recreate subsumes it').to.be.undefined;
 			expect(diff.tablesToDrop, 'mv dropped for the recreate').to.deep.equal(['mv']);
-			expect(diff.tablesToCreate.some(s => /create\s+materialized\s+view\s+mv\b/i.test(s) && /mem2/i.test(s)), 'mv recreated using mem2').to.be.true;
+			expect(diff.tablesToCreate.map(c => c.sql).some(s => /create\s+materialized\s+view\s+mv\b/i.test(s) && /mem2/i.test(s)), 'mv recreated using mem2').to.be.true;
 			expect(diff.maintainedModuleMigrations, 'one args-only module migration recorded').to.deep.equal([
 				{ name: 'mv', fromModule: `mem2(k="a")`, toModule: `mem2(k="b")` },
 			]);
@@ -1793,7 +1793,7 @@ describe('declarative-equivalence: materialized views', () => {
 			// The drop targets the NEW name (the just-renamed live incarnation), not the old.
 			expect(diff.tablesToDrop, 'drop targets the new declared name mv2').to.deep.equal(['mv2']);
 			expect(
-				diff.tablesToCreate.some(s => /create\s+materialized\s+view\s+mv2\b/i.test(s) && /mem2/i.test(s)),
+				diff.tablesToCreate.map(c => c.sql).some(s => /create\s+materialized\s+view\s+mv2\b/i.test(s) && /mem2/i.test(s)),
 				'mv2 recreated using mem2',
 			).to.be.true;
 			expect(diff.maintainedModuleMigrations, 'one module migration recorded under the new name').to.deep.equal([
@@ -1842,7 +1842,7 @@ describe('declarative-equivalence: materialized views', () => {
 			// one migration, the drop+recreate, and NO `set maintained as` alter for mv.
 			expect(diff.maintainedModuleMigrations.length, 'one migration only').to.equal(1);
 			expect(diff.tablesToDrop, 'mv dropped once').to.deep.equal(['mv']);
-			expect(diff.tablesToCreate.some(s => /create\s+materialized\s+view\s+mv\b/i.test(s) && /mem2/i.test(s)), 'recreate carries new module').to.be.true;
+			expect(diff.tablesToCreate.map(c => c.sql).some(s => /create\s+materialized\s+view\s+mv\b/i.test(s) && /mem2/i.test(s)), 'recreate carries new module').to.be.true;
 			expect(diff.tablesToAlter.find(a => a.tableName === 'mv'), 'no separate re-attach alter for mv').to.be.undefined;
 		} finally {
 			await db.close();
@@ -1880,7 +1880,7 @@ describe('declarative-equivalence: materialized views', () => {
 			expect(diff.tablesToDrop, 'mvt dropped for the recreate').to.deep.equal(['mvt']);
 			// Recreate renders the declared-shape `create table … maintained as` form
 			// (NOT the MV-sugar) and carries the moved module.
-			expect(diff.tablesToCreate.some(s => /create\s+table\s+(?:"mvt"|mvt)\b/i.test(s) && /maintained\s+as/i.test(s) && /mem2/i.test(s)),
+			expect(diff.tablesToCreate.map(c => c.sql).some(s => /create\s+table\s+(?:"mvt"|mvt)\b/i.test(s) && /maintained\s+as/i.test(s) && /mem2/i.test(s)),
 				'recreate is a create-table-maintained-as carrying mem2').to.be.true;
 			expect(diff.tablesToAlter.find(a => a.tableName === 'mvt'), 'no orphaned alter for mvt').to.be.undefined;
 
@@ -1926,7 +1926,7 @@ describe('declarative-equivalence: materialized views', () => {
 			).to.be.true;
 			expect(diff.tablesToDrop, 'drop targets the new declared name mvt2').to.deep.equal(['mvt2']);
 			expect(
-				diff.tablesToCreate.some(s => /create\s+table\s+(?:"mvt2"|mvt2)\b/i.test(s) && /maintained\s+as/i.test(s) && /mem2/i.test(s)),
+				diff.tablesToCreate.map(c => c.sql).some(s => /create\s+table\s+(?:"mvt2"|mvt2)\b/i.test(s) && /maintained\s+as/i.test(s) && /mem2/i.test(s)),
 				'recreate is a create-table-maintained-as carrying mem2 under the new name',
 			).to.be.true;
 			expect(diff.maintainedModuleMigrations, 'one module migration recorded under the new name').to.deep.equal([
@@ -4918,6 +4918,93 @@ describe('declarative-equivalence: default_collation', () => {
 				'explicit COLLATE NOCASE survives a BINARY-session replay').to.equal('NOCASE');
 		} finally {
 			await replay.close();
+		}
+	});
+});
+
+/**
+ * `apply schema` executes the migration plan's statement ASTs directly rather than
+ * re-parsing the DDL it just rendered (see `generateMigrationPlan`). These guard the
+ * three hazards that swap introduces: the executed AST is now SHARED with the stored
+ * declaration (a `main`-schema apply hands the executor the very node
+ * `DeclaredSchemaManager` holds), schema qualification must ride the AST and not just
+ * the text, and the whole thing must still converge on a re-apply.
+ */
+describe('declarative-equivalence: apply executes the plan AST', () => {
+	const FULL_SCHEMA = `
+		table t { id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE, qty INTEGER default 0 }
+		table src { id INTEGER PRIMARY KEY, qty INTEGER }
+		view v as select id, name from t where qty > 0
+		materialized view mv as select id, qty from src
+		index idx_t_name on t (name)
+		assertion a_qty check (not exists (select 1 from t where qty < 0))
+	`;
+
+	it('does not mutate the stored declaration', async function () {
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {${FULL_SCHEMA}}`);
+			// Clone BEFORE the apply. Today's text round-trip handed the executor a fresh
+			// parse every time; executing the stored AST would expose any planner/builder
+			// mutation of statement nodes as declaration drift.
+			const before = structuredClone(db.declaredSchemaManager.getDeclaredSchema('main')!);
+			await db.exec('apply schema main');
+			expect(db.declaredSchemaManager.getDeclaredSchema('main'), 'apply left the stored declaration untouched')
+				.to.deep.equal(before);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('converges: a second apply produces an empty migration', async function () {
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {${FULL_SCHEMA}}`);
+			await db.exec('apply schema main');
+			const diff2 = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			expect(generateMigrationDDL(diff2, 'main'), 're-diff after apply is empty').to.deep.equal([]);
+			// And the re-apply itself is a clean no-op.
+			await db.exec('apply schema main');
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('lands every object in a non-main target schema', async function () {
+		const db = new Database();
+		try {
+			await db.exec(`declare schema analytics {${FULL_SCHEMA}}`);
+			await db.exec('apply schema analytics');
+
+			const catalog = collectSchemaCatalog(db, 'analytics');
+			expect(catalog.tables.map(x => x.name).sort(), 'tables + maintained table in analytics')
+				.to.deep.equal(['mv', 'src', 't']);
+			expect(catalog.views.map(x => x.name), 'view in analytics').to.deep.equal(['v']);
+			expect(catalog.indexes.map(x => x.name), 'index in analytics').to.include('idx_t_name');
+			expect(catalog.assertions.map(x => x.name), 'assertion in analytics').to.deep.equal(['a_qty']);
+
+			// Nothing leaked into main.
+			const mainCatalog = collectSchemaCatalog(db, 'main');
+			expect(mainCatalog.tables, 'no tables leaked into main').to.deep.equal([]);
+			expect(mainCatalog.views, 'no views leaked into main').to.deep.equal([]);
+
+			// The objects are usable where they landed.
+			await db.exec("insert into analytics.t values (1, 'a', 5)");
+			const names: SqlValue[] = [];
+			for await (const row of db.eval('select name from analytics.v')) names.push(row.name);
+			expect(names, 'the landed view queries the landed table').to.deep.equal(['a']);
+
+			// Converges on re-apply too.
+			const diff2 = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('analytics')!,
+				collectSchemaCatalog(db, 'analytics'),
+			);
+			expect(generateMigrationDDL(diff2, 'analytics'), 're-diff of a non-main schema is empty').to.deep.equal([]);
+		} finally {
+			await db.close();
 		}
 	});
 });

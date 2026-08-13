@@ -9,7 +9,7 @@
 import { Database } from '../dist/src/core/database.js';
 import { Parser } from '../dist/src/parser/parser.js';
 import { collectSchemaCatalog } from '../dist/src/schema/catalog.js';
-import { computeSchemaDiff, generateMigrationDDL } from '../dist/src/schema/schema-differ.js';
+import { computeSchemaDiff, generateMigrationDDL, generateMigrationPlan } from '../dist/src/schema/schema-differ.js';
 
 const TABLES = 54;
 const VIEWS = 14;
@@ -86,6 +86,44 @@ async function timedApply(declaration) {
 	return { totalNs, planNs, parseNs, parseCalls };
 }
 
+/**
+ * A/B of the migration loop alone — the only thing the plan-representation change
+ * touched. `mode: 'ast'` is today's apply path (execute each plan step's statement
+ * AST when it has one); `mode: 'text'` reproduces the pre-change path exactly
+ * (parse the rendered DDL, then execute). Catalog collection, diff and render are
+ * identical in both arms, so the delta between them IS the removed re-lex/re-parse
+ * leg — measured on one machine, in one process, at the same JIT state.
+ *
+ * Runs outside `emitApplySchema`'s mutex / statement machinery and skips the
+ * module batch hooks, so these totals sit slightly below `apply schema total`
+ * above. Compare the two arms to each other, not to that number.
+ */
+async function timedMigrateLoop(declaration, mode) {
+	const db = new Database();
+	await db.exec(declaration);
+	const declared = db.declaredSchemaManager.getDeclaredSchema('main');
+	const collation = db.options.getStringOption('default_collation');
+
+	let parseNs = 0n;
+	const realParseSql = db._parseSql.bind(db);
+	db._parseSql = (sql) => {
+		const t = process.hrtime.bigint();
+		try { return realParseSql(sql); } finally { parseNs += process.hrtime.bigint() - t; }
+	};
+
+	const t0 = process.hrtime.bigint();
+	const diff = computeSchemaDiff(declared, collectSchemaCatalog(db, 'main'), 'allow', collation);
+	const plan = generateMigrationPlan(diff, 'main');
+	for (const step of plan) {
+		if (mode === 'ast' && step.ast) await db._execAstWithinTransaction([step.ast]);
+		else await db._execWithinTransaction(step.sql);
+	}
+	const totalNs = process.hrtime.bigint() - t0;
+
+	await db.close();
+	return { totalNs, parseNs };
+}
+
 async function main() {
 	const declaration = buildDeclaration();
 	console.log(`declaration: ${TABLES} tables, ${VIEWS} views, ${(declaration.length / 1024).toFixed(1)} KB`);
@@ -142,6 +180,25 @@ async function main() {
 	console.log(`  emit + run + rest:       ${rest.toFixed(2)} ms  (${(rest / total * 100).toFixed(1)}%)`);
 
 	await fresh.close();
+
+	// A/B the migration loop itself: today's AST path vs the pre-change text path.
+	for (const mode of ['text', 'ast']) {
+		for (let i = 0; i < 3; i++) await timedMigrateLoop(declaration, mode);
+	}
+	const loopRuns = { text: [], ast: [] };
+	for (let i = 0; i < RUNS; i++) {
+		for (const mode of ['text', 'ast']) loopRuns[mode].push(await timedMigrateLoop(declaration, mode));
+	}
+	const loopMedian = (mode, pick) => {
+		const v = loopRuns[mode].map(pick).map(Number).sort((a, b) => a - b);
+		return v[Math.floor(v.length / 2)];
+	};
+	const textTotal = ms(loopMedian('text', r => r.totalNs));
+	const astTotal = ms(loopMedian('ast', r => r.totalNs));
+	console.log(`\nmigration loop A/B (diff + render + execute; median of ${RUNS}, no mutex/batch-hook overhead):`);
+	console.log(`  text path (pre-change):  ${textTotal.toFixed(2)} ms   parse leg ${ms(loopMedian('text', r => r.parseNs)).toFixed(2)} ms`);
+	console.log(`  AST path (current):      ${astTotal.toFixed(2)} ms   parse leg ${ms(loopMedian('ast', r => r.parseNs)).toFixed(2)} ms`);
+	console.log(`  delta:                   ${(textTotal - astTotal).toFixed(2)} ms  (${((1 - astTotal / textTotal) * 100).toFixed(1)}% of the text-path loop)`);
 }
 
 main().catch(e => { console.error(e); process.exit(1); });
