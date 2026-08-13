@@ -427,6 +427,22 @@ export function emitExplainSchema(plan: PlanNode, _ctx: EmissionContext): Instru
  * Modules that opt in via `beginSchemaBatch` may fold the entire
  * APPLY SCHEMA into a single substrate commit. Modules without the hook
  * pay nothing — they're filtered out before the loop.
+ *
+ * A step that carries its AST is executed directly — the differ rendered `step.sql`
+ * FROM that statement, so re-lexing it would rebuild the same tree. Template-built
+ * steps (renames, drops, alters, SET TAGS) carry no AST and take the parsing path.
+ * Both branches report `step.sql` on failure, so the error text is identical either way.
+ *
+ * NOTE: for a `main`-schema apply the AST handed to the executor is the very node
+ * `DeclaredSchemaManager` holds (the `applyTableDefaults` / `applyViewSchemaDefault` /
+ * `applyAssertionSchemaDefault` qualifiers return the input unchanged when there is
+ * nothing to qualify), so the executor shares it with the stored declaration rather
+ * than getting a fresh parse. That is safe today — the planner/builder treat statement
+ * ASTs as read-only (`_executeSingleStatement` rebuilds a plan per call; no cache keys
+ * off AST identity), and `declarative-equivalence.spec.ts` § "apply executes the plan
+ * AST" asserts the stored declaration is unchanged after an apply. If a builder ever
+ * starts mutating statement nodes in place, clone per step here (still far cheaper
+ * than parsing).
  */
 async function runBatchedMigrationLoop(
 	db: Database,
@@ -440,23 +456,6 @@ async function runBatchedMigrationLoop(
 			const ddl = step.sql;
 			log('Executing migration DDL: %s', ddl);
 			try {
-				// A step that carries its AST is executed directly — the differ rendered
-				// `ddl` FROM that statement, so re-lexing it would rebuild the same tree.
-				// Template-built steps (renames, drops, alters, SET TAGS) carry no AST and
-				// take the parsing path. Both branches report `step.sql` on failure, so the
-				// error text is identical either way.
-				//
-				// NOTE: for a `main`-schema apply the AST handed to the executor is the very
-				// node `DeclaredSchemaManager` holds (the `applyTableDefaults` /
-				// `applyViewSchemaDefault` / `applyAssertionSchemaDefault` qualifiers return
-				// the input unchanged when there is nothing to qualify), so the executor
-				// shares it with the stored declaration rather than getting a fresh parse.
-				// That is safe today — the planner/builder treat statement ASTs as read-only,
-				// and `declarative-equivalence.spec.ts` § "apply executes the plan AST" asserts
-				// the stored declaration is byte-identical after an apply. If a builder ever
-				// starts mutating statement nodes in place, clone per step here (still far
-				// cheaper than parsing).
-
 				if (step.ast) await db._execAstWithinTransaction([step.ast]);
 				else await db._execWithinTransaction(ddl);
 			} catch (e) {

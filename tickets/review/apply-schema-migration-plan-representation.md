@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-08-13T00:35:24.757Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\apply-schema-migration-plan-representation.review.2026-08-13T00-35-24-757Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: Applying a declarative schema used to convert the schema into SQL text and then immediately read that text back again; it now carries the already-parsed form alongside the text and skips the re-read, while the human-readable preview is unchanged.
 files: packages/quereus/src/schema/schema-differ.ts, packages/quereus/src/runtime/emit/schema-declarative.ts, packages/quereus/src/core/database.ts, packages/quereus/bench/apply-schema-split.mjs, packages/quereus/test/schema-differ.spec.ts, packages/quereus/test/declarative-equivalence.spec.ts, packages/quereus/test/index-ddl-roundtrip.spec.ts, packages/quereus/test/covering-structure.spec.ts, docs/schema.md
 difficulty: medium

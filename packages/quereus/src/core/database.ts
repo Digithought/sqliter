@@ -967,21 +967,17 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 */
 	async _execWithinTransaction(sql: string, params?: SqlParameters): Promise<void> {
 		log('Executing nested SQL: %s', sql);
-
-		const batch = this._parseSql(sql);
-		if (batch.length === 0) return;
-
-		// No mutex, no implicit transaction management - we're already inside a transaction
-		await this._executeStatementBatch(batch, params);
+		await this._execAstWithinTransaction(this._parseSql(sql), params);
 	}
 
 	/**
 	 * @internal
-	 * Executes an already-parsed statement batch inside the caller's transaction.
-	 * The AST-taking twin of {@link _execWithinTransaction}; same no-mutex,
-	 * no-implicit-transaction contract. Used by `APPLY SCHEMA`, whose migration plan
-	 * already holds the statement it rendered its DDL from — re-lexing that text is
-	 * pure overhead (see `generateMigrationPlan`).
+	 * Executes an already-parsed statement batch inside the caller's transaction —
+	 * no mutex, no implicit transaction management, because we are already inside one.
+	 * {@link _execWithinTransaction} is the text-taking front door onto this.
+	 * `APPLY SCHEMA` calls it directly: its migration plan already holds the statement
+	 * it rendered its DDL from, so re-lexing that text is pure overhead (see
+	 * `generateMigrationPlan`).
 	 */
 	async _execAstWithinTransaction(batch: AST.Statement[], params?: SqlParameters): Promise<void> {
 		if (batch.length === 0) return;

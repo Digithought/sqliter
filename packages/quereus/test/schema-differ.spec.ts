@@ -1293,3 +1293,132 @@ describe('generateMigrationPlan / generateMigrationDDL parity', () => {
 		expect(generateMigrationPlan(diff, 'main').map(s => s.sql)).to.deep.equal(generateMigrationDDL(diff, 'main'));
 	});
 });
+
+/**
+ * `apply schema` executes a create step's paired AST while `diff schema` previews its
+ * `sql`. That swap is only sound while the two MEAN the same statement: a renderer that
+ * drops a field would make apply do more than the preview promised, and a parser that
+ * normalizes one would make it do less.
+ *
+ * These assert the property over every create the differ can emit, rather than over a
+ * hand-picked pair — so a future field added to an AST node and forgotten in
+ * `ast-stringify` fails here instead of silently diverging preview from apply.
+ */
+describe('migration creates: the paired AST and its rendered DDL mean the same statement', () => {
+	/**
+	 * A statement's *meaning*: the AST reduced to what the schema builder actually
+	 * reads off it, so a differ-built statement and a re-parse of its own DDL compare
+	 * on content alone. Exactly four things are normalized away — everything else must
+	 * match, so a renderer that drops a real field still fails here:
+	 *
+	 * - `loc` — legitimately differs (declaration source vs generated DDL). This IS the
+	 *   documented behavior change: a create's error now sites in the declaration.
+	 * - `{ x: undefined }` vs a missing `x` — not a difference to any reader.
+	 * - collation case — the declaration keeps `COLLATE NOCASE` as written while the
+	 *   re-parse lowercases it; both reach the catalog through
+	 *   `validateCollationForType` → `normalizeCollationName` (upper-cases), so the
+	 *   resulting `ColumnSchema.collation` / `IndexSchema` collation is identical.
+	 * - `moduleArgs: {}` vs absent — `SchemaManager.resolveModuleInfo` does
+	 *   `Object.freeze(stmt.moduleArgs || {})`, collapsing the two.
+	 */
+	function astMeaning(node: unknown): unknown {
+		if (Array.isArray(node)) return node.map(astMeaning);
+		if (node === null || typeof node !== 'object') return node;
+		const out: Record<string, unknown> = {};
+		for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+			if (key === 'loc' || value === undefined) continue;
+			if (key === 'moduleArgs' && value !== null && typeof value === 'object' && Object.keys(value).length === 0) continue;
+			out[key] = key === 'collation' && typeof value === 'string' ? value.toUpperCase() : astMeaning(value);
+		}
+		return out;
+	}
+
+	/** Every create the differ emitted, across all four buckets. */
+	function allCreates(diff: SchemaDiff): MigrationCreate[] {
+		return [...diff.tablesToCreate, ...diff.viewsToCreate, ...diff.indexesToCreate, ...diff.assertionsToCreate];
+	}
+
+	function expectCreatesRoundTrip(declaration: string, expectedCount: number, schemaName = 'main'): void {
+		const diff = computeSchemaDiff(parseDeclaredSchema(declaration), { ...makeCatalog(), schemaName });
+		const creates = allCreates(diff);
+		expect(creates.length, 'creates emitted').to.equal(expectedCount);
+		for (const create of creates) {
+			expect(astMeaning(new Parser().parse(create.sql)), `re-parse of: ${create.sql}`)
+				.to.deep.equal(astMeaning(create.ast));
+		}
+	}
+
+	it('a table carrying every column/table-level feature the renderer emits', () => {
+		expectCreatesRoundTrip(`declare schema main {
+			table t {
+				id INTEGER PRIMARY KEY,
+				name TEXT COLLATE NOCASE NOT NULL,
+				email TEXT constraint uq_email UNIQUE,
+				qty INTEGER default 7,
+				note TEXT default 'hi',
+				total INTEGER generated always as (qty * 2) stored,
+				flag INTEGER with tags (owner = 'a'),
+				constraint ck_qty check (qty >= 0)
+			} with tags (owner = 't')
+		}`, 1);
+	});
+
+	it('a table with an explicit backing module and a mutation-context clause', () => {
+		expectCreatesRoundTrip(`declare schema main {
+			table t using memory (k = 'v') {
+				id INTEGER PRIMARY KEY
+			} with context (actor TEXT, trace TEXT NULL)
+		}`, 1);
+	});
+
+	it('a table with a composite primary key and a foreign key', () => {
+		expectCreatesRoundTrip(`declare schema main {
+			table parent { id INTEGER PRIMARY KEY, code TEXT }
+			table child {
+				a INTEGER,
+				b INTEGER,
+				parent_id INTEGER references parent (id),
+				primary key (a, b desc)
+			}
+		}`, 2);
+	});
+
+	it('a view with an explicit column list, insert defaults and tags', () => {
+		expectCreatesRoundTrip(`declare schema main {
+			table t { id INTEGER PRIMARY KEY, qty INTEGER, created INTEGER }
+			view v (vid, vqty) as select id, qty from t where qty > 0 with defaults (created = 222) with tags (owner = 'v')
+		}`, 2);
+	});
+
+	it('indexes: unique, descending, partial, per-column collation and tags', () => {
+		expectCreatesRoundTrip(`declare schema main {
+			table t { id INTEGER PRIMARY KEY, name TEXT, active INTEGER }
+			unique index idx_a on t (name collate nocase, active desc) where active = 1 with tags (purpose = 'b')
+			index idx_b on t (active)
+		}`, 3);
+	});
+
+	it('maintained tables: the materialized-view sugar and the declared-shape form', () => {
+		expectCreatesRoundTrip(`declare schema main {
+			table src { id INTEGER PRIMARY KEY, qty INTEGER }
+			materialized view mv (mid, mqty) as select id, qty from src
+			table mvt { id INTEGER PRIMARY KEY, qty INTEGER } maintained as select id, qty from src
+		}`, 3);
+	});
+
+	it('an assertion body', () => {
+		expectCreatesRoundTrip(`declare schema main {
+			table t { id INTEGER PRIMARY KEY, qty INTEGER }
+			assertion a1 check (not exists (select 1 from t where qty < 0))
+		}`, 2);
+	});
+
+	it('holds under a non-main target schema, where the qualifiers rewrite the AST', () => {
+		expectCreatesRoundTrip(`declare schema analytics {
+			table t { id INTEGER PRIMARY KEY, name TEXT }
+			view v as select id from t
+			index idx_t on t (name)
+			assertion a1 check (not exists (select 1 from t where id < 0))
+		}`, 4, 'analytics');
+	});
+});
