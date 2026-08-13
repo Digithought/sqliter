@@ -14,6 +14,7 @@ import type { Database } from '../../core/database.js';
 import type { AnyVirtualTableModule } from '../../vtab/module.js';
 import type { TableSchema } from '../../schema/table.js';
 import { quoteIdentifier } from '../../emit/ast-stringify.js';
+import { spineCloneAst } from '../../util/ast-spine-clone.js';
 
 const log = createLogger('runtime:emit:declare');
 
@@ -428,21 +429,33 @@ export function emitExplainSchema(plan: PlanNode, _ctx: EmissionContext): Instru
  * APPLY SCHEMA into a single substrate commit. Modules without the hook
  * pay nothing — they're filtered out before the loop.
  *
- * A step that carries its AST is executed directly — the differ rendered `step.sql`
- * FROM that statement, so re-lexing it would rebuild the same tree. Template-built
- * steps (renames, drops, alters, SET TAGS) carry no AST and take the parsing path.
- * Both branches report `step.sql` on failure, so the error text is identical either way.
+ * A step that carries its AST is executed on a spine clone of it — the differ rendered
+ * `step.sql` FROM that statement, so re-lexing it would rebuild the same tree, but the
+ * plan's own node must not escape into the catalog (see below). Template-built steps
+ * (renames, drops, alters, SET TAGS) carry no AST and take the parsing path. Both
+ * branches report `step.sql` on failure, so the error text is identical either way.
  *
- * NOTE: for a `main`-schema apply the AST handed to the executor is the very node
- * `DeclaredSchemaManager` holds (the `applyTableDefaults` / `applyViewSchemaDefault` /
- * `applyAssertionSchemaDefault` qualifiers return the input unchanged when there is
- * nothing to qualify), so the executor shares it with the stored declaration rather
- * than getting a fresh parse. That is safe today — the planner/builder treat statement
- * ASTs as read-only (`_executeSingleStatement` rebuilds a plan per call; no cache keys
- * off AST identity), and `declarative-equivalence.spec.ts` § "apply executes the plan
- * AST" asserts the stored declaration is unchanged after an apply. If a builder ever
- * starts mutating statement nodes in place, clone per step here (still far cheaper
- * than parsing).
+ * The clone is NOT optional. A plan step's AST is (a subtree of) the statement
+ * `DeclaredSchemaManager` holds — the schema qualifiers spread only the outermost node,
+ * so a view's `select`, an assertion's body and a `set maintained as` body are the
+ * declaration's own subtrees on every target schema, main or not. The create emitters
+ * retain what they are handed (`emitCreateView` stores `plan.selectStmt` as
+ * `ViewSchema.selectAst`, and the assertion / maintained-table paths do the same), and
+ * rename propagation rewrites those catalog bodies IN PLACE (`renameTableInAst` /
+ * `renameColumnInAst` in `runtime/emit/alter-table.ts`). Without the clone, an
+ * `ALTER TABLE … RENAME` after an apply silently rewrites the stored declaration, so
+ * `diff schema` stops seeing the drift it should report.
+ * `declarative-equivalence.spec.ts` § "apply executes the plan AST" pins both halves:
+ * the apply itself leaves the declaration untouched, and so does a later rename.
+ *
+ * NOTE: the clone costs about what the parse it replaces costs, because it copies the
+ * WHOLE statement while the catalog retains only a few subtrees of it. Measured over
+ * the 68 creates of `bench/apply-schema-split.mjs`: clone 0.91 ms vs parse 1.07 ms on
+ * the 20.4 KB declaration, and clone 3.57 ms vs parse 3.13 ms on the 112.7 KB one — so
+ * the create-heavy apply nets ~3–8% off the migration loop, not the ~26–38% the
+ * uncloned version appeared to. If apply latency ever matters, the fix is to move
+ * ownership into the emitters (each copies only what it stores) and drop this blunt
+ * clone — see `tickets/backlog/debt-catalog-aliases-caller-ast`.
  */
 async function runBatchedMigrationLoop(
 	db: Database,
@@ -456,7 +469,7 @@ async function runBatchedMigrationLoop(
 			const ddl = step.sql;
 			log('Executing migration DDL: %s', ddl);
 			try {
-				if (step.ast) await db._execAstWithinTransaction([step.ast]);
+				if (step.ast) await db._execAstWithinTransaction([spineCloneAst(step.ast)]);
 				else await db._execWithinTransaction(ddl);
 			} catch (e) {
 				log('Migration failed for DDL: %s', ddl);

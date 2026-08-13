@@ -5007,4 +5007,40 @@ describe('declarative-equivalence: apply executes the plan AST', () => {
 			await db.close();
 		}
 	});
+
+	/**
+	 * The declaration must survive an apply and everything that happens AFTER it.
+	 * A plan step's AST is (a subtree of) the stored declaration, the create emitters
+	 * retain what they execute (`ViewSchema.selectAst` and friends), and rename
+	 * propagation rewrites catalog bodies in place — so without the spine clone in
+	 * `runBatchedMigrationLoop` an imperative rename edits the declaration itself and
+	 * `diff schema` stops reporting the drift. These assert the observable both ways:
+	 * the declaration is byte-identical, and the drift is still seen.
+	 */
+	for (const { what, ddl } of [
+		{ what: 'column', ddl: 'alter table t rename column name to label' },
+		{ what: 'table', ddl: 'alter table t rename to t_renamed' },
+	]) {
+		it(`a later imperative ${what} rename does not rewrite the stored declaration`, async function () {
+			const db = new Database();
+			try {
+				await db.exec(`declare schema main {${FULL_SCHEMA}}`);
+				await db.exec('apply schema main');
+				const before = structuredClone(db.declaredSchemaManager.getDeclaredSchema('main')!);
+
+				await db.exec(ddl);
+
+				expect(db.declaredSchemaManager.getDeclaredSchema('main'), `${ddl} left the declaration untouched`)
+					.to.deep.equal(before);
+				// And the drift is still visible: the rename is exactly what a re-apply must undo.
+				const diff = computeSchemaDiff(
+					db.declaredSchemaManager.getDeclaredSchema('main')!,
+					collectSchemaCatalog(db, 'main'),
+				);
+				expect(generateMigrationDDL(diff, 'main'), 'the imperative rename shows up as drift').to.not.deep.equal([]);
+			} finally {
+				await db.close();
+			}
+		});
+	}
 });

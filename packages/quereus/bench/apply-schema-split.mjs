@@ -1,8 +1,9 @@
 /**
  * One-off measurement harness for ticket apply-schema-migration-plan-representation.
  * Splits `apply schema` wall time into: diff+render, DDL re-lex/parse,
- * plan (build+optimize), and emit+run. NOT part of the bench suite — delete after
- * the numbers are recorded.
+ * plan (build+optimize), and emit+run. NOT part of the bench suite — the sibling
+ * ticket apply-schema-unchanged-fast-path measures against it too; delete once that
+ * one lands and its numbers are recorded.
  *
  * Run: node bench/apply-schema-split.mjs [colsPerTable] (requires a built dist/)
  */
@@ -10,6 +11,7 @@ import { Database } from '../dist/src/core/database.js';
 import { Parser } from '../dist/src/parser/parser.js';
 import { collectSchemaCatalog } from '../dist/src/schema/catalog.js';
 import { computeSchemaDiff, generateMigrationDDL, generateMigrationPlan } from '../dist/src/schema/schema-differ.js';
+import { spineCloneAst } from '../dist/src/util/ast-spine-clone.js';
 
 const TABLES = 54;
 const VIEWS = 14;
@@ -115,7 +117,9 @@ async function timedMigrateLoop(declaration, mode) {
 	const diff = computeSchemaDiff(declared, collectSchemaCatalog(db, 'main'), 'allow', collation);
 	const plan = generateMigrationPlan(diff, 'main');
 	for (const step of plan) {
-		if (mode === 'ast' && step.ast) await db._execAstWithinTransaction([step.ast]);
+		// Mirrors `runBatchedMigrationLoop`, spine clone included — the clone is part of
+		// the AST path's cost, not an optimization the harness may skip.
+		if (mode === 'ast' && step.ast) await db._execAstWithinTransaction([spineCloneAst(step.ast)]);
 		else await db._execWithinTransaction(step.sql);
 	}
 	const totalNs = process.hrtime.bigint() - t0;
