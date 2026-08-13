@@ -1,6 +1,6 @@
 {
   "name": "@quereus/plugin-react-native-leveldb",
-  "version": "4.11.0",
+  "version": "4.12.0",
   "type": "module",
   "description": "React Native LevelDB storage plugin for Quereus - mobile persistent storage",
   "keywords": [
