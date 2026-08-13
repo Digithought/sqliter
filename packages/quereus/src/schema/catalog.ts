@@ -15,6 +15,13 @@ import { ENGINE_MANAGED_TABLE_TAG } from './reserved-tags.js';
 
 /**
  * Represents a catalog snapshot of the current database schema state
+ *
+ * Adding a field to this interface — or to any `Catalog*` interface below —
+ * requires a matching arm in `renderCatalogForComparison`
+ * (`schema/catalog-rendering.ts`), which decides whether the field participates
+ * in `apply schema`'s unchanged-catalog fast path. The compiler enforces it: the
+ * renderer destructures every field and hands the remainder to a
+ * `Record<string, never>` guard, so an unconsidered field fails the build.
  */
 export interface SchemaCatalog {
 	schemaName: string;
@@ -24,6 +31,7 @@ export interface SchemaCatalog {
 	assertions: CatalogAssertion[];
 }
 
+/** New field ⇒ new arm in `renderCatalogForComparison` (compiler-enforced; see {@link SchemaCatalog}). */
 export interface CatalogTable {
 	name: string;
 	ddl: string;
@@ -76,6 +84,7 @@ export interface CatalogTable {
 	};
 }
 
+/** New field ⇒ new arm in `renderCatalogForComparison` (compiler-enforced; see {@link SchemaCatalog}). */
 export interface CatalogView {
 	name: string;
 	ddl: string;
@@ -103,6 +112,7 @@ export interface CatalogView {
 	select?: AST.QueryExpr;
 }
 
+/** New field ⇒ new arm in `renderCatalogForComparison` (compiler-enforced; see {@link SchemaCatalog}). */
 export interface CatalogIndex {
 	name: string;
 	tableName: string;
@@ -135,6 +145,7 @@ export interface CatalogIndex {
 	implicit?: boolean;
 }
 
+/** New field ⇒ new arm in `renderCatalogForComparison` (compiler-enforced; see {@link SchemaCatalog}). */
 export interface CatalogAssertion {
 	name: string;
 	ddl: string;

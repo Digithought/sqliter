@@ -451,6 +451,44 @@ Destructive changes require explicit acknowledgement. The maintained-table backi
 
 Direct `create table` / `create view` DDL and the corresponding `declare schema` + `apply schema` body are guaranteed to produce indistinguishable catalogs and runtime behaviour.
 
+### Applied-state snapshot (the unchanged-schema fast path)
+
+Re-applying an unchanged declaration used to pay for a full comparison to be told nothing changed, and `computeSchemaDiff` is two thirds to three quarters of a no-op apply's cost. `apply schema` therefore keeps, per `Database` and per (lowercased) schema name, an **applied-state snapshot**: what the declaration rendered to, what the live catalog rendered to, and the effective `default_collation`, as of the end of the last successful apply whose migration plan came out **empty**.
+
+On the next apply the physical branch collects the catalog as before, re-renders both sides, and compares. On a three-way match it skips `computeSchemaDiff` and `generateMigrationPlan` entirely; everything else — schema creation, the seed loop, the empty-plan hook behaviour — is unchanged.
+
+| | rendered by | includes |
+|---|---|---|
+| declared side | `renderDeclaredSchemaCanonical` (`schema/schema-hasher.ts`) | the `isLogical` kind prefix + `generateDeclaredDDL`, **tags included** |
+| catalog side | `renderCatalogForComparison` (`schema/catalog-rendering.ts`) | every field of every `Catalog*` interface, each category sorted so live `Map` insertion order cannot matter |
+
+**Why skipping is sound.** `computeSchemaDiff(declared, catalog, renamePolicy, defaultCollation)` reads nothing but its four arguments. On a hit, two of them render identically to the recorded strings and the third is compared directly; the remaining one, `renamePolicy`, is inert when there are no differences — there are no name-change pairs for a policy to police. (`allow_destructive` likewise only gates a non-empty `diff.maintainedModuleMigrations`.) So the diff would again be empty.
+
+**Why it is recorded only after a verified-empty plan.** At write time this process has *observed*, via a real diff, that the catalog matches the declaration. Two consequences are features rather than accidents:
+
+- The very first apply on a fresh database migrates, so it records nothing; the *second* apply diffs, finds the plan empty, and records; the third and later are fast. This preserves `apply schema`'s self-healing property — if DDL generation were ever imperfect, a repeat apply still re-diffs rather than being told by a cache that everything is fine.
+- A failed apply (a mid-migration DDL failure, a seed failure) records nothing, so the next apply reconciles in full.
+
+A snapshot is a claim about a *pair* of renderings — "these two were once verified equal" — not about a moment in time, so it survives a later re-`declare schema` (a byte-identical redeclaration still renders the same and still hits) and survives an intervening migrating apply (drift makes the compare miss; repairing the drift makes it match again). `removeDeclaredSchema` clears it, since nothing is left to compare against.
+
+**Not covered, deliberately:**
+
+- **`diff schema`** — a preview; no cache read, no cache write, ever.
+- **`explain schema`** — keeps returning the tag-stripped version hash (see [Schema Hashing](#schema-hashing)).
+- **Logical schemas / lenses** — the `isLogical` branch returns before catalog collection and has real side effects on every apply (lens compile, snapshot rotation, module notification). No fast path there.
+- **Reserved-tag warning advisories** — `computeSchemaDiff` raises tag diagnostics. The `severity:'error'` ones throw, so an apply that recorded a snapshot never had one; the `severity:'warning'` ones go to a debug logger and are not re-logged on a fast-pathed apply. This is the one observable difference, and it is debug-log-only.
+- **A second `Database` over the same store, or a store reopen** — each connection has its own `DeclaredSchemaManager` and starts with an empty snapshot map, so it always reconciles first. In particular this does **not** help the declare-and-apply-once-per-process-start case; serving that needs the snapshot persisted alongside the catalog.
+
+Measured on the synthetic 54-table / 14-view declaration of `bench/apply-schema-unchanged.mjs` (median of 9, one Windows box — treat the ratios as the finding):
+
+| declaration | full-diff no-op | fast-pathed no-op | |
+|---|---|---|---|
+| 20.4 KB | 1.52 ms | 0.64 ms | 58% off |
+| 62.9 KB | 3.13 ms | 1.14 ms | 64% off |
+| 112.7 KB | 5.64 ms | 1.52 ms | 73% off |
+
+The fast path removes `computeSchemaDiff` (0.86 / 2.30 / 4.35 ms) and adds a catalog render plus a string compare (0.17 / 0.40 / 0.56 ms and 0.004 / 0.012 / 0.017 ms); `collectSchemaCatalog` (0.26 / 0.46 / 0.67 ms) is still paid on both paths. Storing the rendered strings rather than hashing them is what makes the comparison exact — the cost is memory proportional to the schema's DDL (309 KB catalog + 109 KB declaration at the top size measured).
+
 ### Logical schemas and lenses
 
 `declare logical schema X { ... }` declares a design-only schema (`kind: 'logical'`) — columns and *logical* constraints, no module / index / storage. At `apply schema X` the lens compiler aligns each logical table against a basis schema and registers an inlined effective view body, so reads ride the standard view path and writes ride [view updateability](view-updateability.md).
@@ -523,6 +561,7 @@ Declared schemas can include seed data (`seed <tableName> values ...`). Under `a
 
 1. Each declared seed row is written as `INSERT INTO <tbl> VALUES (…) ON CONFLICT (<pk-cols>) DO NOTHING` — **idempotent**: a re-apply skips seed PKs already present rather than colliding. User-edited and non-seed rows stay in place, so a reopen never destroys user data and fires no `ON DELETE CASCADE`. (A table whose PK is empty — a `primary key ()` singleton — falls back to the untargeted `ON CONFLICT DO NOTHING`.)
 2. Per-table, after all structural migrations complete (and after `endSchemaBatch` fires).
+3. On **both** apply paths. The [applied-state snapshot](#applied-state-snapshot-the-unchanged-schema-fast-path) elides the diff and the migration plan, nothing else — so a table emptied since the last apply gets its seed rows back, which is the behaviour a user relies on and the only reading consistent with "observably indistinguishable from a full apply whose diff came out empty". Seeding is idempotent, so the repeat costs no correctness.
 
 **One block per table** (SCH-003): `setSeedData` overwrites by key, so a repeat drops the first block's rows. `declare schema` rejects it before storing anything; the differ never sees `seed` items, so the guard cannot live at diff time.
 
@@ -545,6 +584,8 @@ explain schema main version '2.0';
 -- Returns: version:2.0,hash:a1b2c3d4
 ```
 
+**The version hash and the reconciliation rendering are different strings, deliberately.** Both go through `renderDeclaredSchemaCanonical` (`schema/schema-hasher.ts`), but `computeSchemaHash` calls it on a **tag-stripped** copy first, because tags are non-behavioral metadata and must not move a schema's version. The differ, by contrast, *does* diff tags and emits `ALTER … SET TAGS` steps for them — so the [applied-state snapshot](#applied-state-snapshot-the-unchanged-schema-fast-path) uses the tags-**inclusive** rendering. Reusing the version hash there would silently skip a tag-only edit. Do not conflate the two.
+
 ### DeclaredSchemaManager API
 
 The `DeclaredSchemaManager` (via `db.declaredSchemaManager`) stores declared schema ASTs and seed data between `declare schema` and `apply schema` calls.
@@ -559,8 +600,11 @@ The `DeclaredSchemaManager` (via `db.declaredSchemaManager`) stores declared sch
 | `getSeedData(schemaName, tableName)` | Retrieves seed data for a specific table |
 | `getAllSeedData(schemaName)` | Returns all seed data for a schema (`Map<string, SqlValue[][]>`) |
 | `clearSeedData(schemaName)` | Clears all seed data for a schema |
+| `getDeclaredRendering(schemaName)` | Canonical **tags-inclusive** rendering of the stored declaration (memoized), or `undefined` |
+| `getAppliedSnapshot(schemaName)` | The [applied-state snapshot](#applied-state-snapshot-the-unchanged-schema-fast-path), or `undefined` |
+| `setAppliedSnapshot(schemaName, snapshot)` | Records one — only valid after an apply that succeeded **and** produced an empty plan |
 
-All name lookups are case-insensitive. The manager is stateful: re-declaring a schema clears its seed data and replaces earlier state.
+All name lookups are case-insensitive. The manager is stateful: re-declaring a schema clears its seed data and replaces earlier state. Re-declaring also drops the memoized rendering (it described the previous declaration) but **keeps** the applied snapshot, so a byte-identical redeclaration still takes the fast path; `removeDeclaredSchema` drops both.
 
 ## Aggregate Function Algebra
 

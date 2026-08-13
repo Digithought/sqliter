@@ -5,6 +5,7 @@ import { createLogger } from '../../common/logger.js';
 import { StatusCode, type Row, type SqlValue } from '../../common/types.js';
 import { QuereusError } from '../../common/errors.js';
 import { collectSchemaCatalog } from '../../schema/catalog.js';
+import { renderCatalogForComparison } from '../../schema/catalog-rendering.js';
 import { computeSchemaDiff, generateMigrationDDL, generateMigrationPlan, type MigrationStep } from '../../schema/schema-differ.js';
 import { computeShortSchemaHash } from '../../schema/schema-hasher.js';
 import { deployLogicalSchema } from '../../schema/lens-compiler.js';
@@ -272,40 +273,81 @@ export function emitApplySchema(plan: PlanNode, _ctx: EmissionContext): Instruct
 		// Collect actual catalog
 		const actualCatalog = collectSchemaCatalog(rctx.db, schemaName);
 
-		// Compute diff (default rename_policy = 'allow' when unspecified). Thread the
-		// live default_collation so an omitted-COLLATE declared column resolves to the
-		// same effective collation the CREATE path produces — keeping a fresh apply at
-		// parity with direct DDL and a re-apply idempotent under a non-BINARY default.
-		const diff = computeSchemaDiff(declaredSchema, actualCatalog, applyStmt.options?.renamePolicy ?? 'allow', rctx.db.options.getStringOption('default_collation'));
+		const defaultCollation = rctx.db.options.getStringOption('default_collation');
 
-		// Acknowledgement gate: a backing-module change on a maintained table is a
-		// destructive incarnation-minting move (drop + recreate — fires
-		// materialized_view_removed then _added, so row identity changes for a
-		// replicated/synced table). Refuse to execute it unless the user opted in via
-		// `options (allow_destructive = true)`. The whole apply aborts here, BEFORE any
-		// DDL runs, so no partial migration occurs. (`diff schema` does NOT gate — it
-		// is a read-only preview and surfaces the DROP/recreate DDL unconditionally.)
-		if (diff.maintainedModuleMigrations.length > 0 && !applyStmt.options?.allowDestructive) {
-			const names = diff.maintainedModuleMigrations.map(m => `'${m.name}'`).join(', ');
-			throw new QuereusError(
-				`apply schema '${schemaName}': backing-module change on maintained table(s) ${names} is destructive ` +
-				`(drop + recreate, new incarnation). Re-run with options (allow_destructive = true) to migrate the backing.`,
-				StatusCode.ERROR,
-			);
-		}
+		// Applied-state fast path. If both sides render to exactly what they rendered
+		// to at the end of the last successful, verified-no-op apply — and the
+		// effective default_collation is unchanged — the diff would again be empty,
+		// so skip it. `computeSchemaDiff` reads nothing but its four arguments; the
+		// remaining one, `renamePolicy`, is inert when there are no differences (no
+		// name-change pairs for a policy to police), and `allow_destructive` only
+		// gates a non-empty `diff.maintainedModuleMigrations`. So the skip is
+		// behaviour-preserving. See docs/schema.md § Applied-state snapshot.
+		const catalogRendering = renderCatalogForComparison(actualCatalog);
+		const declaredRendering = rctx.db.declaredSchemaManager.getDeclaredRendering(schemaName);
+		const snapshot = rctx.db.declaredSchemaManager.getAppliedSnapshot(schemaName);
+		const unchanged = snapshot !== undefined
+			&& declaredRendering !== undefined
+			&& snapshot.declaredRendering === declaredRendering
+			&& snapshot.catalogRendering === catalogRendering
+			&& snapshot.defaultCollation === defaultCollation;
 
-		// Build the migration plan. Same ordering (and same DDL text) `diff schema`
-		// previews; the create steps additionally carry the statement they were
-		// rendered from, so the loop below skips re-parsing them.
-		const migrationStatements = generateMigrationPlan(diff, schemaName);
+		// True when this apply may record a snapshot: nothing needed doing. Set by the
+		// fast path, or by a full reconcile whose plan came out empty.
+		let verifiedNoOp = unchanged;
 
-		// Run the migration loop. When there are no statements we keep the
-		// idempotency fast-path: no module batch hooks fire.
-		if (migrationStatements.length > 0) {
-			await runBatchedMigrationLoop(rctx.db, schemaName, migrationStatements);
+		if (unchanged) {
+			log('APPLY SCHEMA %s: catalog and declaration unchanged since last no-op apply; skipping diff', schemaName);
+		} else {
+			// Compute diff (default rename_policy = 'allow' when unspecified). Thread the
+			// live default_collation so an omitted-COLLATE declared column resolves to the
+			// same effective collation the CREATE path produces — keeping a fresh apply at
+			// parity with direct DDL and a re-apply idempotent under a non-BINARY default.
+			const diff = computeSchemaDiff(declaredSchema, actualCatalog, applyStmt.options?.renamePolicy ?? 'allow', defaultCollation);
+
+			// Acknowledgement gate: a backing-module change on a maintained table is a
+			// destructive incarnation-minting move (drop + recreate — fires
+			// materialized_view_removed then _added, so row identity changes for a
+			// replicated/synced table). Refuse to execute it unless the user opted in via
+			// `options (allow_destructive = true)`. The whole apply aborts here, BEFORE any
+			// DDL runs, so no partial migration occurs. (`diff schema` does NOT gate — it
+			// is a read-only preview and surfaces the DROP/recreate DDL unconditionally.)
+			if (diff.maintainedModuleMigrations.length > 0 && !applyStmt.options?.allowDestructive) {
+				const names = diff.maintainedModuleMigrations.map(m => `'${m.name}'`).join(', ');
+				throw new QuereusError(
+					`apply schema '${schemaName}': backing-module change on maintained table(s) ${names} is destructive ` +
+					`(drop + recreate, new incarnation). Re-run with options (allow_destructive = true) to migrate the backing.`,
+					StatusCode.ERROR,
+				);
+			}
+
+			// Build the migration plan. Same ordering (and same DDL text) `diff schema`
+			// previews; the create steps additionally carry the statement they were
+			// rendered from, so the loop below skips re-parsing them.
+			const migrationStatements = generateMigrationPlan(diff, schemaName);
+
+			// Run the migration loop. When there are no statements we keep the
+			// idempotency fast-path: no module batch hooks fire.
+			if (migrationStatements.length > 0) {
+				await runBatchedMigrationLoop(rctx.db, schemaName, migrationStatements);
+			}
+
+			// A migrating apply records nothing: `catalogRendering` describes the
+			// PRE-migration catalog, and re-collecting post-migration would assert an
+			// equivalence this apply never verified with a diff. The next apply does a
+			// full diff, finds it empty, and records then — which is what preserves
+			// `apply schema`'s self-healing property (a repeat apply always re-diffs
+			// rather than being told by a cache that everything is fine).
+			verifiedNoOp = migrationStatements.length === 0;
 		}
 
 		// Apply seed data if requested.
+		//
+		// Runs on BOTH paths — the applied-state fast path elides the diff and the
+		// migration plan, nothing else. A table emptied since the last apply gets its
+		// seed rows back, which is the behaviour a user relies on and the only reading
+		// consistent with "observably indistinguishable from a full apply whose diff
+		// came out empty". Seeding is idempotent, so the repeat costs no correctness.
 		//
 		// Seed application is idempotent: each row is written as
 		// `INSERT INTO <tbl> VALUES (…) ON CONFLICT (<pk>) DO NOTHING`. An existing
@@ -381,6 +423,23 @@ export function emitApplySchema(plan: PlanNode, _ctx: EmissionContext): Instruct
 			}
 		}
 
+		// Record the applied-state snapshot. Only reached when nothing threw AND the
+		// apply was a verified no-op, so `catalogRendering` (collected at the top of
+		// this run, before any DDL could have executed) still describes the live
+		// catalog, and a real diff has confirmed catalog ≡ declaration.
+		//
+		// NOTE: catalog DDL is not rolled back today (see the comment above
+		// `emitApplySchema`), so a transaction that unwinds after an apply cannot
+		// leave this snapshot describing a state the catalog is not in. If catalog DDL
+		// ever becomes rollback-able, the snapshot must be invalidated on rollback.
+		if (verifiedNoOp && declaredRendering !== undefined) {
+			rctx.db.declaredSchemaManager.setAppliedSnapshot(schemaName, {
+				declaredRendering,
+				catalogRendering,
+				defaultCollation,
+			});
+		}
+
 		// Return empty row to satisfy type system (void result)
 		return [];
 	};
@@ -450,7 +509,8 @@ export function emitExplainSchema(plan: PlanNode, _ctx: EmissionContext): Instru
  *
  * NOTE: the clone costs about what the parse it replaces costs, because it copies the
  * WHOLE statement while the catalog retains only a few subtrees of it. Measured over
- * the 68 creates of `bench/apply-schema-split.mjs`: clone 0.91 ms vs parse 1.07 ms on
+ * 68 creates of the synthetic declaration `bench/apply-schema-unchanged.mjs` builds
+ * (harness since deleted): clone 0.91 ms vs parse 1.07 ms on
  * the 20.4 KB declaration, and clone 3.57 ms vs parse 3.13 ms on the 112.7 KB one — so
  * the create-heavy apply nets ~3–8% off the migration loop, not the ~26–38% the
  * uncloned version appeared to. If apply latency ever matters, the fix is to move

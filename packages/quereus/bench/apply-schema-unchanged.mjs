@@ -1,22 +1,30 @@
 /**
- * One-off measurement harness for ticket apply-schema-unchanged-fast-path.
- * Measures the cost of a NO-OP re-apply (`apply schema main` when the catalog
- * already matches the declaration) and splits it into the legs a fast path could
- * skip: `collectSchemaCatalog`, `computeSchemaDiff`, `generateMigrationPlan`, plus
- * the statement floor (parse + plan + emit) that no fast path can remove.
+ * Acceptance harness for the `apply schema` applied-state fast path
+ * (docs/schema.md § Applied-state snapshot).
  *
- * Then prices the three candidate "nothing changed" signals against each other:
- * a declared-side schema hash, a both-sides catalog content fingerprint (split
- * into collect / render / hash legs), and a live-object identity snapshot.
+ * Times a NO-OP re-apply — `apply schema main` when the catalog already matches
+ * the declaration — in both of its shapes, on one machine in one run:
+ *
+ *   - the **full-diff no-op**: pays `collectSchemaCatalog` + `computeSchemaDiff` +
+ *     `generateMigrationPlan` in full. This is what EVERY no-op apply cost before
+ *     the fast path landed. Forced here by poisoning the applied-state snapshot
+ *     before each timed run, so it is measured warm and in the same process as
+ *     the fast-pathed number (timing the genuine first re-apply instead would
+ *     compare a cold sample against a warm median and overstate the win).
+ *   - the **fast-pathed no-op**: both sides are re-rendered and compared; the
+ *     diff and the plan are skipped.
+ *
+ * Then prices the pieces the fast path added (catalog render, declared render,
+ * string compare) against the `computeSchemaDiff` it removed.
  *
  * NOT part of the bench suite. Run: node bench/apply-schema-unchanged.mjs [colsPerTable]
  * (requires a built dist/)
  */
 import { Database } from '../dist/src/core/database.js';
 import { collectSchemaCatalog } from '../dist/src/schema/catalog.js';
+import { renderCatalogForComparison } from '../dist/src/schema/catalog-rendering.js';
 import { computeSchemaDiff, generateMigrationPlan } from '../dist/src/schema/schema-differ.js';
-import { computeSchemaHash } from '../dist/src/schema/schema-hasher.js';
-import { fnv1aHash, toBase64Url } from '../dist/src/util/hash.js';
+import { renderDeclaredSchemaCanonical, computeSchemaHash } from '../dist/src/schema/schema-hasher.js';
 
 const TABLES = 54;
 const VIEWS = 14;
@@ -55,70 +63,55 @@ function buildDeclaration() {
 const ms = (ns) => Number(ns) / 1e6;
 const med = (xs) => { const v = [...xs].map(Number).sort((a, b) => a - b); return v[Math.floor(v.length / 2)]; };
 const time = (fn) => { const t = process.hrtime.bigint(); const r = fn(); return [process.hrtime.bigint() - t, r]; };
-
-/** The canonical string a both-sides catalog fingerprint would hash. */
-function renderCatalog(cat) {
-	return [
-		...cat.tables.map(t => `${t.ddl}${JSON.stringify(t.tags ?? null)}${t.namedConstraints.map(c => `${c.name}${c.definition}${JSON.stringify(c.tags ?? null)}`).join('')}${JSON.stringify(t.maintained ? { h: t.maintained.bodyHash, m: t.maintained.backingModuleName ?? null, a: t.maintained.backingModuleArgs ?? null } : null)}`),
-		...cat.views.map(v => `${v.name}${v.definition}${JSON.stringify(v.tags ?? null)}`),
-		...cat.indexes.map(x => `${x.name}${x.tableName}${x.definition}${JSON.stringify(x.tags ?? null)}${x.implicit ? 1 : 0}`),
-		...cat.assertions.map(a => `${a.name}${a.definition}`),
-	].join('\n');
-}
-
-/** Reference snapshot of the live schema objects — no rendering, no hashing. */
-function identitySnapshot(db) {
-	const schema = db.schemaManager.getSchema('main');
-	const refs = [];
-	for (const t of schema.getAllTables()) {
-		refs.push(t);
-		if (t.indexes) for (const i of t.indexes) refs.push(i);
-	}
-	for (const v of schema.getAllViews()) refs.push(v);
-	for (const a of schema.getAllAssertions()) refs.push(a);
-	return refs;
-}
-
-function refsEqual(a, b) {
-	if (!a || !b || a.length !== b.length) return false;
-	for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-	return true;
-}
-
-/** A db with the declaration applied once, so every later apply is a no-op. */
-async function settledDb(declaration) {
-	const db = new Database();
-	await db.exec(declaration);
-	await db.exec('apply schema main');
-	return db;
-}
+const timeAsync = async (fn) => { const t = process.hrtime.bigint(); const r = await fn(); return [process.hrtime.bigint() - t, r]; };
 
 async function main() {
 	const declaration = buildDeclaration();
 	console.log(`declaration: ${TABLES} tables, ${VIEWS} views, ${(declaration.length / 1024).toFixed(1)} KB`);
 
-	const db = await settledDb(declaration);
+	const db = new Database();
+	await db.exec(declaration);
+	// Apply #1 migrates (creates everything) — records no snapshot.
+	await db.exec('apply schema main');
+	if (db.declaredSchemaManager.getAppliedSnapshot('main')) {
+		throw new Error('expected the migrating apply to record no snapshot');
+	}
+
+	// Apply #2 diffs, finds nothing, and records.
+	await db.exec('apply schema main');
+	if (!db.declaredSchemaManager.getAppliedSnapshot('main')) {
+		throw new Error('expected the verified-no-op apply to record a snapshot');
+	}
+
 	const declared = db.declaredSchemaManager.getDeclaredSchema('main');
 	const collation = db.options.getStringOption('default_collation');
 
-	// Warm.
+	/** Forces the next apply onto the full-diff path by recording renderings that cannot match. */
+	const poisonSnapshot = () => db.declaredSchemaManager.setAppliedSnapshot('main', {
+		declaredRendering: '', catalogRendering: '', defaultCollation: '',
+	});
+
+	// Warm the fast path and every leg measured below.
 	for (let i = 0; i < 5; i++) {
+		await db.exec('apply schema main');
+		poisonSnapshot();
 		await db.exec('apply schema main');
 		const c = collectSchemaCatalog(db, 'main');
 		computeSchemaDiff(declared, c, 'allow', collation);
+		renderCatalogForComparison(c);
+		renderDeclaredSchemaCanonical(declared);
 		computeSchemaHash(declared);
-		toBase64Url(fnv1aHash(renderCatalog(c)));
-		identitySnapshot(db);
 	}
 
-	const totals = [], collectNs = [], diffNs = [], planNs = [], hashNs = [], renderNs = [], fnvNs = [], cmpNs = [], identNs = [];
+	const fastNs = [], slowNs = [], collectNs = [], diffNs = [], planNs = [], catRenderNs = [], declRenderNs = [], cmpNs = [], hashNs = [];
 	let prevText = '';
-	let stepCount = 0, catalogSize = 0, refCount = 0, identStable = true;
-	let prevRefs = identitySnapshot(db);
+	let stepCount = 0, catalogSize = 0, declaredSize = 0;
 	for (let i = 0; i < RUNS; i++) {
-		const t = process.hrtime.bigint();
-		await db.exec('apply schema main');
-		totals.push(process.hrtime.bigint() - t);
+		fastNs.push((await timeAsync(() => db.exec('apply schema main')))[0]);
+
+		// Same statement, same catalog, snapshot forced to miss → the pre-change cost.
+		poisonSnapshot();
+		slowNs.push((await timeAsync(() => db.exec('apply schema main')))[0]);
 
 		const [cNs, catalog] = time(() => collectSchemaCatalog(db, 'main'));
 		collectNs.push(cNs);
@@ -128,42 +121,40 @@ async function main() {
 		planNs.push(pNs);
 		stepCount = steps.length;
 
-		hashNs.push(time(() => computeSchemaHash(declared))[0]);
-
-		const [rNs, text] = time(() => renderCatalog(catalog));
-		renderNs.push(rNs);
+		const [rNs, text] = time(() => renderCatalogForComparison(catalog));
+		catRenderNs.push(rNs);
 		catalogSize = text.length;
-		fnvNs.push(time(() => toBase64Url(fnv1aHash(text)))[0]);
-
-		// Exact-string compare against the previously rendered catalog — the
-		// collision-free alternative to hashing it.
 		cmpNs.push(time(() => text === prevText)[0]);
 		prevText = text;
 
-		const [iNs, refs] = time(() => identitySnapshot(db));
-		identNs.push(iNs);
-		refCount = refs.length;
-		if (!refsEqual(refs, prevRefs)) identStable = false;
-		prevRefs = refs;
+		const [drNs, declText] = time(() => renderDeclaredSchemaCanonical(declared));
+		declRenderNs.push(drNs);
+		declaredSize = declText.length;
+
+		hashNs.push(time(() => computeSchemaHash(declared))[0]);
 	}
 
-	const total = ms(med(totals));
-	const pct = (n) => `${(ms(n) / total * 100).toFixed(1)}%`;
+	const full = ms(med(slowNs));
+	const fast = ms(med(fastNs));
 	console.log(`\nmigration steps on the unchanged re-apply: ${stepCount} (expected 0)`);
-	console.log(`rendered catalog size: ${(catalogSize / 1024).toFixed(1)} KB; live schema objects: ${refCount}`);
-	console.log(`object identities stable across ${RUNS} no-op applies: ${identStable}`);
-	console.log(`\nno-op \`apply schema main\` total (median of ${RUNS}): ${total.toFixed(2)} ms`);
-	console.log(`  collectSchemaCatalog:    ${ms(med(collectNs)).toFixed(2)} ms  (${pct(med(collectNs))})`);
-	console.log(`  computeSchemaDiff:       ${ms(med(diffNs)).toFixed(2)} ms  (${pct(med(diffNs))})`);
-	console.log(`  generateMigrationPlan:   ${ms(med(planNs)).toFixed(2)} ms  (${pct(med(planNs))})`);
-	const floor = total - ms(med(collectNs)) - ms(med(diffNs)) - ms(med(planNs));
-	console.log(`  statement floor (rest):  ${floor.toFixed(2)} ms  (${(floor / total * 100).toFixed(1)}%)   [parse+plan+emit of the apply stmt itself]`);
-	console.log(`\ncandidate fast-path signals:`);
-	console.log(`  declared-side computeSchemaHash:  ${ms(med(hashNs)).toFixed(2)} ms   [uncached; memoizable at declare time]`);
-	console.log(`  catalog fingerprint = collect ${ms(med(collectNs)).toFixed(2)} + render ${ms(med(renderNs)).toFixed(2)} + fnv ${ms(med(fnvNs)).toFixed(2)} = ${(ms(med(collectNs)) + ms(med(renderNs)) + ms(med(fnvNs))).toFixed(2)} ms`);
-	console.log(`  catalog render + exact compare:   collect ${ms(med(collectNs)).toFixed(2)} + render ${ms(med(renderNs)).toFixed(2)} + cmp ${ms(med(cmpNs)).toFixed(3)} = ${(ms(med(collectNs)) + ms(med(renderNs)) + ms(med(cmpNs))).toFixed(2)} ms`);
-	console.log(`  live-object identity snapshot:    ${ms(med(identNs)).toFixed(3)} ms`);
-	console.log(`  epoch-counter compare:            ~0 ms`);
+	console.log(`rendered catalog: ${(catalogSize / 1024).toFixed(1)} KB; rendered declaration: ${(declaredSize / 1024).toFixed(1)} KB`);
+	console.log(`  (both strings are retained per schema for as long as the declaration lives)`);
+
+	console.log(`\nno-op \`apply schema main\` (median of ${RUNS} each, interleaved):`);
+	console.log(`  full-diff:   ${full.toFixed(2)} ms`);
+	console.log(`  fast-pathed: ${fast.toFixed(2)} ms   (${((1 - fast / full) * 100).toFixed(0)}% off)`);
+
+	console.log(`\nwhat the fast path removes (measured out-of-band, same inputs):`);
+	console.log(`  computeSchemaDiff:       ${ms(med(diffNs)).toFixed(2)} ms`);
+	console.log(`  generateMigrationPlan:   ${ms(med(planNs)).toFixed(2)} ms`);
+	console.log(`what it adds:`);
+	console.log(`  renderCatalogForComparison: ${ms(med(catRenderNs)).toFixed(2)} ms`);
+	console.log(`  exact string compare:       ${ms(med(cmpNs)).toFixed(3)} ms`);
+	console.log(`what it still pays:`);
+	console.log(`  collectSchemaCatalog:    ${ms(med(collectNs)).toFixed(2)} ms`);
+	console.log(`\nmemoized once per \`declare schema\` (not on the fast path):`);
+	console.log(`  renderDeclaredSchemaCanonical: ${ms(med(declRenderNs)).toFixed(2)} ms   [ceiling input for the persisted-snapshot backlog ticket]`);
+	console.log(`  computeSchemaHash (for scale): ${ms(med(hashNs)).toFixed(2)} ms   [same render over a tag-stripped copy, plus FNV-1a]`);
 
 	await db.close();
 }

@@ -52,6 +52,25 @@ function stripTagsFromDeclaredSchema(schema: AST.DeclareSchemaStmt): AST.Declare
 }
 
 /**
+ * Canonical text of a declared schema — the `isLogical` kind prefix plus the
+ * generated DDL, joined by newlines.
+ *
+ * **Tags-inclusive, deliberately.** This is the reconciliation rendering: the
+ * schema differ DOES diff tags and emits `ALTER … SET TAGS` steps for them, so
+ * `apply schema`'s applied-state snapshot (see `runtime/emit/schema-declarative.ts`)
+ * must treat a tag-only edit as a change. {@link computeSchemaHash} calls this on
+ * a tag-STRIPPED copy instead, because tags must not affect schema *versioning*.
+ * One renderer, two callers, one difference — do not conflate them.
+ */
+export function renderDeclaredSchemaCanonical(declaredSchema: AST.DeclareSchemaStmt): string {
+	// Prefix the schema kind so a physical↔logical flip changes the rendering and the
+	// logical declarations (their tables / columns / constraints, emitted by
+	// generateDeclaredDDL) are covered.
+	const kindPrefix = declaredSchema.isLogical ? 'logical\n' : '';
+	return kindPrefix + generateDeclaredDDL(declaredSchema).join('\n');
+}
+
+/**
  * Computes a hash of a declared schema (or a lens block) for versioning.
  *
  * A `declare lens` block is **behavioral** — it changes what `select * from X.T`
@@ -65,16 +84,16 @@ export function computeSchemaHash(declaredSchema: AST.DeclareSchemaStmt | AST.De
 		return toBase64Url(fnv1aHash(canonicalText));
 	}
 
-	// Strip tags before generating DDL — tags are non-behavioral metadata
-	const strippedSchema = stripTagsFromDeclaredSchema(declaredSchema);
-	const ddlStatements = generateDeclaredDDL(strippedSchema);
-	// Prefix the schema kind so a physical↔logical flip changes the hash and the
-	// logical declarations (their tables / columns / constraints, emitted by
-	// generateDeclaredDDL) are covered. The basis hash lives on the basis
-	// schema's own declaration, so a logical-table removal changes this logical
-	// hash without perturbing the basis hash (asymmetric removal).
-	const kindPrefix = declaredSchema.isLogical ? 'logical\n' : '';
-	const canonicalText = kindPrefix + ddlStatements.join('\n');
+	// Strip tags before rendering — tags are non-behavioral metadata, so they must
+	// not move the version hash. This strip is the ONLY difference from the
+	// reconciliation rendering (see {@link renderDeclaredSchemaCanonical}), which
+	// keeps tags because the differ acts on them.
+	//
+	// The kind prefix inside the shared renderer makes a physical↔logical flip
+	// change the hash. The basis hash lives on the basis schema's own declaration,
+	// so a logical-table removal changes this logical hash without perturbing the
+	// basis hash (asymmetric removal).
+	const canonicalText = renderDeclaredSchemaCanonical(stripTagsFromDeclaredSchema(declaredSchema));
 
 	// Compute hash using FNV-1a algorithm and encode as base64url
 	const hashBytes = fnv1aHash(canonicalText);
