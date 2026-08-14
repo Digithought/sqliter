@@ -69,6 +69,18 @@ say nothing about a real browser. So there is now a concrete piece of work that 
 used a browser run if one existed — a scan of ~20,000 rows, timed before and after. That is
 one more small item on option 2's side of the ledger; it does not settle the call.
 
+## New evidence (2026-08-14): a real-browser-only bug actually occurred
+
+Option 1's revisit trigger — "a real-browser-only bug ships (green under the stand-in,
+broken in a browser)" — has now fired once, in the benchmark harness rather than the plugin
+itself: `bench/arms.mjs`'s `deleteDb` treated IndexedDB's `onblocked` event as fatal.
+`fake-indexeddb` never delivers `onblocked`, so all specs were green; real Chromium delivers
+it routinely on the close-then-delete pattern, which intermittently made the harness skip its
+two headline measurement arms while still reporting success. Found and fixed during review of
+`idb-native-index-bench`. The plugin's own `manager.ts` handles `onblocked` correctly, so no
+shipped-code bug — but the divergence class this ticket names is now demonstrated, not
+hypothetical.
+
 ## Already settled — do not re-open here
 
 The **default** test harness for IndexedDB was decided by the parent plan

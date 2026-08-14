@@ -114,12 +114,24 @@ export function openDb(env, name, version, upgrade) {
 	});
 }
 
+/**
+ * `onblocked` is TRANSIENT, not terminal: it fires when a connection is still tearing down
+ * (a `close()` whose last transaction has not finished), and `onsuccess` still follows once
+ * it does. Real Chromium delivers it on exactly the close-then-delete pattern every layout
+ * teardown uses — `fake-indexeddb` never does, so only a real browser hits this. Treating it
+ * as fatal made the binary-index-key probe intermittently report "not supported" and
+ * silently skip arms B/B2. Keep waiting instead; the timeout catches a genuinely wedged
+ * delete (a connection that never closes).
+ */
 export function deleteDb(env, name) {
 	return new Promise((resolve, reject) => {
+		const timeout = setTimeout(
+			() => reject(new Error(`delete of ${name} still blocked after 10s (a connection never closed)`)),
+			10000,
+		);
 		const request = env.factory.deleteDatabase(name);
-		request.onsuccess = () => resolve();
-		request.onerror = () => reject(request.error);
-		request.onblocked = () => reject(new Error(`delete blocked (a connection is still open on ${name})`));
+		request.onsuccess = () => { clearTimeout(timeout); resolve(); };
+		request.onerror = () => { clearTimeout(timeout); reject(request.error); };
 	});
 }
 
@@ -362,6 +374,9 @@ export async function probeBinaryIndexKeys(env, dbName = 'quereus-bench-probe') 
 			const hits = await req(readTx.objectStore(DATA_STORE).index(INDEX_NAME).getAll(
 				env.KeyRange.bound(encU32(0), encU32(9)),
 			));
+			// Let the transaction finish before the finally-block's close-then-delete, so the
+			// delete does not spend time blocked behind a connection that is still tearing down.
+			await txDone(readTx);
 			if (hits.length !== 1) return { supported: false, reason: 'binary index range returned no record' };
 			return { supported: true };
 		} finally {
@@ -544,10 +559,12 @@ export async function armB2(env, db, opts) {
 		const tx = db.transaction(DATA_STORE, 'readonly');
 		transactions++;
 		requests += 1;
-		const keys = await req(tx.objectStore(DATA_STORE).index(INDEX_NAME).getAllKeys(range, want));
-		// A window that fills its cap may have been truncated — that would silently drop rows,
-		// so the window arithmetic above must always leave headroom.
-		if (keys.length > want) throw new Error(`arm B2: window returned ${keys.length} > cap ${want}`);
+		// Ask for ONE more key than the window can hold under the dataset's rows-per-value
+		// contract: `getAllKeys` silently truncates at its count, so a request capped at
+		// exactly `want` could never distinguish "full window" from "window overflowed the
+		// arithmetic". The extra key costs nothing measurable and makes overflow loud.
+		const keys = await req(tx.objectStore(DATA_STORE).index(INDEX_NAME).getAllKeys(range, want + 1));
+		if (keys.length > want) throw new Error(`arm B2: window returned ${keys.length} > expected ${want}`);
 		for (const key of keys) ordinals.push(ordinalOf(key));
 	}
 	return { ordinals, ms: env.now() - t0, requests, transactions };
