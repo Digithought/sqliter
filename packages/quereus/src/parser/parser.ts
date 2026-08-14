@@ -4165,8 +4165,8 @@ export class Parser {
 
 		let value: AST.LiteralExpr | AST.IdentifierExpr | undefined;
 		if (this.match(TokenType.EQUAL)) {
-			if (this.check(TokenType.IDENTIFIER)) {
-				value = { type: 'identifier', name: this.getIdentifierValue(this.advance()) };
+			if (this.checkIdentifierLike(CONTEXTUAL_KEYWORDS)) {
+				value = { type: 'identifier', name: this.consumeIdentifierOrContextualKeyword(CONTEXTUAL_KEYWORDS, `Expected ${context} value.`) };
 			} else if (this.match(TokenType.STRING, TokenType.INTEGER, TokenType.FLOAT, TokenType.NULL, TokenType.TRUE, TokenType.FALSE)) {
 				const token = this.previous();
 				let literal_value: SqlValue;

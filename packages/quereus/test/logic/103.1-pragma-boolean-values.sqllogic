@@ -1,0 +1,92 @@
+-- pragma-boolean-values.sqllogic - PRAGMA boolean value bareword parsing
+--
+-- Regression coverage for the `on`/`off` bareword spellings of a boolean
+-- pragma value. `on` lexes as the JOIN keyword (TokenType.ON), while `off`
+-- is not a reserved word at all -- so `pragma foreign_keys = off` always
+-- parsed fine, but `pragma foreign_keys = on` used to throw a misleading
+-- "'ON' must follow a JOIN" parse error. The fix accepts any
+-- CONTEXTUAL_KEYWORDS-listed bareword (not just `on`) as a name/value item.
+
+-- Default is true
+PRAGMA foreign_keys;
+→ [{"name": "foreign_keys", "value": true}]
+
+-- ===================================
+-- off (never broken; regression guard)
+-- ===================================
+
+PRAGMA foreign_keys = off;
+-- run
+
+PRAGMA foreign_keys;
+→ [{"name": "foreign_keys", "value": false}]
+
+-- ===================================
+-- on (the bug: used to throw a JOIN parse error)
+-- ===================================
+
+PRAGMA foreign_keys = on;
+-- run
+
+PRAGMA foreign_keys;
+→ [{"name": "foreign_keys", "value": true}]
+
+-- ===================================
+-- Case-insensitivity
+-- ===================================
+
+PRAGMA foreign_keys = OFF;
+-- run
+
+PRAGMA foreign_keys;
+→ [{"name": "foreign_keys", "value": false}]
+
+PRAGMA foreign_keys = On;
+-- run
+
+PRAGMA foreign_keys;
+→ [{"name": "foreign_keys", "value": true}]
+
+-- ===================================
+-- Quoted string forms
+-- ===================================
+
+PRAGMA foreign_keys = 'off';
+-- run
+
+PRAGMA foreign_keys;
+→ [{"name": "foreign_keys", "value": false}]
+
+PRAGMA foreign_keys = 'on';
+-- run
+
+PRAGMA foreign_keys;
+→ [{"name": "foreign_keys", "value": true}]
+
+-- ===================================
+-- Numeric and TRUE/FALSE forms (regression guard)
+-- ===================================
+
+PRAGMA foreign_keys = 0;
+-- run
+
+PRAGMA foreign_keys;
+→ [{"name": "foreign_keys", "value": false}]
+
+PRAGMA foreign_keys = 1;
+-- run
+
+PRAGMA foreign_keys;
+→ [{"name": "foreign_keys", "value": true}]
+
+PRAGMA foreign_keys = false;
+-- run
+
+PRAGMA foreign_keys;
+→ [{"name": "foreign_keys", "value": false}]
+
+PRAGMA foreign_keys = true;
+-- run
+
+PRAGMA foreign_keys;
+→ [{"name": "foreign_keys", "value": true}]
