@@ -90,3 +90,37 @@ PRAGMA foreign_keys = true;
 
 PRAGMA foreign_keys;
 → [{"name": "foreign_keys", "value": true}]
+
+-- ===================================
+-- Another boolean pragma on the same grammar path
+-- ===================================
+
+PRAGMA runtime_fuse_scalars = off;
+-- run
+
+PRAGMA runtime_fuse_scalars;
+→ [{"name": "runtime_fuse_scalars", "value": false}]
+
+PRAGMA runtime_fuse_scalars = on;
+-- run
+
+PRAGMA runtime_fuse_scalars;
+→ [{"name": "runtime_fuse_scalars", "value": true}]
+
+-- ===================================
+-- Generality: any CONTEXTUAL_KEYWORDS bareword is a value, not just `on`.
+-- A string-typed pragma stores it verbatim (no boolean conversion involved).
+-- ===================================
+
+PRAGMA schema_path = key;
+-- run
+
+PRAGMA schema_path;
+→ [{"name": "schema_path", "value": "key"}]
+
+-- Reset
+PRAGMA schema_path = 'main';
+-- run
+
+PRAGMA schema_path;
+→ [{"name": "schema_path", "value": "main"}]

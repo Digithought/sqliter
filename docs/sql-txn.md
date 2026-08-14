@@ -148,6 +148,8 @@ pragma name = value;
 pragma name;  -- query the current value
 ```
 
+The value may be a quoted string, a number, or a bareword (`pragma foreign_keys = on`). Boolean-typed pragmas accept `on`/`off`, `true`/`false`, `yes`/`no`, and `1`/`0`, in any case and in either bareword or quoted form.
+
 ### 9.2 Supported PRAGMA Statements
 
 #### 9.2.1 default_vtab_module
