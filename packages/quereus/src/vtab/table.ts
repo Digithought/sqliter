@@ -293,6 +293,23 @@ export abstract class VirtualTable {
 	 */
 	getStatistics?(): Promise<TableStatistics> | TableStatistics;
 
+	/**
+	 * Persist statistics the engine just collected, so a later open can read them back
+	 * without re-scanning. Optional; a module that cannot store them simply omits it.
+	 * `ANALYZE` calls this after it has written the statistics onto the schema.
+	 *
+	 * ADVISORY: a rejection is logged and swallowed by the caller. `ANALYZE` succeeding
+	 * with statistics in memory but not on disk is strictly better than `ANALYZE` failing.
+	 *
+	 * A module that implements this must NOT then report the persisted snapshot back from
+	 * {@link getStatistics} — see that method's contract in docs/module-authoring.md: a
+	 * non-empty `columnStats` there reads as "answered cheaply, skip the scan", which would
+	 * make the next `ANALYZE` a no-op refresh of numbers it never recomputed.
+	 *
+	 * @param stats The statistics `ANALYZE` recorded on this table's schema.
+	 */
+	saveStatistics?(stats: TableStatistics): Promise<void>;
+
 	// --- Isolation Layer Support ---
 
 	/**

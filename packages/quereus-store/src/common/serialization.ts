@@ -18,7 +18,7 @@
  * (or thrown) before the wrapper could suppress it.
  */
 
-import type { Row, SqlValue } from '@quereus/quereus';
+import type { ColumnStatistics, Row, SqlValue, TableSchema } from '@quereus/quereus';
 
 const BIGINT_MARKER = '$bigint';
 const BLOB_MARKER = '$blob';
@@ -245,23 +245,112 @@ function base64ToUint8Array(base64: string): Uint8Array {
 // ============================================================================
 
 /**
- * Table statistics stored in metadata.
+ * Table statistics stored in metadata — one record per table in the unified
+ * `__stats__` store, keyed by `schema.table`.
+ *
+ * `rowCount` / `updatedAt` are the LIVE size the write paths delta-track and flush.
+ * The three optional fields are the `ANALYZE` snapshot, written only by
+ * `StoreTableBase.saveStatistics`. They are optional so a record written before column
+ * statistics were persisted reads back cleanly as "no column statistics" — no migration
+ * step and no version field.
  */
 export interface TableStats {
   rowCount: number;
   updatedAt: number;  // Unix timestamp
+  /**
+   * Per-column statistics keyed by LOWERCASE column name — the same key
+   * `TableStatistics.columnStats` uses. Name-keyed by design: a column renamed or
+   * dropped between the `ANALYZE` and the reopen is then simply never looked up (and its
+   * entry is dead weight), where a positional key would silently match a DIFFERENT column.
+   */
+  columnStats?: Record<string, ColumnStatistics>;
+  /**
+   * The row count the `ANALYZE` that produced {@link columnStats} counted — deliberately
+   * NOT {@link rowCount}, which keeps drifting with every mutation after that `ANALYZE`.
+   * Every `1/distinctCount` and `nullCount/rows` estimate divides by this, so the
+   * numerator and the denominator have to describe the same moment.
+   */
+  analyzedRowCount?: number;
+  /** Epoch ms of that `ANALYZE`, so a staleness check can see how old the snapshot is. */
+  lastAnalyzed?: number;
 }
 
 /**
  * Serialize table statistics.
+ *
+ * Routed through the row codec's `replacer`, NOT bare `JSON.stringify`: `minValue`,
+ * `maxValue` and every `HistogramBucket.upperBound` are `SqlValue`s, so they can be a
+ * `bigint` (bare stringify THROWS) or a `Uint8Array` (bare stringify silently mangles it
+ * into `{"0":…,"1":…}`, which reads back as an object rather than a blob).
  */
 export function serializeStats(stats: TableStats): Uint8Array {
-  return textEncoder.encode(JSON.stringify(stats));
+  return textEncoder.encode(JSON.stringify(stats, replacer));
 }
 
 /**
- * Deserialize table statistics.
+ * Deserialize table statistics. Reviver-gated exactly like {@link deserializeRow}, so a
+ * record holding no markers pays only the scan.
  */
 export function deserializeStats(buffer: Uint8Array): TableStats {
-  return JSON.parse(decoder.decode(buffer)) as TableStats;
+  const json = decoder.decode(buffer);
+  return JSON.parse(json, needsReviver(json) ? reviver : undefined) as TableStats;
+}
+
+/**
+ * Which columns keep their histogram on the way to disk: a PRIMARY-KEY member, or the
+ * LEADING column of a secondary index. Returned as lowercase column names, matching the
+ * `columnStats` key.
+ *
+ * Why bound it at all: `collectStatisticsFromScan` builds up to 100 buckets per column
+ * from a 1000-row sample, and a bucket is three fields — so a histogram runs to roughly
+ * 100 × 40 ≈ 4 KB of JSON per column. The whole `__stats__` record is read and written as
+ * ONE value, so a 30-column table would carry ~120 KB through every stats flush.
+ *
+ * Why THIS boundary: a histogram only ever feeds a RANGE estimate
+ * (`selectivityFromHistogram`), and a range predicate only becomes a seek on a column the
+ * store can address — a PK prefix or an index's leading key column. Every other column's
+ * range falls back to the fixed 1/3 guess whether or not a histogram survived the reopen,
+ * so dropping it costs a re-`ANALYZE` to recover and nothing else. `distinctCount`,
+ * `nullCount`, `minValue` and `maxValue` are persisted for EVERY column regardless — they
+ * are what the equality, IS NULL and join estimates read, and they are O(1) bytes each.
+ *
+ * Reads the ENGINE-facing schema's indexes: the store's hidden `_uc_*` UNIQUE-enforcement
+ * indexes are deliberately invisible to the read planner, so a histogram on one could
+ * never be turned into a seek. Widen here — deliberately, with the arithmetic above — if
+ * a future planner can seek more than this.
+ */
+export function histogramColumns(schema: TableSchema): Set<string> {
+  const names = new Set<string>();
+  const add = (columnIndex: number): void => {
+    const column = schema.columns[columnIndex];
+    if (column) names.add(column.name.toLowerCase());
+  };
+  for (const pk of schema.primaryKeyDefinition) add(pk.index);
+  for (const index of schema.indexes ?? []) {
+    const leading = index.columns[0];
+    if (leading) add(leading.index);
+  }
+  return names;
+}
+
+/**
+ * Project the statistics `ANALYZE` collected into the persistable record shape: every
+ * column keeps its scalar statistics, and only a {@link histogramColumns} member keeps
+ * its histogram.
+ */
+export function toPersistedColumnStats(
+  columnStats: ReadonlyMap<string, ColumnStatistics>,
+  schema: TableSchema,
+): Record<string, ColumnStatistics> {
+  const keepHistogram = histogramColumns(schema);
+  const persisted: Record<string, ColumnStatistics> = {};
+  for (const [name, stats] of columnStats) {
+    if (stats.histogram === undefined || keepHistogram.has(name)) {
+      persisted[name] = stats;
+      continue;
+    }
+    const { histogram: _dropped, ...rest } = stats;
+    persisted[name] = rest;
+  }
+  return persisted;
 }

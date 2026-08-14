@@ -42,6 +42,7 @@ import {
 	deserializeRow,
 	serializeStats,
 	deserializeStats,
+	toPersistedColumnStats,
 	type TableStats,
 } from './serialization.js';
 import { type EncodeOptions, type KeyValueTransform } from './encoding.js';
@@ -561,8 +562,16 @@ export abstract class StoreTableBase extends VirtualTable {
 	 * stats-store read failure is already a storage-level fault and the count is advisory.
 	 * If it ever needs to be safe, gate {@link flushStats} on a "primed or genuinely
 	 * absent" flag rather than on `cachedStats` being non-null.
+	 *
+	 * PUBLIC because it is also the SINGLE OWNER of the column-statistics stamp (see
+	 * {@link publishPersistedStatistics}): whichever path opens this table first — the
+	 * rehydrate reconcile loop calling it directly, or a later first storage access —
+	 * runs it exactly once, so a table's persisted `ANALYZE` snapshot reaches the planner
+	 * whether or not it happened to be connected during rehydration. It touches only the
+	 * stats store, never the data store, so calling it eagerly does not open (or create)
+	 * table storage.
 	 */
-	private async primeStats(): Promise<void> {
+	async primeStats(): Promise<void> {
 		if (this.cachedStats) return;
 		try {
 			const statsStore = await this.ensureStatsStore();
@@ -571,6 +580,58 @@ export abstract class StoreTableBase extends VirtualTable {
 		} catch (e) {
 			console.warn(`[StoreModule] Failed to read persisted statistics for '${this.schemaName}.${this.tableName}': ${e instanceof Error ? e.message : String(e)}`);
 		}
+		this.publishPersistedStatistics();
+	}
+
+	/**
+	 * The persisted `ANALYZE` snapshot as a {@link TableStatistics}, or undefined when this
+	 * table has none on disk (never analyzed, or a record written before column statistics
+	 * were persisted at all).
+	 *
+	 * `rowCount` is the ANALYZE-time count (`TableStats.analyzedRowCount`), NOT the live
+	 * delta-tracked one: every estimate the column statistics drive divides by it, so the
+	 * two halves have to describe the same moment. A record whose column statistics predate
+	 * the `analyzedRowCount` field falls back to the live count — the closest thing it has.
+	 *
+	 * Synchronous, and answers only from what {@link primeStats} already loaded.
+	 */
+	getPersistedStatistics(): TableStatistics | undefined {
+		const cached = this.cachedStats;
+		if (!cached?.columnStats) return undefined;
+		return {
+			rowCount: cached.analyzedRowCount ?? cached.rowCount,
+			columnStats: new Map(Object.entries(cached.columnStats)),
+			lastAnalyzed: cached.lastAnalyzed,
+		};
+	}
+
+	/**
+	 * Stamp the just-loaded `ANALYZE` snapshot onto this table's REGISTERED `TableSchema`,
+	 * which is where `CatalogStatsProvider` reads statistics from — without it the record
+	 * would sit on disk, correctly loaded and never consulted.
+	 *
+	 * SILENT by design: `schema.addTable` with no `notifyChange`. Phase 3 of
+	 * `StoreModuleSchemaSync.rehydrateCatalog` deliberately fires no schema-change events,
+	 * and emitting one from inside rehydration would drive the store module's own listener
+	 * during its own rehydrate. Nothing is lost — statistics do not participate in plan
+	 * invalidation the way DDL does, and the next prepared statement reads the stamped
+	 * schema.
+	 *
+	 * Never OVERWRITES: an already-present `statistics` came from an `ANALYZE` this session
+	 * (or a previous stamp), and a disk snapshot must not displace a fresher in-memory one.
+	 *
+	 * The stamp deliberately does NOT update this instance's own cached `tableSchema`. The
+	 * store never reads `statistics` off it — key encoding, constraint enforcement and index
+	 * maintenance are all it consults there — and `getBestAccessPlan` is handed the
+	 * REGISTERED schema by the engine, which is the copy stamped here.
+	 */
+	private publishPersistedStatistics(): void {
+		const statistics = this.getPersistedStatistics();
+		if (!statistics) return;
+		const schema = this.db.schemaManager.getSchema(this.schemaName);
+		const registered = schema?.getTable(this.tableName);
+		if (!schema || !registered || registered.statistics) return;
+		schema.addTable({ ...registered, statistics });
 	}
 
 	/**
@@ -1074,12 +1135,18 @@ export abstract class StoreTableBase extends VirtualTable {
 	 * The `VirtualTable.getStatistics` contract: this table's SIZE, reported from the
 	 * running count the write paths already maintain and persist, in O(1) — no scan.
 	 *
-	 * Column statistics are deliberately absent. The store keeps no value distribution
-	 * (a distinct count or histogram would cost a full scan of the table or of an index),
-	 * and `ANALYZE` reads an empty `columnStats` as "this module reported its size
-	 * cheaply, collect the rest by scanning" (see `runtime/emit/analyze.ts`) — so
-	 * implementing this method makes the count reachable without giving up the
-	 * per-column statistics ANALYZE collects today.
+	 * Column statistics are deliberately absent, and stay absent even though this table
+	 * now HOLDS a persisted per-column snapshot ({@link getPersistedStatistics}).
+	 * `ANALYZE` reads a non-empty `columnStats` as "this module answered cheaply, skip the
+	 * scan" (see `collectTableStatistics` in `runtime/emit/analyze.ts`), so reporting the
+	 * snapshot here would turn every `ANALYZE` into a no-op that re-saves numbers it never
+	 * recomputed — a cached snapshot is not an answer to "analyze me". The snapshot reaches
+	 * the planner by a different route: {@link primeStats} stamps it onto the registered
+	 * `TableSchema` at open.
+	 *
+	 * The store still computes no distribution of its own — a distinct count or histogram
+	 * would cost a full scan of the table or of an index — so an empty `columnStats` also
+	 * remains the honest answer for a table nobody has ever analyzed.
 	 *
 	 * `rowCount` is delta-tracked rather than counted, so it can drift from the true
 	 * count if a write path ever mis-accounts; `ANALYZE`'s scan is the reconciliation.
@@ -1093,6 +1160,36 @@ export abstract class StoreTableBase extends VirtualTable {
 			rowCount: await this.getEstimatedRowCount(),
 			columnStats: new Map<string, ColumnStatistics>(),
 		};
+	}
+
+	/**
+	 * The `VirtualTable.saveStatistics` contract: fold the snapshot `ANALYZE` just
+	 * collected into this table's `__stats__` record and flush it, so the next open reads
+	 * the numbers back instead of planning blind until someone re-runs `ANALYZE`.
+	 *
+	 * Only the three ANALYZE fields are written. The live `rowCount` is left exactly as the
+	 * write paths delta-track it — `ANALYZE`'s exact count lands in `analyzedRowCount`,
+	 * which is what pairs with the column statistics. (Reconciling the drifted live count
+	 * against the scan is a separate, defensible change; it is not made here, so this hook
+	 * cannot alter what any existing caller of `getEstimatedRowCount` sees.)
+	 *
+	 * Histograms are dropped for columns the store cannot seek on — see
+	 * {@link toPersistedColumnStats}, which owns that rule and its size arithmetic.
+	 *
+	 * Primes first so a table whose storage this session never opened does not overwrite
+	 * its persisted row count with a fresh zero. In practice `ANALYZE` has already scanned
+	 * through `query()` by the time this runs, so the prime is a no-op guard.
+	 */
+	async saveStatistics(stats: TableStatistics): Promise<void> {
+		await this.primeStats();
+		const live = this.cachedStats ?? { rowCount: stats.rowCount, updatedAt: Date.now() };
+		this.cachedStats = {
+			...live,
+			columnStats: toPersistedColumnStats(stats.columnStats, this.tableSchema!),
+			analyzedRowCount: stats.rowCount,
+			lastAnalyzed: stats.lastAnalyzed ?? Date.now(),
+		};
+		await this.flushStats();
 	}
 
 	/** Track a mutation and schedule lazy stats persistence. */

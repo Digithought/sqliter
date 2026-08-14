@@ -223,6 +223,87 @@ describe('Row Serialization', () => {
 
       expect(deserialized).to.deep.equal(stats);
     });
+
+    it('reads a record written before column statistics existed as "no column statistics"', () => {
+      // The exact on-disk shape a pre-column-statistics session wrote. It must reopen
+      // cleanly and simply carry no snapshot — there is no version field and no migration.
+      const legacy = new TextEncoder().encode(JSON.stringify({ rowCount: 42, updatedAt: 1700000000000 }));
+
+      const deserialized = deserializeStats(legacy);
+
+      expect(deserialized.rowCount).to.equal(42);
+      expect(deserialized.columnStats).to.be.undefined;
+      expect(deserialized.analyzedRowCount).to.be.undefined;
+      expect(deserialized.lastAnalyzed).to.be.undefined;
+    });
+
+    /**
+     * `minValue` / `maxValue` / `HistogramBucket.upperBound` are `SqlValue`s, so the stats
+     * record has to go through the same extended-JSON codec rows do. Bare `JSON.stringify`
+     * THROWS on a bigint and silently mangles a `Uint8Array` into `{"0":…}` — the kind of
+     * defect that only shows up on the one column type nobody tried, so every shape is
+     * covered here rather than sampled.
+     */
+    it('round-trips min/max and histogram bounds for every SqlValue shape', () => {
+      const shapes: Array<{ label: string; value: SqlValue }> = [
+        { label: 'null', value: null },
+        { label: 'integer', value: 42 },
+        { label: 'negative integer', value: -7 },
+        { label: 'bigint past 2^53', value: 9007199254740993n },
+        { label: 'negative bigint past 2^53', value: -9007199254740993n },
+        { label: 'real', value: 3.5 },
+        { label: 'text', value: 'hello' },
+        { label: 'text shaped like a marker', value: '{"$bigint":"1"}' },
+        { label: 'empty text', value: '' },
+        { label: 'boolean', value: true },
+        { label: 'blob', value: new Uint8Array([0, 1, 254, 255]) },
+        { label: 'empty blob', value: new Uint8Array([]) },
+        { label: 'json object', value: { a: 1, b: [2, 3] } },
+        { label: 'json object with a colliding key', value: { $bigint: 'not a marker' } },
+        { label: 'json array', value: [1, 'two', null] },
+        // Temporal values reach the store as their canonical text spelling.
+        { label: 'date', value: '2026-08-14' },
+        { label: 'datetime', value: '2026-08-14T17:57:41.183Z' },
+        { label: 'timespan', value: 'PT1H' },
+      ];
+
+      for (const { label, value } of shapes) {
+        const stats = {
+          rowCount: 10,
+          updatedAt: 1,
+          analyzedRowCount: 10,
+          lastAnalyzed: 2,
+          columnStats: {
+            c: {
+              distinctCount: 3,
+              nullCount: 1,
+              minValue: value,
+              maxValue: value,
+              histogram: {
+                sampleSize: 10,
+                buckets: [{ upperBound: value, cumulativeCount: 10, distinctCount: 3 }],
+              },
+            },
+          },
+        };
+
+        const deserialized = deserializeStats(serializeStats(stats));
+
+        expect(deserialized, `${label}: whole record`).to.deep.equal(stats);
+        const column = deserialized.columnStats!.c;
+        if (value instanceof Uint8Array) {
+          // deep.equal already compares the bytes; assert the TYPE survived, since a
+          // mangled blob deep-equals a plain object of the same shape under some matchers.
+          expect(column.minValue, `${label}: minValue is still a blob`).to.be.instanceOf(Uint8Array);
+          expect(column.histogram!.buckets[0].upperBound, `${label}: bound is still a blob`)
+            .to.be.instanceOf(Uint8Array);
+        } else if (typeof value === 'bigint') {
+          expect(typeof column.maxValue, `${label}: maxValue is still a bigint`).to.equal('bigint');
+          expect(typeof column.histogram!.buckets[0].upperBound, `${label}: bound is still a bigint`)
+            .to.equal('bigint');
+        }
+      }
+    });
   });
 
   describe('reviver fast-path gate (property)', () => {

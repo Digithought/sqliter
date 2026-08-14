@@ -294,6 +294,28 @@ export abstract class StoreModuleSchemaSync extends StoreModuleCatalog {
 				void table.dispose().catch(disposeError => console.warn(
 					`[StoreModule] dispose of evicted ${current.schemaName}.${current.name} failed: ${String(disposeError)}`,
 				));
+				continue;
+			}
+			// Load the persisted `ANALYZE` snapshot and stamp it onto the schema registered
+			// just above, so a reopened database plans with the per-column numbers the last
+			// ANALYZE collected instead of reverting to fixed-fraction guesses.
+			//
+			// `StoreTableBase.primeStats` is the single OWNER of that stamp, so this call only
+			// decides TIMING: every table connected at rehydration picks its statistics up
+			// here, and a table first touched later picks them up at its own first storage
+			// access — neither ordering can leave a table planning blind. It touches only the
+			// stats store (one `get` against the shared `__stats__` store per table), never the
+			// data store, so it does not open or create table storage.
+			//
+			// Advisory, hence its own guard: statistics must never cost a table its
+			// rehydration the way a refused schema above does.
+			try {
+				await table.primeStats();
+			} catch (e) {
+				console.warn(
+					`[StoreModule] Failed to load persisted statistics for `
+						+ `${current.schemaName}.${current.name}: ${e instanceof Error ? e.message : String(e)}`,
+				);
 			}
 		}
 

@@ -57,6 +57,30 @@ async function collectTableStatistics(
 	return reported;
 }
 
+/**
+ * Hand the statistics just recorded on the schema to the module, so a backend that can
+ * store them durably does not have to re-scan after a reopen. A module that omits
+ * `saveStatistics` (the memory backend, every module written before the hook existed)
+ * simply skips this.
+ *
+ * ADVISORY by contract (see `VirtualTable.saveStatistics`): a rejection is logged and
+ * swallowed rather than failing the statement. `ANALYZE` succeeding with statistics in
+ * memory but not on disk is strictly better than `ANALYZE` failing — and the surrounding
+ * per-table `try` already takes exactly that posture for an unreadable table.
+ */
+async function saveStatisticsIfSupported(
+	vtab: VirtualTable,
+	tableSchema: TableSchema,
+	stats: TableStatistics,
+): Promise<void> {
+	if (typeof vtab.saveStatistics !== 'function') return;
+	try {
+		await vtab.saveStatistics(stats);
+	} catch (e) {
+		log('Failed to persist statistics for %s: %s', tableSchema.name, e);
+	}
+}
+
 export function emitAnalyze(plan: AnalyzePlanNode, _ctx: EmissionContext): Instruction {
 	// Eager: ANALYZE's side effects (connecting to each table, collecting statistics,
 	// writing them back onto the schema) must happen when this instruction is run, not
@@ -122,6 +146,7 @@ export function emitAnalyze(plan: AnalyzePlanNode, _ctx: EmissionContext): Instr
 							oldObject: tableSchema,
 							newObject: updatedTableSchema,
 						});
+						await saveStatisticsIfSupported(vtab, tableSchema, stats);
 						report.push([tableSchema.name, stats.rowCount]);
 					}
 				} finally {

@@ -51,6 +51,8 @@ export {
   deserializeValue,
   serializeStats,
   deserializeStats,
+  histogramColumns,
+  toPersistedColumnStats,
   type TableStats,
 } from './serialization.js';
 

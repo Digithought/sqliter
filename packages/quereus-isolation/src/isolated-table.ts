@@ -1,4 +1,4 @@
-import type { CollationFunction, CollationResolver, Database, DatabaseInternal, MaybePromise, Row, SqlValue, TableIndexSchema as IndexSchema, FilterInfo, SchemaChangeInfo, TableSchema, UniqueConstraintSchema, CompiledPredicate, UpdateArgs, VirtualTableConnection, UpdateResult, AccessPath, IndexDescriptor, IndexKeyColumn } from '@quereus/quereus';
+import type { CollationFunction, CollationResolver, Database, DatabaseInternal, MaybePromise, Row, SqlValue, TableIndexSchema as IndexSchema, FilterInfo, SchemaChangeInfo, TableSchema, TableStatistics, UniqueConstraintSchema, CompiledPredicate, UpdateArgs, VirtualTableConnection, UpdateResult, AccessPath, IndexDescriptor, IndexKeyColumn } from '@quereus/quereus';
 import { VirtualTable, compareSqlValues, compareSqlValuesFast, resolveCollationFunctions, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, resolveUniqueEnforcementCollations, uniqueEnforcementCollations, uniqueEnforcementComparators, normalizeCollationName, serializeKey, pkKeyCollationName, retargetFilterInfoIndex, PRIMARY_INDEX_NAME, coerceRowToSchema, IndexConstraintOp, decodeIdxStr, createTypedComparator, hasSemanticOrdering, semanticKeyTransform } from '@quereus/quereus';
 import type { EffectiveRowSource, KeyNormalizerResolver } from '@quereus/quereus';
 import type { IsolationModule } from './isolation-module.js';
@@ -85,6 +85,29 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 */
 	private pkSemanticCache?: { schema: TableSchema; comparators: (((a: SqlValue, b: SqlValue) => number) | undefined)[] };
 
+	/**
+	 * The `VirtualTable` statistics pair, forwarded to the wrapped table.
+	 *
+	 * Declared as optional FIELDS and wired in the constructor only when the underlying
+	 * implements the corresponding hook, so "this module reports no statistics" / "this
+	 * module cannot store statistics" survives the wrapping. A plain delegating method
+	 * would always be present, and `ANALYZE` reads a present `getStatistics` as a real
+	 * report (see `collectTableStatistics` in runtime/emit/analyze.ts) and a present
+	 * `saveStatistics` as durable storage — so an unconditional wrapper would answer for a
+	 * module that declined to.
+	 *
+	 * Neither is overlay-aware: the overlay holds one transaction's uncommitted delta,
+	 * statistics are advisory planner input, and `ANALYZE` is not a transactional read — so
+	 * folding the delta in would buy a difference no plan choice depends on at the price of
+	 * a full overlay scan per call.
+	 *
+	 * Without the `saveStatistics` half in particular, an isolated store table could never
+	 * persist what `ANALYZE` collected for it, and nothing would say so: the hook is
+	 * optional, so a dropped delegation is indistinguishable from a module that cannot store.
+	 */
+	readonly getStatistics?: () => Promise<TableStatistics> | TableStatistics;
+	readonly saveStatistics?: (stats: TableStatistics) => Promise<void>;
+
 	private getPkSemanticComparators(): (((a: SqlValue, b: SqlValue) => number) | undefined)[] {
 		const schema = this.tableSchema;
 		if (!schema) return [];
@@ -148,6 +171,11 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		this.keyNormalizerResolver = db.getKeyNormalizerResolver();
 		// Schema comes from underlying - may be populated lazily by the underlying module
 		this.tableSchema = underlyingTable.tableSchema;
+		// Statistics delegation — present iff the underlying implements it (see the fields).
+		const reportStats = underlyingTable.getStatistics;
+		if (reportStats) this.getStatistics = () => reportStats.call(underlyingTable);
+		const persistStats = underlyingTable.saveStatistics;
+		if (persistStats) this.saveStatistics = stats => persistStats.call(underlyingTable, stats);
 	}
 
 	/**

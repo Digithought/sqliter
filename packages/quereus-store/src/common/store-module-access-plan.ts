@@ -1014,6 +1014,7 @@ function tryIndexAccessPlan(
 			// the veto regardless — so the veto price IS the declared price.
 			vetoCost: plan.cost,
 			isMultiSeek: true,
+			statsBacked,
 		};
 	}
 
@@ -1032,6 +1033,7 @@ function tryIndexAccessPlan(
 		// round trip through the declared one.
 		vetoCost: seekingArm(PARITY_COST_PROFILE.pointRead).build().cost,
 		isMultiSeek: false,
+		statsBacked,
 	};
 }
 
