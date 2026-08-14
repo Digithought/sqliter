@@ -5,6 +5,10 @@
     "module": "ES2022",
     "moduleResolution": "node",
     "strict": true,
+    // `bench/arms.mjs` is deliberately plain JavaScript: the benchmark page loads it straight
+    // from a <script type="module"> with no build step. The smoke spec imports that same file,
+    // so this pass has to be able to resolve it.
+    "allowJs": true,
     "sourceMap": true,
     "types": ["node", "mocha"],
     "noEmit": true
@@ -13,6 +17,11 @@
     "esm": true,
     "experimentalSpecifierResolution": "node"
   },
-  "include": ["test/**/*", "src/**/*"]
+  // `bench/**/*` is listed because this config is composite: an imported file that is not in
+  // the file list is a hard error (TS6307), not an implicit addition.
+  "include": ["test/**/*", "src/**/*", "bench/**/*"],
+  // Repeated rather than inherited: `extends` replaces `exclude` wholesale, and dropping it
+  // here would pull `dist` back into the pass.
+  "exclude": ["node_modules", "dist"]
 }
 

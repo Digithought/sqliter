@@ -152,6 +152,13 @@ sync.close();
 | `databaseName` | string | `'quereus'` | Name for the unified IndexedDB database |
 | `cache` | CacheOptions | — | Read cache configuration |
 
+## Benchmark
+
+[`bench/`](./bench/) holds a manual browser benchmark (not part of `yarn test`) that prices how
+a secondary-index lookup resolves its rows: the current one-`get()`-per-row path against an
+engine-maintained `IDBIndex` that returns whole records per request. Measured numbers and how
+to reproduce them are in [`bench/README.md`](./bench/README.md).
+
 ## Related Packages
 
 - [`@quereus/store`](../quereus-store/) - Core storage module (StoreModule, StoreTable)

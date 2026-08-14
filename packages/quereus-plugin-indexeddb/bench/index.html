@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>IndexedDB native-index resolution benchmark</title>
+<style>
+	body { font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; margin: 24px; max-width: 1100px; }
+	h1 { font-size: 18px; }
+	h2 { font-size: 15px; margin-top: 28px; }
+	fieldset { border: 1px solid #ccc; margin-bottom: 12px; }
+	label { margin-right: 14px; }
+	input[type=number] { width: 6em; }
+	button { font: inherit; padding: 4px 12px; }
+	table { border-collapse: collapse; margin-top: 8px; width: 100%; }
+	th, td { border: 1px solid #ddd; padding: 2px 8px; text-align: right; }
+	th:first-child, td:first-child, th.l, td.l { text-align: left; }
+	thead th { background: #f4f4f4; position: sticky; top: 0; }
+	tbody tr:nth-child(even) { background: #fafafa; }
+	#log { white-space: pre-wrap; background: #f7f7f7; border: 1px solid #ddd; padding: 8px; max-height: 220px; overflow: auto; }
+	.bad { color: #b00; font-weight: bold; }
+	.ok { color: #070; }
+	.note { color: #555; }
+</style>
+</head>
+<body>
+<h1>IndexedDB native-index resolution benchmark</h1>
+
+<p class="note">
+	Prices resolving a secondary-index lookup's rows two ways: the plugin's current
+	<em>index store + one <code>get()</code> per row</em> path (arm A) against an
+	<em>engine-maintained <code>IDBIndex</code></em> that returns whole records from one request
+	(arm B), plus three controls. Nothing here imports the plugin or the engine — raw IndexedDB
+	only. Results land in <code>window.__benchResults</code> as JSON.
+	See <code>README.md</code> for what each arm does and how to read the numbers.
+</p>
+
+<fieldset>
+	<legend>parameters</legend>
+	<label>rows <input id="rowCount" type="number" value="20000" min="100" step="1000"></label>
+	<label>page size <input id="pageSize" type="number" value="256" min="1"></label>
+	<label>repetitions <input id="reps" type="number" value="5" min="1"></label>
+	<label>warm-up runs <input id="warmup" type="number" value="1" min="0"></label>
+	<label>rows updated (arm E) <input id="updateRows" type="number" value="2000" min="1"></label>
+	<br>
+	<button id="run">Run benchmark</button>
+	<button id="copy" disabled>Copy JSON</button>
+	<span id="status" class="note">idle</span>
+</fieldset>
+
+<h2>log</h2>
+<div id="log"></div>
+
+<h2>read arms</h2>
+<div id="cells"></div>
+
+<h2>seeding &amp; write side (arm E)</h2>
+<div id="writes"></div>
+
+<h2>cross-arm agreement</h2>
+<div id="agreement"></div>
+
+<script type="module">
+import {
+	armA, armB, armB2, armC, armD,
+	armEUpdateNative, armEUpdateTwoStore,
+	buildDataset, deleteDb, expectedOrdinals, fingerprint, makeEnv, median,
+	probeBinaryIndexKeys, seedNative, seedTwoStore, selectivityToK, updateSample,
+} from './arms.mjs';
+
+const DB_TWO_STORE = 'quereus-bench-two-store';
+const DB_NATIVE = 'quereus-bench-native';
+const SELECTIVITIES = [0.001, 0.01, 0.05, 0.25];
+const CLUSTERINGS = ['clustered', 'uniform'];
+
+const el = (id) => document.getElementById(id);
+const logBox = el('log');
+
+function log(message) {
+	logBox.textContent += `${message}\n`;
+	logBox.scrollTop = logBox.scrollHeight;
+	// Yield to the renderer so the log is readable while a long sweep runs.
+	return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+function setStatus(text, className = 'note') {
+	el('status').textContent = text;
+	el('status').className = className;
+	window.__benchStatus = text;
+}
+
+function renderTable(host, columns, rows) {
+	const head = columns.map((c) => `<th class="${c.left ? 'l' : ''}">${c.label}</th>`).join('');
+	const body = rows.map((row) => `<tr>${
+		columns.map((c) => `<td class="${c.left ? 'l' : ''}">${c.get(row) ?? ''}</td>`).join('')
+	}</tr>`).join('');
+	host.innerHTML = `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+}
+
+const fixed = (value, digits) => (value === undefined || value === null ? '' : value.toFixed(digits));
+
+/**
+ * Run one arm `warmup + reps` times, discard the warm-up samples, and report the median.
+ * The final run's row set and request counts are kept — every run does identical work, so
+ * any one of them describes the whole cell.
+ */
+async function measure(run, reps, warmup) {
+	const samples = [];
+	let last;
+	for (let i = 0; i < warmup + reps; i++) {
+		last = await run();
+		if (i >= warmup) samples.push(last.ms);
+	}
+	return { ...last, msMedian: median(samples), msSamples: samples };
+}
+
+/** One row of the read-arm table. */
+function toCell(arm, clustering, selectivity, matchedRows, measured) {
+	return {
+		arm,
+		clustering,
+		selectivity,
+		matchedRows,
+		rowsReturned: measured.ordinals.length,
+		msMedian: measured.msMedian,
+		msPerRow: measured.ordinals.length ? measured.msMedian / measured.ordinals.length : null,
+		requests: measured.requests,
+		transactions: measured.transactions,
+		spanRows: measured.spanRows,
+		msSamples: measured.msSamples,
+		fingerprint: fingerprint(measured.ordinals),
+	};
+}
+
+async function runBenchmark() {
+	const rowCount = Number(el('rowCount').value);
+	const pageSize = Number(el('pageSize').value);
+	const reps = Number(el('reps').value);
+	const warmup = Number(el('warmup').value);
+	const updateRows = Number(el('updateRows').value);
+
+	const env = makeEnv();
+	const results = {
+		meta: {
+			userAgent: navigator.userAgent,
+			generatedAt: new Date().toISOString(),
+			rowCount, pageSize, reps, warmup, updateRows,
+			selectivities: SELECTIVITIES,
+			hardwareConcurrency: navigator.hardwareConcurrency,
+			storageEstimate: null,
+		},
+		binaryIndexKeys: null,
+		cells: [],
+		seeding: [],
+		writes: [],
+		agreement: [],
+	};
+	window.__benchResults = null;
+
+	if (navigator.storage?.estimate) {
+		try {
+			results.meta.storageEstimate = await navigator.storage.estimate();
+		} catch (error) {
+			// Storage quota is reporting-only; a refusal must not abort the benchmark.
+			await log(`storage estimate unavailable: ${error.message}`);
+		}
+	}
+
+	// Binary values as index keys need IndexedDB 2 (Chromium/Firefox yes, Safari 14+). Say so
+	// plainly instead of letting the native layout throw something opaque mid-seed.
+	results.binaryIndexKeys = await probeBinaryIndexKeys(env);
+	const nativeOk = results.binaryIndexKeys.supported;
+	await log(nativeOk
+		? 'binary index keys: supported'
+		: `binary index keys: NOT SUPPORTED (${results.binaryIndexKeys.reason}) — arms B and B2 skipped`);
+
+	/** fingerprint agreement is checked per (clustering, selectivity) across every arm. */
+	const prints = new Map();
+	const record = (clustering, selectivity, arm, print) => {
+		const key = `${clustering}|${selectivity}`;
+		if (!prints.has(key)) prints.set(key, []);
+		prints.get(key).push({ arm, print });
+	};
+
+	for (const clustering of CLUSTERINGS) {
+		const dataset = buildDataset({ rowCount, clustering });
+
+		await log(`[${clustering}] seeding two-store layout (${rowCount} rows)…`);
+		const twoStore = await seedTwoStore(env, DB_TWO_STORE, dataset);
+		results.seeding.push({ layout: 'two-store', clustering, ms: twoStore.ms, requests: twoStore.requests, transactions: twoStore.transactions });
+		try {
+			for (const selectivity of SELECTIVITIES) {
+				const k = selectivityToK(dataset, selectivity);
+				const matchedRows = expectedOrdinals(dataset, k).length;
+				for (const [arm, fn] of [['A current path', armA], ['C full scan + filter', armC], ['D span getAll + set filter', armD]]) {
+					const measured = await measure(() => fn(env, twoStore.db, { k, pageSize }), reps, warmup);
+					const cell = toCell(arm, clustering, selectivity, matchedRows, measured);
+					results.cells.push(cell);
+					record(clustering, selectivity, arm, cell.fingerprint);
+					renderCells(results);
+					await log(`  ${arm} @ ${(selectivity * 100).toFixed(1)}% → ${cell.rowsReturned} rows, ${cell.msMedian.toFixed(1)} ms, ${cell.requests} requests`);
+				}
+			}
+		} finally {
+			twoStore.db.close();
+			await deleteDb(env, DB_TWO_STORE);
+		}
+
+		if (!nativeOk) continue;
+
+		await log(`[${clustering}] seeding native layout (${rowCount} rows)…`);
+		const native = await seedNative(env, DB_NATIVE, dataset);
+		results.seeding.push({ layout: 'native', clustering, ms: native.ms, requests: native.requests, transactions: native.transactions });
+		try {
+			for (const selectivity of SELECTIVITIES) {
+				const k = selectivityToK(dataset, selectivity);
+				const matchedRows = expectedOrdinals(dataset, k).length;
+				for (const [arm, fn] of [['B native index', armB], ['B2 native entries only', armB2]]) {
+					const measured = await measure(() => fn(env, native.db, { k, pageSize }), reps, warmup);
+					const cell = toCell(arm, clustering, selectivity, matchedRows, measured);
+					results.cells.push(cell);
+					record(clustering, selectivity, arm, cell.fingerprint);
+					renderCells(results);
+					await log(`  ${arm} @ ${(selectivity * 100).toFixed(1)}% → ${cell.rowsReturned} rows, ${cell.msMedian.toFixed(1)} ms, ${cell.requests} requests`);
+				}
+			}
+		} finally {
+			native.db.close();
+			await deleteDb(env, DB_NATIVE);
+		}
+	}
+
+	for (const [key, entries] of prints) {
+		const [clustering, selectivity] = key.split('|');
+		const agree = entries.every((e) => e.print === entries[0].print);
+		results.agreement.push({ clustering, selectivity: Number(selectivity), agree, arms: entries });
+		if (!agree) await log(`DISAGREEMENT at ${key}: ${entries.map((e) => `${e.arm}=${e.print}`).join(' ')}`);
+	}
+	renderAgreement(results);
+
+	// Arm E — the write side. Each repetition re-seeds from scratch (the database is deleted
+	// first), so a repetition never measures writes on top of the previous one's state.
+	const writeDataset = buildDataset({ rowCount, clustering: 'uniform' });
+	const ordinals = updateSample(writeDataset, updateRows);
+	const valueShift = rowCount; // pushes every touched row's value above every original one
+	const samples = { twoStoreSeed: [], twoStoreUpdate: [], nativeSeed: [], nativeUpdate: [] };
+	for (let i = 0; i < warmup + reps; i++) {
+		await log(`arm E repetition ${i + 1}/${warmup + reps}…`);
+		const twoStore = await seedTwoStore(env, DB_TWO_STORE, writeDataset);
+		const twoUpdate = await armEUpdateTwoStore(env, twoStore.db, writeDataset, { ordinals, valueShift });
+		twoStore.db.close();
+		await deleteDb(env, DB_TWO_STORE);
+		if (nativeOk) {
+			const native = await seedNative(env, DB_NATIVE, writeDataset);
+			const nativeUpdate = await armEUpdateNative(env, native.db, writeDataset, { ordinals, valueShift });
+			native.db.close();
+			await deleteDb(env, DB_NATIVE);
+			if (i >= warmup) {
+				samples.nativeSeed.push(native.ms);
+				samples.nativeUpdate.push(nativeUpdate.ms);
+			}
+		}
+		if (i >= warmup) {
+			samples.twoStoreSeed.push(twoStore.ms);
+			samples.twoStoreUpdate.push(twoUpdate.ms);
+		}
+	}
+	const writeRow = (layout, op, rows, requestsPerRow, list) => list.length && results.writes.push({
+		layout, op, rows, requests: rows * requestsPerRow,
+		msMedian: median(list), msPerRow: median(list) / rows, msSamples: list,
+	});
+	writeRow('two-store', 'seed', rowCount, 2, samples.twoStoreSeed);
+	writeRow('native', 'seed', rowCount, 1, samples.nativeSeed);
+	writeRow('two-store', 'update indexed value', ordinals.length, 3, samples.twoStoreUpdate);
+	writeRow('native', 'update indexed value', ordinals.length, 1, samples.nativeUpdate);
+	renderWrites(results);
+
+	window.__benchResults = results;
+	el('copy').disabled = false;
+	return results;
+}
+
+function renderCells(results) {
+	renderTable(el('cells'), [
+		{ label: 'arm', left: true, get: (r) => r.arm },
+		{ label: 'clustering', left: true, get: (r) => r.clustering },
+		{ label: 'selectivity', get: (r) => `${(r.selectivity * 100).toFixed(1)}%` },
+		{ label: 'rows', get: (r) => r.rowsReturned },
+		{ label: 'ms (median)', get: (r) => fixed(r.msMedian, 2) },
+		{ label: 'ms/row', get: (r) => fixed(r.msPerRow, 4) },
+		{ label: 'IDB requests', get: (r) => r.requests },
+		{ label: 'transactions', get: (r) => r.transactions },
+		{ label: 'rows swept', get: (r) => r.spanRows },
+	], results.cells);
+}
+
+function renderWrites(results) {
+	renderTable(el('writes'), [
+		{ label: 'layout', left: true, get: (r) => r.layout },
+		{ label: 'operation', left: true, get: (r) => r.op },
+		{ label: 'rows', get: (r) => r.rows },
+		{ label: 'ms (median)', get: (r) => fixed(r.msMedian, 2) },
+		{ label: 'ms/row', get: (r) => fixed(r.msPerRow, 4) },
+		{ label: 'IDB requests', get: (r) => r.requests },
+	], results.writes);
+}
+
+function renderAgreement(results) {
+	renderTable(el('agreement'), [
+		{ label: 'clustering', left: true, get: (r) => r.clustering },
+		{ label: 'selectivity', get: (r) => `${(r.selectivity * 100).toFixed(1)}%` },
+		{ label: 'arms compared', get: (r) => r.arms.length },
+		{ label: 'same rows?', left: true, get: (r) => r.agree
+			? '<span class="ok">yes</span>'
+			: `<span class="bad">NO — ${r.arms.map((a) => `${a.arm}=${a.print}`).join(', ')}</span>` },
+	], results.agreement);
+}
+
+/** Exposed so an automation driver can start the run and poll `window.__benchResults`. */
+window.__benchRun = async () => {
+	el('run').disabled = true;
+	el('copy').disabled = true;
+	logBox.textContent = '';
+	setStatus('running');
+	try {
+		const results = await runBenchmark();
+		setStatus('done', 'ok');
+		return results;
+	} catch (error) {
+		setStatus(`error: ${error.message}`, 'bad');
+		await log(`FAILED: ${error.stack ?? error.message}`);
+		window.__benchError = String(error.stack ?? error);
+		throw error;
+	} finally {
+		el('run').disabled = false;
+	}
+};
+
+el('run').addEventListener('click', () => { window.__benchRun().catch(() => {}); });
+el('copy').addEventListener('click', async () => {
+	await navigator.clipboard.writeText(JSON.stringify(window.__benchResults, null, 2));
+	await log('results copied to clipboard');
+});
+
+setStatus('idle');
+if (!globalThis.indexedDB) setStatus('IndexedDB unavailable — serve this page over http://, not file://', 'bad');
+</script>
+</body>
+</html>
