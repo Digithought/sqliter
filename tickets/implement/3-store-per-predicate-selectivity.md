@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-08-14T17:57:41.183Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\3-store-per-predicate-selectivity.implement.2026-08-14T17-57-41-183Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 ----
 description: The persistent storage backend guesses that any indexed lookup matches a tenth of the table, so it prices a lookup on a unique column exactly like one on a yes/no flag. Make it use the real per-column value counts the ANALYZE command already collects, so it can tell a selective query from an unselective one.
 files:

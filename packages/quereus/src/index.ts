@@ -365,6 +365,13 @@ import './runtime/register.js';
 // caches on the table's schema entry. Exported so out-of-package modules (the store
 // backends) can implement that method with the engine's own types.
 export type { TableStatistics, ColumnStatistics, EquiHeightHistogram, HistogramBucket } from './planner/stats/catalog-stats.js';
+// The two numeric helpers behind `CatalogStatsProvider`'s estimates, exported so a
+// module pricing an access plan from `TableSchema.statistics` produces the SAME number
+// the engine's own selectivity walk would — restating either formula in a module is how
+// the two estimates drift apart (the store's `store-module-access-plan.ts` is the
+// consumer).
+export { selectivityFromHistogram } from './planner/stats/histogram.js';
+export { combineConjunctive } from './planner/stats/selectivity-combine.js';
 
 // Re-export virtual table framework
 export type { VirtualTableModule } from './vtab/module.js';

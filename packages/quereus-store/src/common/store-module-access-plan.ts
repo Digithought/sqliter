@@ -20,13 +20,22 @@
 import type {
 	BestAccessPlanRequest,
 	BestAccessPlanResult,
+	ColumnStatistics,
 	Database,
 	OrderingSpec,
 	PredicateConstraint,
 	TableIndexSchema,
 	TableSchema,
+	TableStatistics,
 } from '@quereus/quereus';
-import { AccessPlanBuilder, equalitySeekKeyCount, hasSemanticOrdering, isMultiValueEquality } from '@quereus/quereus';
+import {
+	AccessPlanBuilder,
+	combineConjunctive,
+	equalitySeekKeyCount,
+	hasSemanticOrdering,
+	isMultiValueEquality,
+	selectivityFromHistogram,
+} from '@quereus/quereus';
 import { PARITY_COST_PROFILE, type ResolvedCostProfile } from './cost-profile.js';
 import {
 	indexPrefixSeekIsCollationExact,
@@ -85,13 +94,18 @@ const MAX_MULTI_SEEK_KEYS = 1000;
 // `profile.seekPositioning` — the per-seek-key cost of a multi-seek, charged by both
 // multi-seek arms (`tryIndexAccessPlan`'s secondary arm and `primaryKeyMultiSeekPlan`).
 //
-// **`pointRead` is arm-DISABLING, not arm-tuning, and that is why the seek-vs-scan veto
-// ignores it.** Because ARM_SELECTIVITY is a fixed FRACTION of the table, every arm's cost
-// is linear in `estimatedRows` and so is the full scan's — for a given `pointRead` an arm
-// either ALWAYS prices above a sequential scan or never does, for every query on every
-// table. With `R` = `pointRead`, the flip points are `range` (0.3·N·(0.5 + R) > N) at
-// R > 2.83, `prefixRange` at R > 6.17, and `eq` at R > 9.7. The veto below therefore keeps
-// pricing resolution at PARITY_COST_PROFILE; the full reasoning is at the veto site.
+// **Whether the declared `pointRead` may decide the seek-vs-scan veto depends on where the
+// arm's row estimate came from.** An arm whose estimate is real (per-predicate, from
+// `tableSchema.statistics` — see {@link resolveArmEstimate}) is judged at its declared
+// price: the estimate discriminates per query, so the veto discriminates per query too.
+// An arm still priced by an {@link ARM_SELECTIVITY} shape constant is judged at
+// PARITY_COST_PROFILE instead, because a constant fraction makes every arm's cost linear
+// in `estimatedRows` — for a given `pointRead` such an arm either ALWAYS prices above a
+// sequential scan or never does, for every query on every table (with `R` = `pointRead`,
+// the flip points are `range` (0.3·N·(0.5 + R) > N) at R > 2.83, `prefixRange` at
+// R > 6.17, and `eq` at R > 9.7 — and IndexedDB's measured `pointRead` band straddles the
+// `range` flip point exactly). Judging a shape constant at the declared price would be a
+// wholesale, every-query arm shutdown derived from a guess; full reasoning at the veto site.
 
 /** Which shape of window a secondary index can serve for a given predicate. */
 type IndexArm =
@@ -103,36 +117,36 @@ type IndexArm =
 	| 'prefixRange';
 
 /**
- * Estimated rows each arm returns, as a fraction of the request's `estimatedRows`. The
- * store keeps no per-column histograms, so these are shape constants, not statistics.
+ * FALLBACK rows each arm returns, as a fraction of the request's `estimatedRows` — shape
+ * constants, reached only when {@link resolveArmEstimate} cannot produce a per-predicate
+ * estimate from `tableSchema.statistics`. Concretely, a constant is still the estimate
+ * when:
  *
- * `prefixRange` sits between the two pre-existing factors, as its window does: it is
- * narrower than a bare leading-column range (the prefix pins every column ahead of the
- * bound) and wider than the pure-equality estimate, which stands for a prefix pinning
- * every column the predicate names.
+ *  - the table has never been `ANALYZE`d (`tableSchema.statistics` absent) — the common
+ *    case, which must plan byte-identically to the pre-statistics module;
+ *  - any column filling an EQUALITY role in the arm has no per-column statistics (a
+ *    column added or renamed after the last `ANALYZE` — the arm falls back WHOLESALE
+ *    rather than mixing a measured factor with a shape constant);
+ *  - a pure `range` arm's bound cannot be answered by the column's histogram (no
+ *    histogram was built, the bound's value is a parameter unknown at plan time, or the
+ *    histogram declines). A `prefixRange` arm in the same position stays per-query — its
+ *    measured prefix factors carry the estimate and only the bound's factor falls back
+ *    to this constant.
  *
- * NOTE: these are the store's biggest cost-model gap, and no per-row cost term closes it.
- * They are shape constants, so `where col = ?` is modelled at 10% of the table whatever
- * the predicate actually matches, and `request.estimatedRows` is the table's row count,
- * not a selectivity-adjusted estimate. A predicate matching MOST of the table therefore
- * still prices as an index seek returning 10% of it, and the full-scan comparison in
- * {@link computeBestAccessPlan} cannot rescue it — the fix is real per-column statistics,
- * not another constant here. Two things have to land for that: the store has to KEEP a
- * value distribution (`StoreTableBase.getStatistics` reports the row count only — a
- * distinct count or histogram would cost a scan, which is why `ANALYZE` collects the
- * per-column half itself), and `BestAccessPlanRequest` has to CARRY it, which it does not
- * today — the module sees `estimatedRows` and the filters, nothing else, so even an
- * analyzed table plans identically. Until then every cost decision this file makes is
- * per-ARM, never per-PREDICATE.
+ * `prefixRange` sits between the two other factors, as its window does: narrower than a
+ * bare leading-column range (the prefix pins every column ahead of the bound) and wider
+ * than the pure-equality estimate, which stands for a prefix pinning every column the
+ * predicate names.
  *
- * NOTE: the arms are exclusive per index, but two INDEXES compete on cost — and an index
- * on the equality prefix ALONE prices its `eq` arm cheaper (0.1) than the composite index
- * prices its `prefixRange` arm (0.15), so a schema carrying both `(a)` and `(a, b)` picks
- * `(a)` for `a = ? and b > ?` and leaves the `b` bound residual. Answers are unaffected.
- * Fine while redundant prefix indexes are rare; if one shows up as a slow plan, either
- * scale the `eq` factor by how many index columns the prefix actually pins, or drop
- * `prefixRange` below `eq` — do not just swap the two constants, which would then mis-rank
- * a genuine leading-column range.
+ * NOTE: the arms are exclusive per index, but two INDEXES compete on cost — and on an
+ * un-analyzed table an index on the equality prefix ALONE prices its `eq` arm cheaper
+ * (0.1) than the composite index prices its `prefixRange` arm (0.15), so a schema
+ * carrying both `(a)` and `(a, b)` picks `(a)` for `a = ? and b > ?` and leaves the `b`
+ * bound residual. Answers are unaffected, and `ANALYZE` largely resolves it: under real
+ * statistics the composite arm's estimate is the prefix's factor damped by the bound's,
+ * so it under-prices the single-column arm whenever the bound is at all selective. If
+ * the un-analyzed ranking ever shows up as a slow plan, the fix is `ANALYZE`, not a
+ * constant swap here.
  */
 const ARM_SELECTIVITY: Readonly<Record<IndexArm, number>> = {
 	eq: 0.1,
@@ -141,26 +155,179 @@ const ARM_SELECTIVITY: Readonly<Record<IndexArm, number>> = {
 };
 
 /**
+ * What {@link resolveArmEstimate} established for one arm of one index: the fraction of
+ * `request.estimatedRows` the arm is expected to return, and whether real per-column
+ * statistics produced that fraction (versus an {@link ARM_SELECTIVITY} shape constant).
+ */
+interface ArmEstimate {
+	readonly selectivity: number;
+	readonly statsBacked: boolean;
+}
+
+/**
+ * The `ANALYZE`-collected statistics for the table column at `colIdx`, or undefined when
+ * the table has none or the column is not covered.
+ *
+ * `columnStats` is keyed by LOWERCASE COLUMN NAME while this file works in column index,
+ * so the lookup goes index → current column name → stats. That direction is what keeps a
+ * post-`ANALYZE` `ALTER TABLE` safe: a RENAMED column's current name is absent from the
+ * map (falls back to the shape constant), and a DROPPED column shifts later indexes onto
+ * their own current names — a miss or the right entry, never a neighbour's numbers.
+ */
+function columnStatsFor(
+	tableInfo: TableSchema,
+	stats: TableStatistics,
+	colIdx: number,
+): ColumnStatistics | undefined {
+	const name = tableInfo.columns[colIdx]?.name;
+	return name === undefined ? undefined : stats.columnStats.get(name.toLowerCase());
+}
+
+/**
+ * The histogram-answered selectivity of the range bound(s) on `colIdx`, or undefined
+ * when the histogram cannot answer them (then the caller falls back to a shape
+ * constant).
+ *
+ * Reads the FIRST lower and FIRST upper bound in `filters` order — the same positional
+ * pick {@link claimFirstPerRole} claims and `rule-select-access-path` seeks on, so the
+ * bound being priced is the bound being served. Each bound needs a plan-time value
+ * (`f.value !== undefined`; a parameter binding has none) and a histogram verdict; a
+ * present bound that cannot be answered makes the whole factor undefined rather than
+ * half-measured. Both formulas are the engine's: a single bound is
+ * `selectivityFromHistogram` verbatim, and a two-sided range combines as
+ * `max(0, lowSel + highSel - 1)` — `CatalogStatsProvider.estimateLeaf`'s BETWEEN
+ * arithmetic, which models the two bounds as the anti-correlated pair they are rather
+ * than damped-independent conjuncts.
+ */
+function rangeBoundSelectivity(
+	stats: TableStatistics,
+	colStats: ColumnStatistics,
+	filters: readonly PredicateConstraint[],
+	colIdx: number,
+): number | undefined {
+	const histogram = colStats.histogram;
+	if (!histogram) return undefined;
+	const boundSel = (ops: readonly string[]): { present: boolean; sel: number | undefined } => {
+		const bound = filters.find(f => f.columnIndex === colIdx && ops.includes(f.op));
+		if (!bound) return { present: false, sel: undefined };
+		return {
+			present: true,
+			sel: bound.value === undefined
+				? undefined
+				: selectivityFromHistogram(histogram, bound.op, bound.value, stats.rowCount),
+		};
+	};
+	const low = boundSel(LOWER_BOUND_OPS);
+	const high = boundSel(UPPER_BOUND_OPS);
+	if ((low.present && low.sel === undefined) || (high.present && high.sel === undefined)) return undefined;
+	if (low.sel !== undefined && high.sel !== undefined) return Math.max(0, low.sel + high.sel - 1);
+	return low.sel ?? high.sel;
+}
+
+/**
+ * The per-predicate row estimate for one arm: equality columns in `eqCols`, plus — for
+ * the `range` / `prefixRange` arms — the bound on `rangeCol`.
+ *
+ * **The design rule this implements: the estimate must be the number the engine's
+ * `CatalogStatsProvider` would produce for the same predicate.** A seek's advertised
+ * `rows` and the estimate the residual `Filter` above it carries describe the same row
+ * set; two different numbers would have the optimizer comparing two different worlds. So
+ * every formula here is `estimateLeaf`'s — equality is `1 / max(distinctCount, 1)`, a
+ * bound is the histogram's verdict ({@link rangeBoundSelectivity}) — and the factors
+ * combine through the engine's own `combineConjunctive` (damped independence), never a
+ * restated product.
+ *
+ * `statsBacked` — the flag the veto, the multi-seek's resolution charge, and `vetoCost`
+ * all key off — means the estimate is per-QUERY rather than a shape constant: every
+ * equality column had real statistics, and at least one factor was measured. An arm that
+ * is not statistics-backed returns exactly {@link ARM_SELECTIVITY}'s constant, so an
+ * un-analyzed table plans byte-identically to the pre-statistics module. A missing
+ * equality column falls back WHOLESALE (no mixing a measured factor with a constant);
+ * only a `prefixRange` arm's unanswerable BOUND degrades softly, contributing the arm
+ * constant as its factor while the measured prefix keeps the estimate per-query.
+ *
+ * A fraction of `request.estimatedRows`, deliberately, even though the histogram/NDV
+ * numbers are ratios of `statistics.rowCount`: `estimatedRows` is the figure the rest of
+ * the plan was costed with, and both snapshots come from the same `ANALYZE` unless the
+ * planner overrode the size — in which case following the override is the engine-wide
+ * rule (see `sizeRequestFromLiveCount`).
+ */
+function resolveArmEstimate(
+	tableInfo: TableSchema,
+	filters: readonly PredicateConstraint[],
+	arm: IndexArm,
+	eqCols: readonly number[],
+	rangeCol: number | undefined,
+): ArmEstimate {
+	const fallback: ArmEstimate = { selectivity: ARM_SELECTIVITY[arm], statsBacked: false };
+	const stats = tableInfo.statistics;
+	if (!stats) return fallback;
+
+	const factors: number[] = [];
+	for (const colIdx of eqCols) {
+		const colStats = columnStatsFor(tableInfo, stats, colIdx);
+		if (!colStats) return fallback;
+		// NOTE: `1/D` assumes uniformity, so an equality on a skewed column (a 99/1
+		// two-valued flag) is still mispriced for the common value. The histogram carries
+		// per-bucket distinct counts and could answer equality too, but the engine's
+		// `CatalogStatsProvider.estimateLeaf` prices `=` as `1/D`, and this file's design
+		// rule is to match it — if a skewed equality is ever measured planning wrong, move
+		// BOTH the engine and this factor to the histogram together.
+		//
+		// NOTE: `distinctCount` counts distinct NON-NULL values but the factor is applied
+		// against the full row count, so a mostly-NULL column over-estimates its matches
+		// (NULL rows never match an equality). Same treatment as skew: the engine prices it
+		// this way, so this file does too — fix both together or neither.
+		factors.push(1 / Math.max(colStats.distinctCount, 1));
+	}
+
+	if (rangeCol !== undefined) {
+		const colStats = columnStatsFor(tableInfo, stats, rangeCol);
+		const boundFactor = colStats
+			? rangeBoundSelectivity(stats, colStats, filters, rangeCol)
+			: undefined;
+		if (boundFactor !== undefined) {
+			factors.push(boundFactor);
+		} else if (eqCols.length === 0) {
+			// A pure `range` arm with no histogram answer has no measured factor at all —
+			// that IS the fallback case, not a degraded estimate.
+			return fallback;
+		} else {
+			// `prefixRange` with a measured prefix: the bound alone degrades to the arm
+			// constant as its factor; the estimate stays per-query on the prefix's strength.
+			factors.push(ARM_SELECTIVITY[arm]);
+		}
+	}
+
+	return { selectivity: combineConjunctive(factors), statsBacked: true };
+}
+
+/**
  * One index's advertisement, plus what {@link computeBestAccessPlan} needs to rank it
  * against the sequential scan it does not itself build.
  */
 interface IndexPlanCandidate {
 	plan: BestAccessPlanResult;
 	/**
-	 * `plan.cost` recomputed with {@link PARITY_COST_PROFILE}'s `pointRead` — the price the
-	 * seek-vs-scan veto judges this candidate at, whatever the backend declared. Equal to
-	 * `plan.cost` on a parity backend, and on any arm that pays no resolution term at all
-	 * (the multi-seek, a cost-only decline). Reasoning at the veto site.
+	 * The price the seek-vs-scan veto judges this candidate at. For a STATISTICS-BACKED
+	 * arm this is `plan.cost` itself — the estimate is per-query, so the backend's
+	 * declared profile is allowed to decide the arm's fate per query. For an arm still
+	 * priced by an {@link ARM_SELECTIVITY} shape constant it is the arm repriced at
+	 * {@link PARITY_COST_PROFILE}'s `pointRead`: judging a fixed fraction at a declared
+	 * price would disable the arm for every query on every table (reasoning at the veto
+	 * site). Equal to `plan.cost` on a parity backend either way, and on any arm that
+	 * pays no resolution term at all (an unbacked multi-seek, a cost-only decline).
 	 */
 	vetoCost: number;
 	/**
-	 * True for the `plan=5` multi-seek arm, which is EXEMPT from that comparison. Reasoning
-	 * in full at the comparison site; the short of it is that this module cannot tell a
-	 * user's `col in (…)` from the SYNTHETIC probes `rule-key-set-seek` sends it, which read
-	 * the arm's cost as a curve at 2 and 1000 keys and decline outright if either answer
-	 * stops naming an index.
+	 * True for the `plan=5` multi-seek arm. Together with {@link statsBacked} it decides
+	 * the veto exemption at the comparison site: a multi-seek whose row estimate is still
+	 * the clamped shape-constant union (`min(N, inCount × 0.1N)`) must not be judged by
+	 * the veto — the figure is an artifact, not an estimate.
 	 */
 	isMultiSeek: boolean;
+	/** {@link ArmEstimate.statsBacked} for the arm behind this plan. */
+	statsBacked: boolean;
 }
 
 /** One (column, operator-group) slot that the access-path rule fills from a single filter. */
@@ -308,6 +475,12 @@ export function computeBestAccessPlan(
 	costProfile: ResolvedCostProfile,
 ): BestAccessPlanResult {
 	const estimatedRows = request.estimatedRows ?? 1000;
+
+	// Whether ANY pushed filter is a runtime-valued set. Detected once, on the REQUEST:
+	// such a request is engine-synthesized (`rule-key-set-seek`'s probes, or the key-set
+	// semi join itself) and must never be answered with this module's own scan verdict,
+	// whichever arm ends up serving it — see the exemption at the seek-vs-scan comparison.
+	const requestCarriesRuntimeSet = request.filters.some(f => f.runtimeSet !== undefined);
 
 	const pkColumns = tableInfo.primaryKeyDefinition.map(pk => pk.index);
 
@@ -458,63 +631,53 @@ export function computeBestAccessPlan(
 		if (!costOnlyFallback) costOnlyFallback = plan;
 	}
 	if (bestSeekPlan) {
+		// Two narrow exemptions skip the seek-vs-scan comparison outright:
 		//
-		// The MULTI-SEEK arm is exempt, and that is a measured decision rather than an
-		// oversight. `rule-key-set-seek` (engine side) does not consume this arm as a PLAN —
-		// it probes `getBestAccessPlan` with SYNTHESIZED runtime-set filters at 2 and 1000
-		// keys, reads the two costs as a straight line, and interpolates the key count at
-		// which the seek would overtake a scan. A probe answer that stops naming an index is
-		// read as "the module declined" and the whole rewrite is abandoned. Since nothing
-		// here distinguishes a probe from a user's own `col in (…)`, substituting this
-		// module's own scan verdict at 1000 keys silently switches key-set semi joins off:
-		// MEASURED, it fails 11 tests in `key-set-seek-store.spec.ts` on tables of 200 and
-		// 300 rows where the seek is unambiguously the right plan at the key counts actually
-		// used. The arm's brakes stay `inCount × profile.seekPositioning` (which is what the
-		// engine interpolates) and {@link MAX_MULTI_SEEK_KEYS}; the engine makes the scan
-		// comparison this exemption skips, off the same numbers.
+		//  - **A request carrying a runtime-valued set** (`filter.runtimeSet`). Such a
+		//    request is only ever built by the engine — `rule-key-set-seek`'s synthesized
+		//    probes and the key-set semi join itself — and the engine reads a probe answer
+		//    that names no index as "the module declined", abandoning the whole rewrite.
+		//    So this module must NEVER substitute its own scan verdict there: the engine
+		//    makes the scan comparison itself, interpolating a break-even from the module's
+		//    costs at 2 and 1000 keys. Detected on the REQUEST rather than on the winning
+		//    arm, because the probe must survive whichever arm this module happens to pick
+		//    for it. (Substituting a scan verdict at 1000 keys was MEASURED to fail 11
+		//    tests in `key-set-seek-store.spec.ts` on 200-and-300-row tables where the seek
+		//    is unambiguously right at the key counts actually used.)
+		//  - **A multi-seek whose row estimate is not statistics-backed.** Its
+		//    `min(N, inCount × 0.1N)` union reaches the whole table at ten seek keys, so
+		//    beyond that the figure is a CLAMP rather than an estimate — vetoing on it
+		//    would judge the estimator's artifact. A statistics-backed multi-seek clamps
+		//    only at `inCount ≈ distinctCount`, which is the honest saturation point, so it
+		//    faces the comparison like every other arm — a literal `col in (…900 values…)`
+		//    over an analyzed 100-row table now correctly loses to the scan.
 		//
-		// **The comparison uses `vetoCost` — the candidate priced at PARITY `pointRead` —
-		// not the declared cost the plan advertises.** A backend's declared `pointRead`
-		// scales what an arm ADVERTISES and how index arms RANK against each other; it
-		// deliberately does not decide whether an index is used at all. Three reasons,
-		// settled when the IndexedDB profile was measured:
-		//  - The flip is a knife edge, and it sits on the GUESS rather than on the
-		//    measurement. Raising `pointRead` past 2.83 disables the `range` arm for EVERY
-		//    query on EVERY table (the flip-point arithmetic is above, where the profile's
-		//    two terms are introduced), and IndexedDB's measured band (2.8–3.4, from
-		//    `packages/quereus-plugin-indexeddb/bench/README.md`) straddles that point
-		//    exactly. At the 30% selectivity the `range` arm MODELS, that same bench puts
-		//    seek and scan within ~10% of each other (87.5 ms vs 92.6 ms at 20k rows / 25%
-		//    selectivity) — the measurement cannot resolve which side of the line the arm
-		//    belongs on.
-		//  - The error is wildly asymmetric. Disabling the arm costs up to 25× when the real
-		//    predicate is selective (a range matching 1% of 20k rows: 3.8 ms seeked vs 95 ms
-		//    scanned). Keeping it costs ~10% in the case the guess describes.
-		//  - So a wholesale, every-query arm shutdown is not a defensible thing to derive
-		//    from a knife-edge measurement of a number the model only guesses at.
-		//    `store-column-statistics` replaces {@link ARM_SELECTIVITY} with a real
-		//    per-predicate estimate; when it lands, DELETE `vetoCost` and compare on
-		//    `plan.cost`, so the veto discriminates per query instead of shutting an arm off
-		//    per schema. `cost-profile.spec.ts` pins the current policy — that test is what
-		//    tells a future reader the choice was deliberate.
+		// **The comparison judges the candidate at `vetoCost`, which is `plan.cost` itself
+		// exactly when the arm's row estimate is statistics-backed.** A per-query estimate
+		// lets the backend's declared profile decide the arm's fate per query: on
+		// IndexedDB (`pointRead: 3.0`) the `range` arm's break-even is
+		// 1/(0.5 + 3.0) ≈ 0.286 of the table, so a range the histogram puts at 25% seeks
+		// and one it puts at 35% scans — the discrimination the declared profile exists to
+		// buy. An arm still priced by an {@link ARM_SELECTIVITY} shape constant is instead
+		// judged at PARITY `pointRead`, settled when the IndexedDB profile was measured:
+		// a fixed fraction makes the veto arm-DISABLING rather than arm-tuning (the
+		// flip-point arithmetic is at the top of this file, where the profile's terms are
+		// introduced), IndexedDB's measured band straddles the `range` arm's flip point
+		// exactly, and the error is wildly asymmetric — disabling the arm costs up to 25×
+		// when the real predicate is selective, keeping it costs ~10% in the case the
+		// constant describes. So the declared profile decides per QUERY once the estimate
+		// is real, and falls back to the parity price where the estimate is still a shape
+		// constant. `cost-profile.spec.ts` pins both halves of that policy.
 		//
 		// Ties keep the seek: it returns fewer rows for the rest of the plan to carry.
-		if (bestSeekPlan.isMultiSeek || bestSeekPlan.vetoCost <= scanPlan.cost) return bestSeekPlan.plan;
+		const exemptFromVeto = requestCarriesRuntimeSet
+			|| (bestSeekPlan.isMultiSeek && !bestSeekPlan.statsBacked);
+		if (exemptFromVeto || bestSeekPlan.vetoCost <= scanPlan.cost) return bestSeekPlan.plan;
 		// Losing the seek is SAFE, never a wrong answer: the scan claims no filters, so the
 		// engine keeps every one of them as a residual Filter and the row set is identical.
 		// Deliberately returns the scan rather than falling through to `costOnlyFallback`
 		// below — a cost-only plan performs this same sequential scan while advertising an
 		// index arm's (cheaper) cost, so falling through would undo the comparison.
-		//
-		// NOTE: a vetoed seek is indistinguishable from a DECLINE to the engine, and
-		// `rule-key-set-seek` reads a probe answer that names no index as "the module
-		// declined" and abandons its rewrite. Harmless while the veto is reachable only
-		// where an arm's estimate is the whole table (a one-row table, per the flip-point
-		// arithmetic above — and `vetoCost` keeps that true on every backend, whatever it
-		// declares) — a key-set seek there is worthless anyway. If real
-		// per-column statistics ever make the veto fire on tables worth seeking, the
-		// comparison has to exempt any request carrying a runtime-valued set, not just the
-		// arm this module happens to pick for it.
 		return { ...scanPlan, explains: 'Store full table scan (cheaper than the best index seek)' };
 	}
 	// NOTE: a cost-only plan carries no PK-order advertisement even though the store still
@@ -643,14 +806,20 @@ function primaryKeyMultiSeekPlan(
  * handled" and "build a window" decisions cannot disagree. A decline returns a cost-only
  * plan: cheaper cost, filters unhandled, residual retained; correct, just not sped up.
  *
+ * **Rows.** Each arm's row estimate comes from {@link resolveArmEstimate}: per-predicate
+ * when the table's `ANALYZE`-collected statistics cover the arm's columns, the
+ * {@link ARM_SELECTIVITY} shape constant otherwise — with `statsBacked` recording which.
+ *
  * **Cost.** Each single-window seek arm pays the backend's declared `profile.pointRead`
  * per row it expects to return, on top of the `AccessPlanBuilder` shape's own per-row term:
  * the shape prices reading the index ENTRY, and the store must then read the ROW that entry
- * names out of the data store. Two arms deliberately do NOT pay it — a cost-only decline
- * (it resolves nothing; the scan reads rows directly) and the multi-seek, for the measured
- * reason recorded at that arm below. Every candidate also carries a `vetoCost`: the same
- * arm priced at the PARITY `pointRead`, which is what the seek-vs-scan comparison in
- * {@link computeBestAccessPlan} judges it at (reasoning at that site).
+ * names out of the data store. A cost-only decline deliberately does not pay it (it
+ * resolves nothing; the scan reads rows directly), and the multi-seek pays it exactly when
+ * its row estimate is statistics-backed — the reason is recorded at that arm below. Every
+ * candidate also carries a `vetoCost`, the price the seek-vs-scan comparison in
+ * {@link computeBestAccessPlan} judges it at: the declared cost itself for a
+ * statistics-backed arm, the arm repriced at PARITY `pointRead` otherwise (reasoning at
+ * that site).
  */
 function tryIndexAccessPlan(
 	db: Database,
@@ -729,7 +898,18 @@ function tryIndexAccessPlan(
 	}
 
 	const isRange = arm !== 'eq';
-	const rows = Math.max(1, Math.floor(estimatedRows * ARM_SELECTIVITY[arm]));
+	// Resolved AFTER the prefixRange→eq degradation above, so the estimate prices the arm
+	// actually advertised (a degraded arm's unclaimed bound survives in the residual and
+	// must not narrow this estimate). For a multi-seek, `eq`'s estimate is PER SEEK KEY —
+	// one full equality tuple — which is exactly what the union arithmetic below wants.
+	const { selectivity, statsBacked } = resolveArmEstimate(
+		tableInfo,
+		request.filters,
+		arm,
+		arm === 'range' ? [] : eqCols,
+		arm === 'eq' ? undefined : (arm === 'range' ? leadingCol : trailingRangeCol),
+	);
+	const rows = Math.max(1, Math.floor(estimatedRows * selectivity));
 	/** The arm's shape — `AccessPlanBuilder`'s per-row index-entry term, no resolution. */
 	const armShape = (): AccessPlanBuilder =>
 		isRange ? AccessPlanBuilder.rangeScan(rows, 0.2) : AccessPlanBuilder.eqMatch(rows, 0.3);
@@ -747,6 +927,7 @@ function tryIndexAccessPlan(
 			vetoCost: plan.cost,
 			// Likewise immaterial; false states the fact — this plan seeks nothing at all.
 			isMultiSeek: false,
+			statsBacked,
 		};
 	};
 
