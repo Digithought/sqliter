@@ -647,7 +647,8 @@ export class StoreModule extends StoreModuleRename implements VirtualTableModule
 		const tableKeyCollation = (table?.getConfig().collation || 'NOCASE').toUpperCase();
 
 		return {
-			...computeBestAccessPlan(db, tableInfo, sizeRequestFromLiveCount(request, table), tableKeyCollation),
+			...computeBestAccessPlan(
+				db, tableInfo, sizeRequestFromLiveCount(request, table), tableKeyCollation, this.costProfile),
 			honorsCollatedRangeBounds: true,
 		};
 	}

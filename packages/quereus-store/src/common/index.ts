@@ -19,6 +19,14 @@ export type {
 // Shared `getMany` fallback for backends without a native batch point-read
 export { defaultGetMany } from './kv-store.js';
 
+// Per-backend cost declaration consumed by access planning
+export {
+  PARITY_COST_PROFILE,
+  resolveCostProfile,
+  type KVCostProfile,
+  type ResolvedCostProfile,
+} from './cost-profile.js';
+
 // Bounded paging for backends without a streaming cursor
 export { pagedIterate, type FetchBatch } from './paged-iterate.js';
 

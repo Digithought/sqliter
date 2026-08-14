@@ -3,6 +3,8 @@
  * Implemented by LevelDBStore (Node.js) and IndexedDBStore (browser).
  */
 
+import type { KVCostProfile } from './cost-profile.js';
+
 /**
  * Options for iterating over key-value pairs.
  */
@@ -317,6 +319,22 @@ export interface KVStoreOptions {
 // ever again found re-deriving names, or a sixth provider lands, revisit and change these
 // signatures to take the built name.
 export interface KVStoreProvider {
+	/**
+	 * How expensive this backend's basic read operations are, relative to reading one row
+	 * sequentially during a full scan. Omitted (and every omitted field within it) means
+	 * the parity defaults, which reproduce the module's pre-profile cost constants exactly
+	 * — so a provider that declares nothing plans byte-identically to before.
+	 *
+	 * Declared on the PROVIDER rather than on a store because a cost profile is a property
+	 * of the BACKEND, one provider is the per-backend singleton, and `StoreModuleBase`
+	 * already holds the provider without having to open anything.
+	 *
+	 * Declare only MEASURED numbers. An unmeasured guess here is worse than the parity
+	 * default: it changes advertised costs for every query on the backend. See
+	 * {@link KVCostProfile}.
+	 */
+	readonly costProfile?: KVCostProfile;
+
 	/**
 	 * Get or create a KVStore for a table's row data.
 	 * Store name: {schema}.{table}

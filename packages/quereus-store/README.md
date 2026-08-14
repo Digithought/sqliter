@@ -98,6 +98,36 @@ than per-query, and today it only fires where the guess is the whole table. Mult
 exempt from the comparison — the engine reads their cost as a curve to decide its own key-set
 rewrites, and answering it with a scan would switch that feature off.
 
+**Backend cost profile.** How expensive those reads actually are depends on the backend: a
+point read is nearly free on LevelDB (in-process, block-cached) and is a separate request
+across an IPC boundary on IndexedDB. A provider can therefore declare a `costProfile`
+(`KVCostProfile`, in `src/common/cost-profile.ts`), whose unit is **one row read
+sequentially during a full scan = 1.0**:
+
+| knob | what it prices | parity default | declared by IndexedDB |
+|---|---|---|---|
+| `pointRead` | resolving one secondary-index entry to the row it names | 1.0 | 3.0 |
+| `seekPositioning` | one key of a multi-seek — positioning the window *and* reading its row | 0.5 | 5.0 |
+
+Both fields are optional and an omitted field takes its parity default, which reproduces the
+module's pre-profile constants exactly — **a provider that declares nothing plans exactly as
+it always did.** A field declared non-finite or non-positive falls back to its parity value
+with a warning rather than breaking planning. Only LevelDB's numbers are unmeasured (it
+declares nothing, deliberately); IndexedDB's come from the benchmark in
+`packages/quereus-plugin-indexeddb/bench/README.md`. The profile is expressed as a *ratio*,
+not milliseconds, because these costs are request-latency dominated — a slower device scales
+the seek path and the scan baseline together.
+
+`seekPositioning` is the knob that moves plan choice today: it is what the engine's key-set
+rewrite reads when it interpolates the key count at which a seek overtakes the plan it would
+displace, so an expensive-seek backend stops firing that rewrite on small tables.
+`pointRead` changes what an index arm *advertises* and how two indexes rank against each
+other — but **the seek-vs-scan comparison above is deliberately still priced at the parity
+1.0.** Because the match-count guess is a fixed fraction of the table, that comparison is
+arm-disabling rather than arm-tuning: past `pointRead` 2.83 the range arm would be switched
+off for every query on every table, off a guess no measurement can resolve. When real
+per-column statistics replace the guess, the comparison will use the declared cost instead.
+
 **`IN`-list index seeks ("multi-seek").** An `IN`-list on an indexed column
 (`where v in (1, 2, 3)`, including parameter-bound lists) is served from the index as one
 deduplicated, key-ordered point seek per distinct list value, instead of a full scan with

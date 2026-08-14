@@ -12,7 +12,7 @@
  *   __catalog__                   - Catalog store (DDL metadata)
  */
 
-import type { AtomicBatch, KVStore, KVStoreProvider } from '@quereus/store';
+import type { AtomicBatch, KVCostProfile, KVStore, KVStoreProvider } from '@quereus/store';
 import {
 	buildDataStoreName,
 	buildIndexStoreName,
@@ -50,6 +50,50 @@ export interface IndexedDBProviderOptions {
  * IndexedDB database with multiple object stores (one per table).
  */
 export class IndexedDBProvider implements KVStoreProvider {
+	/**
+	 * What this backend's random reads cost, relative to one row read sequentially during
+	 * a full scan (= 1.0). Every point read here is a separate request across the browser's
+	 * IPC boundary, where a scan pages 256 entries per request — so the store's parity
+	 * defaults (1.0 / 0.5), which fit an in-process block-cached backend like LevelDB,
+	 * price an IndexedDB lookup at roughly a third of what it costs.
+	 *
+	 * Measured in `bench/README.md` (Chromium 151 / Windows 11, 200-byte rows, page size
+	 * 256, medians). A full scan reads a row in 0.0047 ms at 20k rows and ~0.011 ms at
+	 * 100k; the index path (bench arm A — today's two-store design) resolves a matched row
+	 * in 0.0169–0.0175 ms at 20k and 0.0406–0.0465 ms at 100k.
+	 *
+	 * `pointRead` = arm A's per-row cost MINUS the index-entry paging it also pays, over
+	 * arm C's per-scanned-row cost. Index entries are read sequentially, 256 per request;
+	 * the bench's closest measurement of an entry read is arm B2 at 0.8× a data row, so
+	 * entry paging is charged at 0.8. That subtraction is an ESTIMATE, not a measurement —
+	 * the bench never timed two-store index paging on its own.
+	 *
+	 *   | size / clustering       | arm A /row | entry paging  | resolution | ÷ scan row | ratio |
+	 *   |-------------------------|------------|---------------|------------|------------|-------|
+	 *   | 20k, 25% sel, either    | 0.0169–0.0175 | 0.8 × 0.0047 | ~0.0131 ms | 0.0047     | 2.8   |
+	 *   | 100k, 25%, clustered    | 0.0406     | 0.8 × 0.011   | ~0.0318 ms | 0.011      | 2.9   |
+	 *   | 100k, 25%, uniform      | 0.0465     | 0.8 × 0.011   | ~0.0376 ms | 0.011      | 3.4   |
+	 *
+	 * Band 2.8–3.4 ⇒ declare 3.0.
+	 *
+	 * `seekPositioning` prices one multi-seek key: an index window request PLUS a row read,
+	 * neither amortized across a 256-entry page ⇒ ≈ 2 × the point-read cost above, i.e.
+	 * 0.026 ms at 20k (5.5 scan-rows) and ~0.062 ms at 100k (5.7). Declared 5.0, rounded
+	 * slightly DOWN so a borderline key-set seek keeps firing rather than being priced out
+	 * on a rounding decision.
+	 *
+	 * Both numbers are request-latency dominated, so a slower device scales the seek path
+	 * and the scan baseline together — which is why the profile is a ratio and not
+	 * milliseconds.
+	 *
+	 * NOTE: this provider wraps every store in a `CachedKVStore` by default, and the bench
+	 * measured RAW IndexedDB. A warm LRU cache makes point reads far cheaper than 3.0, but
+	 * a cost profile is a static, cold-path declaration and cannot express a hit rate. The
+	 * cold number is the safe one to plan against; if cache-hit rates ever become
+	 * observable at plan time, revisit this.
+	 */
+	readonly costProfile: KVCostProfile = { pointRead: 3.0, seekPositioning: 5.0 };
+
 	private databaseName: string;
 	private stores = new Map<string, KVStore>();
 	/**

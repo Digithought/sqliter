@@ -99,6 +99,12 @@ export interface LevelDBProviderOptions {
  * LevelDB implementation of KVStoreProvider over a single shared root with one
  * sublevel per logical store.
  */
+// NOTE: no `costProfile` declared, deliberately. This provider therefore takes the store
+// framework's parity defaults — "a random point read costs about what a sequentially
+// scanned row costs" — which is plausible for an in-process, block-cached backend but has
+// never been measured here. An unmeasured guess would be worse than the default, since it
+// would change advertised costs for every query on this backend; measuring it is
+// backlog/debt-leveldb-cost-profile-measurement.
 export class LevelDBProvider implements KVStoreProvider {
 	private basePath: string;
 	private createIfMissing: boolean;

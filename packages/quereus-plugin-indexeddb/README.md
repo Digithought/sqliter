@@ -152,6 +152,27 @@ sync.close();
 | `databaseName` | string | `'quereus'` | Name for the unified IndexedDB database |
 | `cache` | CacheOptions | — | Read cache configuration |
 
+## Query planning: this backend declares itself expensive for random reads
+
+Every point read here is a separate request across the browser's IPC boundary, while a full
+scan pages 256 entries per request — so a random row read costs roughly **3×** a sequentially
+scanned row on this backend, and one key of a multi-key lookup costs about **5×**. This
+provider declares those numbers (`costProfile`), and the store module's query planner prices
+its access paths with them instead of assuming a disk-backed store's ratios. The numbers come
+from the browser benchmark below; the derivation is in the comment on `IndexedDBProvider`.
+
+What changes in practice: a key-set lookup (`where col in (select …)`) stops being rewritten
+into a seek on small tables, where seeking N keys costs more than reading the whole table —
+roughly under ten rows, versus effectively never on a disk-backed backend. Index seeks are
+still chosen for the shapes that benefit; a cost profile only changes which plan runs, never
+what it returns. See [`@quereus/store`'s README](../quereus-store/README.md) § Backend cost
+profile for the two knobs and their unit.
+
+One caveat worth knowing: this provider wraps every store in a read cache by default, and the
+benchmark measured raw IndexedDB. A warm cache makes point reads much cheaper than the
+declared 3×, but a cost profile is a static declaration and cannot express a hit rate, so the
+cold-path number is what the planner sees.
+
 ## Benchmark
 
 [`bench/`](./bench/) holds a manual browser benchmark (not part of `yarn test`) that prices how

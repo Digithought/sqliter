@@ -12,6 +12,7 @@
 import type { BaseModuleConfig, Database, LensDeploymentSnapshot, SqlValue, TableSchema } from '@quereus/quereus';
 import { QuereusError, StatusCode } from '@quereus/quereus';
 import type { KVStore, KVStoreProvider } from './kv-store.js';
+import { resolveCostProfile, type ResolvedCostProfile } from './cost-profile.js';
 import type { StoreEventEmitter } from './events.js';
 import { TransactionCoordinator } from './transaction.js';
 import { StoreTable } from './store-table.js';
@@ -218,10 +219,24 @@ export abstract class StoreModuleBase {
 	 */
 	protected readonly atomicProvider: boolean;
 
+	/**
+	 * What this provider's backend declares its basic reads to cost, relative to one
+	 * sequentially scanned row ({@link KVStoreProvider.costProfile}), with the parity
+	 * defaults filled in for whatever it left undeclared.
+	 *
+	 * Resolved once at construction for the same reason {@link atomicProvider} is: a
+	 * profile is a property of the BACKEND and so is fixed for the provider's lifetime,
+	 * and the consumer (`StoreModule.getBestAccessPlan` → `computeBestAccessPlan`) runs
+	 * per planned query. Resolving here also means a malformed third-party declaration
+	 * warns once at module construction rather than once per planned statement.
+	 */
+	protected readonly costProfile: ResolvedCostProfile;
+
 	constructor(provider: KVStoreProvider, eventEmitter?: StoreEventEmitter) {
 		this.provider = provider;
 		this.eventEmitter = eventEmitter;
 		this.atomicProvider = typeof provider.beginAtomicBatch === 'function';
+		this.costProfile = resolveCostProfile(provider.costProfile);
 	}
 
 	/**

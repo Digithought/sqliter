@@ -45,6 +45,7 @@ import {
 	StoreModule,
 	StoreTable,
 	InMemoryKVStore,
+	type KVCostProfile,
 	type KVStoreProvider,
 	type StoreModuleConfig,
 	type IterateOptions,
@@ -127,7 +128,11 @@ function createCountingProvider(dataStores: Map<string, CountingKVStore>): KVSto
 	};
 }
 
-function createInMemoryProvider(): KVStoreProvider {
+/**
+ * `costProfile` is optional so every existing caller stays a parity backend — the 16 tests
+ * above are the regression fingerprint for "an undeclared provider plans as it always did".
+ */
+function createInMemoryProvider(costProfile?: KVCostProfile): KVStoreProvider {
 	const stores = new Map<string, InMemoryKVStore>();
 	const get = (key: string): InMemoryKVStore => {
 		let s = stores.get(key);
@@ -135,6 +140,7 @@ function createInMemoryProvider(): KVStoreProvider {
 		return s;
 	};
 	return {
+		...(costProfile ? { costProfile } : {}),
 		async getStore(schemaName, tableName) { return get(`${schemaName}.${tableName}`); },
 		async getIndexStore(schemaName, tableName, indexName) { return get(`${schemaName}.${tableName}_idx_${indexName}`); },
 		async getStatsStore(schemaName, tableName) { return get(`${schemaName}.${tableName}.__stats__`); },
@@ -904,6 +910,96 @@ describe('key-set semi join over the store backend (feat-key-set-seek-store-isol
 				expect(at.pks).to.deep.equal([1, 2, 3, 4, 5, 6, 7]);
 				expect(over.pks, 'the scan path returns the 7-key rows plus the 8th match')
 					.to.deep.equal([1, 2, 3, 4, 5, 6, 7, 8]);
+			});
+		});
+
+		// A backend that declares its seeks expensive (`store-backend-cost-profile`) moves
+		// where this rewrite pays off, and that movement has to be a TESTED outcome rather
+		// than a surprise. Everything above runs on a provider declaring nothing (parity), so
+		// these are the only tests here that see a declared profile.
+		//
+		// The engine probes the module at 2 and 1000 seek keys, fits a line, and solves for
+		// the key count at which a seek overtakes the displaced plan. With the store's
+		// multi-seek cost `k·S + 0.3·min(N, k·0.1N)` against a scan baseline of `N`, the
+		// break-even lands at roughly `N/(2S)` — so raising `seekPositioning` from the parity
+		// 0.5 to IndexedDB's declared 5.0 divides it by ten.
+		describe('a backend declaring expensive seeks (IndexedDB profile)', () => {
+			/** IndexedDB's declared profile — see `packages/quereus-plugin-indexeddb/src/provider.ts`. */
+			const IDB_PROFILE: KVCostProfile = { pointRead: 3.0, seekPositioning: 5.0 };
+
+			/**
+			 * A fresh database over a provider declaring `profile`, holding `big` (`rowCount`
+			 * rows, indexed on `v`) and a 3-key `ksrc`.
+			 */
+			async function seed(profile: KVCostProfile | undefined, rowCount: number): Promise<{
+				db: Database;
+				provider: KVStoreProvider;
+				mod: IdxStrCapturingStoreModule;
+			}> {
+				const provider = createInMemoryProvider(profile);
+				const mod = new IdxStrCapturingStoreModule(provider);
+				const db = new Database();
+				db.registerModule('store', mod);
+				await db.exec(`create table big (pk integer primary key, v integer) using store`);
+				await db.exec(`create index ix_v on big (v)`);
+				await db.exec(`create table ksrc (id integer primary key, k integer) using store`);
+				await db.exec(`insert into big values ${
+					Array.from({ length: rowCount }, (_, i) => `(${i + 1}, ${(i + 1) * 10})`).join(', ')}`);
+				await db.exec(`insert into ksrc values (1, 10), (2, 20), (3, 30)`);
+				mod.reset();
+				return { db, provider, mod };
+			}
+
+			const KEY_SET_QUERY = `select pk from big where v in (select k from ksrc)`;
+
+			/** The `query_plan()` op names for `query` on `db`, as a JSON array string. */
+			const opsOf = async (db: Database, query: string): Promise<string> => {
+				const rows = await asyncIterableToArray(
+					db.eval(`select json_group_array(op) as ops from query_plan(?)`, [query]));
+				return rows[0].ops as string;
+			};
+
+			it('still rewrites, and still seeks, on a 200-row table', async () => {
+				const { db, provider, mod } = await seed(IDB_PROFILE, 200);
+				try {
+					// Break-even at N=200, S=5: seek costs 22 at 2 keys and 5,060 at 1,000, so the
+					// line through them crosses the 200-row scan baseline around 37 keys — well
+					// above the 3 keys this query carries.
+					expect(await opsOf(db, KEY_SET_QUERY), 'the rewrite fired').to.contain('KEYSETSEMIJOIN');
+					mod.reset();
+					const rows = await asyncIterableToArray(db.eval(KEY_SET_QUERY));
+					expect(rows.map(r => r.pk as number).sort((a, b) => a - b)).to.deep.equal([1, 2, 3]);
+					expect(mod.seen('big')[0], 'the store served it as a multi-seek')
+						.to.match(multiSeekRe('ix_v'));
+				} finally {
+					await provider.closeAll();
+				}
+			});
+
+			it('declines the rewrite on a tiny table — and returns the parity rows anyway', async () => {
+				// The deliberate behavior change. At 5 rows the two-key probe already costs more
+				// than the whole scan (10.6 vs 5), so `interpolateBreakEven` returns 0 and
+				// `rule-key-set-seek` declines outright. Right answer, right cost — a 5-row seek
+				// on this backend is five IPC round trips to avoid reading five rows.
+				const scaled = await seed(IDB_PROFILE, 5);
+				const parity = await seed(undefined, 5);
+				try {
+					expect(await opsOf(scaled.db, KEY_SET_QUERY), 'the expensive backend declines')
+						.to.not.contain('KEYSETSEMIJOIN');
+					expect(await opsOf(parity.db, KEY_SET_QUERY), 'a parity backend still rewrites')
+						.to.contain('KEYSETSEMIJOIN');
+
+					const rowsOf = async (db: Database): Promise<number[]> =>
+						(await asyncIterableToArray(db.eval(KEY_SET_QUERY)))
+							.map(r => r.pk as number).sort((a, b) => a - b);
+					const scaledRows = await rowsOf(scaled.db);
+					expect(scaledRows, 'declining the rewrite never changes the answer')
+						.to.deep.equal(await rowsOf(parity.db));
+					expect(scaledRows).to.deep.equal([1, 2, 3]);
+				} finally {
+					await scaled.provider.closeAll();
+					await parity.provider.closeAll();
+				}
 			});
 		});
 	});

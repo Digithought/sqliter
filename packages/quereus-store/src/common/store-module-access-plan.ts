@@ -27,6 +27,7 @@ import type {
 	TableSchema,
 } from '@quereus/quereus';
 import { AccessPlanBuilder, equalitySeekKeyCount, hasSemanticOrdering, isMultiValueEquality } from '@quereus/quereus';
+import { PARITY_COST_PROFILE, type ResolvedCostProfile } from './cost-profile.js';
 import {
 	indexPrefixSeekIsCollationExact,
 	indexRangeAtPositionIsOrderSafe,
@@ -67,35 +68,30 @@ const RANGE_OPS = [...LOWER_BOUND_OPS, ...UPPER_BOUND_OPS] as readonly string[];
  */
 const MAX_MULTI_SEEK_KEYS = 1000;
 
-/** Cost of positioning one index seek, in the same unit as the per-row fetch cost. */
-const INDEX_SEEK_COST = 0.5;
-
-/**
- * Cost of resolving ONE secondary-index entry to its row, in the same unit as the full
- * scan's 1.0-per-row sequential read.
- *
- * A secondary-index path reads TWO stores per matched row — the index entry, then the row
- * it names — where a sequential scan reads one row per row. `AccessPlanBuilder.eqMatch` /
- * `.rangeScan` charge only the first (0.3 / 0.5 per row), so the `eq`, `prefixRange` and
- * `range` seek arms add this term on top of the shape's own cost. The MULTI-SEEK arm does
- * not; the measured reason is at that arm in {@link tryIndexAccessPlan}.
- *
- * Why 1.0: `StoreTableScan` resolves entries in `ROW_RESOLUTION_BATCH`-sized `getMany`
- * batches (`store-table-scan.ts`: one store round trip per 256 entries, not per row), so a resolved row
- * costs about what a sequentially-iterated row costs — the index path simply pays it ON TOP
- * OF the entry read. Nothing here has been measured against real storage; it is a shape
- * constant like {@link ARM_SELECTIVITY}, chosen for parity rather than from a benchmark.
- *
- * The constant is not freely tunable upward. Because {@link ARM_SELECTIVITY} is a fixed
- * FRACTION of the table, every arm's cost is linear in `estimatedRows` and so is the full
- * scan's — an arm either always prices above a sequential scan or never does, for a given
- * constant. The switch-over points: the `range` arm (0.3 × N × (0.5 + R) > N) flips at
- * R > 2.83, `prefixRange` at R > 6.17, `eq` at R > 9.7. So raising this past ~2.8 does not
- * make range seeks "more expensive", it DISABLES them outright. Real per-column statistics
- * (see the NOTE on {@link ARM_SELECTIVITY}) are what would make the comparison
- * discriminate per query rather than per arm.
- */
-const ROW_RESOLUTION_COST = 1.0;
+// --- The backend cost profile -------------------------------------------------------------
+//
+// Both per-backend cost terms this file consumes live on the provider's ResolvedCostProfile,
+// passed into `computeBestAccessPlan`. See `cost-profile.ts` for the unit (one sequentially
+// scanned row = 1) and the parity defaults an undeclared backend gets.
+//
+// `profile.pointRead` — resolving ONE secondary-index entry to its row. A secondary-index
+// path reads TWO stores per matched row (the index entry, then the row it names) where a
+// sequential scan reads one, and `AccessPlanBuilder.eqMatch` / `.rangeScan` charge only the
+// first (0.3 / 0.5 per row) — so the `eq`, `prefixRange` and `range` arms add this term on
+// top of the shape's own cost. Two arms deliberately do not: a cost-only decline (it
+// resolves nothing) and the MULTI-SEEK, for the measured reason recorded at that arm in
+// `tryIndexAccessPlan`.
+//
+// `profile.seekPositioning` — the per-seek-key cost of a multi-seek, charged by both
+// multi-seek arms (`tryIndexAccessPlan`'s secondary arm and `primaryKeyMultiSeekPlan`).
+//
+// **`pointRead` is arm-DISABLING, not arm-tuning, and that is why the seek-vs-scan veto
+// ignores it.** Because ARM_SELECTIVITY is a fixed FRACTION of the table, every arm's cost
+// is linear in `estimatedRows` and so is the full scan's — for a given `pointRead` an arm
+// either ALWAYS prices above a sequential scan or never does, for every query on every
+// table. With `R` = `pointRead`, the flip points are `range` (0.3·N·(0.5 + R) > N) at
+// R > 2.83, `prefixRange` at R > 6.17, and `eq` at R > 9.7. The veto below therefore keeps
+// pricing resolution at PARITY_COST_PROFILE; the full reasoning is at the veto site.
 
 /** Which shape of window a secondary index can serve for a given predicate. */
 type IndexArm =
@@ -150,6 +146,13 @@ const ARM_SELECTIVITY: Readonly<Record<IndexArm, number>> = {
  */
 interface IndexPlanCandidate {
 	plan: BestAccessPlanResult;
+	/**
+	 * `plan.cost` recomputed with {@link PARITY_COST_PROFILE}'s `pointRead` — the price the
+	 * seek-vs-scan veto judges this candidate at, whatever the backend declared. Equal to
+	 * `plan.cost` on a parity backend, and on any arm that pays no resolution term at all
+	 * (the multi-seek, a cost-only decline). Reasoning at the veto site.
+	 */
+	vetoCost: number;
 	/**
 	 * True for the `plan=5` multi-seek arm, which is EXEMPT from that comparison. Reasoning
 	 * in full at the comparison site; the short of it is that this module cannot tell a
@@ -292,12 +295,17 @@ function resolvePrimaryKeyPins(
  * K for an undecorated text PK member. The secondary-index arm never sees it: index key
  * bytes encode under each index column's own collation, so {@link tryIndexAccessPlan}
  * judges its filters against that instead.
+ *
+ * `costProfile` is the BACKEND's declared price for a random point read and a seek key,
+ * resolved once per module (`StoreModuleBase.costProfile`) and passed in for the same
+ * reason `tableKeyCollation` is: this function reads no module state of its own.
  */
 export function computeBestAccessPlan(
 	db: Database,
 	tableInfo: TableSchema,
 	request: BestAccessPlanRequest,
 	tableKeyCollation: string,
+	costProfile: ResolvedCostProfile,
 ): BestAccessPlanResult {
 	const estimatedRows = request.estimatedRows ?? 1000;
 
@@ -369,7 +377,8 @@ export function computeBestAccessPlan(
 			.build();
 	}
 	if (pkPins) {
-		const plan = primaryKeyMultiSeekPlan(tableInfo, request, pkColumns, pkPins, estimatedRows, pkOrderPreservingPrefix);
+		const plan = primaryKeyMultiSeekPlan(
+			tableInfo, request, pkColumns, pkPins, estimatedRows, pkOrderPreservingPrefix, costProfile);
 		// A gate decline FALLS THROUGH to the arms below rather than returning cost-only.
 		// That is safe: an `IN` is not in {@link RANGE_OPS}, so the leading-PK-range arm
 		// cannot grab it, and it lands on the secondary-index arms / full scan exactly as
@@ -434,7 +443,7 @@ export function computeBestAccessPlan(
 	let costOnlyFallback: BestAccessPlanResult | null = null;
 	for (const index of indexes) {
 		if (index.columns.length === 0) continue;
-		const candidate = tryIndexAccessPlan(db, tableInfo, request, index, estimatedRows);
+		const candidate = tryIndexAccessPlan(db, tableInfo, request, index, estimatedRows, costProfile);
 		if (!candidate) continue;
 		const { plan } = candidate;
 		// A fully-handled seek (indexName + seekColumns set) is a candidate: keep the
@@ -460,12 +469,37 @@ export function computeBestAccessPlan(
 		// module's own scan verdict at 1000 keys silently switches key-set semi joins off:
 		// MEASURED, it fails 11 tests in `key-set-seek-store.spec.ts` on tables of 200 and
 		// 300 rows where the seek is unambiguously the right plan at the key counts actually
-		// used. The arm's brakes stay `inCount × INDEX_SEEK_COST` (which is what the engine
-		// interpolates) and {@link MAX_MULTI_SEEK_KEYS}; the engine makes the scan comparison
-		// this exemption skips, off the same numbers.
+		// used. The arm's brakes stay `inCount × profile.seekPositioning` (which is what the
+		// engine interpolates) and {@link MAX_MULTI_SEEK_KEYS}; the engine makes the scan
+		// comparison this exemption skips, off the same numbers.
+		//
+		// **The comparison uses `vetoCost` — the candidate priced at PARITY `pointRead` —
+		// not the declared cost the plan advertises.** A backend's declared `pointRead`
+		// scales what an arm ADVERTISES and how index arms RANK against each other; it
+		// deliberately does not decide whether an index is used at all. Three reasons,
+		// settled when the IndexedDB profile was measured:
+		//  - The flip is a knife edge, and it sits on the GUESS rather than on the
+		//    measurement. Raising `pointRead` past 2.83 disables the `range` arm for EVERY
+		//    query on EVERY table (the flip-point arithmetic is above, where the profile's
+		//    two terms are introduced), and IndexedDB's measured band (2.8–3.4, from
+		//    `packages/quereus-plugin-indexeddb/bench/README.md`) straddles that point
+		//    exactly. At the 30% selectivity the `range` arm MODELS, that same bench puts
+		//    seek and scan within ~10% of each other (87.5 ms vs 92.6 ms at 20k rows / 25%
+		//    selectivity) — the measurement cannot resolve which side of the line the arm
+		//    belongs on.
+		//  - The error is wildly asymmetric. Disabling the arm costs up to 25× when the real
+		//    predicate is selective (a range matching 1% of 20k rows: 3.8 ms seeked vs 95 ms
+		//    scanned). Keeping it costs ~10% in the case the guess describes.
+		//  - So a wholesale, every-query arm shutdown is not a defensible thing to derive
+		//    from a knife-edge measurement of a number the model only guesses at.
+		//    `store-column-statistics` replaces {@link ARM_SELECTIVITY} with a real
+		//    per-predicate estimate; when it lands, DELETE `vetoCost` and compare on
+		//    `plan.cost`, so the veto discriminates per query instead of shutting an arm off
+		//    per schema. `cost-profile.spec.ts` pins the current policy — that test is what
+		//    tells a future reader the choice was deliberate.
 		//
 		// Ties keep the seek: it returns fewer rows for the rest of the plan to carry.
-		if (bestSeekPlan.isMultiSeek || bestSeekPlan.plan.cost <= scanPlan.cost) return bestSeekPlan.plan;
+		if (bestSeekPlan.isMultiSeek || bestSeekPlan.vetoCost <= scanPlan.cost) return bestSeekPlan.plan;
 		// Losing the seek is SAFE, never a wrong answer: the scan claims no filters, so the
 		// engine keeps every one of them as a residual Filter and the row set is identical.
 		// Deliberately returns the scan rather than falling through to `costOnlyFallback`
@@ -475,8 +509,9 @@ export function computeBestAccessPlan(
 		// NOTE: a vetoed seek is indistinguishable from a DECLINE to the engine, and
 		// `rule-key-set-seek` reads a probe answer that names no index as "the module
 		// declined" and abandons its rewrite. Harmless while the veto is reachable only
-		// where an arm's estimate is the whole table (a one-row table, per the arithmetic on
-		// {@link ROW_RESOLUTION_COST}) — a key-set seek there is worthless anyway. If real
+		// where an arm's estimate is the whole table (a one-row table, per the flip-point
+		// arithmetic above — and `vetoCost` keeps that true on every backend, whatever it
+		// declares) — a key-set seek there is worthless anyway. If real
 		// per-column statistics ever make the veto fire on tables worth seeking, the
 		// comparison has to exempt any request carrying a runtime-valued set, not just the
 		// arm this module happens to pick for it.
@@ -521,6 +556,7 @@ function primaryKeyMultiSeekPlan(
 	pins: EqualityPins,
 	estimatedRows: number,
 	pkOrderPreservingPrefix: number,
+	profile: ResolvedCostProfile,
 ): BestAccessPlanResult | null {
 	if (pins.seekKeyCount > MAX_MULTI_SEEK_KEYS) return null;
 	// Mirrors `StoreTableScan.pkHasSemanticOrderingMember`, which `scanMultiSeekPrimary`
@@ -532,8 +568,16 @@ function primaryKeyMultiSeekPlan(
 	if (pkColumns.some(colIdx => hasSemanticOrdering(tableInfo.columns[colIdx]?.logicalType))) return null;
 
 	// The PK is unique, so each seek key matches at most one row — no `multiRows` clamp
-	// artifact (contrast the secondary arm's), and no ROW_RESOLUTION_COST: the point read
-	// IS the row read, with no index-entry → row indirection to charge for.
+	// artifact (contrast the secondary arm's), and no separate `profile.pointRead` term: the
+	// point read IS the row read, with no index-entry → row indirection to charge for.
+	//
+	// NOTE: this arm is therefore slightly OVER-charged on a backend that declares an
+	// expensive profile — `profile.seekPositioning` prices "position an index window AND
+	// read the row it names", and here there is no index window (IndexedDB: ≈ 3 units of
+	// real cost, charged 5). Accepted rather than split into a third knob: a second
+	// multi-seek term would double the tuning surface to model a bias whose only effect is
+	// that a very large `where pk in (…)` prefers a scan slightly sooner than it should.
+	// Revisit only if a primary-key IN is ever measured planning wrong because of it.
 	//
 	// `Math.max(1, …)` is LOAD-BEARING, not defensive. `rows: 0` on a plan that claims
 	// every filter makes `rule-select-access-path` replace the whole table access with an
@@ -544,7 +588,7 @@ function primaryKeyMultiSeekPlan(
 	const plan = AccessPlanBuilder
 		// `setIsSet(false)` is likewise load-bearing: `eqMatch` defaults `isSet` to
 		// `rows <= 1`, which a one-key runtime set would satisfy.
-		.eqMatch(rows, pins.seekKeyCount * INDEX_SEEK_COST)
+		.eqMatch(rows, pins.seekKeyCount * profile.seekPositioning)
 		.setIsSet(false)
 		.setIndexName('_primary_')
 		// EVERY primary-key column, in `primaryKeyDefinition` order: `scanMultiSeekPrimary`
@@ -599,12 +643,14 @@ function primaryKeyMultiSeekPlan(
  * handled" and "build a window" decisions cannot disagree. A decline returns a cost-only
  * plan: cheaper cost, filters unhandled, residual retained; correct, just not sped up.
  *
- * **Cost.** Each single-window seek arm pays {@link ROW_RESOLUTION_COST} per row it expects
- * to return, on top of the `AccessPlanBuilder` shape's own per-row term: the shape prices
- * reading the index ENTRY, and the store must then read the ROW that entry names out of the
- * data store. Two arms deliberately do NOT pay it — a cost-only decline (it resolves
- * nothing; the scan reads rows directly) and the multi-seek, for the measured reason
- * recorded at that arm below.
+ * **Cost.** Each single-window seek arm pays the backend's declared `profile.pointRead`
+ * per row it expects to return, on top of the `AccessPlanBuilder` shape's own per-row term:
+ * the shape prices reading the index ENTRY, and the store must then read the ROW that entry
+ * names out of the data store. Two arms deliberately do NOT pay it — a cost-only decline
+ * (it resolves nothing; the scan reads rows directly) and the multi-seek, for the measured
+ * reason recorded at that arm below. Every candidate also carries a `vetoCost`: the same
+ * arm priced at the PARITY `pointRead`, which is what the seek-vs-scan comparison in
+ * {@link computeBestAccessPlan} judges it at (reasoning at that site).
  */
 function tryIndexAccessPlan(
 	db: Database,
@@ -612,6 +658,7 @@ function tryIndexAccessPlan(
 	request: BestAccessPlanRequest,
 	index: TableIndexSchema,
 	estimatedRows: number,
+	profile: ResolvedCostProfile,
 ): IndexPlanCandidate | null {
 	// Exclude PARTIAL indexes from access planning: neither the engine nor this
 	// module checks that the query's WHERE implies the index predicate, so seeking
@@ -686,17 +733,22 @@ function tryIndexAccessPlan(
 	/** The arm's shape — `AccessPlanBuilder`'s per-row index-entry term, no resolution. */
 	const armShape = (): AccessPlanBuilder =>
 		isRange ? AccessPlanBuilder.rangeScan(rows, 0.2) : AccessPlanBuilder.eqMatch(rows, 0.3);
-	/** The arm's shape plus the per-fetched-row {@link ROW_RESOLUTION_COST}. */
-	const seekingArm = (): AccessPlanBuilder => armShape().addCost(rows * ROW_RESOLUTION_COST);
-	const costOnly = (why: string): IndexPlanCandidate => ({
-		plan: armShape()
+	/** The arm's shape plus one per-fetched-row resolution term at the given price. */
+	const seekingArm = (pointRead: number): AccessPlanBuilder => armShape().addCost(rows * pointRead);
+	const costOnly = (why: string): IndexPlanCandidate => {
+		const plan = armShape()
 			.setHandledFilters(new Array(request.filters.length).fill(false))
 			.setExplanation(`Store index scan on ${index.name} (${why})`)
-			.build(),
-		// Cost-only never reaches the comparison (it claims no seek columns), so the flag
-		// is immaterial; false states the fact — this plan seeks nothing at all.
-		isMultiSeek: false,
-	});
+			.build();
+		return {
+			plan,
+			// Cost-only resolves nothing, so its cost carries no `pointRead` term to reprice —
+			// and it never reaches the comparison anyway (it claims no seek columns).
+			vetoCost: plan.cost,
+			// Likewise immaterial; false states the fact — this plan seeks nothing at all.
+			isMultiSeek: false,
+		};
+	};
 
 	if (arm === 'range') {
 		if (!indexRangeAtPositionIsOrderSafe(db, tableInfo.columns, index, indexKeyCollations, 0)) {
@@ -746,7 +798,7 @@ function tryIndexAccessPlan(
 		// MemoryTableModule.evaluateIndexAccess's setIsSet(!isMultiSeek). No ordering is
 		// advertised — window emission order is encoded-key order, not any column order.
 		//
-		// NOTE: this arm alone does NOT pay {@link ROW_RESOLUTION_COST}, though it resolves
+		// NOTE: this arm alone does NOT pay a per-row `profile.pointRead`, though it resolves
 		// every entry it matches exactly like the single-window arms do. The reason is
 		// `multiRows`, not the physics: `inCount × rows` reaches `estimatedRows` at ten seek
 		// keys (`rows` is the fixed 0.1 × N equality shape constant) and at two or three on a
@@ -768,14 +820,18 @@ function tryIndexAccessPlan(
 		// the union estimate has to stop clamping before both can hold. See
 		// backlog/debt-store-multi-seek-union-row-estimate.
 		const multiRows = Math.min(estimatedRows, inCount * rows);
+		const plan = AccessPlanBuilder.eqMatch(multiRows, inCount * profile.seekPositioning)
+			.setIsSet(false)
+			.setHandledFilters(handledFilters)
+			.setIndexName(index.name)
+			.setSeekColumns(seekCols)
+			.setExplanation(`Store index multi-seek(${inCount}) on ${index.name}`)
+			.build();
 		return {
-			plan: AccessPlanBuilder.eqMatch(multiRows, inCount * INDEX_SEEK_COST)
-				.setIsSet(false)
-				.setHandledFilters(handledFilters)
-				.setIndexName(index.name)
-				.setSeekColumns(seekCols)
-				.setExplanation(`Store index multi-seek(${inCount}) on ${index.name}`)
-				.build(),
+			plan,
+			// No `pointRead` term to reprice (see the NOTE above), and the arm is exempt from
+			// the veto regardless — so the veto price IS the declared price.
+			vetoCost: plan.cost,
 			isMultiSeek: true,
 		};
 	}
@@ -784,12 +840,16 @@ function tryIndexAccessPlan(
 		? `prefix-range seek(prefix=${eqCols.length})`
 		: arm === 'range' ? 'range scan' : 'seek';
 	return {
-		plan: seekingArm()
+		plan: seekingArm(profile.pointRead)
 			.setHandledFilters(handledFilters)
 			.setIndexName(index.name)
 			.setSeekColumns(seekCols)
 			.setExplanation(`Store index ${armLabel} on ${index.name}`)
 			.build(),
+		// Re-derived from `armShape()` rather than adjusted off `plan.cost`, so the parity
+		// price is the exact number the pre-profile module produced rather than a float
+		// round trip through the declared one.
+		vetoCost: seekingArm(PARITY_COST_PROFILE.pointRead).build().cost,
 		isMultiSeek: false,
 	};
 }
