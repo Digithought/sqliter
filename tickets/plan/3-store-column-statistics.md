@@ -47,6 +47,16 @@ exemptions come back out, with the arithmetic in the comments at those sites re-
   still lands sensible break-evens (cost stays linear in K under N/D estimation — confirm).
 - Absent stats (fresh table, pre-existing database) ⇒ fall back to today's fractions; behavior
   must degrade to current, not to nonsense.
+- **Remove the parity-priced veto that `store-backend-cost-profile` leaves behind.** That
+  ticket lets a backend declare its point-read cost but deliberately keeps the seek-vs-scan
+  comparison priced at the parity default (`IndexPlanCandidate.vetoCost` in
+  `store-module-access-plan.ts`), because with `ARM_SELECTIVITY` a fixed fraction a
+  declared cost decides an arm's availability for EVERY query rather than per query — and
+  IndexedDB's measured value (2.8–3.4) straddles the range arm's 2.83 flip point exactly.
+  Once selectivity is estimated per predicate, the veto should price with the declared
+  profile and `vetoCost` should go away. Expected effect on IndexedDB: a range seek at a
+  measured 30%-of-table selectivity loses to a scan (which the benchmark confirms), while a
+  selective one keeps seeking.
 
 # Open questions the plan pass must resolve (not the implementer)
 
