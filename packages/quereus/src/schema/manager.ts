@@ -1716,6 +1716,10 @@ export class SchemaManager {
 		columns: ColumnSchema[];
 		pkDefinition: ReadonlyArray<import('./table.js').PrimaryKeyColumnDefinition>;
 		pkDefaultConflict: import('../common/constants.js').ConflictResolution | undefined;
+		/** True when `pkDefinition` is the no-PK all-columns fallback rather than a
+		 *  declared key — carried onto `TableSchema.synthesizedPrimaryKey`, whose
+		 *  doc explains why the shape test cannot answer this. */
+		synthesizedPk: boolean;
 	} {
 		// Gate an explicit column COLLATE against this connection's collation registry
 		// (accepts a registered custom collation; rejects an unregistered name for every
@@ -1741,7 +1745,7 @@ export class SchemaManager {
 			};
 		});
 
-		return { columns, pkDefinition, pkDefaultConflict };
+		return { columns, pkDefinition, pkDefaultConflict, synthesizedPk: synthesized };
 	}
 
 	/**
@@ -1918,7 +1922,7 @@ export class SchemaManager {
 		const defaultNotNull = defaultNullability === 'not_null';
 
 		const astColumns = stmt.columns || [];
-		const { columns, pkDefinition, pkDefaultConflict } = this.buildColumnSchemas(astColumns, stmt.constraints, defaultNotNull, defaultCollation);
+		const { columns, pkDefinition, pkDefaultConflict, synthesizedPk } = this.buildColumnSchemas(astColumns, stmt.constraints, defaultNotNull, defaultCollation);
 		// Statement-wide taken-set the CHECK / FK mint sites disambiguate against:
 		// seeded with every user-written constraint name up front, then accumulating
 		// each mint, so a colliding auto-name gets a `_<N>` suffix instead of
@@ -1959,6 +1963,7 @@ export class SchemaManager {
 			columnIndexMap,
 			primaryKeyDefinition: pkDefinition,
 			primaryKeyDefaultConflict: pkDefaultConflict,
+			synthesizedPrimaryKey: synthesizedPk,
 			checkConstraints: Object.freeze(checkConstraints),
 			foreignKeys: foreignKeys.length > 0 ? Object.freeze(foreignKeys) : undefined,
 			uniqueConstraints: uniqueConstraints.length > 0 ? Object.freeze(uniqueConstraints) : undefined,
@@ -2001,7 +2006,7 @@ export class SchemaManager {
 		const defaultCollation = normalizeCollationName(this.db.options.getStringOption('default_collation'));
 
 		const astColumns = stmt.columns || [];
-		const { columns, pkDefinition, pkDefaultConflict } = this.buildColumnSchemas(astColumns, stmt.constraints, defaultNotNull, defaultCollation);
+		const { columns, pkDefinition, pkDefaultConflict, synthesizedPk } = this.buildColumnSchemas(astColumns, stmt.constraints, defaultNotNull, defaultCollation);
 		// Same statement-wide mint disambiguation as buildTableSchemaFromAST, so a
 		// logical spec and the physical table it describes mint identical names.
 		const takenConstraintNames = collectDeclaredConstraintNames(astColumns, stmt.constraints);
@@ -2017,6 +2022,7 @@ export class SchemaManager {
 			columnIndexMap,
 			primaryKeyDefinition: pkDefinition,
 			primaryKeyDefaultConflict: pkDefaultConflict,
+			synthesizedPrimaryKey: synthesizedPk,
 			checkConstraints: Object.freeze(checkConstraints),
 			foreignKeys: foreignKeys.length > 0 ? Object.freeze(foreignKeys) : undefined,
 			uniqueConstraints: uniqueConstraints.length > 0 ? Object.freeze(uniqueConstraints) : undefined,

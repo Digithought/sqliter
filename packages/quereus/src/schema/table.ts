@@ -39,6 +39,26 @@ export interface TableSchema {
 	 * `defaultConflict` on any PK column > ABORT.
 	 */
 	primaryKeyDefaultConflict?: ConflictResolution;
+	/**
+	 * True when `primaryKeyDefinition` is the **synthesized all-columns key** —
+	 * the no-PK fallback {@link findPKDefinition} produces for a CREATE TABLE that
+	 * declares no PRIMARY KEY — rather than a key the author declared.
+	 *
+	 * {@link isSynthesizedAllColumnsKey} answers the same question by SHAPE and
+	 * cannot distinguish a declared all-columns PK (`primary key (a, b)` on a
+	 * two-column table) from the fallback: both promote to identical schemas, so
+	 * the shape test is sound for the one thing it gates (omitting the PRIMARY KEY
+	 * clause from emitted canonical DDL). It is NOT sound for a consumer that
+	 * changes behavior on the answer — a module deciding whether ALTER TABLE ADD
+	 * COLUMN should re-derive the key across the new column set would silently
+	 * rewrite a declared key. This field carries the real answer for those.
+	 *
+	 * Set by the schema builder on every CREATE / rehydrate path. Absent means
+	 * "not stated" (a host-authored schema literal), NOT "declared" — consumers
+	 * that need certainty should treat absent as unknown and fall back to their
+	 * own conservative default.
+	 */
+	synthesizedPrimaryKey?: boolean;
 	/** CHECK constraints defined on the table or its columns */
 	checkConstraints: ReadonlyArray<RowConstraintSchema>;
 	/**
