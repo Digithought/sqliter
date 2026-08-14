@@ -74,7 +74,10 @@ export type ResolvedCostProfile = Required<KVCostProfile>;
  * Also the price the seek-vs-scan veto uses regardless of what a provider declares —
  * see the veto site in `store-module-access-plan.ts`.
  */
-export const PARITY_COST_PROFILE: ResolvedCostProfile = { pointRead: 1.0, seekPositioning: 0.5 };
+// Frozen because {@link resolveCostProfile} returns this very object (not a copy) for the
+// undeclared case, so every parity-backend module in the process shares one instance — and
+// it is a public export, reachable from JS that the interface's `readonly` cannot stop.
+export const PARITY_COST_PROFILE: ResolvedCostProfile = Object.freeze({ pointRead: 1.0, seekPositioning: 0.5 });
 
 /**
  * Fill in the parity defaults for whatever a provider left undeclared, replacing any

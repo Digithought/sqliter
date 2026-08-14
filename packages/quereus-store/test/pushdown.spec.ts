@@ -1609,8 +1609,8 @@ describe('StoreModule predicate pushdown', () => {
 
 		// A secondary-index path reads the index ENTRY and then the ROW it names, while a
 		// sequential scan reads one row per row. These pin that the second read is priced
-		// (ROW_RESOLUTION_COST, 1.0 per fetched row) and that the module now returns the
-		// sequential scan when a seek prices above it.
+		// (the backend profile's `pointRead`, 1.0 per fetched row on this undeclared provider)
+		// and that the module now returns the sequential scan when a seek prices above it.
 		describe('row-resolution cost and the seek-versus-scan comparison', () => {
 			/** The module's own plan for `filters` against `table`, at a stated table size. */
 			function planFor(

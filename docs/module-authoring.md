@@ -868,8 +868,16 @@ walking a matched window and nothing more, so a module whose secondary index sto
 IDENTIFIERS rather than rows — it must read each matched row out of a second place — pays a
 per-row term those shapes do not model. Add it with `addCost(rows * yourPerRowCost)` rather
 than recomputing the factory's formula, so your arm cannot drift from the shape it started
-from. The store module does exactly this (`ROW_RESOLUTION_COST` in
+from. The store module does exactly this (the `pointRead` term in
 `store-module-access-plan.ts`).
+
+What that per-row term costs may depend on the BACKEND rather than on the module: a random
+row read is nearly free in-process and block-cached, and is a separate request across an IPC
+boundary in a browser. If your module runs over more than one backend, let each backend
+declare the ratio and price your arms from the declaration rather than from one constant —
+the store module's `KVCostProfile` (`@quereus/store`, `src/common/cost-profile.ts`) is the
+worked example, including its unit (one sequentially scanned row = 1.0) and its rule that an
+undeclared backend must plan exactly as it did before the knob existed.
 
 **Nothing compares your plan with an alternative.** `rule-select-access-path` takes the
 single plan you return and uses it, so an index seek priced ABOVE your own sequential scan

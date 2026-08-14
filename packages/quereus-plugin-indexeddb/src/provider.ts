@@ -76,6 +76,17 @@ export class IndexedDBProvider implements KVStoreProvider {
 	 *
 	 * Band 2.8–3.4 ⇒ declare 3.0.
 	 *
+	 * NOTE: 0.8 is a LOWER bound on arm A's entry paging, which biases the whole band — and
+	 * therefore the declared 3.0 — to the pessimistic side. Arm B2 spends one request per
+	 * entry page (`getAllKeys` over a carved value window); arm A spends two (`bench/arms.mjs`
+	 * charges `requests += 2` per `readPage`, since a resumable two-store scan must read the
+	 * entry keys AND their values). Charging arm A's paging at B2's price leaves too much
+	 * cost in the "resolution" remainder, so the true `pointRead` is likely at or below 2.8.
+	 * Harmless while the seek-vs-scan veto is clamped to the parity price (it is — see
+	 * `store-module-access-plan.ts`), because an over-stated `pointRead` then only inflates
+	 * what an index arm advertises and cannot switch an arm off. Re-derive from a bench arm
+	 * that times two-store entry paging alone before the veto starts reading this number.
+	 *
 	 * `seekPositioning` prices one multi-seek key: an index window request PLUS a row read,
 	 * neither amortized across a 256-entry page ⇒ ≈ 2 × the point-read cost above, i.e.
 	 * 0.026 ms at 20k (5.5 scan-rows) and ~0.062 ms at 100k (5.7). Declared 5.0, rounded

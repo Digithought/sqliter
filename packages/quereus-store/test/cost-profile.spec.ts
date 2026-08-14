@@ -245,6 +245,38 @@ describe('store backend cost profile (store-backend-cost-profile)', () => {
 		}
 	});
 
+	// The SEAM between the resolver and the planner. `resolveCostProfile` is unit-tested
+	// above and the planner is driven with well-formed profiles below, but neither pins that
+	// `StoreModuleBase` resolves what the provider declared before handing it on. A refactor
+	// that passed `provider.costProfile` straight through would leave both of those groups
+	// green while a `NaN` cost turned every `<` in the module into `false`.
+	describe('a malformed provider declaration is resolved at the module boundary', () => {
+		it('plans exactly like an undeclared provider, and warns once per bad field', async () => {
+			const warnings: string[] = [];
+			// eslint-disable-next-line no-console
+			const realWarn = console.warn;
+			// eslint-disable-next-line no-console
+			console.warn = (...args: unknown[]) => { warnings.push(args.join(' ')); };
+			let malformed: Fixture;
+			try {
+				malformed = await createFixture({ pointRead: NaN, seekPositioning: -1 });
+			} finally {
+				// eslint-disable-next-line no-console
+				console.warn = realWarn;
+			}
+			const undeclared = await createFixture();
+			try {
+				expect(warnings, 'both bad fields warned, at construction').to.have.lengthOf(2);
+				for (const { name, filters } of PLAN_CASES) {
+					expect(malformed.plan(filters), name).to.deep.equal(undeclared.plan(filters));
+				}
+			} finally {
+				await malformed.provider.closeAll();
+				await undeclared.provider.closeAll();
+			}
+		});
+	});
+
 	describe('pointRead scales the single-window index arms', () => {
 		const fixtures = new Map<number, Fixture>();
 
@@ -437,6 +469,11 @@ describe('store backend cost profile (store-backend-cost-profile)', () => {
 			'select id from t where id > 7 order by id',
 			'select id from t where c > 3 order by id',
 			'select count(*) as n from t where a >= 40',
+			// A join, because an arm's declared cost does not stop at this module: it feeds
+			// join ordering and cache decisions in the engine. Those are free to pick a
+			// different shape on an expensive backend — they are not free to return
+			// different rows.
+			'select a1.id from t a1 join t a2 on a2.a = a1.a where a1.a > 30 order by a1.id',
 		];
 
 		async function rowsUnder(costProfile: KVCostProfile | undefined, rowCount: number): Promise<Row[][]> {

@@ -14,7 +14,7 @@ The store estimates selectivity with fixed fractions of table size: an indexed e
 assumed to match 10% of the table, a range 30%. With no per-column information, every cost
 decision is per-*arm* rather than per-*query* — a unique-ish column and a two-valued flag
 column price identically. This is the root blocker called out (as an accepted limitation) in
-the comments at `ROW_RESOLUTION_COST` and `ARM_SELECTIVITY`, and it is what stops the
+the comments at `ARM_SELECTIVITY` and at the `vetoCost` clamp, and it is what stops the
 backend cost profile (`store-backend-cost-profile`, the prereq) from being able to
 discriminate seek-vs-scan honestly instead of enabling/disabling whole arms.
 

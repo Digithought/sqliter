@@ -534,7 +534,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 			const seekCols = indexCols.slice(0, equalityMatches.matchCount).map(c => c.index);
 			const { inCardinality, isMultiSeek } = equalityMatches;
 			// NOTE: no seek-key cap and no per-seek positioning term here (the store has both:
-			// MAX_MULTI_SEEK_KEYS and inCount * INDEX_SEEK_COST), so a large multi-seek over a
+			// MAX_MULTI_SEEK_KEYS and inCount * its backend's `seekPositioning`), so a large multi-seek over a
 			// small memory table prices optimistically. Harmless while every seek-key list is a
 			// literal the author typed; if runtime-valued IN sets start arriving with large
 			// ceilings, add the positioning term so the two modules stay comparable.

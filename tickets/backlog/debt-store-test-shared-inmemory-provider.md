@@ -37,5 +37,10 @@ Points to settle while doing it:
 - A few specs want extra behavior from the provider (failure injection, counting calls).
   The shared factory should take options rather than force those specs to keep a private
   copy.
+- Two copies now take an optional backend cost declaration —
+  `test/cost-profile.spec.ts` and `test/key-set-seek-store.spec.ts` both accept a
+  `costProfile?` argument and spread it in only when present, deliberately, so the
+  "declares nothing" provider has no such property at all. The shared factory needs that
+  same option with that same spread, or those two specs stop testing what they test.
 - This is mechanical and low-risk, but it touches many files: the test suite passing
   unchanged is the whole acceptance criterion.
