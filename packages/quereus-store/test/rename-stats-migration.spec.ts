@@ -13,6 +13,11 @@
  *
  * This provider mirrors that unified-store layout (unlike the per-table stats in
  * coordinator-callback-leak.spec.ts) so it exercises the exact real-world path.
+ *
+ * The re-key copies the record's BYTES, so the `ANALYZE` snapshot that now shares it
+ * (`columnStats` / `analyzedRowCount` / `lastAnalyzed`) rides along for free. "For free"
+ * is exactly the kind of claim that stops being true the moment someone rewrites the copy
+ * field-by-field, so the last test here pins it rather than trusting the reading.
  */
 
 import { describe, it, beforeEach, afterEach } from 'mocha';
@@ -132,5 +137,43 @@ describe('ALTER TABLE RENAME migrates row-count stats', () => {
 		}
 
 		await db.close();
+	});
+
+	it('carries the ANALYZE snapshot to the new name across a reopen', async () => {
+		const db = new Database();
+		const mod = new StoreModule(provider);
+		db.registerModule('store', mod);
+
+		const N = 12;
+		const DISTINCT_V = 3;
+		await db.exec(`create table t (id integer primary key, v integer) using store`);
+		for (let i = 0; i < N; i++) {
+			await db.exec(`insert into t values (${i}, ${i % DISTINCT_V})`);
+		}
+		// `analyze` persists the per-column snapshot into the SAME `__stats__` record the
+		// row count lives in, so the rename's re-key is the only thing carrying it over.
+		for await (const _ of db.eval(`analyze t`)) { /* consume */ }
+		await db.exec(`alter table t rename to u`);
+
+		await db.close();
+		await mod.closeAll();
+
+		const db2 = new Database();
+		const mod2 = new StoreModule(provider);
+		db2.registerModule('store', mod2);
+		await mod2.rehydrateCatalog(db2);
+		try {
+			const stats = db2.schemaManager.findTable('u')?.statistics;
+			expect(stats, 'the renamed table reopens with its snapshot').to.not.be.undefined;
+			expect(stats!.rowCount, 'the ANALYZE-time row count came along').to.equal(N);
+			expect(stats!.columnStats.get('v')?.distinctCount, 'and the per-column numbers')
+				.to.equal(DISTINCT_V);
+			expect(stats!.columnStats.get('id')?.distinctCount).to.equal(N);
+			// The old key is gone, so nothing is left behind to be re-read under the old name.
+			expect(await readRowCount(provider.stores.get(STATS_STORE)!, 'main', 't')).to.be.undefined;
+		} finally {
+			await db2.close();
+			await mod2.closeAll();
+		}
 	});
 });

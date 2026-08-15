@@ -1026,6 +1026,34 @@ Returning **`undefined`** declines for the state the table is currently in, and 
 
 A row count with an **empty** `columnStats` is a supported partial answer, for a module that can size itself cheaply but keeps no value distribution: `ANALYZE` reads it as *"size answered, collect the rest yourself"*, still scans for the per-column numbers, and prefers the scan's row count (it counted every live row; a maintained count can drift). Nothing consults `getStatistics()` during *planning* — to get a live size into cost decisions between `ANALYZE`s, fill in `request.estimatedRows` from `getBestAccessPlan` (see [Index-Based Access](#2-index-based-access-standard)).
 
+### Persisting statistics across a reopen
+
+Statistics collected by `ANALYZE` live on `TableSchema.statistics`, which is in-memory only — close the database and they are gone. A module with durable storage can implement the optional companion hook so the next open reads them back instead of planning blind until someone re-runs `ANALYZE`:
+
+```typescript
+class MyTable extends VirtualTable {
+  async saveStatistics(stats: TableStatistics): Promise<void> {
+    await this.backend.writeStats(this.tableName, stats);
+  }
+}
+```
+
+`ANALYZE` calls it once per table, right after it writes the statistics onto the schema. Three rules:
+
+- **It is advisory.** A rejection is logged and swallowed — `ANALYZE` succeeding with statistics in memory but not on disk is strictly better than `ANALYZE` failing. Do not throw to signal "I could not store these"; just return.
+- **Persisting less than you were given is fine.** `ColumnStatistics.histogram` can run to a few KB per column, so a module may drop what it cannot use and keep the scalar fields. The store module persists `distinctCount` / `nullCount` / `minValue` / `maxValue` for every column but keeps histograms only for columns it can actually seek on (a primary-key member or an index's leading column) — a dropped histogram costs a re-`ANALYZE` to recover and nothing else. Whatever you keep, keep it **keyed by column name**: a positional key silently matches a *different* column after a rename or drop.
+- **Do not then report the saved snapshot from `getStatistics()`.** `ANALYZE` reads a non-empty `columnStats` as *"this module answered cheaply, skip the scan"*, so a module that echoes its own stored snapshot turns every `ANALYZE` into a no-op that re-saves numbers it never recomputed. A cached snapshot is not an answer to "analyze me". Get the loaded snapshot to the planner by stamping it onto the registered `TableSchema` at open instead (the store module does this from `primeStats`).
+
+Statistics you persist are also **per-connection on the way back in**: a second connection over the same storage keeps whatever its own schema holds until it reopens or re-analyzes. That is the same visibility model a persisted row count already has.
+
+A **wrapper** module (isolation, logging, sharding) must forward `getStatistics` *and* `saveStatistics` to the table it wraps — and forward them conditionally, since both are optional and an unconditional wrapper would answer on behalf of an underlying that declined. Forward only the half the underlying implements:
+
+```typescript
+if (underlying.saveStatistics) {
+  this.saveStatistics = stats => underlying.saveStatistics!(stats);
+}
+```
+
 ## Update results and REPLACE displacement
 
 `update()` returns an `UpdateResult`. On success (`{ status: 'ok', … }`) it reports what the call actually did through `row`, plus — via two **independent, additive, optional** channels — any rows this same call displaced through `OR REPLACE` conflict resolution. A module that reports neither displacement channel behaves exactly as it would have before they existed, so those two are purely opt-in; `row` is not.
