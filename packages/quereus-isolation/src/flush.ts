@@ -1,6 +1,6 @@
 import type { SqlValue, UpdateResult, RowOp, VirtualTable } from '@quereus/quereus';
 import { QuereusError, StatusCode, isConstraintViolation } from '@quereus/quereus';
-import { makePkPointLookupFilter } from './filter-info.js';
+import { type PkEquals, makePkEquals, probeRowByPk } from './pk-probe.js';
 import { type OverlayEntry, collectOverlayEntries } from './overlay-rows.js';
 
 /**
@@ -66,10 +66,15 @@ export async function applyOverlayToUnderlying(
 	// staged drafts). Each PK appears at most once in the overlay, so no write in
 	// this flush can change another entry's existence answer — hoisting the
 	// probes is answer-preserving as well as one fewer read per written row.
+	//
+	// The equality test is built once per flush: the probe verifies each returned row's
+	// key rather than trusting the seek, and that comparison must be the collation-aware
+	// / semantic-ordering one the rest of the layer keys rows by.
+	const pkEquals = makePkEquals(underlyingSchema, underlyingTable.db.getCollationResolver());
 	const existsInUnderlying = new Map<OverlayEntry, boolean>();
 	for (const entry of ordered) {
 		if (entry.isTombstone) continue;
-		existsInUnderlying.set(entry, await rowExistsInUnderlying(underlyingTable, pkIndices, entry.pk));
+		existsInUnderlying.set(entry, await rowExistsInUnderlying(underlyingTable, pkIndices, entry.pk, pkEquals));
 	}
 
 	for (const entry of ordered) {
@@ -106,18 +111,19 @@ export async function applyOverlayToUnderlying(
 
 /**
  * Checks if a row with the given primary key exists in the underlying table.
- * Uses an O(log n) point lookup via the PK index.
+ *
+ * Drives the PK index for an O(log n) lookup where the module can serve one, but
+ * verifies the key of every row it gets back — see {@link probeRowByPk}. Believing an
+ * unverified first row here classifies a fresh PK as an `update`, which writes against a
+ * key that does not exist and silently loses the row.
  */
 async function rowExistsInUnderlying(
 	underlyingTable: VirtualTable,
 	pkIndices: number[],
 	pk: SqlValue[],
+	pkEquals: PkEquals,
 ): Promise<boolean> {
-	if (!underlyingTable.query) return false;
-	for await (const _row of underlyingTable.query(makePkPointLookupFilter(pkIndices, pk))) {
-		return true;
-	}
-	return false;
+	return (await probeRowByPk(underlyingTable, pkIndices, pk, pkEquals)) !== undefined;
 }
 
 /**

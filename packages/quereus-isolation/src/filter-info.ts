@@ -17,8 +17,14 @@ export { makeFullScanFilterInfo };
  *
  * The overlay always names its primary-key index `_primary_`, so the descriptor is
  * built here rather than resolved from a schema.
+ *
+ * This is a seek REQUEST, not a contract — the module never claimed these constraints
+ * through `getBestAccessPlan`, so it may answer with any superset of the requested rows,
+ * and no engine sits above a direct `query()` call to reapply them. Callers must verify
+ * each returned row's key; see {@link probeRowByPk} in `pk-probe.ts`, which is how every
+ * primary-key probe in this package consumes the answer.
  */
-export function makePkPointLookupFilter(pkIndices: number[], pk: SqlValue[]): FilterInfo {
+export function makePkPointLookupFilter(pkIndices: readonly number[], pk: readonly SqlValue[]): FilterInfo {
 	const index: IndexDescriptor = {
 		name: PRIMARY_INDEX_NAME,
 		role: 'primary',
@@ -37,9 +43,11 @@ export function makePkPointLookupFilter(pkIndices: number[], pk: SqlValue[]): Fi
  * not match the UNIQUE constraint's `columns` order — so read off the index, never
  * assume the two arrays agree.
  *
- * The built `constraints` carry an EQ per key column, so a module that ignores the
- * `idxStr` index hint still applies the equalities as a residual filter rather than
- * returning the whole table.
+ * Like {@link makePkPointLookupFilter}, this is a seek REQUEST rather than a contract:
+ * a module that ignores the `idxStr` index hint may return the whole table, and nothing
+ * between here and the module reapplies the equalities as a residual. The one caller
+ * (`findUnderlyingUniqueConflict`) stays correct because it re-checks every returned row
+ * against the constraint's columns itself — not because the equalities are enforced.
  */
 export function makeSecondaryIndexEqSeekFilter(index: TableIndexSchema, newRow: readonly SqlValue[]): FilterInfo {
 	const descriptor: IndexDescriptor = {

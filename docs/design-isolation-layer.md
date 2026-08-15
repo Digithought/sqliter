@@ -639,6 +639,28 @@ the commit flush, PK point lookups) build their FilterInfo through the engine's
 `accessPath`; a hand-built FilterInfo that omits it makes a *dirty-overlay* read throw INTERNAL
 (a clean, no-overlay read takes the fast path and never inspects `accessPath`).
 
+**A hand-built FilterInfo is a seek REQUEST, not a contract — verify before you believe.** The
+scans above call `VirtualTable.query()` directly, bypassing the planner. The module therefore
+never claimed those constraints through `getBestAccessPlan`, and nothing sits between the caller
+and the module to reapply the unclaimed ones as a residual. So the answer may be **any superset**
+of the rows asked for, up to the whole table — a module that cannot seek the requested columns
+(the documented, correct behaviour when a column's logical type orders by meaning rather than by
+stored bytes, e.g. `TIMESPAN` or `JSON`) simply scans. Every consumer of such an answer re-checks
+each returned row itself:
+
+- The three primary-key probes (`getUnderlyingRow`, `getOverlayRow`, the commit flush's
+  `rowExistsInUnderlying`) go through `probeRowByPk` in `pk-probe.ts`, which compares each row's
+  key to the requested one under the PK's declared collations and semantic-ordering comparators —
+  the same `PkEquals` the write path's "same logical key" test uses. The check runs over the
+  **whole** iteration, not just row #1: stopping early would turn a false positive ("some row came
+  back ⇒ the key is taken") into a false negative that lets a genuine duplicate key through.
+- The UNIQUE-conflict search (`findUnderlyingUniqueConflict`) seeks when it can and full-scans
+  when it cannot, and re-applies `rowMatchesUniqueConstraint` per returned row either way.
+
+Correspondingly, `makeIndexEqSeekFilterInfo` reports `aConstraintUsage[].omit: false`. `omit` is
+an **output** of `getBestAccessPlan` — the module's own claim that it applied a filter — and a
+hand-built FilterInfo cannot assert it on the module's behalf.
+
 **The INTERNAL error a module earns by aliasing without a descriptor.** If a module names an
 index anything other than `_primary_` or a real schema index and does **not** return an
 `indexDescriptor`, the engine cannot resolve it and records `accessPath.kind:

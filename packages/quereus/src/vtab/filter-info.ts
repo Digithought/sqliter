@@ -123,6 +123,15 @@ export function makeEmptyFilterInfo(): FilterInfo {
  *
  * Used by the isolation layer's primary-key point lookups and by any caller that must
  * drive an O(log n) seek instead of a scan.
+ *
+ * The result is a seek REQUEST, not a negotiated access plan. `aConstraintUsage[].omit`
+ * is an OUTPUT of `getBestAccessPlan` — the module's own claim that it applied a filter,
+ * which is what earns the engine the right to drop the residual. A hand-built FilterInfo
+ * never ran that negotiation, so this builder cannot assert `omit` on the module's
+ * behalf: it reports `false`, and the caller driving `query()` directly owns re-checking
+ * every returned row (there is no engine above the call to reapply anything). The
+ * negotiated path in `rule-select-access-path` builds its own `aConstraintUsage` inline
+ * and still sets `omit: true`, where it is earned.
  */
 export function makeIndexEqSeekFilterInfo(
 	index: IndexDescriptor,
@@ -147,7 +156,7 @@ export function makeIndexEqSeekFilterInfo(
 			nOrderBy: 0,
 			aOrderBy: [],
 			colUsed: 0n,
-			aConstraintUsage: constraints.map(c => ({ argvIndex: c.argvIndex, omit: true })),
+			aConstraintUsage: constraints.map(c => ({ argvIndex: c.argvIndex, omit: false })),
 			idxNum: 0,
 			idxStr,
 			orderByConsumed: false,

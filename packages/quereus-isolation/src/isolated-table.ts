@@ -1,15 +1,23 @@
-import type { CollationFunction, CollationResolver, Database, DatabaseInternal, MaybePromise, Row, SqlValue, TableIndexSchema as IndexSchema, FilterInfo, SchemaChangeInfo, TableSchema, TableStatistics, UniqueConstraintSchema, CompiledPredicate, UpdateArgs, VirtualTableConnection, UpdateResult, AccessPath, IndexDescriptor, IndexKeyColumn } from '@quereus/quereus';
-import { VirtualTable, compareSqlValues, compareSqlValuesFast, resolveCollationFunctions, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, resolveUniqueEnforcementCollations, uniqueEnforcementCollations, uniqueEnforcementComparators, normalizeCollationName, serializeKey, pkKeyCollationName, retargetFilterInfoIndex, PRIMARY_INDEX_NAME, coerceRowToSchema, IndexConstraintOp, decodeIdxStr, createTypedComparator, hasSemanticOrdering, semanticKeyTransform } from '@quereus/quereus';
+import type { CollationResolver, Database, DatabaseInternal, MaybePromise, Row, SqlValue, TableIndexSchema as IndexSchema, FilterInfo, SchemaChangeInfo, TableSchema, TableStatistics, UniqueConstraintSchema, CompiledPredicate, UpdateArgs, VirtualTableConnection, UpdateResult, AccessPath, IndexDescriptor, IndexKeyColumn } from '@quereus/quereus';
+import { VirtualTable, compareSqlValues, compareSqlValuesFast, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, resolveUniqueEnforcementCollations, uniqueEnforcementCollations, uniqueEnforcementComparators, normalizeCollationName, serializeKey, pkKeyCollationName, retargetFilterInfoIndex, PRIMARY_INDEX_NAME, coerceRowToSchema, IndexConstraintOp, decodeIdxStr, createTypedComparator, hasSemanticOrdering, semanticKeyTransform } from '@quereus/quereus';
 import type { EffectiveRowSource, KeyNormalizerResolver } from '@quereus/quereus';
 import type { IsolationModule } from './isolation-module.js';
 import type { ConnectionOverlayState } from './isolation-types.js';
 import { IsolatedConnection, type IsolatedTableCallback } from './isolated-connection.js';
 import { mergeStreams, createMergeEntry, createTombstone } from './merge-iterator.js';
 import type { MergeEntry, MergeConfig } from './merge-types.js';
-import { makeFullScanFilterInfo, makePkPointLookupFilter, makeSecondaryIndexEqSeekFilter } from './filter-info.js';
+import { makeFullScanFilterInfo, makeSecondaryIndexEqSeekFilter } from './filter-info.js';
+import { type PkEquals, type PkKeyShape, makePkKeyShape, pkEqualsFromShape, probeRowByPk } from './pk-probe.js';
 
-/** Returned when the schema has not been populated yet; never mutated. */
-const EMPTY_PK_KEY_SHAPE: { functions: CollationFunction[]; directions: boolean[] } = { functions: [], directions: [] };
+/**
+ * Returned when the schema has not been populated yet; never mutated. An empty shape
+ * degrades every key position to BINARY, matching the prior "no PK definition" behaviour.
+ */
+const EMPTY_PK_SHAPE: PkKeyShape = { compares: [], directions: [] };
+const EMPTY_PK_SHAPE_ENTRY: { shape: PkKeyShape; equals: PkEquals } = {
+	shape: EMPTY_PK_SHAPE,
+	equals: pkEqualsFromShape(EMPTY_PK_SHAPE),
+};
 
 /**
  * Information about which index is being scanned.
@@ -68,22 +76,14 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	private readonly keyNormalizerResolver: KeyNormalizerResolver;
 
 	/**
-	 * Per-PK-column comparison functions and sort directions, resolved from the PK
-	 * columns' declared collations and memoized against the `TableSchema` object
-	 * identity — an `alter table` hands this instance a fresh (frozen) schema object,
-	 * which invalidates the entry.
+	 * The PK key shape (per-column comparison functions and sort directions) and the
+	 * equality test derived from it, memoized against the `TableSchema` object identity —
+	 * an `alter table` hands this instance a fresh (frozen) schema object, which
+	 * invalidates the entry. Both are built by `pk-probe.ts`, which is also what the
+	 * commit flush uses, so the merge order, the write path's "same logical key" test,
+	 * and the flush's existence probes cannot drift apart.
 	 */
-	private pkCollationCache?: { schema: TableSchema; functions: CollationFunction[]; directions: boolean[] };
-
-	/**
-	 * Per-PK-column typed EQUALITY comparators for semantic-ordering members (TIMESPAN,
-	 * JSON — see the engine's `hasSemanticOrdering`), `undefined` elsewhere. The
-	 * underlying backends collapse semantically-equal PK spellings onto one row (the
-	 * memory table's typed BTree; the store's `groupKey`-transformed key bytes), so
-	 * shadowing and self-PK questions here must call 'PT1H' and 'PT60M' the same key
-	 * too. Memoized against the schema object like {@link pkCollationCache}.
-	 */
-	private pkSemanticCache?: { schema: TableSchema; comparators: (((a: SqlValue, b: SqlValue) => number) | undefined)[] };
+	private pkShapeCache?: { schema: TableSchema; shape: PkKeyShape; equals: PkEquals };
 
 	/**
 	 * The `VirtualTable` statistics pair, forwarded to the wrapped table.
@@ -114,21 +114,6 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 */
 	readonly getStatistics?: () => Promise<TableStatistics | undefined> | TableStatistics | undefined;
 	readonly saveStatistics?: (stats: TableStatistics) => Promise<void>;
-
-	private getPkSemanticComparators(): (((a: SqlValue, b: SqlValue) => number) | undefined)[] {
-		const schema = this.tableSchema;
-		if (!schema) return [];
-		if (this.pkSemanticCache?.schema !== schema) {
-			this.pkSemanticCache = {
-				schema,
-				comparators: (schema.primaryKeyDefinition ?? []).map(pk => {
-					const logicalType = schema.columns[pk.index]?.logicalType;
-					return hasSemanticOrdering(logicalType) ? createTypedComparator(logicalType) : undefined;
-				}),
-			};
-		}
-		return this.pkSemanticCache.comparators;
-	}
 
 	/**
 	 * Returns the connection-scoped set of savepoint depths that pre-date the overlay.
@@ -1004,50 +989,31 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	}
 
 	/**
-	 * Per-PK-column comparison functions for this table's current schema, resolved
-	 * against THIS database's collation registry (so `db.registerCollation` names
-	 * participate) rather than the process-global built-in trio.
-	 *
-	 * A PK column with no declared `COLLATE` resolves to BINARY; a PK definition
-	 * shorter than the key being compared (or absent entirely) yields BINARY for the
-	 * trailing positions, matching the prior `collation === undefined` behaviour.
+	 * Per-PK-column comparison functions and sort directions for this table's current
+	 * schema, resolved against THIS database's collation registry (so
+	 * `db.registerCollation` names participate) rather than the process-global built-in
+	 * trio. See {@link makePkKeyShape} for what each comparator is.
 	 *
 	 * Memoized on the schema object so comparator construction — and the per-call
-	 * {@link keysEqual} — never re-resolves per row. Resolution is not retroactive: a
-	 * collation registered *after* a comparator was built is not picked up, the same
-	 * contract `Database.registerCollation` documents engine-wide.
-	 *
-	 * NOTE: this is the *comparison* collation only. The store's physical key bytes are
-	 * produced by the key NORMALIZER of the same collation, resolved through the same
-	 * connection's registry (`bug-store-key-encoder-ignores-database-collations`, landed),
-	 * so the two agree on equality — but only on ORDER for a collation asserting
-	 * `orderPreserving` (see docs/store.md § Order preservation).
+	 * {@link keysEqual} — never re-resolves per row.
 	 */
-	private getPkCollations(): CollationFunction[] {
-		return this.getPkKeyShape().functions;
+	private getPkKeyShape(): PkKeyShape {
+		return this.getPkShapeEntry().shape;
 	}
 
-	/**
-	 * Per-PK-column sort directions (`true` ⇒ DESC), positionally aligned with
-	 * {@link getPkCollations}. Only the ordering comparator needs them; `keysEqual`
-	 * asks about equality, which direction cannot change.
-	 */
-	private getPkDirections(): boolean[] {
-		return this.getPkKeyShape().directions;
+	/** The collation-aware / semantic-ordering "same logical key" test for this schema. */
+	private getPkEquals(): PkEquals {
+		return this.getPkShapeEntry().equals;
 	}
 
-	private getPkKeyShape(): { functions: CollationFunction[]; directions: boolean[] } {
+	private getPkShapeEntry(): { shape: PkKeyShape; equals: PkEquals } {
 		const schema = this.tableSchema;
-		if (!schema) return EMPTY_PK_KEY_SHAPE;
-		if (this.pkCollationCache?.schema !== schema) {
-			const pkDef = schema.primaryKeyDefinition ?? [];
-			this.pkCollationCache = {
-				schema,
-				functions: resolveCollationFunctions(this.collationResolver, pkDef.map(pk => schema.columns[pk.index]?.collation)),
-				directions: pkDef.map(pk => !!pk.desc),
-			};
+		if (!schema) return EMPTY_PK_SHAPE_ENTRY;
+		if (this.pkShapeCache?.schema !== schema) {
+			const shape = makePkKeyShape(schema, this.collationResolver);
+			this.pkShapeCache = { schema, shape, equals: pkEqualsFromShape(shape) };
 		}
-		return this.pkCollationCache;
+		return this.pkShapeCache;
 	}
 
 	/**
@@ -1070,14 +1036,13 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		// A semantic-ordering member compares through its type's `compare` — both the
 		// memory table's typed BTree and the store's groupKey-transformed key bytes
 		// emit in that order, and its equality is what shadowing needs ('PT1H' ≡ 'PT60M').
-		const collations = this.getPkCollations();
-		const directions = this.getPkDirections();
-		const semantic = this.getPkSemanticComparators();
+		const { compares, directions } = this.getPkKeyShape();
 		return (a: SqlValue[], b: SqlValue[]) => {
 			for (let i = 0; i < a.length; i++) {
-				const cmp = semantic[i]
-					? semantic[i]!(a[i], b[i])
-					: compareSqlValuesFast(a[i], b[i], collations[i] ?? BINARY_COLLATION);
+				const compare = compares[i];
+				const cmp = compare
+					? compare(a[i], b[i])
+					: compareSqlValuesFast(a[i], b[i], BINARY_COLLATION);
 				if (cmp !== 0) return directions[i] ? -cmp : cmp;
 			}
 			return 0;
@@ -1511,15 +1476,17 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	}
 
 	/**
-	 * Gets a row from the overlay by primary key using O(log n) point lookup.
+	 * Gets a row from the overlay by primary key, driving an O(log n) point lookup and
+	 * verifying the key of whatever comes back (see {@link probeRowByPk}). The overlay
+	 * schema appends the tombstone column AFTER the table's own columns, so the table's
+	 * PK column indices address the overlay row unchanged.
+	 *
+	 * The default overlay is a memory table that serves the seek, so verification is a
+	 * no-op there; it is load-bearing when a host supplies a scan-only module as
+	 * `IsolationConfig.overlay`.
 	 */
 	private async getOverlayRow(overlay: VirtualTable, pk: SqlValue[]): Promise<Row | undefined> {
-		if (!overlay.query) return undefined;
-
-		for await (const row of overlay.query(this.buildPKPointLookupFilter(pk))) {
-			return row;
-		}
-		return undefined;
+		return probeRowByPk(overlay, this.getPrimaryKeyIndices(), pk, this.getPkEquals());
 	}
 
 	/**
@@ -1527,14 +1494,6 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 */
 	private createFullScanFilterInfo(): FilterInfo {
 		return makeFullScanFilterInfo();
-	}
-
-	/**
-	 * Creates a FilterInfo for a primary key point lookup (equality on all PK columns).
-	 * This produces O(log n) lookups instead of O(n) full scans.
-	 */
-	private buildPKPointLookupFilter(pk: SqlValue[]): FilterInfo {
-		return makePkPointLookupFilter(this.getPrimaryKeyIndices(), pk);
 	}
 
 	// ==================== Merged-View Conflict Detection ====================
@@ -1554,32 +1513,24 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		return compiled;
 	}
 
+	/**
+	 * "Same logical key?" — compared under each PK column's declared collation, not
+	 * BINARY. The underlying store keys rows collation-aware (e.g. a NOCASE text PK), so
+	 * a case-only PK rewrite ('apple' → 'APPLE') is the SAME logical key. A binary
+	 * comparison here would mis-classify it as a PK relocation, then resolve the "new"
+	 * key back to the same physical underlying row and raise a false UNIQUE PK conflict.
+	 * A semantic-ordering member compares through its type's `compare` for the same
+	 * reason: both backends key 'PT1H' and 'PT60M' as one row.
+	 *
+	 * This is the same function the PK probes verify their returned rows with — one
+	 * definition, so the write path and the probes cannot disagree about key identity.
+	 */
 	private keysEqual(a: SqlValue[], b: SqlValue[]): boolean {
-		if (a.length !== b.length) return false;
-		// Compare under each PK column's declared collation, not BINARY. The underlying
-		// store keys rows collation-aware (e.g. a NOCASE text PK), so a case-only PK
-		// rewrite ('apple' → 'APPLE') is the SAME logical key. A binary comparison here
-		// would mis-classify it as a PK relocation, then resolve the "new" key back to the
-		// same physical underlying row and raise a false UNIQUE PK conflict. A
-		// semantic-ordering member compares through its type's `compare` for the same
-		// reason: both backends key 'PT1H' and 'PT60M' as one row.
-		const collations = this.getPkCollations();
-		const semantic = this.getPkSemanticComparators();
-		for (let i = 0; i < a.length; i++) {
-			const cmp = semantic[i]
-				? semantic[i]!(a[i], b[i])
-				: compareSqlValuesFast(a[i], b[i], collations[i] ?? BINARY_COLLATION);
-			if (cmp !== 0) return false;
-		}
-		return true;
+		return this.getPkEquals()(a, b);
 	}
 
 	private async getUnderlyingRow(pk: SqlValue[]): Promise<Row | undefined> {
-		if (!this.underlyingTable.query) return undefined;
-		for await (const row of this.underlyingTable.query(this.buildPKPointLookupFilter(pk))) {
-			return row;
-		}
-		return undefined;
+		return probeRowByPk(this.underlyingTable, this.getPrimaryKeyIndices(), pk, this.getPkEquals());
 	}
 
 	/**

@@ -243,6 +243,14 @@ Three corollaries worth spelling out:
   column is usable only as the trailing bound of a prefix seek, and only when every
   preceding seek column is pinned by a *single-valued* equality (`a = 1`, or `a in (1)`
   — not `a in (1, 2)`). Otherwise the planner declines the seek entirely and scans.
+- **The residual only exists on the planned path.** Declining a filter here is safe
+  because the engine reattaches it above the module. A caller that drives
+  `VirtualTable.query()` *directly*, outside the planner — the isolation layer's
+  primary-key probes are the in-repo example — has no engine above it to reattach
+  anything, so the constraints in its hand-built `FilterInfo` are a **request**, not a
+  contract. Such a caller owns re-checking every row you return, and must stay correct
+  when you answer a seek with the whole table. Do not treat a direct `query()` call as
+  permission to skip the negotiation: your module remains free to decline.
 
 **Runtime-valued `IN` sets**:
 
