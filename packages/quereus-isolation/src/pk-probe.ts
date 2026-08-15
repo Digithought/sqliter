@@ -42,8 +42,11 @@ export interface PkKeyShape {
 	readonly directions: readonly boolean[];
 }
 
-/** Returned when the schema has not been populated yet; never mutated. */
-const EMPTY_PK_KEY_SHAPE: PkKeyShape = { compares: [], directions: [] };
+/**
+ * The shape of a schema that has not been populated yet; never mutated. An empty shape
+ * degrades every key position to BINARY, matching the "no PK definition" behaviour.
+ */
+export const EMPTY_PK_KEY_SHAPE: PkKeyShape = { compares: [], directions: [] };
 
 /** Builds the {@link PkKeyShape} for `schema`'s primary key. */
 export function makePkKeyShape(schema: TableSchema | undefined, resolveCollation: CollationResolver): PkKeyShape {

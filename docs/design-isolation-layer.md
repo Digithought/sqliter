@@ -639,14 +639,16 @@ the commit flush, PK point lookups) build their FilterInfo through the engine's
 `accessPath`; a hand-built FilterInfo that omits it makes a *dirty-overlay* read throw INTERNAL
 (a clean, no-overlay read takes the fast path and never inspects `accessPath`).
 
-**A hand-built FilterInfo is a seek REQUEST, not a contract — verify before you believe.** The
-scans above call `VirtualTable.query()` directly, bypassing the planner. The module therefore
-never claimed those constraints through `getBestAccessPlan`, and nothing sits between the caller
-and the module to reapply the unclaimed ones as a residual. So the answer may be **any superset**
-of the rows asked for, up to the whole table — a module that cannot seek the requested columns
-(the documented, correct behaviour when a column's logical type orders by meaning rather than by
-stored bytes, e.g. `TIMESPAN` or `JSON`) simply scans. Every consumer of such an answer re-checks
-each returned row itself:
+**A FilterInfo the module did not negotiate is a seek REQUEST, not a contract — verify before you
+believe.** A module owes the constraints in a FilterInfo only when it claimed them through its own
+`getBestAccessPlan`; that claim is what earns the engine the right to drop the residual predicate.
+Absent it, the answer may be **any superset** of the rows asked for, up to the whole table — a
+module that cannot seek the requested columns (the documented, correct behaviour when a column's
+logical type orders by meaning rather than by stored bytes, e.g. `TIMESPAN` or `JSON`) simply
+scans. Two families of read inside this layer hit that case, and each re-checks the answer itself.
+
+*Hand-built FilterInfo* — the scans above call `VirtualTable.query()` directly, bypassing the
+planner, so no negotiation happened at all and no engine sits above the call:
 
 - The three primary-key probes (`getUnderlyingRow`, `getOverlayRow`, the commit flush's
   `rowExistsInUnderlying`) go through `probeRowByPk` in `pk-probe.ts`, which compares each row's
@@ -656,6 +658,15 @@ each returned row itself:
   back ⇒ the key is taken") into a false negative that lets a genuine duplicate key through.
 - The UNIQUE-conflict search (`findUnderlyingUniqueConflict`) seeks when it can and full-scans
   when it cannot, and re-applies `rowMatchesUniqueConstraint` per returned row either way.
+
+*Someone else's negotiated FilterInfo* — a merged read negotiates with the **underlying** module
+and then reads the **overlay**, which claimed nothing. Both merged paths therefore re-apply the
+window over the overlay's stream with `buildConstraintMatcher`: `mergedSecondaryIndexQuery` because
+it full-scans the overlay outright (it cannot resolve an underlying-minted index name), and
+`queryOverlayAsMergeEntries` because a host-supplied scan-only `IsolationConfig.overlay` may answer
+the underlying's seek with the whole overlay. Tombstones bypass the matcher deliberately — they
+carry null non-PK columns, and an out-of-window tombstone can only shadow a primary key the
+underlying stream does not carry.
 
 Correspondingly, `makeIndexEqSeekFilterInfo` reports `aConstraintUsage[].omit: false`. `omit` is
 an **output** of `getBestAccessPlan` — the module's own claim that it applied a filter — and a

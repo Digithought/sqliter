@@ -7,17 +7,20 @@ import { IsolatedConnection, type IsolatedTableCallback } from './isolated-conne
 import { mergeStreams, createMergeEntry, createTombstone } from './merge-iterator.js';
 import type { MergeEntry, MergeConfig } from './merge-types.js';
 import { makeFullScanFilterInfo, makeSecondaryIndexEqSeekFilter } from './filter-info.js';
-import { type PkEquals, type PkKeyShape, makePkKeyShape, pkEqualsFromShape, probeRowByPk } from './pk-probe.js';
+import { type PkEquals, type PkKeyShape, EMPTY_PK_KEY_SHAPE, makePkKeyShape, pkEqualsFromShape, probeRowByPk } from './pk-probe.js';
+
+/** The cache entry served while `tableSchema` is still unpopulated; never mutated. */
+const EMPTY_PK_SHAPE_ENTRY: { shape: PkKeyShape; equals: PkEquals } = {
+	shape: EMPTY_PK_KEY_SHAPE,
+	equals: pkEqualsFromShape(EMPTY_PK_KEY_SHAPE),
+};
 
 /**
- * Returned when the schema has not been populated yet; never mutated. An empty shape
- * degrades every key position to BINARY, matching the prior "no PK definition" behaviour.
+ * The window matcher {@link IsolatedTable.buildConstraintMatcher} returns when the scan
+ * pushes no window at all. Shared (rather than a fresh closure per call) so a caller can
+ * identity-test it and skip the per-row call on the full-scan path.
  */
-const EMPTY_PK_SHAPE: PkKeyShape = { compares: [], directions: [] };
-const EMPTY_PK_SHAPE_ENTRY: { shape: PkKeyShape; equals: PkEquals } = {
-	shape: EMPTY_PK_SHAPE,
-	equals: pkEqualsFromShape(EMPTY_PK_SHAPE),
-};
+const MATCH_ALL_ROWS = (_row: Row): boolean => true;
 
 /**
  * Information about which index is being scanned.
@@ -702,12 +705,17 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	}
 
 	/**
-	 * Builds the window predicate for the overlay side of a merged secondary-index read.
+	 * Builds the window predicate for the overlay side of a merged read.
 	 *
-	 * The overlay is full-scanned there (it cannot resolve an underlying-minted index
-	 * name), so every staged row surfaces — including rows outside the query's window.
-	 * This predicate re-applies the pushed constraints that the underlying's index seek
-	 * enforces on its own stream.
+	 * Both merged paths need it, for the same reason: the overlay's stream is not bound by
+	 * the constraints the underlying negotiated. A merged secondary read full-scans the
+	 * overlay outright (it cannot resolve an underlying-minted index name); a merged primary
+	 * read hands the overlay the underlying's FilterInfo, which the overlay module never
+	 * claimed and may legally answer with a superset. Either way this predicate re-applies
+	 * the pushed constraints that the underlying's index seek enforces on its own stream.
+	 *
+	 * Returns the shared {@link MATCH_ALL_ROWS} when the scan pushes no window, so callers
+	 * can skip the per-row call entirely on the full-scan path.
 	 *
 	 * Interpretation follows the plan kind:
 	 * - `scan` pushes no window — everything matches.
@@ -733,7 +741,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		// Only 'index' paths reach the merged secondary read (resolveScanIndex gates on
 		// the access path first); an ordering-only walk pushes no window.
 		if (path?.kind !== 'index' || path.plan === 'scan') {
-			return () => true;
+			return MATCH_ALL_ROWS;
 		}
 		if (path.plan === 'multiRangeSeek') {
 			return this.buildMultiRangeWindowMatcher(filterInfo, path.index);
@@ -772,7 +780,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 			}
 		}
 
-		if (windows.size === 0) return () => true;
+		if (windows.size === 0) return MATCH_ALL_ROWS;
 		const entries = [...windows.entries()];
 
 		return (row: Row): boolean => {
@@ -882,6 +890,19 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 *
 	 * Uses the same FilterInfo as the underlying query so both streams are in the same order.
 	 * For secondary index scans, the sort key includes both the index key and primary key.
+	 *
+	 * The window is re-applied here rather than trusted: `filterInfo` was negotiated with
+	 * the UNDERLYING module, and the engine dropped the residual on the underlying's claim,
+	 * but the OVERLAY module never claimed anything. A module is entitled to answer a seek
+	 * it cannot serve with any superset of the requested rows — up to the whole table — so a
+	 * host-supplied scan-only `IsolationConfig.overlay` would otherwise merge staged rows
+	 * from outside the query's window into the answer. This is the same re-check
+	 * {@link mergedSecondaryIndexQuery} already runs over its full overlay scan, and a no-op
+	 * (the identity matcher) for the full-scan reads the default memory overlay serves.
+	 *
+	 * Tombstones bypass the window deliberately: a tombstone carries null non-PK columns, so
+	 * a window over a non-key column would reject it, and an out-of-window tombstone is inert
+	 * anyway — it can only shadow a PK the underlying stream does not carry.
 	 */
 	private async *queryOverlayAsMergeEntries(
 		overlay: VirtualTable,
@@ -894,6 +915,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 
 		const pkIndices = this.getPrimaryKeyIndices();
 		const tombstoneIndex = this.getTombstoneColumnIndex(overlay);
+		const matchesWindow = this.buildConstraintMatcher(filterInfo);
 
 		// Query overlay with the same filter constraints
 		for await (const overlayRow of overlay.query(filterInfo)) {
@@ -908,6 +930,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 			} else {
 				// Remove the tombstone column from the row before yielding
 				const dataRow = overlayRow.slice(0, tombstoneIndex);
+				if (matchesWindow !== MATCH_ALL_ROWS && !matchesWindow(dataRow)) continue;
 				yield createMergeEntry(dataRow, pk, sortKey);
 			}
 		}

@@ -1,42 +1,48 @@
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
 import { Database, MemoryTableModule, asyncIterableToArray, makeFullScanFilterInfo } from '@quereus/quereus';
-import type { BestAccessPlanRequest, BestAccessPlanResult, Database as Db, SqlValue, TableSchema } from '@quereus/quereus';
+import type { BestAccessPlanRequest, BestAccessPlanResult, Database as Db, SqlValue, TableSchema, VirtualTableModule } from '@quereus/quereus';
 import { IsolationModule } from '../src/index.js';
 
 /**
- * Pins the isolation layer's primary-key probe invariant:
+ * Pins the isolation layer's overlay/underlying read invariant:
  *
- * **A hand-built FilterInfo is a seek REQUEST, not a contract — the answer may be a
- * superset, so every probe verifies the key of each row it gets back.**
+ * **A FilterInfo a module did not negotiate is a seek REQUEST, not a contract — the answer
+ * may be a superset, so the layer verifies before it believes.**
  *
- * The layer's three PK probes (`getUnderlyingRow`, `getOverlayRow`, and the commit
- * flush's `rowExistsInUnderlying`) call `VirtualTable.query()` directly with a
- * FilterInfo they built themselves. The module never claimed those constraints through
- * `getBestAccessPlan`, and no engine sits above a direct `query()` call to reapply them
- * as a residual — so a module that cannot seek the requested columns may legally answer
- * with the whole table.
+ * Two families of read reach a module with constraints it never claimed:
  *
- * The regression this guards: the probes returned row #1 of whatever came back. Against
- * a scan-only underlying that made a distinct primary key look occupied
- * (`UNIQUE constraint failed: t PK.` for a key not in the table), and — once the
- * conflict check was fixed in isolation — made the flush classify a fresh key as an
- * update, writing against a key that does not exist and silently losing the row.
+ * 1. The three primary-key probes (`getUnderlyingRow`, `getOverlayRow`, and the commit
+ *    flush's `rowExistsInUnderlying`) call `VirtualTable.query()` directly with a FilterInfo
+ *    they built themselves — no `getBestAccessPlan` ran at all.
+ * 2. The merged primary-key read hands the OVERLAY the FilterInfo negotiated with the
+ *    UNDERLYING. The engine dropped the residual on the underlying's claim; the overlay
+ *    module never made one.
  *
- * The trigger is the MODULE, not the column type: an `integer` primary key reproduces
- * it. A semantic-ordering type (TIMESPAN, JSON) only makes declining the seek the
- * *correct* thing for a module to do, which is how the original report hit it.
+ * Either way no engine sits above the call to reapply the constraints as a residual, so a
+ * module that cannot seek the requested columns may legally answer with the whole table.
+ *
+ * The regressions these guard: the probes returned row #1 of whatever came back — against a
+ * scan-only underlying that made a distinct primary key look occupied (`UNIQUE constraint
+ * failed: t PK.` for a key not in the table), and, once the conflict check was fixed in
+ * isolation, made the flush classify a fresh key as an update, writing against a key that
+ * does not exist and silently losing the row. The merged read yielded the overlay's answer
+ * unwindowed, surfacing staged rows from outside the query's window.
+ *
+ * The trigger is the MODULE, not the column type: an `integer` primary key reproduces it. A
+ * semantic-ordering type (TIMESPAN, JSON) only makes declining the seek the *correct* thing
+ * for a module to do, which is how the original report hit it.
  */
 
-type UnderlyingTable = Awaited<ReturnType<MemoryTableModule['create']>>;
+type AnyTable = Awaited<ReturnType<MemoryTableModule['create']>>;
 
 /**
  * A module that declines every pushed filter and answers every `query()` with a full
  * scan — the legal shape for a module that cannot seek the requested column.
  *
  * Declining at plan time keeps ordinary SQL correct: the engine keeps the residual
- * predicate above the module. Only the isolation layer's hand-built probes, which
- * bypass the planner entirely, see the unfiltered answer.
+ * predicate above the module. Only the isolation layer's own reads, which consume a
+ * FilterInfo this module never claimed, see the unfiltered answer.
  */
 class ScanOnlyMemoryModule extends MemoryTableModule {
 	override getBestAccessPlan(_db: Db, _tableInfo: TableSchema, request: BestAccessPlanRequest): BestAccessPlanResult {
@@ -44,7 +50,7 @@ class ScanOnlyMemoryModule extends MemoryTableModule {
 		return { handledFilters: request.filters.map(() => false), rows, cost: rows };
 	}
 
-	private wrap(table: UnderlyingTable): UnderlyingTable {
+	private wrap(table: AnyTable): AnyTable {
 		return new Proxy(table, {
 			get(target, prop) {
 				if (prop === 'query') {
@@ -56,27 +62,57 @@ class ScanOnlyMemoryModule extends MemoryTableModule {
 		});
 	}
 
-	override async create(...args: Parameters<MemoryTableModule['create']>): Promise<UnderlyingTable> {
+	override async create(...args: Parameters<MemoryTableModule['create']>): Promise<AnyTable> {
 		return this.wrap(await super.create(...args));
 	}
 
-	override async connect(...args: Parameters<MemoryTableModule['connect']>): Promise<UnderlyingTable> {
+	override async connect(...args: Parameters<MemoryTableModule['connect']>): Promise<AnyTable> {
 		return this.wrap(await super.connect(...args));
 	}
 }
 
-async function openScanOnlyDb(ddl: string): Promise<Database> {
+async function openDb(
+	ddl: string,
+	modules: { underlying: VirtualTableModule<any, any>; overlay?: VirtualTableModule<any, any> },
+): Promise<Database> {
 	const db = new Database();
-	db.registerModule('isolated', new IsolationModule({ underlying: new ScanOnlyMemoryModule() }));
+	db.registerModule('isolated', new IsolationModule(modules));
 	await db.exec(ddl);
 	return db;
 }
+
+/** Scan-only UNDERLYING, default (seeking) memory overlay. */
+function openScanOnlyUnderlyingDb(ddl: string): Promise<Database> {
+	return openDb(ddl, { underlying: new ScanOnlyMemoryModule() });
+}
+
+/** Seeking underlying, scan-only OVERLAY — the `IsolationConfig.overlay` arm. */
+function openScanOnlyOverlayDb(ddl: string): Promise<Database> {
+	return openDb(ddl, { underlying: new MemoryTableModule(), overlay: new ScanOnlyMemoryModule() });
+}
+
+/**
+ * Asserts `run()` rejects with a constraint violation naming the expected constraint —
+ * not merely that *something* threw, which a typo in the SQL would also satisfy.
+ */
+async function expectConstraintFailure(run: () => Promise<unknown>, matching: RegExp): Promise<void> {
+	let error: unknown;
+	try {
+		await run();
+	} catch (e) {
+		error = e;
+	}
+	expect(error, 'expected a constraint violation, but the statement succeeded').to.not.be.undefined;
+	expect(String((error as Error).message)).to.match(matching);
+}
+
+const DUPLICATE_PK = /UNIQUE constraint failed/i;
 
 describe('isolation PK probe vs an underlying that scans', () => {
 	let db: Database;
 
 	beforeEach(async () => {
-		db = await openScanOnlyDb('create table t (k integer primary key, v text) using isolated');
+		db = await openScanOnlyUnderlyingDb('create table t (k integer primary key, v text) using isolated');
 	});
 
 	afterEach(async () => {
@@ -136,15 +172,40 @@ describe('isolation PK probe vs an underlying that scans', () => {
 		expect(await rows()).to.deep.equal([[1, 'ONE'], [2, 'two']]);
 	});
 
+	it('a staged delete removes exactly its own row', async () => {
+		// A tombstone resolves through the same probes; believing row #1 could delete
+		// against a key the overlay never staged.
+		await db.exec(`insert into t values (1, 'one')`);
+		await db.exec(`insert into t values (2, 'two')`);
+		await db.exec(`insert into t values (3, 'three')`);
+		await db.exec('begin');
+		await db.exec('delete from t where k = 2');
+		await db.exec('commit');
+		expect(await rows()).to.deep.equal([[1, 'one'], [3, 'three']]);
+	});
+
+	it('a delete and a re-insert of the same key in one transaction lands the new row', async () => {
+		await db.exec(`insert into t values (1, 'one')`);
+		await db.exec(`insert into t values (2, 'two')`);
+		await db.exec('begin');
+		await db.exec('delete from t where k = 2');
+		await db.exec(`insert into t values (2, 'two-again')`);
+		await db.exec('commit');
+		expect(await rows()).to.deep.equal([[1, 'one'], [2, 'two-again']]);
+	});
+
+	it('a rolled-back transaction leaves the committed rows untouched', async () => {
+		await db.exec(`insert into t values (1, 'one')`);
+		await db.exec('begin');
+		await db.exec(`insert into t values (2, 'two')`);
+		await db.exec(`update t set v = 'ONE' where k = 1`);
+		await db.exec('rollback');
+		expect(await rows()).to.deep.equal([[1, 'one']]);
+	});
+
 	it('sanity: a genuine duplicate PK still conflicts', async () => {
 		await db.exec(`insert into t values (1, 'one')`);
-		let threw = false;
-		try {
-			await db.exec(`insert into t values (1, 'again')`);
-		} catch {
-			threw = true;
-		}
-		expect(threw, 'a real duplicate must still be rejected').to.be.true;
+		await expectConstraintFailure(() => db.exec(`insert into t values (1, 'again')`), DUPLICATE_PK);
 	});
 
 	it('sanity: a genuine duplicate PK staged in a transaction still conflicts', async () => {
@@ -154,14 +215,8 @@ describe('isolation PK probe vs an underlying that scans', () => {
 		await db.exec(`insert into t values (2, 'two')`);
 		await db.exec(`insert into t values (3, 'three')`);
 		await db.exec('begin');
-		let threw = false;
-		try {
-			await db.exec(`insert into t values (3, 'again')`);
-		} catch {
-			threw = true;
-		}
+		await expectConstraintFailure(() => db.exec(`insert into t values (3, 'again')`), DUPLICATE_PK);
 		await db.exec('rollback');
-		expect(threw, 'a real duplicate must still be rejected').to.be.true;
 		expect(await rows()).to.deep.equal([[1, 'one'], [2, 'two'], [3, 'three']]);
 	});
 });
@@ -170,7 +225,7 @@ describe('isolation PK probe vs an underlying that scans — compound PK', () =>
 	let db: Database;
 
 	beforeEach(async () => {
-		db = await openScanOnlyDb(
+		db = await openScanOnlyUnderlyingDb(
 			'create table t (a integer, b integer, v text, primary key (a, b)) using isolated');
 	});
 
@@ -199,13 +254,7 @@ describe('isolation PK probe vs an underlying that scans — compound PK', () =>
 	it('sanity: a full compound-key duplicate still conflicts', async () => {
 		await db.exec(`insert into t values (1, 1, 'one-one')`);
 		await db.exec(`insert into t values (1, 2, 'one-two')`);
-		let threw = false;
-		try {
-			await db.exec(`insert into t values (1, 2, 'again')`);
-		} catch {
-			threw = true;
-		}
-		expect(threw, 'a real duplicate must still be rejected').to.be.true;
+		await expectConstraintFailure(() => db.exec(`insert into t values (1, 2, 'again')`), DUPLICATE_PK);
 	});
 });
 
@@ -213,7 +262,7 @@ describe('isolation PK probe vs an underlying that scans — NOCASE text PK', ()
 	let db: Database;
 
 	beforeEach(async () => {
-		db = await openScanOnlyDb(
+		db = await openScanOnlyUnderlyingDb(
 			'create table t (k text collate nocase primary key, v text) using isolated');
 	});
 
@@ -243,13 +292,7 @@ describe('isolation PK probe vs an underlying that scans — NOCASE text PK', ()
 
 	it('a case-differing insert is a duplicate, not a fresh key', async () => {
 		await db.exec(`insert into t values ('apple', 'fruit')`);
-		let threw = false;
-		try {
-			await db.exec(`insert into t values ('APPLE', 'other')`);
-		} catch {
-			threw = true;
-		}
-		expect(threw, 'NOCASE makes this the same key').to.be.true;
+		await expectConstraintFailure(() => db.exec(`insert into t values ('APPLE', 'other')`), DUPLICATE_PK);
 		expect(await rows()).to.deep.equal([['apple', 'fruit']]);
 	});
 
@@ -259,5 +302,127 @@ describe('isolation PK probe vs an underlying that scans — NOCASE text PK', ()
 		await db.exec(`insert into t values ('banana', 'also fruit')`);
 		await db.exec('commit');
 		expect(await rows()).to.deep.equal([['apple', 'fruit'], ['banana', 'also fruit']]);
+	});
+});
+
+describe('isolation PK probe vs an underlying that scans — semantic-ordering (TIMESPAN) PK', () => {
+	let db: Database;
+
+	beforeEach(async () => {
+		db = await openScanOnlyUnderlyingDb('create table t (d timespan primary key, v text) using isolated');
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	async function values(): Promise<SqlValue[]> {
+		const out = await asyncIterableToArray(db.eval('select v from t order by d'));
+		return out.map((r: Record<string, SqlValue>) => r.v);
+	}
+
+	/**
+	 * The column shape the original report came from: a TIMESPAN orders by elapsed time
+	 * rather than by stored bytes, so 'PT2H' and 'PT120M' are ONE key with two spellings
+	 * and a module that cannot seek it is right to decline. The probe must therefore
+	 * compare through the type's own comparator, not the collation path.
+	 */
+	it('a re-spelled duplicate key is a duplicate, not a fresh key', async () => {
+		await db.exec(`insert into t values ('PT2H', 'two hours')`);
+		await expectConstraintFailure(() => db.exec(`insert into t values ('PT120M', 'again')`), DUPLICATE_PK);
+		expect(await values()).to.deep.equal(['two hours']);
+	});
+
+	it('a staged re-spelling of the key stays one row', async () => {
+		await db.exec(`insert into t values ('PT2H', 'two hours')`);
+		await db.exec('begin');
+		await db.exec(`update t set d = 'PT120M' where d = 'PT2H'`);
+		await db.exec('commit');
+		expect(await values()).to.deep.equal(['two hours']);
+	});
+
+	it('genuinely distinct spans both land', async () => {
+		await db.exec('begin');
+		await db.exec(`insert into t values ('PT1H', 'one hour')`);
+		await db.exec(`insert into t values ('PT2H', 'two hours')`);
+		await db.exec('commit');
+		expect(await values()).to.deep.equal(['one hour', 'two hours']);
+	});
+});
+
+describe('isolation reads vs an OVERLAY that scans', () => {
+	let db: Database;
+
+	beforeEach(async () => {
+		db = await openScanOnlyOverlayDb('create table t (k integer primary key, v text) using isolated');
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	async function rows(sql: string): Promise<SqlValue[][]> {
+		const out = await asyncIterableToArray(db.eval(sql));
+		return out.map((r: Record<string, SqlValue>) => [r.k, r.v]);
+	}
+
+	it('a staged PK-point read returns only the matching row', async () => {
+		// The merged primary read hands the overlay the FilterInfo the UNDERLYING
+		// negotiated. The engine dropped the residual on the underlying's claim, so
+		// trusting the overlay's answer surfaces every staged row instead of the one asked
+		// for. The layer re-applies the window itself.
+		await db.exec(`insert into t values (1, 'one')`);
+		await db.exec('begin');
+		await db.exec(`insert into t values (2, 'two')`);
+		await db.exec(`insert into t values (3, 'three')`);
+		const seeked = await rows('select k, v from t where k = 2');
+		const scanned = await rows('select k, v from t order by k');
+		await db.exec('rollback');
+
+		expect(seeked, 'the seek must not leak the other staged rows').to.deep.equal([[2, 'two']]);
+		// The unwindowed read still sees everything — the window filter narrows, never drops.
+		expect(scanned).to.deep.equal([[1, 'one'], [2, 'two'], [3, 'three']]);
+	});
+
+	it('a staged row is still visible to a point read that asks for it', async () => {
+		await db.exec(`insert into t values (1, 'one')`);
+		await db.exec('begin');
+		await db.exec(`insert into t values (2, 'two')`);
+		expect(await rows('select k, v from t where k = 2')).to.deep.equal([[2, 'two']]);
+		// A staged UPDATE shadows the committed row rather than duplicating it.
+		await db.exec(`update t set v = 'ONE' where k = 1`);
+		expect(await rows('select k, v from t where k = 1')).to.deep.equal([[1, 'ONE']]);
+		// A staged DELETE's tombstone still suppresses the committed row, though a
+		// tombstone carries null non-PK columns and so bypasses the window filter.
+		await db.exec('delete from t where k = 1');
+		expect(await rows('select k, v from t where k = 1')).to.deep.equal([]);
+		await db.exec('rollback');
+	});
+
+	it('staged rows commit through a scan-only overlay', async () => {
+		// `getOverlayRow` and the commit flush's overlay collection both read this
+		// overlay; neither may believe an unverified row.
+		await db.exec(`insert into t values (1, 'one')`);
+		await db.exec('begin');
+		await db.exec(`insert into t values (2, 'two')`);
+		await db.exec(`insert into t values (3, 'three')`);
+		await db.exec('commit');
+		expect(await rows('select k, v from t order by k')).to.deep.equal([[1, 'one'], [2, 'two'], [3, 'three']]);
+	});
+
+	it('sanity: a duplicate against a staged row still conflicts', async () => {
+		await db.exec('begin');
+		await db.exec(`insert into t values (1, 'one')`);
+		await db.exec(`insert into t values (2, 'two')`);
+		await expectConstraintFailure(() => db.exec(`insert into t values (1, 'again')`), DUPLICATE_PK);
+		await db.exec('rollback');
+	});
+
+	it('sanity: a duplicate against a committed row still conflicts', async () => {
+		await db.exec(`insert into t values (1, 'one')`);
+		await db.exec('begin');
+		await db.exec(`insert into t values (2, 'two')`);
+		await expectConstraintFailure(() => db.exec(`insert into t values (1, 'again')`), DUPLICATE_PK);
+		await db.exec('rollback');
 	});
 });
