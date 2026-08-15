@@ -762,12 +762,20 @@ function primaryKeyMultiSeekPlan(
 		.setExplanation(`Store primary key multi-seek(${pins.seekKeyCount})`)
 		.build();
 
-	// This arm returns straight out of the PK branch, so it never reaches the
-	// seek-versus-scan comparison further down `computeBestAccessPlan` — the same
-	// exemption the secondary multi-seek arm gets explicitly, for the same reason:
-	// `rule-key-set-seek` reads this cost as a straight line at 2 and 1000 keys and
-	// abandons its rewrite if either probe stops naming an index. Do not "fix" this by
-	// adding the comparison.
+	// This arm returns straight out of the PK branch, so it never reaches the seek-versus-scan
+	// comparison further down `computeBestAccessPlan` — structurally what the secondary arms
+	// state as `requestCarriesRuntimeSet`, and ONE rule for both: a request the engine
+	// synthesized to probe this module must never be answered with the module's own scan
+	// verdict. `rule-key-set-seek` reads this cost as a straight line at 2 and 1000 keys and
+	// abandons its whole rewrite if either probe stops naming an index; the engine makes the
+	// scan comparison itself, off the break-even it interpolates from those two costs. Do not
+	// "fix" this by adding the comparison.
+	//
+	// The PK arm is exempt unconditionally where the secondary arms are exempt per request,
+	// and that is not a divergence: a literal `where pk in (…)` is priced honestly here with
+	// or without statistics (the PK is unique, so `D = N` and `min(estimatedRows, K)` already
+	// IS the per-predicate estimate — nothing for `ANALYZE` to sharpen), so there is no
+	// clamp artifact for a veto to correct.
 	//
 	// `scanMultiSeekPrimary` sorts its points ascending by encoded data key, which IS
 	// primary-key order (per-column DESC inversion is baked into the bytes), so the plan
@@ -979,13 +987,16 @@ function tryIndexAccessPlan(
 		// MemoryTableModule.evaluateIndexAccess's setIsSet(!isMultiSeek). No ordering is
 		// advertised — window emission order is encoded-key order, not any column order.
 		//
-		// NOTE: this arm alone does NOT pay a per-row `profile.pointRead`, though it resolves
-		// every entry it matches exactly like the single-window arms do. The reason is
-		// `multiRows`, not the physics: `inCount × rows` reaches `estimatedRows` at ten seek
-		// keys (`rows` is the fixed 0.1 × N equality shape constant) and at two or three on a
-		// handful-of-rows table, so beyond that the figure is a CLAMP — "the whole table" —
-		// rather than an estimate of what the keys match. Charging a per-row term against a
-		// clamp prices the estimator's artifact:
+		// **This arm pays the per-row `profile.pointRead` exactly when `statsBacked`.** It
+		// resolves every entry it matches, like the single-window arms do, so the physics
+		// always says charge it; what varies is whether `multiRows` is an ESTIMATE worth
+		// charging against — and that is precisely what `statsBacked` records.
+		//
+		// UNBACKED, `rows` is the fixed 0.1 × N equality shape constant, so
+		// `min(N, inCount × rows)` reaches the whole table at ten seek keys, and at two or
+		// three on a handful-of-rows table. Beyond that the figure is a CLAMP — "the whole
+		// table" — rather than an estimate of what the keys match, and charging a per-row
+		// term against a clamp prices the estimator's artifact:
 		//   - MEASURED: it fails 16 tests in `key-set-seek-store.spec.ts`, every one a
 		//     runtime key-set semi join over a 3-to-4-row table that stops seeking.
 		//   - The engine's `rule-key-set-seek` interpolates a break-even from THIS cost at 2
@@ -993,15 +1004,35 @@ function tryIndexAccessPlan(
 		//     `N` for every N, so the break-even can never reach the engine's 1000-key ceiling
 		//     — key sets above ~710 keys would stop seeking on a table of ANY size, including
 		//     the 10M-row tables where an index seek is the entire point.
-		// The price of leaving it off is a narrower mis-ranking: against another index's `eq`
-		// arm (which does pay the term) a small-key IN now looks relatively cheaper than it
-		// is — `where a in (x, y) and b = ?` over a 1000-row table prices ix_a at 61 and ix_b
-		// at 130 and picks ix_a, though ix_a's own estimate says it fetches 200 rows to ix_b's
-		// 100. Charging the term everywhere fixes that ranking and breaks the feature above;
-		// the union estimate has to stop clamping before both can hold. See
-		// backlog/debt-store-multi-seek-union-row-estimate.
+		//
+		// BACKED, `rows` is `N/D` for the seek column, so `inCount × rows` only reaches N as
+		// `inCount` approaches `D` — the honest saturation point (at `inCount = D` the IN list
+		// really does name every value the column holds). The two failure modes above both
+		// dissolve there: the 3-to-4-row key-set tables are covered by the `runtimeSet`
+		// exemption at the veto site regardless of statistics, and the probe cost stays a
+		// straight line in K (`K·seekPositioning + min(N, K·N/D)·(0.3 + pointRead)`) until the
+		// clamp bites at `K ≈ D`, which is where a scan genuinely is cheaper.
+		//
+		// NOTE: charging it DOES change which key-set semi joins the engine rewrites. The
+		// engine fits a chord through this cost at 2 and 1000 keys and solves for a break-even;
+		// the honest cost is higher, so a rewrite stops firing once the seek keys approach the
+		// table's own row count — 1000 keys over a 1000-row table now scans, correctly. The
+		// answer never moves (`column-statistics-plan.spec.ts` pins that), and large tables are
+		// untouched (10k keys into 10M rows is still nowhere near the clamp). If an ANALYZE is
+		// ever measured making a real key-set join SLOWER, the thing to look at is the chord,
+		// not this term: the true cost is concave (linear, then flat once `multiRows` clamps at
+		// `K = D`), so a two-point interpolation under-reads it in between.
+		//
+		// Charging it also fixes the mis-ranking the unbacked case still carries: against
+		// another index's `eq` arm (which always pays the term) a small-key IN looks cheaper
+		// than it is — `where a in (x, y) and b = ?` over an un-analyzed 1000-row table prices
+		// ix_a at 61 and ix_b at 130 and picks ix_a, though ix_a's own estimate says it fetches
+		// 200 rows to ix_b's 100. `ANALYZE` is now the fix for that; the residual unbacked case
+		// is backlog/debt-store-multi-seek-union-row-estimate.
 		const multiRows = Math.min(estimatedRows, inCount * rows);
-		const plan = AccessPlanBuilder.eqMatch(multiRows, inCount * profile.seekPositioning)
+		const multiSeekShape = AccessPlanBuilder.eqMatch(multiRows, inCount * profile.seekPositioning);
+		if (statsBacked) multiSeekShape.addCost(multiRows * profile.pointRead);
+		const plan = multiSeekShape
 			.setIsSet(false)
 			.setHandledFilters(handledFilters)
 			.setIndexName(index.name)
@@ -1010,8 +1041,10 @@ function tryIndexAccessPlan(
 			.build();
 		return {
 			plan,
-			// No `pointRead` term to reprice (see the NOTE above), and the arm is exempt from
-			// the veto regardless — so the veto price IS the declared price.
+			// Statistics-backed: the declared profile decides this arm's fate per query, so the
+			// veto price IS the declared price. Unbacked: no `pointRead` term was charged, so
+			// there is nothing to reprice at parity — and the arm is exempt from the veto
+			// anyway. `plan.cost` is right either way.
 			vetoCost: plan.cost,
 			isMultiSeek: true,
 			statsBacked,
@@ -1021,17 +1054,22 @@ function tryIndexAccessPlan(
 	const armLabel = arm === 'prefixRange'
 		? `prefix-range seek(prefix=${eqCols.length})`
 		: arm === 'range' ? 'range scan' : 'seek';
+	const plan = seekingArm(profile.pointRead)
+		.setHandledFilters(handledFilters)
+		.setIndexName(index.name)
+		.setSeekColumns(seekCols)
+		.setExplanation(`Store index ${armLabel} on ${index.name}`)
+		.build();
 	return {
-		plan: seekingArm(profile.pointRead)
-			.setHandledFilters(handledFilters)
-			.setIndexName(index.name)
-			.setSeekColumns(seekCols)
-			.setExplanation(`Store index ${armLabel} on ${index.name}`)
-			.build(),
-		// Re-derived from `armShape()` rather than adjusted off `plan.cost`, so the parity
-		// price is the exact number the pre-profile module produced rather than a float
-		// round trip through the declared one.
-		vetoCost: seekingArm(PARITY_COST_PROFILE.pointRead).build().cost,
+		plan,
+		// Statistics-backed: `rows` discriminates per query, so the backend's DECLARED price
+		// decides this arm's fate per query — that discrimination is what declaring a profile
+		// buys. Otherwise judged at parity, because a shape constant makes the veto
+		// arm-disabling rather than arm-tuning (full reasoning at the veto site). The parity
+		// price is re-derived from `armShape()` rather than adjusted off `plan.cost`, so it is
+		// the exact number the pre-profile module produced rather than a float round trip
+		// through the declared one.
+		vetoCost: statsBacked ? plan.cost : seekingArm(PARITY_COST_PROFILE.pointRead).build().cost,
 		isMultiSeek: false,
 		statsBacked,
 	};

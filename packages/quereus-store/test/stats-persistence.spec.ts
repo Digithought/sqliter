@@ -74,14 +74,23 @@ const statsKeyBytes = (schema: string, table: string) =>
 const columnStats = (schema: TableSchema | undefined, name: string): ColumnStatistics | undefined =>
 	schema?.statistics?.columnStats.get(name);
 
-/** The `est_rows` the planner assigns the whole statement — the number statistics move. */
-async function planRows(db: Database, sql: string): Promise<number> {
+/**
+ * The cost the planner assigns the TABLE ACCESS — the number per-column statistics move.
+ *
+ * Deliberately not `est_rows`: neither the root's nor the access node's row estimate can
+ * see this. A `BLOCK` root reports a fixed default, and an access node's `est_rows` is the
+ * engine's own estimate rather than the module's advertised `rows`, which lives on
+ * `filterInfo.indexInfoOutput` and reaches the plan only through the cost. The store's
+ * per-predicate estimate (`store-per-predicate-selectivity`) shows up here.
+ */
+async function planAccessCost(db: Database, sql: string): Promise<number> {
 	for await (const row of db.eval(
-		`select est_rows as r from query_plan(?) where parent_id is null`, [sql],
+		`select est_cost as c from query_plan(?) where op in ('INDEXSEEK', 'SEEK', 'INDEXSCAN', 'SCAN')`,
+		[sql],
 	)) {
-		return (row as { r: number }).r;
+		return (row as { c: number }).c;
 	}
-	throw new Error(`query_plan() yielded no root row for: ${sql}`);
+	throw new Error(`query_plan() yielded no table-access row for: ${sql}`);
 }
 
 async function drain(db: Database, sql: string): Promise<void> {
@@ -175,15 +184,15 @@ describe('ANALYZE statistics survive a reopen', () => {
 		const query = `select id from t where k = 2`;
 
 		await seed(db);
-		const unanalyzed = await planRows(db, query);
+		const unanalyzed = await planAccessCost(db, query);
 		await drain(db, 'analyze t');
-		const analyzed = await planRows(db, query);
+		const analyzed = await planAccessCost(db, query);
 		expect(analyzed, 'statistics moved the estimate at all').to.not.equal(unanalyzed);
 
 		await shutdown();
 		const { db2 } = await reopen();
 		try {
-			expect(await planRows(db2, query), 'the reopened plan matches the pre-close plan')
+			expect(await planAccessCost(db2, query), 'the reopened plan matches the pre-close plan')
 				.to.equal(analyzed);
 		} finally {
 			await db2.close();
@@ -268,7 +277,7 @@ describe('ANALYZE statistics survive a reopen', () => {
 				'no snapshot on disk means no snapshot on the schema').to.be.undefined;
 			// The live row count still loads — the old fields are read exactly as before.
 			expect(await mod2.getTable('main', 't')!.getEstimatedRowCount()).to.equal(ROW_COUNT);
-			expect(await planRows(db2, `select id from t where k = 2`),
+			expect(await planAccessCost(db2, `select id from t where k = 2`),
 				'and the un-analyzed table still plans, on the fallback').to.be.a('number');
 		} finally {
 			await db2.close();

@@ -184,6 +184,36 @@ interface BestAccessPlanResult {
 
 `request.estimatedRows` is the planner's hint, populated only from `ANALYZE`-collected statistics; `undefined` means unknown, and a module that can size itself may substitute its own count there — but must defer to a supplied hint, or the access path is costed against a different figure than the plan around it. `rows` in the result is an estimate, with one exception: **`rows: 0` on a plan claiming at least one filter handled asserts the predicate is unsatisfiable**, and `rule-select-access-path` replaces the entire table access with a static empty relation. Never report 0 as an estimate there, nor merely because the table is empty right now — planning precedes execution, and a statement can write rows into a table before reading it. Report at least 1.
 
+**Sizing `rows` per predicate: read `tableInfo.statistics`.**
+
+`getBestAccessPlan` is handed the `TableSchema` itself, so everything `ANALYZE` collected
+is already in scope. `tableInfo.statistics` is a `TableStatistics` — `rowCount`,
+`lastAnalyzed`, and a `columnStats` map **keyed by lowercase column name** — where each
+`ColumnStatistics` carries `distinctCount`, `nullCount`, `minValue`/`maxValue` and an
+optional equi-height `histogram`. It is `undefined` until someone runs `ANALYZE`, and a
+column added or renamed since the last one simply has no entry. Nothing else on the request
+carries these numbers; there is no separate hook to implement.
+
+Two rules make a module's estimate usable rather than merely present:
+
+- **Produce the number the engine would produce for the same predicate.** A seek's
+  advertised `rows` and the estimate a residual `Filter` above it carries describe the same
+  row set; if they disagree the optimizer is comparing two different worlds. The engine's
+  `CatalogStatsProvider` prices `c = v` as `1 / max(distinctCount, 1)` and a bound as the
+  histogram's verdict, then combines conjuncts with damped independence — so use the two
+  exported helpers, `selectivityFromHistogram(histogram, op, value, rowCount)` and
+  `combineConjunctive(factors)`, rather than restating either formula.
+- **Fall back wholesale, not partially.** If any column your plan pins has no statistics,
+  size the whole access from your shape constant instead of mixing a measured factor with a
+  guess. Look statistics up as index → the column's *current* name → `columnStats`: a
+  renamed column then misses cleanly, and a dropped column cannot borrow a neighbour's
+  numbers.
+
+`@quereus/quereus` exports `TableStatistics`, `ColumnStatistics`, `EquiHeightHistogram`,
+`HistogramBucket`, `selectivityFromHistogram` and `combineConjunctive` for exactly this.
+The store module (`packages/quereus-store/src/common/store-module-access-plan.ts`) is the
+worked example.
+
 **Claiming `handledFilters` — the positional contract**:
 
 A module may set `handledFilters[i] = true` only for a filter it will actually apply.
@@ -224,6 +254,17 @@ sets exist today.
 
 Declining is always correct; only the speed-up is lost. A module predating `runtimeSet`
 declines automatically, since `Array.isArray(f.value) && f.value.length > 0` is false.
+
+**But never answer a `runtimeSet` request with your own scan verdict.** A request carrying
+`runtimeSet` on any filter is engine-synthesized: `rule-key-set-seek` probes the module
+twice, at 2 keys and at `maxCount`, and reads *either* answer that names no index as "the
+module declined", abandoning the whole rewrite. So a module that otherwise compares its
+seek against a sequential scan and returns the scan when the seek looks worse must skip that
+comparison here, and answer with the seek plan and its honest cost. The engine makes the
+scan comparison itself — it interpolates a break-even key count from the two costs you
+return, so what it needs from you is a *cost that varies with `maxCount`*, not a verdict.
+Keep that cost as close to linear in the key count as you can: two points are all the engine
+gets, so a sharply non-linear cost makes its interpolation meaningless.
 
 If you accept one: claim `providesOrdering` or `monotonicOn` over its column only if your
 multi-seek emits in the index's own KEY order — which the hard requirement below obliges

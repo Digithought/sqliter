@@ -11,9 +11,13 @@
  *     there would be a silent re-baseline rather than a finding.
  *  2. **A profile changes COST, never ROWS and never the answer.** The arms it makes more
  *     expensive claim no extra filters, so the residual `Filter` survives either way.
- *  3. **`pointRead` scales what an arm advertises; it does not decide whether an index is
- *     used.** The seek-vs-scan veto is deliberately still priced at parity — see the
- *     "veto is profile-independent" block, which encodes that policy.
+ *  3. **On an UN-ANALYZED table, `pointRead` scales what an arm advertises; it does not
+ *     decide whether an index is used.** The seek-vs-scan veto prices row resolution at
+ *     parity while an arm's rows are still a fixed fraction of the table — see the
+ *     "veto is profile-independent on an un-analyzed table" block, which encodes that
+ *     policy and its now-conditional boundary. Once `ANALYZE` makes the estimate
+ *     per-predicate the declared price decides the arm per query
+ *     (`column-statistics-plan.spec.ts`).
  *  4. **A malformed third-party declaration degrades to parity, loudly.**
  *
  * Plans are driven through `StoreModule.getBestAccessPlan` directly, with an explicit
@@ -387,16 +391,21 @@ describe('store backend cost profile (store-backend-cost-profile)', () => {
 		});
 	});
 
-	// This block encodes a POLICY DECISION, not just an observation: a declared `pointRead`
-	// scales what an arm advertises and how index arms rank against each other, but the
-	// seek-vs-scan veto keeps pricing row resolution at parity. The reason (in full at the
-	// veto site in `store-module-access-plan.ts`) is that `ARM_SELECTIVITY` is a fixed
-	// fraction of the table, so the veto is arm-DISABLING rather than arm-tuning — past
-	// pointRead 2.83 the `range` arm would be switched off for every query on every table,
-	// off a guess the measurement cannot resolve. When `store-column-statistics` replaces
-	// that guess, the intended change is to DELETE the parity clamp and let the veto compare
-	// on the declared cost. A future reader doing that should expect these tests to change.
-	describe('the seek-vs-scan veto is profile-independent', () => {
+	// This block encodes a POLICY DECISION, not just an observation, and the decision is now
+	// CONDITIONAL: the seek-vs-scan veto prices row resolution at parity for an arm whose row
+	// estimate is still an `ARM_SELECTIVITY` shape constant, and at the DECLARED price for
+	// one estimated per predicate from `ANALYZE` statistics. Every table in this file is
+	// un-analyzed, so everything below is the fallback half — the guarantee that a backend
+	// declaring an expensive profile does not lose its index arms wholesale on a table nobody
+	// analyzed. The reason (in full at the veto site in `store-module-access-plan.ts`) is that
+	// a fixed fraction of the table makes the veto arm-DISABLING rather than arm-tuning: past
+	// pointRead 2.83 the `range` arm would be switched off for every query on every table, off
+	// a guess the measurement cannot resolve.
+	//
+	// The other half — the declared profile deciding per query once the estimate is real — is
+	// pinned in `column-statistics-plan.spec.ts`, and the seam between them (the same arm,
+	// same profile, analyzed and not) is pinned at the end of this block.
+	describe('the seek-vs-scan veto is profile-independent on an un-analyzed table', () => {
 		let parity: Fixture;
 		let extreme: Fixture;
 
@@ -451,6 +460,30 @@ describe('store backend cost profile (store-backend-cost-profile)', () => {
 				expect(plan.handledFilters, 'the predicate stays residual').to.deep.equal([false]);
 				expect(plan.explains).to.match(/full table scan/i);
 			}
+		});
+
+		it('but ANALYZE hands the same veto over to the declared profile', async () => {
+			// The seam. One table, one predicate, one declared profile — the only difference
+			// is whether `ANALYZE` has run, and that is what decides whether the backend's own
+			// `pointRead` is allowed to veto the arm. Here the measured selectivity (50% of a
+			// two-valued column) is WORSE than the 30% the shape constant assumed, so at
+			// pointRead 50 the arm that survived above is correctly dropped.
+			//
+			// `store-per-predicate-selectivity` owns the estimator; this test exists so that
+			// deleting the `statsBacked` condition and reverting to an unconditional parity
+			// clamp fails HERE, next to the policy it would contradict.
+			const db = extreme.db;
+			await db.exec(`insert into t values ${
+				Array.from({ length: 200 }, (_, i) => `(${i + 1}, ${i % 2}, ${i % 4}, ${i + 1})`).join(', ')}`);
+			const filters: PredicateConstraint[] = [{ columnIndex: 1, op: '>', value: 0, usable: true }];
+
+			expect(extreme.plan(filters, { estimatedRows: 200 }).indexName,
+				'un-analyzed: judged at parity, so the arm survives').to.equal('ix_a');
+
+			await db.exec('analyze t');
+			const analyzed = extreme.plan(filters, { estimatedRows: 200 });
+			expect(analyzed.indexName, 'analyzed: judged at pointRead 50, so the scan wins').to.be.undefined;
+			expect(analyzed.handledFilters, 'and the predicate stays residual').to.deep.equal([false]);
 		});
 	});
 
