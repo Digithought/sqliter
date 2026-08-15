@@ -124,6 +124,8 @@ type IndexArm =
  *
  *  - the table has never been `ANALYZE`d (`tableSchema.statistics` absent) — the common
  *    case, which must plan byte-identically to the pre-statistics module;
+ *  - the snapshot was taken while the table was EMPTY (`rowCount` 0), so it describes
+ *    nothing and every `distinctCount` in it is 0 — see {@link resolveArmEstimate};
  *  - any column filling an EQUALITY role in the arm has no per-column statistics (a
  *    column added or renamed after the last `ANALYZE` — the arm falls back WHOLESALE
  *    rather than mixing a measured factor with a shape constant);
@@ -198,6 +200,16 @@ function columnStatsFor(
  * `max(0, lowSel + highSel - 1)` — `CatalogStatsProvider.estimateLeaf`'s BETWEEN
  * arithmetic, which models the two bounds as the anti-correlated pair they are rather
  * than damped-independent conjuncts.
+ *
+ * NOTE: that is the engine's number for `v between 10 and 20` but not for the same range
+ * spelled `v > 10 and v < 20` — the engine reaches this arithmetic only from a `Between`
+ * node and folds two separate comparisons through `combineConjunctive` instead (roughly 2x
+ * looser; `estimateConjunction` carries its own note saying same-column pairing is what
+ * would fix it). The tighter number is kept here deliberately: it is the more accurate of
+ * the two, and a claimed range leaves no residual `Filter` carrying the engine's competing
+ * estimate for the optimizer to compare it against. If the engine ever pairs same-column
+ * bounds the two spellings converge with no change on this side; if a plan is measured
+ * going wrong on the gap before then, it is the ENGINE's conjunction that should move.
  */
 function rangeBoundSelectivity(
 	stats: TableStatistics,
@@ -261,7 +273,17 @@ function resolveArmEstimate(
 ): ArmEstimate {
 	const fallback: ArmEstimate = { selectivity: ARM_SELECTIVITY[arm], statsBacked: false };
 	const stats = tableInfo.statistics;
-	if (!stats) return fallback;
+	// A snapshot taken while the table was EMPTY describes nothing — every `distinctCount`
+	// is 0, no histogram was built — so it is treated as no statistics at all rather than
+	// applied. Both halves of the design rule demand it: the engine short-circuits the same
+	// case (`estimatePredicateSelectivity` returns 0 outright on `rowCount === 0` and never
+	// reaches `estimateLeaf`'s formulas), and applying the snapshot anyway reads `1 / max(0,
+	// 1)` as "this equality matches EVERY row" — the opposite extreme — which prices the arm
+	// above a scan and hands the veto a table it should never have judged. That is reachable
+	// in ordinary use: `analyze` in a bootstrap script that runs before the data load leaves
+	// the request sized from the LIVE row count while these numbers still say zero, so every
+	// equality on the table would scan until someone re-analyzed it.
+	if (!stats || stats.rowCount <= 0) return fallback;
 
 	const factors: number[] = [];
 	for (const colIdx of eqCols) {

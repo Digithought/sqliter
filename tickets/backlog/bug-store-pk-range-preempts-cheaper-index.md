@@ -68,3 +68,38 @@ whichever path loses, its filters go back to the residual.
 - Test coverage should mirror the existing `cost-based index choice (declaration order must
   not decide)` block in `packages/quereus-store/test/pushdown.spec.ts` — assert the chosen
   path *and* the returned rows, so a wrong choice and a wrong answer are both caught.
+
+## Second arm: the primary-key range arm never learned to read statistics
+
+Found reviewing `store-per-predicate-selectivity`, which taught the *secondary*-index arms to
+size themselves from the per-column counts `ANALYZE` collects. The leading-PK range arm — the
+same code site as the arm-ordering problem above — was left on its hardcoded 30%, so it is
+now the only range arm in the module that cannot tell a selective bound from an unselective
+one.
+
+Verified on a store-backed `t(id integer primary key, v integer)` holding 1000 rows, after
+`analyze t`. Both of these price identically:
+
+```
+select v from t where id < 10    -- INDEXSEEK est_cost 150.2
+select v from t where id < 900   -- INDEXSEEK est_cost 150.2
+```
+
+150.2 is `0.2 + 300 × 0.5`, i.e. `rows = 0.3 × 1000` in both cases — the shape constant. The
+true fractions are 1% and 90%. (Read off `query_plan()`'s `est_cost`; the access node's
+`est_rows` is the engine's own number and cannot see the module's advertised `rows`.)
+
+Two consequences, both speed-only — the rows returned are correct either way:
+
+- The advertised row count feeds join ordering, so `where id < 10` joined against another
+  table is planned as though it produced 300 rows rather than 10.
+- It makes the arm-ordering problem above sharper rather than milder: the PK range arm wins
+  by position *and* now advertises the only estimate in the module that `ANALYZE` cannot
+  improve, so no amount of analyzing lets the cost comparison this ticket asks for reach the
+  right answer.
+
+Both arms resolve at the same place. Whatever gives the primary-key arms a cost model should
+route the leading-PK range arm through the same `resolveArmEstimate` the secondary arms use
+(the primary key's own histogram is in `tableInfo.statistics` like any other column's) — the
+per-predicate estimate is the input a cost comparison between the arms needs to be worth
+making.

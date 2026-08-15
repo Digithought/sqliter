@@ -207,7 +207,11 @@ Two rules make a module's estimate usable rather than merely present:
   size the whole access from your shape constant instead of mixing a measured factor with a
   guess. Look statistics up as index → the column's *current* name → `columnStats`: a
   renamed column then misses cleanly, and a dropped column cannot borrow a neighbour's
-  numbers.
+  numbers. Treat `rowCount === 0` as no statistics at all: a snapshot taken while the table
+  was empty (an `ANALYZE` that ran before the data load) has a `distinctCount` of 0 for
+  every column, which `1 / max(distinctCount, 1)` reads as "matches every row" — the
+  opposite of the truth, and enough to disable your index arms until someone re-analyzes.
+  `CatalogStatsProvider` short-circuits the same case rather than applying it.
 
 `@quereus/quereus` exports `TableStatistics`, `ColumnStatistics`, `EquiHeightHistogram`,
 `HistogramBucket`, `selectivityFromHistogram` and `combineConjunctive` for exactly this.

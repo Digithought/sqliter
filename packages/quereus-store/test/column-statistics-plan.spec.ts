@@ -760,6 +760,40 @@ describe('store per-predicate selectivity from column statistics', () => {
 			}
 		});
 
+		it('a snapshot taken while the table was empty is ignored once rows arrive', async () => {
+			// `analyze` in a bootstrap script that runs BEFORE the data load: `rowCount` 0 and
+			// every `distinctCount` 0, while the request is sized from the LIVE row count. Read
+			// literally those numbers say `1 / max(0, 1)` — "this equality matches every row" —
+			// which prices the arm above a scan and disables the index until someone
+			// re-analyzes. The engine never reaches that formula (`estimatePredicateSelectivity`
+			// short-circuits `rowCount === 0` outright), so applying it here would also break
+			// this file's design rule. A vacuous snapshot is treated as NO statistics instead.
+			const N = 2000;
+			const analyzedEmpty = await track({ ddl: STANDARD_DDL });
+			await analyzedEmpty.analyze();
+			expect(analyzedEmpty.table().statistics!.rowCount, 'the snapshot is vacuous').to.equal(0);
+
+			const never = await track({ ddl: STANDARD_DDL });
+			const load = Array.from({ length: N }, (_, i) => `(${i + 1}, ${i % 500}, ${i % 4}, ${i + 1})`).join(', ');
+			for (const f of [analyzedEmpty, never]) await f.exec(`insert into t values ${load}`);
+
+			const eq = [{ columnIndex: 1, op: '=' as const, value: 7, usable: true }];
+			const poisoned = analyzedEmpty.plan(eq, { estimatedRows: N });
+			expect(poisoned.indexName, 'the arm survives the stale snapshot').to.equal('ix_a');
+			// Byte-identical to never having analyzed at all — the fallback, not a measurement.
+			const baseline = never.plan(eq, { estimatedRows: N });
+			expect(poisoned.rows).to.equal(baseline.rows);
+			expect(poisoned.rows).to.equal(Math.floor(N * ARM_SELECTIVITY.eq));
+			expect(poisoned.cost).to.be.closeTo(baseline.cost, 1e-9);
+
+			// And through SQL, since that is how a user meets it — right rows, index used.
+			expect(await analyzedEmpty.rows('select count(*) as n from t where a = 7'))
+				.to.deep.equal(await never.rows('select count(*) as n from t where a = 7'));
+			expect(JSON.stringify(await analyzedEmpty.rows(
+				`select detail from query_plan('select id from t where a = 7')`)))
+				.to.match(/INDEX SEEK t USING ix_a/);
+		});
+
 		it('a one-row analyzed table keeps its arms sound', async () => {
 			const f = await track({
 				ddl: STANDARD_DDL,
