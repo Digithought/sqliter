@@ -289,9 +289,16 @@ export abstract class VirtualTable {
 	 * Modules that can efficiently compute exact or approximate statistics
 	 * (row counts, distinct values, histograms) should implement this.
 	 * Called by the ANALYZE command or lazily by the optimizer.
-	 * @returns Table statistics, or a promise resolving to them
+	 *
+	 * A module that implements this may still DECLINE for the state it is currently in
+	 * by returning `undefined` — `ANALYZE` then falls back to scanning, exactly as it
+	 * would for a module that never implemented the hook at all. That is the escape
+	 * hatch for a wrapper whose cheap answer would be wrong for the read it is serving
+	 * (the isolation layer's overlay: see `IsolatedTable`).
+	 *
+	 * @returns Table statistics, a promise resolving to them, or `undefined` to decline
 	 */
-	getStatistics?(): Promise<TableStatistics> | TableStatistics;
+	getStatistics?(): Promise<TableStatistics | undefined> | TableStatistics | undefined;
 
 	/**
 	 * Persist statistics the engine just collected, so a later open can read them back

@@ -1018,6 +1018,8 @@ class MyTable extends VirtualTable {
 
 The `ANALYZE` command calls `getStatistics()` when it is implemented, and otherwise collects statistics by scanning the table. Statistics are cached on `TableSchema.statistics` and consumed by `CatalogStatsProvider` for selectivity estimation.
 
+Returning **`undefined`** declines for the state the table is currently in, and `ANALYZE` scans exactly as it would for a module that never implemented the hook. That is for a wrapper whose cheap answer would be wrong for the read it is serving — the isolation layer declines while a transaction's overlay is dirty, since its underlying reports the committed base and would miss the connection's own uncommitted rows.
+
 A row count with an **empty** `columnStats` is a supported partial answer, for a module that can size itself cheaply but keeps no value distribution: `ANALYZE` reads it as *"size answered, collect the rest yourself"*, still scans for the per-column numbers, and prefers the scan's row count (it counted every live row; a maintained count can drift). Nothing consults `getStatistics()` during *planning* — to get a live size into cost decisions between `ANALYZE`s, fill in `request.estimatedRows` from `getBestAccessPlan` (see [Index-Based Access](#2-index-based-access-standard)).
 
 ## Update results and REPLACE displacement

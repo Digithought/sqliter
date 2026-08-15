@@ -26,6 +26,11 @@ const log = createLogger('runtime:emit:analyze');
  * both cheaper and more exact than a scan (MemoryTable reads an exact row count and
  * per-index distinct counts straight off its BTree metadata).
  *
+ * A module may also DECLINE outright, returning `undefined` for the state it is
+ * currently in — the isolation layer does that while a transaction's overlay is dirty,
+ * because its underlying would answer for the committed base and miss the connection's
+ * own uncommitted rows. A decline is treated exactly like an unimplemented hook: scan.
+ *
  * But a module may only be able to answer *part* of the question cheaply. A
  * key-value backend maintains a running row count and no value distribution at all,
  * so its `getStatistics()` reports a row count with an EMPTY `columnStats`. Taking

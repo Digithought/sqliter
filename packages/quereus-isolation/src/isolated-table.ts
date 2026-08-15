@@ -96,16 +96,23 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 * `saveStatistics` as durable storage — so an unconditional wrapper would answer for a
 	 * module that declined to.
 	 *
-	 * Neither is overlay-aware: the overlay holds one transaction's uncommitted delta,
-	 * statistics are advisory planner input, and `ANALYZE` is not a transactional read — so
-	 * folding the delta in would buy a difference no plan choice depends on at the price of
-	 * a full overlay scan per call.
+	 * Neither is overlay-aware, and the underlying answers for the COMMITTED base alone. That
+	 * is the right answer while this connection's overlay is clean, and the wrong one the
+	 * moment it is dirty: every other read through this table merges the overlay, so an
+	 * `ANALYZE` inside the transaction that reported the committed size would be the one read
+	 * that does not see this connection's own writes. So `getStatistics` DECLINES (returns
+	 * `undefined`, which the contract reads as "collect it yourself") whenever the overlay has
+	 * changes, and `ANALYZE` falls back to the merged scan — which folds the delta in for free,
+	 * since it is the same scan it would have run had the underlying reported nothing.
+	 *
+	 * The decline is scoped to the dirty window on purpose: outside a transaction — the case
+	 * `ANALYZE` is actually run in — the cheap exact report still wins and nothing scans.
 	 *
 	 * Without the `saveStatistics` half in particular, an isolated store table could never
 	 * persist what `ANALYZE` collected for it, and nothing would say so: the hook is
 	 * optional, so a dropped delegation is indistinguishable from a module that cannot store.
 	 */
-	readonly getStatistics?: () => Promise<TableStatistics> | TableStatistics;
+	readonly getStatistics?: () => Promise<TableStatistics | undefined> | TableStatistics | undefined;
 	readonly saveStatistics?: (stats: TableStatistics) => Promise<void>;
 
 	private getPkSemanticComparators(): (((a: SqlValue, b: SqlValue) => number) | undefined)[] {
@@ -173,7 +180,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		this.tableSchema = underlyingTable.tableSchema;
 		// Statistics delegation — present iff the underlying implements it (see the fields).
 		const reportStats = underlyingTable.getStatistics;
-		if (reportStats) this.getStatistics = () => reportStats.call(underlyingTable);
+		if (reportStats) this.getStatistics = () => this.hasChanges ? undefined : reportStats.call(underlyingTable);
 		const persistStats = underlyingTable.saveStatistics;
 		if (persistStats) this.saveStatistics = stats => persistStats.call(underlyingTable, stats);
 	}
