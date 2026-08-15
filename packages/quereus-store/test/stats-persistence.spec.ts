@@ -350,6 +350,36 @@ describe('ANALYZE statistics survive a reopen', () => {
 		}
 	});
 
+	it('keeps the snapshot keyed by column NAME across a rename, so no column inherits another\'s numbers', async () => {
+		// The whole safety argument for persisting column statistics rests on the key being
+		// the column NAME: a positional key would survive a rename intact and silently hand
+		// the renamed slot the numbers of whatever column now sits at that index. Here `plain`
+		// (6 distinct text values) is renamed to `renamed` while `k` (4 distinct integers)
+		// keeps its name — so a positional keying would give `renamed` a live entry, and a
+		// name keying gives it none.
+		await seed(db);
+		await drain(db, 'analyze t');
+		await db.exec(`alter table t rename column plain to renamed`);
+		await shutdown();
+
+		const { db2 } = await reopen();
+		try {
+			const after = db2.schemaManager.findTable('t');
+			expect(after?.statistics, 'the reopened schema still carries the snapshot').to.not.be.undefined;
+			expect(columnStats(after, 'renamed'),
+				'the renamed column has NO statistics rather than another column\'s').to.be.undefined;
+			expect(columnStats(after, 'k')!.distinctCount,
+				'an untouched column keeps its own numbers').to.equal(DISTINCT_K);
+			// The pre-rename entry is still in the record under its old key — unreachable dead
+			// weight by design, which is the price of never mis-attributing.
+			expect(columnStats(after, 'plain')!.distinctCount).to.equal(DISTINCT_PLAIN);
+			// And the table still plans: a missing entry falls back, it does not throw.
+			expect(await planAccessCost(db2, `select id from t where renamed = 'p1'`)).to.be.a('number');
+		} finally {
+			await db2.close();
+		}
+	});
+
 	it('does not let a disk snapshot displace a fresher in-memory ANALYZE', async () => {
 		await seed(db);
 		await drain(db, 'analyze t');

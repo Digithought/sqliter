@@ -37,6 +37,20 @@ the reverse). Nothing returns wrong ROWS — the count is an estimate only.
 
 Secondary effect: the stats store grows by one permanently-orphaned entry per dropped table.
 
+### Second arm: the orphan now carries per-column numbers too
+
+Since `store-persist-column-statistics` landed, the same `__stats__` entry also holds the
+last `ANALYZE`'s per-column distinct counts, null counts, min/max and histograms
+(`TableStats.columnStats` / `analyzedRowCount` / `lastAnalyzed`). So a table re-created under
+a dropped name does not merely inherit a wrong SIZE — `StoreTableBase.primeStats` stamps the
+old table's whole per-column snapshot onto the new table's schema, and the planner estimates
+predicate selectivity on the new table from the old one's value distribution. Same root cause,
+same one-line fix, larger blast radius: the orphan is now kilobytes rather than dozens of
+bytes, and it now misleads more than the cardinality estimate.
+
+The suggested "nothing keyed to the dropped table survives" assertion covers this arm as
+written — no extra work beyond re-running it against a table that was analyzed before the drop.
+
 ## Expected behavior
 
 Dropping a table leaves nothing behind that a table later created under the same name can

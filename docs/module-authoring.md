@@ -190,9 +190,12 @@ interface BestAccessPlanResult {
 is already in scope. `tableInfo.statistics` is a `TableStatistics` — `rowCount`,
 `lastAnalyzed`, and a `columnStats` map **keyed by lowercase column name** — where each
 `ColumnStatistics` carries `distinctCount`, `nullCount`, `minValue`/`maxValue` and an
-optional equi-height `histogram`. It is `undefined` until someone runs `ANALYZE`, and a
-column added or renamed since the last one simply has no entry. Nothing else on the request
-carries these numbers; there is no separate hook to implement.
+optional equi-height `histogram`. It is `undefined` until statistics exist for the table —
+either because someone ran `ANALYZE` this session, or because a module that persists them
+([Persisting statistics across a reopen](#persisting-statistics-across-a-reopen)) stamped a
+saved snapshot back onto the schema at open. A column added or renamed since those statistics
+were collected simply has no entry. Nothing else on the request carries these numbers; there
+is no separate hook to implement.
 
 Two rules make a module's estimate usable rather than merely present:
 

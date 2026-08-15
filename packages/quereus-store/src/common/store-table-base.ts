@@ -564,22 +564,32 @@ export abstract class StoreTableBase extends VirtualTable {
 	 * absent" flag rather than on `cachedStats` being non-null.
 	 *
 	 * PUBLIC because it is also the SINGLE OWNER of the column-statistics stamp (see
-	 * {@link publishPersistedStatistics}): whichever path opens this table first — the
-	 * rehydrate reconcile loop calling it directly, or a later first storage access —
-	 * runs it exactly once, so a table's persisted `ANALYZE` snapshot reaches the planner
-	 * whether or not it happened to be connected during rehydration. It touches only the
-	 * stats store, never the data store, so calling it eagerly does not open (or create)
-	 * table storage.
+	 * {@link publishPersistedStatistics}): every path that opens this table — the rehydrate
+	 * reconcile loop calling it directly, and every later first storage access — runs it, so
+	 * a table's persisted `ANALYZE` snapshot reaches the planner whether or not it happened
+	 * to be connected during rehydration. The READ is once per instance; the stamp is
+	 * re-attempted on every call and no-ops once it has landed. It touches only the stats
+	 * store, never the data store, so calling it eagerly does not open (or create) table
+	 * storage.
 	 */
 	async primeStats(): Promise<void> {
-		if (this.cachedStats) return;
-		try {
-			const statsStore = await this.ensureStatsStore();
-			const statsData = await statsStore.get(buildStatsKey(this.schemaName, this.tableName));
-			if (statsData) this.cachedStats = deserializeStats(statsData);
-		} catch (e) {
-			console.warn(`[StoreModule] Failed to read persisted statistics for '${this.schemaName}.${this.tableName}': ${e instanceof Error ? e.message : String(e)}`);
+		if (!this.cachedStats) {
+			try {
+				const statsStore = await this.ensureStatsStore();
+				const statsData = await statsStore.get(buildStatsKey(this.schemaName, this.tableName));
+				if (statsData) this.cachedStats = deserializeStats(statsData);
+			} catch (e) {
+				console.warn(`[StoreModule] Failed to read persisted statistics for '${this.schemaName}.${this.tableName}': ${e instanceof Error ? e.message : String(e)}`);
+			}
 		}
+		// Outside the load guard on purpose. The READ is once per instance, but the stamp is
+		// a property of the REGISTERED schema, and the two can be primed in either order — a
+		// table's storage opens from inside `module.create`/`connect`, which runs BEFORE
+		// `SchemaManager.finalizeCreatedTableSchema` registers it, so an early prime finds no
+		// schema to stamp. Were the stamp inside the guard, the rehydrate loop's explicit
+		// `primeStats()` (the call whose whole job is to land it) would then early-return and
+		// the snapshot would never reach the planner. Re-stamping costs two map lookups and
+		// is a no-op on a schema that already carries statistics.
 		this.publishPersistedStatistics();
 	}
 
@@ -595,7 +605,7 @@ export abstract class StoreTableBase extends VirtualTable {
 	 *
 	 * Synchronous, and answers only from what {@link primeStats} already loaded.
 	 */
-	getPersistedStatistics(): TableStatistics | undefined {
+	private getPersistedStatistics(): TableStatistics | undefined {
 		const cached = this.cachedStats;
 		if (!cached?.columnStats) return undefined;
 		return {
@@ -997,6 +1007,12 @@ export abstract class StoreTableBase extends VirtualTable {
 	 * Reset statistics to an absolute committed row count and flush immediately.
 	 * Used by the host's `replaceContents` (create-fill / refresh), where the new
 	 * count is exact, replacing any drifted delta-tracked estimate.
+	 *
+	 * Replaces the WHOLE record, so any persisted `ANALYZE` snapshot
+	 * (`columnStats` / `analyzedRowCount` / `lastAnalyzed`) is dropped with it — correct,
+	 * because `replaceContents` substitutes every row, which is exactly the state those
+	 * numbers described. The caller's in-memory `TableSchema.statistics` is not cleared to
+	 * match; it is equally stale either way, and the next `ANALYZE` reconciles both.
 	 */
 	async resetStats(rowCount: number): Promise<void> {
 		this.cachedStats = { rowCount, updatedAt: Date.now() };
@@ -1179,6 +1195,13 @@ export abstract class StoreTableBase extends VirtualTable {
 	 * Primes first so a table whose storage this session never opened does not overwrite
 	 * its persisted row count with a fresh zero. In practice `ANALYZE` has already scanned
 	 * through `query()` by the time this runs, so the prime is a no-op guard.
+	 *
+	 * NOTE: the flush is immediate and does NOT ride the coordinator, so `ANALYZE` inside an
+	 * explicit transaction that later rolls back leaves a snapshot on disk describing rows
+	 * that never committed. Deliberate — the in-memory `TableSchema.statistics` stamp is not
+	 * rolled back either, statistics are advisory, and the next `ANALYZE` reconciles both. If
+	 * statistics ever gain a non-advisory consumer, route this through the coordinator's
+	 * commit callback instead of writing straight through.
 	 */
 	async saveStatistics(stats: TableStatistics): Promise<void> {
 		await this.primeStats();
