@@ -147,7 +147,7 @@ The rule declines immediately on an already-stamped Filter, so the second and th
 
 - a multi-seek charges its per-resolved-row cost only when the estimate is real, because the fallback's `min(N, K × 0.1N)` union saturates at ten seek keys and is a clamp rather than an estimate past that;
 - the module's own seek-versus-scan comparison judges a real estimate at the backend's declared cost profile and a shape constant at the parity profile — a fixed fraction of the table makes that comparison arm-*disabling* rather than arm-tuning, since the arm's cost is then linear in the table size for every query;
-- and the comparison is skipped entirely for a request carrying `runtimeSet`, whichever arm serves it (see [Module Authoring § Runtime-valued `IN` sets](module-authoring.md#index-based-access-standard)).
+- and the comparison is skipped entirely for a request carrying `runtimeSet`, whichever arm serves it (see [Module Authoring § Runtime-valued `IN` sets](module-authoring.md#2-index-based-access-standard)).
 
 The practical consequence for a user: `ANALYZE` can now change which index a store-backed query uses, and can make a key-set semi join stop rewriting where the seek keys approach the table's own row count. It never changes the rows returned — every arm the comparison drops leaves its filters unclaimed, so the residual `Filter` survives.
 
