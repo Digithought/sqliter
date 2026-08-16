@@ -83,14 +83,28 @@ select * from t_type order by id;
 drop table t_type;
 
 -- ===================================
--- 6. Cannot drop NOT NULL on PK column
+-- 6. DROP NOT NULL on a PK column is permitted (key membership does not imply NOT NULL —
+--    docs/schema.md § "Primary-key nullability") and is metadata-only: no row is rewritten,
+--    so no key moves. SET DATA TYPE on a PK column is a DIFFERENT rule and still refused.
+--    Full coverage in 43.3-nullable-primary-key § 9.
 -- ===================================
 
 create table t_pk (id integer primary key, c integer);
+insert into t_pk values (1, 10);
 -- run
 
 alter table t_pk alter column id drop not null;
--- error: PRIMARY KEY
+-- run
+
+select name, "notnull", pk from table_info('t_pk') where name = 'id';
+→ [{"name":"id","notnull":0,"pk":1}]
+
+-- The existing row is untouched and still addressable by key.
+select id, c from t_pk;
+→ [{"id":1,"c":10}]
+
+alter table t_pk alter column id set data type text;
+-- error: Cannot SET DATA TYPE on PRIMARY KEY column
 
 drop table t_pk;
 

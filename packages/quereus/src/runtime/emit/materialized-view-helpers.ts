@@ -67,9 +67,9 @@ export function materializedViewNotASetError(schemaName: string, viewName: strin
  * the schema declares NOT NULL *and* that is a physical-PK member. This is the exact
  * reachable contradiction: the view's `order by <col>` seeded the column into the
  * backing's **physical** primary key ({@link computeBackingPrimaryKey}), which keeps it
- * declared NOT NULL even after the source column loosened to nullable — a physical-PK
- * column cannot drop NOT NULL (`MemoryTableManager.alterColumn` refuses it, and the
- * refresh reshape masks the doomed loosen — see {@link isPhysicalPkColumn}). Once the
+ * declared NOT NULL even after the source column loosened to nullable — the refresh reshape
+ * masks the loosening of a physical-PK column rather than emitting it (see
+ * {@link isPhysicalPkColumn}). Once the
  * source column becomes nullable and the recomputed body yields a NULL row, storing it
  * would leave the backing schema declaring NOT NULL while holding a NULL — a silent
  * contradiction. Both maintenance vectors raise this instead, naming the column, the cause,
@@ -1586,8 +1586,8 @@ export async function rebuildBacking(
 	// a backing column declared NOT NULL that is also a physical-PK member cannot legally
 	// hold the recomputed NULL a nullable source now produces. The ordering-seeded physical
 	// PK (computeBackingPrimaryKey) pins such a column NOT NULL even after its source column
-	// dropped NOT NULL — the memory manager refuses to loosen a PK column and the reshape
-	// masks the doomed loosen — so at this point the only still-NOT-NULL columns that can
+	// dropped NOT NULL — the reshape masks the loosening of a physical-PK column rather than
+	// emitting it — so at this point the only still-NOT-NULL columns that can
 	// carry source-nullable data are the physical-PK ones. Storing the NULL would make the
 	// backing schema declare NOT NULL while holding a NULL; reject it before either swap.
 	// NOTE: narrow loud guard until `debt-mv-ordering-seed-to-materialized-index` replaces
@@ -1698,9 +1698,17 @@ function backingCollationMatches(a: ColumnSchema, b: ColumnSchema): boolean {
 /** Whether `columnNameLower` (already lowercased) names a column of `table`'s
  *  *physical* primary key ({@link TableSchema.primaryKeyDefinition} — which for an
  *  MV backing includes any ordering-seeded columns, {@link computeBackingPrimaryKey}).
- *  A physical-PK column is NOT NULL by definition: `MemoryTableManager.alterColumn`
- *  refuses to DROP NOT NULL on one, so the refresh reshape must never try to loosen
- *  its NOT NULL — see the two callers below. */
+ *  An MV backing keeps its physical-PK columns NOT NULL, so the refresh reshape must
+ *  never try to loosen one — see the two callers below.
+ *
+ *  NOTE: that is now a POLICY of the MV backing, not an engine constraint. A primary key
+ *  column may be nullable in general (docs/schema.md § Primary-key nullability) and
+ *  `alter column … drop not null` on one is accepted by both backends; the backing keeps
+ *  its seeded key columns NOT NULL because the ordering seed treats them as a total order
+ *  and `assertNoNullInNotNullSeededPk` is the loud guard for the contradiction. If
+ *  ordering-seeded backings ever need to carry NULLs in the seeded column, this mask and
+ *  that guard are the pair to revisit together — `debt-mv-ordering-seed-to-materialized-index`
+ *  removes the need for both. */
 function isPhysicalPkColumn(table: TableSchema, columnNameLower: string): boolean {
 	return table.primaryKeyDefinition.some(
 		def => table.columns[def.index]?.name.toLowerCase() === columnNameLower,
@@ -1726,8 +1734,8 @@ function describeBackingShapeMismatch(current: TableSchema, shape: BackingShape)
 		}
 		if (!backingNotNullMatches(a, b)) {
 			// A physical-PK column stays NOT NULL in the backing regardless of the
-			// re-derived logical nullability (a PK column cannot hold NULL — the memory
-			// manager refuses to DROP NOT NULL on it), so a NOT-NULL→nullable *loosening*
+			// re-derived logical nullability (an MV-backing policy — see
+			// {@link isPhysicalPkColumn}), so a NOT-NULL→nullable *loosening*
 			// of a PK column is NOT a shape difference. Masking it lets refresh keep the
 			// data-only rebuild path instead of emitting a doomed `loosenNotNull` op. Tight
 			// on purpose: only a loosening (`current` NOT NULL, derived nullable) of a

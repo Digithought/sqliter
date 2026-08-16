@@ -2084,10 +2084,18 @@ interface TransportProof {
  * NULL-skipping (SQL UNIQUE permits multiple all-NULL rows), so a nullable key is
  * only *conditionally* unique — the existing row-time path classifies that with a
  * guarded FD (`key → others [guard: key IS NOT NULL]`), which the unconditional
- * `proved` FD would unsoundly override. A PK column is always NOT NULL; an
- * authored-bijective column whose logical column is NOT NULL has a non-null,
- * unconditionally-unique key. A nullable key column therefore defers to
- * row-time/commit-time rather than taking the transport shortcut.
+ * `proved` FD would unsoundly override. A nullable key column therefore defers to
+ * row-time/commit-time rather than taking the transport shortcut, whatever made it
+ * nullable.
+ *
+ * NOTE: the NOT NULL gate below is deliberately blunter than it has to be. `primary
+ * key` does not imply `not null` (docs/schema.md § Primary-key nullability), so a
+ * basis key column can be nullable — but a basis *PRIMARY* key is NOT NULL-skipping
+ * the way UNIQUE is: NULL is a self-equal value there, so a nullable PK column is in
+ * fact unconditionally unique and could be proved. The gate rejects it anyway, which
+ * costs a missed shortcut (fall back to the commit-time scan), never soundness. If a
+ * nullable-PK lens ever shows up as slow at commit time, split the gate on whether
+ * the key {@link findDeclaredKey} matched is the basis PK or a UNIQUE.
  *
  * Conservative: a multi-source body (no `basisSource`), a key column that is
  * neither bare nor authored-bijective, a nullable key column, an authored column

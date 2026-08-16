@@ -14,7 +14,11 @@ Constraints written **without** a name are auto-named — `_check_<column>`, `_f
 
 The primary key constraint uniquely identifies each record in a table.
 
-A table declared with **no** primary key gets one covering **every** column, in declaration order — Quereus has no rowid, so whole-row identity is the fallback. The synthesized key does not force its columns `not null`. This matters wherever the primary key is referenced implicitly: `references <parent>` with no column list resolves to it (see [§ 7.6](#76-foreign-key-constraint)).
+A table declared with **no** primary key gets one covering **every** column, in declaration order — Quereus has no rowid, so whole-row identity is the fallback. That synthesized key is exact syntactic sugar for writing the same `primary key (...)` clause out: the two produce identical schemas.
+
+**Primary key does not imply `not null`.** A key column keeps the nullability it declared, or the one `pragma default_column_nullability` gave it — the same rule for a declared key and a synthesized one. Under the shipped `not_null` default that is invisible (every column is NOT NULL unless it says otherwise), so `id integer primary key` is still non-nullable; the nullable case needs an explicit `x integer null primary key` or the `nullable` session default. NULL is an ordinary self-equal value in key position, so two rows with an all-NULL key collide as a duplicate primary key — unlike `UNIQUE`, where NULLs stay distinct and never collide ([§ 7.2](#72-unique-constraint)). See [Schema § Primary-key nullability](schema.md#columnschema).
+
+Nullability matters wherever the primary key is referenced implicitly: `references <parent>` with no column list resolves to it (see [§ 7.6](#76-foreign-key-constraint)).
 
 **Syntax - Column Constraint:**
 ```sql
@@ -265,6 +269,14 @@ When `pragma foreign_keys = on` (the default):
 On UPDATE, all three propagating actions (CASCADE / SET NULL / SET DEFAULT) apply the same short-circuit as the RESTRICT check above: if the update leaves every parent column the FK references at its old value, the action does not fire and child rows are not written at all — an update to an unrelated parent column never touches, re-points, or emits a data-change event for the children.
 
 Cascade cycle detection prevents infinite recursion when cascading actions chain across multiple tables.
+
+**A parent key tuple containing NULL is unreferenceable.** A primary key may hold NULL (see [§ 7.1](#71-primary-key-constraint)), and so may a `UNIQUE` parent column, so `references <parent>` — with or without a column list — can point at a parent row whose key contains NULL. MATCH SIMPLE settles what happens, in both directions, with no rule specific to primary keys:
+
+- A child row whose FK columns are all non-NULL compares with `=` against the parent columns. `=` against NULL is never true, so it never matches a NULL-containing parent key and the child row is **rejected** (no such parent).
+- A child row with NULL in any FK column is admitted unchecked — that is MATCH SIMPLE, and it is why a NULL-containing parent key can never be the thing that satisfies a reference.
+- Every parent-side action skips a parent tuple containing NULL for the same reason: `restrict` does not fire for it, and `cascade` / `set null` / `set default` do not propagate from it.
+
+The practical consequence: a row whose primary key contains NULL can be deleted freely regardless of `on delete restrict`, because nothing can legally reference it.
 
 **When a foreign key cannot be enforced:**
 

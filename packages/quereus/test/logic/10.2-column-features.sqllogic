@@ -220,7 +220,8 @@ select optional_field from t_nullable where id = 3;
 
 drop table t_nullable;
 
--- 3c. Primary key column is always NOT NULL
+-- 3c. A primary key column takes its nullability from its own declaration, not from key
+-- membership. Undecorated under the shipped `not_null` default → NOT NULL, like any column.
 create table t_pk_nn (
 	id integer primary key,
 	val text
@@ -229,8 +230,27 @@ create table t_pk_nn (
 insert into t_pk_nn values (null, 'test');
 -- error: NOT NULL constraint failed: t_pk_nn.id
 
--- 3d. Update to NULL on NOT NULL column should fail
 drop table t_pk_nn;
+
+-- ...and an explicit `null` on the key column is honoured: `primary key` names the row identity
+-- and implies nothing about nullability. Full coverage in 43.3-nullable-primary-key.
+create table t_pk_null (
+	id integer null primary key,
+	val text
+);
+
+insert into t_pk_null values (null, 'test');
+
+select id, val from t_pk_null;
+→ [{"id":null,"val":"test"}]
+
+-- The NULL key is a real identity: a second one collides.
+insert into t_pk_null values (null, 'again');
+-- error: UNIQUE constraint failed
+
+drop table t_pk_null;
+
+-- 3d. Update to NULL on NOT NULL column should fail
 create table t_update_nn (
 	id integer primary key,
 	name text

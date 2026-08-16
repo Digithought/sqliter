@@ -2582,12 +2582,9 @@ export class MemoryTableManager {
 				);
 			}
 			seen.add(pk.index);
-			if (!columns[pk.index].notNull) {
-				throw new QuereusError(
-					`Column '${columns[pk.index].name}' must be NOT NULL to participate in PRIMARY KEY`,
-					StatusCode.CONSTRAINT,
-				);
-			}
+			// A nullable member is keyable here: this backend compares NULL == NULL as
+			// equal and orders NULL first, so a NULL-containing key is an ordinary key.
+			// See docs/schema.md § Primary-key nullability.
 		}
 
 		return rekeySchemaPrimaryKey(this.tableSchema, newPkColumns);
@@ -2618,8 +2615,8 @@ export class MemoryTableManager {
 	 * collision. That is what lets every apply step succeed unconditionally, and what
 	 * `TransactionLayer.rekeyPrimaryKey` / `convertColumn` rely on. Both arms can set it: `set
 	 * collate` moves the comparator (the `structuresRekeyed` arm, values untouched), and the `set
-	 * not null` backfill moves the key VALUES (the rewrite arm — a key column is nullable whenever
-	 * the table's identity is its full column set, so two NULL keys can converge on one DEFAULT).
+	 * not null` backfill moves the key VALUES (the rewrite arm — key membership does not imply NOT
+	 * NULL, so any key column can be nullable and two NULL keys can converge on one DEFAULT).
 	 * The rewrite arm probes the CONVERTED rows through the same `mapRow`, on both of the pass's
 	 * row sets: the effective rows decide legality, and the layer chain — whose base rebuild is
 	 * what would merge two committed rows — decides representability. A retype of a PK column is

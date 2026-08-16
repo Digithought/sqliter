@@ -1,7 +1,8 @@
 -- ALTER COLUMN ... SET NOT NULL on a PRIMARY KEY member: the null → DEFAULT backfill moves the
--- key VALUES, so two rows that differed only by NULL-vs-DEFAULT there would merge. A table with
--- no declared primary key is keyed by ALL its columns, which stay nullable — that is how a key
--- column comes to hold NULLs.
+-- key VALUES, so two rows that differed only by NULL-vs-DEFAULT there would merge. Key membership
+-- does not imply NOT NULL (docs/schema.md § "Primary-key nullability"), so any key column can be
+-- nullable and hold NULLs — the cases below reach that state via the all-columns key a table with
+-- no declared PRIMARY KEY gets, and 43.3-nullable-primary-key § 10 reaches it via a declared key.
 --
 -- Cross-module: both backends treat the backfill as a primary-key re-key and ask the same two
 -- questions before mutating anything (memory: MemoryTableManager.validateRekeyedPrimaryKey over

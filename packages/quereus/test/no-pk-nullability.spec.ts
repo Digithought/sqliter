@@ -3,14 +3,19 @@
  * `lens-no-pk-nullable-column-deploy-mismatch`).
  *
  * Quereus synthesizes an all-columns primary key when a table declares no
- * PRIMARY KEY (the whole row is the row identity). That synthesized key must NOT
- * promote its columns to NOT NULL — only an *explicitly-declared* PK does. These
- * tests pin:
- *   - schema-building nullability (synthesized vs declared PK),
+ * PRIMARY KEY (the whole row is the row identity). No key promotes its columns to
+ * NOT NULL — synthesized or declared alike, a key column keeps the nullability it
+ * declared or the one the session default gave it (docs/schema.md § "Primary-key
+ * nullability"). These tests pin:
+ *   - schema-building nullability (synthesized and declared keys agreeing),
  *   - that a nullable synthesized-key column accepts a NULL insert and that a
  *     fully-identical second row conflicts on the key (NOT a NOT NULL error),
  *   - that canonical DDL omits the synthesized PRIMARY KEY clause so a store
  *     persistence round-trip preserves the nullable declaration.
+ *
+ * The declared-key side of that first bullet is covered more widely in
+ * `test/logic/43.3-nullable-primary-key.sqllogic` and
+ * `test/nullable-primary-key-round-trip.spec.ts`.
  */
 
 import { expect } from 'chai';
@@ -59,27 +64,42 @@ describe('no-PK table column nullability', () => {
 			expect(col(db, 't', 'b').notNull, 'b stays nullable').to.equal(false);
 		});
 
-		it('an explicitly-declared table-level PK still forces its columns NOT NULL', async () => {
+		it('an explicitly-declared table-level PK leaves its columns nullable too', async () => {
 			await db.exec('create table t (a integer null, b integer null, primary key (a))');
-			// Declared PK column: forced NOT NULL despite the `null` annotation.
-			expect(col(db, 't', 'a').notNull, 'declared PK column forced NOT NULL').to.equal(true);
-			// Non-PK column keeps its declared nullability.
+			// A declared key column keeps its `null` annotation, exactly like a synthesized one.
+			expect(col(db, 't', 'a').primaryKey, 'a is the declared key').to.equal(true);
+			expect(col(db, 't', 'a').notNull, 'declared PK column stays nullable').to.equal(false);
 			expect(col(db, 't', 'b').notNull, 'non-PK column stays nullable').to.equal(false);
 		});
 
-		it('a column-level PRIMARY KEY still forces NOT NULL', async () => {
+		it('a column-level PRIMARY KEY leaves its column nullable too', async () => {
 			await db.exec('create table t (a integer null primary key, b integer null)');
-			expect(col(db, 't', 'a').notNull, 'column-level PK forced NOT NULL').to.equal(true);
+			expect(col(db, 't', 'a').notNull, 'column-level PK column stays nullable').to.equal(false);
 			expect(col(db, 't', 'b').notNull, 'non-PK column stays nullable').to.equal(false);
 		});
 
-		it('the session NOT NULL default still applies to a no-PK table (not key-driven)', async () => {
-			// No explicit null/not null ⇒ Third Manifesto default (NOT NULL). The fix
-			// only removes the *key-driven* promotion, not the session default.
+		it('the declared and synthesized spellings of one key agree column-for-column', async () => {
+			// The whole point: `create table (x, y)` is syntactic sugar for
+			// `create table (x, y, primary key (x, y))`, nullability included.
+			await db.exec('create table t (a integer null, b integer null)');
+			await db.exec('create table t2 (a integer null, b integer null, primary key (a, b))');
+			const shape = (name: string) =>
+				db.schemaManager.getTable('main', name)!.columns.map(c => [c.name, c.notNull, c.primaryKey]);
+			expect(shape('t2'), 'declared key matches the synthesized one').to.deep.equal(shape('t'));
+		});
+
+		it('the session NOT NULL default still applies (nullability is never key-driven)', async () => {
+			// No explicit null/not null ⇒ Third Manifesto default (NOT NULL). Removing the
+			// key-driven promotion does not touch the session default.
 			await db.exec('create table t (a integer, b integer)');
 			expect(col(db, 't', 'a').notNull, 'session default NOT NULL').to.equal(true);
 			expect(col(db, 't', 'b').notNull, 'session default NOT NULL').to.equal(true);
 			expect(col(db, 't', 'a').primaryKey, 'still in synthesized key').to.equal(true);
+
+			// ...and the same for a DECLARED key: undecorated stays NOT NULL under the
+			// shipped default, which is why most of the corpus is unaffected.
+			await db.exec('create table t2 (id integer primary key, v integer)');
+			expect(col(db, 't2', 'id').notNull, 'declared key column, session default NOT NULL').to.equal(true);
 		});
 	});
 

@@ -2587,8 +2587,10 @@ function materializedViewToDeclaredTable(declaredMv: AST.DeclaredMaterializedVie
  */
 function extractDeclaredNotNull(col: AST.ColumnDef): boolean | undefined {
 	if (!col.constraints) return undefined;
-	// PK always implies NOT NULL.
-	if (col.constraints.some(c => c.type === 'primaryKey')) return true;
+	// PRIMARY KEY membership does not imply NOT NULL (docs/schema.md § Primary-key
+	// nullability), so a key column reports exactly what it declared — otherwise every
+	// apply would compute a phantom `SET NOT NULL` against a nullable key column in the
+	// live catalog and never converge.
 	for (const c of col.constraints) {
 		if (c.type === 'notNull') return true;
 		if (c.type === 'null') return false;

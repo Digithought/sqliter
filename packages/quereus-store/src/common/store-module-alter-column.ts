@@ -339,7 +339,7 @@ export abstract class StoreModuleAlterColumn extends StoreModuleIndex {
  */
 async function alterColumnSetNotNull(
 	table: StoreTable,
-	oldSchema: TableSchema,
+	_oldSchema: TableSchema,
 	oldCol: ColumnSchema,
 	colIndex: number,
 	change: Extract<SchemaChangeInfo, { type: 'alterColumn' }>,
@@ -385,12 +385,9 @@ async function alterColumnSetNotNull(
 		}
 		newCol = { ...oldCol, notNull: true };
 	} else if (change.setNotNull === false && oldCol.notNull) {
-		if (oldSchema.primaryKeyDefinition.some(def => def.index === colIndex)) {
-			throw new QuereusError(
-				`Cannot DROP NOT NULL on PRIMARY KEY column '${change.columnName}'`,
-				StatusCode.CONSTRAINT,
-			);
-		}
+		// Permitted on a key column too: loosening rewrites no value, so no data key is
+		// re-encoded and the persisted rows are untouched. Key membership does not imply
+		// NOT NULL — docs/schema.md § Primary-key nullability.
 		newCol = { ...oldCol, notNull: false };
 	} else {
 		return null; // already in desired state

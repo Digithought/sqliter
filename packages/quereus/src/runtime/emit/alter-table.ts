@@ -1462,13 +1462,12 @@ async function runAlterColumn(
 		);
 	}
 
-	// Cannot alter a PRIMARY KEY column's nullability or data type. (SET COLLATE on
-	// a PK column IS permitted — the module re-keys the primary structure under the
-	// new collation; see runAlterColumn module contract.)
+	// Cannot alter a PRIMARY KEY column's data type. (SET COLLATE and SET/DROP NOT NULL
+	// on a PK column ARE permitted — for SET COLLATE the module re-keys the primary
+	// structure under the new collation, see runAlterColumn module contract; DROP NOT
+	// NULL is a pure schema loosening that re-keys nothing, since key membership no
+	// longer implies NOT NULL — docs/schema.md § Primary-key nullability.)
 	if (tableSchema.primaryKeyDefinition.some(def => def.index === colIndex)) {
-		if (action.setNotNull === false) {
-			throw new QuereusError(`Cannot DROP NOT NULL on PRIMARY KEY column '${action.columnName}'`, StatusCode.CONSTRAINT);
-		}
 		if (action.setDataType !== undefined) {
 			throw new QuereusError(`Cannot SET DATA TYPE on PRIMARY KEY column '${action.columnName}'`, StatusCode.CONSTRAINT);
 		}
@@ -1774,13 +1773,9 @@ async function runAlterPrimaryKey(
 				StatusCode.ERROR,
 			);
 		}
-		const colSchema = tableSchema.columns[idx];
-		if (!colSchema.notNull) {
-			throw new QuereusError(
-				`Column '${col.name}' must be NOT NULL to participate in PRIMARY KEY`,
-				StatusCode.CONSTRAINT,
-			);
-		}
+		// A nullable column may join the key: NULL is an ordinary, self-equal value in key
+		// position on both backends, so an all-NULL key is a real identity that collides
+		// with itself. See docs/schema.md § Primary-key nullability.
 		return { index: idx, desc: col.direction === 'desc' };
 	});
 

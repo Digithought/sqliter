@@ -121,10 +121,14 @@ describe('alter column: planSetNotNull', () => {
 		expect(await planSetNotNull(makeCtx(nullable), false)).to.equal(null);
 	});
 
-	it('rejects DROP NOT NULL on a primary key column', async () => {
+	it('drops NOT NULL on a primary key column as metadata only', async () => {
+		// Key membership does not imply NOT NULL (docs/schema.md § "Primary-key
+		// nullability"), and loosening rewrites no value — so no key moves.
 		const schema = makeSchema([TEXT_COL('a', { notNull: true })], { primaryKeyDefinition: [{ index: 0 }] });
-		const err = await expectStatus(() => planSetNotNull(makeCtx(schema), false), StatusCode.CONSTRAINT);
-		expect(err.message).to.contain("PRIMARY KEY column 'a'");
+		const change = await planSetNotNull(makeCtx(schema), false);
+		expect(change!.newCol.notNull).to.equal(false);
+		expect(change!.rewrite).to.equal(null);
+		expect(change!.comparatorChanged, 'a pure loosening moves no key').to.equal(false);
 	});
 
 	it('drops NOT NULL on a non-key column as metadata only', async () => {

@@ -183,15 +183,10 @@ export function planSetCollation(ctx: AlterColumnContext, requested: string): Co
 export async function planSetNotNull(ctx: AlterColumnContext, setNotNull: boolean): Promise<ColumnAttributeChange | null> {
 	const oldCol = ctx.schema.columns[ctx.colIndex];
 	if (setNotNull && !oldCol.notNull) return planTightenNotNull(ctx, oldCol);
-	if (!setNotNull && oldCol.notNull) {
-		if (isPrimaryKeyColumn(ctx)) {
-			throw new QuereusError(
-				`Cannot DROP NOT NULL on PRIMARY KEY column '${ctx.columnName}'`,
-				StatusCode.CONSTRAINT,
-			);
-		}
-		return metadataOnly({ ...oldCol, notNull: false });
-	}
+	// Loosening is metadata-only even on a key column: no row is rewritten, so no key
+	// moves and the existing (non-NULL) values stay exactly where they are. Key
+	// membership no longer implies NOT NULL — docs/schema.md § Primary-key nullability.
+	if (!setNotNull && oldCol.notNull) return metadataOnly({ ...oldCol, notNull: false });
 	return null; // already in the desired state
 }
 
@@ -205,9 +200,10 @@ export async function planSetNotNull(ctx: AlterColumnContext, setNotNull: boolea
  * rows — they live in the pending layer, not the base — and mutated a base the open layers
  * derive from.)
  *
- * On a PRIMARY KEY member the backfill moves the key VALUES: a nullable key column (a table with
- * no declared key is keyed by ALL its columns, which stay nullable) can hold two rows that differ
- * only by NULL-vs-DEFAULT there, and the backfill would merge them. So {@link buildAlterColumnPlan}
+ * On a PRIMARY KEY member the backfill moves the key VALUES: key membership does not imply NOT
+ * NULL (docs/schema.md § Primary-key nullability), so any key column can be nullable and hold two
+ * rows that differ only by NULL-vs-DEFAULT there, which the backfill would merge. So
+ * {@link buildAlterColumnPlan}
  * flags it `pkColumnRekeyed`, the manager runs the primary-key collision pre-pass over the
  * CONVERTED rows, and each open layer re-derives its staged deletion keys under the backfilled
  * values (`TransactionLayer.convertColumn`).

@@ -90,14 +90,34 @@ drop table t_empty_pk;
 -- run
 
 -- ===================================
--- 5. Rekey to nullable column should fail
+-- 5. Rekey ONTO a nullable column succeeds — key membership does not imply NOT NULL
+--    (docs/schema.md § "Primary-key nullability"). The column keeps its declared
+--    nullability and NULL participates in the new key as a self-equal value, so a
+--    second NULL key is a duplicate. Full coverage in 43.3-nullable-primary-key § 11.
 -- ===================================
 
-create table t_rekey_null (id integer primary key, val text null);
+create table t_rekey_null (id integer primary key, val integer null);
+insert into t_rekey_null values (1, 10), (2, 20);
 -- run
 
 alter table t_rekey_null alter primary key (val);
--- error: NOT NULL
+-- run
+
+select name, "notnull", pk from table_info('t_rekey_null') order by cid;
+→ [{"name": "id", "notnull": 1, "pk": 0}, {"name": "val", "notnull": 0, "pk": 1}]
+
+-- Existing rows survive the re-key and stay addressable under the new key.
+select id from t_rekey_null where val = 20;
+→ [{"id": 2}]
+
+insert into t_rekey_null values (3, null);
+-- run
+
+insert into t_rekey_null values (4, null);
+-- error: UNIQUE constraint failed
+
+select count(*) as cnt from t_rekey_null;
+→ [{"cnt": 3}]
 
 drop table t_rekey_null;
 -- run

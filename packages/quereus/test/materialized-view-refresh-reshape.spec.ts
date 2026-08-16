@@ -279,9 +279,15 @@ describe('materialized view refresh — identity-preserving reshape', () => {
 			// `order by x` seeds x into the physical PK ([x, id]); x starts NOT NULL (source
 			// x is NOT NULL). A source DROP NOT NULL loosens the DERIVED x to nullable, but a
 			// physical-PK column stays NOT NULL in the backing — the old code emitted a
-			// `loosenNotNull` op, which the memory manager refuses on a PK column
+			// `loosenNotNull` op, which the memory manager then refused on a PK column
 			// ("Cannot DROP NOT NULL on PRIMARY KEY column 'x'"). The fix masks that PK-column
 			// loosening so refresh takes the data-only rebuild path and keeps x NOT NULL.
+			//
+			// That refusal is gone (a key column may be nullable — docs/schema.md
+			// § "Primary-key nullability"), so the mask is no longer avoiding a throw: it is
+			// what keeps the ordering-seeded backing key NOT NULL at all. Without it, refresh
+			// would now SUCCEED at loosening the backing's x and the assertions below would
+			// fail instead of the refresh throwing. Same guard, different failure mode.
 			const db = new Database();
 			try {
 				await db.exec('create table par (id integer primary key, x integer not null)');
@@ -293,10 +299,9 @@ describe('materialized view refresh — identity-preserving reshape', () => {
 				expect(pkBefore.primaryKeyDefinition.map(d => d.index)).to.deep.equal([1, 0]);
 				expect(pkBefore.columns[1].notNull, 'backing x starts NOT NULL').to.equal(true);
 
-				// Source x → nullable. The backing's x is a physical-PK column, so the memory
-				// manager could not have dropped its NOT NULL (the alter would have thrown);
-				// the backing keeps x NOT NULL while the RE-DERIVED body shape now reports x
-				// nullable — the exact skew that makes the next refresh want to loosen a PK col.
+				// Source x → nullable. The ALTER touches `par`, not the backing; the backing
+				// keeps x NOT NULL while the RE-DERIVED body shape now reports x nullable —
+				// the exact skew that makes the next refresh want to loosen a PK column.
 				await db.exec('alter table par alter column x drop not null');
 				expect(db.schemaManager.getTable('main', 'par_ix')!.columns[1].notNull,
 					'backing x still NOT NULL after the source drop-not-null').to.equal(true);
@@ -308,7 +313,7 @@ describe('materialized view refresh — identity-preserving reshape', () => {
 				await db.exec('refresh materialized view par_ix');
 
 				const after = db.schemaManager.getTable('main', 'par_ix')!;
-				// Backing keeps x NOT NULL and the seeded [x, id] PK (a PK column cannot hold NULL).
+				// Backing keeps x NOT NULL and the seeded [x, id] PK.
 				expect(after.columns[1].notNull, 'backing x stays NOT NULL (physical PK)').to.equal(true);
 				expect(after.primaryKeyDefinition.map(d => d.index)).to.deep.equal([1, 0]);
 				// The re-derived body (both rows) is materialized.

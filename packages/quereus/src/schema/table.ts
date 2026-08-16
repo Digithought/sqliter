@@ -547,10 +547,6 @@ export function columnDefToSchema(
 		);
 	}
 
-	if (schema.primaryKey) {
-		schema.notNull = true;
-	}
-
 	if (schema.primaryKey && schema.pkOrder === 0) {
 		schema.pkOrder = 1;
 	}
@@ -1200,9 +1196,9 @@ export interface PrimaryKeyColumnDefinition {
  * `ON CONFLICT` lives on `ColumnSchema.defaultConflict`) or when no `ON CONFLICT`
  * was declared on the table-level constraint. `synthesized` is `true` only on the
  * no-PK all-columns fallback below (`false` for any explicitly-declared PK,
- * including the empty-key `primary key ()` singleton). Callers must NOT promote a
- * synthesized key's columns to NOT NULL — the whole row is the identity, but each
- * column keeps its declared (or session-default) nullability.
+ * including the empty-key `primary key ()` singleton). Callers must NOT promote ANY
+ * key's columns to NOT NULL, declared or synthesized — the key names the row
+ * identity, and each column keeps its declared (or session-default) nullability.
  * @throws QuereusError if multiple primary keys are defined or PK column not found.
  */
 export function findPKDefinition(
@@ -1243,12 +1239,12 @@ export function findPKDefinition(
 		}))
 	);
 
-	// A synthesized all-columns key does NOT force NOT NULL on its members — each
-	// column keeps the nullability the author declared (or the session default).
-	// NULL-in-key is supported by both backends (memory: NULL == NULL sorts first;
-	// store: TYPE_NULL=0x00), so the whole-row identity stays valid with nullable
-	// members. Only an explicitly-declared PK promotes nullability (see
-	// `buildColumnSchemas` and `columnDefToSchema`).
+	// No key forces NOT NULL on its members — synthesized or declared, each column keeps
+	// the nullability the author declared (or the session default). NULL-in-key is
+	// supported by both backends (memory: NULL == NULL sorts first; store:
+	// TYPE_NULL=0x00), so a row identity stays valid with nullable members. The
+	// `synthesized` flag survives only for the canonical-DDL emitter's clause-omission
+	// decision (see `isSynthesizedAllColumnsKey`), not for nullability.
 	return {
 		pkDef: synthesizedPkDef,
 		defaultConflict: undefined,
@@ -1262,36 +1258,36 @@ export function findPKDefinition(
  * declaration order, ascending, with no declared PK conflict action.
  *
  * Canonical-DDL emitters ({@link generateTableDDL}) use this to OMIT the PRIMARY
- * KEY clause for such a key. Re-parsing DDL that names an all-columns PK would
- * treat it as an *explicitly-declared* PK and force its columns NOT NULL —
- * silently dropping a nullable declaration on a store persistence round-trip
- * (the very promotion {@link findPKDefinition} deliberately avoids for a
- * synthesized key). Omitting the clause lets the re-parse re-synthesize the same
- * key while preserving each column's declared nullability.
+ * KEY clause for such a key; the re-parse re-synthesizes the identical key from the
+ * absent clause.
  *
  * Detection is by shape rather than a stored flag so it holds regardless of how
  * the schema was constructed (CREATE, store rehydrate, module rebuild). An
- * explicitly-declared all-columns PK has the identical shape and re-synthesizes
- * to an identical schema (a declared PK has already forced its columns NOT NULL),
- * so treating the two alike is sound. The conflict-action guard keeps an explicit
- * table-level `primary key (...) on conflict X` on its own declared emission path.
+ * explicitly-declared all-columns PK has the identical shape and re-synthesizes to
+ * an identical schema, so treating the two alike is sound — declared and
+ * synthesized keys now differ in nothing at all, nullability included. The
+ * conflict-action guard keeps an explicit table-level
+ * `primary key (...) on conflict X` on its own declared emission path.
  *
  * NOTE: that guard is deliberately partial. An action declared on a key *column*
  * (`a integer primary key on conflict replace`) leaves `primaryKeyDefaultConflict`
  * unset, so an all-columns key still matches here, emits no clause, and loses the
  * action on a round-trip. Widening the guard to {@link resolvePkDefaultConflict}
- * would emit a `PRIMARY KEY` clause for a genuinely synthesized key whose column
- * carries a `not null on conflict X` — re-parsing that as a *declared* key would
- * force its columns NOT NULL, the exact regression this omission exists to avoid.
- * The retirement below is what clears it; pinned by the
+ * used to be unsafe — it would emit a `PRIMARY KEY` clause for a genuinely
+ * synthesized key whose column carries a `not null on conflict X`, and the re-parse
+ * would read that as a *declared* key and tighten its columns to NOT NULL. That
+ * hazard is gone (declaring a key no longer changes nullability), so the guard is
+ * now merely unfinished rather than load-bearing; emitting a clause for every key
+ * is `tickets/implement/4-debt-emit-primary-key-clause-for-every-key`. Pinned by the
  * `expectedConflictAfterRoundTrip` cases in `test/table-ddl-round-trip.spec.ts`.
  *
  * NOTE: this predicate — and {@link TableSchema.synthesizedPrimaryKey} with it —
- * is scheduled to go away. Both exist only because a *declared* `PRIMARY KEY`
- * promotes its columns to NOT NULL while a synthesized one does not; once that
- * promotion is removed the two keys are the same key and every key emits its
- * clause. The retirement also has to land in the sibling `../lamina` repo's
- * `lamina-quereus` adapter, which reads the field. See
+ * is scheduled to go away. Both existed only because a *declared* `PRIMARY KEY`
+ * promoted its columns to NOT NULL while a synthesized one did not; that promotion
+ * is now removed, so the two keys are the same key and every key can emit its
+ * clause. What is left is the emitter change above plus the field's retirement,
+ * which also has to land in the sibling `../lamina` repo's `lamina-quereus`
+ * adapter, which reads the field. See
  * `packages/quereus/test/table-ddl-round-trip.spec.ts` — the round-trip harness
  * that change flips.
  */

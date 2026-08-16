@@ -1734,14 +1734,15 @@ export class SchemaManager {
 			const pkOrder = isPkColumn
 				? pkDefinition.findIndex(pkC => pkC.index === idx) + 1
 				: 0;
-			// Only an explicitly-declared PK forces NOT NULL. A synthesized
-			// all-columns key (the no-PK fallback) leaves each column's declared
-			// nullability intact — see findPKDefinition.
+			// PRIMARY KEY membership does NOT force NOT NULL — for a declared key any
+			// more than for the synthesized all-columns one. `primary key` names the row
+			// identity and nothing else; nullability is whatever the column declared or
+			// `pragma default_column_nullability` gave it. See findPKDefinition and
+			// docs/schema.md § Primary-key nullability.
 			return {
 				...col,
 				primaryKey: isPkColumn,
 				pkOrder,
-				notNull: (isPkColumn && !synthesized) ? true : col.notNull,
 			};
 		});
 

@@ -213,14 +213,18 @@ create table users (
 
 -- With default_column_nullability = 'nullable' (SQL standard)
 create table users (
-  id integer primary key, -- Implicitly NOT NULL
+  id integer primary key, -- Allows NULL (primary key does not imply NOT NULL)
   name text,           -- Allows NULL
   email text not null, -- Explicitly NOT NULL
   bio text             -- Allows NULL
 );
 ```
 
-**Note:** Primary key columns are always NOT NULL regardless of this setting.
+**Note:** This setting governs primary-key columns like any other — `primary key` names the
+row identity and does not imply `not null`. Under the default `'not_null'` an undecorated
+`id integer primary key` is still non-nullable (every column is); under `'nullable'`, or with
+an explicit `x integer null primary key`, the key column accepts NULL and NULL participates in
+the key as a self-equal value. See [Schema § Primary-key nullability](schema.md#columnschema).
 
 #### 9.2.4 default_collation
 

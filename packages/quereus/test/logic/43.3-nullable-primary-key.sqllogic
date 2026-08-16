@@ -1,0 +1,482 @@
+-- PRIMARY KEY does not imply NOT NULL.
+--
+-- `primary key` names the row identity and nothing more; a key column keeps the nullability it
+-- declared, or the one `pragma default_column_nullability` gave it. That is one rule for both
+-- spellings: a declared `primary key (x, y)` and the all-columns key Quereus synthesizes for a
+-- table with no PRIMARY KEY produce identical schemas.
+--
+-- Under the shipped `not_null` default this is mostly invisible — every column is NOT NULL unless
+-- it says otherwise, so `id integer primary key` is still non-nullable. The nullable case needs an
+-- explicit `null` on the column or the `nullable` session default.
+--
+-- NULL is an ordinary, self-equal value in key position on both backends (memory compares
+-- NULL == NULL as equal and orders NULL first; the store's key codec encodes TYPE_NULL first), so
+-- two rows with an all-NULL key collide as a duplicate primary key. `UNIQUE` still answers NULL
+-- the other way — NULLs stay distinct there and never collide. See docs/schema.md
+-- § "Primary-key nullability".
+--
+-- Key columns are INTEGER throughout: the store defaults an undecorated TEXT primary-key column to
+-- NOCASE while memory uses BINARY (see the 10.2.2 note in logic.spec.ts), which would make this
+-- file diverge between backends for reasons that have nothing to do with nullability.
+
+-- ===================================
+-- 1. The shipped default is unchanged: an undecorated key column is still NOT NULL.
+--    This is most of the existing corpus and must NOT move.
+-- ===================================
+
+pragma default_column_nullability;
+→ [{"name": "default_column_nullability", "value": "not_null"}]
+
+create table t_default_pk (id integer primary key, val text);
+
+select name, "notnull", pk from table_info('t_default_pk') where name = 'id';
+→ [{"name":"id","notnull":1,"pk":1}]
+
+insert into t_default_pk values (null, 'nope');
+-- error: NOT NULL constraint failed: t_default_pk.id
+
+drop table t_default_pk;
+
+-- ===================================
+-- 2. The headline case: `x integer null primary key` is nullable and accepts NULL.
+-- ===================================
+
+create table t_null_pk (x integer null primary key, val text null);
+
+select name, "notnull", pk from table_info('t_null_pk') where name = 'x';
+→ [{"name":"x","notnull":0,"pk":1}]
+
+insert into t_null_pk values (null, 'first');
+
+select x, val from t_null_pk;
+→ [{"x":null,"val":"first"}]
+
+-- The NULL key is a real identity: a second all-NULL key is a duplicate, not a new row.
+insert into t_null_pk values (null, 'second');
+-- error: UNIQUE constraint failed
+
+select count(*) as n from t_null_pk;
+→ [{"n":1}]
+
+-- Non-NULL keys coexist with the NULL one and are addressable by value.
+insert into t_null_pk values (1, 'one'), (2, 'two');
+
+select x, val from t_null_pk order by x;
+→ [{"x":null,"val":"first"},{"x":1,"val":"one"},{"x":2,"val":"two"}]
+
+select val from t_null_pk where x is null;
+→ [{"val":"first"}]
+
+delete from t_null_pk where x is null;
+
+select count(*) as n from t_null_pk;
+→ [{"n":2}]
+
+drop table t_null_pk;
+
+-- ===================================
+-- 3. Same outcome via the session default rather than an explicit `null`.
+-- ===================================
+
+pragma default_column_nullability='nullable';
+
+create table t_sess_pk (x integer, val text, primary key (x));
+
+select name, "notnull", pk from table_info('t_sess_pk') where name = 'x';
+→ [{"name":"x","notnull":0,"pk":1}]
+
+insert into t_sess_pk values (null, 'first');
+
+select x, val from t_sess_pk;
+→ [{"x":null,"val":"first"}]
+
+insert into t_sess_pk values (null, 'second');
+-- error: UNIQUE constraint failed
+
+drop table t_sess_pk;
+
+-- A declared key and the synthesized all-columns key are now the same key: identical column
+-- nullability for the same declaration, differing only in which columns the key covers.
+create table t_declared (x integer, y integer, primary key (x, y));
+create table t_synth (x integer, y integer);
+
+select name, "notnull" from table_info('t_declared') order by cid;
+→ [{"name":"x","notnull":0},{"name":"y","notnull":0}]
+
+select name, "notnull" from table_info('t_synth') order by cid;
+→ [{"name":"x","notnull":0},{"name":"y","notnull":0}]
+
+drop table t_declared;
+drop table t_synth;
+
+pragma default_column_nullability='not_null';
+
+-- ===================================
+-- 4. Composite declared key with nullable members.
+-- ===================================
+
+create table t_comp (a integer null, b integer null, val text null, primary key (a, b));
+
+insert into t_comp values (null, null, 'both null');
+insert into t_comp values (null, 1, 'a null');
+insert into t_comp values (1, null, 'b null');
+
+select a, b, val from t_comp order by a, b;
+→ [{"a":null,"b":null,"val":"both null"},{"a":null,"b":1,"val":"a null"},{"a":1,"b":null,"val":"b null"}]
+
+-- Each of those keys is distinct from the others but equal to itself.
+insert into t_comp values (null, null, 'dup');
+-- error: UNIQUE constraint failed
+
+insert into t_comp values (null, 1, 'dup');
+-- error: UNIQUE constraint failed
+
+select count(*) as n from t_comp;
+→ [{"n":3}]
+
+drop table t_comp;
+
+-- ===================================
+-- 5. Key equality and UNIQUE answer NULL differently — deliberately, and unchanged by the above.
+--    Two rows with y = null are legal; two rows with x = null are not.
+-- ===================================
+
+create table t_vs_unique (x integer null primary key, y integer null unique);
+
+insert into t_vs_unique values (1, null);
+insert into t_vs_unique values (2, null);
+
+-- UNIQUE is NULL-distinct: both rows stand.
+select count(*) as n from t_vs_unique where y is null;
+→ [{"n":2}]
+
+insert into t_vs_unique values (null, 1);
+insert into t_vs_unique values (null, 2);
+-- error: UNIQUE constraint failed
+
+select count(*) as n from t_vs_unique;
+→ [{"n":3}]
+
+drop table t_vs_unique;
+
+-- ===================================
+-- 6. Conflict resolution against a NULL-containing key resolves to the EXISTING row.
+-- ===================================
+
+create table t_conflict (x integer null primary key, val text null);
+
+insert into t_conflict values (null, 'original');
+
+insert or replace into t_conflict values (null, 'replaced');
+
+select x, val from t_conflict;
+→ [{"x":null,"val":"replaced"}]
+
+select count(*) as n from t_conflict;
+→ [{"n":1}]
+
+insert or ignore into t_conflict values (null, 'ignored');
+
+select x, val from t_conflict;
+→ [{"x":null,"val":"replaced"}]
+
+insert into t_conflict values (null, 'upserted') on conflict do update set val = 'upserted';
+
+select x, val from t_conflict;
+→ [{"x":null,"val":"upserted"}]
+
+select count(*) as n from t_conflict;
+→ [{"n":1}]
+
+drop table t_conflict;
+
+-- ===================================
+-- 7. UPDATE moving a key column to NULL and back.
+-- ===================================
+
+create table t_move (x integer null primary key, val text null);
+
+insert into t_move values (1, 'a'), (2, 'b');
+
+update t_move set x = null where x = 1;
+
+select x, val from t_move order by x;
+→ [{"x":null,"val":"a"},{"x":2,"val":"b"}]
+
+-- Addressable by its NEW key, and no longer by the old one.
+select val from t_move where x is null;
+→ [{"val":"a"}]
+
+select count(*) as n from t_move where x = 1;
+→ [{"n":0}]
+
+-- Moving the second row onto the NULL key now collides with the first.
+update t_move set x = null where x = 2;
+-- error: UNIQUE constraint failed
+
+select count(*) as n from t_move;
+→ [{"n":2}]
+
+-- And back out of NULL.
+update t_move set x = 3 where x is null;
+
+select x, val from t_move order by x;
+→ [{"x":2,"val":"b"},{"x":3,"val":"a"}]
+
+select count(*) as n from t_move where x is null;
+→ [{"n":0}]
+
+drop table t_move;
+
+-- ===================================
+-- 8. Foreign keys: a parent key tuple containing NULL is unreferenceable (MATCH SIMPLE).
+--    `references par` with no column list resolves to the parent's primary key.
+-- ===================================
+
+create table fk_par (id integer null primary key, label text null);
+create table fk_child (cid integer primary key, parent_id integer null references fk_par on delete restrict);
+
+insert into fk_par values (null, 'null-keyed'), (1, 'one');
+
+-- A child row with a non-NULL FK value matches the non-NULL parent key.
+insert into fk_child values (10, 1);
+
+-- Nothing can point AT the NULL-keyed parent: `=` against NULL is never true, so a non-NULL
+-- child value finds no parent...
+insert into fk_child values (11, 99);
+-- error: CHECK constraint failed: _fk_fk_child_parent_id
+
+-- ...and a NULL child value is admitted unchecked (MATCH SIMPLE), which is not a reference to
+-- the NULL-keyed parent row either.
+insert into fk_child values (12, null);
+
+select cid, parent_id from fk_child order by cid;
+→ [{"cid":10,"parent_id":1},{"cid":12,"parent_id":null}]
+
+-- `on delete restrict` does not fire for a parent tuple containing NULL: nothing can reference it.
+delete from fk_par where id is null;
+
+select id, label from fk_par;
+→ [{"id":1,"label":"one"}]
+
+-- ...while the genuinely referenced parent is still protected.
+delete from fk_par where id = 1;
+-- error: violates RESTRICT from 'fk_child'
+
+drop table fk_child;
+drop table fk_par;
+
+-- Parent side, cascade: deleting a NULL-keyed parent propagates to nothing.
+create table fk_par_c (id integer null primary key, label text null);
+create table fk_child_c (cid integer primary key, parent_id integer null references fk_par_c on delete cascade);
+
+insert into fk_par_c values (null, 'null-keyed'), (1, 'one');
+insert into fk_child_c values (20, 1), (21, null);
+
+delete from fk_par_c where id is null;
+
+-- Neither child was touched: the NULL-FK child is not a reference, and the id=1 child's parent
+-- is still there.
+select cid, parent_id from fk_child_c order by cid;
+→ [{"cid":20,"parent_id":1},{"cid":21,"parent_id":null}]
+
+delete from fk_par_c where id = 1;
+
+-- Only the genuine reference cascaded.
+select cid, parent_id from fk_child_c order by cid;
+→ [{"cid":21,"parent_id":null}]
+
+drop table fk_child_c;
+drop table fk_par_c;
+
+-- ===================================
+-- 9. ALTER TABLE ... ALTER COLUMN <key column> DROP NOT NULL is permitted and metadata-only.
+-- ===================================
+
+create table t_drop_nn (a integer, b integer null, primary key (a));
+
+select name, "notnull", pk from table_info('t_drop_nn') where name = 'a';
+→ [{"name":"a","notnull":1,"pk":1}]
+
+insert into t_drop_nn values (1, 10), (2, 20);
+
+alter table t_drop_nn alter column a drop not null;
+
+select name, "notnull", pk from table_info('t_drop_nn') where name = 'a';
+→ [{"name":"a","notnull":0,"pk":1}]
+
+-- No row was rewritten: both existing rows survive unchanged and stay addressable by key.
+select a, b from t_drop_nn order by a;
+→ [{"a":1,"b":10},{"a":2,"b":20}]
+
+select b from t_drop_nn where a = 2;
+→ [{"b":20}]
+
+-- The loosening took effect.
+insert into t_drop_nn values (null, 30);
+
+select a, b from t_drop_nn order by a;
+→ [{"a":null,"b":30},{"a":1,"b":10},{"a":2,"b":20}]
+
+insert into t_drop_nn values (null, 40);
+-- error: UNIQUE constraint failed
+
+-- SET DATA TYPE on a key column is a DIFFERENT rule and is still refused.
+alter table t_drop_nn alter column a set data type text;
+-- error: Cannot SET DATA TYPE on PRIMARY KEY column
+
+drop table t_drop_nn;
+
+-- ===================================
+-- 10. ALTER TABLE ... ALTER COLUMN <key column> SET NOT NULL — the tightening direction.
+--     The collision semantics belong to 41.2.3; this only pins that a DECLARED key column
+--     takes the same path a synthesized one does, so the two stay in lock-step.
+-- ===================================
+
+-- No visible NULL: metadata-only, moves no key.
+create table t_set_nn (a integer null default 0, b integer null, primary key (a));
+insert into t_set_nn values (1, 10), (2, 20);
+
+alter table t_set_nn alter column a set not null;
+
+select name, "notnull", pk from table_info('t_set_nn') where name = 'a';
+→ [{"name":"a","notnull":1,"pk":1}]
+
+select a, b from t_set_nn order by a;
+→ [{"a":1,"b":10},{"a":2,"b":20}]
+
+insert into t_set_nn values (null, 30);
+-- error: NOT NULL constraint failed
+
+drop table t_set_nn;
+
+-- A visible NULL backfills from DEFAULT and physically re-keys the row.
+create table t_set_nn2 (a integer null default 0, b integer null, primary key (a));
+insert into t_set_nn2 values (null, 10), (1, 20);
+
+alter table t_set_nn2 alter column a set not null;
+
+select a, b from t_set_nn2 order by a;
+→ [{"a":0,"b":10},{"a":1,"b":20}]
+
+-- The backfilled row is addressable by its NEW key.
+select b from t_set_nn2 where a = 0;
+→ [{"b":10}]
+
+drop table t_set_nn2;
+
+-- Two rows converging on one key under the backfill: refused, nothing changes.
+create table t_set_nn3 (a integer null default 0, b integer null, primary key (a));
+insert into t_set_nn3 values (null, 10), (0, 20);
+
+alter table t_set_nn3 alter column a set not null;
+-- error: collides under the new key definition
+
+select name, "notnull" from table_info('t_set_nn3') where name = 'a';
+→ [{"name":"a","notnull":0}]
+
+select count(*) as n from t_set_nn3;
+→ [{"n":2}]
+
+drop table t_set_nn3;
+
+-- ===================================
+-- 11. ALTER TABLE ... ALTER PRIMARY KEY onto a nullable column.
+-- ===================================
+
+create table t_repk (a integer primary key, b integer null);
+
+insert into t_repk values (1, 10), (2, 20);
+
+alter table t_repk alter primary key (b);
+
+select name, "notnull", pk from table_info('t_repk') order by cid;
+→ [{"name":"a","notnull":1,"pk":0},{"name":"b","notnull":0,"pk":1}]
+
+-- Existing rows are present and addressable under the new key.
+select a, b from t_repk order by b;
+→ [{"a":1,"b":10},{"a":2,"b":20}]
+
+select a from t_repk where b = 20;
+→ [{"a":2}]
+
+-- The new key accepts NULL, once.
+insert into t_repk values (3, null);
+
+select a, b from t_repk order by b;
+→ [{"a":3,"b":null},{"a":1,"b":10},{"a":2,"b":20}]
+
+insert into t_repk values (4, null);
+-- error: UNIQUE constraint failed
+
+drop table t_repk;
+
+-- Re-keying ONTO a column that already holds a collision among its NULLs must be reported as a
+-- duplicate key, not silently merged.
+create table t_repk2 (a integer primary key, b integer null);
+
+insert into t_repk2 values (1, null), (2, null);
+
+alter table t_repk2 alter primary key (b);
+-- error: UNIQUE constraint failed
+
+-- Nothing moved: the old key and both rows are intact.
+select name, pk from table_info('t_repk2') order by cid;
+→ [{"name":"a","pk":1},{"name":"b","pk":0}]
+
+select count(*) as n from t_repk2;
+→ [{"n":2}]
+
+drop table t_repk2;
+
+-- ===================================
+-- 12. A nullable declared key through an explicit transaction and a secondary-index read.
+--     Meets the isolation-layer coverage in bug-isolation-null-pk-shadow-key from the other side:
+--     there the key was synthesized, here it is declared.
+-- ===================================
+
+-- Table-level `unique` (not a standalone `create unique index`) so the file needs no
+-- `-- requires-capability: standalone-index-ddl` and runs on every backend.
+create table t_txn (x integer null primary key, tag integer null unique);
+
+insert into t_txn values (null, 1);
+
+begin;
+
+insert into t_txn values (5, 2);
+
+-- Read-your-own-writes across both the primary key and the secondary index.
+select x, tag from t_txn order by x;
+→ [{"x":null,"tag":1},{"x":5,"tag":2}]
+
+select x from t_txn where tag = 1;
+→ [{"x":null}]
+
+-- The staged transaction still sees the committed NULL key as occupied.
+insert into t_txn values (null, 3);
+-- error: UNIQUE constraint failed
+
+update t_txn set tag = 7 where x is null;
+
+select x, tag from t_txn order by x;
+→ [{"x":null,"tag":7},{"x":5,"tag":2}]
+
+commit;
+
+select x, tag from t_txn order by x;
+→ [{"x":null,"tag":7},{"x":5,"tag":2}]
+
+select x from t_txn where tag = 7;
+→ [{"x":null}]
+
+-- Rollback restores the NULL-keyed row's committed value.
+begin;
+update t_txn set tag = 99 where x is null;
+select tag from t_txn where x is null;
+→ [{"tag":99}]
+rollback;
+
+select tag from t_txn where x is null;
+→ [{"tag":7}]
+
+drop table t_txn;
