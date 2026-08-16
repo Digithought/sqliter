@@ -1,6 +1,6 @@
 import type { CollationResolver, Database, DatabaseInternal, MaybePromise, Row, SqlValue, TableIndexSchema as IndexSchema, FilterInfo, SchemaChangeInfo, TableSchema, TableStatistics, UniqueConstraintSchema, CompiledPredicate, UpdateArgs, VirtualTableConnection, UpdateResult, AccessPath, IndexDescriptor, IndexKeyColumn } from '@quereus/quereus';
-import { VirtualTable, compareSqlValues, compareSqlValuesFast, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, resolveUniqueEnforcementCollations, uniqueEnforcementCollations, uniqueEnforcementComparators, normalizeCollationName, serializeKeyNullGrouping, pkKeyCollationName, retargetFilterInfoIndex, PRIMARY_INDEX_NAME, coerceRowToSchema, IndexConstraintOp, decodeIdxStr, createTypedComparator, hasSemanticOrdering, semanticKeyTransform } from '@quereus/quereus';
-import type { EffectiveRowSource, KeyNormalizerResolver } from '@quereus/quereus';
+import { VirtualTable, compareSqlValues, compareSqlValuesFast, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, resolveUniqueEnforcementCollations, uniqueEnforcementCollations, uniqueEnforcementComparators, normalizeCollationName, pkKeyCollationName, retargetFilterInfoIndex, PRIMARY_INDEX_NAME, coerceRowToSchema, IndexConstraintOp, decodeIdxStr, createTypedComparator, hasSemanticOrdering } from '@quereus/quereus';
+import type { EffectiveRowSource } from '@quereus/quereus';
 import type { IsolationModule } from './isolation-module.js';
 import type { ConnectionOverlayState } from './isolation-types.js';
 import { IsolatedConnection, type IsolatedTableCallback } from './isolated-connection.js';
@@ -8,6 +8,7 @@ import { mergeStreams, createMergeEntry, createTombstone } from './merge-iterato
 import type { MergeEntry, MergeConfig } from './merge-types.js';
 import { makeFullScanFilterInfo, makeSecondaryIndexEqSeekFilter } from './filter-info.js';
 import { type PkEquals, type PkKeyShape, EMPTY_PK_KEY_SHAPE, makePkKeyShape, pkEqualsFromShape, probeRowByPk } from './pk-probe.js';
+import { makePkKeySerializer } from './overlay-rows.js';
 
 /** The cache entry served while `tableSchema` is still unpopulated; never mutated. */
 const EMPTY_PK_SHAPE_ENTRY: { shape: PkKeyShape; equals: PkEquals } = {
@@ -70,13 +71,6 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 * database registry.
 	 */
 	private readonly collationResolver: CollationResolver;
-
-	/**
-	 * `db.getKeyNormalizerResolver()`, bound once at connect beside {@link collationResolver}
-	 * for the same reason: the modified-PK set's key encoding and the comparators above must
-	 * agree on which rows are equal, or a staged row fails to shadow the base row it replaces.
-	 */
-	private readonly keyNormalizerResolver: KeyNormalizerResolver;
 
 	/**
 	 * The PK key shape (per-column comparison functions and sort directions) and the
@@ -163,7 +157,6 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		this.underlyingTable = underlyingTable;
 		this.readCommitted = readCommitted;
 		this.collationResolver = db.getCollationResolver();
-		this.keyNormalizerResolver = db.getKeyNormalizerResolver();
 		// Schema comes from underlying - may be populated lazily by the underlying module
 		this.tableSchema = underlyingTable.tableSchema;
 		// Statistics delegation — present iff the underlying implements it (see the fields).
@@ -525,49 +518,23 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		const pkIndices = this.getPrimaryKeyIndices();
 		const tombstoneIndex = this.getTombstoneColumnIndex(overlay);
 
-		// Key the modified-PK set with the engine's canonical, bigint-safe,
-		// collation-aware encoder — NOT JSON.stringify, which throws on a bigint PK
-		// value and ignores collation (a NOCASE PK rewritten 'abc' -> 'ABC' would fail
-		// to shadow the underlying 'abc', surfacing both rows). One normalizer per PK
-		// column, drawn from `pkKeyCollationName` (the same decision `resolvePkKeyCollations`
-		// makes for the store's on-disk PK encoding) via the connection's own resolver, so
-		// equal keys under the PK collation encode to identical strings — matching
-		// getComparePK/keysEqual and agreeing with `db.registerCollation`.
-		//
-		// A PK column whose declared type can never hold text takes the identity
-		// normalizer regardless of its collation: the key serializer normalizes only
-		// string values, so the collation cannot affect how such a key buckets. Asking
-		// the resolver for it would reject `n integer collate mycoll` under a
-		// comparator-only collation, which the engine's own hash sites accept (they gate
-		// through `hashKeyCollationName`, the same predicate). A collation-aware column
-		// (`text`, `any` — types whose `compare` honors the collation it is handed) keys
-		// under its own declared collation; a collation-blind text-capable column
-		// (`json`, the temporal types) is keyed under `'BINARY'` regardless, since PK
-		// equality compares those types through `logicalType.compare`, which is not the
-		// generic collation comparison (the temporals ignore the argument; JSON ranks
-		// structurally).
-		const pkNormalizers = pkIndices.map(i => {
-			const column = this.tableSchema!.columns[i];
-			return this.keyNormalizerResolver(pkKeyCollationName(column));
-		});
-		// Key-identity transforms for semantic-ordering PK members (TIMESPAN's total-seconds
-		// groupKey): the underlying backends key 'PT1H' and 'PT60M' as ONE row, so the
-		// modified-PK shadow set must bucket them identically or a staged rewrite fails to
-		// shadow the committed spelling and both rows surface. A no-PK table's synthesized
-		// all-columns key does not force its columns NOT NULL (each keeps its declared
-		// nullability), so a NULL PK component is a legitimate value here, not an error —
-		// `serializeKeyNullGrouping` tags it with a distinct `N:` marker instead of the
-		// whole-key-collapses-to-null semantics `serializeKey` uses for SQL's `NULL <> NULL`.
-		// Both the build and probe below use this one encoder so they stay consistent.
-		const pkTransforms = pkIndices.map(i => semanticKeyTransform(this.tableSchema!.columns[i]?.logicalType));
-		const pkShadowKey = (row: Row): string => serializeKeyNullGrouping(
-			pkIndices.map((idx, i) => {
-				const v = row[idx];
-				const transform = pkTransforms[i];
-				return transform && v !== null ? transform(v) : v;
-			}),
-			pkNormalizers,
-		);
+		// Key the modified-PK set through the engine's ONE row-identity recipe
+		// (`makePkKeySerializer` -> `makePkIdentitySerializer`): per-PK-column collation
+		// normalizer, semantic key transform for semantic-ordering types (TIMESPAN's
+		// groupKey, so a staged 'PT60M' shadows the committed 'PT1H' the backends store as
+		// one row), and NULL-grouping serialization (a synthesized all-columns PK does not
+		// force its members NOT NULL, so a NULL component is a value to tag, not a key to
+		// collapse). Never re-derive that recipe here: this set decides "same row?" for the
+		// rows the overlay writer and the sync engine key by the same recipe, and a local
+		// copy drifting from it is exactly how the NULL-PK shadow collapse got in. Both the
+		// build and probe below use this one encoder so they stay consistent.
+		// An unpopulated schema yields no PK indices at all, so the shadow set is degenerate
+		// either way; keying every row alike (as this did before the recipe was shared) beats
+		// throwing out of the serializer on a schema the underlying has not filled in yet.
+		const pkKeyOf = this.tableSchema
+			? makePkKeySerializer(this.db, this.tableSchema)
+			: () => '';
+		const pkShadowKey = (row: Row): string => pkKeyOf(pkIndices.map(i => row[i]));
 
 		// Step 1: one full overlay scan collects the modified PKs AND the in-window
 		// non-tombstone data rows. The window filter is applied here, unconditionally —

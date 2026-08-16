@@ -124,6 +124,27 @@ describe('null primary-key components through the merged secondary-index read (f
 		await db.exec(`rollback`);
 	});
 
+	it('shadows only the row a staged UPDATE rewrote, not every other NULL-keyed row', async () => {
+		// On a no-PK table every column is part of the synthesized key, so this UPDATE
+		// relocates the row: the overlay holds both a tombstone at the old key and the
+		// rewritten row at the new one, and BOTH carry a NULL `id`.
+		await db.exec(`create table tu (id integer null, tag text not null) using isolated`);
+		await db.exec(`create index ix_tag on tu (tag)`);
+		await db.exec(`insert into tu values (null, 'a'), (null, 'b'), (null, 'c')`);
+
+		await db.exec(`begin`);
+		await db.exec(`update tu set tag = 'a2' where tag = 'a'`);
+		mem.reset();
+
+		expect(await rowsBy(`select id, tag from tu where tag in ('a', 'a2', 'b', 'c')`, 'tag')).to.deep.equal([
+			{ id: null, tag: 'a2' },
+			{ id: null, tag: 'b' },
+			{ id: null, tag: 'c' },
+		]);
+		expectSecondarySeek(mem, 'tu', 'ix_tag');
+		await db.exec(`rollback`);
+	});
+
 	it('keys rows differing only in WHICH column is NULL distinctly, not by "has a null somewhere"', async () => {
 		await db.exec(`create table t3 (id1 integer null, id2 integer null, tag text not null) using isolated`);
 		await db.exec(`create index ix_tag on t3 (tag)`);
