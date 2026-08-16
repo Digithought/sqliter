@@ -57,6 +57,12 @@ export interface TableSchema {
 	 * "not stated" (a host-authored schema literal), NOT "declared" — consumers
 	 * that need certainty should treat absent as unknown and fall back to their
 	 * own conservative default.
+	 *
+	 * NOTE: no in-repo code reads this, but it is NOT dead — the `lamina-quereus`
+	 * adapter in the sibling `../lamina` repo reads it
+	 * (`src/quereus-ast-translators.ts`, and `module.ts`'s ADD COLUMN key-widening
+	 * guard) and falls back to the unsound shape test when the slot is absent.
+	 * Retire it only together with that consumer.
 	 */
 	synthesizedPrimaryKey?: boolean;
 	/** CHECK constraints defined on the table or its columns */
@@ -1258,6 +1264,15 @@ export function findPKDefinition(
  * to an identical schema (a declared PK has already forced its columns NOT NULL),
  * so treating the two alike is sound. The conflict-action guard keeps an explicit
  * `primary key (...) on conflict X` on its own declared emission path.
+ *
+ * NOTE: this predicate — and {@link TableSchema.synthesizedPrimaryKey} with it —
+ * is scheduled to go away. Both exist only because a *declared* `PRIMARY KEY`
+ * promotes its columns to NOT NULL while a synthesized one does not; once that
+ * promotion is removed the two keys are the same key and every key emits its
+ * clause. The retirement also has to land in the sibling `../lamina` repo's
+ * `lamina-quereus` adapter, which reads the field. See
+ * `packages/quereus/test/table-ddl-round-trip.spec.ts` — the round-trip harness
+ * that change flips.
  */
 export function isSynthesizedAllColumnsKey(tableSchema: TableSchema): boolean {
 	const pk = tableSchema.primaryKeyDefinition;

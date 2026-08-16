@@ -25,6 +25,7 @@ import type { ViewSchema } from './view.js';
 import { normalizeBackingModule } from './view.js';
 import type { MaintainedTableSchema } from './derivation.js';
 import type { SqlValue } from '../common/types.js';
+import { ConflictResolution } from '../common/constants.js';
 import type * as AST from '../parser/ast.js';
 import { quoteIdentifier, expressionToString, constraintBodyToCanonicalString, createIndexBodyToCanonicalString, tableConstraintsToString, createViewToString, maintainedClauseToString, alterIndexToString } from '../emit/ast-stringify.js';
 import { normalizeCollationName } from '../util/comparison.js';
@@ -126,8 +127,13 @@ function generateTableDDLInternal(
 		? tableSchema.primaryKeyDefinition[0].index
 		: -1;
 
+	// The declared `ON CONFLICT` action rides whichever clause ends up carrying the key
+	// (see pkConflictClause) — without it a `primary key (...) on conflict replace`
+	// re-parses as ABORT and stops replacing after a persistence reopen.
+	const pkConflict = pkConflictClause(tableSchema.primaryKeyDefaultConflict);
+
 	const columnDefs: string[] = tableSchema.columns.map((col, columnIndex) =>
-		formatColumnDef(col, tableSchema, ctx.defaultNotNull, columnIndex === inlinePkIndex));
+		formatColumnDef(col, tableSchema, ctx.defaultNotNull, columnIndex === inlinePkIndex, pkConflict));
 
 	// Table-level PRIMARY KEY: empty () for singleton, (a, b, ...) for composite.
 	// Single-column PK is emitted inline on the column above. A synthesized
@@ -136,12 +142,12 @@ function generateTableDDLInternal(
 	// maintained-table backing key) survives the round-trip instead of silently
 	// re-keying ascending on re-parse.
 	if (tableSchema.primaryKeyDefinition.length === 0) {
-		columnDefs.push('PRIMARY KEY ()');
+		columnDefs.push(`PRIMARY KEY ()${pkConflict}`);
 	} else if (!synthesizedKey && tableSchema.primaryKeyDefinition.length > 1) {
 		const pkCols = tableSchema.primaryKeyDefinition
 			.map(pk => quoteName(tableSchema.columns[pk.index].name) + (pk.desc ? ' DESC' : ''))
 			.join(', ');
-		columnDefs.push(`PRIMARY KEY (${pkCols})`);
+		columnDefs.push(`PRIMARY KEY (${pkCols})${pkConflict}`);
 	}
 
 	// Table-level CHECK / UNIQUE / FOREIGN KEY constraints. Emitting these is what
@@ -489,12 +495,32 @@ function qualifiedName(schemaName: string | undefined, name: string, currentSche
 }
 
 /**
+ * Renders the ` ON CONFLICT <action>` tail of a table's primary-key declaration, or ''
+ * when none was declared or it is the ABORT default (which re-parses identically).
+ *
+ * Emitted on whichever clause carries the key — inline on the column for a
+ * single-column key, table-level otherwise — because the action is a property of the
+ * key, not of the clause's spelling. Dropping it silently downgrades a
+ * `primary key (...) on conflict replace` table to ABORT on any DDL round-trip, so a
+ * store-backed table stops replacing on duplicate-key writes after a reopen.
+ *
+ * Uppercase to match the surrounding CREATE TABLE keywords; the parser is
+ * case-insensitive, and the constraint fragment emitted below (lowercase, via
+ * `tableConstraintsToString`) already mixes the two.
+ */
+function pkConflictClause(defaultConflict: ConflictResolution | undefined): string {
+	if (defaultConflict === undefined || defaultConflict === ConflictResolution.ABORT) return '';
+	return ` ON CONFLICT ${ConflictResolution[defaultConflict]}`;
+}
+
+/**
  * Renders one column definition. `isInlinePk` is decided by the caller from
  * `primaryKeyDefinition` (see `generateTableDDLInternal`) — this function never
  * consults the per-column `primaryKey` flag, so flag drift from any ALTER producer
- * cannot reach the emitted DDL.
+ * cannot reach the emitted DDL. `pkConflict` is the rendered `ON CONFLICT` tail for the
+ * table's key, appended only when this column carries the inline clause.
  */
-function formatColumnDef(col: ColumnSchema, tableSchema: TableSchema, defaultNotNull: boolean | undefined, isInlinePk: boolean): string {
+function formatColumnDef(col: ColumnSchema, tableSchema: TableSchema, defaultNotNull: boolean | undefined, isInlinePk: boolean, pkConflict: string): string {
 	let colDef = quoteName(col.name);
 	// NOTE: emits the flattened col.logicalType.name (e.g. 'INTEGER'), not col.declaredType
 	// (e.g. 'BIGINT'). That's intentional today — declaredType is informational-only, read
@@ -505,6 +531,14 @@ function formatColumnDef(col: ColumnSchema, tableSchema: TableSchema, defaultNot
 
 	const nullAnnotation = nullabilityAnnotation(col.notNull, defaultNotNull);
 	if (nullAnnotation) colDef += ` ${nullAnnotation}`;
+	// NOTE: a column's own `ON CONFLICT` action (`ColumnSchema.defaultConflict`, which a
+	// `not null` / `null` / `primary key` column clause all collapse onto) is emitted ONLY
+	// on the inline PRIMARY KEY clause below. On a non-key column — `x integer not null on
+	// conflict rollback` — it is still dropped, so the column falls back to ABORT after a
+	// persistence round-trip. Emitting it on the nullability annotation would fix that, but
+	// the annotation elides in the with-`db` form (see nullabilityAnnotation), so the action
+	// would need a forced annotation to ride on. Worth doing when a non-key `on conflict`
+	// declaration actually has to survive a reopen.
 
 	// Column COLLATE: emit only a non-default collation (BINARY / '' are elided),
 	// mirroring the index column path (generateIndexDDL). Without this, a re-parse
@@ -523,6 +557,12 @@ function formatColumnDef(col: ColumnSchema, tableSchema: TableSchema, defaultNot
 	// would otherwise silently re-key ascending).
 	if (isInlinePk) {
 		colDef += tableSchema.primaryKeyDefinition[0].desc ? ' PRIMARY KEY DESC' : ' PRIMARY KEY';
+		// Precedence mirrors resolvePkDefaultConflict: a table-level
+		// `PRIMARY KEY (...) ON CONFLICT X` first, else this column's own action. The
+		// fallback is what makes the emission a fixed point — a table-level action
+		// re-parses onto the column (`ColumnSchema.defaultConflict`), so the second
+		// emission has only the column-level record to read.
+		colDef += pkConflict || pkConflictClause(col.defaultConflict);
 	}
 
 	if (col.defaultValue !== null && col.defaultValue !== undefined) {
