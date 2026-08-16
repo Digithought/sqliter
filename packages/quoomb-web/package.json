@@ -1,6 +1,6 @@
 {
   "name": "@quereus/quoomb-web",
-  "version": "4.13.0",
+  "version": "4.13.1",
   "type": "module",
   "description": "Quoomb Web - Browser-based playground for Quereus SQL engine",
   "publisher": "Got Choices Foundation",
