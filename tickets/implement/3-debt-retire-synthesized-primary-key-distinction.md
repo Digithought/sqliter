@@ -106,8 +106,11 @@ A previous run landed the supporting work (see
   exactly which expectations flip. **This is your harness; read it first.** Most of the
   "Edge cases" list below is already a case in it.
 - **A real bug found while building that harness is fixed**: the key's `ON CONFLICT` action
-  was dropped from emitted DDL entirely. It now rides whichever clause carries the key. So
-  the `ON CONFLICT` edge case below is already covered — just confirm it still passes.
+  was dropped from emitted DDL entirely. It now rides whichever clause carries the key,
+  resolved through `resolvePkDefaultConflict` so a column-declared action reaches the
+  table-level clause too. `packages/quereus-store/test/pk-conflict-action-reopen.spec.ts`
+  pins the reopen behaviour end-to-end. One residue is left for *this* ticket to clear — see
+  the second `ON CONFLICT` bullet below.
 - `NOTE:` markers are in place at `TableSchema.synthesizedPrimaryKey` (recording the lamina
   consumer) and at `isSynthesizedAllColumnsKey` (recording this retirement).
 
@@ -133,6 +136,20 @@ A previous run landed the supporting work (see
   is set, keeping `primary key (...) on conflict X` on the declared emission path. With the
   guard gone, an all-columns key *with* a conflict action must still render its
   `ON CONFLICT`. *(Already covered — three cases in the harness.)*
+- **`ON CONFLICT` declared on a key COLUMN of an all-columns key — this change fixes a live
+  bug, not just a cosmetic one.** The guard's bail-out only inspects the *table-level*
+  `primaryKeyDefaultConflict`. An action declared on a key column instead — `create table t
+  (a integer primary key on conflict replace)`, or `create table t (a integer not null on
+  conflict replace, b text, primary key (a, b))` — leaves the guard matching, so no clause is
+  emitted and the action has nowhere to ride. Both tables come back as `ABORT` after a
+  reopen and start throwing on a duplicate-key write. The loss is *stable* (the second
+  emission drops it identically), so the fixed-point assertion cannot see it; the harness
+  pins it with an explicit `expectedConflictAfterRoundTrip: '(none)'`. **When you delete the
+  omission, delete those two `expectedConflictAfterRoundTrip` entries too** — the round-trip
+  then preserves the action and the field should stop being needed. Fixing this inside the
+  guard instead was rejected: distinguishing a declared all-columns key from a synthesized
+  one by shape is exactly what is impossible, so a shape-based bail-out would emit a clause
+  for a genuinely synthesized key and reintroduce blocker 1's nullability regression.
 - **`DESC` key components.** The old guard also required every component ascending. A
   descending all-columns key (reachable via `ALTER TABLE … ALTER PRIMARY KEY`, and used by
   ordering-seeded maintained-table backing keys) already emitted a clause; confirm it still

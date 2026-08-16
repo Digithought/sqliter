@@ -33,11 +33,16 @@ closed. After a reopen the column behaves as though it had said nothing — the 
 
 ## Why it is limited to non-key columns
 
-A sibling fix (`tickets/review/3-ddl-primary-key-conflict-action-persisted`) made the
+A sibling fix (`tickets/complete/3-ddl-primary-key-conflict-action-persisted`) made the
 *primary key's* conflict action survive, by attaching it to the `PRIMARY KEY` clause the
 key already emits. `ColumnSchema.defaultConflict` is a single field that a column-level
 `primary key`, `not null`, or `null` clause all write to, so for a key column the action
 now has somewhere to ride. A non-key column has no such clause in the emitted text.
+
+One carve-out: a key column of an **all-columns** key is in the same position as a non-key
+column, because that key emits no clause at all. That case is not this ticket — it clears
+with `tickets/implement/debt-retire-synthesized-primary-key-distinction`, which makes every
+key emit its clause, and the round-trip harness pins it in the meantime.
 
 ## Why it was not fixed at the same time
 

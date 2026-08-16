@@ -776,6 +776,17 @@ export function shiftSchemaIndicesForDrop(schema: TableSchema, colIndex: number)
  * snapshot, and `ColumnSchema` objects are not frozen, so in-place mutation would
  * silently corrupt both with nothing to catch it.
  *
+ * NOTE: the key's `ON CONFLICT` action follows the re-key asymmetrically, and that is
+ * observable. A table-level `primary key (a) on conflict replace` lives in
+ * `TableSchema.primaryKeyDefaultConflict`, so it survives and now governs the NEW key;
+ * a column-declared `a integer primary key on conflict replace` lives in
+ * `ColumnSchema.defaultConflict` on `a`, which stops being a key column, so
+ * {@link resolvePkDefaultConflict} reads no action for the new key. `ALTER PRIMARY KEY`
+ * has no `ON CONFLICT` clause of its own (see the `alterPrimaryKey` AST node), so neither
+ * spelling can be restated at ALTER time. Emitted DDL is faithful to whichever the schema
+ * ends up holding. Revisit if `ALTER PRIMARY KEY` ever gains its own conflict clause, or
+ * if the two spellings are expected to be interchangeable across an ALTER.
+ *
  * User-level validation stays with the callers: the memory manager pre-checks by index and
  * the engine emitter (`runAlterPrimaryKey`) validates by column name before dispatch, so
  * NOT NULL membership is not re-checked here. What IS asserted — as {@link
@@ -1263,7 +1274,17 @@ export function findPKDefinition(
  * explicitly-declared all-columns PK has the identical shape and re-synthesizes
  * to an identical schema (a declared PK has already forced its columns NOT NULL),
  * so treating the two alike is sound. The conflict-action guard keeps an explicit
- * `primary key (...) on conflict X` on its own declared emission path.
+ * table-level `primary key (...) on conflict X` on its own declared emission path.
+ *
+ * NOTE: that guard is deliberately partial. An action declared on a key *column*
+ * (`a integer primary key on conflict replace`) leaves `primaryKeyDefaultConflict`
+ * unset, so an all-columns key still matches here, emits no clause, and loses the
+ * action on a round-trip. Widening the guard to {@link resolvePkDefaultConflict}
+ * would emit a `PRIMARY KEY` clause for a genuinely synthesized key whose column
+ * carries a `not null on conflict X` — re-parsing that as a *declared* key would
+ * force its columns NOT NULL, the exact regression this omission exists to avoid.
+ * The retirement below is what clears it; pinned by the
+ * `expectedConflictAfterRoundTrip` cases in `test/table-ddl-round-trip.spec.ts`.
  *
  * NOTE: this predicate — and {@link TableSchema.synthesizedPrimaryKey} with it —
  * is scheduled to go away. Both exist only because a *declared* `PRIMARY KEY`

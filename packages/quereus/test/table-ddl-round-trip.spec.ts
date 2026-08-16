@@ -39,7 +39,8 @@
 import { expect } from 'chai';
 import { Database } from '../src/core/database.js';
 import { generateTableDDL } from '../src/schema/ddl-generator.js';
-import type { TableSchema } from '../src/schema/table.js';
+import { resolvePkDefaultConflict, type TableSchema } from '../src/schema/table.js';
+import { ConflictResolution } from '../src/common/constants.js';
 
 /** Key as `(name[ desc][ collate X], …)` in definition order — the comparison form. */
 function keySpelling(schema: TableSchema): string[] {
@@ -47,6 +48,22 @@ function keySpelling(schema: TableSchema): string[] {
 		const col = schema.columns[pk.index];
 		return col.name + (pk.desc ? ' desc' : '') + (pk.collation ? ` collate ${pk.collation.toLowerCase()}` : '');
 	});
+}
+
+/**
+ * The key's effective conflict action, named, or `'(none)'`. Read through
+ * `resolvePkDefaultConflict` rather than `primaryKeyDefaultConflict` because a
+ * table-level action re-parses onto the column — comparing the raw field would report a
+ * difference where the resolved behaviour is identical.
+ *
+ * A declared ABORT reads as `'(none)'`: every consumer resolves the action as
+ * `statementOnConflict ?? perConstraint ?? ABORT` (memory `layer/manager.ts`, store
+ * `store-table.ts`, `quereus-isolation`), so a declared ABORT and an absent action behave
+ * identically — which is why the emitter elides it.
+ */
+function conflictSpelling(schema: TableSchema): string {
+	const action = resolvePkDefaultConflict(schema);
+	return action === undefined || action === ConflictResolution.ABORT ? '(none)' : ConflictResolution[action];
 }
 
 /** `name: notNull` for every column, in declaration order. */
@@ -86,6 +103,18 @@ interface Shape {
 	expectedClauses: number;
 	/** Expected key, as `keySpelling` renders it. */
 	expectedKey: string[];
+	/** Expected live conflict action, as `conflictSpelling` renders it. Default `'(none)'`. */
+	expectedConflict?: string;
+	/**
+	 * Conflict action expected AFTER the round-trip, when it differs from the live one —
+	 * i.e. a shape whose action the emitter still drops. Only the all-columns keys are in
+	 * this state, and only because they emit no clause for the action to ride; the loss is
+	 * stable (identical on the second emission), so the fixed-point assertion cannot see it
+	 * and this field is what pins it. These entries clear when
+	 * `tickets/implement/3-debt-retire-synthesized-primary-key-distinction` lands and every
+	 * key emits its clause.
+	 */
+	expectedConflictAfterRoundTrip?: string;
 	/**
 	 * Substring the emitted DDL must contain, for shapes whose point is a clause that
 	 * used to be dropped. Absent = no text assertion beyond the clause count.
@@ -156,7 +185,50 @@ const SHAPES: Shape[] = [
 		statements: [`create table t (a integer, b text, primary key (a, b) on conflict replace)`],
 		expectedClauses: 1,
 		expectedKey: ['a collate binary', 'b collate binary'],
+		expectedConflict: 'REPLACE',
 		expectedText: 'PRIMARY KEY ("a", "b") ON CONFLICT REPLACE',
+	},
+	{
+		// The action declared on a PK COLUMN rather than on the table-level clause. It is
+		// still the key's action (resolvePkDefaultConflict reads either), so the table-level
+		// clause has to carry it — emitting from `primaryKeyDefaultConflict` alone dropped it
+		// here while the inline branch kept it.
+		label: 'narrow composite PK, action declared on a key column',
+		statements: [`create table t (a integer not null on conflict replace, b text, c text, primary key (a, b))`],
+		expectedClauses: 1,
+		expectedKey: ['a collate binary', 'b collate binary'],
+		expectedConflict: 'REPLACE',
+		expectedText: 'PRIMARY KEY ("a", "b") ON CONFLICT REPLACE',
+	},
+	{
+		// All-columns shape ⇒ no clause ⇒ nowhere for the action to ride, so it is lost. The
+		// loss is stable, so only expectedConflictAfterRoundTrip catches it.
+		label: 'all-columns PK, action declared on a key column (clause omitted; action lost)',
+		statements: [`create table t (a integer not null on conflict replace, b text, primary key (a, b))`],
+		expectedClauses: 0,
+		expectedKey: ['a collate binary', 'b collate binary'],
+		expectedConflict: 'REPLACE',
+		expectedConflictAfterRoundTrip: '(none)',
+	},
+	{
+		// Same omission, single-column spelling: the lone column IS the whole key, so the
+		// all-columns shape matches and the inline clause that would carry the action is
+		// never emitted.
+		label: 'single-column table, inline PK with ON CONFLICT (clause omitted; action lost)',
+		statements: [`create table t (a integer primary key on conflict replace)`],
+		expectedClauses: 0,
+		expectedKey: ['a collate binary'],
+		expectedConflict: 'REPLACE',
+		expectedConflictAfterRoundTrip: '(none)',
+	},
+	{
+		// The empty-key singleton emits its own clause, so its action rides that.
+		label: 'empty-key singleton with ON CONFLICT',
+		statements: [`create table t (a integer, b text, primary key () on conflict replace)`],
+		expectedClauses: 1,
+		expectedKey: [],
+		expectedConflict: 'REPLACE',
+		expectedText: 'PRIMARY KEY () ON CONFLICT REPLACE',
 	},
 	{
 		// A narrow table-level key with a conflict action lands on the INLINE branch, so
@@ -166,6 +238,7 @@ const SHAPES: Shape[] = [
 		statements: [`create table t (a integer, b text, v integer, primary key (a) on conflict replace)`],
 		expectedClauses: 1,
 		expectedKey: ['a collate binary'],
+		expectedConflict: 'REPLACE',
 		expectedText: '"a" INTEGER NOT NULL PRIMARY KEY ON CONFLICT REPLACE',
 	},
 	{
@@ -176,6 +249,7 @@ const SHAPES: Shape[] = [
 		statements: [`create table t (a integer primary key on conflict replace, b text)`],
 		expectedClauses: 1,
 		expectedKey: ['a collate binary'],
+		expectedConflict: 'REPLACE',
 		expectedText: '"a" INTEGER NOT NULL PRIMARY KEY ON CONFLICT REPLACE',
 	},
 	{
@@ -219,10 +293,12 @@ describe('CREATE TABLE canonical DDL — primary-key round-trip is a fixed point
 			const original = await withTable(shape.statements, schema => ({
 				ddl: generateTableDDL(schema),
 				key: keySpelling(schema),
+				conflict: conflictSpelling(schema),
 				nullability: nullabilitySpelling(schema),
 			}));
 
 			expect(original.key, 'live key').to.deep.equal(shape.expectedKey);
+			expect(original.conflict, 'live conflict action').to.equal(shape.expectedConflict ?? '(none)');
 			expect(countPrimaryKeyClauses(original.ddl), `PRIMARY KEY clause count in: ${original.ddl}`)
 				.to.equal(shape.expectedClauses);
 			if (shape.expectedText) {
@@ -231,14 +307,17 @@ describe('CREATE TABLE canonical DDL — primary-key round-trip is a fixed point
 				expect(original.ddl, 'no ON CONFLICT expected').to.not.contain('ON CONFLICT');
 			}
 
-			// Re-parse equivalence: key and nullability survive the emitted text.
+			// Re-parse equivalence: key, conflict action and nullability survive the emitted text.
 			const reparsed = await withTable([original.ddl], schema => ({
 				ddl: generateTableDDL(schema),
 				key: keySpelling(schema),
+				conflict: conflictSpelling(schema),
 				nullability: nullabilitySpelling(schema),
 			}));
 
 			expect(reparsed.key, `re-parsed key from: ${original.ddl}`).to.deep.equal(original.key);
+			expect(reparsed.conflict, `re-parsed conflict action from: ${original.ddl}`)
+				.to.equal(shape.expectedConflictAfterRoundTrip ?? original.conflict);
 			expect(reparsed.nullability, `re-parsed nullability from: ${original.ddl}`)
 				.to.deep.equal(original.nullability);
 			// Emit twice: the second emission must be byte-identical, so the persisted text
@@ -267,4 +346,30 @@ describe('CREATE TABLE canonical DDL — primary-key round-trip is a fixed point
 		expect(rehydrated.key).to.deep.equal(['a collate binary', 'b collate binary']);
 		expect(rehydrated.nullability).to.deep.equal(['a: not null', 'b: not null']);
 	});
+
+	// The assertions above are about the schema; these two are about what a duplicate-key
+	// write actually DOES after a table has been persisted and re-parsed, which is the
+	// behaviour the emitted `ON CONFLICT` exists to preserve.
+	for (const [label, create] of [
+		['table-level', `create table t (a integer, b text, v integer, primary key (a) on conflict replace)`],
+		['column-declared', `create table t (a integer primary key on conflict replace, b text, v integer)`],
+	] as const) {
+		it(`a ${label} REPLACE key still replaces after its DDL round-trips`, async () => {
+			const ddl = await withTable([create], generateTableDDL);
+
+			const db = new Database();
+			try {
+				await db.exec(ddl);
+				await db.exec(`insert into t values (1, 'first', 10)`);
+				// Second write collides on the key. REPLACE overwrites the row; ABORT — the
+				// default the action used to decay to — throws a constraint error instead.
+				await db.exec(`insert into t values (1, 'second', 20)`);
+				const rows = [];
+				for await (const row of db.eval(`select b, v from t`)) rows.push(row);
+				expect(rows).to.deep.equal([{ b: 'second', v: 20 }]);
+			} finally {
+				await db.close();
+			}
+		});
+	}
 });

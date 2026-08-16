@@ -19,7 +19,7 @@
 
 import type { Database } from '../core/database.js';
 import type { TableSchema, IndexSchema, RowConstraintSchema, UniqueConstraintSchema, ForeignKeyConstraintSchema, NamedConstraintClass } from './table.js';
-import { maskToOps, isSynthesizedAllColumnsKey } from './table.js';
+import { maskToOps, isSynthesizedAllColumnsKey, resolvePkDefaultConflict } from './table.js';
 import type { ColumnSchema } from './column.js';
 import type { ViewSchema } from './view.js';
 import { normalizeBackingModule } from './view.js';
@@ -129,8 +129,12 @@ function generateTableDDLInternal(
 
 	// The declared `ON CONFLICT` action rides whichever clause ends up carrying the key
 	// (see pkConflictClause) — without it a `primary key (...) on conflict replace`
-	// re-parses as ABORT and stops replacing after a persistence reopen.
-	const pkConflict = pkConflictClause(tableSchema.primaryKeyDefaultConflict);
+	// re-parses as ABORT and stops replacing after a persistence reopen. Resolved through
+	// resolvePkDefaultConflict, not the raw `primaryKeyDefaultConflict` field, so a
+	// column-declared action (`a integer not null on conflict replace, … primary key (a, b)`)
+	// reaches the table-level clause too — reading the field alone dropped it there, and
+	// dropped it stably enough that the fixed-point assertion could not see it.
+	const pkConflict = pkConflictClause(resolvePkDefaultConflict(tableSchema));
 
 	const columnDefs: string[] = tableSchema.columns.map((col, columnIndex) =>
 		formatColumnDef(col, tableSchema, ctx.defaultNotNull, columnIndex === inlinePkIndex, pkConflict));
@@ -557,12 +561,11 @@ function formatColumnDef(col: ColumnSchema, tableSchema: TableSchema, defaultNot
 	// would otherwise silently re-key ascending).
 	if (isInlinePk) {
 		colDef += tableSchema.primaryKeyDefinition[0].desc ? ' PRIMARY KEY DESC' : ' PRIMARY KEY';
-		// Precedence mirrors resolvePkDefaultConflict: a table-level
-		// `PRIMARY KEY (...) ON CONFLICT X` first, else this column's own action. The
-		// fallback is what makes the emission a fixed point — a table-level action
-		// re-parses onto the column (`ColumnSchema.defaultConflict`), so the second
-		// emission has only the column-level record to read.
-		colDef += pkConflict || pkConflictClause(col.defaultConflict);
+		// `pkConflict` already folds in this column's own action (resolvePkDefaultConflict
+		// reads the column-level record when no table-level one is set), which is what makes
+		// the emission a fixed point — a table-level action re-parses ONTO the column, so the
+		// second emission has only the column-level record to read.
+		colDef += pkConflict;
 	}
 
 	if (col.defaultValue !== null && col.defaultValue !== undefined) {
