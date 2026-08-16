@@ -72,6 +72,23 @@ too. Key comparison and UNIQUE enforcement answering NULL differently is the sta
 ships today; relaxing the PK rule widens where an existing rule applies rather than introducing a
 new one. It is still worth stating explicitly rather than leaving a reader to discover it.
 
+## Maintainer direction (recorded 2026-08-15)
+
+The maintainer — who owns both this repo and lamina — has stated the decision that motivates this
+ticket: **an undeclared all-columns key is syntactic sugar for the declared one**, not a different
+kind of key. That is Option A below. Plan against A; do not re-litigate A vs B, and do not treat the
+lamina side's preference as an outside opinion — it is the same person's call on both boards.
+
+Backwards compatibility is **not** a constraint on this change. The only downstream consumer is
+SiteCAD, which is unreleased. Where a choice below is weighed against "existing databases would have
+to migrate", resolve it in favour of the correct end state.
+
+Two things still need a human answer and are **not** settled by the above; surface them from the plan
+rather than deciding them silently:
+
+1. What an FK referencing a parent key that contains NULL means (the MATCH SIMPLE question below).
+2. Whether `create table … (x integer null, primary key (x))` should emit an advisory.
+
 ## What to decide
 
 Pick one and apply it to both spellings:
