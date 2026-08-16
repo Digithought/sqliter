@@ -239,15 +239,18 @@ analysis, and UNIQUE enforcement compare under. The schema entry points:
   no-`COLLATE` column to `BINARY`, so the reloaded collation matches what the physical
   keys were written under. (A persisted DDL whose declared collation does not match its
   key bytes loads as-declared — see `store-pk-collate-legacy-reopen-divergence`.)
-- **`ALTER COLUMN … SET COLLATE` on a PK column, and `ALTER TABLE … ALTER PRIMARY KEY`,**
-  are both honored by a **physical re-key**: `StoreTable.rekeyRows` re-encodes every
-  data-store key under the new key definition (a new collation for SET COLLATE, a new
-  column set for ALTER PRIMARY KEY) and `rebuildSecondaryIndexes` rebuilds each secondary
-  index non-enforcing (its keys embed the PK suffix; uniqueness was already judged
-  pre-mutation, see below). Before anything is flushed or mutated, both arms ask
+- **`ALTER COLUMN … SET COLLATE` on a PK column, `ALTER COLUMN … SET NOT NULL` on a PK
+  column when it backfills, and `ALTER TABLE … ALTER PRIMARY KEY`,** are all honored by a
+  **physical re-key**: `StoreTable.rekeyRows` re-encodes every data-store key under the new
+  key definition (a new collation for SET COLLATE, the backfilled value for SET NOT NULL —
+  the value rewrite runs first so the re-key reads the rewritten row — a new column set for
+  ALTER PRIMARY KEY) and `rebuildSecondaryIndexes` rebuilds each secondary index
+  non-enforcing (its keys embed the PK suffix; uniqueness was already judged pre-mutation,
+  see below). Before anything is flushed or mutated, every arm asks
   `StoreTable.validateRekeyedPrimaryKey` the memory backend's two re-key questions over two
-  different row sets (see [memory-table.md](memory-table.md) §"A collation change on a
-  PRIMARY KEY column obeys a stricter rule" — the store mirrors it status-for-status): a
+  different row sets (see [memory-table.md](memory-table.md) §"A change that moves a
+  PRIMARY KEY column's keys obeys a stricter rule" — the store mirrors it status-for-status;
+  for the backfill both probes judge the rows as the rewrite will leave them): a
   collision among the rows the DDL transaction can *see* (its staged rows included, via the
   isolation wrapper's effective row stream) throws `CONSTRAINT` naming the key; a collision
   confined to committed rows the transaction has *deleted* — rows a `rollback` must restore,

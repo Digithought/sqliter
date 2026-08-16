@@ -2944,6 +2944,175 @@ describe('IsolationModule', () => {
 		});
 	});
 
+	describe('SET NOT NULL on a nullable PRIMARY KEY column re-keys the overlay like SET COLLATE does', () => {
+		// A table with no declared PRIMARY KEY is keyed by ALL its columns, which stay nullable, so
+		// the null → DEFAULT backfill of `set not null` moves the KEY values. The overlay stages
+		// deletion markers by the committed row's key, and that key just moved under them in the
+		// underlying — so the marker must move too (`backfillStagedNotNull` with `rekeysMarkers`),
+		// a marker collapsing onto a live row is dropped first (`dropCollapsedPkRekeyMarkers`),
+		// and two live rows converging on one key are refused / poison exactly as under a
+		// collation re-key. The cross-backend `.sqllogic` (41.2.3) covers the issuer path through
+		// SQL; these pin the overlay's internal state and the foreign-overlay routing.
+		let iso: IsolationModule;
+
+		beforeEach(() => {
+			iso = new IsolationModule({ underlying: new MemoryTableModule() });
+			db.registerModule('isolated', iso);
+		});
+
+		function overlayRows(table: string): Promise<Row[]> {
+			const state = iso.getConnectionOverlay(db, 'main', table)!;
+			return asyncIterableToArray(state.overlayTable.query!(makeFullScanFilterInfo()));
+		}
+
+		it('re-keys a staged deletion marker whose committed row the backfill moved, so the delete lands at COMMIT', async () => {
+			await db.exec(`CREATE TABLE nk (x INTEGER NULL DEFAULT 0, y INTEGER NULL) USING isolated`);
+			await db.exec(`INSERT INTO nk (x, y) VALUES (NULL, 1), (NULL, 2)`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`DELETE FROM nk WHERE x IS NULL AND y = 1`);
+			expect((await overlayRows('nk')).map(r => [r[0], r[1], r[2]]), 'marker minted at the NULL key').to.deep.equal([[null, 1, 1]]);
+
+			await db.exec(`ALTER TABLE nk ALTER COLUMN x SET NOT NULL`);
+
+			// The marker followed the committed row's key: NULL → DEFAULT at the key column.
+			expect((await overlayRows('nk')).map(r => [r[0], r[1], r[2]]), 'marker re-keyed to the backfilled key').to.deep.equal([[0, 1, 1]]);
+			const inTxn = await asyncIterableToArray(db.eval(`SELECT x, y FROM nk`));
+			expect(inTxn.map((r: any) => [r.x, r.y]), 'the deleted row stays deleted in the transaction').to.deep.equal([[0, 2]]);
+
+			await db.exec(`COMMIT`);
+			const rows = await asyncIterableToArray(db.eval(`SELECT x, y FROM nk`));
+			expect(rows.map((r: any) => [r.x, r.y]), 'the flush deleted the re-keyed row — no resurrection').to.deep.equal([[0, 2]]);
+		});
+
+		it('drops a marker the backfill collapses onto a staged live row, then backfills the live row', async () => {
+			await db.exec(`CREATE TABLE nc (x INTEGER NULL DEFAULT 0, y INTEGER NULL) USING isolated`);
+			await db.exec(`INSERT INTO nc (x, y) VALUES (0, 1)`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`DELETE FROM nc WHERE x = 0 AND y = 1`);
+			await db.exec(`INSERT INTO nc (x, y) VALUES (NULL, 1)`);
+			await db.exec(`ALTER TABLE nc ALTER COLUMN x SET NOT NULL`);
+
+			// Without the drop the live row's backfill update would collide with the marker at
+			// (0, 1) — the overlay's PK covers markers — and the migrate step would fail.
+			expect((await overlayRows('nc')).map(r => [r[0], r[1], r[2]]), 'marker collapsed onto the live row').to.deep.equal([[0, 1, 0]]);
+
+			await db.exec(`COMMIT`);
+			const rows = await asyncIterableToArray(db.eval(`SELECT x, y FROM nc`));
+			expect(rows.map((r: any) => [r.x, r.y])).to.deep.equal([[0, 1]]);
+		});
+
+		it('leaves a marker at its NULL key when the tightening is metadata-only (no visible NULL)', async () => {
+			// The underlyings backfill only when a NULL is visible in the issuer's effective rows;
+			// otherwise the committed keys do not move and the marker must not either.
+			await db.exec(`CREATE TABLE nm (x INTEGER NULL DEFAULT 0, y INTEGER NULL) USING isolated`);
+			await db.exec(`INSERT INTO nm (x, y) VALUES (NULL, 1), (2, 2)`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`DELETE FROM nm WHERE x IS NULL AND y = 1`);
+			await db.exec(`ALTER TABLE nm ALTER COLUMN x SET NOT NULL`);
+			expect((await overlayRows('nm')).map(r => [r[0], r[1], r[2]]), 'marker untouched').to.deep.equal([[null, 1, 1]]);
+
+			await db.exec(`COMMIT`);
+			const rows = await asyncIterableToArray(db.eval(`SELECT x, y FROM nm`));
+			expect(rows.map((r: any) => [r.x, r.y]), 'the delete still landed').to.deep.equal([[2, 2]]);
+		});
+
+		describe('foreign overlays under a cross-connection key-column backfill', () => {
+			// Same white-box shape as the SET COLLATE foreign-overlay suite: two Databases share
+			// one IsolationModule, overlays are injected directly, the ALTER is driven through
+			// iso.alterTable(dbA, …). Rows are FULL overlay rows `[x, y, tombstoneFlag]`.
+			let isoShared: IsolationModule;
+			let dbA: Database; // the ALTER issuer
+			let dbB: Database; // the foreign connection
+
+			const setNotNull: SchemaChangeInfo = { type: 'alterColumn', columnName: 'x', setNotNull: true };
+
+			beforeEach(async () => {
+				isoShared = new IsolationModule({ underlying: new MemoryTableModule() });
+				dbA = new Database();
+				dbB = new Database();
+				dbA.registerModule('isolated', isoShared);
+				await dbA.exec(`create table cn (x integer null default 0, y integer null) using isolated`);
+			});
+
+			afterEach(async () => {
+				await dbA.close();
+				await dbB.close();
+			});
+
+			async function injectOverlayRows(forDb: Database, rows: SqlValue[][]): Promise<void> {
+				const underlying = isoShared.getUnderlyingState('main', 'cn')!.underlyingTable;
+				const overlay = await isoShared.overlayModule.create(forDb, isoShared.createOverlaySchema(underlying.tableSchema!));
+				for (const r of rows) {
+					await overlay.update({ operation: 'insert', values: r });
+				}
+				isoShared.setConnectionOverlay(forDb, 'main', 'cn', { overlayTable: overlay, hasChanges: true, db: forDb });
+			}
+
+			function committedRows(): Promise<Row[]> {
+				return asyncIterableToArray(isoShared.getUnderlyingState('main', 'cn')!.underlyingTable.query!(makeFullScanFilterInfo()));
+			}
+
+			it('poisons a foreign overlay whose two staged live rows converge under the backfill', async () => {
+				await dbA.exec(`insert into cn (x, y) values (null, 9)`); // the issuer's visible NULL triggers the backfill
+				await injectOverlayRows(dbB, [[null, 1, 0], [0, 1, 0]]);
+
+				const updated = await isoShared.alterTable(dbA, 'main', 'cn', setNotNull);
+				expect(updated.columns.find(c => c.name === 'x')!.notNull, 'the ALTER applied for the issuer').to.equal(true);
+				expect((await committedRows()).map(r => [r[0], r[1]]), 'the committed NULL row was backfilled').to.deep.equal([[0, 9]]);
+
+				const bState = isoShared.getConnectionOverlay(dbB, 'main', 'cn')!;
+				expect(bState.poison, 'a real staged duplicate must poison, not migrate').to.not.be.undefined;
+				expect(bState.poison!.message).to.match(/NOT NULL/);
+				expect(bState.poison!.message).to.match(/roll back this transaction/i);
+
+				// The rejection fired in the pre-validation pass: both staged rows are intact.
+				const bRows = await asyncIterableToArray(bState.overlayTable.query!(makeFullScanFilterInfo()));
+				expect(bRows.map(r => [r[0], r[1]]).sort(), 'no staged row was touched').to.deep.equal([[null, 1], [0, 1]]);
+
+				let commitErr: unknown;
+				try { await isoShared.commitConnectionOverlays(dbB); } catch (e) { commitErr = e; }
+				expect(commitErr, 'poisoned overlay must abort the commit').to.be.instanceOf(QuereusError);
+				expect((commitErr as QuereusError).code).to.equal(StatusCode.CONSTRAINT);
+			});
+
+			it("re-keys a foreign overlay's deletion marker so its delete still lands after the issuer's backfill", async () => {
+				await dbA.exec(`insert into cn (x, y) values (null, 1), (null, 2)`);
+				await injectOverlayRows(dbB, [[null, 1, 1]]); // B deleted the committed (NULL, 1)
+				const before = isoShared.getConnectionOverlay(dbB, 'main', 'cn')!.overlayTable;
+
+				await isoShared.alterTable(dbA, 'main', 'cn', setNotNull);
+				expect((await committedRows()).map(r => [r[0], r[1]]).sort(), 'both committed rows backfilled').to.deep.equal([[0, 1], [0, 2]]);
+
+				const bState = isoShared.getConnectionOverlay(dbB, 'main', 'cn')!;
+				expect(bState.poison, 'a lone marker adopts the change').to.be.undefined;
+				expect(bState.overlayTable, 'adopted IN PLACE').to.equal(before);
+				const bRows = await asyncIterableToArray(bState.overlayTable.query!(makeFullScanFilterInfo()));
+				expect(bRows.map(r => [r[0], r[1], r[2]]), 'the marker followed the committed key').to.deep.equal([[0, 1, 1]]);
+
+				await isoShared.commitConnectionOverlays(dbB);
+				expect((await committedRows()).map(r => [r[0], r[1]]), "B's delete removed the re-keyed row").to.deep.equal([[0, 2]]);
+			});
+
+			it('collapses a foreign marker onto its backfilled live replacement and commits the replacement', async () => {
+				await dbA.exec(`insert into cn (x, y) values (0, 1), (null, 2)`);
+				await injectOverlayRows(dbB, [[0, 1, 1], [null, 1, 0]]); // B deleted (0, 1) and staged (NULL, 1)
+
+				await isoShared.alterTable(dbA, 'main', 'cn', setNotNull);
+
+				const bState = isoShared.getConnectionOverlay(dbB, 'main', 'cn')!;
+				expect(bState.poison, 'a collapsible pair adopts the change').to.be.undefined;
+				const bRows = await asyncIterableToArray(bState.overlayTable.query!(makeFullScanFilterInfo()));
+				expect(bRows.map(r => [r[0], r[1], r[2]]), 'marker dropped, live row backfilled').to.deep.equal([[0, 1, 0]]);
+
+				await isoShared.commitConnectionOverlays(dbB);
+				expect((await committedRows()).map(r => [r[0], r[1]]).sort()).to.deep.equal([[0, 1], [0, 2]]);
+			});
+		});
+	});
+
 	describe('in-transaction column-shape ALTER keeps the overlay tombstone flag last', () => {
 		// The overlay stages rows as [data columns..., tombstone flag] and every read/write
 		// path assumes the flag is LAST. A bare addColumn forward to the overlay would append

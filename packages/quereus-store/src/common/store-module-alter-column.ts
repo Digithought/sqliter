@@ -172,6 +172,11 @@ export abstract class StoreModuleAlterColumn extends StoreModuleIndex {
 		// while tables covered by several UNIQUE constraints over one column are rare; if a
 		// wide-constraint table makes ALTER COLUMN slow, judge all covering constraints in a
 		// single pass (one `seen` Set per constraint, one stream).
+		// The per-row form of `valueConvert`, shared by every pre-mutation probe that has to judge
+		// the rows as the deferred rewrite will leave them (the memory module's `convertRowAtIndex`
+		// counterpart). Undefined for a change that rewrites nothing.
+		const convertRow = valueConvert ? makeRowConverter(colIndex, valueConvert) : undefined;
+
 		if (collationChanged || keyTransformChanged || rewritesValues) {
 			const coveringConstraints = (updatedSchema.uniqueConstraints ?? [])
 				.filter(uc => uc.columns.includes(colIndex));
@@ -179,7 +184,7 @@ export abstract class StoreModuleAlterColumn extends StoreModuleIndex {
 				// Fresh generator per constraint — an async generator is single-shot.
 				const effectiveRows = effectiveDdlRows(table, rows);
 				await validateUniqueOverExistingRows(
-					valueConvert ? convertRowsAtIndex(effectiveRows, colIndex, valueConvert) : effectiveRows,
+					convertRow ? mapRowsAsync(effectiveRows, convertRow) : effectiveRows,
 					updatedSchema,
 					uc,
 					db.getKeyNormalizerResolver(),
@@ -187,13 +192,18 @@ export abstract class StoreModuleAlterColumn extends StoreModuleIndex {
 			}
 		}
 
-		// SET COLLATE on a PRIMARY KEY member (Option B physical re-key): re-encode
-		// every data-store key under the column's new key collation, then rebuild every
-		// secondary index (its keys embed the PK suffix). Runs AFTER the non-PK UNIQUE
-		// re-validation above so every throw-only check precedes the first store
-		// mutation. `updatedSchema.columns` carries the new collation, so the new key
-		// bytes follow it.
-		const pkRekeyNeeded = (collationChanged || keyTransformChanged)
+		// A change that moves a PRIMARY KEY member's KEY BYTES (Option B physical re-key):
+		// SET COLLATE (new key collation), a key-transform change, or the SET NOT NULL
+		// null → DEFAULT backfill (the key VALUES themselves move — a key column is nullable
+		// whenever the table's identity is its full column set, so two NULL keys can converge
+		// on one DEFAULT). Re-encode every data-store key, then rebuild every secondary index
+		// (its keys embed the PK suffix). The pre-mutation probes below run AFTER the non-PK
+		// UNIQUE re-validation above so every throw-only check precedes the first store
+		// mutation. `updatedSchema.columns` carries the new collation, so the new key bytes
+		// follow it; for the backfill the new key follows the REWRITTEN value, which is why the
+		// value rewrite is applied before `rekeyRows` (see the block order below). A retype of a
+		// PK member never gets here — `alterColumnSetDataType` refuses it.
+		const pkRekeyNeeded = (collationChanged || keyTransformChanged || rewritesValues)
 			&& oldSchema.primaryKeyDefinition.some(def => def.index === colIndex);
 		if (pkRekeyNeeded) {
 			// The two throw-only re-key questions — "is the change legal?" over the rows
@@ -208,16 +218,44 @@ export abstract class StoreModuleAlterColumn extends StoreModuleIndex {
 			// insert colliding with a committed row was caught by neither side) — else
 			// this module's own effective entries, which include its buffered ops, so a
 			// pending insert that is itself the duplicate is caught without flushing.
+			// Both probes judge the CONVERTED rows for a value-rewriting change (the store
+			// still holds the old values), so the committed probe sees exactly the
+			// collision the backfill would create among rows a rollback must restore.
 			await table.validateRekeyedPrimaryKey(
 				oldSchema.primaryKeyDefinition,
 				updatedSchema.columns,
 				effectiveDdlRows(table, rows),
+				convertRow,
 			);
+		}
+
+		// Deferred value rewrite (SET DATA TYPE physical conversion / SET NOT NULL DEFAULT
+		// backfill): every throw-only check above has passed, so the store mutation is now
+		// safe — a rejected ALTER never reaches this point, leaving values, DDL and the
+		// transaction untouched. Flush buffered writes first so `mapRowsAtIndex` rewrites this
+		// transaction's rows too; unflushed, they would replay under the OLD physical type
+		// (see `StoreModuleBase.ddlCommitPendingOps`).
+		//
+		// Runs BEFORE the PK re-key block: `mapRowsAtIndex` is a payload-only rewrite that keeps
+		// each stored key verbatim, and `rekeyRows` recomputes every key from the STORED row — so
+		// when both fire for one statement (the SET NOT NULL backfill of a key member) the
+		// re-key must read the already-rewritten values, or the keys would keep encoding the
+		// old NULL while the value moved to the DEFAULT (unfindable by lookup, deletable by
+		// nothing, and duplicable by an INSERT of the same values). The re-key's own index
+		// rebuild then encodes the rewritten values too, so the rebuild after it is skipped
+		// (`!pkRekeyNeeded`) and every index is built exactly once.
+		if (valueConvert) {
+			await this.ddlCommitPendingOps();
+			storeMutated = true;
+			await table.mapRowsAtIndex(colIndex, valueConvert);
+		}
+
+		if (pkRekeyNeeded) {
 			// Physical re-key ahead — flush buffered writes (see
-			// `StoreModuleBase.ddlCommitPendingOps`). Every refusal this arm can make has
-			// already run above, reading effectively and throwing without the flush, so a
-			// rejected ALTER keeps the transaction alive; `rekeyRows`' own pass 1 is now a
-			// backstop, not the gate.
+			// `StoreModuleBase.ddlCommitPendingOps`; a re-flush after the value rewrite's own is
+			// a no-op). Every refusal this arm can make has already run above, reading
+			// effectively and throwing without the flush, so a rejected ALTER keeps the
+			// transaction alive; `rekeyRows`' own pass 1 is now a backstop, not the gate.
 			await this.ddlCommitPendingOps();
 			storeMutated = true;
 			await table.rekeyRows(oldSchema.primaryKeyDefinition, updatedSchema.columns);
@@ -232,30 +270,6 @@ export abstract class StoreModuleAlterColumn extends StoreModuleIndex {
 			// it cannot newly collide (the PK-suffix change never affects index-column
 			// uniqueness). See `rebuildSecondaryIndexes`' skipDuplicateCheck contract.
 			await this.rebuildSecondaryIndexes(schemaName, tableName, table, withImplicitUniqueIndexes(updatedSchema), db.getKeyNormalizerResolver(), true);
-		}
-
-		// Deferred value rewrite (SET DATA TYPE physical conversion / SET NOT NULL DEFAULT
-		// backfill): every throw-only check above has passed, so the store mutation is now
-		// safe — a rejected ALTER never reaches this point, leaving values, DDL and the
-		// transaction untouched. Flush buffered writes first so `mapRowsAtIndex` rewrites this
-		// transaction's rows too; unflushed, they would replay under the OLD physical type
-		// (see `StoreModuleBase.ddlCommitPendingOps`; a re-flush after the PK re-key's own is a no-op).
-		//
-		// NOTE: `valueConvert` and `pkRekeyNeeded` cannot both be set today, and this ordering
-		// depends on that. `valueConvert` comes only from SET DATA TYPE or SET NOT NULL;
-		// SET NOT NULL changes neither collation nor logical type, so it never sets
-		// `pkRekeyNeeded`, and SET DATA TYPE on a PK member is refused both upstream (every live
-		// caller — the engine's ALTER COLUMN emitter, see `runAlterColumn` in
-		// runtime/emit/alter-table.ts, and the materialized-view reshape, which declares a
-		// key-column retype inexpressible) AND locally, by `alterColumnSetDataType` itself. If a
-		// PK-member retype is ever admitted (that local guard removed), this rewrite must move IN
-		// FRONT of the `pkRekeyNeeded` block: otherwise `rekeyRows` and its index rebuild encode
-		// the PRE-rewrite values and the rebuild below is skipped, leaving keys and indexes
-		// disagreeing with the stored values.
-		if (valueConvert) {
-			await this.ddlCommitPendingOps();
-			storeMutated = true;
-			await table.mapRowsAtIndex(colIndex, valueConvert);
 		}
 
 		// The value rewrite above changed stored column values in place (same PK, new value) —
@@ -396,16 +410,13 @@ async function alterColumnSetNotNull(
  * canonical spelling ('2024-06-05T00:00:00Z' → '2024-06-05') — exactly as an INSERT
  * would have stored them.
  *
- * A retype of a PRIMARY KEY member is refused here rather than converted: the rewrite
- * below is `mapRowsAtIndex`, a payload-only rewrite that reuses `entry.key` verbatim, so
- * a PK column's physical key bytes would stay encoded under the OLD type while the value
- * moves to the new one — unfindable by any lookup under the new encoding, and the same
- * `keyTransformChanged` path in the caller would re-key from the pre-rewrite values before
- * this rewrite ever ran (see the NOTE above the `valueConvert` block in
- * {@link alterColumnChange}). Every live SQL caller already refuses this earlier (the
- * engine's `runAlterColumn` and the materialized-view reshape's inexpressibility check),
- * so this only guards a direct module call — mirrors the memory backend's carve-out
- * (`MemoryTableManager.alterColumn`).
+ * A retype of a PRIMARY KEY member is refused here rather than converted. The caller's
+ * value-rewrite → re-key ordering (see {@link alterColumnChange}) would now carry the key
+ * bytes along mechanically, but a retype also moves the key's TYPE and comparator, and
+ * every live SQL caller already refuses it earlier (the engine's `runAlterColumn` and the
+ * materialized-view reshape's inexpressibility check), so this only guards a direct module
+ * call — mirrors the memory backend's carve-out (`MemoryTableManager.alterColumn`). Lifting
+ * it is a decision for `feat-`-level work, not a store-side detail.
  */
 async function alterColumnSetDataType(
 	table: StoreTable,
@@ -480,21 +491,24 @@ function alterColumnSetCollation(
 }
 
 /**
- * Read-side wrap for a value-rewriting ALTER COLUMN's pre-mutation UNIQUE probe: each row's
- * value at `colIndex` run through `convert` (the sub-branch's deferred `valueConvert`, which
- * owns its own NULL handling), so the probe judges the POST-alter values while the store
- * still holds the old ones. Mutates nothing — the memory module's `convertRowAtIndex`
- * counterpart. A conversion failure propagates: the setDataType pre-pass already proved
- * every visible value convertible, so a throw here is unreachable, and surfacing it beats
- * probing a stale value that could mask a collision.
+ * The per-row form of a value-rewriting ALTER COLUMN's deferred `valueConvert` (which owns its
+ * own NULL handling): the value at `colIndex` run through it, the row returned unchanged — same
+ * object — when the value did not move. Read-side only, mutates nothing — the memory module's
+ * `convertRowAtIndex` counterpart. Every pre-mutation probe that must judge the POST-alter rows
+ * while the store still holds the old ones (the UNIQUE re-validation, both primary-key re-key
+ * probes) goes through this one mapper so they cannot disagree about what "the converted row"
+ * is. A conversion failure propagates: the setDataType pre-pass already proved every visible
+ * value convertible, so a throw here is unreachable, and surfacing it beats probing a stale
+ * value that could mask a collision.
  */
-async function* convertRowsAtIndex(
-	rows: AsyncIterable<Row>,
-	colIndex: number,
-	convert: (v: SqlValue) => SqlValue,
-): AsyncIterable<Row> {
-	for await (const row of rows) {
+function makeRowConverter(colIndex: number, convert: (v: SqlValue) => SqlValue): (row: Row) => Row {
+	return (row: Row): Row => {
 		const newVal = convert(row[colIndex]);
-		yield newVal === row[colIndex] ? row : row.map((v, i) => i === colIndex ? newVal : v) as Row;
-	}
+		return newVal === row[colIndex] ? row : row.map((v, i) => i === colIndex ? newVal : v) as Row;
+	};
+}
+
+/** Applies `mapRow` to an async row stream — the read-side wrap the UNIQUE probe consumes. */
+async function* mapRowsAsync(rows: AsyncIterable<Row>, mapRow: (row: Row) => Row): AsyncIterable<Row> {
+	for await (const row of rows) yield mapRow(row);
 }

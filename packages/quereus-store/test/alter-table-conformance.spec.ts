@@ -482,6 +482,45 @@ const ARMS: Arm[] = [
 			}
 		},
 	},
+	{
+		// PK member (a table with no declared key is keyed by ALL its columns, which stay
+		// nullable), SET NOT NULL whose null → DEFAULT backfill moves the KEY values: the
+		// backfill is a physical re-key, so the value rewrite runs first and `rekeyRows` then
+		// re-encodes each data key from the rewritten row. Read-back proves the key followed
+		// the value: the backfilled row is findable by an equality seek on its new key,
+		// deletable, and an INSERT of the same values collides with it (pre-fix the payload was
+		// rewritten under the old NULL-encoding key — unfindable, undeletable, duplicable).
+		label: 'alterColumn SET NOT NULL backfill on a nullable key member (no collision) → honored re-key',
+		seed: [`create table t (x integer null default 7, y integer null) using store`, `insert into t (x, y) values (null, 1), (3, 1)`],
+		alter: `alter table t alter column x set not null`,
+		expect: { kind: 'honored' },
+		confirm: async (db) => {
+			expect((await columnInfo(db, 'x'))?.notnull, 'column tightened').to.equal(1);
+			expect((await rows(db, `select x, y from t where x = 7 and y = 1`)).map(r => [r.x, r.y]), 'backfilled row findable by its new key').to.deep.equal([[7, 1]]);
+			await expectConstraint(db, `insert into t (x, y) values (7, 1)`, 're-keyed row occupies its key');
+			await db.exec(`delete from t where x = 7 and y = 1`);
+			expect((await rows(db, `select x, y from t`)).map(r => [r.x, r.y]), 'backfilled row deletable by its new key').to.deep.equal([[3, 1]]);
+		},
+	},
+	{
+		// PK member, SET NOT NULL whose backfill would COLLAPSE two rows onto one key: (NULL, 1)
+		// and (0, 1) become one row under `default 0`. The re-key's pre-mutation probe (over the
+		// rows AS the backfill will leave them) throws CONSTRAINT WITHOUT mutating the store —
+		// mirroring the SET COLLATE collision arm above.
+		label: 'alterColumn SET NOT NULL backfill on a nullable key member that collides → CONSTRAINT',
+		seed: [`create table t (x integer null default 0, y integer null) using store`, `insert into t (x, y) values (null, 1), (0, 1)`],
+		alter: `alter table t alter column x set not null`,
+		expect: { kind: 'reject', codes: [StatusCode.CONSTRAINT], site: /unique|primary key|duplicate/i },
+		confirm: async (db, outcome) => {
+			expect((await columnInfo(db, 'x'))?.notnull, 'nullability unchanged after reject').to.equal(0);
+			if (outcome === 'rejected') {
+				expect((await rows(db, `select count(*) as n from t`))[0].n, 'both rows survive the rejected backfill').to.equal(2);
+				expect((await rows(db, `select count(*) as n from t where x is null`))[0].n, 'the NULL key is still NULL').to.equal(1);
+				await db.exec(`insert into t (x, y) values (5, 5)`); // still writable
+				expect((await rows(db, `select count(*) as n from t`))[0].n, 'table writable post-reject').to.equal(3);
+			}
+		},
+	},
 ];
 
 // ── Driver ────────────────────────────────────────────────────────────────────

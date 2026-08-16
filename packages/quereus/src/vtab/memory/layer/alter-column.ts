@@ -81,7 +81,14 @@ export interface AlterColumnPlan {
 	 * {@link rewrite}, whose full-rebuild path subsumes the comparator-only re-sort).
 	 */
 	readonly structuresRekeyed: boolean;
-	/** `set collate` moved a PRIMARY KEY member's collation — the primary tree itself re-keys. */
+	/**
+	 * The altered column is a PRIMARY KEY member and the change moves its keys — `set collate`
+	 * (the comparator moves; values untouched) or the `set not null` null → DEFAULT backfill
+	 * (the key VALUES move; two NULL keys can converge on one DEFAULT). Either way the primary
+	 * tree re-keys and the change takes the primary-key collision pre-pass
+	 * (`MemoryTableManager.validateRekeyedPrimaryKey`). A retype of a key member never gets
+	 * here — {@link planSetDataType} refuses it.
+	 */
 	readonly pkColumnRekeyed: boolean;
 }
 
@@ -193,10 +200,17 @@ export async function planSetNotNull(ctx: AlterColumnContext, setNotNull: boolea
  * visible, either reject or backfill from the column's DEFAULT.
  *
  * The backfill maps null → the folded DEFAULT literal, routed through the SAME base-replacement
- * + open-layer conversion machinery `set data type` uses — no logical-type change, no PK re-key,
- * no in-place base mutation. (An in-place `tree.upsert` backfill could not fill the transaction's
- * pending rows — they live in the pending layer, not the base — and mutated a base the open
- * layers derive from.)
+ * + open-layer conversion machinery `set data type` uses — no logical-type change, no in-place
+ * base mutation. (An in-place `tree.upsert` backfill could not fill the transaction's pending
+ * rows — they live in the pending layer, not the base — and mutated a base the open layers
+ * derive from.)
+ *
+ * On a PRIMARY KEY member the backfill moves the key VALUES: a nullable key column (a table with
+ * no declared key is keyed by ALL its columns, which stay nullable) can hold two rows that differ
+ * only by NULL-vs-DEFAULT there, and the backfill would merge them. So {@link buildAlterColumnPlan}
+ * flags it `pkColumnRekeyed`, the manager runs the primary-key collision pre-pass over the
+ * CONVERTED rows, and each open layer re-derives its staged deletion keys under the backfilled
+ * values (`TransactionLayer.convertColumn`).
  */
 async function planTightenNotNull(ctx: AlterColumnContext, oldCol: ColumnSchema): Promise<ColumnAttributeChange> {
 	const newCol: ColumnSchema = { ...oldCol, notNull: true };
@@ -333,11 +347,14 @@ export function buildAlterColumnPlan(
 		indexes: updatedIndexes ? Object.freeze(updatedIndexes) : updatedIndexes,
 	});
 
+	// A key member's keys move under a collation change (comparator) or a value rewrite (the
+	// backfill; a retype is refused upstream) — both need the primary-key pre-pass and re-key.
+	const isPkMember = updatedPkDef.some(def => def.index === colIndex);
 	return {
 		colIndex,
 		newSchema,
 		rewrite: change.rewrite,
 		structuresRekeyed,
-		pkColumnRekeyed: change.collationChanged && updatedPkDef.some(def => def.index === colIndex),
+		pkColumnRekeyed: isPkMember && (change.collationChanged || change.rewrite !== null),
 	};
 }

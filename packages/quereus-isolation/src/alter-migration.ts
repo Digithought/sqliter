@@ -1,4 +1,4 @@
-import type { Database, TableSchema, SchemaChangeInfo, Row, SqlValue, VirtualTable, UpdateResult } from '@quereus/quereus';
+import type { Database, TableSchema, SchemaChangeInfo, Row, SqlValue, VirtualTable, UpdateResult, EffectiveRowSource } from '@quereus/quereus';
 import { QuereusError, StatusCode, foldDefaultToType, columnDefToSchema, isConstraintViolation, planRetypeConversion, validateCollationForType, formatKeyValue } from '@quereus/quereus';
 import type { ConnectionOverlayState, Predicate } from './isolation-types.js';
 import { makeFullScanFilterInfo } from './filter-info.js';
@@ -102,25 +102,40 @@ export interface SetDataTypeConvertContext {
 }
 
 /**
- * Per-ALTER constants for an `alter column … set collate` that re-keys the PRIMARY KEY (see
- * {@link derivePkRekey}). Present only when the normalized collation actually changes on a PK
- * member column and there are staged overlays to carry — a non-PK collate change, or a re-declare
- * of the column's current collation, re-keys nothing. A retype of a PK column is rejected
- * upstream, so `setCollation` is the only ALTER COLUMN attribute that re-keys.
+ * Per-ALTER constants for an `alter column` that re-keys the PRIMARY KEY (see
+ * {@link derivePkRekey}): `set collate` on a PK member (the comparator moves), or `set not null`
+ * on a PK member whose null → DEFAULT backfill the underlying will actually apply (the key VALUES
+ * move — a key column is nullable whenever the table's identity is its full column set). Present
+ * only when there are staged overlays to carry — a non-PK change, a re-declare of the column's
+ * current collation, or a tightening the underlying applies as metadata only re-keys nothing. A
+ * retype of a PK column is rejected upstream.
  *
  * Under the re-keyed primary key, a staged deletion marker and a staged live row that land on
  * one key are the same logical row's before and after — not two rows — so
  * {@link validateOverlayMigration} accepts the pair and {@link dropCollapsedPkRekeyMarkers}
- * discards the marker before the re-key is forwarded to the overlay. Two live rows on one key
- * stay a real duplicate and are refused. This is the isolation-layer lift of the rule
- * `TransactionLayer.rekeyPrimaryKey` applies to its own write log one level down: a deletion
- * whose key an upsert now occupies is dropped.
+ * discards the marker before the re-key reaches the overlay. Two live rows on one key stay a
+ * real duplicate and are refused. This is the isolation-layer lift of the rule
+ * `TransactionLayer.rekeyPrimaryKey` / `convertColumn` apply to their own write log one level
+ * down: a deletion whose key an upsert now occupies is dropped.
  */
 export interface PkRekeyContext {
 	/** Overlay positions of the PRIMARY KEY columns (identical to the base's — the tombstone flag sits after them). */
 	pkIndices: readonly number[];
-	/** Serializes a PK tuple under the POST-change collation — two old keys that serialize alike collapse. */
+	/**
+	 * Serializes a PK tuple as the POST-change key: under the new collation for `set collate`,
+	 * with NULL at the tightened column replaced by its DEFAULT for `set not null`. Two old keys
+	 * that serialize alike collapse.
+	 */
 	keyOf: (pk: readonly SqlValue[]) => string;
+	/**
+	 * How the re-key reaches the overlay's own trees. `set collate` is forwarded through the
+	 * overlay module's `alterSchema`, which is itself fallible (it re-validates the re-key
+	 * against the overlay's layer chain) and so is dry-run in `IsolationModule.alterTable`'s
+	 * tier 2 before the underlying mutates. The `set not null` backfill is applied through
+	 * ordinary overlay writes instead ({@link backfillStagedNotNull}) — nothing to pre-flight,
+	 * and its marker drop runs in the migrate step only.
+	 */
+	forwardedViaAlterSchema: boolean;
 	/** User-facing table name, for the CONSTRAINT message. */
 	tableName: string;
 }
@@ -141,10 +156,13 @@ interface PkRekeyGroup {
  * Every per-change-type constant one ALTER's overlay migration needs, derived once from the
  * PRE-alter schema and shared by the validate and migrate passes so the two cannot drift.
  *
- * At most one field is ever populated — each is gated on a different change type (or, for the
- * three `alterColumn` arms, a different attribute, and the runtime admits exactly one attribute
- * per ALTER COLUMN). Bundled into one object rather than threaded as one parameter per
- * attribute, which is what the cluster did while it lived on `IsolationModule`.
+ * Each field is gated on a different change type (or, for the `alterColumn` arms, a different
+ * attribute, and the runtime admits exactly one attribute per ALTER COLUMN), so at most one of
+ * `addColumn` / `setNotNull` / `setDataType` is ever populated. `pkRekey` rides ALONGSIDE one of
+ * two attributes: `set collate` on a PK member, or `set not null` on a PK member whose backfill
+ * moves the key values (then `setNotNull` and `pkRekey` are both set). Bundled into one object
+ * rather than threaded as one parameter per attribute, which is what the cluster did while it
+ * lived on `IsolationModule`.
  */
 export interface AlterMigrationPlan {
 	addColumn?: AddColumnBackfillContext;
@@ -194,10 +212,11 @@ export function assertColumnNameNotTombstone(
  * schema.table and the offending column so the owning connection's eventual
  * read/write/commit error is self-explanatory. Poison arises on the addColumn NOT NULL
  * path (a new NOT-NULL column with no usable default), the `set not null` tightening
- * path (a staged NULL with no usable default), the `set data type` path (a staged value
- * that cannot be converted to the new type), and the primary-key `set collate` path (two
- * staged live rows colliding under the new collation); other change types never reach
- * here but are handled defensively.
+ * path (a staged NULL with no usable default, or — on a primary-key member — two staged
+ * live rows converging on one key under the DEFAULT backfill), the `set data type` path
+ * (a staged value that cannot be converted to the new type), and the primary-key
+ * `set collate` path (two staged live rows colliding under the new collation); other
+ * change types never reach here but are handled defensively.
  */
 export function buildAlterPoisonMessage(schemaName: string, tableName: string, change: SchemaChangeInfo): string {
 	if (change.type === 'addColumn') {
@@ -210,7 +229,7 @@ export function buildAlterPoisonMessage(schemaName: string, tableName: string, c
 		if (change.setCollation !== undefined) {
 			return `ALTER on '${schemaName}.${tableName}' changed the collation of primary-key column '${change.columnName}', under which this connection's uncommitted rows collide; roll back this transaction.`;
 		}
-		return `ALTER on '${schemaName}.${tableName}' tightened column '${change.columnName}' to NOT NULL, which this connection's uncommitted row violates; roll back this transaction.`;
+		return `ALTER on '${schemaName}.${tableName}' tightened column '${change.columnName}' to NOT NULL, which this connection's uncommitted rows cannot satisfy (a NULL with no usable default, or two rows converging on one primary key under the backfill); roll back this transaction.`;
 	}
 	if (change.type === 'alterPrimaryKey') {
 		return `ALTER on '${schemaName}.${tableName}' changed the table's primary key, which this connection's uncommitted rows cannot follow; roll back this transaction.`;
@@ -227,18 +246,26 @@ export function buildAlterPoisonMessage(schemaName: string, tableName: string, c
  * attribute contexts are probed from `toMigrate[0]`'s schema, never from a skipped poisoned
  * overlay whose schema may be a stale pre-alter layout; with no overlays to migrate there is
  * nothing to backfill, convert or re-key, so those arms stay undefined.
+ *
+ * `underlyingRows` is the row stream the underlying's own data-dependent decisions read: the
+ * effective rows it is handed when the ISSUING transaction has staged work, else its committed
+ * rows (`IsolationModule.committedRowsOf`). The `set not null` re-key arm reads it (see
+ * {@link derivePkRekey}) because whether the underlying backfills at all — and so whether the
+ * committed keys move — is decided over exactly that stream. Async for that one scan only.
  */
-export function deriveAlterMigrationPlan(
+export async function deriveAlterMigrationPlan(
 	change: SchemaChangeInfo,
 	db: Database,
 	tableName: string,
 	toMigrate: readonly [string, ConnectionOverlayState][],
-): AlterMigrationPlan {
+	underlyingRows: EffectiveRowSource | undefined,
+): Promise<AlterMigrationPlan> {
+	const setNotNull = deriveSetNotNullBackfill(change, toMigrate);
 	return {
 		addColumn: deriveAddColumnBackfill(change, db, tableName),
-		setNotNull: deriveSetNotNullBackfill(change, toMigrate),
+		setNotNull,
 		setDataType: deriveSetDataTypeConvert(change, toMigrate),
-		pkRekey: derivePkRekey(change, db, tableName, toMigrate),
+		pkRekey: await derivePkRekey(change, db, tableName, toMigrate, setNotNull, underlyingRows),
 	};
 }
 
@@ -369,26 +396,42 @@ function deriveSetDataTypeConvert(
 }
 
 /**
- * Precomputes the per-ALTER constants a primary-key re-keying `alter column … set collate`
- * overlay migration needs: the PK column positions and a key serializer built over the
- * POST-change collation — the PRE-alter overlay schema with the named column's collation
- * replaced. The overlay's PK definition mirrors the base's (the tombstone flag is appended
- * after the data columns), so the synthesized schema keys exactly as the re-keyed base will.
+ * Precomputes the per-ALTER constants a primary-key re-keying `alter column` overlay migration
+ * needs: the PK column positions and a serializer that keys a PK tuple as the POST-change key.
+ * Two attributes re-key:
  *
- * Returns undefined unless the named column is a PRIMARY KEY member and the normalized
- * collation actually differs from the column's current one — mirroring the underlying's
- * metadata-only gate (`MemoryTableManager.alterColumn`'s `nameMatches`), so overlay and
- * committed rows re-key together or not at all. `validateCollationForType` can throw for an
- * unknown collation, but the engine already validated the name before dispatching the ALTER,
- * and a direct module caller gets the same pre-mutation rejection the underlying would give.
+ * - `set collate` on a PK member: the serializer is built over the PRE-alter overlay schema
+ *   with the named column's collation replaced. The overlay's PK definition mirrors the base's
+ *   (the tombstone flag is appended after the data columns), so the synthesized schema keys
+ *   exactly as the re-keyed base will. Undefined when the normalized collation equals the
+ *   column's current one — mirroring the underlying's metadata-only gate
+ *   (`MemoryTableManager.alterColumn`'s `nameMatches`), so overlay and committed rows re-key
+ *   together or not at all. `validateCollationForType` can throw for an unknown collation, but
+ *   the engine already validated the name before dispatching the ALTER, and a direct module
+ *   caller gets the same pre-mutation rejection the underlying would give.
+ * - `set not null` on a PK member with a usable DEFAULT: the serializer keys the BACKFILLED
+ *   tuple — NULL at the tightened column replaced by the folded DEFAULT — under the unchanged
+ *   collations. Undefined unless the underlying will actually rewrite, which both underlyings
+ *   decide the same way: a NULL is visible in the rows they read (`underlyingRows` — the
+ *   issuer's effective rows when it has staged work, else the committed rows). When none is,
+ *   the tightening is metadata-only there, the committed keys do not move, and a staged
+ *   deletion marker at a NULL key must keep pointing at the still-NULL committed row — so the
+ *   overlay must not re-key either. This is the isolation-layer counterpart of
+ *   `TransactionLayer.convertColumn`'s deletion re-key: without it a marker minted for a
+ *   NULL-keyed committed row would delete nothing at flush, and the row the transaction
+ *   deleted would come back with the backfilled value.
+ *
+ * Returns undefined for every other change, and whenever there is no overlay to migrate.
  */
-function derivePkRekey(
+async function derivePkRekey(
 	change: SchemaChangeInfo,
 	db: Database,
 	tableName: string,
 	toMigrate: readonly [string, ConnectionOverlayState][],
-): PkRekeyContext | undefined {
-	if (change.type !== 'alterColumn' || change.setCollation === undefined) return undefined;
+	setNotNull: SetNotNullBackfillContext | undefined,
+	underlyingRows: EffectiveRowSource | undefined,
+): Promise<PkRekeyContext | undefined> {
+	if (change.type !== 'alterColumn') return undefined;
 	const overlaySchema = probeOverlaySchema(toMigrate);
 	if (!overlaySchema) return undefined;
 	const colIndex = overlaySchema.columnIndexMap.get(change.columnName.toLowerCase());
@@ -396,17 +439,44 @@ function derivePkRekey(
 	if (!overlaySchema.primaryKeyDefinition.some(def => def.index === colIndex)) return undefined;
 	const oldCol = overlaySchema.columns[colIndex];
 	if (!oldCol) return undefined;
-	const normalized = validateCollationForType(change.setCollation, oldCol.logicalType, change.columnName, (n) => db.isCollationRegistered(n));
-	if (normalized === (oldCol.collation || 'BINARY')) return undefined; // metadata-only — the underlying re-keys nothing
-	const postChangeSchema: TableSchema = {
-		...overlaySchema,
-		columns: overlaySchema.columns.map((c, i) => (i === colIndex ? { ...c, collation: normalized } : c)),
-	};
-	return {
-		pkIndices: overlaySchema.primaryKeyDefinition.map(def => def.index),
-		keyOf: makePkKeySerializer(db, postChangeSchema),
-		tableName,
-	};
+	const pkIndices = overlaySchema.primaryKeyDefinition.map(def => def.index);
+
+	if (change.setCollation !== undefined) {
+		const normalized = validateCollationForType(change.setCollation, oldCol.logicalType, change.columnName, (n) => db.isCollationRegistered(n));
+		if (normalized === (oldCol.collation || 'BINARY')) return undefined; // metadata-only — the underlying re-keys nothing
+		const postChangeSchema: TableSchema = {
+			...overlaySchema,
+			columns: overlaySchema.columns.map((c, i) => (i === colIndex ? { ...c, collation: normalized } : c)),
+		};
+		return { pkIndices, keyOf: makePkKeySerializer(db, postChangeSchema), forwardedViaAlterSchema: true, tableName };
+	}
+
+	if (setNotNull?.hasDefault && setNotNull.colIndex === colIndex) {
+		// NOTE: one extra scan of the underlying's rows per key-member `set not null` with open
+		// overlays (the underlying repeats it for its own gate; a stream is single-shot and the
+		// answer is not handed down). Fine for DDL this rare; if it ever shows up, thread the
+		// answer to the underlying instead of re-deriving it here.
+		if (!underlyingRows || !await anyRowNullAt(underlyingRows, colIndex)) return undefined; // metadata-only tightening — keys stay
+		const keyPos = pkIndices.indexOf(colIndex);
+		const fill = setNotNull.foldedDefault;
+		const serialize = makePkKeySerializer(db, overlaySchema);
+		return {
+			pkIndices,
+			keyOf: (pk) => serialize(pk[keyPos] === null ? pk.map((v, i) => (i === keyPos ? fill : v)) : pk),
+			forwardedViaAlterSchema: false,
+			tableName,
+		};
+	}
+
+	return undefined;
+}
+
+/** True when any row of the effective stream holds NULL at `colIndex` — the underlyings' backfill gate. */
+async function anyRowNullAt(rows: EffectiveRowSource, colIndex: number): Promise<boolean> {
+	for await (const row of rows()) {
+		if (row[colIndex] === null) return true;
+	}
+	return false;
 }
 
 /**
@@ -468,7 +538,9 @@ async function collectPkRekeyGroups(
  * those rows, and it must run before the migration so a failure becomes poison rather than a
  * half-migrated overlay.
  *
- * For a primary-key re-keying `set collate` (`plan.pkRekey`), the staged rows are grouped by
+ * For a primary-key re-key (`plan.pkRekey` — `set collate` on a PK member, or a `set not null`
+ * backfill that moves a PK member's values; the tightening arm above deliberately does NOT
+ * return early when a DEFAULT exists, so it reaches this block), the staged rows are grouped by
  * their POST-change key: a deletion marker sharing a key with one live row is that row's
  * before-image (the migrate step discards it — {@link dropCollapsedPkRekeyMarkers}), and
  * markers alone on one key are one deletion — neither is a duplicate. Two LIVE rows on one
@@ -506,7 +578,9 @@ export async function validateOverlayMigration(
 	}
 
 	// SET NOT NULL with no usable DEFAULT: reject a staged NULL the forward could not fill.
-	// (With a DEFAULT there is nothing to reject — backfillStagedNotNull fills instead.)
+	// (With a DEFAULT there is nothing to reject here — backfillStagedNotNull fills instead —
+	// and control falls through to the re-key block below, which the backfill of a PK member
+	// populates.)
 	if (plan.setNotNull && !plan.setNotNull.hasDefault) {
 		const setNotNullCtx = plan.setNotNull;
 		for await (const oldRow of stagedLiveRows(oldOverlay, oldTombstoneIdx)) {
@@ -531,17 +605,20 @@ export async function validateOverlayMigration(
 		return;
 	}
 
-	// SET COLLATE re-keying the PRIMARY KEY: two staged LIVE rows landing on one post-change
-	// key are a real duplicate — refuse before the underlying re-keys (atomic for the issuer,
-	// poison for a foreign overlay via the caller). Marker/live and marker/marker groups
-	// collapse cleanly and are handled by the migrate step, not rejected here.
+	// A PRIMARY-KEY re-key (SET COLLATE, or the SET NOT NULL backfill of a key member): two
+	// staged LIVE rows landing on one post-change key are a real duplicate — refuse before the
+	// underlying re-keys (atomic for the issuer, poison for a foreign overlay via the caller).
+	// Marker/live and marker/marker groups collapse cleanly and are handled by the migrate step,
+	// not rejected here.
 	if (plan.pkRekey) {
 		const pkRekeyCtx = plan.pkRekey;
 		for (const group of (await collectPkRekeyGroups(oldOverlay, oldTombstoneIdx, pkRekeyCtx)).values()) {
 			if (group.livePks.length < 2) continue;
+			// Name the colliding key by the second row's OLD tuple — what the user staged; the
+			// underlyings name it by the post-change tuple. Same message shape either way.
 			const keyDesc = group.livePks[1].map(formatKeyValue).join(', ');
 			throw new QuereusError(
-				`UNIQUE constraint failed: ${pkRekeyCtx.tableName} primary key collides under new collation (key: ${keyDesc})`,
+				`UNIQUE constraint failed: ${pkRekeyCtx.tableName} primary key collides under the new key definition (key: ${keyDesc})`,
 				StatusCode.CONSTRAINT,
 			);
 		}
@@ -744,7 +821,11 @@ function buildOverlayAddColumnChange(
  *   is not a row) or reject it outright when no usable DEFAULT exists. The base's NOT NULL
  *   is enforced where it belongs — by the underlying over the issuer's effective rows, and
  *   per overlay by {@link validateOverlayMigration} — and the staged LIVE rows' NULLs are
- *   filled here via {@link backfillStagedNotNull}.
+ *   filled here via {@link backfillStagedNotNull}. When the tightened column is a PRIMARY-KEY
+ *   member whose backfill the underlying applies (`pkRekeyCtx`), the backfill IS a re-key: the
+ *   collapsed deletion markers are dropped first (exactly as for `set collate`), and the
+ *   backfill then also fills the markers' own key value — a marker carries the REAL key of the
+ *   committed row it deletes, and that row's key has just moved under it in the underlying.
  * - **Relaxing (`drop not null`).** Nothing to do: the overlay never enforced the flag, and
  *   the rows it stages are written with `preCoerced: true` through the overlay module's own
  *   write path, which does not consult column nullability at all.
@@ -771,7 +852,11 @@ async function forwardAlterColumnToOverlay(
 ): Promise<void> {
 	if (change.setNotNull !== undefined) {
 		if (change.setNotNull === true && setNotNullCtx?.hasDefault) {
-			await backfillStagedNotNull(host, overlayState, setNotNullCtx);
+			// Key-member backfill: drop the markers the backfill collapses onto a live row BEFORE
+			// the rewrites — the overlay's PK covers markers, so the update moving a live row onto
+			// a marker's post-backfill key would otherwise be refused as a PK collision.
+			if (pkRekeyCtx) await dropCollapsedPkRekeyMarkers(host, overlayState, pkRekeyCtx);
+			await backfillStagedNotNull(host, overlayState, setNotNullCtx, pkRekeyCtx !== undefined);
 		}
 		return;
 	}
@@ -789,8 +874,9 @@ async function forwardAlterColumnToOverlay(
  * are one deletion, so all but the first are dropped. A group holding two live rows was
  * already refused by {@link validateOverlayMigration} before the underlying mutated.
  *
- * Runs BEFORE the re-key is forwarded to the overlay, and deletes by each marker's OLD
- * primary key — the overlay is still keyed under the old collation at that moment.
+ * Runs BEFORE the re-key reaches the overlay (the `set collate` forward, or the `set not null`
+ * backfill's rewrites), and deletes by each marker's OLD primary key — the overlay is still
+ * keyed under the old collation / the pre-backfill values at that moment.
  *
  * NOTE: like {@link backfillStagedNotNull}'s rewrites, the drops land in the overlay's
  * CURRENT savepoint frame. A later `rollback to savepoint` taken BEFORE this ALTER restores
@@ -908,8 +994,17 @@ function requireTombstoneIndex(host: AlterMigrationHost, overlaySchema: TableSch
  * non-tombstone row holding NULL at the tightened column is rewritten with the column's
  * folded literal DEFAULT through the overlay's ordinary write path, so the overlay's layer
  * chain and savepoint snapshots stay intact — the overlay-side mirror of the value rewrite
- * the underlying applies to its committed rows. Tombstone rows are never touched
- * ({@link stagedLiveRows}).
+ * the underlying applies to its committed rows. Tombstone rows are normally never touched
+ * ({@link stagedLiveRows}): their non-key columns hold placeholder NULLs, not values.
+ *
+ * `rekeysMarkers` — set when the tightened column is a PRIMARY-KEY member whose backfill the
+ * underlying applies (a `PkRekeyContext` exists) — widens the pass to the tombstone rows too.
+ * At a KEY column a marker's value is not a placeholder but the real key of the committed row
+ * it deletes, and the underlying has just backfilled that row's key under it; a marker left at
+ * the NULL key would delete nothing at flush and the row the transaction deleted would come
+ * back with the backfilled value. The caller has already dropped every marker that collapses
+ * onto a live row ({@link dropCollapsedPkRekeyMarkers}), and both underlyings refuse a pair of
+ * committed rows converging on one key, so no two rewritten rows can land on one key here.
  *
  * Only called with a usable DEFAULT ({@link SetNotNullBackfillContext.hasDefault}); the
  * no-DEFAULT case rejects (issuer) or poisons (foreign) in {@link validateOverlayMigration}
@@ -926,6 +1021,7 @@ async function backfillStagedNotNull(
 	host: AlterMigrationHost,
 	overlayState: ConnectionOverlayState,
 	ctx: SetNotNullBackfillContext,
+	rekeysMarkers: boolean,
 ): Promise<void> {
 	const overlay = overlayState.overlayTable;
 	const overlaySchema = overlay.tableSchema;
@@ -935,7 +1031,8 @@ async function backfillStagedNotNull(
 	// Materialize before writing: the rewrites mutate the overlay's pending layer the
 	// scan is reading through.
 	const toFill: Row[] = [];
-	for await (const row of stagedLiveRows(overlay, tombstoneIdx)) {
+	const candidates = rekeysMarkers ? overlay.query(makeFullScanFilterInfo()) : stagedLiveRows(overlay, tombstoneIdx);
+	for await (const row of candidates) {
 		if (row[ctx.colIndex] === null) toFill.push(row);
 	}
 	for (const row of toFill) {

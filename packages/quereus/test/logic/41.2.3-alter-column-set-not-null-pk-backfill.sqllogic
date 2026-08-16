@@ -1,0 +1,279 @@
+-- ALTER COLUMN ... SET NOT NULL on a PRIMARY KEY member: the null → DEFAULT backfill moves the
+-- key VALUES, so two rows that differed only by NULL-vs-DEFAULT there would merge. A table with
+-- no declared primary key is keyed by ALL its columns, which stay nullable — that is how a key
+-- column comes to hold NULLs.
+--
+-- Cross-module: both backends treat the backfill as a primary-key re-key and ask the same two
+-- questions before mutating anything (memory: MemoryTableManager.validateRekeyedPrimaryKey over
+-- the CONVERTED rows; store: StoreTable.validateRekeyedPrimaryKey with the same per-row mapper) —
+-- a collision the transaction can SEE is CONSTRAINT, a collision confined to rows only a rollback
+-- could restore is BUSY, and either refusal leaves the table and the transaction untouched. An
+-- accepted backfill physically re-keys: memory re-derives each open layer's staged deletion keys
+-- (TransactionLayer.convertColumn), the store re-encodes the data keys after the value rewrite
+-- (StoreModuleAlterColumn.alterColumnChange → rekeyRows), and the isolation overlay the store runs
+-- behind re-keys its staged deletion markers (alter-migration.ts derivePkRekey / backfillStagedNotNull).
+
+-- ===================================
+-- 1. Two COMMITTED rows that converge under the backfill: refused (CONSTRAINT), nothing changes.
+-- ===================================
+
+create table t_bf1 (x integer null default 0, y integer null);
+insert into t_bf1 (x, y) values (null, 1), (0, 1);
+-- run
+
+alter table t_bf1 alter column x set not null;
+-- error: collides under the new key definition
+
+select count(*) as n from t_bf1;
+→ [{"n":2}]
+
+select count(*) as n from t_bf1 where x is null;
+→ [{"n":1}]
+
+select name, "notnull" from table_info('t_bf1') where name = 'x';
+→ [{"name":"x","notnull":0}]
+
+drop table t_bf1;
+
+-- ===================================
+-- 2. A STAGED insert converging with a committed row is a duplicate this transaction's own
+--    select would return: refused (CONSTRAINT), transaction still usable.
+-- ===================================
+
+create table t_bf2 (x integer null default 0, y integer null);
+insert into t_bf2 (x, y) values (null, 1);
+-- run
+
+begin;
+insert into t_bf2 (x, y) values (0, 1);
+-- run
+
+alter table t_bf2 alter column x set not null;
+-- error: collides under the new key definition
+
+select count(*) as n from t_bf2;
+→ [{"n":2}]
+
+rollback;
+select x, y from t_bf2;
+→ [{"x":null,"y":1}]
+
+drop table t_bf2;
+
+-- ===================================
+-- 3. A collision confined to a committed row this transaction has DELETED: invisible to the
+--    transaction's view, but it must survive a rollback and the rebuilt key structure cannot
+--    hold the pair — refused as retryable (BUSY), transaction usable, retry after commit lands.
+-- ===================================
+
+create table t_bf3 (x integer null default 0, y integer null);
+insert into t_bf3 (x, y) values (null, 1), (0, 1), (null, 2);
+-- run
+
+begin;
+delete from t_bf3 where x is null and y = 1;
+-- run
+
+alter table t_bf3 alter column x set not null;
+-- error: still collide under the new key definition
+
+select count(*) as n from t_bf3;
+→ [{"n":2}]
+
+commit;
+alter table t_bf3 alter column x set not null;
+select x, y from t_bf3 order by y;
+→ [{"x":0,"y":1},{"x":0,"y":2}]
+
+drop table t_bf3;
+
+-- ===================================
+-- 4. A staged delete that REMOVES the collision (delete the NULL row, re-insert its backfilled
+--    twin) is accepted, and exactly one row per key survives the commit.
+-- ===================================
+
+create table t_bf4 (x integer null default 0, y integer null);
+insert into t_bf4 (x, y) values (null, 1), (null, 2);
+-- run
+
+begin;
+delete from t_bf4 where x is null and y = 1;
+insert into t_bf4 (x, y) values (0, 1);
+alter table t_bf4 alter column x set not null;
+select x, y from t_bf4 order by y;
+→ [{"x":0,"y":1},{"x":0,"y":2}]
+
+commit;
+select x, y from t_bf4 order by y;
+→ [{"x":0,"y":1},{"x":0,"y":2}]
+
+select count(*) as n from t_bf4 where x = 0 and y = 1;
+→ [{"n":1}]
+
+drop table t_bf4;
+
+-- ===================================
+-- 5. RESURRECTION guard: a row DELETED in this transaction whose key the backfill moves must
+--    stay deleted — through the ALTER and through the commit. (The staged deletion was recorded
+--    under the pre-backfill key; a replay under that key would land nowhere and the row would
+--    reappear with the backfilled value.)
+-- ===================================
+
+create table t_bf5 (x integer null default 0, y integer null);
+insert into t_bf5 (x, y) values (null, 1), (null, 2);
+-- run
+
+begin;
+delete from t_bf5 where x is null and y = 1;
+select count(*) as n from t_bf5;
+→ [{"n":1}]
+
+alter table t_bf5 alter column x set not null;
+select x, y from t_bf5;
+→ [{"x":0,"y":2}]
+
+commit;
+select x, y from t_bf5;
+→ [{"x":0,"y":2}]
+
+drop table t_bf5;
+
+-- ===================================
+-- 6. A NON-colliding key-column backfill is accepted, and the backfilled row is still FINDABLE
+--    by an equality lookup on its new key and DELETABLE — i.e. the key bytes followed the value
+--    (the store used to rewrite the row payload under its old NULL-encoding key).
+-- ===================================
+
+create table t_bf6 (x integer null default 7, y integer null);
+insert into t_bf6 (x, y) values (null, 1), (3, 1);
+alter table t_bf6 alter column x set not null;
+select x, y from t_bf6 order by x;
+→ [{"x":3,"y":1},{"x":7,"y":1}]
+
+select x, y from t_bf6 where x = 7 and y = 1;
+→ [{"x":7,"y":1}]
+
+insert into t_bf6 (x, y) values (7, 1);
+-- error: UNIQUE constraint failed
+
+delete from t_bf6 where x = 7 and y = 1;
+select x, y from t_bf6;
+→ [{"x":3,"y":1}]
+
+insert into t_bf6 (x, y) values (7, 1);
+select count(*) as n from t_bf6 where x = 7;
+→ [{"n":1}]
+
+drop table t_bf6;
+
+-- ===================================
+-- 7. Single-column key (the whole row IS the key): the scalar key form re-keys too.
+-- ===================================
+
+create table t_bf7 (x integer null default 5);
+insert into t_bf7 (x) values (null), (3);
+alter table t_bf7 alter column x set not null;
+select x from t_bf7 order by x;
+→ [{"x":3},{"x":5}]
+
+select x from t_bf7 where x = 5;
+→ [{"x":5}]
+
+delete from t_bf7 where x = 5;
+select x from t_bf7;
+→ [{"x":3}]
+
+drop table t_bf7;
+
+-- ===================================
+-- 9. Two STAGED rows converging under the backfill: refused (CONSTRAINT), rollback clean.
+--    (Behind the isolation layer this is the overlay's own pre-flight; on plain memory it is
+--    the manager's effective-row probe — same message.)
+-- ===================================
+
+create table t_bf9 (x integer null default 0, y integer null);
+-- run
+
+begin;
+insert into t_bf9 (x, y) values (null, 1), (0, 1);
+-- run
+
+alter table t_bf9 alter column x set not null;
+-- error: collides under the new key definition
+
+rollback;
+select count(*) as n from t_bf9;
+→ [{"n":0}]
+
+drop table t_bf9;
+
+-- ===================================
+-- 10. A staged NULL row that backfills onto the key of a committed row this transaction has
+--     DELETED: the deletion is that row's before-image, not a duplicate — accepted, and the
+--     staged row is what survives the commit.
+-- ===================================
+
+create table t_bf10 (x integer null default 0, y integer null);
+insert into t_bf10 (x, y) values (0, 1);
+-- run
+
+begin;
+delete from t_bf10 where x = 0 and y = 1;
+insert into t_bf10 (x, y) values (null, 1);
+alter table t_bf10 alter column x set not null;
+select x, y from t_bf10;
+→ [{"x":0,"y":1}]
+
+commit;
+select x, y from t_bf10;
+→ [{"x":0,"y":1}]
+
+select count(*) as n from t_bf10 where x = 0 and y = 1;
+→ [{"n":1}]
+
+drop table t_bf10;
+
+-- ===================================
+-- 11. A tightening the transaction can see NO NULL for is metadata-only: the committed keys do
+--     not move, and a staged deletion of a NULL-keyed committed row still lands at commit.
+-- ===================================
+
+create table t_bf11 (x integer null default 0, y integer null);
+insert into t_bf11 (x, y) values (null, 1), (2, 2);
+-- run
+
+begin;
+delete from t_bf11 where x is null and y = 1;
+alter table t_bf11 alter column x set not null;
+select x, y from t_bf11;
+→ [{"x":2,"y":2}]
+
+commit;
+select x, y from t_bf11;
+→ [{"x":2,"y":2}]
+
+insert into t_bf11 (x, y) values (null, 3);
+-- error: NOT NULL
+
+drop table t_bf11;
+
+-- ===================================
+-- 12. The same backfill on a NON-key column is unchanged: no re-key, values filled, key intact.
+-- ===================================
+
+create table t_bf12 (id integer primary key, v integer null default 9);
+insert into t_bf12 values (1, null), (2, null), (3, 4);
+begin;
+delete from t_bf12 where id = 2;
+alter table t_bf12 alter column v set not null;
+select id, v from t_bf12 order by id;
+→ [{"id":1,"v":9},{"id":3,"v":4}]
+
+commit;
+select id, v from t_bf12 order by id;
+→ [{"id":1,"v":9},{"id":3,"v":4}]
+
+select id, v from t_bf12 where id = 1;
+→ [{"id":1,"v":9}]
+
+drop table t_bf12;

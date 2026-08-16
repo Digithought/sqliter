@@ -546,14 +546,18 @@ append: a column-level `CHECK` on the new column is evaluated by `buildAddColumn
 `[...existingRow, value]`, so a wrapper that redirects an *engine-driven* `ADD COLUMN` to a
 position must not rely on one.
 
-**3. A collation change on a PRIMARY KEY column obeys a stricter rule, because the primary tree
-is a map.** A secondary index is a multi-map and tolerates two primary keys under one index key,
-so re-keying it can never lose a row. The primary tree cannot: two rows whose keys collapse under
-the new comparator have nowhere to go. And every layer of the chain — the committed base, each
-savepoint snapshot, each statement-boundary layer — physically holds rows that a `ROLLBACK` or
-`ROLLBACK TO SAVEPOINT` must be able to restore, so *none* of them may hold such a pair, not just
-the transaction's effective view. `validateRekeyedPrimaryKey` asks two questions before anything
-is mutated, over two **different** row sets:
+**3. A change that moves a PRIMARY KEY column's keys obeys a stricter rule, because the primary
+tree is a map.** Two `alter column` attributes do: `set collate` moves the comparator (values
+untouched), and the `set not null` null → DEFAULT backfill moves the key VALUES — a key column is
+nullable whenever the table's identity is its full column set, so `(NULL, 1)` and `(0, 1)`
+converge under `default 0`. A secondary index is a multi-map and tolerates two primary keys under
+one index key, so re-keying it can never lose a row. The primary tree cannot: two rows whose keys
+collapse have nowhere to go. And every layer of the chain — the committed base, each savepoint
+snapshot, each statement-boundary layer — physically holds rows that a `ROLLBACK` or `ROLLBACK
+TO SAVEPOINT` must be able to restore, so *none* of them may hold such a pair, not just the
+transaction's effective view. `validateRekeyedPrimaryKey` asks two questions before anything is
+mutated, over two **different** row sets (for the backfill, both judge the rows *as the backfill
+will leave them* — the caller passes the same per-row conversion the base rewrite applies):
 
 *   **Is the change legal?** — over the rows the transaction can SEE: the wrapper-supplied
     `EffectiveRowSource` when there is one, else `effectiveDdlRows()`. A duplicate here is one a
@@ -591,6 +595,17 @@ collapse into one; `rekeyPrimaryKey` therefore **rewrites the log to its net eff
 one entry per key, deletions first, and a deletion whose key an upsert now occupies dropped. Every
 later reader of that log replays the rewritten form: the index rebuild, a `CREATE INDEX` later in
 the same transaction, and the commit-time rebase.
+
+The backfill takes the value-rewrite path instead (`rebuildPrimaryTreeFromRows` on the base,
+`TransactionLayer.convertColumn` per open layer): the key definition and `pkFunctions` are
+unchanged, own rows re-key themselves because the tree extracts each key from the converted row,
+and the one thing that needs explicit care is a staged **deletion** — it carries only the key
+recorded when the delete was staged, still encoding the pre-backfill NULL, and the parent tree it
+is replayed into has already been rebuilt over converted rows where that key no longer exists.
+`convertColumn` re-derives each deletion key under the same conversion
+(`makePrimaryKeyConverter`); without that the deletion landed nowhere and the deleted row came
+back with the backfilled value. The pre-pass's "no converging pair anywhere in the chain" is what
+makes the re-derived key resolve to exactly the row this layer deleted.
 
 **`ALTER PRIMARY KEY` shares this machinery, with two additions for a change of the key's
 COLUMNS rather than its comparator** (`MemoryTableManager.alterPrimaryKey`). First, a logged

@@ -4,6 +4,7 @@ import type { ConnectionOverlayState, IsolationModuleConfig, Predicate, Underlyi
 import { IsolatedTable } from './isolated-table.js';
 import { applyOverlayToUnderlying } from './flush.js';
 import { iterateEffectiveRows, makePkKeySerializer } from './overlay-rows.js';
+import { makeFullScanFilterInfo } from './filter-info.js';
 import type { AlterMigrationHost } from './alter-migration.js';
 import {
 	applyPkRekeyMarkerDrops,
@@ -1109,6 +1110,22 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	}
 
 	/**
+	 * The rows the underlying's OWN data-dependent DDL decisions read when
+	 * {@link issuerEffectiveRows} hands it nothing: its committed rows. Behind this layer a
+	 * connection's writes reach the underlying only at commit, so with nothing staged by the
+	 * issuer the underlying's effective view IS the committed set — for both bundled
+	 * underlyings (the memory table's DDL-connection view, the store's buffered-plus-committed
+	 * scan). Used to mirror the `set not null` backfill gate the underlying will apply
+	 * (`deriveAlterMigrationPlan`), which decides whether the committed keys move. Undefined
+	 * when the underlying is not connected or cannot be scanned.
+	 */
+	private committedRowsOf(state: UnderlyingTableState | undefined): EffectiveRowSource | undefined {
+		const table = state?.underlyingTable;
+		if (!table?.query) return undefined;
+		return () => table.query!(makeFullScanFilterInfo());
+	}
+
+	/**
 	 * Creates an index on the underlying table, then hands the same index to every
 	 * per-connection overlay so it (and, for a UNIQUE index, the constraint derived from it)
 	 * is enforced for the rest of each open transaction.
@@ -1405,9 +1422,10 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * `runtime/emit/alter-table.ts`.
 	 *
 	 * **Row-content validation.** The row-validating arms (`add constraint … unique`,
-	 * `alter column … set collate`) judge the ISSUING connection's effective rows, not the
-	 * underlying's committed ones — see {@link issuerEffectiveRows}. The underlying runs that
-	 * check before it mutates anything, so the atomic-abort guarantee above still holds.
+	 * `alter column … set collate` / `set not null` on a key member) judge the ISSUING
+	 * connection's effective rows, not the underlying's committed ones — see
+	 * {@link issuerEffectiveRows}. The underlying runs that check before it mutates anything,
+	 * so the atomic-abort guarantee above still holds.
 	 */
 	async alterTable(
 		db: Database,
@@ -1483,11 +1501,25 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 
 		assertColumnNameNotTombstone(this, schemaName, tableName, change);
 
+		const underlyingState = this.getUnderlyingState(schemaName, tableName);
+
+		// Hand the underlying the issuer's effective rows so its own row-content checks
+		// (`add constraint … unique`, `alter column … set collate` / `set not null`) see the
+		// transaction's pending rows and skip the ones it has deleted. An outer wrapper's source
+		// wins if one was supplied. Built before the migration plan, which reads the same stream
+		// to learn whether a `set not null` backfill will actually move the committed keys.
+		let rowSource = rows ?? (underlyingState
+			? this.issuerEffectiveRows(db, schemaName, tableName, underlyingState.underlyingTable)
+			: undefined);
+
 		// Precompute every per-change-type migration constant, from the PRE-alter schema — so the
 		// whole plan is valid here, before the underlying is mutated, and the same plan drives the
 		// post-mutation migration. The attribute arms read a to-be-migrated overlay's schema, never
-		// a skipped poisoned overlay's (possibly stale pre-alter) one.
-		const migration = deriveAlterMigrationPlan(change, db, tableName, toMigrate);
+		// a skipped poisoned overlay's (possibly stale pre-alter) one. The plan is also told which
+		// rows the underlying's own data-dependent decisions will read — the issuer's effective rows
+		// when it has staged work, else the committed set — so the `set not null` re-key arm gates
+		// exactly as the underlying's backfill does.
+		const migration = await deriveAlterMigrationPlan(change, db, tableName, toMigrate, rowSource ?? this.committedRowsOf(underlyingState));
 
 		// Tier 2: validate the ISSUER's own overlay BEFORE mutating the shared underlying.
 		// Any throw here (CONSTRAINT backfill, MISMATCH conversion, or INTERNAL tombstone guard)
@@ -1497,30 +1529,23 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 			await validateOverlayMigration(this, ownEntry[1], migration);
 		}
 
-		const underlyingState = this.getUnderlyingState(schemaName, tableName);
-
-		// Hand the underlying the issuer's effective rows so its own row-content checks
-		// (`add constraint … unique`, `alter column … set collate`) see the transaction's
-		// pending rows and skip the ones it has deleted. An outer wrapper's source wins if
-		// one was supplied.
-		let rowSource = rows ?? (underlyingState
-			? this.issuerEffectiveRows(db, schemaName, tableName, underlyingState.underlyingTable)
-			: undefined);
-
-		// Tier 2, PRIMARY-KEY re-key arm: the overlay's own `alterSchema` is itself fallible —
-		// its module re-validates the re-key against the overlay's layer chain (e.g. the memory
-		// module's representability BUSY when a savepoint could restore rows that collide under
-		// the new collation) — and it runs in the migrate step, AFTER the underlying has
-		// irreversibly re-keyed. So dry-run it here, against the exact state the migrate step
-		// will see: drop the collapsed markers first (saving them), pre-flight the overlay's
-		// `alterSchema` in validate-only mode, and on ANY later refusal — the pre-flight's or
-		// the underlying's — reinsert the markers and rethrow with everything net-untouched.
+		// Tier 2, PRIMARY-KEY re-key arm forwarded through the overlay's `alterSchema` (`set
+		// collate`): that call is itself fallible — its module re-validates the re-key against
+		// the overlay's layer chain (e.g. the memory module's representability BUSY when a
+		// savepoint could restore rows that collide under the new collation) — and it runs in
+		// the migrate step, AFTER the underlying has irreversibly re-keyed. So dry-run it here,
+		// against the exact state the migrate step will see: drop the collapsed markers first
+		// (saving them), pre-flight the overlay's `alterSchema` in validate-only mode, and on ANY
+		// later refusal — the pre-flight's or the underlying's — reinsert the markers and rethrow
+		// with everything net-untouched. The `set not null` re-key never comes here: it reaches
+		// the overlay through ordinary writes (nothing to pre-flight), and its marker drop runs
+		// in the migrate step only — see `PkRekeyContext.forwardedViaAlterSchema`.
 		//
 		// The drops happen BEFORE `underlying.alterTable`, and a dropped marker un-shadows the
 		// committed row it deletes in `issuerEffectiveRows`'s merged stream — so the effective
 		// rows are SNAPSHOTTED first, and the underlying judges the pre-drop view.
 		let droppedMarkerRows: Row[] = [];
-		if (migration.pkRekey && ownEntry && ownEntry[1].hasChanges && ownEntry[1].overlayTable.alterSchema) {
+		if (migration.pkRekey?.forwardedViaAlterSchema && ownEntry && ownEntry[1].hasChanges && ownEntry[1].overlayTable.alterSchema) {
 			const ownOverlayState = ownEntry[1];
 			const pkRekeyCtx = migration.pkRekey;
 			const plan = await planPkRekeyMarkerDrops(this, ownOverlayState, pkRekeyCtx);

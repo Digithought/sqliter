@@ -89,6 +89,11 @@ export class StoreTable extends StoreTableConstraints {
 	 * the batch is written only after every row maps, so a throw leaves the store
 	 * untouched.
 	 *
+	 * Payload-only: the stored key is reused verbatim, so a caller whose mapping moves a
+	 * PRIMARY KEY member's value (the SET NOT NULL backfill of a key column) must follow
+	 * this with {@link rekeyRows}, which recomputes every key from the rewritten row —
+	 * see `StoreModuleAlterColumn.alterColumnChange` for the ordering.
+	 *
 	 * NOTE: reads and writes the COMMITTED store, outside the coordinator. Sound
 	 * only because every caller calls `StoreModule.ddlCommitPendingOps` first, so
 	 * "committed" is "everything live". A caller that skips that flush would leave
@@ -147,8 +152,8 @@ export class StoreTable extends StoreTableConstraints {
 	 * The store's counterpart of the memory backend's
 	 * `MemoryTableManager.validateRekeyedPrimaryKey`: the two throw-only questions a
 	 * PK re-key must answer, over two DIFFERENT row sets, BEFORE anything is flushed
-	 * or mutated (see docs/memory-table.md §"A collation change on a PRIMARY KEY
-	 * column obeys a stricter rule"):
+	 * or mutated (see docs/memory-table.md §"A change that moves a PRIMARY KEY
+	 * column's keys obeys a stricter rule"):
 	 *
 	 *  1. **Is the change legal?** — over `effectiveRows`, the rows the DDL-issuing
 	 *     transaction can SEE (a wrapper's `EffectiveRowSource` when the isolation
@@ -175,10 +180,15 @@ export class StoreTable extends StoreTableConstraints {
 	 * wrapped path gives, and `commit; <retry>` still lands the change.
 	 *
 	 * Both probes key through {@link rekeyedKeyComputer}, so they and the re-key agree
-	 * byte-for-byte.
+	 * byte-for-byte. `mapRow`, when given, is applied to every row of BOTH probes before its
+	 * key is computed: a value-rewriting change (the SET NOT NULL backfill of a key member)
+	 * moves the key values, and the store still holds the old ones — so the probes judge the
+	 * keys the rows will have after the rewrite, exactly as `rekeyRows` will compute them once
+	 * `mapRowsAtIndex` has run. Without it the committed probe would compare un-backfilled
+	 * values and miss precisely the collision that matters.
 	 *
-	 * NOTE: these two probes put both re-keying arms — SET COLLATE on a PK member and
-	 * ALTER PRIMARY KEY — at four full table scans (two here, then {@link rekeyRows}'
+	 * NOTE: these two probes put every re-keying arm — SET COLLATE / SET NOT NULL on a PK
+	 * member and ALTER PRIMARY KEY — at four full table scans (two here, then {@link rekeyRows}'
 	 * pass 1 backstop and pass 2), each holding one hex
 	 * key signature per row. Fine for a statement this rare; if a huge table ever makes
 	 * it slow, drop pass 1 for callers that pre-validated — it cannot fire for them.
@@ -187,18 +197,22 @@ export class StoreTable extends StoreTableConstraints {
 		newPkDef: ReadonlyArray<{ index: number; desc?: boolean }>,
 		newColumns: ReadonlyArray<ColumnSchema>,
 		effectiveRows: AsyncIterable<Row>,
+		mapRow?: (row: Row) => Row,
 	): Promise<void> {
 		const computeNewKey = this.rekeyedKeyComputer(newPkDef, newColumns);
+		const keyOf = mapRow ? (row: Row): Uint8Array => computeNewKey(mapRow(row)) : computeNewKey;
 
 		const seenEffective = new Set<string>();
 		for await (const row of effectiveRows) {
-			const hex = bytesToHex(computeNewKey(row));
+			const hex = bytesToHex(keyOf(row));
 			if (seenEffective.has(hex)) {
 				// Mirror the memory module's diagnostic, naming the key from the second
-				// (colliding) row's PK values — including its empty-key wording, since
-				// `alter primary key ()` leaves no components to name and "(key: )" reads
-				// as a bug (`MemoryTableManager.assertNoPrimaryKeyCollisionInRows`).
-				const parts = newPkDef.map(pk => formatKeyValue(row[pk.index]));
+				// (colliding) row's PK values — its POST-rewrite values, which are the key
+				// that collides — including its empty-key wording, since `alter primary
+				// key ()` leaves no components to name and "(key: )" reads as a bug
+				// (`MemoryTableManager.assertNoPrimaryKeyCollisionInRows`).
+				const judged = mapRow ? mapRow(row) : row;
+				const parts = newPkDef.map(pk => formatKeyValue(judged[pk.index]));
 				const keyDesc = parts.length > 0 ? `(key: ${parts.join(', ')})` : '(the empty key admits one row)';
 				throw new QuereusError(
 					`UNIQUE constraint failed: ${this.tableName} primary key collides under the new key definition ${keyDesc}`,
@@ -211,7 +225,7 @@ export class StoreTable extends StoreTableConstraints {
 		const store = await this.ensureStore();
 		const seenCommitted = new Set<string>();
 		for await (const entry of store.iterate(buildFullScanBounds())) {
-			const hex = bytesToHex(computeNewKey(deserializeRow(entry.value)));
+			const hex = bytesToHex(keyOf(deserializeRow(entry.value)));
 			if (seenCommitted.has(hex)) {
 				throw new QuereusError(
 					`Cannot re-key the primary key of table ${this.tableName}: `

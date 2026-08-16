@@ -2613,30 +2613,28 @@ export class MemoryTableManager {
 	 * untouched — hence no `mapRow` — and only the comparator the structures are keyed by moves.
 	 * `newSchema` carries the new collations, so the probe indexes compare as the rebuilt ones will.
 	 *
-	 * The primary key: `set collate` on a PK member gets a stricter pre-pass
-	 * ({@link validateRekeyedPrimaryKey}): no layer in the chain, base included, may hold a collision.
-	 * That is what lets every apply step succeed unconditionally, and what
-	 * `TransactionLayer.rekeyPrimaryKey` relies on. The rewrite arm needs no PK pre-pass and cannot
-	 * shadow one: a retype of a PK column is rejected upstream, the backfill only fires on a column
-	 * holding NULLs (which a PK member cannot — the engine enforces NOT NULL on every PK member
-	 * regardless of the declared nullability), and `pkColumnRekeyed` is set only by `set collate`,
-	 * which never sets `rewrite` — so whenever `pkColumnRekeyed` is true, the `structuresRekeyed` arm
-	 * still runs.
-	 * NOTE: if PK members ever become genuinely nullable, the backfill arm gains a PK collision path
-	 * (two NULL keys → one DEFAULT) and needs `validateRekeyedPrimaryKey` plus a primary-tree re-key
-	 * of its own.
+	 * The primary key: a change that moves a PK member's keys (`pkColumnRekeyed`) gets a stricter
+	 * pre-pass ({@link validateRekeyedPrimaryKey}): no layer in the chain, base included, may hold a
+	 * collision. That is what lets every apply step succeed unconditionally, and what
+	 * `TransactionLayer.rekeyPrimaryKey` / `convertColumn` rely on. Both arms can set it: `set
+	 * collate` moves the comparator (the `structuresRekeyed` arm, values untouched), and the `set
+	 * not null` backfill moves the key VALUES (the rewrite arm — a key column is nullable whenever
+	 * the table's identity is its full column set, so two NULL keys can converge on one DEFAULT).
+	 * The rewrite arm probes the CONVERTED rows through the same `mapRow`, on both of the pass's
+	 * row sets: the effective rows decide legality, and the layer chain — whose base rebuild is
+	 * what would merge two committed rows — decides representability. A retype of a PK column is
+	 * rejected upstream, so `rewrite` + `pkColumnRekeyed` is only ever the backfill.
 	 */
 	private async validateAlterColumnPlan(plan: AlterColumnPlan, rows?: EffectiveRowSource): Promise<void> {
 		if (plan.rewrite) {
 			const { convert, convertNulls } = plan.rewrite;
-			await this.validateRekeyedUniqueStructures(
-				plan.newSchema, plan.colIndex, rows,
-				// Unlike `convertBaseRows`, a conversion failure here is NOT swallowed. Every row
-				// the probe sees is visible to the transaction, and the `set data type` pre-pass
-				// already proved each one convertible, so a throw is unreachable; surfacing it as
-				// MISMATCH still beats probing a stale value that could mask a collision.
-				row => convertRowAtIndex(row, plan.colIndex, convert, convertNulls),
-			);
+			// Unlike `convertBaseRows`, a conversion failure here is NOT swallowed. Every row
+			// the probe sees is visible to the transaction, and the `set data type` pre-pass
+			// already proved each one convertible, so a throw is unreachable; surfacing it as
+			// MISMATCH still beats probing a stale value that could mask a collision.
+			const mapRow: RowMapper = row => convertRowAtIndex(row, plan.colIndex, convert, convertNulls);
+			await this.validateRekeyedUniqueStructures(plan.newSchema, plan.colIndex, rows, mapRow);
+			if (plan.pkColumnRekeyed) await this.validateRekeyedPrimaryKey(plan.newSchema, rows, mapRow);
 		} else if (plan.structuresRekeyed) {
 			await this.validateRekeyedUniqueStructures(plan.newSchema, plan.colIndex, rows);
 			// Unlike the secondary-structure pass above — which only ever judges the effective
@@ -3551,8 +3549,10 @@ export class MemoryTableManager {
 	}
 
 	/**
-	 * The primary-key re-key pre-pass, shared by both statements that move the key:
-	 * `alter column … set collate` on a PK member (the comparator moves) and
+	 * The primary-key re-key pre-pass, shared by every statement that moves the key:
+	 * `alter column … set collate` on a PK member (the comparator moves), `alter column … set
+	 * not null` on a PK member (the key VALUES move — null → DEFAULT — so the caller passes the
+	 * conversion as `mapRow` and both passes judge the post-backfill rows), and
 	 * `alter table … alter primary key` (the key columns move — {@link alterPrimaryKey}).
 	 * Runs before anything is mutated, so a rejection leaves the table, the schema and the
 	 * transaction untouched.
@@ -3598,7 +3598,7 @@ export class MemoryTableManager {
 	 * collisions anywhere in the chain, every primary key resolves to at most one row in
 	 * each layer under the new definition.
 	 */
-	private async validateRekeyedPrimaryKey(newSchema: TableSchema, rows?: EffectiveRowSource): Promise<void> {
+	private async validateRekeyedPrimaryKey(newSchema: TableSchema, rows?: EffectiveRowSource, mapRow?: RowMapper): Promise<void> {
 		const newPkFunctions = createPrimaryKeyFunctions(newSchema, this.collationResolver);
 		const connection = this.ddlConnection();
 		const view: Layer = connection
@@ -3609,13 +3609,14 @@ export class MemoryTableManager {
 			rows ? rows() : this.effectiveDdlRows(),
 			newPkFunctions,
 			primaryKeyArity(newSchema) !== 1,
+			mapRow,
 		);
 
 		// `ensureSchemaChangeSafety` has already drained every committed layer into the base and
 		// rejected sibling connections with open work, so this walk covers the transaction's own
 		// layers plus the base — every tree a rollback could restore.
 		for (let layer: Layer | null = rows ? view : view.getParent(); layer; layer = layer.getParent()) {
-			this.assertNoPrimaryKeyCollisionInLayer(layer, newPkFunctions);
+			this.assertNoPrimaryKeyCollisionInLayer(layer, newPkFunctions, mapRow);
 		}
 	}
 
@@ -3623,19 +3624,22 @@ export class MemoryTableManager {
 	 * A duplicate-key detector over the new primary key functions: feed it rows, and it returns
 	 * the key the moment one repeats. Shared by both arms of {@link validateRekeyedPrimaryKey}
 	 * so the async (effective-row) arm and the sync (layer-tree) arm cannot disagree about what
-	 * counts as a collision.
+	 * counts as a collision. `mapRow`, when given, is applied to each row BEFORE its key is
+	 * extracted — the value-rewriting ALTER's per-row conversion, so the probe judges the keys
+	 * the rows will have AFTER the rewrite, not the ones stored now.
 	 *
 	 * NOTE: the probe holds every row it has seen, because the BTree derives its key from the
 	 * stored value — so an ALTER over a large table transiently doubles that table's row
 	 * references. If a wide table ever makes this the memory peak, key the probe by the PK
 	 * encoding (`primaryKeyFunctions.encode`) into a `Set` instead of by the row.
 	 */
-	private makePrimaryKeyProbe(pkFunctions: PrimaryKeyFunctions): (row: Row) => BTreeKeyForPrimary | undefined {
+	private makePrimaryKeyProbe(pkFunctions: PrimaryKeyFunctions, mapRow?: RowMapper): (row: Row) => BTreeKeyForPrimary | undefined {
 		const probe = new BTree<BTreeKeyForPrimary, Row>(
 			(row: Row): BTreeKeyForPrimary => pkFunctions.extractFromRow(row),
 			pkFunctions.compare,
 		);
-		return (row: Row): BTreeKeyForPrimary | undefined => {
+		return (stored: Row): BTreeKeyForPrimary | undefined => {
+			const row = mapRow ? mapRow(stored) : stored;
 			const key = pkFunctions.extractFromRow(row);
 			if (probe.get(key) !== undefined) return key;
 			probe.insert(row);
@@ -3652,8 +3656,9 @@ export class MemoryTableManager {
 		rows: Iterable<Row> | AsyncIterable<Row>,
 		pkFunctions: PrimaryKeyFunctions,
 		keyIsTuple: boolean,
+		mapRow?: RowMapper,
 	): Promise<void> {
-		const seen = this.makePrimaryKeyProbe(pkFunctions);
+		const seen = this.makePrimaryKeyProbe(pkFunctions, mapRow);
 		for await (const row of rows) {
 			const key = seen(row);
 			if (key === undefined) continue;
@@ -3679,10 +3684,10 @@ export class MemoryTableManager {
 	 * deep savepoint stack over a large table ever makes an ALTER slow, note that a layer's rows
 	 * differ from its parent's only at the keys it wrote, so the walk can be narrowed to those.
 	 */
-	private assertNoPrimaryKeyCollisionInLayer(layer: Layer, pkFunctions: PrimaryKeyFunctions): void {
+	private assertNoPrimaryKeyCollisionInLayer(layer: Layer, pkFunctions: PrimaryKeyFunctions, mapRow?: RowMapper): void {
 		const tree = layer.getModificationTree('primary');
 		if (!tree) return;
-		const seen = this.makePrimaryKeyProbe(pkFunctions);
+		const seen = this.makePrimaryKeyProbe(pkFunctions, mapRow);
 		for (const row of iteratePrimaryRows(tree)) {
 			if (seen(row) !== undefined) {
 				throw new QuereusError(
@@ -3729,9 +3734,11 @@ export class MemoryTableManager {
 	 * `convertNulls` routes null own-values through `convert` (the SET NOT NULL null → DEFAULT map);
 	 * SET DATA TYPE leaves them untouched. No-op in autocommit.
 	 *
-	 * PRIMARY-KEY columns never reach here — any retype of a key column is rejected before
-	 * any mutation, and SET NOT NULL leaves the key bytes unchanged — so the primary tree's keys are
-	 * stable and no re-key is needed.
+	 * A retype of a PRIMARY-KEY column never reaches here (rejected before any mutation), but the
+	 * SET NOT NULL backfill of a key member does — its keys move with the values. The layer's own
+	 * rows re-key themselves (their keys are extracted from the converted row); the layer's staged
+	 * DELETIONS carry only a key, which `convertColumn` re-derives under the same conversion. The
+	 * pre-pass has already proved no two rows converge anywhere in the chain.
 	 */
 	private convertColumnOnOpenLayers(newSchema: TableSchema, colIndex: number, convert: (v: SqlValue) => SqlValue, convertNulls = false): void {
 		for (const layer of this.openTransactionLayersOldestFirst()) {

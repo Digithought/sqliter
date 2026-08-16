@@ -9,7 +9,7 @@ import { createPrimaryKeyFunctions, type PrimaryKeyFunctions } from '../utils/pr
 import { QuereusError } from '../../../common/errors.js';
 import { StatusCode } from '../../../common/types.js';
 import type { CollationResolver } from '../../../types/logical-type.js';
-import { convertRowAtIndex } from './row-convert.js';
+import { convertRowAtIndex, makePrimaryKeyConverter } from './row-convert.js';
 
 const log = createLogger('vtab:memory:layer:transaction');
 const warnLog = log.extend('warn');
@@ -510,8 +510,10 @@ export class TransactionLayer implements Layer {
 	 * `deletionTargets` guards each deletion's replay: `find(key)` runs under the NEW key, so a
 	 * re-key can land it on a colliding row this layer never removed — a row a PARENT layer
 	 * upserted at what is now the same key. Only the two re-keys pass it (each an old-key
-	 * identity check on the found row); the column-set/value rebuilds leave key values
-	 * untouched, where find() can only land on the deleted key itself.
+	 * identity check on the found row). The column-set rebuild leaves key values untouched, so
+	 * find() can only land on the deleted key itself; the value rebuild ({@link convertColumn})
+	 * may move a key member's values but replays under a precondition that rules a cross-row
+	 * land out (see its doc), and has no image to check against anyway.
 	 */
 	private installNetOwnWrites(
 		deletions: readonly BTreeKeyForPrimary[],
@@ -554,11 +556,23 @@ export class TransactionLayer implements Layer {
 	 * fills the transaction's OWN pending NULL rows for SET NOT NULL backfill, which live in this
 	 * layer, not the base.
 	 *
-	 * NON-primary-key column, or a key column whose bytes are unchanged. `MemoryTableManager.alterColumn`
-	 * rejects any retype of a key column before any mutation, and SET NOT NULL leaves the key
-	 * bytes intact, so the primary key encoding is unchanged: {@link pkFunctions} and the primary tree
-	 * keep their keys, and only the value at `colIndex` moves. (Contrast {@link rekeyPrimaryKey}, which
-	 * must rebuild the tree because the keys themselves change.)
+	 * The key DEFINITION is unchanged — `MemoryTableManager.alterColumn` rejects any retype of a
+	 * key column before any mutation, and SET NOT NULL touches no collation or type — so
+	 * {@link pkFunctions} stay. The key VALUES may move, though: a SET NOT NULL backfill of a
+	 * PRIMARY-KEY member (a key column is nullable whenever the table's identity is its full column
+	 * set) rewrites NULL → DEFAULT inside the key. Own rows re-key themselves — the tree extracts
+	 * each key from the converted row — but a staged DELETION carries only its OLD key, recorded
+	 * when the delete was staged and still encoding the pre-backfill NULL, and the parent's tree it
+	 * must be replayed into has already been rebuilt over converted rows where that key no longer
+	 * exists (a replay under the old key would land nowhere and RESURRECT the deleted row). So a
+	 * deletion's key is re-derived under the same conversion, at the key's position for `colIndex`.
+	 * Soundness rests on the precondition `MemoryTableManager.validateRekeyedPrimaryKey` establishes
+	 * over the CONVERTED rows before any of this runs: no layer in the chain, base included, holds
+	 * two rows that converge under the backfill — so every re-derived deletion key resolves to at
+	 * most one row in the parent, the converted image of the very row this layer deleted, and no
+	 * `deletionTargets` identity check is needed (nor possible: a deletion carries no image, and
+	 * the conversion is not invertible). (Contrast {@link rekeyPrimaryKey}, where the comparator
+	 * itself changes and pkFunctions must be rebuilt.)
 	 *
 	 * Subsumes {@link adoptSchema} for a same-storage-class retype that ALSO moves the comparator
 	 * (text → date/timespan): `tableSchemaAtCreation` is swapped to `newSchema` and every secondary
@@ -583,20 +597,22 @@ export class TransactionLayer implements Layer {
 	public convertColumn(colIndex: number, convert: (v: SqlValue) => SqlValue, newSchema: TableSchema, convertNulls = false): void {
 		const preTree = this.primaryModifications;
 		this.tableSchemaAtCreation = newSchema;
+		const convertKey = makePrimaryKeyConverter(newSchema, colIndex, convert, convertNulls);
 
 		// The parent's primary tree has been REPLACED by the conversion (base rebuilt from fresh
 		// rows, or a parent layer already converted oldest-first), so this layer's own tree — which
 		// derived from the OLD one — must be rebuilt over the parent's NEW tree; installNetOwnWrites
-		// below does that. The PK is unchanged (a key-column retype is rejected upstream), so
-		// pkFunctions and the keys stay; only the value at colIndex moves — which also means a key
-		// is either finally-deleted or finally-upserted, never both, and no key can collapse onto
-		// another (unlike rekeyPrimaryKey). The net per-key effect is read out of the
-		// pre-conversion tree.
+		// below does that. The PK DEFINITION is unchanged (a key-column retype is rejected
+		// upstream), so pkFunctions stay; the value at colIndex moves, and with it — when colIndex is
+		// a key member — the key, so a surviving deletion's key is re-derived (see the method doc).
+		// The pre-pass has refused any chain in which two rows converge, so a key is still either
+		// finally-deleted or finally-upserted, never both, and no key can collapse onto another
+		// (unlike rekeyPrimaryKey). The net per-key effect is read out of the pre-conversion tree.
 		const survivingDeletions: BTreeKeyForPrimary[] = [];
 		const upserts: Row[] = [];
 		for (const { write, effectiveRow } of this.netOwnWriteEffects(preTree, this.pkFunctions.encode)) {
 			if (effectiveRow === undefined) {
-				survivingDeletions.push(write.primaryKey);
+				survivingDeletions.push(convertKey(write.primaryKey));
 				continue;
 			}
 			let newRow = effectiveRow;
