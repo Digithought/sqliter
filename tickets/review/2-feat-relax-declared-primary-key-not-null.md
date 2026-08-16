@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-08-16T21:49:21.713Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\2-feat-relax-declared-primary-key-not-null.review.2026-08-16T21-49-21-713Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 ---
 description: A table that names its identity columns out loud is no longer forced to fill them in — declaring a primary key now means exactly what leaving it undeclared meant, so the two spellings accept the same values.
 files:

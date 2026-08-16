@@ -110,10 +110,11 @@ function generateTableDDLInternal(
 	const parts: string[] = ['CREATE'];
 	parts.push('TABLE', qualifiedName(tableSchema.schemaName, tableSchema.name, ctx.currentSchemaName));
 
-	// A synthesized all-columns key (the no-PK fallback) must NOT round-trip as a
-	// named PRIMARY KEY: re-parsing one would force its columns NOT NULL, dropping
-	// a nullable declaration. Omit the clause entirely so the re-parse re-synthesizes
-	// the key and preserves nullability (see isSynthesizedAllColumnsKey).
+	// A synthesized all-columns key (the no-PK fallback) round-trips by OMITTING the
+	// PRIMARY KEY clause: the re-parse re-synthesizes the identical key from its absence.
+	// Emitting a named clause instead would also be correct now that declaring a key
+	// changes nothing about its columns — see isSynthesizedAllColumnsKey and
+	// `tickets/implement/4-debt-emit-primary-key-clause-for-every-key`.
 	const synthesizedKey = isSynthesizedAllColumnsKey(tableSchema);
 
 	// The one column that carries the inline `PRIMARY KEY` clause, or -1 when there is

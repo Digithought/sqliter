@@ -2262,10 +2262,10 @@ function classifyBackingReshape(current: TableSchema, shape: BackingShape): Resh
 		if (!backingCollationMatches(from, to)) postReconcileOps.push({ kind: 'recollate', name, collation: to.collation ?? 'BINARY' });
 		if (!backingNotNullMatches(from, to)) {
 			if (to.notNull === true) postReconcileOps.push({ kind: 'tightenNotNull', name });
-			// A physical-PK column cannot hold NULL, so the backing keeps it NOT NULL and
-			// the memory manager refuses to DROP NOT NULL on it: skip the doomed
-			// `loosenNotNull` op for a physical-PK column of `current` (matched by its
-			// pre-rename name). Reached only when reshape is entered for SOME OTHER genuine
+			// An MV backing keeps its physical-PK columns NOT NULL (a backing policy — see
+			// {@link isPhysicalPkColumn}), so skip the `loosenNotNull` op for a physical-PK
+			// column of `current` (matched by its pre-rename name) rather than emitting a
+			// loosening the backing must not take. Reached only when reshape is entered for SOME OTHER genuine
 			// shape change coexisting with a PK-column loosening in the same refresh;
 			// touch point #1 masks the loosening-only case before reshape. See the NOTE at
 			// describeBackingShapeMismatch / computeBackingPrimaryKey (~line 236).

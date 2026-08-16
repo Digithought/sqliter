@@ -16,7 +16,8 @@ select * from nn_test where a is null;
 select id from nn_test where b is null;
 → [{"id": 2}]
 
--- IS NULL on PK (always NOT NULL) should return empty
+-- IS NULL on the key column should return empty — not because it is a key (membership implies
+-- nothing about nullability) but because it is NOT NULL under the shipped default
 select * from nn_test where id is null;
 → []
 
