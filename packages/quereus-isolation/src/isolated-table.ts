@@ -1,5 +1,5 @@
 import type { CollationResolver, Database, DatabaseInternal, MaybePromise, Row, SqlValue, TableIndexSchema as IndexSchema, FilterInfo, SchemaChangeInfo, TableSchema, TableStatistics, UniqueConstraintSchema, CompiledPredicate, UpdateArgs, VirtualTableConnection, UpdateResult, AccessPath, IndexDescriptor, IndexKeyColumn } from '@quereus/quereus';
-import { VirtualTable, compareSqlValues, compareSqlValuesFast, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, resolveUniqueEnforcementCollations, uniqueEnforcementCollations, uniqueEnforcementComparators, normalizeCollationName, serializeKey, pkKeyCollationName, retargetFilterInfoIndex, PRIMARY_INDEX_NAME, coerceRowToSchema, IndexConstraintOp, decodeIdxStr, createTypedComparator, hasSemanticOrdering, semanticKeyTransform } from '@quereus/quereus';
+import { VirtualTable, compareSqlValues, compareSqlValuesFast, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, resolveUniqueEnforcementCollations, uniqueEnforcementCollations, uniqueEnforcementComparators, normalizeCollationName, serializeKeyNullGrouping, pkKeyCollationName, retargetFilterInfoIndex, PRIMARY_INDEX_NAME, coerceRowToSchema, IndexConstraintOp, decodeIdxStr, createTypedComparator, hasSemanticOrdering, semanticKeyTransform } from '@quereus/quereus';
 import type { EffectiveRowSource, KeyNormalizerResolver } from '@quereus/quereus';
 import type { IsolationModule } from './isolation-module.js';
 import type { ConnectionOverlayState } from './isolation-types.js';
@@ -553,18 +553,21 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		// Key-identity transforms for semantic-ordering PK members (TIMESPAN's total-seconds
 		// groupKey): the underlying backends key 'PT1H' and 'PT60M' as ONE row, so the
 		// modified-PK shadow set must bucket them identically or a staged rewrite fails to
-		// shadow the committed spelling and both rows surface. `!` on the serialized key is
-		// safe: PK columns are NOT NULL, so serializeKey never returns null; both the build
-		// and probe below use this one encoder so they stay consistent.
+		// shadow the committed spelling and both rows surface. A no-PK table's synthesized
+		// all-columns key does not force its columns NOT NULL (each keeps its declared
+		// nullability), so a NULL PK component is a legitimate value here, not an error —
+		// `serializeKeyNullGrouping` tags it with a distinct `N:` marker instead of the
+		// whole-key-collapses-to-null semantics `serializeKey` uses for SQL's `NULL <> NULL`.
+		// Both the build and probe below use this one encoder so they stay consistent.
 		const pkTransforms = pkIndices.map(i => semanticKeyTransform(this.tableSchema!.columns[i]?.logicalType));
-		const pkShadowKey = (row: Row): string => serializeKey(
+		const pkShadowKey = (row: Row): string => serializeKeyNullGrouping(
 			pkIndices.map((idx, i) => {
 				const v = row[idx];
 				const transform = pkTransforms[i];
 				return transform && v !== null ? transform(v) : v;
 			}),
 			pkNormalizers,
-		)!;
+		);
 
 		// Step 1: one full overlay scan collects the modified PKs AND the in-window
 		// non-tombstone data rows. The window filter is applied here, unconditionally —
