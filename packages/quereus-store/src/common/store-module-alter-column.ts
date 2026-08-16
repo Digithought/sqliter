@@ -172,6 +172,7 @@ export abstract class StoreModuleAlterColumn extends StoreModuleIndex {
 		// while tables covered by several UNIQUE constraints over one column are rare; if a
 		// wide-constraint table makes ALTER COLUMN slow, judge all covering constraints in a
 		// single pass (one `seen` Set per constraint, one stream).
+
 		// The per-row form of `valueConvert`, shared by every pre-mutation probe that has to judge
 		// the rows as the deferred rewrite will leave them (the memory module's `convertRowAtIndex`
 		// counterpart). Undefined for a change that rewrites nothing.

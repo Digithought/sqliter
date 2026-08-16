@@ -2681,7 +2681,10 @@ export class MemoryTableManager {
 			// `set not null` (`convertNulls`): null base values are mapped to the DEFAULT literal.
 			const convertedBaseRows = this.convertBaseRows(plan.colIndex, plan.rewrite.convert, plan.rewrite.convertNulls);
 			undo.basePrimaryTree = this.baseLayer.primaryTree;
-			this.baseLayer.rebuildPrimaryTreeFromRows(convertedBaseRows);
+			// `assertDistinctKeys` only when the rewrite moves the KEY values (the backfill of a
+			// key member): the pre-pass has already refused any converging pair, so this is the
+			// invariant check that turns a hole in it into a throw instead of a merged row.
+			this.baseLayer.rebuildPrimaryTreeFromRows(convertedBaseRows, plan.pkColumnRekeyed);
 		} else if (plan.structuresRekeyed) {
 			this.baseLayer.rebuildAllSecondaryIndexes();
 			if (plan.pkColumnRekeyed) {

@@ -244,8 +244,16 @@ export class BaseLayer implements Layer {
 	 * already applied), so the base must be *replaced* — not unioned — or rows
 	 * deleted in the transaction layer would remain physically resident in the base
 	 * and resurface in base-direct scans (e.g. UNIQUE index builds).
+	 *
+	 * `assertDistinctKeys` is the same invariant check {@link rebuildPrimaryTreeStrict}
+	 * makes, for the one caller whose `rows` can carry two keys where the stored tree had
+	 * one: `MemoryTableManager.applyAlterColumnToBase`'s value rewrite when the rewritten
+	 * column is a PRIMARY KEY member (the `set not null` null → DEFAULT backfill). Every
+	 * other caller passes rows that already keyed distinctly, and skips the per-row `get`.
+	 * The enforcement path is `validateRekeyedPrimaryKey`'s pre-pass over the converted
+	 * rows; this is what a hole in it surfaces as, instead of a silently merged row.
 	 */
-	public rebuildPrimaryTreeFromRows(rows: Row[]): void {
+	public rebuildPrimaryTreeFromRows(rows: Row[], assertDistinctKeys = false): void {
 		const btreeKeyFromValue = (value: Row): BTreeKeyForPrimary =>
 			this.primaryKeyFunctions.extractFromRow(value);
 		const newTree = new BTree<BTreeKeyForPrimary, Row>(
@@ -253,6 +261,12 @@ export class BaseLayer implements Layer {
 			this.primaryKeyFunctions.compare,
 		);
 		for (const row of rows) {
+			if (assertDistinctKeys && newTree.get(btreeKeyFromValue(row)) !== undefined) {
+				throw new QuereusError(
+					`UNIQUE constraint failed: ${this.tableSchema.name} primary key collides under the new key definition`,
+					StatusCode.CONSTRAINT,
+				);
+			}
 			newTree.insert(row);
 		}
 		this.primaryTree = newTree;
