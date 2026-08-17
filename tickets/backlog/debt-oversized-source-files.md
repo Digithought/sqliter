@@ -14,6 +14,9 @@ files:
   - packages/quereus/src/planner/analysis/constraint-extractor.ts   # 1,647 lines (`wc -l`, 2026-08-11) — noticed during the relation-key review; predicate normalization, covered-key derivation, `analyzeRowSpecific`, and `TableInfo` construction are four separable concerns in one file
   - packages/quereus/src/planner/building/select-aggregates.ts # 1,630 lines (`wc -l`, 2026-08-12, after the post-aggregate redirect choke point + finished-plan boundary check; 1,486 earlier the same day after the select-list group-key redirect; 1,451 on 2026-08-11, 1,400 before the ungrouped-aggregate ORDER BY alias change, 1,296 before the grouping-key-alias change) — noticed during the window/group-key-alias review; GROUP BY key indexing and redirection, the aggregate output scope, HAVING construction, and the final grouped projection are four separable concerns in one file, and the redirect half now has five callers routed through one entry point (select list, window phase, ORDER BY, HAVING, pre-window sort) plus a plan-walking coverage checker
   - packages/quereus/src/schema/table.ts                     # 1,751 lines (`wc -l`, 2026-08-16) — noticed during the PK-conflict DDL review; the `TableSchema`/`ColumnSchema` type surface, the AST→schema builders (`columnDefToSchema` and friends), the key resolvers (`findPKDefinition`, `resolvePkDefaultConflict`, `isSynthesizedAllColumnsKey`), and the structural mutators (`rekeySchemaPrimaryKey`, `shiftSchemaIndicesForDrop`) are four separable concerns in one file
+  - packages/quereus/src/planner/mutation/multi-source.ts    # 3,541 lines (`wc -l`, 2026-08-17) — second-largest non-test source file in the repo and never listed here
+  - packages/quereus/src/planner/mutation/decomposition.ts   # 2,262 lines (`wc -l`, 2026-08-17) — the sibling half of the same folder
+  - packages/quereus/src/planner/mutation/set-op.ts          # 2,058 lines (`wc -l`, 2026-08-17)
   - packages/quereus/src/schema/rename/table-rename.ts       # 1,063 lines (`wc -l`, 2026-08-07) — the other half of the same split; crossed 1,000 when the qualifier-collision predicate landed
   - packages/quereus/src/schema/rename/column-rename.ts      # 1,370 lines (`wc -l`, 2026-08-06; 1,057 when this ticket was filed) — residue of the 1,759-line rename-rewriter.ts split (table/column/strip); the column walk alone is still over, and still growing
   - packages/quereus-store/src/common/store-table.ts         # update() alone is ~315 lines (~252-565)
@@ -147,6 +150,24 @@ The plugin half alone is roughly half the file and is where all recent work has 
 formatting code. `bug-cli-corrupt-plugins-file-silently-wipes-plugins` (still open)
 targets the record store inside the same file. Its plugin-side suite,
 `packages/quoomb-cli/test/plugin-commands.spec.ts`, splits the same way.
+
+### `packages/quereus/src/planner/mutation/` — three files over, 7,861 lines together
+
+Measured with `wc -l` on 2026-08-17 while reviewing the join-view NULL-key write fix:
+3,541 `multi-source.ts`, 2,262 `decomposition.ts`, 2,058 `set-op.ts`. `multi-source.ts` is
+the second-largest non-test source file in the repo behind `schema/manager.ts` and had
+never been listed in this theme. It grew ~190 lines in that one ticket alone.
+
+Named seams inside `multi-source.ts`, already barely interacting: the **join-body analysis**
+(`analyzeJoinView`, side classification, key/EC discovery); the **identity capture substrate**
+(`buildMultiSourceKeyCapture`, `rebuildJoinWithMatchFlags`, `withKeyCapture`,
+`capturedValueSubquery`, `buildCapturedKeyPredicate` — the `__vmupd_keys` machinery, which
+now also owns the match-marker join rebuild); the **UPDATE/DELETE decomposition**
+(`decomposeUpdate`, `decomposeDelete`, the outer-join matched/materialize branches); the
+**RETURNING re-query builders**; and the **multi-source INSERT** analysis. The capture
+substrate is the natural first extraction — it is the piece `decomposition.ts` and
+`set-op.ts` both import, and `capture-correlation.ts` (added by that same ticket) is already
+the start of that module.
 
 ### `packages/quereus-store/src/common/store-table-base.ts` (1,120) and `store-table-scan.ts` (1,401)
 

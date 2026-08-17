@@ -1727,7 +1727,7 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 			// partner's PK matches all N capture rows, so a bare scalar read would error
 			// `Scalar subquery returned more than one row` — `min` collapses the
 			// shared-partner group to one value (a no-op for a constant / np-only SET).
-			perSide[out.sideIndex].push({ column: out.baseColumn, value: capturedValueSubquery(valAlias, out.sideIndex, requireKeyColumns(view, npSide), 'min', SELF_ALIAS, captureRelationName, true) });
+			perSide[out.sideIndex].push({ column: out.baseColumn, value: capturedValueSubquery(valAlias, out.sideIndex, requireKeyColumns(view, npSide), { dedupAggregate: 'min', correlationAlias: SELF_ALIAS, captureRelationName, matchedOnly: true }) });
 			// Null-extended rows: accumulate the (column, captured value) for this side's
 			// single materialization insert, built after the loop.
 			let list = nullExtendedBySide.get(out.sideIndex);
@@ -2429,6 +2429,17 @@ export function buildMultiSourceKeyCapture(
 		for (const i of npSideIndices) {
 			const spec = flagsBySide.get(i)!;
 			const columnIndex = captureAttrs.findIndex(a => a.id === spec.attrId);
+			if (columnIndex < 0) {
+				// Unreachable by construction (the flag is minted on a join inside the rebuilt
+				// spine, and `buildJoinAttributes` propagates every child attribute to the root);
+				// named explicitly so a future rebuild regression fails legibly instead of as an
+				// undefined-property TypeError.
+				raiseMutationDiagnostic({
+					reason: 'unsupported-join',
+					table: view.name,
+					message: `internal: cannot write through view '${view.name}': match marker '${matchFlagName(i)}' is missing from the rebuilt capture join's attributes`,
+				});
+			}
 			const flagType = captureAttrs[columnIndex].type;
 			const name = matchFlagName(i);
 			keyColumns.push({ name, type: flagType });
@@ -2994,7 +3005,7 @@ function stripSideQualifier(
 		// Qualify the owning-PK operands with the per-side UPDATE's collision-proof alias so
 		// the read-back correlates to the target row even when this subquery nests inside a
 		// user value subquery whose FROM has a same-named column (the bug-1 site).
-		return capturedValueSubquery(srcAlias, owningSideIndex, owningPk, undefined, SELF_ALIAS);
+		return capturedValueSubquery(srcAlias, owningSideIndex, owningPk, { correlationAlias: SELF_ALIAS });
 	};
 	// QUALIFIED-only substitution: an owning-alias ref is re-qualified to the lowered
 	// target's `__vm_self` correlation alias; a partner-alias ref
@@ -3022,6 +3033,14 @@ function stripSideQualifier(
 		return undefined;
 	};
 	return transformAliasScopedExpr(expr, substitute);
+}
+
+/** Optional shaping of a {@link capturedValueSubquery} read-back; each field is documented there. */
+export interface CapturedValueOptions {
+	readonly dedupAggregate?: string;
+	readonly correlationAlias?: string;
+	readonly captureRelationName?: string;
+	readonly matchedOnly?: boolean;
 }
 
 /**
@@ -3060,7 +3079,8 @@ function stripSideQualifier(
  * non-preserved matched read-back passes it so a null-extended capture row cannot
  * pollute the aggregate for a target row keyed NULL.
  */
-export function capturedValueSubquery(srcAlias: string, owningSideIndex: number, owningPk: readonly KeyColumnInfo[], dedupAggregate?: string, correlationAlias?: string, captureRelationName: string = MS_UPDATE_KEYS_CTE, matchedOnly = false): AST.Expression {
+export function capturedValueSubquery(srcAlias: string, owningSideIndex: number, owningPk: readonly KeyColumnInfo[], options: CapturedValueOptions = {}): AST.Expression {
+	const { dedupAggregate, correlationAlias, captureRelationName = MS_UPDATE_KEYS_CTE, matchedOnly = false } = options;
 	const conds = owningPk.map((pk, j): AST.Expression => captureKeyEquality(
 		{ type: 'column', name: keyColumnName(owningSideIndex, j), table: 'k' },
 		correlationAlias ? { type: 'column', name: pk.name, table: correlationAlias } : { type: 'column', name: pk.name },

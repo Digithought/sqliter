@@ -2182,12 +2182,6 @@ function isSharedKeyColumn(shape: DecompShape, logical: string): boolean {
 }
 
 /**
- * The single shared-key column for a member. v1 threads a single-column key
- * (mirrors `multi-source.ts`' single-column-PK boundary); a composite/absent key
- * is deferred. `view` is optional purely so the deferral message can name the
- * logical table (the anchor-subquery call site has none in scope).
- */
-/**
  * A capture-correlation key column with its declared nullability, resolved off the
  * owning member's base schema — what makes {@link capturedValueSubquery}'s read-back
  * NULL-safe exactly when the key column is nullable (a nullable anchor/member key would
@@ -2200,6 +2194,12 @@ function keyColumnInfo(schema: TableSchema, name: string): KeyColumnInfo {
 	return { name, nullable: !col || !col.notNull };
 }
 
+/**
+ * The single shared-key column for a member. v1 threads a single-column key
+ * (mirrors `multi-source.ts`' single-column-PK boundary); a composite/absent key
+ * is deferred. `view` is optional purely so the deferral message can name the
+ * logical table (the anchor-subquery call site has none in scope).
+ */
 function singleKeyColumn(view: MutableViewLike | undefined, shape: DecompShape, member: DecompositionMember): string {
 	const keys = shape.storage.sharedKey.keyColumnsByRelation.get(member.relationId) ?? [];
 	if (keys.length !== 1) {

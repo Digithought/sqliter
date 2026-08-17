@@ -4785,3 +4785,97 @@ select count(*) as n from nk_ep;
 → [{"n":0}]
 select cc, cv, pv, hasP from nk_ev;
 → [{"cc":1,"cv":100,"pv":null,"hasP":false}]
+
+-- --- cross-source SET whose OWNING side is the NULL-keyed one ---
+-- `set pv = cv` reads a PARTNER column, so the value rides the capture under a `srcN`
+-- alias and the parent's UPDATE reads it back correlated by its OWN key (`capturedValueSubquery`,
+-- a different correlation site from the identifying EXISTS above). With a plain `=` the
+-- NULL-keyed parent read back NULL and the write silently blanked the column.
+create table nk_xp (pp integer null primary key, jk integer null, pv integer null);
+create table nk_xc (cc integer primary key, pr integer null unique, cv integer null);
+create view nk_xv as select c.cc as cc, c.cv as cv, p.pv as pv
+    from nk_xc c join nk_xp p on p.jk = c.pr;
+insert into nk_xp values (null, 7, 10);
+insert into nk_xc values (1, 7, 100);
+
+update nk_xv set pv = cv where cc = 1;
+select pp, pv from nk_xp;
+→ [{"pp":null,"pv":100}]
+
+-- --- RIGHT join mirror: the non-preserved side is the LEFT child ---
+-- The match marker's `side` is the null-extended child, so RIGHT must mint it on the
+-- left; the substrate keys off `JoinSide.preserved`, not source order.
+create table nk_rp (pp integer null primary key
+                      default (coalesce((select max(pp) from nk_rp), 0) + 1),
+                    jk integer null, pv integer null);
+create table nk_rc (cc integer primary key, pr integer null, cv integer null);
+create view nk_rv as select c.cc as cc, c.cv as cv, p.pv as pv
+    from nk_rp p right join nk_rc c on p.jk = c.pr;
+insert into nk_rp (pp, jk, pv) values (null, 7, 10);
+insert into nk_rc values (1, 7, 100);
+insert into nk_rc values (2, 8, 200);
+
+select cc, cv, pv from nk_rv order by cc;
+→ [{"cc":1,"cv":100,"pv":10},{"cc":2,"cv":200,"pv":null}]
+
+-- cc=1 is MATCHED (partner keyed NULL) → update in place; cc=2 has no partner → materialize.
+update nk_rv set pv = 99 where cc = 1;
+select pp, jk, pv from nk_rp;
+→ [{"pp":null,"jk":7,"pv":99}]
+update nk_rv set pv = 55 where cc = 2;
+select jk, pv from nk_rp order by jk;
+→ [{"jk":7,"pv":99},{"jk":8,"pv":55}]
+
+update nk_rv set pv = 77 where cc = 1 returning cc, cv, pv;
+→ [{"cc":1,"cv":100,"pv":77}]
+
+-- --- two non-preserved sides in ONE capture, markers disagreeing ---
+-- A 3-way left-join chain captures two markers. `a` has a real partner keyed NULL
+-- (marker true → matched UPDATE); `b` has none (marker false → materialize). Reading
+-- "captured key is all NULL" would have routed BOTH to materialize.
+create table nk3c (c integer primary key, pr integer null, cv integer null);
+create table nk3p1 (pp integer null primary key, jk integer null, pv integer null);
+create table nk3p2 (qq integer null primary key
+                      default (coalesce((select max(qq) from nk3p2), 0) + 1),
+                    jk integer null, qv integer null);
+create view nk3v as select x.c as c, x.cv as cv, a.pv as pv, b.qv as qv
+    from nk3c x left join nk3p1 a on a.jk = x.pr
+                left join nk3p2 b on b.jk = x.pr;
+insert into nk3p1 values (null, 7, 10);
+insert into nk3c values (1, 7, 100);
+
+select c, pv, qv from nk3v;
+→ [{"c":1,"pv":10,"qv":null}]
+
+update nk3v set pv = 11, qv = 22 where c = 1;
+select pp, pv from nk3p1;
+→ [{"pp":null,"pv":11}]
+select count(*) as n from nk3p1;
+→ [{"n":1}]
+select jk, qv from nk3p2;
+→ [{"jk":7,"qv":22}]
+
+-- --- a marker that is itself NULL (null-extended by an ENCLOSING outer join) ---
+-- `(x left join b) right join a`: the RIGHT join null-extends its LEFT child, which is
+-- where b's marker lives, so a row with no `x` partner captures b's marker as NULL.
+-- Every marker reader spells "not true" (`is null or not …`), so NULL reads as "no partner".
+create table ex_x (xx integer primary key, pr integer null, xv integer null);
+create table ex_b (bb integer null primary key, jk integer null, bv integer null);
+create table ex_a (aa integer primary key, ar integer null, av integer null);
+create view exv as select a.aa as aa, a.av as av, x.xv as xv, b.bv as bv
+    from ex_x x left join ex_b b on b.jk = x.pr
+                right join ex_a a on a.ar = x.xx;
+insert into ex_b values (null, 7, 10);
+insert into ex_x values (1, 7, 100);
+insert into ex_a values (1, 1, 1000);
+insert into ex_a values (2, 99, 2000);
+
+select aa, xv, bv from exv order by aa;
+→ [{"aa":1,"xv":100,"bv":10},{"aa":2,"xv":null,"bv":null}]
+
+-- The preserved-side update's RETURNING re-query reads b's marker per row: NULL for
+-- aa=2 (whole left child null-extended), true for aa=1 (partner keyed NULL).
+update exv set av = 5 where aa = 2 returning aa, av, xv, bv;
+→ [{"aa":2,"av":5,"xv":null,"bv":null}]
+update exv set av = 6 where aa = 1 returning aa, av, xv, bv;
+→ [{"aa":1,"av":6,"xv":100,"bv":10}]

@@ -33,6 +33,14 @@ export interface KeyColumnInfo {
  *
  * Operands are cloned into each emitted position, so a caller may pass the same
  * node it uses elsewhere without sharing AST subtrees.
+ *
+ * NOTE: the gate reads the **declared** nullability, so a database run under
+ * `pragma default_column_nullability = nullable` declares every key column nullable
+ * and every capture correlation takes the disjunction — including the ones a NOT NULL
+ * default would have left as a seekable `=`. Correct either way, but if view writes
+ * under that pragma ever show up as slow, narrow the gate to the *reachable* nullability
+ * (a key column with a NOT NULL check, or one the body's predicate already excludes NULL
+ * on) rather than the declared one.
  */
 export function captureKeyEquality(left: AST.Expression, right: AST.Expression, nullable: boolean): AST.Expression {
 	const eq: AST.Expression = { type: 'binary', operator: '=', left: cloneExpr(left), right: cloneExpr(right) };
