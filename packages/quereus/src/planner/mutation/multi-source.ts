@@ -114,6 +114,13 @@ import { requireValidatedNewRefIndex } from '../analysis/authored-inverse.js';
  * `k<sideIndex>_<pkColumnOrdinal>` ({@link keyColumnName}) — so a composite-PK side
  * contributes `k<side>_0, k<side>_1, …`. This flattened per-side-per-column shape is
  * what generalizes the substrate past the retired single-column `(k0, k1)` tuple.
+ *
+ * KNOWN HOLE: every reader correlates on the captured key with plain `=`, and the
+ * outer-join branches read "all of a side's captured key columns are NULL" as "that side
+ * had no join partner". Both were sound while every key column was NOT NULL. A key column
+ * may now be nullable (`docs/schema.md` § Primary-key nullability), so a real partner row
+ * whose key holds NULL is both unaddressable by the `=` correlation and indistinguishable
+ * from a null-extension — see `tickets/fix/bug-multi-source-view-write-misreads-null-keys`.
  */
 export const MS_UPDATE_KEYS_CTE = '__vmupd_keys';
 
@@ -3182,8 +3189,10 @@ function resolveColumnSide(col: AST.ColumnExpr, sides: readonly JoinSide[]): num
  * **non-partial** UNIQUE index. A **partial** unique key (one carrying a `predicate`) does
  * not bound the rows outside its predicate scope, so it does not prove global at-most-one
  * and is NOT counted. NULL semantics need no special handling — a `=` join only matches
- * non-null equal values and a unique key bounds each non-null value to ≤1 row (PK columns
- * are NOT NULL regardless).
+ * non-null equal values and a unique key bounds each non-null value to ≤1 row. That holds
+ * even for a nullable key column (key membership does not imply NOT NULL — `docs/schema.md`
+ * § Primary-key nullability): key equality is NULL-self-equal, so uniqueness over the pinned
+ * non-null values is if anything stronger.
  *
  * This is the inverse of the FK-correlation reasoning {@link edgeCorrelated} the delete
  * path uses, but **FK is not required** — the proof is purely partner-side uniqueness (the

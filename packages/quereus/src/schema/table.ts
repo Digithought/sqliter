@@ -794,8 +794,9 @@ export function shiftSchemaIndicesForDrop(schema: TableSchema, colIndex: number)
  * if the two spellings are expected to be interchangeable across an ALTER.
  *
  * User-level validation stays with the callers: the memory manager pre-checks by index and
- * the engine emitter (`runAlterPrimaryKey`) validates by column name before dispatch, so
- * NOT NULL membership is not re-checked here. What IS asserted — as {@link
+ * the engine emitter (`runAlterPrimaryKey`) validates by column name before dispatch. A
+ * nullable member needs no check at all — key membership does not imply NOT NULL (see
+ * `docs/schema.md` § Primary-key nullability). What IS asserted — as {@link
  * shiftSchemaIndicesForDrop} asserts its column index — are the two inputs that would
  * otherwise yield a SELF-INCONSISTENT schema rather than a rejected statement: an
  * out-of-range index (a definition member addressing no column) and a repeated index (a

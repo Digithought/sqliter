@@ -67,6 +67,17 @@ select x, val from t_null_pk order by x;
 select val from t_null_pk where x is null;
 → [{"val":"first"}]
 
+-- SQL comparison stays three-valued in key position: `= null` is UNKNOWN and matches
+-- nothing, even though key EQUALITY (which decides duplicates above) is NULL-self-equal.
+-- The two rules coexist; only `is null` reaches the row. This also pins the point-seek
+-- arm that short-circuits a literal-NULL key equality to an empty result.
+select val from t_null_pk where x = null;
+→ []
+
+-- The same reason an equi-join never reaches a NULL-keyed row.
+select p.val as pval from t_null_pk p join t_null_pk c on p.x = c.x where c.val = 'first';
+→ []
+
 delete from t_null_pk where x is null;
 
 select count(*) as n from t_null_pk;

@@ -24,6 +24,7 @@ import { Database } from '../src/core/database.js';
 import { generateTableDDL } from '../src/schema/ddl-generator.js';
 import type { TableSchema } from '../src/schema/table.js';
 import type { DatabaseSchemaChangeEvent } from '../src/core/database-events.js';
+import type { SqlValue } from '../src/common/types.js';
 
 /** Key as `(name[ desc], …)` in definition order. */
 function keySpelling(schema: TableSchema): string[] {
@@ -168,6 +169,42 @@ describe('nullable PRIMARY KEY — DDL round-trip and apply schema', () => {
 				.to.have.lengthOf(0);
 			expect(nullability(db.schemaManager.findTable('t')!), 'still nullable after the second apply')
 				.to.deep.equal([['x', false], ['y', false]]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('`apply schema` over a POPULATED nullable key holding NULL neither rejects nor backfills', async () => {
+		// The empty-table case above proves the differ computes no phantom `SET NOT NULL`;
+		// it cannot prove what one would DO. Over rows that actually hold NULL in a key
+		// column, a phantom tightening is loud: it either throws (no DEFAULT to backfill
+		// from) or backfills the NULL key to the DEFAULT, moving the row's identity. Both
+		// are visible here, so this is the case that fails if `extractDeclaredNotNull` ever
+		// re-learns "PK implies NOT NULL".
+		const declaration = `
+			declare schema main {
+				table t {
+					x integer null default 0,
+					y integer null,
+					primary key (x, y)
+				}
+			}
+		`;
+		const db = new Database();
+		try {
+			await db.exec(declaration);
+			await db.exec('apply schema main');
+			await db.exec(`insert into t (x, y) values (null, 1), (2, null)`);
+
+			await db.exec('apply schema main');
+
+			expect(nullability(db.schemaManager.findTable('t')!), 'key columns stay nullable')
+				.to.deep.equal([['x', false], ['y', false]]);
+
+			const rows: Array<Record<string, SqlValue>> = [];
+			for await (const row of db.eval(`select x, y from t order by y`)) rows.push(row);
+			expect(rows, 'no key value moved — the NULL key was not backfilled to `default 0`')
+				.to.deep.equal([{ x: 2, y: null }, { x: null, y: 1 }]);
 		} finally {
 			await db.close();
 		}

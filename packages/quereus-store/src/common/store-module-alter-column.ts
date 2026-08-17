@@ -83,7 +83,7 @@ export abstract class StoreModuleAlterColumn extends StoreModuleIndex {
 		// already-explicit) that leave the table and any open transaction untouched.
 		let attr: AlterColumnAttrChange | null;
 		if (change.setNotNull !== undefined) {
-			attr = await alterColumnSetNotNull(table, oldSchema, oldCol, colIndex, change, rows);
+			attr = await alterColumnSetNotNull(table, oldCol, colIndex, change, rows);
 		} else if (change.setDataType !== undefined) {
 			attr = await alterColumnSetDataType(table, oldSchema, oldCol, colIndex, change);
 		} else if (change.setDefault !== undefined) {
@@ -339,7 +339,6 @@ export abstract class StoreModuleAlterColumn extends StoreModuleIndex {
  */
 async function alterColumnSetNotNull(
 	table: StoreTable,
-	_oldSchema: TableSchema,
 	oldCol: ColumnSchema,
 	colIndex: number,
 	change: Extract<SchemaChangeInfo, { type: 'alterColumn' }>,
