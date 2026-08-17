@@ -3272,3 +3272,214 @@ describe('lens decomposition stitch correlation: plan shape', () => {
 		}
 	});
 });
+
+describe('lens decomposition stitch correlation: MIXED nullability keeps the plain forms', () => {
+	// The NULL-safe gate needs BOTH stitch columns declared nullable. When only one side
+	// admits NULL the plain `=` / IN forms are kept DELIBERATELY: a row keyed NULL on the
+	// nullable side has no possible partner on the NOT NULL side, so it is a genuine
+	// orphan (member side) or a componentless logical row (anchor side) — not a stitch
+	// the correlation should re-pair. Both arms of the gate are pinned here.
+	async function setupMixed(db: Database, anchorKeyDecl: string, memberKeyDecl: string): Promise<void> {
+		const mod = new AdvertisingModule();
+		mod.ads = [nullableKeySplit()];
+		db.registerModule('mixmod', mod);
+		await db.exec(`create table N_core (id ${anchorKeyDecl}, a integer) using mixmod`);
+		await db.exec(`create table N_c (id ${memberKeyDecl}, c integer null) using mixmod`);
+		await db.exec(`declare logical schema x { table N { id ${anchorKeyDecl}, a integer, c integer null } }`);
+		await db.exec('apply schema x');
+	}
+
+	/** Both stitch-correlation spellings for `update x.N set c = 5` — the get body and the member UPDATE. */
+	function shapes(db: Database): { body: string; memberUpdate: string } {
+		const ctx = makeCtx(db);
+		const view = db.schemaManager.getView('x', 'N')!;
+		const shape = analyzeDecomposition(ctx, view, decompositionStorage(ctx, view)!);
+		const stmt = new Parser().parseAll('update x.N set c = 5')[0] as AST.UpdateStmt;
+		return {
+			body: astToString(view.selectAst).toLowerCase(),
+			memberUpdate: decomposeUpdate(ctx, view, shape, stmt)
+				.map(op => astToString(op.statement).toLowerCase()).find(s => s.startsWith('update'))!,
+		};
+	}
+
+	it('a NULLABLE anchor key over a NOT NULL member key stays plain — the NULL-keyed row is componentless', async () => {
+		const db = new Database();
+		try {
+			await setupMixed(db, 'integer null primary key', 'integer primary key');
+			const { body, memberUpdate } = shapes(db);
+			expect(body, 'no NULL-safe disjunction').to.not.contain('is null');
+			expect(memberUpdate, 'legacy IN correlation').to.contain('in (select');
+			expect(memberUpdate, 'no synthesized target alias').to.not.contain('__vm_self');
+
+			await db.exec('insert into main.N_core values (null, 10), (1, 20)');
+			await db.exec('insert into main.N_c values (1, 21)');
+			// The NULL-keyed anchor row reads null-extended (no component can exist for it).
+			expect(await rows(db, 'select id, a, c from x.N order by a')).to.deep.equal([
+				{ id: null, a: 10, c: null }, { id: 1, a: 20, c: 21 },
+			]);
+			// Assigning the optional cell of the NULL-keyed row RAISES rather than silently
+			// no-opping: the matched UPDATE misses (`… in (select null …)` is UNKNOWN) and the
+			// materialize INSERT threads the anchor's NULL into the member's NOT NULL key.
+			// Loud + atomic, the documented boundary (docs/lens.md § Current Limitations).
+			await expectThrows(() => db.exec('update x.N set c = 5 where id is null'), /NOT NULL constraint failed: N_c\.id/);
+			expect(await rows(db, 'select id, c from main.N_c')).to.deep.equal([{ id: 1, c: 21 }]);
+			// The non-NULL row's cell still writes normally.
+			await db.exec('update x.N set c = 6 where id = 1');
+			expect(await rows(db, 'select id, c from main.N_c')).to.deep.equal([{ id: 1, c: 6 }]);
+			// A keyed DELETE removes the anchor row; the control row's component survives.
+			await db.exec('delete from x.N where id is null');
+			expect(await rows(db, 'select id, a from main.N_core')).to.deep.equal([{ id: 1, a: 20 }]);
+			expect(await rows(db, 'select id, c from main.N_c')).to.deep.equal([{ id: 1, c: 6 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a NOT NULL anchor key over a NULLABLE member key stays plain — a NULL-keyed member row is a genuine orphan', async () => {
+		const db = new Database();
+		try {
+			await setupMixed(db, 'integer primary key', 'integer null primary key');
+			const { body, memberUpdate } = shapes(db);
+			expect(body, 'no NULL-safe disjunction').to.not.contain('is null');
+			expect(memberUpdate, 'legacy IN correlation').to.contain('in (select');
+			expect(memberUpdate, 'no synthesized target alias').to.not.contain('__vm_self');
+
+			await db.exec('insert into main.N_core values (1, 20)');
+			await db.exec('insert into main.N_c values (1, 21), (null, 99)');
+			// The orphan (no anchor row can key NULL) never surfaces through the anchor-rooted read.
+			expect(await rows(db, 'select id, a, c from x.N order by a')).to.deep.equal([{ id: 1, a: 20, c: 21 }]);
+			// An unpredicated logical DELETE truncates the member, orphan included (no correlation to miss).
+			await db.exec('delete from x.N');
+			expect(await rows(db, 'select count(*) as n from main.N_c')).to.deep.equal([{ n: 0 }]);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+describe('lens decomposition put: all-null assignment under a NULL stitch key', () => {
+	// Assigning null to EVERY value column of an optional member empties the component →
+	// the member write lowers to a base DELETE (docs/lens.md § put fan-out UPDATE), which
+	// routes through the same anchor correlation as the fan-out DELETE. Under a nullable
+	// stitch key that correlation must reach the NULL-keyed component too, or the emptied
+	// cell survives as a stale row.
+	it('empties the NULL-keyed component (member DELETE branch) and leaves the control row alone', async () => {
+		const db = new Database();
+		try {
+			await setupNullableKey(db, false);
+			await db.exec('insert into x.N (id, a, c) values (null, 10, 77), (1, 20, 21)');
+			await db.exec('update x.N set c = null where id is null');
+			expect(await rows(db, 'select id, c from main.N_c')).to.deep.equal([{ id: 1, c: 21 }]);
+			expect(await rows(db, 'select id, a, c from x.N order by a')).to.deep.equal([
+				{ id: null, a: 10, c: null }, { id: 1, a: 20, c: 21 },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+describe('lens decomposition put: row-local CHECK over a NULL stitch key', () => {
+	// The member UPDATE/DELETE now carries a synthesized target alias (`__vm_self`) on the
+	// nullable-key branch, and the logical CHECK threading layers its deferred logical-row
+	// re-read onto that same statement. Pinned here so the alias and the constraint
+	// threading cannot drift apart: the check must still fire, and still pass, for the
+	// NULL-keyed row.
+	async function setupCheckedKey(db: Database, keyDecl: string): Promise<void> {
+		const mod = new AdvertisingModule();
+		mod.ads = [nullableKeySplit()];
+		db.registerModule('chkmod', mod);
+		await db.exec(`create table N_core (id ${keyDecl}, a integer) using chkmod`);
+		await db.exec(`create table N_c (id ${keyDecl}, c integer null) using chkmod`);
+		await db.exec(`declare logical schema x { table N { id ${keyDecl}, a integer, c integer null, constraint climit check (c is null or c < 100) } }`);
+		await db.exec('apply schema x');
+	}
+
+	it('CONTROL: fires over a NOT NULL stitch key', async () => {
+		const db = new Database();
+		try {
+			await setupCheckedKey(db, 'integer primary key');
+			await db.exec('insert into x.N (id, a, c) values (1, 20, 21)');
+			await expectThrows(() => db.exec('update x.N set c = 500 where id = 1'), /check|constraint|climit/i);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('fires on the NULL-keyed row and still admits a conforming write', async () => {
+		const db = new Database();
+		try {
+			await setupCheckedKey(db, 'integer null primary key');
+			await db.exec('insert into x.N (id, a, c) values (null, 10, 77), (1, 20, 21)');
+			await expectThrows(() => db.exec('update x.N set c = 500 where id = 1'), /check|constraint|climit/i);
+			await expectThrows(() => db.exec('update x.N set c = 500 where id is null'), /check|constraint|climit/i);
+			expect(await rows(db, 'select id, c from main.N_c order by c')).to.deep.equal([
+				{ id: 1, c: 21 }, { id: null, c: 77 },
+			]);
+			await db.exec('update x.N set c = 50 where id is null');
+			expect(await rows(db, 'select id, c from main.N_c order by c')).to.deep.equal([
+				{ id: 1, c: 21 }, { id: null, c: 50 },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('fires on the member-DELETE lowering (all-null assignment) of the NULL-keyed row', async () => {
+		// Emptying the cell lowers to a member DELETE, whose deferred re-read is OLD-correlated
+		// — the other arm of the same address predicate.
+		const db = new Database();
+		try {
+			const mod = new AdvertisingModule();
+			mod.ads = [nullableKeySplit()];
+			db.registerModule('chkdelmod', mod);
+			await db.exec('create table N_core (id integer null primary key, a integer) using chkdelmod');
+			await db.exec('create table N_c (id integer null primary key, c integer null) using chkdelmod');
+			await db.exec('declare logical schema x { table N { id integer null primary key, a integer, c integer null, constraint cpresent check (c is not null) } }');
+			await db.exec('apply schema x');
+			await db.exec('insert into x.N (id, a, c) values (null, 10, 77)');
+			await expectThrows(() => db.exec('update x.N set c = null where id is null'), /check|constraint|cpresent/i);
+			expect(await rows(db, 'select id, c from main.N_c')).to.deep.equal([{ id: null, c: 77 }]);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+describe('lens decomposition put: anchor-resolvable upsert under a NULL stitch key', () => {
+	// An anchor-resolvable value (`set c = a + 1`) collapses the matched + materialize
+	// branches into ONE `on conflict (<memberKey>) do update set c = excluded.c` upsert,
+	// so it never routes through the anchor correlation — it relies instead on the base
+	// runtime treating NULL as a self-equal key value when it detects the conflict. Both
+	// halves of that partition are pinned here for a NULL-keyed row.
+	it('materializes the absent component of a NULL-keyed row', async () => {
+		const db = new Database();
+		try {
+			await setupNullableKey(db); // N_core (null, 10), (1, 20); no N_c rows
+			await db.exec('update x.N set c = a + 1');
+			expect(await rows(db, 'select id, c from main.N_c order by c')).to.deep.equal([
+				{ id: null, c: 11 }, { id: 1, c: 21 },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('updates the present component of a NULL-keyed row instead of double-inserting it', async () => {
+		const db = new Database();
+		try {
+			await setupNullableKey(db, false);
+			await db.exec('insert into x.N (id, a, c) values (null, 10, 77), (1, 20, 21)');
+			await db.exec('update x.N set c = a + 1');
+			// `do update` must win on the NULL-keyed row: one component row per anchor row.
+			expect(await rows(db, 'select id, c from main.N_c order by c')).to.deep.equal([
+				{ id: null, c: 11 }, { id: 1, c: 21 },
+			]);
+			expect(await rows(db, 'select id, a, c from x.N order by a')).to.deep.equal([
+				{ id: null, a: 10, c: 11 }, { id: 1, a: 20, c: 21 },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+});

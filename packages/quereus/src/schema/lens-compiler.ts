@@ -19,7 +19,7 @@ import type { MappingAdvertisement, DecompositionMember, StorageShape } from '..
 import type { AnyVirtualTableModule } from '../vtab/module.js';
 import type { InclusionDependency } from '../planner/nodes/plan-node.js';
 import { addInd, MAX_INDS_PER_NODE } from '../planner/util/fd-utils.js';
-import { captureKeyEquality } from '../planner/mutation/capture-correlation.js';
+import { captureKeyEquality, keyColumnInfo } from '../planner/mutation/capture-correlation.js';
 import { spineCloneAst } from '../util/ast-spine-clone.js';
 
 const log = createLogger('schema:lens-compiler');
@@ -812,13 +812,11 @@ function compileDecompositionBody(
 	// Projection: each logical column → its advertised backing expression.
 	const aliasOf = (relationId: string): string | undefined =>
 		joinedMembers.has(relationId) ? relationId : undefined;
-	const eavAnchor = anchorKeys.length > 0
-		? { alias: anchor.relationId, keyColumn: anchorKeys[0], keyNullable: columnNullable(anchorTable, anchorKeys[0]) }
-		: undefined;
+	const eav = eavContext(storage, memberTables, anchor.relationId, anchorKeys, anchorTable);
 
 	const columns: AST.ResultColumn[] = [];
 	for (const col of logicalTable.columns) {
-		const res = resolveAdvertisedColumn(col.name, storage, basis.schemaName, aliasOf, eavAnchor, memberTables);
+		const res = resolveAdvertisedColumn(col.name, storage, basis.schemaName, aliasOf, eav);
 		let expr: AST.Expression;
 		if (res.kind === 'expr') {
 			expr = res.expr;
@@ -967,18 +965,6 @@ function memberTableSource(table: TableSchema, basisSchemaName: string, alias: s
 }
 
 /**
- * Declared nullability of `name` on `table` (`ColumnSchema.notNull === false`).
- * An unknown column (defensive — advertisement validation already guarantees
- * existence) reads as nullable, so a stitch correlation over it falls back to
- * the NULL-safe form: semantically identical for a NOT NULL column, merely less
- * index-friendly (the same convention as `decomposition.ts` `keyColumnInfo`).
- */
-function columnNullable(table: TableSchema, name: string): boolean {
-	const col = table.columns.find(c => c.name.toLowerCase() === name.toLowerCase());
-	return !col || !col.notNull;
-}
-
-/**
  * Builds the per-member key-equi-join ON condition: a positional conjunction of
  * per-column stitch equalities `member.kᵢ = anchor.kᵢ` over the two relations'
  * shared-key column lists (paired by index, since a surrogate may be spelled
@@ -1012,7 +998,7 @@ function buildKeyEquiJoin(
 	const n = Math.min(anchorKeys.length, memberKeys.length);
 	const eqs: AST.Expression[] = [];
 	for (let i = 0; i < n; i++) {
-		const bothNullable = columnNullable(memberTable, memberKeys[i]) && columnNullable(anchorTable, anchorKeys[i]);
+		const bothNullable = keyColumnInfo(memberTable, memberKeys[i]).nullable && keyColumnInfo(anchorTable, anchorKeys[i]).nullable;
 		eqs.push(captureKeyEquality(
 			{ type: 'column', name: memberKeys[i], table: memberAlias } as AST.ColumnExpr,
 			{ type: 'column', name: anchorKeys[i], table: anchorAlias } as AST.ColumnExpr,
@@ -1062,8 +1048,7 @@ function resolveAdvertisedColumn(
 	storage: StorageShape,
 	basisSchemaName: string,
 	aliasOf: (relationId: string) => string | undefined,
-	eavAnchor: { alias: string; keyColumn: string; keyNullable: boolean } | undefined,
-	memberTables?: ReadonlyMap<string, TableSchema>,
+	eav: EavContext | undefined,
 ): AdvertisedColumnResolution {
 	const lc = logicalColumn.toLowerCase();
 
@@ -1076,15 +1061,50 @@ function resolveAdvertisedColumn(
 		return { kind: 'expr', expr: requalifyColumnRefs(mapping.basisExpr, alias) };
 	}
 
-	// 2. EAV attribute pivot — a correlated scalar subquery keyed by the attribute
-	//    literal (only with exactly one pivot member + an entity correlation key).
-	const eavMembers = storage.members.filter(m => m.attributePivot);
-	if (eavMembers.length === 1 && eavAnchor) {
-		return { kind: 'expr', expr: buildEavSubquery(eavMembers[0], logicalColumn, basisSchemaName, eavAnchor, memberTables?.get(eavMembers[0].relationId)) };
-	}
+	// 2. EAV attribute pivot — a correlated scalar subquery keyed by the attribute literal.
+	if (eav) return { kind: 'expr', expr: buildEavSubquery(eav, logicalColumn, basisSchemaName) };
 
 	// 3. Not advertised → caller falls back to name-match.
 	return { kind: 'none' };
+}
+
+/**
+ * Everything the EAV-backed projection needs, resolved together by
+ * {@link eavContext} so no half-supplied combination is representable: the sole
+ * pivot member with its basis schema, and the anchor side of the entity
+ * correlation with its declared nullability. Absent ⇒ no logical column is
+ * EAV-backed in this body (no pivot member, more than one, or no correlation key).
+ */
+interface EavContext {
+	readonly pivot: DecompositionMember;
+	readonly pivotTable: TableSchema;
+	readonly anchorAlias: string;
+	readonly anchorKeyColumn: string;
+	readonly anchorKeyNullable: boolean;
+}
+
+/**
+ * The body's EAV context, or undefined when the shape admits no EAV column: an
+ * attribute pivot backs logical columns only with **exactly one** pivot member
+ * (two would make the attribute literal ambiguous) and a shared-key column to
+ * correlate the entity against.
+ */
+function eavContext(
+	storage: StorageShape,
+	memberTables: ReadonlyMap<string, TableSchema>,
+	anchorAlias: string,
+	anchorKeys: readonly string[],
+	anchorTable: TableSchema,
+): EavContext | undefined {
+	const pivots = storage.members.filter(m => m.attributePivot);
+	if (pivots.length !== 1 || anchorKeys.length === 0) return undefined;
+	return {
+		pivot: pivots[0],
+		pivotTable: memberTables.get(pivots[0].relationId)!,
+		anchorAlias,
+		anchorKeyColumn: anchorKeys[0],
+		anchorKeyNullable: keyColumnInfo(anchorTable, anchorKeys[0]).nullable,
+	};
 }
 
 /**
@@ -1098,21 +1118,18 @@ function resolveAdvertisedColumn(
  * {@link captureKeyEquality} under the same both-sides-nullable gate as
  * {@link buildKeyEquiJoin}: a NULL-keyed entity's triples are otherwise
  * unreachable through the plain `=`. The attribute conjunct compares against a
- * non-null literal and stays plain `=`. `pivotTable` may be absent (defensive —
- * the sole call chain that builds an EAV subquery threads it); then the entity
- * column reads as nullable, falling back to the NULL-safe form.
+ * non-null literal and stays plain `=`.
  */
 function buildEavSubquery(
-	pivot: DecompositionMember,
+	eav: EavContext,
 	logicalColumn: string,
 	basisSchemaName: string,
-	eavAnchor: { alias: string; keyColumn: string; keyNullable: boolean },
-	pivotTable: TableSchema | undefined,
 ): AST.SubqueryExpr {
+	const { pivot } = eav;
 	const piv = pivot.attributePivot!;
 	const pivotAlias = pivot.relationId;
 	const pivotSchema = pivot.relation.schema || basisSchemaName;
-	const entityNullable = !pivotTable || columnNullable(pivotTable, piv.entityColumn);
+	const entityNullable = keyColumnInfo(eav.pivotTable, piv.entityColumn).nullable;
 	const query: AST.SelectStmt = {
 		type: 'select',
 		columns: [{ type: 'column', expr: { type: 'column', name: piv.valueColumn, table: pivotAlias } as AST.ColumnExpr }],
@@ -1126,8 +1143,8 @@ function buildEavSubquery(
 			operator: 'AND',
 			left: captureKeyEquality(
 				{ type: 'column', name: piv.entityColumn, table: pivotAlias } as AST.ColumnExpr,
-				{ type: 'column', name: eavAnchor.keyColumn, table: eavAnchor.alias } as AST.ColumnExpr,
-				entityNullable && eavAnchor.keyNullable,
+				{ type: 'column', name: eav.anchorKeyColumn, table: eav.anchorAlias } as AST.ColumnExpr,
+				entityNullable && eav.anchorKeyNullable,
 			),
 			right: {
 				type: 'binary',

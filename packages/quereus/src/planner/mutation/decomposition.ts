@@ -21,7 +21,7 @@ import { containsNonDeterministicCall } from '../analysis/check-extraction.js';
 import { FunctionFlags } from '../../common/constants.js';
 import { analyzeBodyLineage, type BackwardColumn } from './backward-body.js';
 import { keyColumnName, capturedValueSubquery, type MultiSourceKeyCapture } from './multi-source.js';
-import { captureKeyEquality, type KeyColumnInfo } from './capture-correlation.js';
+import { captureKeyEquality, keyColumnInfo } from './capture-correlation.js';
 import { raiseMutationDiagnostic, type MutationDiagnostic } from './mutation-diagnostic.js';
 
 /**
@@ -2182,6 +2182,14 @@ function anchorKeySubquery(shape: DecompShape, pred: AST.Expression | undefined)
  * `targetAlias` is undefined on the IN branch so NOT NULL schemas keep an alias-free
  * statement. Composite stitch keys are deferred by {@link singleKeyColumn}, so the
  * per-column shape degenerates to one column here.
+ *
+ * NOTE: the EXISTS branch is **correlated**, so unlike the uncorrelated IN subquery it
+ * cannot be evaluated once per statement. The anchor's own value-column UPDATE routes
+ * through here too (it is a mandatory member of its own fan-out) and so self-correlates
+ * against the table it writes — where {@link anchorDeleteOp} sidesteps the same shape by
+ * applying the bare predicate. Not measured; if a nullable-stitch-key lens write ever
+ * shows up in profiles, give the anchor member the bare-predicate form the delete side
+ * already uses, and consider a NULL-safe uncorrelated membership shape for the rest.
  */
 function anchorKeyCorrelation(
 	ctx: PlanningContext,
@@ -2242,19 +2250,6 @@ function stripAnchorQualifier(expr: AST.Expression, shape: DecompShape): AST.Exp
 function isSharedKeyColumn(shape: DecompShape, logical: string): boolean {
 	const keys = shape.storage.sharedKey.keyColumnsByRelation.get(shape.anchor.relationId) ?? [];
 	return keys.some(k => k.toLowerCase() === logical);
-}
-
-/**
- * A capture-correlation key column with its declared nullability, resolved off the
- * owning member's base schema — what makes {@link capturedValueSubquery}'s read-back
- * NULL-safe exactly when the key column is nullable (a nullable anchor/member key would
- * otherwise make the correlation silently miss rows keyed NULL). An unknown column
- * (defensive) falls back to the NULL-safe form, which is semantically identical for a
- * NOT NULL column and merely less index-friendly.
- */
-function keyColumnInfo(schema: TableSchema, name: string): KeyColumnInfo {
-	const col = schema.columns.find(c => c.name.toLowerCase() === name.toLowerCase());
-	return { name, nullable: !col || !col.notNull };
 }
 
 /**

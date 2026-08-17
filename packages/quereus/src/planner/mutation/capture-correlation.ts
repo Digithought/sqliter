@@ -1,4 +1,5 @@
 import type * as AST from '../../parser/ast.js';
+import type { TableSchema } from '../../schema/table.js';
 import { cloneExpr } from './scope-transform.js';
 
 /**
@@ -13,6 +14,20 @@ export interface KeyColumnInfo {
 	readonly name: string;
 	/** True when the column's declared type admits NULL (`ColumnSchema.notNull === false`). */
 	readonly nullable: boolean;
+}
+
+/**
+ * Look one correlation key column up on its base schema (case-insensitively). An
+ * unknown column (defensive — every caller resolves the name off validated
+ * schema/advertisement metadata) reads as **nullable**, so a correlation over it
+ * falls back to the NULL-safe form: semantically identical for a NOT NULL column,
+ * merely less index-friendly. The one place declared nullability is read, so the
+ * decomposition write fan-out and the lens read body cannot drift apart on the
+ * gate that decides {@link captureKeyEquality}'s shape.
+ */
+export function keyColumnInfo(schema: TableSchema, name: string): KeyColumnInfo {
+	const col = schema.columns.find(c => c.name.toLowerCase() === name.toLowerCase());
+	return { name, nullable: !col || !col.notNull };
 }
 
 /**

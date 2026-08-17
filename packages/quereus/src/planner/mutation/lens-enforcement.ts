@@ -13,6 +13,7 @@ import {
 	findLogicalParentFkRefs,
 } from '../../schema/lens-fk-discovery.js';
 import { transformScopedExpr, transformExpr, type ScopeContext } from './scope-transform.js';
+import { captureKeyEquality, keyColumnInfo } from './capture-correlation.js';
 import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
 import type { PlanningContext } from '../planning-context.js';
 import { synthesizeFKExistsExpr, synthesizeFKNotExistsExpr } from '../building/foreign-key-builder.js';
@@ -673,22 +674,31 @@ const MEMBER_HOP_ALIAS = '__lra';
  * `ridingKeyColumn` is the shared-key column of the relation the constraint
  * RIDES (what `<CORR>.…` exposes); each hop leg reads its own member's key
  * column, which may be spelled differently — hence the two names.
+ *
+ * Every leg routes through {@link captureKeyEquality}, NULL-safe exactly when the
+ * logical key column it addresses by is declared nullable: NULL is a self-equal
+ * key value (docs/schema.md § Primary-key nullability), so a plain `=` addresses
+ * NO row for a NULL-keyed write — the `min` over the empty group reads NULL and
+ * every row-local rule of the table silently passes on that row. `nullableLogical`
+ * answers per **logical** column (one question — "can this key value be NULL?"),
+ * so a NOT NULL logical key keeps the byte-identical plain `=` address.
  */
 function buildLogicalRowAddressPredicate(
 	address: LensLogicalRowAddress,
 	ridingKeyColumn: string,
 	correlation: 'NEW' | 'OLD',
+	nullableLogical: (logicalColumn: string) => boolean,
 ): AST.Expression {
 	const corrKey = { type: 'column', name: ridingKeyColumn, table: correlation } as AST.ColumnExpr;
 	if (address.kind === 'shared-key') {
-		return {
-			type: 'binary',
-			operator: '=',
-			left: { type: 'column', name: address.logicalKeyColumn, table: LOGICAL_ROW_ALIAS } as AST.ColumnExpr,
-			right: corrKey,
-		} as AST.BinaryExpr;
+		return captureKeyEquality(
+			{ type: 'column', name: address.logicalKeyColumn, table: LOGICAL_ROW_ALIAS } as AST.ColumnExpr,
+			corrKey,
+			nullableLogical(address.logicalKeyColumn),
+		);
 	}
 	const legs: AST.Expression[] = address.pkColumns.map(({ logicalColumn, basisColumn, relation, relationKeyColumn: memberKeyColumn }) => {
+		const nullable = nullableLogical(logicalColumn);
 		const hop: AST.SelectStmt = {
 			type: 'select',
 			columns: [{ type: 'column', expr: { type: 'column', name: basisColumn, table: MEMBER_HOP_ALIAS } as AST.ColumnExpr }],
@@ -697,19 +707,17 @@ function buildLogicalRowAddressPredicate(
 				table: { type: 'identifier', name: relation.table, schema: relation.schema },
 				alias: MEMBER_HOP_ALIAS,
 			} as AST.TableSource],
-			where: {
-				type: 'binary',
-				operator: '=',
-				left: { type: 'column', name: memberKeyColumn, table: MEMBER_HOP_ALIAS } as AST.ColumnExpr,
-				right: corrKey,
-			} as AST.BinaryExpr,
+			where: captureKeyEquality(
+				{ type: 'column', name: memberKeyColumn, table: MEMBER_HOP_ALIAS } as AST.ColumnExpr,
+				corrKey,
+				nullable,
+			),
 		};
-		return {
-			type: 'binary',
-			operator: '=',
-			left: { type: 'column', name: logicalColumn, table: LOGICAL_ROW_ALIAS } as AST.ColumnExpr,
-			right: { type: 'subquery', query: hop } as AST.SubqueryExpr,
-		} as AST.BinaryExpr;
+		return captureKeyEquality(
+			{ type: 'column', name: logicalColumn, table: LOGICAL_ROW_ALIAS } as AST.ColumnExpr,
+			{ type: 'subquery', query: hop } as AST.SubqueryExpr,
+			nullable,
+		);
 	});
 	return legs.reduce((acc, leg) => ({ type: 'binary', operator: 'AND', left: acc, right: leg } as AST.BinaryExpr));
 }
@@ -823,7 +831,8 @@ export function synthesizeLensRowLocalDeferredConstraint(
 			table: { type: 'identifier', name: slot.logicalTable.name, schema: slot.logicalTable.schemaName },
 			alias: LOGICAL_ROW_ALIAS,
 		} as AST.TableSource],
-		where: buildLogicalRowAddressPredicate(address, relationKeyColumn, correlation),
+		where: buildLogicalRowAddressPredicate(address, relationKeyColumn, correlation,
+			logicalColumn => keyColumnInfo(slot.logicalTable, logicalColumn).nullable),
 	};
 	return {
 		name: LENS_ROW_LOCAL_DEFERRED_NAME,
