@@ -18,6 +18,7 @@ import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
 import { propagate, type BaseOp, type MutableViewLike, type MutationRequest } from './propagate.js';
 import { MS_UPDATE_KEYS_CTE, isJoinBody, isInnerJoinBody, analyzeJoinView, analyzeMultiSourceInsert, decomposeUpdate, decomposeDelete, buildMultiSourceKeyCapture, capturedSideIndices, withKeyCapture, type MultiSourceKeyCapture, type JoinViewAnalysis } from './multi-source.js';
 import { cloneExpr, transformExpr } from './scope-transform.js';
+import { captureKeyEquality } from './capture-correlation.js';
 import { bodyPlanningContext } from './body-context.js';
 import { unwrapPassthroughSubquery } from '../util/set-op-wrapper.js';
 
@@ -1402,9 +1403,12 @@ function resolveInsertLayout(view: MutableViewLike, analysis: SetOpAnalysis, stm
 function buildMemberExists(analysis: SetOpAnalysis, branch: SetOpBranch, gateFlags: readonly string[] = []): AST.Expression {
 	let pred: AST.Expression | undefined;
 	for (let i = 0; i < analysis.dataColCount; i++) {
-		const colMatch = nullSafeEqual(
+		// Data columns are always compared NULL-safely (set operations treat NULL = NULL
+		// as equal), so `nullable` is unconditionally true here.
+		const colMatch = captureKeyEquality(
 			{ type: 'column', name: analysis.dataColNames[i], table: 'k' },
 			{ type: 'column', name: branch.dataColNames[i], table: branch.view.name },
+			true,
 		);
 		pred = pred ? { type: 'binary', operator: 'AND', left: pred, right: colMatch } : colMatch;
 	}
@@ -1423,18 +1427,6 @@ function buildMemberExists(analysis: SetOpAnalysis, branch: SetOpBranch, gateFla
 			where: pred,
 		},
 	} as AST.ExistsExpr;
-}
-
-/** `a = b or (a is null and b is null)` — null-safe equality built from primitives. */
-function nullSafeEqual(a: AST.ColumnExpr, b: AST.ColumnExpr): AST.Expression {
-	const eq: AST.Expression = { type: 'binary', operator: '=', left: { ...a }, right: { ...b } };
-	const bothNull: AST.Expression = {
-		type: 'binary',
-		operator: 'AND',
-		left: { type: 'unary', operator: 'IS NULL', expr: { ...a } } as AST.UnaryExpr,
-		right: { type: 'unary', operator: 'IS NULL', expr: { ...b } } as AST.UnaryExpr,
-	};
-	return { type: 'binary', operator: 'OR', left: eq, right: bothNull };
 }
 
 /**

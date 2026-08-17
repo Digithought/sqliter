@@ -491,3 +491,97 @@ select tag from t_txn where x is null;
 → [{"tag":7}]
 
 drop table t_txn;
+
+-- ===================================
+-- 13. A NULL-keyed row is addressable through a writable JOIN VIEW. The multi-source
+--     write substrate captures each side's key columns up front (`__vmupd_keys`) and
+--     correlates every base op back to them — NULL-safely per nullable key column, with
+--     an explicit match marker deciding the outer-join matched/null-extended partition
+--     (never "captured key is all NULL", which a real partner keyed NULL satisfies too).
+--     The full corpus lives in 93.4-view-mutation.sqllogic (§ NULL key columns through a
+--     writable join view); this section pins the shapes from the nullable-key side.
+-- ===================================
+pragma foreign_keys = false;
+
+-- Inner join: update, RETURNING, and the both-sides delete all reach the NULL-keyed side.
+create table jp (pp integer null primary key, jk integer null, pv integer null);
+create table jc (cc integer primary key, pr integer null, cv integer null);
+create view jv as select c.cc as cc, c.cv as cv, p.pv as pv from jc c join jp p on p.jk = c.pr;
+insert into jp values (null, 7, 10);
+insert into jc values (1, 7, 100);
+
+update jv set pv = 42 where cc = 1;
+select pp, jk, pv from jp;
+→ [{"pp":null,"jk":7,"pv":42}]
+
+update jv set cv = 55 where cc = 1 returning cc, cv, pv;
+→ [{"cc":1,"cv":55,"pv":42}]
+
+delete from jv where cc = 1;
+select count(*) as n from jp;
+→ [{"n":0}]
+select count(*) as n from jc;
+→ [{"n":0}]
+
+drop view jv; drop table jc; drop table jp;
+
+-- Left join: a MATCHED partner keyed NULL updates in place; a row with truly no
+-- partner still materializes one (the marker, not the NULL key, partitions).
+create table ljp (pp integer null primary key
+                    default (coalesce((select max(pp) from ljp), 0) + 1),
+                  jk integer null, pv integer null);
+create table ljc (cc integer primary key, pr integer null, cv integer null);
+create view ljv as select c.cc as cc, c.cv as cv, p.pv as pv from ljc c left join ljp p on p.jk = c.pr;
+insert into ljp (pp, jk, pv) values (null, 7, 10);
+insert into ljc values (1, 7, 100);
+insert into ljc values (2, 8, 200);
+
+update ljv set pv = 99 where cc = 1;
+update ljv set pv = 55 where cc = 2;
+-- cc=1's NULL-keyed partner updated in place; cc=2 minted a new partner for jk=8.
+select jk, pv from ljp order by jk;
+→ [{"jk":7,"pv":99},{"jk":8,"pv":55}]
+
+update ljv set pv = 77 where cc = 1 returning cc, cv, pv;
+→ [{"cc":1,"cv":100,"pv":77}]
+select count(*) as n from ljp;
+→ [{"n":2}]
+
+delete from ljv where cc = 1;
+select cc from ljv order by cc;
+→ [{"cc":2}]
+
+drop view ljv; drop table ljc; drop table ljp;
+
+-- Composite key holding NULL in only some members — both join shapes.
+create table cjp (a integer null, b integer null, jk integer null, pv integer null, primary key (a, b));
+create table cjc (cc integer primary key, pr integer null, cv integer null);
+create view cjv as select c.cc as cc, c.cv as cv, p.pv as pv from cjc c join cjp p on p.jk = c.pr;
+insert into cjp values (1, null, 7, 10);
+insert into cjc values (1, 7, 100);
+
+update cjv set pv = 42 where cc = 1;
+select a, b, pv from cjp;
+→ [{"a":1,"b":null,"pv":42}]
+
+delete from cjv where cc = 1 returning cc, cv, pv;
+→ [{"cc":1,"cv":100,"pv":42}]
+select count(*) as n from cjp;
+→ [{"n":0}]
+
+drop view cjv; drop table cjc;
+create table cjc (cc integer primary key, pr integer null, cv integer null);
+create view cjlv as select c.cc as cc, c.cv as cv, p.pv as pv from cjc c left join cjp p on p.jk = c.pr;
+insert into cjp values (1, null, 7, 10);
+insert into cjc values (1, 7, 100);
+
+update cjlv set pv = 42 where cc = 1;
+select a, b, pv from cjp;
+→ [{"a":1,"b":null,"pv":42}]
+select count(*) as n from cjp;
+→ [{"n":1}]
+
+update cjlv set pv = 43 where cc = 1 returning cc, cv, pv;
+→ [{"cc":1,"cv":100,"pv":43}]
+
+drop view cjlv; drop table cjc; drop table cjp;

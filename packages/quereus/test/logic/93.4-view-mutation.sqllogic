@@ -4625,3 +4625,163 @@ select id, x from nmj_a order by id;
 delete from NMV where inJ = true;
 select id, x from nmj_a order by id;
 → [{"id":2,"x":20}]
+
+-- ===================================
+-- NULL key columns through a writable join view (bug-multi-source-view-write-
+-- misreads-null-keys). A primary key column may be nullable and NULL is an
+-- ordinary, self-equal key value (docs/schema.md § Primary-key nullability), so
+-- the `__vmupd_keys` capture correlates NULL-safely per nullable key column and
+-- carries an explicit per-non-preserved-side MATCH MARKER (`m<side>`) instead of
+-- reading "captured key is all NULL" as "no join partner". Each arm asserts the
+-- post-write BASE state — before the fix every arm "succeeded" while silently
+-- doing nothing, duplicating a row, or returning no rows.
+-- ===================================
+pragma foreign_keys = false;
+
+-- --- inner join: a NULL-keyed side is addressable (update / returning / delete) ---
+create table nk_ip (pp integer null primary key, jk integer null, pv integer null);
+create table nk_ic (cc integer primary key, pr integer null, cv integer null);
+create view nk_iv as select c.cc as cc, c.cv as cv, p.pv as pv
+    from nk_ic c join nk_ip p on p.jk = c.pr;
+insert into nk_ip values (null, 7, 10);
+insert into nk_ic values (1, 7, 100);
+
+select cc, cv, pv from nk_iv;
+→ [{"cc":1,"cv":100,"pv":10}]
+
+-- Update of the NULL-keyed parent's column lands (was: silent no-op).
+update nk_iv set pv = 42 where cc = 1;
+select pp, jk, pv from nk_ip;
+→ [{"pp":null,"jk":7,"pv":42}]
+
+-- UPDATE … RETURNING of the child: the re-query's identity EXISTS spans ALL
+-- sides, so the parent's NULL captured key must still correlate (was: []).
+update nk_iv set cv = 55 where cc = 1 returning cc, cv, pv;
+→ [{"cc":1,"cv":55,"pv":42}]
+select cv from nk_ic;
+→ [{"cv":55}]
+
+-- DELETE … RETURNING projects the pre-mutation OLD image.
+delete from nk_iv where cc = 1 returning cc, cv, pv;
+→ [{"cc":1,"cv":55,"pv":42}]
+
+-- The inner-join delete fans out to BOTH sides; the NULL-keyed parent row must
+-- go too (was: child deleted, parent silently skipped — a half-fired delete).
+select count(*) as n from nk_ic;
+→ [{"n":0}]
+select count(*) as n from nk_ip;
+→ [{"n":0}]
+
+-- --- inner join, composite key with NULL in only SOME members ---
+create table nk_cp (a integer null, b integer null, jk integer null, pv integer null, primary key (a, b));
+create table nk_cc (cc integer primary key, pr integer null, cv integer null);
+create view nk_cv as select c.cc as cc, c.cv as cv, p.pv as pv
+    from nk_cc c join nk_cp p on p.jk = c.pr;
+insert into nk_cp values (1, null, 7, 10);
+insert into nk_cc values (1, 7, 100);
+
+-- (1, NULL) is neither fully non-null nor all-NULL: the per-column NULL-safe
+-- equality must hold on both members at once (was: silent no-op).
+update nk_cv set pv = 42 where cc = 1;
+select a, b, pv from nk_cp;
+→ [{"a":1,"b":null,"pv":42}]
+
+update nk_cv set cv = 9 where cc = 1 returning cc, cv, pv;
+→ [{"cc":1,"cv":9,"pv":42}]
+
+delete from nk_cv where cc = 1;
+select count(*) as n from nk_cp;
+→ [{"n":0}]
+
+-- --- left join: a MATCHED partner keyed NULL is updated in place, not re-minted ---
+-- The DEFAULT on the parent key lets the (mistaken) materialization branch mint a
+-- key, which is exactly how the pre-fix bug surfaced as a duplicated partner.
+create table nk_lp (pp integer null primary key
+                      default (coalesce((select max(pp) from nk_lp), 0) + 1),
+                    jk integer null, pv integer null);
+create table nk_lc (cc integer primary key, pr integer null, cv integer null);
+create view nk_lv as select c.cc as cc, c.cv as cv, p.pv as pv
+    from nk_lc c left join nk_lp p on p.jk = c.pr;
+insert into nk_lp (pp, jk, pv) values (null, 7, 10);
+insert into nk_lc values (1, 7, 100);
+
+-- The row is MATCHED (real partner, key NULL) — not null-extended.
+select cc, cv, pv from nk_lv;
+→ [{"cc":1,"cv":100,"pv":10}]
+
+-- Non-preserved-side update: the capture's match marker routes this to the
+-- matched UPDATE; the NULL-keyed partner updates in place (was: a second parent
+-- row minted via the DEFAULT, and the view fanned out to two rows for cc=1).
+update nk_lv set pv = 99 where cc = 1;
+select pp, jk, pv from nk_lp;
+→ [{"pp":null,"jk":7,"pv":99}]
+select cc, cv, pv from nk_lv;
+→ [{"cc":1,"cv":100,"pv":99}]
+
+-- Same shape with RETURNING: the re-query's matched branch finds the NULL-keyed
+-- partner NULL-safely.
+update nk_lv set pv = 77 where cc = 1 returning cc, cv, pv;
+→ [{"cc":1,"cv":100,"pv":77}]
+select count(*) as n from nk_lp;
+→ [{"n":1}]
+
+-- Genuine null-extension keeps working (the regression the match marker is most
+-- exposed to): a row with truly NO partner materializes one — because its marker
+-- says so, not because its captured key happened to be NULL.
+insert into nk_lc values (2, 8, 200);
+update nk_lv set pv = 55 where cc = 2;
+select jk, pv from nk_lp order by jk;
+→ [{"jk":7,"pv":77},{"jk":8,"pv":55}]
+select cc, cv, pv from nk_lv order by cc;
+→ [{"cc":1,"cv":100,"pv":77},{"cc":2,"cv":200,"pv":55}]
+
+-- Left-join delete routes to the preserved (child) side; the NULL-keyed parent
+-- survives by design.
+delete from nk_lv where cc = 1;
+select cc from nk_lv order by cc;
+→ [{"cc":2}]
+select jk, pv from nk_lp order by jk;
+→ [{"jk":7,"pv":77},{"jk":8,"pv":55}]
+
+-- --- left join, composite non-preserved PK with a NULL member (matched branch) ---
+create table nk_lcp (a integer null, b integer null, jk integer null, pv integer null, primary key (a, b));
+create table nk_lcc (cc integer primary key, pr integer null, cv integer null);
+create view nk_lcv as select c.cc as cc, c.cv as cv, p.pv as pv
+    from nk_lcc c left join nk_lcp p on p.jk = c.pr;
+insert into nk_lcp values (1, null, 7, 10);
+insert into nk_lcc values (1, 7, 100);
+
+update nk_lcv set pv = 42 where cc = 1;
+select a, b, pv from nk_lcp;
+→ [{"a":1,"b":null,"pv":42}]
+-- …and exactly one partner row (no mistaken materialization).
+select count(*) as n from nk_lcp;
+→ [{"n":1}]
+
+update nk_lcv set pv = 43 where cc = 1 returning cc, cv, pv;
+→ [{"cc":1,"cv":100,"pv":43}]
+
+delete from nk_lcv where cc = 1;
+select count(*) as n from nk_lcc;
+→ [{"n":0}]
+select count(*) as n from nk_lcp;
+→ [{"n":1}]
+
+-- --- existence-flip DELETE over a NULL-keyed matched partner ---
+-- `set hasP = false` deletes the MATCHED partition; the captured-key EXISTS must
+-- reach the partner keyed NULL (NULL-safe + marker), was: silent no-op.
+create table nk_ep (pp integer null primary key, jk integer null, pv integer null);
+create table nk_ec (cc integer primary key, pr integer null, cv integer null);
+create view nk_ev as select c.cc as cc, c.cv as cv, p.pv as pv, hasP
+    from nk_ec c left join nk_ep p on p.jk = c.pr exists right as hasP;
+insert into nk_ep values (null, 7, 10);
+insert into nk_ec values (1, 7, 100);
+
+select cc, hasP from nk_ev;
+→ [{"cc":1,"hasP":true}]
+
+update nk_ev set hasP = false where cc = 1;
+select count(*) as n from nk_ep;
+→ [{"n":0}]
+select cc, cv, pv, hasP from nk_ev;
+→ [{"cc":1,"cv":100,"pv":null,"hasP":false}]

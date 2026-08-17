@@ -2966,3 +2966,61 @@ describe('lens decomposition put: per-op gate routes by owning basis relation (c
 		}
 	});
 });
+
+describe('lens decomposition put: captured read-back over a NULLABLE anchor key', () => {
+	// A key column may be nullable and NULL is a self-equal key value (docs/schema.md
+	// § Primary-key nullability). The captured-value read-back (`capturedValueSubquery`)
+	// correlates NULL-safely per nullable key column (planner/mutation/capture-correlation.ts),
+	// so a NULL-keyed anchor row's captured value is reachable — pinned here on the
+	// materialize-INSERT branch, whose value and non-empty filter both read the capture
+	// back by the anchor key. Base state is asserted directly: the lens GET body (and the
+	// matched-UPDATE / member-delete `in (select <anchorKey> …)` correlations) still stitch
+	// the shared key with plain `=`, so a NULL-keyed row does not yet round-trip through
+	// the logical read — tracked separately (fix/bug-lens-decomposition-null-stitch-key).
+	function nullableKeySplit(): MappingAdvertisement {
+		return {
+			id: 'N_core',
+			logicalTable: 'N',
+			role: 'primary-storage',
+			storage: {
+				anchorRelationId: 'N_core',
+				members: [
+					{ relationId: 'N_core', relation: { schema: 'main', table: 'N_core' }, presence: 'mandatory', columns: [colMap('id', 'id'), colMap('a', 'a')] },
+					{ relationId: 'N_c', relation: { schema: 'main', table: 'N_c' }, presence: 'optional', columns: [colMap('c', 'c')] },
+				],
+				sharedKey: { kind: 'logical-tuple', keyColumnsByRelation: keyMap(['N_core', ['id']], ['N_c', ['id']]) },
+			},
+		};
+	}
+
+	async function setupNullableKey(db: Database): Promise<void> {
+		const mod = new AdvertisingModule();
+		mod.ads = [nullableKeySplit()];
+		db.registerModule('admod', mod);
+		await db.exec('create table N_core (id integer null primary key, a integer) using admod');
+		await db.exec('create table N_c (id integer null primary key, c integer null) using admod');
+		await db.exec('declare logical schema x { table N { id integer null primary key, a integer, c integer null } }');
+		await db.exec('apply schema x');
+		// Row keyed NULL and a non-NULL control row; neither has an optional N_c component.
+		await db.exec('insert into main.N_core values (null, 10), (1, 20)');
+	}
+
+	it('materializes an absent optional component for a NULL-keyed anchor row (captured mixed value)', async () => {
+		// `set c = coalesce(c, 0) + a` mixes self (N_c.c) and anchor (N_core.a) leaves, so it
+		// rides the single-identity capture. The materialize INSERT reads the captured value
+		// back correlated by the anchor key — NULL for the first row — which only the NULL-safe
+		// per-column equality can match (plain `=` read back null, the non-empty filter dropped
+		// the row, and the write silently skipped it).
+		const db = new Database();
+		try {
+			await setupNullableKey(db);
+			await db.exec('update x.N set c = coalesce(c, 0) + a');
+			expect(await rows(db, 'select id, c from main.N_c order by c')).to.deep.equal([
+				{ id: null, c: 10 },   // materialized for the NULL-keyed anchor (was: silently missing)
+				{ id: 1, c: 20 },      // control: the non-NULL-keyed row behaves as before
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+});

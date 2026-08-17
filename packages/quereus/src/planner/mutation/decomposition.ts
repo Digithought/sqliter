@@ -21,6 +21,7 @@ import { containsNonDeterministicCall } from '../analysis/check-extraction.js';
 import { FunctionFlags } from '../../common/constants.js';
 import { analyzeBodyLineage, type BackwardColumn } from './backward-body.js';
 import { keyColumnName, capturedValueSubquery, type MultiSourceKeyCapture } from './multi-source.js';
+import type { KeyColumnInfo } from './capture-correlation.js';
 import { raiseMutationDiagnostic, type MutationDiagnostic } from './mutation-diagnostic.js';
 
 /**
@@ -1343,7 +1344,7 @@ function emitCapturedMemberUpdate(
 
 	// Matched UPDATE (unfiltered over the present rows): each value read back by the member key.
 	ops.push(memberUpdateOp(ctx, view, shape, member,
-		cells.map((c, i) => ({ column: c.basisColumn, value: capturedValueSubquery(srcByCell[i], 0, [memberKey]) })),
+		cells.map((c, i) => ({ column: c.basisColumn, value: capturedValueSubquery(srcByCell[i], 0, [keyColumnInfo(schema, memberKey)]) })),
 		pred, stmt));
 
 	// Materialize INSERT (filtered over the absent rows): each value read back by the anchor key.
@@ -1377,6 +1378,7 @@ function buildCapturedMaterializeInsert(
 	const ref = resolveMemberTable(ctx, member);
 	const schema = ref.tableSchema;
 	const anchorKey = singleKeyColumn(view, shape, shape.anchor);
+	const anchorKeyInfo = keyColumnInfo(resolveMemberTable(ctx, shape.anchor).tableSchema, anchorKey);
 	const memberKey = singleKeyColumn(view, shape, member);
 
 	const targetColumns: string[] = [memberKey];
@@ -1385,7 +1387,7 @@ function buildCapturedMaterializeInsert(
 	];
 	cells.forEach((c, i) => {
 		targetColumns.push(c.basisColumn);
-		projections.push({ type: 'column', expr: capturedValueSubquery(srcByCell[i], 0, [anchorKey]) });
+		projections.push({ type: 'column', expr: capturedValueSubquery(srcByCell[i], 0, [anchorKeyInfo]) });
 	});
 	assertNoMissingNotNull(view, schema, targetColumns.map((baseColumn): DecompInsertColumn => ({ baseColumn })));
 
@@ -1393,7 +1395,7 @@ function buildCapturedMaterializeInsert(
 	// non-null. A fresh `capturedValueSubquery` per disjunct (distinct AST nodes from the
 	// projections') keeps the filter self-contained.
 	const nonEmpty = cells
-		.map((_, i): AST.Expression => ({ type: 'unary', operator: 'IS NOT NULL', expr: capturedValueSubquery(srcByCell[i], 0, [anchorKey]) }))
+		.map((_, i): AST.Expression => ({ type: 'unary', operator: 'IS NOT NULL', expr: capturedValueSubquery(srcByCell[i], 0, [anchorKeyInfo]) }))
 		.reduce((acc, e): AST.Expression => acc ? { type: 'binary', operator: 'OR', left: acc, right: e } : e);
 	const where = combineAnd(pred ? cloneExpr(pred) : undefined, nonEmpty);
 
@@ -1808,7 +1810,7 @@ function emitEavCapturedAttr(
 	const srcAlias = registerCapturedExpr(`cap:${member.relationId.toLowerCase()}:attr:${cell.attribute.toLowerCase()}`, cloneExpr(cell.value));
 	// Matched UPDATE: existing triples read the captured value back by the entity column.
 	ops.push(buildEavAttrOp(ctx, view, shape, member, pivot, cell, pred, stmt, 'update',
-		capturedValueSubquery(srcAlias, 0, [pivot.entityColumn])));
+		capturedValueSubquery(srcAlias, 0, [keyColumnInfo(resolveMemberTable(ctx, member).tableSchema, pivot.entityColumn)])));
 	// Materialize INSERT: entities lacking the triple, value read back by the anchor key, non-null filtered.
 	ops.push(buildEavCapturedInsert(ctx, view, shape, member, pivot, cell, srcAlias, pred, stmt));
 }
@@ -1941,8 +1943,9 @@ function buildEavCapturedInsert(
 ): BaseOp {
 	const ref = resolveMemberTable(ctx, member);
 	const anchorKey = singleKeyColumn(view, shape, shape.anchor);
+	const anchorKeyInfo = keyColumnInfo(resolveMemberTable(ctx, shape.anchor).tableSchema, anchorKey);
 	// A fresh read-back subquery per use (projection + filter) — distinct AST nodes.
-	const capturedVal = (): AST.Expression => capturedValueSubquery(srcAlias, 0, [anchorKey]);
+	const capturedVal = (): AST.Expression => capturedValueSubquery(srcAlias, 0, [anchorKeyInfo]);
 	const projections: AST.ResultColumn[] = [
 		{ type: 'column', expr: { type: 'column', name: anchorKey, table: shape.anchor.relationId } },
 		{ type: 'column', expr: { type: 'literal', value: cell.attribute } },
@@ -2184,6 +2187,19 @@ function isSharedKeyColumn(shape: DecompShape, logical: string): boolean {
  * is deferred. `view` is optional purely so the deferral message can name the
  * logical table (the anchor-subquery call site has none in scope).
  */
+/**
+ * A capture-correlation key column with its declared nullability, resolved off the
+ * owning member's base schema — what makes {@link capturedValueSubquery}'s read-back
+ * NULL-safe exactly when the key column is nullable (a nullable anchor/member key would
+ * otherwise make the correlation silently miss rows keyed NULL). An unknown column
+ * (defensive) falls back to the NULL-safe form, which is semantically identical for a
+ * NOT NULL column and merely less index-friendly.
+ */
+function keyColumnInfo(schema: TableSchema, name: string): KeyColumnInfo {
+	const col = schema.columns.find(c => c.name.toLowerCase() === name.toLowerCase());
+	return { name, nullable: !col || !col.notNull };
+}
+
 function singleKeyColumn(view: MutableViewLike | undefined, shape: DecompShape, member: DecompositionMember): string {
 	const keys = shape.storage.sharedKey.keyColumnsByRelation.get(member.relationId) ?? [];
 	if (keys.length !== 1) {

@@ -13,8 +13,9 @@ import { InternalRecursiveCTERefNode } from '../nodes/internal-recursive-cte-ref
 import { analyzeBodyLineage } from './backward-body.js';
 import { buildExpression } from '../building/expression.js';
 import { columnSchemaToScalarType } from '../type-utils.js';
-import { JoinNode } from '../nodes/join-node.js';
+import { JoinNode, type ExistenceColumnSpec } from '../nodes/join-node.js';
 import { EXISTENCE_FLAG_TYPE } from '../nodes/join-utils.js';
+import { captureKeyEquality, type KeyColumnInfo } from './capture-correlation.js';
 import { FilterNode } from '../nodes/filter.js';
 import { ProjectNode, type Projection } from '../nodes/project-node.js';
 import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
@@ -115,12 +116,20 @@ import { requireValidatedNewRefIndex } from '../analysis/authored-inverse.js';
  * contributes `k<side>_0, k<side>_1, …`. This flattened per-side-per-column shape is
  * what generalizes the substrate past the retired single-column `(k0, k1)` tuple.
  *
- * KNOWN HOLE: every reader correlates on the captured key with plain `=`, and the
- * outer-join branches read "all of a side's captured key columns are NULL" as "that side
- * had no join partner". Both were sound while every key column was NOT NULL. A key column
- * may now be nullable (`docs/schema.md` § Primary-key nullability), so a real partner row
- * whose key holds NULL is both unaddressable by the `=` correlation and indistinguishable
- * from a null-extension — see `tickets/fix/bug-multi-source-view-write-misreads-null-keys`.
+ * Two invariants keep the capture sound now that a key column may be nullable
+ * (`docs/schema.md` § Primary-key nullability — NULL is an ordinary, self-equal key value):
+ *
+ * 1. **Correlation is NULL-safe per nullable key column.** Every reader correlates a
+ *    captured key column through {@link captureKeyEquality}: plain `=` for a column
+ *    declared NOT NULL (index-friendly), `left = right or (left is null and right is
+ *    null)` for a nullable one — so a row keyed NULL stays addressable.
+ * 2. **"Had no join partner" is carried explicitly.** For each captured non-preserved
+ *    (outer-join) side the capture projects a boolean **match marker**
+ *    (`m<side>` — {@link matchFlagName}), an {@link ExistenceColumnSpec} flag set by the
+ *    join runtime from the actual null-extension decision. The outer-join branches read
+ *    the marker — never "all of the side's captured key columns are NULL", which a real
+ *    partner keyed NULL would satisfy too. A NULL marker (the flag itself null-extended
+ *    by an enclosing outer join) reads as false.
  */
 export const MS_UPDATE_KEYS_CTE = '__vmupd_keys';
 
@@ -130,6 +139,35 @@ export const MS_UPDATE_KEYS_CTE = '__vmupd_keys';
  */
 export function keyColumnName(sideIndex: number, j: number): string {
 	return `k${sideIndex}_${j}`;
+}
+
+/**
+ * The capture column name of side `sideIndex`'s **match marker** — the boolean
+ * "did this non-preserved side have a join partner" flag the capture projects
+ * alongside the side's `k<side>_<j>` key columns (invariant 2 of
+ * {@link MS_UPDATE_KEYS_CTE}). Minted only for captured non-preserved sides;
+ * readers and the capture projection both derive the name here so they cannot
+ * drift. Namespace-disjoint from `k<side>_<j>` and the `srcN` value aliases.
+ */
+export function matchFlagName(sideIndex: number): string {
+	return `m${sideIndex}`;
+}
+
+/**
+ * The AST predicate reading side `sideIndex`'s capture match marker as "this side had
+ * NO join partner": `k.m<side> is null or not k.m<side>`. A NULL marker — the flag
+ * itself null-extended by an enclosing outer join in an n-way body — must read as
+ * false ("no partner"), so the declared NOT NULL of {@link EXISTENCE_FLAG_TYPE} is
+ * deliberately not assumed here.
+ */
+function matchFlagIsFalse(sideIndex: number): AST.Expression {
+	const flag = (): AST.ColumnExpr => ({ type: 'column', name: matchFlagName(sideIndex), table: 'k' });
+	return {
+		type: 'binary',
+		operator: 'OR',
+		left: { type: 'unary', operator: 'IS NULL', expr: flag() } as AST.UnaryExpr,
+		right: { type: 'unary', operator: 'NOT', expr: flag() } as AST.UnaryExpr,
+	};
 }
 
 // --- shape model ----------------------------------------------------------
@@ -1648,12 +1686,14 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 		// Joins — Updates on a non-preserved-side column): where the non-preserved side
 		// matched it is an ordinary base update; where the row is null-extended (no match) it
 		// is rewritten as an insert on that side. Both ride the up-front `__vmupd_keys`
-		// capture, materialized pre-mutation over the join body: the matched op reads its
-		// captured PK (non-null for a matched row); the null-extended op fires for the rows
-		// whose captured PK is null. The assigned value is captured ONCE (so both branches
-		// read the identical pre-mutation value), and the matched op reads it back keyed on
-		// the non-preserved PK. Needs the capture carrier; the legacy `propagateMultiSource`
-		// path (no carrier) keeps deferring with `unsupported-outer-join-update`.
+		// capture, materialized pre-mutation over the join body, and both partition on the
+		// capture's explicit MATCH MARKER (invariant 2 of MS_UPDATE_KEYS_CTE): the matched
+		// op correlates only marker-true capture rows; the null-extended op fires for the
+		// marker-false rows. The assigned value is captured ONCE (so both branches read the
+		// identical pre-mutation value), and the matched op reads it back keyed NULL-safely
+		// on the non-preserved PK. Needs the capture carrier; the legacy
+		// `propagateMultiSource` path (no carrier) keeps deferring with
+		// `unsupported-outer-join-update`.
 		if (out.nullExtended && out.sideIndex !== undefined && out.baseColumn) {
 			if (!registerCapturedExpr) {
 				raiseMutationDiagnostic({
@@ -1679,13 +1719,15 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 			const baseValue = substituteViewColumns(ctx, asg.value, analysis.viewColToBaseRef, view, analysis.sides);
 			const valAlias = registerCapturedExpr(`neval:${out.sideIndex}:${out.baseColumn.toLowerCase()}`, baseValue);
 			// Matched rows: a per-side UPDATE reading the captured value back, correlated by
-			// the non-preserved side's PK (`buildCapturedKeyPredicate` already filters to
-			// matched rows — a null captured PK never equals a real one). The read-back is
-			// `min`-de-duped per non-preserved partner: when N preserved rows share one
-			// existing partner, that partner's PK matches all N capture rows, so a bare scalar
-			// read would error `Scalar subquery returned more than one row` — `min` collapses
-			// the shared-partner group to one value (a no-op for a constant / np-only SET).
-			perSide[out.sideIndex].push({ column: out.baseColumn, value: capturedValueSubquery(valAlias, out.sideIndex, requireKeyColumns(view, npSide), 'min', SELF_ALIAS, captureRelationName) });
+			// the non-preserved side's PK (`buildCapturedKeyPredicate` restricts the op to
+			// matched rows via the capture's match marker; `matchedOnly` gates this read-back
+			// the same way, so a null-extended capture row — key columns NULL — cannot feed a
+			// target row whose key genuinely holds NULL). The read-back is `min`-de-duped per
+			// non-preserved partner: when N preserved rows share one existing partner, that
+			// partner's PK matches all N capture rows, so a bare scalar read would error
+			// `Scalar subquery returned more than one row` — `min` collapses the
+			// shared-partner group to one value (a no-op for a constant / np-only SET).
+			perSide[out.sideIndex].push({ column: out.baseColumn, value: capturedValueSubquery(valAlias, out.sideIndex, requireKeyColumns(view, npSide), 'min', SELF_ALIAS, captureRelationName, true) });
 			// Null-extended rows: accumulate the (column, captured value) for this side's
 			// single materialization insert, built after the loop.
 			let list = nullExtendedBySide.get(out.sideIndex);
@@ -1864,9 +1906,11 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 	}
 
 	// Existence-flip deletes (§ Existence columns): `set hasB = false` removes the matched
-	// non-preserved rows (their captured PK is non-null; a null-extended row's captured PK
-	// is null, so the same captured-key EXISTS naturally excludes it). The preserved side is
-	// untouched, so a deleted row reads back null-extended (`hasB` now false).
+	// non-preserved rows — the captured-key EXISTS carries the capture's match-marker
+	// conjunct (`buildCapturedKeyPredicate` on a non-preserved side), so a null-extended
+	// capture row is excluded explicitly, not by its NULL key columns failing `=`. The
+	// preserved side is untouched, so a deleted row reads back null-extended (`hasB` now
+	// false).
 	for (const sideIndex of existenceDeleteSides) {
 		const side = analysis.sides[sideIndex];
 		const where = buildCapturedKeyPredicate(view, side, sideIndex, captureRelationName);
@@ -1896,12 +1940,14 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 /**
  * Build the null-extended materialization INSERT for a non-preserved outer-join side:
  * `insert into <np> (<joinKey>, <set cols…>) select k.<jk>, min(k.<val…>) from __vmupd_keys k
- * where <every np PK k col> is null and k.<jk> is not null group by k.<jk>` (§ Outer Joins —
- * Updates). The `group by k.<jk>` de-dups per dangling join key so a shared missing partner
- * materializes exactly once (a fan-out of N preserved rows would otherwise double-insert the
- * partner PK); the value projections are `min` so each is single-valued per group. It
- * fires only for the affected rows the join null-extended (the non-preserved PK captured
- * null) whose preserved-side join key is non-null (a null key cannot seed a joinable row).
+ * where (k.m<np> is null or not k.m<np>) and k.<jk> is not null group by k.<jk>` (§ Outer
+ * Joins — Updates). The `group by k.<jk>` de-dups per dangling join key so a shared missing
+ * partner materializes exactly once (a fan-out of N preserved rows would otherwise
+ * double-insert the partner PK); the value projections are `min` so each is single-valued
+ * per group. It fires only for the affected rows the join null-extended — the capture's
+ * match marker says "no partner" (invariant 2 of {@link MS_UPDATE_KEYS_CTE}; a real matched
+ * partner keyed NULL keeps its marker true and is never re-materialized) — whose
+ * preserved-side join key is non-null (a null key cannot seed a joinable row).
  * The new row carries the EC join key (so the preserved row joins it), the assigned
  * value(s) read from the same pre-mutation `__vmupd_keys` capture the matched UPDATE reads,
  * and base defaults for everything else; a NOT NULL base column without a default that no
@@ -1947,11 +1993,12 @@ function buildNullExtendedInsert(
 	}
 	assertNullExtendedInsertCovered(view, npSide.schema, targetColumns);
 
-	// Restrict to the null-extended partition: every captured PK column of the non-preserved
-	// side is null (no join match), and the preserved join key is non-null (a null key has
-	// no joinable row to create).
-	const conds: AST.Expression[] = requireKeyColumns(view, npSide).map((_pk, j): AST.Expression =>
-		({ type: 'unary', operator: 'IS NULL', expr: { type: 'column', name: keyColumnName(npSideIndex, j), table: 'k' } } as AST.UnaryExpr));
+	// Restrict to the null-extended partition: the capture's match marker says this side
+	// had NO join partner (invariant 2 of MS_UPDATE_KEYS_CTE — never "every captured PK
+	// column is null", which a real matched partner keyed NULL would satisfy too; a NULL
+	// marker reads as false), and the preserved join key is non-null (a null key has no
+	// joinable row to create).
+	const conds: AST.Expression[] = [matchFlagIsFalse(npSideIndex)];
 	conds.push({ type: 'unary', operator: 'IS NOT NULL', expr: { type: 'column', name: jkAlias, table: 'k' } } as AST.UnaryExpr);
 	const where = conds.reduce((acc, c) => combineAnd(acc, c)!);
 
@@ -2072,7 +2119,10 @@ function preservedSideIndices(sides: readonly JoinSide[]): number[] {
  * <pk1> …])` — matching ALL of the side's PK columns (composite keys included) against
  * the up-front materialized key set (the both-sides-assigned UPDATE path, every
  * single-side update/delete, and the multi-side DELETE fan-out; see
- * {@link MS_UPDATE_KEYS_CTE}). The right-hand `<pk_j>` are unqualified, so they bind to
+ * {@link MS_UPDATE_KEYS_CTE}). Each per-column equality is NULL-safe when the key column
+ * is declared nullable ({@link captureKeyEquality} — invariant 1), and a non-preserved
+ * side additionally conjoins its match marker (`k.m<side>` — invariant 2) so only
+ * MATCHED capture rows correlate. The right-hand `<pk_j>` are unqualified, so they bind to
  * the base op's own target table; `k.k<side>_<j>` reads the captured column. The builder
  * injects `__vmupd_keys` into the base op's planning `cteNodes` (resolving to the
  * context-backed key relation), so this is read by descriptor rather than re-querying
@@ -2081,12 +2131,19 @@ function preservedSideIndices(sides: readonly JoinSide[]): number[] {
  */
 function buildCapturedKeyPredicate(view: MutableViewLike, side: JoinSide, sideIndex: number, captureRelationName: string = MS_UPDATE_KEYS_CTE): AST.Expression {
 	const keyCols = requireKeyColumns(view, side);
-	const conds = keyCols.map((pkCol, j): AST.Expression => ({
-		type: 'binary',
-		operator: '=',
-		left: { type: 'column', name: keyColumnName(sideIndex, j), table: 'k' },
-		right: { type: 'column', name: pkCol },
-	}));
+	const conds = keyCols.map((pk, j): AST.Expression => captureKeyEquality(
+		{ type: 'column', name: keyColumnName(sideIndex, j), table: 'k' },
+		{ type: 'column', name: pk.name },
+		pk.nullable,
+	));
+	// A non-preserved (outer-join) side correlates only its MATCHED capture rows: the
+	// capture's match marker (invariant 2 of MS_UPDATE_KEYS_CTE) is AND'd in, so a
+	// null-extended capture row — whose captured key columns are NULL — cannot
+	// NULL-safe-match a real partner row whose key genuinely holds NULL. A NULL marker
+	// reads as false (the bare-column conjunct is not-true for NULL).
+	if (!side.preserved) {
+		conds.push({ type: 'column', name: matchFlagName(sideIndex), table: 'k' });
+	}
 	return {
 		type: 'exists',
 		subquery: {
@@ -2112,7 +2169,9 @@ function buildCapturedKeyPredicate(view: MutableViewLike, side: JoinSide, sideIn
  *  - `descriptor`: the identity stitch shared between the materialized capture rows
  *    and every {@link InternalRecursiveCTERefNode} that reads them back.
  *  - `keyColumns`: the flattened `k<side>_<j>` column shape (one entry per requested
- *    side per PK column) each reader mints a key ref over.
+ *    side per PK column) each reader mints a key ref over — followed by one `m<side>`
+ *    match marker per captured non-preserved side ({@link matchFlagName}) and any
+ *    `srcN` captured-value projections.
  *  - `relationName`: the AST relation name this capture is injected under in `cteNodes`
  *    (and that every base-op predicate reads back via `from <relationName> k`). Absent ⇒
  *    {@link MS_UPDATE_KEYS_CTE} — the standalone multi-source / decomposition / set-op /
@@ -2201,6 +2260,82 @@ export function capturedSideIndices(baseOps: readonly BaseOp[], analysis: JoinVi
 	return [...set].sort((a, b) => a - b);
 }
 
+/** True when the `TableReferenceNode` with plan-node id `tableId` sits anywhere beneath `node`. */
+function subtreeContainsTable(node: PlanNode, tableId: number): boolean {
+	if (node instanceof TableReferenceNode) return Number(node.id) === tableId;
+	return node.getRelations().some(child => subtreeContainsTable(child, tableId));
+}
+
+/**
+ * Rebuild the capture's join tree with one synthetic {@link ExistenceColumnSpec} match
+ * flag per requested non-preserved side (invariant 2 of {@link MS_UPDATE_KEYS_CTE}).
+ * Each flag is appended at the **nearest enclosing join that null-extends its side** —
+ * the join whose non-preserved child subtree contains the side's table — so the flag's
+ * value is the actual null-extension decision for that side (`runtime/emit/join.ts`
+ * sets it from the match bit, never from a re-evaluation of the ON predicate). For an
+ * n-way body the ancestors are rebuilt around the flagged join; a flag minted below an
+ * enclosing outer join is itself nullable-widened by the parent's attribute rebuild
+ * (readers treat NULL as false). Attribute identity is preserved throughout: the
+ * children are reused verbatim and only the `JoinNode` wrappers are re-created, with
+ * each flag carrying a freshly minted stable attribute id.
+ *
+ * NOTE: a flag-bearing join is pinned to the nested-loop emitter (the existence-flag
+ * guards disable physical join selection), so an outer-join write's capture forgoes
+ * hash/merge join. The capture materializes once per statement; if outer-join view
+ * writes over large bodies ever show up as slow, teach the physical joins to emit
+ * match flags rather than weakening the guards.
+ */
+function rebuildJoinWithMatchFlags(
+	view: MutableViewLike,
+	root: JoinNode,
+	sides: readonly JoinSide[],
+	npSideIndices: readonly number[],
+): { joinNode: JoinNode; flagsBySide: ReadonlyMap<number, ExistenceColumnSpec> } {
+	const flagsBySide = new Map<number, ExistenceColumnSpec>();
+	// Post-order: inner joins rebuild first, so each side is claimed at the NEAREST
+	// join that null-extends it (a nested outer join claims before its ancestors).
+	const rebuild = (node: RelationalPlanNode): RelationalPlanNode => {
+		if (!(node instanceof JoinNode)) return node;
+		const newLeft = rebuild(node.left) as RelationalPlanNode;
+		const newRight = rebuild(node.right) as RelationalPlanNode;
+		const nullExtends = (child: 'left' | 'right'): boolean =>
+			(node.joinType === 'left' && child === 'right')
+			|| (node.joinType === 'right' && child === 'left')
+			|| node.joinType === 'full';
+		const newSpecs: ExistenceColumnSpec[] = [];
+		for (const i of npSideIndices) {
+			if (flagsBySide.has(i)) continue;
+			const tableId = Number(sides[i].table.id);
+			const child = subtreeContainsTable(node.left, tableId) ? 'left'
+				: subtreeContainsTable(node.right, tableId) ? 'right'
+				: undefined;
+			if (!child || !nullExtends(child)) continue;
+			const spec: ExistenceColumnSpec = { attrId: PlanNode.nextAttrId(), name: matchFlagName(i), side: child };
+			flagsBySide.set(i, spec);
+			newSpecs.push(spec);
+		}
+		if (newLeft === node.left && newRight === node.right && newSpecs.length === 0) return node;
+		return new JoinNode(
+			node.scope, newLeft, newRight, node.joinType, node.condition,
+			node.usingColumns, [...(node.existence ?? []), ...newSpecs],
+		);
+	};
+	const rebuilt = rebuild(root) as JoinNode;
+	// A non-preserved side is, by collectJoinSources' classification, null-extended by
+	// SOME enclosing outer join — a missing claim means the planned tree and the AST
+	// classification disagree.
+	for (const i of npSideIndices) {
+		if (!flagsBySide.has(i)) {
+			raiseMutationDiagnostic({
+				reason: 'unsupported-join',
+				table: view.name,
+				message: `internal: cannot write through view '${view.name}': non-preserved side '${sides[i].schema.name}' did not resolve to a null-extending join for its match marker`,
+			});
+		}
+	}
+	return { joinNode: rebuilt, flagsBySide };
+}
+
 /**
  * Build the up-front identity capture: each affected view row's base-PK identities,
  * by the same identifying predicate the base ops route on (user WHERE → base ∧ body
@@ -2247,9 +2382,25 @@ export function buildMultiSourceKeyCapture(
 	const predicate = idPredicateAst
 		? buildExpression({ ...ctx, scope: analysis.joinScope }, idPredicateAst)
 		: undefined;
+
+	// Match markers (invariant 2 of MS_UPDATE_KEYS_CTE): the capture — and ONLY the
+	// capture — reads the join through a rebuilt copy carrying one synthetic
+	// `ExistenceColumnSpec` per captured non-preserved side, so "did this side have a
+	// join partner" is materialized explicitly (set by the join runtime from the actual
+	// null-extension decision) instead of being inferred from NULL key columns. The
+	// rebuild preserves every pre-existing attribute id (`buildJoinAttributes` copies
+	// the child attributes verbatim), so `analysis.joinScope` still resolves the
+	// identifying predicate and PK projections against it; the RETURNING re-query keeps
+	// reading `analysis.joinNode` unchanged and reads `k.m<side>` out of the capture.
+	// An all-preserved (inner-join) capture rebuilds nothing — byte-identical shape.
+	const npSideIndices = sideIndices.filter(i => !analysis.sides[i].preserved);
+	const { joinNode: captureJoin, flagsBySide } = npSideIndices.length > 0
+		? rebuildJoinWithMatchFlags(view, analysis.joinNode, analysis.sides, npSideIndices)
+		: { joinNode: analysis.joinNode, flagsBySide: new Map<number, ExistenceColumnSpec>() };
+
 	const filtered: RelationalPlanNode = predicate
-		? new FilterNode(analysis.joinScope, analysis.joinNode, predicate)
-		: analysis.joinNode;
+		? new FilterNode(analysis.joinScope, captureJoin, predicate)
+		: captureJoin;
 
 	// One capture column per requested side per PK column: `k<side>_<j>`. A composite-PK
 	// side projects all its PK columns; the readers' EXISTS correlate on the same set.
@@ -2260,12 +2411,32 @@ export function buildMultiSourceKeyCapture(
 		const pkCols = requireKeyColumns(view, side);
 		pkCols.forEach((pk, j) => {
 			const name = keyColumnName(i, j);
-			keyColumns.push({ name, type: columnSchemaToScalarType(columnByName(side.schema, pk)) });
+			keyColumns.push({ name, type: columnSchemaToScalarType(columnByName(side.schema, pk.name)) });
 			projections.push({
-				node: buildExpression({ ...ctx, scope: analysis.joinScope }, { type: 'column', name: pk, table: side.alias }),
+				node: buildExpression({ ...ctx, scope: analysis.joinScope }, { type: 'column', name: pk.name, table: side.alias }),
 				alias: name,
 			});
 		});
+	}
+
+	// Project each non-preserved side's match marker as a capture column (`m<side>`),
+	// referenced directly by the flag's own attribute id — the scope knows nothing of the
+	// synthetic flags. The attribute's type is read off the rebuilt join (nullable-widened
+	// when an enclosing outer join can null-extend the flag itself; readers treat NULL as
+	// false).
+	if (npSideIndices.length > 0) {
+		const captureAttrs = captureJoin.getAttributes();
+		for (const i of npSideIndices) {
+			const spec = flagsBySide.get(i)!;
+			const columnIndex = captureAttrs.findIndex(a => a.id === spec.attrId);
+			const flagType = captureAttrs[columnIndex].type;
+			const name = matchFlagName(i);
+			keyColumns.push({ name, type: flagType });
+			projections.push({
+				node: new ColumnReferenceNode(analysis.joinScope, { type: 'column', name }, flagType, spec.attrId, columnIndex),
+				alias: name,
+			});
+		}
 	}
 
 	// Cross-source SET read values: project each partner base column the SET reads under
@@ -2296,15 +2467,16 @@ export function buildMultiSourceKeyCapture(
  * still returned (single-source NEW semantics). It keeps only the structural join
  * ON-condition; the body/user WHERE is intentionally NOT re-applied.
  *
- * The per-side identity is **preserved-keyed**: a preserved side matches by exact
- * per-PK-column equality (`k.k<p>_<j> = s<p>.pk<j>`), while a non-preserved (outer-join
- * null-extended) side uses a matched-OR-null disjunction `(AND_j k.k<np>_<j> =
- * s<np>.pk<j>) OR (AND_j k.k<np>_<j> is null)`. This re-keys the re-query off the
- * **stable preserved-side identity** so a freshly-materialized null-extended row (whose
- * non-preserved PK was captured NULL) surfaces via its preserved-side equalities alone,
- * rather than being silently dropped by a `NULL = <minted pk>` match. For an all-
- * preserved (inner) join every side is exact equality — byte-identical to the prior
- * behavior, so inner-join RETURNING is unchanged.
+ * The per-side identity is **preserved-keyed**: a preserved side matches by per-PK-column
+ * equality (`k.k<p>_<j> = s<p>.pk<j>`, NULL-safe per nullable key column —
+ * {@link captureKeyEquality}), while a non-preserved (outer-join null-extended) side uses
+ * a matched-OR-no-partner disjunction `(AND_j k.k<np>_<j> ≈ s<np>.pk<j>) OR (k.m<np> is
+ * false-or-null)` keyed off the capture's **match marker** ({@link matchFlagName}). This
+ * re-keys the re-query off the **stable preserved-side identity** so a freshly-materialized
+ * null-extended row (whose marker was captured false) surfaces via its preserved-side
+ * equalities alone, rather than being silently dropped by a `NULL = <minted pk>` match.
+ * For an all-preserved (inner) join every side is plain equality over its NOT NULL key
+ * columns — byte-identical to the prior behavior, so inner-join RETURNING is unchanged.
  *
  * Reads the shared {@link MultiSourceKeyCapture} the builder materializes
  * before the base ops fire (via its own freshly-minted key ref over the same
@@ -2328,36 +2500,36 @@ export function buildMultiSourceUpdateReturning(
 	// join row through `joinScope`.
 	//
 	// The per-side identity predicate is AND'd over all sides:
-	//  - a **preserved** side keys by exact per-PK-column equality (`AND_j k.k<side>_<j>
-	//    = s<side>.pk<j>`) — its PK is stable across the mutation and uniquely identifies
-	//    the view row (the premise that makes a non-preserved column updatable at all);
-	//  - a **non-preserved** (outer-join null-extended) side keys by a matched-OR-null
-	//    disjunction `(AND_j k.k<np>_<j> = s<np>.pk<j>) OR (AND_j k.k<np>_<j> is null)`.
+	//  - a **preserved** side keys by per-PK-column equality (`AND_j k.k<side>_<j> =
+	//    s<side>.pk<j>`, NULL-safe when the column is declared nullable) — its PK is
+	//    stable across the mutation and uniquely identifies the view row (the premise
+	//    that makes a non-preserved column updatable at all);
+	//  - a **non-preserved** (outer-join null-extended) side keys by a matched-OR-no-
+	//    partner disjunction `(AND_j k.k<np>_<j> ≈ s<np>.pk<j>) OR (k.m<np> is null or
+	//    not k.m<np>)`.
 	//
-	// A *matched* capture row (np PK non-null) takes the matched branch and finds the
-	// stable np row; the null branch is false (the np PK is non-null). A *materialized
-	// null-extended* capture row (np PK captured NULL — it had no pre-mutation partner)
-	// fails the matched branch (`null = …` is not-true) and takes the null branch, so it
-	// is identified by the preserved-side equalities ALONE — surfacing the freshly-minted
-	// partner row (and a preserved-side update touching a still-null-extended row, the
-	// latent partial-set bug #2). SQL three-valued comparison keeps the two branches
-	// disjoint, so no explicit `is not null` guard is needed.
+	// A *matched* capture row (marker true) takes the matched branch and finds the
+	// stable np row (NULL-safe per nullable key column, so a partner genuinely keyed
+	// NULL is still found); its no-partner branch is false. A *materialized
+	// null-extended* capture row (marker false — it had no pre-mutation partner) takes
+	// the no-partner branch, so it is identified by the preserved-side equalities ALONE
+	// — surfacing the freshly-minted partner row (and a preserved-side update touching
+	// a still-null-extended row, the latent partial-set bug #2). The marker — not "the
+	// captured np PK is all NULL", which a real partner keyed NULL would satisfy too —
+	// is what partitions the two branches (invariant 2 of MS_UPDATE_KEYS_CTE); a NULL
+	// marker reads as false.
 	const sideConds = analysis.sides.map((side, sideIndex): AST.Expression => {
 		const pkCols = requireKeyColumns(view, side);
-		const exact = pkCols.map((pk, j): AST.Expression => ({
-			type: 'binary',
-			operator: '=',
-			left: { type: 'column', name: keyColumnName(sideIndex, j), table: 'k' },
-			right: { type: 'column', name: pk, table: side.alias },
-		})).reduce((acc, c) => combineAnd(acc, c)!);
+		const exact = pkCols.map((pk, j): AST.Expression => captureKeyEquality(
+			{ type: 'column', name: keyColumnName(sideIndex, j), table: 'k' },
+			{ type: 'column', name: pk.name, table: side.alias },
+			pk.nullable,
+		)).reduce((acc, c) => combineAnd(acc, c)!);
 		if (side.preserved) return exact;
-		// Null-extended branch: every captured PK column of this non-preserved side is null
-		// (no pre-mutation join partner), so the row is identified by the preserved sides'
-		// exact equalities alone.
-		const allNull = pkCols.map((_pk, j): AST.Expression =>
-			({ type: 'unary', operator: 'IS NULL', expr: { type: 'column', name: keyColumnName(sideIndex, j), table: 'k' } } as AST.UnaryExpr))
-			.reduce((acc, c) => combineAnd(acc, c)!);
-		return { type: 'binary', operator: 'OR', left: exact, right: allNull } as AST.BinaryExpr;
+		// No-partner branch: the capture's match marker says this non-preserved side had
+		// no pre-mutation join partner, so the row is identified by the preserved sides'
+		// equalities alone.
+		return { type: 'binary', operator: 'OR', left: exact, right: matchFlagIsFalse(sideIndex) } as AST.BinaryExpr;
 	});
 	// Read the capture's own relation name so a fresh-named capture's RETURNING re-query
 	// reads back from (and injects under) the same relation its base ops do — the constant
@@ -2797,7 +2969,7 @@ function stripSideQualifier(
 	});
 	// The owning side's PK — the correlation a captured cross-source read binds on.
 	// Resolved lazily (only a cross-source rewrite needs it).
-	let owningPk: readonly string[] | undefined;
+	let owningPk: readonly KeyColumnInfo[] | undefined;
 	// Route a partner-side base-column read through the up-front capture: project it into
 	// `__vmupd_keys` under a stable `srcN` alias and rewrite the reference to a correlated
 	// scalar read of it, keyed by the owning side's PK. Shared by the qualified-other branch
@@ -2881,14 +3053,26 @@ function stripSideQualifier(
  * `captureRelationName` is the relation the correlated read scans (`from <name> k`); it
  * defaults to {@link MS_UPDATE_KEYS_CTE} so the standalone multi-source and decomposition
  * callers are byte-identical, while a nested multi-source capture threads its fresh name.
+ *
+ * Correlation is NULL-safe per nullable owning-PK column ({@link captureKeyEquality} —
+ * invariant 1 of {@link MS_UPDATE_KEYS_CTE}); `matchedOnly` additionally restricts the
+ * read to matched capture rows via the owning side's match marker (invariant 2) — the
+ * non-preserved matched read-back passes it so a null-extended capture row cannot
+ * pollute the aggregate for a target row keyed NULL.
  */
-export function capturedValueSubquery(srcAlias: string, owningSideIndex: number, owningPk: readonly string[], dedupAggregate?: string, correlationAlias?: string, captureRelationName: string = MS_UPDATE_KEYS_CTE): AST.Expression {
-	const conds = owningPk.map((pk, j): AST.Expression => ({
-		type: 'binary',
-		operator: '=',
-		left: { type: 'column', name: keyColumnName(owningSideIndex, j), table: 'k' },
-		right: correlationAlias ? { type: 'column', name: pk, table: correlationAlias } : { type: 'column', name: pk },
-	}));
+export function capturedValueSubquery(srcAlias: string, owningSideIndex: number, owningPk: readonly KeyColumnInfo[], dedupAggregate?: string, correlationAlias?: string, captureRelationName: string = MS_UPDATE_KEYS_CTE, matchedOnly = false): AST.Expression {
+	const conds = owningPk.map((pk, j): AST.Expression => captureKeyEquality(
+		{ type: 'column', name: keyColumnName(owningSideIndex, j), table: 'k' },
+		correlationAlias ? { type: 'column', name: pk.name, table: correlationAlias } : { type: 'column', name: pk.name },
+		pk.nullable,
+	));
+	// `matchedOnly`: restrict the read to MATCHED capture rows via the owning side's
+	// match marker (the non-preserved matched read-back). Without it, a null-extended
+	// capture row — key columns all NULL — would NULL-safe-match a target row whose key
+	// genuinely holds NULL and pollute the aggregate with the null-extended branch's value.
+	if (matchedOnly) {
+		conds.push({ type: 'column', name: matchFlagName(owningSideIndex), table: 'k' });
+	}
 	const colRef: AST.ColumnExpr = { type: 'column', name: srcAlias, table: 'k' };
 	const projection: AST.Expression = dedupAggregate
 		? { type: 'function', name: dedupAggregate, args: [colRef] }
@@ -2992,12 +3176,14 @@ function asBooleanLiteral(expr: AST.Expression): boolean | undefined {
 }
 
 /**
- * The side's primary-key column names (≥1), in declaration order — the per-side
- * identifying key the capture projects and the base ops' EXISTS correlates on.
- * Composite keys are admitted (each PK column contributes a `k<side>_<j>` capture
- * column); a keyless table is the only reject (`unsupported-join`).
+ * The side's primary-key columns (≥1), in declaration order, each carrying its
+ * **declared nullability** — the per-side identifying key the capture projects and
+ * the base ops' EXISTS correlates on, NULL-safely per nullable column
+ * ({@link captureKeyEquality}). Composite keys are admitted (each PK column
+ * contributes a `k<side>_<j>` capture column); a keyless table is the only reject
+ * (`unsupported-join`).
  */
-function requireKeyColumns(view: MutableViewLike, side: JoinSide): string[] {
+function requireKeyColumns(view: MutableViewLike, side: JoinSide): KeyColumnInfo[] {
 	const pk = side.schema.primaryKeyDefinition;
 	if (pk.length === 0) {
 		raiseMutationDiagnostic({
@@ -3006,7 +3192,10 @@ function requireKeyColumns(view: MutableViewLike, side: JoinSide): string[] {
 			message: `cannot write through view '${view.name}': base table '${side.schema.name}' has no primary key; multi-source identifying predicates need a key`,
 		});
 	}
-	return pk.map(def => side.schema.columns[def.index].name);
+	return pk.map(def => {
+		const col = side.schema.columns[def.index];
+		return { name: col.name, nullable: !col.notNull };
+	});
 }
 
 /**
