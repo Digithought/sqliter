@@ -15,7 +15,7 @@ The contract signals capability three different ways, and the behavior when a mo
 
 | Signaling | Members | Engine consults it? |
 | --- | --- | --- |
-| **Method presence** | `supports` / `executePlan`, `getBestAccessPlan`, `getMappingAdvertisements`, `getBackingHost`, `createIndex` / `dropIndex`, `alterTable`, `renameTable`, `finalizeRename`, `beginSchemaBatch` / `endSchemaBatch`, `notifyLensDeployment`, `onRegister`, `assertCatalogObjectPersistable` | yes, per call site (varies) |
+| **Method presence** | `supports` / `executePlan`, `getBestAccessPlan`, `getMappingAdvertisements`, `getBackingHost`, `normalizeCreateSchema`, `createIndex` / `dropIndex`, `alterTable`, `renameTable`, `finalizeRename`, `beginSchemaBatch` / `endSchemaBatch`, `notifyLensDeployment`, `onRegister`, `assertCatalogObjectPersistable` | yes, per call site (varies) |
 | **Static field** | `concurrencyMode`, `expectedLatencyMs` | yes, before dispatch (the clean model) |
 | **`getCapabilities()` flag** | `delegatesNotNullBackfill`, `permitsGrandfatheredCheckViolators`, `permitsOrphanedForeignKeyRows`, `permitsGrandfatheredNotNullViolators`, `ddlTransactionality` (live); `isolation`, `savepoints`, `persistent`, `secondaryIndexes`, `rangeScans` (informational) | only the first five |
 
@@ -39,6 +39,7 @@ Each surface below is tagged by how its **unsupported path** behaves:
 | `supports` / `executePlan` | presence (pair) | engine-side fallback (index path) — isolation **deliberately suppresses** it so the overlay sees every row | — | — | suppressed | — |
 | `getMappingAdvertisements` | presence | engine-side fallback (name-match only) | ✓ tags | ✓ tags | forwards | via store |
 | `getBackingHost` | presence | negotiated rejection (`create materialized view … using <module>` and catalog import both reject a capability-less module with a sited `UNSUPPORTED`; resolving a host on an already-created backing without the capability is a sited `INTERNAL` — engine bug) | ✓ | ✓ (`StoreBackingHost` — coordinator-pending) | conditional forward (constructor-assigned **only when the underlying implements it**, so method presence mirrors the underlying — a wrapper around a capability-less module must not advertise) | via store |
+| `normalizeCreateSchema` | presence | engine-side fallback (identity — the module is taken to create schemas verbatim) | n/a | ✓ supplies the table-level key collation `K` to an implicit-collation text primary-key column (`reconcilePkCollations`; `create` routes through the hook so the rewrite has one owner) | conditional forward (constructor-assigned **only when the underlying implements it** — a wrapper that delegates `create` but hides the hook makes the engine's probe disagree with the actual create) | via store |
 | `createIndex` / `dropIndex` | presence | negotiated rejection (`SchemaManager.createIndex` — "does not support CREATE INDEX") | ✓ | ✓ | forwards (instance-level preferred) | via store |
 | `alterTable` (method present) | presence | negotiated rejection (each data-affecting `run*` in `runtime/emit/alter-table.ts` throws a sited `UNSUPPORTED` if absent — except `renameColumn`, which degrades to an engine-side schema-only rename) | ✓ | ✓ | forwards (throws if underlying lacks) | via store |
 | `renameTable` | presence | engine-side fallback (schema-only rename) | ✓ | ✓ physical move | forwards + rekeys maps | via store |

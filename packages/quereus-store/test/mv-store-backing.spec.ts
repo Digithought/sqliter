@@ -579,6 +579,27 @@ describe('materialized views `using store` (end-to-end)', () => {
 			expect(await rows(db, 'select name from mv order by name')).to.deep.equal([{ name: 'A' }, { name: 'a' }]);
 		});
 
+		it('a text PK backing refreshes on the data-only path (the wrapper forwards normalizeCreateSchema)', async () => {
+			// The backing's text PK has no explicit COLLATE, so the store keys it under
+			// K = NOCASE while the body's output type says BINARY. The engine asks the
+			// module "what would this schema become?" (`normalizeCreateSchema`) before
+			// comparing — and `IsolationModule` must FORWARD that hook, or the probe
+			// answers "verbatim" while `create` still rewrote, and refresh misreads the
+			// no-op as a physical-PK re-key (an inexpressible reshape ⇒ an error).
+			await db.exec('create table src (id integer primary key, a text not null, b integer) using store');
+			await db.exec("insert into src values (1, 'x', 10), (2, 'y', 20)");
+			await db.exec('create materialized view mv using store as select a, sum(b) as s from src group by a');
+			const backing = db.schemaManager.getTable('main', BACKING)!;
+			expect(backing.columns[0].collation, 'the store keyed the implicit text PK under K').to.equal('NOCASE');
+
+			await db.exec('refresh materialized view mv');
+
+			expect(db.schemaManager.getTable('main', BACKING), 'data-only refresh preserves the table identity')
+				.to.equal(backing);
+			expect(await rows(db, 'select a, s from mv order by a'))
+				.to.deep.equal([{ a: 'x', s: 10 }, { a: 'y', s: 20 }]);
+		});
+
 		it('the default key collation (NOCASE) collapses case-variant keys — the set gate rejects the body', async () => {
 			await db.exec('create table src (name text primary key, v integer)');
 			await db.exec("insert into src values ('a', 1), ('A', 2)");

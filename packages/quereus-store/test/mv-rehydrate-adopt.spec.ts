@@ -23,7 +23,7 @@
 
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
-import { Database, asyncIterableToArray } from '@quereus/quereus';
+import { Database, asyncIterableToArray, type SqlValue } from '@quereus/quereus';
 import {
 	StoreModule,
 	InMemoryKVStore,
@@ -390,6 +390,154 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 		expect(result.errors).to.have.lengthOf(0);
 		expect(await rows(db2, 'select id, v from mv order by id'), 'refilled from the fresh memory source')
 			.to.deep.equal([{ id: 1, v: 11 }, { id: 2, v: 22 }]);
+	});
+
+	/**
+	 * A backing whose primary key is a TEXT column with NO explicit `collate`.
+	 *
+	 * The store keys such a column under its table-level key collation K (default
+	 * NOCASE — `reconcilePkCollations`), so the PERSISTED backing reads
+	 * `COLLATE NOCASE` while the body's output type says BINARY. Until the engine
+	 * ran the derived shape through the module's own `normalizeCreateSchema`, gate 2
+	 * compared the post-reconcile persisted schema against a pre-reconcile derived
+	 * shape and refilled EVERY reopen — a full body re-execution proportional to the
+	 * source data. These pin the fast path AND the divergences that must still refill.
+	 */
+	describe('text primary-key backing (module-normalized collation)', () => {
+		/** Plant a sentinel into a TEXT-keyed backing. The physical key must be encoded
+		 *  under the same per-column key collation the backing declares, else the row
+		 *  lands off-key. */
+		async function plantTextSentinel(storeName: string, row: SqlValue[], collation = 'NOCASE'): Promise<void> {
+			const s = provider.stores.get(storeName);
+			expect(s, `physical store ${storeName} exists`).to.not.be.undefined;
+			await s!.put(buildDataKey([row[0]], undefined, undefined, [collation]), serializeRow(row));
+		}
+
+		/** Source + a group-by MV whose backing PK is the implicit-collation text column `a`. */
+		async function seedTextKeyed(moduleClause = 'using store'): Promise<void> {
+			const { db, mod } = open();
+			await db.exec('create table src (id integer primary key, a text not null, b integer) using store');
+			await db.exec("insert into src values (1, 'x', 10), (2, 'y', 20)");
+			await db.exec(`create materialized view mv ${moduleClause} as select a, count(*) as n, sum(b) as s from src group by a`);
+			await mod.closeAll();
+		}
+
+		it('adopts across a clean reopen — and again on a second consecutive reopen', async () => {
+			await seedTextKeyed();
+			await plantTextSentinel('main.mv', ['zz', 7, 700]);
+
+			const s2 = await reopen();
+			expect(s2.result.errors).to.have.lengthOf(0);
+			expect(s2.result.materializedViews).to.deep.equal(['main.mv']);
+			// The sentinel serves ⇒ the body was NOT re-run. Pre-fix this refilled.
+			expect(await rows(s2.db, 'select a, n, s from mv order by a'), 'adopted — sentinel served')
+				.to.deep.equal([
+					{ a: 'x', n: 1, s: 10 }, { a: 'y', n: 1, s: 20 }, { a: 'zz', n: 7, s: 700 },
+				]);
+			// Adopted, not merely registered: row-time maintenance is armed.
+			await s2.db.exec("insert into src values (3, 'x', 5)");
+			expect(await rows(s2.db, 'select a, n, s from mv where a = \'x\''))
+				.to.deep.equal([{ a: 'x', n: 2, s: 15 }]);
+
+			// The first adopt must leave the backing in a state the NEXT open also accepts.
+			await s2.mod.closeAll();
+			const s3 = await reopen();
+			expect(s3.result.errors).to.have.lengthOf(0);
+			expect(await rows(s3.db, 'select a, n, s from mv order by a'), 'adopts again on the second reopen')
+				.to.deep.equal([
+					{ a: 'x', n: 2, s: 15 }, { a: 'y', n: 1, s: 20 }, { a: 'zz', n: 7, s: 700 },
+				]);
+		});
+
+		it("a non-default `using store(collation = 'BINARY')` backing adopts (K read from the backing's own args)", async () => {
+			// K comes from the BACKING's stored module args, not a session default and not
+			// the source's args: the persisted backing keys `a` under BINARY here, and the
+			// derived shape must normalize to the same.
+			await seedTextKeyed("using store(collation = 'BINARY')");
+			await plantTextSentinel('main.mv', ['zz', 7, 700], 'BINARY');
+
+			const { db, result } = await reopen();
+			expect(result.errors).to.have.lengthOf(0);
+			expect(await rows(db, 'select a, n, s from mv order by a'), 'adopted under a non-default K')
+				.to.deep.equal([
+					{ a: 'x', n: 1, s: 10 }, { a: 'y', n: 1, s: 20 }, { a: 'zz', n: 7, s: 700 },
+				]);
+		});
+
+		it('a GENUINE collation divergence still fails the shape gate and refills', async () => {
+			// The property that keeps the fix from degenerating into "ignore collation on
+			// PK columns": normalization only supplies K to an IMPLICIT collation, so an
+			// EXPLICIT one the persisted backing does not carry is still a real shape
+			// change and must still rebuild.
+			await seedTextKeyed();
+
+			// Session 2: declare the source column RTRIM. `set collate` carries the standing
+			// of a CREATE-time COLLATE clause, and a non-BINARY collation persists in the
+			// source's DDL — so on reopen the body publishes an EXPLICIT RTRIM output
+			// collation, which the store's reconcile leaves alone. The backing is still
+			// NOCASE: the live ALTER marks the view stale rather than re-collating it.
+			const s2 = await reopen();
+			expect(s2.result.errors).to.have.lengthOf(0);
+			await s2.db.exec('alter table src alter column a set collate rtrim');
+			expect(s2.db.schemaManager.getTable('main', 'mv')!.columns[0].collation,
+				'the live backing keeps the collation it was built under').to.equal('NOCASE');
+			await s2.mod.closeAll();
+
+			// Re-arm FULL trust (as the arity tests do) so gate 2 — not the stale-at-close
+			// marker — is what decides.
+			const catalog = await provider.getCatalogStore();
+			await catalog.put(buildMetaCatalogKey(CLEAN_SHUTDOWN_META_NAME), new TextEncoder().encode('[]'));
+			await plantTextSentinel('main.mv', ['zz', 7, 700]);
+
+			const { db: db3, result } = await reopen();
+			expect(result.errors).to.have.lengthOf(0);
+			expect(await rows(db3, 'select a, n, s from mv order by a'), 'refilled — the sentinel is scrubbed')
+				.to.deep.equal([{ a: 'x', n: 1, s: 10 }, { a: 'y', n: 1, s: 20 }]);
+			// The refill rebuilt the backing at the collation the body actually produces.
+			expect(db3.schemaManager.getTable('main', 'mv')!.columns[0].collation).to.equal('RTRIM');
+		});
+
+		it('a table-form key declared `collate binary` keeps its own declaration and still adopts', async () => {
+			// The other reading of an implicit body collation. `create table … maintained`
+			// freezes a DECLARED shape, and a text key declared `collate binary` opts out of
+			// the store's K — so the module's reconcile is a no-op and the backing keys
+			// BINARY. Normalization must not push it to K: that would refill this table on
+			// every reopen (and make `refresh` misread a no-op as a physical re-key), the
+			// exact bug this ticket removes, in mirror image. See `normalizeBackingShape`
+			// § two-valued compatibility.
+			const { db, mod } = open();
+			await db.exec('create table src (id integer primary key, a text not null, b integer) using store');
+			await db.exec("insert into src values (1, 'x', 10), (2, 'y', 20)");
+			await db.exec('create table mv (a text not null collate binary primary key, n integer not null) '
+				+ 'using store maintained as select a, count(*) as n from src group by a');
+			expect(db.schemaManager.getTable('main', 'mv')!.columns[0].collation,
+				'the declaration wins over the store K').to.equal('BINARY');
+			await db.exec('refresh materialized view mv');
+			await mod.closeAll();
+			await plantTextSentinel('main.mv', ['zz', 7], 'BINARY');
+
+			const { db: db2, result } = await reopen();
+			expect(result.errors).to.have.lengthOf(0);
+			expect(await rows(db2, 'select a, n from mv order by a'), 'adopted — sentinel served')
+				.to.deep.equal([{ a: 'x', n: 1 }, { a: 'y', n: 1 }, { a: 'zz', n: 7 }]);
+			expect(db2.schemaManager.getTable('main', 'mv')!.columns[0].collation).to.equal('BINARY');
+		});
+
+		it('an `any`-typed primary key column is untouched by normalization (still adopts)', async () => {
+			// `reconcilePkCollations` deliberately gates on `isTextual`, so an `any` PK keeps
+			// its BINARY. The hook inherits that — it must not start rewriting `any`.
+			const { db, mod } = open();
+			await db.exec('create table src (k any primary key, v integer) using store');
+			await db.exec("insert into src values ('a', 1), (2, 20)");
+			await db.exec('create materialized view mv using store as select k, v from src');
+			await mod.closeAll();
+			await plantTextSentinel('main.mv', ['zz', 99], 'BINARY');
+
+			const { db: db2, result } = await reopen();
+			expect(result.errors).to.have.lengthOf(0);
+			expect(await rows(db2, 'select count(*) as c from mv'), 'adopted — sentinel present')
+				.to.deep.equal([{ c: 3 }]);
+		});
 	});
 
 	describe('MV-over-MV', () => {

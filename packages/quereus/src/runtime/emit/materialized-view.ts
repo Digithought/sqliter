@@ -197,7 +197,8 @@ export async function refreshMaintainedTable(db: Database, mv: MaintainedTableSc
 	// column labels (a latent direct-read corruption) and break the positional
 	// backing↔body alignment the join read-rewrite relies on. So compare the derived
 	// shape to the live table and rebuild it when the shape shifted.
-	const shape = deriveBackingShape(db, mv.schemaName, bodySql, d.columns);
+	const shape = deriveBackingShape(db, mv.schemaName, bodySql, d.columns,
+		{ moduleName: mv.vtabModuleName, moduleArgs: mv.vtabArgs, against: mv });
 
 	// An explicit column list is a declared interface. A body whose output count
 	// shifted under it (a source column add behind `mv(a, b, c)`) would silently

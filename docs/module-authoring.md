@@ -512,6 +512,64 @@ cannot see content divergence from a crash. See
 [`docs/mv-backing-host.md` § Cross-module atomicity](mv-backing-host.md#cross-module-atomicity)
 for the full gate set.
 
+## `normalizeCreateSchema` — "what would this schema become?"
+
+Some modules rewrite a table schema on the way through `create`. The store module
+supplies its table-level key collation `K` to a text primary-key column that declares
+no `COLLATE` clause, so `create table t (a text primary key) using store` registers `a`
+as `COLLATE NOCASE`, not the engine's BINARY default.
+
+That rewrite is invisible to the engine, which mattered in one place: a materialized
+view's backing. The engine re-derives the backing's shape from the body on reopen and on
+refresh and compares it to the live table. Derivation produces the *pre*-rewrite shape
+while the live table carries the *post*-rewrite one, so the comparison reported a
+difference that did not exist — a text-keyed backing failed the adopt gate and re-ran its
+whole body on **every** reopen.
+
+The optional hook lets the engine ask the module the question directly, without creating
+anything:
+
+```typescript
+interface VirtualTableModule {
+  /** Deterministic, side-effect free. May adjust per-column attributes the module owns
+   *  physically; may NOT add, remove, reorder, or rename columns. */
+  normalizeCreateSchema?(tableSchema: TableSchema): TableSchema;
+}
+```
+
+Rules for an implementor:
+
+- **Route your own `create` through it.** The rewrite must have exactly one owner, or the
+  engine's answer and your actual create can drift. `StoreModule.create` calls
+  `this.normalizeCreateSchema(tableSchema)` instead of the rewrite directly.
+- **Read your configuration off the schema.** The hook takes no extra parameters; the
+  store reads `K` from `tableSchema.vtabArgs`, so the answer is a pure function of the
+  input.
+- **Stay pure and shape-preserving.** The engine calls it on a *probe* schema (columns,
+  column-index map, physical primary key, `vtabArgs` — no module state, no table
+  behind it) outside any create, and may call it more than once. Changing the column
+  count, or a column's name or position, is a contract violation and raises `INTERNAL`
+  rather than being read as a shape difference.
+- **Omit it** if your module creates schemas verbatim — the engine then treats
+  normalization as the identity (memory, and every module written before the hook
+  existed).
+- **A wrapper module must forward it** by presence, exactly like `getBackingHost` and
+  `createBacking` — `IsolationModule` assigns it in its constructor only when the
+  underlying module implements it. A wrapper that delegates `create` but hides the hook
+  reintroduces the asymmetry the hook exists to close.
+
+Engine side: `deriveBackingShape` applies it (`normalizeBackingShape` in
+`runtime/emit/materialized-view-helpers.ts`) before any comparison against a live table,
+so `backingShapeMatches`, `describeBackingShapeMismatch`, the refresh reshape classifier
+and the rename-propagation assertion all see post-normalization shapes. One subtlety: an
+attribute the body left *implicit* is ambiguous once a table exists, because explicitness
+is not persisted (`ColumnSchema.collationExplicit` — a declared `COLLATE BINARY` reloads
+indistinguishable from no clause). Such a column is therefore compatible with either its
+own declared value or the module's normalized one, and the reading that agrees with the
+live table wins — so a `create table … maintained` whose text key is declared
+`COLLATE BINARY` keeps matching its own declaration. A value matching neither reading is
+still a real mismatch.
+
 ## Capability negotiation surface
 
 The inventory of every negotiation surface on the `VirtualTableModule` contract — how each

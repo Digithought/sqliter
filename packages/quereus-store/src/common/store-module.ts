@@ -309,6 +309,28 @@ export class StoreModule extends StoreModuleRename implements VirtualTableModule
 	}
 
 	/**
+	 * Engine `normalizeCreateSchema` hook (see {@link VirtualTableModule.normalizeCreateSchema}):
+	 * the pure schema→schema rewrite this module applies at CREATE, exposed so the
+	 * engine can ask what a schema WOULD become without creating anything.
+	 *
+	 * The store's one such rewrite is the implicit text primary-key collation: a text
+	 * PK column that declares no explicit `collate` is keyed under the table-level key
+	 * collation K (`collation` module arg, default NOCASE) rather than the engine's
+	 * BINARY column default — see {@link reconcilePkCollations}. K is read from the
+	 * schema's OWN `vtabArgs`, so the hook needs no extra parameters and stays a pure
+	 * function of its input (no module state, no side effects, columns untouched
+	 * except for that one attribute).
+	 *
+	 * {@link create} routes through this method, so the persisted DDL and the engine's
+	 * probe answer are the same rewrite by construction.
+	 */
+	normalizeCreateSchema(tableSchema: TableSchema): TableSchema {
+		const config = this.parseConfig(tableSchema.vtabArgs as Record<string, SqlValue> | undefined);
+		const keyCollation = (config.collation || 'NOCASE').toUpperCase();
+		return reconcilePkCollations(tableSchema, keyCollation);
+	}
+
+	/**
 	 * Creates a new store-backed table.
 	 * Called by CREATE TABLE.
 	 *
@@ -334,8 +356,11 @@ export class StoreModule extends StoreModuleRename implements VirtualTableModule
 		// encoding — see reconcilePkCollations / StoreTable.pkKeyCollations). The reconciled
 		// schema is what StoreTable holds and what `finalizeCreatedTableSchema` registers, so
 		// an undecorated text PK reports/keys under K rather than the engine BINARY default.
-		const keyCollation = (config.collation || 'NOCASE').toUpperCase();
-		const reconciledSchema = reconcilePkCollations(tableSchema, keyCollation);
+		// Routed through the ENGINE-FACING hook (not `reconcilePkCollations` directly) so the
+		// rewrite has exactly one owner: the engine probes the same hook to ask "what would
+		// this schema become?" when comparing a persisted backing against a re-derived
+		// materialized-view shape, and a second call site here could drift from that answer.
+		const reconciledSchema = this.normalizeCreateSchema(tableSchema);
 
 		// Reject when this new table's physical data store name already names an
 		// existing store (the only real positive here is data-vs-index: a sibling

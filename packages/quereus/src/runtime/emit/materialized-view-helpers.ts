@@ -126,18 +126,32 @@ export interface BackingShape {
  * `keysOf` (all-columns fallback when none — such an MV is incremental-ineligible
  * until Phase 2). Re-planning here is cheap relative to materialization and keeps
  * the create/refresh emitters free of optimizer plumbing.
+ *
+ * `backing` names the module that hosts (or would host) this shape's backing table,
+ * plus (for a comparison) the table the result will be compared against. Supplying it
+ * runs the derived shape through that module's own create-time normalization
+ * ({@link normalizeBackingShape}) so every downstream comparison sees the shape the
+ * module would actually create — see that function for why, and for what `against`
+ * resolves. Omit only where no backing identity exists; every consumer that compares
+ * against a live backing must pass it.
  */
 export function deriveBackingShape(
 	db: Database,
 	schemaName: string,
 	bodySql: string,
 	explicitColumns: ReadonlyArray<string> | undefined,
+	backing?: {
+		moduleName?: string;
+		moduleArgs?: Readonly<Record<string, SqlValue>>;
+		against?: TableSchema;
+	},
 ): BackingShape {
 	// Suppress the read-side rewrite: we are computing the MV body to derive/populate
 	// its OWN backing, so it must not be rewritten to read that backing.
-	return db.schemaManager.withSuppressedMaterializedViewRewrite(
+	const shape = db.schemaManager.withSuppressedMaterializedViewRewrite(
 		() => deriveBackingShapeUnguarded(db, schemaName, bodySql, explicitColumns),
 	);
+	return normalizeBackingShape(db, schemaName, shape, backing?.moduleName, backing?.moduleArgs, backing?.against);
 }
 
 function deriveBackingShapeUnguarded(
@@ -351,6 +365,130 @@ export function buildBackingTableSchema(
 	};
 }
 
+/**
+ * Applies the backing module's own create-time schema normalization
+ * ({@link VirtualTableModule.normalizeCreateSchema}) to a derived {@link BackingShape},
+ * so a shape derived from the body is expressed in the SAME terms as a table the module
+ * actually created.
+ *
+ * Why: a module may own per-column physical attributes the body's output type cannot
+ * predict. The store module keys an *implicit*-collation text primary-key column under
+ * its table-level key collation K (default NOCASE — `reconcilePkCollations`), so a
+ * persisted backing reads `COLLATE NOCASE` while the re-derived shape says BINARY. Every
+ * shape comparison ({@link backingShapeMatches}, {@link describeBackingShapeMismatch},
+ * {@link classifyBackingReshape}) would then report a difference that does not exist,
+ * refilling the backing on every reopen. Normalizing here — at the SOURCE, before any
+ * comparison — keeps both sides post-normalization rather than teaching each comparison
+ * site to special-case a module's rewrite.
+ *
+ * Identity for a module without the hook (memory, and every third-party module), and for
+ * an unresolvable module name — the real `no virtual table module named …` /
+ * capability diagnostics stay with {@link buildBackingTableSchema}, which is deliberately
+ * NOT reused here: it carries the `getBackingHost` gate (whose error must keep firing at
+ * its own site) and stamps primary-key flags onto `shape.columns`, neither of which
+ * belongs on a pure "what would this become?" probe.
+ *
+ * **`against` — two-valued compatibility for an implicit attribute.** The hook only ever
+ * rewrites attributes the shape left IMPLICIT (the store touches a text primary-key column
+ * only when it declares no `collate`). An implicit attribute is genuinely ambiguous once a
+ * table exists, because explicitness does not survive a catalog round-trip
+ * (`ColumnSchema.collationExplicit` is not persisted; a declared `collate binary` reloads
+ * indistinguishable from no clause at all). So an implicit shape column is compatible with
+ * a live column carrying EITHER the shape's own declared value or the module's normalized
+ * one — both are physically consistent with the body. When the caller names the table this
+ * shape will be compared against, the rewrite is therefore kept only where the RAW shape
+ * does not already agree with that table; a table-form maintained table whose text key was
+ * declared `collate binary` keeps matching its own declaration, while a materialized-view
+ * backing the module keyed under K matches that. Omit `against` on a create path (nothing
+ * to be compatible with yet) and the module's answer is taken verbatim.
+ *
+ * A collation the module would NOT produce and the body did NOT declare (a backing
+ * persisted under RTRIM, say) matches neither reading and still reports a mismatch.
+ *
+ * Only `columns` can change; `primaryKey`, `ordering`, `sourceTables`, `coarsenedKey`,
+ * and `allProvedKeys` pass through untouched.
+ */
+export function normalizeBackingShape(
+	db: Database,
+	schemaName: string,
+	shape: BackingShape,
+	moduleName?: string,
+	moduleArgs?: Readonly<Record<string, SqlValue>>,
+	against?: TableSchema,
+): BackingShape {
+	const resolvedModuleName = normalizeBackingModuleName(moduleName);
+	const module = db.schemaManager.getModule(resolvedModuleName)?.module;
+	if (!module?.normalizeCreateSchema) return shape;
+
+	// Copy the columns into the probe: the contract says the hook is pure, but a
+	// sloppy implementation mutating a column in place would otherwise corrupt the
+	// caller's shape. The probe uses the PHYSICAL primary key
+	// ({@link computeBackingPrimaryKey} — ordering-seeded), not `shape.primaryKey`,
+	// because that is the key the module will actually be handed at create; a text
+	// ORDERING column is reconciled there too and would keep diverging otherwise.
+	const probeColumns: ColumnSchema[] = shape.columns.map(c => ({ ...c }));
+	const probe: TableSchema = {
+		name: `<materialized-view backing shape probe>`,
+		schemaName,
+		columns: probeColumns,
+		columnIndexMap: buildColumnIndexMap(probeColumns),
+		primaryKeyDefinition: computeBackingPrimaryKey(shape).map(pk => ({
+			index: pk.index,
+			desc: pk.desc,
+			collation: probeColumns[pk.index]?.collation,
+		})),
+		checkConstraints: [],
+		vtabModule: module,
+		vtabModuleName: resolvedModuleName,
+		vtabArgs: moduleArgs ? { ...moduleArgs } : {},
+		isView: false,
+		estimatedRows: 0,
+	};
+
+	const normalized = module.normalizeCreateSchema(probe);
+	if (normalized.columns === probe.columns) return shape;   // hook declined to rewrite
+
+	// A reshape is a contract violation, not a shape difference: the hook may only
+	// adjust per-column attributes it owns physically. Fail loud rather than let a
+	// misbehaving module silently redefine the backing's column list.
+	if (normalized.columns.length !== shape.columns.length) {
+		throw new QuereusError(
+			`module '${resolvedModuleName}' normalizeCreateSchema changed the column count `
+				+ `(${shape.columns.length} → ${normalized.columns.length}); it may only adjust per-column attributes`,
+			StatusCode.INTERNAL,
+		);
+	}
+	for (let i = 0; i < shape.columns.length; i++) {
+		if (normalized.columns[i].name !== shape.columns[i].name) {
+			throw new QuereusError(
+				`module '${resolvedModuleName}' normalizeCreateSchema renamed or reordered column ${i} `
+					+ `('${shape.columns[i].name}' → '${normalized.columns[i].name}'); it may only adjust per-column attributes`,
+				StatusCode.INTERNAL,
+			);
+		}
+	}
+
+	// Two-valued compatibility (see the docblock): where the RAW shape column already
+	// agrees with the table this shape is about to be compared against, that reading is
+	// the live one and the module's alternative is not applied.
+	// NOTE: the two readings exist only because `ColumnSchema.collationExplicit` does not
+	// survive a catalog round-trip. If explicitness is ever persisted, the live table can
+	// answer "did the author declare this?" directly and this collapses to a single
+	// reading — take the module's answer iff the live column is implicit.
+	const columns = normalized.columns.map((col, i) => {
+		const raw = shape.columns[i];
+		if (col === raw) return raw;
+		const live = against?.columns[i];
+		if (live && backingTypeMatches(raw, live) && backingNotNullMatches(raw, live) && backingCollationMatches(raw, live)) {
+			return raw;
+		}
+		return col;
+	});
+	if (columns.every((c, i) => c === shape.columns[i])) return shape;
+
+	return { ...shape, columns };
+}
+
 /** Runs the body to completion and returns its rows (raw `Row` arrays). Uses the
  *  no-transaction-management primitive — the caller is already inside DDL execution. */
 export async function collectBodyRows(db: Database, schemaName: string, bodySql: string): Promise<Row[]> {
@@ -506,7 +644,8 @@ function warnKeyCoarsening(schemaName: string, viewName: string, info: Coarsened
 export async function materializeView(db: Database, def: MaterializeViewDefinition, preDerivedShape?: BackingShape): Promise<MaintainedTableSchema> {
 	const sm = db.schemaManager;
 
-	const shape = preDerivedShape ?? deriveBackingShape(db, def.schemaName, def.bodySql, def.columns);
+	const shape = preDerivedShape ?? deriveBackingShape(db, def.schemaName, def.bodySql, def.columns,
+		{ moduleName: def.backingModuleName, moduleArgs: def.backingModuleArgs });
 	// Lives here — not in deriveBackingShape — because the refresh path reaches a
 	// legitimate mismatch after a source ALTER (see the assert's docstring).
 	assertDeclaredColumnArity(def, shape);
@@ -1086,7 +1225,8 @@ export async function attachMaintainedDerivation(
 	// renamed positionally to it and the name check skipped; otherwise natural output
 	// names with the strict declared-shape check (the body must already be aliased to
 	// the declared names — the attach verb / implicit-create posture).
-	const shape = deriveBackingShape(db, schemaName, bodySql, positionalRename ? recordedColumns : undefined);
+	const shape = deriveBackingShape(db, schemaName, bodySql, positionalRename ? recordedColumns : undefined,
+		{ moduleName: table.vtabModuleName, moduleArgs: table.vtabArgs, against: table });
 
 	// Explicit rename-list arity guard. `deriveBackingShape` sizes the shape to the
 	// BODY's arity (a surplus rename name is dropped, a missing one padded), so a
@@ -1482,7 +1622,8 @@ export async function createMaintainedTable(db: Database, stmt: AST.CreateTableS
 	const declared = sm.buildDeclaredTableSchema(stmt);
 	const recordedColumns = explicit ? declared.columns.map(c => c.name) : undefined;
 	const bodySql = astToString(stmt.maintained!.select);
-	const shape = deriveBackingShape(db, schemaName, bodySql, explicit ? recordedColumns : undefined);
+	const shape = deriveBackingShape(db, schemaName, bodySql, explicit ? recordedColumns : undefined,
+		{ moduleName: declared.vtabModuleName, moduleArgs: declared.vtabArgs, against: declared });
 	const mismatch = describeAttachShapeMismatch(declared, shape, explicit);
 	if (mismatch) {
 		throw new QuereusError(
@@ -2078,15 +2219,16 @@ export function tryRecompileMaterializedViewLive(
 	try {
 		const d = mv.derivation;
 		const bodySql = astToString(d.selectAst);
-		const shape = deriveBackingShape(db, mv.schemaName, bodySql, d.columns);
+		const schema = db.schemaManager.getSchemaOrFail(mv.schemaName);
+		const live = schema.getTable(mv.name);
+		const backing = isMaintainedTable(live) ? live : mv;
+		const shape = deriveBackingShape(db, mv.schemaName, bodySql, d.columns,
+			{ moduleName: mv.vtabModuleName, moduleArgs: mv.vtabArgs, against: backing });
 		if (!sameSourceTables(d.sourceTables, shape.sourceTables)) {
 			log('Marking materialized view %s.%s stale instead of recompiling: re-planned source tables (%s) disagree with the recorded set (%s) — REFRESH re-derives',
 				mv.schemaName, mv.name, shape.sourceTables.join(', '), d.sourceTables.join(', '));
 			return false;
 		}
-		const schema = db.schemaManager.getSchemaOrFail(mv.schemaName);
-		const live = schema.getTable(mv.name);
-		const backing = isMaintainedTable(live) ? live : mv;
 		const mismatch = describeBackingShapeMismatch(backing, shape);
 		if (mismatch) {
 			// Relaxed superkey gate: columns match structurally AND the existing backing
@@ -3081,7 +3223,8 @@ export async function restoreUnaffectedMaterializedViews(
 			// Throws when the body no longer plans against the renamed catalog
 			// (e.g. a chained MV referencing a renamed-away output name) → catch
 			// below leaves it stale.
-			const shape = deriveBackingShape(db, mv.schemaName, bodySql, d.columns);
+			const shape = deriveBackingShape(db, mv.schemaName, bodySql, d.columns,
+				{ moduleName: mv.vtabModuleName, moduleArgs: mv.vtabArgs, against: schema.getTable(mv.name) });
 			// The retry of a failure-marked MV must not revive an inconsistent record: a
 			// rewrite that threw between the in-place AST mutation and the derived-field
 			// re-key leaves the OLD derivation (un-re-keyed `sourceTables`) holding the
@@ -3149,7 +3292,8 @@ async function renameShiftedBackingColumns(
 	bodySql: string,
 	preDerivedShape?: BackingShape,
 ): Promise<void> {
-	const shape = preDerivedShape ?? deriveBackingShape(db, mv.schemaName, bodySql, mv.derivation.columns);
+	const shape = preDerivedShape ?? deriveBackingShape(db, mv.schemaName, bodySql, mv.derivation.columns,
+		{ moduleName: mv.vtabModuleName, moduleArgs: mv.vtabArgs, against: schema.getTable(mv.name) });
 	const backing = schema.getTable(mv.name);
 	if (!backing) {
 		throw new QuereusError(

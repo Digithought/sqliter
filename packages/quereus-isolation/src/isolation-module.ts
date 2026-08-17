@@ -174,6 +174,19 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	retireBackingForAttach?: (db: Database, schemaName: string, tableName: string, plainSchema: TableSchema) => Promise<void>;
 	discardBackingForAttach?: (db: Database, schemaName: string, tableName: string) => Promise<void>;
 
+	/**
+	 * Create-time schema-normalization forward
+	 * (see {@link VirtualTableModule.normalizeCreateSchema}) — assigned only when the
+	 * underlying implements it, mirroring presence like the seams above. MUST be
+	 * forwarded: the wrapper's {@link create} delegates to the underlying's `create`,
+	 * which applies the rewrite, so a wrapper that did NOT advertise the hook would
+	 * make the engine's "what would this schema become?" probe answer `verbatim` while
+	 * the actual create still rewrote — the exact asymmetry the hook exists to close
+	 * (a materialized view over a store-hosted backing would refill on every reopen).
+	 * Pure schema→schema, no overlay bookkeeping.
+	 */
+	normalizeCreateSchema?: (tableSchema: TableSchema) => TableSchema;
+
 	constructor(config: IsolationModuleConfig) {
 		this.underlying = config.underlying;
 		this.overlayModule = config.overlay ?? new MemoryTableModule();
@@ -183,6 +196,11 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		if (underlyingGetBackingHost) {
 			this.getBackingHost = (db, schemaName, tableName) =>
 				underlyingGetBackingHost.call(this.underlying, db, schemaName, tableName);
+		}
+
+		const underlyingNormalize = this.underlying.normalizeCreateSchema;
+		if (underlyingNormalize) {
+			this.normalizeCreateSchema = (tableSchema) => underlyingNormalize.call(this.underlying, tableSchema);
 		}
 
 		const underlyingCreateBacking = this.underlying.createBacking;

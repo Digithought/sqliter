@@ -232,6 +232,25 @@ export interface VirtualTableModule<
 	): Promise<TTable>;
 
 	/**
+	 * Optional. The pure schema→schema normalization this module applies to a table
+	 * schema it is about to CREATE, exposed so the engine can ask "what would this
+	 * schema become?" WITHOUT creating anything.
+	 *
+	 * Must be deterministic and side-effect free, and must not add, remove, reorder,
+	 * or rename columns — only adjust per-column attributes the module owns
+	 * physically (the store module's implicit text primary-key collation, today).
+	 * Absent ⇒ the module creates schemas verbatim.
+	 *
+	 * A module implementing this MUST route its own {@link create} through it, so the
+	 * rewrite has exactly one owner and the engine's probe and the real create can
+	 * never diverge. The engine calls it on a PROBE schema (columns + PK + vtabArgs,
+	 * no module state), outside any create, to compare a persisted table against the
+	 * shape a fresh create would produce — see `normalizeBackingShape` in
+	 * `runtime/emit/materialized-view-helpers.ts` and docs/module-authoring.md.
+	 */
+	normalizeCreateSchema?(tableSchema: TableSchema): TableSchema;
+
+	/**
 	 * Connects to an existing virtual table definition.
 	 * Called when the schema is loaded or a connection needs to interact with the table.
 	 *

@@ -3340,12 +3340,28 @@ export class SchemaManager {
 			backingModuleArgs: backing.storedModuleArgs,
 		};
 
+		// A durable backing-host module may have rehydrated the maintained table itself
+		// (phase 1: a plain `create table` bundle under the same name) before this MV
+		// catalog entry imports (phase 3). Looked up BEFORE the derivation only so the
+		// shape can be normalized against it (below); the adopt/collision decisions still
+		// happen further down, after the arity and ordering gates. Pure read — nothing
+		// between here and there mutates the catalog.
+		const preExisting = this.getTable(targetSchemaName, viewName);
+
 		// Derive the backing shape ONCE for the whole import (ordering gate, adopt
 		// gates, and the refill all read it). Throws when the body cannot plan —
 		// deliberately BEFORE any drop, so a not-yet-resolvable body (the store's
 		// MV-over-MV fixpoint: a dependent fails until its upstream's round lands)
 		// errors per-entry with any pre-existing backing preserved — data-safe.
-		const shape: BackingShape = deriveBackingShape(this.db, def.schemaName, def.bodySql, def.columns);
+		// The backing identity is threaded in so the derived shape is normalized through
+		// the hosting module's own create-time rewrite (see `normalizeBackingShape`):
+		// without it the adopt gate below compares the module-normalized PERSISTED
+		// backing against a pre-normalization derived shape and refills every reopen.
+		const shape: BackingShape = deriveBackingShape(this.db, def.schemaName, def.bodySql, def.columns, {
+			moduleName: backing.moduleName,
+			moduleArgs: def.backingModuleArgs,
+			against: (preExisting?.vtabModuleName ?? '').toLowerCase() === backing.moduleName ? preExisting : undefined,
+		});
 		// Declared-column arity mismatch: the entry can NEVER materialize, so throw
 		// with the backing preserved rather than dropping durable rows for nothing.
 		assertDeclaredColumnArity(def, shape);
@@ -3364,15 +3380,11 @@ export class SchemaManager {
 			}
 		}
 
-		// A durable backing-host module may have rehydrated the maintained table
-		// itself (phase 1: a plain `create table` bundle under the same name)
-		// before this MV catalog entry imports (phase 3). A pre-existing
-		// derivation-less table owned by the MV's own backing module IS that
-		// rehydrated backing: adopt it when every gate passes, else drop it and
-		// re-materialize from the body. A table in a DIFFERENT module is not
-		// ours — fail the entry rather than dropping user data. The create
+		// A pre-existing derivation-less table owned by the MV's own backing module IS
+		// that rehydrated backing (see the lookup above): adopt it when every gate
+		// passes, else drop it and re-materialize from the body. A table in a DIFFERENT
+		// module is not ours — fail the entry rather than dropping user data. The create
 		// emitter keeps the plain collision error.
-		const preExisting = this.getTable(targetSchemaName, viewName);
 		if (preExisting) {
 			if (isMaintainedTable(preExisting)) {
 				throw new QuereusError(
