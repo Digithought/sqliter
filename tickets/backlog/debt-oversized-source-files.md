@@ -2,7 +2,7 @@ description: Nine source and test files across the repo have grown well past the
 files:
   - packages/quereus/src/schema/manager.ts                   # 3,633 lines (`wc -l`, 2026-08-10)
   - packages/quereus/src/vtab/memory/layer/manager.ts        # 3,589 lines
-  - packages/quereus/src/runtime/emit/materialized-view-helpers.ts   # 3,107 lines
+  - packages/quereus/src/runtime/emit/materialized-view-helpers.ts   # 3,404 lines (`wc -l`, 2026-08-17; 3,107 earlier) — +~300 from the backing-module schema-normalization hook
   - packages/quereus/src/schema/schema-differ.ts             # 3,013 lines (`wc -l`, 2026-08-07; 2,725 when this ticket was filed) (spec: 1,186)
   - packages/quereus/src/runtime/emit/alter-table.ts         # 2,419 lines
   - packages/quereus-isolation/src/isolated-table.ts         # 2,077 lines

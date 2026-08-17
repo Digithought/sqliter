@@ -403,12 +403,14 @@ export function buildBackingTableSchema(
  * to be compatible with yet) and the module's answer is taken verbatim.
  *
  * A collation the module would NOT produce and the body did NOT declare (a backing
- * persisted under RTRIM, say) matches neither reading and still reports a mismatch.
+ * persisted under RTRIM, say) matches neither reading and still reports a mismatch. The
+ * agreement test looks only at the attributes the hook actually rewrote — see
+ * {@link rawReadingIsTheLiveOne}.
  *
  * Only `columns` can change; `primaryKey`, `ordering`, `sourceTables`, `coarsenedKey`,
  * and `allProvedKeys` pass through untouched.
  */
-export function normalizeBackingShape(
+function normalizeBackingShape(
 	db: Database,
 	schemaName: string,
 	shape: BackingShape,
@@ -475,18 +477,44 @@ export function normalizeBackingShape(
 	// survive a catalog round-trip. If explicitness is ever persisted, the live table can
 	// answer "did the author declare this?" directly and this collapses to a single
 	// reading — take the module's answer iff the live column is implicit.
+	// NOTE: `against` is read POSITIONALLY, which is what the rename cascade needs (names
+	// have shifted there, the attributes have not). It is only ever consulted for a column
+	// the hook rewrote, so a pure append/drop reshape still resolves correctly — but if a
+	// reshape ever MOVES a rewritten column to a position the live table fills with a
+	// different column, this asks the wrong column and the alignment-based
+	// {@link classifyBackingReshape} would see a collation the module did not produce. Give
+	// callers a way to say "align by name" if a reshape is ever seen misclassified this way.
 	const columns = normalized.columns.map((col, i) => {
 		const raw = shape.columns[i];
 		if (col === raw) return raw;
 		const live = against?.columns[i];
-		if (live && backingTypeMatches(raw, live) && backingNotNullMatches(raw, live) && backingCollationMatches(raw, live)) {
-			return raw;
-		}
+		if (live && rawReadingIsTheLiveOne(raw, col, live)) return raw;
 		return col;
 	});
 	if (columns.every((c, i) => c === shape.columns[i])) return shape;
 
 	return { ...shape, columns };
+}
+
+/**
+ * The two-valued compatibility test of {@link normalizeBackingShape}: does the RAW
+ * (pre-normalization) reading of a column agree with the live table on every attribute
+ * the hook actually rewrote?
+ *
+ * Only the REWRITTEN attributes are compared. An attribute the hook left alone carries no
+ * second reading, so a difference in it is a genuine shape change for the comparison sites
+ * to report — it says nothing about which reading of the rewritten attribute is live.
+ * Testing all three attributes unconditionally instead would let an unrelated difference
+ * decide the collation: a NOT NULL loosening on a physical-PK column — which
+ * {@link describeBackingShapeMismatch} deliberately masks — would flip a declared
+ * `collate binary` key over to the module's K and turn a data-only refresh into a
+ * spurious "primary-key column 0 collation BINARY → NOCASE" inexpressible reshape.
+ */
+function rawReadingIsTheLiveOne(raw: ColumnSchema, normalized: ColumnSchema, live: ColumnSchema): boolean {
+	if (!backingTypeMatches(raw, normalized) && !backingTypeMatches(raw, live)) return false;
+	if (!backingNotNullMatches(raw, normalized) && !backingNotNullMatches(raw, live)) return false;
+	if (!backingCollationMatches(raw, normalized) && !backingCollationMatches(raw, live)) return false;
+	return true;
 }
 
 /** Runs the body to completion and returns its rows (raw `Row` arrays). Uses the

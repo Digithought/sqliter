@@ -600,6 +600,33 @@ describe('materialized views `using store` (end-to-end)', () => {
 				.to.deep.equal([{ a: 'x', s: 10 }, { a: 'y', s: 20 }]);
 		});
 
+		it('a declared `collate binary` key survives a source NOT NULL loosening (still data-only)', async () => {
+			// The mirror of the case above, and the shape `06.6-aggregate-extended.sqllogic`
+			// uses: a table-form maintained table whose text key opts OUT of the store's K.
+			// The re-derived shape's key column is IMPLICIT-BINARY, which is compatible with
+			// both readings — but only the collation is in question. Weighing the NOT NULL
+			// difference too (the backing keeps its physical-PK column NOT NULL; the loosened
+			// body does not) pushed the key to NOCASE, marking the view stale and turning
+			// `refresh` into a spurious inexpressible re-key.
+			await db.exec('create table src (id integer primary key, a text not null, b integer) using store');
+			await db.exec("insert into src values (1, 'x', 10), (2, 'y', 20)");
+			await db.exec('create table mt (a text not null collate binary primary key, n integer not null) '
+				+ 'using store maintained as select a, count(*) as n from src group by a');
+
+			await db.exec('alter table src alter column a drop not null');
+
+			const live = db.schemaManager.getTable('main', 'mt')!;
+			expect(live.columns[0].collation, 'the declaration still wins over the store K').to.equal('BINARY');
+			expect(db.schemaManager.getMaintainedTable('main', 'mt')!.derivation.stale ?? false,
+				'the loosening did not strand the view stale').to.equal(false);
+
+			await db.exec('refresh materialized view mt');
+			expect(db.schemaManager.getTable('main', 'mt'), 'data-only refresh preserves the table identity')
+				.to.equal(live);
+			expect(await rows(db, 'select a, n from mt order by a'))
+				.to.deep.equal([{ a: 'x', n: 1 }, { a: 'y', n: 1 }]);
+		});
+
 		it('the default key collation (NOCASE) collapses case-variant keys — the set gate rejects the body', async () => {
 			await db.exec('create table src (name text primary key, v integer)');
 			await db.exec("insert into src values ('a', 1), ('A', 2)");
