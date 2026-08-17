@@ -4,7 +4,7 @@
  * primary-key shapes, which is where the generator is least uniform.
  *
  * For each shape it asserts:
- *   - the emitted DDL contains exactly the expected number of `PRIMARY KEY` clauses,
+ *   - the emitted DDL contains exactly one `PRIMARY KEY` clause,
  *   - re-parsing it in a fresh `Database` yields the same key (index + desc + collation)
  *     and the same per-column nullability, and
  *   - emitting the re-parsed schema reproduces the identical text.
@@ -92,14 +92,6 @@ interface Shape {
 	label: string;
 	/** Statements to build the table; the CREATE need not be the last one. */
 	statements: string[];
-	/**
-	 * Expected count of `PRIMARY KEY` occurrences in the emitted DDL. Always 1 — every key
-	 * emits exactly one clause. The count is asserted rather than assumed because the
-	 * single-column and composite branches are separate, and a shape landing on both would
-	 * emit an inline clause AND a table-level one (which the parser silently merges rather
-	 * than rejecting).
-	 */
-	expectedClauses: number;
 	/** Expected key, as `keySpelling` renders it. */
 	expectedKey: string[];
 	/** Expected live conflict action, as `conflictSpelling` renders it. Default `'(none)'`. */
@@ -124,14 +116,12 @@ const SHAPES: Shape[] = [
 		// clause: an inline plus a table-level one would re-parse to a merged key.
 		label: 'no-PK single column (synthesized key, inline clause)',
 		statements: [`create table t (a integer)`],
-		expectedClauses: 1,
 		expectedKey: ['a collate binary'],
 		expectedText: '"a" INTEGER NOT NULL PRIMARY KEY',
 	},
 	{
 		label: 'no-PK composite (synthesized key, table-level clause)',
 		statements: [`create table t (a integer, b text)`],
-		expectedClauses: 1,
 		expectedKey: ['a collate binary', 'b collate binary'],
 		expectedText: 'PRIMARY KEY ("a", "b")',
 	},
@@ -141,7 +131,6 @@ const SHAPES: Shape[] = [
 		// below the shape table).
 		label: 'declared all-columns PK (shape-equal to synthesized, same clause)',
 		statements: [`create table t (a integer, b text, primary key (a, b))`],
-		expectedClauses: 1,
 		expectedKey: ['a collate binary', 'b collate binary'],
 		expectedText: 'PRIMARY KEY ("a", "b")',
 	},
@@ -155,7 +144,6 @@ const SHAPES: Shape[] = [
 			`pragma default_column_nullability = 'nullable'`,
 			`create table t (a integer, b text)`,
 		],
-		expectedClauses: 1,
 		expectedKey: ['a collate binary', 'b collate binary'],
 		expectedNullability: ['a: null', 'b: null'],
 		expectedText: 'PRIMARY KEY ("a", "b")',
@@ -167,7 +155,6 @@ const SHAPES: Shape[] = [
 			`pragma default_column_nullability = 'nullable'`,
 			`create table t (a integer)`,
 		],
-		expectedClauses: 1,
 		expectedKey: ['a collate binary'],
 		expectedNullability: ['a: null'],
 		expectedText: '"a" INTEGER NULL PRIMARY KEY',
@@ -175,13 +162,11 @@ const SHAPES: Shape[] = [
 	{
 		label: 'declared narrow PK (subset of columns)',
 		statements: [`create table t (a integer, b text, v integer, primary key (a))`],
-		expectedClauses: 1,
 		expectedKey: ['a collate binary'],
 	},
 	{
 		label: 'declared single-column inline PK',
 		statements: [`create table t (id integer primary key, v text)`],
-		expectedClauses: 1,
 		expectedKey: ['id collate binary'],
 	},
 	{
@@ -193,23 +178,20 @@ const SHAPES: Shape[] = [
 			`create table t (a integer, b text)`,
 			`alter table t add column c integer not null default 0`,
 		],
-		expectedClauses: 1,
 		expectedKey: ['a collate binary', 'b collate binary'],
 	},
 	{
 		// The empty-key singleton has its own emission path (`PRIMARY KEY ()`) and must stay
-		// on it — `isSynthesizedAllColumnsKey` never matches it, and folding it into the
-		// composite branch would render an empty column list.
+		// on it — folding it into the composite branch (`length > 1`) would render an empty
+		// column list, and dropping it entirely would re-parse as the all-columns key.
 		label: 'empty-key singleton `primary key ()`',
 		statements: [`create table t (a integer, b text, primary key ())`],
-		expectedClauses: 1,
 		expectedKey: [],
 	},
 	{
 		// An all-columns key WITH a table-level conflict action; the clause carries it.
 		label: 'all-columns PK with ON CONFLICT',
 		statements: [`create table t (a integer, b text, primary key (a, b) on conflict replace)`],
-		expectedClauses: 1,
 		expectedKey: ['a collate binary', 'b collate binary'],
 		expectedConflict: 'REPLACE',
 		expectedText: 'PRIMARY KEY ("a", "b") ON CONFLICT REPLACE',
@@ -221,7 +203,6 @@ const SHAPES: Shape[] = [
 		// here while the inline branch kept it.
 		label: 'narrow composite PK, action declared on a key column',
 		statements: [`create table t (a integer not null on conflict replace, b text, c text, primary key (a, b))`],
-		expectedClauses: 1,
 		expectedKey: ['a collate binary', 'b collate binary'],
 		expectedConflict: 'REPLACE',
 		expectedText: 'PRIMARY KEY ("a", "b") ON CONFLICT REPLACE',
@@ -232,7 +213,6 @@ const SHAPES: Shape[] = [
 		// so the fixed-point assertion could not see it. The clause now carries it.
 		label: 'all-columns PK, action declared on a key column (clause carries the action)',
 		statements: [`create table t (a integer not null on conflict replace, b text, primary key (a, b))`],
-		expectedClauses: 1,
 		expectedKey: ['a collate binary', 'b collate binary'],
 		expectedConflict: 'REPLACE',
 		expectedText: 'PRIMARY KEY ("a", "b") ON CONFLICT REPLACE',
@@ -242,7 +222,6 @@ const SHAPES: Shape[] = [
 		// clause is what carries the action.
 		label: 'single-column table, inline PK with ON CONFLICT (inline clause carries it)',
 		statements: [`create table t (a integer primary key on conflict replace)`],
-		expectedClauses: 1,
 		expectedKey: ['a collate binary'],
 		expectedConflict: 'REPLACE',
 		expectedText: '"a" INTEGER NOT NULL PRIMARY KEY ON CONFLICT REPLACE',
@@ -251,7 +230,6 @@ const SHAPES: Shape[] = [
 		// The empty-key singleton emits its own clause, so its action rides that.
 		label: 'empty-key singleton with ON CONFLICT',
 		statements: [`create table t (a integer, b text, primary key () on conflict replace)`],
-		expectedClauses: 1,
 		expectedKey: [],
 		expectedConflict: 'REPLACE',
 		expectedText: 'PRIMARY KEY () ON CONFLICT REPLACE',
@@ -262,7 +240,6 @@ const SHAPES: Shape[] = [
 		// to ABORT on reopen just as silently as on the table-level branch.
 		label: 'narrow table-level PK with ON CONFLICT (inline branch carries the action)',
 		statements: [`create table t (a integer, b text, v integer, primary key (a) on conflict replace)`],
-		expectedClauses: 1,
 		expectedKey: ['a collate binary'],
 		expectedConflict: 'REPLACE',
 		expectedText: '"a" INTEGER NOT NULL PRIMARY KEY ON CONFLICT REPLACE',
@@ -273,7 +250,6 @@ const SHAPES: Shape[] = [
 		// the second write.
 		label: 'column-declared PK with ON CONFLICT',
 		statements: [`create table t (a integer primary key on conflict replace, b text)`],
-		expectedClauses: 1,
 		expectedKey: ['a collate binary'],
 		expectedConflict: 'REPLACE',
 		expectedText: '"a" INTEGER NOT NULL PRIMARY KEY ON CONFLICT REPLACE',
@@ -283,7 +259,6 @@ const SHAPES: Shape[] = [
 		// otherwise the text differs from an equivalent table that never named it.
 		label: 'PK with ON CONFLICT ABORT emits no ON CONFLICT (the default)',
 		statements: [`create table t (a integer, b text, v integer, primary key (a) on conflict abort)`],
-		expectedClauses: 1,
 		expectedKey: ['a collate binary'],
 	},
 	{
@@ -292,7 +267,6 @@ const SHAPES: Shape[] = [
 		// ordering-seeded maintained-table backing keys.)
 		label: 'all-columns PK with a DESC component',
 		statements: [`create table t (a integer, b text, primary key (a, b desc))`],
-		expectedClauses: 1,
 		expectedKey: ['a collate binary', 'b desc collate binary'],
 		expectedText: 'PRIMARY KEY ("a", "b" DESC)',
 	},
@@ -301,7 +275,6 @@ const SHAPES: Shape[] = [
 		// in the DECLARED order, which is the key's order.
 		label: 'all-columns PK in non-declaration order',
 		statements: [`create table t (a integer, b text, primary key (b, a))`],
-		expectedClauses: 1,
 		expectedKey: ['b collate binary', 'a collate binary'],
 		expectedText: 'PRIMARY KEY ("b", "a")',
 	},
@@ -311,7 +284,6 @@ const SHAPES: Shape[] = [
 		// collation via the emitted column-level `COLLATE`.
 		label: 'no-PK table with a NOCASE column',
 		statements: [`create table t (a text collate nocase, b integer)`],
-		expectedClauses: 1,
 		expectedKey: ['a collate nocase', 'b collate binary'],
 	},
 ];
@@ -328,8 +300,11 @@ describe('CREATE TABLE canonical DDL — primary-key round-trip is a fixed point
 
 			expect(original.key, 'live key').to.deep.equal(shape.expectedKey);
 			expect(original.conflict, 'live conflict action').to.equal(shape.expectedConflict ?? '(none)');
+			// Exactly one clause for every shape: the inline and table-level branches are
+			// separate, and a shape landing on both would emit an inline clause AND a
+			// table-level one, which the parser silently merges rather than rejecting.
 			expect(countPrimaryKeyClauses(original.ddl), `PRIMARY KEY clause count in: ${original.ddl}`)
-				.to.equal(shape.expectedClauses);
+				.to.equal(1);
 			if (shape.expectedText) {
 				expect(original.ddl, 'emitted DDL carries the declared clause').to.contain(shape.expectedText);
 			}

@@ -57,6 +57,20 @@ key from a synthesized one, and that using it for the ADD COLUMN decision would 
 rewrite a key its author wrote". So the shape fallback is not an acceptable landing pad —
 the flag has to disappear from both sides in step.
 
+## New since this ticket was filed: the flag already stops being true on reopen
+
+`debt-emit-primary-key-clause-for-every-key` has landed, so persisted DDL now names every key.
+A table created with no `PRIMARY KEY` therefore writes `PRIMARY KEY ("a", "b")` into the
+catalog, and when that text is re-parsed on reopen the flag comes back **false** (verified
+directly: `create table t (a integer, b text)` → flag `true`; emit its canonical DDL, re-parse
+it in a fresh database → flag `false`).
+
+So lamina's two consumers already see the flag change answer across a database reopen, without
+lamina having changed anything. `rejectSynthesizedKeyWidening` stops refusing after a reopen;
+the translator's answer flips the same way. Whatever the flag is meant to guard is therefore
+already not guarded end-to-end today — which argues for sequencing lamina's side sooner rather
+than treating the current state as safe.
+
 ## The change, once unblocked
 
 Small and mechanical — it is only the sequencing that is hard.

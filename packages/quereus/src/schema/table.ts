@@ -58,6 +58,16 @@ export interface TableSchema {
 	 * that need certainty should treat absent as unknown and fall back to their
 	 * own conservative default.
 	 *
+	 * **It does not survive a canonical-DDL round-trip, by design.** Canonical DDL
+	 * names every key, so a table created with no PRIMARY KEY emits
+	 * `PRIMARY KEY (...)` and rehydrates from its own catalog text with this field
+	 * `false`. That is the intended reading — the DDL states the key the table
+	 * actually has, and an undeclared all-columns key IS the declared one — but it
+	 * means the field answers "did the ORIGINAL author write the clause", and only
+	 * until the schema is persisted and reopened. A consumer that must keep the
+	 * distinction across a reopen cannot get it from here (or from anywhere else);
+	 * see `tickets/blocked/debt-retire-quereus-synthesized-primary-key-flag.md`.
+	 *
 	 * NOTE: no in-repo code reads this, but it is NOT dead — the `lamina-quereus`
 	 * adapter in the sibling `../lamina` repo reads it
 	 * (`src/quereus-ast-translators.ts`, and `module.ts`'s ADD COLUMN key-widening

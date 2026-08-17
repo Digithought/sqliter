@@ -12,6 +12,12 @@
  * and column-level `a integer primary key on conflict replace`. They land on different
  * emission branches (table-level clause vs. inline column clause) and both re-parse onto
  * the column, so each has to survive on its own.
+ *
+ * Two more shapes cover the **all-columns key** (the key a table gets when its declared key
+ * spans every column, and the one it gets when it declares none — they are the same key).
+ * The generator used to emit no clause at all for that key, so its action had nowhere to
+ * ride and decayed to ABORT here too. Because the whole row is the key, the colliding row
+ * has to be identical rather than merely sharing `a`.
  */
 
 import { describe, it, beforeEach, afterEach } from 'mocha';
@@ -41,10 +47,44 @@ function createInMemoryProvider(): KVStoreProvider {
 	};
 }
 
-const SPELLINGS = [
-	['table-level', 'create table pk_oc (a integer, b text, primary key (a) on conflict replace) using store'],
-	['column-level', 'create table pk_oc (a integer primary key on conflict replace, b text) using store'],
-] as const;
+interface Case {
+	label: string;
+	create: string;
+	/** Row inserted before the reopen, and the colliding row inserted after it. */
+	first: string;
+	second: string;
+	/** Expected `b` of the surviving row, for the shapes that have a non-key `b`. */
+	expectB?: string;
+}
+
+const CASES: Case[] = [
+	{
+		label: 'table-level',
+		create: 'create table pk_oc (a integer, b text, primary key (a) on conflict replace) using store',
+		first: `(1, 'first')`, second: `(1, 'second')`, expectB: 'second',
+	},
+	{
+		label: 'column-level',
+		create: 'create table pk_oc (a integer primary key on conflict replace, b text) using store',
+		first: `(1, 'first')`, second: `(1, 'second')`, expectB: 'second',
+	},
+	{
+		// All-columns key, action declared on a key COLUMN. This is the shape the generator
+		// used to emit no clause for at all, so the action had nowhere to ride and came back
+		// ABORT — the second insert threw instead of replacing. The whole row is the key, so
+		// the colliding row must be identical rather than merely sharing `a`.
+		label: 'all-columns key, action on the key column',
+		create: 'create table pk_oc (a integer not null on conflict replace, b text, primary key (a, b)) using store',
+		first: `(1, 'first')`, second: `(1, 'first')`, expectB: 'first',
+	},
+	{
+		// Single-column spelling of the same loss: the lone column IS the whole key, so the
+		// inline clause that carries the action is the one that used to be omitted.
+		label: 'single-column table, inline key with the action',
+		create: 'create table pk_oc (a integer primary key on conflict replace) using store',
+		first: `(1)`, second: `(1)`,
+	},
+];
 
 describe("a primary key's ON CONFLICT action survives a store reopen", () => {
 	let provider: KVStoreProvider;
@@ -57,14 +97,14 @@ describe("a primary key's ON CONFLICT action survives a store reopen", () => {
 		await provider.closeAll();
 	});
 
-	for (const [label, create] of SPELLINGS) {
-		it(`${label} REPLACE still replaces after rehydrate`, async () => {
+	for (const c of CASES) {
+		it(`${c.label} REPLACE still replaces after rehydrate`, async () => {
 			// Phase 1 — declare and persist.
 			const db1 = new Database();
 			const mod1 = new StoreModule(provider);
 			db1.registerModule('store', mod1);
-			await db1.exec(create);
-			await db1.exec(`insert into pk_oc values (1, 'first')`);
+			await db1.exec(c.create);
+			await db1.exec(`insert into pk_oc values ${c.first}`);
 			await mod1.whenCatalogPersisted();
 			await db1.close();
 
@@ -77,9 +117,11 @@ describe("a primary key's ON CONFLICT action survives a store reopen", () => {
 
 			// The point of the whole exercise: a colliding write replaces rather than
 			// raising the ABORT the action used to decay to.
-			await db2.exec(`insert into pk_oc values (1, 'second')`);
-			const row = await db2.get(`select b from pk_oc where a = 1`);
-			expect(row?.b, 'duplicate-key write replaced the existing row').to.equal('second');
+			await db2.exec(`insert into pk_oc values ${c.second}`);
+			if (c.expectB !== undefined) {
+				const row = await db2.get(`select b from pk_oc where a = 1`);
+				expect(row?.b, 'duplicate-key write replaced the existing row').to.equal(c.expectB);
+			}
 			const count = await db2.get(`select count(*) as cnt from pk_oc`);
 			expect(count?.cnt, 'replaced rather than appended').to.equal(1);
 			await db2.close();

@@ -38,13 +38,6 @@ interface Case {
 	alter: string;
 	/** Expected post-ALTER key, as `keySpelling` renders it. */
 	expectedKey: string[];
-	/**
-	 * Expected count of `PRIMARY KEY` occurrences in the generated DDL. Always 1 — every
-	 * key emits exactly one clause, the all-columns key included. Two would mean a re-key
-	 * left an inline clause on the retired column alongside the new table-level one, which
-	 * the parser silently merges back into the old key rather than rejecting.
-	 */
-	expectedClauses: number;
 }
 
 const CASES: Case[] = [
@@ -53,28 +46,24 @@ const CASES: Case[] = [
 		create: `create table t (id integer primary key, code integer not null)`,
 		alter: `alter table t alter primary key (code)`,
 		expectedKey: ['code'],
-		expectedClauses: 1,
 	},
 	{
 		label: 'single → single desc',
 		create: `create table t (id integer primary key, code integer not null)`,
 		alter: `alter table t alter primary key (code desc)`,
 		expectedKey: ['code desc'],
-		expectedClauses: 1,
 	},
 	{
 		label: 'composite → single (must not emit two inline clauses)',
 		create: `create table t (a integer not null, b integer not null, v integer null, primary key (a, b))`,
 		alter: `alter table t alter primary key (b)`,
 		expectedKey: ['b'],
-		expectedClauses: 1,
 	},
 	{
 		label: 'single → composite subset',
 		create: `create table t (id integer primary key, a integer not null, b integer not null)`,
 		alter: `alter table t alter primary key (a, b)`,
 		expectedKey: ['a', 'b'],
-		expectedClauses: 1,
 	},
 	{
 		// The new key spans every column — the shape a table with no declared PRIMARY KEY
@@ -84,7 +73,6 @@ const CASES: Case[] = [
 		create: `create table t (id integer primary key, code integer not null)`,
 		alter: `alter table t alter primary key (id, code)`,
 		expectedKey: ['id', 'code'],
-		expectedClauses: 1,
 	},
 	{
 		// The empty-key singleton: the retired inline clause must go and the table-level
@@ -93,14 +81,12 @@ const CASES: Case[] = [
 		create: `create table t (id integer primary key, code integer not null)`,
 		alter: `alter table t alter primary key ()`,
 		expectedKey: [],
-		expectedClauses: 1,
 	},
 	{
 		label: 'composite → composite reordered',
 		create: `create table t (a integer not null, b integer not null, v integer null, primary key (a, b))`,
 		alter: `alter table t alter primary key (b, a desc)`,
 		expectedKey: ['b', 'a desc'],
-		expectedClauses: 1,
 	},
 ];
 
@@ -117,7 +103,11 @@ describe('ALTER PRIMARY KEY — generated DDL names the new key', () => {
 				expect(keySpelling(schema), 'live schema re-keyed').to.deep.equal(c.expectedKey);
 
 				ddl = generateTableDDL(schema);
-				expect(countPrimaryKeyClauses(ddl), `PRIMARY KEY clause count in: ${ddl}`).to.equal(c.expectedClauses);
+				// Exactly one for every case, the all-columns key included. Two would mean the
+				// re-key left an inline clause on the retired column alongside the new
+				// table-level one, which the parser silently merges back into the old key
+				// rather than rejecting.
+				expect(countPrimaryKeyClauses(ddl), `PRIMARY KEY clause count in: ${ddl}`).to.equal(1);
 				for (const member of c.expectedKey) {
 					// The retired key's column must not carry a clause; assert positively that
 					// each new member's name appears somewhere and rely on the re-parse below
