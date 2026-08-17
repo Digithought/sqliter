@@ -19,6 +19,7 @@ import type { MappingAdvertisement, DecompositionMember, StorageShape } from '..
 import type { AnyVirtualTableModule } from '../vtab/module.js';
 import type { InclusionDependency } from '../planner/nodes/plan-node.js';
 import { addInd, MAX_INDS_PER_NODE } from '../planner/util/fd-utils.js';
+import { captureKeyEquality } from '../planner/mutation/capture-correlation.js';
 import { spineCloneAst } from '../util/ast-spine-clone.js';
 
 const log = createLogger('schema:lens-compiler');
@@ -804,7 +805,7 @@ function compileDecompositionBody(
 			joinType: member.presence === 'mandatory' ? 'inner' : 'left',
 			left: from,
 			right: memberTableSource(memberTable, basis.schemaName, member.relationId),
-			condition: buildKeyEquiJoin(anchor.relationId, anchorKeys, member.relationId, memberKeys),
+			condition: buildKeyEquiJoin(anchor.relationId, anchorKeys, anchorTable, member.relationId, memberKeys, memberTable),
 		};
 	}
 
@@ -812,12 +813,12 @@ function compileDecompositionBody(
 	const aliasOf = (relationId: string): string | undefined =>
 		joinedMembers.has(relationId) ? relationId : undefined;
 	const eavAnchor = anchorKeys.length > 0
-		? { alias: anchor.relationId, keyColumn: anchorKeys[0] }
+		? { alias: anchor.relationId, keyColumn: anchorKeys[0], keyNullable: columnNullable(anchorTable, anchorKeys[0]) }
 		: undefined;
 
 	const columns: AST.ResultColumn[] = [];
 	for (const col of logicalTable.columns) {
-		const res = resolveAdvertisedColumn(col.name, storage, basis.schemaName, aliasOf, eavAnchor);
+		const res = resolveAdvertisedColumn(col.name, storage, basis.schemaName, aliasOf, eavAnchor, memberTables);
 		let expr: AST.Expression;
 		if (res.kind === 'expr') {
 			expr = res.expr;
@@ -966,27 +967,57 @@ function memberTableSource(table: TableSchema, basisSchemaName: string, alias: s
 }
 
 /**
+ * Declared nullability of `name` on `table` (`ColumnSchema.notNull === false`).
+ * An unknown column (defensive — advertisement validation already guarantees
+ * existence) reads as nullable, so a stitch correlation over it falls back to
+ * the NULL-safe form: semantically identical for a NOT NULL column, merely less
+ * index-friendly (the same convention as `decomposition.ts` `keyColumnInfo`).
+ */
+function columnNullable(table: TableSchema, name: string): boolean {
+	const col = table.columns.find(c => c.name.toLowerCase() === name.toLowerCase());
+	return !col || !col.notNull;
+}
+
+/**
  * Builds the per-member key-equi-join ON condition: a positional conjunction of
- * `member.kᵢ = anchor.kᵢ` over the two relations' shared-key column lists (paired
- * by index, since a surrogate may be spelled differently per relation). An empty
- * key column list (the `primary key ()` singleton) yields the vacuously-true
- * `1 = 1` — no singleton-specific branch (docs/lens.md § The Default Mapper).
+ * per-column stitch equalities `member.kᵢ = anchor.kᵢ` over the two relations'
+ * shared-key column lists (paired by index, since a surrogate may be spelled
+ * differently per relation). Each pair routes through {@link captureKeyEquality}:
+ * plain `=` unless **both** sides declare the column nullable, in which case the
+ * NULL-safe disjunction is emitted — NULL is a self-equal key value
+ * (docs/schema.md § Primary-key nullability), so a NULL-keyed logical row must
+ * still find its member components. The both-sides gate keeps the emitted
+ * condition byte-identical for any schema whose stitch key is NOT NULL on either
+ * side (a member row keyed NULL is then a genuine orphan and `=` correctly
+ * matches nothing). An empty key column list (the `primary key ()` singleton)
+ * yields the vacuously-true `1 = 1` — no singleton-specific branch
+ * (docs/lens.md § The Default Mapper).
+ *
+ * NOTE: accepted tradeoff — the gate reads **declared** nullability, so under
+ * `pragma default_column_nullability = nullable` every stitch key is declared
+ * nullable and every decomposition get body takes the disjunctive ON, which
+ * yields no equi-pairs (`rules/join/equi-pair-extractor.ts`) — the join falls
+ * back to nested-loop and loses its coverage proofs — on the read path of every
+ * select. Correct but potentially slow; revisit (narrow to *reachable*
+ * nullability) if lens reads under that pragma ever show up in profiles.
  */
 function buildKeyEquiJoin(
 	anchorAlias: string,
 	anchorKeys: readonly string[],
+	anchorTable: TableSchema,
 	memberAlias: string,
 	memberKeys: readonly string[],
+	memberTable: TableSchema,
 ): AST.Expression {
 	const n = Math.min(anchorKeys.length, memberKeys.length);
 	const eqs: AST.Expression[] = [];
 	for (let i = 0; i < n; i++) {
-		eqs.push({
-			type: 'binary',
-			operator: '=',
-			left: { type: 'column', name: memberKeys[i], table: memberAlias } as AST.ColumnExpr,
-			right: { type: 'column', name: anchorKeys[i], table: anchorAlias } as AST.ColumnExpr,
-		} as AST.BinaryExpr);
+		const bothNullable = columnNullable(memberTable, memberKeys[i]) && columnNullable(anchorTable, anchorKeys[i]);
+		eqs.push(captureKeyEquality(
+			{ type: 'column', name: memberKeys[i], table: memberAlias } as AST.ColumnExpr,
+			{ type: 'column', name: anchorKeys[i], table: anchorAlias } as AST.ColumnExpr,
+			bothNullable,
+		));
 	}
 	if (eqs.length === 0) {
 		// Singleton / empty key: vacuously true (`on 1 = 1`).
@@ -1031,7 +1062,8 @@ function resolveAdvertisedColumn(
 	storage: StorageShape,
 	basisSchemaName: string,
 	aliasOf: (relationId: string) => string | undefined,
-	eavAnchor: { alias: string; keyColumn: string } | undefined,
+	eavAnchor: { alias: string; keyColumn: string; keyNullable: boolean } | undefined,
+	memberTables?: ReadonlyMap<string, TableSchema>,
 ): AdvertisedColumnResolution {
 	const lc = logicalColumn.toLowerCase();
 
@@ -1048,7 +1080,7 @@ function resolveAdvertisedColumn(
 	//    literal (only with exactly one pivot member + an entity correlation key).
 	const eavMembers = storage.members.filter(m => m.attributePivot);
 	if (eavMembers.length === 1 && eavAnchor) {
-		return { kind: 'expr', expr: buildEavSubquery(eavMembers[0], logicalColumn, basisSchemaName, eavAnchor) };
+		return { kind: 'expr', expr: buildEavSubquery(eavMembers[0], logicalColumn, basisSchemaName, eavAnchor, memberTables?.get(eavMembers[0].relationId)) };
 	}
 
 	// 3. Not advertised → caller falls back to name-match.
@@ -1061,16 +1093,26 @@ function resolveAdvertisedColumn(
  *   p.<attribute> = '<logicalColumn>')`. Keeps every EAV column independently
  * nullable (a logical row may have a triple for some attributes and not others)
  * and rides the existing scalar-subquery read path with no new runtime.
+ *
+ * The entity correlation is a stitch-key equality, so it routes through
+ * {@link captureKeyEquality} under the same both-sides-nullable gate as
+ * {@link buildKeyEquiJoin}: a NULL-keyed entity's triples are otherwise
+ * unreachable through the plain `=`. The attribute conjunct compares against a
+ * non-null literal and stays plain `=`. `pivotTable` may be absent (defensive —
+ * the sole call chain that builds an EAV subquery threads it); then the entity
+ * column reads as nullable, falling back to the NULL-safe form.
  */
 function buildEavSubquery(
 	pivot: DecompositionMember,
 	logicalColumn: string,
 	basisSchemaName: string,
-	eavAnchor: { alias: string; keyColumn: string },
+	eavAnchor: { alias: string; keyColumn: string; keyNullable: boolean },
+	pivotTable: TableSchema | undefined,
 ): AST.SubqueryExpr {
 	const piv = pivot.attributePivot!;
 	const pivotAlias = pivot.relationId;
 	const pivotSchema = pivot.relation.schema || basisSchemaName;
+	const entityNullable = !pivotTable || columnNullable(pivotTable, piv.entityColumn);
 	const query: AST.SelectStmt = {
 		type: 'select',
 		columns: [{ type: 'column', expr: { type: 'column', name: piv.valueColumn, table: pivotAlias } as AST.ColumnExpr }],
@@ -1082,12 +1124,11 @@ function buildEavSubquery(
 		where: {
 			type: 'binary',
 			operator: 'AND',
-			left: {
-				type: 'binary',
-				operator: '=',
-				left: { type: 'column', name: piv.entityColumn, table: pivotAlias } as AST.ColumnExpr,
-				right: { type: 'column', name: eavAnchor.keyColumn, table: eavAnchor.alias } as AST.ColumnExpr,
-			} as AST.BinaryExpr,
+			left: captureKeyEquality(
+				{ type: 'column', name: piv.entityColumn, table: pivotAlias } as AST.ColumnExpr,
+				{ type: 'column', name: eavAnchor.keyColumn, table: eavAnchor.alias } as AST.ColumnExpr,
+				entityNullable && eavAnchor.keyNullable,
+			),
 			right: {
 				type: 'binary',
 				operator: '=',

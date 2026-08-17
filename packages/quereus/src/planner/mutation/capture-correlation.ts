@@ -16,8 +16,11 @@ export interface KeyColumnInfo {
 }
 
 /**
- * Per-key-column equality for correlating a capture (`__vmupd_keys`) reader to
- * its target row:
+ * Per-key-column equality for correlating two spellings of one key value — a
+ * capture (`__vmupd_keys`) reader to its target row, and equally a decomposition
+ * lens's stitch-key correlations (the get body's `anchor ⋈ member` ON condition
+ * and EAV entity subquery in `schema/lens-compiler.ts`, and the write fan-out's
+ * anchor EXISTS correlation in `decomposition.ts`):
  *
  * ```
  * left = right                                    -- column declared NOT NULL

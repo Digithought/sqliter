@@ -12,7 +12,7 @@ import type { TableSchema } from '../../schema/table.js';
 import type { ColumnSchema } from '../../schema/column.js';
 import type { SqlValue } from '../../common/types.js';
 import type { BaseOp, MutableViewLike, MutationRequest } from './propagate.js';
-import { combineAnd } from './single-source.js';
+import { combineAnd, SELF_ALIAS } from './single-source.js';
 import { transformExpr, cloneExpr } from './scope-transform.js';
 import { buildExpression } from '../building/expression.js';
 import { columnSchemaToScalarType } from '../type-utils.js';
@@ -21,7 +21,7 @@ import { containsNonDeterministicCall } from '../analysis/check-extraction.js';
 import { FunctionFlags } from '../../common/constants.js';
 import { analyzeBodyLineage, type BackwardColumn } from './backward-body.js';
 import { keyColumnName, capturedValueSubquery, type MultiSourceKeyCapture } from './multi-source.js';
-import type { KeyColumnInfo } from './capture-correlation.js';
+import { captureKeyEquality, type KeyColumnInfo } from './capture-correlation.js';
 import { raiseMutationDiagnostic, type MutationDiagnostic } from './mutation-diagnostic.js';
 
 /**
@@ -719,7 +719,10 @@ function decomposeDelete(ctx: PlanningContext, view: MutableViewLike, shape: Dec
  * One member's delete. No predicate ⇒ an unconditional `delete from <member>`
  * (truncate the component — also the sound singleton path, which has no key to
  * thread). With an anchor predicate ⇒ `delete from <member> where
- * <memberKeyOrEntity> in (select <anchorKey> from <anchor> where <pred>)`.
+ * <memberKeyOrEntity> in (select <anchorKey> from <anchor> where <pred>)` — or
+ * the NULL-safe correlated EXISTS with the target aliased {@link SELF_ALIAS}
+ * when both stitch columns are nullable ({@link anchorKeyCorrelation}), so a
+ * NULL-keyed component row does not survive the fan-out as an orphan.
  */
 function memberDeleteOp(
 	ctx: PlanningContext,
@@ -730,15 +733,19 @@ function memberDeleteOp(
 	stmt: AST.DeleteStmt,
 ): BaseOp {
 	let where: AST.Expression | undefined;
+	let targetAlias: string | undefined;
 	if (pred) {
 		const memberCol = member.attributePivot
 			? member.attributePivot.entityColumn // EAV: delete every triple for the matched entities
 			: singleKeyColumn(view, shape, member);
-		where = { type: 'in', expr: { type: 'column', name: memberCol }, subquery: anchorKeySubquery(shape, pred) };
+		const correlation = anchorKeyCorrelation(ctx, shape, member, memberCol, pred);
+		where = correlation.where;
+		targetAlias = correlation.targetAlias;
 	}
 	const statement: AST.DeleteStmt = {
 		type: 'delete',
 		table: memberIdentifier(member),
+		alias: targetAlias,
 		where,
 		contextValues: stmt.contextValues,
 		schemaPath: stmt.schemaPath,
@@ -1113,7 +1120,11 @@ function collectValueScopes(expr: AST.Expression): { qualifiers: Set<string>; ha
 	return { qualifiers, hasUnqualifiedColumn, hasSubquery };
 }
 
-/** `update <member> set <cols> where <memberKey> in (select <anchorKey> from <anchor> where <pred>)`. */
+/**
+ * `update <member> set <cols> where <memberKey> in (select <anchorKey> from <anchor>
+ * where <pred>)` — or the NULL-safe correlated EXISTS with the target aliased
+ * {@link SELF_ALIAS} when both stitch columns are nullable ({@link anchorKeyCorrelation}).
+ */
 function memberUpdateOp(
 	ctx: PlanningContext,
 	view: MutableViewLike,
@@ -1124,16 +1135,13 @@ function memberUpdateOp(
 	stmt: AST.UpdateStmt,
 ): BaseOp {
 	const memberKey = singleKeyColumn(view, shape, member);
-	const where: AST.InExpr = {
-		type: 'in',
-		expr: { type: 'column', name: memberKey },
-		subquery: anchorKeySubquery(shape, pred),
-	};
+	const correlation = anchorKeyCorrelation(ctx, shape, member, memberKey, pred);
 	const statement: AST.UpdateStmt = {
 		type: 'update',
 		table: memberIdentifier(member),
+		alias: correlation.targetAlias,
 		assignments: assignments.map(a => ({ column: a.column, value: a.value })),
-		where,
+		where: correlation.where,
 		contextValues: stmt.contextValues,
 		schemaPath: stmt.schemaPath,
 		loc: stmt.loc,
@@ -1818,7 +1826,10 @@ function emitEavCapturedAttr(
 /**
  * One matched EAV op for an attribute: `update <pivot> set <valCol> = <value>` (upsert
  * value branch) or `delete from <pivot>` (null branch), each scoped
- * `where <attrCol> = '<attribute>' and <entityCol> in (<anchor subquery>)`. `valueOverride`
+ * `where <attrCol> = '<attribute>' and <entityCol> in (<anchor subquery>)` — the entity
+ * correlation taking the NULL-safe EXISTS form (target aliased {@link SELF_ALIAS}) when
+ * both the entity column and the anchor key are nullable ({@link anchorKeyCorrelation});
+ * the attribute conjunct compares a non-null literal and stays plain `=`. `valueOverride`
  * supplies the matched-UPDATE value for a `captured` cell (the `__vmupd_keys` read-back correlated
  * by the entity column); absent, the cell's own lowered value is used (the `constant` branch).
  */
@@ -1834,22 +1845,19 @@ function buildEavAttrOp(
 	op: 'update' | 'delete',
 	valueOverride?: AST.Expression,
 ): BaseOp {
-	const where = combineAnd(eavAttrEquals(pivot, cell.attribute), {
-		type: 'in',
-		expr: { type: 'column', name: pivot.entityColumn },
-		subquery: anchorKeySubquery(shape, pred),
-	})!;
+	const correlation = anchorKeyCorrelation(ctx, shape, member, pivot.entityColumn, pred);
+	const where = combineAnd(eavAttrEquals(pivot, cell.attribute), correlation.where)!;
 	const table = memberIdentifier(member);
 	const resolved = resolveMemberTable(ctx, member);
 	if (op === 'delete') {
 		const statement: AST.DeleteStmt = {
-			type: 'delete', table, where,
+			type: 'delete', table, alias: correlation.targetAlias, where,
 			contextValues: stmt.contextValues, schemaPath: stmt.schemaPath, loc: stmt.loc,
 		};
 		return { table: resolved, op: 'delete', statement };
 	}
 	const statement: AST.UpdateStmt = {
-		type: 'update', table,
+		type: 'update', table, alias: correlation.targetAlias,
 		assignments: [{ column: pivot.valueColumn, value: valueOverride ?? cloneExpr(cell.value) }],
 		where,
 		contextValues: stmt.contextValues, schemaPath: stmt.schemaPath, loc: stmt.loc,
@@ -2151,6 +2159,61 @@ function anchorKeySubquery(shape: DecompShape, pred: AST.Expression | undefined)
 		columns: [{ type: 'column', expr: { type: 'column', name: anchorKey, table: shape.anchor.relationId } }],
 		from: [{ ...memberIdentifierSource(shape.anchor), alias: shape.anchor.relationId }],
 		where: pred ? cloneExpr(pred) : undefined,
+	};
+}
+
+/**
+ * The identifying correlation a member op routes on: `<memberCol> in (select <anchorKey>
+ * from <anchor> [where <pred>])` when either stitch column is declared NOT NULL, or the
+ * NULL-safe correlated `exists (select 1 from <anchor> where [<pred> and] <per-column
+ * {@link captureKeyEquality}>)` when **both** are nullable — NULL is a self-equal key
+ * value (docs/schema.md § Primary-key nullability), and `NULL IN (…)` is UNKNOWN, so
+ * the IN shape leaves a NULL-keyed member row unreachable (an update misses it; a
+ * fan-out delete strands it as an orphan). The both-sides gate keeps the emitted
+ * statement byte-identical to the legacy IN form for any schema whose stitch key is
+ * NOT NULL on either side. `memberCol` is the member's stitch key, or the EAV pivot's
+ * entity column.
+ *
+ * On the EXISTS branch the member operand is qualified with {@link SELF_ALIAS} — under
+ * a logical-tuple key the anchor and member key columns are spelled identically, so a
+ * bare ref inside the subquery would bind the anchor's column, not the outer target
+ * row. The caller must stamp the returned `targetAlias` onto the emitted UPDATE/DELETE
+ * (`stmt.alias` → `AliasedScope`, `building/update.ts` / `building/delete.ts`);
+ * `targetAlias` is undefined on the IN branch so NOT NULL schemas keep an alias-free
+ * statement. Composite stitch keys are deferred by {@link singleKeyColumn}, so the
+ * per-column shape degenerates to one column here.
+ */
+function anchorKeyCorrelation(
+	ctx: PlanningContext,
+	shape: DecompShape,
+	member: DecompositionMember,
+	memberCol: string,
+	pred: AST.Expression | undefined,
+): { where: AST.Expression; targetAlias?: string } {
+	const anchorKey = singleKeyColumn(undefined, shape, shape.anchor);
+	const anchorInfo = keyColumnInfo(resolveMemberTable(ctx, shape.anchor).tableSchema, anchorKey);
+	const memberInfo = keyColumnInfo(resolveMemberTable(ctx, member).tableSchema, memberCol);
+	if (!(anchorInfo.nullable && memberInfo.nullable)) {
+		return {
+			where: { type: 'in', expr: { type: 'column', name: memberCol }, subquery: anchorKeySubquery(shape, pred) },
+		};
+	}
+	const keyEq = captureKeyEquality(
+		{ type: 'column', name: anchorKey, table: shape.anchor.relationId },
+		{ type: 'column', name: memberCol, table: SELF_ALIAS },
+		true,
+	);
+	return {
+		where: {
+			type: 'exists',
+			subquery: {
+				type: 'select',
+				columns: [{ type: 'column', expr: { type: 'literal', value: 1 } }],
+				from: [{ ...memberIdentifierSource(shape.anchor), alias: shape.anchor.relationId }],
+				where: combineAnd(pred ? cloneExpr(pred) : undefined, keyEq)!,
+			},
+		},
+		targetAlias: SELF_ALIAS,
 	};
 }
 

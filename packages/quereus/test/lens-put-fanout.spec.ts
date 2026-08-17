@@ -58,8 +58,11 @@ import type { Database as DatabaseType } from '../src/core/database.js';
 import type { Schema } from '../src/schema/schema.js';
 import type { MappingAdvertisement, LogicalColumnMapping } from '../src/vtab/mapping-advertisement.js';
 import type * as AST from '../src/parser/ast.js';
+import { Parser } from '../src/parser/parser.js';
 import { astToString } from '../src/emit/ast-stringify.js';
 import { collectLensRowLocalConstraints } from '../src/planner/mutation/lens-enforcement.js';
+import { decompositionStorage } from '../src/planner/mutation/propagate.js';
+import { analyzeDecomposition, decomposeUpdate } from '../src/planner/mutation/decomposition.js';
 import { BuildTimeDependencyTracker, type PlanningContext } from '../src/planner/planning-context.js';
 import { GlobalScope } from '../src/planner/scopes/global.js';
 import { ParameterScope } from '../src/planner/scopes/param.js';
@@ -2967,44 +2970,51 @@ describe('lens decomposition put: per-op gate routes by owning basis relation (c
 	});
 });
 
-describe('lens decomposition put: captured read-back over a NULLABLE anchor key', () => {
-	// A key column may be nullable and NULL is a self-equal key value (docs/schema.md
-	// § Primary-key nullability). The captured-value read-back (`capturedValueSubquery`)
-	// correlates NULL-safely per nullable key column (planner/mutation/capture-correlation.ts),
-	// so a NULL-keyed anchor row's captured value is reachable — pinned here on the
-	// materialize-INSERT branch, whose value and non-empty filter both read the capture
-	// back by the anchor key. Base state is asserted directly: the lens GET body (and the
-	// matched-UPDATE / member-delete `in (select <anchorKey> …)` correlations) still stitch
-	// the shared key with plain `=`, so a NULL-keyed row does not yet round-trip through
-	// the logical read — tracked separately (fix/bug-lens-decomposition-null-stitch-key).
-	function nullableKeySplit(): MappingAdvertisement {
-		return {
-			id: 'N_core',
-			logicalTable: 'N',
-			role: 'primary-storage',
-			storage: {
-				anchorRelationId: 'N_core',
-				members: [
-					{ relationId: 'N_core', relation: { schema: 'main', table: 'N_core' }, presence: 'mandatory', columns: [colMap('id', 'id'), colMap('a', 'a')] },
-					{ relationId: 'N_c', relation: { schema: 'main', table: 'N_c' }, presence: 'optional', columns: [colMap('c', 'c')] },
-				],
-				sharedKey: { kind: 'logical-tuple', keyColumnsByRelation: keyMap(['N_core', ['id']], ['N_c', ['id']]) },
-			},
-		};
-	}
+/**
+ * Nullable-stitch-key fixture (shared by the NULL-key suites below): anchor N_core
+ * (id, a) + optional columnar member N_c (c), logical-tuple key on a NULLABLE `id`.
+ * A key column may be nullable and NULL is a self-equal key value (docs/schema.md
+ * § Primary-key nullability), so every stitch correlation — the get body's equi-join
+ * and EAV entity subquery (schema/lens-compiler.ts) and the put fan-out's anchor
+ * correlation (planner/mutation/decomposition.ts) — is NULL-safe per key column,
+ * gated on BOTH sides declaring the column nullable (`captureKeyEquality`).
+ */
+function nullableKeySplit(): MappingAdvertisement {
+	return {
+		id: 'N_core',
+		logicalTable: 'N',
+		role: 'primary-storage',
+		storage: {
+			anchorRelationId: 'N_core',
+			members: [
+				{ relationId: 'N_core', relation: { schema: 'main', table: 'N_core' }, presence: 'mandatory', columns: [colMap('id', 'id'), colMap('a', 'a')] },
+				{ relationId: 'N_c', relation: { schema: 'main', table: 'N_c' }, presence: 'optional', columns: [colMap('c', 'c')] },
+			],
+			sharedKey: { kind: 'logical-tuple', keyColumnsByRelation: keyMap(['N_core', ['id']], ['N_c', ['id']]) },
+		},
+	};
+}
 
-	async function setupNullableKey(db: Database): Promise<void> {
-		const mod = new AdvertisingModule();
-		mod.ads = [nullableKeySplit()];
-		db.registerModule('admod', mod);
-		await db.exec('create table N_core (id integer null primary key, a integer) using admod');
-		await db.exec('create table N_c (id integer null primary key, c integer null) using admod');
-		await db.exec('declare logical schema x { table N { id integer null primary key, a integer, c integer null } }');
-		await db.exec('apply schema x');
+/** Deploy the N decomposition over nullable-key tables; `seed` loads the captured read-back suite's base rows. */
+async function setupNullableKey(db: Database, seed = true): Promise<void> {
+	const mod = new AdvertisingModule();
+	mod.ads = [nullableKeySplit()];
+	db.registerModule('admod', mod);
+	await db.exec('create table N_core (id integer null primary key, a integer) using admod');
+	await db.exec('create table N_c (id integer null primary key, c integer null) using admod');
+	await db.exec('declare logical schema x { table N { id integer null primary key, a integer, c integer null } }');
+	await db.exec('apply schema x');
+	if (seed) {
 		// Row keyed NULL and a non-NULL control row; neither has an optional N_c component.
 		await db.exec('insert into main.N_core values (null, 10), (1, 20)');
 	}
+}
 
+describe('lens decomposition put: captured read-back over a NULLABLE anchor key', () => {
+	// The captured-value read-back (`capturedValueSubquery`) correlates NULL-safely per
+	// nullable key column (planner/mutation/capture-correlation.ts), so a NULL-keyed
+	// anchor row's captured value is reachable — pinned here on the materialize-INSERT
+	// branch, whose value and non-empty filter both read the capture back by the anchor key.
 	it('materializes an absent optional component for a NULL-keyed anchor row (captured mixed value)', async () => {
 		// `set c = coalesce(c, 0) + a` mixes self (N_c.c) and anchor (N_core.a) leaves, so it
 		// rides the single-identity capture. The materialize INSERT reads the captured value
@@ -3019,6 +3029,244 @@ describe('lens decomposition put: captured read-back over a NULLABLE anchor key'
 				{ id: null, c: 10 },   // materialized for the NULL-keyed anchor (was: silently missing)
 				{ id: 1, c: 20 },      // control: the non-NULL-keyed row behaves as before
 			]);
+			// The logical read stitches the NULL-keyed component back through the
+			// NULL-safe get-body join.
+			expect(await rows(db, 'select id, a, c from x.N order by a')).to.deep.equal([
+				{ id: null, a: 10, c: 10 }, { id: 1, a: 20, c: 20 },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+describe('lens decomposition put: NULL stitch-key round-trip (columnar split)', () => {
+	it('a NULL-keyed logical row inserts, reads, updates, and deletes across both members', async () => {
+		const db = new Database();
+		try {
+			await setupNullableKey(db, false);
+			// INSERT through the lens: a NULL-keyed row WITH the optional component + a control row.
+			await db.exec('insert into x.N (id, a, c) values (null, 10, 77), (1, 20, 21)');
+			expect(await rows(db, 'select id, c from main.N_c order by c')).to.deep.equal([
+				{ id: 1, c: 21 }, { id: null, c: 77 },
+			]);
+			// SELECT reads every column back: the NULL-keyed row's component joins.
+			expect(await rows(db, 'select id, a, c from x.N order by a')).to.deep.equal([
+				{ id: null, a: 10, c: 77 }, { id: 1, a: 20, c: 21 },
+			]);
+			// A mandatory (anchor) value column updates through the anchor's own self-correlation.
+			await db.exec('update x.N set a = a + 1');
+			expect(await rows(db, 'select id, a from x.N order by a')).to.deep.equal([
+				{ id: null, a: 11 }, { id: 1, a: 21 },
+			]);
+			// A keyed constant UPDATE reaches the NULL-keyed component (matched member UPDATE).
+			await db.exec('update x.N set c = 5 where id is null');
+			expect(await rows(db, 'select id, c from main.N_c order by c')).to.deep.equal([
+				{ id: null, c: 5 }, { id: 1, c: 21 },
+			]);
+			// A computed (captured) UPDATE writes the computed value on both rows.
+			await db.exec('update x.N set c = coalesce(c, 0) + a');
+			expect(await rows(db, 'select id, c from main.N_c order by c')).to.deep.equal([
+				{ id: null, c: 16 },   // 5 + 11
+				{ id: 1, c: 42 },      // 21 + 21
+			]);
+			// A keyed DELETE removes every component of the NULL-keyed row — no orphan.
+			await db.exec('delete from x.N where id is null');
+			expect(await rows(db, 'select id, a from main.N_core')).to.deep.equal([{ id: 1, a: 21 }]);
+			expect(await rows(db, 'select id, c from main.N_c')).to.deep.equal([{ id: 1, c: 42 }]);
+			// A full DELETE truncates both members.
+			await db.exec('delete from x.N');
+			expect(await rows(db, 'select count(*) as n from main.N_core')).to.deep.equal([{ n: 0 }]);
+			expect(await rows(db, 'select count(*) as n from main.N_c')).to.deep.equal([{ n: 0 }]);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+describe('lens decomposition put: NULL stitch-key round-trip (EAV pivot)', () => {
+	function nullableKeyEavSplit(): MappingAdvertisement {
+		return {
+			id: 'NE_core',
+			logicalTable: 'NE',
+			role: 'primary-storage',
+			storage: {
+				anchorRelationId: 'NE_core',
+				members: [
+					{ relationId: 'NE_core', relation: { schema: 'main', table: 'NE_core' }, presence: 'mandatory', columns: [colMap('id', 'id'), colMap('a', 'a')] },
+					{
+						relationId: 'NE_eav', relation: { schema: 'main', table: 'NE_eav' }, presence: 'optional', columns: [],
+						attributePivot: { entityColumn: 'eid', attributeColumn: 'attr', valueColumn: 'val' },
+					},
+				],
+				sharedKey: { kind: 'logical-tuple', keyColumnsByRelation: keyMap(['NE_core', ['id']], ['NE_eav', ['eid']]) },
+			},
+		};
+	}
+
+	async function setupNullableKeyEav(db: Database): Promise<void> {
+		const mod = new AdvertisingModule();
+		mod.ads = [nullableKeyEavSplit()];
+		db.registerModule('nemod', mod);
+		await db.exec('create table NE_core (id integer null primary key, a integer) using nemod');
+		await db.exec('create table NE_eav (eid integer null, attr text, val integer null, primary key (eid, attr)) using nemod');
+		await db.exec('declare logical schema x { table NE { id integer null primary key, a integer, p integer null } }');
+		await db.exec('apply schema x');
+	}
+
+	it('a NULL-keyed logical row inserts, reads, updates, and deletes its triples', async () => {
+		const db = new Database();
+		try {
+			await setupNullableKeyEav(db);
+			// INSERT through the lens emits one triple per supplied attribute.
+			await db.exec('insert into x.NE (id, a, p) values (null, 10, 1000), (1, 20, 2000)');
+			expect(await rows(db, 'select eid, attr, val from main.NE_eav order by val')).to.deep.equal([
+				{ eid: null, attr: 'p', val: 1000 }, { eid: 1, attr: 'p', val: 2000 },
+			]);
+			// SELECT: the NULL-keyed entity's triple reads back through the correlated subquery.
+			expect(await rows(db, 'select id, a, p from x.NE order by a')).to.deep.equal([
+				{ id: null, a: 10, p: 1000 }, { id: 1, a: 20, p: 2000 },
+			]);
+			// A constant UPDATE reaches the NULL-keyed entity's matched triple.
+			await db.exec('update x.NE set p = 5');
+			expect(await rows(db, 'select eid, val from main.NE_eav order by eid')).to.deep.equal([
+				{ eid: null, val: 5 }, { eid: 1, val: 5 },
+			]);
+			// A captured (self + anchor mix) UPDATE writes the computed value on both entities.
+			await db.exec('update x.NE set p = coalesce(p, 0) + a');
+			expect(await rows(db, 'select id, p from x.NE order by a')).to.deep.equal([
+				{ id: null, p: 15 },   // 5 + 10
+				{ id: 1, p: 25 },      // 5 + 20
+			]);
+			// A keyed DELETE removes the NULL-keyed entity's triples — no orphan.
+			await db.exec('delete from x.NE where id is null');
+			expect(await rows(db, 'select id from main.NE_core')).to.deep.equal([{ id: 1 }]);
+			expect(await rows(db, 'select eid, val from main.NE_eav')).to.deep.equal([{ eid: 1, val: 25 }]);
+			// A full DELETE truncates both members.
+			await db.exec('delete from x.NE');
+			expect(await rows(db, 'select count(*) as n from main.NE_eav')).to.deep.equal([{ n: 0 }]);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+describe('lens decomposition put: NULL stitch key under a surrogate shared key', () => {
+	// Surrogate keys pair the anchor/member stitch columns POSITIONALLY under distinct
+	// spellings (`sid` / `meta_sid`), so the NULL-safe gate must read each side's own
+	// declared nullability (modeled on the surrogate-keyed optional-member suite above).
+	function nullableSurrogateAd(): MappingAdvertisement {
+		return {
+			id: 'NS_core',
+			logicalTable: 'NS',
+			role: 'primary-storage',
+			storage: {
+				anchorRelationId: 'NS_core',
+				members: [
+					{ relationId: 'NS_core', relation: { schema: 'main', table: 'NS_core' }, presence: 'mandatory', columns: [colMap('k', 'k'), colMap('title', 'title')] },
+					{ relationId: 'NS_meta', relation: { schema: 'main', table: 'NS_meta' }, presence: 'optional', columns: [colMap('note', 'note')] },
+				],
+				sharedKey: { kind: 'surrogate', keyColumnsByRelation: keyMap(['NS_core', ['sid']], ['NS_meta', ['meta_sid']]) },
+			},
+		};
+	}
+
+	// Seed the basis DIRECTLY with a NULL surrogate (the allocator default only fires for
+	// lens INSERTs): k0 rides the NULL stitch value, k1 the non-NULL control.
+	async function setupNullableSurrogate(db: Database): Promise<void> {
+		const mod = new AdvertisingModule();
+		mod.ads = [nullableSurrogateAd()];
+		db.registerModule('nsmod', mod);
+		await db.exec('create table NS_core (sid integer null primary key default (coalesce((select max(sid) from NS_core), 0) + mutation_ordinal()), k text, title text) using nsmod');
+		await db.exec('create table NS_meta (meta_sid integer null primary key, note text null) using nsmod');
+		await db.exec('declare logical schema x { table NS { k text primary key, title text, note text null } }');
+		await db.exec('apply schema x');
+		await db.exec("insert into main.NS_core (sid, k, title) values (null, 'k0', 'T0'), (100, 'k1', 'T1')");
+		await db.exec("insert into main.NS_meta values (null, 'm0')");
+	}
+
+	it('reads, updates, materializes, and deletes through a NULL surrogate stitch', async () => {
+		const db = new Database();
+		try {
+			await setupNullableSurrogate(db);
+			// Read: the NULL-sid component pairs positionally (meta_sid ↔ sid).
+			expect(await rows(db, 'select k, note from x.NS order by k')).to.deep.equal([
+				{ k: 'k0', note: 'm0' }, { k: 'k1', note: null },
+			]);
+			// Matched UPDATE reaches the NULL-keyed component through the distinct spellings.
+			await db.exec("update x.NS set note = 'm0b' where k = 'k0'");
+			expect(await rows(db, 'select meta_sid, note from main.NS_meta order by note')).to.deep.equal([
+				{ meta_sid: null, note: 'm0b' },
+			]);
+			// Materialize INSERT threads the existing non-NULL surrogate for the absent control.
+			await db.exec("update x.NS set note = 'm1' where k = 'k1'");
+			expect(await rows(db, 'select meta_sid, note from main.NS_meta order by note')).to.deep.equal([
+				{ meta_sid: null, note: 'm0b' }, { meta_sid: 100, note: 'm1' },
+			]);
+			// Keyed DELETE removes the NULL-keyed component — no orphan; the control survives.
+			await db.exec("delete from x.NS where k = 'k0'");
+			expect(await rows(db, 'select k from main.NS_core')).to.deep.equal([{ k: 'k1' }]);
+			expect(await rows(db, 'select meta_sid, note from main.NS_meta')).to.deep.equal([{ meta_sid: 100, note: 'm1' }]);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+describe('lens decomposition stitch correlation: plan shape', () => {
+	// The NULL-safe forms are gated on BOTH stitch columns being declared nullable, so a
+	// NOT NULL schema must keep the byte-identical legacy shapes: the plain `=` equi-join ON
+	// (equi-pair-extractable — hash/merge join and coverage proofs intact) and the plain
+	// `<memberKey> in (select <anchorKey> …)` member correlation with no synthesized alias.
+	async function setupShapeFixture(db: Database, nullableKeys: boolean): Promise<void> {
+		const mod = new AdvertisingModule();
+		mod.ads = [nullableKeySplit()];
+		db.registerModule('shapemod', mod);
+		const keyDecl = nullableKeys ? 'integer null primary key' : 'integer primary key';
+		await db.exec(`create table N_core (id ${keyDecl}, a integer) using shapemod`);
+		await db.exec(`create table N_c (id ${keyDecl}, c integer null) using shapemod`);
+		await db.exec(`declare logical schema x { table N { id ${keyDecl}, a integer, c integer null } }`);
+		await db.exec('apply schema x');
+	}
+
+	/** The put fan-out's emitted statements for `sql` against x.N, stringified lowercase. */
+	function fanOutSql(db: Database, sql: string): string[] {
+		const ctx = makeCtx(db);
+		const view = db.schemaManager.getView('x', 'N')!;
+		const storage = decompositionStorage(ctx, view);
+		expect(storage, 'x.N carries a primary-storage advertisement').to.not.be.undefined;
+		const shape = analyzeDecomposition(ctx, view, storage!);
+		const stmt = new Parser().parseAll(sql)[0] as AST.UpdateStmt;
+		return decomposeUpdate(ctx, view, shape, stmt).map(op => astToString(op.statement).toLowerCase());
+	}
+
+	it('a NOT NULL stitch key keeps the plain = join and IN correlation (byte-identical legacy shapes)', async () => {
+		const db = new Database();
+		try {
+			await setupShapeFixture(db, false);
+			const body = astToString(db.schemaManager.getView('x', 'N')!.selectAst).toLowerCase();
+			expect(body, 'plain equi-join ON').to.contain('n_c.id = n_core.id');
+			expect(body, 'no NULL-safe disjunction').to.not.contain('is null');
+			const memberUpdate = fanOutSql(db, 'update x.N set c = 5').find(s => s.startsWith('update'))!;
+			expect(memberUpdate, 'legacy IN correlation').to.contain('in (select');
+			expect(memberUpdate, 'no synthesized target alias').to.not.contain('__vm_self');
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a nullable stitch key takes the NULL-safe join and the aliased EXISTS correlation', async () => {
+		const db = new Database();
+		try {
+			await setupShapeFixture(db, true);
+			const body = astToString(db.schemaManager.getView('x', 'N')!.selectAst).toLowerCase();
+			expect(body, 'the equality arm survives').to.contain('n_c.id = n_core.id');
+			expect(body, 'member NULL arm').to.contain('n_c.id is null');
+			expect(body, 'anchor NULL arm').to.contain('n_core.id is null');
+			const memberUpdate = fanOutSql(db, 'update x.N set c = 5').find(s => s.startsWith('update'))!;
+			expect(memberUpdate, 'NULL-safe correlated EXISTS').to.contain('exists (select');
+			expect(memberUpdate, 'member operand bound to the outer target').to.contain('__vm_self');
+			expect(memberUpdate, 'the IN correlation is replaced').to.not.contain(' in (select');
 		} finally {
 			await db.close();
 		}
