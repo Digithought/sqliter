@@ -13,27 +13,25 @@
  * (fully qualified, every column's nullability annotated), and it is what `@quereus/store`
  * writes to its catalog and re-parses on reopen.
  *
- * ## The one non-uniform case, and what will change
+ * ## The rule: every key emits its clause
  *
- * A **synthesized all-columns key** — the key a table gets when it declares no
- * `PRIMARY KEY` — emits *no clause at all* (`expectedClauses: 0` below). So does a
- * *declared* all-columns key, which `isSynthesizedAllColumnsKey` cannot tell apart by
- * shape. The omission exists for exactly one reason: a declared `PRIMARY KEY` promotes
- * its columns to NOT NULL (`schema/manager.ts` `buildColumnSchemas`, `schema/table.ts`
- * `columnDefToSchema`) while a synthesized one does not, so naming a synthesized key
- * would silently tighten a nullable column on every persistence round-trip.
+ * There is no exception. A table that declares no `PRIMARY KEY` is keyed by all its
+ * columns, and that key is named in the emitted DDL exactly like a declared one — inline
+ * when it is a single column, table-level otherwise. Declaring a key changes nothing about
+ * its columns (in particular it does not tighten their nullability), so the two spellings
+ * are one key and emit identical text; asserted directly below the shape table.
  *
- * When that promotion is removed, the two spellings become one key and every key emits
- * its clause. This file is the harness for that change: flip the `expectedClauses: 0`
- * entries to `1`, and add the case this file cannot assert today —
+ * The clause used to be omitted for that key, because a declared `PRIMARY KEY` did promote
+ * its columns to NOT NULL and naming a synthesized key would have silently tightened a
+ * nullable column on every persistence round-trip. That promotion is gone. The omission
+ * also left a column-declared `ON CONFLICT` on an all-columns key with nowhere to ride, so
+ * the action decayed to `ABORT` on every round-trip — two shapes below pin that it now
+ * survives.
  *
- *   pragma default_column_nullability = 'nullable';
- *   create table t (a integer, b text);   -- emit → re-parse → both columns still NULL
- *
- * — which currently comes back NOT NULL because the re-parse reads the emitted
- * `PRIMARY KEY ("a", "b")` as declared. Every shape below runs under the shipped
- * `default_column_nullability = 'not_null'`, where each column is non-nullable either
- * way, so the nullability leg is only pinned for non-nullable columns until then.
+ * `expectedNullability` pins the absolute answer for the shapes that need it: the ones
+ * running under `pragma default_column_nullability = 'nullable'`, where naming the key is
+ * the thing that used to tighten the column. Shapes without it run under the shipped
+ * `not_null` default, where the re-parse-equals-original assertion is the whole check.
  */
 
 import { expect } from 'chai';
@@ -95,10 +93,11 @@ interface Shape {
 	/** Statements to build the table; the CREATE need not be the last one. */
 	statements: string[];
 	/**
-	 * Expected count of `PRIMARY KEY` occurrences in the emitted DDL: 1 for a key that
-	 * emits a clause, 0 for an all-columns key (which is deliberately omitted — see the
-	 * file header; these are the entries that become 1 once `PRIMARY KEY` stops implying
-	 * NOT NULL).
+	 * Expected count of `PRIMARY KEY` occurrences in the emitted DDL. Always 1 — every key
+	 * emits exactly one clause. The count is asserted rather than assumed because the
+	 * single-column and composite branches are separate, and a shape landing on both would
+	 * emit an inline clause AND a table-level one (which the parser silently merges rather
+	 * than rejecting).
 	 */
 	expectedClauses: number;
 	/** Expected key, as `keySpelling` renders it. */
@@ -106,15 +105,12 @@ interface Shape {
 	/** Expected live conflict action, as `conflictSpelling` renders it. Default `'(none)'`. */
 	expectedConflict?: string;
 	/**
-	 * Conflict action expected AFTER the round-trip, when it differs from the live one —
-	 * i.e. a shape whose action the emitter still drops. Only the all-columns keys are in
-	 * this state, and only because they emit no clause for the action to ride; the loss is
-	 * stable (identical on the second emission), so the fixed-point assertion cannot see it
-	 * and this field is what pins it. These entries clear when
-	 * `tickets/implement/3-debt-retire-synthesized-primary-key-distinction` lands and every
-	 * key emits its clause.
+	 * Expected per-column nullability, as `nullabilitySpelling` renders it. Set it for the
+	 * shapes where the absolute answer is the point (a nullable key emitted, re-parsed
+	 * under a different session default); omit it elsewhere, where re-parse-equals-original
+	 * is the real assertion.
 	 */
-	expectedConflictAfterRoundTrip?: string;
+	expectedNullability?: string[];
 	/**
 	 * Substring the emitted DDL must contain, for shapes whose point is a clause that
 	 * used to be dropped. Absent = no text assertion beyond the clause count.
@@ -124,25 +120,57 @@ interface Shape {
 
 const SHAPES: Shape[] = [
 	{
-		label: 'no-PK single column (synthesized key, clause omitted)',
+		// The lone column IS the whole key, so this lands on the INLINE branch. Exactly one
+		// clause: an inline plus a table-level one would re-parse to a merged key.
+		label: 'no-PK single column (synthesized key, inline clause)',
 		statements: [`create table t (a integer)`],
-		expectedClauses: 0,
+		expectedClauses: 1,
 		expectedKey: ['a collate binary'],
+		expectedText: '"a" INTEGER NOT NULL PRIMARY KEY',
 	},
 	{
-		label: 'no-PK composite (synthesized key, clause omitted)',
+		label: 'no-PK composite (synthesized key, table-level clause)',
 		statements: [`create table t (a integer, b text)`],
-		expectedClauses: 0,
+		expectedClauses: 1,
 		expectedKey: ['a collate binary', 'b collate binary'],
+		expectedText: 'PRIMARY KEY ("a", "b")',
 	},
 	{
-		// The declared spelling of the shape above. `isSynthesizedAllColumnsKey` matches it
-		// by shape, so it takes the same omission path — the two forms already emit
-		// identical DDL today (asserted separately below).
-		label: 'declared all-columns PK (shape-equal to synthesized, clause omitted)',
+		// The declared spelling of the shape above. The two are the same key and no test over
+		// the schema can tell them apart, so they must emit the same text (asserted directly
+		// below the shape table).
+		label: 'declared all-columns PK (shape-equal to synthesized, same clause)',
 		statements: [`create table t (a integer, b text, primary key (a, b))`],
-		expectedClauses: 0,
+		expectedClauses: 1,
 		expectedKey: ['a collate binary', 'b collate binary'],
+		expectedText: 'PRIMARY KEY ("a", "b")',
+	},
+	{
+		// The case the harness could not assert while the clause was omitted: naming a
+		// synthesized key over NULLABLE columns. The emitted text annotates each column
+		// explicitly, and the re-parse runs under the stock `not_null` default — so if
+		// naming the key still tightened anything, both columns would come back NOT NULL.
+		label: 'no-PK composite over nullable columns (key named, nullability preserved)',
+		statements: [
+			`pragma default_column_nullability = 'nullable'`,
+			`create table t (a integer, b text)`,
+		],
+		expectedClauses: 1,
+		expectedKey: ['a collate binary', 'b collate binary'],
+		expectedNullability: ['a: null', 'b: null'],
+		expectedText: 'PRIMARY KEY ("a", "b")',
+	},
+	{
+		// Single-column spelling of the same thing, on the inline branch.
+		label: 'no-PK single nullable column (inline key named, nullability preserved)',
+		statements: [
+			`pragma default_column_nullability = 'nullable'`,
+			`create table t (a integer)`,
+		],
+		expectedClauses: 1,
+		expectedKey: ['a collate binary'],
+		expectedNullability: ['a: null'],
+		expectedText: '"a" INTEGER NULL PRIMARY KEY',
 	},
 	{
 		label: 'declared narrow PK (subset of columns)',
@@ -178,10 +206,8 @@ const SHAPES: Shape[] = [
 		expectedKey: [],
 	},
 	{
-		// An all-columns key WITH a conflict action: the shape guard bails out on
-		// `primaryKeyDefaultConflict`, so this stays on the declared path and its
-		// `ON CONFLICT` must survive the round-trip.
-		label: 'all-columns PK with ON CONFLICT (guard bails; clause emitted)',
+		// An all-columns key WITH a table-level conflict action; the clause carries it.
+		label: 'all-columns PK with ON CONFLICT',
 		statements: [`create table t (a integer, b text, primary key (a, b) on conflict replace)`],
 		expectedClauses: 1,
 		expectedKey: ['a collate binary', 'b collate binary'],
@@ -201,25 +227,25 @@ const SHAPES: Shape[] = [
 		expectedText: 'PRIMARY KEY ("a", "b") ON CONFLICT REPLACE',
 	},
 	{
-		// All-columns shape ⇒ no clause ⇒ nowhere for the action to ride, so it is lost. The
-		// loss is stable, so only expectedConflictAfterRoundTrip catches it.
-		label: 'all-columns PK, action declared on a key column (clause omitted; action lost)',
+		// An all-columns key whose action is declared on a key COLUMN. This used to emit no
+		// clause, so the action had nowhere to ride and decayed to ABORT on reopen — stably,
+		// so the fixed-point assertion could not see it. The clause now carries it.
+		label: 'all-columns PK, action declared on a key column (clause carries the action)',
 		statements: [`create table t (a integer not null on conflict replace, b text, primary key (a, b))`],
-		expectedClauses: 0,
+		expectedClauses: 1,
 		expectedKey: ['a collate binary', 'b collate binary'],
 		expectedConflict: 'REPLACE',
-		expectedConflictAfterRoundTrip: '(none)',
+		expectedText: 'PRIMARY KEY ("a", "b") ON CONFLICT REPLACE',
 	},
 	{
-		// Same omission, single-column spelling: the lone column IS the whole key, so the
-		// all-columns shape matches and the inline clause that would carry the action is
-		// never emitted.
-		label: 'single-column table, inline PK with ON CONFLICT (clause omitted; action lost)',
+		// Same, single-column spelling: the lone column IS the whole key, so the inline
+		// clause is what carries the action.
+		label: 'single-column table, inline PK with ON CONFLICT (inline clause carries it)',
 		statements: [`create table t (a integer primary key on conflict replace)`],
-		expectedClauses: 0,
+		expectedClauses: 1,
 		expectedKey: ['a collate binary'],
 		expectedConflict: 'REPLACE',
-		expectedConflictAfterRoundTrip: '(none)',
+		expectedText: '"a" INTEGER NOT NULL PRIMARY KEY ON CONFLICT REPLACE',
 	},
 	{
 		// The empty-key singleton emits its own clause, so its action rides that.
@@ -261,20 +287,23 @@ const SHAPES: Shape[] = [
 		expectedKey: ['a collate binary'],
 	},
 	{
-		// The guard also requires every component ascending, so a descending all-columns key
-		// emits a clause and must keep its `desc`.
-		label: 'all-columns PK with a DESC component (guard bails; clause emitted)',
+		// A descending component is part of the key and must be spelled in the clause, or the
+		// re-parse silently re-keys ascending. (Reachable via ALTER PRIMARY KEY, and used by
+		// ordering-seeded maintained-table backing keys.)
+		label: 'all-columns PK with a DESC component',
 		statements: [`create table t (a integer, b text, primary key (a, b desc))`],
 		expectedClauses: 1,
 		expectedKey: ['a collate binary', 'b desc collate binary'],
+		expectedText: 'PRIMARY KEY ("a", "b" DESC)',
 	},
 	{
-		// Same length as the column list but not in declaration order, so the guard's
-		// `def.index === i` test fails and the clause is emitted in the declared order.
-		label: 'all-columns PK in non-declaration order (guard bails; clause emitted)',
+		// Same length as the column list but not in declaration order: the clause is emitted
+		// in the DECLARED order, which is the key's order.
+		label: 'all-columns PK in non-declaration order',
 		statements: [`create table t (a integer, b text, primary key (b, a))`],
 		expectedClauses: 1,
 		expectedKey: ['b collate binary', 'a collate binary'],
+		expectedText: 'PRIMARY KEY ("b", "a")',
 	},
 	{
 		// A non-BINARY collation on a synthesized key member: findPKDefinition copies the
@@ -282,7 +311,7 @@ const SHAPES: Shape[] = [
 		// collation via the emitted column-level `COLLATE`.
 		label: 'no-PK table with a NOCASE column',
 		statements: [`create table t (a text collate nocase, b integer)`],
-		expectedClauses: 0,
+		expectedClauses: 1,
 		expectedKey: ['a collate nocase', 'b collate binary'],
 	},
 ];
@@ -303,8 +332,12 @@ describe('CREATE TABLE canonical DDL — primary-key round-trip is a fixed point
 				.to.equal(shape.expectedClauses);
 			if (shape.expectedText) {
 				expect(original.ddl, 'emitted DDL carries the declared clause').to.contain(shape.expectedText);
-			} else {
+			}
+			if (shape.expectedConflict === undefined) {
 				expect(original.ddl, 'no ON CONFLICT expected').to.not.contain('ON CONFLICT');
+			}
+			if (shape.expectedNullability) {
+				expect(original.nullability, 'live nullability').to.deep.equal(shape.expectedNullability);
 			}
 
 			// Re-parse equivalence: key, conflict action and nullability survive the emitted text.
@@ -317,7 +350,7 @@ describe('CREATE TABLE canonical DDL — primary-key round-trip is a fixed point
 
 			expect(reparsed.key, `re-parsed key from: ${original.ddl}`).to.deep.equal(original.key);
 			expect(reparsed.conflict, `re-parsed conflict action from: ${original.ddl}`)
-				.to.equal(shape.expectedConflictAfterRoundTrip ?? original.conflict);
+				.to.equal(original.conflict);
 			expect(reparsed.nullability, `re-parsed nullability from: ${original.ddl}`)
 				.to.deep.equal(original.nullability);
 			// Emit twice: the second emission must be byte-identical, so the persisted text
@@ -327,8 +360,9 @@ describe('CREATE TABLE canonical DDL — primary-key round-trip is a fixed point
 	}
 
 	it('an omitted PRIMARY KEY and a declared all-columns PRIMARY KEY produce identical DDL', async () => {
-		// True today via the shared omission, and it must stay true once both emit the
-		// clause instead — the point is that the two spellings are one table.
+		// The two spellings are one table: both name the key in the emitted text, and neither
+		// is recoverable from the other. (This held under the old omission too, for the
+		// opposite reason — neither emitted a clause.)
 		const omitted = await withTable([`create table t (a integer, b text)`], generateTableDDL);
 		const declared = await withTable([`create table t (a integer, b text, primary key (a, b))`], generateTableDDL);
 		expect(omitted).to.equal(declared);
@@ -372,4 +406,52 @@ describe('CREATE TABLE canonical DDL — primary-key round-trip is a fixed point
 			}
 		});
 	}
+
+	it('an all-columns key\'s column-declared REPLACE survives its DDL round-trip', async () => {
+		// The live bug the omission caused: this key spans every column, so it used to emit
+		// no clause and its REPLACE had nowhere to ride. After a reopen the key was ABORT and
+		// the second insert below threw instead of replacing.
+		const ddl = await withTable(
+			[`create table t (a integer not null on conflict replace, b text, primary key (a, b))`],
+			generateTableDDL);
+
+		const db = new Database();
+		try {
+			await db.exec(ddl);
+			await db.exec(`insert into t values (1, 'x')`);
+			// Same key ⇒ a collision. REPLACE overwrites; ABORT throws a constraint error.
+			await db.exec(`insert into t values (1, 'x')`);
+			const rows = [];
+			for await (const row of db.eval(`select a, b from t`)) rows.push(row);
+			expect(rows).to.deep.equal([{ a: 1, b: 'x' }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('applying a declaration with no PRIMARY KEY twice is a no-op', async () => {
+		// The declarative differ compares the DECLARED key (which falls back to all columns
+		// when a declaration names none) against the LIVE key. Now that a live no-PK table's
+		// emitted DDL carries an explicit clause the declared side omits, a churning
+		// `ALTER PRIMARY KEY` on every apply is the regression to guard against.
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main { table t { a integer, b text } }`);
+			await db.exec('apply schema main');
+			expect(keySpelling(db.schemaManager.findTable('t')!), 'declared-side fallback key')
+				.to.deep.equal(['a collate binary', 'b collate binary']);
+
+			const events: unknown[] = [];
+			const unsubscribe = db.onSchemaChange(e => { events.push(e); });
+			try {
+				await db.exec('apply schema main');
+			} finally {
+				unsubscribe();
+			}
+			expect(events, 'the second apply of an unchanged declaration mutates nothing')
+				.to.have.lengthOf(0);
+		} finally {
+			await db.close();
+		}
+	});
 });

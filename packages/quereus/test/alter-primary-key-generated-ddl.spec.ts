@@ -39,9 +39,10 @@ interface Case {
 	/** Expected post-ALTER key, as `keySpelling` renders it. */
 	expectedKey: string[];
 	/**
-	 * Expected count of `PRIMARY KEY` occurrences in the generated DDL. 1 for a key that
-	 * emits a clause; 0 for the synthesized all-columns key, which deliberately emits
-	 * none so the re-parse re-synthesizes it (see `isSynthesizedAllColumnsKey`).
+	 * Expected count of `PRIMARY KEY` occurrences in the generated DDL. Always 1 — every
+	 * key emits exactly one clause, the all-columns key included. Two would mean a re-key
+	 * left an inline clause on the retired column alongside the new table-level one, which
+	 * the parser silently merges back into the old key rather than rejecting.
 	 */
 	expectedClauses: number;
 }
@@ -76,11 +77,14 @@ const CASES: Case[] = [
 		expectedClauses: 1,
 	},
 	{
-		label: 'single → composite all columns (synthesized key: no clause)',
+		// The new key spans every column — the shape a table with no declared PRIMARY KEY
+		// also has. It emits its clause like any other key, and the retired inline clause
+		// on `id` must be gone (hence exactly one occurrence).
+		label: 'single → composite all columns',
 		create: `create table t (id integer primary key, code integer not null)`,
 		alter: `alter table t alter primary key (id, code)`,
 		expectedKey: ['id', 'code'],
-		expectedClauses: 0,
+		expectedClauses: 1,
 	},
 	{
 		// The empty-key singleton: the retired inline clause must go and the table-level

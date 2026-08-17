@@ -19,7 +19,7 @@
 
 import type { Database } from '../core/database.js';
 import type { TableSchema, IndexSchema, RowConstraintSchema, UniqueConstraintSchema, ForeignKeyConstraintSchema, NamedConstraintClass } from './table.js';
-import { maskToOps, isSynthesizedAllColumnsKey, resolvePkDefaultConflict } from './table.js';
+import { maskToOps, resolvePkDefaultConflict } from './table.js';
 import type { ColumnSchema } from './column.js';
 import type { ViewSchema } from './view.js';
 import { normalizeBackingModule } from './view.js';
@@ -110,21 +110,21 @@ function generateTableDDLInternal(
 	const parts: string[] = ['CREATE'];
 	parts.push('TABLE', qualifiedName(tableSchema.schemaName, tableSchema.name, ctx.currentSchemaName));
 
-	// A synthesized all-columns key (the no-PK fallback) round-trips by OMITTING the
-	// PRIMARY KEY clause: the re-parse re-synthesizes the identical key from its absence.
-	// Emitting a named clause instead would also be correct now that declaring a key
-	// changes nothing about its columns — see isSynthesizedAllColumnsKey and
-	// `tickets/implement/4-debt-emit-primary-key-clause-for-every-key`.
-	const synthesizedKey = isSynthesizedAllColumnsKey(tableSchema);
+	// EVERY key emits its clause — including the all-columns key a table gets when it
+	// declares none. A declared key and a synthesized one differ in nothing (declaring a
+	// key does not change its columns' nullability), so naming the synthesized one is
+	// lossless and matches the no-`db` form's stance that persisted DDL states everything
+	// explicitly. It is also what gives a column-declared `ON CONFLICT` on an all-columns
+	// key somewhere to ride; the old omission dropped it on every round-trip.
 
 	// The one column that carries the inline `PRIMARY KEY` clause, or -1 when there is
-	// none to emit (no key, a composite key — rendered table-level below — or a
-	// synthesized all-columns key). Resolved from `primaryKeyDefinition`, the
-	// authoritative key record, NOT from the per-column `primaryKey` flag: the flag is a
-	// CREATE-time mirror that `ALTER TABLE … ALTER PRIMARY KEY` producers may leave
-	// pointing at the retired key, and rendering from it emitted DDL that re-parsed to
-	// the OLD key (and, on a composite→single move, two inline clauses).
-	const inlinePkIndex = !synthesizedKey && tableSchema.primaryKeyDefinition.length === 1
+	// none to emit (the empty-key singleton, or a composite key — rendered table-level
+	// below). Resolved from `primaryKeyDefinition`, the authoritative key record, NOT from
+	// the per-column `primaryKey` flag: the flag is a CREATE-time mirror that
+	// `ALTER TABLE … ALTER PRIMARY KEY` producers may leave pointing at the retired key,
+	// and rendering from it emitted DDL that re-parsed to the OLD key (and, on a
+	// composite→single move, two inline clauses).
+	const inlinePkIndex = tableSchema.primaryKeyDefinition.length === 1
 		? tableSchema.primaryKeyDefinition[0].index
 		: -1;
 
@@ -141,14 +141,12 @@ function generateTableDDLInternal(
 		formatColumnDef(col, tableSchema, ctx.defaultNotNull, columnIndex === inlinePkIndex, pkConflict));
 
 	// Table-level PRIMARY KEY: empty () for singleton, (a, b, ...) for composite.
-	// Single-column PK is emitted inline on the column above. A synthesized
-	// all-columns key emits no clause at all (neither here nor inline). Per-column
-	// DESC is emitted so a descending key component (e.g. an ordering-seeded
-	// maintained-table backing key) survives the round-trip instead of silently
-	// re-keying ascending on re-parse.
+	// Single-column PK is emitted inline on the column above. Per-column DESC is emitted
+	// so a descending key component (e.g. an ordering-seeded maintained-table backing key)
+	// survives the round-trip instead of silently re-keying ascending on re-parse.
 	if (tableSchema.primaryKeyDefinition.length === 0) {
 		columnDefs.push(`PRIMARY KEY ()${pkConflict}`);
-	} else if (!synthesizedKey && tableSchema.primaryKeyDefinition.length > 1) {
+	} else if (tableSchema.primaryKeyDefinition.length > 1) {
 		const pkCols = tableSchema.primaryKeyDefinition
 			.map(pk => quoteName(tableSchema.columns[pk.index].name) + (pk.desc ? ' DESC' : ''))
 			.join(', ');

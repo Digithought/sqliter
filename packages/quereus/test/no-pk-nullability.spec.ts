@@ -10,8 +10,9 @@
  *   - schema-building nullability (synthesized and declared keys agreeing),
  *   - that a nullable synthesized-key column accepts a NULL insert and that a
  *     fully-identical second row conflicts on the key (NOT a NOT NULL error),
- *   - that canonical DDL omits the synthesized PRIMARY KEY clause so a store
- *     persistence round-trip preserves the nullable declaration.
+ *   - that canonical DDL names the synthesized PRIMARY KEY like any other key, and
+ *     that a store persistence round-trip through that text preserves the nullable
+ *     declaration (naming the key no longer tightens it).
  *
  * The declared-key side of that first bullet is covered more widely in
  * `test/logic/43.3-nullable-primary-key.sqllogic` and
@@ -133,11 +134,11 @@ describe('no-PK table column nullability', () => {
 	});
 
 	describe('canonical DDL round-trip', () => {
-		it('omits the synthesized PRIMARY KEY clause and annotates nullability', async () => {
+		it('names the synthesized PRIMARY KEY and annotates nullability', async () => {
 			await db.exec('create table t (a integer null, b integer null)');
 			const ddl = generateTableDDL(db.schemaManager.getTable('main', 't')!);
-			// No PRIMARY KEY annotation (inline or table-level) for a synthesized key.
-			expect(ddl, 'no PK clause for synthesized key').to.not.match(/primary key/i);
+			// Every key emits its clause; the all-columns one is table-level here.
+			expect(ddl, 'PK clause for synthesized key').to.contain('PRIMARY KEY ("a", "b")');
 			expect(ddl, 'nullability annotated').to.match(/NULL/);
 		});
 
@@ -159,7 +160,10 @@ describe('no-PK table column nullability', () => {
 		it('a single-column no-PK table round-trips without forcing NOT NULL', async () => {
 			await db.exec('create table t (a integer null)');
 			const ddl = generateTableDDL(db.schemaManager.getTable('main', 't')!);
-			expect(ddl, 'no inline PK for synthesized single-column key').to.not.match(/primary key/i);
+			// A one-column table's synthesized key IS that column, so it takes the inline
+			// branch — exactly one clause, not an inline plus a table-level one.
+			expect(ddl, 'inline PK for synthesized single-column key').to.match(/primary key/i);
+			expect((ddl.match(/primary key/gi) ?? []).length, `clause count in: ${ddl}`).to.equal(1);
 
 			const db2 = new Database();
 			try {
@@ -170,12 +174,13 @@ describe('no-PK table column nullability', () => {
 			}
 		});
 
-		it('an explicit single-column PK still emits an inline PRIMARY KEY', async () => {
-			// Regression guard: the synthesized-key omission must not swallow a genuine
-			// declared single-column PK on a multi-column table.
+		it('an explicit single-column PK emits an inline PRIMARY KEY on its own column', async () => {
+			// Regression guard: a declared narrow key on a multi-column table must ride the
+			// key column, not widen into a table-level all-columns clause.
 			await db.exec('create table t (id integer primary key, v integer null)');
 			const ddl = generateTableDDL(db.schemaManager.getTable('main', 't')!);
 			expect(ddl, 'declared single-column PK still emitted').to.match(/primary key/i);
+			expect(ddl, 'inline on the key column').to.contain('"id" INTEGER NOT NULL PRIMARY KEY');
 		});
 	});
 });
