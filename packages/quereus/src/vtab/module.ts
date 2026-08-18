@@ -477,7 +477,7 @@ export interface VirtualTableModule<
 	 * data-affecting changes — every `SchemaChangeInfo` arm: ADD / DROP /
 	 * RENAME COLUMN, ADD / DROP / RENAME CONSTRAINT, ALTER COLUMN, ALTER
 	 * PRIMARY KEY. RENAME TABLE is schema-only and routes through `renameTable`,
-	 * not this method. See docs/module-authoring.md § "Schema Changes
+	 * not this method. See docs/module-authoring-schema-changes.md § "Schema Changes
 	 * (`SchemaChangeInfo`)" for the per-arm mandate each arm carries.
 	 *
 	 * Returns the updated TableSchema after the operation. The engine
@@ -817,7 +817,7 @@ export type SchemaChangeInfo = (
 	 * call **iff** `ddl` is set, and put this text on the event. This is what keeps
 	 * one statement = one event (`add column x text unique` is one `addColumn` call
 	 * plus one `addConstraint` call, but announces once, with the whole statement's
-	 * text). See `docs/module-authoring.md` § Schema Changes.
+	 * text). See `docs/module-authoring-schema-changes.md` § Schema Changes.
 	 */
 	readonly ddl?: string;
 };

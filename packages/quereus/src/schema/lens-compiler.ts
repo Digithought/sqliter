@@ -94,7 +94,7 @@ export function deployLogicalSchema(
 	let allAdvertisements: MappingAdvertisement[] | undefined;
 
 	const compiled: Array<{ slot: LensSlot; view: ViewSchema }> = [];
-	// Prover accumulators (docs/lens.md § Coverage checklist). Errors aggregate
+	// Prover accumulators (docs/lens-prover.md § Coverage checklist). Errors aggregate
 	// across every table and throw atomically below — before any catalog mutation,
 	// preserving the existing atomic-deploy property. Warnings flow to the report.
 	const proveErrors: LensDiagnostic[] = [];
@@ -194,7 +194,7 @@ export function deployLogicalSchema(
 		// Only shape/site is checked here — no reserved tag's semantics are read.
 		validateLensTags(slot);
 
-		// Prove the slot and classify its constraints (docs/lens.md § Coverage
+		// Prove the slot and classify its constraints (docs/lens-prover.md § Coverage
 		// checklist). The verdict is recorded on the slot (obligations + readOnly)
 		// and its diagnostics are aggregated into the deploy report. Errors are
 		// thrown atomically after every table is proved (below), preserving the
@@ -203,7 +203,7 @@ export function deployLogicalSchema(
 		slot.obligations = prove.obligations;
 		slot.readOnly = prove.readOnly;
 
-		// Acknowledgment + escalation governance (docs/lens.md § Acknowledging
+		// Acknowledgment + escalation governance (docs/lens-prover.md § Acknowledging
 		// advisories). Coded+sited advisories the prover emitted become
 		// acknowledgeable in source (the `quereus.lens.ack.<code>` tag, with a
 		// recorded fingerprint that re-surfaces them on material change), and the
@@ -269,7 +269,7 @@ export function deployLogicalSchema(
 
 	// Errors are already thrown above; a returned report carries only advisories.
 	// Persist it on the manager — the stable hook the sibling acknowledgment ticket
-	// reads to fingerprint / tally / expand advisories (docs/lens.md § Acknowledging
+	// reads to fingerprint / tally / expand advisories (docs/lens-prover.md § Acknowledging
 	// advisories). `apply schema` returning these as result rows is deferred to that
 	// ticket (converting the universally-used void statement to relational is a
 	// separate, high-blast-radius change); the report is fully produced here.

@@ -1,6 +1,6 @@
 /**
  * Lens advisory acknowledgment & escalation governance (ticket
- * `lens-advisory-acknowledgment`, docs/lens.md § Acknowledging advisories).
+ * `lens-advisory-acknowledgment`, docs/lens-prover.md § Acknowledging advisories).
  *
  * Sits atop the prover's advisory list: a developer acknowledges a coded+sited
  * advisory in source via the reserved `quereus.lens.ack.<code>[:<target>]` tag

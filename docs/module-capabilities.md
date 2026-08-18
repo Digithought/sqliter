@@ -126,7 +126,7 @@ the honest choice.
 
 > **Invariant:** [SCH-004](invariants.md#sch-004--a-module-never-silently-no-ops-an-altertable-arm)
 
-`alterTable` presence is **one bit covering ~12 `SchemaChangeInfo` arms** (see [Schema Changes](module-authoring.md#schema-changes-schemachangeinfo)), each with its own mandate. This mismatch is the divergence hazard: a module can be "ALTER-capable" (the method is present) yet silently fail one arm it cannot honor. The `alterPrimaryKey` row is the model the [recommended pattern](#recommended-capability-negotiation-pattern) promotes to a universal rule: **try native → on `UNSUPPORTED` apply a defined fallback**.
+`alterTable` presence is **one bit covering ~12 `SchemaChangeInfo` arms** (see [Schema Changes](module-authoring-schema-changes.md)), each with its own mandate. This mismatch is the divergence hazard: a module can be "ALTER-capable" (the method is present) yet silently fail one arm it cannot honor. The `alterPrimaryKey` row is the model the [recommended pattern](#recommended-capability-negotiation-pattern) promotes to a universal rule: **try native → on `UNSUPPORTED` apply a defined fallback**.
 
 | Arm | Mandate | memory | store |
 | --- | --- | --- | --- |

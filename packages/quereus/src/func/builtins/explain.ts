@@ -902,7 +902,7 @@ export const basisBackfillFunc = createIntegratedTableValuedFunction(
 );
 
 // Lens advisory governance introspection: the **expand** path for the deploy
-// summary's `acknowledged: N` tally (docs/lens.md § Acknowledging advisories).
+// summary's `acknowledged: N` tally (docs/lens-prover.md § Acknowledging advisories).
 // One row per advisory of the last deploy of a logical schema — active ones, the
 // ones an in-source `quereus.lens.ack.<code>` tag suppressed, and any that
 // re-surfaced because their recorded fingerprint no longer matches.

@@ -541,7 +541,7 @@ that slot in every committed and pending row and renumbering the schema's index-
 (PK definition, secondary index and UNIQUE column lists, FK child columns, generated-column
 bookkeeping) to match. Omitting it appends, which is what `alter table … add column` always asks
 for — there is no SQL syntax for a position, so it reaches the module only from an in-process
-wrapper (see `docs/module-authoring.md` § Per-arm mandate). One engine-side path still assumes an
+wrapper (see `docs/module-authoring-schema-changes.md` § Per-arm mandate). One engine-side path still assumes an
 append: a column-level `CHECK` on the new column is evaluated by `buildAddColumnChecks` against
 `[...existingRow, value]`, so a wrapper that redirects an *engine-driven* `ADD COLUMN` to a
 position must not rely on one.

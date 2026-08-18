@@ -1,7 +1,7 @@
 /**
  * ALTER-conformance matrix — the "no silent divergence" contract.
  *
- * The hard rule (docs/module-authoring.md § "Schema Changes"): a
+ * The hard rule (docs/module-authoring-schema-changes.md § "Schema Changes"): a
  * `VirtualTableModule` that cannot honor an invoked `alterTable` arm MUST throw
  * `QuereusError` with a sited message — never silently no-op. A statement that
  * "succeeds but changes nothing" is the divergence signature this suite forbids

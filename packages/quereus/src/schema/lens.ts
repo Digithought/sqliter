@@ -121,7 +121,7 @@ export interface LensSlot {
 	 * Whether the logical table is read-only — its primary key is not
 	 * reconstructible at the lens boundary, so reads work but any mutation errors
 	 * at the lens (`planner/mutation/single-source.ts` `analyzeView` raises). Set by `proveLens`;
-	 * `undefined`/`false` ⇒ writable. See `docs/lens.md` § Coverage checklist
+	 * `undefined`/`false` ⇒ writable. See `docs/lens-prover.md` § Coverage checklist
 	 * (Key reconstructibility).
 	 */
 	readOnly?: boolean;

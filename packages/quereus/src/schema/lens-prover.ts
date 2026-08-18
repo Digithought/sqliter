@@ -43,7 +43,7 @@ const log = createLogger('schema:lens-prover');
  *    plus the warning-severity diagnostics that flow to the deploy report: the
  *    pure advisories (no-backing-index / no-answering-structure /
  *    partial-override / getput-lossy) plus the read-only verdict
- *    (`pk-not-reconstructible`). See `docs/lens.md` § Coverage checklist.
+ *    (`pk-not-reconstructible`). See `docs/lens-prover.md` § Coverage checklist.
  *  - **obligations + readOnly** — per-constraint enforcement classification and
  *    the writable-or-read-only verdict, recorded on the {@link LensSlot}. The
  *    *live* per-write enforcement wiring (`lens-constraint-enforcement-wiring`)
@@ -72,7 +72,7 @@ const log = createLogger('schema:lens-prover');
 /**
  * Error-severity diagnostic codes — already hard errors that block the deploy
  * before ack/escalation governance runs, so they are *not* valid escalation
- * policy targets (see `docs/lens.md` § Coverage checklist). One code is
+ * policy targets (see `docs/lens-prover.md` § Coverage checklist). One code is
  * dual-severity: `lens.nullability-mismatch` is a hard error by default but is
  * demoted to a governable advisory when every basis module the body reads
  * declares `permitsGrandfatheredNotNullViolators` (see
@@ -116,7 +116,7 @@ export type LensAdvisoryCode = typeof ADVISORY_CODE_LIST[number];
 export const ACKNOWLEDGEABLE_ADVISORY_CODES: ReadonlySet<LensAdvisoryCode> =
 	new Set(ADVISORY_CODE_LIST);
 
-/** Stable diagnostic codes (see `docs/lens.md` § Coverage checklist). */
+/** Stable diagnostic codes (see `docs/lens-prover.md` § Coverage checklist). */
 export type LensCheckCode = LensErrorCode | LensAdvisoryCode;
 
 /** The logical site a diagnostic concerns (table / constraint / column). */
@@ -223,7 +223,7 @@ export interface LensDeployReport {
 	 * Advisories an in-source `quereus.lens.ack.<code>` tag suppressed from the
 	 * default report. The deploy summary tallies `acknowledged: N` (=
 	 * `acknowledged.length`) and the `quereus_lens_advisories` TVF expands them on
-	 * demand (`docs/lens.md` § Acknowledging advisories). Produced by `lens-ack.ts`.
+	 * demand (`docs/lens-prover.md` § Acknowledging advisories). Produced by `lens-ack.ts`.
 	 */
 	readonly acknowledged: AcknowledgedAdvisory[];
 	/** Lowercased logical table name → its constraint obligations. */
@@ -632,7 +632,7 @@ interface RoundTripAnalysis {
  * behaviour, the mutation-time and key-reconstructibility nets still govern. The
  * body is planned **logically** ({@link planLogicalBody}, not `ctx.root`) so the
  * Project/Filter/TableReference operator tree threading `updateLineage` survives.
- * See `docs/lens.md` § Round-trip and `docs/vu-roundtrip.md`
+ * See `docs/lens-prover.md` § Round-trip and `docs/vu-roundtrip.md`
  * § The predicate-honest complement.
  */
 function analyzeRoundTrip(ctx: ProveContext): RoundTripAnalysis {

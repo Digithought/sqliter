@@ -1504,7 +1504,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		// The engine treats an UNSUPPORTED `alterTable` refusal as "use the shadow-table
 		// rebuild fallback" (see runAlterPrimaryKey in runtime/emit/alter-table.ts), which
 		// copies committed rows only — it would silently drop this transaction's staged
-		// writes. See docs/module-authoring.md § alterPrimaryKey.
+		// writes. See docs/module-authoring-schema-changes.md § alterPrimaryKey.
 		//
 		// NOTE: an already-poisoned own overlay leaves `ownEntry` undefined (skipped above), so this
 		// refusal never fires for it — harmless while poison is terminal (rollback is the only exit,

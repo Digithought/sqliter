@@ -317,7 +317,7 @@ const RESERVED_TAG_SPECS: ReservedTagSpec[] = [
 	// project promotes beyond advisory. Codes carry dots and hyphens, so the value
 	// is `string` (free CSV) rather than `csv-of-identifiers`. Read by the ack
 	// governance (`lens-ack.ts`) after the prover runs; default-empty when absent.
-	// See `docs/lens.md` § Acknowledging advisories (Escalation policy).
+	// See `docs/lens-prover.md` § Acknowledging advisories (Escalation policy).
 	{
 		key: 'quereus.lens.policy.error-on',
 		sites: siteSet('logical-table'),

@@ -10,7 +10,7 @@
  * single shared harness module cannot cleanly serve all three. The harness shape
  * is therefore duplicated, deliberately, per package.
  *
- * Contract (docs/module-authoring.md § "Schema Changes"): each (store × arm) cell
+ * Contract (docs/module-authoring-schema-changes.md § "Schema Changes"): each (store × arm) cell
  * must resolve to exactly one of — **honored** (the ALTER applies and a post-ALTER
  * read-back proves it is in force) or **clean reject** (`QuereusError` with the
  * arm's declared code + a sited message). The forbidden third outcome — "succeeds

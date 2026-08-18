@@ -492,7 +492,7 @@ export function makeViewColumnDescend(
 function analyzeView(ctx: PlanningContext, view: MutableViewLike, correlationName?: string): ViewAnalysis {
 	// Lens read-only gate: a logical table whose primary key is not reconstructible
 	// at the lens boundary deploys read-only (the prover sets `LensSlot.readOnly`;
-	// docs/lens.md § Coverage checklist). Reads still resolve through the registered
+	// docs/lens-prover.md § Coverage checklist). Reads still resolve through the registered
 	// view; any mutation errors here with a precise diagnostic. The lookup only
 	// matches a logical schema's lens slot — a plain view / MV (physical schema) has
 	// none, so this never false-positives on ordinary view write-through.
