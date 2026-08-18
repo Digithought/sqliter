@@ -1,6 +1,6 @@
 {
   "name": "@quereus/quereus-plugin-json-table",
-  "version": "4.13.1",
+  "version": "4.14.0",
   "type": "module",
   "description": "Virtual table for JSON data",
   "author": "Quereus Team",
