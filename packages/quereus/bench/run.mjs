@@ -879,6 +879,10 @@ function buildOutput({ environment, allBenchmarks, failures, skipped, wallClockM
 		// WITHOUT parsing benchmark names for a backend suffix, which would break the
 		// moment an advisory row is not a backend expansion. Sorted, so two runs of the
 		// same suites produce byte-identical lists.
+		// NOTE: this is every advisory name in the SUITE SET, not only the ones this run
+		// selected — a `--filter parser` run still writes all 19. Correct for its stated
+		// use (a lookup set: "is this name advisory?"); if a consumer ever reads it as
+		// "the advisory rows in this run", intersect it with `benchmarks` here instead.
 		informational: [...informational].sort(),
 		ratio_guards: ratioGuards,
 		baseline: baselinePath,

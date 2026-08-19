@@ -118,9 +118,14 @@ export async function levelDBSkipReason() {
  * benchmark that quietly turned it off would measure a configuration nobody uses. It is
  * also the single biggest term in what these rows cost; see `docs/benchmarking.md`.
  *
- * Exported because `bench/suites/store.bench.mjs` measures the key-value layer DIRECTLY,
- * with no `Database` above it — the sequential-versus-random read arms are storage-layer
- * questions and an engine on top of them would compress the very ratio they measure.
+ * Exported as this file's provider seam, for a suite that wants the key-value layer with
+ * no `Database` above it — a storage-layer question an engine on top would compress. The
+ * only caller today is `openLevelDBDatabase` below; the `store` suite still runs over the
+ * in-memory provider alone.
+ *
+ * A CALLER THAT USES THIS OWNS THE CLOSE ORDER: provider first (which releases LevelDB's
+ * exclusive directory lock), then `temp.remove()`. `openLevelDBDatabase` is the worked
+ * example, on both its success and its failure path.
  *
  * @param {string} label a short hint, embedded in the temporary directory's name
  * @returns {Promise<{ provider: import('@quereus/plugin-leveldb').LevelDBProvider, temp: import('./tempdir.mjs').BenchTempDir }>}
@@ -151,7 +156,29 @@ export async function createBenchLevelDBProvider(label) {
  */
 export async function openLevelDBDatabase() {
 	const { provider, temp } = await createBenchLevelDBProvider('store-leveldb');
-	const handle = await openStoreDatabase(provider);
+	/** @type {Awaited<ReturnType<typeof openStoreDatabase>>} */
+	let handle;
+	try {
+		handle = await openStoreDatabase(provider);
+	} catch (err) {
+		// The SAME close order the teardown below uses, for a setup that got half-way:
+		// the provider is open and holding LevelDB's directory lock, so releasing it
+		// before the removal is what makes the removal possible on Windows. Without this
+		// a failed `open` leaks an open database for the life of the worker, and the exit
+		// hook's removal then fails against that live lock — leaving exactly the stale
+		// directory the whole tempdir layer exists to prevent.
+		try {
+			await provider.closeAll();
+		} catch (closeError) {
+			process.stderr.write(`bench leveldb: opening the store database failed and the provider would not close either: ${closeError instanceof Error ? closeError.message : String(closeError)}\n`);
+		}
+		try {
+			temp.remove();
+		} catch (removeError) {
+			process.stderr.write(`bench leveldb: opening the store database failed and '${temp.dir}' could not be removed: ${removeError instanceof Error ? removeError.message : String(removeError)}\n`);
+		}
+		throw err;
+	}
 	return {
 		db: handle.db,
 		async close() {

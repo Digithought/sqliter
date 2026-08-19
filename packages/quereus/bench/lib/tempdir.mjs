@@ -155,6 +155,11 @@ export function createBenchTempDir(label) {
 			// Untracked BEFORE the removal, not after: a removal that throws has already
 			// had its retries, and leaving the path tracked would make the exit hook print
 			// the same failure a second time with no new information.
+			// NOTE: that also means a removal which exhausts its retries is never retried
+			// at exit, when the lock holding it may well be gone. Fine while a failure
+			// here is rare enough to be reported as an error and investigated; if
+			// `RM_OPTIONS`-exhausted removals start showing up on some filesystem, keep
+			// the path tracked and make the exit hook the retry instead of a duplicate.
 			removed = true;
 			outstanding.delete(dir);
 			rmSync(dir, RM_OPTIONS);
@@ -247,6 +252,13 @@ export function sweepBenchTempDirs(forcePids = []) {
 			rmSync(dir, RM_OPTIONS);
 			removed.push(dir);
 		} catch (err) {
+			// A directory that vanished between the `readdir` and the `stat` is not a
+			// failure: two parents sweeping the same dead worker's leftovers is the
+			// expected shape when runs overlap, and exactly one of them wins the race.
+			// Reporting the loser would print a scary line about a directory that is
+			// gone, which is the outcome the sweep wanted. `rmSync` already treats it
+			// this way via `force`; only the `stat` can raise it.
+			if (/** @type {NodeJS.ErrnoException} */ (err)?.code === 'ENOENT') continue;
 			failed.push({ dir, error: err instanceof Error ? err.message : String(err) });
 		}
 	}

@@ -125,3 +125,43 @@ test.
 `bench/suites/mutation.bench.mjs` 5. The suite files dropped from 36 errors to 14 when
 their workloads moved out, so the remaining gap is smaller than it was. `bench/*.mjs` is
 still linted by nothing — `packages/quereus`'s eslint glob is `'src/**/*.ts' 'test/**/*.ts'`.
+
+## Arm added by review of `bench-leveldb-backend`
+
+**The `informational` flag's parent-side half — the part that decides whether a number can
+fail a build — has no automated test.** The pure halves do: `expandBackends` stamping the
+flag and `compareRun` refusing to gate it are covered by
+`test/bench-backends.spec.ts` and `test/bench-comparison.spec.ts`. Everything the *runner*
+does with it lives in `bench/run.mjs` and is verified only by a person reading a terminal:
+
+- the cyan `informational` marker on measured, skipped and failed rows,
+- the yellow "N informational benchmark(s) regressed — reported, never gated" summary line,
+  which is the only thing explaining a red `regression` status next to an exit code of 0,
+- **the refusal of a ratio guard that names an advisory row**, reported as `misconfigured`
+  and checked before every other guard case so a `--filter` cannot hide it. This one is a
+  build gate: if it silently stopped firing, a build-gating ratio could be anchored to a
+  disk-dependent number and nothing would say so.
+
+Same blocker as every arm above — a caller-supplied suites directory. The guard refusal in
+particular needs a fixture suite that declares a deliberately-bad guard, which is exactly
+what cannot be written today without dropping a file into the real `bench/suites/`.
+
+**Also uncovered, and specific to this ticket: `run.mjs`'s signal handler.** It now records
+the active worker's PID, `SIGKILL`s it, and sweeps temporary databases before exiting. The
+sweep itself is covered as of this review (`test/bench-tempdir.spec.ts`), and the
+timeout path exercises the same
+`killedWorkerPids` → `SIGKILL` → `sweepBenchTempDirs` sequence — but the handler itself has
+never run in any test. Windows cannot deliver `SIGINT` to another process programmatically
+(`child.kill('SIGINT')` terminates instead), so closing this needs either a Linux/macOS run
+or the same fixture-suite seam.
+
+**Re-measured static-check coverage.** Unchanged in shape and now carrying this ticket's
+new code: `bench/run.mjs` gained roughly 110 lines here (PID tracking, the sweep call, the
+marker, the guard refusal, the advisory-regression summary) and **is type-checked by
+nothing** — `packages/quereus/tsconfig.test.json` still includes only `bench/lib/**/*` and
+`bench/workloads/**/*`, and eslint still globs `'src/**/*.ts' 'test/**/*.ts'` only. The two
+new modules this ticket added (`bench/lib/leveldb-backend.mjs`, `bench/lib/tempdir.mjs`)
+ARE inside the checked include, and that is what caught a real error: `tempdir.mjs` shipped
+in commit `9dd90e02d` with `error TS2339: Property 'code' does not exist on type '{}'`,
+breaking `yarn lint` outright until the implementer's second commit fixed it. The same
+mistake in `run.mjs` would still ship green.
