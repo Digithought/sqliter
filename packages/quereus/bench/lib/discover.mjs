@@ -20,6 +20,10 @@ const benchDir = fileURLToPath(new URL('..', import.meta.url));
  * @property {() => unknown | Promise<unknown>} fn the timed call
  * @property {() => unknown | Promise<unknown>} [setup] run once, untimed, before warmup
  * @property {() => unknown | Promise<unknown>} [teardown] run once, untimed, after timing
+ * @property {() => object | Promise<object>} [counters] optional second entry point: run
+ *   ONCE, untimed, after timing and before `teardown`, with runtime metrics on. Returns a
+ *   plain JSON object of machine-independent work counts — see `lib/counters.mjs`. Absent
+ *   means this benchmark reports no counters, which is a different claim from zero counts.
  * @property {number} [iterations] pins the benchmark out of calibration — see `lib/calibrate.mjs`
  * @property {number} [warmup] pins the benchmark out of calibration — see `lib/calibrate.mjs`
  *
@@ -75,6 +79,13 @@ export async function loadSuite(file) {
 		// where a malformed suite spends a fork per benchmark to say the same thing.
 		if (typeof bench.fn !== 'function') {
 			throw new Error(`suite '${file}' benchmark '${bench.name}' has no 'fn' function`);
+		}
+		// Checked here for the same reason `fn` is, and because the failure mode is
+		// silent: a `counters` that is not callable would otherwise be skipped exactly
+		// like a benchmark that never declared one, and the missing block would read as
+		// "no counters pass" rather than as the typo it is.
+		if (bench.counters !== undefined && typeof bench.counters !== 'function') {
+			throw new Error(`suite '${file}' benchmark '${bench.name}' has a 'counters' that is not a function (got ${typeof bench.counters})`);
 		}
 		if (seen.has(bench.name)) {
 			throw new Error(`suite '${file}' declares benchmark '${bench.name}' more than once`);

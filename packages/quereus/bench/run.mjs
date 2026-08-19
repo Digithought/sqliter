@@ -30,6 +30,7 @@
  *   yarn bench --baseline latest       — compare against the newest file in bench/results/
  *   yarn bench --filter <substring>    — run only benchmarks whose suite/name matches
  *   yarn bench --json                  — result object on stdout, everything else on stderr
+ *   yarn bench --no-counters           — skip the untimed work-counter pass
  */
 
 import { readFile, writeFile, mkdir, readdir } from 'node:fs/promises';
@@ -54,7 +55,15 @@ const BENCH_TIMEOUT_MS = 120_000;
 /** Characters of a dead child's stderr quoted in the failure report. */
 const STDERR_TAIL_CHARS = 4000;
 
-const USAGE = 'usage: node bench/run.mjs [--filter <substring>] [--baseline <file>|latest] [--json]';
+/**
+ * Counter changes printed per benchmark before the list is elided. A per-instruction
+ * diff of a plan that changed shape can run to hundreds of lines, which would bury the
+ * benchmarks that changed by three counts. The elision is ANNOUNCED, never silent, and
+ * the full list is always in the results JSON's `comparison` block.
+ */
+const COUNTER_CHANGES_SHOWN = 12;
+
+const USAGE = 'usage: node bench/run.mjs [--filter <substring>] [--baseline <file>|latest] [--json] [--no-counters]';
 
 /** Caller error — a bad flag, an unreadable baseline, a filter that matches nothing.
  * Reported as a single line: a stack trace through the harness diagnoses nothing the
@@ -88,16 +97,18 @@ const dim = ansi(2);
 
 // ── CLI args ────────────────────────────────────────────────────────────
 const VALUE_FLAGS = new Set(['--baseline', '--filter']);
-const BOOLEAN_FLAGS = new Set(['--json']);
+const BOOLEAN_FLAGS = new Set(['--json', '--no-counters']);
 
 function parseArgs(argv) {
 	let baselinePath = null;
 	let filter = null;
 	let json = false;
+	let counters = true;
 	for (let i = 0; i < argv.length; i++) {
 		const flag = argv[i];
 		if (BOOLEAN_FLAGS.has(flag)) {
-			json = true;
+			if (flag === '--json') json = true;
+			else counters = false;
 			continue;
 		}
 		if (!VALUE_FLAGS.has(flag)) {
@@ -110,7 +121,7 @@ function parseArgs(argv) {
 		if (flag === '--baseline') baselinePath = value;
 		else filter = value;
 	}
-	return { baselinePath, filter, json };
+	return { baselinePath, filter, json, counters };
 }
 
 /**
@@ -167,9 +178,10 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
  *
  * @returns {Promise<{ result: object|null, failure: object|null, code: number|null, signal: string|null, timedOut: boolean, stderr: string }>}
  */
-function forkBenchmark(suiteFile, benchName) {
+function forkBenchmark(suiteFile, benchName, collectCounters) {
 	return new Promise((resolve) => {
-		const child = fork(childPath, [suiteFile, benchName], {
+		const args = collectCounters ? [suiteFile, benchName] : [suiteFile, benchName, '--no-counters'];
+		const child = fork(childPath, args, {
 			stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
 		});
 		activeChild = child;
@@ -259,13 +271,17 @@ function classify(fullName, outcome) {
 	if (!Array.isArray(timings) || timings.length === 0) {
 		return { failure: { kind: 'error', detail: `child reported an empty timing set for ${fullName}` } };
 	}
-	return {
-		result: summarize(timings, {
-			batch: outcome.result.batch,
-			warmup: outcome.result.warmup,
-			pinned: outcome.result.pinned,
-		}),
-	};
+	const result = summarize(timings, {
+		batch: outcome.result.batch,
+		warmup: outcome.result.warmup,
+		pinned: outcome.result.pinned,
+	});
+	// Attached verbatim and only when the child actually sent one. A benchmark that
+	// declares no `counters()` — or a `--no-counters` run — leaves the field ABSENT,
+	// which reads as "not collected"; an empty object would read as "collected, all
+	// zero", which is a different and false claim.
+	if (outcome.result.counters !== undefined) result.counters = outcome.result.counters;
+	return { result };
 }
 
 function tail(text) {
@@ -285,14 +301,23 @@ function tail(text) {
  * clear. The floor is printed rather than applied invisibly, so a reader can see WHY
  * a 12% delta was called no change without reading this file.
  *
+ * A third column appears when any benchmark reported work counters: how many exact
+ * counts differ. It is deliberately NOT merged into Delta — a timing delta says "this
+ * might be slower" and a counter delta says "this does different work", and one column
+ * holding both claims would let a reader mistake the noisy one for the exact one. The
+ * column carries only the count; what changed goes in the block below the table, which
+ * a terminal column could never hold.
+ *
  * @param {{fullName: string, result: object|null, failure: object|null}[]} rows
  * @param {Map<string, object>|null} verdicts by full name, from `compareRun`
  */
 function printTable(rows, verdicts) {
 	const nameWidth = Math.max(30, ...rows.map((r) => r.fullName.length + 2));
+	const showCounters = Boolean(verdicts) && [...verdicts.values()].some((v) => v.counters?.status !== 'none');
 
 	const columns = ['Median', 'Spread', 'Min', 'Max'];
 	if (verdicts) columns.push('Delta', 'Noise');
+	if (showCounters) columns.push('Counters');
 	const header = `${'Benchmark'.padEnd(nameWidth)}  ${columns.map((c) => c.padStart(10)).join('  ')}`;
 
 	say();
@@ -313,6 +338,7 @@ function printTable(rows, verdicts) {
 
 		const verdict = verdicts?.get(row.fullName);
 		if (verdict) line += `  ${paintDelta(verdict)}  ${fmtFloor(verdict).padStart(10)}`;
+		if (showCounters) line += `  ${paintCounters(verdict?.counters)}`;
 
 		// Markers, not columns: they apply to a minority of rows and padding a column
 		// for them would cost more width than they are worth.
@@ -324,7 +350,69 @@ function printTable(rows, verdicts) {
 	}
 
 	say();
-	say(tableLegend(rows, verdicts));
+	say(tableLegend(rows, verdicts, showCounters));
+}
+
+/** The Counters cell: how many exact counts differ, or a word for why there is no diff. */
+function fmtCounters(counters) {
+	switch (counters?.status) {
+		case 'changed': return `${counters.changes.length} diff`;
+		case 'same': return 'same';
+		case 'new': return 'new';
+		case 'dropped': return 'dropped';
+		case 'skipped': return 'skipped';
+		default: return '—';
+	}
+}
+
+/** Pad first, colour second — an ANSI escape has width in the string and none on screen. */
+function paintCounters(counters) {
+	const cell = fmtCounters(counters).padStart(10);
+	// Cyan, never red: a counter change is a statement of fact that this ticket does
+	// not gate on, and red would read as a failure the exit code does not agree with.
+	if (counters?.status === 'changed') return cyan(cell);
+	if (counters?.status === 'dropped') return yellow(cell);
+	return cell;
+}
+
+/**
+ * The counter-difference block, printed below the table because a per-instruction diff
+ * is far too wide for a column.
+ *
+ * Every difference is listed with no threshold: these are machine-independent integers,
+ * so unlike a timing delta there is no noise for a floor to filter out. The only elision
+ * is the per-benchmark line cap, and it says so on the line where it applies.
+ *
+ * @param {object[]} comparisons from `compareRun`
+ */
+function printCounterChanges(comparisons) {
+	const changed = comparisons.filter((c) => c.counters.status === 'changed');
+	const dropped = comparisons.filter((c) => c.counters.status === 'dropped');
+	if (changed.length === 0 && dropped.length === 0) return;
+
+	say();
+	say('Work-counter changes (exact counts, no noise floor — a difference here means the');
+	say('engine did different work, not that it might have been slower). Not gated.');
+
+	for (const comparison of changed) {
+		say(`\n  ${cyan(comparison.fullName)} — ${comparison.counters.changes.length} count(s) differ`);
+		const pathWidth = Math.min(64, Math.max(...comparison.counters.changes.slice(0, COUNTER_CHANGES_SHOWN).map((c) => c.path.length)));
+		for (const change of comparison.counters.changes.slice(0, COUNTER_CHANGES_SHOWN)) {
+			say(`    ${change.path.padEnd(pathWidth)}  ${fmtCounterValue(change.before)} -> ${fmtCounterValue(change.after)}`);
+		}
+		const hidden = comparison.counters.changes.length - COUNTER_CHANGES_SHOWN;
+		if (hidden > 0) say(dim(`    … and ${hidden} more — the full list is in this run's results JSON under comparison`));
+	}
+
+	for (const comparison of dropped) {
+		say(`\n  ${yellow(comparison.fullName)} — the baseline reported counters and this run did not`);
+	}
+}
+
+/** A counter value, or `absent` where the path exists on only one side. `null` prints
+ * as a word rather than as a bare `null`, which reads like a recorded value of null. */
+function fmtCounterValue(value) {
+	return value === null ? 'absent' : String(value);
 }
 
 /** The trailing word that says what the comparison decided, for the verdicts a
@@ -338,7 +426,7 @@ function verdictMarker(verdict) {
 
 /** One line under the table saying what the numbers mean, because several of them do
  * not mean what a reader would assume. */
-function tableLegend(rows, verdicts) {
+function tableLegend(rows, verdicts, showCounters) {
 	const batched = rows.filter((r) => r.result && r.result.batch > 1);
 	const parts = [
 		`Spread = relative IQR ((p75-p25)/median); rows above ${(UNSTABLE_SPREAD * 100).toFixed(0)}% are marked unstable`,
@@ -349,6 +437,9 @@ function tableLegend(rows, verdicts) {
 	}
 	if (verdicts) {
 		parts.push(`Noise = both runs' spreads in quadrature; a |Delta| within it is no change, and a regression also needs |Delta| > ${GATE_MIN_DELTA_PCT}%`);
+	}
+	if (showCounters) {
+		parts.push('Counters = exact work counts that differ, with no tolerance; \'—\' means none were collected on either side');
 	}
 	return parts.map((p) => `  ${p}`).join('\n');
 }
@@ -552,6 +643,22 @@ function printComparisonSummary(comparisons, counts) {
 	}
 }
 
+/**
+ * One line for the counter comparison, kept apart from the timing summary above for
+ * the same reason the column is: they answer different questions.
+ *
+ * @param {Record<string, number>} counterCounts from `compareRun`
+ */
+function printCounterSummary(counterCounts) {
+	const comparable = counterCounts.same + counterCounts.changed + counterCounts.new + counterCounts.dropped;
+	if (comparable === 0 && counterCounts.skipped === 0) return;
+	if (counterCounts.skipped > 0) {
+		say(`Counters: not collected (--no-counters) — ${counterCounts.skipped} benchmark(s) compared on timings only`);
+		return;
+	}
+	say(`Counters: ${counterCounts.same} identical, ${counterCounts.changed} changed, ${counterCounts.new} new, ${counterCounts.dropped} dropped (never gated)`);
+}
+
 /** Join names into indented lines no wider than a terminal, so a long exclusion list
  * stays one readable block instead of one line per name.
  * @param {string[]} names
@@ -588,7 +695,7 @@ function selectFor(suites, filter) {
 }
 
 /** Fork each selected benchmark in turn and collect its outcome. */
-async function runSelected(selected) {
+async function runSelected(selected, collectCounters) {
 	const allBenchmarks = {};
 	const rows = [];
 	const failures = [];
@@ -604,7 +711,7 @@ async function runSelected(selected) {
 		// STRICTLY SEQUENTIAL, deliberately. Parallel children contend for CPU and
 		// would reintroduce a worse version of the cross-benchmark interference this
 		// whole file exists to remove. Do not "optimize" this into a worker pool.
-		const classified = classify(bench.fullName, await forkBenchmark(bench.suiteFile, bench.name));
+		const classified = classify(bench.fullName, await forkBenchmark(bench.suiteFile, bench.name, collectCounters));
 
 		// The result line is printed only after the child exits, so a benchmark that
 		// logs cannot interleave into the middle of it.
@@ -642,7 +749,7 @@ async function runSelected(selected) {
  * suite often accumulates a file per run. Harmless at the current sizes (a few KB
  * each); add a retention sweep if it ever becomes a nuisance.
  */
-function buildOutput({ environment, allBenchmarks, failures, wallClockMs, baselinePath, comparison, ratioGuards }) {
+function buildOutput({ environment, allBenchmarks, failures, wallClockMs, baselinePath, comparison, ratioGuards, collectCounters }) {
 	return {
 		timestamp: new Date().toISOString(),
 		// Lifted out of `environment` rather than captured a second time: these two are
@@ -652,6 +759,10 @@ function buildOutput({ environment, allBenchmarks, failures, wallClockMs, baseli
 		node: environment.node,
 		environment,
 		wall_clock_ms: Math.round(wallClockMs),
+		// Recorded so a later reader can tell a file whose benchmarks declare no
+		// `counters()` from one written by a `--no-counters` run. Both leave the same
+		// absent per-benchmark field; only this says which happened.
+		counters_collected: collectCounters,
 		benchmarks: allBenchmarks,
 		// Failures are recorded separately rather than as zero-valued benchmark
 		// entries, so a failed run can never be mistaken for a fast one.
@@ -687,7 +798,7 @@ function indent(text) {
 
 // ── Main ────────────────────────────────────────────────────────────────
 async function main() {
-	const { baselinePath: baselineSpec, filter, json } = parseArgs(process.argv.slice(2));
+	const { baselinePath: baselineSpec, filter, json, counters: collectCounters } = parseArgs(process.argv.slice(2));
 
 	if (json) {
 		humanStream = process.stderr;
@@ -710,19 +821,28 @@ async function main() {
 		say(yellow('Working tree is dirty — these numbers correspond to no commit.'));
 	}
 	if (baselinePath) say(`Baseline: ${baselinePath}`);
+	if (!collectCounters) say(yellow('--no-counters: the untimed work-counter pass is skipped; timings only.'));
 
 	const suites = await loadSuites();
 	const selected = selectFor(suites, filter);
 
-	const { allBenchmarks, rows, failures, wallClockMs } = await runSelected(selected);
+	const { allBenchmarks, rows, failures, wallClockMs } = await runSelected(selected, collectCounters);
 
-	const comparison = baseline ? compareRun(rows, baseline.benchmarks, filter) : null;
+	const comparison = baseline ? compareRun(rows, baseline.benchmarks, filter, { counters: collectCounters }) : null;
 	if (comparison) {
 		printComparisonBanner(baselinePath, compareEnvironments(environment, baseline.environment), comparison.assumedSpreads);
 	}
 
 	printTable(rows, comparison ? new Map(comparison.comparisons.map((c) => [c.fullName, c])) : null);
-	say(`Total wall-clock: ${(wallClockMs / 1000).toFixed(1)} s across ${selected.length} isolated process(es)`);
+	if (comparison) printCounterChanges(comparison.comparisons);
+	// Without a baseline there is nothing to diff, but a reader still needs to know
+	// whether the pass ran at all — a silent absence reads as "these benchmarks have no
+	// counters", which is a claim about the suite rather than about this invocation.
+	if (!comparison && collectCounters) {
+		const collected = rows.filter((r) => r.result?.counters !== undefined).length;
+		say(`\nWork counters collected for ${collected} of ${rows.length} benchmark(s) — no baseline, so nothing to compare.`);
+	}
+	say(`\nTotal wall-clock: ${(wallClockMs / 1000).toFixed(1)} s across ${selected.length} isolated process(es)`);
 
 	// Within-run ratio guards (shape-economy gates). Independent of --baseline:
 	// a single run of a query that is 26× slower than its hand-written twin
@@ -730,7 +850,7 @@ async function main() {
 	const selectedNames = new Set(selected.map((b) => b.fullName));
 	const ratioGuards = checkRatioGuards(suites, allBenchmarks, selectedNames, Boolean(filter));
 
-	const output = buildOutput({ environment, allBenchmarks, failures, wallClockMs, baselinePath, comparison, ratioGuards });
+	const output = buildOutput({ environment, allBenchmarks, failures, wallClockMs, baselinePath, comparison, ratioGuards, collectCounters });
 	say(`Results written to ${await writeResults(output)}`);
 
 	let exitCode = 0;
@@ -738,6 +858,7 @@ async function main() {
 
 	if (comparison) {
 		printComparisonSummary(comparison.comparisons, comparison.counts);
+		printCounterSummary(comparison.counterCounts);
 		if (comparison.regressions > 0) {
 			say(red(`${comparison.regressions} benchmark(s) regressed beyond the noise floor`));
 			exitCode = 1;

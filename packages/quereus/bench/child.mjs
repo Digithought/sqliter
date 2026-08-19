@@ -7,8 +7,13 @@
  * no benchmark inherits another's de-optimized dispatch sites or warmed tiers.
  * Nothing else in the suite is executed: the module is imported (which is
  * unavoidable — that is where the benchmark definitions live), the one named
- * benchmark's `setup` / warmup / timed loop / `teardown` run, and the raw
- * samples go back over IPC as plain JSON.
+ * benchmark's `setup` / warmup / timed loop / `counters` / `teardown` run, and the
+ * raw samples go back over IPC as plain JSON.
+ *
+ * A benchmark may declare an optional `counters()` entry point. It runs ONCE, after
+ * the timed loop and before `teardown`, with runtime metrics on — never inside the
+ * timed loop, because metrics wrap every streaming operator in a counting generator
+ * and would corrupt the timing this worker exists to produce.
  *
  * How long to run is NOT hand-written per benchmark. Each worker warms up by
  * duration, then measures the warmed `fn` to pick an inner batch size and a sample
@@ -17,7 +22,7 @@
  * `lib/calibrate.mjs`.
  *
  * Usage (not intended to be run by hand):
- *   node bench/child.mjs <suite-file.bench.mjs> <benchmark-name>
+ *   node bench/child.mjs <suite-file.bench.mjs> <benchmark-name> [--no-counters]
  */
 
 import { loadSuite } from './lib/discover.mjs';
@@ -33,7 +38,10 @@ import { calibrate, collectSamples, pinnedPlan, runPinnedWarmup } from './lib/ca
  * ever loses its tail, drain stdout before exiting rather than raising this. */
 const LINGER_GRACE_MS = 250;
 
-const [suiteFile, benchName] = process.argv.slice(2);
+const [suiteFile, benchName, ...flags] = process.argv.slice(2);
+
+/** `--no-counters` skips the counters pass entirely, for a run that only wants timings. */
+const collectCounters = !flags.includes('--no-counters');
 
 /** Set just before the worker disconnects itself on the normal path, so the handler
  * below can tell an orderly finish from the parent vanishing. */
@@ -70,6 +78,27 @@ function send(message) {
 async function fail(phase, err) {
 	await send({ type: 'failure', phase, error: serializeError(err) });
 	process.exit(1);
+}
+
+/**
+ * Run a benchmark's `counters()` and return a JSON-safe copy of what it produced.
+ *
+ * Round-tripped through JSON here rather than at the IPC boundary for two reasons: an
+ * unserializable value (a bigint, a cycle, a class instance) fails inside the
+ * `counters` phase with the benchmark's name attached, instead of as a bare
+ * DataCloneError from `process.send`; and what the parent receives is then byte-identical
+ * to what lands in the results file, so a snapshot cannot compare equal in memory and
+ * differ on disk.
+ *
+ * @param {() => object | Promise<object>} counters
+ * @returns {Promise<object>}
+ */
+async function runCountersPass(counters) {
+	const raw = await counters();
+	if (raw === null || typeof raw !== 'object') {
+		throw new Error(`counters() must return a plain JSON object, got ${raw === null ? 'null' : typeof raw}`);
+	}
+	return JSON.parse(JSON.stringify(raw));
 }
 
 async function main() {
@@ -120,10 +149,25 @@ async function main() {
 
 		const timings = await collectSamples(fn, plan);
 
+		// After the timed loop, before teardown — the pass needs whatever `setup` built,
+		// and must not be inside anything the timings are derived from. Its own phase, so
+		// a `counters()` that throws is reported as a benchmark failure rather than
+		// silently leaving out the block, which would be indistinguishable from a
+		// benchmark that never declared one.
+		let counters;
+		if (collectCounters && bench.counters) {
+			phase = 'counters';
+			counters = await runCountersPass(() => bench.counters());
+		}
+
 		phase = 'teardown';
 		if (bench.teardown) await bench.teardown();
 
-		await send({ type: 'result', timings, warmup: plan.warmup, batch: plan.batch, pinned });
+		// `counters` is omitted, never sent as `{}` or `null`: an absent block means "not
+		// collected", and an empty one would read as "collected, and everything was zero".
+		const message = { type: 'result', timings, warmup: plan.warmup, batch: plan.batch, pinned };
+		if (counters !== undefined) message.counters = counters;
+		await send(message);
 	} catch (err) {
 		// Best-effort cleanup so a failing benchmark does not leave a database open
 		// and stall the exit — but never let it mask the original error.

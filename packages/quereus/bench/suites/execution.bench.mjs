@@ -20,6 +20,7 @@
  */
 
 import { Database } from '../../dist/src/index.js';
+import { snapshotStatement } from '../lib/counters.mjs';
 
 /** Collect an async iterable into an array. */
 async function collect(iter) {
@@ -148,6 +149,9 @@ export const benchmarks = [
 			const rows = await collect(db.eval('select * from bench_t'));
 			if (rows.length !== 10000) throw new Error(`Expected 10000 rows, got ${rows.length}`);
 		},
+		// Runs ONCE after timing, with metrics on — never inside `fn`, whose number the
+		// counting generators would corrupt. Same statement, fully drained.
+		counters() { return snapshotStatement(db, 'select * from bench_t'); },
 	},
 	{
 		// One DATE + TIMESPAN add per row over a full scan. Both operands are declared
