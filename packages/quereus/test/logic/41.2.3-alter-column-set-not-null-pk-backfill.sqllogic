@@ -285,8 +285,9 @@ drop table t_bf12;
 --     store re-key) and the open-layer rebuild (TransactionLayer.convertColumn) are exercised.
 -- ===================================
 
-create table t_bf13 (x integer null default 7, y integer null);
-create index ix_bf13 on t_bf13 (y);
+-- Table-level `unique` (not a standalone `create index`) so the file needs no
+-- `-- requires-capability: standalone-index-ddl` and runs on every backend.
+create table t_bf13 (x integer null default 7, y integer null unique);
 insert into t_bf13 (x, y) values (3, 2);
 -- run
 

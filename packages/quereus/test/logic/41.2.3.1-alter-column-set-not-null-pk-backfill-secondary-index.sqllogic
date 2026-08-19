@@ -1,0 +1,37 @@
+-- 41.2.3.1-alter-column-set-not-null-pk-backfill-secondary-index.sqllogic
+--
+-- requires-capability: standalone-index-ddl
+--
+-- Carved out of 41.2.3-alter-column-set-not-null-pk-backfill's former § 12: a standalone
+-- `create index` needs standalone index DDL, which not every backend implements, and the
+-- `-- requires-capability:` directive is whole-file — leaving this case in the parent file
+-- would have made its eleven other primary-key-backfill sections, which need no index DDL,
+-- skippable too. 41.2.3 § 12 now covers the same ground via a table-level `unique` column
+-- instead, so it needs no directive; this file keeps the standalone-index-DDL shape covered.
+--
+-- Subject: a SECONDARY INDEX (built via standalone `create index`, not `unique`) over an
+-- untouched column still resolves after ALTER COLUMN ... SET NOT NULL backfills and re-keys
+-- the primary key. Its entries embed the primary key, which the backfill just moved. Both
+-- the committed rebuild (base / store re-key) and the open-layer rebuild
+-- (TransactionLayer.convertColumn) are exercised.
+
+create table t_bf13 (x integer null default 7, y integer null);
+create index ix_bf13 on t_bf13 (y);
+insert into t_bf13 (x, y) values (3, 2);
+-- run
+
+begin;
+insert into t_bf13 (x, y) values (null, 1);
+alter table t_bf13 alter column x set not null;
+select x, y from t_bf13 where y = 1;
+→ [{"x":7,"y":1}]
+
+commit;
+select x, y from t_bf13 where y = 1;
+→ [{"x":7,"y":1}]
+
+delete from t_bf13 where y = 1;
+select x, y from t_bf13;
+→ [{"x":3,"y":2}]
+
+drop table t_bf13;
