@@ -13,6 +13,105 @@ files:
 difficulty: hard
 ---
 
+<!-- resume-note -->
+## Progress (run interrupted by budget warning — no code changes made yet)
+
+A prior agent run completed all investigation and the pre-change bench baseline, then hit
+the soft token budget before editing any source file. The working tree has **zero source
+changes** — resume by implementing directly; no partial-state check needed.
+
+**Baseline bench (Phase 5 prerequisite) is DONE — do not redo it:**
+- Pre-change tree (clean at HEAD), `packages/quereus` built via `yarn build`, then
+  `node bench/run.mjs --filter execution` from `packages/quereus`.
+- Baseline results file: `packages/quereus/bench/results/2026-08-19T10-56-27-427Z.json`
+- Console copy: `tickets/.logs/2-work-counter-core.bench-baseline.log`
+- After the change: rebuild, then `node bench/run.mjs --filter execution --baseline bench/results/2026-08-19T10-56-27-427Z.json`.
+- Bench imports `../../dist/src/index.js` — always rebuild before benching.
+
+**Design decisions resolved by reading the code (follow these, they dodge real traps):**
+
+- **Do NOT feed the collector via a new `onAsyncOutput` hook.** `Scheduler.runAsyncLoop`
+  does `output = await hooks.onAsyncOutput(...)` — the await flattens any promise the hook
+  returns, so adding that hook to metrics mode would eagerly await every promise output at
+  the producing instruction, serializing what today runs concurrently via parked promises
+  + destination `Promise.all`. That changes existing metrics-mode behavior, which the
+  ticket forbids.
+- **Instead:** add an `index` first param to the private `RunHooks.runInstruction`
+  signature in `scheduler.ts` (two call sites: `runSyncLoop`, `runAsyncLoop`); optimized/
+  tracing hooks ignore it. Change `metricsHooks()` → `metricsHooks(ctx)` (one call site in
+  `run()`), look up `const counters = ctx.workCounters?.countersFor(this)` once per run,
+  and pass `counters?.[i]` into `runInstructionWithMetrics(instruction, ctx, args, slot?)`.
+  Inside it: compute `countInputs(args)` once, add to both `stats` and slot; on output
+  (sync value and inside the existing `.then(resolved => ...)`) call a
+  `recordOutput(slot, value)` helper from work-counters.ts — arrays add `.length`, async
+  iterables get wrapped in a counting generator (slot.out++ per yield), everything else
+  adds 1. Existing `runtimeStats` lines stay byte-identical.
+- **Counting-wrapper marker:** symbol whose value is the *slot* that wrapped it — skip
+  only if same slot (a pass-through iterable re-counted by a different instruction's slot
+  is correct double-wrapping, not a bug). Note in code: metrics mode and tracing mode are
+  mutually exclusive in `Scheduler.run()` (metrics wins), so no interplay with
+  `TRACED_ITERABLE_SYMBOL`.
+- **Collector:** `WorkCounterCollector` holds `Map<Scheduler, WorkCounterSlot[]>` + a
+  flat `walkOrder` array. Constructor walks root scheduler: program path `r`; sub-program
+  at `instructions[i].programs[j]` of `P` → `P/i/j`; slot key `${path}#${i}`. Defensive:
+  if a scheduler was already walked, skip (first path wins). `snapshot(plan)` filters
+  `executions > 0`, builds fresh objects (by-value contract), totals summed over included
+  entries.
+- **Plan shape:** write an own iterative walk with a visited `Set` over `getChildren()` —
+  do NOT use `PlanNode.visit()`, it deliberately visits a DAG node once **per path**
+  (plan-node.ts ~line 901), which would inflate `nodeCount` nondeterministically-looking
+  and double-count shared subtrees.
+- **Statement wiring:** in `_iterateRowsRawInternal`, after the scheduler is
+  built/reused: `this.workCounters = enableMetrics ? { collector: new
+  WorkCounterCollector(scheduler), planShape: computePlanShape(blockPlanNode) } : null`,
+  and put `workCounters: collector` (or undefined) on the runtime ctx. Capture planShape
+  AT EXECUTION time so a schema-invalidation recompile between execution and
+  `getWorkCounters()` can't pair new plan shape with old counters. `getWorkCounters()`
+  returns `collector.snapshot(storedPlanShape)`. `getPlanShape()` =
+  `computePlanShape(this.compile())` (works pre-execution). Null the stored pair in
+  `finalize()`.
+- **`Instruction.nodeType`:** optional `PlanNodeType` field on `Instruction`
+  (runtime/types.ts already type-imports from planner); stamp in `emitPlanNode` right
+  after `registration.emitter(plan, ctx)` returns (before the tracing wrap — wrap only
+  replaces `run`).
+- **No-collector contexts are already safe by construction:** `database.ts:852`,
+  `deferred-constraint-queue.ts:160`, `database-assertions.ts:509` build metrics-enabled
+  contexts without a collector → `countersFor` returns undefined → slot undefined →
+  today's behavior. The analysis contexts (`enableMetrics: false`) never reach
+  metricsHooks. No edits needed at any of those sites.
+- **Existing consumer to keep green:** `test/prepared-statement-amortization.spec.ts`
+  reaches into `(stmt as any).scheduler.getMetrics()` — leave `getMetrics()`,
+  `runtimeStats`, the per-run reset in `onStart`, and its `NOTE:` untouched.
+- **Fork contract:** `fork()` must enumerate `workCounters: rctx.workCounters` explicitly
+  (the pinned-keys test derives the field list from `Object.keys(fork)`). Add
+  `workCounters: 'shared-sink'` to `EXPECTED_FORK_POLICY` and a non-undefined sentinel
+  (`parent.workCounters = {} as unknown as ...`) in the "shared fields are aliased to
+  parent" test. Add a row to the fork-policy table in `docs/runtime-parallel.md`
+  § Parallel runtime fork contract.
+- **Child-process stability leg mechanics:** put shared logic in a NON-spec module
+  `test/runtime/work-counter-stability-shared.ts` (mocha glob is `test/**/*.spec.ts`, so
+  it won't be collected) exporting `collectSnapshots(warmupStatements: number)`. Child
+  runner `test/runtime/work-counter-stability-child.ts` imports it and `process.send`s
+  the result (IPC, not stdout — ts-node may chat on stdio).
+  Fork from the spec with:
+  `fork(childPath, [String(warmupN)], { cwd: repoRoot, execArgv: ['--import', pathToFileURL(join(repoRoot, 'packages/quereus/register.mjs')).href] })`
+  — `register.mjs` sets `TS_NODE_PROJECT='./packages/quereus/tsconfig.test.json'`
+  **relative to cwd**, so cwd MUST be the repo root. Give each child a different
+  `warmupN` (number of dummy statements prepared before the real ones) so the two
+  processes execute the real statements at different `PlanNode.nextId` offsets — that is
+  what makes the cross-process leg catch an id leaking into a key. ts-node startup is
+  slow: `this.timeout(120000)` on that test.
+- **Stability spec extra assertions worth including:** JSON round-trip deep-equal (proves
+  no bigint); metrics-off execution → `getWorkCounters()` undefined; zero-row execution →
+  snapshot present with `executions > 0`, `out === 0`; correlated-subquery snapshot has
+  some instruction with `executions >= outerRowCount` (the N+1-visibility claim).
+- **Strict-fork leg:** run once manually, e.g.
+  `QUEREUS_FORK_STRICT=1 node --import ./packages/quereus/register.mjs node_modules/mocha/bin/mocha.js "packages/quereus/test/runtime/work-counter-stability.spec.ts"` from repo root
+  (or `yarn workspace @quereus/quereus run test:fork-strict` for the full suite).
+- **Docs:** add the work-counter section under `docs/runtime.md` § "Scheduler Execution
+  Model" (after the "Scalar fusion" subsection); the fused-scalar per-operator blindness
+  is already documented there — reference it rather than restating.
+
 # What this is
 
 The scheduler already collects per-instruction statistics when metrics mode is on
