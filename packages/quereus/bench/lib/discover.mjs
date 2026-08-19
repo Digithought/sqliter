@@ -35,6 +35,17 @@ const benchDir = fileURLToPath(new URL('..', import.meta.url));
  *   their metadata only. A skip is neither a failure (it does not affect the exit code)
  *   nor an absence (an absent benchmark reads as UNCHANGED to anyone diffing two runs),
  *   which is exactly why it is a third answer rather than either of those.
+ * @property {boolean} [informational] this row's number is ADVISORY: printed, recorded in
+ *   the results file, and never counted toward a pass/fail verdict. For a measurement
+ *   whose value is not a property of this repository's code — a disk-backed timing, where
+ *   the machine's filesystem and page cache dominate — so a slow disk can never fail a
+ *   build. Absent means the ordinary thing: the row gates like any other.
+ *
+ *   Read in the PARENT, unlike `skip`, which is why it is plain metadata rather than a
+ *   function: `run.mjs` has to know before the comparison which rows may contribute a
+ *   regression, and `checkRatioGuards` has to know before it evaluates a guard whether the
+ *   guard names one. A backend can declare it once for every row it produces — see
+ *   `BenchBackend.informational` in `lib/backends.mjs`.
  * @property {number} [iterations] pins the benchmark out of calibration — see `lib/calibrate.mjs`
  * @property {number} [warmup] pins the benchmark out of calibration — see `lib/calibrate.mjs`
  *
@@ -104,6 +115,13 @@ export async function loadSuite(file) {
 		if (bench.skip !== undefined && typeof bench.skip !== 'function') {
 			throw new Error(`suite '${file}' benchmark '${bench.name}' has a 'skip' that is not a function (got ${typeof bench.skip})`);
 		}
+		// Checked for the same reason, with the failure mode running the other way: the
+		// harness tests this for STRICT `true`, so a truthy non-boolean (`'yes'`, `1`)
+		// would leave the row GATED while its author believed it advisory — a disk-backed
+		// number would then fail a build.
+		if (bench.informational !== undefined && typeof bench.informational !== 'boolean') {
+			throw new Error(`suite '${file}' benchmark '${bench.name}' has an 'informational' that is not a boolean (got ${typeof bench.informational})`);
+		}
 		if (seen.has(bench.name)) {
 			throw new Error(`suite '${file}' declares benchmark '${bench.name}' more than once`);
 		}
@@ -143,19 +161,48 @@ export function matchesFilter(fullName, filter) {
  * Flatten loaded suites into the ordered work list, optionally narrowed by a
  * substring match against the `suite/name` full name.
  *
+ * `informational` is carried along rather than looked up again later: the parent needs it
+ * in three places (the printed marker, the ratio-guard refusal, the comparison's gating),
+ * and each of those re-finding the `Benchmark` object by name would be three chances to
+ * disagree about which rows are advisory. Normalized to a strict boolean HERE, once, so
+ * every consumer downstream can test it plainly.
+ *
  * @param {Suite[]} suites as returned by `loadSuites`
  * @param {string|null} filter substring; `null` selects everything
- * @returns {{ suiteFile: string, suiteName: string, name: string, fullName: string }[]}
+ * @returns {{ suiteFile: string, suiteName: string, name: string, fullName: string, informational: boolean }[]}
  */
 export function selectBenchmarks(suites, filter) {
-	/** @type {{ suiteFile: string, suiteName: string, name: string, fullName: string }[]} */
+	/** @type {{ suiteFile: string, suiteName: string, name: string, fullName: string, informational: boolean }[]} */
 	const selected = [];
 	for (const suite of suites) {
 		for (const bench of suite.benchmarks) {
 			const fullName = `${suite.name}/${bench.name}`;
 			if (!matchesFilter(fullName, filter)) continue;
-			selected.push({ suiteFile: suite.file, suiteName: suite.name, name: bench.name, fullName });
+			selected.push({ suiteFile: suite.file, suiteName: suite.name, name: bench.name, fullName, informational: bench.informational === true });
 		}
 	}
 	return selected;
+}
+
+/**
+ * The full names of every benchmark in `suites` whose row is advisory, whether or not
+ * this run selected it.
+ *
+ * Deliberately NOT derived from the selection: `checkRatioGuards` has to refuse a guard
+ * naming an informational benchmark even under a `--filter` that excluded it, and a
+ * baseline can carry a name this run never selected. Reading the whole suite set answers
+ * both without either caller special-casing.
+ *
+ * @param {Suite[]} suites as returned by `loadSuites`
+ * @returns {Set<string>}
+ */
+export function informationalNames(suites) {
+	/** @type {Set<string>} */
+	const names = new Set();
+	for (const suite of suites) {
+		for (const bench of suite.benchmarks) {
+			if (bench.informational === true) names.add(`${suite.name}/${bench.name}`);
+		}
+	}
+	return names;
 }

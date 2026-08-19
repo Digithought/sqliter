@@ -39,10 +39,11 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
 
-import { loadSuites, selectBenchmarks } from './lib/discover.mjs';
+import { informationalNames, loadSuites, selectBenchmarks } from './lib/discover.mjs';
 import { summarize, UNSTABLE_SPREAD, GATE_MIN_DELTA_PCT } from './lib/stats.mjs';
 import { compareRun, STATUS_ORDER } from './lib/compare.mjs';
 import { captureEnvironment, compareEnvironments, describeCheckout, describeEnvironment } from './lib/environment.mjs';
+import { sweepBenchTempDirs } from './lib/tempdir.mjs';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const childPath = join(__dirname, 'child.mjs');
@@ -157,12 +158,49 @@ async function resolveBaselinePath(spec) {
  * interrupted parent can take it down with it — see the signal handlers below. */
 let activeChild = null;
 
+/**
+ * PIDs of workers this parent `SIGKILL`ed. A killed process runs no handler of any kind,
+ * so a disk-backed benchmark's temporary database is left behind and only the parent is
+ * in a position to remove it — and only the parent knows these PIDs are dead, since the
+ * OS may not have reaped them by the time the sweep asks. See `lib/tempdir.mjs`.
+ *
+ * @type {Set<number>}
+ */
+const killedWorkerPids = new Set();
+
+/**
+ * Remove temporary databases left by workers that are gone, and say what was removed.
+ *
+ * Best-effort and never throwing: this runs alongside a report the user actually asked
+ * for. Silent when there was nothing to do, because on the overwhelmingly common path
+ * there is nothing to do and a line saying so would be noise on every run.
+ *
+ * @param {boolean} [quiet] true in a signal handler, where the run's output is already
+ *   being abandoned and a tidy report is not what the reader is waiting for
+ */
+function sweepTempDirs(quiet = false) {
+	const { removed, failed } = sweepBenchTempDirs(killedWorkerPids);
+	if (!quiet && removed.length > 0) {
+		say(yellow(`Removed ${removed.length} temporary database director${removed.length === 1 ? 'y' : 'ies'} left by killed worker(s).`));
+	}
+	// Reported even when quiet: a directory that could not be removed silently changes
+	// the next run's numbers, which is exactly the failure this whole layer exists to
+	// prevent.
+	for (const failure of failed) {
+		process.stderr.write(`bench: could not remove leftover temporary database '${failure.dir}': ${failure.error}\n`);
+	}
+}
+
 // A fork()ed child outlives its parent. Without this, one Ctrl+C mid-run orphans a
 // worker that holds a populated 10k-row database and keeps burning CPU until it
 // finishes on its own.
 for (const signal of ['SIGINT', 'SIGTERM']) {
 	process.on(signal, () => {
+		if (activeChild?.pid !== undefined) killedWorkerPids.add(activeChild.pid);
 		activeChild?.kill('SIGKILL');
+		// Synchronous, and before the exit: the worker we just killed cannot clean up
+		// after itself, and there is no later moment in this process to do it in.
+		sweepTempDirs(true);
 		process.exit(signal === 'SIGINT' ? 130 : 143);
 	});
 }
@@ -219,6 +257,9 @@ function forkBenchmark(suiteFile, benchName, collectCounters) {
 
 		const timer = setTimeout(() => {
 			timedOut = true;
+			// Recorded before the kill, so the end-of-run sweep can remove a temporary
+			// database this worker will now never get the chance to remove itself.
+			if (child.pid !== undefined) killedWorkerPids.add(child.pid);
 			child.kill('SIGKILL');
 			// A killed child normally emits 'close' within milliseconds. The backstop is
 			// for the case where it does not (an unkillable process, a wedged pipe): the
@@ -317,8 +358,9 @@ function tail(text) {
  *
  * @param {{fullName: string, result: object|null, failure: object|null}[]} rows
  * @param {Map<string, object>|null} verdicts by full name, from `compareRun`
+ * @param {Set<string>} [informational] rows whose numbers are advisory
  */
-function printTable(rows, verdicts) {
+function printTable(rows, verdicts, informational = new Set()) {
 	const nameWidth = Math.max(30, ...rows.map((r) => r.fullName.length + 2));
 	const showCounters = Boolean(verdicts) && [...verdicts.values()].some((v) => v.counters?.status !== 'none');
 
@@ -332,17 +374,23 @@ function printTable(rows, verdicts) {
 	say('─'.repeat(header.length));
 
 	for (const row of rows) {
+		// A MARKER, not a column — the same treatment `unstable` and `pinned` get, and for
+		// the same reason: it applies to a minority of rows and padding a column for it
+		// would cost more width than it is worth. Printed on skipped and failed rows too,
+		// because "this row would not have gated anyway" is exactly as relevant when the
+		// row has no number as when it has one.
+		const advisory = informational.has(row.fullName) ? `  ${cyan('informational')}` : '';
 		// A skipped benchmark keeps its row too, and for the same reason a failed one
 		// does — but in yellow rather than red, because a skip is a deliberate decline
 		// and does not fail the run.
 		if (row.skipped) {
-			say(`${row.fullName.padEnd(nameWidth)}  ${yellow(`skipped — ${row.skipped.reason}`)}`);
+			say(`${row.fullName.padEnd(nameWidth)}  ${yellow(`skipped — ${row.skipped.reason}`)}${advisory}`);
 			continue;
 		}
 		// A failed benchmark keeps its row: a missing row reads as "unchanged" to
 		// anyone diffing two runs.
 		if (!row.result) {
-			say(`${row.fullName.padEnd(nameWidth)}  ${red(`FAILED (${row.failure.kind})`)}`);
+			say(`${row.fullName.padEnd(nameWidth)}  ${red(`FAILED (${row.failure.kind})`)}${advisory}`);
 			continue;
 		}
 
@@ -358,6 +406,7 @@ function printTable(rows, verdicts) {
 		// for them would cost more width than they are worth.
 		if (!result.stable) line += `  ${yellow('unstable')}`;
 		if (result.pinned) line += `  ${cyan('pinned')}`;
+		line += advisory;
 		if (verdict) line += verdictMarker(verdict);
 
 		say(line);
@@ -513,16 +562,32 @@ function fmtFloor(verdict) {
  * machine, not a guard naming something that does not exist, and failing the run over
  * one would turn every skip into a red build.
  *
+ * A guard naming an INFORMATIONAL benchmark is `misconfigured`, and that is checked before
+ * anything else. An advisory row's number is not a property of this repository's code — a
+ * guard over one would fail the build on a slow disk — so no guard may name one, and the
+ * mistake belongs to whoever wrote the guard. It is deliberately not a silent skip: a
+ * guard that quietly never evaluates is a guard everyone believes is protecting them.
+ *
  * @param {Map<string, string>} skippedNames full name -> the reason it skipped
+ * @param {Set<string>} informational full names whose rows are advisory
  * @returns {{ target: string, baseline: string, status: string, ratio: number|null, maxRatio: number, detail: string }[]}
  */
-function checkRatioGuards(suites, allBenchmarks, selectedNames, filterActive, skippedNames = new Map()) {
+function checkRatioGuards(suites, allBenchmarks, selectedNames, filterActive, skippedNames = new Map(), informational = new Set()) {
 	const verdicts = [];
 	for (const suite of suites) {
 		for (const guard of suite.ratioGuards ?? []) {
 			const targetName = `${suite.name}/${guard.name}`;
 			const baseName = `${suite.name}/${guard.baseline}`;
 			const record = { target: targetName, baseline: baseName, ratio: null, maxRatio: guard.maxRatio };
+
+			// FIRST, before every other case: a guard naming an advisory row is a guard
+			// authoring error whatever else is true of this run, and reporting it as
+			// "skipped by --filter" or "not evaluated" would let it sit unnoticed.
+			const advisory = [targetName, baseName].filter((n) => informational.has(n));
+			if (advisory.length > 0) {
+				verdicts.push({ ...record, status: 'misconfigured', detail: `guard names '${advisory[0]}', whose row is informational — advisory numbers depend on the machine's disk and must not gate a build` });
+				continue;
+			}
 
 			// Checked before the unselected case: a skipped benchmark IS selected, so it
 			// would otherwise fall through to the ratio computation and be reported as a
@@ -786,7 +851,7 @@ async function runSelected(selected, collectCounters) {
  * suite often accumulates a file per run. Harmless at the current sizes (a few KB
  * each); add a retention sweep if it ever becomes a nuisance.
  */
-function buildOutput({ environment, allBenchmarks, failures, skipped, wallClockMs, baselinePath, comparison, ratioGuards, collectCounters }) {
+function buildOutput({ environment, allBenchmarks, failures, skipped, wallClockMs, baselinePath, comparison, ratioGuards, collectCounters, informational }) {
 	return {
 		timestamp: new Date().toISOString(),
 		// Lifted out of `environment` rather than captured a second time: these two are
@@ -809,6 +874,12 @@ function buildOutput({ environment, allBenchmarks, failures, skipped, wallClockM
 		// from all three is the one thing it must not be — that reads as UNCHANGED to
 		// anyone diffing two runs.
 		skipped,
+		// Recorded as a first-class list rather than left implicit in the names: a later
+		// gate script reading this file must be able to tell which rows are advisory
+		// WITHOUT parsing benchmark names for a backend suffix, which would break the
+		// moment an advisory row is not a backend expansion. Sorted, so two runs of the
+		// same suites produce byte-identical lists.
+		informational: [...informational].sort(),
 		ratio_guards: ratioGuards,
 		baseline: baselinePath,
 		comparison,
@@ -870,12 +941,17 @@ async function main() {
 
 	const { allBenchmarks, rows, failures, skipped, wallClockMs } = await runSelected(selected, collectCounters);
 
-	const comparison = baseline ? compareRun(rows, baseline.benchmarks, filter, { counters: collectCounters }) : null;
+	// Read from the whole suite set rather than from the selection: a `--filter`ed run
+	// must still refuse a guard naming an advisory row, and a baseline can carry a name
+	// this run never selected.
+	const informational = informationalNames(suites);
+
+	const comparison = baseline ? compareRun(rows, baseline.benchmarks, filter, { counters: collectCounters, informational }) : null;
 	if (comparison) {
 		printComparisonBanner(baselinePath, compareEnvironments(environment, baseline.environment), comparison.assumedSpreads);
 	}
 
-	printTable(rows, comparison ? new Map(comparison.comparisons.map((c) => [c.fullName, c])) : null);
+	printTable(rows, comparison ? new Map(comparison.comparisons.map((c) => [c.fullName, c])) : null, informational);
 	if (comparison) printCounterChanges(comparison.comparisons);
 	// Without a baseline there is nothing to diff, but a reader still needs to know
 	// whether the pass ran at all — a silent absence reads as "these benchmarks have no
@@ -896,9 +972,14 @@ async function main() {
 	// otherwise prints a fine-looking number and passes.
 	const selectedNames = new Set(selected.map((b) => b.fullName));
 	const skippedNames = new Map(skipped.map((s) => [s.name, s.reason]));
-	const ratioGuards = checkRatioGuards(suites, allBenchmarks, selectedNames, Boolean(filter), skippedNames);
+	const ratioGuards = checkRatioGuards(suites, allBenchmarks, selectedNames, Boolean(filter), skippedNames, informational);
 
-	const output = buildOutput({ environment, allBenchmarks, failures, skipped, wallClockMs, baselinePath, comparison, ratioGuards, collectCounters });
+	// After every worker has exited, so a temporary database a killed worker left behind
+	// is gone before the run reports. Nothing to do on the normal path — the worker
+	// removes its own.
+	sweepTempDirs();
+
+	const output = buildOutput({ environment, allBenchmarks, failures, skipped, wallClockMs, baselinePath, comparison, ratioGuards, collectCounters, informational });
 	say(`Results written to ${await writeResults(output)}`);
 
 	let exitCode = 0;
@@ -907,6 +988,14 @@ async function main() {
 	if (comparison) {
 		printComparisonSummary(comparison.comparisons, comparison.counts);
 		printCounterSummary(comparison.counterCounts);
+		// Said separately and in yellow, because `comparison.regressions` counts only GATED
+		// rows: an advisory row that regressed would otherwise print a red `regression`
+		// status in the table next to an exit code of 0, and read as a harness bug rather
+		// than as the deliberate policy it is.
+		const advisoryRegressions = comparison.comparisons.filter((c) => c.status === 'regression' && !c.gated).length;
+		if (advisoryRegressions > 0) {
+			say(yellow(`${advisoryRegressions} informational benchmark(s) regressed — reported, never gated (their numbers depend on this machine's disk)`));
+		}
 		if (comparison.regressions > 0) {
 			say(red(`${comparison.regressions} benchmark(s) regressed beyond the noise floor`));
 			exitCode = 1;

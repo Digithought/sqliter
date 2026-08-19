@@ -27,6 +27,7 @@
  */
 
 import { Database } from '../../dist/src/index.js';
+import { LEVELDB_ENV_VAR, levelDBSkipReason, openLevelDBDatabase } from './leveldb-backend.mjs';
 import { openCountingStoreDatabase, openStoreDatabase, storeLoadFailure } from './store-counters.mjs';
 
 /**
@@ -52,6 +53,14 @@ import { openCountingStoreDatabase, openStoreDatabase, storeLoadFailure } from '
  *   Either way the row survives and prints `skipped — <reason>`; an omitted benchmark
  *   would read as UNCHANGED to anyone diffing two runs, which is the opposite of what a
  *   decline means.
+ * @property {boolean} [informational] this backend's numbers are ADVISORY: printed and
+ *   recorded, never counted toward a pass/fail verdict. Declared on the BACKEND rather
+ *   than per benchmark because it is a property of what the numbers describe, not of any
+ *   one workload — a backend whose timings depend on the machine's disk, filesystem or
+ *   page cache is measuring something that is not a property of this repository's code,
+ *   and no amount of care in a workload changes that. `expandBackends` stamps it onto
+ *   every benchmark it produces, so no suite file can forget it; `run.mjs` prints the
+ *   marker, refuses any ratio guard naming such a row, and `compare.mjs` never gates one.
  * @property {() => Promise<CountingBackendHandle>} [openCounting] builds the SECOND
  *   database the untimed `counters()` pass uses, instrumented to count storage traffic.
  *   A backend without one reports engine work counters only, exactly as before backends
@@ -151,10 +160,52 @@ export const STORE_MEM_BACKEND = {
 };
 
 /**
+ * The persistent store path over REAL ON-DISK STORAGE — the backend a Node deployment
+ * actually runs.
+ *
+ * OPT-IN. It runs only when `QUEREUS_BENCH_LEVELDB` is set; without it every row prints
+ * `skipped — …` naming the variable. See `bench/lib/leveldb-backend.mjs` for why the
+ * plugin sits behind its own lazy import, and `docs/benchmarking.md` for how to run it.
+ *
+ * INFORMATIONAL. Its timings are dominated by the machine's disk, filesystem and page
+ * cache, none of which is a property of this repository's code, so they are printed and
+ * recorded and never counted toward a verdict.
+ *
+ * NO `openCounting`, deliberately — the same absence, for a different reason than the
+ * memory backend's. `createCountingProvider(map, 'all')` wraps an in-memory map, not an
+ * arbitrary provider, so there is nothing to wrap a `LevelDBProvider` in; this backend
+ * contributes TIMINGS ONLY, not storage round-trip counts. That is not a loss worth
+ * fixing here: the round-trip counts are a property of the store LAYER and `store-mem`
+ * already reports them exactly, on every run, for free. The one thing they would say
+ * differently is noted in `store-counters.mjs`'s header — a LevelDB provider has a shared
+ * commit domain, so one commit is a single cross-store atomic write rather than the
+ * per-store fallback the in-memory counting provider forces.
+ *
+ * @type {BenchBackend}
+ */
+export const STORE_LEVELDB_BACKEND = {
+	id: 'store-leveldb',
+	label: `StoreModule (isolation-wrapped) over LevelDB on a temporary directory — advisory, opt in with ${LEVELDB_ENV_VAR}=1`,
+	informational: true,
+	// Ignores its workload argument for the same reason `store-mem` does: no workload is
+	// intrinsically unrunnable here. Both reasons this backend declines are per-BACKEND,
+	// and they are asked cheapest-first — the opt-in (a string compare) before the plugin
+	// load (a native binding), and the plugin before `@quereus/store`, since a run that
+	// did not ask for disk rows must not pay either load to be told so.
+	async skipWorkload() {
+		return (await levelDBSkipReason()) ?? (await storeLoadFailure());
+	},
+	open() { return openLevelDBDatabase(); },
+};
+
+/**
  * The backend set every suite expands over.
  *
  * One entry per storage path, shared by both suites rather than listed per suite, so a
  * new backend reaches every workload at once and cannot be half-added.
+ *
+ * `STORE_LEVELDB_BACKEND` is deliberately NOT here — see its own comment for the measured
+ * reason.
  *
  * @type {BenchBackend[]}
  */
@@ -203,6 +254,13 @@ function validateBackends(backends) {
 		}
 		if (backend.openCounting !== undefined && typeof backend.openCounting !== 'function') {
 			throw new Error(`expandBackends: backend '${backend.id}' has an 'openCounting' that is not a function (got ${typeof backend.openCounting})`);
+		}
+		// Same reason as the two above, and the worst failure mode of the three: a truthy
+		// non-boolean would stamp `informational: 'yes'` onto every row, and `run.mjs`
+		// tests the flag for STRICT `true` — so a backend meant to be advisory would gate
+		// the build on a disk-dependent number and nothing would say so.
+		if (backend.informational !== undefined && typeof backend.informational !== 'boolean') {
+			throw new Error(`expandBackends: backend '${backend.id}' has an 'informational' that is not a boolean (got ${typeof backend.informational})`);
 		}
 		if (ids.has(backend.id)) {
 			throw new Error(`expandBackends: backend id '${backend.id}' appears more than once`);
@@ -299,7 +357,13 @@ export function expandBackends(backends, workloads, bind) {
 				throw new Error(`expandBackends: bind returned the name '${declared}' for workload '${workload.name}' on backend '${backend.id}', which must be named '${name}'`);
 			}
 			const skip = composeSkip(workload, backend, bound.skip);
-			expanded.push(skip ? { ...bound, name, skip } : { ...bound, name });
+			// Stamped from the BACKEND, never from the binder: a suite that had to remember
+			// to mark its own rows advisory is a suite that will forget on the next workload
+			// added. Set only when true, so a row on an ordinary backend carries no
+			// `informational` key at all — byte-identical to what it was before this
+			// existed.
+			const expandedBenchmark = skip ? { ...bound, name, skip } : { ...bound, name };
+			expanded.push(backend.informational ? { ...expandedBenchmark, informational: true } : expandedBenchmark);
 		}
 	}
 	return expanded;

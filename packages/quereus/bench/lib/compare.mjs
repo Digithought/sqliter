@@ -266,13 +266,20 @@ const roundPct = (n) => round(n, PERCENT_PRECISION);
  * to be: a benchmark too noisy to gate on wall-clock still has exact work counts, and
  * suppressing them there would hide the one signal that survives a busy machine.
  *
+ * An `informational` row is compared exactly like any other and then never gated. The
+ * STATUS still says `regression` when the number moved — suppressing that would hide the
+ * very signal an advisory row exists to provide — but `gated` stays false, so it cannot
+ * reach `regressions` and cannot fail a build. The note says so, because a red-looking
+ * status next to a zero exit code otherwise reads as a bug in the harness.
+ *
  * @param {string} fullName
  * @param {import('./stats.mjs').BenchmarkSummary} result this run's summary
  * @param {import('./stats.mjs').BaselineEntry} base the baseline file's entry
  * @param {CounterVerdict} counters
+ * @param {boolean} informational whether this row's number is advisory
  * @returns {Comparison}
  */
-function compareOne(fullName, result, base, counters) {
+function compareOne(fullName, result, base, counters, informational) {
 	const floor = roundPct(noiseFloorPct(result.spread_pct, base.spread_pct));
 
 	// A baseline median at or below the microsecond rounding floor makes the delta a
@@ -297,8 +304,8 @@ function compareOne(fullName, result, base, counters) {
 		status,
 		delta_pct: delta,
 		noise_floor_pct: floor,
-		gated: status === 'regression',
-		note: null,
+		gated: status === 'regression' && !informational,
+		note: informational && status === 'regression' ? 'informational — reported, never gated' : null,
 		counters,
 	};
 }
@@ -321,13 +328,18 @@ function compareOne(fullName, result, base, counters) {
  * @param {Record<string, import('./stats.mjs').BaselineEntry>} baseline the baseline file's `benchmarks` map
  * @param {string|null} filter the active `--filter`, used only to tell a benchmark
  *   that was excluded from one that vanished
- * @param {{ counters?: boolean }} [options] `counters: false` for a `--no-counters` run:
- *   every row reports `skipped` instead of a diff, so a timings-only run does not
- *   report the whole baseline's counters as dropped
+ * @param {{ counters?: boolean, informational?: Set<string> }} [options] `counters: false`
+ *   for a `--no-counters` run: every row reports `skipped` instead of a diff, so a
+ *   timings-only run does not report the whole baseline's counters as dropped.
+ *   `informational` names the rows whose numbers are advisory — they are compared and
+ *   reported exactly like any other row and never marked `gated`, so a disk-dependent
+ *   measurement cannot fail a build. A name in the set that this run did not produce is
+ *   simply never consulted; the non-delta statuses are ungated already.
  * @returns {{ comparisons: Comparison[], counts: Record<string, number>, counterCounts: Record<string, number>, counterChanges: number, regressions: number, assumedSpreads: number }}
  */
 export function compareRun(rows, baseline, filter = null, options = {}) {
 	const countersEnabled = options.counters !== false;
+	const informational = options.informational ?? new Set();
 	/** @type {Comparison[]} */
 	const comparisons = [];
 	const seen = new Set();
@@ -358,7 +370,7 @@ export function compareRun(rows, baseline, filter = null, options = {}) {
 		}
 		if (spreadAssumed(base)) assumedSpreads++;
 		const counters = countersEnabled ? compareCountersOne(row.result, base) : noCounters('skipped');
-		comparisons.push(compareOne(row.fullName, row.result, base, counters));
+		comparisons.push(compareOne(row.fullName, row.result, base, counters, informational.has(row.fullName)));
 	}
 
 	for (const fullName of Object.keys(baseline)) {
