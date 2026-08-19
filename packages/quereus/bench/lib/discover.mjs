@@ -43,6 +43,11 @@ export async function loadSuite(file) {
 		if (typeof bench?.name !== 'string' || bench.name.length === 0) {
 			throw new Error(`suite '${file}' contains a benchmark with no name`);
 		}
+		// Checked in the parent, where it costs one message, rather than in the worker,
+		// where a malformed suite spends a fork per benchmark to say the same thing.
+		if (typeof bench.fn !== 'function') {
+			throw new Error(`suite '${file}' benchmark '${bench.name}' has no 'fn' function`);
+		}
 		if (seen.has(bench.name)) {
 			throw new Error(`suite '${file}' declares benchmark '${bench.name}' more than once`);
 		}

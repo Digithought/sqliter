@@ -70,5 +70,5 @@ same ticket, since its only reason to exist was running its two halves in separa
 processes by hand. The two-point ladder technique it demonstrates - time the same query
 shape at two expression widths, report the slope so the fixed per-row cost cancels - is
 what this benchmark should reimplement inside the suite; read the deleted file out of git
-history (`git show HEAD~1:packages/quereus/bench/fusion-slope.mjs`, adjusting the revision)
-if the details are wanted.
+history - `git show 75800d3fb^:packages/quereus/bench/fusion-slope.mjs` (the commit that
+deleted it) - if the details are wanted.

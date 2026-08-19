@@ -214,9 +214,11 @@ export const benchmarks = [
 		// NOTE: an earlier revision of this comment claimed ~380 ms/iteration and ~4.5 s of
 		// the total run, and called this the most expensive entry in the suite. All of that
 		// was wrong. Under the per-benchmark process isolation the harness now enforces
-		// (Windows 11, node 24.2), three full runs put it at 68-91 ms/iteration — well under
-		// a second of a 23-42 s run — and in every one of them `temporal-arith-scan-10k`
-		// (85-118 ms) and `mutation/bulk-insert-10k` (121-173 ms) cost more.
+		// (Windows 11, node 24.2), four full runs put it at 67-91 ms/iteration — well under
+		// a second of a 23-42 s run — and in every one of them at least four other entries
+		// cost more, among them `temporal-arith-scan-10k` (85-118 ms), `mutation/bulk-
+		// insert-10k` (121-173 ms), `mutation/delete-where-100` and
+		// `mutation/single-row-insert-1k` (both ~100-120 ms).
 		//
 		// Do not read those figures as bounds. Runs taken while the machine was busy measured
 		// this same benchmark at 228-338 ms, so background load moves it several-fold; the

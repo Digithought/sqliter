@@ -40,24 +40,49 @@ const BENCH_TIMEOUT_MS = 120_000;
 /** Characters of a dead child's stderr quoted in the failure report. */
 const STDERR_TAIL_CHARS = 4000;
 
+const USAGE = 'usage: node bench/run.mjs [--filter <substring>] [--baseline <file>]';
+
+/** Caller error — a bad flag, an unreadable baseline, a filter that matches nothing.
+ * Reported as a single line: a stack trace through the harness diagnoses nothing the
+ * user can act on. */
+class UsageError extends Error {}
+
 // ── CLI args ────────────────────────────────────────────────────────────
+const VALUE_FLAGS = new Set(['--baseline', '--filter']);
+
 function parseArgs(argv) {
 	let baselinePath = null;
 	let filter = null;
 	for (let i = 0; i < argv.length; i++) {
-		const arg = argv[i];
-		if (arg === '--baseline' && argv[i + 1]) {
-			baselinePath = argv[++i];
-		} else if (arg === '--filter' && argv[i + 1]) {
-			filter = argv[++i];
-		} else {
-			throw new Error(`unrecognized argument '${arg}' (expected --baseline <file> or --filter <substring>)`);
+		const flag = argv[i];
+		if (!VALUE_FLAGS.has(flag)) {
+			throw new UsageError(`unrecognized argument '${flag}'\n${USAGE}`);
 		}
+		// Reported separately from the unknown-flag case: `--filter` with its value
+		// forgotten is a different mistake and deserves a different sentence.
+		const value = argv[++i];
+		if (!value) throw new UsageError(`'${flag}' needs a non-empty value\n${USAGE}`);
+		if (flag === '--baseline') baselinePath = value;
+		else filter = value;
 	}
 	return { baselinePath, filter };
 }
 
 // ── Run one benchmark in its own process ────────────────────────────────
+/** The worker currently being timed, or null between benchmarks. Tracked only so an
+ * interrupted parent can take it down with it — see the signal handlers below. */
+let activeChild = null;
+
+// A fork()ed child outlives its parent. Without this, one Ctrl+C mid-run orphans a
+// worker that holds a populated 10k-row database and keeps burning CPU until it
+// finishes on its own.
+for (const signal of ['SIGINT', 'SIGTERM']) {
+	process.on(signal, () => {
+		activeChild?.kill('SIGKILL');
+		process.exit(signal === 'SIGINT' ? 130 : 143);
+	});
+}
+
 /**
  * Fork `child.mjs` for a single benchmark and await its exit.
  *
@@ -72,6 +97,7 @@ function forkBenchmark(suiteFile, benchName) {
 		const child = fork(childPath, [suiteFile, benchName], {
 			stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
 		});
+		activeChild = child;
 
 		let result = null;
 		let failure = null;
@@ -93,6 +119,7 @@ function forkBenchmark(suiteFile, benchName) {
 		const settle = (code, signal) => {
 			if (settled) return;
 			settled = true;
+			activeChild = null;
 			clearTimeout(timer);
 			clearTimeout(reapTimer);
 			const stderr = Buffer.concat(stderrChunks).toString('utf8');
@@ -266,34 +293,53 @@ function checkRatioGuards(suites, allBenchmarks, selectedNames, filterActive) {
 	return failures;
 }
 
-// ── Get git commit hash ─────────────────────────────────────────────────
-function getCommitHash() {
+// ── Baseline ────────────────────────────────────────────────────────────
+/**
+ * Read a previous results file. Loaded BEFORE any benchmark runs: a typo in the path
+ * should cost a second, not a full run. An unreadable or shapeless baseline is a
+ * `UsageError` and not a warning — the user asked for a comparison, so completing
+ * without one and exiting 0 would report a gate that never ran as a gate that passed.
+ */
+async function loadBaseline(path) {
+	let data;
 	try {
-		return execSync('git rev-parse --short HEAD', { encoding: 'utf8' }).trim();
-	} catch {
-		return 'unknown';
+		data = JSON.parse(await readFile(path, 'utf8'));
+	} catch (err) {
+		throw new UsageError(`could not read baseline '${path}': ${err.message}`);
 	}
+	if (!data?.benchmarks || typeof data.benchmarks !== 'object') {
+		throw new UsageError(`baseline '${path}' has no 'benchmarks' object — not a bench results file`);
+	}
+	return data.benchmarks;
 }
 
-// ── Main ────────────────────────────────────────────────────────────────
-async function main() {
-	const { baselinePath, filter } = parseArgs(process.argv.slice(2));
+/** Benchmarks whose median rose more than 20% against the baseline. */
+function countRegressions(allBenchmarks, baseline) {
+	let regressions = 0;
+	for (const [name, result] of Object.entries(allBenchmarks)) {
+		if (!baseline[name]) continue;
+		const delta = ((result.median_ms - baseline[name].median_ms) / baseline[name].median_ms) * 100;
+		if (delta > 20) regressions++;
+	}
+	return regressions;
+}
 
-	console.log('Quereus Benchmark Suite');
-	console.log('=======================');
-
-	const suites = await loadSuites();
-	const allSelectable = selectBenchmarks(suites, null);
+// ── Selection and execution ─────────────────────────────────────────────
+/** Resolve `--filter` to the ordered work list, refusing a silent empty run. */
+function selectFor(suites, filter) {
 	const selected = selectBenchmarks(suites, filter);
-
 	if (selected.length === 0) {
-		// Never a silent empty run that reads as success.
-		throw new Error(`--filter '${filter}' matched no benchmarks (${allSelectable.length} available)`);
+		const available = selectBenchmarks(suites, null).length;
+		throw new UsageError(`--filter '${filter}' matched no benchmarks (${available} available)`);
 	}
 	if (filter) {
-		console.log(`\nFilter '${filter}' selected ${selected.length} of ${allSelectable.length} benchmarks`);
+		console.log(`\nFilter '${filter}' selected ${selected.length} of ${selectBenchmarks(suites, null).length} benchmarks`);
 	}
+	return selected;
+}
 
+/** Fork each selected benchmark in turn and collect its outcome. */
+async function runSelected(selected) {
 	const allBenchmarks = {};
 	const rows = [];
 	const failures = [];
@@ -309,8 +355,7 @@ async function main() {
 		// STRICTLY SEQUENTIAL, deliberately. Parallel children contend for CPU and
 		// would reintroduce a worse version of the cross-benchmark interference this
 		// whole file exists to remove. Do not "optimize" this into a worker pool.
-		const outcome = await forkBenchmark(bench.suiteFile, bench.name);
-		const classified = classify(bench.fullName, outcome);
+		const classified = classify(bench.fullName, await forkBenchmark(bench.suiteFile, bench.name));
 
 		// The result line is printed only after the child exits, so a benchmark that
 		// logs cannot interleave into the middle of it.
@@ -319,34 +364,28 @@ async function main() {
 			rows.push({ fullName: bench.fullName, result: classified.result, failure: null });
 			console.log(`  ${bench.name}... ${fmt(classified.result.median_ms)} (p95: ${fmt(classified.result.p95_ms)})`);
 		} else {
-			const failure = { fullName: bench.fullName, ...classified.failure };
-			failures.push(failure);
+			failures.push({ fullName: bench.fullName, ...classified.failure });
 			rows.push({ fullName: bench.fullName, result: null, failure: classified.failure });
-			console.log(`  ${bench.name}... \x1b[31mFAILED\x1b[0m — ${failure.detail}`);
+			console.log(`  ${bench.name}... \x1b[31mFAILED\x1b[0m — ${classified.failure.detail}`);
 		}
 	}
 
-	const wallClockMs = performance.now() - runStart;
+	return { allBenchmarks, rows, failures, wallClockMs: performance.now() - runStart };
+}
 
-	// Load baseline if requested
-	let baseline = null;
-	if (baselinePath) {
-		try {
-			const data = JSON.parse(await readFile(baselinePath, 'utf8'));
-			baseline = data.benchmarks;
-			console.log(`\nBaseline: ${baselinePath}`);
-		} catch (err) {
-			console.error(`Warning: could not load baseline: ${err.message}`);
-		}
+// ── Results file ────────────────────────────────────────────────────────
+function getCommitHash() {
+	try {
+		return execSync('git rev-parse --short HEAD', { encoding: 'utf8' }).trim();
+	} catch {
+		return 'unknown';
 	}
+}
 
-	printTable(rows, baseline);
-	console.log(`Total wall-clock: ${(wallClockMs / 1000).toFixed(1)} s across ${selected.length} isolated process(es)`);
-
-	// Write results JSON
+/** Write the timestamped results JSON and return its path. */
+async function writeResults({ allBenchmarks, failures, wallClockMs }) {
 	await mkdir(resultsDir, { recursive: true });
-	const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-	const outputPath = join(resultsDir, `${timestamp}.json`);
+	const outputPath = join(resultsDir, `${new Date().toISOString().replace(/[:.]/g, '-')}.json`);
 	const output = {
 		timestamp: new Date().toISOString(),
 		commit: getCommitHash(),
@@ -357,9 +396,43 @@ async function main() {
 		// entries, so a failed run can never be mistaken for a fast one.
 		failures: failures.map((f) => ({ name: f.fullName, kind: f.kind, detail: f.detail })),
 	};
-
 	await writeFile(outputPath, JSON.stringify(output, null, 2) + '\n');
-	console.log(`Results written to ${outputPath}`);
+	return outputPath;
+}
+
+/** Print every failed benchmark with whatever the child left behind to explain it. */
+function reportFailures(failures) {
+	if (failures.length === 0) return;
+	console.log(`\n\x1b[31m${failures.length} benchmark(s) failed:\x1b[0m`);
+	for (const failure of failures) {
+		console.log(`\x1b[31m  ${failure.fullName} — ${failure.detail}\x1b[0m`);
+		if (failure.stack) console.log(indent(failure.stack));
+		else if (failure.stderr) console.log(indent(failure.stderr.trimEnd()));
+	}
+}
+
+function indent(text) {
+	return text.split('\n').map((line) => `      ${line}`).join('\n');
+}
+
+// ── Main ────────────────────────────────────────────────────────────────
+async function main() {
+	const { baselinePath, filter } = parseArgs(process.argv.slice(2));
+
+	console.log('Quereus Benchmark Suite');
+	console.log('=======================');
+
+	const baseline = baselinePath ? await loadBaseline(baselinePath) : null;
+	if (baselinePath) console.log(`\nBaseline: ${baselinePath}`);
+
+	const suites = await loadSuites();
+	const selected = selectFor(suites, filter);
+
+	const { allBenchmarks, rows, failures, wallClockMs } = await runSelected(selected);
+
+	printTable(rows, baseline);
+	console.log(`Total wall-clock: ${(wallClockMs / 1000).toFixed(1)} s across ${selected.length} isolated process(es)`);
+	console.log(`Results written to ${await writeResults({ allBenchmarks, failures, wallClockMs })}`);
 
 	let exitCode = 0;
 
@@ -367,43 +440,23 @@ async function main() {
 	// a single run of a query that is 26× slower than its hand-written twin
 	// otherwise prints a fine-looking number and passes.
 	const selectedNames = new Set(selected.map((b) => b.fullName));
-	if (checkRatioGuards(suites, allBenchmarks, selectedNames, Boolean(filter)) > 0) {
-		exitCode = 1;
-	}
+	if (checkRatioGuards(suites, allBenchmarks, selectedNames, Boolean(filter)) > 0) exitCode = 1;
 
-	// Check for regressions
 	if (baseline) {
-		let regressions = 0;
-		for (const [name, result] of Object.entries(allBenchmarks)) {
-			if (baseline[name]) {
-				const delta = ((result.median_ms - baseline[name].median_ms) / baseline[name].median_ms) * 100;
-				if (delta > 20) regressions++;
-			}
-		}
+		const regressions = countRegressions(allBenchmarks, baseline);
 		if (regressions > 0) {
 			console.log(`\x1b[31m${regressions} benchmark(s) regressed >20%\x1b[0m`);
 			exitCode = 1;
 		}
 	}
 
-	if (failures.length > 0) {
-		console.log(`\n\x1b[31m${failures.length} benchmark(s) failed:\x1b[0m`);
-		for (const failure of failures) {
-			console.log(`\x1b[31m  ${failure.fullName} — ${failure.detail}\x1b[0m`);
-			if (failure.stack) console.log(indent(failure.stack));
-			else if (failure.stderr) console.log(indent(failure.stderr.trimEnd()));
-		}
-		exitCode = 1;
-	}
+	reportFailures(failures);
+	if (failures.length > 0) exitCode = 1;
 
 	process.exitCode = exitCode;
 }
 
-function indent(text) {
-	return text.split('\n').map((line) => `      ${line}`).join('\n');
-}
-
 main().catch((err) => {
-	console.error(err);
+	console.error(err instanceof UsageError ? `bench: ${err.message}` : err);
 	process.exit(1);
 });

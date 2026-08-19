@@ -29,6 +29,17 @@ const LINGER_GRACE_MS = 250;
 
 const [suiteFile, benchName] = process.argv.slice(2);
 
+/** Set just before the worker disconnects itself on the normal path, so the handler
+ * below can tell an orderly finish from the parent vanishing. */
+let finished = false;
+
+// A fork()ed child outlives its parent. If the parent is killed, nothing will ever read
+// this benchmark's result, but the worker would otherwise run to completion holding a
+// populated database. Losing the channel early is fatal by design.
+process.on('disconnect', () => {
+	if (!finished) process.exit(1);
+});
+
 /** IPC payloads must be structured-cloneable plain JSON — an Error's `message`
  * and `stack` are non-enumerable and would silently vanish. Serialize by hand. */
 function serializeError(err) {
@@ -115,6 +126,7 @@ async function main() {
 		return;
 	}
 
+	finished = true;
 	if (process.disconnect) process.disconnect();
 	setTimeout(() => process.exit(0), LINGER_GRACE_MS).unref();
 }
