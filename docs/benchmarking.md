@@ -41,6 +41,20 @@ and `.` replaced, so they sort lexicographically in chronological order; `--base
 relies on that rather than on file modification times, which a copy or a checkout can
 reorder.
 
+### Measuring one commit's cost
+
+To put a number on what a single commit cost, the "before" side must be that commit's
+**literal git parent** — `git rev-parse <commit>^` — not the last commit that happened to
+touch the same file. `git log -- <path>` skips every commit that did not touch that path,
+so using its previous entry as the baseline measures everything that landed in between as
+well. That mistake produced 50-80% "improvements" on `parser/` and `planner/` benchmarks
+while isolating a change to `emit/scan.ts`, which cannot affect either.
+
+Confirm the isolation before trusting the numbers: `git diff --stat <parent> <commit>`
+should show only the files the change touched. Then `yarn build` and `yarn bench` on each
+side, back to back in one sitting on one machine — `dist/` is what the suites import, and
+the noise floor only covers within-run noise (see below).
+
 ## Reading the table
 
 ```
