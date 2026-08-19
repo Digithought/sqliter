@@ -14,11 +14,52 @@ difficulty: hard
 ---
 
 <!-- resume-note -->
-## Progress (run interrupted by budget warning — no code changes made yet)
+## Progress (second run also budget-interrupted — Phase 1 code landed, compiles clean)
 
-A prior agent run completed all investigation and the pre-change bench baseline, then hit
-the soft token budget before editing any source file. The working tree has **zero source
-changes** — resume by implementing directly; no partial-state check needed.
+Run 1 completed all investigation + the bench baseline (below). Run 2 landed **Phase 1
+in full** and was then budget-stopped. Current tree state (coherent, no dangling refs):
+
+- **DONE — `src/runtime/work-counters.ts` (new, complete):** `PlanShape`,
+  `WorkCounterSnapshot`, `WorkCounterSlot`, `recordOutput(slot, value)` (counting
+  async-iterable wrapper with `COUNTED_ITERABLE_SYMBOL` marker whose value is the slot;
+  skip re-wrap only when same slot), `WorkCounterCollector` (constructor walks root
+  scheduler, paths `r` / `P/i/j`, keys `${path}#${i}`, `countersFor()`, `snapshot(plan)`
+  filtering `executions > 0` with by-value copies + totals), and `computePlanShape(root)`
+  (iterative visited-set walk over `getChildren()` — NOT `PlanNode.visit()`). All doc
+  comments + the emitCall-assumption NOTE written.
+- **DONE — `src/runtime/types.ts`:** `Instruction.nodeType?: PlanNodeType` and
+  `RuntimeContext.workCounters?: WorkCounterCollector` added with doc comments
+  (type-only imports; no runtime cycle: only scheduler→work-counters is a value import).
+- **NOT STARTED:** everything else — scheduler.ts wiring (Phase 2), emitters.ts stamp,
+  statement.ts surface (Phase 3), parallel-driver fork + fork-contract spec (Phase 4),
+  stability tests + strict-fork leg + bench comparison (Phase 5), docs (Phase 6), and
+  exporting `WorkCounterSnapshot`/`PlanShape` types from `src/index.ts` (add near the
+  existing runtime exports at index.ts:272-274).
+
+No build/test/lint has been run this session — run `yarn build` first thing to confirm
+the Phase-1 files compile (they were written against read source, diagnostics clean).
+
+Additional facts confirmed this run (trust these, skip re-verification):
+- tsconfig has `strict` but NOT `exactOptionalPropertyTypes` — optional-field assignment
+  from a `T | undefined` value is fine.
+- Metrics gate: `statement.ts:413` reads `runtime_metrics` option (registered at
+  `database.ts:294` as `runtime_stats` with alias `runtime_metrics`);
+  `db.setOption('runtime_metrics', true)` is the test idiom
+  (see test/prepared-statement-amortization.spec.ts:79).
+- `RunHooks.runInstruction` call sites to change: scheduler.ts:203 (runSyncLoop) and
+  :285 (runAsyncLoop); `metricsHooks()` built at :121, optimized/tracing hooks gain an
+  ignored `_index` first param.
+- Fork test sentinel goes in the "shared fields are aliased to parent" block
+  (fork-contract.spec.ts:199-228); policy table `EXPECTED_FORK_POLICY` at :34.
+- docs/runtime-parallel.md fork table rows are at lines 25-44; docs/runtime.md
+  "## Scheduler Execution Model" at :506, "### Scalar fusion" at :534 — new
+  work-counter section goes after the fusion subsection (before "### Key Points for
+  Emitter Authors" at :602).
+- `PlanNodeType` is a string enum (planner/nodes/plan-node-type.ts) — stable values,
+  assignable to `Record<string, number>` keys.
+- For the DML leg of the stability spec use a fixed-point UPDATE
+  (`update t set b = b + 0 where a <= 3`) so two executions of one prepared statement
+  count identically (an INSERT would change table size between runs).
 
 **Baseline bench (Phase 5 prerequisite) is DONE — do not redo it:**
 - Pre-change tree (clean at HEAD), `packages/quereus` built via `yarn build`, then

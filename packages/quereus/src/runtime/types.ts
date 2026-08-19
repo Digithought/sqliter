@@ -9,6 +9,8 @@ import type { PlanNode } from '../planner/nodes/plan-node.js';
 import type { RowContextMap } from './context-helpers.js';
 import type { CacheState } from './cache/shared-cache.js';
 import type { BTree } from 'inheritree';
+import type { PlanNodeType } from '../planner/nodes/plan-node-type.js';
+import type { WorkCounterCollector } from './work-counters.js';
 
 // Re-export types from common/types.js for convenience
 export type { OutputValue };
@@ -138,6 +140,15 @@ export type RuntimeContext = {
 	 * false). Mirrors {@link executionMemo} / {@link cacheStates}.
 	 */
 	inSetProbes?: Map<symbol, { tree: BTree<SqlValue, SqlValue>; hasNull: boolean }>;
+	/**
+	 * Per-execution work-counter collector; present only when `enableMetrics` is on
+	 * AND the execution site built one (`Statement._iterateRowsRawInternal`). The
+	 * transient metrics-enabled contexts (database.ts exec path, deferred-constraint
+	 * queue, assertions) leave it undefined and keep today's behavior. Fork policy
+	 * `shared-sink`: forks share the collector by reference so branch counts roll up
+	 * into the parent snapshot with no merge step (see parallel-driver.ts).
+	 */
+	workCounters?: WorkCounterCollector;
 };
 
 export type InstructionRun = (ctx: RuntimeContext, ...args: RuntimeValue[]) => OutputValue;
@@ -151,6 +162,14 @@ export type Instruction = {
 	programs?: Scheduler[];
 	/** Optional runtime statistics collected during execution */
 	runtimeStats?: InstructionRuntimeStats;
+	/**
+	 * PlanNodeType of the plan node this instruction was emitted from; stamped
+	 * centrally in `emitPlanNode`. Undefined for synthetic instructions (emitCall
+	 * callbacks, fused scalars). Labels work-counter snapshot entries
+	 * (runtime/work-counters.ts) — values are stable strings, safe in a
+	 * machine-independent surface where a plan-node id is not.
+	 */
+	nodeType?: PlanNodeType;
 };
 
 /**
