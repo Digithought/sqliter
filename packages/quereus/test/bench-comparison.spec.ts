@@ -23,6 +23,7 @@ import {
 	describeEnvironment,
 } from '../bench/lib/environment.mjs';
 import {
+	COUNTER_STATUS_ORDER,
 	STATUS_ORDER,
 	compareRun,
 	diffCounters,
@@ -199,6 +200,19 @@ describe('bench/lib/compare.mjs', () => {
 			expect(flat['lastBatch.totals.rowsOut']).to.equal(10);
 		});
 
+		it('records nothing for a shape with no path to address — a bare primitive, or an empty instruction list', () => {
+			expect(flattenCounters(5)).to.deep.equal({});
+			expect(flattenCounters({ instructions: [] })).to.deep.equal({});
+		});
+
+		it('records a malformed non-primitive leaf by its string form, so it shows up as a difference instead of comparing equal', () => {
+			// Every counter block has been through JSON, so this is unreachable by
+			// construction; the point is that it surfaces rather than vanishing.
+			const flat = flattenCounters({ totals: { rowsOut: () => 1 } });
+			expect(flat['totals.rowsOut']).to.be.a('string');
+			expect(diffCounters({ totals: { rowsOut: 10 } }, { totals: { rowsOut: () => 1 } })).to.have.lengthOf(1);
+		});
+
 		it('skips an undefined field rather than recording it, so a value compares equal to itself after a JSON round-trip', () => {
 			const withUndefined = counterBlock({ instructions: [{ key: 'r#0', nodeType: undefined, executions: 1, in: 0, out: 1 }] });
 			const flat = flattenCounters(withUndefined);
@@ -225,6 +239,11 @@ describe('bench/lib/compare.mjs', () => {
 
 		it('reports no changes for two identical blocks', () => {
 			expect(diffCounters(counterBlock(), counterBlock())).to.deep.equal([]);
+		});
+
+		it('treats a path whose value is literally null as absent, not as a difference', () => {
+			expect(diffCounters({ a: null }, {})).to.deep.equal([]);
+			expect(diffCounters({}, { a: null })).to.deep.equal([]);
 		});
 	});
 
@@ -433,6 +452,32 @@ describe('bench/lib/compare.mjs', () => {
 				expect(verdict.status).to.equal('no-change');
 				expect(verdict.gated).to.equal(false);
 				expect(comparison.regressions).to.equal(0);
+			});
+
+			describe('the counter summary', () => {
+				const comparison = compareRun(
+					[rowWithCounters('a/same', 10, c1), rowWithCounters('a/changed', 10, c2), rowWithCounters('a/firstcount', 10, c1), rowWithCounters('a/fresh', 10, c1), row('a/lost', 10), row('a/never', 10)],
+					{ 'a/same': entryWithCounters(10, c1), 'a/changed': entryWithCounters(10, c1), 'a/firstcount': entry(10), 'a/lost': entryWithCounters(10, c1), 'a/never': entry(10), 'a/gone': entryWithCounters(10, c1) },
+				);
+
+				it('counts every counter status, including the ones that are zero', () => {
+					expect(Object.keys(comparison.counterCounts)).to.deep.equal(COUNTER_STATUS_ORDER);
+					expect(comparison.counterCounts).to.deep.equal({
+						// `a/fresh` is new to the baseline, and `a/gone` is missing from this run:
+						// neither is comparable at all, so both land in `none` alongside `a/never`.
+						same: 1, changed: 1, new: 1, dropped: 1, none: 3, skipped: 0,
+					});
+				});
+
+				it('counts as many rows as it classified, so no benchmark is missing a counter verdict', () => {
+					const total = COUNTER_STATUS_ORDER.reduce((sum, s) => sum + comparison.counterCounts[s], 0);
+					expect(total).to.equal(comparison.comparisons.length);
+				});
+
+				it('reports counterChanges as the changed count, and still gates on nothing', () => {
+					expect(comparison.counterChanges).to.equal(comparison.counterCounts.changed);
+					expect(comparison.regressions).to.equal(0);
+				});
 			});
 		});
 	});

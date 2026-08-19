@@ -226,21 +226,16 @@ no minimum delta**: a difference of one is reported, and every difference is lis
 
 ### Adding a `counters()` pass
 
-A benchmark opts in with a second, untimed entry point, alongside `fn`:
+A benchmark opts in with a second, untimed entry point, alongside `fn` in the object shown
+under *Adding a benchmark* below:
 
 ```js
-{
-	name: 'my-shape-10k',
-	async setup() { db = await createPopulatedDb(); },
-	async teardown() { await db.close(); db = null; },
-	async fn() {
-		const rows = await collect(db.eval('select ...'));
-		if (rows.length !== 10000) throw new Error(`Expected 10000 rows, got ${rows.length}`);
-	},
-	async counters() {
-		return snapshotStatement(db, 'select ...');
-	},
-}
+import { snapshotStatement } from '../lib/counters.mjs';
+
+// … then one more member alongside `fn`, in the same benchmark object:
+async counters() {
+	return snapshotStatement(db, 'select ...');
+},
 ```
 
 `counters()` runs **once, after the timed loop and before `teardown`** — never inside `fn`.
@@ -273,17 +268,25 @@ per-suite switch:
 losing the counter columns. The results file can end up with no counters for two different
 reasons, and one field tells them apart: `counters_collected` is `false` only when the run
 itself was invoked with `--no-counters`; a benchmark that simply declares no `counters()` pass
-leaves `counters_collected: true` and is absent only on its own entries. Comparing against a
-`--no-counters` run reports every benchmark's counter status as `skipped` rather than
-`dropped` — a timings-only run must not read as the whole baseline's counters disappearing.
+leaves `counters_collected: true` and is absent only on its own entries.
+
+The flag is read off **this** run, never off the baseline. A run invoked with
+`--no-counters` reports every benchmark's counter status as `skipped` rather than
+`dropped` — a timings-only run must not read as the whole baseline's counters
+disappearing. The other direction is a different verdict: a counter-collecting run
+compared against a `--no-counters` *baseline* reports `new` per benchmark, because there
+is nothing on the baseline side to have changed from.
 
 ### Reading the output
 
 When counter data is available, the table gains a `Counters` column: `same`, `N diff`,
-`new`, `dropped`, or `—` when neither side collected any. A `changed` or `dropped` benchmark
-is followed by a block listing every differing path, `before -> after` — capped at
-`COUNTER_CHANGES_SHOWN` (12) lines per benchmark in the printed output; the full,
-uncapped list is always in the results JSON under that benchmark's `comparison` entry.
+`new`, `dropped`, `skipped`, or `—` when neither side collected any.
+
+Below the table, each `changed` benchmark gets a block listing every differing path as
+`before -> after` — capped at `COUNTER_CHANGES_SHOWN` (12) lines per benchmark in the
+printed output, with the full uncapped list always in the results JSON under `comparison`.
+A `dropped` benchmark gets one line saying the baseline reported counters and this run did
+not, and no path list: there is nothing to list against a run that collected none.
 
 ## Ratio guards
 
@@ -362,6 +365,9 @@ Requirements:
 - Prefer a shape with a plausible slow counterpart, and give it a `ratioGuards` entry. A
   guard that fires from a single run is worth more than a delta that needs a baseline file
   from the same machine.
+- **Add a `counters()` pass if the benchmark runs a statement.** It is a second, untimed
+  entry point alongside `fn`, and it is what makes a plan change visible without a
+  same-machine baseline. See *Work counters* above for the shape and the helpers.
 - **Drain the result fully if you read work counters from it.** `Statement.getWorkCounters()`
   reports what the execution actually did, so a benchmark that stops early — a `LIMIT`, a
   `break` out of the loop, an abort — leaves a partial `rowsScanned` whose value depends on
