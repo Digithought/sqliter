@@ -19,6 +19,22 @@
  *
  * NOT part of the bench suite. Run: node bench/apply-schema-unchanged.mjs [colsPerTable]
  * (requires a built dist/)
+ *
+ * NOTE: it stays ad hoc DELIBERATELY — decided, not pending. Folding it into
+ * `bench/suites/` was considered and declined: this file is not an end-to-end benchmark
+ * but a DECOMPOSITION. It times a no-op `apply schema` broken into the internal functions
+ * the applied-state fast path removed (`computeSchemaDiff`, `generateMigrationPlan`),
+ * added (`renderCatalogForComparison` plus an exact string compare) and still pays
+ * (`collectSchemaCatalog`), and it deliberately poisons the applied-state snapshot between
+ * runs so the pre-fast-path shape is measured warm and in-process. The bench framework
+ * times exactly one `fn` per benchmark and cannot express that: forcing it in would keep
+ * one number and lose the five that make it useful. Its figures are quoted in
+ * `docs/schema.md` as a one-off measurement, not as a tracked series.
+ *
+ * Giving the fast path a STANDING, ratio-guarded benchmark is a different and larger
+ * piece of work — a fast-pathed apply against a forced full-diff apply, guarded by their
+ * ratio — and is parked as `feat-bench-apply-schema-fastpath-guard` in the backlog. It
+ * would live alongside this file rather than replace it.
  */
 import { Database } from '../dist/src/core/database.js';
 import { collectSchemaCatalog } from '../dist/src/schema/catalog.js';
