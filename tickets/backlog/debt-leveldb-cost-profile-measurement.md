@@ -45,8 +45,11 @@ to run in.
 
 ## Cross-reference
 
-`bench-store-suite` (plan/) builds a standing store-backend benchmark suite whose
-sequential-versus-random-read micro-benchmarks are the measurement this ticket asks for.
-If that suite produces the two ratios at both a cache-warm and a cache-cold dataset size,
-this ticket reduces to reading them and deciding whether to declare a profile on
-`LevelDBProvider` or record the parity finding in the plugin README.
+`bench-store-leveldb` (implement/) adds the opt-in LevelDB arm of the store benchmark
+suite, and its explicit job is to produce exactly the two ratios this ticket asks for, at
+both a cache-resident and a non-resident dataset size, through the batched read path the
+index resolver actually uses. Once it lands, this ticket reduces to reading those numbers
+and deciding whether to declare a profile on `LevelDBProvider` or record the parity
+finding in the plugin README. (The suite is built across `bench-backend-dimension` ->
+`bench-store-workloads` -> `bench-store-micro` -> `bench-store-leveldb`, which together
+replace the earlier single `bench-store-suite` plan ticket.)

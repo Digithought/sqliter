@@ -68,3 +68,25 @@ Still open here: `test/unique-constraints.spec.ts` holds a third counting-double
 its own (a `CountingKVStore` that counts only iteration, plus a `createCountingProvider`
 exposing a `dataEntriesScanned(table)` method instead of a map). Folding it onto the shared
 pair is a natural companion to this ticket's sweep.
+
+
+## Arm added while planning `bench-store-suite`
+
+The shared plain provider this ticket asks for is now being created as part of the
+benchmark work: `bench-store-workloads` (implement/) adds `createInMemoryProvider(options?)`
+to `packages/quereus-store/src/testing/`, exported from `@quereus/store/testing`, because
+the store benchmark backend needs one and writing a twenty-first local copy inside `bench/`
+would be the wrong move.
+
+It is specified to match the two conventions the `store-counting-double-extraction` review
+settled (store names from the shared builders; one unified `__stats__` store) plus the
+only-when-present `costProfile` option this ticket already called for, and additionally to
+implement `deleteIndexStore` / `deleteTableStores` with real erase semantics - the counting
+sibling deliberately does not, and the benchmark suite's index-build workload drops and
+recreates an index on every iteration.
+
+**What remains for this ticket after that lands is the sweep itself**: pointing the twenty-odd
+local `createInMemoryProvider` copies at the shared one, reconciling their variations, and
+folding in `test/unique-constraints.spec.ts`'s third counting shape. The sweep was deliberately
+kept out of the benchmark ticket, which would otherwise have become a merge-conflict magnet
+across the whole store test suite.

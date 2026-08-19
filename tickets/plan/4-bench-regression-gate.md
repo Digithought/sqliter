@@ -1,6 +1,6 @@
 ---
 description: Even with good benchmarks, nothing compares today's numbers against yesterday's unless a person remembers to do it by hand; add a checked-in reference set and a single command that fails when performance gets worse.
-prereq: bench-store-suite
+prereq: bench-store-micro
 files:
   - packages/quereus/bench/run.mjs                  # --baseline compare and the >20% exit-1 rule live here today
   - packages/quereus/bench/results/                 # timestamped output, currently gitignored
