@@ -23,6 +23,14 @@
  * `renameTableStores` is deliberately NOT implemented; `StoreModule` falls back to a generic
  * copy for a provider without it (`test/rename-store-copy-fallback.spec.ts`), and nothing
  * that needs this provider today renames.
+ *
+ * Neither is `beginAtomicBatch`, and that one is not a gap to fill later: separate
+ * `InMemoryKVStore`s share no commit domain, so there is nothing for a cross-store batch to
+ * make atomic. The consequence is worth knowing before reading numbers off this provider —
+ * `StoreModuleBase` sets `atomicProvider` from that method's presence and commits per store
+ * here, where a LevelDB-family provider commits in one physical write. A benchmark putting
+ * this provider next to LevelDB is comparing two commit PATHS, not one path over two
+ * backends.
  */
 
 import type { KVStoreProvider } from '../common/kv-store.js';
@@ -47,6 +55,12 @@ export interface InMemoryProviderOptions {
 export function createInMemoryProvider(options?: InMemoryProviderOptions): KVStoreProvider {
 	const stores = new Map<string, InMemoryKVStore>();
 
+	// NOTE: a cached store the CALLER closed directly is handed back closed, so the next op
+	// on it throws `InMemoryKVStore is closed` rather than re-opening — unlike a real backend,
+	// which re-opens the name with its bytes intact. No StoreModule path does that today
+	// (`StoreTableBase.releaseIndexStore` is the only close, and its caller always deletes the
+	// store right after, which drops the entry). If a spec or benchmark ever closes a handle
+	// and keeps using the name, treat a closed cached store as absent here.
 	const getOrCreate = (key: string): InMemoryKVStore => {
 		let store = stores.get(key);
 		if (!store) {
@@ -72,6 +86,13 @@ export function createInMemoryProvider(options?: InMemoryProviderOptions): KVSto
 	 *
 	 * A store that was never created (key absent from the map) is a no-op, matching the
 	 * interface's speculative-delete contract.
+	 *
+	 * NOTE: the live handle is cleared, not closed, so a caller still holding it can go on
+	 * PUTting into a store the provider has forgotten — those writes land nowhere anyone can
+	 * read, silently. A real backend's handle is dead after its store is dropped. Closing here
+	 * instead would trade the silence for a throw, but would also break the contract line
+	 * above (a live handle must read back EMPTY, not throw); revisit if a spec is ever found
+	 * writing through a post-delete handle.
 	 */
 	const erase = async (key: string): Promise<void> => {
 		const store = stores.get(key);

@@ -415,8 +415,9 @@ it over one suppresses that batch. See the class doc comment before reusing it f
 
 **A plain in-memory provider, for specs that need a real backend with no counting attached.**
 `createInMemoryProvider(options?)` builds an all-`InMemoryKVStore` `KVStoreProvider` — the
-one shared implementation most specs in this package (and its benchmark suite) reach for
-instead of pasting a private copy. Unlike `createCountingProvider`, it implements
+one shared implementation to reach for instead of pasting yet another private copy. (The
+twenty-odd copies already living in this package's specs have not been swept onto it yet;
+that sweep is its own backlog item.) Unlike `createCountingProvider`, it implements
 `deleteIndexStore` and `deleteTableStores`, and both actually ERASE the named store (a live
 handle still open on it sees the erase too), so a spec exercising `drop index` / `drop table`
 reclaim can use it directly:
@@ -430,7 +431,11 @@ db.registerModule('store', new StoreModule(provider));
 ```
 
 `renameTableStores` is not implemented; `StoreModule` falls back to its generic copy for a
-provider without it.
+provider without it. Neither is `beginAtomicBatch` — separate `InMemoryKVStore`s share no
+commit domain, so there is nothing to make atomic. That means `StoreModuleBase` takes its
+per-store commit path here, not the single-physical-write path a LevelDB-family provider
+gets; a benchmark comparing this provider against LevelDB is comparing two commit paths,
+not one path over two backends.
 
 ## KVStore Interface
 

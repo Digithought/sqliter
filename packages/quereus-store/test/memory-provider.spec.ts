@@ -29,6 +29,45 @@ function lifecycle(): KVProviderLifecycle {
 runStoreNameDistinctness('createInMemoryProvider store names', lifecycle);
 runStoreReclaimConformance('createInMemoryProvider store reclaim', lifecycle);
 
+describe('createInMemoryProvider store identity', () => {
+	it('hands back one handle per built store name', async () => {
+		const provider = createInMemoryProvider();
+		expect(await provider.getStore('main', 't')).to.equal(await provider.getStore('main', 't'));
+		expect(await provider.getIndexStore('main', 't', 'x'))
+			.to.equal(await provider.getIndexStore('main', 't', 'x'));
+	});
+
+	it('returns ONE unified stats store whatever schema/table it is asked for', async () => {
+		// The interface documents both arguments as ignored; the per-table
+		// `schema.table.__stats__` spelling most local copies use is the accidental variant.
+		const provider = createInMemoryProvider();
+		const forT = await provider.getStatsStore('main', 't');
+		expect(await provider.getStatsStore('main', 'u')).to.equal(forT);
+		expect(await provider.getStatsStore('other', 't')).to.equal(forT);
+	});
+
+	it('closes every handed-out store on closeAll, and re-opens the name fresh after', async () => {
+		const provider = createInMemoryProvider();
+		const data = await provider.getStore('main', 't');
+		await data.put(Uint8Array.of(0x01), Uint8Array.of(0x10));
+		await provider.closeAll();
+
+		// A closed InMemoryKVStore rejects every operation — that is how closeAll is observable.
+		let closedError: unknown;
+		try {
+			await data.get(Uint8Array.of(0x01));
+		} catch (err) {
+			closedError = err;
+		}
+		expect(closedError).to.be.an('error');
+		expect((closedError as Error).message).to.match(/closed/);
+
+		const reopened = await provider.getStore('main', 't');
+		expect(reopened).to.not.equal(data);
+		expect(await reopened.get(Uint8Array.of(0x01))).to.equal(undefined);
+	});
+});
+
 describe('createInMemoryProvider costProfile shape', () => {
 	it('has no costProfile property when called with no arguments', () => {
 		const provider = createInMemoryProvider();
