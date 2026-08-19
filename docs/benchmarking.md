@@ -300,6 +300,11 @@ A benchmark may declare a `skip()` alongside `fn`. It returns a **reason** to de
 }
 ```
 
+Nothing in the repo hand-writes one. The only `skip()` that exists today is the one
+`expandBackends` attaches from a backend's `skipWorkload` — see
+[Storage backends](#storage-backends-and-what-a-name-means) — which is how the `store-mem`
+rows decline when `@quereus/store` will not load.
+
 It is evaluated in the **worker**, before `setup`, in its own phase — because the reason a
 benchmark declines is usually a runtime fact (a module that will not load, a missing
 binary, an environment variable), and the parent imports suites for their metadata only. A

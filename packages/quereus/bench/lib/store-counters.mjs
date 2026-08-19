@@ -80,23 +80,35 @@ function loadStoreModules() {
 				import('@quereus/store'),
 				import('@quereus/store/testing'),
 			]);
-			return {
+			const resolved = {
 				createIsolatedStoreModule: store.createIsolatedStoreModule,
 				createInMemoryProvider: testing.createInMemoryProvider,
 				createCountingProvider: testing.createCountingProvider,
 			};
+			// A package that imports but no longer exports one of these is the same
+			// answer to the same question as one that does not import at all: this
+			// checkout cannot run the store rows. Checked here so it reaches
+			// `storeLoadFailure` and becomes a stated skip reason, rather than surfacing
+			// as `createIsolatedStoreModule is not a function` inside `setup` — which
+			// fails the row and says nothing about which export moved.
+			const missing = Object.entries(resolved).filter(([, fn]) => typeof fn !== 'function').map(([name]) => name);
+			if (missing.length > 0) {
+				throw new Error(`@quereus/store loaded but does not export ${missing.join(', ')} as a function`);
+			}
+			return resolved;
 		})();
 	}
 	return storeModulesPromise;
 }
 
 /**
- * Why `@quereus/store` cannot be loaded here, or `null` if it can.
+ * Why `@quereus/store` cannot be used here, or `null` if it can.
  *
  * Exists so the backend can DECLINE with a stated reason (`bench/lib/backends.mjs`'s
  * `skipWorkload`) instead of failing every store row with the same stack trace. The
  * overwhelmingly likely cause is a stale or absent `packages/quereus-store/dist` —
- * `yarn build` builds it, in dependency order, along with everything else.
+ * `yarn build` builds it, in dependency order, along with everything else — and the
+ * other is an export this file names that the package no longer has.
  *
  * @returns {Promise<string|null>}
  */
@@ -105,7 +117,7 @@ export async function storeLoadFailure() {
 		await loadStoreModules();
 		return null;
 	} catch (err) {
-		return `@quereus/store did not load (is packages/quereus-store/dist built? try 'yarn build'): ${err instanceof Error ? err.message : String(err)}`;
+		return `@quereus/store is not usable here (is packages/quereus-store/dist built? try 'yarn build'): ${err instanceof Error ? err.message : String(err)}`;
 	}
 }
 
@@ -129,10 +141,15 @@ function attach(module) {
 	return {
 		db,
 		// The module close is NOT optional: a leaked store module trips the worker's
-		// leaked-handle exit path, which presents as a hang rather than as an error.
+		// leaked-handle exit path, which presents as a hang rather than as an error. So
+		// `closeAll` runs in a `finally` — a `db.close()` that throws would otherwise
+		// turn one reportable error into that hang.
 		async close() {
-			await db.close();
-			await module.closeAll();
+			try {
+				await db.close();
+			} finally {
+				await module.closeAll();
+			}
 		},
 	};
 }
@@ -169,13 +186,24 @@ export async function openCountingStoreDatabase() {
 	// `'all'` rather than the default `'data'`: an index scan's traffic is the single most
 	// interesting thing here, and it lands on the index store, not the data store.
 	const handle = attach(createIsolatedStoreModule({ provider: createCountingProvider(counted, 'all') }));
+	let closed = false;
 	return {
 		...handle,
+		async close() {
+			closed = true;
+			await handle.close();
+		},
 		resetCounters() {
 			for (const store of counted.values()) store.reset();
 		},
-		// Read BEFORE `close()`: the provider's `closeAll` clears the map.
+		// Read BEFORE `close()`: the provider's `closeAll` CLEARS the counted map, so a
+		// read afterwards would hand back an empty block — nineteen counts silently
+		// becoming zero counts, which the comparison would then report as every store
+		// path vanishing. Refused rather than tolerated.
 		readCounters() {
+			if (closed) {
+				throw new Error('readCounters() after close(): the provider clears its counted stores on close, so the counts are gone — read them before closing');
+			}
 			return readStoreCounters(counted);
 		},
 	};

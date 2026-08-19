@@ -101,7 +101,20 @@ async function mutationCounters(workload, backend, shared) {
 	const counting = await backend.openCounting();
 	try {
 		if (workload.populate) await workload.populate(counting.db);
-		const engine = await workload.counters(counting.db, { beginMeasured: () => counting.resetCounters() });
+		// Tracked, not merely offered: a body that never calls it reports a store block
+		// describing its own fixture, which is a wrong number that looks exactly like a
+		// right one and would poison every baseline diff after it. There is no sensible
+		// default boundary to fall back to, so the pass fails and names the workload.
+		let measuredBegun = false;
+		const engine = await workload.counters(counting.db, {
+			beginMeasured() {
+				measuredBegun = true;
+				counting.resetCounters();
+			},
+		});
+		if (!measuredBegun) {
+			throw new Error(`mutation workload '${workload.name}' never called ctx.beginMeasured() in its counters() pass, so its storage counters would describe its fixture as well as its subject — call it at the boundary (first, if the pass has no fixture of its own)`);
+		}
 		return { engine, store: counting.readCounters() };
 	} finally {
 		await counting.close();
