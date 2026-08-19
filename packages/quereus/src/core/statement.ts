@@ -9,6 +9,7 @@ import type { BlockNode } from '../planner/nodes/block.js';
 import { emitPlanNode } from '../runtime/emitters.js';
 import { Scheduler } from '../runtime/scheduler.js';
 import type { InstructionTracer, RuntimeContext } from '../runtime/types.js';
+import { WorkCounterCollector, computePlanShape, type PlanShape, type WorkCounterSnapshot } from '../runtime/work-counters.js';
 import { createStrictRowContextMap, wrapTableContextsStrict } from '../runtime/strict-fork.js';
 import { REPR_STRICT } from '../runtime/strict-flags.js';
 import { assertRowConforms, type DeclaredType } from '../runtime/strict-representation.js';
@@ -60,6 +61,14 @@ export class Statement {
 	 * at every invalidation site, and rebuilt lazily in `_iterateRowsRawInternal`.
 	 */
 	private scheduler: Scheduler | null = null;
+	/**
+	 * Work-counter state from the most recent metrics-enabled execution, or null
+	 * when the last execution did not collect. The plan shape is captured AT
+	 * EXECUTION time (not lazily in getWorkCounters) so a schema-invalidation
+	 * recompile between the execution and the read cannot pair a new plan's shape
+	 * with the old execution's counters.
+	 */
+	private workCounters: { collector: WorkCounterCollector; planShape: PlanShape } | null = null;
 	private needsCompile = true;
 	private columnDefCache = new Cached<DeepReadonly<ColumnDef>[]>(() => this.getColumnDefs());
 	private schemaChangeUnsubscriber: (() => void) | null = null;
@@ -412,6 +421,12 @@ export class Statement {
 			const tracer = runtimeOverrides?.tracer ?? this.db.getInstructionTracer();
 			const enableMetrics = runtimeOverrides?.enableMetrics ?? Boolean(this.db.getOption('runtime_metrics'));
 			const signal = runtimeOverrides?.signal;
+			// One collector per execution (concurrent iterations are refused by `busy`
+			// above, so replacing the previous execution's collector is unambiguous).
+			const collector = enableMetrics ? new WorkCounterCollector(scheduler) : undefined;
+			this.workCounters = collector
+				? { collector, planShape: computePlanShape(blockPlanNode) }
+				: null;
 			runtimeCtx = {
 				db: this.db,
 				stmt: this,
@@ -423,6 +438,7 @@ export class Statement {
 				signal,
 				scanConnections,
 				readCommitted: runtimeOverrides?.readCommitted,
+				workCounters: collector,
 			};
 
 			// Validate captured schema objects once per execution — hoisted out of every
@@ -632,6 +648,36 @@ export class Statement {
 	}
 
 	/**
+	 * Machine-independent work counters from the most recent execution, or
+	 * `undefined` when that execution did not collect (metrics off — the
+	 * `runtime_stats`/`runtime_metrics` database option gates collection; no
+	 * separate switch).
+	 *
+	 * The snapshot is a fresh by-value copy — a caller holding an earlier one
+	 * never watches it mutate. Counts are only COMPLETE once the row iterable has
+	 * been fully drained: breaking out of a `for await` yields a partial count
+	 * that will read as a regression if compared against a drained run. An
+	 * execution that threw likewise leaves the counts recorded up to the throw —
+	 * partial, but diagnostic.
+	 */
+	getWorkCounters(): WorkCounterSnapshot | undefined {
+		return this.workCounters
+			? this.workCounters.collector.snapshot(this.workCounters.planShape)
+			: undefined;
+	}
+
+	/**
+	 * Plan-shape facts (node count and per-PlanNodeType tallies) for the current
+	 * statement. Available after compile — no execution needed, so a harness that
+	 * only ever prepares statements (e.g. the planner benchmark suite) can still
+	 * report these.
+	 */
+	getPlanShape(): PlanShape {
+		this.validateStatement("get plan shape for");
+		return computePlanShape(this.compile());
+	}
+
+	/**
 	 * Resets the prepared statement to its initial state, ready to be re-executed.
 	 */
 	async reset(): Promise<void> {
@@ -666,6 +712,7 @@ export class Statement {
 		this.plan = null;
 		this.emissionContext = null;
 		this.scheduler = null;
+		this.workCounters = null;
 		this.columnDefCache.clear();
 		this.astBatchIndex = -1;
 

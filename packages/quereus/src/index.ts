@@ -272,6 +272,8 @@ export type { CompiledPredicate } from './vtab/memory/utils/predicate.js';
 export { isAsyncIterable, getAsyncIterator, asyncIterableToArray } from './runtime/utils.js';
 export { CollectingInstructionTracer } from './runtime/types.js';
 export type { InstructionTracer, InstructionTraceEvent } from './runtime/types.js';
+// Machine-independent work counters (Statement.getWorkCounters / getPlanShape)
+export type { WorkCounterSnapshot, PlanShape } from './runtime/work-counters.js';
 
 // Function registration utilities
 export {

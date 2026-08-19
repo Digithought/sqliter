@@ -95,6 +95,11 @@ export class ParallelDriver {
 	 *   sibling branch re-driving the same IN site within the same execution. Same
 	 *   lazy-creation caveat as `executionMemo`. Dormant today: ParallelDriver has no
 	 *   query consumers.)
+	 *   (`workCounters` is the per-execution work-counter collector; shared by
+	 *   reference — a write-only sink like `tracer` — so counts incremented inside a
+	 *   forked branch roll up into the parent's snapshot with no merge step. It is a
+	 *   plain object field, not one of the two strict-fork-wrapped maps, so
+	 *   incrementing it from a fork never trips the strict-fork parent-mutation guard.)
 	 *
 	 * The parent is treated as immutable for the lifetime of the forks.
 	 */
@@ -140,6 +145,7 @@ export class ParallelDriver {
 				cacheStates: rctx.cacheStates,
 				cteMaterializations: rctx.cteMaterializations,
 				inSetProbes: rctx.inSetProbes,
+				workCounters: rctx.workCounters,
 			};
 			if (strict) {
 				markForkOf(childTableContexts, rctx.tableContexts);

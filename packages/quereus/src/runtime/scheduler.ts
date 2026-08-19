@@ -4,6 +4,7 @@ import { isAsyncIterable } from "./utils.js";
 import { hrtimeNs } from "../util/hrtime.js";
 import { createLogger } from "../common/logger.js";
 import { DefaultContextTracker } from './types.js';
+import { recordOutput, type WorkCounterSlot } from './work-counters.js';
 
 const log = createLogger('runtime:metrics');
 const contextLog = createLogger('runtime:context');
@@ -59,8 +60,12 @@ interface RunHooks {
 	onComplete?(): void;
 	/** Runs before each instruction, with its resolved args (tracing: trace input). */
 	onInput?(index: number, instruction: Instruction, args: RuntimeValue[]): void;
-	/** Runs the instruction. Metrics wraps timing/counting around the call here. */
-	runInstruction(instruction: Instruction, ctx: RuntimeContext, args: RuntimeValue[]): OutputValue;
+	/**
+	 * Runs the instruction. Metrics wraps timing/counting around the call here;
+	 * `index` lets it address the instruction's work-counter slot (optimized and
+	 * tracing modes ignore it).
+	 */
+	runInstruction(index: number, instruction: Instruction, ctx: RuntimeContext, args: RuntimeValue[]): OutputValue;
 	/**
 	 * Post-processes a non-promise output in the synchronous entry loop (tracing:
 	 * wrap async iterables + trace); returns the value to park. Only ever called
@@ -118,7 +123,7 @@ export class Scheduler {
 		let result: OutputValue;
 
 		if (ctx.enableMetrics) {
-			result = this.runSyncLoop(ctx, this.metricsHooks());
+			result = this.runSyncLoop(ctx, this.metricsHooks(ctx));
 		} else if (!ctx.tracer) {
 			result = this.runSyncLoop(ctx, this.optimizedHooks());
 		} else {
@@ -200,7 +205,7 @@ export class Scheduler {
 			hooks.onInput?.(i, instruction, args as RuntimeValue[]);
 
 			try {
-				output = hooks.runInstruction(instruction, ctx, args as RuntimeValue[]);
+				output = hooks.runInstruction(i, instruction, ctx, args as RuntimeValue[]);
 
 				// If the instruction returned a promise, switch to async mode for the rest.
 				if (output instanceof Promise) {
@@ -282,7 +287,7 @@ export class Scheduler {
 				hooks.onInput?.(i, instruction, args as RuntimeValue[]);
 
 				try {
-					output = hooks.runInstruction(instruction, ctx, args as RuntimeValue[]);
+					output = hooks.runInstruction(i, instruction, ctx, args as RuntimeValue[]);
 					if (hooks.onAsyncOutput) {
 						output = await hooks.onAsyncOutput(i, instruction, output);
 					}
@@ -342,7 +347,7 @@ export class Scheduler {
 	/** Optimized mode: plain dispatch, no tracing or metrics overhead. */
 	private optimizedHooks(): RunHooks {
 		return {
-			runInstruction: (instruction, ctx, args) => instruction.run(ctx, ...args),
+			runInstruction: (_index, instruction, ctx, args) => instruction.run(ctx, ...args),
 		};
 	}
 
@@ -358,7 +363,7 @@ export class Scheduler {
 		const tracer = ctx.tracer!;
 		return {
 			onInput: (i, instruction, args) => tracer.traceInput(i, instruction, args),
-			runInstruction: (instruction, rctx, args) => instruction.run(rctx, ...args),
+			runInstruction: (_index, instruction, rctx, args) => instruction.run(rctx, ...args),
 			onSyncOutput: (i, instruction, output) => {
 				let traced = output;
 				if (isAsyncIterable(traced)) {
@@ -390,8 +395,18 @@ export class Scheduler {
 	 * destination — like optimized — so no separate async instruction runner is
 	 * needed. `onComplete` logs the aggregate on the normal-completion path only
 	 * (never on throw), matching the pre-collapse behavior.
+	 *
+	 * When the context carries a work-counter collector
+	 * (`Statement._iterateRowsRawInternal` builds one per execution), each
+	 * instruction also feeds its counter slot. Unlike `runtimeStats`, slots are
+	 * never reset here — they accumulate across sub-program re-invocations for the
+	 * whole execution. Deliberately NOT fed via an `onAsyncOutput` hook: the async
+	 * loop `await`s that hook's return, which would eagerly settle every promise
+	 * output at the producing instruction and serialize work that today runs
+	 * concurrently via parked promises + destination `Promise.all`.
 	 */
-	private metricsHooks(): RunHooks {
+	private metricsHooks(ctx: RuntimeContext): RunHooks {
+		const counters = ctx.workCounters?.countersFor(this);
 		return {
 			onStart: () => {
 				// Reset (not create-if-absent): a cached scheduler is reused across
@@ -418,17 +433,22 @@ export class Scheduler {
 					}
 				}
 			},
-			runInstruction: (instruction, ctx, args) => this.runInstructionWithMetrics(instruction, ctx, args),
+			runInstruction: (i, instruction, rctx, args) => this.runInstructionWithMetrics(instruction, rctx, args, counters?.[i]),
 			onComplete: () => this.logAggregateMetrics(),
 		};
 	}
 
-	private runInstructionWithMetrics(instruction: Instruction, ctx: RuntimeContext, args: RuntimeValue[]): OutputValue {
+	private runInstructionWithMetrics(instruction: Instruction, ctx: RuntimeContext, args: RuntimeValue[], slot?: WorkCounterSlot): OutputValue {
 		const stats = instruction.runtimeStats!;
 		const start = hrtimeNs();
+		const inputCount = this.countInputs(args);
 
 		stats.executions++;
-		stats.in += this.countInputs(args);
+		stats.in += inputCount;
+		if (slot) {
+			slot.executions++;
+			slot.in += inputCount;
+		}
 
 		try {
 			const result = instruction.run(ctx, ...args);
@@ -438,7 +458,7 @@ export class Scheduler {
 				return result.then(resolved => {
 					stats.out += this.countOutputs(resolved);
 					stats.elapsedNs += hrtimeNs() - start;
-					return resolved;
+					return slot ? recordOutput(slot, resolved) : resolved;
 				}).catch(error => {
 					stats.elapsedNs += hrtimeNs() - start;
 					throw error;
@@ -448,7 +468,7 @@ export class Scheduler {
 			stats.out += this.countOutputs(result);
 			stats.elapsedNs += hrtimeNs() - start;
 
-			return result;
+			return slot ? recordOutput(slot, result) : result;
 		} catch (error) {
 			stats.elapsedNs += hrtimeNs() - start;
 			throw error;

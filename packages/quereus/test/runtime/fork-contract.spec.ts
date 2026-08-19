@@ -79,6 +79,10 @@ const EXPECTED_FORK_POLICY = {
 	// the same IN site within the same execution. Mutation across branches is the
 	// emitIn set-probe contract's responsibility.
 	inSetProbes: 'shared-cooperative',
+	// Per-execution work-counter collector: shared write-only instrumentation (like
+	// tracer/planStack) so counts from a forked branch roll up into the parent's
+	// snapshot with no merge step.
+	workCounters: 'shared-sink',
 } as const satisfies Record<keyof RuntimeContext, ForkPolicy>;
 
 /**
@@ -216,6 +220,7 @@ describe('Fork contract (test harness)', () => {
 			parent.cacheStates = new Map();
 			parent.cteMaterializations = new Map();
 			parent.inSetProbes = new Map();
+			parent.workCounters = {} as unknown as RuntimeContext['workCounters'];
 
 			const [fork] = driver.fork(parent, 1);
 

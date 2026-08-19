@@ -115,6 +115,9 @@ export function emitPlanNode(plan: PlanNode, ctx: EmissionContext): Instruction 
 		throw new QuereusError(`No emitter registered for ${plan.nodeType}`, StatusCode.ERROR);
 	}
 	const instruction = registration.emitter(plan, ctx);
+	// Stamp the plan node type as a stable label for work-counter snapshots — this is
+	// the one place that knows both the plan node and the instruction it produced.
+	instruction.nodeType = plan.nodeType;
 	// Wrap with instrumentation for tracing
 	if (ctx.tracePlanStack) {
 		instruction.run = instrumentRunForTracing(plan, instruction.run);
