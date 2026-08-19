@@ -371,6 +371,10 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 	 * Called immediately before each of the four `vtab.update` sites (insert, the UPSERT
 	 * update arm, update, delete) — an `insert ... on conflict do update` therefore counts
 	 * two calls, which is what the engine issued. No-op unless runtime metrics are on.
+	 *
+	 * NOTE: keyed by the EMITTED name, with no `RuntimeContext.tableNameRemap` resolution —
+	 * see the counter key in emit/scan.ts for why that remap is unreachable for counting
+	 * today and what would have to change here if it ever becomes reachable.
 	 */
 	function countUpdateCall(ctx: RuntimeContext): void {
 		const counters = ctx.workCounters;

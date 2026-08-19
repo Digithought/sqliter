@@ -664,19 +664,15 @@ row while the row count barely moves.
 - **Counted at engine-owned call sites** — the `vtabInstance.query()` call and its
   `for await` loop in `runtime/emit/scan.ts` (the one door for `SeqScan`, `IndexScan`
   and `IndexSeek`), and the per-row `vtab.update()` await in
-  `runtime/emit/dml-executor.ts`. So they work for the memory module, the store module,
-  the isolation wrapper and any third-party module, with nothing for a module author to
-  implement.
+  `runtime/emit/dml-executor.ts`. So they work for every module — in-tree, wrapper or
+  third-party — with nothing for a module author to implement.
 - **This is the engine-to-module boundary, NOT the module-to-storage boundary.** A
   module that swaps 1000 single-key reads for one batched multi-key read moves neither
   number — the engine issued the same one `query()` either way. That layer has its own
-  instrument (the counting key-value store double in `@quereus/store/testing`). Two
-  layers, two instruments: these counters cannot catch a batching regression inside a
-  module.
+  instrument (the counting key-value store double in `@quereus/store/testing`); these
+  counters cannot catch a batching regression inside a module.
 - **Keyed by table, not by scan site**: a self-join's two sites roll into one entry —
-  the per-site breakdown is already in `instructions`. When a deferred constraint
-  evaluates a plan frozen before an `ALTER TABLE ... RENAME TO`, the *effective*
-  (post-remap) name is the key, so one table never appears twice.
+  the per-site breakdown is already in `instructions`.
 - **Calls, not connects**: `RuntimeContext.scanConnections` caches the instance per scan
   site, so a nested-loop-join inner re-scan connects once but calls `query()` once per
   outer row. The call count is the work; the connect count is a caching artifact.
@@ -684,8 +680,11 @@ row while the row count barely moves.
   rows into a filter passing 3 reports `rowsScanned: 10000` and `out: 3`. A `LIMIT` or
   abort that stops a scan early leaves a partial count — the truth of what ran, and why
   a benchmark must drain fully for reproducible counters.
-- **Not counted**: `ANALYZE`'s sampling scan — `planner/stats/analyze.ts` queries
-  outside the instruction pipeline, so it has no collector to report to.
+- **Not counted**: table access outside the instruction pipeline, where no collector
+  exists — `ANALYZE`'s sampling scan (`planner/stats/analyze.ts`) and deferred constraint
+  evaluation (`runtime/deferred-constraint-queue.ts` builds its own context), so a
+  deferred CHECK's reads are invisible. The latter is also the only context that resolves
+  a mid-execution table rename, so the scan's post-rename counter key never fires.
 
 `test/runtime/work-counter-tables.spec.ts` pins exact counts per shape.
 

@@ -22,6 +22,11 @@ import type { Row } from '../../src/common/types.js';
  *   with the module's independent tally, which is the whole claim of counting at the
  *   engine-to-module boundary.
  *
+ * NOTE: `query()` is an async generator, so a call only lands in `queries` once the
+ * caller pulls its first row — while the engine's `queryCalls` counter increments at the
+ * call itself. The two tallies agree only for a fully drained execution; a test that
+ * stops a scan early (`limit 0`, an immediate `break`) will see the engine one ahead.
+ *
  * `getBestAccessPlan` reports a LARGE estimated row count (above the optimizer's
  * `join.maxRightRowsForCaching` of 50000) so the materialization advisory does NOT wrap
  * a nested-loop-join inner in a cache node — the inner therefore genuinely re-scans once

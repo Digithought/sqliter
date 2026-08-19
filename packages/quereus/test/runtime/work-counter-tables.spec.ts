@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 import { Database } from '../../src/index.js';
 import type { WorkCounterSnapshot } from '../../src/index.js';
-import { CountingModule } from './counting-vtab.js';
+import { CountingModule, CountingTable } from './counting-vtab.js';
 
 /**
  * Per-table work counters (`WorkCounterSnapshot.tables`) — the engine-to-module
@@ -209,6 +209,63 @@ describe('work counters: engine-to-module table access', () => {
 			const snapshot = await snapshotStatement(db, 'insert into c values (7, 70), (8, 80)');
 			expect(snapshot.tables['main.c'].updateCalls).to.equal(2);
 			expect(snapshot.tables['main.c'].updateCalls).to.equal(mod.updateCount('c'));
+		});
+	});
+
+	describe('entry existence and key normalization', () => {
+		let db: Database;
+
+		beforeEach(async () => { db = await setupDatabase(); });
+		afterEach(async () => { await db.close(); });
+
+		it('lowercases the key, so a mixed-case table name yields one canonical entry', async () => {
+			await db.exec('create table "MixedCase" (id integer primary key)');
+			await db.exec('insert into "MixedCase" values (1)');
+			const snapshot = await snapshotStatement(db, 'select id from "MixedCase"');
+			expect(Object.keys(snapshot.tables)).to.deep.equal(['main.mixedcase']);
+		});
+
+		it('reports one execution, not the running sum of every execution', async () => {
+			// A prepared statement gets a fresh collector per execution. Without that, a
+			// benchmark that warms up before measuring would read inflated counts.
+			const stmt = db.prepare('select a, b from t');
+			try {
+				for await (const _ of stmt.all()) { /* first run */ }
+				for await (const _ of stmt.all()) { /* second run */ }
+				expect(stmt.getWorkCounters()!.tables['main.t']).to.deep.equal({
+					queryCalls: 1, rowsScanned: ROW_COUNT, updateCalls: 0,
+				});
+			} finally {
+				await stmt.finalize();
+			}
+		});
+
+		it('leaves no all-zero entry for a table the engine never got to call', async () => {
+			// An absent entry and a zeroed one are different claims. A scan whose connect
+			// fails issued no `query()`, so it must not appear at all — the counter cell is
+			// minted at the call site, not on entering the scan.
+			const failing = new (class extends CountingModule {
+				override async connect(): Promise<CountingTable> {
+					throw new Error('connect refused');
+				}
+			})();
+			db.registerModule('failing', failing);
+			await db.exec('create table f (id integer primary key) using failing');
+			const stmt = db.prepare('select f.id from f');
+			try {
+				let error: unknown;
+				try {
+					for await (const _ of stmt.all()) { /* expected to throw */ }
+				} catch (e: unknown) {
+					error = e;
+				}
+				// Assert on the message so the test cannot pass vacuously by failing
+				// somewhere before the scan ever reached the module.
+				expect(String((error as Error | undefined)?.message)).to.contain('connect refused');
+				expect(stmt.getWorkCounters()!.tables).to.not.have.property('main.f');
+			} finally {
+				await stmt.finalize();
+			}
 		});
 	});
 

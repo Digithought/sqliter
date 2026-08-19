@@ -110,18 +110,8 @@ export function emitSeqScan(
 		// pre-built key. Nothing else in this scan is name-bound — `schema.columns`, the
 		// row descriptor and the `FilterInfo` are positional, and a rename changes no column.
 		// Resolved on EVERY invocation, not only on a connect: a cached instance skips the
-		// connect but still needs the effective name for the counter key.
+		// connect but still needs the effective name for the counter key below.
 		const effectiveName = runtimeCtx.tableNameRemap?.get(emittedQualifiedNameLower) ?? schema.name;
-
-		// Engine-to-module access counters for this table. Undefined unless runtime
-		// metrics are on, so the default path pays one property read per scan invocation
-		// and one already-undefined branch per row. Keyed by the EFFECTIVE name so a
-		// renamed table never splits across two entries; the common (no-remap) case
-		// reuses the pre-built key rather than composing a new string.
-		const tableCounters = runtimeCtx.workCounters?.tableCounters(
-			effectiveName === schema.name
-				? emittedQualifiedNameLower
-				: `${schema.schemaName}.${effectiveName}`.toLowerCase());
 
 		// True only when this invocation must disconnect the instance itself (no cache
 		// to defer teardown to). A reused (cached) instance is never owned here.
@@ -177,11 +167,34 @@ export function emitSeqScan(
 			}
 
 			const asyncRowIterable = vtabInstance.query(effectiveFilterInfo);
+			// Engine-to-module access counters for this table, resolved HERE — immediately
+			// after a `query()` that returned — so an entry exists exactly when the engine
+			// issued a call. Resolving it earlier would leave an all-zero entry behind on a
+			// scan that failed to connect, and an absent entry and a zeroed one are different
+			// claims (see WorkCounterCollector.snapshot). Undefined unless runtime metrics are
+			// on, so the default path pays one property read per query and one
+			// already-undefined branch per row.
+			//
 			// Count the CALL, not the connect: an NLJ inner re-scan reuses one cached
 			// instance but issues one `query()` per outer row, and the call count is the
 			// work while the connect count is a caching artifact. This is the number an
 			// N+1 regression moves — a subquery the optimizer failed to decorrelate goes
 			// from 1 call to one per outer row while the row count barely changes.
+			//
+			// Keyed by the EFFECTIVE (post-remap) name so a renamed table never splits across
+			// two entries; the common (no-remap) case reuses the pre-built key rather than
+			// composing a new string.
+			// NOTE: that remap arm is unreachable today — the only context that sets
+			// `tableNameRemap` (`runtime/deferred-constraint-queue.ts` `runDeferredRows`)
+			// builds its own RuntimeContext with no `workCounters`, so deferred constraint
+			// reads are uncounted entirely (documented in docs/runtime.md). Kept because it
+			// costs nothing when metrics are off and is the behaviour that context would need.
+			// If it ever gains a collector, the `update()` counter key in emit/dml-executor.ts
+			// needs the same remap treatment or one table splits across two entries.
+			const tableCounters = runtimeCtx.workCounters?.tableCounters(
+				effectiveName === schema.name
+					? emittedQualifiedNameLower
+					: `${schema.schemaName}.${effectiveName}`.toLowerCase());
 			if (tableCounters) tableCounters.queryCalls++;
 			throwIfAborted(runtimeCtx.signal);
 			for await (const row of asyncRowIterable) {
