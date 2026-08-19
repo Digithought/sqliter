@@ -541,7 +541,12 @@ function makeDecodeBenchmark() {
  * are kept apart.
  * ═══════════════════════════════════════════════════════════════════════════════════════ */
 
-/** Collect an async iterable into an array. */
+/**
+ * Collect an async iterable into an array.
+ * @template T
+ * @param {AsyncIterable<T>} iter
+ * @returns {Promise<T[]>}
+ */
 async function collect(iter) {
 	const out = [];
 	for await (const item of iter) out.push(item);
@@ -908,7 +913,11 @@ const CATALOG_INDEXES = Math.ceil(CATALOG_TABLES / CATALOG_INDEX_EVERY);
 
 /**
  * Build the catalog fixture on `db`. Each table gets one row because catalog persistence
- * is lazy — a table nothing ever wrote may never reach the persisted catalog at all.
+ * is lazy — a table nothing ever wrote may never reach the persisted catalog at all. The
+ * insert names EVERY column: quereus columns default to NOT NULL (`columnDefToSchema`'s
+ * Third-Manifesto default), so `email text` here is a NOT NULL column with no DEFAULT,
+ * and an `(id, name)`-only insert fails on it. `apply-schema-unchanged.mjs` shares this
+ * DDL shape and never trips that, because it never inserts a row.
  *
  * @param {import('../../dist/src/index.js').Database} db
  */
@@ -925,15 +934,20 @@ async function buildCatalogFixture(db) {
 			'created text',
 		];
 		const constraints = [`constraint ck_${t}_qty check (qty >= 0)`];
+		const insertCols = ['id', 'name', 'email', 'qty', 'price', 'note', 'active', 'created'];
+		const insertVals = ['1', "'n'", "'e'", '1', '1.5', "'x'", '1', "'c'"];
 		if (t > 0) {
 			cols.push('parent_id integer');
 			constraints.push(`constraint fk_${t}_parent foreign key (parent_id) references tbl_${t - 1}(id)`);
+			// References the previous table's one row — every table inserts id = 1.
+			insertCols.push('parent_id');
+			insertVals.push('1');
 		}
 		await db.exec(`create table tbl_${t} (${[...cols, ...constraints].join(', ')})`);
 		if (t % CATALOG_INDEX_EVERY === 0) {
 			await db.exec(`create index idx_tbl_${t}_name on tbl_${t} (name)`);
 		}
-		await db.exec(`insert into tbl_${t} (id, name) values (1, 'n')`);
+		await db.exec(`insert into tbl_${t} (${insertCols.join(', ')}) values (${insertVals.join(', ')})`);
 	}
 	for (let v = 0; v < CATALOG_VIEWS; v++) {
 		await db.exec(`create view vw_${v} as select a.id, a.name, b.qty from tbl_${v} a join tbl_${v + 1} b on b.parent_id = a.id where a.active = 1 and b.qty > 0`);

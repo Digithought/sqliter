@@ -11,13 +11,13 @@ cd packages/quereus
 yarn bench
 ```
 
-It is **not** part of `yarn test` or `yarn check`. A full run takes roughly 100 seconds and
+It is **not** part of `yarn test` or `yarn check`. A full run takes roughly 150 seconds and
 is deliberately manual: a benchmark suite inside a test run either slows every test run
 down or gets its time target cut until the numbers stop meaning anything.
 
 ## What is measured
 
-57 benchmarks across five suites — 38 entries, of which the 19 in `execution` and
+71 benchmarks across five suites — 52 entries, of which the 19 in `execution` and
 `mutation` are each measured against two storage backends (see below):
 
 | Suite | Benchmarks | What it covers |
@@ -26,7 +26,7 @@ down or gets its time target cut until the numbers stop meaning anything.
 | `planner` | 4 | AST to optimized plan, without executing it: scan, join, aggregate, subquery. |
 | `execution` | 30 (15 × 2 backends) | Whole queries over a 10 000-row table: full scan, indexed filter, group by, order by, distinct, joins, a correlated subquery and its hand-written equivalent. Seven of the fifteen are text-comparison shapes (`order by` text, unicode text, 40-character shared prefixes, text primary keys) because the `BINARY` collation comparator is the engine's hottest code. |
 | `mutation` | 8 (4 × 2 backends) | Writes: a 10 000-row bulk insert, 1 000 single-row inserts, an update and a delete over a `where` clause. |
-| `store` | 11 | Store-layer code called directly, with no database in the picture. Today: building a row key from its values, across the value shapes where a fast path can be lost silently (plain integer, plain text, astral-plane text, JSON, a blob, a `NOCASE` key, a descending key and its ascending control, a four-column composite, a secondary-index key), plus one decode. See [The `store` suite](#the-store-suite-micro-benchmarks-with-no-backend-dimension). |
+| `store` | 25 | The storage layer priced one path at a time, in two halves. Eleven rows call `@quereus/store` key-encoding functions directly, with no database in the picture — the value shapes where a fast path can be lost silently (plain integer, plain text, astral-plane text, JSON, a blob, a `NOCASE` key, a descending key and its ascending control, a four-column composite, a secondary-index key), plus one decode. Fourteen rows drive one storage hot path each — scan, point read, batched multi-key seeks, fetching rows found through a secondary index, commits at four sizes, an index build, a catalog rehydration — through a `Database` over the store module, and assert the exact storage round trips alongside the timing. See [The `store` suite](#the-store-suite-micro-benchmarks-with-no-backend-dimension). |
 
 ### The `store` suite: micro-benchmarks with no backend dimension
 
@@ -36,28 +36,52 @@ key decoding, iteration, row deserialization and the isolation overlay into one 
 a regression in any one of them reads as "the scan got slower" with no way to say which.
 The `store` suite exists to give the individual pieces their own numbers.
 
-Two things about it differ from every other suite, both deliberately:
+It has two halves, split at `scan-10k` in the run order:
 
-- **Its names carry no `@` suffix.** Nothing in it runs a query, so there is no storage
-  engine to swap underneath it — every benchmark calls `@quereus/store` functions directly.
-  A bare name here means "the store package", not "the engine's default vtab module". The
-  invariant below — *every* entry of `execution` and `mutation` is backend-expanded — is
-  untouched; `store` is simply not in the backend dimension at all.
-- **It reports no counters.** No `Database`, no plan, no storage traffic, so there is
-  nothing for the work counters to count — the same position `parser` is in.
+- **Key encoding** (11 rows: `data-key-*`, `index-key-*`, `decode-composite-4col`) calls
+  `@quereus/store`'s key functions directly — no `Database`, no plan, no storage traffic.
+  These rows report no counters, for the same reason `parser` reports none: nothing runs,
+  so there is nothing to count.
+- **Store hot paths** (14 rows: a full scan, a point read, two multi-key seek widths, four
+  index-then-fetch widths, four commit sizes, an index build, a catalog rehydration) drive
+  one storage code path each through a `Database` opened over the store module — the
+  `openStoreDatabase()` / `openCountingStoreDatabase()` pair in
+  `bench/lib/store-counters.mjs`, so the counting wrapper never sits inside a timed
+  number. Each reports the same nested `{engine, store}` block a `@store-mem` row does
+  (see [Storage round trips](#storage-round-trips-what-a-store-mem-row-counts)), and goes
+  one step further: the `counters()` pass **asserts** the expected round-trip counts, so a
+  plan change that moved traffic between stores fails the pass loudly instead of shipping
+  a silently different block. Expected counts that depend on the row-resolution batch size
+  are derived from the imported `ROW_RESOLUTION_BATCH`, never restated, so they move with
+  the constant. The four commit sizes (1, 10, 100, 1000) together carry the claim no read
+  count can — committing N queued operations costs a *flat* number of write-side round
+  trips (`batchWrites` stays at one per touched store while `batchOps` scales with N);
+  N = 10 000 was considered and deliberately dropped, because the shape is visible across
+  three decades and a fourth would add hundreds of milliseconds per timed call for no
+  additional claim.
+
+One thing differs from every other suite, deliberately: **its names carry no `@` suffix.**
+The suite is not in the backend dimension. The key half calls store functions directly, so
+there is no storage engine to swap underneath it; the hot-path half exists to measure *the*
+store module specifically — the same query shapes on the memory vtab are `execution`'s bare
+rows, not a missing backend of these. The invariant below — *every* entry of `execution`
+and `mutation` is backend-expanded — is untouched; `store` is simply not in the backend
+dimension at all.
 
 Its `skip()` is the one place in the repo that hand-writes one — a single
 `skipUnlessStoreLoads` shared by every entry — and it returns the same
 `storeLoadFailure()` reason the `@store-mem` rows use, so an unbuilt
 `packages/quereus-store/dist` skips these rows with a stated reason instead of failing all
-eleven with a module-resolution stack trace.
+twenty-five with a module-resolution stack trace.
 
-Every `fn` in it builds **1 000 keys per call** (`KEYS_PER_CALL` in
+Every `fn` in the **key-encoding half** builds **1 000 keys per call** (`KEYS_PER_CALL` in
 `bench/suites/store.bench.mjs`), one shared constant across every shape so the shapes stay
 comparable to each other. A single key build costs on the order of a hundred nanoseconds
 and the `await` around `fn` costs a microtask tick, so timing one build per call would
-report mostly harness overhead. **Every figure in this suite is therefore the cost of 1 000
-key builds, not of one** — divide before quoting a per-key number.
+report mostly harness overhead. **Every figure in that half is therefore the cost of 1 000
+key builds, not of one** — divide before quoting a per-key number. The hot-path half does
+not amortize: its cheapest timed call is a whole statement over a 10 000-row store, well
+clear of the scale where harness overhead is a meaningful share of the reading.
 
 Fixture values are built in `setup`, never in `fn`, because calibration batches
 sub-millisecond work and an `fn` that allocates its own input measures the allocation. The
@@ -70,8 +94,9 @@ would cost about as much as the encode and halve the resolution of the thing bei
 measured. The one dedicated `decode-composite-4col` benchmark does assert value equality on
 every column, because there the decode *is* the subject.
 
-The suite adds roughly **16 s** to a `yarn bench` run, on the machine the results-file
-header records.
+The suite adds roughly **50 s** to a `yarn bench` run — about 16 s of it the key-encoding
+half, the rest the hot-path rows and their per-row process forks — on the machine the
+results-file header records.
 
 Two rows exist only as controls and are not interesting on their own:
 `data-key-asc-2col` (the uninverted twin of `data-key-desc-2col`, so the cost of the
@@ -510,7 +535,7 @@ Two mechanics worth knowing:
 
 - The counters pass builds a **second database**, over a counting provider, so the counting
   wrapper never sits inside a timed number. It costs about a second across all nineteen
-  store rows of a ~100 s run.
+  store rows of a ~150 s run.
 - Each pass has to say where its *fixture* ends and its *measurement* begins, or a ten-key
   index probe would be buried under ten thousand fixture inserts. The `execution` binder
   does it structurally (fixture, then reset, then the statement); a `mutation` workload does
@@ -533,7 +558,7 @@ per-suite switch:
 | `mutation` | 8 / 8 | Writes are statements too — same treatment. |
 | `planner` | 4 / 4 | `snapshotPlanShape` only. These benchmarks compile a plan and deliberately never execute it, so there is no instruction or table access to count — only plan shape. |
 | `parser` | 0 / 4 | Nothing to count: no `Database`, no plan, no runtime. |
-| `store` | 0 / 11 | Same as `parser`: these call store functions directly, so there is no `Database`, no plan and no storage traffic. |
+| `store` | 14 / 25 | The 11 key-encoding rows call store functions directly — no `Database`, nothing to count. The 14 hot-path rows all report a `store` round-trip block over a counting `store-mem` database and **assert** the expected counts in the pass. Twelve also report an `engine` block; the index-build row reports the `store` block only (its timed body is DDL plus verification scans, not one statement), and the catalog-rehydrate row reports what rehydration found instead of engine counts. |
 
 ### `--no-counters`
 
