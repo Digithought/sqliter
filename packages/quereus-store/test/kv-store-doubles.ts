@@ -3,16 +3,16 @@
  *
  * Not a `*.spec.ts`, so Mocha's glob does not pick it up as a suite.
  *
- * `DelegatingKVStore` — the base every double here extends — lives in `src/testing/`
- * (published as `@quereus/store/testing`, alongside `CountingKVStore`) and is re-exported
- * from here so the doubles below keep a single import source.
+ * `DelegatingKVStore` — the base every double here extends — lives in
+ * `src/testing/kv-delegating-store.ts` (published as `@quereus/store/testing`) and is
+ * re-exported from here so the doubles below keep a single import source.
  */
 
 import { bytesToHex, compareBytes } from '../src/common/bytes.js';
 import type { IterateOptions, KVEntry, KVStore } from '../src/common/kv-store.js';
-import { DelegatingKVStore } from '../src/testing/kv-counting-store.js';
+import { DelegatingKVStore } from '../src/testing/kv-delegating-store.js';
 
-export { DelegatingKVStore } from '../src/testing/kv-counting-store.js';
+export { DelegatingKVStore };
 
 /**
  * DELIBERATELY QUADRATIC: pages in fixed-size batches — so peak memory and the FIRST

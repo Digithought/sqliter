@@ -386,6 +386,33 @@ a provider that omits one is skipped for those cases, and the skip is printed ra
 silent. Reclaiming bytes *on disk* is deliberately not asserted — a provider may leave an
 emptied database directory or an unshrunk file behind and still be correct.
 
+**Counting test doubles, for asserting on read traffic.** `@quereus/store/testing` also
+exports the doubles this package's own specs use to prove the engine reads what it claims
+to: `DelegatingKVStore` (forwards every method to an inner store — the base to subclass
+when modelling ONE method's behavior), `CountingKVStore` (tallies `iterate()` entries,
+`get()` calls, and `getMany()` round trips plus the keys they carried), and
+`createCountingProvider(map, scope?)`, an all-in-memory `KVStoreProvider` whose stores are
+counting stores, recorded into a map the caller reads counters back out of:
+
+```typescript
+import { CountingKVStore, createCountingProvider } from '@quereus/store/testing';
+
+const stores = new Map<string, CountingKVStore>();
+// 'data' (default) counts only each table's data store; 'all' counts index, stats, and
+// catalog stores too. Keys are BUILT store names — 'main.t', 'main.t_idx_ix_v', …
+const provider = createCountingProvider(stores, 'all');
+db.registerModule('store', new StoreModule(provider));
+
+await db.exec(`select v from t where id = 7`);
+expect(stores.get('main.t')!.iterateEntryCount).to.be.at.most(1);  // sought, not scanned
+```
+
+`CountingKVStore.getMany` deliberately answers through its own counted `get`, so a batch of
+N keys advances `getCount` by N and `getManyCalls` by one. That measures batching AT THE
+CALL BOUNDARY — did the caller issue one `getMany` or N `get`s — which is what the engine's
+specs are proving; it does NOT measure a real backend's own native multi-get, and layering
+it over one suppresses that batch. See the class doc comment before reusing it for that.
+
 ## KVStore Interface
 
 The `KVStore` interface is the foundation for all storage backends:

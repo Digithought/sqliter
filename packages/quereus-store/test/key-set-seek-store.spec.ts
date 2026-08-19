@@ -67,7 +67,6 @@ function multiSeekRe(indexName: string): RegExp {
  */
 const SCAN_RE = /^idx=\S+;plan=0$/;
 
-
 /**
  * `costProfile` is optional so every existing caller stays a parity backend — the 16 tests
  * above are the regression fingerprint for "an undeclared provider plans as it always did".

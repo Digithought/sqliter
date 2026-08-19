@@ -44,3 +44,27 @@ Points to settle while doing it:
   same option with that same spread, or those two specs stop testing what they test.
 - This is mechanical and low-risk, but it touches many files: the test suite passing
   unchanged is the whole acceptance criterion.
+
+## Arm added during review of `store-counting-double-extraction`
+
+A sibling of this helper has since been collapsed and published: the counting variant now
+lives once in `packages/quereus-store/src/testing/kv-counting-store.ts` as
+`createCountingProvider(map, scope?)`, exported from `@quereus/store/testing`. Three specs
+that each had their own copy now import it.
+
+Two things that pass settle the "reconcile the variants first" question above, and the
+shared plain provider should match them:
+
+- Store names come from `buildDataStoreName` / `buildIndexStoreName` and the reserved
+  `__stats__` / `__catalog__` constants, not hand-composed template strings. Hand-composing
+  drops the builders' lowercasing, so a mixed-case table name reaches a store no real
+  backend would have used.
+- The statistics store is ONE unified store for every table, which is what the provider
+  interface specifies (its schema/table arguments are documented as ignored) and what every
+  real backend does. The per-table `schema.table.__stats__` spelling that most copies use
+  is the accidental variant, not a deliberate one.
+
+Still open here: `test/unique-constraints.spec.ts` holds a third counting-double shape of
+its own (a `CountingKVStore` that counts only iteration, plus a `createCountingProvider`
+exposing a `dataEntriesScanned(table)` method instead of a map). Folding it onto the shared
+pair is a natural companion to this ticket's sweep.

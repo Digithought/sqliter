@@ -37,8 +37,8 @@ export { runKVProviderConformance, type KVProviderBackend } from './kv-provider-
 export { runStoreNameDistinctness, assertStoreNamesDistinct, type KVNamingBackend } from './kv-naming-conformance.js';
 export { runStoreReclaimConformance, type KVReclaimBackend } from './kv-reclaim-conformance.js';
 export type { KVProviderLifecycle } from './kv-lifecycle.js';
+export { DelegatingKVStore } from './kv-delegating-store.js';
 export {
-	DelegatingKVStore,
 	CountingKVStore,
 	createCountingProvider,
 	type CountingProviderScope,

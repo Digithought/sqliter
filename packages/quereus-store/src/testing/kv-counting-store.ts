@@ -9,53 +9,11 @@
  * subtlety in how it has to be built.
  */
 
-import type { IterateOptions, KVEntry, KVStore, KVStoreProvider, WriteBatch, WriteOptions } from '../common/kv-store.js';
+import type { IterateOptions, KVEntry, KVStore, KVStoreProvider } from '../common/kv-store.js';
 import { defaultGetMany } from '../common/kv-store.js';
+import { buildDataStoreName, buildIndexStoreName, CATALOG_STORE_NAME, STATS_STORE_NAME } from '../common/key-builder.js';
 import { InMemoryKVStore } from '../common/memory-store.js';
-
-/**
- * Forwards every {@link KVStore} method to an inner store. Subclasses override only
- * the one method whose behavior they are modeling.
- */
-export class DelegatingKVStore implements KVStore {
-	constructor(protected readonly inner: KVStore) {}
-
-	get(key: Uint8Array): Promise<Uint8Array | undefined> {
-		return this.inner.get(key);
-	}
-
-	getMany(keys: readonly Uint8Array[]): Promise<(Uint8Array | undefined)[]> {
-		return this.inner.getMany(keys);
-	}
-
-	put(key: Uint8Array, value: Uint8Array, options?: WriteOptions): Promise<void> {
-		return this.inner.put(key, value, options);
-	}
-
-	delete(key: Uint8Array, options?: WriteOptions): Promise<void> {
-		return this.inner.delete(key, options);
-	}
-
-	has(key: Uint8Array): Promise<boolean> {
-		return this.inner.has(key);
-	}
-
-	iterate(options?: IterateOptions): AsyncIterable<KVEntry> {
-		return this.inner.iterate(options);
-	}
-
-	batch(): WriteBatch {
-		return this.inner.batch();
-	}
-
-	close(): Promise<void> {
-		return this.inner.close();
-	}
-
-	approximateCount(options?: IterateOptions): Promise<number> {
-		return this.inner.approximateCount(options);
-	}
-}
+import { DelegatingKVStore } from './kv-delegating-store.js';
 
 /**
  * Counts what passes through a wrapped {@link KVStore}: entries pulled from `iterate()`,
@@ -126,14 +84,25 @@ export type CountingProviderScope = 'data' | 'all';
  * on the `iterate`/`get`/`getMany` traffic StoreModule generates without reaching into a
  * real backend.
  *
- * @param countedStores - Map the counted stores are recorded into, keyed `schema.table`
- * (every table's data store) and, when `scope` is `'all'`, also `schema.table_idx_index`
- * (secondary indexes), `schema.table.__stats__`, and `__catalog__`. The caller reads
- * counters back out of this map after driving a query.
+ * Store names come from the shared builders (`buildDataStoreName` / `buildIndexStoreName`,
+ * the reserved `__stats__` / `__catalog__` constants) — the same rule every real provider
+ * is held to by `runStoreNameDistinctness`. Hand-composing them here would lose the
+ * builders' lowercasing, so a mixed-case table name would land on a store no real backend
+ * would have used.
+ *
+ * @param countedStores - Map the counted stores are recorded into, keyed by BUILT store
+ * name: `schema.table` (every table's data store) and, when `scope` is `'all'`, also
+ * `schema.table_idx_index` (secondary indexes), `__stats__`, and `__catalog__`. The caller
+ * reads counters back out of this map after driving a query.
  * @param scope - `'data'` (default): only each table's data store is counted; index,
  * stats, and catalog stores stay plain, uncounted `InMemoryKVStore`s the caller never
  * sees. `'all'`: every store the provider hands out is counted into `countedStores`.
  */
+// NOTE: implements no `deleteIndexStore` / `deleteTableStores` (both optional on the
+// interface), so a spec that drops a table or index and recreates it under the same name
+// reads the dropped store's entries back. Every spec using this provider today creates its
+// tables once; if one starts exercising drop-then-recreate, implement them (erase, don't
+// just drop the handle) rather than working around it in the spec.
 export function createCountingProvider(
 	countedStores: Map<string, CountingKVStore>,
 	scope: CountingProviderScope = 'data',
@@ -152,16 +121,18 @@ export function createCountingProvider(
 	const maybeCounted = (key: string): KVStore => (scope === 'all' ? counted(key) : aux(key));
 	return {
 		async getStore(schemaName: string, tableName: string) {
-			return counted(`${schemaName}.${tableName}`);
+			return counted(buildDataStoreName(schemaName, tableName));
 		},
 		async getIndexStore(schemaName: string, tableName: string, indexName: string) {
-			return maybeCounted(`${schemaName}.${tableName}_idx_${indexName}`);
+			return maybeCounted(buildIndexStoreName(schemaName, tableName, indexName));
 		},
-		async getStatsStore(schemaName: string, tableName: string) {
-			return maybeCounted(`${schemaName}.${tableName}.__stats__`);
+		// One unified stats store for every table, as the interface specifies — the
+		// schema/table arguments are ignored.
+		async getStatsStore() {
+			return maybeCounted(STATS_STORE_NAME);
 		},
 		async getCatalogStore() {
-			return maybeCounted('__catalog__');
+			return maybeCounted(CATALOG_STORE_NAME);
 		},
 		async closeStore() {},
 		async closeIndexStore() {},
