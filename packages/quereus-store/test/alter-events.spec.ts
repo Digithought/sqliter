@@ -602,9 +602,16 @@ describe('Store-backed ALTER TABLE: the schema-change event describes the altera
  * statements against a default (memory-backed) database and a store-backed one, and require the
  * delivered shapes to be equal.
  *
- * This is the assertion the store's `alter`/`table`-for-every-arm divergence would have failed:
- * both sides derive their shape from one shared helper (`alterEventShape` in the engine), so a
- * future backend that hand-rolls its own reporting fails here rather than in production.
+ * This is the assertion the store's `alter`/`table`-for-every-arm divergence would have failed.
+ * Note the comparison is across two DIFFERENT implementations, not one helper against itself:
+ * a default `new Database()` registers `new MemoryTableModule()` with NO emitter
+ * (`core/database.ts`), so its column is produced by the engine's own fallback — the per-arm
+ * `emitAlterSchemaEvent` calls in `runtime/emit/alter-table.ts` — while the store's column comes
+ * from the shared `alterEventShape` helper. Don't "simplify" either side into the other; that
+ * would make this tautological. The memory module's OWN emitter path (the third producer, and
+ * the helper's other caller) is pinned in the engine's
+ * `test/alter-table-schema-events.spec.ts` § ALTER TABLE on an emitter-backed module emits
+ * exactly once.
  */
 describe('Store-backed and memory-backed ALTER TABLE deliver the same schema-event shapes', () => {
 	/** Every structural arm, in an order each statement's predecessors leave valid. */

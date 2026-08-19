@@ -181,6 +181,32 @@ class MyTable extends VirtualTable {
 }
 ```
 
+#### Don't hand-roll the `ALTER TABLE` event shape
+
+A subscriber must see the same facts whichever backend holds the table, so the per-arm
+`type` / `objectType` / `columnName` / `oldColumnName` of an `ALTER TABLE` announcement is a
+contract, not a module's choice — see [usage.md § What each `ALTER TABLE` arm
+reports](usage.md#what-each-alter-table-arm-reports) for the table. Derive it from the
+`SchemaChangeInfo` you were handed with the exported `alterEventShape(change)` instead of
+writing the triple out per arm; you supply only the rest of the event:
+
+```typescript
+import { alterEventShape } from '@quereus/quereus';
+
+if (change.ddl !== undefined) {
+  this.eventEmitter?.emitSchemaChange?.({
+    ...alterEventShape(change),
+    schemaName,
+    objectName: tableName,   // the TABLE, even for a column arm
+    ddl: change.ddl,
+  });
+}
+```
+
+Its `switch` is exhaustive over the arm union, so a new arm fails your build rather than
+announcing the wrong shape. `RENAME TO` is not an arm of that union — it goes through
+`renameTable` and reports `alter`/`table` with `oldObjectName` set to the pre-rename name.
+
 #### A failed DDL statement announces nothing, even from a native emitter
 
 A module emits its schema event from inside its own `create` / `alterTable` / `destroy`, which
@@ -236,7 +262,7 @@ Two `ALTER TABLE` arm families are **excluded** on both paths, so no asymmetry i
 - the metadata-tag arms (`SET TAGS`, `ADD TAGS`, `DROP TAGS`) — catalog-only; they never reach `module.alterTable`, and no backend announces them
 - the materialized-view lifecycle arms (`SET MAINTAINED`, `DROP MAINTAINED`) — these raise only *internal* catalog notifications (`materialized_view_added` / `_modified` / `_removed`)
 
-Auto DDL events carry no `ddl` text (the fallback has only the schema/object names at the emit site). A module that needs replication should implement its own emitter and render the DDL itself, as the memory and store modules do.
+The `ALTER TABLE` arms are the exception to the auto path's usual silence about statement text: they **do** carry `ddl` (the planner renders the statement's canonical, schema-qualified SQL once at plan-build time and every arm passes it through), so a table alteration replicates from a module with no emitter of its own. The `CREATE`/`DROP TABLE` and `CREATE`/`DROP INDEX` auto events carry none — the fallback has only the schema/object names at those emit sites — so a module that needs *those* replicated should implement its own emitter and render the DDL itself, as the memory and store modules do.
 
 ### Engine-Internal Scaffolding Is Silent
 

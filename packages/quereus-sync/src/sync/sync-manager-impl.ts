@@ -127,7 +127,7 @@ export function assertOpSeqInRange(opSeq: number): void {
  * build here and be decided deliberately. Exhaustiveness is over `objectType` only —
  * an untracked `(objectType, type)` combination inside a branch still returns `undefined`.
  */
-function mapSchemaMigrationType(event: DatabaseSchemaChangeEvent): SchemaMigrationType | undefined {
+export function mapSchemaMigrationType(event: DatabaseSchemaChangeEvent): SchemaMigrationType | undefined {
 	const { objectType, type } = event;
 	switch (objectType) {
 		case 'table': {

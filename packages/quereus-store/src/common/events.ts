@@ -2,7 +2,7 @@
  * Reactive event types and emitter for schema and data changes.
  */
 
-import type { Row, SqlValue, VTableEventEmitter, VTableSchemaChangeEvent } from '@quereus/quereus';
+import type { SqlValue, VTableDataChangeEvent, VTableEventEmitter, VTableSchemaChangeEvent } from '@quereus/quereus';
 
 /**
  * Schema change event types.
@@ -19,24 +19,17 @@ export type SchemaChangeEvent = VTableSchemaChangeEvent;
 /**
  * Data change event types.
  *
- * Producers owe the engine's key contract (`docs/usage.md` § Subscribing to Data Changes):
- * `key` is projected from the event's own row image, and an `update` never moves a row — a
- * relocating primary-key change is a `delete` at the old key then an `insert` at the new one.
+ * EXTENDS the engine's {@link VTableDataChangeEvent} rather than restating it, for the same
+ * reason {@link SchemaChangeEvent} is an alias: a hand-maintained second copy of one wire
+ * shape drifts, and the schema half of this file is what that drift already cost. The store
+ * adds exactly one field of its own — `pk`, a legacy alias of `key` — and inherits the rest,
+ * including the engine's key contract (`docs/usage.md` § Subscribing to Data Changes): `key`
+ * is projected from the event's own row image, and an `update` never moves a row (a
+ * relocating primary-key change is a `delete` at the old key then an `insert` at the new one).
  */
-export interface DataChangeEvent {
-  type: 'insert' | 'update' | 'delete';
-  schemaName: string;
-  tableName: string;
-  /** Primary key projected from this event's own image: `newRow` for insert/update, `oldRow` for delete. Alias: pk */
-  key?: SqlValue[];
-  /** Primary key values. Alias: key */
+export interface DataChangeEvent extends VTableDataChangeEvent {
+  /** Primary key values. Legacy alias of the inherited `key`. */
   pk?: SqlValue[];
-  oldRow?: Row;
-  newRow?: Row;
-  /** Column names that were changed (for update events). */
-  changedColumns?: string[];
-  /** True if this event originated from sync (remote replica) or cross-tab. */
-  remote?: boolean;
 }
 
 /**

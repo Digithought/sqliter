@@ -26,6 +26,16 @@ export type AlterEventShape = Pick<
  *
  * The `switch` is exhaustive over the union so a new arm fails the build here rather
  * than silently announcing the wrong shape.
+ *
+ * NOTE: this unifies the two EMITTER-BACKED producers (the memory module and the store).
+ * The engine's own fallback path is a third producer that still writes the same triples out
+ * by hand, one per arm, in `runtime/emit/alter-table.ts` — it emits at each arm's tail from
+ * per-arm locals, with no `SchemaChangeInfo` in scope to derive from. Drift between the two
+ * derivations is caught by the cross-backend parity spec (`@quereus/store`'s
+ * `test/alter-events.spec.ts`), so this is a duplication with a guard, not an open hole. If a
+ * fourth producer appears, or the arm union grows enough that the parity spec stops covering
+ * every arm, thread the `SchemaChangeInfo` down to those emit sites and delete the hand-written
+ * triples.
  */
 export function alterEventShape(change: SchemaChangeInfo): AlterEventShape {
 	switch (change.type) {
