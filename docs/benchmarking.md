@@ -17,7 +17,7 @@ down or gets its time target cut until the numbers stop meaning anything.
 
 ## What is measured
 
-56 benchmarks across five suites — 37 entries, of which the 19 in `execution` and
+57 benchmarks across five suites — 38 entries, of which the 19 in `execution` and
 `mutation` are each measured against two storage backends (see below):
 
 | Suite | Benchmarks | What it covers |
@@ -26,7 +26,7 @@ down or gets its time target cut until the numbers stop meaning anything.
 | `planner` | 4 | AST to optimized plan, without executing it: scan, join, aggregate, subquery. |
 | `execution` | 30 (15 × 2 backends) | Whole queries over a 10 000-row table: full scan, indexed filter, group by, order by, distinct, joins, a correlated subquery and its hand-written equivalent. Seven of the fifteen are text-comparison shapes (`order by` text, unicode text, 40-character shared prefixes, text primary keys) because the `BINARY` collation comparator is the engine's hottest code. |
 | `mutation` | 8 (4 × 2 backends) | Writes: a 10 000-row bulk insert, 1 000 single-row inserts, an update and a delete over a `where` clause. |
-| `store` | 10 | Store-layer code called directly, with no database in the picture. Today: building a row key from its values, across the value shapes where a fast path can be lost silently (plain integer, plain text, astral-plane text, JSON, a `NOCASE` key, a descending key and its ascending control, a four-column composite, a secondary-index key), plus one decode. See [The `store` suite](#the-store-suite-micro-benchmarks-with-no-backend-dimension). |
+| `store` | 11 | Store-layer code called directly, with no database in the picture. Today: building a row key from its values, across the value shapes where a fast path can be lost silently (plain integer, plain text, astral-plane text, JSON, a blob, a `NOCASE` key, a descending key and its ascending control, a four-column composite, a secondary-index key), plus one decode. See [The `store` suite](#the-store-suite-micro-benchmarks-with-no-backend-dimension). |
 
 ### The `store` suite: micro-benchmarks with no backend dimension
 
@@ -46,10 +46,11 @@ Two things about it differ from every other suite, both deliberately:
 - **It reports no counters.** No `Database`, no plan, no storage traffic, so there is
   nothing for the work counters to count — the same position `parser` is in.
 
-Its `skip()` is the one place in the repo that hand-writes one, and it returns the same
+Its `skip()` is the one place in the repo that hand-writes one — a single
+`skipUnlessStoreLoads` shared by every entry — and it returns the same
 `storeLoadFailure()` reason the `@store-mem` rows use, so an unbuilt
 `packages/quereus-store/dist` skips these rows with a stated reason instead of failing all
-ten with a module-resolution stack trace.
+eleven with a module-resolution stack trace.
 
 Every `fn` in it builds **1 000 keys per call** (`KEYS_PER_CALL` in
 `bench/suites/store.bench.mjs`), one shared constant across every shape so the shapes stay
@@ -69,8 +70,8 @@ would cost about as much as the encode and halve the resolution of the thing bei
 measured. The one dedicated `decode-composite-4col` benchmark does assert value equality on
 every column, because there the decode *is* the subject.
 
-The suite adds roughly **15 s** to a `yarn bench` run — 15.1 s and 14.3 s on two runs, on
-the machine the results-file header records.
+The suite adds roughly **16 s** to a `yarn bench` run, on the machine the results-file
+header records.
 
 Two rows exist only as controls and are not interesting on their own:
 `data-key-asc-2col` (the uninverted twin of `data-key-desc-2col`, so the cost of the
@@ -374,9 +375,9 @@ A benchmark may declare a `skip()` alongside `fn`. It returns a **reason** to de
 Two exist today, and both decline for the same reason — `@quereus/store` will not load.
 One is attached by `expandBackends` from a backend's `skipWorkload` (see
 [Storage backends](#storage-backends-and-what-a-name-means)) and covers the `@store-mem`
-rows. The other is hand-written on every entry of the `store` suite, which has no backend
-dimension to attach one for it; it calls the same `storeLoadFailure()` and so gives the
-same reason.
+rows. The other is hand-written once in the `store` suite — one `skipUnlessStoreLoads` shared by
+all of its entries, which have no backend dimension to attach one for them; it calls the
+same `storeLoadFailure()` and so gives the same reason.
 
 It is evaluated in the **worker**, before `setup`, in its own phase — because the reason a
 benchmark declines is usually a runtime fact (a module that will not load, a missing
@@ -532,7 +533,7 @@ per-suite switch:
 | `mutation` | 8 / 8 | Writes are statements too — same treatment. |
 | `planner` | 4 / 4 | `snapshotPlanShape` only. These benchmarks compile a plan and deliberately never execute it, so there is no instruction or table access to count — only plan shape. |
 | `parser` | 0 / 4 | Nothing to count: no `Database`, no plan, no runtime. |
-| `store` | 0 / 10 | Same as `parser`: these call store functions directly, so there is no `Database`, no plan and no storage traffic. |
+| `store` | 0 / 11 | Same as `parser`: these call store functions directly, so there is no `Database`, no plan and no storage traffic. |
 
 ### `--no-counters`
 
@@ -684,8 +685,10 @@ Requirements:
 - **`bench/suites/` is currently OUTSIDE the type pass.** `tsconfig.test.json` includes
   `bench/lib/**` and `bench/workloads/**` but not `bench/suites/**`, so a suite file's own
   `checkJs` errors surface only when the benchmark runs. `store.bench.mjs` was written to
-  compile clean under that pass and verified to; the other four suites report 21 mostly
-  implicit-`any` errors, which is what stands between here and widening the `include`. Until
+  compile clean under that pass and verified to; three of the other four (`execution`,
+  `mutation`, `planner` — `parser` is clean) report 21 mostly implicit-`any` errors, which
+  is what stands between here and widening the `include`. Parked as
+  `debt-bench-suites-outside-type-pass`. Until
   that is done, a renamed `@quereus/store` export is caught by the annotated resolution in
   `bench/lib/store-counters.mjs` (which *is* checked) rather than at the suite's call site.
 - **Drain the result fully if you read work counters from it.** `Statement.getWorkCounters()`

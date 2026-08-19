@@ -24,7 +24,8 @@
  * file's header says why: the parent process imports every suite file purely to enumerate
  * benchmark names, so a second import site is a second way for an unbuilt
  * `packages/quereus-store/dist` to kill the whole `yarn bench` run — parser and planner
- * included. `skip()` below turns that same failure into a stated reason per row.
+ * included. `skipUnlessStoreLoads` below turns that same failure into a stated reason per
+ * row, on every benchmark in the suite.
  *
  * PUBLIC EXPORTS ONLY. `buildDataKey`, `buildIndexKey`, `encodeCompositeKey`,
  * `decodeCompositeKey` and `BUILTIN_KEY_NORMALIZER_RESOLVER` are all part of
@@ -34,6 +35,19 @@
  */
 
 import { loadStoreKeyApi, storeLoadFailure } from '../lib/store-counters.mjs';
+
+/**
+ * Why this suite's rows cannot run here, or `null` to run them.
+ *
+ * Same answer, and the same stated reason, the `@store-mem` rows give when
+ * `packages/quereus-store/dist` is absent or stale. Without it every row here would fail
+ * inside `setup` with a module-resolution stack trace instead of declining with a sentence.
+ *
+ * ONE definition shared by every benchmark below rather than a `skip()` body per factory:
+ * they all decline for exactly one reason, and a second copy is a second thing to forget
+ * when a benchmark is added.
+ */
+const skipUnlessStoreLoads = () => storeLoadFailure();
 
 /**
  * How many keys one `fn` call builds.
@@ -96,10 +110,10 @@ const TEXTS = Array.from({ length: DISTINCT_ROWS }, (_, i) =>
 
 /**
  * Each of {@link TEXTS} with four astral-plane characters appended. Every one is a
- * well-formed surrogate PAIR, so `findUnpairedSurrogate`'s `HAS_SURROGATE` fast-path test
- * FAILS and the encode falls into the per-code-unit scan — the distinction
- * `execution/order-by-text-unicode-10k` exists to price at the comparator level, priced here
- * at the key level.
+ * well-formed surrogate PAIR, so `findUnpairedSurrogate`'s `HAS_SURROGATE` pre-test MATCHES,
+ * its early return is skipped and the encode pays the per-code-unit pairing scan — the
+ * distinction `execution/order-by-text-unicode-10k` exists to price at the comparator
+ * level, priced here at the key level.
  *
  * A SUPERSET of the plain fixture on purpose, so `data-key-text-astral` minus
  * `data-key-text-binary` is attributable. It is NOT a controlled A/B on the surrogate scan
@@ -114,6 +128,26 @@ const ASTRAL_TEXTS = TEXTS.map((text) => `${text}\u{1D400}\u{1D401}\u{1F4E6}\u{1
  *  magnitude should NOT move the number; a shape here that does is the finding. */
 const INTEGERS = Array.from({ length: DISTINCT_ROWS }, (_, i) =>
 	(i % 3 === 0 ? BigInt(i) : i % 3 === 1 ? BigInt(i) * 1_000_000_007n : -BigInt(i) * 4_294_967_296n));
+
+/**
+ * Blob fixtures, each the same 34 bytes long as a {@link TEXTS} entry is, and each carrying
+ * an embedded `0x00` and `0x01` — the two bytes the shared escape scheme rewrites, so this
+ * prices the escape path rather than a plain copy. (Those two escapes cost two bytes the
+ * text fixture does not pay, so the pair is close but not a byte-exact A/B.)
+ *
+ * The BLOB path is not a curiosity: a column DECLARED `json` keys through it, because its
+ * key transform maps the value to a `Uint8Array` before encoding — see `encodeObject`'s
+ * comment on why the generic OBJECT path instead stays canonical text. `data-key-json`
+ * prices the path an UNDECLARED `any` column holding an object takes; this prices the byte
+ * shape a declared `json` column ends up in.
+ */
+const BLOBS = Array.from({ length: DISTINCT_ROWS }, (_, i) => {
+	const bytes = new Uint8Array(34);
+	for (let j = 0; j < bytes.length; j++) bytes[j] = (i * 7 + j * 13 + 2) & 0xff;
+	bytes[5] = 0x00;
+	bytes[6] = 0x01;
+	return bytes;
+});
 
 /** @type {KeyShape[]} */
 const KEY_SHAPES = [
@@ -151,6 +185,13 @@ const KEY_SHAPES = [
 			const value = { sku: `sku-${i}`, dims: [i, i + 1, i + 2], active: i % 2 === 0 };
 			return { values: [value], decodesTo: [{ active: value.active, dims: value.dims, sku: value.sku }] };
 		}),
+	},
+	{
+		// Raw bytes: no UTF-8 step and no collation, but the same escape-and-terminate scheme
+		// TEXT uses, so its distance from `data-key-text-binary` is roughly the UTF-8 encode.
+		name: 'data-key-blob',
+		collation: 'BINARY',
+		rows: BLOBS.map((v) => ({ values: [v] })),
 	},
 	{
 		// The ASC control for `data-key-desc-2col`, over the SAME fixture values. Without it a
@@ -307,12 +348,7 @@ function makeKeyBenchmark(shape) {
 
 	return {
 		name: shape.name,
-		// Same answer, and the same stated reason, the `@store-mem` rows give when
-		// `packages/quereus-store/dist` is absent or stale. Without it every row in this
-		// suite would fail inside `setup` with a module-resolution stack trace.
-		async skip() {
-			return await storeLoadFailure();
-		},
+		skip: skipUnlessStoreLoads,
 		async setup() {
 			api = await loadStoreKeyApi();
 			// The resolver is named explicitly rather than left to the default so the row says
@@ -371,9 +407,7 @@ function makeIndexKeyBenchmark() {
 
 	return {
 		name,
-		async skip() {
-			return await storeLoadFailure();
-		},
+		skip: skipUnlessStoreLoads,
 		async setup() {
 			api = await loadStoreKeyApi();
 			options = { collation: 'BINARY', normalizers: api.BUILTIN_KEY_NORMALIZER_RESOLVER };
@@ -441,9 +475,7 @@ function makeDecodeBenchmark() {
 
 	return {
 		name,
-		async skip() {
-			return await storeLoadFailure();
-		},
+		skip: skipUnlessStoreLoads,
 		async setup() {
 			api = await loadStoreKeyApi();
 			options = { collation: shape.collation, normalizers: api.BUILTIN_KEY_NORMALIZER_RESOLVER };

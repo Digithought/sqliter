@@ -53,3 +53,22 @@ probably out of scope, in which case say so and rely on the shared module being 
 import.
 
 Behavior must not change: this is allocation only, no encoding, ordering, or format change.
+
+## Second measurement: the encode side, from the `store` benchmark suite
+
+`bench/suites/store.bench.mjs` builds a one-column data key 1 000 times per call, over
+fixtures whose payload is the same 34 bytes either way. On the machine that suite's results
+header records:
+
+| shape | per key build |
+|---|---|
+| `data-key-blob` (raw bytes — no UTF-8 step at all) | ~200 ns |
+| `data-key-text-binary` (same byte count, through `encodeText`) | ~503 ns |
+
+So the whole UTF-8 step on the *encode* side is roughly 300 ns of a ~500 ns text key build.
+That is the surrogate scan, the `new TextEncoder()`, the UTF-8 conversion itself and the
+normalizer resolution together — this measurement does **not** isolate the allocation's
+share, and should not be quoted as if it did. It does say the text path is the expensive
+one and that `encodeText` is worth including in the sweep, not just `decodeText`.
+
+Re-check by running `yarn bench --filter store/` from `packages/quereus`.
