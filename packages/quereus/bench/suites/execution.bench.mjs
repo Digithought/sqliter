@@ -28,16 +28,10 @@
  * itself out of calibration.
  */
 
+import { asyncIterableToArray } from '../../dist/src/index.js';
 import { BACKENDS, expandBackends } from '../lib/backends.mjs';
 import { snapshotStatement } from '../lib/counters.mjs';
 import { DECORRELATION_WORKLOADS, FIXTURES, QUERY_WORKLOADS } from '../workloads/execution.mjs';
-
-/** Collect an async iterable into an array. */
-async function collect(iter) {
-	const out = [];
-	for await (const item of iter) out.push(item);
-	return out;
-}
 
 /**
  * The counters block for one workload on one backend.
@@ -105,7 +99,7 @@ function bindQuery(workload, backend) {
 			db = null;
 		},
 		async fn() {
-			const rows = await collect(db.eval(workload.sql));
+			const rows = await asyncIterableToArray(db.eval(workload.sql));
 			if (rows.length !== workload.expectedRows) {
 				throw new Error(`Expected ${workload.expectedRows} rows, got ${rows.length}`);
 			}

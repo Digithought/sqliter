@@ -49,9 +49,10 @@ It has two halves, split at `scan-10k` in the run order:
   `bench/lib/store-counters.mjs`, so the counting wrapper never sits inside a timed
   number. Each reports the same nested `{engine, store}` block a `@store-mem` row does
   (see [Storage round trips](#storage-round-trips-what-a-store-mem-row-counts)), and goes
-  one step further: the `counters()` pass **asserts** the expected round-trip counts, so a
-  plan change that moved traffic between stores fails the pass loudly instead of shipping
-  a silently different block. Expected counts that depend on the row-resolution batch size
+  one step further: the `counters()` pass **asserts** the expected round-trip counts on the
+  table stores it names, so a plan change that moved traffic between stores fails the pass
+  loudly instead of shipping a silently different block. (The reserved `__catalog__` /
+  `__stats__` blocks are reported but not asserted — see the counters table below.) Expected counts that depend on the row-resolution batch size
   are derived from the imported `ROW_RESOLUTION_BATCH`, never restated, so they move with
   the constant. The four commit sizes (1, 10, 100, 1000) together carry the claim no read
   count can — committing N queued operations costs a *flat* number of write-side round
@@ -558,7 +559,7 @@ per-suite switch:
 | `mutation` | 8 / 8 | Writes are statements too — same treatment. |
 | `planner` | 4 / 4 | `snapshotPlanShape` only. These benchmarks compile a plan and deliberately never execute it, so there is no instruction or table access to count — only plan shape. |
 | `parser` | 0 / 4 | Nothing to count: no `Database`, no plan, no runtime. |
-| `store` | 14 / 25 | The 11 key-encoding rows call store functions directly — no `Database`, nothing to count. The 14 hot-path rows all report a `store` round-trip block over a counting `store-mem` database and **assert** the expected counts in the pass. Twelve also report an `engine` block; the index-build row reports the `store` block only (its timed body is DDL plus verification scans, not one statement), and the catalog-rehydrate row reports what rehydration found instead of engine counts. |
+| `store` | 14 / 25 | The 11 key-encoding rows call store functions directly — no `Database`, nothing to count. The 14 hot-path rows all report a `store` round-trip block over a counting `store-mem` database and **assert** it in the pass: thirteen pin exact per-field integers on the table stores they name, and the catalog-rehydrate row pins "every table store saw nothing", which is the claim reopening makes. The reserved `__catalog__` / `__stats__` blocks are reported but never asserted — their counts are catalog-layout facts, not contracts. Twelve rows also report an `engine` block; the index-build row reports the `store` block only (its timed body is DDL plus verification scans, not one statement), and the catalog-rehydrate row reports what rehydration found instead of engine counts. |
 
 ### `--no-counters`
 

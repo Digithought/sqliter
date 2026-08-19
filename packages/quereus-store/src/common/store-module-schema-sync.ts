@@ -307,6 +307,12 @@ export abstract class StoreModuleSchemaSync extends StoreModuleCatalog {
 			// stats store (one `get` against the shared `__stats__` store per table), never the
 			// data store, so it does not open or create table storage.
 			//
+			// NOTE: that is one round trip PER TABLE against `__stats__`, serially — the
+			// `store/catalog-rehydrate-54t` benchmark measures exactly 54 of them for its
+			// 54-table catalog. Free on an in-memory provider and cheap on LevelDB; if reopen
+			// latency ever matters on a backend where a `get` is a network or IPC hop, collect
+			// the keys and issue one `getMany` here instead of a get per table.
+			//
 			// Advisory, hence its own guard: statistics must never cost a table its
 			// rehydration the way a refused schema above does.
 			try {
