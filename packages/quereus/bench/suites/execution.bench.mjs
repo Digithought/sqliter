@@ -211,10 +211,21 @@ export const benchmarks = [
 		// never resolve on its fast early bytes — the opposite cost profile of
 		// `order-by-text-10k`, where keys diverge at character 5.
 		//
-		// NOTE: this is by far the most expensive entry in the suite (~380 ms/iteration,
-		// ~4.5 s of the total run). If `yarn bench` wall-clock ever becomes a problem, lower
-		// THIS entry's `iterations` rather than shortening `PREFIX40` — the long prefix is
-		// the whole point of the benchmark.
+		// NOTE: an earlier revision of this comment claimed ~380 ms/iteration and ~4.5 s of
+		// the total run, and called this the most expensive entry in the suite. All of that
+		// was wrong. Under the per-benchmark process isolation the harness now enforces
+		// (Windows 11, node 24.2), three full runs put it at 68-91 ms/iteration — well under
+		// a second of a 23-42 s run — and in every one of them `temporal-arith-scan-10k`
+		// (85-118 ms) and `mutation/bulk-insert-10k` (121-173 ms) cost more.
+		//
+		// Do not read those figures as bounds. Runs taken while the machine was busy measured
+		// this same benchmark at 228-338 ms, so background load moves it several-fold; the
+		// ordering above is the durable claim, not the milliseconds. Per-run medians being
+		// this noisy is what `bench-adaptive-sampling` exists to fix.
+		//
+		// If `yarn bench` wall-clock ever becomes a problem this is not the entry to cut, and
+		// if it ever is, lower its `iterations` rather than shortening `PREFIX40` — the long
+		// prefix is the whole point of the benchmark.
 		name: 'order-by-text-prefix40-10k',
 		iterations: 10,
 		warmup: 2,

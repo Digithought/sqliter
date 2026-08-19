@@ -56,15 +56,19 @@ worse than no gate.
 
 ## Cross-reference
 
-The process-isolation blocker named above is addressed by `bench-process-isolation`, which
-makes **per-benchmark** child-process execution a property of the harness - measurement
+The process-isolation blocker named above **is cleared**. `bench-process-isolation` has
+landed: `bench/run.mjs` is now a parent orchestrator that forks `bench/child.mjs` once per
+benchmark, so every benchmark in the suite already runs in a fresh process. Measurement
 during its planning showed per-suite isolation is not enough, because the distortion is
-between benchmarks inside one suite file (up to 2.7x). Once that lands, this benchmark no
-longer needs its own invocation mode.
+between benchmarks inside one suite file (up to 2.7x) - the unit of isolation is the
+benchmark. This benchmark therefore needs no invocation mode of its own: adding the ladders
+as ordinary suite entries gets them isolated automatically. `--filter <substring>` runs a
+single one by `suite/name` when a shape needs to be looked at on its own.
 
-The ad-hoc `bench/fusion-slope.mjs` this ticket grew out of is deleted by that same ticket,
-since its only reason to exist was running its two halves in separate processes by hand.
-The two-point ladder technique it demonstrates - time the same query shape at two
-expression widths, report the slope so the fixed per-row cost cancels - is what this
-benchmark should reimplement inside the suite; read the deleted file out of git history if
-the details are wanted.
+The ad-hoc `bench/fusion-slope.mjs` this ticket grew out of **has been deleted** by that
+same ticket, since its only reason to exist was running its two halves in separate
+processes by hand. The two-point ladder technique it demonstrates - time the same query
+shape at two expression widths, report the slope so the fixed per-row cost cancels - is
+what this benchmark should reimplement inside the suite; read the deleted file out of git
+history (`git show HEAD~1:packages/quereus/bench/fusion-slope.mjs`, adjusting the revision)
+if the details are wanted.
