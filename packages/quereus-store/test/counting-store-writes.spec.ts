@@ -186,6 +186,42 @@ describe('CountingKVStore write counters through StoreModule', () => {
 		expect(data.directPutCount, 'the commit path does not point-write').to.equal(0);
 	});
 
+	it('commits deleted rows as batch operations, not point deletes', async () => {
+		await db.exec(`insert into w values (1, 10), (2, 20), (3, 30)`);
+		const data = stores.get('main.w')!;
+		data.reset();
+
+		await db.exec('begin');
+		await db.exec(`delete from w where id <= 2`);
+		await db.exec('commit');
+
+		expect(data.batchWriteCalls, 'the delete commits in one round trip').to.equal(1);
+		expect(data.batchOpCount, 'carrying one operation per deleted row').to.equal(2);
+		expect(data.directDeleteCount, 'the commit path does not point-delete').to.equal(0);
+	});
+
+	it('takes one write-side round trip per TOUCHED store', async () => {
+		// The per-store fallback the counting provider forces, made visible: a table with a
+		// secondary index touches two stores, so one commit is two round trips — one each,
+		// not one shared. A provider with `beginAtomicBatch` would commit both as a single
+		// cross-store atomic write, which this double does not model.
+		await db.exec(`create table wi (id integer primary key, v integer) using store`);
+		await db.exec(`create index wi_v on wi(v)`);
+		const data = stores.get('main.wi')!;
+		const index = stores.get('main.wi_idx_wi_v')!;
+		data.reset();
+		index.reset();
+
+		await db.exec('begin');
+		await db.exec(`insert into wi values (1, 10), (2, 20), (3, 30)`);
+		await db.exec('commit');
+
+		expect(data.batchWriteCalls, 'the data store commits once').to.equal(1);
+		expect(data.batchOpCount, 'carrying one row each').to.equal(3);
+		expect(index.batchWriteCalls, 'and the index store commits once of its own').to.equal(1);
+		expect(index.batchOpCount, 'carrying one entry each').to.equal(3);
+	});
+
 	it('keeps the commit round trip flat as the row count grows', async () => {
 		const data = stores.get('main.w')!;
 		const values = Array.from({ length: 50 }, (_, i) => `(${i + 1}, ${i})`).join(', ');

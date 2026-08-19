@@ -81,6 +81,16 @@ directories must be current: `yarn build` builds them in dependency order, and a
 against a stale `packages/quereus-store/dist` measures the wrong code just as surely as a
 stale `packages/quereus/dist` does.
 
+A suite needing more of the store package's surface **widens that one site** rather than
+opening an import of its own. What it hands out today: `openStoreDatabase()` (the plain
+timed database — its handle also carries the `provider` it was built over, for a benchmark
+whose claim is about what physically landed in a store), `openCountingStoreDatabase()` (the
+untimed counters database), and `loadStoreKeyApi()` (the store's key-encoding and
+key-building functions, plus `ROW_RESOLUTION_BATCH` — read the constant, never restate
+`256`, so an expected round-trip count moves with it). Every name is shape-checked as the
+import resolves, so a renamed export becomes a stated skip reason instead of a throw inside
+a benchmark's `setup`.
+
 A backend declines a workload through `BenchBackend.skipWorkload(workload)`, which
 `expandBackends` wires into the benchmark's `skip()` so no suite file has to remember to.
 When a binder *also* supplies a `skip`, the two compose — the backend is asked first and

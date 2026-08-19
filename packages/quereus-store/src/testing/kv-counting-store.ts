@@ -154,6 +154,12 @@ export class CountingKVStore extends DelegatingKVStore {
 		return this.inner.delete(key, options);
 	}
 
+	// NOTE: only the per-store `WriteBatch` path is counted, never `AtomicBatch`. Nothing
+	// counted reaches the atomic path today — `createCountingProvider` exposes no
+	// `beginAtomicBatch`, so the transaction coordinator always takes its per-store
+	// fallback — and an `AtomicBatch` wrapper nothing exercises is dead weight. If the
+	// counting provider ever gains a shared commit domain, wrap `AtomicBatch` at the same
+	// time: until then such a commit would report zero writes rather than fail loudly.
 	override batch(): WriteBatch {
 		return new CountingWriteBatch(this.inner.batch(), (opsCarried) => {
 			this.batchWriteCalls++;

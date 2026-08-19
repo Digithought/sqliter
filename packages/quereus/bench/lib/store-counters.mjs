@@ -79,29 +79,28 @@ import { Database } from '../../dist/src/index.js';
  * @property {number} batchOps put/delete operations those commits carried
  *
  * The store package's key-encoding and key-building API, reached through the same single
- * dynamic import as the database builders — see `loadStoreKeyApi`.
+ * dynamic import as the database builders — see `loadStoreKeyApi`. `ROW_RESOLUTION_BATCH`
+ * is the number of index entries an index-driven scan resolves to data rows per round
+ * trip: read, never restated, so a benchmark's expected round-trip count moves with it.
  *
- * @typedef {object} StoreKeyApi
- * @property {Function} encodeValue
- * @property {Function} encodeCompositeKey
- * @property {Function} decodeCompositeKey
- * @property {Function} buildDataKey
- * @property {Function} buildIndexKey
- * @property {Function} BUILTIN_KEY_NORMALIZER_RESOLVER
- * @property {number} ROW_RESOLUTION_BATCH index entries an index-driven scan resolves to
- *   data rows per round trip — read, never restated, so a benchmark's expected round-trip
- *   count moves with the constant
+ * Picked off the package's own module type rather than restated as `Function` properties,
+ * so a suite calling these gets the real signatures and a renamed export fails the
+ * `yarn lint` type pass as well as the runtime shape check below.
+ *
+ * @typedef {Pick<typeof import('@quereus/store'),
+ *   'encodeValue' | 'encodeCompositeKey' | 'decodeCompositeKey' | 'buildDataKey' |
+ *   'buildIndexKey' | 'BUILTIN_KEY_NORMALIZER_RESOLVER' | 'ROW_RESOLUTION_BATCH'
+ * >} StoreKeyApi
  */
 
 /**
  * Everything this file resolves out of `@quereus/store`. Every name is expected to be a
  * function EXCEPT the ones in `NUMERIC_EXPORTS`, which must be numbers.
  *
- * @typedef {StoreKeyApi & {
- *   createIsolatedStoreModule: Function,
- *   createInMemoryProvider: Function,
- *   createCountingProvider: Function,
- * }} ResolvedStoreModules
+ * @typedef {StoreKeyApi
+ *   & Pick<typeof import('@quereus/store'), 'createIsolatedStoreModule'>
+ *   & Pick<typeof import('@quereus/store/testing'), 'createInMemoryProvider' | 'createCountingProvider'>
+ * } ResolvedStoreModules
  */
 
 /**
@@ -136,6 +135,9 @@ function loadStoreModules() {
 				import('@quereus/store'),
 				import('@quereus/store/testing'),
 			]);
+			// Annotated, not inferred: that is what makes a renamed export fail the
+			// `yarn lint` type pass here rather than only at bench time.
+			/** @type {ResolvedStoreModules} */
 			const resolved = {
 				createIsolatedStoreModule: store.createIsolatedStoreModule,
 				createInMemoryProvider: testing.createInMemoryProvider,
@@ -180,19 +182,15 @@ function loadStoreModules() {
  * opening an `import('@quereus/store')` of its own — the exact thing the file header
  * exists to prevent.
  *
+ * Hands back the resolved bundle itself, narrowed by the declared return type, rather than
+ * re-projecting the seven names into a fresh object: a projection is a second copy of the
+ * name list, and a name added to `loadStoreModules` but missed there would reach a suite as
+ * `undefined` with no shape check in the way.
+ *
  * @returns {Promise<StoreKeyApi>}
  */
-export async function loadStoreKeyApi() {
-	const m = await loadStoreModules();
-	return {
-		encodeValue: m.encodeValue,
-		encodeCompositeKey: m.encodeCompositeKey,
-		decodeCompositeKey: m.decodeCompositeKey,
-		buildDataKey: m.buildDataKey,
-		buildIndexKey: m.buildIndexKey,
-		BUILTIN_KEY_NORMALIZER_RESOLVER: m.BUILTIN_KEY_NORMALIZER_RESOLVER,
-		ROW_RESOLUTION_BATCH: m.ROW_RESOLUTION_BATCH,
-	};
+export function loadStoreKeyApi() {
+	return loadStoreModules();
 }
 
 /**

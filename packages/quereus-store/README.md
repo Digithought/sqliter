@@ -386,11 +386,13 @@ a provider that omits one is skipped for those cases, and the skip is printed ra
 silent. Reclaiming bytes *on disk* is deliberately not asserted — a provider may leave an
 emptied database directory or an unshrunk file behind and still be correct.
 
-**Counting test doubles, for asserting on read traffic.** `@quereus/store/testing` also
-exports the doubles this package's own specs use to prove the engine reads what it claims
-to: `DelegatingKVStore` (forwards every method to an inner store — the base to subclass
-when modelling ONE method's behavior), `CountingKVStore` (tallies `iterate()` entries,
-`get()` calls, and `getMany()` round trips plus the keys they carried), and
+**Counting test doubles, for asserting on storage traffic.** `@quereus/store/testing` also
+exports the doubles this package's own specs use to prove the engine reads and writes what
+it claims to: `DelegatingKVStore` (forwards every method to an inner store — the base to
+subclass when modelling ONE method's behavior), `CountingKVStore` (tallies reads —
+`iterate()` entries, `get()` calls, `getMany()` round trips plus the keys they carried —
+and writes — point `put`/`delete` issued outside any batch, `WriteBatch.write()` round
+trips, and the operations those carried; `reset()` zeroes all eight), and
 `createCountingProvider(map, scope?)`, an all-in-memory `KVStoreProvider` whose stores are
 counting stores, recorded into a map the caller reads counters back out of:
 
@@ -412,6 +414,12 @@ N keys advances `getCount` by N and `getManyCalls` by one. That measures batchin
 CALL BOUNDARY — did the caller issue one `getMany` or N `get`s — which is what the engine's
 specs are proving; it does NOT measure a real backend's own native multi-get, and layering
 it over one suppresses that batch. See the class doc comment before reusing it for that.
+
+The write counters have the same call-boundary meaning, and one rule worth knowing:
+operations belong to the `write()` that carried them, not to the moment they were queued —
+a batch that is `clear()`ed or abandoned without committing contributes nothing. Only the
+per-store `WriteBatch` path is counted; a provider with a shared atomic commit domain (this
+one has none) would commit through `AtomicBatch`, which this double does not wrap.
 
 **A plain in-memory provider, for specs that need a real backend with no counting attached.**
 `createInMemoryProvider(options?)` builds an all-`InMemoryKVStore` `KVStoreProvider` — the
