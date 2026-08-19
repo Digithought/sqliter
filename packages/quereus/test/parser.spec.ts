@@ -404,6 +404,16 @@ describe('Parser', () => {
 				expect(err.message).to.include('Unknown rename_policy');
 			}
 		});
+
+		it('should reject dry_run as an apply schema option', () => {
+			expect(() => parse(`apply schema temp options (dry_run = true)`))
+				.to.throw(ParseError, /Unsupported apply schema option 'dry_run'/);
+		});
+
+		it('should reject validate_only as an apply schema option', () => {
+			expect(() => parse(`apply schema temp options (validate_only = true)`))
+				.to.throw(ParseError, /Unsupported apply schema option 'validate_only'/);
+		});
 	});
 
 	describe('Equality Operators', () => {

@@ -990,8 +990,6 @@ export interface ApplySchemaStmt extends AstNode {
 	toVersion?: string;
 	withSeed?: boolean;
 	options?: {
-		dryRun?: boolean;
-		validateOnly?: boolean;
 		allowDestructive?: boolean;
 		renamePolicy?: 'allow' | 'require-hint' | 'deny';
 	};

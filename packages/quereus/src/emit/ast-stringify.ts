@@ -156,8 +156,6 @@ export function astToString(node: AST.AstNode): string {
 			if (n.options) {
 				s += ' options (';
 				const parts: string[] = [];
-				if (n.options.dryRun !== undefined) parts.push(`dry_run = ${n.options.dryRun ? 'true' : 'false'}`);
-				if (n.options.validateOnly !== undefined) parts.push(`validate_only = ${n.options.validateOnly ? 'true' : 'false'}`);
 				if (n.options.allowDestructive !== undefined) parts.push(`allow_destructive = ${n.options.allowDestructive ? 'true' : 'false'}`);
 				if (n.options.renamePolicy) parts.push(`rename_policy = '${n.options.renamePolicy}'`);
 				s += parts.join(', ') + ')';

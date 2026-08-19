@@ -4103,9 +4103,12 @@ export class Parser {
 			if (!this.check(TokenType.RPAREN)) {
 				do {
 					const key = this.consumeIdentifier('Expected option key.').toLowerCase();
+					const keyToken = this.previous();
 					this.consume(TokenType.EQUAL, "Expected '=' after option key.");
-					if (key === 'dry_run') options.dryRun = this.consumeBooleanLiteral();
-					else if (key === 'validate_only') options.validateOnly = this.consumeBooleanLiteral();
+					if (key === 'dry_run' || key === 'validate_only') {
+						this.consumeBooleanLiteral();
+						throw new ParseError(keyToken, `Unsupported apply schema option '${key}'. Use 'diff schema' to preview changes read-only instead.`);
+					}
 					else if (key === 'allow_destructive') options.allowDestructive = this.consumeBooleanLiteral();
 					else if (key === 'rename_policy') {
 						const vtok = this.consume(TokenType.STRING, "Expected string for rename_policy.");

@@ -190,7 +190,6 @@ Database‑wide integrity assertions deferrable at COMMIT (auto-detected), with 
 **Planned:**
 - [x] Rename detection with `old name` hints and stable `id` matching (tables, columns, named constraints; views/indexes drop+recreate when hinted — see `docs/sql.md` §"Rename detection")
 - [ ] Destructive change gating with `allow_destructive` option
-- [ ] `validate_only` and `dry_run` modes for safety
 - [ ] Import support: `import schema <alias> from '<url>' cache '<key>' version '<semver>'`
 - [ ] Local cache registry for offline imports
 - [ ] Idempotent seeds with PK/UNIQUE upsert logic

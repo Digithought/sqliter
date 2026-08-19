@@ -153,11 +153,11 @@ explain schema main;
 
 -- Future: versioned apply with options
 apply schema main to version '1.0.0' options (
-  dry_run = false,
-  validate_only = false,
   allow_destructive = false,
   rename_policy = 'require-hint'
 );
+-- `dry_run` and `validate_only` are rejected (parse error): use `diff schema` for a
+-- read-only preview instead — there's no engine-level dry-run/validate-only mode.
 ```
 
 ### Semantics and Features
