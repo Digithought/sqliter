@@ -138,6 +138,41 @@ async function createTextPkDb() {
 	return db;
 }
 
+/**
+ * Every benchmark's query, named once and used twice: `fn` times it, and `counters()`
+ * snapshots the same statement after timing. Sharing one literal is what keeps the two
+ * from drifting — a query edited in `fn` alone would leave the counters pass reporting
+ * counts for a statement the benchmark no longer runs, and the counts would still look
+ * perfectly stable while describing the wrong plan.
+ */
+const SQL = {
+	fullScan: 'select * from bench_t',
+	temporalArith: 'select d + s as a from bench_temporal_t',
+	filteredScanIndex: 'select * from bench_t where val = 42',
+	groupBy: 'select label, count(*) as cnt, sum(val) as total from bench_t group by label',
+	orderBy: 'select * from bench_t order by val desc, id asc',
+	orderByText: 'select * from bench_text_t order by tkey',
+	orderByTextPrefix40: 'select * from bench_text_t order by tkey_prefixed',
+	orderByTextUnicode: 'select * from bench_text_t order by tkey_unicode',
+	groupByText: 'select label, count(*) as cnt from bench_text_t group by label',
+	distinctText: 'select distinct tkey from bench_text_t',
+	textPkRangeScan: "select * from bench_text_pk where tkey >= 'key_03000' and tkey < 'key_04000'",
+	textPkPointSeek: "select * from bench_text_pk where tkey = 'key_05000'",
+	join: 'select l.id, r.payload from left_t l join right_t r on l.key_col = r.key_col where l.id <= 100',
+	correlatedSubquery: `
+		select id, val,
+			(select count(*) from bench_t b where b.label = a.label) as peer_count
+		from bench_t a
+		where a.id <= 100
+	`,
+	handBatchedPeerCount: `
+		select a.id, a.val, coalesce(g.cnt, 0) as peer_count
+		from bench_t a
+		left join (select label, count(*) as cnt from bench_t group by label) g on g.label = a.label
+		where a.id <= 100
+	`,
+};
+
 let db;
 
 export const benchmarks = [
@@ -146,12 +181,13 @@ export const benchmarks = [
 		async setup() { db = await createPopulatedDb(); },
 		async teardown() { await db.close(); db = null; },
 		async fn() {
-			const rows = await collect(db.eval('select * from bench_t'));
+			const rows = await collect(db.eval(SQL.fullScan));
 			if (rows.length !== 10000) throw new Error(`Expected 10000 rows, got ${rows.length}`);
 		},
 		// Runs ONCE after timing, with metrics on — never inside `fn`, whose number the
-		// counting generators would corrupt. Same statement, fully drained.
-		counters() { return snapshotStatement(db, 'select * from bench_t'); },
+		// counting generators would corrupt. Same statement, fully drained. Every other
+		// `counters()` in this file follows this shape.
+		counters() { return snapshotStatement(db, SQL.fullScan); },
 	},
 	{
 		// One DATE + TIMESPAN add per row over a full scan. Both operands are declared
@@ -173,51 +209,50 @@ export const benchmarks = [
 		async setup() { db = await createTemporalDb(); },
 		async teardown() { await db.close(); db = null; },
 		async fn() {
-			const rows = await collect(db.eval('select d + s as a from bench_temporal_t'));
+			const rows = await collect(db.eval(SQL.temporalArith));
 			if (rows.length !== 10000) throw new Error(`Expected 10000 rows, got ${rows.length}`);
 		},
+		counters() { return snapshotStatement(db, SQL.temporalArith); },
 	},
 	{
 		name: 'filtered-scan-index-10k',
 		async setup() { db = await createPopulatedDb(); },
 		async teardown() { await db.close(); db = null; },
 		async fn() {
-			const rows = await collect(db.eval('select * from bench_t where val = 42'));
+			const rows = await collect(db.eval(SQL.filteredScanIndex));
 			if (rows.length === 0) throw new Error('Expected some rows');
 		},
+		counters() { return snapshotStatement(db, SQL.filteredScanIndex); },
 	},
 	{
 		name: 'group-by-10k',
 		async setup() { db = await createPopulatedDb(); },
 		async teardown() { await db.close(); db = null; },
 		async fn() {
-			const rows = await collect(
-				db.eval('select label, count(*) as cnt, sum(val) as total from bench_t group by label')
-			);
+			const rows = await collect(db.eval(SQL.groupBy));
 			if (rows.length !== 100) throw new Error(`Expected 100 groups, got ${rows.length}`);
 		},
+		counters() { return snapshotStatement(db, SQL.groupBy); },
 	},
 	{
 		name: 'order-by-10k',
 		async setup() { db = await createPopulatedDb(); },
 		async teardown() { await db.close(); db = null; },
 		async fn() {
-			const rows = await collect(
-				db.eval('select * from bench_t order by val desc, id asc')
-			);
+			const rows = await collect(db.eval(SQL.orderBy));
 			if (rows.length !== 10000) throw new Error(`Expected 10000 rows, got ${rows.length}`);
 		},
+		counters() { return snapshotStatement(db, SQL.orderBy); },
 	},
 	{
 		name: 'order-by-text-10k',
 		async setup() { db = await createTextDb(); },
 		async teardown() { await db.close(); db = null; },
 		async fn() {
-			const rows = await collect(
-				db.eval('select * from bench_text_t order by tkey')
-			);
+			const rows = await collect(db.eval(SQL.orderByText));
 			if (rows.length !== 10000) throw new Error(`Expected 10000 rows, got ${rows.length}`);
 		},
+		counters() { return snapshotStatement(db, SQL.orderByText); },
 	},
 	{
 		// Every key shares the same 40-char prefix (`PREFIX40`), so the comparator can
@@ -247,11 +282,10 @@ export const benchmarks = [
 		async setup() { db = await createTextDb(); },
 		async teardown() { await db.close(); db = null; },
 		async fn() {
-			const rows = await collect(
-				db.eval('select * from bench_text_t order by tkey_prefixed')
-			);
+			const rows = await collect(db.eval(SQL.orderByTextPrefix40));
 			if (rows.length !== 10000) throw new Error(`Expected 10000 rows, got ${rows.length}`);
 		},
+		counters() { return snapshotStatement(db, SQL.orderByTextPrefix40); },
 	},
 	{
 		// Every key carries an astral emoji + a CJK Extension B ideograph
@@ -261,11 +295,10 @@ export const benchmarks = [
 		async setup() { db = await createTextDb(); },
 		async teardown() { await db.close(); db = null; },
 		async fn() {
-			const rows = await collect(
-				db.eval('select * from bench_text_t order by tkey_unicode')
-			);
+			const rows = await collect(db.eval(SQL.orderByTextUnicode));
 			if (rows.length !== 10000) throw new Error(`Expected 10000 rows, got ${rows.length}`);
 		},
+		counters() { return snapshotStatement(db, SQL.orderByTextUnicode); },
 	},
 	{
 		// NOTE: grouping is hash-based (`runtime/emit/hash-aggregate.ts` serializes each key
@@ -276,11 +309,10 @@ export const benchmarks = [
 		async setup() { db = await createTextDb(); },
 		async teardown() { await db.close(); db = null; },
 		async fn() {
-			const rows = await collect(
-				db.eval('select label, count(*) as cnt from bench_text_t group by label')
-			);
+			const rows = await collect(db.eval(SQL.groupByText));
 			if (rows.length !== 100) throw new Error(`Expected 100 groups, got ${rows.length}`);
 		},
+		counters() { return snapshotStatement(db, SQL.groupByText); },
 	},
 	{
 		// `tkey` is unique per row, so dedup must compare all 10K values rather than
@@ -289,33 +321,30 @@ export const benchmarks = [
 		async setup() { db = await createTextDb(); },
 		async teardown() { await db.close(); db = null; },
 		async fn() {
-			const rows = await collect(
-				db.eval('select distinct tkey from bench_text_t')
-			);
+			const rows = await collect(db.eval(SQL.distinctText));
 			if (rows.length !== 10000) throw new Error(`Expected 10000 distinct rows, got ${rows.length}`);
 		},
+		counters() { return snapshotStatement(db, SQL.distinctText); },
 	},
 	{
 		name: 'text-pk-range-scan-10k',
 		async setup() { db = await createTextPkDb(); },
 		async teardown() { await db.close(); db = null; },
 		async fn() {
-			const rows = await collect(
-				db.eval("select * from bench_text_pk where tkey >= 'key_03000' and tkey < 'key_04000'")
-			);
+			const rows = await collect(db.eval(SQL.textPkRangeScan));
 			if (rows.length !== 1000) throw new Error(`Expected 1000 rows, got ${rows.length}`);
 		},
+		counters() { return snapshotStatement(db, SQL.textPkRangeScan); },
 	},
 	{
 		name: 'text-pk-point-seek-10k',
 		async setup() { db = await createTextPkDb(); },
 		async teardown() { await db.close(); db = null; },
 		async fn() {
-			const rows = await collect(
-				db.eval("select * from bench_text_pk where tkey = 'key_05000'")
-			);
+			const rows = await collect(db.eval(SQL.textPkPointSeek));
 			if (rows.length !== 1) throw new Error(`Expected 1 row, got ${rows.length}`);
 		},
+		counters() { return snapshotStatement(db, SQL.textPkPointSeek); },
 	},
 	{
 		name: 'join-1kx1k',
@@ -336,27 +365,24 @@ export const benchmarks = [
 		},
 		async teardown() { await db.close(); db = null; },
 		async fn() {
-			const rows = await collect(
-				db.eval('select l.id, r.payload from left_t l join right_t r on l.key_col = r.key_col where l.id <= 100')
-			);
+			const rows = await collect(db.eval(SQL.join));
 			if (rows.length === 0) throw new Error('Expected join results');
 		},
+		counters() { return snapshotStatement(db, SQL.join); },
 	},
 	{
 		name: 'correlated-subquery',
 		async setup() { db = await createPopulatedDb(); },
 		async teardown() { await db.close(); db = null; },
 		async fn() {
-			const rows = await collect(
-				db.eval(`
-					select id, val,
-						(select count(*) from bench_t b where b.label = a.label) as peer_count
-					from bench_t a
-					where a.id <= 100
-				`)
-			);
+			const rows = await collect(db.eval(SQL.correlatedSubquery));
 			if (rows.length !== 100) throw new Error(`Expected 100 rows, got ${rows.length}`);
 		},
+		// The counter that would catch `scalar-agg-decorrelation` breaking BEFORE the
+		// `ratioGuards` entry below does: an N+1 regression multiplies `queryCalls` and
+		// `rowsScanned` on `main.bench_t`, and unlike the ratio it needs no second
+		// benchmark and has no variance to tolerate.
+		counters() { return snapshotStatement(db, SQL.correlatedSubquery); },
 	},
 	{
 		// Hand-batched twin of `correlated-subquery`: the identical result via an
@@ -368,16 +394,10 @@ export const benchmarks = [
 		async setup() { db = await createPopulatedDb(); },
 		async teardown() { await db.close(); db = null; },
 		async fn() {
-			const rows = await collect(
-				db.eval(`
-					select a.id, a.val, coalesce(g.cnt, 0) as peer_count
-					from bench_t a
-					left join (select label, count(*) as cnt from bench_t group by label) g on g.label = a.label
-					where a.id <= 100
-				`)
-			);
+			const rows = await collect(db.eval(SQL.handBatchedPeerCount));
 			if (rows.length !== 100) throw new Error(`Expected 100 rows, got ${rows.length}`);
 		},
+		counters() { return snapshotStatement(db, SQL.handBatchedPeerCount); },
 	},
 ];
 

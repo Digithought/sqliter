@@ -20,6 +20,7 @@
  */
 
 import { Database } from '../../dist/src/index.js';
+import { snapshotPlanShape } from '../lib/counters.mjs';
 
 let db;
 
@@ -41,6 +42,16 @@ async function teardown() {
 	db = null;
 }
 
+/**
+ * COUNTERS: every benchmark here declares a PLAN-SHAPE-only `counters()`. These
+ * benchmarks prepare and finalize; nothing ever executes, so there are no row counts,
+ * `query()` calls or instruction executions to record — `snapshotPlanShape` is the
+ * whole counter surface available.
+ *
+ * That is a signal in its own right rather than a consolation prize: the node count and
+ * per-`PlanNodeType` tallies are what would catch an optimizer rule regressing, say a
+ * hash join back into a nested loop, on a suite whose timings would barely move.
+ */
 export const benchmarks = [
 	{
 		name: 'simple-scan-plan',
@@ -50,6 +61,7 @@ export const benchmarks = [
 			const stmt = await db.prepare(simpleScan);
 			await stmt.finalize();
 		},
+		counters() { return snapshotPlanShape(db, simpleScan); },
 	},
 	{
 		name: 'join-plan',
@@ -59,6 +71,7 @@ export const benchmarks = [
 			const stmt = await db.prepare(joinPlan);
 			await stmt.finalize();
 		},
+		counters() { return snapshotPlanShape(db, joinPlan); },
 	},
 	{
 		name: 'aggregate-plan',
@@ -68,6 +81,7 @@ export const benchmarks = [
 			const stmt = await db.prepare(aggregatePlan);
 			await stmt.finalize();
 		},
+		counters() { return snapshotPlanShape(db, aggregatePlan); },
 	},
 	{
 		name: 'subquery-plan',
@@ -77,5 +91,6 @@ export const benchmarks = [
 			const stmt = await db.prepare(subqueryPlan);
 			await stmt.finalize();
 		},
+		counters() { return snapshotPlanShape(db, subqueryPlan); },
 	},
 ];

@@ -40,6 +40,16 @@ const wideCols = Array.from({ length: 50 }, (_, i) => `col_${i}`).join(', ');
 const wideSelect = `select ${wideCols} from big_table where col_0 > 10`;
 const insertValues = `insert into t (a, b, c, d) values (1, 'hello', 3.14, null), (2, 'world', 2.72, null), (3, 'foo', 1.41, null)`;
 
+/**
+ * COUNTERS: no benchmark in this file declares one, and that is deliberate rather than
+ * an oversight. Every `fn` here calls `parser.parseAll` directly — no `Database`, no
+ * plan, no runtime — so there is nothing the work counters count: no instructions
+ * execute, no plan nodes are built, no virtual table is queried. The absence is the
+ * honest report. See `bench/lib/counters.mjs`.
+ *
+ * If a future parser benchmark ever builds a plan (an AST-to-plan benchmark, say), it
+ * should declare a `snapshotPlanShape` pass the way `planner.bench.mjs` does.
+ */
 export const benchmarks = [
 	{
 		name: 'simple-select',
