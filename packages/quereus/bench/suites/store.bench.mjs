@@ -5,7 +5,7 @@
  * right top-level signal and a poor diagnostic: a full scan blends key decoding, iteration,
  * row deserialization and the isolation overlay into one number, so a regression in any one
  * of them reads as "the scan got slower". This suite gives the store's pieces their own
- * numbers, in two halves:
+ * numbers, in three groups:
  *
  *  - KEY ENCODING (`data-key-*`, `index-key-*`, `decode-*`): pure functions of their
  *    inputs — no `Database`, no provider, no statement — the cheapest pieces to measure
@@ -21,16 +21,24 @@
  *    reported in STORAGE ROUND TRIPS as well as time, which is the honest measurement
  *    anyway: round-trip counts are exact integers, identical on every machine, where a
  *    wall-clock median describes one CPU.
+ *  - READ COST ON REAL DISK (`leveldb-read-cost-*`): the one group that touches a provider
+ *    with NO `Database` above it, and the only one that touches disk. It prices a random
+ *    read against a sequential one on LevelDB, because that ratio is what a provider
+ *    declares in its `costProfile` and what the planner then prices access paths with.
+ *    Opt-in (`QUEREUS_BENCH_LEVELDB`) and informational; see the section header above
+ *    `makeReadCostBenchmark` for why all three arms share one benchmark and why the ratios
+ *    are printed rather than reported as counters.
  *
  * A STORE-ONLY SUITE, SO ITS NAMES CARRY NO `@` SUFFIX. `execution` and `mutation` hold
  * workloads that `bench/lib/backends.mjs` expands across every backend, and the bare name
- * in those suites means "the engine's default vtab module". Here there is no storage
- * engine to swap underneath: the first half calls `@quereus/store` functions directly,
- * and the second half exists to measure THE store module specifically — the same query
- * shapes on the memory vtab are `execution`'s bare rows, not a missing backend of these.
- * The invariant `docs/benchmarking.md` states — every entry of BOTH those suites is
- * expanded — is untouched; this is a third suite that is not in the backend dimension at
- * all.
+ * in those suites means "the engine's default vtab module". Here there is no backend
+ * DIMENSION to expand along: the key group calls `@quereus/store` functions directly, the
+ * hot-path group exists to measure THE store module specifically (the same query shapes on
+ * the memory vtab are `execution`'s bare rows, not a missing backend of these), and the
+ * read-cost group names LevelDB in its own benchmark names because a disk backend IS its
+ * subject — not because some other row was expanded onto one. The invariant
+ * `docs/benchmarking.md` states — every entry of BOTH those suites is expanded — is
+ * untouched; this is a third suite that is not in the backend dimension at all.
  *
  * TIMED AND COUNTED DATABASES ARE SEPARATE. A hot-path row's `fn` runs against
  * `openStoreDatabase()`, with no counting wrapper anywhere in it; its `counters()` pass
@@ -54,25 +62,34 @@
  * benchmark names, so a second import site is a second way for an unbuilt
  * `packages/quereus-store/dist` to kill the whole `yarn bench` run — parser and planner
  * included. `skipUnlessStoreLoads` below turns that same failure into a stated reason per
- * row, on every benchmark in the suite.
+ * row, on every benchmark in the suite. The read-cost rows compose a SECOND reason on top of
+ * it — the LevelDB opt-in — reached through `bench/lib/leveldb-backend.mjs`, which is that
+ * plugin's single lazy import site for exactly the same reason.
  *
- * NOTE: this file is far the largest suite (roughly 600 code lines to the next one's 150),
- * because it holds twenty-five benchmarks where the others hold four to fifteen. Left whole
- * deliberately: `bench/lib/discover.mjs` names a suite after its FILE, so splitting the two
- * halves into two files splits `store` into two suites and changes every published row name.
- * If a third half ever lands, move the halves into a `suites/store/` directory that this
- * file re-exports, rather than splitting the suite.
+ * NOTE: this file is far the largest suite, because it holds twenty-seven benchmarks where
+ * the others hold four to fifteen. The read-cost group is the third one this header
+ * anticipated, so the split it prescribed is now DUE: move the three groups into a
+ * `suites/store/` directory that this file re-exports — NOT into sibling `*.bench.mjs`
+ * files, because `bench/lib/discover.mjs` names a suite after its FILE and that would split
+ * `store` into three suites and change every published row name. Tracked as
+ * `backlog/debt-split-store-bench-suite`.
  *
  * PUBLIC EXPORTS ONLY. The key half binds `buildDataKey`, `buildIndexKey`,
  * `encodeCompositeKey`, `decodeCompositeKey` and `BUILTIN_KEY_NORMALIZER_RESOLVER`; the
  * hot-path half reaches `StoreModule` (`whenCatalogPersisted`, `rehydrateCatalog`) and the
- * key-value provider through the handles `store-counters.mjs` builds. All of it is
+ * key-value provider through the handles `store-counters.mjs` builds; the read-cost group
+ * adds `ROW_RESOLUTION_BATCH` and the `KVStore` surface (`iterate`, `getMany`, `batch`).
+ * All of it is
  * `@quereus/store`'s public surface (`packages/quereus-store/src/common/index.ts`), so this
  * suite breaks at a deliberate API change rather than at an internal refactor.
  */
 
+import { performance } from 'node:perf_hooks';
+
 import { asyncIterableToArray } from '../../dist/src/index.js';
 import { snapshotStatement, snapshotStatements } from '../lib/counters.mjs';
+import { createBenchLevelDBProvider, levelDBSkipReason } from '../lib/leveldb-backend.mjs';
+import { median } from '../lib/stats.mjs';
 import { loadStoreKeyApi, openCountingStoreDatabase, openStoreDatabase, storeLoadFailure } from '../lib/store-counters.mjs';
 
 /**
@@ -1171,6 +1188,438 @@ const COUNTED_QUERY_BENCHMARKS = [
 	makeIndexResolveBenchmark('index-resolve-four-batches', 4),
 ];
 
+/* ========================================================================== *
+ * READ COST ON REAL DISK: what a random read costs against a sequential one
+ * ========================================================================== */
+
+/**
+ * WHY THESE ROWS EXIST. `packages/quereus-store/src/common/cost-profile.ts` lets a
+ * provider declare what its basic reads cost RELATIVE to reading one row sequentially
+ * during a full scan (1.0 by definition), and the planner prices access paths with those
+ * numbers. IndexedDB's come from a real browser benchmark. LevelDB declares nothing, so it
+ * takes the framework's parity default — `pointRead: 1.0`, `seekPositioning: 0.5` — never
+ * measured. These two rows are that measurement; `backlog/debt-leveldb-cost-profile-measurement`
+ * is the ticket that decides what to do with it.
+ *
+ * MEASURED AT THE KEY-VALUE LAYER, NOT THROUGH SQL. The unit the cost profile defines is
+ * one row read sequentially during a full scan — a STORAGE-layer unit. So these arms drive
+ * the `KVStore` the LevelDB provider hands out directly: no `Database`, no planner, no
+ * isolation overlay. Two reasons, both load-bearing:
+ *
+ *  - Engine overhead is roughly equal on both sides of the ratio, so including it
+ *    compresses every ratio toward 1.0 and understates the very difference being measured.
+ *  - The sibling IndexedDB harness (`packages/quereus-plugin-indexeddb/bench/README.md`)
+ *    measured at the raw IndexedDB API for the same reason, and matching its 200-byte row
+ *    values is what makes the two backends' numbers comparable at all.
+ *
+ * THIS IS THEREFORE THE ONE PLACE IN THE SUITE THAT TOUCHES A PROVIDER WITHOUT A DATABASE
+ * ABOVE IT, and the only place that touches disk. It is a third group beside the two the
+ * file header describes; see the note there about splitting the suite into `suites/store/`.
+ *
+ * ALL THREE ARMS LIVE IN ONE BENCHMARK PER DATASET SIZE, NOT THREE. The harness forks a
+ * fresh process per benchmark, so three separate rows would compare three medians taken in
+ * three processes with three different page-cache and block-cache histories — for a
+ * disk-backed measurement that is the wrong experiment. One `fn` call performs one round of
+ * all three arms against the same dataset in the same process, and `teardown` takes the
+ * median per arm across rounds.
+ *
+ * CONSEQUENCE, STATED PLAINLY: THE HARNESS'S OWN MEDIAN FOR THESE ROWS IS THE COST OF ONE
+ * WHOLE ROUND AND IS NOT THE INTERESTING NUMBER. The interesting numbers are the per-arm
+ * milliseconds-per-operation and the two ratios, which `teardown` prints.
+ *
+ * CACHE-WARM VERSUS CACHE-COLD, HONESTLY. The cold/warm distinction is the whole question
+ * for a disk-backed store, and it is a declared property of each row rather than an accident
+ * of run order. BE PRECISE ABOUT WHAT "COLD" MEANS HERE, BECAUSE THE OBVIOUS CLAIM WOULD BE
+ * FALSE: there is no portable way to drop the OS page cache from Node, and a dataset large
+ * enough to exceed a modern machine's PAGE cache cannot be seeded inside a benchmark's time
+ * budget. What these two sizes actually separate is LevelDB's own BLOCK cache
+ * (`classic-level` defaults to 8 MB and this provider does not override it):
+ *
+ *  - {@link READ_COST_SIZES}[0] rows of 200-byte values fits inside it, so random reads are
+ *    served in-process;
+ *  - {@link READ_COST_SIZES}[1] is well past it, so random reads go out to the filesystem —
+ *    which on a warm machine usually means the OS page cache, NOT the physical disk.
+ *
+ * A claim of "cold" that is really "block-cache-miss, page-cache-hit" is worse than no
+ * claim, so it is not made. `docs/benchmarking.md` repeats this caveat.
+ *
+ * NO `counters()` PASS, DELIBERATELY — and the ratios are NOT reported through one. Counter
+ * values are compared with no tolerance and no noise floor, because they are exact
+ * machine-independent integers. A wall-clock ratio is neither: it would report a "counter
+ * change" on literally every run. The ratios are printed to stdout instead, which `run.mjs`
+ * forwards to the human stream live. Note the block lands immediately ABOVE its row, not
+ * under it: `child.mjs` runs `teardown` and only THEN sends the result, and `run.mjs` prints
+ * the row when the result arrives.
+ *
+ * INFORMATIONAL, for the same reason every `@store-leveldb` row is: a disk timing is not a
+ * property of this repository's code. These rows enter no ratio guard (this suite declares
+ * none) and no pass/fail verdict.
+ */
+
+/** Bytes in one seeded row's VALUE. Matches the IndexedDB harness's row size exactly
+ * (`packages/quereus-plugin-indexeddb/bench/README.md` § Layouts), which is the only reason
+ * the two backends' ratios can be read side by side. */
+const READ_COST_VALUE_BYTES = 200;
+
+/**
+ * The two dataset sizes, in rows. Chosen against `classic-level`'s 8 MB default block
+ * cache: 20 000 × 200 bytes is ~4 MB and fits inside it; 200 000 × 200 bytes is ~40 MB and
+ * does not. The IndexedDB run found its small size hid the scatter effect entirely, which
+ * is exactly why both are needed here. 20 000 also matches that harness's small size.
+ */
+const READ_COST_SIZES = [20000, 200000];
+
+/**
+ * Random keys drawn PER READ ARM — a fixed count shared by both dataset sizes, so the two
+ * read arms stay directly comparable across sizes (only the dataset around them changes).
+ *
+ * Kept at 1 000 rather than larger for a cache reason: a LevelDB data block is a few
+ * kilobytes and holds roughly twenty 200-byte rows, so 1 000 scattered reads pull on the
+ * order of 4 MB of blocks — half the default cache. Doubling this would let the batched arm
+ * alone fill the cache before the seek arm runs.
+ */
+const READ_COST_RANDOM_KEYS = 1000;
+
+/**
+ * Rows per seed `batch()`. Seeding 200 000 rows as one batch would build a 40 MB operation
+ * array and hand it to the binding whole; a few thousand at a time keeps both the array and
+ * the write bounded with no measurable difference to what lands on disk.
+ */
+const READ_COST_SEED_CHUNK = 4000;
+
+/** Fixed PRNG seed, so two runs on one machine draw the SAME random keys and their numbers
+ * are comparable. An unseeded draw would add a fresh source of run-to-run variance to a
+ * measurement that already has enough. */
+const READ_COST_RANDOM_SEED = 0x5eedbead;
+
+/** The single logical table these rows seed. Bare `getStore`, so it is one sublevel of the
+ * provider's shared physical root — no catalog entry, no schema, nothing above the store. */
+const READ_COST_TABLE = 'read_cost';
+
+/**
+ * A seeded 32-bit PRNG (mulberry32). Deliberately not `Math.random`: see
+ * {@link READ_COST_RANDOM_SEED}.
+ *
+ * @param {number} seed
+ * @returns {() => number} successive values in [0, 1)
+ */
+function makeSeededRandom(seed) {
+	let state = seed >>> 0;
+	return () => {
+		state = (state + 0x6d2b79f5) >>> 0;
+		let t = Math.imul(state ^ (state >>> 15), 1 | state);
+		t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+	};
+}
+
+/**
+ * Two DISJOINT sets of `perSet` distinct row ordinals drawn from `[0, rowCount)`.
+ *
+ * TWO SETS, NOT ONE, and this is the whole reason the function exists. With one shared key
+ * set the batched-`getMany` arm would pull those rows' blocks into the block cache and the
+ * seek arm that follows it in the same round would then measure a cache hit — exactly the
+ * thing the large-dataset row exists to avoid claiming.
+ *
+ * It does not eliminate block-level sharing: a block the batched arm read holds ~20
+ * neighbouring rows, so a seek key can still land in a warmed block. At 1 000 keys against
+ * 200 000 rows that is on the order of a tenth of the seek keys. Stated rather than
+ * engineered away — pushing it to zero would mean partitioning the key space, which would
+ * make the two arms read different REGIONS and stop them being comparable.
+ *
+ * @param {number} rowCount
+ * @param {number} perSet
+ * @param {number} seed
+ * @returns {[number[], number[]]}
+ */
+function drawDisjointOrdinals(rowCount, perSet, seed) {
+	if (perSet * 2 > rowCount) {
+		throw new Error(`read-cost: two disjoint sets of ${perSet} ordinals do not fit in ${rowCount} rows`);
+	}
+	const random = makeSeededRandom(seed);
+	/** @type {Set<number>} */
+	const seen = new Set();
+	/** @type {number[]} */
+	const drawn = [];
+	while (drawn.length < perSet * 2) {
+		const ordinal = Math.floor(random() * rowCount);
+		if (seen.has(ordinal)) continue;
+		seen.add(ordinal);
+		drawn.push(ordinal);
+	}
+	return [drawn.slice(0, perSet), drawn.slice(perSet)];
+}
+
+/**
+ * One row's 200-byte value: the ordinal big-endian in the first four bytes, deterministic
+ * filler after it. The same shape the IndexedDB harness seeds, so the two are comparable.
+ *
+ * @param {number} ordinal
+ * @returns {Uint8Array}
+ */
+function makeReadCostValue(ordinal) {
+	const value = new Uint8Array(READ_COST_VALUE_BYTES);
+	new DataView(value.buffer).setUint32(0, ordinal, false);
+	for (let i = 4; i < value.length; i++) value[i] = (ordinal + i) & 0xff;
+	return value;
+}
+
+/**
+ * The exclusive upper bound of a one-key seek window: `key` with a zero byte appended.
+ *
+ * WHY THIS IS CORRECT without `incrementLastByte` (which the harness's single
+ * `@quereus/store` import site does not expose): `key` is a byte-prefix of `key ‖ 0x00`, so
+ * it sorts strictly below it and stays inside the window. Every OTHER stored key differs
+ * from `key` WITHIN `key`'s own length, because the composite-key column encodings are
+ * self-delimiting and so no stored key is a proper prefix of another. The `fn` below asserts
+ * each seek drained exactly one entry, which is what catches this argument being violated
+ * if the key shape ever changes.
+ *
+ * @param {Uint8Array} key
+ * @returns {Uint8Array}
+ */
+function seekWindowEnd(key) {
+	const end = new Uint8Array(key.length + 1);
+	end.set(key);
+	return end;
+}
+
+/**
+ * Drop the first round before taking a median.
+ *
+ * Calibration's minimum for these rows is 8 rounds — 2 warmup calls
+ * (`CALIBRATION.minWarmup`), 1 batch-sizing call, and 5 samples (`minSamples`) — so this
+ * leaves at least 7. The degenerate case falls back to every recorded round rather than
+ * dividing by zero.
+ *
+ * @param {number[]} samples
+ * @returns {number[]}
+ */
+function withoutFirstRound(samples) {
+	return samples.length > 1 ? samples.slice(1) : samples;
+}
+
+/**
+ * Print the per-arm milliseconds-per-operation and the two cost-profile ratios.
+ *
+ * Goes to stdout, which `run.mjs` forwards to the human stream as it arrives — see the
+ * section header for why this is not a `counters()` block, and for where the block lands
+ * relative to its row.
+ *
+ * @param {string} name
+ * @param {number} rowCount
+ * @param {{ sequential: number[], batched: number[], seek: number[] }} rounds
+ */
+function reportReadCost(name, rowCount, rounds) {
+	const sequentialMs = median(withoutFirstRound(rounds.sequential));
+	const batchedMs = median(withoutFirstRound(rounds.batched));
+	const seekMs = median(withoutFirstRound(rounds.seek));
+
+	const sequentialPerRow = sequentialMs / rowCount;
+	const batchedPerRow = batchedMs / READ_COST_RANDOM_KEYS;
+	const seekPerKey = seekMs / READ_COST_RANDOM_KEYS;
+
+	const counted = withoutFirstRound(rounds.sequential).length;
+	/** @param {number} ms */
+	const perOp = (ms) => ms.toFixed(6).padStart(10);
+	/** @param {number} ratio */
+	const asRatio = (ratio) => ratio.toFixed(2).padStart(6);
+
+	process.stdout.write(
+		`\n${name}: ${rowCount} rows x ${READ_COST_VALUE_BYTES}-byte values, median of ${counted} rounds\n`
+		+ `  sequential   full iterate            ${perOp(sequentialPerRow)} ms/row   (the 1.0 denominator)\n`
+		+ `  batched      getMany, paged          ${perOp(batchedPerRow)} ms/row   pointRead        ${asRatio(batchedPerRow / sequentialPerRow)}\n`
+		+ `  single-seek  iterate, one window     ${perOp(seekPerKey)} ms/key   seekPositioning  ${asRatio(seekPerKey / sequentialPerRow)}\n`
+		+ `  (parity defaults are pointRead 1.00 / seekPositioning 0.50; see packages/quereus-store/src/common/cost-profile.ts)\n\n`,
+	);
+}
+
+/**
+ * One read-cost row: seed `rowCount` rows into a fresh LevelDB directory, then time three
+ * arms per round against that one dataset.
+ *
+ * ARM ORDER WITHIN A ROUND IS LOAD-BEARING: sequential, then batched read, then seeks. The
+ * sequential full scan is both the 1.0 denominator AND the within-round cache buster — at
+ * the large size it streams ~40 MB through an 8 MB block cache and evicts what the previous
+ * round's random arms left resident. At the small size nothing is evicted, and that IS the
+ * small row's finding.
+ *
+ * WHAT THE THIRD ARM ACTUALLY PRICES. `StoreTableScan.scanMultiSeek` iterates one window per
+ * seek key over the INDEX store, with `{gte, lt: incrementLastByte(gte)}` and no `limit`;
+ * `scanMultiSeekPrimary` does not iterate per key at all — it batches through `getMany` on
+ * the data store, which is the path the second arm already prices. So this arm prices THE
+ * SHAPE of one seek window (position an iterator, drain it, close it) against a real
+ * on-disk store, not a literal transcription of a call site.
+ *
+ * KEY BYTES ARE THE REAL ONES: `encodeCompositeKey` over a single integer column, reached
+ * through `loadStoreKeyApi()` so this file keeps the suite's single `@quereus/store` import.
+ * (The IndexedDB harness used a bare 4-byte big-endian ordinal as its key instead. The
+ * difference is a few bytes of key against a 200-byte value.)
+ *
+ * SEED WRITES GO THROUGH `KVStore.batch()` DIRECTLY, not through SQL and not through the
+ * provider's `beginAtomicBatch`: the measurement is about reads, a SQL seed would put the
+ * engine and the isolation overlay in the setup path for no gain, and the per-store
+ * `batch()` is not subject to the provider's `syncCommits: true` fsync-per-commit default.
+ *
+ * @param {number} rowCount
+ * @returns {import('../lib/discover.mjs').Benchmark}
+ */
+function makeReadCostBenchmark(rowCount) {
+	const name = `leveldb-read-cost-${rowCount / 1000}k`;
+	/** @type {import('@quereus/plugin-leveldb').LevelDBProvider|null} */
+	let provider = null;
+	/** @type {import('./../lib/tempdir.mjs').BenchTempDir|null} */
+	let temp = null;
+	/** @type {import('@quereus/store').KVStore|null} */
+	let store = null;
+	/** Random keys for the batched arm, pre-paged at `ROW_RESOLUTION_BATCH` so `fn`
+	 * allocates nothing inside a timed arm.
+	 * @type {Uint8Array[][]} */
+	let batchedPages = [];
+	/** One `{gte, lt, limit: 1}` window per seek key, built once in `setup` for the same
+	 * reason.
+	 * @type {import('@quereus/store').IterateOptions[]} */
+	let seekWindows = [];
+	/** @type {{ sequential: number[], batched: number[], seek: number[] }} */
+	const rounds = { sequential: [], batched: [], seek: [] };
+
+	return {
+		name,
+		// Advisory: a disk timing is not a property of this repository's code. Declared as a
+		// literal `true` because `discover.mjs` tests it STRICTLY — a truthy non-boolean
+		// would leave the row gated.
+		informational: true,
+		// TWO reasons compose here, and both must be able to reach the row: `@quereus/store`
+		// not loading (the same reason every other row in this suite gives) and the LevelDB
+		// opt-in being absent or the plugin failing to load. Store first, because these rows
+		// need its key encoder before they need a provider at all.
+		async skip() {
+			return (await storeLoadFailure()) ?? (await levelDBSkipReason());
+		},
+		async setup() {
+			const api = await loadStoreKeyApi();
+			// BINARY and the built-in resolver named explicitly rather than left to the
+			// default, which is NOCASE — see `makeKeyBenchmark` for the full reason. On an
+			// integer column collation is a no-op, so this changes no byte; it is stated so
+			// the row says what it encoded.
+			/** @type {import('@quereus/store').EncodeOptions} */
+			const options = { collation: 'BINARY', normalizers: api.BUILTIN_KEY_NORMALIZER_RESOLVER };
+			/** @param {number} ordinal */
+			const encodeKey = (ordinal) => api.encodeCompositeKey([BigInt(ordinal)], options);
+
+			// Assigned BEFORE the first await that can throw, so `teardown` (which `child.mjs`
+			// also runs as best-effort cleanup after a failed `setup`) can always close the
+			// provider and remove the directory.
+			const created = await createBenchLevelDBProvider(`read-cost-${rowCount}`);
+			provider = created.provider;
+			temp = created.temp;
+
+			store = await provider.getStore('main', READ_COST_TABLE);
+			let batch = store.batch();
+			let queued = 0;
+			for (let ordinal = 0; ordinal < rowCount; ordinal++) {
+				batch.put(encodeKey(ordinal), makeReadCostValue(ordinal));
+				if (++queued === READ_COST_SEED_CHUNK) {
+					await batch.write();
+					batch = store.batch();
+					queued = 0;
+				}
+			}
+			if (queued > 0) await batch.write();
+
+			const [batchedOrdinals, seekOrdinals] = drawDisjointOrdinals(rowCount, READ_COST_RANDOM_KEYS, READ_COST_RANDOM_SEED);
+			const batchedKeys = batchedOrdinals.map(encodeKey);
+			batchedPages = [];
+			// Paged at the imported `ROW_RESOLUTION_BATCH`, never a restated 256, because that
+			// is the page size `StoreTableScan` actually resolves index entries at. A naive
+			// per-key `get` loop would price a path the engine never takes.
+			for (let offset = 0; offset < batchedKeys.length; offset += api.ROW_RESOLUTION_BATCH) {
+				batchedPages.push(batchedKeys.slice(offset, offset + api.ROW_RESOLUTION_BATCH));
+			}
+			seekWindows = seekOrdinals.map(encodeKey).map((key) => ({ gte: key, lt: seekWindowEnd(key), limit: 1 }));
+
+			rounds.sequential.length = 0;
+			rounds.batched.length = 0;
+			rounds.seek.length = 0;
+		},
+		// Guarded throughout: this also runs as best-effort cleanup after a `setup` that
+		// threw, so nothing here may assume the seed completed.
+		async teardown() {
+			if (rounds.sequential.length > 0) reportReadCost(name, rowCount, rounds);
+			store = null;
+			if (provider) {
+				try {
+					// CLOSE ORDER IS LOAD-BEARING: the provider releases LevelDB's exclusive
+					// directory lock, and only then can the directory be removed — removing
+					// first fails on Windows against a live lock. Held rather than rethrown for
+					// the same reason `openLevelDBDatabase` holds it: the removal below is the
+					// thing that must not be skipped.
+					await provider.closeAll();
+				} catch (err) {
+					process.stderr.write(`${name}: closing the LevelDB provider failed, removing the directory anyway: ${err instanceof Error ? err.message : String(err)}\n`);
+				}
+				provider = null;
+			}
+			if (temp) {
+				temp.remove();
+				temp = null;
+			}
+			batchedPages = [];
+			seekWindows = [];
+		},
+		async fn() {
+			const kv = /** @type {import('@quereus/store').KVStore} */ (store);
+
+			// ARM 1 — SEQUENTIAL. A full `iterate()` over every row, draining values. This is
+			// the 1.0 denominator by definition, and the within-round cache buster.
+			const sequentialStart = performance.now();
+			let scanned = 0;
+			let scannedBytes = 0;
+			for await (const entry of kv.iterate()) {
+				scannedBytes += entry.value.length;
+				scanned++;
+			}
+			rounds.sequential.push(performance.now() - sequentialStart);
+			// Asserted AFTER the clock is read, so the check never lands in the arm's number.
+			if (scanned !== rowCount) {
+				throw new Error(`${name}: sequential scan drained ${scanned} entries, expected ${rowCount}`);
+			}
+			if (scannedBytes !== rowCount * READ_COST_VALUE_BYTES) {
+				throw new Error(`${name}: sequential scan drained ${scannedBytes} value bytes, expected ${rowCount * READ_COST_VALUE_BYTES} — values are not being read`);
+			}
+
+			// ARM 2 — BATCHED RANDOM POINT READS, paged at `ROW_RESOLUTION_BATCH`.
+			const batchedStart = performance.now();
+			let resolved = 0;
+			for (const page of batchedPages) {
+				const values = await kv.getMany(page);
+				for (const value of values) {
+					if (value !== undefined) resolved++;
+				}
+			}
+			rounds.batched.push(performance.now() - batchedStart);
+			if (resolved !== READ_COST_RANDOM_KEYS) {
+				throw new Error(`${name}: batched read resolved ${resolved} of ${READ_COST_RANDOM_KEYS} keys — a miss means the key encoding or the seed drifted`);
+			}
+
+			// ARM 3 — SINGLE-KEY SEEK WINDOWS, one `iterate` per random key, each drained and
+			// closed (draining a `limit: 1` window to completion is what runs the generator's
+			// `finally`, which closes the underlying iterator).
+			const seekStart = performance.now();
+			let seekEntries = 0;
+			for (const window of seekWindows) {
+				for await (const _entry of kv.iterate(window)) seekEntries++;
+			}
+			rounds.seek.push(performance.now() - seekStart);
+			// Exactly one entry per window: this is what catches the `key ‖ 0x00` upper-bound
+			// argument in `seekWindowEnd` being violated by a change to the key shape.
+			if (seekEntries !== seekWindows.length) {
+				throw new Error(`${name}: ${seekWindows.length} single-key seeks drained ${seekEntries} entries, expected one each — the seek window bound no longer isolates one key`);
+			}
+		},
+	};
+}
+
 export const benchmarks = [
 	...KEY_SHAPES.map(makeKeyBenchmark),
 	makeIndexKeyBenchmark(),
@@ -1182,4 +1631,5 @@ export const benchmarks = [
 	makeCommitBenchmark(1000),
 	makeIndexBuildBenchmark(),
 	makeCatalogRehydrateBenchmark(),
+	...READ_COST_SIZES.map(makeReadCostBenchmark),
 ];
