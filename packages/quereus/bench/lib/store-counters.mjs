@@ -51,16 +51,31 @@ import { Database } from '../../dist/src/index.js';
  *
  * @typedef {object} StoreDatabaseHandle
  * @property {import('../../dist/src/index.js').Database} db
- * @property {() => Promise<void>} close closes `db` AND the module it registered
+ * @property {AttachableModule} module the isolation-wrapped module registered on `db`
+ * @property {import('@quereus/store').StoreModule} storeModule the `StoreModule` beneath
+ *   the isolation wrapper — the object that owns catalog persistence
+ *   (`whenCatalogPersisted`) and reopen (`rehydrateCatalog`). The wrapper types its
+ *   `underlying` as a generic vtab module; the narrowing to `StoreModule` happens ONCE,
+ *   in `attach`, because this file is the single sanctioned touch point for
+ *   `@quereus/store`.
+ * @property {() => Promise<void>} closeDbOnly closes `db` and NOTHING else — the module
+ *   and its provider stay alive, so a reopen-shaped benchmark can build a schema, close
+ *   the database, and open a fresh one over the SAME provider. Idempotent, and `close()`
+ *   still works (and is still required, on exactly one handle per provider) afterwards.
+ * @property {() => Promise<void>} close closes `db` AND the module it registered — and the
+ *   module close closes its PROVIDER, so a caller sharing one provider across several
+ *   handles calls this on exactly ONE of them and `closeDbOnly` on the rest
  *
  * @typedef {StoreDatabaseHandle & {
  *   provider: import('@quereus/store').KVStoreProvider,
  * }} PlainStoreDatabaseHandle the plain handle, plus the provider its database was built
  *   over — so a benchmark that has to assert on PHYSICAL store contents (does an index
- *   store exist, how many entries does it hold) can reach one. Additive; a caller that
- *   only wants `db` / `close` ignores it.
+ *   store exist, how many entries does it hold) can reach one, and a reopen-shaped one can
+ *   hand it back to `openStoreDatabase`. Additive; a caller that only wants `db` / `close`
+ *   ignores it.
  *
  * @typedef {StoreDatabaseHandle & {
+ *   provider: import('@quereus/store').KVStoreProvider,
  *   resetCounters: () => void,
  *   readCounters: () => Record<string, StoreCounters>,
  * }} CountingStoreDatabaseHandle
@@ -223,22 +238,38 @@ export async function storeLoadFailure() {
  *   what `Database.registerModule` accepts, taken from its own signature rather than
  *   re-stated — `AnyVirtualTableModule` is not part of the package's public surface
  *
- * @param {RegisterableModule & { closeAll: () => Promise<void> }} module
+ * @typedef {RegisterableModule & { closeAll: () => Promise<void>, underlying: unknown }} AttachableModule
+ *   what `attach` needs on top of registerability: a module close, and the isolation
+ *   wrapper's `underlying` slot holding the `StoreModule` it wraps
+ *
+ * @param {AttachableModule} module
  * @returns {StoreDatabaseHandle}
  */
 function attach(module) {
 	const db = new Database();
 	db.registerModule('store', module);
 	db.setOption('default_vtab_module', 'store');
+	// Idempotent, so `close()` after `closeDbOnly()` (the reopen-benchmark shape: close the
+	// fixture database in `setup`, close module + provider in `teardown`) does not close
+	// the database twice.
+	let dbClosed = false;
+	const closeDbOnly = async () => {
+		if (dbClosed) return;
+		dbClosed = true;
+		await db.close();
+	};
 	return {
 		db,
+		module,
+		storeModule: /** @type {import('@quereus/store').StoreModule} */ (module.underlying),
+		closeDbOnly,
 		// The module close is NOT optional: a leaked store module trips the worker's
 		// leaked-handle exit path, which presents as a hang rather than as an error. So
 		// `closeAll` runs in a `finally` — a `db.close()` that throws would otherwise
 		// turn one reportable error into that hang.
 		async close() {
 			try {
-				await db.close();
+				await closeDbOnly();
 			} finally {
 				await module.closeAll();
 			}
@@ -257,11 +288,18 @@ function attach(module) {
  * landed in a store — an index build, say — otherwise has no way to reach the provider its
  * own database was built over. Additive, and it costs a benchmark that ignores it nothing.
  *
+ * `existingProvider` is the reopen shape: a fresh `Database` and a fresh module over a
+ * provider that already holds data — what catalog rehydration measures. A caller passing
+ * one owns its lifetime: `close()` on the handle built here would close that shared
+ * provider, so per-cycle handles get `closeDbOnly()` and exactly one handle (the one whose
+ * builder minted the provider) gets `close()`.
+ *
+ * @param {import('@quereus/store').KVStoreProvider} [existingProvider]
  * @returns {Promise<PlainStoreDatabaseHandle>}
  */
-export async function openStoreDatabase() {
+export async function openStoreDatabase(existingProvider) {
 	const { createIsolatedStoreModule, createInMemoryProvider } = await loadStoreModules();
-	const provider = createInMemoryProvider();
+	const provider = existingProvider ?? createInMemoryProvider();
 	return { ...attach(createIsolatedStoreModule({ provider })), provider };
 }
 
@@ -274,6 +312,12 @@ export async function openStoreDatabase() {
  * already gives this for free — `counters()` runs once, after the timed loop — and three
  * of `mutation.bench.mjs`'s four entries already build their own database in it.
  *
+ * Unlike `openStoreDatabase` this deliberately accepts NO existing provider: a
+ * caller-supplied provider's stores would not be in the counted map, so nothing about them
+ * could ever be read back. A reopen-shaped counters pass goes the other way around — build
+ * the fixture here, `closeDbOnly()`, then `openStoreDatabase(counting.provider)` over the
+ * counting provider this handle exposes.
+ *
  * @returns {Promise<CountingStoreDatabaseHandle>}
  */
 export async function openCountingStoreDatabase() {
@@ -282,10 +326,12 @@ export async function openCountingStoreDatabase() {
 	const counted = new Map();
 	// `'all'` rather than the default `'data'`: an index scan's traffic is the single most
 	// interesting thing here, and it lands on the index store, not the data store.
-	const handle = attach(createIsolatedStoreModule({ provider: createCountingProvider(counted, 'all') }));
+	const provider = createCountingProvider(counted, 'all');
+	const handle = attach(createIsolatedStoreModule({ provider }));
 	let closed = false;
 	return {
 		...handle,
+		provider,
 		async close() {
 			closed = true;
 			await handle.close();
