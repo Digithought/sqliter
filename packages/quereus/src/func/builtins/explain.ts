@@ -320,7 +320,7 @@ export const schedulerProgramFunc = createIntegratedTableValuedFunction(
 				yield [
 					entry.addr,                         // addr
 					JSON.stringify(entry.dependencies), // dependencies
-					entry.description,                  // instruction_id
+					entry.description,                  // description
 					null,                                // estimated_cost (not available in current implementation)
 					entry.isSubprogram ? 1 : 0,         // is_subprogram
 					entry.parentAddr                    // parent_addr
@@ -513,10 +513,11 @@ export const executionTraceFunc = createIntegratedTableValuedFunction(
 					results.push(row); // We don't yield the results, just the trace events
 				}
 
-				await stmt.finalize();
 			} catch (executionError: unknown) {
 				// If execution fails, we might still have some trace events
 				log('Query execution failed during tracing: %s', executionError instanceof Error ? executionError.message : String(executionError));
+			} finally {
+				await stmt?.finalize();
 			}
 
 			// Get the collected trace events
@@ -667,11 +668,12 @@ export const rowTraceFunc = createIntegratedTableValuedFunction(
 					results.push(row); // We don't yield the results, just the trace events
 				}
 
-				await stmt.finalize();
 			} catch (executionError: unknown) {
 				// If execution fails, we might still have some trace events
 				const message = executionError instanceof Error ? executionError.message : String(executionError);
-				console.warn('Query execution failed during row tracing:', message);
+				log('Query execution failed during row tracing: %s', message);
+			} finally {
+				await stmt?.finalize();
 			}
 
 			// Get the collected trace events and filter for row events

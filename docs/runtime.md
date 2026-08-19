@@ -594,7 +594,8 @@ Fusion is off when `trace_plan_stack = true` (fused frames would silently vanish
 false — the explicit kill switch for bisecting a suspected fusion bug. Both are baked
 into a prepared statement's cached emission context at emit time; recompile to pick up
 a toggle. **Debug introspection reports the unfused graph**: `scheduler_program()`,
-`execution_trace()` (which joins the former by instruction index), and
+`execution_trace()` (which joins its trace events against that same instruction
+listing by index — both build it from one shared in-process helper), and
 `Statement.getDebugProgram()` all emit with fusion disabled — the faithful description
 of what the query computes — while a normal execution runs the fused form.
 
