@@ -19,7 +19,19 @@
  */
 const METRICS_OPTION = 'runtime_metrics';
 
-/** Turn work-counter collection on for `db`. Idempotent. */
+/** @typedef {import('../../dist/src/index.js').Database} Database */
+
+/**
+ * What `Statement.all()` accepts for its bindings — named bag or positional list.
+ *
+ * @typedef {import('../../dist/src/index.js').SqlParameters | import('../../dist/src/index.js').SqlValue[]} StatementParams
+ */
+
+/**
+ * Turn work-counter collection on for `db`. Idempotent.
+ *
+ * @param {Database} db
+ */
 export function enableMetrics(db) {
 	db.setOption(METRICS_OPTION, true);
 }
@@ -32,9 +44,9 @@ export function enableMetrics(db) {
  * stopped — and a partial count compared against a drained baseline reads as a change
  * in the engine when nothing changed but the loop.
  *
- * @param {import('../../dist/src/index.js').Database} db
+ * @param {Database} db
  * @param {string} sql
- * @param {unknown} [params]
+ * @param {StatementParams} [params]
  * @returns {Promise<object>} a `WorkCounterSnapshot`
  */
 export async function snapshotStatement(db, sql, params) {
@@ -61,7 +73,7 @@ export async function snapshotStatement(db, sql, params) {
  * statement and `r#0` of another are different instructions with the same key. They
  * must never be summed; naming each snapshot keeps them apart.
  *
- * @param {import('../../dist/src/index.js').Database} db
+ * @param {Database} db
  * @param {Record<string, string>} statements name -> SQL, run in insertion order
  * @returns {Promise<Record<string, object>>}
  */
@@ -80,7 +92,7 @@ export async function snapshotStatements(db, statements) {
  * statement, and the one that would catch a rule regression turning a hash join back
  * into a nested loop.
  *
- * @param {import('../../dist/src/index.js').Database} db
+ * @param {Database} db
  * @param {string} sql
  * @returns {Promise<object>} a `PlanShape`
  */

@@ -115,6 +115,10 @@ export function round(n, precision = PRECISION) {
  * @property {number} batch
  * @property {number} warmup
  * @property {boolean} pinned
+ * @property {object} [counters] the benchmark's `counters()` return value, attached by
+ *   `run.mjs` after summarizing and stored verbatim. ABSENT rather than `{}` when the
+ *   benchmark declares no `counters()` or the run passed `--no-counters` — see the
+ *   note at the attachment site.
  */
 
 /**

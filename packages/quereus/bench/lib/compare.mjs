@@ -76,7 +76,12 @@ export const STATUS_ORDER = ['no-change', 'changed', 'improvement', 'regression'
 /** Order counter counts are reported in. */
 export const COUNTER_STATUS_ORDER = ['same', 'changed', 'new', 'dropped', 'none', 'skipped'];
 
-/** A counter verdict with nothing to say — the shared shape for every non-comparison. */
+/**
+ * A counter verdict with nothing to say — the shared shape for every non-comparison.
+ *
+ * @param {CounterStatus} status
+ * @returns {CounterVerdict}
+ */
 const noCounters = (status) => ({ status, changes: [] });
 
 /**
@@ -92,7 +97,39 @@ function isKeyedArray(value) {
 		&& value.every((e) => e !== null && typeof e === 'object' && !Array.isArray(e) && typeof e.key === 'string');
 }
 
+/**
+ * Address `part` under `prefix`, or at the root when there is no prefix yet.
+ *
+ * @param {string} prefix
+ * @param {string} part
+ * @returns {string}
+ */
 const joinPath = (prefix, part) => (prefix ? `${prefix}.${part}` : part);
+
+/**
+ * Narrow one non-object leaf to the primitive types a counter path can hold.
+ *
+ * The walk starts from `unknown`, so nothing in the type system knows a leaf is one of
+ * the four JSON primitives — and it genuinely is one, because every counter block has
+ * been through JSON already (parsed from a baseline file, or sent by the child over
+ * its JSON message channel). Anything else is impossible by that construction, so it
+ * is recorded by its string form rather than dropped: a malformed counter shows up as
+ * a visible difference instead of silently comparing equal on both sides.
+ *
+ * @param {unknown} value
+ * @returns {number|string|boolean|null}
+ */
+function asCounterLeaf(value) {
+	if (value === null) return null;
+	switch (typeof value) {
+		case 'number':
+		case 'string':
+		case 'boolean':
+			return value;
+		default:
+			return String(value);
+	}
+}
 
 /**
  * Flatten a `counters()` return value into `path -> primitive` pairs, so two runs can
@@ -117,7 +154,7 @@ const joinPath = (prefix, part) => (prefix ? `${prefix}.${part}` : part);
 export function flattenCounters(value, prefix = '', out = {}) {
 	if (value === null || typeof value !== 'object') {
 		// A primitive at the root has no path to file itself under and is not a counter.
-		if (prefix) out[prefix] = value;
+		if (prefix) out[prefix] = asCounterLeaf(value);
 		return out;
 	}
 	if (Array.isArray(value)) {
@@ -171,8 +208,8 @@ export function diffCounters(before, after) {
 /**
  * Compare one benchmark's counter block against its baseline entry's.
  *
- * @param {{counters?: unknown}|null|undefined} result this run's summary record
- * @param {{counters?: unknown}|null|undefined} base the baseline file's entry
+ * @param {import('./stats.mjs').BenchmarkSummary|null|undefined} result this run's summary record
+ * @param {import('./stats.mjs').BaselineEntry|null|undefined} base the baseline file's entry
  * @returns {CounterVerdict}
  */
 function compareCountersOne(result, base) {
