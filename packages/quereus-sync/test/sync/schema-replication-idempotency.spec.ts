@@ -364,7 +364,8 @@ describe('schema replication idempotency', () => {
 			expect(schemaEvents.map(e => [e.type, e.objectType, e.objectName, e.remote ?? false]))
 				.to.deep.equal([
 					['create', 'index', 'idx_orders_note', false],
-					['alter', 'table', 'orders', false],
+					// `add column` is a column arm: `alter`/`column`, not `alter`/`table`.
+					['alter', 'column', 'orders', false],
 				]);
 		});
 
@@ -391,7 +392,7 @@ describe('schema replication idempotency', () => {
 				expect(result.schemaChangesApplied).to.equal(1);
 				expect(db.schemaManager.getTable('main', 'orders')!.columns.map(c => c.name)).to.include('sku');
 				expect(schemaEvents.map(e => [e.type, e.objectType, e.objectName, e.remote]))
-					.to.deep.equal([['alter', 'table', 'orders', true]]);
+					.to.deep.equal([['alter', 'column', 'orders', true]]);
 			});
 
 			it('counts an add column for a same-typed existing column applied without re-executing', async () => {
@@ -514,7 +515,7 @@ describe('schema replication idempotency', () => {
 				expect(db.schemaManager.getTable('main', 'orders')!
 					.columns.find(c => c.name === 'note')!.notNull).to.equal(false);
 				expect(schemaEvents.map(e => [e.type, e.objectType, e.objectName, e.remote]))
-					.to.deep.equal([['alter', 'table', 'orders', true]]);
+					.to.deep.equal([['alter', 'column', 'orders', true]]);
 			});
 
 			it('alter column over a locally dropped column converges with a warning', async () => {
@@ -570,7 +571,7 @@ describe('schema replication idempotency', () => {
 				// `clearExpectedRemoteSchemaEvent` existed to handle).
 				await db.exec('alter table orders add column after_fail text null');
 				expect(schemaEvents.map(e => [e.type, e.objectType, e.objectName, e.remote ?? false]))
-					.to.deep.equal([['alter', 'table', 'orders', false]]);
+					.to.deep.equal([['alter', 'column', 'orders', false]]);
 			});
 
 			it('a replicated statement that emits no event leaves no scope residue', async () => {
@@ -583,7 +584,7 @@ describe('schema replication idempotency', () => {
 
 				await db.exec('alter table orders add column fresh text null');
 				expect(schemaEvents.map(e => [e.type, e.objectType, e.objectName, e.remote ?? false]))
-					.to.deep.equal([['alter', 'table', 'orders', false]]);
+					.to.deep.equal([['alter', 'column', 'orders', false]]);
 			});
 		});
 	});

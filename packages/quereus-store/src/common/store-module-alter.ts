@@ -22,6 +22,7 @@ import type {
 import {
 	QuereusError,
 	StatusCode,
+	alterEventShape,
 	buildCheckConstraintSchema,
 	buildColumnIndexMap,
 	buildForeignKeyConstraintSchema,
@@ -141,8 +142,7 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 		// exactly one announced event. See `SchemaChangeInfo.ddl`.
 		if (change.ddl !== undefined) {
 			this.eventEmitter?.emitSchemaChange({
-				type: 'alter',
-				objectType: 'table',
+				...alterEventShape(change),
 				schemaName,
 				objectName: tableName,
 				ddl: change.ddl,

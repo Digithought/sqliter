@@ -109,31 +109,52 @@ export function assertOpSeqInRange(opSeq: number): void {
 /**
  * Map an engine schema-change event to the sync {@link SchemaMigrationType} it
  * records, or `undefined` when the combination is not tracked for replication
- * (e.g. column-level or view/trigger objects, or an `alter` on an index). Takes
- * the whole event rather than `(objectType, type)` because a rename is only
- * distinguishable by `oldObjectName`, which exactly the three RENAME TO emit sites
- * set — `StoreModuleRename.renameTable`, the memory module's `renameTable`, and the
- * engine's own `runRenameTable` tail (for a module with no emitter of its own). All
- * three put the NEW name in `objectName`. Every other `'table' alter` is recorded as
- * `alter_column` — the coarse "table definition changed" migration the schema-sync
- * layer replays.
+ * (e.g. an `alter` on an index). Takes the whole event rather than
+ * `(objectType, type)` because a rename is only distinguishable by `oldObjectName`,
+ * which exactly the three RENAME TO emit sites set — `StoreModuleRename.renameTable`,
+ * the memory module's `renameTable`, and the engine's own `runRenameTable` tail (for a
+ * module with no emitter of its own). All three put the NEW name in `objectName`.
+ *
+ * Every `'table' alter` and EVERY column arm is recorded as `alter_column` — the coarse
+ * "table definition changed" migration the schema-sync layer replays by parsing the
+ * carried `ddl` and deciding per arm (`store-adapter.ts` § `decideAlterTable`). That
+ * includes `drop column`, which arrives as `drop`/`column`: it is a table-definition
+ * change, NOT a `drop_table`.
+ *
+ * The `objectType` dispatch is exhaustive (`never` fall-through) on purpose: a silently
+ * unmapped object type disables replication for it without a word, which is how
+ * column-shaped ALTER events went unrecorded before. A new object type must fail the
+ * build here and be decided deliberately. Exhaustiveness is over `objectType` only —
+ * an untracked `(objectType, type)` combination inside a branch still returns `undefined`.
  */
 function mapSchemaMigrationType(event: DatabaseSchemaChangeEvent): SchemaMigrationType | undefined {
 	const { objectType, type } = event;
-	if (objectType === 'table') {
-		if (type === 'alter' && event.oldObjectName !== undefined) return 'rename_table';
-		switch (type) {
-			case 'create': return 'create_table';
-			case 'drop': return 'drop_table';
-			case 'alter': return 'alter_column';
+	switch (objectType) {
+		case 'table': {
+			if (type === 'create') return 'create_table';
+			if (type === 'drop') return 'drop_table';
+			// A rename is the only `'table' alter` distinguishable from the rest; everything
+			// else that alters a table definition is the coarse `alter_column`.
+			if (type === 'alter') return event.oldObjectName !== undefined ? 'rename_table' : 'alter_column';
+			return undefined;
 		}
-	} else if (objectType === 'index') {
-		switch (type) {
-			case 'create': return 'add_index';
-			case 'drop': return 'drop_index';
+		case 'column': {
+			// Both `alter column` / `add column` / `rename column` (`alter`) and `drop column`
+			// (`drop`) are table-definition changes replayed from the carried `ddl`.
+			if (type === 'alter' || type === 'drop') return 'alter_column';
+			return undefined;
+		}
+		case 'index': {
+			if (type === 'create') return 'add_index';
+			if (type === 'drop') return 'drop_index';
+			return undefined;
+		}
+		default: {
+			const _exhaustive: never = objectType;
+			void _exhaustive;
+			return undefined;
 		}
 	}
-	return undefined;
 }
 
 /**

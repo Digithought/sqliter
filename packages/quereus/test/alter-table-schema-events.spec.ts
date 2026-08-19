@@ -22,8 +22,8 @@
  * the statement's action), so `add column … <inline constraint>` announces once on either
  * path, carrying the whole statement's text. The remaining deliberate silence: the tag arms
  * (`SET`/`ADD`/`DROP TAGS`) and the materialized-view lifecycle arms (`SET`/`DROP
- * MAINTAINED`) raise nothing on either path — see
- * `backlog/feat-alter-table-tags-emit-no-schema-event`.
+ * MAINTAINED`) raise nothing on either path — a documented decision, not a gap; see
+ * `docs/usage.md` § What each `ALTER TABLE` arm reports.
  */
 
 import assert from 'node:assert/strict';
@@ -352,13 +352,28 @@ describe('ALTER TABLE raises a schema-change event on the engine\'s own path', (
 
 	describe('arms that are deliberately silent', () => {
 		it('the tag arms raise nothing (catalog-only, and no backend reports them)', async () => {
-			await db.exec('create table t (id integer primary key, v text null)');
-			await db.exec("alter table t set tags (owner = 'a')");
-			await db.exec("alter table t add tags (team = 'b')");
-			await db.exec('alter table t drop tags (owner)');
-			await db.exec("alter table t alter column v set tags (unit = 'ms')");
-
-			assert.deepEqual(alterEvents().map(shape), []);
+			// All NINE tag statement forms: three sites (table / column / named constraint)
+			// x three mutations (SET / ADD / DROP). The silence is the contract, not an
+			// oversight - see `docs/usage.md` § What each `ALTER TABLE` arm reports ("Two arm
+			// families report nothing on either path"). Tags are informational metadata the
+			// engine derives no behaviour from, and mechanically the tag arms never reach
+			// `module.alterTable` at all (they go straight to the SchemaManager setters), so an
+			// emitter-backed backend has no seam to announce from either.
+			await db.exec('create table t (id integer primary key, v text null, e text null, constraint uq_e unique (e))');
+			for (const statement of [
+				"alter table t set tags (owner = 'a')",
+				"alter table t add tags (team = 'b')",
+				'alter table t drop tags (owner)',
+				"alter table t alter column v set tags (unit = 'ms')",
+				"alter table t alter column v add tags (source = 'sensor')",
+				'alter table t alter column v drop tags (unit)',
+				"alter table t alter constraint uq_e set tags (msg = 'dup')",
+				"alter table t alter constraint uq_e add tags (hint = 'email')",
+				'alter table t alter constraint uq_e drop tags (msg)',
+			]) {
+				await db.exec(statement);
+				assert.deepEqual(alterEvents().map(shape), [], statement);
+			}
 		});
 	});
 

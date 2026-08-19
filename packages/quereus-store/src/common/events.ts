@@ -2,22 +2,19 @@
  * Reactive event types and emitter for schema and data changes.
  */
 
-import type { Row, SqlValue, VTableEventEmitter } from '@quereus/quereus';
+import type { Row, SqlValue, VTableEventEmitter, VTableSchemaChangeEvent } from '@quereus/quereus';
 
 /**
  * Schema change event types.
+ *
+ * An ALIAS of the engine's {@link VTableSchemaChangeEvent}, not a re-declaration: the two
+ * are one wire shape, and the hand-maintained copy this replaced had drifted narrower than
+ * the engine's (no `'column'` object type, no `columnName` / `oldColumnName`), which made
+ * the documented per-arm ALTER TABLE shape unrepresentable here. Keep it an alias so the
+ * store cannot drift from the contract in `docs/usage.md`
+ * § What each `ALTER TABLE` arm reports again.
  */
-export interface SchemaChangeEvent {
-  type: 'create' | 'alter' | 'drop';
-  objectType: 'table' | 'index';
-  schemaName: string;
-  objectName: string;
-  /** `RENAME TO` only: the table name before the rename (`objectName` carries the new one). */
-  oldObjectName?: string;
-  ddl?: string;
-  /** True if this event originated from sync (remote replica) or cross-tab. */
-  remote?: boolean;
-}
+export type SchemaChangeEvent = VTableSchemaChangeEvent;
 
 /**
  * Data change event types.

@@ -622,6 +622,8 @@ Tag values can be strings, numbers, booleans (`true`/`false`), or `null`. Tag ke
 
 Tags are available on the schema interfaces (`TableSchema.tags`, `ColumnSchema.tags`, etc.) and via the programmatic API (`SchemaManager.getTableTags()`, `SchemaManager.setTableTags()`, `SchemaManager.setColumnTags()`, `SchemaManager.setConstraintTags()`). Tags set at `CREATE` time can be changed later from SQL with `ALTER TABLE … SET TAGS` (whole-set replacement; see [§2.7](#27-alter-table-statement)).
 
+A tag edit raises **no schema-change event** on `db.onSchemaChange` — not for `SET`, `ADD`, or `DROP TAGS`, and not at the table, column, or named-constraint site. Tags are informational and catalog-only, so no backend announces them; see [`usage.md`](usage.md#what-each-alter-table-arm-reports) § What each `ALTER TABLE` arm reports. An application that must react to tag edits has to poll the schema interfaces above.
+
 **Reserved namespace `quereus.*`:** keys whose name starts with `quereus.` are reserved for the engine and validated against a typed registry (`src/schema/reserved-tags.ts`). The two most common keys, both rename hints, are:
 
 | Key | Used by | Effect |

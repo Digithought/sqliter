@@ -32,10 +32,10 @@ export function emitSetObjectTags(plan: SetObjectTagsNode, _ctx: EmissionContext
 		await rctx.db._ensureTransaction();
 
 		// Statement-scoped schema-event scope. The tag arms raise nothing on the public
-		// schema channel today, so the scope is a no-op — it is here so the invariant holds
-		// by construction (see ddl-event-scope.ts): if
-		// `backlog/feat-alter-table-tags-emit-no-schema-event` ever lands, a failed tag edit
-		// still cannot announce.
+		// schema channel — a documented decision (`docs/usage.md` § What each `ALTER TABLE`
+		// arm reports), so the scope is a no-op today. It is here so the invariant holds by
+		// construction (see ddl-event-scope.ts): if that decision is ever revisited, a failed
+		// tag edit still cannot announce.
 		return withStatementScopedSchemaEvents(rctx, async () => {
 			const sm = rctx.db.schemaManager;
 			const m = plan.mutation;

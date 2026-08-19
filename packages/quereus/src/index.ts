@@ -81,6 +81,8 @@ export type {
 	VTableEventEmitter
 } from './vtab/events.js';
 export { DefaultVTableEventEmitter } from './vtab/events.js';
+export type { AlterEventShape } from './vtab/alter-event-shape.js';
+export { alterEventShape } from './vtab/alter-event-shape.js';
 
 // Database-Level Event System (unified reactivity)
 export type {

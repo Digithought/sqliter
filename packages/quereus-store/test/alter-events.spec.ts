@@ -44,6 +44,19 @@ function createInMemoryProvider(): KVStoreProvider {
 	};
 }
 
+/**
+ * One event rendered as `type/objectType/objectName[/columnName[/oldColumnName]]` — the whole
+ * asserted per-arm contract in one comparable string, the same rendering the engine's own
+ * `packages/quereus/test/alter-table-schema-events.spec.ts` uses. Trailing absent fields are
+ * omitted rather than placeholdered, so a spurious `columnName` on a table-level arm diffs.
+ */
+function shape(e: DatabaseSchemaChangeEvent): string {
+	const parts = [e.type, e.objectType, e.objectName];
+	if (e.columnName !== undefined) parts.push(e.columnName);
+	if (e.oldColumnName !== undefined) parts.push(e.oldColumnName);
+	return parts.join('/');
+}
+
 /** Assert the committed contents of a table, so a re-keyed event can be checked against it. */
 async function assertRows(db: Database, sql: string, expected: unknown[]): Promise<void> {
 	const rows: unknown[] = [];
@@ -369,64 +382,86 @@ describe('Store-backed ALTER TABLE: the schema-change event describes the altera
 			(e.objectName === name || e.oldObjectName === name) && e.type !== 'create');
 	}
 
-	/** Runs one ALTER statement and asserts it announced exactly one event carrying `ddl`. */
-	async function assertSingleEventDdl(statement: string, expectedDdl: string): Promise<void> {
+	/**
+	 * Runs one ALTER statement and asserts it announced exactly one event carrying `ddl`
+	 * and the shape `docs/usage.md` § What each `ALTER TABLE` arm reports promises for that
+	 * arm. Asserting only that an event carrying `ddl` happened is what let the store report
+	 * `alter`/`table` for every column arm unnoticed, so the shape is pinned here per arm.
+	 */
+	async function assertSingleEvent(statement: string, expectedDdl: string, expectedShape: string): Promise<void> {
 		const before = schemaEvents.length;
 		await db.exec(statement);
 		const emitted = schemaEvents.slice(before);
 		assert.equal(emitted.length, 1, `expected 1 schema event for '${statement}', got ${emitted.length}: ${JSON.stringify(emitted)}`);
 		assert.equal(emitted[0].ddl, expectedDdl);
+		assert.equal(shape(emitted[0]), expectedShape, `event shape for '${statement}'`);
 		// The wire contract: every announced ddl must re-parse.
 		assert.doesNotThrow(() => new Parser().parse(emitted[0].ddl!));
 	}
 
-	it('every ALTER arm announces its own canonical statement text', async () => {
+	it('every ALTER arm announces its own canonical statement text and per-arm shape', async () => {
 		await db.exec('create table orders (id integer primary key, v text, w text null) using store');
 
 		// Hand-typed expectations (not round-tripped through the stringifier), so a silent
-		// rendering change is visible here.
-		await assertSingleEventDdl(
+		// rendering change is visible here. The third argument is the shape from
+		// `docs/usage.md` § What each `ALTER TABLE` arm reports: column arms name their
+		// column, DROP COLUMN reports `drop`, whole-table arms report `alter`/`table`.
+		await assertSingleEvent(
 			'alter table orders add column sku text null',
-			'alter table orders add column sku text null');
-		await assertSingleEventDdl(
+			'alter table orders add column sku text null',
+			'alter/column/orders/sku');
+		await assertSingleEvent(
 			'alter table orders rename column v to vv',
-			'alter table orders rename column v to vv');
-		await assertSingleEventDdl(
+			'alter table orders rename column v to vv',
+			'alter/column/orders/vv/v');
+		await assertSingleEvent(
 			"alter table orders alter column vv set default 'x'",
-			"alter table orders alter column vv set default 'x'");
-		await assertSingleEventDdl(
+			"alter table orders alter column vv set default 'x'",
+			'alter/column/orders/vv');
+		await assertSingleEvent(
 			'alter table orders alter column vv drop default',
-			'alter table orders alter column vv drop default');
-		await assertSingleEventDdl(
+			'alter table orders alter column vv drop default',
+			'alter/column/orders/vv');
+		await assertSingleEvent(
 			'alter table orders alter column vv set data type text',
-			'alter table orders alter column vv set data type text');
-		await assertSingleEventDdl(
+			'alter table orders alter column vv set data type text',
+			'alter/column/orders/vv');
+		await assertSingleEvent(
 			'alter table orders alter column vv set collate nocase',
-			'alter table orders alter column vv set collate nocase');
-		await assertSingleEventDdl(
+			'alter table orders alter column vv set collate nocase',
+			'alter/column/orders/vv');
+		await assertSingleEvent(
 			'alter table orders alter column vv set not null',
-			'alter table orders alter column vv set not null');
-		await assertSingleEventDdl(
+			'alter table orders alter column vv set not null',
+			'alter/column/orders/vv');
+		await assertSingleEvent(
 			'alter table orders alter column vv drop not null',
-			'alter table orders alter column vv drop not null');
-		await assertSingleEventDdl(
+			'alter table orders alter column vv drop not null',
+			'alter/column/orders/vv');
+		await assertSingleEvent(
 			'alter table orders add constraint c1 check (id > 0)',
-			'alter table orders add constraint c1 check (id > 0)');
-		await assertSingleEventDdl(
+			'alter table orders add constraint c1 check (id > 0)',
+			'alter/table/orders');
+		await assertSingleEvent(
 			'alter table orders rename constraint c1 to c2',
-			'alter table orders rename constraint c1 to c2');
-		await assertSingleEventDdl(
+			'alter table orders rename constraint c1 to c2',
+			'alter/table/orders');
+		await assertSingleEvent(
 			'alter table orders drop constraint c2',
-			'alter table orders drop constraint c2');
-		await assertSingleEventDdl(
+			'alter table orders drop constraint c2',
+			'alter/table/orders');
+		await assertSingleEvent(
 			'alter table orders alter primary key (id)',
-			'alter table orders alter primary key (id)');
-		await assertSingleEventDdl(
+			'alter table orders alter primary key (id)',
+			'alter/table/orders');
+		await assertSingleEvent(
 			'alter table orders drop column w',
-			'alter table orders drop column w');
-		await assertSingleEventDdl(
+			'alter table orders drop column w',
+			'drop/column/orders/w');
+		await assertSingleEvent(
 			'alter table orders rename to orders2',
-			'alter table orders rename to orders2');
+			'alter table orders rename to orders2',
+			'alter/table/orders2');
 	});
 
 	it('the rendered statement is canonical, not the spelling the user wrote', async () => {
@@ -435,9 +470,10 @@ describe('Store-backed ALTER TABLE: the schema-change event describes the altera
 		// (A data TYPE's casing is preserved as written; only the statement keywords and
 		// the table qualification are canonicalized.)
 		await db.exec('create table t (id integer primary key, v text) using store');
-		await assertSingleEventDdl(
+		await assertSingleEvent(
 			'ALTER TABLE main.t ADD COLUMN w text NULL',
-			'alter table t add column w text null');
+			'alter table t add column w text null',
+			'alter/column/t/w');
 	});
 
 	it('RENAME TO names both the new table and the one it renamed from', async () => {
@@ -455,22 +491,26 @@ describe('Store-backed ALTER TABLE: the schema-change event describes the altera
 		// One statement, one inline UNIQUE → an addColumn module call plus an addConstraint
 		// module call, but only the first carries `ddl`, so exactly one announcement.
 		await db.exec('create table orders (id integer primary key, v text) using store');
-		await assertSingleEventDdl(
+		await assertSingleEvent(
 			'alter table orders add column sku text unique',
-			'alter table orders add column sku text unique');
+			'alter table orders add column sku text unique',
+			'alter/column/orders/sku');
 	});
 
 	it('quoting round-trips: reserved-word column, quoted default, generated expression', async () => {
 		await db.exec('create table t (id integer primary key) using store');
-		await assertSingleEventDdl(
+		await assertSingleEvent(
 			'alter table t add column "select" text null',
-			'alter table t add column "select" text null');
-		await assertSingleEventDdl(
+			'alter table t add column "select" text null',
+			'alter/column/t/select');
+		await assertSingleEvent(
 			"alter table t add column o text default 'O''Brien'",
-			"alter table t add column o text default 'O''Brien'");
-		await assertSingleEventDdl(
+			"alter table t add column o text default 'O''Brien'",
+			'alter/column/t/o');
+		await assertSingleEvent(
 			'alter table t add column g integer generated always as (id * 2)',
-			'alter table t add column g integer generated always as (id * 2)');
+			'alter table t add column g integer generated always as (id * 2)',
+			'alter/column/t/g');
 	});
 
 	it('a failed ADD COLUMN announces nothing — not even its revert', async () => {
@@ -551,5 +591,80 @@ describe('Store-backed ALTER TABLE: the schema-change event describes the altera
 				db.exec('alter table p add column c integer default 42 references parent(pid)'));
 			await assertAlterLeftNoTrace();
 		});
+	});
+});
+
+/**
+ * The promise `docs/usage.md` § What each `ALTER TABLE` arm reports makes is not per-backend:
+ * every structural arm raises one event, "whether or not the storage backend ships an emitter
+ * of its own ... so a subscriber sees the same facts either way". Pin that as a PROPERTY rather
+ * than as two hand-tabulated expectation lists that can drift apart: run the identical
+ * statements against a default (memory-backed) database and a store-backed one, and require the
+ * delivered shapes to be equal.
+ *
+ * This is the assertion the store's `alter`/`table`-for-every-arm divergence would have failed:
+ * both sides derive their shape from one shared helper (`alterEventShape` in the engine), so a
+ * future backend that hand-rolls its own reporting fails here rather than in production.
+ */
+describe('Store-backed and memory-backed ALTER TABLE deliver the same schema-event shapes', () => {
+	/** Every structural arm, in an order each statement's predecessors leave valid. */
+	const ARMS = [
+		'alter table orders add column sku text null',
+		'alter table orders rename column v to vv',
+		"alter table orders alter column vv set default 'x'",
+		'alter table orders alter column vv drop default',
+		'alter table orders alter column vv set data type text',
+		'alter table orders alter column vv set collate nocase',
+		'alter table orders alter column vv set not null',
+		'alter table orders alter column vv drop not null',
+		'alter table orders add constraint c1 check (id > 0)',
+		'alter table orders rename constraint c1 to c2',
+		'alter table orders drop constraint c2',
+		'alter table orders alter primary key (id)',
+		'alter table orders drop column w',
+		'alter table orders rename to orders2',
+	];
+
+	/** Run every arm on a fresh database and return one `shape()` string per delivered event. */
+	async function shapesFor(using: '' | ' using store'): Promise<string[]> {
+		const provider = createInMemoryProvider();
+		const db = new Database();
+		if (using) db.registerModule('store', new StoreModule(provider, new StoreEventEmitter()));
+		const shapes: string[] = [];
+		const unsub = db.onSchemaChange(e => shapes.push(shape(e)));
+		try {
+			await db.exec(`create table orders (id integer primary key, v text, w text null)${using}`);
+			shapes.length = 0;   // the CREATE is not under test
+			for (const arm of ARMS) await db.exec(arm);
+		} finally {
+			unsub();
+			await db.close();
+			await provider.closeAll();
+		}
+		return shapes;
+	}
+
+	it('the two backends agree arm for arm', async () => {
+		const [memory, store] = [await shapesFor(''), await shapesFor(' using store')];
+
+		// Spelled out rather than only compared, so a shape that is wrong on BOTH paths is
+		// still caught. Matches the table in `docs/usage.md`.
+		assert.deepEqual(memory, [
+			'alter/column/orders/sku',
+			'alter/column/orders/vv/v',
+			'alter/column/orders/vv',
+			'alter/column/orders/vv',
+			'alter/column/orders/vv',
+			'alter/column/orders/vv',
+			'alter/column/orders/vv',
+			'alter/column/orders/vv',
+			'alter/table/orders',
+			'alter/table/orders',
+			'alter/table/orders',
+			'alter/table/orders',
+			'drop/column/orders/w',
+			'alter/table/orders2',
+		]);
+		assert.deepEqual(store, memory);
 	});
 });
