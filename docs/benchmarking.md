@@ -159,6 +159,18 @@ that cannot hold a stable number is a bug in the benchmark, not a signal about t
 A baseline median that rounds to zero is treated the same way — there is no delta to
 compute — rather than emitting `Infinity`.
 
+**What the floor cannot see.** It is built from each run's *own* samples, so it measures
+within-run noise and nothing else. A whole run displaced by background load — every
+benchmark moving the same direction by a similar amount — still reads as tight, and the
+displacement can exceed the floor. Measured while building this: two full 27-benchmark runs
+minutes apart on an unchanged tree, on a machine that was also running other work, produced
+two gated "regressions" whose spreads were 3-6% in *both* runs. So treat a red result on a
+busy machine as a prompt to re-run, not as a verdict, and do not wire this exit code into an
+automatic gate until a between-run estimate exists — repeating runs and taking a median of
+medians, subtracting the common-mode shift, or requiring a regression to reproduce twice.
+That work belongs to the regression-gate ticket, which already plans to gate on work counters
+and within-run ratios rather than on wall-clock for exactly this reason.
+
 A results file written before spreads were recorded has its spread assumed to be 20%: the
 widest a run could be and still have been called stable, so the assumption can only make the
 comparison more forgiving. The banner says how many entries needed the fallback.
@@ -168,6 +180,11 @@ comparison more forgiving. The banner says how many entries needed the fallback.
 Every benchmark in either run appears in the comparison exactly once, and the run closes
 with a count of each outcome. A comparison that silently drops what it could not evaluate
 reads as green when it is not.
+
+*Unstable*, *new* and *missing* each get a line per benchmark, because each carries its own
+reason. *Filtered* names share one wrapped block instead: they all have the same reason, and
+narrowing a 27-benchmark baseline to one suite otherwise printed 23 identical sentences that
+pushed the lines a reader had to act on off the top of the screen.
 
 - **new** — in this run, absent from the baseline. Not a failure.
 - **missing** — in the baseline, absent from this run: renamed, deleted, or never started.
@@ -265,6 +282,6 @@ Requirements:
 | `bench/lib/stats.mjs` | Median, percentiles, relative IQR, the summary record, and the noise floor. |
 | `bench/lib/compare.mjs` | The cross-run comparison rules, as pure functions over two result objects. |
 | `bench/lib/environment.mjs` | Environment capture and the material-difference check. |
-| `bench/lib/discover.mjs` | Suite enumeration and `--filter` selection, shared by parent and worker. |
+| `bench/lib/discover.mjs` | Suite enumeration and the one definition of what `--filter` matches (`matchesFilter`), shared by the parent, the worker and the comparison. |
 
 See also [Architecture § Benchmark Suite](architecture.md#testing-strategy).

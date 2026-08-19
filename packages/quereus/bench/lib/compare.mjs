@@ -12,7 +12,8 @@
  * are testable without running a benchmark. Presentation lives in `run.mjs`.
  */
 
-import { UNSTABLE_SPREAD, classifyDelta, noiseFloorPct } from './stats.mjs';
+import { matchesFilter } from './discover.mjs';
+import { PERCENT_PRECISION, UNSTABLE_SPREAD, classifyDelta, noiseFloorPct, round } from './stats.mjs';
 
 /**
  * One benchmark's verdict.
@@ -27,6 +28,13 @@ import { UNSTABLE_SPREAD, classifyDelta, noiseFloorPct } from './stats.mjs';
  * @property {number|null} noise_floor_pct the delta had to clear this to count
  * @property {boolean} gated whether this row contributes to a non-zero exit
  * @property {string|null} note why the row is not a plain delta, in one phrase
+ *
+ * One benchmark as this run left it: a summary, or the failure that replaced it.
+ *
+ * @typedef {object} RunRow
+ * @property {string} fullName
+ * @property {import('./stats.mjs').BenchmarkSummary|null} result
+ * @property {{ kind?: string, detail?: string }|null} failure
  */
 
 /** Order the summary counts are reported in: outcomes first, exclusions after. */
@@ -42,7 +50,7 @@ export const STATUS_ORDER = ['no-change', 'changed', 'improvement', 'regression'
  * assuming otherwise would exclude every benchmark from every comparison against a
  * pre-spread baseline, which is the opposite of what the fallback is for.
  *
- * @param {object} record a per-benchmark entry from a results file
+ * @param {import('./stats.mjs').BaselineEntry} record a per-benchmark entry from a results file
  * @returns {boolean}
  */
 export function isUnstable(record) {
@@ -51,30 +59,39 @@ export function isUnstable(record) {
 	return false;
 }
 
-/** Whether a results record predates spread capture, and so had its spread assumed. */
+/** Whether a results record predates spread capture, and so had its spread assumed.
+ * @param {import('./stats.mjs').BaselineEntry} record
+ * @returns {boolean} */
 function spreadAssumed(record) {
 	return typeof record?.spread_pct !== 'number';
 }
+
+/** Percentages carried into the results JSON are rounded like every other percentage
+ * the harness writes. Full float precision would print fourteen decimals of a figure
+ * the table renders with one, in the same file whose spreads are rounded to three.
+ * @param {number} n
+ * @returns {number} */
+const roundPct = (n) => round(n, PERCENT_PRECISION);
 
 /**
  * Compare one benchmark's current result against its baseline entry.
  *
  * @param {string} fullName
- * @param {object} result this run's summary
- * @param {object} base the baseline file's entry
+ * @param {import('./stats.mjs').BenchmarkSummary} result this run's summary
+ * @param {import('./stats.mjs').BaselineEntry} base the baseline file's entry
  * @returns {Comparison}
  */
 function compareOne(fullName, result, base) {
-	const floor = noiseFloorPct(result.spread_pct, base.spread_pct);
+	const floor = roundPct(noiseFloorPct(result.spread_pct, base.spread_pct));
 
 	// A baseline median at or below the microsecond rounding floor makes the delta a
 	// division by zero. `checkRatioGuards` already refuses to emit `Infinity` for the
 	// same reason; so does this.
-	if (!(base.median_ms > 0)) {
+	if (!(typeof base.median_ms === 'number' && base.median_ms > 0)) {
 		return { fullName, status: 'unstable', delta_pct: null, noise_floor_pct: floor, gated: false, note: 'baseline median rounds to zero — no delta is computable' };
 	}
 
-	const delta = ((result.median_ms - base.median_ms) / base.median_ms) * 100;
+	const delta = roundPct(((result.median_ms - base.median_ms) / base.median_ms) * 100);
 
 	const unstableHere = isUnstable(result);
 	const unstableThere = isUnstable(base);
@@ -102,8 +119,8 @@ function compareOne(fullName, result, base) {
  * four non-delta outcomes — new, missing, filtered out, failed — are statuses like
  * any other rather than omissions.
  *
- * @param {{ fullName: string, result: object|null, failure: object|null }[]} rows this run, in run order
- * @param {Record<string, object>} baseline the baseline file's `benchmarks` map
+ * @param {RunRow[]} rows this run, in run order
+ * @param {Record<string, import('./stats.mjs').BaselineEntry>} baseline the baseline file's `benchmarks` map
  * @param {string|null} filter the active `--filter`, used only to tell a benchmark
  *   that was excluded from one that vanished
  * @returns {{ comparisons: Comparison[], counts: Record<string, number>, regressions: number, assumedSpreads: number }}
@@ -134,7 +151,7 @@ export function compareRun(rows, baseline, filter = null) {
 		// `--filter` narrowing the run is the innocent explanation and is reported as its
 		// own status; without a filter, a name that was in the baseline and is not here
 		// now means the benchmark was renamed or deleted, which someone should notice.
-		const filteredOut = Boolean(filter) && !fullName.includes(filter);
+		const filteredOut = Boolean(filter) && !matchesFilter(fullName, filter);
 		comparisons.push({
 			fullName,
 			status: filteredOut ? 'filtered' : 'missing',

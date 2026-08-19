@@ -96,6 +96,22 @@ export async function loadSuites() {
 }
 
 /**
+ * Whether `--filter` selects a benchmark, by its `suite/name` full name.
+ *
+ * The one definition of what `--filter` means. Selection uses it to decide what to
+ * run; the comparison uses it to tell a baseline entry the filter EXCLUDED from one
+ * that vanished. Two copies of a substring test would agree until the day one of them
+ * grew a glob, and the comparison would then quietly report deletions.
+ *
+ * @param {string} fullName
+ * @param {string|null|undefined} filter `null` selects everything
+ * @returns {boolean}
+ */
+export function matchesFilter(fullName, filter) {
+	return !filter || fullName.includes(filter);
+}
+
+/**
  * Flatten loaded suites into the ordered work list, optionally narrowed by a
  * substring match against the `suite/name` full name.
  *
@@ -109,7 +125,7 @@ export function selectBenchmarks(suites, filter) {
 	for (const suite of suites) {
 		for (const bench of suite.benchmarks) {
 			const fullName = `${suite.name}/${bench.name}`;
-			if (filter && !fullName.includes(filter)) continue;
+			if (!matchesFilter(fullName, filter)) continue;
 			selected.push({ suiteFile: suite.file, suiteName: suite.name, name: bench.name, fullName });
 		}
 	}

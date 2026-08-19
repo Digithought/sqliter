@@ -69,3 +69,34 @@ not a couple of minutes. The real suites must stay out of it entirely.
 Worth deciding as part of this: whether these tests join `yarn test` (fast feedback, small
 constant cost on every run) or sit behind their own script that `yarn check` calls
 (no cost day to day, but only runs before a release).
+
+## Arm added by review of `bench-comparison-and-reporting`
+
+**The harness is not covered by the project's *static* checks either, and that gap has
+already shipped a broken `yarn lint` once.** The two modules added by
+`bench-comparison-and-reporting` landed with 25 type errors, which broke `yarn lint`
+outright — `packages/quereus`'s lint script ends in `tsc -p tsconfig.test.json --noEmit`,
+and `tsconfig.test.json` includes `bench/lib/**/*` with `checkJs` on. The review fixed
+those 25 errors by giving the modules real types.
+
+The rest of the benchmark directory is not covered at all, and that is why nothing caught
+it earlier in the same directory:
+
+- `tsconfig.test.json` includes only `bench/lib/**/*`. `bench/run.mjs`, `bench/child.mjs`,
+  `bench/apply-schema-unchanged.mjs` and every `bench/suites/*.bench.mjs` are type-checked
+  by nothing.
+- `packages/quereus`'s eslint glob is `'src/**/*.ts' 'test/**/*.ts'`. **No `.mjs` file
+  under `bench/` is linted at all**, including `bench/lib/`.
+
+Measured during the review by widening the include to `bench/**/*.mjs` and running `tsc`:
+131 errors, distributed `bench/run.mjs` 72, `bench/suites/execution.bench.mjs` 32,
+`bench/apply-schema-unchanged.mjs` 10, `bench/child.mjs` 7, `bench/suites/planner.bench.mjs`
+6, `bench/suites/mutation.bench.mjs` 4. Most are missing JSDoc parameter types and untyped
+object bags rather than real defects, but they are what makes the directory unable to hold
+a check.
+
+The end state is the same invariant either way: **every file under `bench/` is covered by
+the same static checks as the rest of the package**, so an unchecked file cannot be added
+there again. That is a config change plus the type annotations to clear it, and it pairs
+naturally with the behavioural tests this ticket already describes — both are "the harness
+that decides whether performance regressed is itself unchecked".

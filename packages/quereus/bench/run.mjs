@@ -532,12 +532,45 @@ function printComparisonSummary(comparisons, counts) {
 	say(`Comparison: ${STATUS_ORDER.map((s) => `${counts[s]} ${labels[s]}`).join(', ')}`);
 
 	// The non-delta outcomes are named individually: a count alone tells a reader that
-	// something was excluded without telling them what, which is not actionable.
-	for (const status of ['unstable', 'new', 'missing', 'filtered']) {
+	// something was excluded without telling them what, which is not actionable. Each of
+	// these three carries a DIFFERENT reason per benchmark, so each earns its own line.
+	for (const status of ['unstable', 'new', 'missing']) {
 		for (const comparison of comparisons.filter((c) => c.status === status)) {
 			say(`  ${status.padEnd(9)} ${comparison.fullName} — ${comparison.note}`);
 		}
 	}
+
+	// `filtered` is the exception, and it is measured: a `--filter` narrowing a 27-benchmark
+	// baseline to one printed 26 consecutive lines that all said the same sentence, and the
+	// three lines above that a reader actually had to act on scrolled off the top. Every
+	// name is still listed — dropping them would make a narrowed run indistinguishable from
+	// a deleted benchmark — but they share one wrapped block, because they share one reason.
+	const filtered = comparisons.filter((c) => c.status === 'filtered');
+	if (filtered.length > 0) {
+		say(`  filtered  ${filtered.length} not selected by --filter:`);
+		say(wrapNames(filtered.map((c) => c.fullName), '    '));
+	}
+}
+
+/** Join names into indented lines no wider than a terminal, so a long exclusion list
+ * stays one readable block instead of one line per name.
+ * @param {string[]} names
+ * @param {string} indent
+ * @returns {string} */
+function wrapNames(names, indent, width = 100) {
+	const lines = [];
+	let line = indent;
+	for (const name of names) {
+		const piece = line === indent ? name : `, ${name}`;
+		if (line.length + piece.length > width && line !== indent) {
+			lines.push(line);
+			line = `${indent}${name}`;
+		} else {
+			line += piece;
+		}
+	}
+	lines.push(line);
+	return lines.join('\n');
 }
 
 // ── Selection and execution ─────────────────────────────────────────────

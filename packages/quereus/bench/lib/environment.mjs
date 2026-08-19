@@ -15,11 +15,34 @@
 
 import os from 'node:os';
 import { execSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+/**
+ * What machine and checkout produced a set of numbers.
+ *
+ * @typedef {object} Environment
+ * @property {string} cpu
+ * @property {number} cores
+ * @property {number} memory_bytes
+ * @property {string} platform
+ * @property {string} os_release
+ * @property {string} arch
+ * @property {string} node
+ * @property {string} v8
+ * @property {string} commit
+ * @property {boolean | 'unknown'} dirty tri-state: `'unknown'` outside a git checkout
+ *
+ * The same block as READ from a results file: every field may be absent, because a
+ * file written before this module existed carries none of them.
+ *
+ * @typedef {Partial<Environment>} RecordedEnvironment
+ */
 
 /** Fields whose disagreement makes two runs' absolute timings incomparable, in the
  * order the banner reports them. `os_release` and memory are recorded but NOT here:
  * a Windows point release or 4 GB of extra RAM does not move a CPU-bound median, and
- * warning about it would train everyone to ignore the banner. */
+ * warning about it would train everyone to ignore the banner.
+ * @type {{ key: keyof Environment, label: string }[]} */
 const MATERIAL_FIELDS = [
 	{ key: 'cpu', label: 'CPU' },
 	{ key: 'cores', label: 'logical cores' },
@@ -27,10 +50,18 @@ const MATERIAL_FIELDS = [
 	{ key: 'arch', label: 'architecture' },
 ];
 
+/** Where this module lives, and therefore which checkout git is asked about. The
+ * checkout being benchmarked is the one holding this file, NOT whatever directory the
+ * harness happened to be launched from: running it by absolute path from inside some
+ * other repository would otherwise record that repository's commit against these
+ * timings. */
+const moduleDir = fileURLToPath(new URL('.', import.meta.url));
+
 /** Short-lived git lookups. `windowsHide` keeps a console window from flashing on
  * Windows; the timeout keeps a wedged git (a stale index lock, a network-backed
- * checkout) from stalling a benchmark run before it starts. */
-const GIT_OPTIONS = { encoding: 'utf8', windowsHide: true, timeout: 5_000, stdio: ['ignore', 'pipe', 'ignore'] };
+ * checkout) from stalling a benchmark run before it starts.
+ * @type {import('node:child_process').ExecSyncOptionsWithStringEncoding} */
+const GIT_OPTIONS = { encoding: 'utf8', windowsHide: true, timeout: 5_000, cwd: moduleDir, stdio: ['ignore', 'pipe', 'ignore'] };
 
 /**
  * Run a git command and return its trimmed stdout, or `null` outside a checkout.
@@ -52,9 +83,7 @@ function git(command) {
 /**
  * Describe the machine and checkout this run is happening on.
  *
- * @returns {{ cpu: string, cores: number, memory_bytes: number, platform: string,
- *             os_release: string, arch: string, node: string, v8: string,
- *             commit: string, dirty: boolean | 'unknown' }}
+ * @returns {Environment}
  */
 export function captureEnvironment() {
 	// Empty inside some containers, so the model is read defensively — an unknown CPU
@@ -78,7 +107,9 @@ export function captureEnvironment() {
 }
 
 /** Major version of a `v22.11.0`-shaped string, or the string itself if it is not
- * shaped like one. Two runs on 22.11 and 22.14 are comparable; 20 against 22 is not. */
+ * shaped like one. Two runs on 22.11 and 22.14 are comparable; 20 against 22 is not.
+ * @param {string|null|undefined} version
+ * @returns {string} */
 function nodeMajor(version) {
 	const match = /^v?(\d+)\./.exec(String(version ?? ''));
 	return match ? match[1] : String(version ?? 'unknown');
@@ -91,8 +122,8 @@ function nodeMajor(version) {
  * about — which is not the same as "the numbers are comparable": background load,
  * thermal state and a different power profile are all invisible here.
  *
- * @param {object} current as returned by `captureEnvironment`
- * @param {object | null | undefined} baseline the baseline file's block, absent on old files
+ * @param {Environment} current as returned by `captureEnvironment`
+ * @param {RecordedEnvironment | null | undefined} baseline the baseline file's block, absent on old files
  * @returns {string[]}
  */
 export function compareEnvironments(current, baseline) {
@@ -111,14 +142,18 @@ export function compareEnvironments(current, baseline) {
 	return diffs;
 }
 
-/** One line naming the machine, for the run header. */
+/** One line naming the machine, for the run header.
+ * @param {Environment} env
+ * @returns {string} */
 export function describeEnvironment(env) {
 	const gb = (env.memory_bytes / 1024 ** 3).toFixed(0);
 	return `${env.cpu} (${env.cores} cores, ${gb} GB) · ${env.platform} ${env.os_release} ${env.arch} · node ${env.node} / v8 ${env.v8}`;
 }
 
 /** One line naming the checkout, for the run header. A dirty tree is worth saying out
- * loud: it is the most common reason a number does not reproduce. */
+ * loud: it is the most common reason a number does not reproduce.
+ * @param {Environment} env
+ * @returns {string} */
 export function describeCheckout(env) {
 	const state = env.dirty === 'unknown' ? 'working tree state unknown' : env.dirty ? 'DIRTY working tree' : 'clean working tree';
 	return `commit ${env.commit} (${state})`;

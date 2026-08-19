@@ -145,3 +145,30 @@ tickets.
 - Add a report-without-failing escape flag, and document when to use it
 - State the division of labor between the gate and `performance-sentinels.spec.ts`
 - Update `docs/architecture.md` sections 5 and 6 to describe the gate and its place in the `check` chain
+
+## Arm added by review of `bench-comparison-and-reporting`
+
+**The wall-clock half of the current comparison cannot be gated on as it stands, and this
+is now measured rather than suspected.** Two full 27-benchmark runs, minutes apart, same
+commit, same machine, unchanged tree, reported two regressions and four improvements.
+Almost every benchmark moved in the *same direction* between the two runs — a run-level
+displacement, not per-benchmark noise — and the flagged benchmarks each had a tight 3-6%
+within-run spread in *both* runs: a narrow distribution around a centre that had moved.
+
+The noise floor `bench-comparison-and-reporting` shipped is built from within-run spreads,
+so it is blind to exactly this. It is a real improvement on the flat 20% rule it replaced,
+and it is not sufficient to fail a build on. This ticket's existing instinct — "bias hard
+toward counters and ratios, and toward reporting rather than failing on anything
+wall-clock" — is the right one, and this is the evidence for it.
+
+If any wall-clock measurement is to gate at all, one of these has to come with it:
+
+- take the median of N repeated runs per benchmark rather than one run's median (the honest
+  fix; costs N× wall-clock),
+- estimate the between-run displacement and subtract the common-mode shift before judging
+  any individual benchmark,
+- require a regression to reproduce across two consecutive comparison runs before gating.
+
+The limitation is recorded at the code site (`NOTE:` on `noiseFloorPct` in
+`bench/lib/stats.mjs`) and in `docs/benchmarking.md` § *Noise floor*, so nobody has to
+rediscover it. It is not a separate ticket because the decision it forces is this ticket's.

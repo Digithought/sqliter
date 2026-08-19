@@ -86,7 +86,7 @@ const PRECISION = 1e6;
 /** Digits kept for a figure that is already a percentage. A spread is a ratio of two
  * timings, so carrying it to nanosecond-equivalent precision would print six decimals
  * of a number the table renders with one. */
-const PERCENT_PRECISION = 1e3;
+export const PERCENT_PRECISION = 1e3;
 
 /** Round to the resolution the results JSON records. See `PRECISION`.
  * @param {number} n
@@ -95,6 +95,39 @@ const PERCENT_PRECISION = 1e3;
 export function round(n, precision = PRECISION) {
 	return Math.round(n * precision) / precision;
 }
+
+/**
+ * One benchmark's entry in a results file.
+ *
+ * Named so the comparison layer can talk about a results record without restating its
+ * shape: `object` would type-check and describe nothing, and every consumer would go
+ * back to reaching into an untyped bag.
+ *
+ * @typedef {object} BenchmarkSummary
+ * @property {number} median_ms
+ * @property {number|null} spread_pct relative IQR as a percentage; `null` when it could
+ *   not be computed (see `relativeIqr`)
+ * @property {boolean} stable this run's own samples agreed — NOT that two runs are
+ *   comparable; see the note in `summarize`
+ * @property {number} min_sample_ms
+ * @property {number} max_sample_ms
+ * @property {number} samples
+ * @property {number} batch
+ * @property {number} warmup
+ * @property {boolean} pinned
+ */
+
+/**
+ * A results-file entry as READ rather than as written.
+ *
+ * Every field is optional because a baseline may predate any of them: `p95_ms` has been
+ * dropped, `min_ms`/`max_ms` renamed and `spread_pct`/`stable` added since the first
+ * file was written, and the comparison must keep working against all of it. Typing the
+ * read side separately from the write side is what stops a consumer assuming a field an
+ * old file does not carry.
+ *
+ * @typedef {Partial<BenchmarkSummary>} BaselineEntry
+ */
 
 /**
  * Reduce one benchmark's samples to the summary record stored in the results JSON.
@@ -108,6 +141,7 @@ export function round(n, precision = PRECISION) {
  * @param {{ batch?: number, warmup?: number, pinned?: boolean }} meta calibration
  *        metadata from the worker, recorded verbatim so a later analysis can tell a
  *        500-sample calibrated run from a pinned 10-iteration one without re-running.
+ * @returns {BenchmarkSummary}
  */
 export function summarize(samples, meta = {}) {
 	const spread = relativeIqr(samples);
@@ -167,6 +201,16 @@ export const ASSUMED_SPREAD_PCT = UNSTABLE_SPREAD * 100;
  * entirely. A `null` spread means the run did not record one, and is replaced by
  * `ASSUMED_SPREAD_PCT` — a run whose spread is *known* to be bad is handled by the
  * unstable path in `compare.mjs`, not here.
+ *
+ * NOTE: this floor is built from WITHIN-run spreads and therefore cannot see BETWEEN-run
+ * drift. Measured on a loaded machine: two full 27-benchmark runs minutes apart on an
+ * unchanged tree moved almost every benchmark in the same direction, and two of them
+ * cleared their floors and gated — each with a tight 3-6% spread in both runs, a narrow
+ * distribution around a centre that had moved. The floor is a strict improvement on the
+ * flat 20% rule it replaced, but it is NOT sufficient to gate a build on a loaded machine.
+ * Fixing that needs a between-run estimate (repeat runs and take a median of medians,
+ * subtract the common-mode shift, or require a regression to reproduce twice) and belongs
+ * to whoever builds the gate — see `tickets/plan/4-bench-regression-gate.md`.
  *
  * @param {number|null|undefined} currentSpreadPct
  * @param {number|null|undefined} baselineSpreadPct
