@@ -1,24 +1,45 @@
 /**
- * Store key building, priced on its own.
+ * The storage layer, priced piece by piece.
  *
  * `execution` and `mutation` measure whole queries against a storage backend. That is the
  * right top-level signal and a poor diagnostic: a full scan blends key decoding, iteration,
  * row deserialization and the isolation overlay into one number, so a regression in any one
- * of them reads as "the scan got slower". Key building runs once per row per index, is a
- * pure function of its inputs — no `Database`, no provider, no statement — and is therefore
- * the cheapest piece to measure directly.
+ * of them reads as "the scan got slower". This suite gives the store's pieces their own
+ * numbers, in two halves:
+ *
+ *  - KEY ENCODING (`data-key-*`, `index-key-*`, `decode-*`): pure functions of their
+ *    inputs — no `Database`, no provider, no statement — the cheapest pieces to measure
+ *    directly. These declare NO `counters()` pass, for the same reason `parser` declares
+ *    none: nothing runs, so there is nothing for a work counter to count. The absence is
+ *    the honest report, not an oversight.
+ *  - STORE HOT PATHS (`scan-10k` and everything after it): scanning, point reads,
+ *    multi-key seeks, resolving rows found through a secondary index, committing a batch
+ *    of writes, building an index, reopening a database. These run per row, per index,
+ *    per commit — where a per-operation cost that should have been per-batch can hide
+ *    behind a whole-query number — and none of them can be reached without white-boxing
+ *    the store. So they are driven through a `Database` over the store module and
+ *    reported in STORAGE ROUND TRIPS as well as time, which is the honest measurement
+ *    anyway: round-trip counts are exact integers, identical on every machine, where a
+ *    wall-clock median describes one CPU.
  *
  * A STORE-ONLY SUITE, SO ITS NAMES CARRY NO `@` SUFFIX. `execution` and `mutation` hold
- * workloads that `bench/lib/backends.mjs` expands across every backend, and the bare name in
- * those suites means "the engine's default vtab module". Nothing here runs a query, so there
- * is no storage engine to swap underneath it: every benchmark below calls `@quereus/store`
- * directly and the bare name means exactly that. The invariant `docs/benchmarking.md` states
- * — every entry of BOTH those suites is expanded — is untouched; this is a third suite that
- * is not in the backend dimension at all.
+ * workloads that `bench/lib/backends.mjs` expands across every backend, and the bare name
+ * in those suites means "the engine's default vtab module". Here there is no storage
+ * engine to swap underneath: the first half calls `@quereus/store` functions directly,
+ * and the second half exists to measure THE store module specifically — the same query
+ * shapes on the memory vtab are `execution`'s bare rows, not a missing backend of these.
+ * The invariant `docs/benchmarking.md` states — every entry of BOTH those suites is
+ * expanded — is untouched; this is a third suite that is not in the backend dimension at
+ * all.
  *
- * NO `counters()` PASS, for the same reason `parser` declares none: there is no `Database`,
- * no plan and no storage traffic, so nothing the work counters count. The absence is the
- * honest report, not an oversight.
+ * TIMED AND COUNTED DATABASES ARE SEPARATE. A hot-path row's `fn` runs against
+ * `openStoreDatabase()`, with no counting wrapper anywhere in it; its `counters()` pass
+ * builds a SECOND database from `openCountingStoreDatabase()`, replays the fixture,
+ * resets the counters at the fixture/measurement boundary, and ASSERTS the exact
+ * expected round-trip block before reporting it — a plan change that moved traffic
+ * between stores fails the pass loudly instead of shipping a silently different block.
+ * Expected counts are derived from the imported `ROW_RESOLUTION_BATCH`, never from a
+ * restated `256`, so they move with the constant.
  *
  * REACHING THE STORE PACKAGE. Through `bench/lib/store-counters.mjs` and nothing else. That
  * file's header says why: the parent process imports every suite file purely to enumerate
@@ -27,14 +48,16 @@
  * included. `skipUnlessStoreLoads` below turns that same failure into a stated reason per
  * row, on every benchmark in the suite.
  *
- * PUBLIC EXPORTS ONLY. `buildDataKey`, `buildIndexKey`, `encodeCompositeKey`,
- * `decodeCompositeKey` and `BUILTIN_KEY_NORMALIZER_RESOLVER` are all part of
- * `@quereus/store`'s public surface (`packages/quereus-store/src/common/index.ts`). Binding
- * to those means this suite breaks at a deliberate API change rather than at an internal
- * refactor.
+ * PUBLIC EXPORTS ONLY. The key half binds `buildDataKey`, `buildIndexKey`,
+ * `encodeCompositeKey`, `decodeCompositeKey` and `BUILTIN_KEY_NORMALIZER_RESOLVER`; the
+ * hot-path half reaches `StoreModule` (`whenCatalogPersisted`, `rehydrateCatalog`) and the
+ * key-value provider through the handles `store-counters.mjs` builds. All of it is
+ * `@quereus/store`'s public surface (`packages/quereus-store/src/common/index.ts`), so this
+ * suite breaks at a deliberate API change rather than at an internal refactor.
  */
 
-import { loadStoreKeyApi, storeLoadFailure } from '../lib/store-counters.mjs';
+import { snapshotStatement, snapshotStatements } from '../lib/counters.mjs';
+import { loadStoreKeyApi, openCountingStoreDatabase, openStoreDatabase, storeLoadFailure } from '../lib/store-counters.mjs';
 
 /**
  * Why this suite's rows cannot run here, or `null` to run them.
@@ -512,8 +535,590 @@ function makeDecodeBenchmark() {
 	};
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════════════════
+ * Second half: store hot paths, driven through a `Database` over the store module.
+ * See the file header for why these live here and how the timed and counted databases
+ * are kept apart.
+ * ═══════════════════════════════════════════════════════════════════════════════════════ */
+
+/** Collect an async iterable into an array. */
+async function collect(iter) {
+	const out = [];
+	for await (const item of iter) out.push(item);
+	return out;
+}
+
+/**
+ * Built store names of the shared `bench_t` fixture — what the key-value provider (and
+ * therefore a counter block) is keyed by. An index store's name embeds both its table and
+ * its index: `{schema}.{table}_idx_{index}`.
+ */
+const BENCH_T_DATA_STORE = 'main.bench_t';
+const BENCH_T_INDEX_STORE = 'main.bench_t_idx_bench_t_val';
+
+/** Rows per `insert ... values` statement in the fixtures below — the same batching
+ * `bench/workloads/execution.mjs` uses. */
+const FIXTURE_BATCH_ROWS = 500;
+
+/**
+ * Create and populate `table (id integer primary key, val integer)` with ids `0..rows-1`
+ * and `val = id` — so `id < N` selects exactly N rows and a `val` range of width n
+ * matches exactly n rows, which is what lets every expected count below be stated as an
+ * exact integer.
+ *
+ * @param {import('../../dist/src/index.js').Database} db
+ * @param {string} table
+ * @param {number} rows
+ * @param {boolean} withValIndex also `create index {table}_val on {table} (val)`
+ */
+async function populateIdValTable(db, table, rows, withValIndex) {
+	await db.exec(`create table ${table} (id integer primary key, val integer)`);
+	if (withValIndex) {
+		await db.exec(`create index ${table}_val on ${table} (val)`);
+	}
+	for (let start = 0; start < rows; start += FIXTURE_BATCH_ROWS) {
+		const count = Math.min(FIXTURE_BATCH_ROWS, rows - start);
+		const values = Array.from({ length: count }, (_, j) => `(${start + j}, ${start + j})`).join(', ');
+		await db.exec(`insert into ${table} values ${values}`);
+	}
+}
+
+/** The shared fixture of every query-shaped row below: 10 000 rows in `bench_t`, with a
+ * secondary index on `val`.
+ * @param {import('../../dist/src/index.js').Database} db */
+function populateBenchT(db) {
+	return populateIdValTable(db, 'bench_t', 10000, true);
+}
+
+/**
+ * A store expected to be OPENED but never TOUCHED: all eight counts zero. Stated in full
+ * rather than left absent, because "the index store saw no traffic" is exactly the claim
+ * a scan or a PK seek makes and an unasserted zero is not a claim at all.
+ */
+const NO_TRAFFIC = Object.freeze({
+	iterateEntries: 0, getManyCalls: 0, getManyKeys: 0, singleGets: 0,
+	directPuts: 0, directDeletes: 0, batchWrites: 0, batchOps: 0,
+});
+
+/**
+ * Throw unless every STATED field of every stated store matches `actual` exactly.
+ *
+ * Only stated fields are compared, which is what lets the commit rows assert the
+ * flat-batch claim without also pinning the reads a commit provokes (linear in N by
+ * nature), and lets every row leave the `__stats__` / `__catalog__` zero-blocks out of
+ * its contract.
+ *
+ * @param {string} name benchmark name, for the failure message
+ * @param {Record<string, import('../lib/store-counters.mjs').StoreCounters>} actual
+ * @param {Record<string, Partial<import('../lib/store-counters.mjs').StoreCounters>>} expected
+ */
+function assertStoreCounters(name, actual, expected) {
+	for (const [storeName, fields] of Object.entries(expected)) {
+		const block = actual[storeName];
+		if (!block) {
+			throw new Error(`${name}: counter block has no store '${storeName}' (stores present: ${Object.keys(actual).join(', ') || 'none'})`);
+		}
+		for (const [field, want] of Object.entries(fields)) {
+			if (block[/** @type {keyof typeof block} */ (field)] !== want) {
+				throw new Error(`${name}: ${storeName}.${field} is ${block[/** @type {keyof typeof block} */ (field)]}, expected ${want}`);
+			}
+		}
+	}
+}
+
+/**
+ * What one counted read-query benchmark measures, computed ONCE in `setup` — from the
+ * imported `ROW_RESOLUTION_BATCH` where a count depends on it — and then driving both the
+ * timed `fn` and the `counters()` pass, so the counters can never describe a different
+ * statement than the one timed.
+ *
+ * @typedef {object} CountedQuerySpec
+ * @property {string} sql the ONE statement `fn` times and `counters()` snapshots
+ * @property {number} expectedRows asserted by `fn` on every call
+ * @property {Record<string, Partial<import('../lib/store-counters.mjs').StoreCounters>>} expectedStore
+ *   expected storage round trips by built store name; every stated field is asserted
+ *   exactly (see {@link assertStoreCounters})
+ */
+
+/**
+ * Build one read-query benchmark over the shared `bench_t` fixture.
+ *
+ * @param {string} name
+ * @param {(batch: number) => CountedQuerySpec} build handed `ROW_RESOLUTION_BATCH`
+ * @returns {import('../lib/discover.mjs').Benchmark}
+ */
+function makeCountedQueryBenchmark(name, build) {
+	/** @type {import('../lib/store-counters.mjs').PlainStoreDatabaseHandle|null} */
+	let handle = null;
+	/** @type {CountedQuerySpec|null} */
+	let spec = null;
+
+	return {
+		name,
+		skip: skipUnlessStoreLoads,
+		async setup() {
+			const api = await loadStoreKeyApi();
+			spec = build(api.ROW_RESOLUTION_BATCH);
+			handle = await openStoreDatabase();
+			await populateBenchT(handle.db);
+		},
+		// Guarded: `teardown` also runs as best-effort cleanup after a `setup` that threw,
+		// and `build` throwing (a size guard) leaves no handle to close.
+		async teardown() {
+			if (handle) await handle.close();
+			handle = null;
+			spec = null;
+		},
+		async fn() {
+			const { sql, expectedRows } = /** @type {CountedQuerySpec} */ (spec);
+			const rows = await collect(/** @type {import('../lib/store-counters.mjs').PlainStoreDatabaseHandle} */ (handle).db.eval(sql));
+			if (rows.length !== expectedRows) {
+				throw new Error(`${name}: expected ${expectedRows} rows, got ${rows.length}`);
+			}
+		},
+		// Runs ONCE after timing, against a second database over a counting provider —
+		// fixture, then reset, then the statement, exactly the boundary discipline
+		// `execution.bench.mjs`'s binder uses.
+		async counters() {
+			const { sql, expectedStore } = /** @type {CountedQuerySpec} */ (spec);
+			const counting = await openCountingStoreDatabase();
+			try {
+				await populateBenchT(counting.db);
+				counting.resetCounters();
+				const engine = await snapshotStatement(counting.db, sql);
+				const store = counting.readCounters();
+				assertStoreCounters(name, store, expectedStore);
+				return { engine, store };
+			} finally {
+				await counting.close();
+			}
+		},
+	};
+}
+
+/**
+ * One index-resolve benchmark: a `val` range of width n, sized as a multiple of
+ * `ROW_RESOLUTION_BATCH` (B). The index scan yields n entries; resolving them to data
+ * rows must go back to the data store in `ceil(n / B)` batched reads carrying n keys —
+ * the round-trip claim this family exists to pin. If resolution ever stopped batching,
+ * `getManyCalls` goes to n and the counters pass fails loudly.
+ *
+ * @param {string} name
+ * @param {number} batchMultiple range width as a multiple of B (0.25, 1, 2, 4)
+ * @returns {import('../lib/discover.mjs').Benchmark}
+ */
+function makeIndexResolveBenchmark(name, batchMultiple) {
+	return makeCountedQueryBenchmark(name, (batch) => {
+		const n = Math.max(1, Math.floor(batch * batchMultiple));
+		if (2000 + n > 10000) {
+			// Thrown from `setup` (where `build` runs): the range must stay inside the
+			// 10 000-row fixture, or `expectedRows` silently stops meaning "range width".
+			throw new Error(`${name}: range width ${n} overruns the 10 000-row fixture — ROW_RESOLUTION_BATCH grew; resize the fixture or the multiples`);
+		}
+		return {
+			sql: `select id from bench_t where val >= 2000 and val < ${2000 + n}`,
+			expectedRows: n,
+			expectedStore: {
+				// n entries pulled from the index, then the batched resolution against the
+				// data store. Zero data iterates: resolution must be `getMany`, not a scan.
+				[BENCH_T_INDEX_STORE]: { ...NO_TRAFFIC, iterateEntries: n },
+				[BENCH_T_DATA_STORE]: { ...NO_TRAFFIC, getManyCalls: Math.ceil(n / batch), getManyKeys: n },
+			},
+		};
+	});
+}
+
+/** The two values a commit benchmark's update alternates between, so every timed call
+ * genuinely changes the N rows it touches. The store does NOT short-circuit a same-value
+ * update (verified in code and by repeat-commit counter probes), so this is cheap
+ * insurance, not a correctness requirement. */
+const FLIP_A = 111;
+const FLIP_B = 222;
+
+/**
+ * One commit benchmark: `begin; update N rows; commit;`, timed as a unit.
+ *
+ * The four sizes (1, 10, 100, 1000) together carry the claim no read count can:
+ * committing N queued operations costs a number of write-side round trips that is FLAT
+ * in N — `batchWrites` stays at ONE per touched store (the counting provider has no
+ * `beginAtomicBatch`, so the coordinator takes its per-store fallback), while `batchOps`
+ * scales as N on the data store and 2N on the index (delete the old entry, insert the
+ * new one). N = 10000 was considered and deliberately dropped: the shape is visible
+ * across three decades, and the fourth would add hundreds of milliseconds per timed call
+ * for no additional claim.
+ *
+ * @param {number} rowsTouched the N in `where id < N`
+ * @returns {import('../lib/discover.mjs').Benchmark}
+ */
+function makeCommitBenchmark(rowsTouched) {
+	const name = `commit-update-${rowsTouched}`;
+	/** @type {import('../lib/store-counters.mjs').PlainStoreDatabaseHandle|null} */
+	let handle = null;
+	let useA = true;
+
+	/** @param {number} constant */
+	const updateSql = (constant) => `update bench_t set val = ${constant} where id < ${rowsTouched}`;
+
+	return {
+		name,
+		skip: skipUnlessStoreLoads,
+		async setup() {
+			handle = await openStoreDatabase();
+			await populateBenchT(handle.db);
+			useA = true;
+		},
+		async teardown() {
+			if (handle) await handle.close();
+			handle = null;
+		},
+		async fn() {
+			const db = /** @type {import('../lib/store-counters.mjs').PlainStoreDatabaseHandle} */ (handle).db;
+			const constant = useA ? FLIP_A : FLIP_B;
+			useA = !useA;
+			await db.exec(`begin; ${updateSql(constant)}; commit;`);
+			// The point read is IN the timed number — one extra single-key get on top of the
+			// commit, which matters most at N=1. Accepted: it is what stops this benchmark
+			// from timing a commit that stopped writing. Compared through `Number()` because
+			// an integer read back may arrive as a bigint.
+			const rows = await collect(db.eval('select val from bench_t where id = 0'));
+			if (rows.length !== 1 || Number(rows[0].val) !== constant) {
+				throw new Error(`${name}: expected val ${constant} on row 0 after commit, got ${rows.length === 1 ? String(rows[0].val) : `${rows.length} rows`}`);
+			}
+		},
+		async counters() {
+			const counting = await openCountingStoreDatabase();
+			try {
+				await populateBenchT(counting.db);
+				counting.resetCounters();
+				// Three NAMED snapshots: instruction keys are structural addresses within one
+				// program, so the three statements' engine counts must never be summed.
+				const engine = await snapshotStatements(counting.db, {
+					begin: 'begin',
+					update: updateSql(FLIP_A),
+					commit: 'commit',
+				});
+				const store = counting.readCounters();
+				assertStoreCounters(name, store, {
+					// THE flat-commit claim, plus "no write escapes the batch". Commits also
+					// PROVOKE reads (read-modify-write on the data store, old-entry lookups for
+					// index maintenance) — those scale with N by nature, so they are reported
+					// for diffing but deliberately not asserted.
+					[BENCH_T_DATA_STORE]: { batchWrites: 1, batchOps: rowsTouched, directPuts: 0, directDeletes: 0 },
+					[BENCH_T_INDEX_STORE]: { batchWrites: 1, batchOps: 2 * rowsTouched, directPuts: 0, directDeletes: 0 },
+				});
+				return { engine, store };
+			} finally {
+				await counting.close();
+			}
+		},
+	};
+}
+
+/**
+ * Count the physical entries in an index store by draining its `iterate()`.
+ *
+ * @param {import('@quereus/store').KVStoreProvider} provider
+ * @param {string} schemaName
+ * @param {string} tableName
+ * @param {string} indexName
+ * @returns {Promise<number>}
+ */
+async function countIndexEntries(provider, schemaName, tableName, indexName) {
+	const store = await provider.getIndexStore(schemaName, tableName, indexName);
+	let count = 0;
+	for await (const _entry of store.iterate()) count++;
+	return count;
+}
+
+/**
+ * Index build: `create index` over a 5 000-row table, then `drop index` so `fn` is
+ * repeatable back-to-back. The timed number therefore covers one build, one drop, and
+ * two entry-counting scans of the index store — stated so nobody reads it as the build
+ * alone. The before-count doubles as the erase tripwire: a provider whose index drop
+ * only discarded the handle (instead of erasing the store) reads 5 000 here on the
+ * second call and fails.
+ *
+ * @returns {import('../lib/discover.mjs').Benchmark}
+ */
+function makeIndexBuildBenchmark() {
+	const name = 'index-build-5k';
+	const ROWS = 5000;
+	/** @type {import('../lib/store-counters.mjs').PlainStoreDatabaseHandle|null} */
+	let handle = null;
+
+	return {
+		name,
+		skip: skipUnlessStoreLoads,
+		async setup() {
+			handle = await openStoreDatabase();
+			await populateIdValTable(handle.db, 'bench_i', ROWS, false);
+		},
+		async teardown() {
+			if (handle) await handle.close();
+			handle = null;
+		},
+		async fn() {
+			const h = /** @type {import('../lib/store-counters.mjs').PlainStoreDatabaseHandle} */ (handle);
+			// `getIndexStore` before the index exists lazily creates an empty store — fine,
+			// and exactly what makes the zero-count a real claim rather than a missing-store
+			// error.
+			const before = await countIndexEntries(h.provider, 'main', 'bench_i', 'bench_i_val');
+			if (before !== 0) {
+				throw new Error(`${name}: index store holds ${before} entries before the build — the previous drop did not erase it`);
+			}
+			await h.db.exec('create index bench_i_val on bench_i (val)');
+			const after = await countIndexEntries(h.provider, 'main', 'bench_i', 'bench_i_val');
+			if (after !== ROWS) {
+				throw new Error(`${name}: index store holds ${after} entries after the build, expected ${ROWS}`);
+			}
+			await h.db.exec('drop index bench_i_val');
+		},
+		async counters() {
+			const counting = await openCountingStoreDatabase();
+			try {
+				await populateIdValTable(counting.db, 'bench_i', ROWS, false);
+				counting.resetCounters();
+				// Plain `exec`, one `create index`, and NO drop: the counting provider
+				// implements no index-store erase, so a drop-and-recreate cycle here would
+				// read stale entries back. One build is the whole measurement.
+				await counting.db.exec('create index bench_i_val on bench_i (val)');
+				// Counters FIRST: the verification scan below reads through the same counting
+				// store and would otherwise pollute the very block it verifies.
+				const store = counting.readCounters();
+				const entries = await countIndexEntries(counting.provider, 'main', 'bench_i', 'bench_i_val');
+				if (entries !== ROWS) {
+					throw new Error(`${name}: counting index store holds ${entries} entries after the build, expected ${ROWS}`);
+				}
+				return { store };
+			} finally {
+				await counting.close();
+			}
+		},
+	};
+}
+
+/** Catalog fixture scale — a plain-SQL copy of `bench/apply-schema-unchanged.mjs`'s
+ * generator shape, so the two harnesses describe the same catalog. 54 tables of 8
+ * columns (plus a check constraint, and a foreign key to the previous table from t > 0),
+ * an index on every sixth table, and 14 views each joining adjacent tables. */
+const CATALOG_TABLES = 54;
+const CATALOG_VIEWS = 14;
+const CATALOG_INDEX_EVERY = 6;
+const CATALOG_INDEXES = Math.ceil(CATALOG_TABLES / CATALOG_INDEX_EVERY);
+
+/**
+ * Build the catalog fixture on `db`. Each table gets one row because catalog persistence
+ * is lazy — a table nothing ever wrote may never reach the persisted catalog at all.
+ *
+ * @param {import('../../dist/src/index.js').Database} db
+ */
+async function buildCatalogFixture(db) {
+	for (let t = 0; t < CATALOG_TABLES; t++) {
+		const cols = [
+			'id integer primary key',
+			'name text not null',
+			'email text',
+			'qty integer not null default 0',
+			'price real default 1.5',
+			'note text collate nocase',
+			'active integer not null default 1',
+			'created text',
+		];
+		const constraints = [`constraint ck_${t}_qty check (qty >= 0)`];
+		if (t > 0) {
+			cols.push('parent_id integer');
+			constraints.push(`constraint fk_${t}_parent foreign key (parent_id) references tbl_${t - 1}(id)`);
+		}
+		await db.exec(`create table tbl_${t} (${[...cols, ...constraints].join(', ')})`);
+		if (t % CATALOG_INDEX_EVERY === 0) {
+			await db.exec(`create index idx_tbl_${t}_name on tbl_${t} (name)`);
+		}
+		await db.exec(`insert into tbl_${t} (id, name) values (1, 'n')`);
+	}
+	for (let v = 0; v < CATALOG_VIEWS; v++) {
+		await db.exec(`create view vw_${v} as select a.id, a.name, b.qty from tbl_${v} a join tbl_${v + 1} b on b.parent_id = a.id where a.active = 1 and b.qty > 0`);
+	}
+}
+
+/**
+ * Throw unless `result` rehydrated exactly the fixture {@link buildCatalogFixture} built.
+ *
+ * @param {string} name benchmark name, for the failure message
+ * @param {import('@quereus/store').RehydrationResult} result
+ */
+function assertRehydration(name, result) {
+	if (result.errors.length !== 0) {
+		throw new Error(`${name}: rehydration reported ${result.errors.length} error(s); first: ${result.errors[0].error.message}`);
+	}
+	if (result.tables.length !== CATALOG_TABLES || result.indexes.length !== CATALOG_INDEXES || result.views.length !== CATALOG_VIEWS) {
+		throw new Error(`${name}: rehydrated ${result.tables.length} tables / ${result.indexes.length} indexes / ${result.views.length} views, expected ${CATALOG_TABLES} / ${CATALOG_INDEXES} / ${CATALOG_VIEWS}`);
+	}
+}
+
+/**
+ * Catalog rehydration: what an application pays at every reopen of an existing database.
+ *
+ * `setup` builds the catalog once, waits for it to persist, and closes the DATABASE
+ * ONLY — the module and its provider stay alive holding the persisted catalog. Each
+ * timed call then opens a fresh `Database` and a fresh module over that same provider
+ * and rehydrates; the fresh-everything IS the workload. Per-call modules are abandoned
+ * un-closed on purpose: `closeDbOnly()` releases the database, an in-memory module holds
+ * no OS handles (probe-verified — no leaked-handle exit trip), and calling `close()` on
+ * one would close the SHARED provider out from under the next call. Repeatable because
+ * rehydration never consumes what it reads: the clean-shutdown marker it would consume
+ * is only ever written by `module.closeAll()`, which never runs on a per-call module.
+ *
+ * @returns {import('../lib/discover.mjs').Benchmark}
+ */
+function makeCatalogRehydrateBenchmark() {
+	const name = `catalog-rehydrate-${CATALOG_TABLES}t`;
+	/** @type {import('../lib/store-counters.mjs').PlainStoreDatabaseHandle|null} */
+	let fixtureHandle = null;
+
+	return {
+		name,
+		skip: skipUnlessStoreLoads,
+		async setup() {
+			fixtureHandle = await openStoreDatabase();
+			await buildCatalogFixture(fixtureHandle.db);
+			await fixtureHandle.storeModule.whenCatalogPersisted();
+			await fixtureHandle.closeDbOnly();
+		},
+		async teardown() {
+			// `close()` — not `closeDbOnly()` — on the ORIGINAL handle: its `closeAll` is
+			// what finally closes the provider every timed call shared.
+			if (fixtureHandle) await fixtureHandle.close();
+			fixtureHandle = null;
+		},
+		async fn() {
+			const provider = /** @type {import('../lib/store-counters.mjs').PlainStoreDatabaseHandle} */ (fixtureHandle).provider;
+			const reopened = await openStoreDatabase(provider);
+			try {
+				const result = await reopened.storeModule.rehydrateCatalog(reopened.db);
+				assertRehydration(name, result);
+			} finally {
+				await reopened.closeDbOnly();
+			}
+		},
+		// The reopen-shaped counters pass runs the other way around from every other row
+		// (see `openCountingStoreDatabase`'s doc): the FIXTURE is built on the counting
+		// provider, and a fresh plain handle over that same provider does the counted
+		// rehydration.
+		async counters() {
+			const counting = await openCountingStoreDatabase();
+			try {
+				await buildCatalogFixture(counting.db);
+				await counting.storeModule.whenCatalogPersisted();
+				await counting.closeDbOnly();
+				counting.resetCounters();
+				const reopened = await openStoreDatabase(counting.provider);
+				try {
+					const result = await reopened.storeModule.rehydrateCatalog(reopened.db);
+					assertRehydration(name, result);
+					// Read BEFORE any close — the provider clears its counted stores on close.
+					const store = counting.readCounters();
+					return {
+						store,
+						// The rehydration counts are the assertion above; reported so a changed
+						// fixture shows in a diff. `__catalog__.iterateEntries` in the store
+						// block is likewise reported but never hard-asserted: view entries land
+						// beside table entries and index DDL rides inside its table's bundle,
+						// so the raw entry count is a catalog-layout fact, not a contract.
+						rehydrated: {
+							tables: result.tables.length,
+							indexes: result.indexes.length,
+							views: result.views.length,
+							materializedViews: result.materializedViews.length,
+							errors: result.errors.length,
+						},
+					};
+				} finally {
+					await reopened.closeDbOnly();
+				}
+			} finally {
+				await counting.close();
+			}
+		},
+	};
+}
+
+/**
+ * The query-shaped hot-path rows. Sizes that depend on `ROW_RESOLUTION_BATCH` (B) are
+ * computed from the imported constant inside each `build`, never restated.
+ */
+const COUNTED_QUERY_BENCHMARKS = [
+	makeCountedQueryBenchmark('scan-10k', () => ({
+		sql: 'select * from bench_t',
+		expectedRows: 10000,
+		expectedStore: {
+			// One iterate pulling every entry, and nothing else anywhere: a full scan that
+			// started issuing point reads, or consulting the index, fails here.
+			[BENCH_T_DATA_STORE]: { ...NO_TRAFFIC, iterateEntries: 10000 },
+			[BENCH_T_INDEX_STORE]: NO_TRAFFIC,
+		},
+	})),
+	makeCountedQueryBenchmark('point-read-pk', () => ({
+		sql: 'select * from bench_t where id = 4321',
+		expectedRows: 1,
+		expectedStore: {
+			// Exactly one single-key get. A point read that turned into a range scan
+			// (iterateEntries) or a one-key batch (getManyCalls) is a lost fast path.
+			[BENCH_T_DATA_STORE]: { ...NO_TRAFFIC, singleGets: 1 },
+			[BENCH_T_INDEX_STORE]: NO_TRAFFIC,
+		},
+	})),
+	makeCountedQueryBenchmark('multi-seek-pk-10', (batch) => {
+		const ids = Array.from({ length: 10 }, (_, i) => i * 1000);
+		return {
+			sql: `select * from bench_t where id in (${ids.join(', ')})`,
+			expectedRows: ids.length,
+			expectedStore: {
+				// Ten spread-out keys, well under one resolution batch: ONE batched read
+				// carrying all ten. If seeks ever stopped batching, `getManyCalls` goes to
+				// ten — or `singleGets` takes the keys — and this fails.
+				[BENCH_T_DATA_STORE]: { ...NO_TRAFFIC, getManyCalls: Math.ceil(ids.length / batch), getManyKeys: ids.length },
+				[BENCH_T_INDEX_STORE]: NO_TRAFFIC,
+			},
+		};
+	}),
+	makeCountedQueryBenchmark('multi-seek-pk-over-batch', (batch) => {
+		// One batch plus a quarter, so the key list spans a batch boundary whatever B is.
+		const k = batch + Math.ceil(batch / 4);
+		if (k > 1000) {
+			// Thrown from `setup`: past 1 000 keys the multi-seek plan changes shape, and
+			// this row would silently measure something else.
+			throw new Error(`multi-seek-pk-over-batch: k=${k} exceeds the 1000-key multi-seek cap — ROW_RESOLUTION_BATCH grew; resize the sizes here`);
+		}
+		const ids = Array.from({ length: k }, (_, i) => i);
+		return {
+			sql: `select * from bench_t where id in (${ids.join(', ')})`,
+			expectedRows: k,
+			expectedStore: {
+				[BENCH_T_DATA_STORE]: { ...NO_TRAFFIC, getManyCalls: Math.ceil(k / batch), getManyKeys: k },
+				[BENCH_T_INDEX_STORE]: NO_TRAFFIC,
+			},
+		};
+	}),
+	makeIndexResolveBenchmark('index-resolve-quarter-batch', 0.25),
+	makeIndexResolveBenchmark('index-resolve-one-batch', 1),
+	makeIndexResolveBenchmark('index-resolve-two-batches', 2),
+	// NOTE: at 4B = 1 024 rows this is ~10% selectivity against the 10 000-row fixture —
+	// the largest width probe-verified to still pick the index plan. If
+	// ROW_RESOLUTION_BATCH grows, the planner may flip this row to a full scan; the
+	// counter assert (index iterateEntries = n, zero data iterates) is what catches that,
+	// loudly, rather than the timing quietly changing meaning.
+	makeIndexResolveBenchmark('index-resolve-four-batches', 4),
+];
+
 export const benchmarks = [
 	...KEY_SHAPES.map(makeKeyBenchmark),
 	makeIndexKeyBenchmark(),
 	makeDecodeBenchmark(),
+	...COUNTED_QUERY_BENCHMARKS,
+	makeCommitBenchmark(1),
+	makeCommitBenchmark(10),
+	makeCommitBenchmark(100),
+	makeCommitBenchmark(1000),
+	makeIndexBuildBenchmark(),
+	makeCatalogRehydrateBenchmark(),
 ];
