@@ -1,3 +1,22 @@
+/**
+ * TIMING: no benchmark in this file sets `iterations` or `warmup`. The worker
+ * calibrates both from a pilot measurement of `fn` — see `CALIBRATION` in
+ * `bench/child.mjs` — so each benchmark gets roughly a second of timed work
+ * regardless of whether one call costs microseconds or hundreds of milliseconds.
+ *
+ * Setting either field is still honoured and PINS the benchmark to a fixed count,
+ * skipping calibration entirely. It is the escape hatch for a benchmark whose
+ * per-call cost changes as it runs, where a pilot would be unrepresentative. Use it
+ * only with a comment saying why: a pinned benchmark also forfeits a meaningful
+ * spread figure, because ten samples are too few for a quartile range to say much.
+ *
+ * Calibration BATCHES sub-millisecond benchmarks — several consecutive `fn` calls
+ * timed as one sample — so every `fn` here must be repeatable back-to-back without
+ * its `setup` in between. All of them are; a future one that is not (say, a
+ * benchmark that grows a table on each call) must reset itself inside `fn` or pin
+ * itself out of calibration.
+ */
+
 import { Database } from '../../dist/src/index.js';
 
 let db;
@@ -23,8 +42,6 @@ async function teardown() {
 export const benchmarks = [
 	{
 		name: 'simple-scan-plan',
-		iterations: 30,
-		warmup: 3,
 		setup,
 		teardown,
 		async fn() {
@@ -34,8 +51,6 @@ export const benchmarks = [
 	},
 	{
 		name: 'join-plan',
-		iterations: 30,
-		warmup: 3,
 		setup,
 		teardown,
 		async fn() {
@@ -45,8 +60,6 @@ export const benchmarks = [
 	},
 	{
 		name: 'aggregate-plan',
-		iterations: 30,
-		warmup: 3,
 		setup,
 		teardown,
 		async fn() {
@@ -56,8 +69,6 @@ export const benchmarks = [
 	},
 	{
 		name: 'subquery-plan',
-		iterations: 30,
-		warmup: 3,
 		setup,
 		teardown,
 		async fn() {

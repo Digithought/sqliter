@@ -1,3 +1,22 @@
+/**
+ * TIMING: no benchmark in this file sets `iterations` or `warmup`. The worker
+ * calibrates both from a pilot measurement of `fn` — see `CALIBRATION` in
+ * `bench/child.mjs` — so each benchmark gets roughly a second of timed work
+ * regardless of whether one call costs microseconds or hundreds of milliseconds.
+ *
+ * Setting either field is still honoured and PINS the benchmark to a fixed count,
+ * skipping calibration entirely. It is the escape hatch for a benchmark whose
+ * per-call cost changes as it runs, where a pilot would be unrepresentative. Use it
+ * only with a comment saying why: a pinned benchmark also forfeits a meaningful
+ * spread figure, because ten samples are too few for a quartile range to say much.
+ *
+ * Calibration BATCHES sub-millisecond benchmarks — several consecutive `fn` calls
+ * timed as one sample — so every `fn` here must be repeatable back-to-back without
+ * its `setup` in between. All of them are; a future one that is not (say, a
+ * benchmark that grows a table on each call) must reset itself inside `fn` or pin
+ * itself out of calibration.
+ */
+
 import { Database } from '../../dist/src/index.js';
 
 /** Collect an async iterable into an array. */
@@ -121,8 +140,6 @@ let db;
 export const benchmarks = [
 	{
 		name: 'full-scan-10k',
-		iterations: 10,
-		warmup: 2,
 		async setup() { db = await createPopulatedDb(); },
 		async teardown() { await db.close(); db = null; },
 		async fn() {
@@ -147,8 +164,6 @@ export const benchmarks = [
 		// one operand is a constant). If this shape ever needs to be materially faster,
 		// that parse is the target, not the dispatch.
 		name: 'temporal-arith-scan-10k',
-		iterations: 10,
-		warmup: 2,
 		async setup() { db = await createTemporalDb(); },
 		async teardown() { await db.close(); db = null; },
 		async fn() {
@@ -158,8 +173,6 @@ export const benchmarks = [
 	},
 	{
 		name: 'filtered-scan-index-10k',
-		iterations: 10,
-		warmup: 2,
 		async setup() { db = await createPopulatedDb(); },
 		async teardown() { await db.close(); db = null; },
 		async fn() {
@@ -169,8 +182,6 @@ export const benchmarks = [
 	},
 	{
 		name: 'group-by-10k',
-		iterations: 10,
-		warmup: 2,
 		async setup() { db = await createPopulatedDb(); },
 		async teardown() { await db.close(); db = null; },
 		async fn() {
@@ -182,8 +193,6 @@ export const benchmarks = [
 	},
 	{
 		name: 'order-by-10k',
-		iterations: 10,
-		warmup: 2,
 		async setup() { db = await createPopulatedDb(); },
 		async teardown() { await db.close(); db = null; },
 		async fn() {
@@ -195,8 +204,6 @@ export const benchmarks = [
 	},
 	{
 		name: 'order-by-text-10k',
-		iterations: 10,
-		warmup: 2,
 		async setup() { db = await createTextDb(); },
 		async teardown() { await db.close(); db = null; },
 		async fn() {
@@ -222,15 +229,15 @@ export const benchmarks = [
 		//
 		// Do not read those figures as bounds. Runs taken while the machine was busy measured
 		// this same benchmark at 228-338 ms, so background load moves it several-fold; the
-		// ordering above is the durable claim, not the milliseconds. Per-run medians being
-		// this noisy is what `bench-adaptive-sampling` exists to fix.
+		// ordering above is the durable claim, not the milliseconds. The `Spread` column now
+		// reports how much of that noise landed inside a given run — but only inside it; a
+		// whole run displaced by background load still reads as tight.
 		//
 		// If `yarn bench` wall-clock ever becomes a problem this is not the entry to cut, and
-		// if it ever is, lower its `iterations` rather than shortening `PREFIX40` — the long
-		// prefix is the whole point of the benchmark.
+		// if it ever is, lower `CALIBRATION.targetTotalMs` in `bench/child.mjs` (which shortens
+		// every benchmark evenly) rather than shortening `PREFIX40` — the long prefix is the
+		// whole point of the benchmark.
 		name: 'order-by-text-prefix40-10k',
-		iterations: 10,
-		warmup: 2,
 		async setup() { db = await createTextDb(); },
 		async teardown() { await db.close(); db = null; },
 		async fn() {
@@ -245,8 +252,6 @@ export const benchmarks = [
 		// (`UNICODE_PREFIX`), forcing `compareCodePoints`'s surrogate-aware slow path
 		// (see `util/comparison.ts`) rather than its native `<`/`>` fast path.
 		name: 'order-by-text-unicode-10k',
-		iterations: 10,
-		warmup: 2,
 		async setup() { db = await createTextDb(); },
 		async teardown() { await db.close(); db = null; },
 		async fn() {
@@ -262,8 +267,6 @@ export const benchmarks = [
 		// key-serialization path, NOT `compareCodePoints` — a pure comparator regression does
 		// not move this number. `distinct-text-10k` is the comparator-sensitive dedup case.
 		name: 'group-by-text-10k',
-		iterations: 10,
-		warmup: 2,
 		async setup() { db = await createTextDb(); },
 		async teardown() { await db.close(); db = null; },
 		async fn() {
@@ -277,8 +280,6 @@ export const benchmarks = [
 		// `tkey` is unique per row, so dedup must compare all 10K values rather than
 		// collapsing into `group-by-text-10k`'s 100 low-cardinality groups.
 		name: 'distinct-text-10k',
-		iterations: 10,
-		warmup: 2,
 		async setup() { db = await createTextDb(); },
 		async teardown() { await db.close(); db = null; },
 		async fn() {
@@ -290,8 +291,6 @@ export const benchmarks = [
 	},
 	{
 		name: 'text-pk-range-scan-10k',
-		iterations: 10,
-		warmup: 2,
 		async setup() { db = await createTextPkDb(); },
 		async teardown() { await db.close(); db = null; },
 		async fn() {
@@ -303,8 +302,6 @@ export const benchmarks = [
 	},
 	{
 		name: 'text-pk-point-seek-10k',
-		iterations: 10,
-		warmup: 2,
 		async setup() { db = await createTextPkDb(); },
 		async teardown() { await db.close(); db = null; },
 		async fn() {
@@ -316,8 +313,6 @@ export const benchmarks = [
 	},
 	{
 		name: 'join-1kx1k',
-		iterations: 10,
-		warmup: 2,
 		async setup() {
 			db = new Database();
 			await db.exec(`
@@ -343,8 +338,6 @@ export const benchmarks = [
 	},
 	{
 		name: 'correlated-subquery',
-		iterations: 10,
-		warmup: 2,
 		async setup() { db = await createPopulatedDb(); },
 		async teardown() { await db.close(); db = null; },
 		async fn() {
@@ -366,8 +359,6 @@ export const benchmarks = [
 		// the two: when decorrelation works the plans are near-identical (ratio ≈
 		// 1); if it breaks, the declarative side goes N+1 and the ratio spikes.
 		name: 'hand-batched-peer-count',
-		iterations: 10,
-		warmup: 2,
 		async setup() { db = await createPopulatedDb(); },
 		async teardown() { await db.close(); db = null; },
 		async fn() {
@@ -396,8 +387,9 @@ export const benchmarks = [
  *
  * `maxRatio` is deliberately LOOSE (order-of-magnitude): its job is to trip the
  * 26×-class regression, not order-of-1 warm-up variance on the in-memory vtab.
- * If the twin ever shows high variance near the bound, raise its `iterations`
- * rather than tightening `maxRatio`.
+ * If the twin ever shows high variance near the bound, raise
+ * `CALIBRATION.targetTotalMs` in `bench/child.mjs` so both sides collect more
+ * samples, rather than tightening `maxRatio`.
  */
 export const ratioGuards = [
 	{ name: 'correlated-subquery', baseline: 'hand-batched-peer-count', maxRatio: 10 },

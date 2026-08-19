@@ -14,6 +14,11 @@
  * their metadata (names, `ratioGuards`) and nothing else; the moment it executes
  * benchmark work, the isolation guarantee is gone.
  *
+ * Each worker calibrates its own sample count from a pilot measurement (see
+ * `CALIBRATION` in `child.mjs`) and reports raw samples; the parent derives every
+ * statistic here, including the relative-IQR spread that says how much to trust
+ * the median it sits next to.
+ *
  * Usage:
  *   yarn bench                         — run all suites, print table, write JSON
  *   yarn bench --baseline <file>       — compare against a previous result
@@ -27,7 +32,7 @@ import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
 
 import { loadSuites, selectBenchmarks } from './lib/discover.mjs';
-import { summarize } from './lib/stats.mjs';
+import { summarize, UNSTABLE_SPREAD } from './lib/stats.mjs';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const childPath = join(__dirname, 'child.mjs');
@@ -184,7 +189,13 @@ function classify(fullName, outcome) {
 	if (!Array.isArray(timings) || timings.length === 0) {
 		return { failure: { kind: 'error', detail: `child reported an empty timing set for ${fullName}` } };
 	}
-	return { result: summarize(timings) };
+	return {
+		result: summarize(timings, {
+			batch: outcome.result.batch,
+			warmup: outcome.result.warmup,
+			pinned: outcome.result.pinned,
+		}),
+	};
 }
 
 function tail(text) {
@@ -193,12 +204,19 @@ function tail(text) {
 }
 
 // ── Print results table ─────────────────────────────────────────────────
+/**
+ * The table carries median, spread, min and max — and deliberately NOT p95. At
+ * every sample count this suite realistically produces, nearest-rank p95 indexes
+ * `ceil(0.95 * n) - 1`, which is the last element for n ≤ 20 and within a place or
+ * two of it beyond that; the column duplicated Max and its slot is better spent on
+ * a measure of dispersion.
+ */
 function printTable(rows, baseline) {
 	const nameWidth = Math.max(30, ...rows.map((r) => r.fullName.length + 2));
 
-	const header = baseline
-		? `${'Benchmark'.padEnd(nameWidth)}  ${'Median'.padStart(10)}  ${'P95'.padStart(10)}  ${'Min'.padStart(10)}  ${'Max'.padStart(10)}  ${'Delta'.padStart(10)}`
-		: `${'Benchmark'.padEnd(nameWidth)}  ${'Median'.padStart(10)}  ${'P95'.padStart(10)}  ${'Min'.padStart(10)}  ${'Max'.padStart(10)}`;
+	const columns = ['Median', 'Spread', 'Min', 'Max'];
+	if (baseline) columns.push('Delta');
+	const header = `${'Benchmark'.padEnd(nameWidth)}  ${columns.map((c) => c.padStart(10)).join('  ')}`;
 
 	console.log();
 	console.log(header);
@@ -213,7 +231,7 @@ function printTable(rows, baseline) {
 		}
 
 		const result = row.result;
-		let line = `${row.fullName.padEnd(nameWidth)}  ${fmt(result.median_ms).padStart(10)}  ${fmt(result.p95_ms).padStart(10)}  ${fmt(result.min_ms).padStart(10)}  ${fmt(result.max_ms).padStart(10)}`;
+		let line = `${row.fullName.padEnd(nameWidth)}  ${fmt(result.median_ms).padStart(10)}  ${fmtSpread(result.spread_pct).padStart(10)}  ${fmt(result.min_sample_ms).padStart(10)}  ${fmt(result.max_sample_ms).padStart(10)}`;
 
 		if (baseline && baseline[row.fullName]) {
 			const delta = ((result.median_ms - baseline[row.fullName].median_ms) / baseline[row.fullName].median_ms) * 100;
@@ -226,14 +244,40 @@ function printTable(rows, baseline) {
 			line += `  ${colored.padStart(10 + (colored.length - deltaStr.length))}`;
 		}
 
+		// Markers, not columns: they apply to a minority of rows and padding a column
+		// for them would cost more width than they are worth.
+		if (!result.stable) line += '  \x1b[33munstable\x1b[0m';
+		if (result.pinned) line += '  \x1b[36mpinned\x1b[0m';
+
 		console.log(line);
 	}
 
 	console.log();
+	console.log(tableLegend(rows));
+}
+
+/** One line under the table saying what the numbers mean, because two of them do
+ * not mean what a reader would assume. */
+function tableLegend(rows) {
+	const batched = rows.filter((r) => r.result && r.result.batch > 1);
+	const parts = [
+		`Spread = relative IQR ((p75-p25)/median); rows above ${(UNSTABLE_SPREAD * 100).toFixed(0)}% are marked unstable`,
+	];
+	if (batched.length > 0) {
+		// Only mentioned when it applies, so the legend does not train readers to skip it.
+		parts.push(`${batched.length} row(s) batch several calls per sample — their Min/Max are batch means, not per-call extremes`);
+	}
+	return parts.map((p) => `  ${p}`).join('\n');
 }
 
 function fmt(ms) {
 	return ms < 1 ? `${(ms * 1000).toFixed(0)} µs` : `${ms.toFixed(2)} ms`;
+}
+
+/** `null` spread (an empty or zero-median sample set) prints as `?`, never as an
+ * empty cell — a blank reads as "not measured yet", which is a different claim. */
+function fmtSpread(pct) {
+	return pct === null || pct === undefined ? '?' : `${pct.toFixed(1)}%`;
 }
 
 // ── Within-run ratio guards ─────────────────────────────────────────────
@@ -362,7 +406,9 @@ async function runSelected(selected) {
 		if (classified.result) {
 			allBenchmarks[bench.fullName] = classified.result;
 			rows.push({ fullName: bench.fullName, result: classified.result, failure: null });
-			console.log(`  ${bench.name}... ${fmt(classified.result.median_ms)} (p95: ${fmt(classified.result.p95_ms)})`);
+			const r = classified.result;
+			const shape = r.pinned ? `${r.samples} pinned iters` : `${r.samples} samples${r.batch > 1 ? ` x${r.batch}` : ''}`;
+			console.log(`  ${bench.name}... ${fmt(r.median_ms)} (spread: ${fmtSpread(r.spread_pct)}, ${shape})${r.stable ? '' : ' \x1b[33munstable\x1b[0m'}`);
 		} else {
 			failures.push({ fullName: bench.fullName, ...classified.failure });
 			rows.push({ fullName: bench.fullName, result: null, failure: classified.failure });
