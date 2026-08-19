@@ -1,6 +1,6 @@
 ---
 description: All our benchmarks run against the in-memory table implementation, so nothing measures the persistent storage backends that real deployments use; add a benchmark suite that exercises them.
-prereq: bench-work-counters
+prereq: bench-counter-reporting, store-counting-double-extraction
 files:
   - packages/quereus/bench/run.mjs                             # harness; would gain a backend dimension
   - packages/quereus/bench/suites/execution.bench.mjs          # the workloads to re-run against a store backend
