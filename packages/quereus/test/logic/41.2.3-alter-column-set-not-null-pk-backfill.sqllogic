@@ -286,7 +286,9 @@ drop table t_bf12;
 -- ===================================
 
 -- Table-level `unique` (not a standalone `create index`) so the file needs no
--- `-- requires-capability: standalone-index-ddl` and runs on every backend.
+-- `-- requires-capability: standalone-index-ddl` and runs on every backend. The same case
+-- built with a standalone `create index` lives in
+-- 41.2.3.1-alter-column-set-not-null-pk-backfill-secondary-index.sqllogic, which does declare it.
 create table t_bf13 (x integer null default 7, y integer null unique);
 insert into t_bf13 (x, y) values (3, 2);
 -- run
