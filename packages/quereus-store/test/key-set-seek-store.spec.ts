@@ -400,9 +400,7 @@ describe('key-set semi join over the store backend (feat-key-set-seek-store-isol
 					Array.from({ length: 300 }, (_, i) => `(${i + 1}, ${(i + 1) * 10})`).join(', ')}`);
 
 				const store = dataStores.get('main.lz')!;
-				store.iterateEntryCount = 0;
-				store.getCount = 0;
-				store.getManyCalls = 0;
+				store.reset();
 				cmod.reset();
 				const rows = await asyncIterableToArray(cdb.eval(`select pk from lz where v in (select k from lsrc) limit 1`));
 				expect(rows).to.have.lengthOf(1);

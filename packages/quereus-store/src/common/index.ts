@@ -121,6 +121,11 @@ export { CachedKVStore, type CacheOptions } from './cached-kv-store.js';
 
 // Generic store table and connection
 export { StoreTable, type ExternalRowOp } from './store-table.js';
+// How many index entries an index-driven scan resolves to data rows per round trip.
+// Public so a caller that must DERIVE an expected round-trip count from it — the store
+// benchmark suite, specs asserting on batching — reads the constant instead of restating
+// `256`, which would turn into a lie the moment the constant moves.
+export { ROW_RESOLUTION_BATCH } from './store-table-scan.js';
 export { type StoreTableConfig, type StoreTableModule } from './store-table-base.js';
 
 // Physical key properties of primary-key / index columns

@@ -376,35 +376,59 @@ keyed by, so it is stable across runs and says which physical store the traffic 
 {
   "engine": { "...": "the usual snapshot" },
   "store": {
-    "main.bench_t":                 { "iterateEntries": 0,  "getManyCalls": 1, "getManyKeys": 10, "singleGets": 0 },
-    "main.bench_t_idx_bench_t_val": { "iterateEntries": 10, "getManyCalls": 0, "getManyKeys": 0,  "singleGets": 0 }
+    "main.bench_t": {
+      "iterateEntries": 0, "getManyCalls": 1, "getManyKeys": 10, "singleGets": 0,
+      "directPuts": 0, "directDeletes": 0, "batchWrites": 0, "batchOps": 0
+    },
+    "main.bench_t_idx_bench_t_val": {
+      "iterateEntries": 10, "getManyCalls": 0, "getManyKeys": 0, "singleGets": 0,
+      "directPuts": 0, "directDeletes": 0, "batchWrites": 0, "batchOps": 0
+    }
   }
 }
 ```
 
 That is `filtered-scan-index-10k@store-mem`, and it reads: ten entries pulled from the
-secondary index, then **one** batched read carrying ten keys to fetch the rows. If row
-resolution ever stopped batching, `getManyCalls` would go to 10 and `singleGets` would take
-the keys.
+secondary index, then **one** batched read carrying ten keys to fetch the rows, and no
+writes at all — it is a read workload. If row resolution ever stopped batching,
+`getManyCalls` would go to 10 and `singleGets` would take the keys.
 
-The four counts, which are **not** the raw field names of `CountingKVStore` in
+The eight counts, which are **not** the raw field names of `CountingKVStore` in
 `@quereus/store/testing` — that class's `getMany` deliberately routes every key of a batch
 through its own counted `get`, so its `getCount` is not what its name suggests:
 
 | Field | Means |
 | --- | --- |
 | `iterateEntries` | entries pulled from `iterate()` — a scan's volume |
-| `getManyCalls` | batched reads issued: **the round-trip count** |
+| `getManyCalls` | batched reads issued: **the read-side round-trip count** |
 | `getManyKeys` | keys those batched reads carried |
 | `singleGets` | reads that were genuinely one key at a time (`getCount - getManyKeyCount`, derived once, in `bench/lib/store-counters.mjs`) |
+| `directPuts` | puts issued one at a time, outside any batch |
+| `directDeletes` | deletes issued one at a time, outside any batch |
+| `batchWrites` | batch commits issued: **the write-side round-trip count** |
+| `batchOps` | put/delete operations those commits carried |
 
-**Reads only.** `CountingKVStore` counts `get`/`getMany`/`iterate` and nothing else, so a
-write workload's block describes the reads its writes provoked — index maintenance,
-uniqueness probes, read-modify-write — never the writes themselves. `bulk-insert-10k@store-mem`
-reporting 30 000 `singleGets` for 10 000 inserted rows is three reads per row, and that is a
-real, diffable number; it just is not the whole story of what an insert costs.
+**Both sides.** `CountingKVStore` counts reads (`get`/`getMany`/`iterate`) and writes
+(point `put`/`delete`, plus `WriteBatch.write()` commits and the operations they carried),
+so a write workload's block says both what its writes COST and what they PROVOKED in reads
+— index maintenance, uniqueness probes, read-modify-write. `bulk-insert-10k@store-mem`
+reporting 30 000 `singleGets` for 10 000 inserted rows is three reads per row; its
+`batchWrites` / `batchOps` are the other half of that story.
 
-A store that was opened but never read from stays in the block with four zeros. That is
+The write side answers a question no read count can. Whether committing N queued operations
+costs a flat number of round trips or one per operation is a claim about `batchWrites`, and
+it cannot be recovered from the read counters by picking a cleverer workload: any workload
+that queues N operations also touches N rows, so its read counts are linear in N whatever
+the commit path does.
+
+**What `batchWrites` is a fact about.** The counting provider exposes no
+`beginAtomicBatch` — its in-memory stores share no commit domain — so the transaction
+coordinator takes its per-store fallback: one `WriteBatch` per touched store. A provider
+that DOES have a shared commit domain (the LevelDB family) commits the same transaction as
+one cross-store atomic write instead. These are the store LAYER's round trips over an
+in-memory provider, not a prediction of what a real backend physically issues.
+
+A store that was opened but never touched stays in the block with eight zeros. That is
 a different claim from a store that was never opened at all, which is absent — and the
 comparison reports an appeared or vanished path exactly as loudly as a changed count.
 

@@ -609,7 +609,7 @@ describe('StoreModule predicate pushdown', () => {
 			await cdb.exec(`insert into ${table} values ${vals}`);
 			const store = dataStores.get(`main.${table}`);
 			expect(store, `data store for ${table} should exist`).to.exist;
-			store!.iterateEntryCount = 0;
+			store!.reset();
 			return store!;
 		}
 
@@ -657,7 +657,7 @@ describe('StoreModule predicate pushdown', () => {
 			const vals = Array.from({ length: 60 }, (_, i) => `('PT${i + 1}M')`).join(', ');
 			await cdb.exec(`insert into ts values ${vals}`);
 			const store = dataStores.get('main.ts')!;
-			store.iterateEntryCount = 0;
+			store.reset();
 
 			const rows = await asyncIterableToArray(cdb.eval(`select d from ts where d > 'PT57M'`));
 			expect(rows.map(r => r.d)).to.deep.equal(['PT58M', 'PT59M', 'PT60M']);
@@ -674,7 +674,7 @@ describe('StoreModule predicate pushdown', () => {
 			const vals = Array.from({ length: 60 }, (_, i) => `('${i}')`).join(', ');
 			await cdb.exec(`insert into js values ${vals}`);
 			const store = dataStores.get('main.js')!;
-			store.iterateEntryCount = 0;
+			store.reset();
 
 			const rows = await asyncIterableToArray(
 				cdb.eval(`select json_quote(j) as q from js where j > json('57')`),
@@ -687,7 +687,7 @@ describe('StoreModule predicate pushdown', () => {
 			await cdb.exec(`create table ts2 (d timespan primary key) using store`);
 			await cdb.exec(`insert into ts2 values ('PT1M'), ('PT2M'), ('PT3M')`);
 			const store = dataStores.get('main.ts2')!;
-			store.iterateEntryCount = 0;
+			store.reset();
 
 			const rows = await asyncIterableToArray(cdb.eval(`select d from ts2 where d > 'PT5M'`));
 			expect(rows).to.deep.equal([]);
@@ -702,8 +702,7 @@ describe('StoreModule predicate pushdown', () => {
 			const vals = Array.from({ length: 60 }, (_, i) => `('PT${i + 1}M')`).join(', ');
 			await cdb.exec(`insert into ts3 values ${vals}`);
 			const store = dataStores.get('main.ts3')!;
-			store.iterateEntryCount = 0;
-			store.getCount = 0;
+			store.reset();
 
 			// Bound and stored value are different spellings of one hour.
 			const rows = await asyncIterableToArray(cdb.eval(`select d from ts3 where d = 'PT3600S'`));
@@ -717,8 +716,7 @@ describe('StoreModule predicate pushdown', () => {
 			const vals = Array.from({ length: 60 }, (_, i) => `('{"a":${i},"b":0}')`).join(', ');
 			await cdb.exec(`insert into js2 values ${vals}`);
 			const store = dataStores.get('main.js2')!;
-			store.iterateEntryCount = 0;
-			store.getCount = 0;
+			store.reset();
 
 			const rows = await asyncIterableToArray(
 				cdb.eval(`select json_quote(j) as q from js2 where j = json('{"b":0,"a":57}')`),
@@ -737,8 +735,7 @@ describe('StoreModule predicate pushdown', () => {
 			await cdb.exec(`create table ts4 (d timespan primary key) using store`);
 			await cdb.exec(`insert into ts4 values ('PT5S'), ('PT2H'), ('PT30M')`);
 			const store = dataStores.get('main.ts4')!;
-			store.iterateEntryCount = 0;
-			store.getCount = 0;
+			store.reset();
 
 			expect(await asyncIterableToArray(cdb.eval(`select d from ts4 where d = 5`))).to.deep.equal([]);
 			expect(store.iterateEntryCount, 'the arm declined to a full scan').to.equal(3);
@@ -1499,8 +1496,7 @@ describe('StoreModule predicate pushdown', () => {
 				const vals = Array.from({ length: 100 }, (_, i) => `(${i}, ${i})`).join(', ');
 				await cdb.exec(`insert into nums values ${vals}`);
 				const store = dataStores.get('main.nums')!;
-				store.iterateEntryCount = 0;
-				store.getCount = 0;
+				store.reset();
 
 				const rows = await asyncIterableToArray(cdb.eval(`select id from nums where v in (5, 7, 9) order by id`));
 				expect(rows.map(r => r.id)).to.deep.equal([5, 7, 9]);
@@ -1523,8 +1519,7 @@ describe('StoreModule predicate pushdown', () => {
 				const vals = Array.from({ length: 100 }, (_, i) => `(${i}, 1, ${i})`).join(', ');
 				await cdb.exec(`insert into ab values ${vals}`);
 				const store = dataStores.get('main.ab')!;
-				store.iterateEntryCount = 0;
-				store.getCount = 0;
+				store.reset();
 
 				const rows = await asyncIterableToArray(
 					cdb.eval(`select id from ab where a = 1 and b >= 96 order by id`),
@@ -1968,10 +1963,7 @@ describe('StoreModule predicate pushdown', () => {
 			/** The data store for `main.nums`, with its counters zeroed after seeding. */
 			const counted = (): CountingKVStore => {
 				const store = dataStores.get('main.nums')!;
-				store.iterateEntryCount = 0;
-				store.getCount = 0;
-				store.getManyCalls = 0;
-				store.getManyKeyCount = 0;
+				store.reset();
 				return store;
 			};
 

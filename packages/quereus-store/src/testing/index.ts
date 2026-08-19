@@ -22,7 +22,8 @@
  *
  * {@link CountingKVStore} / {@link createCountingProvider} are not a conformance battery —
  * they are the shared counting test double several specs in this package (and its
- * benchmark suite) use to assert on `iterate`/`get`/`getMany` traffic.
+ * benchmark suite) use to assert on storage traffic: reads (`iterate`/`get`/`getMany`) and
+ * writes (point `put`/`delete`, and batch commits with the operations they carried).
  *
  * {@link createInMemoryProvider} is the shared all-`InMemoryKVStore` {@link KVStoreProvider}
  * most specs in this package (and its benchmark suite) need as a plain backend, with no
