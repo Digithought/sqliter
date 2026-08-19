@@ -36,8 +36,16 @@ export interface WorkCounterSnapshot {
 		key: string;
 		/** PlanNodeType, when the instruction came from a plan node. */
 		nodeType?: string;
+		/** Times this instruction's `run` was invoked. */
 		executions: number;
+		/**
+		 * Argument VALUES received, summed over executions — NOT input rows: a
+		 * streaming argument counts 1 however many rows flow through it (its row
+		 * count is the producing instruction's `out`). So `in` and `out` of one
+		 * entry are on different scales; don't read `out/in` as selectivity.
+		 */
 		in: number;
+		/** Rows/values produced, summed over executions — per yield for streams. */
 		out: number;
 	}>;
 	totals: {
@@ -50,7 +58,11 @@ export interface WorkCounterSnapshot {
 export interface WorkCounterSlot {
 	/** Structural address (`<program-path>#<instruction-index>`); never a plan-node id. */
 	readonly key: string;
-	/** PlanNodeType stamped by `emitPlanNode`, or undefined for synthetic instructions (emitCall callbacks, fused scalars). */
+	/**
+	 * PlanNodeType stamped by `emitPlanNode` — the operator that PRODUCED the
+	 * instruction, so a transparent wrapper (alias, collate, …) reports its source's
+	 * type. Undefined for synthetic instructions (emitCall callbacks, fused scalars).
+	 */
 	readonly nodeType: PlanNodeType | undefined;
 	executions: number;
 	in: number;
@@ -73,6 +85,13 @@ const COUNTED_ITERABLE_SYMBOL = Symbol('workCountedIterable');
  * double-wrapping (rows flow through both instructions), not a bug. Metrics mode and
  * tracing mode are mutually exclusive in `Scheduler.run()` (metrics wins), so there
  * is no interplay with the tracing wrapper's own marker symbol.
+ *
+ * NOTE: the wrap turns a re-iterable output (an object whose `[Symbol.asyncIterator]()`
+ * can be called more than once) into a single-shot generator, so a second pass over it
+ * would yield nothing WITH METRICS ON only. Safe today: every re-drive in the runtime
+ * goes through an `emitCall` callback that returns a fresh iterable per call, so no
+ * instruction output is iterated twice. If an emitter ever parks a re-iterable as its
+ * output, wrap per `[Symbol.asyncIterator]()` call instead of once per value.
  */
 export function recordOutput(slot: WorkCounterSlot, value: OutputValue): OutputValue {
 	if (isAsyncIterable(value)) {
@@ -146,9 +165,12 @@ export class WorkCounterCollector {
 			programSlots.push(slot);
 			this.walkOrder.push(slot);
 			// NOTE: assumes `Instruction.programs` is only ever set by `emitCall`
-			// (runtime/emitters.ts), today's single site. The walk stays correct if a
-			// future emitter sets it directly — addressing is purely structural — but
-			// that emitter's sub-programs silently start being counted here too.
+			// (runtime/emitters.ts), today's single site, and set at EMIT time — the walk
+			// runs once at execution start, so a Scheduler built during the run is absent
+			// from the map and `countersFor` returns undefined, silently counting nothing
+			// for it. The walk stays correct if a future emitter sets `programs` directly
+			// at emit time — addressing is purely structural — but that emitter's
+			// sub-programs silently start being counted here too.
 			if (instruction.programs) {
 				for (let j = 0; j < instruction.programs.length; j++) {
 					this.walk(instruction.programs[j], `${path}/${i}/${j}`);

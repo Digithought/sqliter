@@ -146,7 +146,60 @@ describe('work-counter stability', () => {
 			// TABLE_ROW_COUNT executions — the shape of an N+1 regression.
 			const subProgram = snapshot.instructions.filter((i) => i.key.startsWith('r/'));
 			expect(subProgram).to.not.have.length(0);
-			expect(snapshot.instructions.some((i) => i.executions >= TABLE_ROW_COUNT)).to.equal(true);
+			expect(subProgram.some((i) => i.executions >= TABLE_ROW_COUNT)).to.equal(true);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('counts streamed rows per yield, not one per stream', async () => {
+		const db = await setupDatabase();
+		try {
+			const snapshot = await snapshotStatement(db, 'select a, b from t');
+			// Without the counting wrapper every streaming operator would report
+			// out === 1 (the scheduler's countOutputs sees an iterable, not its rows),
+			// and the counters would be blind to how much data actually moved.
+			const scan = snapshot.instructions.find((i) => i.nodeType === 'IndexScan');
+			expect(scan, 'no scan instruction in the snapshot').to.not.equal(undefined);
+			expect(scan!.out).to.equal(TABLE_ROW_COUNT);
+			// Each row crosses several operators, so the pipeline total is a multiple
+			// of the row count — `rowsOut` is rows-through-operators, not rows returned.
+			expect(snapshot.totals.rowsOut).to.be.at.least(TABLE_ROW_COUNT);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('labels an instruction with the operator that produced it, not a transparent wrapper', async () => {
+		const db = await setupDatabase();
+		try {
+			// `emitAlias` returns its source's instruction verbatim (the same is true of
+			// asserted-keys, collate and lens-auxiliary-access), so the aliased scan must
+			// still report IndexScan — otherwise the snapshot claims the work was done by
+			// a node that has no instruction of its own.
+			const snapshot = await snapshotStatement(db, 'select t.a from t join t as u on t.a = u.a');
+			expect(snapshot.plan.nodeTypes['Alias'], 'this plan no longer contains an Alias node — retarget at another transparent wrapper').to.equal(1);
+			expect(snapshot.instructions.map((i) => i.nodeType)).to.not.include('Alias');
+			expect(snapshot.instructions.filter((i) => i.nodeType === 'IndexScan'))
+				.to.have.length(snapshot.plan.nodeTypes['IndexScan']);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('reports plan shape without executing, matching the executed snapshot', async () => {
+		const db = await setupDatabase();
+		try {
+			const stmt = db.prepare('select b, count(*) as n from t group by b');
+			try {
+				const shape = stmt.getPlanShape();
+				expect(shape.nodeCount).to.be.greaterThan(0);
+				expect(Object.values(shape.nodeTypes).reduce((sum, n) => sum + n, 0)).to.equal(shape.nodeCount);
+				for await (const _ of stmt.all()) { /* drain */ }
+				expect(stmt.getWorkCounters()!.plan).to.deep.equal(shape);
+			} finally {
+				await stmt.finalize();
+			}
 		} finally {
 			await db.close();
 		}

@@ -117,7 +117,10 @@ export function emitPlanNode(plan: PlanNode, ctx: EmissionContext): Instruction 
 	const instruction = registration.emitter(plan, ctx);
 	// Stamp the plan node type as a stable label for work-counter snapshots — this is
 	// the one place that knows both the plan node and the instruction it produced.
-	instruction.nodeType = plan.nodeType;
+	// First stamp wins: a transparent wrapper (alias, asserted-keys, collate,
+	// lens-auxiliary-access) returns its SOURCE's instruction verbatim, and the label
+	// has to name the operator that does the work, not the wrapper that vanished.
+	instruction.nodeType ??= plan.nodeType;
 	// Wrap with instrumentation for tracing
 	if (ctx.tracePlanStack) {
 		instruction.run = instrumentRunForTracing(plan, instruction.run);

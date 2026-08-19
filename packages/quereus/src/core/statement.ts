@@ -399,6 +399,10 @@ export class Statement {
 		const scanConnections = new Map<symbol, VirtualTable>();
 		let runtimeCtx: RuntimeContext | undefined;
 		try {
+			// Drop the previous execution's counters up front, so every early exit
+			// below (empty block, compile throw) leaves `getWorkCounters()` reporting
+			// nothing rather than the execution before last.
+			this.workCounters = null;
 			const blockPlanNode = this.compile();
 			if (!blockPlanNode.statements.length) return;
 
@@ -424,9 +428,9 @@ export class Statement {
 			// One collector per execution (concurrent iterations are refused by `busy`
 			// above, so replacing the previous execution's collector is unambiguous).
 			const collector = enableMetrics ? new WorkCounterCollector(scheduler) : undefined;
-			this.workCounters = collector
-				? { collector, planShape: computePlanShape(blockPlanNode) }
-				: null;
+			if (collector) {
+				this.workCounters = { collector, planShape: computePlanShape(blockPlanNode) };
+			}
 			runtimeCtx = {
 				db: this.db,
 				stmt: this,

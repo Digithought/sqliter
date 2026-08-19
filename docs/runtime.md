@@ -617,6 +617,15 @@ counts can be compared where timings cannot.
   operators report true row counts). Totals sum executions and rows over the
   instructions that ran; instructions that never ran are omitted (a missing entry and
   an all-zero entry are different claims).
+- **`in` and `out` are on different scales** — `in` counts argument values, so a
+  streaming argument counts 1 no matter how many rows flow through it, while `out`
+  counts every row. Read an operator's input row count off its *producer's* `out`,
+  never as its own `in`; `totals.rowsOut` likewise sums rows over the whole pipeline
+  (a row crossing three operators counts three times), not rows returned to the caller.
+- **Labels name the producing operator**: a transparent wrapper node (alias,
+  asserted-keys, collate, lens-auxiliary-access) emits its source's instruction
+  verbatim, so that instruction's `nodeType` stays the source operator's — the plan
+  node that vanished at emit time never labels the work someone else did.
 - **What is deliberately not counted**: elapsed time — a nanosecond figure on a
   machine-independence surface invites exactly the cross-machine comparison this
   replaces (`elapsedNs` stays in the debug-only `runtime:metrics` log). A fused

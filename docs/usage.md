@@ -845,6 +845,27 @@ Resets the statement to its initial state, ready to be re-executed with new para
 
 Releases all resources associated with the statement. The statement cannot be used after finalizing.
 
+#### `stmt.getWorkCounters(): WorkCounterSnapshot | undefined`
+
+How much work the most recent execution did — per-instruction execution, input and
+output counts plus totals — as counts only, so the same statement over the same data
+reports identically on every machine. Requires the `runtime_stats` option (alias
+`runtime_metrics`); returns `undefined` when it is off. Counts are complete only once
+the row iterable has been fully drained: breaking out early leaves a partial snapshot.
+See [runtime.md § Work counters](runtime.md#work-counters-machine-independent-execution-counts).
+
+```typescript
+db.setOption('runtime_metrics', true);
+const stmt = db.prepare('select a from t');
+for await (const _row of stmt.all()) { /* drain */ }
+console.log(stmt.getWorkCounters()?.totals);
+```
+
+#### `stmt.getPlanShape(): PlanShape`
+
+Node count and per-node-type tallies for the statement's plan. Available straight
+after preparing — no execution and no metrics option needed.
+
 ## Change-scope introspection
 
 > **Stability: Beta** — see [Stability Tiers](stability.md#tiers).
