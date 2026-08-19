@@ -32,6 +32,11 @@ export const STABILITY_CASES: StabilityCase[] = [
 	// stability case in its own right; the sub-program assertions use the case above.
 	{ name: 'decorrelated-subquery', sql: 'select a, (select count(*) from t as t2 where t2.b = t.b) as n from t' },
 	{ name: 'mutation', sql: 'update t set b = b + 0 where a <= 3' },
+	// Carries the per-table (engine-to-module) counters into the identity legs: two
+	// scan SITES over one table roll into one entry, so this pins the table-keyed
+	// aggregation as well as the counts themselves. The mutation case above covers
+	// `updateCalls`; this one covers multi-site `queryCalls` / `rowsScanned`.
+	{ name: 'self-join', sql: 'select t1.a, t2.b from t as t1 join t as t2 on t1.a = t2.a' },
 ];
 
 /** Rows inserted by {@link setupDatabase}; the N of the N+1-visibility assertion. */

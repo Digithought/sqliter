@@ -26,6 +26,24 @@ export interface PlanShape {
 	nodeTypes: Record<string, number>;
 }
 
+/**
+ * Engine-to-module access counts for one table within one execution.
+ *
+ * These measure the **engine-to-module** boundary — the calls the runtime itself
+ * issued — not the **module-to-storage** boundary. A module that swaps 1000 single-key
+ * reads for one batched multi-key read moves neither number here: the engine issued the
+ * same one `query()` either way. Counting inside a module is a separate instrument
+ * (the counting key-value store double in `@quereus/store/testing`).
+ */
+export interface TableWorkCounters {
+	/** `query()` calls the engine issued against this table. */
+	queryCalls: number;
+	/** Rows the engine pulled out of those `query()` calls. */
+	rowsScanned: number;
+	/** `update()` calls the engine issued — insert, update and delete alike. */
+	updateCalls: number;
+}
+
 /** JSON-serializable snapshot of one execution's work counters: no bigint, no timings. */
 export interface WorkCounterSnapshot {
 	/** Plan-shape facts. Available after compile — no execution needed. */
@@ -48,9 +66,24 @@ export interface WorkCounterSnapshot {
 		/** Rows/values produced, summed over executions — per yield for streams. */
 		out: number;
 	}>;
+	/**
+	 * Engine-to-module access, keyed `<schema>.<table>` (lowercased), keys sorted.
+	 *
+	 * Keyed by TABLE, not by scan site: a self-join scans one table from two sites and
+	 * both roll into one entry — the per-site breakdown is already in `instructions`.
+	 * A table the execution never touched is absent (same claim-vs-silence rule the
+	 * instruction list follows).
+	 */
+	tables: Record<string, TableWorkCounters>;
 	totals: {
 		instructionExecutions: number;
 		rowsOut: number;
+		/** `query()` calls summed over every table. */
+		queryCalls: number;
+		/** Rows pulled out of those calls, summed over every table. */
+		rowsScanned: number;
+		/** `update()` calls summed over every table. */
+		updateCalls: number;
 	};
 }
 
@@ -142,6 +175,13 @@ export class WorkCounterCollector {
 	private readonly slots = new Map<Scheduler, WorkCounterSlot[]>();
 	/** Every slot in deterministic walk order (each sub-program right after its owning instruction). */
 	private readonly walkOrder: WorkCounterSlot[] = [];
+	/**
+	 * Engine-to-module access cells, keyed `<schema>.<table>` (lowercased) and created
+	 * on first access. Unlike the instruction slots this is NOT pre-walked: which tables
+	 * an execution actually touches is a run-time fact (a branch never taken never
+	 * connects), and an entry that exists means "the engine called this table".
+	 */
+	private readonly tables = new Map<string, TableWorkCounters>();
 
 	constructor(root: Scheduler) {
 		this.walk(root, 'r');
@@ -185,9 +225,26 @@ export class WorkCounterCollector {
 	}
 
 	/**
+	 * The engine-to-module cell for one table, created zeroed on first access.
+	 *
+	 * `key` must be the lowercased `<schema>.<table>` the table carries AT RUN TIME —
+	 * the post-remap name when a deferred constraint evaluates a plan frozen before an
+	 * `ALTER TABLE ... RENAME TO` — so one table never splits across two entries.
+	 */
+	tableCounters(key: string): TableWorkCounters {
+		let entry = this.tables.get(key);
+		if (entry === undefined) {
+			entry = { queryCalls: 0, rowsScanned: 0, updateCalls: 0 };
+			this.tables.set(key, entry);
+		}
+		return entry;
+	}
+
+	/**
 	 * Builds a fresh, by-value snapshot: instructions that never ran are omitted
 	 * (a missing snapshot and an all-zero one are different claims — see
 	 * `Statement.getWorkCounters`), and totals sum over the included entries only.
+	 * Table entries exist only for tables the engine actually called, on the same rule.
 	 */
 	snapshot(plan: PlanShape): WorkCounterSnapshot {
 		const instructions: WorkCounterSnapshot['instructions'] = [];
@@ -208,10 +265,25 @@ export class WorkCounterCollector {
 			instructionExecutions += slot.executions;
 			rowsOut += slot.out;
 		}
+		// Sorted keys so two snapshots of the same execution serialize identically —
+		// Map iteration order is insertion order, which is scan-connect order, which a
+		// plan change can reshuffle without changing any count.
+		const tables: WorkCounterSnapshot['tables'] = {};
+		let queryCalls = 0;
+		let rowsScanned = 0;
+		let updateCalls = 0;
+		for (const key of [...this.tables.keys()].sort()) {
+			const cell = this.tables.get(key)!;
+			tables[key] = { queryCalls: cell.queryCalls, rowsScanned: cell.rowsScanned, updateCalls: cell.updateCalls };
+			queryCalls += cell.queryCalls;
+			rowsScanned += cell.rowsScanned;
+			updateCalls += cell.updateCalls;
+		}
 		return {
 			plan: { nodeCount: plan.nodeCount, nodeTypes: { ...plan.nodeTypes } },
 			instructions,
-			totals: { instructionExecutions, rowsOut },
+			tables,
+			totals: { instructionExecutions, rowsOut, queryCalls, rowsScanned, updateCalls },
 		};
 	}
 }

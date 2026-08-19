@@ -57,6 +57,11 @@ export function emitSeqScan(
 	// Capture the module info key for runtime retrieval
 	const moduleKey = `vtab_module:${schema.vtabModuleName}`;
 
+	// Lowercased `<schema>.<table>` as EMITTED. Serves two run-time readers — the
+	// deferred-rename lookup below and the work-counter key — and is built once here
+	// rather than per scan invocation, so the (hot) re-scan path allocates no string.
+	const emittedQualifiedNameLower = `${schema.schemaName}.${schema.name}`.toLowerCase();
+
 	// Stable per-scan-node key for the per-execution connection cache
 	// (RuntimeContext.scanConnections). Minted once here in the emitter closure, so
 	// it is identical across every re-scan of THIS scan site within one execution
@@ -95,6 +100,29 @@ export function emitSeqScan(
 		// lifecycle: connect here and disconnect in this generator's finally.
 		const connectionCache = runtimeCtx.scanConnections;
 		const cachedInstance = connectionCache?.get(scanConnectionKey);
+
+		// `schema.name` is the name this scan was EMITTED against. A deferred constraint
+		// evaluates a plan frozen at row-write time, so an `ALTER TABLE ... RENAME TO`
+		// later in the same transaction leaves that name pointing at nothing. The queue
+		// stamps the entry's old→new mapping onto the context while it evaluates; resolve
+		// through it so we connect — and count — under the name the table carries now.
+		// Undefined for every other execution, so this costs one optional lookup against a
+		// pre-built key. Nothing else in this scan is name-bound — `schema.columns`, the
+		// row descriptor and the `FilterInfo` are positional, and a rename changes no column.
+		// Resolved on EVERY invocation, not only on a connect: a cached instance skips the
+		// connect but still needs the effective name for the counter key.
+		const effectiveName = runtimeCtx.tableNameRemap?.get(emittedQualifiedNameLower) ?? schema.name;
+
+		// Engine-to-module access counters for this table. Undefined unless runtime
+		// metrics are on, so the default path pays one property read per scan invocation
+		// and one already-undefined branch per row. Keyed by the EFFECTIVE name so a
+		// renamed table never splits across two entries; the common (no-remap) case
+		// reuses the pre-built key rather than composing a new string.
+		const tableCounters = runtimeCtx.workCounters?.tableCounters(
+			effectiveName === schema.name
+				? emittedQualifiedNameLower
+				: `${schema.schemaName}.${effectiveName}`.toLowerCase());
+
 		// True only when this invocation must disconnect the instance itself (no cache
 		// to defer teardown to). A reused (cached) instance is never owned here.
 		let ownsInstance = false;
@@ -102,16 +130,6 @@ export function emitSeqScan(
 		if (cachedInstance) {
 			vtabInstance = cachedInstance;
 		} else {
-			// `schema.name` is the name this scan was EMITTED against. A deferred constraint
-			// evaluates a plan frozen at row-write time, so an `ALTER TABLE ... RENAME TO`
-			// later in the same transaction leaves that name pointing at nothing. The queue
-			// stamps the entry's old→new mapping onto the context while it evaluates; resolve
-			// through it so we connect under the name the table carries now. Undefined for
-			// every other execution, so this costs one optional lookup. Nothing else in this
-			// scan is name-bound — `schema.columns`, the row descriptor and the `FilterInfo`
-			// are positional, and a table rename changes no column.
-			const effectiveName = runtimeCtx.tableNameRemap?.get(
-				`${schema.schemaName}.${schema.name}`.toLowerCase()) ?? schema.name;
 			try {
 				const options: BaseModuleConfig = {
 					...(schema.vtabArgs ?? {}),
@@ -159,6 +177,12 @@ export function emitSeqScan(
 			}
 
 			const asyncRowIterable = vtabInstance.query(effectiveFilterInfo);
+			// Count the CALL, not the connect: an NLJ inner re-scan reuses one cached
+			// instance but issues one `query()` per outer row, and the call count is the
+			// work while the connect count is a caching artifact. This is the number an
+			// N+1 regression moves — a subquery the optimizer failed to decorrelate goes
+			// from 1 call to one per outer row while the row count barely changes.
+			if (tableCounters) tableCounters.queryCalls++;
 			throwIfAborted(runtimeCtx.signal);
 			for await (const row of asyncRowIterable) {
 				// Cooperative cancellation checkpoint: a request-timeout (or any
@@ -171,6 +195,13 @@ export function emitSeqScan(
 				// Synchronous and inside this loop on purpose: enabling the flag must not
 				// introduce a microtask hop into the scan's fast path (docs/runtime.md).
 				if (REPR_STRICT) assertRowConforms(row, reprColumnTypes!, reprWhere, reprColumnNames);
+				// Counted HERE — before any downstream operator — so a scan that yields
+				// 10000 rows into a filter passing 3 reports 10000 scanned for the table
+				// and 3 out for the filter instruction. An early-terminating scan (LIMIT,
+				// abort) leaves a partial count on purpose: that is the work it did.
+				// In the loop body, never the `finally` — cancellation and error unwinding
+				// must not depend on, or be perturbed by, counting.
+				if (tableCounters) tableCounters.rowsScanned++;
 				rowSlot.set(row);
 				yield row;
 			}

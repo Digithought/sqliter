@@ -361,6 +361,22 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 	// Pre-calculate primary key column indices from schema (needed for update/delete)
 	const pkColumnIndicesInSchema = tableSchema.primaryKeyDefinition.map(pkColDef => pkColDef.index);
 
+	// Work-counter key for this executor's table: lowercased `<schema>.<table>`, built
+	// once here so the per-row counting call allocates nothing.
+	const counterKeyLower = `${tableSchema.schemaName}.${tableSchema.name}`.toLowerCase();
+
+	/**
+	 * Records one engine-to-module `update()` call against this executor's table.
+	 *
+	 * Called immediately before each of the four `vtab.update` sites (insert, the UPSERT
+	 * update arm, update, delete) — an `insert ... on conflict do update` therefore counts
+	 * two calls, which is what the engine issued. No-op unless runtime metrics are on.
+	 */
+	function countUpdateCall(ctx: RuntimeContext): void {
+		const counters = ctx.workCounters;
+		if (counters) counters.tableCounters(counterKeyLower).updateCalls++;
+	}
+
 	// QUEREUS_REPR_STRICT seam: the row about to be handed to `vtab.update`, checked
 	// against the declared column types AFTER the DML pipeline's coercion pass. This is
 	// the failure mode with the longest fuse — a non-canonical value that gets PERSISTED.
@@ -820,6 +836,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 
 		if (REPR_STRICT) assertRowConforms(updatedRow, reprColumnTypes!, reprWhere, reprColumnNames);
 
+		countUpdateCall(rctx);
 		const updateResult = await vtab.update!(updateArgs);
 
 		if (isConstraintViolation(updateResult)) {
@@ -1197,6 +1214,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 
 		if (REPR_STRICT) assertRowConforms(newRow, reprColumnTypes!, reprWhere, reprColumnNames);
 
+		countUpdateCall(ctx);
 		const result = await vtab.update!(args);
 
 		if (isConstraintViolation(result)) {
@@ -1434,6 +1452,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 
 		if (REPR_STRICT) assertRowConforms(newRow, reprColumnTypes!, reprWhere, reprColumnNames);
 
+		countUpdateCall(ctx);
 		const result = await vtab.update!(args);
 
 		// Handle constraint violations — caller translates for FAIL/ROLLBACK.
@@ -1596,6 +1615,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			mutationStatement
 		};
 
+		countUpdateCall(ctx);
 		const result = await vtab.update!(args);
 
 		// Handle constraint violations (unlikely for DELETE, but be consistent).

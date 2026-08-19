@@ -187,6 +187,21 @@ describe('work-counter stability', () => {
 		}
 	});
 
+	it('carries the per-table engine-to-module counters through every identity leg', async () => {
+		// The identity legs above compare whole snapshots, so `tables` rides along for
+		// free — but only if the cases actually produce table entries. Pin that here, so
+		// a future edit that drops every table-touching case cannot silently reduce the
+		// stability guarantee to the instruction block alone.
+		const snapshots = await collectSnapshots(0);
+		for (const stabilityCase of STABILITY_CASES) {
+			const snapshot = snapshots[stabilityCase.name];
+			expect(Object.keys(snapshot.tables), stabilityCase.name).to.deep.equal(['main.t']);
+			expect(snapshot.tables['main.t'].queryCalls, stabilityCase.name).to.be.greaterThan(0);
+		}
+		expect(snapshots['self-join'].tables['main.t'].queryCalls, 'two scan sites, one entry').to.equal(2);
+		expect(snapshots['mutation'].tables['main.t'].updateCalls, 'one write per matched row').to.equal(3);
+	});
+
 	it('reports plan shape without executing, matching the executed snapshot', async () => {
 		const db = await setupDatabase();
 		try {

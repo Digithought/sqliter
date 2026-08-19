@@ -646,10 +646,48 @@ counts can be compared where timings cannot.
   parallel branches share the collector by reference (fork policy `shared-sink`), so
   their counts roll up with no merge step.
 
-`WorkCounterSnapshot` and `PlanShape` are exported from the package root.
-`test/runtime/work-counter-stability.spec.ts` is the acceptance suite: identical
-snapshots across two executions of one prepared statement, two databases at
+`WorkCounterSnapshot`, `TableWorkCounters` and `PlanShape` are exported from the
+package root. `test/runtime/work-counter-stability.spec.ts` is the acceptance suite:
+identical snapshots across two executions of one prepared statement, two databases at
 different plan-node-id offsets, and two separate processes.
+
+#### Per-table counters, and which boundary they measure
+
+`snapshot.tables` adds how many times the execution **asked a table for data** and how
+much came back. Keyed by lowercased `<schema>.<table>`, keys sorted, each entry carrying
+`queryCalls`, `rowsScanned` and `updateCalls` (insert, update and delete alike);
+`totals` sums each across tables. A row count alone cannot separate a narrow index seek
+from a full scan that post-filters to the same rows, and `queryCalls` is what makes an
+N+1 legible: an undecorrelated correlated subquery goes from 2 calls to one per outer
+row while the row count barely moves.
+
+- **Counted at engine-owned call sites** — the `vtabInstance.query()` call and its
+  `for await` loop in `runtime/emit/scan.ts` (the one door for `SeqScan`, `IndexScan`
+  and `IndexSeek`), and the per-row `vtab.update()` await in
+  `runtime/emit/dml-executor.ts`. So they work for the memory module, the store module,
+  the isolation wrapper and any third-party module, with nothing for a module author to
+  implement.
+- **This is the engine-to-module boundary, NOT the module-to-storage boundary.** A
+  module that swaps 1000 single-key reads for one batched multi-key read moves neither
+  number — the engine issued the same one `query()` either way. That layer has its own
+  instrument (the counting key-value store double in `@quereus/store/testing`). Two
+  layers, two instruments: these counters cannot catch a batching regression inside a
+  module.
+- **Keyed by table, not by scan site**: a self-join's two sites roll into one entry —
+  the per-site breakdown is already in `instructions`. When a deferred constraint
+  evaluates a plan frozen before an `ALTER TABLE ... RENAME TO`, the *effective*
+  (post-remap) name is the key, so one table never appears twice.
+- **Calls, not connects**: `RuntimeContext.scanConnections` caches the instance per scan
+  site, so a nested-loop-join inner re-scan connects once but calls `query()` once per
+  outer row. The call count is the work; the connect count is a caching artifact.
+- **Rows counted at the scan, before any downstream operator**: a scan yielding 10000
+  rows into a filter passing 3 reports `rowsScanned: 10000` and `out: 3`. A `LIMIT` or
+  abort that stops a scan early leaves a partial count — the truth of what ran, and why
+  a benchmark must drain fully for reproducible counters.
+- **Not counted**: `ANALYZE`'s sampling scan — `planner/stats/analyze.ts` queries
+  outside the instruction pipeline, so it has no collector to report to.
+
+`test/runtime/work-counter-tables.spec.ts` pins exact counts per shape.
 
 ### Key Points for Emitter Authors
 

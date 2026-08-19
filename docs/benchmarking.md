@@ -271,6 +271,11 @@ Requirements:
 - Prefer a shape with a plausible slow counterpart, and give it a `ratioGuards` entry. A
   guard that fires from a single run is worth more than a delta that needs a baseline file
   from the same machine.
+- **Drain the result fully if you read work counters from it.** `Statement.getWorkCounters()`
+  reports what the execution actually did, so a benchmark that stops early — a `LIMIT`, a
+  `break` out of the loop, an abort — leaves a partial `rowsScanned` whose value depends on
+  where it stopped. Counts are only reproducible run-to-run once the iterable is exhausted.
+  See [runtime.md § Work counters](runtime.md#work-counters-machine-independent-execution-counts).
 
 ## Where the code lives
 

@@ -273,7 +273,7 @@ export { isAsyncIterable, getAsyncIterator, asyncIterableToArray } from './runti
 export { CollectingInstructionTracer } from './runtime/types.js';
 export type { InstructionTracer, InstructionTraceEvent } from './runtime/types.js';
 // Machine-independent work counters (Statement.getWorkCounters / getPlanShape)
-export type { WorkCounterSnapshot, PlanShape } from './runtime/work-counters.js';
+export type { WorkCounterSnapshot, PlanShape, TableWorkCounters } from './runtime/work-counters.js';
 
 // Function registration utilities
 export {

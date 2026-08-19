@@ -848,11 +848,18 @@ Releases all resources associated with the statement. The statement cannot be us
 #### `stmt.getWorkCounters(): WorkCounterSnapshot | undefined`
 
 How much work the most recent execution did — per-instruction execution, input and
-output counts plus totals — as counts only, so the same statement over the same data
-reports identically on every machine. Requires the `runtime_stats` option (alias
-`runtime_metrics`); returns `undefined` when it is off. Counts are complete only once
-the row iterable has been fully drained: breaking out early leaves a partial snapshot.
+output counts, per-table access counts, plus totals — as counts only, so the same
+statement over the same data reports identically on every machine. Requires the
+`runtime_stats` option (alias `runtime_metrics`); returns `undefined` when it is off.
+Counts are complete only once the row iterable has been fully drained: breaking out
+early leaves a partial snapshot.
 See [runtime.md § Work counters](runtime.md#work-counters-machine-independent-execution-counts).
+
+`snapshot.tables` is keyed by lowercased `<schema>.<table>`, each entry carrying
+`queryCalls`, `rowsScanned` and `updateCalls`. These measure the calls the *engine*
+made into a virtual-table module, so they work for every module without any
+per-module cooperation — but they do not see what a module does internally, so a
+module that batches its own storage reads moves none of them.
 
 ```typescript
 db.setOption('runtime_metrics', true);
