@@ -25,78 +25,8 @@ import {
 	InMemoryKVStore,
 	type KVStoreProvider,
 	type IterateOptions,
-	type KVEntry,
 } from '../src/index.js';
-
-/**
- * In-memory data store that tallies how many entries its `iterate` actually
- * yields. Lets a test prove a selective PK range SEEKS a narrow window rather
- * than full-scanning and post-filtering (both return identical rows, so only the
- * visit count distinguishes them).
- */
-class CountingKVStore extends InMemoryKVStore {
-	public iterateEntryCount = 0;
-	public getCount = 0;
-	public getManyCalls = 0;
-	public getManyKeyCount = 0;
-	override async *iterate(options?: IterateOptions): AsyncIterable<KVEntry> {
-		for await (const entry of super.iterate(options)) {
-			this.iterateEntryCount++;
-			yield entry;
-		}
-	}
-	override async get(key: Uint8Array): Promise<Uint8Array | undefined> {
-		this.getCount++;
-		return super.get(key);
-	}
-	// InMemoryKVStore.getMany delegates through this.get (defaultGetMany), so batched
-	// keys ALSO land in getCount — assert round trips on getManyCalls, volumes on
-	// getManyKeyCount, and total keys fetched on getCount.
-	override getMany(keys: readonly Uint8Array[]): Promise<(Uint8Array | undefined)[]> {
-		this.getManyCalls++;
-		this.getManyKeyCount += keys.length;
-		return super.getMany(keys);
-	}
-}
-
-/**
- * Provider whose DATA stores are {@link CountingKVStore}s (recorded in the
- * supplied `dataStores` map, keyed `schema.table`); index/stats/catalog stores
- * stay plain so only data-row iteration is counted.
- */
-function createCountingProvider(dataStores: Map<string, CountingKVStore>): KVStoreProvider {
-	const auxStores = new Map<string, InMemoryKVStore>();
-	const aux = (key: string): InMemoryKVStore => {
-		let s = auxStores.get(key);
-		if (!s) { s = new InMemoryKVStore(); auxStores.set(key, s); }
-		return s;
-	};
-	return {
-		async getStore(schemaName: string, tableName: string) {
-			const key = `${schemaName}.${tableName}`;
-			let s = dataStores.get(key);
-			if (!s) { s = new CountingKVStore(); dataStores.set(key, s); }
-			return s;
-		},
-		async getIndexStore(schemaName: string, tableName: string, indexName: string) {
-			return aux(`${schemaName}.${tableName}_idx_${indexName}`);
-		},
-		async getStatsStore(schemaName: string, tableName: string) {
-			return aux(`${schemaName}.${tableName}.__stats__`);
-		},
-		async getCatalogStore() {
-			return aux('__catalog__');
-		},
-		async closeStore() {},
-		async closeIndexStore() {},
-		async closeAll() {
-			for (const s of dataStores.values()) await s.close();
-			for (const s of auxStores.values()) await s.close();
-			dataStores.clear();
-			auxStores.clear();
-		},
-	};
-}
+import { CountingKVStore, createCountingProvider } from '../src/testing/kv-counting-store.js';
 
 function createInMemoryProvider(): KVStoreProvider {
 	const stores = new Map<string, InMemoryKVStore>();

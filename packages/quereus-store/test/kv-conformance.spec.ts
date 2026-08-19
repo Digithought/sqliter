@@ -15,7 +15,7 @@
 import { CachedKVStore } from '../src/common/cached-kv-store.js';
 import { InMemoryKVStore } from '../src/common/memory-store.js';
 import { runKVStoreConformance } from '../src/testing/kv-conformance.js';
-import { CountingKVStore } from './kv-store-doubles.js';
+import { CountingKVStore } from '../src/testing/kv-counting-store.js';
 
 runKVStoreConformance('InMemoryKVStore', () => ({
 	open: async () => new InMemoryKVStore(),
@@ -33,7 +33,7 @@ runKVStoreConformance('CachedKVStore over InMemoryKVStore', () => {
 			return new CachedKVStore(counter);
 		},
 		readMeter: {
-			entriesRead: () => counter?.entriesRead() ?? 0,
+			entriesRead: () => counter?.iterateEntryCount ?? 0,
 			maxReadAhead: 1,
 		},
 		teardown: async () => {

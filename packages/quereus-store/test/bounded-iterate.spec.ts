@@ -13,7 +13,8 @@
 import assert from 'node:assert/strict';
 import { InMemoryKVStore } from '../src/common/memory-store.js';
 import { assertBoundedIterate, type ReadMeter } from '../src/testing/kv-conformance.js';
-import { BufferingKVStore, CountingKVStore, RescanningKVStore } from './kv-store-doubles.js';
+import { CountingKVStore } from '../src/testing/kv-counting-store.js';
+import { BufferingKVStore, RescanningKVStore } from './kv-store-doubles.js';
 
 const COUNT = 512;
 
@@ -30,7 +31,7 @@ async function seeded(): Promise<InMemoryKVStore> {
 
 /** A meter over `counter`, declaring the one-entry-per-yield read-ahead it actually has. */
 function meterOf(counter: CountingKVStore): ReadMeter {
-	return { entriesRead: () => counter.entriesRead(), maxReadAhead: 1 };
+	return { entriesRead: () => counter.iterateEntryCount, maxReadAhead: 1 };
 }
 
 describe('assertBoundedIterate (bounded-iteration guard)', () => {
@@ -75,7 +76,7 @@ describe('assertBoundedIterate (bounded-iteration guard)', () => {
 		const BATCH = 64;
 		/** A meter over `counter` declaring the re-pager's batch as its read-ahead. */
 		const pagedMeter = (counter: CountingKVStore): ReadMeter =>
-			({ entriesRead: () => counter.entriesRead(), maxReadAhead: BATCH });
+			({ entriesRead: () => counter.iterateEntryCount, maxReadAhead: BATCH });
 
 		it('slips past every prefix-and-stop assertion', async () => {
 			// Documents WHY the full-drain case exists: stopping early cannot see this bug.

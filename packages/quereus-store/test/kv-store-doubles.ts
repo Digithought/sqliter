@@ -2,75 +2,17 @@
  * KVStore test doubles shared by the bounded-iteration and batch-point-read specs.
  *
  * Not a `*.spec.ts`, so Mocha's glob does not pick it up as a suite.
+ *
+ * `DelegatingKVStore` — the base every double here extends — lives in `src/testing/`
+ * (published as `@quereus/store/testing`, alongside `CountingKVStore`) and is re-exported
+ * from here so the doubles below keep a single import source.
  */
 
 import { bytesToHex, compareBytes } from '../src/common/bytes.js';
-import type { IterateOptions, KVEntry, KVStore, WriteBatch, WriteOptions } from '../src/common/kv-store.js';
+import type { IterateOptions, KVEntry, KVStore } from '../src/common/kv-store.js';
+import { DelegatingKVStore } from '../src/testing/kv-counting-store.js';
 
-/**
- * Forwards every {@link KVStore} method to an inner store. Subclasses override only
- * the one method whose behavior they are modeling.
- */
-export class DelegatingKVStore implements KVStore {
-	constructor(protected readonly inner: KVStore) {}
-
-	get(key: Uint8Array): Promise<Uint8Array | undefined> {
-		return this.inner.get(key);
-	}
-
-	getMany(keys: readonly Uint8Array[]): Promise<(Uint8Array | undefined)[]> {
-		return this.inner.getMany(keys);
-	}
-
-	put(key: Uint8Array, value: Uint8Array, options?: WriteOptions): Promise<void> {
-		return this.inner.put(key, value, options);
-	}
-
-	delete(key: Uint8Array, options?: WriteOptions): Promise<void> {
-		return this.inner.delete(key, options);
-	}
-
-	has(key: Uint8Array): Promise<boolean> {
-		return this.inner.has(key);
-	}
-
-	iterate(options?: IterateOptions): AsyncIterable<KVEntry> {
-		return this.inner.iterate(options);
-	}
-
-	batch(): WriteBatch {
-		return this.inner.batch();
-	}
-
-	close(): Promise<void> {
-		return this.inner.close();
-	}
-
-	approximateCount(options?: IterateOptions): Promise<number> {
-		return this.inner.approximateCount(options);
-	}
-}
-
-/**
- * Counts entries pulled from the inner store's `iterate()` — the read meter for any
- * store layered ON TOP of it. Pulls lazily (one entry per `next()`), so a well-behaved
- * consumer reads exactly what it consumes.
- */
-export class CountingKVStore extends DelegatingKVStore {
-	private reads = 0;
-
-	/** Entries pulled from the inner store since construction. Monotonic. */
-	entriesRead(): number {
-		return this.reads;
-	}
-
-	async *iterate(options?: IterateOptions): AsyncIterable<KVEntry> {
-		for await (const entry of this.inner.iterate(options)) {
-			this.reads++;
-			yield entry;
-		}
-	}
-}
+export { DelegatingKVStore } from '../src/testing/kv-counting-store.js';
 
 /**
  * DELIBERATELY QUADRATIC: pages in fixed-size batches — so peak memory and the FIRST

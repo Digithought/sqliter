@@ -48,10 +48,9 @@ import {
 	type KVCostProfile,
 	type KVStoreProvider,
 	type StoreModuleConfig,
-	type IterateOptions,
-	type KVEntry,
 } from '../src/index.js';
 import { ROW_RESOLUTION_BATCH } from '../src/common/store-table-scan.js';
+import { CountingKVStore, createCountingProvider } from '../src/testing/kv-counting-store.js';
 
 /** The engine's own ceiling on runtime seek keys (`RUNTIME_SET_MAX_KEYS`). */
 const ENGINE_SEEK_CEILING = 1000;
@@ -68,65 +67,6 @@ function multiSeekRe(indexName: string): RegExp {
  */
 const SCAN_RE = /^idx=\S+;plan=0$/;
 
-/**
- * In-memory data store that tallies how many entries its `iterate` yields and how
- * many point `get`s it serves — the only way to tell a narrow seek from a full scan
- * that post-filters to the same rows.
- */
-class CountingKVStore extends InMemoryKVStore {
-	public iterateEntryCount = 0;
-	public getCount = 0;
-	public getManyCalls = 0;
-	// InMemoryKVStore.getMany delegates through this.get (defaultGetMany), so batched
-	// keys land in getCount too; getManyCalls counts the round trips.
-	override getMany(keys: readonly Uint8Array[]): Promise<(Uint8Array | undefined)[]> {
-		this.getManyCalls++;
-		return super.getMany(keys);
-	}
-	override async *iterate(options?: IterateOptions): AsyncIterable<KVEntry> {
-		for await (const entry of super.iterate(options)) {
-			this.iterateEntryCount++;
-			yield entry;
-		}
-	}
-	override async get(key: Uint8Array): Promise<Uint8Array | undefined> {
-		this.getCount++;
-		return super.get(key);
-	}
-}
-
-/**
- * Provider whose DATA stores are {@link CountingKVStore}s (recorded in `dataStores`,
- * keyed `schema.table`); index / stats / catalog stores stay plain so only data-row
- * access is counted.
- */
-function createCountingProvider(dataStores: Map<string, CountingKVStore>): KVStoreProvider {
-	const auxStores = new Map<string, InMemoryKVStore>();
-	const aux = (key: string): InMemoryKVStore => {
-		let s = auxStores.get(key);
-		if (!s) { s = new InMemoryKVStore(); auxStores.set(key, s); }
-		return s;
-	};
-	return {
-		async getStore(schemaName: string, tableName: string) {
-			const key = `${schemaName}.${tableName}`;
-			let s = dataStores.get(key);
-			if (!s) { s = new CountingKVStore(); dataStores.set(key, s); }
-			return s;
-		},
-		async getIndexStore(schemaName, tableName, indexName) { return aux(`${schemaName}.${tableName}_idx_${indexName}`); },
-		async getStatsStore(schemaName, tableName) { return aux(`${schemaName}.${tableName}.__stats__`); },
-		async getCatalogStore() { return aux('__catalog__'); },
-		async closeStore() {},
-		async closeIndexStore() {},
-		async closeAll() {
-			for (const s of dataStores.values()) await s.close();
-			for (const s of auxStores.values()) await s.close();
-			dataStores.clear();
-			auxStores.clear();
-		},
-	};
-}
 
 /**
  * `costProfile` is optional so every existing caller stays a parity backend — the 16 tests

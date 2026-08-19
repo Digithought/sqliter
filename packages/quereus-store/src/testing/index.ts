@@ -19,6 +19,10 @@
  * of two of those batteries, exported standalone so a spec can drive them directly
  * (including against a double built to fail them — a guard nobody has watched fail is not
  * a guard).
+ *
+ * {@link CountingKVStore} / {@link createCountingProvider} are not a conformance battery —
+ * they are the shared counting test double several specs in this package (and its
+ * benchmark suite) use to assert on `iterate`/`get`/`getMany` traffic.
  */
 
 export {
@@ -33,3 +37,9 @@ export { runKVProviderConformance, type KVProviderBackend } from './kv-provider-
 export { runStoreNameDistinctness, assertStoreNamesDistinct, type KVNamingBackend } from './kv-naming-conformance.js';
 export { runStoreReclaimConformance, type KVReclaimBackend } from './kv-reclaim-conformance.js';
 export type { KVProviderLifecycle } from './kv-lifecycle.js';
+export {
+	DelegatingKVStore,
+	CountingKVStore,
+	createCountingProvider,
+	type CountingProviderScope,
+} from './kv-counting-store.js';

@@ -24,79 +24,11 @@ import {
 } from '@quereus/quereus';
 import {
 	StoreModule,
-	InMemoryKVStore,
 	type KVStoreProvider,
-	type IterateOptions,
 	type KVEntry,
 } from '../src/index.js';
 import { ROW_RESOLUTION_BATCH } from '../src/common/store-table-scan.js';
-
-/**
- * Counts iterate yields, single gets, and getMany round trips / key volume.
- * InMemoryKVStore.getMany delegates through `this.get` (defaultGetMany), so batched
- * keys ALSO land in `getCount` — assert round trips on `getManyCalls`, batch volume
- * on `getManyKeyCount`.
- */
-class CountingKVStore extends InMemoryKVStore {
-	public iterateEntryCount = 0;
-	public getCount = 0;
-	public getManyCalls = 0;
-	public getManyKeyCount = 0;
-
-	reset(): void {
-		this.iterateEntryCount = 0;
-		this.getCount = 0;
-		this.getManyCalls = 0;
-		this.getManyKeyCount = 0;
-	}
-
-	override async *iterate(options?: IterateOptions): AsyncIterable<KVEntry> {
-		for await (const entry of super.iterate(options)) {
-			this.iterateEntryCount++;
-			yield entry;
-		}
-	}
-
-	override async get(key: Uint8Array): Promise<Uint8Array | undefined> {
-		this.getCount++;
-		return super.get(key);
-	}
-
-	override getMany(keys: readonly Uint8Array[]): Promise<(Uint8Array | undefined)[]> {
-		this.getManyCalls++;
-		this.getManyKeyCount += keys.length;
-		return super.getMany(keys);
-	}
-}
-
-/** Provider whose EVERY store (data, index, stats, catalog) is a CountingKVStore. */
-function createCountingProvider(stores: Map<string, CountingKVStore>): KVStoreProvider {
-	const of = (key: string): CountingKVStore => {
-		let s = stores.get(key);
-		if (!s) { s = new CountingKVStore(); stores.set(key, s); }
-		return s;
-	};
-	return {
-		async getStore(schemaName: string, tableName: string) {
-			return of(`${schemaName}.${tableName}`);
-		},
-		async getIndexStore(schemaName: string, tableName: string, indexName: string) {
-			return of(`${schemaName}.${tableName}_idx_${indexName}`);
-		},
-		async getStatsStore(schemaName: string, tableName: string) {
-			return of(`${schemaName}.${tableName}.__stats__`);
-		},
-		async getCatalogStore() {
-			return of('__catalog__');
-		},
-		async closeStore() {},
-		async closeIndexStore() {},
-		async closeAll() {
-			for (const s of stores.values()) await s.close();
-			stores.clear();
-		},
-	};
-}
+import { CountingKVStore, createCountingProvider } from '../src/testing/kv-counting-store.js';
 
 describe('batched index-scan row resolution (store-index-seek-batched-scan)', () => {
 	let db: Database;
@@ -106,7 +38,7 @@ describe('batched index-scan row resolution (store-index-seek-batched-scan)', ()
 
 	beforeEach(() => {
 		stores = new Map();
-		provider = createCountingProvider(stores);
+		provider = createCountingProvider(stores, 'all');
 		db = new Database();
 		storeModule = new StoreModule(provider);
 		db.registerModule('store', storeModule);
