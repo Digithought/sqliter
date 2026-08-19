@@ -100,3 +100,28 @@ the same static checks as the rest of the package**, so an unchecked file cannot
 there again. That is a config change plus the type annotations to clear it, and it pairs
 naturally with the behavioural tests this ticket already describes — both are "the harness
 that decides whether performance regressed is itself unchecked".
+
+## Arm added by review of `bench-backend-dimension`
+
+**`skip()` — a benchmark declining to run — shipped with no automated test at all.** A
+benchmark may now declare `skip()`, returning a reason to decline instead of running. Its
+plumbing spans both processes: `bench/child.mjs` evaluates it before `setup` and sends a
+`skipped` message; `bench/run.mjs` prints the row, writes a top-level `skipped` array into
+the results JSON, and makes a ratio guard naming a skipped benchmark report
+*not evaluated* rather than *misconfigured*. Only the pure comparison half
+(`bench/lib/compare.mjs`) has specs.
+
+Every one of those paths was verified the same way this ticket already describes: a
+throwaway suite dropped into the real `bench/suites/`, run by hand, deleted afterwards.
+Same blocker, same fix — a caller-supplied suites directory turns it into an ordinary
+test.
+
+**Re-measured static-check coverage**, since the numbers in the arm above are now stale.
+`packages/quereus/tsconfig.test.json` includes `bench/lib/**/*` and (as of this review)
+`bench/workloads/**/*`. Widening the include to `bench/**/*.mjs` and running
+`tsc -p tsconfig.test.json --noEmit` gives 148 errors: `bench/run.mjs` 99,
+`bench/suites/planner.bench.mjs` 10, `bench/apply-schema-unchanged.mjs` 10,
+`bench/suites/execution.bench.mjs` 9, `bench/child.mjs` 9,
+`bench/suites/mutation.bench.mjs` 5. The suite files dropped from 36 errors to 14 when
+their workloads moved out, so the remaining gap is smaller than it was. `bench/*.mjs` is
+still linted by nothing — `packages/quereus`'s eslint glob is `'src/**/*.ts' 'test/**/*.ts'`.

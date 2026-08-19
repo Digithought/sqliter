@@ -16,7 +16,6 @@ import { expect } from 'chai';
 import {
 	BACKEND_SEPARATOR,
 	benchmarkName,
-	defaultBackend,
 	expandBackends,
 } from '../bench/lib/backends.mjs';
 import type { BenchBackend } from '../bench/lib/backends.mjs';
@@ -59,16 +58,6 @@ describe('bench/lib/backends.mjs', () => {
 			// and one workload across backends.
 			expect(matchesFilter(suffixed, `${BACKEND_SEPARATOR}store-mem`)).to.equal(true);
 			expect(matchesFilter(suffixed, 'full-scan-10k')).to.equal(true);
-		});
-	});
-
-	describe('defaultBackend', () => {
-		it('returns the one backend marked isDefault', () => {
-			expect(defaultBackend([MEM, STORE])).to.equal(MEM);
-		});
-
-		it('refuses a set with no default rather than guessing one', () => {
-			expect(() => defaultBackend([STORE])).to.throw(/isDefault/);
 		});
 	});
 

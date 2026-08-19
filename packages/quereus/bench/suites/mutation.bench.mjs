@@ -41,9 +41,8 @@
  * they only need to be the same every run.
  */
 
-import { BACKENDS, defaultBackend, expandBackends } from '../lib/backends.mjs';
-import { snapshotStatement } from '../lib/counters.mjs';
-import { INSERT_WORKLOADS, SINGLE_ROWS, SINGLE_SCHEMA, UPDATE_DELETE_WORKLOADS, singleRowInsert } from '../workloads/mutation.mjs';
+import { BACKENDS, expandBackends } from '../lib/backends.mjs';
+import { INSERT_WORKLOADS, UPDATE_DELETE_WORKLOADS } from '../workloads/mutation.mjs';
 
 /** The backend handle a `shared-fixture` benchmark holds between `setup` and
  * `teardown`, or null. One module-level slot is enough: the worker runs exactly ONE
@@ -83,69 +82,38 @@ async function withFreshDatabase(backend, body) {
  * @param {import('../lib/backends.mjs').BenchBackend} backend
  */
 function bindMutation(workload, backend) {
-	if (workload.lifecycle === 'own-database') {
-		return {
-			fn() { return withFreshDatabase(backend, (db) => workload.run(db)); },
-			counters() { return withFreshDatabase(backend, (db) => workload.counters(db)); },
-		};
+	switch (workload.lifecycle) {
+		case 'own-database':
+			return {
+				fn() { return withFreshDatabase(backend, (db) => workload.run(db)); },
+				counters() { return withFreshDatabase(backend, (db) => workload.counters(db)); },
+			};
+		case 'shared-fixture':
+			return {
+				async setup() {
+					handle = await backend.open();
+					await workload.populate(handle.db);
+				},
+				// Guarded: `teardown` also runs as best-effort cleanup after a `setup` that
+				// threw, and `backend.open()` is the first thing `setup` does.
+				async teardown() { if (handle) await handle.close(); handle = null; },
+				fn() { return workload.run(handle.db); },
+				counters() { return workload.counters(handle.db); },
+			};
+		default:
+			// Named rather than defaulted, so a mistyped lifecycle fails at suite load with
+			// the workload's name instead of silently taking whichever branch came last.
+			throw new Error(`mutation workload '${workload.name}' has an unknown lifecycle '${workload.lifecycle}'`);
 	}
-	return {
-		async setup() {
-			handle = await backend.open();
-			await workload.populate(handle.db);
-		},
-		async teardown() { await handle.close(); handle = null; },
-		fn() { return workload.run(handle.db); },
-		counters() { return workload.counters(handle.db); },
-	};
 }
 
 /**
- * Written by hand rather than expanded, because it does not fit the shape the other
- * three share: it issues a thousand separate `insert` statements rather than a
- * procedure over batched ones, and its counters pass has to walk to row 1,000 to
- * snapshot the last of them.
- *
- * It therefore runs on the default backend only. When a second backend lands and this
- * shape is worth measuring on it — for a persistent store it is arguably the most
- * interesting write shape there is, since it prices per-statement commit — give it a
- * binder of its own rather than widening `MutationWorkload`.
- */
-const SINGLE_ROW_INSERT_BENCHMARK = {
-	name: 'single-row-insert-1k',
-	fn() {
-		return withFreshDatabase(defaultBackend(BACKENDS), async (db) => {
-			await db.exec(SINGLE_SCHEMA);
-			for (let i = 1; i <= SINGLE_ROWS; i++) {
-				await db.exec(singleRowInsert(i));
-			}
-		});
-	},
-	// First and last row, for the same reason `bulk-insert-10k` snapshots first and
-	// last batch: row 1,000 lands in a table 999 rows deep and row 1 does not. They too
-	// currently come out identical (1 `updateCall`, 0 `rowsScanned` each); holding both
-	// is what turns "insert cost does not depend on table depth" into a checked claim.
-	counters() {
-		return withFreshDatabase(defaultBackend(BACKENDS), async (db) => {
-			await db.exec(SINGLE_SCHEMA);
-			const firstRow = await snapshotStatement(db, singleRowInsert(1));
-			for (let i = 2; i < SINGLE_ROWS; i++) {
-				await db.exec(singleRowInsert(i));
-			}
-			const lastRow = await snapshotStatement(db, singleRowInsert(SINGLE_ROWS));
-			return { firstRow, lastRow };
-		});
-	},
-};
-
-/**
- * The exported work list, in run order. Three segments rather than one concatenation,
- * so `single-row-insert-1k` keeps its position between the inserts and the
- * update/delete pair: expansion is workload-major within each segment, which is what
- * puts a workload's readings on adjacent rows in the table.
+ * The exported work list, in run order. EVERY entry goes through `expandBackends`, so
+ * there is no benchmark here that a new backend can silently fail to reach. The two
+ * segments are a grouping, not an exception: expansion is workload-major within each,
+ * which is what puts one workload's readings on adjacent rows in the table.
  */
 export const benchmarks = [
 	...expandBackends(BACKENDS, INSERT_WORKLOADS, bindMutation),
-	SINGLE_ROW_INSERT_BENCHMARK,
 	...expandBackends(BACKENDS, UPDATE_DELETE_WORKLOADS, bindMutation),
 ];

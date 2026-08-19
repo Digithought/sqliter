@@ -880,6 +880,10 @@ async function main() {
 	// Without a baseline there is nothing to diff, but a reader still needs to know
 	// whether the pass ran at all — a silent absence reads as "these benchmarks have no
 	// counters", which is a claim about the suite rather than about this invocation.
+	// NOTE: the denominator is every selected row, including any that failed or skipped —
+	// so a run with skips reads as "collected for 25 of 27" with no hint why. Fine while
+	// nothing in the repo declares `skip()`; if skips become routine, subtract them and
+	// say how many declined.
 	if (!comparison && collectCounters) {
 		const collected = rows.filter((r) => r.result?.counters !== undefined).length;
 		say(`\nWork counters collected for ${collected} of ${rows.length} benchmark(s) — no baseline, so nothing to compare.`);

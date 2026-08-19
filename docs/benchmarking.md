@@ -52,11 +52,11 @@ There is deliberately **no `--backend` flag**. `--filter` is a plain substring m
 full-scan-10k` already selects one workload across every backend. Expansion is
 workload-major, so a workload's readings land on adjacent rows in the table.
 
-Two entries — `execution/join-1kx1k` and `mutation/single-row-insert-1k` — are written
-by hand in their suite files rather than expanded, because they do not fit their suite's
-workload shape (the first builds two tables; the second issues a thousand separate
-statements). They run on the default backend only. A workload type that could express
-them too would document nothing.
+**Every entry of both suites is expanded** — neither suite file holds a benchmark object
+of its own. That is the invariant worth keeping: a hand-written entry would keep running
+on the default backend forever, and nothing would say so when a new backend landed. A
+workload that seems not to fit usually needs a richer *fixture* (a fixture is a function
+over a database and may build as many tables as it likes), not an exception.
 
 ## Running it
 
@@ -491,7 +491,7 @@ Requirements:
 
 Harness tests, none of which run a benchmark: `test/bench-calibration.spec.ts` (the timing
 policy and the statistics), `test/bench-comparison.spec.ts` (the cross-run rules and the
-environment check), `test/bench-discovery.spec.ts` (the backend expansion and the naming
+environment check), `test/bench-backends.spec.ts` (the backend expansion and the naming
 rule). `yarn bench` is not part of `yarn test`, so these are the only automated check on
 the harness itself.
 

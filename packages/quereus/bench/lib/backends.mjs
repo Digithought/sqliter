@@ -133,25 +133,6 @@ function validateBackends(backends) {
 }
 
 /**
- * The one backend in `backends` that publishes bare names.
- *
- * For a benchmark that is NOT backend-expanded and still has to open a database — the
- * hand-written entries in the suites — so it says "the default one" instead of naming
- * a backend that a future edit to `BACKENDS` would leave stale.
- *
- * @param {BenchBackend[]} backends
- * @returns {BenchBackend}
- */
-export function defaultBackend(backends) {
-	validateBackends(backends);
-	const found = backends.find((b) => b.isDefault);
-	// `validateBackends` has already proved exactly one exists; this is here so the type
-	// is `BenchBackend` rather than `BenchBackend | undefined` at every call site.
-	if (!found) throw new Error('expandBackends: no default backend');
-	return found;
-}
-
-/**
  * One workload definition × N backends → N `Benchmark` entries.
  *
  * Emits WORKLOAD-MAJOR (`full-scan-10k`, `full-scan-10k@store-mem`, `group-by-10k`,

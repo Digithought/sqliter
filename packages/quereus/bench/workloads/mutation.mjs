@@ -50,8 +50,7 @@ const BATCH_ROWS = 500;
 const BATCH_COUNT = 20;
 
 const BULK_SCHEMA = 'create table bulk_t (id integer primary key, val integer, label text)';
-/** Schema for the hand-written `single-row-insert-1k` in the suite file. */
-export const SINGLE_SCHEMA = 'create table single_t (id integer primary key, val integer)';
+const SINGLE_SCHEMA = 'create table single_t (id integer primary key, val integer)';
 const UPD_SCHEMA = 'create table upd_t (id integer primary key, val integer, label text)';
 const DEL_SCHEMA = 'create table del_t (id integer primary key, val integer)';
 
@@ -60,7 +59,7 @@ const UPD_REVERSE = "update upd_t set label = 'reset' where val < 10";
 const DEL_STATEMENT = 'delete from del_t where val = 42';
 
 /** Rows inserted one statement at a time by `single-row-insert-1k`. */
-export const SINGLE_ROWS = 1000;
+const SINGLE_ROWS = 1000;
 
 /**
  * One batch's `insert` statement, built the same way for `run` and for `counters`.
@@ -78,14 +77,20 @@ function batchInsert(table, batch, row) {
 	return `insert into ${table} values ${values}`;
 }
 
+/** @type {(id: number) => string} */
 const bulkRow = (id) => `(${id}, ${id * 3}, 'label_${id % 50}')`;
+/** @type {(id: number) => string} */
 const updRow = (id) => `(${id}, ${id % 100}, 'label_${id % 50}')`;
+/** @type {(id: number) => string} */
 const delRow = (id) => `(${id}, ${id % 100})`;
-/** One row's `insert`, used by the hand-written `single-row-insert-1k` in the suite file. */
-export const singleRowInsert = (id) => `insert into single_t values (${id}, ${id * 2})`;
+/** One row's `insert`, the statement `single-row-insert-1k` issues a thousand times.
+ * @type {(id: number) => string} */
+const singleRowInsert = (id) => `insert into single_t values (${id}, ${id * 2})`;
 
 /** Insert every batch of `table`, the populate half of the bulk workloads.
- * @param {import('../../dist/src/index.js').Database} db */
+ * @param {import('../../dist/src/index.js').Database} db
+ * @param {string} table
+ * @param {(id: number) => string} row */
 async function insertAllBatches(db, table, row) {
 	for (let batch = 0; batch < BATCH_COUNT; batch++) {
 		await db.exec(batchInsert(table, batch, row));
@@ -93,10 +98,7 @@ async function insertAllBatches(db, table, row) {
 }
 
 /**
- * The insert workloads that fit the `MutationWorkload` shape.
- *
- * `single-row-insert-1k` is an insert too and runs right after these, but the suite
- * file writes it by hand — see the comment on its entry there.
+ * The insert workloads, in the order they run.
  *
  * @type {MutationWorkload[]}
  */
@@ -130,12 +132,38 @@ export const INSERT_WORKLOADS = [{
 		const lastBatch = await snapshotStatement(db, batchInsert('bulk_t', BATCH_COUNT - 1, bulkRow));
 		return { firstBatch, lastBatch };
 	},
+}, {
+	// A thousand separate `insert` statements rather than twenty batched ones — the
+	// per-statement shape, which for a persistent store prices one commit per row.
+	// `own-database` for the same reason `bulk-insert-10k` is: the timed body builds
+	// the table it fills, so a table left behind would change what the next call costs.
+	name: 'single-row-insert-1k',
+	lifecycle: 'own-database',
+	async run(db) {
+		await db.exec(SINGLE_SCHEMA);
+		for (let i = 1; i <= SINGLE_ROWS; i++) {
+			await db.exec(singleRowInsert(i));
+		}
+	},
+	// First and last row, for the same reason `bulk-insert-10k` snapshots first and
+	// last batch: row 1,000 lands in a table 999 rows deep and row 1 does not. They too
+	// currently come out identical (1 `updateCall`, 0 `rowsScanned` each); holding both
+	// is what turns "insert cost does not depend on table depth" into a checked claim.
+	async counters(db) {
+		await db.exec(SINGLE_SCHEMA);
+		const firstRow = await snapshotStatement(db, singleRowInsert(1));
+		for (let i = 2; i < SINGLE_ROWS; i++) {
+			await db.exec(singleRowInsert(i));
+		}
+		const lastRow = await snapshotStatement(db, singleRowInsert(SINGLE_ROWS));
+		return { firstRow, lastRow };
+	},
 }];
 
 /**
- * The workloads that rewrite or remove rows rather than adding them. They run after
- * every insert workload, which is why they are their own group: the suite expands the
- * inserts, writes `single-row-insert-1k` by hand between the two, then expands these.
+ * The workloads that rewrite or remove rows rather than adding them, kept as their own
+ * group so the suite's two halves — what adding rows costs, what changing them costs —
+ * stay legible. They run after every entry in `INSERT_WORKLOADS`.
  *
  * @type {MutationWorkload[]}
  */

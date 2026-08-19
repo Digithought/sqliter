@@ -28,7 +28,7 @@
  * itself out of calibration.
  */
 
-import { BACKENDS, defaultBackend, expandBackends } from '../lib/backends.mjs';
+import { BACKENDS, expandBackends } from '../lib/backends.mjs';
 import { snapshotStatement } from '../lib/counters.mjs';
 import { DECORRELATION_WORKLOADS, FIXTURES, QUERY_WORKLOADS } from '../workloads/execution.mjs';
 
@@ -59,8 +59,12 @@ function bindQuery(workload, backend) {
 			db = handle.db;
 			await FIXTURES[workload.fixture](db);
 		},
+		// Guarded, because `teardown` also runs as best-effort cleanup after a `setup`
+		// that threw — and `backend.open()` is the first thing `setup` does, so there may
+		// be no handle to close. An unguarded close would replace the real failure in the
+		// log with a `TypeError` about `null`.
 		async teardown() {
-			await handle.close();
+			if (handle) await handle.close();
 			handle = null;
 			db = null;
 		},
@@ -76,54 +80,14 @@ function bindQuery(workload, backend) {
 	};
 }
 
-/** `join-1kx1k`'s query, named once and used twice — by `fn` and by `counters()` — for
- * the reason spelled out on `Workload.sql` in `bench/workloads/execution.mjs`. */
-const JOIN_SQL = 'select l.id, r.payload from left_t l join right_t r on l.key_col = r.key_col where l.id <= 100';
-
 /**
- * Written by hand rather than expanded, because it does not fit the single-fixture
- * `Workload` shape: it builds TWO tables, and the shape carries one `fixture` name.
- * Forcing it in would mean a `Workload` that can express everything, which is a
- * `Workload` that documents nothing.
- *
- * It therefore runs on the default backend only. When a second backend lands and this
- * shape is worth measuring on it, give it a fixture and a binder of its own rather
- * than widening `Workload`.
- */
-const JOIN_BENCHMARK = {
-	name: 'join-1kx1k',
-	async setup() {
-		handle = await defaultBackend(BACKENDS).open();
-		db = handle.db;
-		await db.exec(`
-			create table left_t (id integer primary key, key_col integer);
-			create table right_t (id integer primary key, key_col integer, payload text);
-		`);
-		const leftVals = Array.from({ length: 1000 }, (_, i) =>
-			`(${i + 1}, ${i % 100})`
-		).join(', ');
-		const rightVals = Array.from({ length: 1000 }, (_, i) =>
-			`(${i + 1}, ${i % 100}, 'data_${i}')`
-		).join(', ');
-		await db.exec(`insert into left_t values ${leftVals}`);
-		await db.exec(`insert into right_t values ${rightVals}`);
-	},
-	async teardown() { await handle.close(); handle = null; db = null; },
-	async fn() {
-		const rows = await collect(db.eval(JOIN_SQL));
-		if (rows.length === 0) throw new Error('Expected join results');
-	},
-	counters() { return snapshotStatement(db, JOIN_SQL); },
-};
-
-/**
- * The exported work list, in run order. Three segments rather than one concatenation,
- * so `join-1kx1k` keeps its position: expansion is workload-major within each segment,
- * which is what puts a workload's readings on adjacent rows in the table.
+ * The exported work list, in run order. EVERY entry goes through `expandBackends`, so
+ * there is no benchmark here that a new backend can silently fail to reach. The two
+ * segments are a grouping, not an exception: expansion is workload-major within each,
+ * which is what puts one workload's readings on adjacent rows in the table.
  */
 export const benchmarks = [
 	...expandBackends(BACKENDS, QUERY_WORKLOADS, bindQuery),
-	JOIN_BENCHMARK,
 	...expandBackends(BACKENDS, DECORRELATION_WORKLOADS, bindQuery),
 ];
 

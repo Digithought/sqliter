@@ -131,6 +131,33 @@ export async function createTextPkDb(db) {
 }
 
 /**
+ * Populate the two 1 000-row tables `join-1kx1k` joins. A fixture is a function over a
+ * database, not a table: nothing stops one from building several, which is why a
+ * multi-table workload needs no shape of its own.
+ *
+ * Both tables carry `key_col = i % 100`, so each of the 100 keys matches ten rows on
+ * each side. Written as one `insert ... values` per table rather than through
+ * `populate`, because 1 000 rows fit in a single statement and batching them would
+ * change what this fixture costs.
+ *
+ * @param {import('../../dist/src/index.js').Database} db
+ */
+export async function createJoinDb(db) {
+	await db.exec(`
+		create table left_t (id integer primary key, key_col integer);
+		create table right_t (id integer primary key, key_col integer, payload text);
+	`);
+	const leftVals = Array.from({ length: 1000 }, (_, i) =>
+		`(${i + 1}, ${i % 100})`
+	).join(', ');
+	const rightVals = Array.from({ length: 1000 }, (_, i) =>
+		`(${i + 1}, ${i % 100}, 'data_${i}')`
+	).join(', ');
+	await db.exec(`insert into left_t values ${leftVals}`);
+	await db.exec(`insert into right_t values ${rightVals}`);
+}
+
+/**
  * The fixtures a `Workload.fixture` names. Addressed by string rather than by function
  * reference so a workload stays plain data — the thing a future suite could read from a
  * file or generate.
@@ -142,6 +169,7 @@ export const FIXTURES = {
 	text: createTextDb,
 	temporal: createTemporalDb,
 	textPk: createTextPkDb,
+	join: createJoinDb,
 };
 
 /**
@@ -272,6 +300,17 @@ export const QUERY_WORKLOADS = [
 		sql: "select * from bench_text_pk where tkey = 'key_05000'",
 		expectedRows: 1,
 	},
+	{
+		// `l.id <= 100` selects left rows 1..100, whose `key_col` covers 0..99 once each;
+		// every one of those keys matches ten rows of `right_t`, so the join emits 1 000.
+		// Stated exactly rather than as "some rows": the assertion this replaced only
+		// checked the count was non-zero, which a join that had collapsed to one match per
+		// key would still have satisfied.
+		name: 'join-1kx1k',
+		fixture: 'join',
+		sql: 'select l.id, r.payload from left_t l join right_t r on l.key_col = r.key_col where l.id <= 100',
+		expectedRows: 1000,
+	},
 ];
 
 /**
@@ -279,9 +318,9 @@ export const QUERY_WORKLOADS = [
  * anything together: `execution.bench.mjs`'s `ratioGuards` entry bounds the first
  * against the second, and both must exist in a run for that guard to evaluate.
  *
- * They run AFTER `join-1kx1k`, which the suite file writes by hand — so the suite
- * expands this group separately rather than appending it to `QUERY_WORKLOADS`, which
- * would move the join and reorder the table for no reason.
+ * They run last, after every entry in `QUERY_WORKLOADS`. Separating them costs one
+ * extra export and buys a group a reader can see is a pair; appending them would put
+ * a guarded twin in the middle of a list of unrelated single queries.
  *
  * @type {Workload[]}
  */
