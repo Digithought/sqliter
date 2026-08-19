@@ -853,7 +853,7 @@ statement over the same data reports identically on every machine. Requires the
 `runtime_stats` option (alias `runtime_metrics`); returns `undefined` when it is off.
 Counts are complete only once the row iterable has been fully drained: breaking out
 early leaves a partial snapshot.
-See [runtime.md § Work counters](runtime.md#work-counters-machine-independent-execution-counts).
+See [Runtime Work Counters](runtime-work-counters.md).
 
 `snapshot.tables` is keyed by lowercased `<schema>.<table>`, each entry carrying
 `queryCalls`, `rowsScanned` and `updateCalls`. These measure the calls the *engine*

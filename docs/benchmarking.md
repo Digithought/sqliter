@@ -212,7 +212,7 @@ pushed the lines a reader had to act on off the top of the screen.
 
 A benchmark can also report **work counters** — exact counts of plan nodes, instruction
 executions and engine-to-module calls, defined in
-[runtime.md § Work counters](runtime.md#work-counters-machine-independent-execution-counts).
+[Runtime Work Counters](runtime-work-counters.md).
 They are judged nothing like a timing:
 
 - **Delta** says "this might be slower" — measurement noise can fake that, so it needs a
@@ -372,7 +372,7 @@ Requirements:
   reports what the execution actually did, so a benchmark that stops early — a `LIMIT`, a
   `break` out of the loop, an abort — leaves a partial `rowsScanned` whose value depends on
   where it stopped. Counts are only reproducible run-to-run once the iterable is exhausted.
-  See [runtime.md § Work counters](runtime.md#work-counters-machine-independent-execution-counts).
+  See [Runtime Work Counters](runtime-work-counters.md).
 
 ## Where the code lives
 

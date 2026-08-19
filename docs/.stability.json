@@ -41,6 +41,7 @@
 		"docs/plugins.md": "Stable",
 		"docs/runtime-caching.md": "Internal",
 		"docs/runtime-parallel.md": "Experimental",
+		"docs/runtime-work-counters.md": "Internal",
 		"docs/runtime.md": "Internal",
 		"docs/schema-rename-detection.md": "Beta",
 		"docs/schema.md": "Beta",
