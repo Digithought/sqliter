@@ -24,7 +24,13 @@ export const STABILITY_CASES: StabilityCase[] = [
 	{ name: 'full-scan', sql: 'select a, b from t' },
 	{ name: 'filtered-scan', sql: 'select b from t where a = 2' },
 	{ name: 'group-by', sql: 'select b, count(*) as n from t group by b' },
-	{ name: 'correlated-subquery', sql: 'select a, (select count(*) from t as t2 where t2.b = t.b) as n from t' },
+	// `limit 1` keeps this a genuine per-row sub-program: the aggregate form
+	// below is decorrelated into a HashJoin by the optimizer, which would leave
+	// nothing for the N+1-visibility assertion.
+	{ name: 'correlated-subquery', sql: 'select a, (select t2.b from t as t2 where t2.a = t.a limit 1) as x from t' },
+	// Decorrelated by the optimizer (HashJoin + HashAggregate) — kept as a
+	// stability case in its own right; the sub-program assertions use the case above.
+	{ name: 'decorrelated-subquery', sql: 'select a, (select count(*) from t as t2 where t2.b = t.b) as n from t' },
 	{ name: 'mutation', sql: 'update t set b = b + 0 where a <= 3' },
 ];
 

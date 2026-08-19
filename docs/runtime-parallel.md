@@ -42,6 +42,7 @@ Three invariants govern what code may do with a `RuntimeContext` once it has bee
 | `cacheStates` | `shared-cooperative` | Once-per-execution `CacheNode` row-cache map; shared so a cache materialized in one branch is visible to a sibling branch re-driving the same cache site. |
 | `cteMaterializations` | `shared-cooperative` | Once-per-execution shared CTE buffer map; shared so a CTE materialized in one branch replays in a sibling branch instead of re-driving the source. |
 | `inSetProbes` | `shared-cooperative` | Once-per-execution uncorrelated `IN`-subquery lookup-set map; shared so a set materialized in one branch is visible to a sibling re-driving the same `IN` site. |
+| `workCounters` | `shared-sink` | Per-execution work-counter collector ([runtime.md § Work counters](runtime.md#work-counters-machine-independent-execution-counts)); shared by reference so a forked branch's counts roll up with no merge step. |
 
 Adding a new field to `RuntimeContext` requires adding it to `EXPECTED_FORK_POLICY` in `fork-contract.spec.ts` with a declared policy — the test fails compile otherwise.
 

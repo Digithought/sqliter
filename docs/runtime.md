@@ -599,6 +599,49 @@ listing by index — both build it from one shared in-process helper), and
 `Statement.getDebugProgram()` all emit with fusion disabled — the faithful description
 of what the query computes — while a normal execution runs the fused form.
 
+### Work counters: machine-independent execution counts
+
+When runtime metrics are on (the `runtime_stats` db option, alias `runtime_metrics`),
+each statement execution also feeds a `WorkCounterCollector`
+(`runtime/work-counters.ts`) carried on the `RuntimeContext`. After the row iterable
+is fully drained, `Statement.getWorkCounters()` returns a `WorkCounterSnapshot` — a
+JSON-safe, by-value record of how much work the execution did — and
+`Statement.getPlanShape()` returns plan-node counts by type without executing at all.
+The premise is **machine independence**: the same statement over the same data
+produces byte-identical snapshots on every machine, every run, and every process, so
+counts can be compared where timings cannot.
+
+- **What is counted**: per instruction, `executions` (times its `run` was invoked),
+  `in` (argument values received), and `out` (rows/values produced — an async
+  iterable's output is counted per yield via a wrapping generator, so streaming
+  operators report true row counts). Totals sum executions and rows over the
+  instructions that ran; instructions that never ran are omitted (a missing entry and
+  an all-zero entry are different claims).
+- **What is deliberately not counted**: elapsed time — a nanosecond figure on a
+  machine-independence surface invites exactly the cross-machine comparison this
+  replaces (`elapsedNs` stays in the debug-only `runtime:metrics` log). A fused
+  scalar subtree (see *Scalar fusion* above) is one instruction, so its interior
+  nodes contribute no separate counts — by design, since fusion also deletes their
+  scheduler-visible existence.
+- **Keys are structural, never plan-node ids**: the root program is `r`; the
+  scheduler at `instructions[i].programs[j]` of program `P` is `P/i/j`; instruction
+  `i` of a program keys as `<path>#<i>` (e.g. `r#4`, `r/2/0#1`). `PlanNode.id` is a
+  process-global counter and must never appear in a key — that is what makes
+  snapshots comparable across processes.
+- **Sub-program counts accumulate across re-invocations** (unlike
+  `Instruction.runtimeStats`, which resets per program invocation for the debug log):
+  a correlated subquery driven once per outer row reports N executions of its inner
+  instructions — the shape that makes an N+1 regression visible.
+- **Drain-completeness caveat**: the snapshot is only complete once the row iterable
+  is fully drained; a snapshot taken after an error is partial but kept. Forked
+  parallel branches share the collector by reference (fork policy `shared-sink`), so
+  their counts roll up with no merge step.
+
+`WorkCounterSnapshot` and `PlanShape` are exported from the package root.
+`test/runtime/work-counter-stability.spec.ts` is the acceptance suite: identical
+snapshots across two executions of one prepared statement, two databases at
+different plan-node-id offsets, and two separate processes.
+
 ### Key Points for Emitter Authors
 
 Build a row descriptor mapping attribute IDs to column indices, close every context in
