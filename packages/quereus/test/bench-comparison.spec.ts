@@ -25,6 +25,8 @@ import {
 import {
 	STATUS_ORDER,
 	compareRun,
+	diffCounters,
+	flattenCounters,
 	isUnstable,
 } from '../bench/lib/compare.mjs';
 import {
@@ -51,6 +53,31 @@ function row(fullName: string, median_ms: number, spread_pct: number | null = 2,
 /** A row whose benchmark never produced a number. */
 function failedRow(fullName: string, detail = 'threw during fn: boom') {
 	return { fullName, result: null, failure: { kind: 'error', detail } };
+}
+
+/** A `WorkCounterSnapshot`-shaped fixture, small enough to hand-check by eye. */
+type CounterBlock = Record<string, unknown>;
+function counterBlock(over: CounterBlock = {}): CounterBlock {
+	return {
+		plan: { nodeCount: 3, nodeTypes: { Filter: 1, Project: 1, TableScan: 1 } },
+		instructions: [
+			{ key: 'r#0', nodeType: 'TableScan', executions: 1, in: 0, out: 10 },
+			{ key: 'r#1', executions: 1, in: 10, out: 10 },
+		],
+		tables: { 'main.t': { queryCalls: 1, rowsScanned: 10, updateCalls: 0 } },
+		totals: { instructionExecutions: 2, rowsOut: 10, queryCalls: 1, rowsScanned: 10, updateCalls: 0 },
+		...over,
+	};
+}
+
+/** A row whose result carries a counter block, for the counter-comparison rules. */
+function rowWithCounters(fullName: string, median_ms: number, block: CounterBlock) {
+	return { fullName, result: { ...entry(median_ms), counters: block }, failure: null };
+}
+
+/** A baseline entry that carries a counter block. */
+function entryWithCounters(median_ms: number, block: CounterBlock) {
+	return { ...entry(median_ms), counters: block };
 }
 
 /** The comparison for one benchmark, which every test here knows exists. */
@@ -135,6 +162,69 @@ describe('bench/lib/compare.mjs', () => {
 			// Assuming otherwise would exclude every benchmark from every comparison
 			// against a pre-spread baseline.
 			expect(isUnstable({ median_ms: 10 })).to.equal(false);
+		});
+	});
+
+	describe('flattenCounters', () => {
+		it('flattens a full WorkCounterSnapshot to dotted paths covering plan, instructions, tables and totals', () => {
+			const flat = flattenCounters(counterBlock());
+			expect(flat['plan.nodeCount']).to.equal(3);
+			expect(flat['plan.nodeTypes.TableScan']).to.equal(1);
+			expect(flat['instructions.r#0.nodeType']).to.equal('TableScan');
+			expect(flat['instructions.r#0.executions']).to.equal(1);
+			expect(flat['instructions.r#1.out']).to.equal(10);
+			expect(flat['tables.main.t.rowsScanned']).to.equal(10);
+			expect(flat['totals.rowsOut']).to.equal(10);
+		});
+
+		it('addresses instructions by their key, not by position, so inserting one at the front reports only its own paths', () => {
+			// Positional addressing would report a change against r#0 and r#1 too, since
+			// everything after the insertion point shifts by one index.
+			const before = { instructions: [{ key: 'r#0', executions: 5 }, { key: 'r#1', executions: 3 }] };
+			const after = { instructions: [{ key: 'r#new', executions: 1 }, { key: 'r#0', executions: 5 }, { key: 'r#1', executions: 3 }] };
+			expect(diffCounters(before, after)).to.deep.equal([{ path: 'instructions.r#new.executions', before: null, after: 1 }]);
+		});
+
+		it('flattens a bare PlanShape with no special handling', () => {
+			const flat = flattenCounters({ nodeCount: 4, nodeTypes: { Join: 1, TableScan: 2 } });
+			expect(flat).to.deep.equal({ nodeCount: 4, 'nodeTypes.Join': 1, 'nodeTypes.TableScan': 2 });
+		});
+
+		it('flattens a named bag of snapshots, keeping each name\'s instructions apart', () => {
+			const bag = { firstBatch: counterBlock(), lastBatch: counterBlock() };
+			const flat = flattenCounters(bag);
+			expect(flat['firstBatch.instructions.r#0.executions']).to.equal(1);
+			expect(flat['lastBatch.instructions.r#0.executions']).to.equal(1);
+			expect(flat['firstBatch.totals.rowsOut']).to.equal(10);
+			expect(flat['lastBatch.totals.rowsOut']).to.equal(10);
+		});
+
+		it('skips an undefined field rather than recording it, so a value compares equal to itself after a JSON round-trip', () => {
+			const withUndefined = counterBlock({ instructions: [{ key: 'r#0', nodeType: undefined, executions: 1, in: 0, out: 1 }] });
+			const flat = flattenCounters(withUndefined);
+			expect(flat).to.not.have.property('instructions.r#0.nodeType');
+			expect(flattenCounters(JSON.parse(JSON.stringify(withUndefined)))).to.deep.equal(flat);
+		});
+	});
+
+	describe('diffCounters', () => {
+		it('reports a difference of one — no tolerance', () => {
+			const changes = diffCounters({ totals: { rowsScanned: 10 } }, { totals: { rowsScanned: 11 } });
+			expect(changes).to.deep.equal([{ path: 'totals.rowsScanned', before: 10, after: 11 }]);
+		});
+
+		it('sorts changes by path, so two runs print differences in the same order', () => {
+			const changes = diffCounters({ c: 1, a: 1, b: 1 }, { c: 2, a: 2, b: 2 });
+			expect(changes.map((c: { path: string }) => c.path)).to.deep.equal(['a', 'b', 'c']);
+		});
+
+		it('reports a path present on only one side with null on the other', () => {
+			expect(diffCounters({ foo: 1, bar: 2 }, { foo: 1 })).to.deep.equal([{ path: 'bar', before: 2, after: null }]);
+			expect(diffCounters({ foo: 1 }, { foo: 1, baz: 3 })).to.deep.equal([{ path: 'baz', before: null, after: 3 }]);
+		});
+
+		it('reports no changes for two identical blocks', () => {
+			expect(diffCounters(counterBlock(), counterBlock())).to.deep.equal([]);
 		});
 	});
 
@@ -288,6 +378,62 @@ describe('bench/lib/compare.mjs', () => {
 					expect(value === null || Number.isFinite(value), `${verdict.fullName}.${key} = ${value}`).to.equal(true);
 				}
 			}
+		});
+
+		describe('counter verdict', () => {
+			const c1 = counterBlock();
+			const c2 = counterBlock({ totals: { instructionExecutions: 2, rowsOut: 10, queryCalls: 1, rowsScanned: 11, updateCalls: 0 } });
+
+			it('reports same when both sides carry counters and match', () => {
+				const verdict = verdictFor(compareRun([rowWithCounters('a/x', 10, c1)], { 'a/x': entryWithCounters(10, c1) }), 'a/x');
+				expect(verdict.counters).to.deep.equal({ status: 'same', changes: [] });
+			});
+
+			it('reports changed with every difference listed when both carry counters and differ', () => {
+				const verdict = verdictFor(compareRun([rowWithCounters('a/x', 10, c2)], { 'a/x': entryWithCounters(10, c1) }), 'a/x');
+				expect(verdict.counters.status).to.equal('changed');
+				expect(verdict.counters.changes).to.deep.equal([{ path: 'totals.rowsScanned', before: 10, after: 11 }]);
+			});
+
+			it('reports new, not changed, when the baseline entry has no counters', () => {
+				const verdict = verdictFor(compareRun([rowWithCounters('a/x', 10, c1)], { 'a/x': entry(10) }), 'a/x');
+				expect(verdict.counters.status).to.equal('new');
+			});
+
+			it('reports dropped when this run collected none and the baseline did', () => {
+				const verdict = verdictFor(compareRun([row('a/x', 10)], { 'a/x': entryWithCounters(10, c1) }), 'a/x');
+				expect(verdict.counters.status).to.equal('dropped');
+			});
+
+			it('reports none when neither side has a counter block', () => {
+				const verdict = verdictFor(compareRun([row('a/x', 10)], { 'a/x': entry(10) }), 'a/x');
+				expect(verdict.counters.status).to.equal('none');
+			});
+
+			it('skips every row under { counters: false }, so a --no-counters run does not report the baseline as dropped', () => {
+				const verdict = verdictFor(compareRun([row('a/x', 10)], { 'a/x': entryWithCounters(10, c1) }, null, { counters: false }), 'a/x');
+				expect(verdict.counters.status).to.equal('skipped');
+			});
+
+			it('carries none, never a diff, for a benchmark --filter excluded from this run', () => {
+				const verdict = verdictFor(compareRun([], { 'a/x': entryWithCounters(10, c1) }, 'b/'), 'a/x');
+				expect(verdict.status).to.equal('filtered');
+				expect(verdict.counters).to.deep.equal({ status: 'none', changes: [] });
+			});
+
+			it('carries none, never a diff, for a failed benchmark', () => {
+				const verdict = verdictFor(compareRun([failedRow('a/x')], { 'a/x': entryWithCounters(10, c1) }), 'a/x');
+				expect(verdict.counters).to.deep.equal({ status: 'none', changes: [] });
+			});
+
+			it('never gates and never counts as a regression on a changed counter alone', () => {
+				const comparison = compareRun([rowWithCounters('a/x', 10, c2)], { 'a/x': entryWithCounters(10, c1) });
+				const verdict = verdictFor(comparison, 'a/x');
+				expect(verdict.counters.status).to.equal('changed');
+				expect(verdict.status).to.equal('no-change');
+				expect(verdict.gated).to.equal(false);
+				expect(comparison.regressions).to.equal(0);
+			});
 		});
 	});
 });

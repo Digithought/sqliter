@@ -208,6 +208,83 @@ pushed the lines a reader had to act on off the top of the screen.
   run exits non-zero.
 - **unstable** — measured, but too noisy in one run or the other to gate on.
 
+## Work counters: exact-count comparison
+
+A benchmark can also report **work counters** — exact counts of plan nodes, instruction
+executions and engine-to-module calls, defined in
+[runtime.md § Work counters](runtime.md#work-counters-machine-independent-execution-counts).
+They are judged nothing like a timing:
+
+- **Delta** says "this might be slower" — measurement noise can fake that, so it needs a
+  noise floor built from both runs' spreads (above).
+- **Counter delta** says "this does different work" — an exact integer, identical on every
+  machine and every run of the same plan, so it needs no floor at all.
+
+Different claims, so they never share a column. A counter comparison has **no tolerance and
+no minimum delta**: a difference of one is reported, and every difference is listed as
+`before -> after` rather than as a percentage.
+
+### Adding a `counters()` pass
+
+A benchmark opts in with a second, untimed entry point, alongside `fn`:
+
+```js
+{
+	name: 'my-shape-10k',
+	async setup() { db = await createPopulatedDb(); },
+	async teardown() { await db.close(); db = null; },
+	async fn() {
+		const rows = await collect(db.eval('select ...'));
+		if (rows.length !== 10000) throw new Error(`Expected 10000 rows, got ${rows.length}`);
+	},
+	async counters() {
+		return snapshotStatement(db, 'select ...');
+	},
+}
+```
+
+`counters()` runs **once, after the timed loop and before `teardown`** — never inside `fn`.
+Runtime metrics wrap every streaming operator in a counting generator, so turning them on
+inside the timed loop would corrupt the very number the harness exists to measure; a separate
+untimed pass keeps the two concerns apart. `snapshotStatement` (one statement) and
+`snapshotStatements` (a named sequence — instruction keys are addresses within one program, so
+two statements' counts must never be summed under one name) live in `bench/lib/counters.mjs`,
+alongside `snapshotPlanShape` for a benchmark that only wants plan-shape facts.
+
+**Drain the result fully before reading its counters** — see the drain requirement under
+*Adding a benchmark* above; a partial drain reads as a change in the engine when nothing
+changed but the loop.
+
+### Which suites qualify
+
+Whether a benchmark can report counters depends on what it does, not on an arbitrary
+per-suite switch:
+
+| Suite | Declares `counters()` | Why |
+| --- | --- | --- |
+| `execution` | 15 / 15 | Every benchmark runs a statement to completion; `snapshotStatement` reruns the same query untimed. |
+| `mutation` | 4 / 4 | Writes are statements too — same treatment. |
+| `planner` | 4 / 4 | `snapshotPlanShape` only. These benchmarks compile a plan and deliberately never execute it, so there is no instruction or table access to count — only plan shape. |
+| `parser` | 0 / 4 | Nothing to count: no `Database`, no plan, no runtime. |
+
+### `--no-counters`
+
+`yarn bench --no-counters` skips the untimed pass entirely — timings only, at the cost of
+losing the counter columns. The results file can end up with no counters for two different
+reasons, and one field tells them apart: `counters_collected` is `false` only when the run
+itself was invoked with `--no-counters`; a benchmark that simply declares no `counters()` pass
+leaves `counters_collected: true` and is absent only on its own entries. Comparing against a
+`--no-counters` run reports every benchmark's counter status as `skipped` rather than
+`dropped` — a timings-only run must not read as the whole baseline's counters disappearing.
+
+### Reading the output
+
+When counter data is available, the table gains a `Counters` column: `same`, `N diff`,
+`new`, `dropped`, or `—` when neither side collected any. A `changed` or `dropped` benchmark
+is followed by a block listing every differing path, `before -> after` — capped at
+`COUNTER_CHANGES_SHOWN` (12) lines per benchmark in the printed output; the full,
+uncapped list is always in the results JSON under that benchmark's `comparison` entry.
+
 ## Ratio guards
 
 A suite may export `ratioGuards`: a bound on one benchmark's median against another's,
@@ -300,6 +377,7 @@ Requirements:
 | `bench/lib/calibrate.mjs` | The timing policy — warmup, batch sizing, sample count. Kept out of the worker so `test/bench-calibration.spec.ts` can drive it. |
 | `bench/lib/stats.mjs` | Median, percentiles, relative IQR, the summary record, and the noise floor. |
 | `bench/lib/compare.mjs` | The cross-run comparison rules, as pure functions over two result objects. |
+| `bench/lib/counters.mjs` | Helpers a benchmark's `counters()` pass uses: `snapshotStatement`, `snapshotStatements`, `snapshotPlanShape`. |
 | `bench/lib/environment.mjs` | Environment capture and the material-difference check. |
 | `bench/lib/discover.mjs` | Suite enumeration and the one definition of what `--filter` matches (`matchesFilter`), shared by the parent, the worker and the comparison. |
 
