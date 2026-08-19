@@ -70,6 +70,44 @@ async function withFreshDatabase(backend, body) {
 	}
 }
 
+/** The `CountersContext` a backend that counts nothing supplies: `beginMeasured` has no
+ * storage counters to reset, and the engine's are already scoped per statement. */
+const NO_COUNTING_CONTEXT = { beginMeasured() { /* nothing to scope */ } };
+
+/**
+ * The counters block for one mutation workload on one backend.
+ *
+ * A backend with no `openCounting` — the memory one — reports the engine's work counters
+ * and nothing else, from whichever database its lifecycle says (`shared`, or a fresh one
+ * for `own-database`), exactly as this suite did before backends existed.
+ *
+ * A backend that CAN count its storage traffic gets its own freshly-built database
+ * either way, and `populate` runs into it first when the workload has one, since a
+ * `shared-fixture` pass assumes a populated table. The result nests
+ * `{ engine, store }` — see `bench/lib/store-counters.mjs` for what the store half
+ * counts, and note that it counts READS only.
+ *
+ * @param {import('../workloads/mutation.mjs').MutationWorkload} workload
+ * @param {import('../lib/backends.mjs').BenchBackend} backend
+ * @param {import('../../dist/src/index.js').Database|null} shared the `setup` database a
+ *   `shared-fixture` workload's uncounted pass snapshots against; null for `own-database`
+ */
+async function mutationCounters(workload, backend, shared) {
+	if (!backend.openCounting) {
+		return shared
+			? await workload.counters(shared, NO_COUNTING_CONTEXT)
+			: await withFreshDatabase(backend, (db) => workload.counters(db, NO_COUNTING_CONTEXT));
+	}
+	const counting = await backend.openCounting();
+	try {
+		if (workload.populate) await workload.populate(counting.db);
+		const engine = await workload.counters(counting.db, { beginMeasured: () => counting.resetCounters() });
+		return { engine, store: counting.readCounters() };
+	} finally {
+		await counting.close();
+	}
+}
+
 /**
  * Bind one `MutationWorkload` to one backend.
  *
@@ -86,7 +124,7 @@ function bindMutation(workload, backend) {
 		case 'own-database':
 			return {
 				fn() { return withFreshDatabase(backend, (db) => workload.run(db)); },
-				counters() { return withFreshDatabase(backend, (db) => workload.counters(db)); },
+				counters() { return mutationCounters(workload, backend, null); },
 			};
 		case 'shared-fixture':
 			return {
@@ -98,7 +136,7 @@ function bindMutation(workload, backend) {
 				// threw, and `backend.open()` is the first thing `setup` does.
 				async teardown() { if (handle) await handle.close(); handle = null; },
 				fn() { return workload.run(handle.db); },
-				counters() { return workload.counters(handle.db); },
+				counters() { return mutationCounters(workload, backend, handle.db); },
 			};
 		default:
 			// Named rather than defaulted, so a mistyped lifecycle fails at suite load with

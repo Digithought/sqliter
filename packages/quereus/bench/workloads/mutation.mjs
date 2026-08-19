@@ -39,9 +39,22 @@ import { snapshotStatement, snapshotStatements } from '../lib/counters.mjs';
  * @property {(db: import('../../dist/src/index.js').Database) => Promise<void>} [populate]
  *   `shared-fixture` only: the untimed fixture build
  * @property {(db: import('../../dist/src/index.js').Database) => Promise<void>} run the timed body
- * @property {(db: import('../../dist/src/index.js').Database) => Promise<object>} counters
+ * @property {(db: import('../../dist/src/index.js').Database, ctx: CountersContext) => Promise<object>} counters
  *   the untimed counters pass. For `own-database` it is handed a FRESH database, since
  *   there is no `setup` one to reuse; for `shared-fixture` it is handed `setup`'s.
+ *
+ * What a `counters` body is handed besides its database.
+ *
+ * @typedef {object} CountersContext
+ * @property {() => void} beginMeasured call it at the boundary between this pass's own
+ *   FIXTURE and the work the pass exists to count.
+ *
+ *   It does nothing to the engine's work counters — `snapshotStatement` already scopes
+ *   those to one statement. It matters to a backend counting STORAGE traffic, which has
+ *   no statement boundary to scope itself by: without the call, `delete-where-100`'s
+ *   storage block would describe ten thousand fixture inserts with one delete somewhere
+ *   inside it. A no-op on backends that count nothing, so every body may call it
+ *   unconditionally, and a body with no fixture at all simply calls it first.
  */
 
 /** Rows per `insert ... values` batch, shared by every bulk-populating benchmark here. */
@@ -123,8 +136,13 @@ export const INSERT_WORKLOADS = [{
 	// keeping both: it is now asserted on every run, so a change that starts scanning or
 	// re-probing on insert moves `lastBatch` away from `firstBatch` and the counter diff
 	// prints it. A first-batch-only snapshot could not say that.
-	async counters(db) {
+	async counters(db, ctx) {
 		await db.exec(BULK_SCHEMA);
+		// The schema is fixture; every batch after it is the subject. So a counting
+		// backend's storage block covers all twenty batches, where the two engine
+		// snapshots below cover the first and the last — the same body at the two
+		// granularities each side can see.
+		ctx.beginMeasured();
 		const firstBatch = await snapshotStatement(db, batchInsert('bulk_t', 0, bulkRow));
 		for (let batch = 1; batch < BATCH_COUNT - 1; batch++) {
 			await db.exec(batchInsert('bulk_t', batch, bulkRow));
@@ -149,8 +167,9 @@ export const INSERT_WORKLOADS = [{
 	// last batch: row 1,000 lands in a table 999 rows deep and row 1 does not. They too
 	// currently come out identical (1 `updateCall`, 0 `rowsScanned` each); holding both
 	// is what turns "insert cost does not depend on table depth" into a checked claim.
-	async counters(db) {
+	async counters(db, ctx) {
 		await db.exec(SINGLE_SCHEMA);
+		ctx.beginMeasured();
 		const firstRow = await snapshotStatement(db, singleRowInsert(1));
 		for (let i = 2; i < SINGLE_ROWS; i++) {
 			await db.exec(singleRowInsert(i));
@@ -187,7 +206,10 @@ export const UPDATE_DELETE_WORKLOADS = [
 		// chose, and the predicate `val < 10` selects the same 1,000 rows throughout since
 		// `run` never touches `val`. Two named snapshots rather than one bag of summed
 		// instructions, for the reason spelled out on `bulk-insert-10k`.
-		counters(db) {
+		// The fixture here is `populate`, which ran before this pass was called, so the
+		// boundary is the pass's first act.
+		counters(db, ctx) {
+			ctx.beginMeasured();
 			return snapshotStatements(db, { apply: UPD_APPLY, reverse: UPD_REVERSE });
 		},
 	},
@@ -201,9 +223,10 @@ export const UPDATE_DELETE_WORKLOADS = [
 		},
 		// Only the delete is snapshotted; the populate is this benchmark's fixture, not its
 		// subject, and `bulk-insert-10k` already counts inserts.
-		async counters(db) {
+		async counters(db, ctx) {
 			await db.exec(DEL_SCHEMA);
 			await insertAllBatches(db, 'del_t', delRow);
+			ctx.beginMeasured();
 			return await snapshotStatement(db, DEL_STATEMENT);
 		},
 	},

@@ -39,6 +39,42 @@ async function collect(iter) {
 	return out;
 }
 
+/**
+ * The counters block for one workload on one backend.
+ *
+ * A backend with no `openCounting` — the memory one — reports the engine's work counters
+ * and nothing else, snapshotted against the database `setup` already built, exactly as
+ * this suite did before backends existed.
+ *
+ * A backend that CAN count its storage traffic gets a second, freshly-built database
+ * instead, because the counting wrapper sits in front of every read and has no business
+ * inside a number the timed loop reported. The pass runs once and is never timed, so the
+ * extra fixture build costs wall-clock and nothing else. Its result nests:
+ *
+ *   { engine: <WorkCounterSnapshot>, store: { '<built store name>': { ...four counts } } }
+ *
+ * which the comparison walks to arbitrary depth, so `store.main.bench_t.getManyCalls`
+ * diffs between two runs like any other counter path.
+ *
+ * The fixture populate is RESET AWAY: it is this benchmark's setup, not its measurement,
+ * and leaving it in would bury a ten-key index probe under ten thousand inserts.
+ *
+ * @param {import('../workloads/execution.mjs').Workload} workload
+ * @param {import('../lib/backends.mjs').BenchBackend} backend
+ */
+async function queryCounters(workload, backend) {
+	if (!backend.openCounting) return await snapshotStatement(db, workload.sql);
+	const counting = await backend.openCounting();
+	try {
+		await FIXTURES[workload.fixture](counting.db);
+		counting.resetCounters();
+		const engine = await snapshotStatement(counting.db, workload.sql);
+		return { engine, store: counting.readCounters() };
+	} finally {
+		await counting.close();
+	}
+}
+
 /** The backend handle the benchmark currently running holds, or null between
  * benchmarks. One module-level slot is enough: the worker runs exactly ONE benchmark
  * per process. */
@@ -76,7 +112,7 @@ function bindQuery(workload, backend) {
 		},
 		// Runs ONCE after timing, with metrics on — never inside `fn`, whose number the
 		// counting generators would corrupt. Same statement, fully drained.
-		counters() { return snapshotStatement(db, workload.sql); },
+		counters() { return queryCounters(workload, backend); },
 	};
 }
 

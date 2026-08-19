@@ -11,20 +11,21 @@ cd packages/quereus
 yarn bench
 ```
 
-It is **not** part of `yarn test` or `yarn check`. A full run takes roughly 35 seconds and
+It is **not** part of `yarn test` or `yarn check`. A full run takes roughly 100 seconds and
 is deliberately manual: a benchmark suite inside a test run either slows every test run
 down or gets its time target cut until the numbers stop meaning anything.
 
 ## What is measured
 
-27 benchmarks across four suites:
+46 benchmarks across four suites — 27 *workloads*, of which the 19 in `execution` and
+`mutation` are each measured against two storage backends (see below):
 
 | Suite | Benchmarks | What it covers |
 | --- | --- | --- |
 | `parser` | 4 | Text to AST: a simple select, a complex select, a 50-column select, an insert with values. |
 | `planner` | 4 | AST to optimized plan, without executing it: scan, join, aggregate, subquery. |
-| `execution` | 15 | Whole queries over a 10 000-row table: full scan, indexed filter, group by, order by, distinct, joins, a correlated subquery and its hand-written equivalent. Seven of the fifteen are text-comparison shapes (`order by` text, unicode text, 40-character shared prefixes, text primary keys) because the `BINARY` collation comparator is the engine's hottest code. |
-| `mutation` | 4 | Writes: a 10 000-row bulk insert, 1 000 single-row inserts, an update and a delete over a `where` clause. |
+| `execution` | 30 (15 × 2 backends) | Whole queries over a 10 000-row table: full scan, indexed filter, group by, order by, distinct, joins, a correlated subquery and its hand-written equivalent. Seven of the fifteen are text-comparison shapes (`order by` text, unicode text, 40-character shared prefixes, text primary keys) because the `BINARY` collation comparator is the engine's hottest code. |
+| `mutation` | 8 (4 × 2 backends) | Writes: a 10 000-row bulk insert, 1 000 single-row inserts, an update and a delete over a `where` clause. |
 
 ### Storage backends, and what a name means
 
@@ -44,8 +45,51 @@ exactly what it meant before backends existed. A name carrying `@` is a claim th
 row ran on something *other* than the engine's default module; a bare name is the
 default.
 
-There is only one backend today (`memory`, the in-process vtab module), so today every
-name is bare. The descriptors and the expansion live in `bench/lib/backends.mjs`.
+Two backends exist today. The descriptors and the expansion live in
+`bench/lib/backends.mjs`:
+
+| id | what it is | name |
+| --- | --- | --- |
+| `memory` | the in-process memory vtab module — the engine default | bare (`full-scan-10k`) |
+| `store-mem` | `StoreModule` wrapped by the isolation layer, over an in-memory key-value provider | `full-scan-10k@store-mem` |
+
+`store-mem` is the persistent path's performance coverage, and it is exactly the wiring
+`yarn test:store` exercises: key encoding, batched row resolution, transaction commit,
+index build and catalog rehydration are all code the memory module never runs. Two
+choices in it are deliberate:
+
+- **Isolation-wrapped.** `createIsolatedStoreModule` adds read-your-own-writes, rollback
+  and savepoints. That is what `yarn test:store` runs and what a deployment runs, so it is
+  what the row measures. "What does the wrapper itself cost" is a different question and
+  would be a different backend id.
+- **In-memory provider, not disk.** It isolates *store-layer* cost from *disk* cost, it is
+  deterministic, and it is cheap enough to run on every `yarn bench`. A disk-backed row is
+  a separate, opt-in backend.
+
+`store-mem` roughly **doubles `yarn bench`'s wall-clock** — measured at 48 s for 27 rows
+before it and 102 s for 46 rows after, on the machine and node version the table header
+records. Nothing in it comes close to the 120 s per-benchmark timeout (`BENCH_TIMEOUT_MS`
+in `bench/run.mjs`); the slowest single call is ~370 ms.
+
+The store package is imported **lazily**, from one dynamic-import site in
+`bench/lib/store-counters.mjs`. The parent process imports every suite file just to
+enumerate benchmark names, so a static import there would let an unbuilt
+`packages/quereus-store/dist` kill the whole run — parser and planner suites included.
+Instead the store rows *skip*, with the reason printed (see
+[A benchmark that declines to run](#a-benchmark-that-declines-to-run-skip)). Both `dist/`
+directories must be current: `yarn build` builds them in dependency order, and a bench run
+against a stale `packages/quereus-store/dist` measures the wrong code just as surely as a
+stale `packages/quereus/dist` does.
+
+A backend declines a workload through `BenchBackend.skipWorkload(workload)`, which
+`expandBackends` wires into the benchmark's `skip()` so no suite file has to remember to.
+When a binder *also* supplies a `skip`, the two compose — the backend is asked first and
+its reason wins, then the binder's is consulted — because a backend that cannot load makes
+any workload-intrinsic reason moot. `store-mem` declines nothing per workload today: every
+workload in both suites was confirmed to run on it and return the row count it asserts,
+including the two divergences that looked most likely to bite (the store applies NOCASE to
+an undecorated text primary key where memory applies BINARY, and the store's cost model may
+validly pick a different join shape — neither changes a result).
 
 There is deliberately **no `--backend` flag**. `--filter` is a plain substring match, so
 `--filter @store-mem` already selects one backend across every workload and `--filter
@@ -313,6 +357,68 @@ alongside `snapshotPlanShape` for a benchmark that only wants plan-shape facts.
 *Adding a benchmark* above; a partial drain reads as a change in the engine when nothing
 changed but the loop.
 
+### Storage round trips: what a `store-mem` row counts
+
+For a store backend the interesting count is not an instruction tally — it is **how many
+times the engine went to storage, and with how many keys**. A change that doubled the
+round trips behind a secondary-index scan would leave every engine counter untouched.
+
+So a `@store-mem` benchmark's block nests. `engine` is the same `WorkCounterSnapshot` the
+bare row reports; `store` is keyed by **built store name** — what the key-value provider is
+keyed by, so it is stable across runs and says which physical store the traffic hit:
+
+```json
+{
+  "engine": { "...": "the usual snapshot" },
+  "store": {
+    "main.bench_t":                 { "iterateEntries": 0,  "getManyCalls": 1, "getManyKeys": 10, "singleGets": 0 },
+    "main.bench_t_idx_bench_t_val": { "iterateEntries": 10, "getManyCalls": 0, "getManyKeys": 0,  "singleGets": 0 }
+  }
+}
+```
+
+That is `filtered-scan-index-10k@store-mem`, and it reads: ten entries pulled from the
+secondary index, then **one** batched read carrying ten keys to fetch the rows. If row
+resolution ever stopped batching, `getManyCalls` would go to 10 and `singleGets` would take
+the keys.
+
+The four counts, which are **not** the raw field names of `CountingKVStore` in
+`@quereus/store/testing` — that class's `getMany` deliberately routes every key of a batch
+through its own counted `get`, so its `getCount` is not what its name suggests:
+
+| Field | Means |
+| --- | --- |
+| `iterateEntries` | entries pulled from `iterate()` — a scan's volume |
+| `getManyCalls` | batched reads issued: **the round-trip count** |
+| `getManyKeys` | keys those batched reads carried |
+| `singleGets` | reads that were genuinely one key at a time (`getCount - getManyKeyCount`, derived once, in `bench/lib/store-counters.mjs`) |
+
+**Reads only.** `CountingKVStore` counts `get`/`getMany`/`iterate` and nothing else, so a
+write workload's block describes the reads its writes provoked — index maintenance,
+uniqueness probes, read-modify-write — never the writes themselves. `bulk-insert-10k@store-mem`
+reporting 30 000 `singleGets` for 10 000 inserted rows is three reads per row, and that is a
+real, diffable number; it just is not the whole story of what an insert costs.
+
+A store that was opened but never read from stays in the block with four zeros. That is
+a different claim from a store that was never opened at all, which is absent — and the
+comparison reports an appeared or vanished path exactly as loudly as a changed count.
+
+Two mechanics worth knowing:
+
+- The counters pass builds a **second database**, over a counting provider, so the counting
+  wrapper never sits inside a timed number. It costs about a second across all nineteen
+  store rows of a ~100 s run.
+- Each pass has to say where its *fixture* ends and its *measurement* begins, or a ten-key
+  index probe would be buried under ten thousand fixture inserts. The `execution` binder
+  does it structurally (fixture, then reset, then the statement); a `mutation` workload does
+  it by calling `ctx.beginMeasured()` at its own boundary — a no-op on backends that count
+  nothing.
+
+Counter portability across machines is **an assumption, not a fact**: nothing has yet
+compared counter blocks from two machines, and plan choice can in principle differ on a
+slower one. Store round trips are reported as facts about *this run*; there is no gate on
+them.
+
 ### Which suites qualify
 
 Whether a benchmark can report counters depends on what it does, not on an arbitrary
@@ -320,8 +426,8 @@ per-suite switch:
 
 | Suite | Declares `counters()` | Why |
 | --- | --- | --- |
-| `execution` | 15 / 15 | Every benchmark runs a statement to completion; `snapshotStatement` reruns the same query untimed. |
-| `mutation` | 4 / 4 | Writes are statements too — same treatment. |
+| `execution` | 30 / 30 | Every benchmark runs a statement to completion; `snapshotStatement` reruns the same query untimed. The 15 `@store-mem` rows add a `store` block to it. |
+| `mutation` | 8 / 8 | Writes are statements too — same treatment. |
 | `planner` | 4 / 4 | `snapshotPlanShape` only. These benchmarks compile a plan and deliberately never execute it, so there is no instruction or table access to count — only plan shape. |
 | `parser` | 0 / 4 | Nothing to count: no `Database`, no plan, no runtime. |
 
@@ -486,7 +592,8 @@ Requirements:
 | `bench/lib/counters.mjs` | Helpers a benchmark's `counters()` pass uses: `snapshotStatement`, `snapshotStatements`, `snapshotPlanShape`. |
 | `bench/lib/environment.mjs` | Environment capture and the material-difference check. |
 | `bench/lib/discover.mjs` | Suite enumeration and the one definition of what `--filter` matches (`matchesFilter`), shared by the parent, the worker and the comparison. |
-| `bench/lib/backends.mjs` | The storage-engine dimension: the `BenchBackend` descriptor, the `BACKENDS` set, and `expandBackends` — one workload × N backends → N benchmarks, named by the bare-name rule. |
+| `bench/lib/backends.mjs` | The storage-engine dimension: the `BenchBackend` descriptor, the `BACKENDS` set, and `expandBackends` — one workload × N backends → N benchmarks, named by the bare-name rule, with each backend's `skipWorkload` wired into the benchmark's `skip()`. |
+| `bench/lib/store-counters.mjs` | Everything that touches `@quereus/store`, behind the harness's one dynamic import: the plain and counting `store-mem` databases, and the round-trip block they report. |
 | `bench/workloads/*.mjs` | What the `execution` and `mutation` suites measure, as data plus fixtures. The suite files are binders over these. |
 
 Harness tests, none of which run a benchmark: `test/bench-calibration.spec.ts` (the timing

@@ -27,6 +27,7 @@
  */
 
 import { Database } from '../../dist/src/index.js';
+import { openCountingStoreDatabase, openStoreDatabase, storeLoadFailure } from './store-counters.mjs';
 
 /**
  * One storage engine a workload can be measured against.
@@ -38,12 +39,36 @@ import { Database } from '../../dist/src/index.js';
  * @property {string} label one line, for the docs and the table legend
  * @property {() => Promise<BackendHandle>} open a FUNCTION, not a pre-built handle: the
  *   mutation benchmarks that time a database's whole life open one per iteration
+ * @property {(workload: any) => (string|null|Promise<string|null>)} [skipWorkload] a
+ *   reason THIS BACKEND declines to run `workload`, or `null` to run it. The backend's
+ *   half of `Benchmark.skip`; `expandBackends` wires it up so no suite file has to
+ *   remember to, and so no future suite can forget. Absent means the backend runs
+ *   everything it is handed.
+ *
+ *   Two quite different declines share it, because both are the same answer to the same
+ *   question. One is per-workload: a query the store's cost model plans differently, or
+ *   one asserting behaviour only the memory module has. The other is per-BACKEND and
+ *   ignores its argument entirely: the backend's package will not load in this checkout.
+ *   Either way the row survives and prints `skipped — <reason>`; an omitted benchmark
+ *   would read as UNCHANGED to anyone diffing two runs, which is the opposite of what a
+ *   decline means.
+ * @property {() => Promise<CountingBackendHandle>} [openCounting] builds the SECOND
+ *   database the untimed `counters()` pass uses, instrumented to count storage traffic.
+ *   A backend without one reports engine work counters only, exactly as before backends
+ *   existed — which is why the memory backend deliberately has none.
  *
  * An open database plus whatever the backend had to register to get it.
  *
  * @typedef {object} BackendHandle
  * @property {import('../../dist/src/index.js').Database} db
  * @property {() => Promise<void>} close closes `db` AND anything the backend registered
+ *
+ * @typedef {BackendHandle & {
+ *   resetCounters: () => void,
+ *   readCounters: () => object,
+ * }} CountingBackendHandle a `BackendHandle` whose storage traffic is counted.
+ *   `resetCounters()` marks the boundary between a benchmark's fixture and the work it
+ *   means to count; `readCounters()` is valid only BEFORE `close()`.
  */
 
 /** Separates a workload name from its backend id. A plain substring `--filter` never
@@ -76,14 +101,64 @@ export const MEMORY_BACKEND = {
 };
 
 /**
+ * The persistent store path, over an in-memory key-value provider.
+ *
+ * `yarn test:store` exists because key encoding, batched row resolution, transaction
+ * commit, index build and catalog rehydration are all code the memory module never
+ * executes. This is that path's performance coverage: same workloads, same assertions,
+ * a different module underneath.
+ *
+ * ISOLATION-WRAPPED, deliberately. `createIsolatedStoreModule` wraps `StoreModule` with
+ * the isolation layer for read-your-own-writes, rollback and savepoints — what
+ * `yarn test:store` runs and what a real deployment runs, so it is what this row
+ * measures. "What does the wrapper itself cost" is a different question and would be a
+ * different backend id, not a change to this one.
+ *
+ * IN-MEMORY PROVIDER, deliberately. It isolates store-layer cost from disk cost, it is
+ * deterministic, and it is cheap enough to run on every `yarn bench`. A disk-backed row
+ * is a separate, opt-in backend.
+ *
+ * Everything that touches `@quereus/store` lives behind `lib/store-counters.mjs`'s lazy
+ * import, so an unbuilt store package skips these rows with a reason instead of killing
+ * the whole run at suite enumeration — see that file's header.
+ *
+ * @type {BenchBackend}
+ */
+export const STORE_MEM_BACKEND = {
+	id: 'store-mem',
+	label: 'StoreModule (isolation-wrapped) over an in-memory key-value provider',
+	// Ignores its workload argument: every workload in both suites has been confirmed to
+	// run on this backend and return the row count it asserts, so the only reason these
+	// rows decline today is a store package that will not load. Two divergences worth
+	// knowing about were checked rather than assumed, and neither needs a skip:
+	//
+	//   - the store applies NOCASE to an UNDECORATED text primary key where memory applies
+	//     BINARY (docs/schema.md §"Per-column PK key collation";
+	//     test/logic/10.2.2-default-collation-memory.sqllogic is memory-only for it). The
+	//     `textPk` fixture declares exactly that column, and its corpus is all lowercase,
+	//     so `text-pk-range-scan-10k@store-mem` still returns its 1 000 rows — measured,
+	//     not assumed.
+	//   - the store's cost model can validly prefer a different join shape than memory's
+	//     (test/logic/83-merge-join.sqllogic is memory-only for that reason).
+	//     `join-1kx1k@store-mem` still returns its 1 000 rows; its counters may describe a
+	//     different plan than the memory row's, which is fine — the two rows are readings
+	//     of one WORKLOAD, never a claim that one plan was chosen twice.
+	async skipWorkload() {
+		return await storeLoadFailure();
+	},
+	open() { return openStoreDatabase(); },
+	openCounting() { return openCountingStoreDatabase(); },
+};
+
+/**
  * The backend set every suite expands over.
  *
- * ONE element today, deliberately shaped as an array so adding a persistent store is a
- * one-line edit rather than a refactor of every suite.
+ * One entry per storage path, shared by both suites rather than listed per suite, so a
+ * new backend reaches every workload at once and cannot be half-added.
  *
  * @type {BenchBackend[]}
  */
-export const BACKENDS = [MEMORY_BACKEND];
+export const BACKENDS = [MEMORY_BACKEND, STORE_MEM_BACKEND];
 
 /**
  * The benchmark name a workload gets on a given backend.
@@ -119,6 +194,16 @@ function validateBackends(backends) {
 		if (typeof backend.open !== 'function') {
 			throw new Error(`expandBackends: backend '${backend.id}' has no 'open' function`);
 		}
+		// Both optional, both checked for the same reason `loadSuite` checks `counters` and
+		// `skip`: a truthy non-callable would be silently ignored, and the backend would
+		// then look exactly like one that never declared it. For `skipWorkload` that means a
+		// backend meant to decline runs and fails instead.
+		if (backend.skipWorkload !== undefined && typeof backend.skipWorkload !== 'function') {
+			throw new Error(`expandBackends: backend '${backend.id}' has a 'skipWorkload' that is not a function (got ${typeof backend.skipWorkload})`);
+		}
+		if (backend.openCounting !== undefined && typeof backend.openCounting !== 'function') {
+			throw new Error(`expandBackends: backend '${backend.id}' has an 'openCounting' that is not a function (got ${typeof backend.openCounting})`);
+		}
 		if (ids.has(backend.id)) {
 			throw new Error(`expandBackends: backend id '${backend.id}' appears more than once`);
 		}
@@ -130,6 +215,35 @@ function validateBackends(backends) {
 			? `expandBackends: no backend is marked isDefault — one must be, or every benchmark name gains a '${BACKEND_SEPARATOR}' suffix and the whole suite is renamed`
 			: `expandBackends: ${defaults.length} backends are marked isDefault (${defaults.join(', ')}) — exactly one may be`);
 	}
+}
+
+/**
+ * The `skip` one expanded benchmark gets, from the backend's `skipWorkload` and whatever
+ * the binder returned.
+ *
+ * Both may be present, and neither may silently overwrite the other — the same failure
+ * mode the bind-returned-a-name check exists to prevent. They COMPOSE: the backend is
+ * asked first and its reason wins, because a backend that cannot load makes any
+ * workload-intrinsic reason moot and its probe is the cheaper of the two. Only when the
+ * backend agrees to run is the binder's own reason consulted.
+ *
+ * Returns `undefined` when neither declares one, so a benchmark on a backend with no
+ * `skipWorkload` carries no `skip` key at all — byte-identical to what it was before this
+ * seam existed.
+ *
+ * @param {any} workload
+ * @param {BenchBackend} backend
+ * @param {(() => string|null|Promise<string|null>)|undefined} boundSkip
+ * @returns {(() => string|null|Promise<string|null>)|undefined}
+ */
+function composeSkip(workload, backend, boundSkip) {
+	const skipWorkload = backend.skipWorkload;
+	if (!skipWorkload) return boundSkip;
+	return async () => {
+		const backendReason = await skipWorkload(workload);
+		if (backendReason) return backendReason;
+		return boundSkip ? (await boundSkip()) ?? null : null;
+	};
 }
 
 /**
@@ -184,7 +298,8 @@ export function expandBackends(backends, workloads, bind) {
 			if (declared !== undefined && declared !== name) {
 				throw new Error(`expandBackends: bind returned the name '${declared}' for workload '${workload.name}' on backend '${backend.id}', which must be named '${name}'`);
 			}
-			expanded.push({ ...bound, name });
+			const skip = composeSkip(workload, backend, bound.skip);
+			expanded.push(skip ? { ...bound, name, skip } : { ...bound, name });
 		}
 	}
 	return expanded;

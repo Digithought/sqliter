@@ -128,5 +128,65 @@ describe('bench/lib/backends.mjs', () => {
 			// a claim about the suite rather than about the malformed set that caused it.
 			expect(() => expandBackends([], [workload('a')], bind)).to.throw(/non-empty array/);
 		});
+
+		it('rejects a non-callable skipWorkload rather than ignoring it', () => {
+			// The bad failure mode: a truthy non-function is skipped exactly like an absent
+			// one, so a backend meant to DECLINE silently runs and fails instead.
+			const bad = { ...backend('bad'), skipWorkload: 'nope' } as unknown as BenchBackend;
+			expect(() => expandBackends([MEM, bad], [workload('a')], bind)).to.throw(/'skipWorkload' that is not a function/);
+		});
+
+		it('rejects a non-callable openCounting rather than ignoring it', () => {
+			const bad = { ...backend('bad'), openCounting: {} } as unknown as BenchBackend;
+			expect(() => expandBackends([MEM, bad], [workload('a')], bind)).to.throw(/'openCounting' that is not a function/);
+		});
+	});
+
+	describe('expandBackends — the backend skip seam', () => {
+		/** A backend that declines `workload`, naming it, so a test can tell WHICH workload
+		 * the seam handed to `skipWorkload`. */
+		function declining(id: string, decline: (w: { name: string }) => string | null): BenchBackend {
+			return { ...backend(id), skipWorkload: decline } as unknown as BenchBackend;
+		}
+
+		it('leaves a benchmark with NO skip key when its backend declares no skipWorkload', () => {
+			// Byte-identical to what the expansion produced before this seam existed — the
+			// memory rows must not gain a `skip` they never had.
+			const [row] = expandBackends([MEM], [workload('a')], bind);
+			expect('skip' in row).to.equal(false);
+		});
+
+		it('attaches a skip that reports the backend\'s reason, per workload', async () => {
+			const backendUnderTest = declining('store-mem', (w) => (w.name === 'b' ? 'not on this backend' : null));
+			const rows = expandBackends([MEM, backendUnderTest], [workload('a'), workload('b')], bind);
+			const byName = new Map(rows.map((r) => [r.name, r]));
+			expect(await byName.get(`a${BACKEND_SEPARATOR}store-mem`)!.skip!()).to.equal(null);
+			expect(await byName.get(`b${BACKEND_SEPARATOR}store-mem`)!.skip!()).to.equal('not on this backend');
+			// The default backend is untouched by the other backend's decline.
+			expect('skip' in byName.get('a')!).to.equal(false);
+		});
+
+		it('composes with a binder-supplied skip, backend first, without either overwriting the other', async () => {
+			// The failure this rules out is silent: whichever of the two was assigned last
+			// would win and the other would never be consulted.
+			const binderSkip = () => 'binder says no';
+			const bindWithSkip = () => ({ fn: () => { }, skip: binderSkip });
+			const rows = expandBackends([MEM, declining('store-mem', () => null)], [workload('a')], bindWithSkip);
+			const byName = new Map(rows.map((r) => [r.name, r]));
+			// No backend skipWorkload at all: the binder's own function is passed through
+			// unwrapped, so a binder that declines still declines.
+			expect(byName.get('a')!.skip).to.equal(binderSkip);
+			// Backend agrees to run → the binder's reason is still consulted.
+			expect(await byName.get(`a${BACKEND_SEPARATOR}store-mem`)!.skip!()).to.equal('binder says no');
+		});
+
+		it('lets the backend\'s reason win when both decline', async () => {
+			// Backend-first because a backend that cannot load makes any workload-intrinsic
+			// reason moot, and its probe is the cheaper of the two.
+			const bindWithSkip = () => ({ fn: () => { }, skip: () => 'binder says no' });
+			const rows = expandBackends([MEM, declining('other', () => 'backend says no')], [workload('a')], bindWithSkip);
+			const suffixed = rows.find((r) => r.name.endsWith('other'))!;
+			expect(await suffixed.skip!()).to.equal('backend says no');
+		});
 	});
 });
