@@ -203,6 +203,90 @@ export const queryPlanFunc = createIntegratedTableValuedFunction(
 	}
 );
 
+/** One row of the compiled instruction listing produced by {@link collectSchedulerProgram}. */
+interface SchedulerProgramEntry {
+	addr: number;
+	dependencies: number[];
+	description: string;
+	isSubprogram: boolean;
+	parentAddr: number | null;
+}
+
+// NOTE: a TVF body runs *inside* the statement that called it — under the
+// same exec mutex the caller already holds (Database._acquireExecMutex).
+// It must reach plan/emit/execute in-process (db.getPlan, db.prepare,
+// Statement.iterateRowsWithTrace) and never issue a nested top-level query
+// via db.eval/db.exec, which deadlocks waiting on a mutex the outer
+// statement cannot release until this generator returns.
+//
+// Shared by scheduler_program() and execution_trace(), which must report the
+// same (full, sub-program) instruction listing — execution_trace() joins its
+// trace events against these addresses by index. Throws rather than
+// returning an error row; callers keep their own error handling.
+function collectSchedulerProgram(db: Database, sql: string): SchedulerProgramEntry[] {
+	const entries: SchedulerProgramEntry[] = [];
+
+	// Parse and plan the SQL to get the actual plan tree
+	const plan = db.getPlan(sql);
+
+	// Emit the plan to get the instruction tree. Unfused: this listing exists to
+	// show the instruction graph, and execution_trace() joins against it by
+	// instruction index — both must report the same (full, sub-program) form.
+	// Scalar fusion would dissolve scalar sub-programs into single fused(...)
+	// instructions.
+	const emissionContext = new EmissionContext(db, { fuseScalars: false });
+	const rootInstruction = emitPlanNode(plan, emissionContext);
+
+	// Create a scheduler to get the instruction sequence
+	const scheduler = new Scheduler(rootInstruction);
+	const indexByInstruction = new Map<Instruction, number>();
+	for (let i = 0; i < scheduler.instructions.length; i++) {
+		indexByInstruction.set(scheduler.instructions[i], i);
+	}
+
+	for (let i = 0; i < scheduler.instructions.length; i++) {
+		const instruction = scheduler.instructions[i];
+		const dependencies = instruction.params
+			.map(inst => indexByInstruction.get(inst))
+			.filter((idx): idx is number => idx !== undefined);
+
+		entries.push({
+			addr: i,
+			dependencies,
+			description: instruction.note || `INSTRUCTION_${i}`,
+			isSubprogram: false,
+			parentAddr: null,
+		});
+
+		// If this instruction has sub-programs, collect those too
+		if (instruction.programs) {
+			for (let progIdx = 0; progIdx < instruction.programs.length; progIdx++) {
+				const subProgram = instruction.programs[progIdx];
+				const subIndexByInstruction = new Map<Instruction, number>();
+				for (let subI = 0; subI < subProgram.instructions.length; subI++) {
+					subIndexByInstruction.set(subProgram.instructions[subI], subI);
+				}
+				for (let subI = 0; subI < subProgram.instructions.length; subI++) {
+					const subInstruction = subProgram.instructions[subI];
+					const subDependencies = subInstruction.params
+						.map(inst => subIndexByInstruction.get(inst))
+						.filter((idx): idx is number => idx !== undefined);
+
+					entries.push({
+						addr: scheduler.instructions.length + progIdx * 1000 + subI, // offset for sub-programs
+						dependencies: subDependencies,
+						description: subInstruction.note || `SUB_INSTRUCTION_${progIdx}_${subI}`,
+						isSubprogram: true,
+						parentAddr: i,
+					});
+				}
+			}
+		}
+	}
+
+	return entries;
+}
+
 // Scheduler program explanation function (table-valued function)
 export const schedulerProgramFunc = createIntegratedTableValuedFunction(
 	{
@@ -231,64 +315,16 @@ export const schedulerProgramFunc = createIntegratedTableValuedFunction(
 		}
 
 		try {
-			// Parse and plan the SQL to get the actual plan tree
-			const plan = db.getPlan(sql);
-
-			// Emit the plan to get the instruction tree. Unfused: this TVF exists to show
-			// the instruction graph, and execution_trace() joins against it by instruction
-			// index — both must report the same (full, sub-program) form. Scalar fusion
-			// would dissolve scalar sub-programs into single fused(...) instructions.
-			const emissionContext = new EmissionContext(db, { fuseScalars: false });
-			const rootInstruction = emitPlanNode(plan, emissionContext);
-
-			// Create a scheduler to get the instruction sequence
-			const scheduler = new Scheduler(rootInstruction);
-			const indexByInstruction = new Map<Instruction, number>();
-			for (let i = 0; i < scheduler.instructions.length; i++) {
-				indexByInstruction.set(scheduler.instructions[i], i);
-			}
-
-			// Yield information about each instruction
-			for (let i = 0; i < scheduler.instructions.length; i++) {
-				const instruction = scheduler.instructions[i];
-				const dependencies = instruction.params
-					.map(inst => indexByInstruction.get(inst))
-					.filter((idx): idx is number => idx !== undefined);
-
+			const entries = collectSchedulerProgram(db, sql);
+			for (const entry of entries) {
 				yield [
-					i, // addr
-					JSON.stringify(dependencies), // dependencies
-					instruction.note || `INSTRUCTION_${i}`, // instruction_id
-					null, // estimated_cost (not available in current implementation)
-					0, // is_subprogram (main program)
-					null // parent_addr (main program)
+					entry.addr,                         // addr
+					JSON.stringify(entry.dependencies), // dependencies
+					entry.description,                  // instruction_id
+					null,                                // estimated_cost (not available in current implementation)
+					entry.isSubprogram ? 1 : 0,         // is_subprogram
+					entry.parentAddr                    // parent_addr
 				];
-
-				// If this instruction has sub-programs, yield those too
-				if (instruction.programs) {
-					for (let progIdx = 0; progIdx < instruction.programs.length; progIdx++) {
-						const subProgram = instruction.programs[progIdx];
-						const subIndexByInstruction = new Map<Instruction, number>();
-						for (let subI = 0; subI < subProgram.instructions.length; subI++) {
-							subIndexByInstruction.set(subProgram.instructions[subI], subI);
-						}
-						for (let subI = 0; subI < subProgram.instructions.length; subI++) {
-							const subInstruction = subProgram.instructions[subI];
-							const subDependencies = subInstruction.params
-								.map(inst => subIndexByInstruction.get(inst))
-								.filter((idx): idx is number => idx !== undefined);
-
-							yield [
-								scheduler.instructions.length + progIdx * 1000 + subI, // addr (offset for sub-programs)
-								JSON.stringify(subDependencies), // dependencies
-								subInstruction.note || `SUB_INSTRUCTION_${progIdx}_${subI}`, // instruction_id
-								null, // estimated_cost
-								1, // is_subprogram
-								i // parent_addr
-							];
-						}
-					}
-				}
 			}
 		} catch (error: unknown) {
 			// If compilation fails, yield an error instruction
@@ -447,18 +483,16 @@ export const executionTraceFunc = createIntegratedTableValuedFunction(
 			const instructionOperations = new Map<number, string>();
 
 			try {
-				// Get scheduler program information
-				for await (const row of db.eval('SELECT * FROM scheduler_program(?)', [sql])) {
-					const addr = row.addr as number;
-					const dependencies = JSON.parse((row.dependencies as string) || '[]') as number[];
-					const description = row.description as string;
-
-					instructionDependencies.set(addr, dependencies);
-					instructionOperations.set(addr, description);
+				// Get scheduler program information. Must stay in-process (not db.eval —
+				// see the NOTE on collectSchedulerProgram): this generator body already
+				// runs under the exec mutex the outer statement holds.
+				for (const entry of collectSchedulerProgram(db, sql)) {
+					instructionDependencies.set(entry.addr, entry.dependencies);
+					instructionOperations.set(entry.addr, entry.description);
 				}
 			} catch (schedulerError: unknown) {
 				const message = schedulerError instanceof Error ? schedulerError.message : String(schedulerError);
-				console.warn('Could not get scheduler program info:', message);
+				log('Could not get scheduler program info: %s', message);
 			}
 
 			// Import the CollectingInstructionTracer
@@ -482,7 +516,7 @@ export const executionTraceFunc = createIntegratedTableValuedFunction(
 				await stmt.finalize();
 			} catch (executionError: unknown) {
 				// If execution fails, we might still have some trace events
-				console.warn('Query execution failed during tracing:', executionError instanceof Error ? executionError.message : String(executionError));
+				log('Query execution failed during tracing: %s', executionError instanceof Error ? executionError.message : String(executionError));
 			}
 
 			// Get the collected trace events

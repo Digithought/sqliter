@@ -729,9 +729,9 @@ describe('scalar fusion', () => {
 	});
 
 	describe('debug surfaces report the unfused graph', function () {
-		// execution_trace() re-plans through scheduler_program() and traces a full
-		// execution — slower than the default 2 s budget on cold caches.
-		this.timeout(20_000);
+		// execution_trace() re-plans through scheduler_program() and re-runs the
+		// statement under trace — slower than the default 2 s budget on cold caches.
+		this.timeout(5_000);
 		let db: Database;
 
 		beforeEach(async () => {
@@ -763,12 +763,12 @@ describe('scalar fusion', () => {
 			expect(descriptions.some(d => String(d).startsWith('fused(')), 'no fused instructions in the dump').to.equal(false);
 		});
 
-		// NOTE: execution_trace() itself cannot be exercised end-to-end here — the TVF
-		// deadlocks on the exec mutex regardless of fusion (nested db.eval inside an
-		// outer db.eval; pre-existing, tracked as
-		// tickets/backlog/bug-execution-trace-hangs-forever). These two tests pin the
-		// mechanism it relies on: `_emitUnfused` re-emitting the sub-program graph,
-		// and — by contrast — the default trace showing fused instructions.
+		it('execution_trace reports the unfused sub-program operations', async () => {
+			const rows = await collect(db, "select operation from execution_trace('select n + 1 from t where n > 2')");
+			const operations = rows.map(r => String(r.operation));
+			expect(operations.some(o => o.includes('+(numeric-fast)')), 'sub-program instruction traced').to.equal(true);
+			expect(operations.some(o => o.includes('fused(')), 'no fused instructions in the trace').to.equal(false);
+		});
 
 		it('_emitUnfused=true traces the full sub-program instruction graph', async () => {
 			const stmt = db.prepare('select n + 1 from t where n > 2');

@@ -425,6 +425,13 @@ export function createTableValuedFunction(options: TableValuedFuncOptions, jsFun
  * Creates a function schema for an integrated table-valued function.
  * Integrated functions receive the database instance as their first parameter.
  *
+ * NOTE: `jsFunc`'s body runs *inside* the statement that called it — under
+ * the same exec mutex (`Database._acquireExecMutex`) the outer statement
+ * already holds. It must reach plan/emit/execute in-process (`db.getPlan`,
+ * `db.prepare`, `Statement.iterateRowsWithTrace`) and never issue a nested
+ * top-level query via `db.eval`/`db.exec`, which deadlocks waiting on a mutex
+ * the outer statement cannot release until this generator returns.
+ *
  * @param options Configuration options for the function
  * @param jsFunc The JavaScript implementation function
  * @returns A FunctionSchema ready for registration
