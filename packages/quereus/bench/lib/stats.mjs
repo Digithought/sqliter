@@ -74,11 +74,26 @@ export function relativeIqr(samples) {
 	return Number.isFinite(spread) ? spread : null;
 }
 
-/** Round to microsecond precision, the resolution the results JSON records.
+/** Digits kept in the results JSON, as a reciprocal: nanoseconds.
+ *
+ * WHY NOT MICROSECONDS, which is what the table displays: the JSON is the input to
+ * the cross-run comparison, and a 4 µs parser median rounded to the microsecond can
+ * only move in 25% steps. Two identical runs then differ by 0% or 25% and nothing in
+ * between — enough to manufacture a regression out of the rounding alone. Node's
+ * `performance.now()` resolves well below this on every platform the suite runs on. */
+const PRECISION = 1e6;
+
+/** Digits kept for a figure that is already a percentage. A spread is a ratio of two
+ * timings, so carrying it to nanosecond-equivalent precision would print six decimals
+ * of a number the table renders with one. */
+const PERCENT_PRECISION = 1e3;
+
+/** Round to the resolution the results JSON records. See `PRECISION`.
  * @param {number} n
+ * @param {number} [precision] reciprocal of the step to round to
  * @returns {number} */
-export function round(n) {
-	return Math.round(n * 1000) / 1000;
+export function round(n, precision = PRECISION) {
+	return Math.round(n * precision) / precision;
 }
 
 /**
@@ -99,7 +114,7 @@ export function summarize(samples, meta = {}) {
 	return {
 		median_ms: round(median(samples)),
 		// `null`, never NaN/Infinity — see `relativeIqr`. Consumers must handle it.
-		spread_pct: spread === null ? null : round(spread * 100),
+		spread_pct: spread === null ? null : round(spread * 100, PERCENT_PRECISION),
 		// NOTE: a low within-run spread is NOT a guarantee that two runs are
 		// comparable. Planning measured `execution/full-scan-10k` at a 20.06 ms median
 		// with an rIQR of 8.8%, in a run whose two neighbours read 12.4 ms — a tight
@@ -116,4 +131,68 @@ export function summarize(samples, meta = {}) {
 		warmup: meta.warmup ?? 0,
 		pinned: meta.pinned ?? false,
 	};
+}
+
+// ── Cross-run comparison ────────────────────────────────────────────────
+/**
+ * The floor below which a delta between two runs is not a change, in percent.
+ *
+ * A benchmark that happens to report a near-zero within-run spread would otherwise
+ * start gating on 1% deltas — a figure no wall-clock measurement on a general-purpose
+ * machine supports, whatever the quartiles said.
+ */
+export const MIN_NOISE_FLOOR_PCT = 5;
+
+/**
+ * The smallest delta that can fail a run, in percent, regardless of how quiet the
+ * two runs were. A 6% change on a benchmark whose combined noise floor is 5% is real
+ * and worth printing, but it is not worth turning a build red over.
+ */
+export const GATE_MIN_DELTA_PCT = 10;
+
+/**
+ * Spread assumed for a run that records none — a results file written before spreads
+ * existed. Equal to the instability threshold on purpose: it is the widest spread a
+ * run could have carried and still have been called stable, so assuming it can only
+ * make the comparison more forgiving, never less.
+ */
+export const ASSUMED_SPREAD_PCT = UNSTABLE_SPREAD * 100;
+
+/**
+ * Combine two runs' within-run spreads into the delta below which the two medians
+ * are indistinguishable.
+ *
+ * Added in quadrature (`sqrt(a² + b²)`) because the two runs' noise is independent:
+ * summing them would double-count, and taking the larger would ignore the other run
+ * entirely. A `null` spread means the run did not record one, and is replaced by
+ * `ASSUMED_SPREAD_PCT` — a run whose spread is *known* to be bad is handled by the
+ * unstable path in `compare.mjs`, not here.
+ *
+ * @param {number|null|undefined} currentSpreadPct
+ * @param {number|null|undefined} baselineSpreadPct
+ * @returns {number} percent
+ */
+export function noiseFloorPct(currentSpreadPct, baselineSpreadPct) {
+	const a = typeof currentSpreadPct === 'number' && Number.isFinite(currentSpreadPct) ? currentSpreadPct : ASSUMED_SPREAD_PCT;
+	const b = typeof baselineSpreadPct === 'number' && Number.isFinite(baselineSpreadPct) ? baselineSpreadPct : ASSUMED_SPREAD_PCT;
+	return Math.max(MIN_NOISE_FLOOR_PCT, Math.sqrt(a * a + b * b));
+}
+
+/**
+ * Name a delta against the noise floor it has to clear.
+ *
+ * `changed` is deliberately its own answer rather than being folded into either
+ * neighbour: a delta that clears the noise floor but not `GATE_MIN_DELTA_PCT` is a
+ * measurement the reader should see and the gate should ignore, and calling it
+ * either "no change" or "regression" would lose one of those two facts.
+ *
+ * @param {number} deltaPct signed, current against baseline
+ * @param {number} floorPct as returned by `noiseFloorPct`
+ * @returns {'no-change' | 'changed' | 'regression' | 'improvement'}
+ */
+export function classifyDelta(deltaPct, floorPct) {
+	if (Math.abs(deltaPct) <= floorPct) return 'no-change';
+	if (deltaPct > GATE_MIN_DELTA_PCT) return 'regression';
+	if (deltaPct < -GATE_MIN_DELTA_PCT) return 'improvement';
+	return 'changed';
 }

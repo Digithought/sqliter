@@ -131,8 +131,14 @@ describe('bench/lib/stats.mjs', () => {
 	});
 
 	describe('round', () => {
-		it('keeps microsecond precision', () => {
-			expect(round(1.23456)).to.equal(1.235);
+		it('keeps nanosecond precision', () => {
+			expect(round(1.2345674)).to.equal(1.234567);
+		});
+
+		// Microsecond rounding would collapse these two to the same number, and a
+		// comparison between them to either 0% or 25% with nothing in between.
+		it('separates two medians a fraction of a microsecond apart', () => {
+			expect(round(0.0042)).to.not.equal(round(0.0044));
 		});
 	});
 
@@ -141,7 +147,7 @@ describe('bench/lib/stats.mjs', () => {
 
 		it('reports a spread as a percentage, not a fraction', () => {
 			const s = summarize([10, 20, 30, 40, 50]);
-			expect(s.spread_pct).to.equal(round((2 / 3) * 100));
+			expect(s.spread_pct).to.equal(round((2 / 3) * 100, 1e3));
 		});
 
 		it('calls a tight distribution stable', () => {

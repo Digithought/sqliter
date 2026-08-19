@@ -19,20 +19,29 @@
  * parent derives every statistic here, including the relative-IQR spread that says
  * how much to trust the median it sits next to.
  *
+ * Comparison against a baseline is noise-aware: every delta is judged against a floor
+ * built from both runs' spreads (`lib/compare.mjs`), and every run records the machine
+ * it ran on (`lib/environment.mjs`) so two results from two laptops cannot compare
+ * silently. See docs/benchmarking.md.
+ *
  * Usage:
  *   yarn bench                         — run all suites, print table, write JSON
  *   yarn bench --baseline <file>       — compare against a previous result
+ *   yarn bench --baseline latest       — compare against the newest file in bench/results/
  *   yarn bench --filter <substring>    — run only benchmarks whose suite/name matches
+ *   yarn bench --json                  — result object on stdout, everything else on stderr
  */
 
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
-import { execSync, fork } from 'node:child_process';
+import { readFile, writeFile, mkdir, readdir } from 'node:fs/promises';
+import { fork } from 'node:child_process';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
 
 import { loadSuites, selectBenchmarks } from './lib/discover.mjs';
-import { summarize, UNSTABLE_SPREAD } from './lib/stats.mjs';
+import { summarize, UNSTABLE_SPREAD, GATE_MIN_DELTA_PCT } from './lib/stats.mjs';
+import { compareRun, STATUS_ORDER } from './lib/compare.mjs';
+import { captureEnvironment, compareEnvironments, describeCheckout, describeEnvironment } from './lib/environment.mjs';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const childPath = join(__dirname, 'child.mjs');
@@ -45,21 +54,52 @@ const BENCH_TIMEOUT_MS = 120_000;
 /** Characters of a dead child's stderr quoted in the failure report. */
 const STDERR_TAIL_CHARS = 4000;
 
-const USAGE = 'usage: node bench/run.mjs [--filter <substring>] [--baseline <file>]';
+const USAGE = 'usage: node bench/run.mjs [--filter <substring>] [--baseline <file>|latest] [--json]';
 
 /** Caller error — a bad flag, an unreadable baseline, a filter that matches nothing.
  * Reported as a single line: a stack trace through the harness diagnoses nothing the
  * user can act on. */
 class UsageError extends Error {}
 
+// ── Output routing ──────────────────────────────────────────────────────
+/**
+ * Every human-readable line goes here. Under `--json` it becomes stderr, so stdout
+ * carries the result object and nothing else: a gate script has to be able to pipe
+ * stdout into a parser without filtering, and one progress line landing in the middle
+ * of the JSON would make that impossible.
+ */
+let humanStream = process.stdout;
+
+/** ANSI escapes are suppressed unless the human stream is an interactive terminal —
+ * a captured log full of `\x1b[31m` is harder to read than an uncolored one. */
+let useColor = Boolean(process.stdout.isTTY);
+
+function say(text = '') {
+	humanStream.write(`${text}\n`);
+}
+
+/** @param {number} code @returns {(text: string) => string} */
+const ansi = (code) => (text) => (useColor ? `\x1b[${code}m${text}\x1b[0m` : text);
+const red = ansi(31);
+const green = ansi(32);
+const yellow = ansi(33);
+const cyan = ansi(36);
+const dim = ansi(2);
+
 // ── CLI args ────────────────────────────────────────────────────────────
 const VALUE_FLAGS = new Set(['--baseline', '--filter']);
+const BOOLEAN_FLAGS = new Set(['--json']);
 
 function parseArgs(argv) {
 	let baselinePath = null;
 	let filter = null;
+	let json = false;
 	for (let i = 0; i < argv.length; i++) {
 		const flag = argv[i];
+		if (BOOLEAN_FLAGS.has(flag)) {
+			json = true;
+			continue;
+		}
 		if (!VALUE_FLAGS.has(flag)) {
 			throw new UsageError(`unrecognized argument '${flag}'\n${USAGE}`);
 		}
@@ -70,7 +110,35 @@ function parseArgs(argv) {
 		if (flag === '--baseline') baselinePath = value;
 		else filter = value;
 	}
-	return { baselinePath, filter };
+	return { baselinePath, filter, json };
+}
+
+/**
+ * Resolve `--baseline latest` to the newest file in `bench/results/`.
+ *
+ * MUST run before this run writes its own result file, or `latest` resolves to the
+ * file this run is about to create and every benchmark compares against itself.
+ *
+ * @param {string} spec the raw `--baseline` value
+ * @returns {Promise<string>} a path
+ */
+async function resolveBaselinePath(spec) {
+	if (spec !== 'latest') return spec;
+	let files;
+	try {
+		files = (await readdir(resultsDir)).filter((f) => f.endsWith('.json'));
+	} catch (err) {
+		const why = err.code === 'ENOENT' ? 'bench/results/ does not exist' : err.message;
+		throw new UsageError(`--baseline latest: ${why} — run the suite once first`);
+	}
+	if (files.length === 0) {
+		throw new UsageError('--baseline latest: bench/results/ is empty — run the suite once first');
+	}
+	// Result filenames are ISO-8601 timestamps with `:` and `.` replaced, so a
+	// lexicographic sort IS a chronological sort. Deliberately NOT mtime: a copy, a
+	// checkout or a backup restore rewrites mtime and would reorder the history.
+	files.sort();
+	return join(resultsDir, files[files.length - 1]);
 }
 
 // ── Run one benchmark in its own process ────────────────────────────────
@@ -93,7 +161,9 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
  *
  * stdio is piped rather than inherited so the child's output can be both
  * forwarded live (diagnostics stay visible) and retained — a child that dies
- * without sending a result has nothing else to explain itself with.
+ * without sending a result has nothing else to explain itself with. It is forwarded
+ * to the HUMAN stream, never to stdout directly: under `--json` a chatty benchmark
+ * would otherwise corrupt the result object.
  *
  * @returns {Promise<{ result: object|null, failure: object|null, code: number|null, signal: string|null, timedOut: boolean, stderr: string }>}
  */
@@ -110,7 +180,7 @@ function forkBenchmark(suiteFile, benchName) {
 		let settled = false;
 		const stderrChunks = [];
 
-		child.stdout.on('data', (chunk) => process.stdout.write(chunk));
+		child.stdout.on('data', (chunk) => humanStream.write(chunk));
 		child.stderr.on('data', (chunk) => {
 			stderrChunks.push(chunk);
 			process.stderr.write(chunk);
@@ -210,55 +280,65 @@ function tail(text) {
  * `ceil(0.95 * n) - 1`, which is the last element for n ≤ 20 and within a place or
  * two of it beyond that; the column duplicated Max and its slot is better spent on
  * a measure of dispersion.
+ *
+ * With a baseline, two more columns appear: the delta and the noise floor it had to
+ * clear. The floor is printed rather than applied invisibly, so a reader can see WHY
+ * a 12% delta was called no change without reading this file.
+ *
+ * @param {{fullName: string, result: object|null, failure: object|null}[]} rows
+ * @param {Map<string, object>|null} verdicts by full name, from `compareRun`
  */
-function printTable(rows, baseline) {
+function printTable(rows, verdicts) {
 	const nameWidth = Math.max(30, ...rows.map((r) => r.fullName.length + 2));
 
 	const columns = ['Median', 'Spread', 'Min', 'Max'];
-	if (baseline) columns.push('Delta');
+	if (verdicts) columns.push('Delta', 'Noise');
 	const header = `${'Benchmark'.padEnd(nameWidth)}  ${columns.map((c) => c.padStart(10)).join('  ')}`;
 
-	console.log();
-	console.log(header);
-	console.log('─'.repeat(header.length));
+	say();
+	say(header);
+	say('─'.repeat(header.length));
 
 	for (const row of rows) {
 		// A failed benchmark keeps its row: a missing row reads as "unchanged" to
 		// anyone diffing two runs.
 		if (!row.result) {
-			console.log(`${row.fullName.padEnd(nameWidth)}  \x1b[31mFAILED (${row.failure.kind})\x1b[0m`);
+			say(`${row.fullName.padEnd(nameWidth)}  ${red(`FAILED (${row.failure.kind})`)}`);
 			continue;
 		}
 
 		const result = row.result;
-		let line = `${row.fullName.padEnd(nameWidth)}  ${fmt(result.median_ms).padStart(10)}  ${fmtSpread(result.spread_pct).padStart(10)}  ${fmt(result.min_sample_ms).padStart(10)}  ${fmt(result.max_sample_ms).padStart(10)}`;
+		const cells = [fmt(result.median_ms), fmtSpread(result.spread_pct), fmt(result.min_sample_ms), fmt(result.max_sample_ms)];
+		let line = `${row.fullName.padEnd(nameWidth)}  ${cells.map((c) => c.padStart(10)).join('  ')}`;
 
-		if (baseline && baseline[row.fullName]) {
-			const delta = ((result.median_ms - baseline[row.fullName].median_ms) / baseline[row.fullName].median_ms) * 100;
-			const deltaStr = `${delta >= 0 ? '+' : ''}${delta.toFixed(1)}%`;
-			const colored = delta > 20
-				? `\x1b[31m${deltaStr}\x1b[0m`  // red for regression
-				: delta < -10
-					? `\x1b[32m${deltaStr}\x1b[0m`  // green for improvement
-					: deltaStr;
-			line += `  ${colored.padStart(10 + (colored.length - deltaStr.length))}`;
-		}
+		const verdict = verdicts?.get(row.fullName);
+		if (verdict) line += `  ${paintDelta(verdict)}  ${fmtFloor(verdict).padStart(10)}`;
 
 		// Markers, not columns: they apply to a minority of rows and padding a column
 		// for them would cost more width than they are worth.
-		if (!result.stable) line += '  \x1b[33munstable\x1b[0m';
-		if (result.pinned) line += '  \x1b[36mpinned\x1b[0m';
+		if (!result.stable) line += `  ${yellow('unstable')}`;
+		if (result.pinned) line += `  ${cyan('pinned')}`;
+		if (verdict) line += verdictMarker(verdict);
 
-		console.log(line);
+		say(line);
 	}
 
-	console.log();
-	console.log(tableLegend(rows));
+	say();
+	say(tableLegend(rows, verdicts));
 }
 
-/** One line under the table saying what the numbers mean, because two of them do
+/** The trailing word that says what the comparison decided, for the verdicts a
+ * coloured percentage does not already state. */
+function verdictMarker(verdict) {
+	if (verdict.status === 'no-change') return `  ${dim('no change')}`;
+	if (verdict.status === 'unstable') return `  ${yellow('not gated')}`;
+	if (verdict.status === 'new') return `  ${cyan('new')}`;
+	return '';
+}
+
+/** One line under the table saying what the numbers mean, because several of them do
  * not mean what a reader would assume. */
-function tableLegend(rows) {
+function tableLegend(rows, verdicts) {
 	const batched = rows.filter((r) => r.result && r.result.batch > 1);
 	const parts = [
 		`Spread = relative IQR ((p75-p25)/median); rows above ${(UNSTABLE_SPREAD * 100).toFixed(0)}% are marked unstable`,
@@ -267,11 +347,17 @@ function tableLegend(rows) {
 		// Only mentioned when it applies, so the legend does not train readers to skip it.
 		parts.push(`${batched.length} row(s) batch several calls per sample — their Min/Max are batch means, not per-call extremes`);
 	}
+	if (verdicts) {
+		parts.push(`Noise = both runs' spreads in quadrature; a |Delta| within it is no change, and a regression also needs |Delta| > ${GATE_MIN_DELTA_PCT}%`);
+	}
 	return parts.map((p) => `  ${p}`).join('\n');
 }
 
+/** One decimal in each unit. The microsecond decimal is not decoration: at whole-µs
+ * display a 4.2 µs median and a 4.4 µs one both print `4 µs`, and the Delta column
+ * next to them would read +5% against two apparently identical numbers. */
 function fmt(ms) {
-	return ms < 1 ? `${(ms * 1000).toFixed(0)} µs` : `${ms.toFixed(2)} ms`;
+	return ms < 1 ? `${(ms * 1000).toFixed(1)} µs` : `${ms.toFixed(2)} ms`;
 }
 
 /** `null` spread (an empty or zero-median sample set) prints as `?`, never as an
@@ -280,12 +366,31 @@ function fmtSpread(pct) {
 	return pct === null || pct === undefined ? '?' : `${pct.toFixed(1)}%`;
 }
 
+/** The Delta cell: a signed percentage, or a word for why there is not one. */
+function fmtDelta(verdict) {
+	if (verdict.delta_pct === null) return verdict.status === 'new' ? '—' : '?';
+	return `${verdict.delta_pct >= 0 ? '+' : ''}${verdict.delta_pct.toFixed(1)}%`;
+}
+
+/** Pad first, colour second: an ANSI escape has width in the string and none on the
+ * screen, so colouring before padding misaligns every coloured row. */
+function paintDelta(verdict) {
+	const cell = fmtDelta(verdict).padStart(10);
+	if (verdict.status === 'regression') return red(cell);
+	if (verdict.status === 'improvement') return green(cell);
+	if (verdict.status === 'unstable') return yellow(cell);
+	return cell;
+}
+
+function fmtFloor(verdict) {
+	return verdict.noise_floor_pct === null ? '—' : `±${verdict.noise_floor_pct.toFixed(1)}%`;
+}
+
 // ── Within-run ratio guards ─────────────────────────────────────────────
 /**
  * Evaluate each suite's `ratioGuards` against the collected medians. A guard
  * `{ name, baseline, maxRatio }` fails when `median[suite/name] /
- * median[suite/baseline]` exceeds `maxRatio`. Returns the number of failures
- * (0 = all pass).
+ * median[suite/baseline]` exceeds `maxRatio`.
  *
  * A guard naming a benchmark that was never selected is handled two ways, by
  * design: with `--filter` active it is REPORTED AS SKIPPED, because narrowing a
@@ -294,22 +399,25 @@ function fmtSpread(pct) {
  * failure, never a silent skip. A guard whose benchmark was selected but failed
  * is reported as not evaluated — the benchmark failure already fails the run, so
  * counting it twice adds noise, not signal.
+ *
+ * Returns records rather than printing them, so the same verdicts can be written into
+ * the results JSON a gate script reads.
+ *
+ * @returns {{ target: string, baseline: string, status: string, ratio: number|null, maxRatio: number, detail: string }[]}
  */
 function checkRatioGuards(suites, allBenchmarks, selectedNames, filterActive) {
-	let failures = 0;
+	const verdicts = [];
 	for (const suite of suites) {
 		for (const guard of suite.ratioGuards ?? []) {
 			const targetName = `${suite.name}/${guard.name}`;
 			const baseName = `${suite.name}/${guard.baseline}`;
+			const record = { target: targetName, baseline: baseName, ratio: null, maxRatio: guard.maxRatio };
 
 			const unselected = [targetName, baseName].filter((n) => !selectedNames.has(n));
 			if (unselected.length > 0) {
-				if (filterActive) {
-					console.log(`ratio guard skipped: ${targetName} / ${baseName} — ${unselected.join(', ')} not selected by --filter`);
-				} else {
-					console.log(`\x1b[31mratio guard misconfigured: benchmark '${unselected[0]}' not found in this run\x1b[0m`);
-					failures++;
-				}
+				verdicts.push(filterActive
+					? { ...record, status: 'skipped', detail: `${unselected.join(', ')} not selected by --filter` }
+					: { ...record, status: 'misconfigured', detail: `benchmark '${unselected[0]}' not found in this run` });
 				continue;
 			}
 
@@ -317,7 +425,7 @@ function checkRatioGuards(suites, allBenchmarks, selectedNames, filterActive) {
 			const base = allBenchmarks[baseName];
 			if (!target || !base) {
 				const failed = !target ? targetName : baseName;
-				console.log(`\x1b[33mratio guard not evaluated: ${targetName} / ${baseName} — '${failed}' failed to run\x1b[0m`);
+				verdicts.push({ ...record, status: 'not-evaluated', detail: `'${failed}' failed to run` });
 				continue;
 			}
 
@@ -326,15 +434,24 @@ function checkRatioGuards(suites, allBenchmarks, selectedNames, filterActive) {
 			const ratio = base.median_ms > 0
 				? target.median_ms / base.median_ms
 				: (target.median_ms > 0 ? Infinity : 1);
-			if (ratio > guard.maxRatio) {
-				console.log(`\x1b[31mratio guard FAILED: ${targetName} is ${ratio.toFixed(1)}× ${baseName} (max ${guard.maxRatio}×) — likely a plan-shape regression\x1b[0m`);
-				failures++;
-			} else {
-				console.log(`ratio guard ok: ${targetName} / ${baseName} = ${ratio.toFixed(2)}× (max ${guard.maxRatio}×)`);
-			}
+			verdicts.push(ratio > guard.maxRatio
+				? { ...record, ratio, status: 'failed', detail: `${targetName} is ${ratio.toFixed(1)}× ${baseName} (max ${guard.maxRatio}×) — likely a plan-shape regression` }
+				: { ...record, ratio, status: 'ok', detail: `${targetName} / ${baseName} = ${ratio.toFixed(2)}× (max ${guard.maxRatio}×)` });
 		}
 	}
-	return failures;
+	return verdicts;
+}
+
+/** Print the guard verdicts and return how many of them fail the run. */
+function reportRatioGuards(verdicts) {
+	for (const verdict of verdicts) {
+		if (verdict.status === 'ok') say(`ratio guard ok: ${verdict.detail}`);
+		else if (verdict.status === 'skipped') say(`ratio guard skipped: ${verdict.target} / ${verdict.baseline} — ${verdict.detail}`);
+		else if (verdict.status === 'not-evaluated') say(yellow(`ratio guard not evaluated: ${verdict.target} / ${verdict.baseline} — ${verdict.detail}`));
+		else if (verdict.status === 'misconfigured') say(red(`ratio guard misconfigured: ${verdict.detail}`));
+		else say(red(`ratio guard FAILED: ${verdict.detail}`));
+	}
+	return verdicts.filter((v) => v.status === 'failed' || v.status === 'misconfigured').length;
 }
 
 // ── Baseline ────────────────────────────────────────────────────────────
@@ -343,6 +460,12 @@ function checkRatioGuards(suites, allBenchmarks, selectedNames, filterActive) {
  * should cost a second, not a full run. An unreadable or shapeless baseline is a
  * `UsageError` and not a warning — the user asked for a comparison, so completing
  * without one and exiting 0 would report a gate that never ran as a gate that passed.
+ *
+ * A file with no `environment` block is a file written before this harness captured
+ * one. It loads: the missing block is reported as an environment mismatch (there is
+ * nothing to check it against), not treated as a match.
+ *
+ * @returns {Promise<{ benchmarks: Record<string, object>, environment: object|null }>}
  */
 async function loadBaseline(path) {
 	let data;
@@ -354,18 +477,67 @@ async function loadBaseline(path) {
 	if (!data?.benchmarks || typeof data.benchmarks !== 'object') {
 		throw new UsageError(`baseline '${path}' has no 'benchmarks' object — not a bench results file`);
 	}
-	return data.benchmarks;
+	return { benchmarks: data.benchmarks, environment: data.environment ?? null };
 }
 
-/** Benchmarks whose median rose more than 20% against the baseline. */
-function countRegressions(allBenchmarks, baseline) {
-	let regressions = 0;
-	for (const [name, result] of Object.entries(allBenchmarks)) {
-		if (!baseline[name]) continue;
-		const delta = ((result.median_ms - baseline[name].median_ms) / baseline[name].median_ms) * 100;
-		if (delta > 20) regressions++;
+/**
+ * The banner above the comparison. Everything a reader needs in order to decide
+ * whether to believe the table under it, printed BEFORE the table so it cannot be
+ * scrolled past.
+ *
+ * It warns; it never refuses. Comparing across machines on purpose is a legitimate
+ * thing to do — it just has to be labelled as what it is.
+ *
+ * @param {string} baselinePath
+ * @param {string[]} envDiffs from `compareEnvironments`
+ * @param {number} assumedSpreads benchmarks whose baseline spread had to be assumed
+ */
+function printComparisonBanner(baselinePath, envDiffs, assumedSpreads) {
+	say();
+	say(`Comparison against ${baselinePath}`);
+	if (envDiffs.length > 0) {
+		say(red('┌─ ENVIRONMENT MISMATCH ──────────────────────────────────────────'));
+		say(red('│ The two runs came from different machines or engines. The deltas'));
+		say(red('│ below describe that difference as much as any code change.'));
+		for (const diff of envDiffs) say(red(`│   • ${diff}`));
+		say(red('└─────────────────────────────────────────────────────────────────'));
 	}
-	return regressions;
+	if (assumedSpreads > 0) {
+		const plural = assumedSpreads === 1 ? 'y records' : 'ies record';
+		say(yellow(`Note: ${assumedSpreads} baseline entr${plural} no spread (written before the harness measured one) — ${(UNSTABLE_SPREAD * 100).toFixed(0)}% assumed for the noise floor.`));
+	}
+}
+
+/**
+ * Close the comparison with a count of every outcome, including the ones that are
+ * not deltas. A comparison that drops what it could not evaluate reads as green when
+ * it is not.
+ *
+ * @param {object[]} comparisons from `compareRun`
+ * @param {Record<string, number>} counts
+ */
+function printComparisonSummary(comparisons, counts) {
+	const labels = {
+		'no-change': 'no change',
+		changed: 'changed below the gate',
+		improvement: 'improved',
+		regression: 'REGRESSED',
+		unstable: 'unstable (not gated)',
+		new: 'new',
+		missing: 'missing from this run',
+		filtered: 'not selected by --filter',
+		failed: 'failed',
+	};
+	say();
+	say(`Comparison: ${STATUS_ORDER.map((s) => `${counts[s]} ${labels[s]}`).join(', ')}`);
+
+	// The non-delta outcomes are named individually: a count alone tells a reader that
+	// something was excluded without telling them what, which is not actionable.
+	for (const status of ['unstable', 'new', 'missing', 'filtered']) {
+		for (const comparison of comparisons.filter((c) => c.status === status)) {
+			say(`  ${status.padEnd(9)} ${comparison.fullName} — ${comparison.note}`);
+		}
+	}
 }
 
 // ── Selection and execution ─────────────────────────────────────────────
@@ -377,7 +549,7 @@ function selectFor(suites, filter) {
 		throw new UsageError(`--filter '${filter}' matched no benchmarks (${available} available)`);
 	}
 	if (filter) {
-		console.log(`\nFilter '${filter}' selected ${selected.length} of ${selectBenchmarks(suites, null).length} benchmarks`);
+		say(`\nFilter '${filter}' selected ${selected.length} of ${selectBenchmarks(suites, null).length} benchmarks`);
 	}
 	return selected;
 }
@@ -393,7 +565,7 @@ async function runSelected(selected) {
 	for (const bench of selected) {
 		if (bench.suiteName !== currentSuite) {
 			currentSuite = bench.suiteName;
-			console.log(`\nRunning suite: ${currentSuite}`);
+			say(`\nRunning suite: ${currentSuite}`);
 		}
 
 		// STRICTLY SEQUENTIAL, deliberately. Parallel children contend for CPU and
@@ -408,11 +580,11 @@ async function runSelected(selected) {
 			rows.push({ fullName: bench.fullName, result: classified.result, failure: null });
 			const r = classified.result;
 			const shape = r.pinned ? `${r.samples} pinned iters` : `${r.samples} samples${r.batch > 1 ? ` x${r.batch}` : ''}`;
-			console.log(`  ${bench.name}... ${fmt(r.median_ms)} (spread: ${fmtSpread(r.spread_pct)}, ${shape})${r.stable ? '' : ' \x1b[33munstable\x1b[0m'}`);
+			say(`  ${bench.name}... ${fmt(r.median_ms)} (spread: ${fmtSpread(r.spread_pct)}, ${shape})${r.stable ? '' : ` ${yellow('unstable')}`}`);
 		} else {
 			failures.push({ fullName: bench.fullName, ...classified.failure });
 			rows.push({ fullName: bench.fullName, result: null, failure: classified.failure });
-			console.log(`  ${bench.name}... \x1b[31mFAILED\x1b[0m — ${classified.failure.detail}`);
+			say(`  ${bench.name}... ${red('FAILED')} — ${classified.failure.detail}`);
 		}
 	}
 
@@ -420,42 +592,47 @@ async function runSelected(selected) {
 }
 
 // ── Results file ────────────────────────────────────────────────────────
-function getCommitHash() {
-	try {
-		return execSync('git rev-parse --short HEAD', { encoding: 'utf8' }).trim();
-	} catch {
-		return 'unknown';
-	}
-}
-
 /**
- * Write the timestamped results JSON and return its path.
+ * Assemble the machine-readable result object — the thing written to
+ * `bench/results/` and, under `--json`, to stdout. One object with one shape, so a
+ * consumer never has to care which of the two it is reading.
  *
- * NOTE: the file carries no schema version, and the per-benchmark field set has
- * already changed once (`p95_ms` dropped, `min_ms`/`max_ms` renamed to
- * `min_sample_ms`/`max_sample_ms` when batching arrived). Nothing reads those
- * fields today — `--baseline` and the ratio guards use `median_ms` alone, which has
- * been stable — so an old file still compares correctly. Add a `schema` field the
- * moment a consumer reads anything else, so it can reject a file it cannot read
- * rather than silently treating a missing field as absent data.
+ * NOTE: the file carries no schema version. The per-benchmark field set has already
+ * changed twice (`p95_ms` dropped, `min_ms`/`max_ms` renamed, `spread_pct`/`stable`
+ * added) and the comparison now reads `spread_pct` as well as `median_ms` — with a
+ * documented fallback for a file that lacks it (`ASSUMED_SPREAD_PCT` in `stats.mjs`).
+ * Add a `schema` field the moment a consumer needs to REJECT an old file rather than
+ * fall back, so it can say so instead of silently treating a missing field as absent
+ * data.
  *
  * NOTE: `bench/results/` is gitignored and never pruned; a machine that runs the
  * suite often accumulates a file per run. Harmless at the current sizes (a few KB
  * each); add a retention sweep if it ever becomes a nuisance.
  */
-async function writeResults({ allBenchmarks, failures, wallClockMs }) {
-	await mkdir(resultsDir, { recursive: true });
-	const outputPath = join(resultsDir, `${new Date().toISOString().replace(/[:.]/g, '-')}.json`);
-	const output = {
+function buildOutput({ environment, allBenchmarks, failures, wallClockMs, baselinePath, comparison, ratioGuards }) {
+	return {
 		timestamp: new Date().toISOString(),
-		commit: getCommitHash(),
-		node: process.version,
+		// Lifted out of `environment` rather than captured a second time: these two are
+		// what a human skims a results file for, and burying them costs more than two
+		// lines of redundancy do.
+		commit: environment.commit,
+		node: environment.node,
+		environment,
 		wall_clock_ms: Math.round(wallClockMs),
 		benchmarks: allBenchmarks,
 		// Failures are recorded separately rather than as zero-valued benchmark
 		// entries, so a failed run can never be mistaken for a fast one.
 		failures: failures.map((f) => ({ name: f.fullName, kind: f.kind, detail: f.detail })),
+		ratio_guards: ratioGuards,
+		baseline: baselinePath,
+		comparison,
 	};
+}
+
+/** Write the timestamped results JSON and return its path. */
+async function writeResults(output) {
+	await mkdir(resultsDir, { recursive: true });
+	const outputPath = join(resultsDir, `${output.timestamp.replace(/[:.]/g, '-')}.json`);
 	await writeFile(outputPath, JSON.stringify(output, null, 2) + '\n');
 	return outputPath;
 }
@@ -463,11 +640,11 @@ async function writeResults({ allBenchmarks, failures, wallClockMs }) {
 /** Print every failed benchmark with whatever the child left behind to explain it. */
 function reportFailures(failures) {
 	if (failures.length === 0) return;
-	console.log(`\n\x1b[31m${failures.length} benchmark(s) failed:\x1b[0m`);
+	say(`\n${red(`${failures.length} benchmark(s) failed:`)}`);
 	for (const failure of failures) {
-		console.log(`\x1b[31m  ${failure.fullName} — ${failure.detail}\x1b[0m`);
-		if (failure.stack) console.log(indent(failure.stack));
-		else if (failure.stderr) console.log(indent(failure.stderr.trimEnd()));
+		say(red(`  ${failure.fullName} — ${failure.detail}`));
+		if (failure.stack) say(indent(failure.stack));
+		else if (failure.stderr) say(indent(failure.stderr.trimEnd()));
 	}
 }
 
@@ -477,41 +654,69 @@ function indent(text) {
 
 // ── Main ────────────────────────────────────────────────────────────────
 async function main() {
-	const { baselinePath, filter } = parseArgs(process.argv.slice(2));
+	const { baselinePath: baselineSpec, filter, json } = parseArgs(process.argv.slice(2));
 
-	console.log('Quereus Benchmark Suite');
-	console.log('=======================');
+	if (json) {
+		humanStream = process.stderr;
+		useColor = Boolean(process.stderr.isTTY);
+	}
 
+	say('Quereus Benchmark Suite');
+	say('=======================');
+
+	// Both resolved before a single benchmark runs: `latest` must not see the file
+	// this run is about to write, and a typo in a baseline path should cost a second
+	// rather than a whole run.
+	const baselinePath = baselineSpec ? await resolveBaselinePath(baselineSpec) : null;
 	const baseline = baselinePath ? await loadBaseline(baselinePath) : null;
-	if (baselinePath) console.log(`\nBaseline: ${baselinePath}`);
+
+	const environment = captureEnvironment();
+	say(`\n${describeEnvironment(environment)}`);
+	say(describeCheckout(environment));
+	if (environment.dirty === true) {
+		say(yellow('Working tree is dirty — these numbers correspond to no commit.'));
+	}
+	if (baselinePath) say(`Baseline: ${baselinePath}`);
 
 	const suites = await loadSuites();
 	const selected = selectFor(suites, filter);
 
 	const { allBenchmarks, rows, failures, wallClockMs } = await runSelected(selected);
 
-	printTable(rows, baseline);
-	console.log(`Total wall-clock: ${(wallClockMs / 1000).toFixed(1)} s across ${selected.length} isolated process(es)`);
-	console.log(`Results written to ${await writeResults({ allBenchmarks, failures, wallClockMs })}`);
+	const comparison = baseline ? compareRun(rows, baseline.benchmarks, filter) : null;
+	if (comparison) {
+		printComparisonBanner(baselinePath, compareEnvironments(environment, baseline.environment), comparison.assumedSpreads);
+	}
 
-	let exitCode = 0;
+	printTable(rows, comparison ? new Map(comparison.comparisons.map((c) => [c.fullName, c])) : null);
+	say(`Total wall-clock: ${(wallClockMs / 1000).toFixed(1)} s across ${selected.length} isolated process(es)`);
 
 	// Within-run ratio guards (shape-economy gates). Independent of --baseline:
 	// a single run of a query that is 26× slower than its hand-written twin
 	// otherwise prints a fine-looking number and passes.
 	const selectedNames = new Set(selected.map((b) => b.fullName));
-	if (checkRatioGuards(suites, allBenchmarks, selectedNames, Boolean(filter)) > 0) exitCode = 1;
+	const ratioGuards = checkRatioGuards(suites, allBenchmarks, selectedNames, Boolean(filter));
 
-	if (baseline) {
-		const regressions = countRegressions(allBenchmarks, baseline);
-		if (regressions > 0) {
-			console.log(`\x1b[31m${regressions} benchmark(s) regressed >20%\x1b[0m`);
+	const output = buildOutput({ environment, allBenchmarks, failures, wallClockMs, baselinePath, comparison, ratioGuards });
+	say(`Results written to ${await writeResults(output)}`);
+
+	let exitCode = 0;
+	if (reportRatioGuards(ratioGuards) > 0) exitCode = 1;
+
+	if (comparison) {
+		printComparisonSummary(comparison.comparisons, comparison.counts);
+		if (comparison.regressions > 0) {
+			say(red(`${comparison.regressions} benchmark(s) regressed beyond the noise floor`));
 			exitCode = 1;
 		}
 	}
 
 	reportFailures(failures);
 	if (failures.length > 0) exitCode = 1;
+
+	// Written last, so a crash anywhere above leaves stdout empty rather than holding
+	// half an object a gate script would try to parse.
+	if (json) process.stdout.write(JSON.stringify(output, null, 2) + '\n');
 
 	process.exitCode = exitCode;
 }

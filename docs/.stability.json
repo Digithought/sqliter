@@ -76,6 +76,7 @@
 	},
 	"untiered": [
 		"docs/architecture.md",
+		"docs/benchmarking.md",
 		"docs/design-isolation-challenges.md",
 		"docs/design-isolation-layer.md",
 		"docs/doc-conventions.md",
