@@ -1,4 +1,13 @@
 /**
+ * Whole-query execution benchmarks.
+ *
+ * This file is a BINDER, not a list of queries. The workloads themselves live in
+ * `bench/workloads/execution.mjs` as plain data (a fixture name, one SQL statement, an
+ * expected row count); `expandBackends` turns each of them into one benchmark per
+ * storage backend, and `bindQuery` below supplies the `setup`/`fn`/`teardown`/`counters`
+ * shape the worker expects. See `bench/lib/backends.mjs` for the naming rule — the
+ * default backend publishes the bare name, every other backend appends `@<id>`.
+ *
  * TIMING: no benchmark in this file sets `iterations` or `warmup`. The worker warms
  * `fn` up by elapsed duration and then measures the WARMED function to pick both —
  * see `CALIBRATION` in `bench/lib/calibrate.mjs` — so each benchmark gets roughly a
@@ -19,8 +28,9 @@
  * itself out of calibration.
  */
 
-import { Database } from '../../dist/src/index.js';
+import { BACKENDS, defaultBackend, expandBackends } from '../lib/backends.mjs';
 import { snapshotStatement } from '../lib/counters.mjs';
+import { DECORRELATION_WORKLOADS, FIXTURES, QUERY_WORKLOADS } from '../workloads/execution.mjs';
 
 /** Collect an async iterable into an array. */
 async function collect(iter) {
@@ -29,376 +39,92 @@ async function collect(iter) {
 	return out;
 }
 
-/** Build and populate a 10K-row database. */
-async function createPopulatedDb() {
-	const db = new Database();
-	await db.exec(`
-		create table bench_t (id integer primary key, val integer, label text);
-		create index bench_t_val on bench_t (val);
-	`);
-
-	// Insert 10K rows in batches of 500
-	for (let batch = 0; batch < 20; batch++) {
-		const values = Array.from({ length: 500 }, (_, j) => {
-			const id = batch * 500 + j + 1;
-			return `(${id}, ${id * 7 % 1000}, 'group_${id % 100}')`;
-		}).join(', ');
-		await db.exec(`insert into bench_t values ${values}`);
-	}
-
-	return db;
-}
-
-/** 40 identical leading characters — forces a comparator to scan past a long common
- * prefix before it finds a differing character, the opposite cost profile of keys
- * that differ at character 1. */
-const PREFIX40 = 'p'.repeat(40);
-
-/** One astral emoji (U+1F600, outside the Basic Multilingual Plane) plus one rare
- * CJK Extension B ideograph (U+20000) — both are surrogate pairs in UTF-16, so any
- * string containing them takes `compareCodePoints`'s surrogate-aware slow path
- * instead of its native `<`/`>` fast path (see `util/comparison.ts`). */
-const UNICODE_PREFIX = '\u{1F600}\u{20000}';
+/** The backend handle the benchmark currently running holds, or null between
+ * benchmarks. One module-level slot is enough: the worker runs exactly ONE benchmark
+ * per process. */
+let handle = null;
+/** Shorthand for `handle.db`, so the bodies below read as they did before backends. */
+let db = null;
 
 /**
- * Build and populate a 10K-row database with several text columns, each shaped for a
- * different comparator workload: `tkey` is unique text (order by / point compares),
- * `label` is low-cardinality text (group by / distinct), `tkey_prefixed` shares a
- * 40-char prefix across every row, and `tkey_unicode` carries astral code points.
+ * Turn one `Workload` into a `Benchmark` bound to one backend.
+ *
+ * @param {import('../workloads/execution.mjs').Workload} workload
+ * @param {import('../lib/backends.mjs').BenchBackend} backend
  */
-async function createTextDb() {
-	const db = new Database();
-	await db.exec(`
-		create table bench_text_t (
-			id integer primary key,
-			tkey text,
-			label text,
-			tkey_prefixed text,
-			tkey_unicode text
-		);
-	`);
-
-	for (let batch = 0; batch < 20; batch++) {
-		const values = Array.from({ length: 500 }, (_, j) => {
-			const id = batch * 500 + j + 1;
-			// Scramble the key so it does NOT ascend with insertion order. V8's sort is
-			// TimSort, which spends exactly n-1 comparisons on an already-ordered input —
-			// an ascending key would make these `order by` benchmarks O(n) comparisons
-			// instead of O(n log n) and hide most of the per-comparison cost they exist to
-			// measure. `7919` is coprime with 100000, so the map stays injective (`tkey`
-			// unique, as `distinct-text-10k` asserts).
-			const suffix = String((id * 7919) % 100000).padStart(5, '0');
-			return `(${id}, 'key_${suffix}', 'group_${id % 100}', '${PREFIX40}${suffix}', '${UNICODE_PREFIX}${suffix}')`;
-		}).join(', ');
-		await db.exec(`insert into bench_text_t values ${values}`);
-	}
-
-	return db;
-}
-
-/**
- * Build and populate a 10K-row database with a DATE column and a TIMESPAN column,
- * so `d + s` over a full scan is one temporal add per row. Both columns are
- * DECLARED temporal, which is what lets `buildNumericOpSpec` resolve the
- * (operator, kind, kind) case once at emit instead of re-deriving both operand
- * kinds from the values on every row (see runtime/emit/binary.ts).
- */
-async function createTemporalDb() {
-	const db = new Database();
-	await db.exec('create table bench_temporal_t (id integer primary key, d date, s timespan)');
-
-	for (let batch = 0; batch < 20; batch++) {
-		const values = Array.from({ length: 500 }, (_, j) => {
-			const id = batch * 500 + j + 1;
-			// Spread over 2024 (a leap year, 366 days) so the dates are not all identical.
-			const day = String((id % 28) + 1).padStart(2, '0');
-			const month = String((id % 12) + 1).padStart(2, '0');
-			return `(${id}, '2024-${month}-${day}', 'P${(id % 30) + 1}D')`;
-		}).join(', ');
-		await db.exec(`insert into bench_temporal_t values ${values}`);
-	}
-
-	return db;
-}
-
-/** Build and populate a 10K-row database with a text primary key (zero-padded so
- * lexicographic order matches insertion order, making range bounds predictable). */
-async function createTextPkDb() {
-	const db = new Database();
-	await db.exec('create table bench_text_pk (tkey text primary key, val integer)');
-
-	for (let batch = 0; batch < 20; batch++) {
-		const values = Array.from({ length: 500 }, (_, j) => {
-			const id = batch * 500 + j + 1;
-			return `('key_${String(id).padStart(5, '0')}', ${id})`;
-		}).join(', ');
-		await db.exec(`insert into bench_text_pk values ${values}`);
-	}
-
-	return db;
-}
-
-/**
- * Every benchmark's query, named once and used twice: `fn` times it, and `counters()`
- * snapshots the same statement after timing. Sharing one literal is what keeps the two
- * from drifting — a query edited in `fn` alone would leave the counters pass reporting
- * counts for a statement the benchmark no longer runs, and the counts would still look
- * perfectly stable while describing the wrong plan.
- */
-const SQL = {
-	fullScan: 'select * from bench_t',
-	temporalArith: 'select d + s as a from bench_temporal_t',
-	filteredScanIndex: 'select * from bench_t where val = 42',
-	groupBy: 'select label, count(*) as cnt, sum(val) as total from bench_t group by label',
-	orderBy: 'select * from bench_t order by val desc, id asc',
-	orderByText: 'select * from bench_text_t order by tkey',
-	orderByTextPrefix40: 'select * from bench_text_t order by tkey_prefixed',
-	orderByTextUnicode: 'select * from bench_text_t order by tkey_unicode',
-	groupByText: 'select label, count(*) as cnt from bench_text_t group by label',
-	distinctText: 'select distinct tkey from bench_text_t',
-	textPkRangeScan: "select * from bench_text_pk where tkey >= 'key_03000' and tkey < 'key_04000'",
-	textPkPointSeek: "select * from bench_text_pk where tkey = 'key_05000'",
-	join: 'select l.id, r.payload from left_t l join right_t r on l.key_col = r.key_col where l.id <= 100',
-	correlatedSubquery: `
-		select id, val,
-			(select count(*) from bench_t b where b.label = a.label) as peer_count
-		from bench_t a
-		where a.id <= 100
-	`,
-	handBatchedPeerCount: `
-		select a.id, a.val, coalesce(g.cnt, 0) as peer_count
-		from bench_t a
-		left join (select label, count(*) as cnt from bench_t group by label) g on g.label = a.label
-		where a.id <= 100
-	`,
-};
-
-let db;
-
-export const benchmarks = [
-	{
-		name: 'full-scan-10k',
-		async setup() { db = await createPopulatedDb(); },
-		async teardown() { await db.close(); db = null; },
+function bindQuery(workload, backend) {
+	return {
+		async setup() {
+			handle = await backend.open();
+			db = handle.db;
+			await FIXTURES[workload.fixture](db);
+		},
+		async teardown() {
+			await handle.close();
+			handle = null;
+			db = null;
+		},
 		async fn() {
-			const rows = await collect(db.eval(SQL.fullScan));
-			if (rows.length !== 10000) throw new Error(`Expected 10000 rows, got ${rows.length}`);
+			const rows = await collect(db.eval(workload.sql));
+			if (rows.length !== workload.expectedRows) {
+				throw new Error(`Expected ${workload.expectedRows} rows, got ${rows.length}`);
+			}
 		},
 		// Runs ONCE after timing, with metrics on — never inside `fn`, whose number the
-		// counting generators would corrupt. Same statement, fully drained. Every other
-		// `counters()` in this file follows this shape.
-		counters() { return snapshotStatement(db, SQL.fullScan); },
+		// counting generators would corrupt. Same statement, fully drained.
+		counters() { return snapshotStatement(db, workload.sql); },
+	};
+}
+
+/** `join-1kx1k`'s query, named once and used twice — by `fn` and by `counters()` — for
+ * the reason spelled out on `Workload.sql` in `bench/workloads/execution.mjs`. */
+const JOIN_SQL = 'select l.id, r.payload from left_t l join right_t r on l.key_col = r.key_col where l.id <= 100';
+
+/**
+ * Written by hand rather than expanded, because it does not fit the single-fixture
+ * `Workload` shape: it builds TWO tables, and the shape carries one `fixture` name.
+ * Forcing it in would mean a `Workload` that can express everything, which is a
+ * `Workload` that documents nothing.
+ *
+ * It therefore runs on the default backend only. When a second backend lands and this
+ * shape is worth measuring on it, give it a fixture and a binder of its own rather
+ * than widening `Workload`.
+ */
+const JOIN_BENCHMARK = {
+	name: 'join-1kx1k',
+	async setup() {
+		handle = await defaultBackend(BACKENDS).open();
+		db = handle.db;
+		await db.exec(`
+			create table left_t (id integer primary key, key_col integer);
+			create table right_t (id integer primary key, key_col integer, payload text);
+		`);
+		const leftVals = Array.from({ length: 1000 }, (_, i) =>
+			`(${i + 1}, ${i % 100})`
+		).join(', ');
+		const rightVals = Array.from({ length: 1000 }, (_, i) =>
+			`(${i + 1}, ${i % 100}, 'data_${i}')`
+		).join(', ');
+		await db.exec(`insert into left_t values ${leftVals}`);
+		await db.exec(`insert into right_t values ${rightVals}`);
 	},
-	{
-		// One DATE + TIMESPAN add per row over a full scan. Both operands are declared
-		// temporal, so the operation-table lookup resolves at emit and the per-row path
-		// is a single call into the selected case; before that, each row re-derived both
-		// operand kinds from the values (four regex/prefix probes each). Scan overhead is
-		// shared with `full-scan-10k`, so the delta between the two isolates the add.
-		//
-		// NOTE: deliberately NOT given a `ratioGuards` entry — those bound a pathological
-		// plan regression (an N+1 scan), not a constant factor like this one.
-		//
-		// NOTE: measured ~90 ms specialized vs ~103 ms on the value-sniffed body (medians of
-		// 4 runs each, `full-scan-10k` steady at ~12 ms across all 8). So dispatch is ~1.2 µs
-		// of the ~9 µs each row spends here — the other ~8 µs is temporal-polyfill parsing
-		// (`Temporal.PlainDate.from` + `Temporal.Duration.from`, re-parsed per row even when
-		// one operand is a constant). If this shape ever needs to be materially faster,
-		// that parse is the target, not the dispatch.
-		name: 'temporal-arith-scan-10k',
-		async setup() { db = await createTemporalDb(); },
-		async teardown() { await db.close(); db = null; },
-		async fn() {
-			const rows = await collect(db.eval(SQL.temporalArith));
-			if (rows.length !== 10000) throw new Error(`Expected 10000 rows, got ${rows.length}`);
-		},
-		counters() { return snapshotStatement(db, SQL.temporalArith); },
+	async teardown() { await handle.close(); handle = null; db = null; },
+	async fn() {
+		const rows = await collect(db.eval(JOIN_SQL));
+		if (rows.length === 0) throw new Error('Expected join results');
 	},
-	{
-		name: 'filtered-scan-index-10k',
-		async setup() { db = await createPopulatedDb(); },
-		async teardown() { await db.close(); db = null; },
-		async fn() {
-			const rows = await collect(db.eval(SQL.filteredScanIndex));
-			if (rows.length === 0) throw new Error('Expected some rows');
-		},
-		counters() { return snapshotStatement(db, SQL.filteredScanIndex); },
-	},
-	{
-		name: 'group-by-10k',
-		async setup() { db = await createPopulatedDb(); },
-		async teardown() { await db.close(); db = null; },
-		async fn() {
-			const rows = await collect(db.eval(SQL.groupBy));
-			if (rows.length !== 100) throw new Error(`Expected 100 groups, got ${rows.length}`);
-		},
-		counters() { return snapshotStatement(db, SQL.groupBy); },
-	},
-	{
-		name: 'order-by-10k',
-		async setup() { db = await createPopulatedDb(); },
-		async teardown() { await db.close(); db = null; },
-		async fn() {
-			const rows = await collect(db.eval(SQL.orderBy));
-			if (rows.length !== 10000) throw new Error(`Expected 10000 rows, got ${rows.length}`);
-		},
-		counters() { return snapshotStatement(db, SQL.orderBy); },
-	},
-	{
-		name: 'order-by-text-10k',
-		async setup() { db = await createTextDb(); },
-		async teardown() { await db.close(); db = null; },
-		async fn() {
-			const rows = await collect(db.eval(SQL.orderByText));
-			if (rows.length !== 10000) throw new Error(`Expected 10000 rows, got ${rows.length}`);
-		},
-		counters() { return snapshotStatement(db, SQL.orderByText); },
-	},
-	{
-		// Every key shares the same 40-char prefix (`PREFIX40`), so the comparator can
-		// never resolve on its fast early bytes — the opposite cost profile of
-		// `order-by-text-10k`, where keys diverge at character 5.
-		//
-		// NOTE: an earlier revision of this comment claimed ~380 ms/iteration and ~4.5 s of
-		// the total run, and called this the most expensive entry in the suite. All of that
-		// was wrong. Under the per-benchmark process isolation the harness now enforces
-		// (Windows 11, node 24.2), four full runs put it at 67-91 ms/iteration — well under
-		// a second of a 23-42 s run — and in every one of them at least four other entries
-		// cost more, among them `temporal-arith-scan-10k` (85-118 ms), `mutation/bulk-
-		// insert-10k` (121-173 ms), `mutation/delete-where-100` and
-		// `mutation/single-row-insert-1k` (both ~100-120 ms).
-		//
-		// Do not read those figures as bounds. Runs taken while the machine was busy measured
-		// this same benchmark at 228-338 ms, so background load moves it several-fold; the
-		// ordering above is the durable claim, not the milliseconds. The `Spread` column now
-		// reports how much of that noise landed inside a given run — but only inside it; a
-		// whole run displaced by background load still reads as tight.
-		//
-		// If `yarn bench` wall-clock ever becomes a problem this is not the entry to cut, and
-		// if it ever is, lower `CALIBRATION.targetTotalMs` in `bench/lib/calibrate.mjs` (which shortens
-		// every benchmark evenly) rather than shortening `PREFIX40` — the long prefix is the
-		// whole point of the benchmark.
-		name: 'order-by-text-prefix40-10k',
-		async setup() { db = await createTextDb(); },
-		async teardown() { await db.close(); db = null; },
-		async fn() {
-			const rows = await collect(db.eval(SQL.orderByTextPrefix40));
-			if (rows.length !== 10000) throw new Error(`Expected 10000 rows, got ${rows.length}`);
-		},
-		counters() { return snapshotStatement(db, SQL.orderByTextPrefix40); },
-	},
-	{
-		// Every key carries an astral emoji + a CJK Extension B ideograph
-		// (`UNICODE_PREFIX`), forcing `compareCodePoints`'s surrogate-aware slow path
-		// (see `util/comparison.ts`) rather than its native `<`/`>` fast path.
-		name: 'order-by-text-unicode-10k',
-		async setup() { db = await createTextDb(); },
-		async teardown() { await db.close(); db = null; },
-		async fn() {
-			const rows = await collect(db.eval(SQL.orderByTextUnicode));
-			if (rows.length !== 10000) throw new Error(`Expected 10000 rows, got ${rows.length}`);
-		},
-		counters() { return snapshotStatement(db, SQL.orderByTextUnicode); },
-	},
-	{
-		// NOTE: grouping is hash-based (`runtime/emit/hash-aggregate.ts` serializes each key
-		// through a collation key normalizer into a `Map`), so this measures the text
-		// key-serialization path, NOT `compareCodePoints` — a pure comparator regression does
-		// not move this number. `distinct-text-10k` is the comparator-sensitive dedup case.
-		name: 'group-by-text-10k',
-		async setup() { db = await createTextDb(); },
-		async teardown() { await db.close(); db = null; },
-		async fn() {
-			const rows = await collect(db.eval(SQL.groupByText));
-			if (rows.length !== 100) throw new Error(`Expected 100 groups, got ${rows.length}`);
-		},
-		counters() { return snapshotStatement(db, SQL.groupByText); },
-	},
-	{
-		// `tkey` is unique per row, so dedup must compare all 10K values rather than
-		// collapsing into `group-by-text-10k`'s 100 low-cardinality groups.
-		name: 'distinct-text-10k',
-		async setup() { db = await createTextDb(); },
-		async teardown() { await db.close(); db = null; },
-		async fn() {
-			const rows = await collect(db.eval(SQL.distinctText));
-			if (rows.length !== 10000) throw new Error(`Expected 10000 distinct rows, got ${rows.length}`);
-		},
-		counters() { return snapshotStatement(db, SQL.distinctText); },
-	},
-	{
-		name: 'text-pk-range-scan-10k',
-		async setup() { db = await createTextPkDb(); },
-		async teardown() { await db.close(); db = null; },
-		async fn() {
-			const rows = await collect(db.eval(SQL.textPkRangeScan));
-			if (rows.length !== 1000) throw new Error(`Expected 1000 rows, got ${rows.length}`);
-		},
-		counters() { return snapshotStatement(db, SQL.textPkRangeScan); },
-	},
-	{
-		name: 'text-pk-point-seek-10k',
-		async setup() { db = await createTextPkDb(); },
-		async teardown() { await db.close(); db = null; },
-		async fn() {
-			const rows = await collect(db.eval(SQL.textPkPointSeek));
-			if (rows.length !== 1) throw new Error(`Expected 1 row, got ${rows.length}`);
-		},
-		counters() { return snapshotStatement(db, SQL.textPkPointSeek); },
-	},
-	{
-		name: 'join-1kx1k',
-		async setup() {
-			db = new Database();
-			await db.exec(`
-				create table left_t (id integer primary key, key_col integer);
-				create table right_t (id integer primary key, key_col integer, payload text);
-			`);
-			const leftVals = Array.from({ length: 1000 }, (_, i) =>
-				`(${i + 1}, ${i % 100})`
-			).join(', ');
-			const rightVals = Array.from({ length: 1000 }, (_, i) =>
-				`(${i + 1}, ${i % 100}, 'data_${i}')`
-			).join(', ');
-			await db.exec(`insert into left_t values ${leftVals}`);
-			await db.exec(`insert into right_t values ${rightVals}`);
-		},
-		async teardown() { await db.close(); db = null; },
-		async fn() {
-			const rows = await collect(db.eval(SQL.join));
-			if (rows.length === 0) throw new Error('Expected join results');
-		},
-		counters() { return snapshotStatement(db, SQL.join); },
-	},
-	{
-		name: 'correlated-subquery',
-		async setup() { db = await createPopulatedDb(); },
-		async teardown() { await db.close(); db = null; },
-		async fn() {
-			const rows = await collect(db.eval(SQL.correlatedSubquery));
-			if (rows.length !== 100) throw new Error(`Expected 100 rows, got ${rows.length}`);
-		},
-		// The counter that would catch `scalar-agg-decorrelation` breaking BEFORE the
-		// `ratioGuards` entry below does: an N+1 regression multiplies `queryCalls` and
-		// `rowsScanned` on `main.bench_t`, and unlike the ratio it needs no second
-		// benchmark and has no variance to tolerate.
-		counters() { return snapshotStatement(db, SQL.correlatedSubquery); },
-	},
-	{
-		// Hand-batched twin of `correlated-subquery`: the identical result via an
-		// explicit grouped join — the shape the optimizer should produce when
-		// `scalar-agg-decorrelation` fires. The `ratioGuards` entry below compares
-		// the two: when decorrelation works the plans are near-identical (ratio ≈
-		// 1); if it breaks, the declarative side goes N+1 and the ratio spikes.
-		name: 'hand-batched-peer-count',
-		async setup() { db = await createPopulatedDb(); },
-		async teardown() { await db.close(); db = null; },
-		async fn() {
-			const rows = await collect(db.eval(SQL.handBatchedPeerCount));
-			if (rows.length !== 100) throw new Error(`Expected 100 rows, got ${rows.length}`);
-		},
-		counters() { return snapshotStatement(db, SQL.handBatchedPeerCount); },
-	},
+	counters() { return snapshotStatement(db, JOIN_SQL); },
+};
+
+/**
+ * The exported work list, in run order. Three segments rather than one concatenation,
+ * so `join-1kx1k` keeps its position: expansion is workload-major within each segment,
+ * which is what puts a workload's readings on adjacent rows in the table.
+ */
+export const benchmarks = [
+	...expandBackends(BACKENDS, QUERY_WORKLOADS, bindQuery),
+	JOIN_BENCHMARK,
+	...expandBackends(BACKENDS, DECORRELATION_WORKLOADS, bindQuery),
 ];
 
 /**
@@ -416,6 +142,14 @@ export const benchmarks = [
  * If the twin ever shows high variance near the bound, raise
  * `CALIBRATION.targetTotalMs` in `bench/lib/calibrate.mjs` so both sides collect more
  * samples, rather than tightening `maxRatio`.
+ *
+ * GUARDS NAME ONE BENCHMARK EACH, AND THAT MEANS ONE BACKEND EACH. These bare names
+ * are the default backend's rows. A guard that wants to bound a suffixed benchmark
+ * spells the suffix out; guards are deliberately NOT expanded per backend, because a
+ * ratio that holds on the in-memory vtab need not hold on a persistent store, and a
+ * guard that silently multiplies itself across backends is a guard nobody trusts.
+ * Bounding `x@some-backend` against bare `x` is worse still — see
+ * docs/benchmarking.md § Ratio guards.
  */
 export const ratioGuards = [
 	{ name: 'correlated-subquery', baseline: 'hand-batched-peer-count', maxRatio: 10 },

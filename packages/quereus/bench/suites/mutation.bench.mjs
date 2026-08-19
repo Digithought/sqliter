@@ -1,4 +1,13 @@
 /**
+ * Write-path benchmarks: bulk insert, single-row insert, update and delete.
+ *
+ * This file is a BINDER, not a list of statements. The workloads themselves live in
+ * `bench/workloads/mutation.mjs`; `expandBackends` turns each of them into one
+ * benchmark per storage backend, and the two binders below supply the
+ * `setup`/`fn`/`teardown`/`counters` shape the worker expects. See
+ * `bench/lib/backends.mjs` for the naming rule — the default backend publishes the
+ * bare name, every other backend appends `@<id>`.
+ *
  * TIMING: no benchmark in this file sets `iterations` or `warmup`. The worker warms
  * `fn` up by elapsed duration and then measures the WARMED function to pick both —
  * see `CALIBRATION` in `bench/lib/calibrate.mjs` — so each benchmark gets roughly a
@@ -14,17 +23,14 @@
  *
  * Calibration BATCHES sub-millisecond benchmarks — several consecutive `fn` calls
  * timed as one sample — so every `fn` here must be repeatable back-to-back without
- * its `setup` in between. All of them are; a future one that is not (say, a
- * benchmark that grows a table on each call) must reset itself inside `fn` or pin
- * itself out of calibration.
+ * its `setup` in between. Three of the four get that by opening and closing their own
+ * database inside `fn` (the `own-database` lifecycle); `update-where-1k` gets it by
+ * reaching a fixed point.
  *
- * COUNTERS: three of these four benchmarks build their own `Database` INSIDE `fn`
- * rather than in `setup`, because the thing being timed is the mutation itself and a
- * table left behind by the previous call would change what the next one costs. Their
- * `counters()` therefore has no `setup` database to reuse and must build, populate and
- * close a database of its own — which is fine, since the pass runs exactly once and is
- * never timed. `update-where-1k` is the exception: it does have a `setup` database, so
- * its pass snapshots against that.
+ * COUNTERS: those same three own-database benchmarks have no `setup` database for
+ * their counters pass to reuse, so the binder opens one for it — which is fine, since
+ * the pass runs exactly once and is never timed. `update-where-1k` is the exception:
+ * it does have a `setup` database, so its pass snapshots against that.
  *
  * NOTE: those three own-database passes each populate a full 10K-row table, and together
  * they are ~340 ms of the ~830 ms the whole suite's counters passes add to a run (27
@@ -35,168 +41,111 @@
  * they only need to be the same every run.
  */
 
-import { Database } from '../../dist/src/index.js';
-import { snapshotStatement, snapshotStatements } from '../lib/counters.mjs';
+import { BACKENDS, defaultBackend, expandBackends } from '../lib/backends.mjs';
+import { snapshotStatement } from '../lib/counters.mjs';
+import { INSERT_WORKLOADS, SINGLE_ROWS, SINGLE_SCHEMA, UPDATE_DELETE_WORKLOADS, singleRowInsert } from '../workloads/mutation.mjs';
 
-let db;
-
-/** Rows per `insert ... values` batch, shared by every bulk-populating benchmark here. */
-const BATCH_ROWS = 500;
-/** Batches per benchmark — 20 × 500 = the 10K rows the names advertise. */
-const BATCH_COUNT = 20;
-
-const BULK_SCHEMA = 'create table bulk_t (id integer primary key, val integer, label text)';
-const SINGLE_SCHEMA = 'create table single_t (id integer primary key, val integer)';
-const UPD_SCHEMA = 'create table upd_t (id integer primary key, val integer, label text)';
-const DEL_SCHEMA = 'create table del_t (id integer primary key, val integer)';
-
-const UPD_APPLY = "update upd_t set label = 'updated' where val < 10";
-const UPD_REVERSE = "update upd_t set label = 'reset' where val < 10";
-const DEL_STATEMENT = 'delete from del_t where val = 42';
-
-/** Rows inserted one statement at a time by `single-row-insert-1k`. */
-const SINGLE_ROWS = 1000;
+/** The backend handle a `shared-fixture` benchmark holds between `setup` and
+ * `teardown`, or null. One module-level slot is enough: the worker runs exactly ONE
+ * benchmark per process. `own-database` benchmarks never touch it — their handle lives
+ * and dies inside a single `fn` call. */
+let handle = null;
 
 /**
- * One batch's `insert` statement, built the same way for `fn` and for `counters()`.
+ * Open a fresh database, hand it to `body`, and close it however `body` ends.
  *
- * Named once and used twice on purpose: a batch shape edited in `fn` alone would leave
- * the counters pass reporting counts for a statement the benchmark no longer runs, and
- * those counts would look perfectly stable while describing the wrong work.
+ * The open and the close are INSIDE whatever this wraps, which for an `own-database`
+ * benchmark means inside the timing — deliberately, because the cost of standing a
+ * database up and tearing it down is part of what those benchmarks measure, and was
+ * before backends existed too.
  *
- * @param {string} table
- * @param {number} batch zero-based batch index
- * @param {(id: number) => string} row renders one row's `(...)` tuple
+ * @param {import('../lib/backends.mjs').BenchBackend} backend
+ * @param {(db: import('../../dist/src/index.js').Database) => Promise<unknown>} body
  */
-function batchInsert(table, batch, row) {
-	const values = Array.from({ length: BATCH_ROWS }, (_, j) => row(batch * BATCH_ROWS + j + 1)).join(', ');
-	return `insert into ${table} values ${values}`;
+async function withFreshDatabase(backend, body) {
+	const fresh = await backend.open();
+	try {
+		return await body(fresh.db);
+	} finally {
+		await fresh.close();
+	}
 }
 
-const bulkRow = (id) => `(${id}, ${id * 3}, 'label_${id % 50}')`;
-const updRow = (id) => `(${id}, ${id % 100}, 'label_${id % 50}')`;
-const delRow = (id) => `(${id}, ${id % 100})`;
-const singleRowInsert = (id) => `insert into single_t values (${id}, ${id * 2})`;
-
-export const benchmarks = [
-	{
-		name: 'bulk-insert-10k',
-		async fn() {
-			const d = new Database();
-			await d.exec(BULK_SCHEMA);
-			for (let batch = 0; batch < BATCH_COUNT; batch++) {
-				await d.exec(batchInsert('bulk_t', batch, bulkRow));
-			}
-			await d.close();
-		},
-		// TWO snapshots, not one. The first batch inserts into an empty table; the last
-		// inserts into a table already holding 9,500 rows. Any per-insert work that grows
-		// with table size — index maintenance, key-uniqueness probes — is invisible in a
-		// first-batch-only snapshot, and that growth is exactly the regression class this
-		// benchmark exists to notice. They are separate named entries rather than a sum
-		// because instruction keys are addresses within ONE program: `r#0` of the first
-		// insert and `r#0` of the last are different instructions that happen to share a key.
-		//
-		// As of this writing the two snapshots come out IDENTICAL (6 instruction executions,
-		// 500 `updateCalls`, 0 `rowsScanned` each) — insert work does not grow with table
-		// size at the granularity these counters record. That equality is the point of
-		// keeping both: it is now asserted on every run, so a change that starts scanning or
-		// re-probing on insert moves `lastBatch` away from `firstBatch` and the counter diff
-		// prints it. A first-batch-only snapshot could not say that.
-		async counters() {
-			const d = new Database();
-			try {
-				await d.exec(BULK_SCHEMA);
-				const firstBatch = await snapshotStatement(d, batchInsert('bulk_t', 0, bulkRow));
-				for (let batch = 1; batch < BATCH_COUNT - 1; batch++) {
-					await d.exec(batchInsert('bulk_t', batch, bulkRow));
-				}
-				const lastBatch = await snapshotStatement(d, batchInsert('bulk_t', BATCH_COUNT - 1, bulkRow));
-				return { firstBatch, lastBatch };
-			} finally {
-				await d.close();
-			}
-		},
-	},
-	{
-		name: 'single-row-insert-1k',
-		async fn() {
-			const d = new Database();
-			await d.exec(SINGLE_SCHEMA);
-			for (let i = 1; i <= SINGLE_ROWS; i++) {
-				await d.exec(singleRowInsert(i));
-			}
-			await d.close();
-		},
-		// First and last row, for the same reason `bulk-insert-10k` snapshots first and
-		// last batch: row 1,000 lands in a table 999 rows deep and row 1 does not. They too
-		// currently come out identical (1 `updateCall`, 0 `rowsScanned` each); holding both
-		// is what turns "insert cost does not depend on table depth" into a checked claim.
-		async counters() {
-			const d = new Database();
-			try {
-				await d.exec(SINGLE_SCHEMA);
-				const firstRow = await snapshotStatement(d, singleRowInsert(1));
-				for (let i = 2; i < SINGLE_ROWS; i++) {
-					await d.exec(singleRowInsert(i));
-				}
-				const lastRow = await snapshotStatement(d, singleRowInsert(SINGLE_ROWS));
-				return { firstRow, lastRow };
-			} finally {
-				await d.close();
-			}
-		},
-	},
-	{
-		name: 'update-where-1k',
+/**
+ * Bind one `MutationWorkload` to one backend.
+ *
+ * The two lifecycles differ only in who owns the database: `own-database` builds and
+ * drops one per call because a table left behind would change what the next call
+ * costs, and `shared-fixture` populates once in `setup` because its `run` reaches a
+ * fixed point and cannot drift.
+ *
+ * @param {import('../workloads/mutation.mjs').MutationWorkload} workload
+ * @param {import('../lib/backends.mjs').BenchBackend} backend
+ */
+function bindMutation(workload, backend) {
+	if (workload.lifecycle === 'own-database') {
+		return {
+			fn() { return withFreshDatabase(backend, (db) => workload.run(db)); },
+			counters() { return withFreshDatabase(backend, (db) => workload.counters(db)); },
+		};
+	}
+	return {
 		async setup() {
-			db = new Database();
-			await db.exec(UPD_SCHEMA);
-			for (let batch = 0; batch < BATCH_COUNT; batch++) {
-				await db.exec(batchInsert('upd_t', batch, updRow));
+			handle = await backend.open();
+			await workload.populate(handle.db);
+		},
+		async teardown() { await handle.close(); handle = null; },
+		fn() { return workload.run(handle.db); },
+		counters() { return workload.counters(handle.db); },
+	};
+}
+
+/**
+ * Written by hand rather than expanded, because it does not fit the shape the other
+ * three share: it issues a thousand separate `insert` statements rather than a
+ * procedure over batched ones, and its counters pass has to walk to row 1,000 to
+ * snapshot the last of them.
+ *
+ * It therefore runs on the default backend only. When a second backend lands and this
+ * shape is worth measuring on it — for a persistent store it is arguably the most
+ * interesting write shape there is, since it prices per-statement commit — give it a
+ * binder of its own rather than widening `MutationWorkload`.
+ */
+const SINGLE_ROW_INSERT_BENCHMARK = {
+	name: 'single-row-insert-1k',
+	fn() {
+		return withFreshDatabase(defaultBackend(BACKENDS), async (db) => {
+			await db.exec(SINGLE_SCHEMA);
+			for (let i = 1; i <= SINGLE_ROWS; i++) {
+				await db.exec(singleRowInsert(i));
 			}
-		},
-		async teardown() { await db.close(); db = null; },
-		async fn() {
-			await db.exec(UPD_APPLY);
-			await db.exec(UPD_REVERSE);
-		},
-		// The `setup` database is reusable here because `fn` reaches a FIXED POINT after its
-		// first call — that call rewrites `label` from `label_N` to `reset` for the val < 10
-		// rows, and every call after it rewrites `reset` to `reset`. (`fn` is not literally
-		// its own inverse: it does not restore `setup`'s labels.) What matters is that the
-		// table `counters()` sees is the same one no matter how many iterations calibration
-		// chose, and the predicate `val < 10` selects the same 1,000 rows throughout since
-		// `fn` never touches `val`. Two named snapshots rather than one bag of summed
-		// instructions, for the reason spelled out on `bulk-insert-10k`.
-		counters() {
-			return snapshotStatements(db, { apply: UPD_APPLY, reverse: UPD_REVERSE });
-		},
+		});
 	},
-	{
-		name: 'delete-where-100',
-		async fn() {
-			const d = new Database();
-			await d.exec(DEL_SCHEMA);
-			for (let batch = 0; batch < BATCH_COUNT; batch++) {
-				await d.exec(batchInsert('del_t', batch, delRow));
+	// First and last row, for the same reason `bulk-insert-10k` snapshots first and
+	// last batch: row 1,000 lands in a table 999 rows deep and row 1 does not. They too
+	// currently come out identical (1 `updateCall`, 0 `rowsScanned` each); holding both
+	// is what turns "insert cost does not depend on table depth" into a checked claim.
+	counters() {
+		return withFreshDatabase(defaultBackend(BACKENDS), async (db) => {
+			await db.exec(SINGLE_SCHEMA);
+			const firstRow = await snapshotStatement(db, singleRowInsert(1));
+			for (let i = 2; i < SINGLE_ROWS; i++) {
+				await db.exec(singleRowInsert(i));
 			}
-			await d.exec(DEL_STATEMENT);
-			await d.close();
-		},
-		// Only the delete is snapshotted; the populate is this benchmark's fixture, not its
-		// subject, and `bulk-insert-10k` already counts inserts.
-		async counters() {
-			const d = new Database();
-			try {
-				await d.exec(DEL_SCHEMA);
-				for (let batch = 0; batch < BATCH_COUNT; batch++) {
-					await d.exec(batchInsert('del_t', batch, delRow));
-				}
-				return await snapshotStatement(d, DEL_STATEMENT);
-			} finally {
-				await d.close();
-			}
-		},
+			const lastRow = await snapshotStatement(db, singleRowInsert(SINGLE_ROWS));
+			return { firstRow, lastRow };
+		});
 	},
+};
+
+/**
+ * The exported work list, in run order. Three segments rather than one concatenation,
+ * so `single-row-insert-1k` keeps its position between the inserts and the
+ * update/delete pair: expansion is workload-major within each segment, which is what
+ * puts a workload's readings on adjacent rows in the table.
+ */
+export const benchmarks = [
+	...expandBackends(BACKENDS, INSERT_WORKLOADS, bindMutation),
+	SINGLE_ROW_INSERT_BENCHMARK,
+	...expandBackends(BACKENDS, UPDATE_DELETE_WORKLOADS, bindMutation),
 ];

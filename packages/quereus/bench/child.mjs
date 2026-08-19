@@ -15,6 +15,12 @@
  * timed loop, because metrics wrap every streaming operator in a counting generator
  * and would corrupt the timing this worker exists to produce.
  *
+ * It may also declare an optional `skip()`. That runs FIRST, in its own phase, before
+ * `setup`: a truthy return sends `{ type: 'skipped', reason }` and exits 0 without
+ * running anything else. It is evaluated here rather than in the parent because the
+ * reason a benchmark declines is usually a runtime fact — a module that will not load,
+ * a missing binary — and the parent imports suites for their metadata only.
+ *
  * How long to run is NOT hand-written per benchmark. Each worker warms up by
  * duration, then measures the warmed `fn` to pick an inner batch size and a sample
  * count, so a 5 µs parser call and a 190 ms bulk insert both get roughly a second of
@@ -80,6 +86,15 @@ async function fail(phase, err) {
 	process.exit(1);
 }
 
+/** Hand the channel back and exit 0, the one orderly finish both the result path and
+ * the skip path take. `finished` first, so the `disconnect` handler above can tell this
+ * from the parent vanishing. */
+function finishCleanly() {
+	finished = true;
+	if (process.disconnect) process.disconnect();
+	setTimeout(() => process.exit(0), LINGER_GRACE_MS).unref();
+}
+
 /**
  * Run a benchmark's `counters()` and return a JSON-safe copy of what it produced.
  *
@@ -119,6 +134,26 @@ async function main() {
 	if (!bench) {
 		await fail('select', new Error(`benchmark '${benchName}' not found in suite '${suiteFile}'`));
 		return;
+	}
+
+	// BEFORE `setup`, and in its own phase. A benchmark that cannot run here — an
+	// unavailable backend, a missing binary — must be able to say so without building a
+	// fixture first, and a `skip()` that throws must be reported as a failure in phase
+	// `skip` rather than swallowed into a silent run. Nothing has been constructed yet,
+	// so there is deliberately no `teardown` on this path.
+	if (bench.skip) {
+		let reason;
+		try {
+			reason = await bench.skip();
+		} catch (err) {
+			await fail('skip', err);
+			return;
+		}
+		if (reason) {
+			await send({ type: 'skipped', reason: String(reason) });
+			finishCleanly();
+			return;
+		}
 	}
 
 	// An explicit `iterations` or `warmup` opts the benchmark out of calibration
@@ -182,9 +217,7 @@ async function main() {
 		return;
 	}
 
-	finished = true;
-	if (process.disconnect) process.disconnect();
-	setTimeout(() => process.exit(0), LINGER_GRACE_MS).unref();
+	finishCleanly();
 }
 
 main().catch(async (err) => {

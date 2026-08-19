@@ -355,6 +355,49 @@ describe('bench/lib/compare.mjs', () => {
 			});
 		});
 
+		describe('a benchmark that declined to run', () => {
+			/** A row as `runSelected` hands it over when the worker's `skip()` returned a reason. */
+			const skippedRow = (fullName: string, reason = 'store backend unavailable') =>
+				({ fullName, result: null, failure: null, skipped: { reason } });
+
+			it('reports skipped, not missing, against a baseline that has the benchmark', () => {
+				const comparison = compareRun([skippedRow('a/x')], { 'a/x': entry(10) });
+				const verdict = verdictFor(comparison, 'a/x');
+				expect(verdict.status).to.equal('skipped');
+				expect(verdict.note).to.equal('store backend unavailable');
+				// The whole point: a skip is not a deletion, so the baseline entry must not
+				// also produce a `missing` row for the same name.
+				expect(comparison.comparisons).to.have.length(1);
+				expect(comparison.counts.missing).to.equal(0);
+				expect(comparison.counts.skipped).to.equal(1);
+			});
+
+			it('reports skipped, not failed, and never gates', () => {
+				const comparison = compareRun([skippedRow('a/x')], { 'a/x': entry(10) });
+				expect(comparison.counts.failed).to.equal(0);
+				expect(comparison.regressions).to.equal(0);
+				expect(verdictFor(comparison, 'a/x').gated).to.equal(false);
+			});
+
+			it('reports no delta, since it produced no number to subtract', () => {
+				const verdict = verdictFor(compareRun([skippedRow('a/x')], { 'a/x': entry(10) }), 'a/x');
+				expect(verdict.delta_pct).to.equal(null);
+				expect(verdict.noise_floor_pct).to.equal(null);
+			});
+
+			it('carries the counter status none, never dropped, against a baseline that had counters', () => {
+				// `counters()` never runs on a skipped benchmark, so its block is absent — but
+				// that is "not comparable", exactly like a failed or filtered row, and NOT the
+				// deliberate removal `dropped` claims.
+				const verdict = verdictFor(compareRun([skippedRow('a/x')], { 'a/x': entryWithCounters(10, counterBlock()) }), 'a/x');
+				expect(verdict.counters).to.deep.equal({ status: 'none', changes: [] });
+			});
+
+			it('is a status of its own in STATUS_ORDER, so the summary counts it', () => {
+				expect(STATUS_ORDER).to.include('skipped');
+			});
+		});
+
 		describe('the summary', () => {
 			const comparison = compareRun(
 				[row('a/same', 10), row('a/regressed', 13), row('a/improved', 7), row('a/noisy', 13, 40, false), row('a/fresh', 4), failedRow('a/broken')],
@@ -371,7 +414,7 @@ describe('bench/lib/compare.mjs', () => {
 				expect(Object.keys(comparison.counts)).to.deep.equal(STATUS_ORDER);
 				expect(comparison.counts).to.deep.equal({
 					'no-change': 1, changed: 0, improvement: 1, regression: 1,
-					unstable: 1, new: 1, missing: 1, filtered: 0, failed: 1,
+					unstable: 1, new: 1, skipped: 0, missing: 1, filtered: 0, failed: 1,
 				});
 			});
 

@@ -26,6 +26,38 @@ down or gets its time target cut until the numbers stop meaning anything.
 | `execution` | 15 | Whole queries over a 10 000-row table: full scan, indexed filter, group by, order by, distinct, joins, a correlated subquery and its hand-written equivalent. Seven of the fifteen are text-comparison shapes (`order by` text, unicode text, 40-character shared prefixes, text primary keys) because the `BINARY` collation comparator is the engine's hottest code. |
 | `mutation` | 4 | Writes: a 10 000-row bulk insert, 1 000 single-row inserts, an update and a delete over a `where` clause. |
 
+### Storage backends, and what a name means
+
+The `execution` and `mutation` suites do not hold queries; they hold *workloads* (in
+`bench/workloads/`) and bind each of them to every **backend** — a storage engine the
+same workload can be measured against. A workload plus a backend is one benchmark, and
+the backend appears in the name:
+
+```
+execution/full-scan-10k            the engine's default vtab module
+execution/full-scan-10k@store-mem  the same query, some other module
+```
+
+**The default backend contributes the bare name.** That rule is what keeps every
+benchmark name, every results file already on disk and every `ratioGuards` entry meaning
+exactly what it meant before backends existed. A name carrying `@` is a claim that the
+row ran on something *other* than the engine's default module; a bare name is the
+default.
+
+There is only one backend today (`memory`, the in-process vtab module), so today every
+name is bare. The descriptors and the expansion live in `bench/lib/backends.mjs`.
+
+There is deliberately **no `--backend` flag**. `--filter` is a plain substring match, so
+`--filter @store-mem` already selects one backend across every workload and `--filter
+full-scan-10k` already selects one workload across every backend. Expansion is
+workload-major, so a workload's readings land on adjacent rows in the table.
+
+Two entries — `execution/join-1kx1k` and `mutation/single-row-insert-1k` — are written
+by hand in their suite files rather than expanded, because they do not fit their suite's
+workload shape (the first builds two tables; the second issues a thousand separate
+statements). They run on the default backend only. A workload type that could express
+them too would document nothing.
+
 ## Running it
 
 | Command | What it does |
@@ -207,6 +239,37 @@ pushed the lines a reader had to act on off the top of the screen.
 - **failed** — the benchmark threw, hung or died this run. Its row reads `FAILED` and the
   run exits non-zero.
 - **unstable** — measured, but too noisy in one run or the other to gate on.
+- **skipped** — the benchmark declined to run (see below). Distinct from *missing*: it is
+  still in the suite, so its baseline entry is not reported as a deletion. It does not
+  affect the exit code.
+
+### A benchmark that declines to run: `skip()`
+
+A benchmark may declare a `skip()` alongside `fn`. It returns a **reason** to decline, or
+`null` to run:
+
+```js
+{
+	name: 'full-scan-10k@store-mem',
+	async skip() { return (await storeAvailable()) ? null : 'store module is not installed'; },
+	// setup / fn / teardown / counters as usual
+}
+```
+
+It is evaluated in the **worker**, before `setup`, in its own phase — because the reason a
+benchmark declines is usually a runtime fact (a module that will not load, a missing
+binary, an environment variable), and the parent imports suites for their metadata only. A
+`skip()` that *throws* is a benchmark failure in phase `skip`, not a silent run.
+
+A skipped benchmark **keeps its row**, printed as `skipped — <reason>`, and is recorded in
+the results JSON under a top-level `skipped` array of `{name, reason}`. It is in neither
+`benchmarks` (it produced no numbers) nor `failures` (it did not fail). Being in none of
+the three is the one thing it must not be: an absent benchmark reads as *unchanged* to
+anyone diffing two runs, which is exactly the wrong claim.
+
+`counters()` never runs on a skipped benchmark, so its counter verdict is `none` — "not
+comparable", the same claim a failed or filtered row makes — and never `dropped`, which
+would say the benchmark deliberately stopped reporting counts.
 
 ## Work counters: exact-count comparison
 
@@ -307,7 +370,21 @@ has.
 
 A guard naming a benchmark that was not selected is reported as *skipped* when `--filter` is
 active (narrowing a run should not make every guard fire) and as a *misconfiguration* — a
-failure — when it is not.
+failure — when it is not. A guard naming a benchmark that failed, or one whose `skip()`
+declined to run it, is reported as *not evaluated* and never as a misconfiguration: neither
+is a guard naming something that does not exist, and failing the run over a skip would make
+every skip a red build.
+
+**Guards name one benchmark each, and that means one backend each.** A bare name in a
+`ratioGuards` entry is the default backend's row. Guards are deliberately **not** expanded
+across backends: a ratio that holds on the in-memory vtab need not hold on a persistent
+store, and a guard that silently multiplies itself across backends is a guard nobody
+trusts. A guard that wants to bound a suffixed benchmark spells the suffix out.
+
+**Do not write a cross-backend guard.** Bounding `x@some-backend` against bare `x` prices a
+storage engine against an in-process array; the number it would encode is this machine's
+ratio between two unrelated things, not a property of either engine. There is no portable
+value for `maxRatio` there, so there is no guard to write.
 
 ## Exit-code contract
 
@@ -327,7 +404,7 @@ Under `--json`, stdout carries the result object and nothing else — the human 
 progress lines, the environment banner and the guard verdicts all move to stderr, and ANSI
 colour is suppressed. The object is exactly what is written to `bench/results/`, so a
 consumer never has to care which of the two it is reading. It includes `environment`,
-`benchmarks`, `failures`, `ratio_guards`, `baseline` and `comparison`.
+`benchmarks`, `failures`, `skipped`, `ratio_guards`, `baseline` and `comparison`.
 
 ```
 node bench/run.mjs --json 2>/dev/null | node -e "let s='';process.stdin.on('data',c=>s+=c).on('end',()=>console.log(Object.keys(JSON.parse(s))))"
@@ -338,7 +415,8 @@ captured log stays readable.
 
 ## Adding a benchmark
 
-Add an entry to the relevant `bench/suites/*.bench.mjs`:
+`parser` and `planner` still hold benchmark objects directly; add an entry to the relevant
+`bench/suites/*.bench.mjs`:
 
 ```js
 {
@@ -351,6 +429,28 @@ Add an entry to the relevant `bench/suites/*.bench.mjs`:
 	},
 }
 ```
+
+For `execution` and `mutation`, add a **workload** instead — the suite file binds it to
+every backend for you. An `execution` workload is plain data:
+
+```js
+// bench/workloads/execution.mjs, in QUERY_WORKLOADS
+{
+	name: 'my-shape-10k',
+	fixture: 'populated',            // a key of FIXTURES, which populates a db it is handed
+	sql: 'select ... from bench_t',  // the ONE statement fn times and counters() snapshots
+	expectedRows: 10000,             // asserted by fn
+}
+```
+
+A `mutation` workload is a small bundle of functions over a `db`, because its timed body
+is a procedure rather than a statement. It declares a `lifecycle`: `own-database` when the
+timed body is a database's whole life (the binder opens a fresh one per call, since a
+table left behind changes what the next call costs), or `shared-fixture` when `populate`
+can run once in `setup` because `run` reaches a fixed point.
+
+A fixture never constructs a `Database` — it populates one it is handed. That is what lets
+the same definition run on a different storage engine.
 
 Requirements:
 
@@ -386,5 +486,13 @@ Requirements:
 | `bench/lib/counters.mjs` | Helpers a benchmark's `counters()` pass uses: `snapshotStatement`, `snapshotStatements`, `snapshotPlanShape`. |
 | `bench/lib/environment.mjs` | Environment capture and the material-difference check. |
 | `bench/lib/discover.mjs` | Suite enumeration and the one definition of what `--filter` matches (`matchesFilter`), shared by the parent, the worker and the comparison. |
+| `bench/lib/backends.mjs` | The storage-engine dimension: the `BenchBackend` descriptor, the `BACKENDS` set, and `expandBackends` — one workload × N backends → N benchmarks, named by the bare-name rule. |
+| `bench/workloads/*.mjs` | What the `execution` and `mutation` suites measure, as data plus fixtures. The suite files are binders over these. |
+
+Harness tests, none of which run a benchmark: `test/bench-calibration.spec.ts` (the timing
+policy and the statistics), `test/bench-comparison.spec.ts` (the cross-run rules and the
+environment check), `test/bench-discovery.spec.ts` (the backend expansion and the naming
+rule). `yarn bench` is not part of `yarn test`, so these are the only automated check on
+the harness itself.
 
 See also [Architecture § Benchmark Suite](architecture.md#testing-strategy).

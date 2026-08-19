@@ -24,6 +24,17 @@ const benchDir = fileURLToPath(new URL('..', import.meta.url));
  *   ONCE, untimed, after timing and before `teardown`, with runtime metrics on. Returns a
  *   plain JSON object of machine-independent work counts — see `lib/counters.mjs`. Absent
  *   means this benchmark reports no counters, which is a different claim from zero counts.
+ * @property {() => string | null | Promise<string|null>} [skip] a reason to skip, or
+ *   `null` to run. Evaluated in the WORKER, before `setup`, in its own phase; when it
+ *   returns a reason, none of `setup`/`fn`/`counters`/`teardown` runs and the benchmark
+ *   KEEPS ITS ROW, printed as `skipped — <reason>`.
+ *
+ *   It runs in the worker rather than the parent because the reason a benchmark skips is
+ *   usually a runtime fact — a backend module that will not load, an environment
+ *   variable, a missing native binary — and the parent deliberately imports suites for
+ *   their metadata only. A skip is neither a failure (it does not affect the exit code)
+ *   nor an absence (an absent benchmark reads as UNCHANGED to anyone diffing two runs),
+ *   which is exactly why it is a third answer rather than either of those.
  * @property {number} [iterations] pins the benchmark out of calibration — see `lib/calibrate.mjs`
  * @property {number} [warmup] pins the benchmark out of calibration — see `lib/calibrate.mjs`
  *
@@ -86,6 +97,12 @@ export async function loadSuite(file) {
 		// "no counters pass" rather than as the typo it is.
 		if (bench.counters !== undefined && typeof bench.counters !== 'function') {
 			throw new Error(`suite '${file}' benchmark '${bench.name}' has a 'counters' that is not a function (got ${typeof bench.counters})`);
+		}
+		// Same reason as `counters`, and a worse failure mode: a truthy non-callable `skip`
+		// would be ignored exactly like a benchmark that never declared one, so a benchmark
+		// meant to decline would silently run and fail instead.
+		if (bench.skip !== undefined && typeof bench.skip !== 'function') {
+			throw new Error(`suite '${file}' benchmark '${bench.name}' has a 'skip' that is not a function (got ${typeof bench.skip})`);
 		}
 		if (seen.has(bench.name)) {
 			throw new Error(`suite '${file}' declares benchmark '${bench.name}' more than once`);

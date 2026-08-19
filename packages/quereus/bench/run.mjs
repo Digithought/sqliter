@@ -176,7 +176,7 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
  * to the HUMAN stream, never to stdout directly: under `--json` a chatty benchmark
  * would otherwise corrupt the result object.
  *
- * @returns {Promise<{ result: object|null, failure: object|null, code: number|null, signal: string|null, timedOut: boolean, stderr: string }>}
+ * @returns {Promise<{ result: object|null, failure: object|null, skipped: object|null, code: number|null, signal: string|null, timedOut: boolean, stderr: string }>}
  */
 function forkBenchmark(suiteFile, benchName, collectCounters) {
 	return new Promise((resolve) => {
@@ -188,6 +188,7 @@ function forkBenchmark(suiteFile, benchName, collectCounters) {
 
 		let result = null;
 		let failure = null;
+		let skipped = null;
 		let timedOut = false;
 		let settled = false;
 		const stderrChunks = [];
@@ -201,6 +202,7 @@ function forkBenchmark(suiteFile, benchName, collectCounters) {
 		child.on('message', (msg) => {
 			if (msg?.type === 'result') result = msg;
 			else if (msg?.type === 'failure') failure = msg;
+			else if (msg?.type === 'skipped') skipped = msg;
 		});
 
 		const settle = (code, signal) => {
@@ -210,7 +212,7 @@ function forkBenchmark(suiteFile, benchName, collectCounters) {
 			clearTimeout(timer);
 			clearTimeout(reapTimer);
 			const stderr = Buffer.concat(stderrChunks).toString('utf8');
-			resolve({ result, failure, code, signal, timedOut, stderr });
+			resolve({ result, failure, skipped, code, signal, timedOut, stderr });
 		};
 
 		let reapTimer = null;
@@ -247,6 +249,11 @@ function classify(fullName, outcome) {
 				stderr: tail(outcome.stderr),
 			},
 		};
+	}
+	// Before the failure and empty-result checks: a skipped benchmark exits 0 having
+	// sent no result on purpose, and would otherwise be classified as a dead child.
+	if (outcome.skipped) {
+		return { skipped: { reason: String(outcome.skipped.reason ?? 'no reason given') } };
 	}
 	if (outcome.failure) {
 		const err = outcome.failure.error ?? {};
@@ -325,6 +332,13 @@ function printTable(rows, verdicts) {
 	say('─'.repeat(header.length));
 
 	for (const row of rows) {
+		// A skipped benchmark keeps its row too, and for the same reason a failed one
+		// does — but in yellow rather than red, because a skip is a deliberate decline
+		// and does not fail the run.
+		if (row.skipped) {
+			say(`${row.fullName.padEnd(nameWidth)}  ${yellow(`skipped — ${row.skipped.reason}`)}`);
+			continue;
+		}
 		// A failed benchmark keeps its row: a missing row reads as "unchanged" to
 		// anyone diffing two runs.
 		if (!row.result) {
@@ -494,15 +508,30 @@ function fmtFloor(verdict) {
  * Returns records rather than printing them, so the same verdicts can be written into
  * the results JSON a gate script reads.
  *
+ * A guard naming a benchmark that SKIPPED is `not-evaluated` for the same reason, and
+ * deliberately never `misconfigured`: a skip is a benchmark declining to run on this
+ * machine, not a guard naming something that does not exist, and failing the run over
+ * one would turn every skip into a red build.
+ *
+ * @param {Map<string, string>} skippedNames full name -> the reason it skipped
  * @returns {{ target: string, baseline: string, status: string, ratio: number|null, maxRatio: number, detail: string }[]}
  */
-function checkRatioGuards(suites, allBenchmarks, selectedNames, filterActive) {
+function checkRatioGuards(suites, allBenchmarks, selectedNames, filterActive, skippedNames = new Map()) {
 	const verdicts = [];
 	for (const suite of suites) {
 		for (const guard of suite.ratioGuards ?? []) {
 			const targetName = `${suite.name}/${guard.name}`;
 			const baseName = `${suite.name}/${guard.baseline}`;
 			const record = { target: targetName, baseline: baseName, ratio: null, maxRatio: guard.maxRatio };
+
+			// Checked before the unselected case: a skipped benchmark IS selected, so it
+			// would otherwise fall through to the ratio computation and be reported as a
+			// failure to run.
+			const declined = [targetName, baseName].filter((n) => skippedNames.has(n));
+			if (declined.length > 0) {
+				verdicts.push({ ...record, status: 'not-evaluated', detail: `'${declined[0]}' skipped — ${skippedNames.get(declined[0])}` });
+				continue;
+			}
 
 			const unselected = [targetName, baseName].filter((n) => !selectedNames.has(n));
 			if (unselected.length > 0) {
@@ -615,6 +644,7 @@ function printComparisonSummary(comparisons, counts) {
 		regression: 'REGRESSED',
 		unstable: 'unstable (not gated)',
 		new: 'new',
+		skipped: 'skipped',
 		missing: 'missing from this run',
 		filtered: 'not selected by --filter',
 		failed: 'failed',
@@ -625,7 +655,7 @@ function printComparisonSummary(comparisons, counts) {
 	// The non-delta outcomes are named individually: a count alone tells a reader that
 	// something was excluded without telling them what, which is not actionable. Each of
 	// these three carries a DIFFERENT reason per benchmark, so each earns its own line.
-	for (const status of ['unstable', 'new', 'missing']) {
+	for (const status of ['unstable', 'new', 'skipped', 'missing']) {
 		for (const comparison of comparisons.filter((c) => c.status === status)) {
 			say(`  ${status.padEnd(9)} ${comparison.fullName} — ${comparison.note}`);
 		}
@@ -699,6 +729,9 @@ async function runSelected(selected, collectCounters) {
 	const allBenchmarks = {};
 	const rows = [];
 	const failures = [];
+	/** Benchmarks that declined to run, as `{name, reason}`. Kept apart from both
+	 * `allBenchmarks` (they have no numbers) and `failures` (they did not fail). */
+	const skipped = [];
 	const runStart = performance.now();
 	let currentSuite = null;
 
@@ -715,7 +748,11 @@ async function runSelected(selected, collectCounters) {
 
 		// The result line is printed only after the child exits, so a benchmark that
 		// logs cannot interleave into the middle of it.
-		if (classified.result) {
+		if (classified.skipped) {
+			skipped.push({ name: bench.fullName, reason: classified.skipped.reason });
+			rows.push({ fullName: bench.fullName, result: null, failure: null, skipped: classified.skipped });
+			say(`  ${bench.name}... ${yellow('skipped')} — ${classified.skipped.reason}`);
+		} else if (classified.result) {
 			allBenchmarks[bench.fullName] = classified.result;
 			rows.push({ fullName: bench.fullName, result: classified.result, failure: null });
 			const r = classified.result;
@@ -728,7 +765,7 @@ async function runSelected(selected, collectCounters) {
 		}
 	}
 
-	return { allBenchmarks, rows, failures, wallClockMs: performance.now() - runStart };
+	return { allBenchmarks, rows, failures, skipped, wallClockMs: performance.now() - runStart };
 }
 
 // ── Results file ────────────────────────────────────────────────────────
@@ -749,7 +786,7 @@ async function runSelected(selected, collectCounters) {
  * suite often accumulates a file per run. Harmless at the current sizes (a few KB
  * each); add a retention sweep if it ever becomes a nuisance.
  */
-function buildOutput({ environment, allBenchmarks, failures, wallClockMs, baselinePath, comparison, ratioGuards, collectCounters }) {
+function buildOutput({ environment, allBenchmarks, failures, skipped, wallClockMs, baselinePath, comparison, ratioGuards, collectCounters }) {
 	return {
 		timestamp: new Date().toISOString(),
 		// Lifted out of `environment` rather than captured a second time: these two are
@@ -767,6 +804,11 @@ function buildOutput({ environment, allBenchmarks, failures, wallClockMs, baseli
 		// Failures are recorded separately rather than as zero-valued benchmark
 		// entries, so a failed run can never be mistaken for a fast one.
 		failures: failures.map((f) => ({ name: f.fullName, kind: f.kind, detail: f.detail })),
+		// Its own top-level array, deliberately in neither of the two above: a skipped
+		// benchmark has no numbers to put under `benchmarks`, and it did not fail. Absent
+		// from all three is the one thing it must not be — that reads as UNCHANGED to
+		// anyone diffing two runs.
+		skipped,
 		ratio_guards: ratioGuards,
 		baseline: baselinePath,
 		comparison,
@@ -826,7 +868,7 @@ async function main() {
 	const suites = await loadSuites();
 	const selected = selectFor(suites, filter);
 
-	const { allBenchmarks, rows, failures, wallClockMs } = await runSelected(selected, collectCounters);
+	const { allBenchmarks, rows, failures, skipped, wallClockMs } = await runSelected(selected, collectCounters);
 
 	const comparison = baseline ? compareRun(rows, baseline.benchmarks, filter, { counters: collectCounters }) : null;
 	if (comparison) {
@@ -848,9 +890,10 @@ async function main() {
 	// a single run of a query that is 26× slower than its hand-written twin
 	// otherwise prints a fine-looking number and passes.
 	const selectedNames = new Set(selected.map((b) => b.fullName));
-	const ratioGuards = checkRatioGuards(suites, allBenchmarks, selectedNames, Boolean(filter));
+	const skippedNames = new Map(skipped.map((s) => [s.name, s.reason]));
+	const ratioGuards = checkRatioGuards(suites, allBenchmarks, selectedNames, Boolean(filter), skippedNames);
 
-	const output = buildOutput({ environment, allBenchmarks, failures, wallClockMs, baselinePath, comparison, ratioGuards, collectCounters });
+	const output = buildOutput({ environment, allBenchmarks, failures, skipped, wallClockMs, baselinePath, comparison, ratioGuards, collectCounters });
 	say(`Results written to ${await writeResults(output)}`);
 
 	let exitCode = 0;

@@ -24,7 +24,7 @@ import { PERCENT_PRECISION, UNSTABLE_SPREAD, classifyDelta, noiseFloorPct, round
 /**
  * One benchmark's verdict.
  *
- * @typedef {'no-change'|'changed'|'regression'|'improvement'|'unstable'|'new'|'missing'|'filtered'|'failed'} ComparisonStatus
+ * @typedef {'no-change'|'changed'|'regression'|'improvement'|'unstable'|'new'|'skipped'|'missing'|'filtered'|'failed'} ComparisonStatus
  *
  * @typedef {object} Comparison
  * @property {string} fullName
@@ -43,10 +43,14 @@ import { PERCENT_PRECISION, UNSTABLE_SPREAD, classifyDelta, noiseFloorPct, round
  * @property {string} fullName
  * @property {import('./stats.mjs').BenchmarkSummary|null} result
  * @property {{ kind?: string, detail?: string }|null} failure
+ * @property {{ reason: string }|null} [skipped] set when the benchmark declined to run
+ *   (its `skip()` returned a reason). Distinct from BOTH a failure and an absence: it
+ *   ran nothing, but it is not gone, so its baseline entry must not be reported as a
+ *   deletion.
  */
 
 /** Order the summary counts are reported in: outcomes first, exclusions after. */
-export const STATUS_ORDER = ['no-change', 'changed', 'improvement', 'regression', 'unstable', 'new', 'missing', 'filtered', 'failed'];
+export const STATUS_ORDER = ['no-change', 'changed', 'improvement', 'regression', 'unstable', 'new', 'skipped', 'missing', 'filtered', 'failed'];
 
 /**
  * One benchmark's counter verdict.
@@ -330,7 +334,19 @@ export function compareRun(rows, baseline, filter = null, options = {}) {
 	let assumedSpreads = 0;
 
 	for (const row of rows) {
+		// `seen` before anything else, INCLUDING for a skipped row. That is the whole
+		// point of the status: a benchmark that declined to run this time is still in the
+		// suite, so its baseline entry must not fall through to the missing loop below and
+		// be reported as a rename or a deletion.
 		seen.add(row.fullName);
+		if (row.skipped) {
+			// Counter status `none`, not `skipped`: the row cannot be compared at all, which
+			// is the same claim `failed`/`new`/`missing`/`filtered` make. `CounterStatus`'s
+			// own `skipped` means the RUN was invoked with `--no-counters`, and reusing it
+			// here would make `printCounterSummary` say so about a run that was not.
+			comparisons.push({ fullName: row.fullName, status: 'skipped', delta_pct: null, noise_floor_pct: null, gated: false, note: row.skipped.reason ?? 'skipped', counters: noCounters('none') });
+			continue;
+		}
 		if (!row.result) {
 			comparisons.push({ fullName: row.fullName, status: 'failed', delta_pct: null, noise_floor_pct: null, gated: false, note: row.failure?.detail ?? 'failed to run', counters: noCounters('none') });
 			continue;
