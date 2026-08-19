@@ -1,6 +1,6 @@
 ---
 description: Nothing measures how much memory a query uses, so a change that makes the engine hold an entire result in memory instead of streaming it row by row would show up as slightly faster rather than as a problem.
-prereq: bench-harness-measurement-rigor
+prereq: bench-comparison-and-reporting
 files:
   - packages/quereus/bench/run.mjs                          # would collect a memory measure alongside timings
   - packages/quereus/src/runtime/scheduler.ts               # where execution completes and a sample could be taken

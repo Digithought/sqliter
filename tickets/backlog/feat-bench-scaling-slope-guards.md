@@ -1,11 +1,11 @@
 ---
 description: Every benchmark runs at one fixed data size, so a change that makes a query scale badly - fine at ten thousand rows, hopeless at a million - looks identical to no change at all; measure each workload at two sizes and check how the cost grows.
-prereq: bench-harness-measurement-rigor
+prereq: bench-comparison-and-reporting
 files:
   - packages/quereus/bench/suites/execution.bench.mjs   # every workload is hard-coded at 10k rows
   - packages/quereus/bench/suites/mutation.bench.mjs
   - packages/quereus/bench/run.mjs                      # would need to express a benchmark as a size ladder
-  - packages/quereus/bench/fusion-slope.mjs             # ad-hoc two-point ladder - the technique, already used once
+  - packages/quereus/bench/child.mjs                     # per-benchmark worker; a size ladder would run one child per rung
   - packages/quereus/test/performance-sentinels.spec.ts # the deep-join-spine sentinel - the same idea as a test
 tradeoffs: Doubles or triples benchmark runtime for a class of regression that the project has so far caught by other means, and a slope measured from two points is a blunt instrument that will need a generous bound to avoid flapping.
 ---
@@ -29,10 +29,10 @@ a modest constant factor - well inside a regression threshold loose enough not t
 The same change at a million rows is a hang. The signal that distinguishes them is how
 cost grows with size, and nothing currently measures it.
 
-The technique is already in the repository, used once and thrown away:
-`bench/fusion-slope.mjs` times the same query shape at two expression widths and reports
-the slope, so the fixed per-row cost cancels and only the marginal cost remains. Same idea,
-applied to row count instead of expression count.
+The technique has been used in this repository once already. `bench/fusion-slope.mjs`
+(since deleted, readable in git history) timed the same query shape at two expression
+widths and reported the slope, so the fixed per-row cost cancels and only the marginal cost
+remains. Same idea, applied to row count instead of expression count.
 
 # What it would look like
 

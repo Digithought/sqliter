@@ -1,6 +1,6 @@
 ---
 description: The benchmarks cover basic scans, joins, sorting and inserts, but say nothing about many features the engine has shipped since - transactions, constraints, materialized views, writable views, window functions and more - so a change that makes any of them dramatically slower would go unnoticed.
-prereq: bench-harness-measurement-rigor
+prereq: bench-comparison-and-reporting
 files:
   - packages/quereus/bench/suites/execution.bench.mjs   # 16 benchmarks: scans, filters, group by, order by, join, correlated subquery
   - packages/quereus/bench/suites/mutation.bench.mjs    # 4 benchmarks: bulk insert, single-row insert, update, delete

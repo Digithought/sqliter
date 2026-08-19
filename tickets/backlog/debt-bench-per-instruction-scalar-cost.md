@@ -56,7 +56,15 @@ worse than no gate.
 
 ## Cross-reference
 
-The process-isolation blocker named above is addressed by `bench-harness-measurement-rigor`
-(plan/), which makes per-suite (or per-benchmark) child-process execution a property of the
-harness. Once that lands, this benchmark no longer needs its own invocation mode - and the
-ad-hoc `bench/fusion-slope.mjs` it grew out of is scheduled to fold in or be deleted there.
+The process-isolation blocker named above is addressed by `bench-process-isolation`, which
+makes **per-benchmark** child-process execution a property of the harness - measurement
+during its planning showed per-suite isolation is not enough, because the distortion is
+between benchmarks inside one suite file (up to 2.7x). Once that lands, this benchmark no
+longer needs its own invocation mode.
+
+The ad-hoc `bench/fusion-slope.mjs` this ticket grew out of is deleted by that same ticket,
+since its only reason to exist was running its two halves in separate processes by hand.
+The two-point ladder technique it demonstrates - time the same query shape at two
+expression widths, report the slope so the fixed per-row cost cancels - is what this
+benchmark should reimplement inside the suite; read the deleted file out of git history if
+the details are wanted.

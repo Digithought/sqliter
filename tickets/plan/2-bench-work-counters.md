@@ -1,6 +1,6 @@
 ---
 description: Timings differ from machine to machine, so a benchmark result from one laptop cannot be compared to another; record counts of the actual work a query does - rows touched, steps run, storage round trips - because those numbers are identical everywhere and a change in them is always a real change.
-prereq: bench-harness-measurement-rigor
+prereq: bench-comparison-and-reporting
 files:
   - packages/quereus/src/runtime/scheduler.ts             # per-instruction runtimeStats already collected, only debug-logged
   - packages/quereus/src/runtime/types.ts                 # RuntimeContext.enableMetrics, InstructionRun surface
