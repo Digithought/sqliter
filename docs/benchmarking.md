@@ -133,13 +133,14 @@ exactly what it meant before backends existed. A name carrying `@` is a claim th
 row ran on something *other* than the engine's default module; a bare name is the
 default.
 
-Two backends exist today. The descriptors and the expansion live in
+Three backends exist today. The descriptors and the expansion live in
 `bench/lib/backends.mjs`:
 
-| id | what it is | name |
-| --- | --- | --- |
-| `memory` | the in-process memory vtab module — the engine default | bare (`full-scan-10k`) |
-| `store-mem` | `StoreModule` wrapped by the isolation layer, over an in-memory key-value provider | `full-scan-10k@store-mem` |
+| id | what it is | name | gates a build? |
+| --- | --- | --- | --- |
+| `memory` | the in-process memory vtab module — the engine default | bare (`full-scan-10k`) | yes |
+| `store-mem` | `StoreModule` wrapped by the isolation layer, over an in-memory key-value provider | `full-scan-10k@store-mem` | yes |
+| `store-leveldb` | the same `StoreModule`, over **LevelDB on a real temporary directory** | `full-scan-10k@store-leveldb` | no — opt-in and [informational](#informational-rows-reported-never-gated) |
 
 `store-mem` is the persistent path's performance coverage, and it is exactly the wiring
 `yarn test:store` exercises: key encoding, batched row resolution, transaction commit,
@@ -189,6 +190,82 @@ including the two divergences that looked most likely to bite (the store applies
 an undecorated text primary key where memory applies BINARY, and the store's cost model may
 validly pick a different join shape — neither changes a result).
 
+#### `store-leveldb`: real disk, opt-in and advisory
+
+`store-mem` deliberately measures the store layer with the disk taken out. `store-leveldb`
+is the other half: the same isolation-wrapped `StoreModule`, over the LevelDB provider a
+Node deployment actually runs.
+
+**It runs only when you ask.**
+
+```bash
+QUEREUS_BENCH_LEVELDB=1 yarn workspace @quereus/quereus bench --filter @store-leveldb
+yarn workspace @quereus/quereus bench:leveldb          # the same, over every suite
+```
+
+Without the variable every `@store-leveldb` row still **prints**, as
+`skipped — disk-backed rows are opt-in and advisory — set QUEREUS_BENCH_LEVELDB=1 to run
+them`. The variable is read as a human would read it: `0`, `false`, `off`, `no` and the
+empty string all mean *no*, so setting it to turn the rows off does not turn them on.
+
+Three properties are deliberate and worth knowing before you read a number:
+
+- **`syncCommits` is left at its default `true`**, which fsyncs every transaction commit.
+  That is what a deployment runs, and it is the single biggest term in what these rows
+  cost — `single-row-insert-1k@store-leveldb` is a thousand statements and therefore a
+  thousand fsync-ed commits. A benchmark that quietly turned it off would measure a
+  configuration nobody uses.
+- **Every row gets its own fresh temporary directory** under `os.tmpdir()`, never inside
+  the working tree — a database under the repo survives `git status` unnoticed and on
+  Windows can hold a lock that fails the next `yarn build`. LevelDB takes an exclusive
+  directory lock, so per-*call* freshness is a requirement and not a nicety: the
+  `own-database` mutation benchmarks open and close a whole store inside every timed call.
+- **No storage round-trip counters.** The counting provider wraps an in-memory map, not an
+  arbitrary provider, so this backend contributes timings only. Nothing is lost: round-trip
+  counts are a property of the store *layer*, and `store-mem` reports them exactly, on
+  every run, for free.
+
+**Cleanup has three layers**, because no single one covers every way a run ends
+(`bench/lib/tempdir.mjs`):
+
+1. The benchmark's own teardown removes its directory — the normal path.
+2. A process-level `exit` hook in the worker covers a throw, and covers the parent
+   vanishing.
+3. The **parent** sweeps at the end of the run. This layer is not a nicety: `run.mjs`
+   `SIGKILL`s a worker that blows the 120 s per-benchmark timeout, and `SIGKILL`s the
+   active worker on Ctrl+C — and a killed process runs no handler of any kind, so layer 2
+   structurally cannot cover it.
+
+The sweep never deletes by prefix. Every directory carries its owner's PID, and one is
+removed only when that PID is force-listed by the parent (which just killed it) or no
+longer alive, so two concurrent bench runs cannot delete each other's databases. That also
+makes the sweep a **cross-run** backstop: if the parent itself dies without running a
+handler — Task Manager, a CI tree-kill, or on Windows any `kill` from another process,
+which terminates rather than signalling — the directory survives that run and the *next*
+`yarn bench` collects it, because its owner is dead by then. A stale directory therefore
+costs some disk until the next run and never reaches a measurement.
+
+**What it costs**, measured on an AMD Ryzen AI 9 HX 370 / NVMe / Windows 11 machine under
+node 24.2 — treat the absolute numbers as that machine's, not as a target:
+
+| | wall clock |
+| --- | --- |
+| the 19-row `@store-leveldb` arm, opted in | 84 s |
+| the same 19 rows skipping, on a default run | 9.2 s of a 163 s / 90-benchmark run |
+| slowest single row (`mutation/delete-where-100@store-leveldb`) | 1.95 s median, ~14 s of wall clock |
+
+Nothing approaches the 120 s per-benchmark timeout. The 9.2 s a *default* run pays is the
+price of the rows printing their skip reason instead of vanishing, and it is roughly
+`0.5 s × rows` — a process fork plus a `dist/` import each, because the skip reason is a
+runtime fact evaluated in the worker.
+
+`@quereus/plugin-leveldb` is reached through **one lazy import site**
+(`bench/lib/leveldb-backend.mjs`), for the same reason `@quereus/store` is: the parent
+imports every suite file just to enumerate names, so a static import would let an unbuilt
+`packages/quereus-plugin-leveldb/dist` — or a native binding that will not load on this
+platform — kill the whole run, parser and planner suites included. Instead the rows skip
+with the load error as their reason, and `yarn bench` completes.
+
 There is deliberately **no `--backend` flag**. `--filter` is a plain substring match, so
 `--filter @store-mem` already selects one backend across every workload and `--filter
 full-scan-10k` already selects one workload across every backend. Expansion is
@@ -209,6 +286,7 @@ over a database and may build as many tables as it likes), not an exception.
 | `yarn bench --baseline <file>` | Compares against a previous results file. |
 | `yarn bench --baseline latest` | Compares against the newest file in `bench/results/`, resolved *before* this run writes its own. |
 | `yarn bench --json` | Writes the result object to stdout and moves every other line — progress, table, banner, guard output — to stderr. |
+| `yarn bench:leveldb` | The same as `yarn bench` with `QUEREUS_BENCH_LEVELDB=1`, so the [disk-backed rows](#store-leveldb-real-disk-opt-in-and-advisory) run instead of printing a skip reason. Adds ~75 s and gates nothing. |
 
 `bench/results/` is gitignored and never pruned. Files are named by ISO timestamp with `:`
 and `.` replaced, so they sort lexicographically in chronological order; `--baseline latest`
@@ -420,6 +498,48 @@ anyone diffing two runs, which is exactly the wrong claim.
 comparable", the same claim a failed or filtered row makes — and never `dropped`, which
 would say the benchmark deliberately stopped reporting counts.
 
+### Informational rows: reported, never gated
+
+Some numbers are worth printing and are not worth failing a build over. A row whose timing
+is dominated by the machine's disk, filesystem or page cache is measuring something that is
+**not a property of this repository's code** — no amount of care in the workload changes
+that, and gating on it would make a slow disk look like a regression in the engine.
+
+Such a row is **informational**. The flag is declared on the *backend*, not per benchmark:
+
+```js
+export const STORE_LEVELDB_BACKEND = {
+	id: 'store-leveldb',
+	informational: true,
+	// …
+};
+```
+
+`expandBackends` stamps `informational: true` onto every benchmark that backend produces,
+so no suite file has to remember and no future workload can forget. A row on an ordinary
+backend carries no such key at all.
+
+What the flag changes, and what it deliberately does not:
+
+- The row prints a cyan **`informational`** marker as a trailing word — the way `unstable`
+  and `pinned` print — on measured, skipped and failed rows alike.
+- Against a baseline it is compared exactly like any other row, and **its status still says
+  `regression`** when the number moved. Suppressing the status would suppress the very
+  signal the row exists to give. Only the *gating* changes: the row is never counted toward
+  the exit code, and the run prints a yellow line saying how many advisory rows regressed,
+  so a red status next to an exit code of 0 reads as policy rather than as a harness bug.
+- **No ratio guard may name one.** A guard whose target or baseline is informational is
+  reported as `misconfigured` — a failure — and that case is checked *before* every other,
+  so it cannot hide behind "not selected by `--filter`". Anchoring a build-gating ratio to
+  a disk-dependent number is the mistake this refusal exists to make impossible.
+- The results JSON carries a top-level `informational` array of full names, sorted, so a
+  gate script can identify advisory rows without parsing names for an `@` suffix.
+
+A benchmark that *fails* on an informational backend still fails the run. That is not an
+inconsistency: an advisory number is exempt from gating, but a benchmark that threw, hung
+or died is a broken benchmark whichever backend it ran on — and it can only happen on a run
+that opted in.
+
 ## Work counters: exact-count comparison
 
 A benchmark can also report **work counters** — exact counts of plan nodes, instruction
@@ -622,6 +742,11 @@ storage engine against an in-process array; the number it would encode is this m
 ratio between two unrelated things, not a property of either engine. There is no portable
 value for `maxRatio` there, so there is no guard to write.
 
+**A guard naming an [informational](#informational-rows-reported-never-gated) row is a
+misconfiguration**, and that is the rule above made mechanical: it fails the run, and it is
+checked before the not-selected and declined cases so a `--filter` cannot hide it. A
+build-gating ratio anchored to a number that moves with the machine's disk is not a gate.
+
 ## Exit-code contract
 
 `yarn bench` exits non-zero on any of:
@@ -631,8 +756,16 @@ value for `maxRatio` there, so there is no guard to write.
 - a gated regression, meaning a delta that cleared both the noise floor and the 10% minimum
   on a benchmark that was stable in both runs.
 
-Unstable benchmarks, new benchmarks, missing benchmarks and sub-threshold deltas never
-contribute to the exit code.
+Unstable benchmarks, new benchmarks, missing benchmarks, sub-threshold deltas and
+[informational](#informational-rows-reported-never-gated) regressions never contribute to
+the exit code. An informational benchmark that *failed* still does — an exempt number is
+not an exempt benchmark.
+
+**No part of this runs in `yarn check`.** `yarn check` does not invoke `yarn bench` at all
+today, and the regression gate planned on top of it should budget its fast mode around the
+`memory` and `store-mem` backends only. It must not set `QUEREUS_BENCH_LEVELDB`: the
+LevelDB rows would add roughly 75 s of disk-bound work whose numbers, by construction,
+cannot gate anything.
 
 ## `--json`
 
@@ -640,7 +773,8 @@ Under `--json`, stdout carries the result object and nothing else — the human 
 progress lines, the environment banner and the guard verdicts all move to stderr, and ANSI
 colour is suppressed. The object is exactly what is written to `bench/results/`, so a
 consumer never has to care which of the two it is reading. It includes `environment`,
-`benchmarks`, `failures`, `skipped`, `ratio_guards`, `baseline` and `comparison`.
+`benchmarks`, `failures`, `skipped`, `informational`, `ratio_guards`, `baseline` and
+`comparison`.
 
 ```
 node bench/run.mjs --json 2>/dev/null | node -e "let s='';process.stdin.on('data',c=>s+=c).on('end',()=>console.log(Object.keys(JSON.parse(s))))"
@@ -737,6 +871,8 @@ Requirements:
 | `bench/lib/discover.mjs` | Suite enumeration and the one definition of what `--filter` matches (`matchesFilter`), shared by the parent, the worker and the comparison. |
 | `bench/lib/backends.mjs` | The storage-engine dimension: the `BenchBackend` descriptor, the `BACKENDS` set, and `expandBackends` — one workload × N backends → N benchmarks, named by the bare-name rule, with each backend's `skipWorkload` wired into the benchmark's `skip()`. |
 | `bench/lib/store-counters.mjs` | Everything that touches `@quereus/store`, behind the harness's one dynamic import: the plain and counting `store-mem` databases, and the round-trip block they report. |
+| `bench/lib/leveldb-backend.mjs` | Everything that touches `@quereus/plugin-leveldb`, behind its own dynamic import: the `QUEREUS_BENCH_LEVELDB` opt-in, the skip reason, and the `store-leveldb` database over a temporary directory. |
+| `bench/lib/tempdir.mjs` | Fresh-per-call temporary directories for disk-backed rows, and the PID-owned sweep that removes the ones a killed worker could not remove itself. |
 | `bench/workloads/*.mjs` | What the `execution` and `mutation` suites measure, as data plus fixtures. The suite files are binders over these. |
 
 Harness tests, none of which run a benchmark: `test/bench-calibration.spec.ts` (the timing

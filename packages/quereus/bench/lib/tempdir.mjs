@@ -16,6 +16,22 @@
  *      handler kills the active worker on Ctrl+C. A killed process runs no handler of any
  *      kind, so someone else has to clean up after it.
  *
+ * THE SWEEP IS ALSO A CROSS-RUN BACKSTOP, not only a within-run one. If the PARENT dies
+ * without running a handler — Task Manager, a CI tree-kill, or on Windows any
+ * `child.kill(...)` from another process, which `TerminateProcess`es rather than
+ * delivering a signal — then layer 3 does not happen either, and the directory survives
+ * the run. Measured, not assumed: killing `run.mjs` mid-benchmark that way twice left
+ * `quereus-bench-<pid>-store-leveldb-*` behind both times. What collects it is the NEXT
+ * `run.mjs` invocation's sweep, whose liveness check now sees a dead PID. So a stale
+ * directory costs the machine some disk until the next bench run and never reaches a
+ * measurement — that being the whole point of naming directories by owner rather than
+ * reusing one path.
+ *
+ * (Whether the orphaned WORKER's own exit hook ran in that scenario is not observable
+ * from outside: `run.mjs` forks workers with piped stdio and forwards it, so once the
+ * parent is gone the worker's stderr has no reader. Do not infer either way from a
+ * silent run.)
+ *
  * WHY THE SWEEP IS SAFE WITH TWO RUNS ON ONE MACHINE. It never deletes by prefix alone.
  * Every directory name carries the PID of the process that made it, and the sweep removes
  * one only when that PID is either force-listed by the caller (the parent just killed that
@@ -163,7 +179,9 @@ function pidAlive(pid) {
 		process.kill(pid, 0);
 		return true;
 	} catch (err) {
-		return err?.code !== 'ESRCH';
+		// Annotated because `catch` binds `unknown` under the type pass: `process.kill`
+		// rejects with an `ErrnoException`, and the whole decision here is its `code`.
+		return /** @type {NodeJS.ErrnoException} */ (err)?.code !== 'ESRCH';
 	}
 }
 

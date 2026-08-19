@@ -263,6 +263,35 @@ describe('bench/lib/compare.mjs', () => {
 			expect(verdict.gated).to.equal(false);
 		});
 
+		it('still calls an informational regression a regression, and never gates it', () => {
+			// The status must NOT be softened: suppressing it would suppress the very signal
+			// an advisory row exists to give. Only `gated` changes, so a disk-dependent
+			// number is reported in full and cannot fail a build.
+			const comparison = compareRun([row('a/x', 13)], { 'a/x': entry(10) }, null, { informational: new Set(['a/x']) });
+			const verdict = verdictFor(comparison, 'a/x');
+			expect(verdict.status).to.equal('regression');
+			expect(verdict.delta_pct).to.equal(30);
+			expect(verdict.gated).to.equal(false);
+			expect(verdict.note).to.match(/informational/);
+			// `regressions` counts GATED rows only — that is what `run.mjs` turns into an
+			// exit code, and why it prints the advisory count on a separate line.
+			expect(comparison.regressions).to.equal(0);
+		});
+
+		it('gates a row the informational set does not name, in the same run', () => {
+			// The control for the case above: the flag must ungate one row without quietly
+			// ungating its neighbours.
+			const comparison = compareRun(
+				[row('a/x', 13), row('a/y', 13)],
+				{ 'a/x': entry(10), 'a/y': entry(10) },
+				null,
+				{ informational: new Set(['a/x']) },
+			);
+			expect(verdictFor(comparison, 'a/x').gated).to.equal(false);
+			expect(verdictFor(comparison, 'a/y').gated).to.equal(true);
+			expect(comparison.regressions).to.equal(1);
+		});
+
 		it('refuses to gate a benchmark unstable in this run, and says which run', () => {
 			const comparison = compareRun([row('a/x', 13, 40, false)], { 'a/x': entry(10) });
 			const verdict = verdictFor(comparison, 'a/x');

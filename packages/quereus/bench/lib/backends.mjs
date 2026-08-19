@@ -204,12 +204,36 @@ export const STORE_LEVELDB_BACKEND = {
  * One entry per storage path, shared by both suites rather than listed per suite, so a
  * new backend reaches every workload at once and cannot be half-added.
  *
- * `STORE_LEVELDB_BACKEND` is deliberately NOT here — see its own comment for the measured
- * reason.
+ * `STORE_LEVELDB_BACKEND` IS here, and that was a measurement rather than a preference.
+ * Two things had to be true. Both were, on an AMD Ryzen AI 9 HX 370 / NVMe / Windows 11
+ * machine (`node bench/run.mjs`, node 24.2):
+ *
+ *   - No opt-in row comes near `BENCH_TIMEOUT_MS` (120 s per benchmark). The whole
+ *     19-row arm runs in 84 s; the slowest single row is
+ *     `mutation/delete-where-100@store-leveldb` at a 1.95 s median, about 14 s of wall
+ *     clock once calibration has taken its five samples. The two rows most at risk were
+ *     the write-heavy ones and neither is close: `bulk-insert-10k@store-leveldb` 917 ms
+ *     per call (a whole LevelDB opened and closed inside every timed call) and
+ *     `single-row-insert-1k@store-leveldb` 907 ms (a thousand separate `insert`
+ *     statements, one fsync-ed commit each, since `syncCommits` is left at its default).
+ *   - A DEFAULT run — the overwhelmingly common one, where nobody set
+ *     `QUEREUS_BENCH_LEVELDB` — pays little for rows that only print a skip reason. It
+ *     costs 9.2 s of the 163 s a full 90-benchmark run takes, about 6%.
+ *
+ * That 9.2 s buys the thing an omitted backend cannot: the rows PRINT, naming the
+ * variable that would run them, so a reader diffing two runs sees a declined measurement
+ * rather than no measurement. It is the same rule `skipWorkload` exists to serve.
+ *
+ * NOTE: the 9.2 s is 19 × ~0.5 s of process fork plus `dist/` import, and it scales
+ * linearly with always-skipped rows — the skip reason is evaluated in the worker, because
+ * the parent never executes benchmark code. Fine at one opt-in backend. If a second or
+ * third lands and a default `yarn bench` starts paying 20-30 s to print skip reasons,
+ * the fix is to let the parent ask a backend-level (not workload-level) skip question
+ * before forking, not to drop the rows from the table.
  *
  * @type {BenchBackend[]}
  */
-export const BACKENDS = [MEMORY_BACKEND, STORE_MEM_BACKEND];
+export const BACKENDS = [MEMORY_BACKEND, STORE_MEM_BACKEND, STORE_LEVELDB_BACKEND];
 
 /**
  * The benchmark name a workload gets on a given backend.

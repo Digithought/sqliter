@@ -19,7 +19,7 @@ import {
 	expandBackends,
 } from '../bench/lib/backends.mjs';
 import type { BenchBackend } from '../bench/lib/backends.mjs';
-import { matchesFilter } from '../bench/lib/discover.mjs';
+import { informationalNames, matchesFilter, selectBenchmarks } from '../bench/lib/discover.mjs';
 
 /** A backend descriptor whose `open` returns no real database. The cast is the honest
  * shape of these tests: `expandBackends` builds names and binds functions, and NOTHING
@@ -139,6 +139,84 @@ describe('bench/lib/backends.mjs', () => {
 		it('rejects a non-callable openCounting rather than ignoring it', () => {
 			const bad = { ...backend('bad'), openCounting: {} } as unknown as BenchBackend;
 			expect(() => expandBackends([MEM, bad], [workload('a')], bind)).to.throw(/'openCounting' that is not a function/);
+		});
+
+		it('rejects a non-boolean informational rather than stamping it onto every row', () => {
+			// The worst of the three: `run.mjs` tests the stamped flag for STRICT `true`, so
+			// `informational: 'yes'` would leave every row of a backend meant to be advisory
+			// gating the build on a disk-dependent number, with nothing saying so.
+			const bad = { ...backend('bad'), informational: 'yes' } as unknown as BenchBackend;
+			expect(() => expandBackends([MEM, bad], [workload('a')], bind)).to.throw(/'informational' that is not a boolean/);
+		});
+	});
+
+	describe('expandBackends — the informational flag', () => {
+		/** A backend whose numbers are advisory. Declared on the BACKEND because it is a
+		 * property of what the numbers describe, not of any one workload. */
+		const ADVISORY = { ...backend('disk'), informational: true } as unknown as BenchBackend;
+
+		it('stamps informational onto every row a declaring backend produces', () => {
+			// Per BACKEND, not per suite file: a suite that had to remember to mark its own
+			// rows advisory is a suite that forgets on the next workload added.
+			const rows = expandBackends([MEM, ADVISORY], [workload('a'), workload('b')], bind);
+			const advisory = rows.filter((r) => r.name.endsWith(`${BACKEND_SEPARATOR}disk`));
+			expect(advisory).to.have.length(2);
+			for (const row of advisory) expect(row.informational).to.equal(true);
+		});
+
+		it('leaves NO informational key on a row from an ordinary backend', () => {
+			// Byte-identical to what the expansion produced before the flag existed, and the
+			// reason `run.mjs` may test for strict `true` rather than truthiness.
+			const rows = expandBackends([MEM, backend('store-mem')], [workload('a')], bind);
+			for (const row of rows) expect('informational' in row).to.equal(false);
+		});
+
+		it('stamps informational alongside a composed skip rather than instead of it', () => {
+			// The two seams are independent and both write to the same object; an expansion
+			// that built one from the other would drop whichever it wrote first.
+			const declining = { ...ADVISORY, skipWorkload: () => 'opt in first' } as unknown as BenchBackend;
+			const [, row] = expandBackends([MEM, declining], [workload('a')], bind);
+			expect(row.informational).to.equal(true);
+			expect(row.skip).to.be.a('function');
+		});
+	});
+
+	describe('informationalNames', () => {
+		/** A loaded-suite record, reduced to the fields these two functions read. */
+		const suite = (name: string, benchmarks: { name: string, informational?: unknown }[]) =>
+			({ file: `${name}.bench.mjs`, name, benchmarks }) as unknown as Parameters<typeof informationalNames>[0][number];
+
+		it('reports advisory rows across every suite, by full name', () => {
+			const names = informationalNames([
+				suite('execution', [{ name: 'x' }, { name: 'x@disk', informational: true }]),
+				suite('mutation', [{ name: 'y@disk', informational: true }]),
+			]);
+			expect([...names].sort()).to.deep.equal(['execution/x@disk', 'mutation/y@disk']);
+		});
+
+		it('reads the WHOLE suite set, not a filtered selection', () => {
+			// Load-bearing: `checkRatioGuards` must still refuse a guard naming an advisory
+			// row under a `--filter` that excluded it, and a baseline can name a row this
+			// run never selected. Deriving this from the selection would silently permit
+			// both. Expressed as the contract it is — this function takes no filter.
+			const suites = [suite('execution', [{ name: 'x@disk', informational: true }, { name: 'y' }])];
+			expect(selectBenchmarks(suites, 'y')).to.have.length(1);
+			expect(informationalNames(suites).has('execution/x@disk')).to.equal(true);
+		});
+
+		it('ignores a truthy non-true flag rather than treating it as advisory', () => {
+			// `expandBackends` rejects a non-boolean at the backend, so a row can only carry
+			// one if it was hand-written. Strict `true` here means such a row GATES — the
+			// safe direction, and the same test both consumers apply.
+			const names = informationalNames([suite('execution', [{ name: 'x', informational: 'yes' }])]);
+			expect(names.size).to.equal(0);
+		});
+
+		it('normalizes the flag to a strict boolean on every selected row', () => {
+			// `selectBenchmarks` carries the flag rather than letting three consumers re-find
+			// the benchmark by name and risk disagreeing about which rows are advisory.
+			const selected = selectBenchmarks([suite('execution', [{ name: 'x@disk', informational: true }, { name: 'y' }])], null);
+			expect(selected.map((s) => s.informational)).to.deep.equal([true, false]);
 		});
 	});
 

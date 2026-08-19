@@ -69,6 +69,7 @@
     "prepublishOnly": "npm run build",
     "typecheck": "tsc --noEmit",
     "bench": "node bench/run.mjs",
+    "bench:leveldb": "QUEREUS_BENCH_LEVELDB=1 node bench/run.mjs",
     "mutation:subsystem": "node mutation-subsystem.mjs"
   },
   "devDependencies": {
