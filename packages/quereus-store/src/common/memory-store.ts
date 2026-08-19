@@ -168,6 +168,18 @@ export class InMemoryKVStore implements KVStore {
     this.data.clear();
   }
 
+  /**
+   * Whether `close()` has already run. Test-support consumers (e.g. the shared
+   * `createInMemoryProvider` in `@quereus/store/testing`) need this to tell a live store
+   * (whose entries a "delete this store" call must `clear()`, so a caller still holding the
+   * handle sees the erase) apart from an already-closed one (whose entries `close()` already
+   * dropped, and whose `clear()`/`checkOpen()` would throw) — without provoking that throw
+   * just to find out.
+   */
+  get isClosed(): boolean {
+    return this.closed;
+  }
+
   async approximateCount(options?: IterateOptions): Promise<number> {
     this.checkOpen();
     if (!options) {

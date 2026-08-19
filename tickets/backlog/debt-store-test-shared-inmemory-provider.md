@@ -90,3 +90,17 @@ local `createInMemoryProvider` copies at the shared one, reconciling their varia
 folding in `test/unique-constraints.spec.ts`'s third counting shape. The sweep was deliberately
 kept out of the benchmark ticket, which would otherwise have become a merge-conflict magnet
 across the whole store test suite.
+
+## Arm added: `store-shared-inmemory-provider` landed the shared factory
+
+`createInMemoryProvider(options?)` now exists at
+`packages/quereus-store/src/testing/memory-provider.ts`, exported from
+`@quereus/store/testing`, matching everything specified above: shared-builder store names,
+one unified `__stats__` store, only-when-present `costProfile`, real-erase
+`deleteIndexStore`/`deleteTableStores` (backed by a new `InMemoryKVStore.isClosed` getter so
+the erase can tell a live handle from one the caller already closed, per
+`KVStoreProvider.deleteTableStores`'s contract), and no `renameTableStores`.
+`test/memory-provider.spec.ts` registers `runStoreNameDistinctness` and
+`runStoreReclaimConformance` against it plus the `costProfile`-shape cases. This ticket's
+own scope — deliberately excluded from that one — is still entirely open: the twenty-odd
+local copies are not yet pointed at it.

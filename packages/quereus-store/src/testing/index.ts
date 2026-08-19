@@ -23,6 +23,10 @@
  * {@link CountingKVStore} / {@link createCountingProvider} are not a conformance battery —
  * they are the shared counting test double several specs in this package (and its
  * benchmark suite) use to assert on `iterate`/`get`/`getMany` traffic.
+ *
+ * {@link createInMemoryProvider} is the shared all-`InMemoryKVStore` {@link KVStoreProvider}
+ * most specs in this package (and its benchmark suite) need as a plain backend, with no
+ * counting attached.
  */
 
 export {
@@ -43,3 +47,7 @@ export {
 	createCountingProvider,
 	type CountingProviderScope,
 } from './kv-counting-store.js';
+export {
+	createInMemoryProvider,
+	type InMemoryProviderOptions,
+} from './memory-provider.js';

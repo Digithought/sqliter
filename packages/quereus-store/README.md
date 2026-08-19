@@ -413,6 +413,25 @@ CALL BOUNDARY — did the caller issue one `getMany` or N `get`s — which is wh
 specs are proving; it does NOT measure a real backend's own native multi-get, and layering
 it over one suppresses that batch. See the class doc comment before reusing it for that.
 
+**A plain in-memory provider, for specs that need a real backend with no counting attached.**
+`createInMemoryProvider(options?)` builds an all-`InMemoryKVStore` `KVStoreProvider` — the
+one shared implementation most specs in this package (and its benchmark suite) reach for
+instead of pasting a private copy. Unlike `createCountingProvider`, it implements
+`deleteIndexStore` and `deleteTableStores`, and both actually ERASE the named store (a live
+handle still open on it sees the erase too), so a spec exercising `drop index` / `drop table`
+reclaim can use it directly:
+
+```typescript
+import { createInMemoryProvider } from '@quereus/store/testing';
+
+const provider = createInMemoryProvider();               // no costProfile property at all
+// const provider = createInMemoryProvider({ costProfile: { pointRead: 2 } });
+db.registerModule('store', new StoreModule(provider));
+```
+
+`renameTableStores` is not implemented; `StoreModule` falls back to its generic copy for a
+provider without it.
+
 ## KVStore Interface
 
 The `KVStore` interface is the foundation for all storage backends:
