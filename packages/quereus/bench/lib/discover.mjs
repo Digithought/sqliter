@@ -12,11 +12,38 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const benchDir = fileURLToPath(new URL('..', import.meta.url));
 
+/**
+ * One benchmark definition, as a `*.bench.mjs` file exports it.
+ *
+ * @typedef {object} Benchmark
+ * @property {string} name unique within its suite
+ * @property {() => unknown | Promise<unknown>} fn the timed call
+ * @property {() => unknown | Promise<unknown>} [setup] run once, untimed, before warmup
+ * @property {() => unknown | Promise<unknown>} [teardown] run once, untimed, after timing
+ * @property {number} [iterations] pins the benchmark out of calibration — see `lib/calibrate.mjs`
+ * @property {number} [warmup] pins the benchmark out of calibration — see `lib/calibrate.mjs`
+ *
+ * A within-run bound on one benchmark's median against another's, so a plan-shape
+ * regression trips from a single run with no baseline file.
+ *
+ * @typedef {object} RatioGuard
+ * @property {string} name benchmark under test
+ * @property {string} baseline benchmark its median is measured against
+ * @property {number} maxRatio largest acceptable `name / baseline`
+ *
+ * @typedef {object} Suite
+ * @property {string} file suite file name
+ * @property {string} name suite name (the file name without `.bench.mjs`)
+ * @property {Benchmark[]} benchmarks
+ * @property {RatioGuard[]} ratioGuards
+ */
+
 /** Absolute path to `bench/suites`. Built with `node:path`, never concatenated,
  * so a checkout path containing spaces survives. */
 export const suitesDir = join(benchDir, 'suites');
 
-/** Sorted list of suite file names (e.g. `execution.bench.mjs`). */
+/** Sorted list of suite file names (e.g. `execution.bench.mjs`).
+ * @returns {Promise<string[]>} */
 export async function listSuiteFiles() {
 	const files = (await readdir(suitesDir)).filter((f) => f.endsWith('.bench.mjs'));
 	files.sort();
@@ -27,7 +54,7 @@ export async function listSuiteFiles() {
  * Import one suite module and return its metadata.
  *
  * @param {string} file suite file name, as returned by `listSuiteFiles`
- * @returns {Promise<{ file: string, name: string, benchmarks: object[], ratioGuards: object[] }>}
+ * @returns {Promise<Suite>}
  */
 export async function loadSuite(file) {
 	const mod = await import(pathToFileURL(join(suitesDir, file)).href);
@@ -38,6 +65,7 @@ export async function loadSuite(file) {
 	}
 	// Duplicate names would make both `--filter` and the worker's lookup ambiguous
 	// (the worker runs the FIRST match, silently ignoring the rest).
+	/** @type {Set<string>} */
 	const seen = new Set();
 	for (const bench of benchmarks) {
 		if (typeof bench?.name !== 'string' || bench.name.length === 0) {
@@ -56,8 +84,10 @@ export async function loadSuite(file) {
 	return { file, name, benchmarks, ratioGuards: mod.ratioGuards ?? [] };
 }
 
-/** Import every suite, in file-name order. */
+/** Import every suite, in file-name order.
+ * @returns {Promise<Suite[]>} */
 export async function loadSuites() {
+	/** @type {Suite[]} */
 	const suites = [];
 	for (const file of await listSuiteFiles()) {
 		suites.push(await loadSuite(file));
@@ -69,11 +99,12 @@ export async function loadSuites() {
  * Flatten loaded suites into the ordered work list, optionally narrowed by a
  * substring match against the `suite/name` full name.
  *
- * @param {object[]} suites as returned by `loadSuites`
+ * @param {Suite[]} suites as returned by `loadSuites`
  * @param {string|null} filter substring; `null` selects everything
  * @returns {{ suiteFile: string, suiteName: string, name: string, fullName: string }[]}
  */
 export function selectBenchmarks(suites, filter) {
+	/** @type {{ suiteFile: string, suiteName: string, name: string, fullName: string }[]} */
 	const selected = [];
 	for (const suite of suites) {
 		for (const bench of suite.benchmarks) {

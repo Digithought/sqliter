@@ -5,7 +5,7 @@
  * so the parent and any future consumer agree on the definitions.
  *
  * A "sample" is one timed observation in milliseconds. When the worker batches
- * (see `CALIBRATION` in `child.mjs`) a sample is the MEAN of `batch` consecutive
+ * (see `CALIBRATION` in `calibrate.mjs`) a sample is the MEAN of `batch` consecutive
  * `fn` calls, not a single call — which is why the summary's extrema are named
  * `min_sample_ms` / `max_sample_ms` rather than min/max iteration.
  */
@@ -25,7 +25,9 @@ export const UNSTABLE_SPREAD = 0.20;
  * sample count to this floor); a benchmark PINNED to a handful of iterations does. */
 export const MIN_STABILITY_SAMPLES = 5;
 
-/** Median of an array of numbers. Does not mutate the input. */
+/** Median of an array of numbers. Does not mutate the input.
+ * @param {number[]} arr
+ * @returns {number} */
 export function median(arr) {
 	const sorted = [...arr].sort((a, b) => a - b);
 	const mid = Math.floor(sorted.length / 2);
@@ -34,7 +36,10 @@ export function median(arr) {
 		: (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
-/** Nearest-rank percentile (`p` in 0..100). Does not mutate the input. */
+/** Nearest-rank percentile (`p` in 0..100). Does not mutate the input.
+ * @param {number[]} arr
+ * @param {number} p
+ * @returns {number} */
 export function percentile(arr, p) {
 	const sorted = [...arr].sort((a, b) => a - b);
 	const idx = Math.ceil((p / 100) * sorted.length) - 1;
@@ -54,6 +59,9 @@ export function percentile(arr, p) {
  * well-behaved passes and 63.2% on the pass whose median was visibly wrong — rIQR
  * discriminated, and a CV over the same data would mostly have reported how many
  * GC pauses landed inside the window. Do not swap this back on aesthetic grounds.
+ *
+ * @param {number[]} samples
+ * @returns {number | null}
  */
 export function relativeIqr(samples) {
 	if (!Array.isArray(samples) || samples.length === 0) return null;
@@ -66,13 +74,20 @@ export function relativeIqr(samples) {
 	return Number.isFinite(spread) ? spread : null;
 }
 
-/** Round to microsecond precision, the resolution the results JSON records. */
+/** Round to microsecond precision, the resolution the results JSON records.
+ * @param {number} n
+ * @returns {number} */
 export function round(n) {
 	return Math.round(n * 1000) / 1000;
 }
 
 /**
  * Reduce one benchmark's samples to the summary record stored in the results JSON.
+ *
+ * `samples` must be non-empty: `median` of nothing is `NaN` and `Math.min` of nothing
+ * is `Infinity`, neither of which belongs in the JSON. An empty set means the worker
+ * produced no timings at all, which is a failure rather than a result — `classify` in
+ * `run.mjs` rejects it before it reaches here.
  *
  * @param {number[]} samples per-sample milliseconds (batch means when `batch > 1`)
  * @param {{ batch?: number, warmup?: number, pinned?: boolean }} meta calibration

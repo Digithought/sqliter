@@ -1,14 +1,16 @@
 /**
- * TIMING: no benchmark in this file sets `iterations` or `warmup`. The worker
- * calibrates both from a pilot measurement of `fn` — see `CALIBRATION` in
- * `bench/child.mjs` — so each benchmark gets roughly a second of timed work
- * regardless of whether one call costs microseconds or hundreds of milliseconds.
+ * TIMING: no benchmark in this file sets `iterations` or `warmup`. The worker warms
+ * `fn` up by elapsed duration and then measures the WARMED function to pick both —
+ * see `CALIBRATION` in `bench/lib/calibrate.mjs` — so each benchmark gets roughly a
+ * second of timed work regardless of whether one call costs microseconds or hundreds
+ * of milliseconds.
  *
  * Setting either field is still honoured and PINS the benchmark to a fixed count,
  * skipping calibration entirely. It is the escape hatch for a benchmark whose
- * per-call cost changes as it runs, where a pilot would be unrepresentative. Use it
- * only with a comment saying why: a pinned benchmark also forfeits a meaningful
- * spread figure, because ten samples are too few for a quartile range to say much.
+ * per-call cost changes as it runs, where a few warm calls would not represent the
+ * rest. Use it only with a comment saying why: a pinned benchmark also forfeits a
+ * meaningful spread figure, because ten samples are too few for a quartile range to
+ * say much.
  *
  * Calibration BATCHES sub-millisecond benchmarks — several consecutive `fn` calls
  * timed as one sample — so every `fn` here must be repeatable back-to-back without

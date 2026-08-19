@@ -14,10 +14,10 @@
  * their metadata (names, `ratioGuards`) and nothing else; the moment it executes
  * benchmark work, the isolation guarantee is gone.
  *
- * Each worker calibrates its own sample count from a pilot measurement (see
- * `CALIBRATION` in `child.mjs`) and reports raw samples; the parent derives every
- * statistic here, including the relative-IQR spread that says how much to trust
- * the median it sits next to.
+ * Each worker calibrates its own batch and sample count by measuring its warmed
+ * `fn` (see `CALIBRATION` in `lib/calibrate.mjs`) and reports raw samples; the
+ * parent derives every statistic here, including the relative-IQR spread that says
+ * how much to trust the median it sits next to.
  *
  * Usage:
  *   yarn bench                         — run all suites, print table, write JSON
@@ -428,7 +428,21 @@ function getCommitHash() {
 	}
 }
 
-/** Write the timestamped results JSON and return its path. */
+/**
+ * Write the timestamped results JSON and return its path.
+ *
+ * NOTE: the file carries no schema version, and the per-benchmark field set has
+ * already changed once (`p95_ms` dropped, `min_ms`/`max_ms` renamed to
+ * `min_sample_ms`/`max_sample_ms` when batching arrived). Nothing reads those
+ * fields today — `--baseline` and the ratio guards use `median_ms` alone, which has
+ * been stable — so an old file still compares correctly. Add a `schema` field the
+ * moment a consumer reads anything else, so it can reject a file it cannot read
+ * rather than silently treating a missing field as absent data.
+ *
+ * NOTE: `bench/results/` is gitignored and never pruned; a machine that runs the
+ * suite often accumulates a file per run. Harmless at the current sizes (a few KB
+ * each); add a retention sweep if it ever becomes a nuisance.
+ */
 async function writeResults({ allBenchmarks, failures, wallClockMs }) {
 	await mkdir(resultsDir, { recursive: true });
 	const outputPath = join(resultsDir, `${new Date().toISOString().replace(/[:.]/g, '-')}.json`);
