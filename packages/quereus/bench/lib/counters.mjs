@@ -44,6 +44,12 @@ export function enableMetrics(db) {
  * stopped — and a partial count compared against a drained baseline reads as a change
  * in the engine when nothing changed but the loop.
  *
+ * ONE statement, as the name says. A `Statement` iterates only the batch entry it is
+ * positioned on, so a semicolon-separated `sql` would run and count the first statement
+ * and silently ignore the rest — counters that look perfectly stable while describing a
+ * fraction of the work. Rejected rather than tolerated; use `snapshotStatements` for a
+ * sequence, which names each snapshot instead of merging them.
+ *
  * @param {Database} db
  * @param {string} sql
  * @param {StatementParams} [params]
@@ -53,6 +59,9 @@ export async function snapshotStatement(db, sql, params) {
 	enableMetrics(db);
 	const stmt = db.prepare(sql);
 	try {
+		if (stmt.astBatch.length !== 1) {
+			throw new Error(`snapshotStatement expects exactly one statement, got ${stmt.astBatch.length}: ${sql}`);
+		}
 		for await (const _row of stmt.all(params)) { /* drain fully — counts are only complete once drained */ }
 		const snapshot = stmt.getWorkCounters();
 		if (!snapshot) {

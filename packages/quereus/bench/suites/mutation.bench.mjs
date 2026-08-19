@@ -161,10 +161,14 @@ export const benchmarks = [
 			await db.exec(UPD_APPLY);
 			await db.exec(UPD_REVERSE);
 		},
-		// The `setup` database is reusable here because `fn` is its own inverse: the pair
-		// leaves `upd_t` in the state it found it, so the counters pass sees the same table
-		// no matter how many iterations calibration chose. Two named snapshots rather than
-		// one bag of summed instructions, for the reason spelled out on `bulk-insert-10k`.
+		// The `setup` database is reusable here because `fn` reaches a FIXED POINT after its
+		// first call — that call rewrites `label` from `label_N` to `reset` for the val < 10
+		// rows, and every call after it rewrites `reset` to `reset`. (`fn` is not literally
+		// its own inverse: it does not restore `setup`'s labels.) What matters is that the
+		// table `counters()` sees is the same one no matter how many iterations calibration
+		// chose, and the predicate `val < 10` selects the same 1,000 rows throughout since
+		// `fn` never touches `val`. Two named snapshots rather than one bag of summed
+		// instructions, for the reason spelled out on `bulk-insert-10k`.
 		counters() {
 			return snapshotStatements(db, { apply: UPD_APPLY, reverse: UPD_REVERSE });
 		},

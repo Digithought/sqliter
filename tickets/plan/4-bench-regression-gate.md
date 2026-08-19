@@ -172,3 +172,37 @@ If any wall-clock measurement is to gate at all, one of these has to come with i
 The limitation is recorded at the code site (`NOTE:` on `noiseFloorPct` in
 `bench/lib/stats.mjs`) and in `docs/benchmarking.md` § *Noise floor*, so nobody has to
 rediscover it. It is not a separate ticket because the decision it forces is this ticket's.
+
+## Arm added by review of `bench-counter-suite-passes`
+
+**"Work counters do not vary by machine" is this ticket's load-bearing premise, and it is
+currently an assumption rather than a measured fact.** The counters ticket verified
+something narrower and should not be read as having settled it: 23 of 27 benchmarks
+produced byte-identical counter blocks across three full runs (each benchmark in its own
+forked process), but all three runs were the same machine, the same OS, and the same Node
+version. Nothing has compared two different machines, and the reference set this ticket
+proposes to check into the repository is exactly a cross-machine comparison.
+
+There is a concrete mechanism by which the premise can be false, and it is in the engine
+rather than in the harness. **Join-order enumeration is bounded by wall-clock time.**
+`ruleQuickPickJoinEnumeration` (`src/planner/rules/join/rule-quickpick-enumeration.ts`)
+loops `while (tours < maxTours && elapsed <= timeLimitMs)` with defaults `maxTours: 100`,
+`timeLimitMs: 100`, `minTriggerCost: 0`, `enabled: true`
+(`src/planner/optimizer-tuning.ts`). Each tour is itself deterministic — what varies is
+*how many* tours finish inside 100 ms. A slower or busier machine therefore evaluates
+fewer candidate orderings and can settle on a different join order, which is a different
+plan, which is a different plan shape and different row counts. The rule only engages on
+joins of **three or more relations**, and every join in the current benchmark suite is
+two-relation, which is consistent with the three identical runs — the mechanism is real
+but the suite does not reach it today.
+
+Two consequences for this ticket:
+
+- A checked-in counter reference is only as portable as the plan that produced it. Either
+  the gate has to be scoped to benchmarks whose plans are provably budget-independent, or
+  the engine's plan choice has to become reproducible first. The engine-side change is
+  filed separately as `bug-join-order-depends-on-wall-clock`; this ticket should not ship
+  a cross-machine exactness claim ahead of it.
+- The premise deserves one real measurement before the reference set is trusted: the same
+  commit, run on two machines that differ in speed, with the counter blocks diffed. Until
+  that exists, "does not vary by machine" is a design intention.

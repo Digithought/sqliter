@@ -645,6 +645,16 @@ counts can be compared where timings cannot.
   is fully drained; a snapshot taken after an error is partial but kept. Forked
   parallel branches share the collector by reference (fork policy `shared-sink`), so
   their counts roll up with no merge step.
+- **The premise holds only as far as plan choice is itself machine-independent**, and
+  today there is one place where it is not: QuickPick join enumeration
+  (`planner/rules/join/rule-quickpick-enumeration.ts`) stops after `maxTours`
+  candidates *or* `timeLimitMs` of wall clock, whichever comes first. The candidates
+  are deterministic; how many of them a slow or loaded machine gets through is not, so
+  a join of **three or more relations** can plan differently on different hardware and
+  count differently as a result. Joins below three relations never reach the rule and
+  are unaffected. Tracked as `bug-join-order-depends-on-wall-clock`; until it is
+  resolved, read the machine-independence claim above as holding for every statement
+  whose plan does not go through QuickPick.
 
 `WorkCounterSnapshot`, `TableWorkCounters` and `PlanShape` are exported from the
 package root. `test/runtime/work-counter-stability.spec.ts` is the acceptance suite:
