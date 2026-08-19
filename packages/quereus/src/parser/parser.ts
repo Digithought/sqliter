@@ -4100,27 +4100,17 @@ export class Parser {
 		if (this.matchKeyword('OPTIONS')) {
 			this.consume(TokenType.LPAREN, "Expected '(' after OPTIONS.");
 			options = {};
+			// NOTE: the option set lives in three places — this dispatch, ApplySchemaStmt['options'],
+			// and astToString's renderer; nothing enforces that a new option reaches all three. Two
+			// options is cheap to keep in sync by hand; if the set grows, table-drive it.
 			if (!this.check(TokenType.RPAREN)) {
 				do {
+					const keyToken = this.peek();
 					const key = this.consumeIdentifier('Expected option key.').toLowerCase();
-					const keyToken = this.previous();
 					this.consume(TokenType.EQUAL, "Expected '=' after option key.");
-					if (key === 'dry_run' || key === 'validate_only') {
-						this.consumeBooleanLiteral();
-						throw new ParseError(keyToken, `Unsupported apply schema option '${key}'. Use 'diff schema' to preview changes read-only instead.`);
-					}
-					else if (key === 'allow_destructive') options.allowDestructive = this.consumeBooleanLiteral();
-					else if (key === 'rename_policy') {
-						const vtok = this.consume(TokenType.STRING, "Expected string for rename_policy.");
-						const v = String(vtok.literal);
-						if (v !== 'allow' && v !== 'require-hint' && v !== 'deny') {
-							throw new ParseError(vtok, `Unknown rename_policy '${v}'. Expected 'allow', 'require-hint', or 'deny'.`);
-						}
-						options.renamePolicy = v;
-					} else {
-						// consume literal
-						if (this.check(TokenType.STRING) || this.check(TokenType.INTEGER) || this.check(TokenType.FLOAT) || this.check(TokenType.IDENTIFIER)) this.advance();
-					}
+					if (key === 'allow_destructive') options.allowDestructive = this.consumeBooleanLiteral();
+					else if (key === 'rename_policy') options.renamePolicy = this.consumeRenamePolicy();
+					else throw this.unsupportedApplySchemaOption(keyToken, key);
 				} while (this.match(TokenType.COMMA));
 			}
 			this.consume(TokenType.RPAREN, "Expected ')' after OPTIONS.");
@@ -4142,19 +4132,31 @@ export class Parser {
 		return { type: 'explainSchema', schemaName, version, loc: _createLoc(startToken, this.previous()) };
 	}
 
+	/**
+	 * @internal Every `apply schema` option key must be recognized here. An unrecognized key is an
+	 * error rather than a silent no-op: a caller passing one is asking for behavior the engine will
+	 * not deliver, and quietly running the migration anyway is exactly the bug this rejects.
+	 */
+	private unsupportedApplySchemaOption(keyToken: Token, key: string): ParseError {
+		const hint = (key === 'dry_run' || key === 'validate_only')
+			? `Use 'diff schema' to preview changes read-only instead.`
+			: `Expected 'allow_destructive' or 'rename_policy'.`;
+		return new ParseError(keyToken, `Unsupported apply schema option '${key}'. ${hint}`);
+	}
+
+	private consumeRenamePolicy(): NonNullable<AST.ApplySchemaStmt['options']>['renamePolicy'] {
+		const vtok = this.consume(TokenType.STRING, "Expected string for rename_policy.");
+		const v = String(vtok.literal);
+		if (v !== 'allow' && v !== 'require-hint' && v !== 'deny') {
+			throw new ParseError(vtok, `Unknown rename_policy '${v}'. Expected 'allow', 'require-hint', or 'deny'.`);
+		}
+		return v;
+	}
+
 	private consumeBooleanLiteral(): boolean {
 		if (this.match(TokenType.TRUE)) return true;
 		if (this.match(TokenType.FALSE)) return false;
-		if (this.check(TokenType.STRING)) {
-			const t = this.advance();
-			const v = String(t.literal).toLowerCase();
-			return v === 'true' || v === '1';
-		}
-		if (this.check(TokenType.INTEGER)) {
-			const t = this.advance();
-			return Number(t.literal) !== 0;
-		}
-		return false;
+		throw new ParseError(this.peek(), `Expected 'true' or 'false' for option value.`);
 	}
 
 	private sourceSlice(_start: number, _end: number): string {

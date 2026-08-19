@@ -156,8 +156,6 @@ apply schema main to version '1.0.0' options (
   allow_destructive = false,
   rename_policy = 'require-hint'
 );
--- `dry_run` and `validate_only` are rejected (parse error): use `diff schema` for a
--- read-only preview instead — there's no engine-level dry-run/validate-only mode.
 ```
 
 ### Semantics and Features
@@ -197,6 +195,10 @@ apply schema main to version '1.0.0' options (
 - Schema declarations can include semantic versions.
 - `explain schema` computes a SHA-256 hash of the canonical schema representation.
 - Enables tracking schema changes and ensuring consistency across environments.
+
+**Options (`OPTIONS (...)`):**
+
+`allow_destructive` (boolean literal `true` / `false`) and `rename_policy` (string) are the only keys accepted; both are described below. Anything else is a parse error — an unrecognized key, or a non-boolean value for `allow_destructive`. Silently dropping an option the engine will not honor would run the full migration anyway, which is precisely what the caller was trying to avoid. `dry_run` and `validate_only` were accepted-and-ignored by earlier builds and are now rejected by name: use `diff schema` for a read-only preview of the exact migration DDL. There is no engine-level dry-run or validate-only mode.
 
 **Safety:**
 - Seed data application is destructive (clears table before inserting).

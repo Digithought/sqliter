@@ -2,7 +2,7 @@ import { expect } from 'chai';
 import { parse, parseAll, type BinaryExpr, type UnaryExpr, type LiteralExpr, type SelectStmt, type Expression, type BetweenExpr } from '../src/parser/index.js';
 import { ParseError } from '../src/parser/parser.js';
 import { astToString } from '../src/emit/index.js';
-import type { CreateMaterializedViewStmt, RefreshMaterializedViewStmt, DropStmt } from '../src/parser/ast.js';
+import type { ApplySchemaStmt, CreateMaterializedViewStmt, RefreshMaterializedViewStmt, DropStmt } from '../src/parser/ast.js';
 
 /** Shorthand to parse an expression from a SELECT wrapper */
 function parseExpr(exprSql: string): Expression {
@@ -405,14 +405,41 @@ describe('Parser', () => {
 			}
 		});
 
-		it('should reject dry_run as an apply schema option', () => {
-			expect(() => parse(`apply schema temp options (dry_run = true)`))
-				.to.throw(ParseError, /Unsupported apply schema option 'dry_run'/);
+		for (const option of ['dry_run', 'validate_only']) {
+			for (const value of ['true', 'false']) {
+				it(`should reject ${option} = ${value} as an apply schema option`, () => {
+					// Rejected whichever way it is set: the option existing at all promises a
+					// preview/check mode the engine does not have.
+					expect(() => parse(`apply schema temp options (${option} = ${value})`))
+						.to.throw(ParseError, new RegExp(`Unsupported apply schema option '${option}'.*diff schema`));
+				});
+			}
+		}
+
+		it('should reject an unrecognized apply schema option instead of ignoring it', () => {
+			expect(() => parse(`apply schema temp options (allow_destrucive = true)`))
+				.to.throw(ParseError, /Unsupported apply schema option 'allow_destrucive'.*allow_destructive.*rename_policy/);
 		});
 
-		it('should reject validate_only as an apply schema option', () => {
-			expect(() => parse(`apply schema temp options (validate_only = true)`))
-				.to.throw(ParseError, /Unsupported apply schema option 'validate_only'/);
+		it('should reject a non-boolean apply schema option value', () => {
+			expect(() => parse(`apply schema temp options (allow_destructive = 'yes')`))
+				.to.throw(ParseError, /Expected 'true' or 'false'/);
+		});
+	});
+
+	describe('Apply Schema Options', () => {
+		it('should parse the supported options onto the AST', () => {
+			const stmt = parse(`apply schema temp options (allow_destructive = true, rename_policy = 'require-hint')`) as ApplySchemaStmt;
+			expect(stmt.type).to.equal('applySchema');
+			expect(stmt.options).to.deep.equal({ allowDestructive: true, renamePolicy: 'require-hint' });
+		});
+
+		it('should round-trip the supported options through astToString', () => {
+			const sql = `apply schema temp options (allow_destructive = false, rename_policy = 'deny')`;
+			const rendered = astToString(parse(sql));
+			expect(rendered).to.include(`allow_destructive = false`);
+			expect(rendered).to.include(`rename_policy = 'deny'`);
+			expect((parse(rendered) as ApplySchemaStmt).options).to.deep.equal({ allowDestructive: false, renamePolicy: 'deny' });
 		});
 	});
 

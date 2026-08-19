@@ -2074,3 +2074,39 @@ select id, label from "recording:1fec5b46-014d-4e77-9dc1-b44df5513e88"."row data
 → [{"id": 1, "label": "first"}]
 
 drop table "recording:1fec5b46-014d-4e77-9dc1-b44df5513e88"."row data";
+
+-- ===================================
+-- apply schema options: unhonored keys are rejected, not dropped
+-- ===================================
+
+create table opt_probe (id integer primary key);
+
+declare schema main {
+	table opt_probe {
+		id integer primary key
+	}
+}
+
+-- run
+
+-- `dry_run` / `validate_only` promise a preview the engine never had.
+apply schema main options (dry_run = true);
+-- error: Unsupported apply schema option 'dry_run'
+
+apply schema main options (validate_only = false);
+-- error: Unsupported apply schema option 'validate_only'
+
+-- An unrecognized key is an error too, rather than a silent no-op.
+apply schema main options (allow_destructiv = true);
+-- error: Unsupported apply schema option 'allow_destructiv'
+
+-- So is a value that is not a boolean literal.
+apply schema main options (allow_destructive = 'yes');
+-- error: Expected 'true' or 'false'
+
+-- The supported options still apply cleanly.
+apply schema main options (allow_destructive = true, rename_policy = 'deny');
+
+-- run
+
+drop table opt_probe;
