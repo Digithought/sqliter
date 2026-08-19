@@ -265,7 +265,8 @@ Quereus employs a multi-faceted testing strategy:
 	*   Records results to timestamped JSON files in `bench/results/` (gitignored).
 	*   `yarn bench --baseline <file>` compares against a previous result, color-codes regressions (>20% red) and improvements (>10% green), and exits non-zero on regressions.
 
-6.  **CI Integration (Planned)**
-	*   Utilize GitHub Actions (or similar) to run test suites automatically, potentially with different configurations (quick checks, full runs, browser environment).
+6.  **Full Run (`yarn check`)**
+	*   `yarn check` is this project's complete verification pass, run before a release: `docs:check` → `lint` → `build` → `typecheck` → `test:full` (memory **and** LevelDB store backends) → the `fork-strict` / `context-strict` / `repr-strict` passes.
+	*   There is deliberately **no continuous-integration service**. `yarn check` on a developer machine is the gate; anything that needs to run automatically belongs in that chain, not in a hosted runner.
 
 This layered approach aims for broad coverage via the logic tests, unit tests for individual subsystems, property tests to explore edge cases, performance sentinels to guard against regressions, and a dedicated benchmark suite for tracking performance over time.

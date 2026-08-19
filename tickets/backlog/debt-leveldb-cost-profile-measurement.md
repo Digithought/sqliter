@@ -42,3 +42,11 @@ from parity, declare the measured profile on `LevelDBProvider`.
 The same harness would answer the question for the React Native LevelDB and NativeScript
 SQLite backends, which are in the same undeclared position, though each needs its own runtime
 to run in.
+
+## Cross-reference
+
+`bench-store-suite` (plan/) builds a standing store-backend benchmark suite whose
+sequential-versus-random-read micro-benchmarks are the measurement this ticket asks for.
+If that suite produces the two ratios at both a cache-warm and a cache-cold dataset size,
+this ticket reduces to reading them and deciding whether to declare a profile on
+`LevelDBProvider` or record the parity finding in the plugin README.

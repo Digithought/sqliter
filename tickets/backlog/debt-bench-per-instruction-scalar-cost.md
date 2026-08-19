@@ -53,3 +53,10 @@ from having done nothing.
 Turning the slope into a `ratioGuards` entry or a regression gate. Establish what the
 number is and how stable it is across machines first; a gate on an unstable number is
 worse than no gate.
+
+## Cross-reference
+
+The process-isolation blocker named above is addressed by `bench-harness-measurement-rigor`
+(plan/), which makes per-suite (or per-benchmark) child-process execution a property of the
+harness. Once that lands, this benchmark no longer needs its own invocation mode - and the
+ad-hoc `bench/fusion-slope.mjs` it grew out of is scheduled to fold in or be deleted there.
