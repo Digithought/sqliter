@@ -53,9 +53,12 @@ const benchDir = fileURLToPath(new URL('..', import.meta.url));
  * regression trips from a single run with no baseline file.
  *
  * @typedef {object} RatioGuard
- * @property {string} name benchmark under test
- * @property {string} baseline benchmark its median is measured against
+ * @property {string} name benchmark under test — bare (resolved within the declaring
+ *   suite) or a full `suite/name`, which is how a guard reaches across suites
+ * @property {string} baseline benchmark its median is measured against; same resolution
  * @property {number} maxRatio largest acceptable `name / baseline`
+ * @property {string} [note] one sentence on what the guard protects, printed with the
+ *   verdict
  *
  * @typedef {object} Suite
  * @property {string} file suite file name
@@ -127,7 +130,43 @@ export async function loadSuite(file) {
 		}
 		seen.add(bench.name);
 	}
-	return { file, name, benchmarks, ratioGuards: mod.ratioGuards ?? [] };
+	return { file, name, benchmarks, ratioGuards: validateRatioGuards(file, mod.ratioGuards ?? []) };
+}
+
+/**
+ * Validate a suite's `ratioGuards` export, loudly, in the parent — for the same reason
+ * the benchmark fields above are: a malformed guard would otherwise surface only when
+ * (or worse, whether) it is evaluated, and a guard that quietly never evaluates is a
+ * guard everyone believes is protecting them.
+ *
+ * Exported for `test/bench-guards.spec.ts`; `loadSuite` is the real caller.
+ *
+ * @param {string} file suite file name, for the error message
+ * @param {unknown} ratioGuards the module's `ratioGuards` export (or `[]`)
+ * @returns {RatioGuard[]} the validated guards, unchanged
+ */
+export function validateRatioGuards(file, ratioGuards) {
+	if (!Array.isArray(ratioGuards)) {
+		throw new Error(`suite '${file}' exports a 'ratioGuards' that is not an array (got ${typeof ratioGuards})`);
+	}
+	for (const guard of ratioGuards) {
+		if (typeof guard?.name !== 'string' || guard.name.length === 0) {
+			throw new Error(`suite '${file}' has a ratio guard with no 'name'`);
+		}
+		if (typeof guard.baseline !== 'string' || guard.baseline.length === 0) {
+			throw new Error(`suite '${file}' ratio guard '${guard.name}' has no 'baseline'`);
+		}
+		// A zero, negative or non-finite bound is checked here rather than tolerated:
+		// maxRatio ≤ 0 fails every run unconditionally, and NaN compares false against
+		// everything, making the guard silently pass forever — opposite bugs, same typo.
+		if (typeof guard.maxRatio !== 'number' || !Number.isFinite(guard.maxRatio) || guard.maxRatio <= 0) {
+			throw new Error(`suite '${file}' ratio guard '${guard.name}' needs a finite 'maxRatio' greater than 0 (got ${String(guard.maxRatio)})`);
+		}
+		if (guard.note !== undefined && typeof guard.note !== 'string') {
+			throw new Error(`suite '${file}' ratio guard '${guard.name}' has a 'note' that is not a string (got ${typeof guard.note})`);
+		}
+	}
+	return ratioGuards;
 }
 
 /** Import every suite, in file-name order.

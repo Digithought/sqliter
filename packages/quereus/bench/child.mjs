@@ -28,12 +28,12 @@
  * `lib/calibrate.mjs`.
  *
  * Usage (not intended to be run by hand):
- *   node bench/child.mjs <suite-file.bench.mjs> <benchmark-name> [--no-counters]
+ *   node bench/child.mjs <suite-file.bench.mjs> <benchmark-name> [--no-counters] [--gate-calibration]
  */
 
 import { loadSuite } from './lib/discover.mjs';
 import { runCountersPass } from './lib/counters.mjs';
-import { calibrate, collectSamples, pinnedPlan, runPinnedWarmup } from './lib/calibrate.mjs';
+import { CALIBRATION, GATE_CALIBRATION, calibrate, collectSamples, pinnedPlan, runPinnedWarmup } from './lib/calibrate.mjs';
 
 /** Force-exit delay after the result is sent, so a benchmark that leaked a timer
  * or an open handle does not sit until the parent's timeout. `unref` means this
@@ -49,6 +49,10 @@ const [suiteFile, benchName, ...flags] = process.argv.slice(2);
 
 /** `--no-counters` skips the counters pass entirely, for a run that only wants timings. */
 const collectCounters = !flags.includes('--no-counters');
+
+/** `--gate-calibration` selects the reduced timing profile the gate's guard pass uses —
+ * see `GATE_CALIBRATION` in `lib/calibrate.mjs` for why a looser median is safe there. */
+const calibration = flags.includes('--gate-calibration') ? GATE_CALIBRATION : CALIBRATION;
 
 /** Set just before the worker disconnects itself on the normal path, so the handler
  * below can tell an orderly finish from the parent vanishing. */
@@ -159,10 +163,10 @@ async function main() {
 			await runPinnedWarmup(fn, plan);
 		} else {
 			// Runs the warmup itself — batch sizing has to happen on a warmed `fn`.
-			plan = await calibrate(fn);
+			plan = await calibrate(fn, calibration);
 		}
 
-		const timings = await collectSamples(fn, plan);
+		const timings = await collectSamples(fn, plan, calibration);
 
 		// After the timed loop, before teardown — the pass needs whatever `setup` built,
 		// and must not be inside anything the timings are derived from. Its own phase, so

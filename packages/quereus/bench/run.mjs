@@ -40,6 +40,7 @@ import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
 
 import { informationalNames, loadSuites, selectBenchmarks } from './lib/discover.mjs';
+import { checkRatioGuards, reportRatioGuards } from './lib/guards.mjs';
 import { summarize, UNSTABLE_SPREAD, GATE_MIN_DELTA_PCT } from './lib/stats.mjs';
 import { compareRun, STATUS_ORDER } from './lib/compare.mjs';
 import { captureEnvironment, compareEnvironments, describeCheckout, describeEnvironment } from './lib/environment.mjs';
@@ -527,105 +528,6 @@ function fmtFloor(verdict) {
 	return verdict.noise_floor_pct === null ? '—' : `±${verdict.noise_floor_pct.toFixed(1)}%`;
 }
 
-// ── Within-run ratio guards ─────────────────────────────────────────────
-/**
- * Evaluate each suite's `ratioGuards` against the collected medians. A guard
- * `{ name, baseline, maxRatio }` fails when `median[suite/name] /
- * median[suite/baseline]` exceeds `maxRatio`.
- *
- * A guard naming a benchmark that was never selected is handled two ways, by
- * design: with `--filter` active it is REPORTED AS SKIPPED, because narrowing a
- * run to one benchmark would otherwise make every guard fire and train everyone
- * to ignore them; with no filter it is a MISCONFIGURATION and counts as a
- * failure, never a silent skip. A guard whose benchmark was selected but failed
- * is reported as not evaluated — the benchmark failure already fails the run, so
- * counting it twice adds noise, not signal.
- *
- * Returns records rather than printing them, so the same verdicts can be written into
- * the results JSON a gate script reads.
- *
- * A guard naming a benchmark that SKIPPED is `not-evaluated` for the same reason, and
- * deliberately never `misconfigured`: a skip is a benchmark declining to run on this
- * machine, not a guard naming something that does not exist, and failing the run over
- * one would turn every skip into a red build.
- *
- * A guard naming an INFORMATIONAL benchmark is `misconfigured`, and that is checked before
- * anything else. An advisory row's number is not a property of this repository's code — a
- * guard over one would fail the build on a slow disk — so no guard may name one, and the
- * mistake belongs to whoever wrote the guard. It is deliberately not a silent skip: a
- * guard that quietly never evaluates is a guard everyone believes is protecting them.
- *
- * @param {Map<string, string>} skippedNames full name -> the reason it skipped
- * @param {Set<string>} informational full names whose rows are advisory
- * @returns {{ target: string, baseline: string, status: string, ratio: number|null, maxRatio: number, detail: string }[]}
- */
-function checkRatioGuards(suites, allBenchmarks, selectedNames, filterActive, skippedNames = new Map(), informational = new Set()) {
-	const verdicts = [];
-	for (const suite of suites) {
-		for (const guard of suite.ratioGuards ?? []) {
-			const targetName = `${suite.name}/${guard.name}`;
-			const baseName = `${suite.name}/${guard.baseline}`;
-			const record = { target: targetName, baseline: baseName, ratio: null, maxRatio: guard.maxRatio };
-
-			// FIRST, before every other case: a guard naming an advisory row is a guard
-			// authoring error whatever else is true of this run, and reporting it as
-			// "skipped by --filter" or "not evaluated" would let it sit unnoticed.
-			const advisory = [targetName, baseName].filter((n) => informational.has(n));
-			if (advisory.length > 0) {
-				verdicts.push({ ...record, status: 'misconfigured', detail: `guard names '${advisory[0]}', whose row is informational — advisory numbers depend on the machine's disk and must not gate a build` });
-				continue;
-			}
-
-			// Checked before the unselected case: a skipped benchmark IS selected, so it
-			// would otherwise fall through to the ratio computation and be reported as a
-			// failure to run.
-			const declined = [targetName, baseName].filter((n) => skippedNames.has(n));
-			if (declined.length > 0) {
-				verdicts.push({ ...record, status: 'not-evaluated', detail: `'${declined[0]}' skipped — ${skippedNames.get(declined[0])}` });
-				continue;
-			}
-
-			const unselected = [targetName, baseName].filter((n) => !selectedNames.has(n));
-			if (unselected.length > 0) {
-				verdicts.push(filterActive
-					? { ...record, status: 'skipped', detail: `${unselected.join(', ')} not selected by --filter` }
-					: { ...record, status: 'misconfigured', detail: `benchmark '${unselected[0]}' not found in this run` });
-				continue;
-			}
-
-			const target = allBenchmarks[targetName];
-			const base = allBenchmarks[baseName];
-			if (!target || !base) {
-				const failed = !target ? targetName : baseName;
-				verdicts.push({ ...record, status: 'not-evaluated', detail: `'${failed}' failed to run` });
-				continue;
-			}
-
-			// Degenerate medians (sub-rounding-floor) collapse to a sane ratio
-			// rather than NaN/Infinity: both ~0 ⇒ 1, only the target ~0 ⇒ still 0.
-			const ratio = base.median_ms > 0
-				? target.median_ms / base.median_ms
-				: (target.median_ms > 0 ? Infinity : 1);
-			verdicts.push(ratio > guard.maxRatio
-				? { ...record, ratio, status: 'failed', detail: `${targetName} is ${ratio.toFixed(1)}× ${baseName} (max ${guard.maxRatio}×) — likely a plan-shape regression` }
-				: { ...record, ratio, status: 'ok', detail: `${targetName} / ${baseName} = ${ratio.toFixed(2)}× (max ${guard.maxRatio}×)` });
-		}
-	}
-	return verdicts;
-}
-
-/** Print the guard verdicts and return how many of them fail the run. */
-function reportRatioGuards(verdicts) {
-	for (const verdict of verdicts) {
-		if (verdict.status === 'ok') say(`ratio guard ok: ${verdict.detail}`);
-		else if (verdict.status === 'skipped') say(`ratio guard skipped: ${verdict.target} / ${verdict.baseline} — ${verdict.detail}`);
-		else if (verdict.status === 'not-evaluated') say(yellow(`ratio guard not evaluated: ${verdict.target} / ${verdict.baseline} — ${verdict.detail}`));
-		else if (verdict.status === 'misconfigured') say(red(`ratio guard misconfigured: ${verdict.detail}`));
-		else say(red(`ratio guard FAILED: ${verdict.detail}`));
-	}
-	return verdicts.filter((v) => v.status === 'failed' || v.status === 'misconfigured').length;
-}
-
 // ── Baseline ────────────────────────────────────────────────────────────
 /**
  * Read a previous results file. Loaded BEFORE any benchmark runs: a typo in the path
@@ -974,7 +876,7 @@ async function main() {
 	say(`Results written to ${await writeResults(output)}`);
 
 	let exitCode = 0;
-	if (reportRatioGuards(ratioGuards) > 0) exitCode = 1;
+	if (reportRatioGuards(ratioGuards, { say, red, yellow }) > 0) exitCode = 1;
 
 	if (comparison) {
 		printComparisonSummary(comparison.comparisons, comparison.counts);

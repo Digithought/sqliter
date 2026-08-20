@@ -61,6 +61,28 @@ export const CALIBRATION = {
 };
 
 /**
+ * The gate's reduced timing profile (`yarn bench:gate` — see `bench/gate.mjs`), selected
+ * in the worker by the `--gate-calibration` flag.
+ *
+ * The gate times only the benchmarks named by a ratio guard, and a guard bounds a RATIO
+ * with generous headroom (the first one allows 10×), so its median does not need the
+ * manual runner's full second of samples — a looser number answers the same question in
+ * a third of the wall-clock. The risk of a noisy reduced median is bounded by design:
+ * a guard that fails under this profile is re-measured once at full `CALIBRATION`
+ * before it may fail the run, so the reduced profile can cost a wasted re-measure but
+ * never a false failure.
+ */
+export const GATE_CALIBRATION = {
+	...CALIBRATION,
+	/** Less warmup than the manual runner's 250 ms, but far from cold: the guard
+	 * benchmarks are millisecond-scale queries, so 100 ms is still dozens of calls. */
+	warmupTargetMs: 100,
+	/** A third of the manual runner's timed work per benchmark. */
+	targetTotalMs: 300,
+	maxTotalMs: 1500,
+};
+
+/**
  * @typedef {typeof CALIBRATION} CalibrationConfig
  *
  * @typedef {object} SamplePlan
