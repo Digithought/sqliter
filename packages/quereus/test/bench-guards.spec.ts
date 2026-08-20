@@ -90,7 +90,15 @@ describe('bench guards: checkRatioGuards', () => {
 		const [verdict] = check(oneGuard(), { 's/a': 15, 's/b': 5 }, ['s/a', 's/b']);
 		expect(verdict.status).to.equal('failed');
 		expect(verdict.ratio).to.equal(3);
-		expect(verdict.detail).to.match(/3\.0× s\/b \(max 2×\)/);
+		expect(verdict.detail).to.match(/3\.00× s\/b \(max 2×\)/);
+	});
+
+	it('prints a failing ratio at two decimals, so a sub-1 bound stays readable', () => {
+		// maxRatio below 1 is a legal "must stay faster than" guard; one decimal would
+		// round this 0.97 to `1.0` and hide which side of the bound it landed on.
+		const [verdict] = check(oneGuard({ maxRatio: 0.5 }), { 's/a': 97, 's/b': 100 }, ['s/a', 's/b']);
+		expect(verdict.status).to.equal('failed');
+		expect(verdict.detail).to.contain('0.97×');
 	});
 
 	it('reports an unselected member as skipped when a --filter is active', () => {
@@ -287,6 +295,25 @@ describe('bench guards: guardMemberNames', () => {
 		])];
 		const names = guardMemberNames(suites, new Set(['s/p']));
 		expect([...names].sort()).to.deep.equal(['s/shared', 's/y']);
+	});
+
+	it('ignores the selection entirely when none is given', () => {
+		expect([...guardMemberNames(oneGuard(), new Set(), null)].sort()).to.deep.equal(['s/a', 's/b']);
+	});
+
+	it('drops both members of a guard whose OTHER member the run did not select', () => {
+		// The verdict is already decided (skipped, or misconfigured with no filter), so
+		// timing 's/a' would be a fork spent on a question nobody asked.
+		expect(guardMemberNames(oneGuard(), new Set(), new Set(['s/a'])).size).to.equal(0);
+	});
+
+	it('keeps a fully-selected guard, and keeps a member shared with one', () => {
+		const suites = [guardSuite('s', [
+			{ name: 'a', baseline: 'b', maxRatio: 2 },
+			{ name: 'a', baseline: 'gone', maxRatio: 2 },
+		])];
+		const names = guardMemberNames(suites, new Set(), new Set(['s/a', 's/b']));
+		expect([...names].sort()).to.deep.equal(['s/a', 's/b']);
 	});
 });
 

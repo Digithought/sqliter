@@ -68,11 +68,19 @@ export function resolveGuardName(suiteName, name) {
  * `misconfigured` whichever way the timing comes out, so timing for it buys nothing.
  * A member shared with a healthy guard is still collected via that guard.
  *
+ * `selectedNames` narrows the same way and for the same reason: a guard one of whose
+ * members this run did not select is `skipped` (under `--filter`) or `misconfigured`
+ * (without one) whatever the other member measures, so timing that other member is a
+ * fork spent on a verdict already decided. Omit it — as the gate's "did the filter name
+ * any guard member at all?" check does — to ask which members a guard COULD need.
+ *
  * @param {GuardSuite[]} suites
  * @param {Set<string>} [informational] full names whose rows are advisory
+ * @param {Set<string>|null} [selectedNames] full names this run selected, or null to
+ *   ignore selection entirely
  * @returns {Set<string>} full names
  */
-export function guardMemberNames(suites, informational = new Set()) {
+export function guardMemberNames(suites, informational = new Set(), selectedNames = null) {
 	/** @type {Set<string>} */
 	const names = new Set();
 	for (const suite of suites) {
@@ -80,11 +88,23 @@ export function guardMemberNames(suites, informational = new Set()) {
 			const target = resolveGuardName(suite.name, guard.name);
 			const base = resolveGuardName(suite.name, guard.baseline);
 			if (informational.has(target) || informational.has(base)) continue;
+			if (selectedNames !== null && !(selectedNames.has(target) && selectedNames.has(base))) continue;
 			names.add(target);
 			names.add(base);
 		}
 	}
 	return names;
+}
+
+/** Every ratio a verdict prints, at ONE precision. Two decimals rather than one because
+ * `maxRatio` may be below 1 — a "must stay faster than" guard — where a single decimal
+ * rounds 0.97 to `1.0` and hides which side of the bound the run landed on.
+ *
+ * @param {number|null} ratio
+ * @returns {string}
+ */
+function fmtRatio(ratio) {
+	return ratio === null ? 'no ratio' : `${ratio.toFixed(2)}×`;
 }
 
 /**
@@ -174,16 +194,11 @@ export function checkRatioGuards(suites, allBenchmarks, selectedNames, filterAct
 				? target.median_ms / base.median_ms
 				: (target.median_ms > 0 ? Infinity : 1);
 			verdicts.push(ratio > guard.maxRatio
-				? { ...record, ratio, status: 'failed', detail: `${targetName} is ${ratio.toFixed(1)}× ${baseName} (max ${guard.maxRatio}×) — likely a plan-shape regression` }
-				: { ...record, ratio, status: 'ok', detail: `${targetName} / ${baseName} = ${ratio.toFixed(2)}× (max ${guard.maxRatio}×)` });
+				? { ...record, ratio, status: 'failed', detail: `${targetName} is ${fmtRatio(ratio)} ${baseName} (max ${guard.maxRatio}×) — likely a plan-shape regression` }
+				: { ...record, ratio, status: 'ok', detail: `${targetName} / ${baseName} = ${fmtRatio(ratio)} (max ${guard.maxRatio}×)` });
 		}
 	}
 	return verdicts;
-}
-
-/** @param {number|null} ratio @returns {string} */
-function fmtRatio(ratio) {
-	return ratio === null ? 'no ratio' : `${ratio.toFixed(2)}×`;
 }
 
 /**

@@ -82,6 +82,13 @@ export const GATE_CALIBRATION = {
 	maxTotalMs: 1500,
 };
 
+// NOTE: a PINNED benchmark ignores this profile — `pinnedPlan` reads its counts off the
+// benchmark and only `collectSamples`' `minSamples` comes from the config, so a pinned
+// guard member measures the same either side of the re-measure. The re-measure is then a
+// second independent sample rather than a longer one, which still breaks a one-off noise
+// spike but does not narrow the distribution. No benchmark pins itself today; if a guard
+// ever names one, either unpin it or give `pinnedPlan` a gate-mode iteration count.
+
 /**
  * @typedef {typeof CALIBRATION} CalibrationConfig
  *

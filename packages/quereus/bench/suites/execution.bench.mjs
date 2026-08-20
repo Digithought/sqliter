@@ -133,9 +133,10 @@ export const benchmarks = [
  *
  * `maxRatio` is deliberately LOOSE (order-of-magnitude): its job is to trip the
  * 26×-class regression, not order-of-1 warm-up variance on the in-memory vtab.
- * If the twin ever shows high variance near the bound, raise
- * `CALIBRATION.targetTotalMs` in `bench/lib/calibrate.mjs` so both sides collect more
- * samples, rather than tightening `maxRatio`.
+ * If the twin ever shows high variance near the bound, raise `targetTotalMs` in
+ * `bench/lib/calibrate.mjs` so both sides collect more samples, rather than tightening
+ * `maxRatio` — in `CALIBRATION` for `yarn bench`, and in `GATE_CALIBRATION` for the
+ * reduced profile `yarn bench:gate` times guard members at.
  *
  * GUARDS NAME ONE BENCHMARK EACH, AND THAT MEANS ONE BACKEND EACH. These bare names
  * are the default backend's rows. A guard that wants to bound a suffixed benchmark

@@ -165,3 +165,37 @@ ARE inside the checked include, and that is what caught a real error: `tempdir.m
 in commit `9dd90e02d` with `error TS2339: Property 'code' does not exist on type '{}'`,
 breaking `yarn lint` outright until the implementer's second commit fixed it. The same
 mistake in `run.mjs` would still ship green.
+
+## Arm added by review of `bench-gate-ratio-guards`
+
+**`bench/gate.mjs` has now grown a second, forked pass, and none of it is covered by any
+check — static or behavioural.** The ratio-guard *rules* are pure and well covered
+(`test/bench-guards.spec.ts`, 35 tests over `bench/lib/guards.mjs`). The *wiring* that
+drives them is roughly 250 new lines in `gate.mjs` verified only by a person running the
+gate and reading the terminal:
+
+- the per-member fork helper, its 120 s timeout and the 5 s reap backstop after `SIGKILL`,
+- the `SIGINT`/`SIGTERM` handlers (same Windows limitation the arm above records for
+  `run.mjs`: `child.kill('SIGINT')` terminates rather than delivering the signal),
+- the member-fork-failure path — a fork that dies deletes its `allBenchmarks` entry, so the
+  guard reads *not evaluated* and a separate counter fails the gate with "guard member
+  benchmark(s) failed to run". Nothing has ever exercised it.
+- the zero-counter-selection relax: a `--filter` that names only guard members selects no
+  counter-declaring benchmark and must run the guard pass instead of refusing. Unreachable
+  today (both members of the only guard declare `counters()`), so it is dead code until a
+  guard names a benchmark without a counters pass — and it will be first exercised by
+  whoever writes that guard, with nothing to tell them if it is wrong.
+- `--report-only` / `QUEREUS_BENCH_GATE_REPORT_ONLY`: the exit rule itself is pure and
+  tested (`gateExitCode`), but the wiring that folds counter failures, guard failures and
+  member failures into the one `failed` flag is not.
+
+**Re-measured static-check coverage**, superseding the numbers in the arms above. Widening
+`packages/quereus/tsconfig.test.json`'s `include` by `bench/*.mjs` alone (the entry points;
+`bench/suites/**` is `debt-bench-suites-outside-type-pass`'s half) and running
+`npx tsc -p <scratch config> --noEmit` from `packages/quereus` gives **180 errors**:
+`bench/run.mjs` 91, `bench/gate.mjs` 80, `bench/child.mjs` 9. Every one read during the
+review was an annotation gap — `TS7006`/`TS7031` implicit-`any` parameters, `TS2339`
+property access on an untyped `object` bag, two `WriteStream` fd-narrowing complaints from
+the `--json` stream swap — and none was a real defect. That is the same shape the earlier
+arms measured; the count grew because this ticket's code did. eslint still globs
+`'src/**/*.ts' 'test/**/*.ts'`, so no `.mjs` under `bench/` is linted at all.

@@ -510,7 +510,9 @@ async function runGuardPass(suites, filter, informational) {
 
 	const selected = selectBenchmarks(suites, filter);
 	const selectedNames = new Set(selected.map((b) => b.fullName));
-	const memberNames = guardMemberNames(suites, informational);
+	// Narrowed by the selection as well as by the informational set: a guard missing a
+	// member is decided before anything is timed, so its other member is not worth a fork.
+	const memberNames = guardMemberNames(suites, informational, selectedNames);
 	const members = selected.filter((b) => memberNames.has(b.fullName));
 
 	/** @type {Record<string, object>} */

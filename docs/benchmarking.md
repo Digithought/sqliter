@@ -1002,7 +1002,8 @@ Requirements:
 | --- | --- |
 | `bench/run.mjs` | Parent orchestrator: arguments, forking, the table, the comparison output, the exit code. Never runs benchmark work itself. |
 | `bench/child.mjs` | Worker: runs exactly one benchmark and reports raw samples over IPC. |
-| `bench/gate.mjs` | The [regression gate](#regression-gate) and accept entry point: arguments, the single-process counters pass, the report, the exit code. |
+| `bench/gate.mjs` | The [regression gate](#regression-gate) and accept entry point: arguments, the single-process counters pass, the forked [ratio-guard](#ratio-guards) pass, the report, the exit code. |
+| `bench/lib/guards.mjs` | The [ratio-guard](#ratio-guards) rules — member selection, verdict classification, the re-measure fold, the gate's exit rule, the verdict report — as pure functions shared by `run.mjs` and `gate.mjs`, which can never import each other. |
 | `bench/lib/reference.mjs` | The gate's rules — reference file read/write, gate eligibility, outcome classification, accept validation — as pure functions over plain objects. |
 | `bench/reference/*.json` | The checked-in expected counter blocks, one file per suite, rewritten only by `yarn bench:accept`. |
 | `bench/lib/calibrate.mjs` | The timing policy — warmup, batch sizing, sample count. Kept out of the worker so `test/bench-calibration.spec.ts` can drive it. |
@@ -1021,7 +1022,8 @@ Harness tests, none of which run a benchmark: `test/bench-calibration.spec.ts` (
 policy and the statistics), `test/bench-comparison.spec.ts` (the cross-run rules and the
 environment check), `test/bench-backends.spec.ts` (the backend expansion and the naming
 rule), `test/bench-gate.spec.ts` (the gate's eligibility, classification, serialization
-and accept-validation rules). Neither `yarn bench` nor `yarn bench:gate` is part of
+and accept-validation rules), `test/bench-guards.spec.ts` (the ratio-guard rules and the
+suite-side guard validation). Neither `yarn bench` nor `yarn bench:gate` is part of
 `yarn test`, so these are the only automated check on the harness itself.
 
 See also [Architecture § Benchmark Suite](architecture.md#testing-strategy).
