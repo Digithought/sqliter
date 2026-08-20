@@ -353,19 +353,99 @@ byte-identical to what `yarn bench` records.
   `counterBlock`). Its `counterBlock` fixture shows the `WorkCounterSnapshot` shape:
   `{ plan: { nodeCount, nodeTypes }, instructions: [...], tables: {...}, totals: {...} }`.
 
-## The ONE unresolved item — check before writing the eligibility walk
+## RESOLVED: `getPlanShape()` returns a BARE `PlanShape` at the root
 
-The exact return shape of `Statement.getPlanShape()` (planner suite's whole counter
-block) was NOT yet confirmed. If `PlanShape` is `{ nodeCount, nodeTypes }` at the
-ROOT — i.e. `nodeTypes` NOT nested under a `plan` key — then a walk that looks only
-for `plan.nodeTypes` pairs would silently never examine planner-suite blocks (they
-would all read as "no plan ⇒ gated", which happens to be the right answer today but
-for the wrong reason, and would go quietly wrong the day a planner row gains a
-three-way join). Grep `getPlanShape`/`PlanShape` in `src/` first, then write the walk
-as: any object member whose value is an object containing a `nodeTypes`
-plain-object-of-numbers counts as ONE plan (this catches both `plan: {nodeTypes}`
-nested at any depth and a bare `PlanShape` root). Sum `/Join$/` keys per plan; two or
-more in any one plan ⇒ ungated.
+Confirmed in `src/runtime/work-counters.ts` (`PlanShape` interface, `computePlanShape`)
+and `src/core/statement.ts` (`getPlanShape()`): the shape is `{ nodeCount, nodeTypes }`
+with `nodeTypes` a `Record<string, number>` — NOT nested under a `plan` key. So the
+planner suite's whole counter block is a bare `PlanShape`, and a walk that only looked
+for `plan.nodeTypes` pairs would never examine it. Write the eligibility walk as
+planned: any object whose value carries a `nodeTypes` plain-object-of-numbers member
+counts as ONE plan (catches both `plan: {nodeTypes}` nested at any depth and the bare
+root). Sum keys matching `/Join$/` per plan; two or more in any ONE plan ⇒ ungated.
+Do not recurse INTO a matched plan object — nothing nests inside one.
+
+# Session 2 learnings (investigation complete — start writing code immediately)
+
+A second agent run confirmed the last open question (above) and settled the module
+design, then hit its token budget before writing code. Nothing below needs re-checking.
+
+## Additional verified facts
+
+- `packages/quereus/tsconfig.json` sets `allowJs: true, checkJs: true, strict: true` —
+  `reference.mjs` must carry full JSDoc types in the style of `bench/lib/compare.mjs`
+  (typedefs, `@param`/`@returns` on everything) or `yarn lint`'s tsc pass fails.
+- `LEVELDB_ENV_VAR = 'QUEREUS_BENCH_LEVELDB'` is already exported from
+  `bench/lib/leveldb-backend.mjs` — import it in `gate.mjs`, don't restate the literal.
+- `environment.mjs`'s `git()` helper (defensive: never throws, 5 s timeout, cwd pinned
+  to the checkout holding the file) is module-private. Export it and use it for
+  `git config user.name` / `user.email` in provenance capture — do not write a second
+  git wrapper.
+- `child.mjs`'s `runCountersPass` (JSON round-trip + plain-object validation) is local
+  to `child.mjs`. Move it into `bench/lib/counters.mjs` as an export and import it from
+  both `child.mjs` and `gate.mjs` — one definition, and `counters.mjs` has no runtime
+  `dist/` import so the parent-side import stays safe.
+- `COUNTER_CHANGES_SHOWN = 12` lives at `run.mjs:65`; move to `reference.mjs`, import
+  back into `run.mjs`.
+- Counter-block nesting shapes, confirmed in the suites: execution/mutation
+  `@store-mem` rows return `{ engine: WorkCounterSnapshot, store: {...} }`;
+  `snapshotStatements` returns a named bag of snapshots; planner returns a bare
+  `PlanShape`; store hot-path rows return snapshots (some with asserted store blocks).
+
+## Settled `bench/lib/reference.mjs` API (pure over plain objects except I/O)
+
+- `COUNTER_CHANGES_SHOWN = 12`; `referencePath(suiteName)` → `bench/reference/<suite>.json`.
+- `countJoinNodesPerPlan(counters): number[]` and
+  `gateEligibility(counters): {gated:true} | {gated:false, ungatedReason:string}`.
+- `OUTCOME_ORDER = ['match','differs','ungated','new','missing','skipped','filtered','failed']`.
+- `classifySuite(suiteName, rows, referenceBenchmarks, filter)` — rows shaped
+  `{name, fullName, counters?, skipped?:{reason}, failure?:{phase,error}}`. Mirrors
+  `compareRun`: add to `seen` first; skipped → `skipped` (beats missing); failure →
+  `failed`; absent from reference → `new`; else recompute eligibility from THIS run's
+  block, then `diffCounters(reference, observed)` → `match`/`differs`/`ungated` (ungated
+  still carries its changes for the report). Leftover reference names → `filtered` via
+  `matchesFilter` on `suite/name`, else `missing`.
+- `gateFails(outcomes, suitesMissingReference): boolean` — any `differs`/`missing`/
+  `failed`, or any suite that produced ≥1 counter block with no reference file.
+- `validateAccept({reason, filter, dirty, allowDirty}): string|null` — usage-error
+  message or null; refuses empty/absent reason, any `--filter`, `dirty === true`
+  without `--allow-dirty`; allows `dirty === 'unknown'`.
+- `buildReferenceBenchmarks(rows)` — only rows with counter blocks; entries
+  `{gated, ungatedReason?, counters}`, names sorted.
+- `nextReference(previous, suite, benchmarks, accepted): {changed, reference}` —
+  returns `previous` verbatim when the benchmarks section is deep-equal, so an
+  unchanged suite's file is not rewritten at all (satisfies the byte-identical
+  `accepted`-block requirement).
+- `serializeReference(ref)` — fixed top-level order (`suite`, `accepted`,
+  `benchmarks`), deep-sorted keys inside, tab indent, trailing `\n`. Key order never
+  affects comparison (diffCounters is path-based).
+- `parseReference(text, filePath)` — throws naming the file on malformed/shapeless
+  input (the `loadBaseline` precedent); an absent file is a separate outcome.
+- `captureAcceptance(reason, environment)` — commit/date/node/platform/reason, plus
+  `by` from git config, omitted (never guessed) when git cannot answer.
+- `formatChangeLines(changes, cap)` — `path  before -> after` lines with announced
+  elision; shared by the gate report and the accept summary.
+- Atomic write: temp file beside the target, then `fs.rename` (overwrites on Windows).
+
+## Settled `bench/gate.mjs` decisions (beyond the ticket text)
+
+- Selection = `bench.counters !== undefined` && `matchesFilter`; zero matches → usage
+  error (`run.mjs` precedent, `UsageError`-style single line).
+- Print one progress line per benchmark — a 42 s silent run reads as a hang.
+- **Accept refuses when any benchmark FAILED during the pass**: a reference written
+  minus a failing benchmark would classify it `new` on later runs and bury the failure.
+- Accept never deletes reference files. A reference file naming a suite that no longer
+  exists (orphan) is reported as an error naming the file and fails the gate — a human
+  deletes it. This closes the "delete a suite, gate stays green forever" hole; a suite
+  whose rows merely all SKIP is untouched by this rule (skip beats missing, and suite
+  "produced results" means ≥1 counter block).
+- `--json`: outcome object on stdout, human lines on stderr (`run.mjs` routing).
+- Both `NOTE:`s land at the pass loop in `gate.mjs`: the single-process premise (56/56
+  byte-identical vs forked; a block differing between `yarn bench` and `yarn bench:gate`
+  is the signal it stopped holding) and the fixture-population cost lever (share one
+  populated counting database across read-only execution workloads if ~42 s must drop).
+- package.json: `"bench:gate": "node bench/gate.mjs"`,
+  `"bench:accept": "node bench/gate.mjs --accept"`.
 
 ## TODO
 
