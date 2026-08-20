@@ -190,6 +190,13 @@ export function checkRatioGuards(suites, allBenchmarks, selectedNames, filterAct
 
 			// Degenerate medians (sub-rounding-floor) collapse to a sane ratio
 			// rather than NaN/Infinity: both ~0 ⇒ 1, only the target ~0 ⇒ still 0.
+			// NOTE: the both-~0 ⇒ 1 fallback assumes a bound ABOVE 1, where it reads as
+			// an `ok`; under a sub-1 bound the same collapse reads as a FAILURE. No
+			// median can reach 0 today — calibration batches a benchmark until one
+			// sample clears clock resolution — so this is unreachable rather than
+			// wrong. If a benchmark is ever PINNED (`iterations` set, skipping
+			// calibration) at sub-clock cost and a sub-1 guard names it, make the
+			// degenerate case a `not-evaluated` verdict instead of a ratio.
 			const ratio = base.median_ms > 0
 				? target.median_ms / base.median_ms
 				: (target.median_ms > 0 ? Infinity : 1);

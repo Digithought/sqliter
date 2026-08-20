@@ -340,7 +340,7 @@ export function gateFails(outcomes, suitesMissingReference, orphanReferences = [
 }
 
 /**
- * Refuse an accept before the ~42 s pass runs, or explain why not to.
+ * Refuse an accept before the ~25 s pass runs, or explain why not to.
  *
  * @param {{ reason: string|null, filter: string|null, dirty: boolean|'unknown', allowDirty: boolean }} options
  *   `dirty` is `captureEnvironment`'s tri-state; `'unknown'` (outside a git checkout)

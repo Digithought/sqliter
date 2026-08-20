@@ -829,7 +829,7 @@ and the two measurements print as one verdict rather than two rows.
 
 **Inside `yarn check`, and what it costs.** The chain runs `docs:check → lint → build →
 typecheck → bench:gate → test:full → …`. On the machine the wall-clock figures above come
-from, the gate adds ~35 s to it: 24 s for the counters pass, 9 s for the guard pass across
+from, the gate adds ~35 s to it: 25 s for the counters pass, 9 s for the guard pass across
 8 forks, against the ~160 s a full `yarn bench` costs. It sits **after `typecheck` and
 before `test:full`** on purpose: the chain is `&&`-chained, `test:full` is by far its
 longest step, and the gate needs nothing but a built `dist/`, which `build` two steps

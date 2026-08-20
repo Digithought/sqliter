@@ -122,39 +122,29 @@ export const benchmarks = [
 ];
 
 /**
- * Within-run shape-economy guards. Each guard is a ratio of one benchmark's
- * median to another's, checked inside a single run (independent of any
- * `--baseline` file), by both `yarn bench` and `yarn bench:gate` — and the gate
- * runs inside `yarn check`, so a guard here is a build gate, not a report.
+ * Within-run shape-economy guards: a bound on one benchmark's median against
+ * another's inside a single run, independent of any `--baseline` file. Both
+ * `yarn bench` and `yarn bench:gate` evaluate them, and the gate runs inside
+ * `yarn check` — so a guard here is a build gate, not a report.
  *
- * `maxRatio` is deliberately LOOSE (order-of-magnitude): its job is to trip a
- * plan-shape collapse, not order-of-1 warm-up variance on the in-memory vtab. Every
- * guard below records the ratio MEASURED on an unchanged tree next to it, and its
- * bound sits at least 3× clear of that — a guard that fires on a good day teaches
- * everyone to ignore it. If a twin shows high variance near its bound, raise
- * `targetTotalMs` in `bench/lib/calibrate.mjs` so both sides collect more samples,
- * rather than tightening `maxRatio` — in `CALIBRATION` for `yarn bench`, and in
- * `GATE_CALIBRATION` for the reduced profile `yarn bench:gate` times guard members
- * at. (A guard that fails at the reduced profile is re-measured once at full
- * `CALIBRATION` before it may fail the run, so a busy machine costs a wasted
- * re-measure rather than a red build.)
+ * Three rules to write one by. Everything else — the field reference including the
+ * optional `note`, sub-1 bounds, cross-suite `suite/name` members, the load-time shape
+ * validation, and the full-calibration re-measure that decides a guard which failed at
+ * the gate's reduced profile — is in docs/benchmarking.md § Ratio guards, and is not
+ * repeated here.
  *
- * A bound may be BELOW 1 — a "must stay this much faster than" guard, which is the
- * natural shape when the regression being guarded against is a fast path collapsing
- * into a slow one it is normally a small fraction of.
- *
- * `name` and `baseline` are bare (resolved within THIS suite) or a full
- * `suite/name`, which is how a guard reaches across suites. The optional `note` is
- * one sentence printed beside the verdict, so the report says what broke rather than
- * only which two rows moved apart.
- *
- * GUARDS NAME ONE BENCHMARK EACH, AND THAT MEANS ONE BACKEND EACH. These bare names
- * are the default backend's rows. A guard that wants to bound a suffixed benchmark
- * spells the suffix out; guards are deliberately NOT expanded per backend, because a
- * ratio that holds on the in-memory vtab need not hold on a persistent store, and a
- * guard that silently multiplies itself across backends is a guard nobody trusts.
- * Bounding `x@some-backend` against bare `x` is worse still — see
- * docs/benchmarking.md § Ratio guards.
+ * 1. BOUNDS ARE ORDER-OF-MAGNITUDE. A guard's job is to trip a plan-shape collapse,
+ *    not order-of-1 warm-up variance on the in-memory vtab. Every guard below records
+ *    the ratio MEASURED on an unchanged tree beside it, with its bound at least 3×
+ *    clear — a guard that fires on a good day teaches everyone to ignore it.
+ * 2. A NOISY TWIN BUYS MORE SAMPLES, NOT A LOOSER BOUND. Raise `targetTotalMs` in
+ *    `bench/lib/calibrate.mjs` — `CALIBRATION` for `yarn bench`, `GATE_CALIBRATION`
+ *    for the reduced profile the gate times members at. Tightening the other knob
+ *    (a higher `maxRatio`) only makes the guard stop meaning anything.
+ * 3. ONE BENCHMARK EACH MEANS ONE BACKEND EACH. These bare names are the default
+ *    backend's rows; guards are deliberately NOT expanded per backend, because a ratio
+ *    that holds on the in-memory vtab need not hold on a persistent store. A guard
+ *    bounding a suffixed row spells the suffix out — and never against the bare name.
  */
 export const ratioGuards = [
 	// `correlated-subquery` relies on `scalar-agg-decorrelation` to become the same

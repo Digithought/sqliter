@@ -216,7 +216,7 @@ async function runOne(bench) {
  *
  * NOTE: the dominant cost is fixture population — an `execution@store-mem` row spends
  * ~600 ms building its 10k-row fixture in `setup` and its `counters()` builds a SECOND
- * database over the counting provider and populates it again. If the ~42 s pass ever
+ * database over the counting provider and populates it again. If the ~25 s pass ever
  * has to come down, sharing one populated counting database across the read-only
  * execution workloads is the lever.
  *
@@ -730,7 +730,7 @@ async function main() {
 	const orphanReferences = (await listReferenceSuites()).filter((name) => !suiteNames.has(name));
 	const informational = informationalNames(suites);
 
-	// In accept mode an orphan refuses BEFORE the ~42 s pass: accept never deletes
+	// In accept mode an orphan refuses BEFORE the ~25 s pass: accept never deletes
 	// reference files (a human does), so running the pass first would waste it.
 	if (accept && orphanReferences.length > 0) {
 		throw new UsageError(`reference file '${referencePath(orphanReferences[0])}' names no known suite — delete it (accept never deletes reference files), then re-run`);
