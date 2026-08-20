@@ -1,322 +1,308 @@
 # Benchmarking
 
-The benchmark suite lives in `packages/quereus/bench/`. It measures how long the engine
-takes to do a fixed amount of work, and — more importantly — tries hard not to report a
-difference that is only measurement noise.
+Bench suite live in `packages/quereus/bench/`. Measure how long engine take to do fixed work, and — more important — try hard not report difference that only measurement noise.
 
-Run it from the engine package:
+Run from engine package:
 
 ```
 cd packages/quereus
 yarn bench
 ```
 
-`yarn bench` is **not** part of `yarn test` or `yarn check`. A full run takes roughly 160
-seconds and is deliberately manual: a benchmark suite inside a test run either slows every
-test run down or gets its time target cut until the numbers stop meaning anything. Its
-cheap sibling `yarn bench:gate` *does* run inside `yarn check`, and measures no absolute
-timing at all — see [Which check catches what](#which-check-catches-what).
+`yarn bench` **not** part of `yarn test` or `yarn check`. Full run ~160 seconds, deliberately manual: bench suite inside test run either slow every test run down or get time target cut until numbers stop meaning anything. Cheap sibling `yarn bench:gate` *does* run inside `yarn check`, measure no absolute timing at all — see [Which check catches what](#which-check-catches-what).
 
 ## What is measured
 
-92 benchmarks across five suites — 54 entries, of which the 19 in `execution` and
-`mutation` are each measured against three storage backends (see below):
+92 benchmarks across five suites — 54 entries, of which 19 in `execution` and `mutation` each measured against three storage backends (see below):
 
 | Suite | Benchmarks | What it covers |
 | --- | --- | --- |
-| `parser` | 4 | Text to AST: a simple select, a complex select, a 50-column select, an insert with values. |
-| `planner` | 4 | AST to optimized plan, without executing it: scan, join, aggregate, subquery. |
-| `execution` | 45 (15 × 3 backends) | Whole queries over a 10 000-row table: full scan, indexed filter, group by, order by, distinct, joins, a correlated subquery and its hand-written equivalent. Seven of the fifteen are text-comparison shapes (`order by` text, unicode text, 40-character shared prefixes, text primary keys) because the `BINARY` collation comparator is the engine's hottest code. |
-| `mutation` | 12 (4 × 3 backends) | Writes: a 10 000-row bulk insert, 1 000 single-row inserts, an update and a delete over a `where` clause. |
-| `store` | 27 | The storage layer priced one path at a time, in three groups. Eleven rows call `@quereus/store` key-encoding functions directly, with no database in the picture — the value shapes where a fast path can be lost silently (plain integer, plain text, astral-plane text, JSON, a blob, a `NOCASE` key, a descending key and its ascending control, a four-column composite, a secondary-index key), plus one decode. Fourteen rows drive one storage hot path each — scan, point read, batched multi-key seeks, fetching rows found through a secondary index, commits at four sizes, an index build, a catalog rehydration — through a `Database` over the store module, and assert the exact storage round trips alongside the timing. Two rows price random reads against sequential ones on **real disk**, at the key-value layer with no database above them. See [The `store` suite](#the-store-suite-micro-benchmarks-with-no-backend-dimension). |
+| `parser` | 4 | Text to AST: simple select, complex select, 50-column select, insert with values. |
+| `planner` | 4 | AST to optimized plan, no execute: scan, join, aggregate, subquery. |
+| `execution` | 45 (15 × 3 backends) | Whole queries over 10 000-row table: full scan, indexed filter, group by, order by, distinct, joins, correlated subquery + hand-written twin. Seven of fifteen are text-comparison shapes (`order by` text, unicode text, 40-character shared prefixes, text primary keys) because `BINARY` collation comparator is engine's hottest code. |
+| `mutation` | 12 (4 × 3 backends) | Writes: 10 000-row bulk insert, 1 000 single-row inserts, update and delete over `where` clause. |
+| `store` | 27 | Storage layer priced one path at a time, three groups. Eleven rows call `@quereus/store` key-encoding functions directly, no database in picture — value shapes where fast path can die silently (plain integer, plain text, astral-plane text, JSON, blob, `NOCASE` key, descending key + ascending control, four-column composite, secondary-index key), plus one decode. Fourteen rows drive one storage hot path each — scan, point read, batched multi-key seeks, fetching rows found through secondary index, commits at four sizes, index build, catalog rehydration — through `Database` over store module, assert exact storage round trips beside timing. Two rows price random reads against sequential on **real disk**, at key-value layer, no database above. See [The `store` suite](#the-store-suite-micro-benchmarks-with-no-backend-dimension). |
 
 ### The `store` suite: micro-benchmarks with no backend dimension
 
-`execution` and `mutation` answer "how long does this query take against this storage
-engine". That is the right top-level signal and a poor **diagnostic**: a full scan blends
-key decoding, iteration, row deserialization and the isolation overlay into one number, so
-a regression in any one of them reads as "the scan got slower" with no way to say which.
-The `store` suite exists to give the individual pieces their own numbers.
+`execution` and `mutation` answer "how long this query take against this storage engine". Right top-level signal, poor **diagnostic**: full scan blend key decoding, iteration, row deserialization and isolation overlay into one number, so regression in any one read as "scan got slower" with no way to say which. `store` suite give individual pieces own numbers.
 
-It has three groups, in run order:
+Three groups, run order:
 
-- **Key encoding** (11 rows: `data-key-*`, `index-key-*`, `decode-composite-4col`) calls
+- **Key encoding** (11 rows: `data-key-*`, `index-key-*`, `decode-composite-4col`) call
   `@quereus/store`'s key functions directly — no `Database`, no plan, no storage traffic.
-  These rows report no counters, for the same reason `parser` reports none: nothing runs,
-  so there is nothing to count.
-- **Store hot paths** (14 rows: a full scan, a point read, two multi-key seek widths, four
-  index-then-fetch widths, four commit sizes, an index build, a catalog rehydration) drive
-  one storage code path each through a `Database` opened over the store module — the
+  Report no counters, same reason `parser` report none: nothing runs, nothing to count.
+- **Store hot paths** (14 rows: full scan, point read, two multi-key seek widths, four
+  index-then-fetch widths, four commit sizes, index build, catalog rehydration) drive
+  one storage code path each through `Database` opened over store module — the
   `openStoreDatabase()` / `openCountingStoreDatabase()` pair in
-  `bench/lib/store-counters.mjs`, so the counting wrapper never sits inside a timed
-  number. Each reports the same nested `{engine, store}` block a `@store-mem` row does
-  (see [Storage round trips](#storage-round-trips-what-a-store-mem-row-counts)), and goes
-  one step further: the `counters()` pass **asserts** the expected round-trip counts on the
-  table stores it names, so a plan change that moved traffic between stores fails the pass
-  loudly instead of shipping a silently different block. (The reserved `__catalog__` /
-  `__stats__` blocks are reported but not asserted — see the counters table below.) Expected counts that depend on the row-resolution batch size
-  are derived from the imported `ROW_RESOLUTION_BATCH`, never restated, so they move with
-  the constant. The four commit sizes (1, 10, 100, 1000) together carry the claim no read
-  count can — committing N queued operations costs a *flat* number of write-side round
-  trips (`batchWrites` stays at one per touched store while `batchOps` scales with N);
-  N = 10 000 was considered and deliberately dropped, because the shape is visible across
-  three decades and a fourth would add hundreds of milliseconds per timed call for no
-  additional claim.
+  `bench/lib/store-counters.mjs`, so counting wrapper never sit inside timed
+  number. Each report same nested `{engine, store}` block as `@store-mem` row
+  (see [Storage round trips](#storage-round-trips-what-a-store-mem-row-counts)), and go
+  one step further: `counters()` pass **assert** expected round-trip counts on
+  table stores it names, so plan change that moved traffic between stores fail loudly
+  instead of shipping silently different block. (Reserved `__catalog__` /
+  `__stats__` blocks reported but not asserted — see counters table below.) Expected counts that depend on row-resolution batch size
+  derive from imported `ROW_RESOLUTION_BATCH`, never restated, so they move with
+  constant. Four commit sizes (1, 10, 100, 1000) together carry claim no read
+  count can — committing N queued operations cost *flat* number of write-side round
+  trips (`batchWrites` stay one per touched store while `batchOps` scale with N);
+  N = 10 000 considered and dropped: shape visible across
+  three decades, fourth add hundreds of milliseconds per timed call for no
+  extra claim.
 - **Read cost on real disk** (2 rows: `leveldb-read-cost-20k`, `leveldb-read-cost-200k`) —
-  the only rows in the suite that touch a provider with no `Database` above them, and the
-  only ones that touch disk. See [Read cost on real
+  only rows in suite touching provider with no `Database` above, and only ones
+  touching disk. See [Read cost on real
   disk](#read-cost-on-real-disk) below.
 
-The first two groups split at `scan-10k` in the run order; the third follows both.
+First two groups split at `scan-10k` in run order; third follow both.
 
-One thing differs from every other suite, deliberately: **its names carry no `@` suffix.**
-The suite is not in the backend dimension. The key half calls store functions directly, so
-there is no storage engine to swap underneath it; the hot-path half exists to measure *the*
-store module specifically — the same query shapes on the memory vtab are `execution`'s bare
-rows, not a missing backend of these. The invariant below — *every* entry of `execution`
-and `mutation` is backend-expanded — is untouched; `store` is simply not in the backend
+One thing differ from every other suite, deliberately: **names carry no `@` suffix.**
+Suite not in backend dimension. Key half call store functions directly, so
+no storage engine to swap underneath; hot-path half exist to measure *the*
+store module specifically — same query shapes on memory vtab are `execution`'s bare
+rows, not missing backend of these. Invariant below — *every* entry of `execution`
+and `mutation` is backend-expanded — untouched; `store` simply not in backend
 dimension at all.
 
-Its `skip()` is the one place in the repo that hand-writes one — a single
-`skipUnlessStoreLoads` shared by every entry — and it returns the same
-`storeLoadFailure()` reason the `@store-mem` rows use, so an unbuilt
-`packages/quereus-store/dist` skips these rows with a stated reason instead of failing all
-twenty-seven with a module-resolution stack trace. The two read-cost rows compose a
-*second* reason on top of it — the LevelDB opt-in below — so an unbuilt store package still
-wins, being the more fundamental failure.
+Its `skip()` is one place in repo that hand-write one — single
+`skipUnlessStoreLoads` shared by every entry — and return same
+`storeLoadFailure()` reason `@store-mem` rows use, so unbuilt
+`packages/quereus-store/dist` skip these rows with stated reason instead of failing all
+twenty-seven with module-resolution stack trace. Two read-cost rows compose
+*second* reason on top — LevelDB opt-in below — so unbuilt store package still
+win, being more fundamental failure.
 
-Every `fn` in the **key-encoding half** builds **1 000 keys per call** (`KEYS_PER_CALL` in
-`bench/suites/store.bench.mjs`), one shared constant across every shape so the shapes stay
-comparable to each other. A single key build costs on the order of a hundred nanoseconds
-and the `await` around `fn` costs a microtask tick, so timing one build per call would
-report mostly harness overhead. **Every figure in that half is therefore the cost of 1 000
-key builds, not of one** — divide before quoting a per-key number. The hot-path half does
-not amortize: its cheapest timed call is a whole statement over a 10 000-row store, well
-clear of the scale where harness overhead is a meaningful share of the reading.
+Every `fn` in **key-encoding half** build **1 000 keys per call** (`KEYS_PER_CALL` in
+`bench/suites/store.bench.mjs`), one shared constant across every shape so shapes stay
+comparable. Single key build cost ~hundred nanoseconds
+and `await` around `fn` cost microtask tick, so timing one build per call would
+report mostly harness overhead. **Every figure in that half is cost of 1 000
+key builds, not one** — divide before quoting per-key number. Hot-path half does
+not amortize: cheapest timed call is whole statement over 10 000-row store, well
+clear of scale where harness overhead matter.
 
-Fixture values are built in `setup`, never in `fn`, because calibration batches
-sub-millisecond work and an `fn` that allocates its own input measures the allocation. The
-assertions are split for the same reason: `setup` round-trips every fixture value through
-`decodeCompositeKey(encodeCompositeKey(v))` and throws on a mismatch — that is what stops
-the suite from measuring a broken encoder, and it is untimed so it costs nothing — while
-`fn` asserts only the total encoded byte length, which is cheap and still catches an
-encoder that stopped producing bytes. A full decode inside an encode benchmark's timed body
-would cost about as much as the encode and halve the resolution of the thing being
-measured. The one dedicated `decode-composite-4col` benchmark does assert value equality on
-every column, because there the decode *is* the subject.
+Fixture values built in `setup`, never in `fn`, because calibration batch
+sub-millisecond work and `fn` that allocate own input measure the allocation. Assertions
+split for same reason: `setup` round-trip every fixture value through
+`decodeCompositeKey(encodeCompositeKey(v))` and throw on mismatch — that stop
+suite measuring broken encoder, and it untimed so cost nothing — while
+`fn` assert only total encoded byte length, cheap and still catch
+encoder that stopped producing bytes. Full decode inside encode benchmark's timed body
+cost about as much as encode and halve resolution of thing being
+measured. One dedicated `decode-composite-4col` benchmark does assert value equality on
+every column, because there decode *is* subject.
 
-The suite adds roughly **51 s** to a default `yarn bench` run — about 16 s of it the key-encoding
-half, the rest the hot-path rows and their per-row process forks — on the machine the
-results-file header records. The two read-cost rows contribute about 1 s of that, being a
-fork and a skip reason each; opted in they cost ~10 s instead.
+Suite add ~**51 s** to default `yarn bench` run — ~16 s key-encoding
+half, rest hot-path rows and per-row process forks — on machine the
+results-file header records. Two read-cost rows contribute ~1 s of that, being
+fork and skip reason each; opted in they cost ~10 s.
 
-Two rows exist only as controls and are not interesting on their own:
-`data-key-asc-2col` (the uninverted twin of `data-key-desc-2col`, so the cost of the
-encoder's DESC bit-inversion is a subtraction rather than a guess) and
-`data-key-text-binary` (the twin of `data-key-text-nocase`, whose difference is the key
-normalizer). `data-key-text-astral` is deliberately a *superset* of the plain text fixture —
-the same string with four astral-plane characters appended — so its delta is attributable,
-but it is not a controlled A/B on the surrogate-scan path alone: the astral string is also 8
-UTF-16 code units and 16 UTF-8 bytes longer. Two strings cannot match on both counts while
-one is astral and the other is not.
+Two rows exist only as controls, not interesting alone:
+`data-key-asc-2col` (uninverted twin of `data-key-desc-2col`, so cost of
+encoder's DESC bit-inversion is subtraction not guess) and
+`data-key-text-binary` (twin of `data-key-text-nocase`, difference is key
+normalizer). `data-key-text-astral` deliberately *superset* of plain text fixture —
+same string with four astral-plane characters appended — so delta attributable,
+but not controlled A/B on surrogate-scan path alone: astral string also 8
+UTF-16 code units and 16 UTF-8 bytes longer. Two strings cannot match both counts while
+one astral and other not.
 
-`bench/apply-schema-unchanged.mjs` is **not** part of any suite, deliberately and by a
-decision recorded at the file itself: it is a decomposition of a no-op `apply schema` into
-five internal timings, and the framework measures one `fn` per benchmark. Giving the
-applied-state fast path a standing, ratio-guarded benchmark is separate work, parked as
+`bench/apply-schema-unchanged.mjs` **not** part of any suite, deliberately, decision
+recorded at file itself: it decompose no-op `apply schema` into
+five internal timings, and framework measure one `fn` per benchmark. Giving
+applied-state fast path standing, ratio-guarded benchmark is separate work, parked as
 `feat-bench-apply-schema-fastpath-guard`.
 
 #### Read cost on real disk
 
-`leveldb-read-cost-20k` and `leveldb-read-cost-200k` answer one question the rest of the
-suite cannot: **on a real disk-backed store, how much more does a random read cost than a
-sequential one?** That ratio is exactly what a provider's *cost profile* declares to the
-planner (`packages/quereus-store/src/common/cost-profile.ts`), and LevelDB's had never been
-measured — it took the framework's parity default instead.
+`leveldb-read-cost-20k` and `leveldb-read-cost-200k` answer one question rest of
+suite cannot: **on real disk-backed store, how much more does random read cost than
+sequential?** That ratio is exactly what provider's *cost profile* declare to
+planner (`packages/quereus-store/src/common/cost-profile.ts`), and LevelDB's never been
+measured — took framework's parity default instead.
 
-Each row seeds N rows of 200-byte values into a fresh LevelDB temporary directory over
-integer keys, then times **three arms** per round against that one dataset:
+Each row seed N rows of 200-byte values into fresh LevelDB temp directory over
+integer keys, then time **three arms** per round against that one dataset:
 
 | arm | what it does | what it stands for |
 | --- | --- | --- |
-| sequential | a full `iterate()` draining every value | the 1.0 denominator — the cost-profile unit |
-| batched | 1 000 random keys through `getMany`, paged at `ROW_RESOLUTION_BATCH` | resolving index entries to rows, and the primary-key multi-seek |
-| single-seek | 1 000 *different* random keys, one `iterate({gte, lt, limit: 1})` each | the secondary-index multi-seek, one window per key |
+| sequential | full `iterate()` draining every value | 1.0 denominator — cost-profile unit |
+| batched | 1 000 random keys through `getMany`, paged at `ROW_RESOLUTION_BATCH` | resolving index entries to rows, and primary-key multi-seek |
+| single-seek | 1 000 *different* random keys, one `iterate({gte, lt, limit: 1})` each | secondary-index multi-seek, one window per key |
 
-Five properties are deliberate:
+Five properties deliberate:
 
-- **The arms measure the key-value layer, with no `Database` above them.** The unit a cost
-  profile defines is a storage-layer row, and engine overhead lands on both sides of the
-  ratio — including it would compress every ratio toward 1.0 and understate the difference
-  being measured. It also matches the sibling IndexedDB harness
-  (`packages/quereus-plugin-indexeddb/bench/README.md`), which is the only reason the two
-  backends' numbers can be read side by side. The cost is that a ratio here is *not* the
-  number to declare directly; the engine-inclusive value is smaller and was not measured.
-- **All three arms share one benchmark per dataset size, not three.** The harness forks a
-  fresh process per benchmark, so three rows would compare three medians taken with three
-  different page-cache and block-cache histories. One `fn` call runs one round of all three
-  arms in one process, and `teardown` takes the median per arm across rounds.
-- **The harness's own median for these rows is the cost of one whole round, and is not the
-  interesting number.** The interesting numbers are the per-arm milliseconds and the two
-  ratios, which `teardown` prints to stdout. The block lands immediately *above* its table
-  row, because `child.mjs` runs `teardown` and only then sends the result.
-- **The ratios are printed, not reported as counters.** Counter values are compared with no
-  tolerance and no noise floor, because they are exact machine-independent integers. A
-  wall-clock ratio is neither, so a counters block would report a "change" on every run.
-- **The two sizes do not separate page-cache-cold from page-cache-warm.** There is no
-  portable way to drop the OS page cache from Node, and a dataset big enough to exceed a
-  modern machine's page cache cannot be seeded inside a benchmark's time budget. What they
-  separate is `classic-level`'s own **8 MB block cache**: 20 000 × 200 bytes (~4 MB) fits
-  inside it, 200 000 (~40 MB) does not, so the large size's random reads go out to the
-  filesystem — which on a warm machine usually means the OS page cache, not the physical
-  disk. A claim of "cold" that is really "block-cache-miss, page-cache-hit" would be worse
-  than no claim, so it is not made.
+- **Arms measure key-value layer, no `Database` above.** Unit a cost
+  profile define is storage-layer row, and engine overhead land on both sides of
+  ratio — including it compress every ratio toward 1.0 and understate difference
+  being measured. Also match sibling IndexedDB harness
+  (`packages/quereus-plugin-indexeddb/bench/README.md`), only reason two
+  backends' numbers readable side by side. Cost: ratio here *not*
+  number to declare directly; engine-inclusive value smaller and not measured.
+- **All three arms share one benchmark per dataset size, not three.** Harness fork
+  fresh process per benchmark, so three rows compare three medians taken with three
+  different page-cache and block-cache histories. One `fn` call run one round of all three
+  arms in one process, `teardown` take median per arm across rounds.
+- **Harness's own median for these rows is cost of one whole round, not the
+  interesting number.** Interesting numbers are per-arm milliseconds and two
+  ratios, which `teardown` print to stdout. Block land immediately *above* its table
+  row, because `child.mjs` run `teardown` then send result.
+- **Ratios printed, not reported as counters.** Counter values compared with no
+  tolerance and no noise floor, because exact machine-independent integers. Wall-clock ratio is neither, so counters block would report "change" every run.
+- **Two sizes do not separate page-cache-cold from page-cache-warm.** No
+  portable way to drop OS page cache from Node, and dataset big enough to exceed
+  modern machine's page cache cannot be seeded inside benchmark's time budget. What they
+  separate: `classic-level`'s own **8 MB block cache**: 20 000 × 200 bytes (~4 MB) fit
+  inside, 200 000 (~40 MB) not, so large size's random reads go out to
+  filesystem — which on warm machine usually mean OS page cache, not physical
+  disk. Claim of "cold" that really "block-cache-miss, page-cache-hit" worse
+  than no claim, so not made.
 
-Like every disk-backed row, these two are **opt-in and [informational](#informational-rows-reported-never-gated)**:
-without `QUEREUS_BENCH_LEVELDB=1` they print the same skip reason `@store-leveldb` rows do,
-and they enter no ratio guard and no pass/fail verdict — a disk timing is not a property of
-this repository's code. Opted in they cost about 10 s for the pair, the 200k row's own
-median being ~1 s per round, well clear of the 120 s per-benchmark timeout.
+Like every disk-backed row, these two **opt-in and [informational](#informational-rows-reported-never-gated)**:
+without `QUEREUS_BENCH_LEVELDB=1` they print same skip reason `@store-leveldb` rows do,
+and enter no ratio guard and no pass/fail verdict — disk timing not property of
+this repo's code. Opted in they cost ~10 s for pair, 200k row's own
+median ~1 s per round, well clear of 120 s per-benchmark timeout.
 
 ```bash
 QUEREUS_BENCH_LEVELDB=1 node packages/quereus/bench/run.mjs --filter store/leveldb-read-cost
 ```
 
-The 2026-08-19 result is recorded in `packages/quereus-plugin-leveldb/README.md`
-§ *Measured read cost*, with the machine it was taken on and what was decided from it.
+2026-08-19 result recorded in `packages/quereus-plugin-leveldb/README.md`
+§ *Measured read cost*, with machine it was taken on and what was decided from it.
 
 ### Storage backends, and what a name means
 
-The `execution` and `mutation` suites do not hold queries; they hold *workloads* (in
-`bench/workloads/`) and bind each of them to every **backend** — a storage engine the
-same workload can be measured against. A workload plus a backend is one benchmark, and
-the backend appears in the name:
+`execution` and `mutation` suites hold no queries; they hold *workloads* (in
+`bench/workloads/`) and bind each to every **backend** — storage engine the
+same workload can be measured against. Workload plus backend is one benchmark, and
+backend appear in name:
 
 ```
 execution/full-scan-10k            the engine's default vtab module
 execution/full-scan-10k@store-mem  the same query, some other module
 ```
 
-**The default backend contributes the bare name.** That rule is what keeps every
+**Default backend contribute bare name.** That rule keep every
 benchmark name, every results file already on disk and every `ratioGuards` entry meaning
-exactly what it meant before backends existed. A name carrying `@` is a claim that the
-row ran on something *other* than the engine's default module; a bare name is the
+exactly what it meant before backends existed. Name carrying `@` claim row
+ran on something *other* than engine's default module; bare name is
 default.
 
-Three backends exist today. The descriptors and the expansion live in
+Three backends today. Descriptors and expansion live in
 `bench/lib/backends.mjs`:
 
 | id | what it is | name | gates a build? |
 | --- | --- | --- | --- |
-| `memory` | the in-process memory vtab module — the engine default | bare (`full-scan-10k`) | yes |
-| `store-mem` | `StoreModule` wrapped by the isolation layer, over an in-memory key-value provider | `full-scan-10k@store-mem` | yes |
-| `store-leveldb` | the same `StoreModule`, over **LevelDB on a real temporary directory** | `full-scan-10k@store-leveldb` | no — opt-in and [informational](#informational-rows-reported-never-gated) |
+| `memory` | in-process memory vtab module — engine default | bare (`full-scan-10k`) | yes |
+| `store-mem` | `StoreModule` wrapped by isolation layer, over in-memory key-value provider | `full-scan-10k@store-mem` | yes |
+| `store-leveldb` | same `StoreModule`, over **LevelDB on real temporary directory** | `full-scan-10k@store-leveldb` | no — opt-in and [informational](#informational-rows-reported-never-gated) |
 
-`store-mem` is the persistent path's performance coverage, and it is exactly the wiring
-`yarn test:store` exercises: key encoding, batched row resolution, transaction commit,
-index build and catalog rehydration are all code the memory module never runs. Two
-choices in it are deliberate:
+`store-mem` is persistent path's performance coverage, exactly the wiring
+`yarn test:store` exercise: key encoding, batched row resolution, transaction commit,
+index build and catalog rehydration all code memory module never run. Two
+choices deliberate:
 
-- **Isolation-wrapped.** `createIsolatedStoreModule` adds read-your-own-writes, rollback
-  and savepoints. That is what `yarn test:store` runs and what a deployment runs, so it is
-  what the row measures. "What does the wrapper itself cost" is a different question and
-  would be a different backend id.
-- **In-memory provider, not disk.** It isolates *store-layer* cost from *disk* cost, it is
-  deterministic, and it is cheap enough to run on every `yarn bench`. A disk-backed row is
-  a separate, opt-in backend.
+- **Isolation-wrapped.** `createIsolatedStoreModule` add read-your-own-writes, rollback
+  and savepoints. That what `yarn test:store` run and what deployment run, so
+  what row measure. "What wrapper itself cost" is different question and
+  would be different backend id.
+- **In-memory provider, not disk.** Isolate *store-layer* cost from *disk* cost,
+  deterministic, cheap enough to run every `yarn bench`. Disk-backed row is
+  separate, opt-in backend.
 
-`store-mem` roughly **doubles `yarn bench`'s wall-clock** — measured at 48 s for 27 rows
-before it and 102 s for 46 rows after, on the machine and node version the table header
-records. Nothing in it comes close to the 120 s per-benchmark timeout (`BENCH_TIMEOUT_MS`
-in `bench/run.mjs`); the slowest single call is ~370 ms.
+`store-mem` roughly **double `yarn bench`'s wall-clock** — measured 48 s for 27 rows
+before, 102 s for 46 rows after, on machine and node version table header
+records. Nothing close to 120 s per-benchmark timeout (`BENCH_TIMEOUT_MS`
+in `bench/run.mjs`); slowest single call ~370 ms.
 
-The store package is imported **lazily**, from one dynamic-import site in
-`bench/lib/store-counters.mjs`. The parent process imports every suite file just to
-enumerate benchmark names, so a static import there would let an unbuilt
-`packages/quereus-store/dist` kill the whole run — parser and planner suites included.
-Instead the store rows *skip*, with the reason printed (see
+Store package imported **lazily**, from one dynamic-import site in
+`bench/lib/store-counters.mjs`. Parent process import every suite file just to
+enumerate benchmark names, so static import there let unbuilt
+`packages/quereus-store/dist` kill whole run — parser and planner suites included.
+Instead store rows *skip*, reason printed (see
 [A benchmark that declines to run](#a-benchmark-that-declines-to-run-skip)). Both `dist/`
-directories must be current: `yarn build` builds them in dependency order, and a bench run
-against a stale `packages/quereus-store/dist` measures the wrong code just as surely as a
-stale `packages/quereus/dist` does.
+directories must be current: `yarn build` build them in dependency order, and bench run
+against stale `packages/quereus-store/dist` measure wrong code just as surely as
+stale `packages/quereus/dist`.
 
-A suite needing more of the store package's surface **widens that one site** rather than
-opening an import of its own. What it hands out today: `openStoreDatabase()` (the plain
-timed database — its handle also carries the `provider` it was built over, for a benchmark
-whose claim is about what physically landed in a store), `openCountingStoreDatabase()` (the
-untimed counters database), and `loadStoreKeyApi()` (the store's key-encoding and
-key-building functions, plus `ROW_RESOLUTION_BATCH` — read the constant, never restate
-`256`, so an expected round-trip count moves with it). Every name is shape-checked as the
-import resolves, so a renamed export becomes a stated skip reason instead of a throw inside
-a benchmark's `setup`.
+Suite needing more of store package's surface **widen that one site** rather than
+opening own import. What it hand out today: `openStoreDatabase()` (plain
+timed database — handle also carry `provider` it was built over, for benchmark
+whose claim is about what physically landed in store), `openCountingStoreDatabase()` (
+untimed counters database), and `loadStoreKeyApi()` (store's key-encoding and
+key-building functions, plus `ROW_RESOLUTION_BATCH` — read constant, never restate
+`256`, so expected round-trip count move with it). Every name shape-checked as
+import resolve, so renamed export become stated skip reason instead of throw inside
+benchmark's `setup`.
 
-A backend declines a workload through `BenchBackend.skipWorkload(workload)`, which
-`expandBackends` wires into the benchmark's `skip()` so no suite file has to remember to.
-When a binder *also* supplies a `skip`, the two compose — the backend is asked first and
-its reason wins, then the binder's is consulted — because a backend that cannot load makes
-any workload-intrinsic reason moot. `store-mem` declines nothing per workload today: every
-workload in both suites was confirmed to run on it and return the row count it asserts,
-including the two divergences that looked most likely to bite (the store applies NOCASE to
-an undecorated text primary key where memory applies BINARY, and the store's cost model may
-validly pick a different join shape — neither changes a result).
+Backend decline workload through `BenchBackend.skipWorkload(workload)`, which
+`expandBackends` wire into benchmark's `skip()` so no suite file must remember.
+When binder *also* supply `skip`, two compose — backend asked first and
+its reason win, then binder's consulted — because backend that cannot load make
+any workload-intrinsic reason moot. `store-mem` decline nothing per workload today: every
+workload in both suites confirmed to run on it and return row count it assert,
+including two divergences most likely to bite (store apply NOCASE to
+undecorated text primary key where memory apply BINARY, and store's cost model may
+validly pick different join shape — neither change result).
 
 #### `store-leveldb`: real disk, opt-in and advisory
 
-`store-mem` deliberately measures the store layer with the disk taken out. `store-leveldb`
-is the other half: the same isolation-wrapped `StoreModule`, over the LevelDB provider a
-Node deployment actually runs.
+`store-mem` deliberately measure store layer with disk taken out. `store-leveldb`
+is other half: same isolation-wrapped `StoreModule`, over LevelDB provider a
+Node deployment actually run.
 
-**It runs only when you ask.**
+**Run only when you ask.**
 
 ```bash
 QUEREUS_BENCH_LEVELDB=1 yarn workspace @quereus/quereus bench --filter @store-leveldb
 yarn workspace @quereus/quereus bench:leveldb          # the same, over every suite
 ```
 
-Without the variable every `@store-leveldb` row still **prints**, as
+Without variable every `@store-leveldb` row still **print**, as
 `skipped — disk-backed rows are opt-in and advisory — set QUEREUS_BENCH_LEVELDB=1 to run
-them`. The variable is read as a human would read it: `0`, `false`, `off`, `no` and the
-empty string all mean *no*, so setting it to turn the rows off does not turn them on.
+them`. Variable read as human would read it: `0`, `false`, `off`, `no` and
+empty string all mean *no*, so setting it to turn rows off does not turn them on.
 
-Three properties are deliberate and worth knowing before you read a number:
+Three properties deliberate, worth knowing before reading number:
 
-- **`syncCommits` is left at its default `true`**, which fsyncs every transaction commit.
-  That is what a deployment runs, and it is the single biggest term in what these rows
-  cost — `single-row-insert-1k@store-leveldb` is a thousand statements and therefore a
-  thousand fsync-ed commits. A benchmark that quietly turned it off would measure a
-  configuration nobody uses.
-- **Every row gets its own fresh temporary directory** under `os.tmpdir()`, never inside
-  the working tree — a database under the repo survives `git status` unnoticed and on
-  Windows can hold a lock that fails the next `yarn build`. LevelDB takes an exclusive
-  directory lock, so per-*call* freshness is a requirement and not a nicety: the
-  `own-database` mutation benchmarks open and close a whole store inside every timed call.
-- **No storage round-trip counters.** The counting provider wraps an in-memory map, not an
-  arbitrary provider, so this backend contributes timings only. Nothing is lost: round-trip
-  counts are a property of the store *layer*, and `store-mem` reports them exactly, on
-  every run, for free.
+- **`syncCommits` left at default `true`**, which fsync every transaction commit.
+  That what deployment run, and single biggest term in what these rows
+  cost — `single-row-insert-1k@store-leveldb` is thousand statements, therefore
+  thousand fsync-ed commits. Benchmark that quietly turned it off measure
+  configuration nobody use.
+- **Every row get own fresh temporary directory** under `os.tmpdir()`, never inside
+  working tree — database under repo survive `git status` unnoticed and on
+  Windows can hold lock that fail next `yarn build`. LevelDB take exclusive
+  directory lock, so per-*call* freshness requirement not nicety:
+  `own-database` mutation benchmarks open and close whole store inside every timed call.
+- **No storage round-trip counters.** Counting provider wrap in-memory map, not
+  arbitrary provider, so this backend contribute timings only. Nothing lost: round-trip
+  counts are property of store *layer*, and `store-mem` report them exactly, every run, free.
 
-**Cleanup has three layers**, because no single one covers every way a run ends
+**Cleanup has three layers**, because no single one cover every way run ends
 (`bench/lib/tempdir.mjs`):
 
-1. The benchmark's own teardown removes its directory — the normal path.
-2. A process-level `exit` hook in the worker covers a throw, and covers the parent
+1. Benchmark's own teardown remove its directory — normal path.
+2. Process-level `exit` hook in worker cover throw, and cover parent
    vanishing.
-3. The **parent** sweeps at the end of the run. This layer is not a nicety: `run.mjs`
-   `SIGKILL`s a worker that blows the 120 s per-benchmark timeout, and `SIGKILL`s the
-   active worker on Ctrl+C — and a killed process runs no handler of any kind, so layer 2
+3. **Parent** sweep at end of run. Not nicety: `run.mjs`
+   `SIGKILL` worker that blow 120 s per-benchmark timeout, and `SIGKILL`
+   active worker on Ctrl+C — killed process run no handler of any kind, so layer 2
    structurally cannot cover it.
 
-The sweep never deletes by prefix. Every directory carries its owner's PID, and one is
-removed only when that PID is force-listed by the parent (which just killed it) or no
+Sweep never delete by prefix. Every directory carry owner's PID, and one
+removed only when that PID force-listed by parent (which just killed it) or no
 longer alive, so two concurrent bench runs cannot delete each other's databases. That also
-makes the sweep a **cross-run** backstop: if the parent itself dies without running a
-handler — Task Manager, a CI tree-kill, or on Windows any `kill` from another process,
-which terminates rather than signalling — the directory survives that run and the *next*
-`yarn bench` collects it, because its owner is dead by then. A stale directory therefore
-costs some disk until the next run and never reaches a measurement.
+make sweep **cross-run** backstop: if parent itself die without running
+handler — Task Manager, CI tree-kill, or on Windows any `kill` from another process,
+which terminate rather than signal — directory survive that run and *next*
+`yarn bench` collect it, because owner dead by then. Stale directory therefore
+cost some disk until next run and never reach measurement.
 
-**What it costs**, measured on an AMD Ryzen AI 9 HX 370 / NVMe / Windows 11 machine under
-node 24.2 — treat the absolute numbers as that machine's, not as a target:
+**What it costs**, measured on AMD Ryzen AI 9 HX 370 / NVMe / Windows 11 machine under
+node 24.2 — treat absolute numbers as that machine's, not target:
 
 | | wall clock |
 | --- | --- |
@@ -325,58 +311,58 @@ node 24.2 — treat the absolute numbers as that machine's, not as a target:
 | slowest single row (`mutation/delete-where-100@store-leveldb`) | 1.95 s median, ~14 s of wall clock |
 | the 2 [read-cost rows](#read-cost-on-real-disk), opted in | 10.3 s (they share the opt-in but carry no `@` suffix) |
 
-Nothing approaches the 120 s per-benchmark timeout. The 9.2 s a *default* run pays is the
-price of the rows printing their skip reason instead of vanishing, and it is roughly
-`0.5 s × rows` — a process fork plus a `dist/` import each, because the skip reason is a
-runtime fact evaluated in the worker.
+Nothing approach 120 s per-benchmark timeout. 9.2 s a *default* run pay is
+price of rows printing skip reason instead of vanishing, roughly
+`0.5 s × rows` — process fork plus `dist/` import each, because skip reason is
+runtime fact evaluated in worker.
 
-`@quereus/plugin-leveldb` is reached through **one lazy import site**
-(`bench/lib/leveldb-backend.mjs`), for the same reason `@quereus/store` is: the parent
-imports every suite file just to enumerate names, so a static import would let an unbuilt
-`packages/quereus-plugin-leveldb/dist` — or a native binding that will not load on this
-platform — kill the whole run, parser and planner suites included. Instead the rows skip
-with the load error as their reason, and `yarn bench` completes.
+`@quereus/plugin-leveldb` reached through **one lazy import site**
+(`bench/lib/leveldb-backend.mjs`), same reason as `@quereus/store`: parent
+import every suite file just to enumerate names, so static import let unbuilt
+`packages/quereus-plugin-leveldb/dist` — or native binding that will not load on this
+platform — kill whole run, parser and planner suites included. Instead rows skip
+with load error as reason, and `yarn bench` complete.
 
-There is deliberately **no `--backend` flag**. `--filter` is a plain substring match, so
-`--filter @store-mem` already selects one backend across every workload and `--filter
-full-scan-10k` already selects one workload across every backend. Expansion is
-workload-major, so a workload's readings land on adjacent rows in the table.
+Deliberately **no `--backend` flag**. `--filter` is plain substring match, so
+`--filter @store-mem` already select one backend across every workload and `--filter
+full-scan-10k` already select one workload across every backend. Expansion is
+workload-major, so workload's readings land on adjacent rows in table.
 
-**Every entry of both suites is expanded** — neither suite file holds a benchmark object
-of its own. That is the invariant worth keeping: a hand-written entry would keep running
-on the default backend forever, and nothing would say so when a new backend landed. A
-workload that seems not to fit usually needs a richer *fixture* (a fixture is a function
-over a database and may build as many tables as it likes), not an exception.
+**Every entry of both suites expanded** — neither suite file hold benchmark object
+of own. That invariant worth keeping: hand-written entry keep running
+on default backend forever, and nothing say so when new backend land. Workload
+that seem not to fit usually need richer *fixture* (fixture is function
+over database, may build as many tables as it like), not exception.
 
 ## Running it
 
 | Command | What it does |
 | --- | --- |
-| `yarn bench` | Runs everything, prints the table, writes a results file. |
-| `yarn bench --filter <substring>` | Runs only benchmarks whose `suite/name` contains the substring. `--filter parser/` runs one suite; `--filter order-by` runs the ordering shapes across suites. |
-| `yarn bench --baseline <file>` | Compares against a previous results file. |
-| `yarn bench --baseline latest` | Compares against the newest file in `bench/results/`, resolved *before* this run writes its own. |
-| `yarn bench --json` | Writes the result object to stdout and moves every other line — progress, table, banner, guard output — to stderr. |
-| `yarn bench:leveldb` | The same as `yarn bench` with `QUEREUS_BENCH_LEVELDB=1`, so the [disk-backed rows](#store-leveldb-real-disk-opt-in-and-advisory) run instead of printing a skip reason. Adds ~85 s and gates nothing. Note `--filter @store-leveldb` reaches only the *backend* rows; the two [read-cost rows](#read-cost-on-real-disk) carry no `@` suffix and are filtered as `store/leveldb-read-cost`. |
+| `yarn bench` | Run everything, print table, write results file. |
+| `yarn bench --filter <substring>` | Run only benchmarks whose `suite/name` contain substring. `--filter parser/` run one suite; `--filter order-by` run ordering shapes across suites. |
+| `yarn bench --baseline <file>` | Compare against previous results file. |
+| `yarn bench --baseline latest` | Compare against newest file in `bench/results/`, resolved *before* this run write its own. |
+| `yarn bench --json` | Write result object to stdout, move every other line — progress, table, banner, guard output — to stderr. |
+| `yarn bench:leveldb` | Same as `yarn bench` with `QUEREUS_BENCH_LEVELDB=1`, so [disk-backed rows](#store-leveldb-real-disk-opt-in-and-advisory) run instead of printing skip reason. Add ~85 s, gate nothing. Note `--filter @store-leveldb` reach only *backend* rows; two [read-cost rows](#read-cost-on-real-disk) carry no `@` suffix, filtered as `store/leveldb-read-cost`. |
 
-`bench/results/` is gitignored and never pruned. Files are named by ISO timestamp with `:`
-and `.` replaced, so they sort lexicographically in chronological order; `--baseline latest`
-relies on that rather than on file modification times, which a copy or a checkout can
+`bench/results/` gitignored, never pruned. Files named by ISO timestamp with `:`
+and `.` replaced, so sort lexicographically in chronological order; `--baseline latest`
+rely on that rather than file modification times, which copy or checkout can
 reorder.
 
 ### Measuring one commit's cost
 
-To put a number on what a single commit cost, the "before" side must be that commit's
-**literal git parent** — `git rev-parse <commit>^` — not the last commit that happened to
-touch the same file. `git log -- <path>` skips every commit that did not touch that path,
-so using its previous entry as the baseline measures everything that landed in between as
-well. That mistake produced 50-80% "improvements" on `parser/` and `planner/` benchmarks
-while isolating a change to `emit/scan.ts`, which cannot affect either.
+To put number on what single commit cost, "before" side must be that commit's
+**literal git parent** — `git rev-parse <commit>^` — not last commit that happened to
+touch same file. `git log -- <path>` skip every commit that did not touch that path,
+so using its previous entry as baseline measure everything that landed between too.
+That mistake produced 50-80% "improvements" on `parser/` and `planner/` benchmarks
+while isolating change to `emit/scan.ts`, which cannot affect either.
 
-Confirm the isolation before trusting the numbers: `git diff --stat <parent> <commit>`
-should show only the files the change touched. Then `yarn build` and `yarn bench` on each
-side, back to back in one sitting on one machine — `dist/` is what the suites import, and
-the noise floor only covers within-run noise (see below).
+Confirm isolation before trusting numbers: `git diff --stat <parent> <commit>`
+should show only files change touched. Then `yarn build` and `yarn bench` on each
+side, back to back in one sitting on one machine — `dist/` is what suites import, and
+noise floor only cover within-run noise (see below).
 
 ## Reading the table
 
@@ -387,98 +373,98 @@ parser/simple-select                4.2 µs        7.0%      4.0 µs      9.1 µ
 parser/insert-values                6.1 µs       28.9%      5.4 µs     21.0 µs       +2.1%      ±30.2%  unstable  not gated
 ```
 
-- **Median** — the middle timed sample. The median, not the mean: these distributions carry
-  garbage-collection and just-in-time-compilation outliers that drag a mean around without
-  saying anything about the typical call.
+- **Median** — middle timed sample. Median not mean: these distributions carry
+  garbage-collection and just-in-time-compilation outliers that drag mean around without
+  saying anything about typical call.
 - **Spread** — relative interquartile range, `(p75 - p25) / median`. How much this run's own
-  samples disagreed with each other. A row above 20% is marked `unstable`.
-- **Min / Max** — the extreme samples. **For a batched benchmark these are batch averages,
-  not the fastest and slowest individual calls** (see *Calibration* below); a benchmark
-  batching 474 calls per sample cannot report a single call's extremes at all.
-- **Delta** — the median against the baseline's, as a percentage. Only present with
+  samples disagreed. Row above 20% marked `unstable`.
+- **Min / Max** — extreme samples. **For batched benchmark these are batch averages,
+  not fastest and slowest individual calls** (see *Calibration* below); benchmark
+  batching 474 calls per sample cannot report single call's extremes at all.
+- **Delta** — median against baseline's, as percentage. Only present with
   `--baseline`.
-- **Noise** — the floor that Delta had to clear to count as a change at all. Also only
+- **Noise** — floor Delta had to clear to count as change at all. Also only
   present with `--baseline`.
 
-Two markers may follow a row: `unstable` (this run's own spread was above 20%, or the
-benchmark collected too few samples for a spread to be believed) and `pinned` (the
+Two markers may follow row: `unstable` (this run's own spread above 20%, or
+benchmark collected too few samples for spread to be believed) and `pinned` (
 benchmark opted out of calibration — see below).
 
 ## Process isolation, and what is portable between machines
 
-**Every benchmark runs in its own process**, forked one at a time by `bench/run.mjs`. This
-is not tidiness. The instruction interpreter shares call sites across query shapes, so in a
-single shared process whichever shape runs first pays the just-in-time compiler's warm-up
-costs and whichever runs later inherits a de-optimized, polymorphic dispatch path. Measured
-during the isolation work: the same fourteen benchmarks moved between **0.37x and 1.66x**
-— a 2.7x swing on identical code — depending only on their position in the run order.
-Isolation removes that variable entirely, at the cost of a process fork per benchmark.
+**Every benchmark run in own process**, forked one at time by `bench/run.mjs`. Not
+tidiness. Instruction interpreter share call sites across query shapes, so in
+single shared process whichever shape run first pay just-in-time compiler's warm-up
+cost and whichever run later inherit de-optimized, polymorphic dispatch path. Measured
+during isolation work: same fourteen benchmarks moved between **0.37x and 1.66x**
+— 2.7x swing on identical code — depending only on position in run order.
+Isolation remove that variable entirely, at cost of process fork per benchmark.
 
-What survives being carried between machines and what does not:
+What survive being carried between machines and what not:
 
-- **Not portable: absolute wall-clock numbers.** A median in milliseconds describes one CPU
-  running one build of V8 under one operating system's scheduler. Comparing yesterday's
-  laptop number against today's desktop number measures the hardware.
-- **Portable: ratios within a single run.** "This query is 26 times slower than its
-  hand-written equivalent" holds on any machine, because both halves ran on the same one.
-  That is what `ratioGuards` (below) exploit.
-- **Portable: the shape of a distribution.** A benchmark whose spread is consistently 3% on
-  one machine and 40% on another is telling you about the benchmark, not the machines.
+- **Not portable: absolute wall-clock numbers.** Median in milliseconds describe one CPU
+  running one build of V8 under one OS scheduler. Comparing yesterday's
+  laptop number against today's desktop number measure hardware.
+- **Portable: ratios within single run.** "This query 26 times slower than its
+  hand-written equivalent" hold on any machine, because both halves ran on same one.
+  That what `ratioGuards` (below) exploit.
+- **Portable: shape of distribution.** Benchmark whose spread consistently 3% on
+  one machine and 40% on another tell you about benchmark, not machines.
 
-Because absolute timings are not portable, every results file records the machine that
-produced it: CPU model, logical core count, total memory, platform, operating-system
-release, architecture, Node and V8 versions, the commit, and whether the working tree was
-dirty. When `--baseline` is given, the two environment blocks are compared *before* the
-table is printed, and a loud banner appears above it if the CPU model, the core count, the
-platform, the architecture or the Node major version differ — or if the baseline file
-records no environment at all, which is itself something you cannot check.
+Because absolute timings not portable, every results file record machine that
+produced it: CPU model, logical core count, total memory, platform, OS
+release, architecture, Node and V8 versions, commit, and whether working tree was
+dirty. When `--baseline` given, two environment blocks compared *before*
+table printed, and loud banner appear above it if CPU model, core count,
+platform, architecture or Node major version differ — or if baseline file
+record no environment at all, which itself something you cannot check.
 
-The banner warns; it never refuses. Comparing across machines on purpose ("does this
-regression reproduce on ARM?") is legitimate — it just has to be labelled.
+Banner warn; never refuse. Comparing across machines on purpose ("does this
+regression reproduce on ARM?") legitimate — just must be labelled.
 
 ## Calibration
 
-No benchmark definition carries an iteration count. Each worker:
+No benchmark definition carry iteration count. Each worker:
 
-1. Warms `fn` up **by elapsed duration** — about 250 ms of untimed calls — so the timed
-   loop measures the optimized code rather than the optimizer.
-2. Measures the warmed `fn` to pick an inner **batch size** that puts one timed sample
+1. Warm `fn` up **by elapsed duration** — ~250 ms untimed calls — so timed
+   loop measure optimized code rather than optimizer.
+2. Measure warmed `fn` to pick inner **batch size** that put one timed sample
    safely above clock resolution.
-3. Buys as many **samples** as a ~1 second time target affords, between 5 and 500.
+3. Buy as many **samples** as ~1 second time target afford, between 5 and 500.
 
-So a 4 µs parser call (batch ~250, 500 samples) and a 110 ms bulk insert (batch 1, ~9
-samples) both get comparable statistical weight without anyone hand-tuning either. Every
+So 4 µs parser call (batch ~250, 500 samples) and 110 ms bulk insert (batch 1, ~9
+samples) both get comparable statistical weight without hand-tuning either. Every
 knob is one commented object, `CALIBRATION`, in `bench/lib/calibrate.mjs`.
 
-Batching is why a batched row's Min and Max are batch means, and it is why **`fn` must be
+Batching is why batched row's Min and Max are batch means, and why **`fn` must be
 repeatable back-to-back without `setup` running between calls**.
 
-Setting `iterations` or `warmup` on a benchmark pins it out of calibration entirely and
-marks it `pinned`. That is an escape hatch for a benchmark whose per-call cost changes as it
-runs, where measuring a few warm calls would not represent the rest. A pinned benchmark
-collects too few samples for its spread to be trusted, so it is reported as unstable and is
+Setting `iterations` or `warmup` on benchmark pin it out of calibration entirely and
+mark it `pinned`. Escape hatch for benchmark whose per-call cost change as it
+run, where measuring few warm calls not represent rest. Pinned benchmark
+collect too few samples for spread to be trusted, so reported unstable and
 never gated on.
 
 ## Noise floor: when a delta is a change
 
-The old rule was a flat 20%: any median more than 20% above the baseline was red. That rule
-was wrong in both directions. `execution/group-by-10k` produced medians of 58.22 ms and
-65.03 ms in consecutive runs of an unchanged tree — a 12% delta that was entirely noise, in
-a run whose own spread was 63%. Meanwhile `execution/distinct-text-10k` reproduces to within
-3% across runs, so a real 15% regression there was invisible under the same flat rule.
+Old rule was flat 20%: any median more than 20% above baseline was red. That rule
+wrong both directions. `execution/group-by-10k` produced medians of 58.22 ms and
+65.03 ms in consecutive runs of unchanged tree — 12% delta entirely noise, in
+run whose own spread was 63%. Meanwhile `execution/distinct-text-10k` reproduce within
+3% across runs, so real 15% regression there was invisible under same flat rule.
 
-Each delta is now judged against a floor built from **both** runs' spreads:
+Each delta now judged against floor built from **both** runs' spreads:
 
 ```
 noiseFloor% = max(5, sqrt(currentSpread² + baselineSpread²))
 ```
 
-Quadrature, because the two runs' noise is independent — adding them would double-count and
-taking the larger would ignore one of them. The 5% minimum stops a benchmark that happened
-to report a near-zero spread from gating on 1% deltas, which no wall-clock measurement on a
-general-purpose machine supports.
+Quadrature, because two runs' noise independent — adding them double-count and
+taking larger ignore one. 5% minimum stop benchmark that happened
+to report near-zero spread from gating on 1% deltas, which no wall-clock measurement on
+general-purpose machine support.
 
-The verdicts:
+Verdicts:
 
 | Condition | Verdict | Gated? |
 | --- | --- | --- |
@@ -487,59 +473,58 @@ The verdicts:
 | `delta < -noiseFloor` and `delta < -10%` | **improvement**, green | no |
 | clears the floor but not the 10% minimum | printed with its percentage, plainly | no |
 
-The floor is printed in the `Noise` column beside every delta, so a reader can see *why* a
-12% delta was called no change without reading the source.
+Floor printed in `Noise` column beside every delta, so reader see *why*
+12% delta called no change without reading source.
 
-**A benchmark unstable in either run is never a regression.** Its delta is still printed and
-its row still says `not gated`, and the summary counts how many were excluded. A benchmark
-that cannot hold a stable number is a bug in the benchmark, not a signal about the engine.
-A baseline median that rounds to zero is treated the same way — there is no delta to
+**Benchmark unstable in either run is never regression.** Delta still printed and
+row still say `not gated`, and summary count how many excluded. Benchmark
+that cannot hold stable number is bug in benchmark, not signal about engine.
+Baseline median that round to zero treated same way — no delta to
 compute — rather than emitting `Infinity`.
 
-**What the floor cannot see.** It is built from each run's *own* samples, so it measures
-within-run noise and nothing else. A whole run displaced by background load — every
-benchmark moving the same direction by a similar amount — still reads as tight, and the
-displacement can exceed the floor. Measured while building this: two full 27-benchmark runs
-minutes apart on an unchanged tree, on a machine that was also running other work, produced
-two gated "regressions" whose spreads were 3-6% in *both* runs. So treat a red result on a
-busy machine as a prompt to re-run, not as a verdict, and do not wire this exit code into an
-automatic gate until a between-run estimate exists — repeating runs and taking a median of
-medians, subtracting the common-mode shift, or requiring a regression to reproduce twice.
-This is exactly why the [regression gate](#regression-gate) (`yarn bench:gate`) never
-compares an absolute millisecond figure against anything: it gates on work counters, and
-where it times something it divides two medians from the *same run* (see
-[Ratio guards](#ratio-guards)) — a quotient the displacement above moves both sides of, and
-so does not move at all.
+**What floor cannot see.** Built from each run's *own* samples, so measure
+within-run noise and nothing else. Whole run displaced by background load — every
+benchmark moving same direction by similar amount — still read tight, and
+displacement can exceed floor. Measured while building this: two full 27-benchmark runs
+minutes apart on unchanged tree, on machine also running other work, produced
+two gated "regressions" whose spreads were 3-6% in *both* runs. So treat red result on
+busy machine as prompt to re-run, not verdict, and do not wire this exit code into
+automatic gate until between-run estimate exists — repeating runs and taking median of
+medians, subtracting common-mode shift, or requiring regression to reproduce twice.
+Exactly why [regression gate](#regression-gate) (`yarn bench:gate`) never
+compare absolute millisecond figure against anything: it gate on work counters, and
+where it time something it divide two medians from *same run* (see
+[Ratio guards](#ratio-guards)) — quotient displacement above move both sides of, and
+so not move at all.
 
-A results file written before spreads were recorded has its spread assumed to be 20%: the
-widest a run could be and still have been called stable, so the assumption can only make the
-comparison more forgiving. The banner says how many entries needed the fallback.
+Results file written before spreads were recorded have spread assumed 20%:
+widest a run could be and still be called stable, so assumption only make
+comparison more forgiving. Banner say how many entries needed fallback.
 
 ## Outcomes that are not deltas
 
-Every benchmark in either run appears in the comparison exactly once, and the run closes
-with a count of each outcome. A comparison that silently drops what it could not evaluate
-reads as green when it is not.
+Every benchmark in either run appear in comparison exactly once, and run close
+with count of each outcome. Comparison that silently drop what it could not evaluate
+read green when it not.
 
-*Unstable*, *new* and *missing* each get a line per benchmark, because each carries its own
-reason. *Filtered* names share one wrapped block instead: they all have the same reason, and
-narrowing a 27-benchmark baseline to one suite otherwise printed 23 identical sentences that
-pushed the lines a reader had to act on off the top of the screen.
+*Unstable*, *new* and *missing* each get line per benchmark, because each carry own
+reason. *Filtered* names share one wrapped block instead: all have same reason, and
+narrowing 27-benchmark baseline to one suite otherwise printed 23 identical sentences that
+pushed lines reader had to act on off top of screen.
 
-- **new** — in this run, absent from the baseline. Not a failure.
-- **missing** — in the baseline, absent from this run: renamed, deleted, or never started.
-- **filtered** — in the baseline and excluded by `--filter`. Reported separately from
-  *missing* so a narrowed run does not look like a deletion.
-- **failed** — the benchmark threw, hung or died this run. Its row reads `FAILED` and the
-  run exits non-zero.
-- **unstable** — measured, but too noisy in one run or the other to gate on.
-- **skipped** — the benchmark declined to run (see below). Distinct from *missing*: it is
-  still in the suite, so its baseline entry is not reported as a deletion. It does not
-  affect the exit code.
+- **new** — in this run, absent from baseline. Not failure.
+- **missing** — in baseline, absent from this run: renamed, deleted, or never started.
+- **filtered** — in baseline and excluded by `--filter`. Reported separately from
+  *missing* so narrowed run not look like deletion.
+- **failed** — benchmark threw, hung or died this run. Row read `FAILED` and
+  run exit non-zero.
+- **unstable** — measured, but too noisy in one run or other to gate on.
+- **skipped** — benchmark declined to run (see below). Distinct from *missing*:
+  still in suite, so baseline entry not reported as deletion. No effect on exit code.
 
 ### A benchmark that declines to run: `skip()`
 
-A benchmark may declare a `skip()` alongside `fn`. It returns a **reason** to decline, or
+Benchmark may declare `skip()` alongside `fn`. Return **reason** to decline, or
 `null` to run:
 
 ```js
@@ -550,36 +535,36 @@ A benchmark may declare a `skip()` alongside `fn`. It returns a **reason** to de
 }
 ```
 
-Two exist today, and both decline for the same reason — `@quereus/store` will not load.
-One is attached by `expandBackends` from a backend's `skipWorkload` (see
-[Storage backends](#storage-backends-and-what-a-name-means)) and covers the `@store-mem`
-rows. The other is hand-written once in the `store` suite — one `skipUnlessStoreLoads` shared by
-all of its entries, which have no backend dimension to attach one for them; it calls the
-same `storeLoadFailure()` and so gives the same reason.
+Two exist today, both decline for same reason — `@quereus/store` will not load.
+One attached by `expandBackends` from backend's `skipWorkload` (see
+[Storage backends](#storage-backends-and-what-a-name-means)) and cover `@store-mem`
+rows. Other hand-written once in `store` suite — one `skipUnlessStoreLoads` shared by
+all entries, which have no backend dimension to attach one for them; it call
+same `storeLoadFailure()` so give same reason.
 
-It is evaluated in the **worker**, before `setup`, in its own phase — because the reason a
-benchmark declines is usually a runtime fact (a module that will not load, a missing
-binary, an environment variable), and the parent imports suites for their metadata only. A
-`skip()` that *throws* is a benchmark failure in phase `skip`, not a silent run.
+Evaluated in **worker**, before `setup`, in own phase — because reason a
+benchmark decline usually runtime fact (module that will not load, missing
+binary, environment variable), and parent import suites for metadata only. A
+`skip()` that *throw* is benchmark failure in phase `skip`, not silent run.
 
-A skipped benchmark **keeps its row**, printed as `skipped — <reason>`, and is recorded in
-the results JSON under a top-level `skipped` array of `{name, reason}`. It is in neither
-`benchmarks` (it produced no numbers) nor `failures` (it did not fail). Being in none of
-the three is the one thing it must not be: an absent benchmark reads as *unchanged* to
-anyone diffing two runs, which is exactly the wrong claim.
+Skipped benchmark **keep its row**, printed as `skipped — <reason>`, recorded in
+results JSON under top-level `skipped` array of `{name, reason}`. In neither
+`benchmarks` (produced no numbers) nor `failures` (did not fail). Being in none of
+three is one thing it must not be: absent benchmark read as *unchanged* to
+anyone diffing two runs, exactly wrong claim.
 
-`counters()` never runs on a skipped benchmark, so its counter verdict is `none` — "not
-comparable", the same claim a failed or filtered row makes — and never `dropped`, which
-would say the benchmark deliberately stopped reporting counts.
+`counters()` never run on skipped benchmark, so counter verdict is `none` — "not
+comparable", same claim failed or filtered row make — and never `dropped`, which
+would say benchmark deliberately stopped reporting counts.
 
 ### Informational rows: reported, never gated
 
-Some numbers are worth printing and are not worth failing a build over. A row whose timing
-is dominated by the machine's disk, filesystem or page cache is measuring something that is
-**not a property of this repository's code** — no amount of care in the workload changes
-that, and gating on it would make a slow disk look like a regression in the engine.
+Some numbers worth printing, not worth failing build over. Row whose timing
+dominated by machine's disk, filesystem or page cache measure something
+**not property of this repo's code** — no care in workload change
+that, and gating on it make slow disk look like regression in engine.
 
-Such a row is **informational**. The flag is declared on the *backend*, not per benchmark:
+Such row is **informational**. Flag declared on *backend*, not per benchmark:
 
 ```js
 export const STORE_LEVELDB_BACKEND = {
@@ -589,50 +574,50 @@ export const STORE_LEVELDB_BACKEND = {
 };
 ```
 
-`expandBackends` stamps `informational: true` onto every benchmark that backend produces,
-so no suite file has to remember and no future workload can forget. A row on an ordinary
-backend carries no such key at all.
+`expandBackends` stamp `informational: true` onto every benchmark that backend produce,
+so no suite file must remember and no future workload can forget. Row on ordinary
+backend carry no such key at all.
 
-What the flag changes, and what it deliberately does not:
+What flag change, and what it deliberately not:
 
-- The row prints a cyan **`informational`** marker as a trailing word — the way `unstable`
+- Row print cyan **`informational`** marker as trailing word — way `unstable`
   and `pinned` print — on measured, skipped and failed rows alike.
-- Against a baseline it is compared exactly like any other row, and **its status still says
-  `regression`** when the number moved. Suppressing the status would suppress the very
-  signal the row exists to give. Only the *gating* changes: the row is never counted toward
-  the exit code, and the run prints a yellow line saying how many advisory rows regressed,
-  so a red status next to an exit code of 0 reads as policy rather than as a harness bug.
-- **No ratio guard may name one.** A guard whose target or baseline is informational is
-  reported as `misconfigured` — a failure — and that case is checked *before* every other,
-  so it cannot hide behind "not selected by `--filter`". Anchoring a build-gating ratio to
-  a disk-dependent number is the mistake this refusal exists to make impossible.
-- The results JSON carries a top-level `informational` array of full names, sorted, so a
-  gate script can identify advisory rows without parsing names for an `@` suffix.
+- Against baseline compared exactly like any other row, and **status still say
+  `regression`** when number moved. Suppressing status suppress the very
+  signal row exist to give. Only *gating* change: row never counted toward
+  exit code, and run print yellow line saying how many advisory rows regressed,
+  so red status next to exit code 0 read as policy not harness bug.
+- **No ratio guard may name one.** Guard whose target or baseline informational is
+  reported `misconfigured` — failure — and that case checked *before* every other,
+  so cannot hide behind "not selected by `--filter`". Anchoring build-gating ratio to
+  disk-dependent number is mistake this refusal exist to make impossible.
+- Results JSON carry top-level `informational` array of full names, sorted, so
+  gate script identify advisory rows without parsing names for `@` suffix.
 
-A benchmark that *fails* on an informational backend still fails the run. That is not an
-inconsistency: an advisory number is exempt from gating, but a benchmark that threw, hung
-or died is a broken benchmark whichever backend it ran on — and it can only happen on a run
+Benchmark that *fail* on informational backend still fail run. Not
+inconsistency: advisory number exempt from gating, but benchmark that threw, hung
+or died is broken benchmark whichever backend it ran on — and can only happen on run
 that opted in.
 
 ## Work counters: exact-count comparison
 
-A benchmark can also report **work counters** — exact counts of plan nodes, instruction
+Benchmark can also report **work counters** — exact counts of plan nodes, instruction
 executions and engine-to-module calls, defined in
 [Runtime Work Counters](runtime-work-counters.md).
-They are judged nothing like a timing:
+Judged nothing like timing:
 
-- **Delta** says "this might be slower" — measurement noise can fake that, so it needs a
+- **Delta** say "this might be slower" — measurement noise can fake that, so need
   noise floor built from both runs' spreads (above).
-- **Counter delta** says "this does different work" — an exact integer, identical on every
-  machine and every run of the same plan, so it needs no floor at all.
+- **Counter delta** say "this does different work" — exact integer, identical on every
+  machine and every run of same plan, so need no floor at all.
 
-Different claims, so they never share a column. A counter comparison has **no tolerance and
-no minimum delta**: a difference of one is reported, and every difference is listed as
-`before -> after` rather than as a percentage.
+Different claims, so never share column. Counter comparison have **no tolerance and
+no minimum delta**: difference of one is reported, every difference listed as
+`before -> after` not percentage.
 
 ### Adding a `counters()` pass
 
-A benchmark opts in with a second, untimed entry point, alongside `fn` in the object shown
+Benchmark opt in with second, untimed entry point, alongside `fn` in object shown
 under *Adding a benchmark* below:
 
 ```js
@@ -644,27 +629,27 @@ async counters() {
 },
 ```
 
-`counters()` runs **once, after the timed loop and before `teardown`** — never inside `fn`.
-Runtime metrics wrap every streaming operator in a counting generator, so turning them on
-inside the timed loop would corrupt the very number the harness exists to measure; a separate
-untimed pass keeps the two concerns apart. `snapshotStatement` (one statement) and
-`snapshotStatements` (a named sequence — instruction keys are addresses within one program, so
+`counters()` run **once, after timed loop and before `teardown`** — never inside `fn`.
+Runtime metrics wrap every streaming operator in counting generator, so turning them on
+inside timed loop corrupt the very number harness exist to measure; separate
+untimed pass keep two concerns apart. `snapshotStatement` (one statement) and
+`snapshotStatements` (named sequence — instruction keys are addresses within one program, so
 two statements' counts must never be summed under one name) live in `bench/lib/counters.mjs`,
-alongside `snapshotPlanShape` for a benchmark that only wants plan-shape facts.
+alongside `snapshotPlanShape` for benchmark that only want plan-shape facts.
 
-**Drain the result fully before reading its counters** — see the drain requirement under
-*Adding a benchmark* above; a partial drain reads as a change in the engine when nothing
-changed but the loop.
+**Drain result fully before reading counters** — see drain requirement under
+*Adding a benchmark* above; partial drain read as change in engine when nothing
+changed but loop.
 
 ### Storage round trips: what a `store-mem` row counts
 
-For a store backend the interesting count is not an instruction tally — it is **how many
-times the engine went to storage, and with how many keys**. A change that doubled the
-round trips behind a secondary-index scan would leave every engine counter untouched.
+For store backend interesting count not instruction tally — it **how many
+times engine went to storage, and with how many keys**. Change that doubled
+round trips behind secondary-index scan leave every engine counter untouched.
 
-So a `@store-mem` benchmark's block nests. `engine` is the same `WorkCounterSnapshot` the
-bare row reports; `store` is keyed by **built store name** — what the key-value provider is
-keyed by, so it is stable across runs and says which physical store the traffic hit:
+So `@store-mem` benchmark's block nest. `engine` is same `WorkCounterSnapshot` the
+bare row report; `store` keyed by **built store name** — what key-value provider is
+keyed by, so stable across runs and say which physical store traffic hit:
 
 ```json
 {
@@ -682,218 +667,218 @@ keyed by, so it is stable across runs and says which physical store the traffic 
 }
 ```
 
-That is `filtered-scan-index-10k@store-mem`, and it reads: ten entries pulled from the
-secondary index, then **one** batched read carrying ten keys to fetch the rows, and no
-writes at all — it is a read workload. If row resolution ever stopped batching,
-`getManyCalls` would go to 10 and `singleGets` would take the keys.
+That `filtered-scan-index-10k@store-mem`, and it read: ten entries pulled from
+secondary index, then **one** batched read carrying ten keys to fetch rows, and no
+writes at all — read workload. If row resolution ever stop batching,
+`getManyCalls` go to 10 and `singleGets` take keys.
 
-The eight counts, which are **not** the raw field names of `CountingKVStore` in
-`@quereus/store/testing` — that class's `getMany` deliberately routes every key of a batch
-through its own counted `get`, so its `getCount` is not what its name suggests:
+Eight counts, **not** raw field names of `CountingKVStore` in
+`@quereus/store/testing` — that class's `getMany` deliberately route every key of batch
+through own counted `get`, so `getCount` not what name suggest:
 
 | Field | Means |
 | --- | --- |
 | `iterateEntries` | entries pulled from `iterate()` — a scan's volume |
 | `getManyCalls` | batched reads issued: **the read-side round-trip count** |
 | `getManyKeys` | keys those batched reads carried |
-| `singleGets` | reads that were genuinely one key at a time (`getCount - getManyKeyCount`, derived once, in `bench/lib/store-counters.mjs`) |
+| `singleGets` | reads genuinely one key at a time (`getCount - getManyKeyCount`, derived once, in `bench/lib/store-counters.mjs`) |
 | `directPuts` | puts issued one at a time, outside any batch |
 | `directDeletes` | deletes issued one at a time, outside any batch |
 | `batchWrites` | batch commits issued: **the write-side round-trip count** |
 | `batchOps` | put/delete operations those commits carried |
 
-**Both sides.** `CountingKVStore` counts reads (`get`/`getMany`/`iterate`) and writes
-(point `put`/`delete`, plus `WriteBatch.write()` commits and the operations they carried),
-so a write workload's block says both what its writes COST and what they PROVOKED in reads
+**Both sides.** `CountingKVStore` count reads (`get`/`getMany`/`iterate`) and writes
+(point `put`/`delete`, plus `WriteBatch.write()` commits and operations they carried),
+so write workload's block say both what its writes COST and what they PROVOKED in reads
 — index maintenance, uniqueness probes, read-modify-write. `bulk-insert-10k@store-mem`
 reporting 30 000 `singleGets` for 10 000 inserted rows is three reads per row; its
-`batchWrites` / `batchOps` are the other half of that story.
+`batchWrites` / `batchOps` are other half of story.
 
-The write side answers a question no read count can. Whether committing N queued operations
-costs a flat number of round trips or one per operation is a claim about `batchWrites`, and
-it cannot be recovered from the read counters by picking a cleverer workload: any workload
-that queues N operations also touches N rows, so its read counts are linear in N whatever
-the commit path does.
+Write side answer question no read count can. Whether committing N queued operations
+cost flat number of round trips or one per operation is claim about `batchWrites`, and
+cannot be recovered from read counters by picking cleverer workload: any workload
+that queue N operations also touch N rows, so read counts linear in N whatever
+commit path do.
 
-**What `batchWrites` is a fact about.** The counting provider exposes no
-`beginAtomicBatch` — its in-memory stores share no commit domain — so the transaction
-coordinator takes its per-store fallback: one `WriteBatch` per touched store. A provider
-that DOES have a shared commit domain (the LevelDB family) commits the same transaction as
-one cross-store atomic write instead. These are the store LAYER's round trips over an
-in-memory provider, not a prediction of what a real backend physically issues.
+**What `batchWrites` is fact about.** Counting provider expose no
+`beginAtomicBatch` — its in-memory stores share no commit domain — so transaction
+coordinator take per-store fallback: one `WriteBatch` per touched store. Provider
+that DOES have shared commit domain (LevelDB family) commit same transaction as
+one cross-store atomic write instead. These are store LAYER's round trips over
+in-memory provider, not prediction of what real backend physically issue.
 
-A store that was opened but never touched stays in the block with eight zeros. That is
-a different claim from a store that was never opened at all, which is absent — and the
-comparison reports an appeared or vanished path exactly as loudly as a changed count.
+Store opened but never touched stay in block with eight zeros. Different claim
+from store never opened at all, which is absent — and comparison report
+appeared or vanished path exactly as loudly as changed count.
 
 Two mechanics worth knowing:
 
-- The counters pass builds a **second database**, over a counting provider, so the counting
-  wrapper never sits inside a timed number. It costs about a second across all nineteen
-  store rows of a ~150 s run.
-- Each pass has to say where its *fixture* ends and its *measurement* begins, or a ten-key
-  index probe would be buried under ten thousand fixture inserts. The `execution` binder
-  does it structurally (fixture, then reset, then the statement); a `mutation` workload does
-  it by calling `ctx.beginMeasured()` at its own boundary — a no-op on backends that count
+- Counters pass build **second database**, over counting provider, so counting
+  wrapper never sit inside timed number. Cost ~second across all nineteen
+  store rows of ~150 s run.
+- Each pass must say where *fixture* end and *measurement* begin, or ten-key
+  index probe buried under ten thousand fixture inserts. `execution` binder
+  do it structurally (fixture, then reset, then statement); `mutation` workload do
+  it by calling `ctx.beginMeasured()` at own boundary — no-op on backends that count
   nothing.
 
-Counter portability across machines is **an assumption, not a fact**: nothing has yet
-compared counter blocks from two machines, and plan choice can in principle differ on a
-slower one — the one known mechanism is the join-order rule's wall-clock budget, which
-engages only on plans with two or more join nodes. The [regression gate](#regression-gate)
-(`yarn bench:gate`) gates on these counters, and excludes exactly that mechanism by
-refusing to gate any benchmark whose observed plan carries two or more join nodes.
+Counter portability across machines is **assumption, not fact**: nothing has yet
+compared counter blocks from two machines, and plan choice can in principle differ on
+slower one — one known mechanism is join-order rule's wall-clock budget, which
+engage only on plans with two or more join nodes. [Regression gate](#regression-gate)
+(`yarn bench:gate`) gate on these counters, and exclude exactly that mechanism by
+refusing to gate any benchmark whose observed plan carry two or more join nodes.
 
 ### Which suites qualify
 
-Whether a benchmark can report counters depends on what it does, not on an arbitrary
+Whether benchmark can report counters depend on what it do, not arbitrary
 per-suite switch:
 
 | Suite | Declares `counters()` | Why |
 | --- | --- | --- |
-| `execution` | 30 / 30 | Every benchmark runs a statement to completion; `snapshotStatement` reruns the same query untimed. The 15 `@store-mem` rows add a `store` block to it. |
+| `execution` | 30 / 30 | Every benchmark run statement to completion; `snapshotStatement` rerun same query untimed. 15 `@store-mem` rows add `store` block. |
 | `mutation` | 8 / 8 | Writes are statements too — same treatment. |
-| `planner` | 4 / 4 | `snapshotPlanShape` only. These benchmarks compile a plan and deliberately never execute it, so there is no instruction or table access to count — only plan shape. |
+| `planner` | 4 / 4 | `snapshotPlanShape` only. These benchmarks compile plan and deliberately never execute, so no instruction or table access to count — only plan shape. |
 | `parser` | 0 / 4 | Nothing to count: no `Database`, no plan, no runtime. |
-| `store` | 14 / 25 | The 11 key-encoding rows call store functions directly — no `Database`, nothing to count. The 14 hot-path rows all report a `store` round-trip block over a counting `store-mem` database and **assert** it in the pass: thirteen pin exact per-field integers on the table stores they name, and the catalog-rehydrate row pins "every table store saw nothing", which is the claim reopening makes. The reserved `__catalog__` / `__stats__` blocks are reported but never asserted — their counts are catalog-layout facts, not contracts. Twelve rows also report an `engine` block; the index-build row reports the `store` block only (its timed body is DDL plus verification scans, not one statement), and the catalog-rehydrate row reports what rehydration found instead of engine counts. |
+| `store` | 14 / 25 | 11 key-encoding rows call store functions directly — no `Database`, nothing to count. 14 hot-path rows all report `store` round-trip block over counting `store-mem` database and **assert** it in pass: thirteen pin exact per-field integers on table stores they name, catalog-rehydrate row pin "every table store saw nothing", which is claim reopening make. Reserved `__catalog__` / `__stats__` blocks reported but never asserted — counts are catalog-layout facts, not contracts. Twelve rows also report `engine` block; index-build row report `store` block only (timed body is DDL plus verification scans, not one statement), catalog-rehydrate row report what rehydration found instead of engine counts. |
 
 ### `--no-counters`
 
-`yarn bench --no-counters` skips the untimed pass entirely — timings only, at the cost of
-losing the counter columns. The results file can end up with no counters for two different
-reasons, and one field tells them apart: `counters_collected` is `false` only when the run
-itself was invoked with `--no-counters`; a benchmark that simply declares no `counters()` pass
-leaves `counters_collected: true` and is absent only on its own entries.
+`yarn bench --no-counters` skip untimed pass entirely — timings only, at cost of
+losing counter columns. Results file can end with no counters for two different
+reasons, one field tell them apart: `counters_collected` is `false` only when run
+itself invoked with `--no-counters`; benchmark that simply declare no `counters()` pass
+leave `counters_collected: true` and is absent only on own entries.
 
-The flag is read off **this** run, never off the baseline. A run invoked with
-`--no-counters` reports every benchmark's counter status as `skipped` rather than
-`dropped` — a timings-only run must not read as the whole baseline's counters
-disappearing. The other direction is a different verdict: a counter-collecting run
-compared against a `--no-counters` *baseline* reports `new` per benchmark, because there
-is nothing on the baseline side to have changed from.
+Flag read off **this** run, never off baseline. Run invoked with
+`--no-counters` report every benchmark's counter status as `skipped` rather than
+`dropped` — timings-only run must not read as whole baseline's counters
+disappearing. Other direction different verdict: counter-collecting run
+compared against `--no-counters` *baseline* report `new` per benchmark, because
+nothing on baseline side to have changed from.
 
 ### Reading the output
 
-When counter data is available, the table gains a `Counters` column: `same`, `N diff`,
+When counter data available, table gain `Counters` column: `same`, `N diff`,
 `new`, `dropped`, `skipped`, or `—` when neither side collected any.
 
-Below the table, each `changed` benchmark gets a block listing every differing path as
-`before -> after` — capped at `COUNTER_CHANGES_SHOWN` (12) lines per benchmark in the
-printed output, with the full uncapped list always in the results JSON under `comparison`.
-A `dropped` benchmark gets one line saying the baseline reported counters and this run did
-not, and no path list: there is nothing to list against a run that collected none.
+Below table, each `changed` benchmark get block listing every differing path as
+`before -> after` — capped at `COUNTER_CHANGES_SHOWN` (12) lines per benchmark in
+printed output, full uncapped list always in results JSON under `comparison`.
+`dropped` benchmark get one line saying baseline reported counters and this run did
+not, no path list: nothing to list against run that collected none.
 
 ## Regression gate
 
-`yarn bench:gate` is the automatic half of the suite, and the only half wired into
-`yarn check`. It runs two passes and fails if either finds a difference:
+`yarn bench:gate` is automatic half of suite, only half wired into
+`yarn check`. Run two passes, fail if either find difference:
 
 1. **Work counters.** Re-measure every counter-declaring benchmark and fail when any count
-   differs from the checked-in reference set — so a change that makes the engine do more
-   work is caught the day it lands, not months later when someone happens to compare two
+   differ from checked-in reference set — so change that make engine do more
+   work caught day it lands, not months later when someone happen to compare two
    runs.
-2. **[Ratio guards](#ratio-guards).** Time only the benchmarks a suite's `ratioGuards`
-   names, and fail when one benchmark's median exceeds its declared bound against
-   another's *in the same run*.
+2. **[Ratio guards](#ratio-guards).** Time only benchmarks a suite's `ratioGuards`
+   name, and fail when one benchmark's median exceed declared bound against
+   another's *in same run*.
 
-**No absolute wall-clock figure gates anything.** The
-[noise floor](#noise-floor-when-a-delta-is-a-change) is built from within-run spread and is
-blind to whole-run displacement, so a millisecond gate on one machine cannot tell a
-regression from background load. What gates instead is machine-portable: work counters,
-exact integers that compare for equality — no floor, no threshold, no re-run — and
-within-run ratios, where machine speed cancels out of the quotient.
+**No absolute wall-clock figure gate anything.**
+[Noise floor](#noise-floor-when-a-delta-is-a-change) built from within-run spread and
+blind to whole-run displacement, so millisecond gate on one machine cannot tell
+regression from background load. What gate instead is machine-portable: work counters,
+exact integers compared for equality — no floor, no threshold, no re-run — and
+within-run ratios, where machine speed cancel out of quotient.
 
-**The reference set** is one file per suite in `bench/reference/<suite>.json`, checked into
-git: the expected counter block per benchmark, plus an `accepted` block recording who
-accepted it, at which commit, and why. The files are pretty-printed with sorted keys so a
-change is a readable diff — the git history of `bench/reference/` is the log of every
-accepted change to how much work the engine does.
+**Reference set** is one file per suite in `bench/reference/<suite>.json`, checked into
+git: expected counter block per benchmark, plus `accepted` block recording who
+accepted it, at which commit, and why. Files pretty-printed with sorted keys so
+change is readable diff — git history of `bench/reference/` is log of every
+accepted change to how much work engine do.
 
-**The counters pass runs every benchmark in one process,** unlike `yarn bench`, which forks
-a worker per benchmark. Forking is load-bearing for timings — the interpreter shares call
-sites across query shapes, so a benchmark's measured speed depends on what ran before it —
-but not for counts: a single-process pass produced counter blocks byte-identical to the
-forked run's for all 56 benchmarks, and saves ~22 s of forks and `dist/` imports. Nothing
-is timed in it, so it runs each benchmark's `skip`/`setup`/`counters`/`teardown` and never
-the timed loop.
+**Counters pass run every benchmark in one process,** unlike `yarn bench`, which fork
+worker per benchmark. Forking load-bearing for timings — interpreter share call
+sites across query shapes, so benchmark's measured speed depend on what ran before —
+but not for counts: single-process pass produced counter blocks byte-identical to
+forked run's for all 56 benchmarks, and save ~22 s of forks and `dist/` imports. Nothing
+timed in it, so it run each benchmark's `skip`/`setup`/`counters`/`teardown` and never
+timed loop.
 
-**The guard pass forks, because it times.** It runs after the counters pass and only in
-gate mode — never under `--accept`, which records a reference and reaches no verdict. It
-times only the benchmarks some suite's `ratioGuards` names (8 of the 92 rows today), one
-per forked worker exactly as `yarn bench` isolates a timed benchmark, at the reduced
-`GATE_CALIBRATION` profile in `bench/lib/calibrate.mjs` — a third of the manual runner's
-timed work per benchmark, which is what keeps the pass to seconds. A guard that **fails**
-there is re-measured once at full `CALIBRATION`, and the re-measure decides: fail-then-pass
-does not fail the run. A busy machine therefore costs a wasted re-measure, not a false red,
-and the two measurements print as one verdict rather than two rows.
+**Guard pass fork, because it time.** Run after counters pass and only in
+gate mode — never under `--accept`, which record reference and reach no verdict. Time
+only benchmarks some suite's `ratioGuards` name (8 of 92 rows today), one
+per forked worker exactly as `yarn bench` isolate timed benchmark, at reduced
+`GATE_CALIBRATION` profile in `bench/lib/calibrate.mjs` — third of manual runner's
+timed work per benchmark, which keep pass to seconds. Guard that **fail**
+there re-measured once at full `CALIBRATION`, and re-measure decide: fail-then-pass
+do not fail run. Busy machine therefore cost wasted re-measure, not false red,
+and two measurements print as one verdict not two rows.
 
-**Inside `yarn check`, and what it costs.** The chain runs `docs:check → lint → build →
-typecheck → bench:gate → test:full → …`. On the machine the wall-clock figures above come
-from, the gate adds ~35 s to it: 25 s for the counters pass, 9 s for the guard pass across
-8 forks, against the ~160 s a full `yarn bench` costs. It sits **after `typecheck` and
-before `test:full`** on purpose: the chain is `&&`-chained, `test:full` is by far its
-longest step, and the gate needs nothing but a built `dist/`, which `build` two steps
-earlier produced from scratch (root `build` runs `yarn clean` first). A 35-second step
-ahead of the long one surfaces a changed work counter in about a minute instead of after
-the whole test run — do not "tidy" it to the end. A dirty tree is the normal development
-case and the gate never refuses it: it prints the dirty-tree banner and gates anyway (only
-`bench:accept` refuses, because only an accept records a provenance commit). Run on its own
-against a stale or absent `dist/`, it fails with an import error like every other bench
+**Inside `yarn check`, and what it costs.** Chain run `docs:check → lint → build →
+typecheck → bench:gate → test:full → …`. On machine wall-clock figures above come
+from, gate add ~35 s: 25 s counters pass, 9 s guard pass across
+8 forks, against ~160 s full `yarn bench` cost. Sit **after `typecheck` and
+before `test:full`** on purpose: chain is `&&`-chained, `test:full` by far longest
+step, and gate need nothing but built `dist/`, which `build` two steps
+earlier produced from scratch (root `build` run `yarn clean` first). 35-second step
+ahead of long one surface changed work counter in ~minute instead of after
+whole test run — do not "tidy" it to end. Dirty tree is normal development
+case and gate never refuse it: print dirty-tree banner and gate anyway (only
+`bench:accept` refuse, because only accept record provenance commit). Run on own
+against stale or absent `dist/`, fail with import error like every other bench
 entry point; build first.
 
-**`--report-only`** prints every finding and still exits 0; the env var
-`QUEREUS_BENCH_GATE_REPORT_ONLY` (any value but empty or `0`) does the same for callers that
-cannot edit the command line. It suppresses *findings*, never breakage: a bad flag, an
-unreadable reference or a suite that will not load still exits non-zero. Two situations
-justify it — a release branch pinned to a deliberately stale reference, and a machine too
-loaded to trust the guard pass on — and it is **not** a standing setting: a gate that
-reports and never fails is a gate nobody reads. It is refused outright with `--accept`.
+**`--report-only`** print every finding and still exit 0; env var
+`QUEREUS_BENCH_GATE_REPORT_ONLY` (any value but empty or `0`) do same for callers that
+cannot edit command line. Suppress *findings*, never breakage: bad flag,
+unreadable reference or suite that will not load still exit non-zero. Two situations
+justify it — release branch pinned to deliberately stale reference, and machine too
+loaded to trust guard pass on — and it **not** standing setting: gate that
+report and never fail is gate nobody read. Refused outright with `--accept`.
 
-**What gates and what does not.** A benchmark gates only when its observed plan carries at
-most one join node. Join order on three or more relations is chosen under a wall-clock
-budget (`bug-join-order-depends-on-wall-clock` in the backlog), so those counts are not
-provably the same on another machine. The gate recomputes this eligibility from each run's
-own counters — the reference file's `gated` flag is documentation, never the authority —
-names every ungated benchmark in its report, and still records their counts so a change
-stays visible. Today nothing is excluded: no benchmark's plan has two or more join nodes.
-The LevelDB rows never gate either: `bench:gate` deletes `QUEREUS_BENCH_LEVELDB` from its
-own environment before loading suites, and says in its report when it was set.
+**What gates and what does not.** Benchmark gate only when observed plan carry at
+most one join node. Join order on three or more relations chosen under wall-clock
+budget (`bug-join-order-depends-on-wall-clock` in backlog), so those counts not
+provably same on another machine. Gate recompute this eligibility from each run's
+own counters — reference file's `gated` flag is documentation, never authority —
+name every ungated benchmark in report, and still record counts so change
+stay visible. Today nothing excluded: no benchmark's plan have two or more join nodes.
+LevelDB rows never gate either: `bench:gate` delete `QUEREUS_BENCH_LEVELDB` from own
+environment before loading suites, and say in report when it was set.
 
-**Outcomes.** `differs` (a gated count changed), `missing` (in the reference, produced no
-result this run) and `failed` (threw during the pass) fail the run; `match`, `new` (ran,
-not yet in the reference), `ungated`, `skipped` and `filtered` do not. A suite that
-produced counter blocks but has no reference file fails — as does one whose reference file
-exists but records *no benchmarks*, so emptying a file cannot turn a suite into a set of
-benign `new` rows — as does a reference file naming a suite that no longer exists.
-Deleting or emptying `bench/reference/` cannot make the gate green. (Deleting *part* of a
-file still can: from inside one run a removed expectation and a genuinely new benchmark are
-the same observation, so the defense there is that `bench/reference/` is checked in and its
-diff gets reviewed.) Each
-`differs` benchmark prints every changed path as `path  before -> after`, capped at 12
-lines per benchmark with the elision announced, and uncapped under `--json` (outcome object
-on stdout, human report on stderr — the same routing as `yarn bench`).
+**Outcomes.** `differs` (gated count changed), `missing` (in reference, produced no
+result this run) and `failed` (threw during pass) fail run; `match`, `new` (ran,
+not yet in reference), `ungated`, `skipped` and `filtered` do not. Suite that
+produced counter blocks but have no reference file fail — as do one whose reference file
+exist but record *no benchmarks*, so emptying file cannot turn suite into set of
+benign `new` rows — as do reference file naming suite that no longer exist.
+Deleting or emptying `bench/reference/` cannot make gate green. (Deleting *part* of
+file still can: from inside one run removed expectation and genuinely new benchmark are
+same observation, so defense there is `bench/reference/` checked in and its
+diff get reviewed.) Each
+`differs` benchmark print every changed path as `path  before -> after`, capped at 12
+lines per benchmark with elision announced, uncapped under `--json` (outcome object
+on stdout, human report on stderr — same routing as `yarn bench`).
 
-**Accepting a change.** When the difference is intentional:
+**Accepting a change.** When difference intentional:
 
 ```
 yarn bench:accept --reason "hash join now probes the build side once per batch"
 ```
 
-re-runs the full pass and rewrites only the reference files whose benchmark contents
-actually changed, so an untouched suite's `accepted` provenance survives in git history.
-`--reason` is required — a reference that changes without a recorded reason is a reference
-nobody trusts. Accept refuses on a dirty working tree (the recorded provenance commit would
-be a lie) unless `--allow-dirty` is passed, refuses `--filter` (a reference is always a
-full re-measure), and refuses to write while any benchmark failed or while a
-previously-recorded benchmark skipped this run — an unbuilt `dist/` must not silently erase
-a suite's expectations. Writes are atomic (temp file, then rename), so a concurrent gate
-run never reads half a file.
+re-run full pass and rewrite only reference files whose benchmark contents
+actually changed, so untouched suite's `accepted` provenance survive in git history.
+`--reason` required — reference that change without recorded reason is reference
+nobody trust. Accept refuse on dirty working tree (recorded provenance commit would
+be lie) unless `--allow-dirty` passed, refuse `--filter` (reference always
+full re-measure), and refuse to write while any benchmark failed or while
+previously-recorded benchmark skipped this run — unbuilt `dist/` must not silently erase
+suite's expectations. Writes atomic (temp file, then rename), so concurrent gate
+run never read half file.
 
 ## Ratio guards
 
-A suite may export `ratioGuards`: a bound on one benchmark's median against another's,
-*within the same run*. Both `yarn bench` and `yarn bench:gate` evaluate them, and the gate
-runs in `yarn check` — so a guard here is a build gate, not a report.
+Suite may export `ratioGuards`: bound on one benchmark's median against another's,
+*within same run*. Both `yarn bench` and `yarn bench:gate` evaluate them, and gate
+run in `yarn check` — so guard here is build gate, not report.
 
 ```js
 export const ratioGuards = [
@@ -906,114 +891,113 @@ export const ratioGuards = [
 ];
 ```
 
-This catches a plan-shape regression from a single run with no baseline file at all. If
-`scalar-agg-decorrelation` stops firing, the correlated form goes N+1 against its
-hand-written twin and the ratio spikes, whatever the absolute timings on that machine are.
-Ratios are the portable measurement, which is what makes this the strongest gate the suite
-has.
+Catch plan-shape regression from single run with no baseline file at all. If
+`scalar-agg-decorrelation` stop firing, correlated form go N+1 against
+hand-written twin and ratio spike, whatever absolute timings on that machine.
+Ratios are portable measurement, which make this strongest gate suite has.
 
-**The fields.** `name` is the benchmark under test, `baseline` the one its median is
-divided by, `maxRatio` the largest acceptable quotient. `note` is optional but write one
-for every guard: a sentence saying what the guard protects, printed in brackets beside the
-verdict, so a red line says *what broke* rather than only which two rows moved apart.
+**Fields.** `name` is benchmark under test, `baseline` the one its median
+divided by, `maxRatio` largest acceptable quotient. `note` optional but write one
+for every guard: sentence saying what guard protect, printed in brackets beside
+verdict, so red line say *what broke* rather than only which two rows moved apart.
 
-**`maxRatio` may be below 1.** That is the natural shape when the regression being guarded
-against is a fast path collapsing into the slow path it is normally a small fraction of:
-`filtered-scan-index-10k` sits at ~0.01× `full-scan-10k` and would land near 1× if index
-selection stopped firing, so its bound is 0.1× — an order of magnitude clear of both.
+**`maxRatio` may be below 1.** Natural shape when regression being guarded
+against is fast path collapsing into slow path it normally small fraction of:
+`filtered-scan-index-10k` sit at ~0.01× `full-scan-10k` and land near 1× if index
+selection stop firing, so bound is 0.1× — order of magnitude clear of both.
 Verdicts print ratios to two decimals for exactly this reason.
 
-**Names may cross suites.** A bare `name`/`baseline` resolves within the declaring suite; a
-name containing `/` is a full `suite/name` and is used as written, which is how a guard in
-one suite bounds a benchmark in another. A cross-suite name pointing at nothing is an
-ordinary "not found in this run" misconfiguration — nothing special-cases it.
+**Names may cross suites.** Bare `name`/`baseline` resolve within declaring suite;
+name containing `/` is full `suite/name` and used as written, which is how guard in
+one suite bound benchmark in another. Cross-suite name pointing at nothing is
+ordinary "not found in this run" misconfiguration — nothing special-case it.
 
-**Shape is validated when the suite loads,** in the parent process, before any benchmark
-runs: a `ratioGuards` that is not an array, an entry missing `name` or `baseline`, a `note`
-that is not a string, or a `maxRatio` that is not a finite number greater than zero all
-throw by name. That last one is two opposite bugs from one typo — `maxRatio: 0` fails every
-run unconditionally, `maxRatio: NaN` compares false against everything and passes forever —
-and neither is allowed to reach a run. The rule behind all of it: a guard that quietly
-never evaluates is a guard everyone believes is protecting them.
+**Shape validated when suite load,** in parent process, before any benchmark
+run: `ratioGuards` not array, entry missing `name` or `baseline`, `note`
+not string, or `maxRatio` not finite number greater than zero all
+throw by name. Last one is two opposite bugs from one typo — `maxRatio: 0` fail every
+run unconditionally, `maxRatio: NaN` compare false against everything and pass forever —
+neither allowed to reach run. Rule behind all: guard that quietly
+never evaluate is guard everyone believe protect them.
 
-**Bound it against what you measured.** Take the ratio from a real `yarn bench` on an
-unchanged tree, record it in a comment beside the guard, and set `maxRatio` at least 3×
-clear of it. Bounds here are order-of-magnitude by design: they trip a plan-shape collapse,
-not warm-up variance. A guard that fires on a good day trains everyone to ignore the gate.
+**Bound it against what you measured.** Take ratio from real `yarn bench` on
+unchanged tree, record in comment beside guard, set `maxRatio` at least 3×
+clear. Bounds here order-of-magnitude by design: trip plan-shape collapse,
+not warm-up variance. Guard that fire on good day train everyone to ignore gate.
 
-A guard naming a benchmark that was not selected is reported as *skipped* when `--filter` is
-active (narrowing a run should not make every guard fire) and as a *misconfiguration* — a
-failure — when it is not. A guard naming a benchmark that failed, or one whose `skip()`
-declined to run it, is reported as *not evaluated* and never as a misconfiguration: neither
-is a guard naming something that does not exist, and failing the run over a skip would make
-every skip a red build.
+Guard naming benchmark not selected reported *skipped* when `--filter`
+active (narrowing run should not make every guard fire) and *misconfiguration* —
+failure — when not. Guard naming benchmark that failed, or one whose `skip()`
+declined to run it, reported *not evaluated* and never misconfiguration: neither
+is guard naming something that not exist, and failing run over skip make
+every skip red build.
 
-**Guards name one benchmark each, and that means one backend each.** A bare name in a
-`ratioGuards` entry is the default backend's row. Guards are deliberately **not** expanded
-across backends: a ratio that holds on the in-memory vtab need not hold on a persistent
-store, and a guard that silently multiplies itself across backends is a guard nobody
-trusts. A guard that wants to bound a suffixed benchmark spells the suffix out.
+**Guards name one benchmark each, meaning one backend each.** Bare name in
+`ratioGuards` entry is default backend's row. Guards deliberately **not** expanded
+across backends: ratio that hold on in-memory vtab need not hold on persistent
+store, and guard that silently multiply itself across backends is guard nobody
+trust. Guard wanting to bound suffixed benchmark spell suffix out.
 
-**Do not write a cross-backend guard.** Bounding `x@some-backend` against bare `x` prices a
-storage engine against an in-process array; the number it would encode is this machine's
-ratio between two unrelated things, not a property of either engine. There is no portable
-value for `maxRatio` there, so there is no guard to write.
+**Do not write cross-backend guard.** Bounding `x@some-backend` against bare `x` price
+storage engine against in-process array; number it encode is this machine's
+ratio between two unrelated things, not property of either engine. No portable
+value for `maxRatio` there, so no guard to write.
 
-**A guard naming an [informational](#informational-rows-reported-never-gated) row is a
-misconfiguration**, and that is the rule above made mechanical: it fails the run, and it is
-checked before the not-selected and declined cases so a `--filter` cannot hide it. A
-build-gating ratio anchored to a number that moves with the machine's disk is not a gate.
+**Guard naming [informational](#informational-rows-reported-never-gated) row is
+misconfiguration**, and that rule above made mechanical: fail run, and
+checked before not-selected and declined cases so `--filter` cannot hide it. A
+build-gating ratio anchored to number that move with machine's disk not gate.
 
 ## Which check catches what
 
-Three separate things in this repository measure speed. They are not redundant, and a new
-check belongs in exactly one of them.
+Three separate things in this repo measure speed. Not redundant, and new
+check belong in exactly one.
 
 | | Runs in | Measures | Catches |
 | --- | --- | --- | --- |
-| **Performance sentinels** (`packages/quereus/test/performance-sentinels.spec.ts`) | `yarn test` | absolute milliseconds, 10-50× headroom | order-of-magnitude collapses, on any machine. The only speed check inside the test run. |
-| **The regression gate** (`yarn bench:gate`) | `yarn check` | exact work counts and within-run ratios — never wall-clock | small changes a 10× threshold cannot see: one more store round trip, one more row visited, a plan shape that stopped being chosen. |
-| **`yarn bench`** | nothing; manual | absolute timings, spreads, deltas against a saved baseline | how fast the engine actually is. The only place absolute timings are measured; its exit code is wired into nothing automatic. |
+| **Performance sentinels** (`packages/quereus/test/performance-sentinels.spec.ts`) | `yarn test` | absolute milliseconds, 10-50× headroom | order-of-magnitude collapses, on any machine. Only speed check inside test run. |
+| **The regression gate** (`yarn bench:gate`) | `yarn check` | exact work counts and within-run ratios — never wall-clock | small changes a 10× threshold cannot see: one more store round trip, one more row visited, plan shape that stopped being chosen. |
+| **`yarn bench`** | nothing; manual | absolute timings, spreads, deltas against saved baseline | how fast engine actually is. Only place absolute timings measured; exit code wired into nothing automatic. |
 
-**Where a new check goes:** the gate, unless it has to run inside `yarn test`.
+**Where new check goes:** gate, unless it must run inside `yarn test`.
 
-The sentinels are **not** replaced by the gate, nor being merged into it: they overlap in
-coverage and not in when they run. The two suites do reach similar workloads by different
-code, and reconciling that is its own piece of work
-(`debt-perf-sentinels-share-bench-workloads` in the backlog).
+Sentinels **not** replaced by gate, nor merged into it: overlap in
+coverage, not in when they run. Two suites do reach similar workloads by different
+code, and reconciling that is own piece of work
+(`debt-perf-sentinels-share-bench-workloads` in backlog).
 
 ## Exit-code contract
 
-`yarn bench` exits non-zero on any of:
+`yarn bench` exit non-zero on any of:
 
-- a benchmark failure (threw, timed out after 120 s, or died without reporting),
-- a ratio-guard failure or misconfiguration,
-- a gated regression, meaning a delta that cleared both the noise floor and the 10% minimum
-  on a benchmark that was stable in both runs.
+- benchmark failure (threw, timed out after 120 s, or died without reporting),
+- ratio-guard failure or misconfiguration,
+- gated regression, meaning delta that cleared both noise floor and 10% minimum
+  on benchmark stable in both runs.
 
 Unstable benchmarks, new benchmarks, missing benchmarks, sub-threshold deltas and
 [informational](#informational-rows-reported-never-gated) regressions never contribute to
-the exit code. An informational benchmark that *failed* still does — an exempt number is
-not an exempt benchmark.
+exit code. Informational benchmark that *failed* still do — exempt number is
+not exempt benchmark.
 
-**`yarn check` runs `yarn bench:gate`, and never `yarn bench`.** The gate's own exit code
-is the one the chain reads: non-zero on a differing gated counter, a failed or misconfigured
-ratio guard, a benchmark that threw, or a harness error — and zero under
+**`yarn check` run `yarn bench:gate`, never `yarn bench`.** Gate's own exit code
+is the one chain read: non-zero on differing gated counter, failed or misconfigured
+ratio guard, benchmark that threw, or harness error — and zero under
 `--report-only` / `QUEREUS_BENCH_GATE_REPORT_ONLY` for everything except that last class.
-`yarn bench`'s exit code above stays wired into nothing automatic, because it can turn red
+`yarn bench`'s exit code above stay wired into nothing automatic, because it can turn red
 from background load alone.
 
-Both entry points budget around the `memory` and `store-mem` backends only; the gate
-additionally deletes `QUEREUS_BENCH_LEVELDB` from its own environment, so a developer with
-it exported gets the same verdict as anyone else. The LevelDB rows would add ~75 s of
+Both entry points budget around `memory` and `store-mem` backends only; gate
+additionally delete `QUEREUS_BENCH_LEVELDB` from own environment, so developer with
+it exported get same verdict as anyone else. LevelDB rows add ~75 s of
 disk-bound work whose numbers, by construction, cannot gate anything.
 
 ## `--json`
 
-Under `--json`, stdout carries the result object and nothing else — the human table, the
-progress lines, the environment banner and the guard verdicts all move to stderr, and ANSI
-colour is suppressed. The object is exactly what is written to `bench/results/`, so a
-consumer never has to care which of the two it is reading. It includes `environment`,
+Under `--json`, stdout carry result object and nothing else — human table,
+progress lines, environment banner and guard verdicts all move to stderr, and ANSI
+colour suppressed. Object is exactly what written to `bench/results/`, so
+consumer never care which of two it reading. Include `environment`,
 `benchmarks`, `failures`, `skipped`, `informational`, `ratio_guards`, `baseline` and
 `comparison`.
 
@@ -1021,12 +1005,12 @@ consumer never has to care which of the two it is reading. It includes `environm
 node bench/run.mjs --json 2>/dev/null | node -e "let s='';process.stdin.on('data',c=>s+=c).on('end',()=>console.log(Object.keys(JSON.parse(s))))"
 ```
 
-Colour is also suppressed whenever the human stream is not an interactive terminal, so a
-captured log stays readable.
+Colour also suppressed whenever human stream not interactive terminal, so
+captured log stay readable.
 
 ## Adding a benchmark
 
-`parser`, `planner` and `store` hold benchmark objects directly; add an entry to the
+`parser`, `planner` and `store` hold benchmark objects directly; add entry to
 relevant `bench/suites/*.bench.mjs`:
 
 ```js
@@ -1041,8 +1025,8 @@ relevant `bench/suites/*.bench.mjs`:
 }
 ```
 
-For `execution` and `mutation`, add a **workload** instead — the suite file binds it to
-every backend for you. An `execution` workload is plain data:
+For `execution` and `mutation`, add **workload** instead — suite file bind it to
+every backend for you. `execution` workload is plain data:
 
 ```js
 // bench/workloads/execution.mjs, in QUERY_WORKLOADS
@@ -1054,78 +1038,78 @@ every backend for you. An `execution` workload is plain data:
 }
 ```
 
-A `mutation` workload is a small bundle of functions over a `db`, because its timed body
-is a procedure rather than a statement. It declares a `lifecycle`: `own-database` when the
-timed body is a database's whole life (the binder opens a fresh one per call, since a
-table left behind changes what the next call costs), or `shared-fixture` when `populate`
-can run once in `setup` because `run` reaches a fixed point.
+`mutation` workload is small bundle of functions over `db`, because timed body
+is procedure not statement. Declare `lifecycle`: `own-database` when
+timed body is database's whole life (binder open fresh one per call, since
+table left behind change what next call cost), or `shared-fixture` when `populate`
+can run once in `setup` because `run` reach fixed point.
 
-A fixture never constructs a `Database` — it populates one it is handed. That is what lets
-the same definition run on a different storage engine.
+Fixture never construct `Database` — populate one it handed. That what let
+same definition run on different storage engine.
 
 Requirements:
 
 - **`fn` must be repeatable back-to-back without `setup` between calls.** Calibration will
-  batch it, and a benchmark that only works the first time will report the cost of failing.
-- **`fn` must assert its own result.** A query that silently returns zero rows is very fast
-  and completely meaningless; the row-count check is what stops a broken benchmark from
-  reading as an improvement.
-- Names must be unique within their suite — `suite/name` is the identity that `--filter`,
-  the baseline comparison and the ratio guards all key on. Renaming a benchmark shows up as
-  one *missing* and one *new*, which is the intended signal.
-- Prefer a shape with a plausible slow counterpart, and give it a `ratioGuards` entry. A
-  guard that fires from a single run is worth more than a delta that needs a baseline file
-  from the same machine.
-- **Add a `counters()` pass if the benchmark runs a statement.** It is a second, untimed
-  entry point alongside `fn`, and it is what makes a plan change visible without a
-  same-machine baseline. See *Work counters* above for the shape and the helpers.
-- **A benchmark whose one call is far below a millisecond must amortize inside `fn`**, the
-  way the `store` suite does with its shared `KEYS_PER_CALL`. Below that scale the `await`
-  around `fn` is a meaningful share of the reading. Say in a comment what the reported
-  figure counts, and use one constant across every benchmark meant to be compared.
-- **`bench/suites/` is currently OUTSIDE the type pass.** `tsconfig.test.json` includes
-  `bench/lib/**` and `bench/workloads/**` but not `bench/suites/**`, so a suite file's own
-  `checkJs` errors surface only when the benchmark runs. `store.bench.mjs` was written to
-  compile clean under that pass and verified to; three of the other four (`execution`,
-  `mutation`, `planner` — `parser` is clean) report 21 mostly implicit-`any` errors, which
-  is what stands between here and widening the `include`. Parked as
+  batch it, and benchmark that only work first time report cost of failing.
+- **`fn` must assert own result.** Query that silently return zero rows is very fast
+  and completely meaningless; row-count check stop broken benchmark from
+  reading as improvement.
+- Names must be unique within suite — `suite/name` is identity `--filter`,
+  baseline comparison and ratio guards all key on. Renaming benchmark show up as
+  one *missing* and one *new*, intended signal.
+- Prefer shape with plausible slow counterpart, give it `ratioGuards` entry. Guard
+  that fire from single run worth more than delta needing baseline file
+  from same machine.
+- **Add `counters()` pass if benchmark run statement.** Second, untimed
+  entry point alongside `fn`, and what make plan change visible without
+  same-machine baseline. See *Work counters* above for shape and helpers.
+- **Benchmark whose one call far below millisecond must amortize inside `fn`**,
+  way `store` suite do with shared `KEYS_PER_CALL`. Below that scale `await`
+  around `fn` is meaningful share of reading. Say in comment what reported
+  figure count, use one constant across every benchmark meant to be compared.
+- **`bench/suites/` currently OUTSIDE type pass.** `tsconfig.test.json` include
+  `bench/lib/**` and `bench/workloads/**` but not `bench/suites/**`, so suite file's own
+  `checkJs` errors surface only when benchmark run. `store.bench.mjs` written to
+  compile clean under that pass and verified; three of other four (`execution`,
+  `mutation`, `planner` — `parser` clean) report 21 mostly implicit-`any` errors, which
+  stand between here and widening `include`. Parked as
   `debt-bench-suites-outside-type-pass`. Until
-  that is done, a renamed `@quereus/store` export is caught by the annotated resolution in
-  `bench/lib/store-counters.mjs` (which *is* checked) rather than at the suite's call site.
-- **Drain the result fully if you read work counters from it.** `Statement.getWorkCounters()`
-  reports what the execution actually did, so a benchmark that stops early — a `LIMIT`, a
-  `break` out of the loop, an abort — leaves a partial `rowsScanned` whose value depends on
-  where it stopped. Counts are only reproducible run-to-run once the iterable is exhausted.
+  done, renamed `@quereus/store` export caught by annotated resolution in
+  `bench/lib/store-counters.mjs` (which *is* checked) rather than at suite's call site.
+- **Drain result fully if you read work counters from it.** `Statement.getWorkCounters()`
+  report what execution actually did, so benchmark that stop early — `LIMIT`,
+  `break` out of loop, abort — leave partial `rowsScanned` whose value depend on
+  where it stopped. Counts only reproducible run-to-run once iterable exhausted.
   See [Runtime Work Counters](runtime-work-counters.md).
 
 ## Where the code lives
 
 | File | Responsibility |
 | --- | --- |
-| `bench/run.mjs` | Parent orchestrator: arguments, forking, the table, the comparison output, the exit code. Never runs benchmark work itself. |
-| `bench/child.mjs` | Worker: runs exactly one benchmark and reports raw samples over IPC. |
-| `bench/gate.mjs` | The [regression gate](#regression-gate) and accept entry point: arguments, the single-process counters pass, the forked [ratio-guard](#ratio-guards) pass, the report, the exit code. |
-| `bench/lib/guards.mjs` | The [ratio-guard](#ratio-guards) rules — member selection, verdict classification, the re-measure fold, the gate's exit rule, the verdict report — as pure functions shared by `run.mjs` and `gate.mjs`, which can never import each other. |
-| `bench/lib/reference.mjs` | The gate's rules — reference file read/write, gate eligibility, outcome classification, accept validation — as pure functions over plain objects. |
-| `bench/reference/*.json` | The checked-in expected counter blocks, one file per suite, rewritten only by `yarn bench:accept`. |
-| `bench/lib/calibrate.mjs` | The timing policy — warmup, batch sizing, sample count. Kept out of the worker so `test/bench-calibration.spec.ts` can drive it. |
-| `bench/lib/stats.mjs` | Median, percentiles, relative IQR, the summary record, and the noise floor. |
-| `bench/lib/compare.mjs` | The cross-run comparison rules, as pure functions over two result objects. |
-| `bench/lib/counters.mjs` | Helpers a benchmark's `counters()` pass uses: `snapshotStatement`, `snapshotStatements`, `snapshotPlanShape`. |
-| `bench/lib/environment.mjs` | Environment capture and the material-difference check. |
-| `bench/lib/discover.mjs` | Suite enumeration and the one definition of what `--filter` matches (`matchesFilter`), shared by the parent, the worker and the comparison. |
-| `bench/lib/backends.mjs` | The storage-engine dimension: the `BenchBackend` descriptor, the `BACKENDS` set, and `expandBackends` — one workload × N backends → N benchmarks, named by the bare-name rule, with each backend's `skipWorkload` wired into the benchmark's `skip()`. |
-| `bench/lib/store-counters.mjs` | Everything that touches `@quereus/store`, behind the harness's one dynamic import: the plain and counting `store-mem` databases, and the round-trip block they report. |
-| `bench/lib/leveldb-backend.mjs` | Everything that touches `@quereus/plugin-leveldb`, behind its own dynamic import: the `QUEREUS_BENCH_LEVELDB` opt-in, the skip reason, and the `store-leveldb` database over a temporary directory. |
-| `bench/lib/tempdir.mjs` | Fresh-per-call temporary directories for disk-backed rows, and the PID-owned sweep that removes the ones a killed worker could not remove itself. |
-| `bench/workloads/*.mjs` | What the `execution` and `mutation` suites measure, as data plus fixtures. The suite files are binders over these. |
+| `bench/run.mjs` | Parent orchestrator: arguments, forking, table, comparison output, exit code. Never run benchmark work itself. |
+| `bench/child.mjs` | Worker: run exactly one benchmark, report raw samples over IPC. |
+| `bench/gate.mjs` | [Regression gate](#regression-gate) and accept entry point: arguments, single-process counters pass, forked [ratio-guard](#ratio-guards) pass, report, exit code. |
+| `bench/lib/guards.mjs` | [Ratio-guard](#ratio-guards) rules — member selection, verdict classification, re-measure fold, gate's exit rule, verdict report — as pure functions shared by `run.mjs` and `gate.mjs`, which can never import each other. |
+| `bench/lib/reference.mjs` | Gate's rules — reference file read/write, gate eligibility, outcome classification, accept validation — as pure functions over plain objects. |
+| `bench/reference/*.json` | Checked-in expected counter blocks, one file per suite, rewritten only by `yarn bench:accept`. |
+| `bench/lib/calibrate.mjs` | Timing policy — warmup, batch sizing, sample count. Kept out of worker so `test/bench-calibration.spec.ts` can drive it. |
+| `bench/lib/stats.mjs` | Median, percentiles, relative IQR, summary record, noise floor. |
+| `bench/lib/compare.mjs` | Cross-run comparison rules, as pure functions over two result objects. |
+| `bench/lib/counters.mjs` | Helpers a benchmark's `counters()` pass use: `snapshotStatement`, `snapshotStatements`, `snapshotPlanShape`. |
+| `bench/lib/environment.mjs` | Environment capture and material-difference check. |
+| `bench/lib/discover.mjs` | Suite enumeration and one definition of what `--filter` match (`matchesFilter`), shared by parent, worker and comparison. |
+| `bench/lib/backends.mjs` | Storage-engine dimension: `BenchBackend` descriptor, `BACKENDS` set, `expandBackends` — one workload × N backends → N benchmarks, named by bare-name rule, each backend's `skipWorkload` wired into benchmark's `skip()`. |
+| `bench/lib/store-counters.mjs` | Everything touching `@quereus/store`, behind harness's one dynamic import: plain and counting `store-mem` databases, and round-trip block they report. |
+| `bench/lib/leveldb-backend.mjs` | Everything touching `@quereus/plugin-leveldb`, behind own dynamic import: `QUEREUS_BENCH_LEVELDB` opt-in, skip reason, `store-leveldb` database over temporary directory. |
+| `bench/lib/tempdir.mjs` | Fresh-per-call temporary directories for disk-backed rows, and PID-owned sweep removing ones killed worker could not remove itself. |
+| `bench/workloads/*.mjs` | What `execution` and `mutation` suites measure, as data plus fixtures. Suite files are binders over these. |
 
-Harness tests, none of which run a benchmark: `test/bench-calibration.spec.ts` (the timing
-policy and the statistics), `test/bench-comparison.spec.ts` (the cross-run rules and the
-environment check), `test/bench-backends.spec.ts` (the backend expansion and the naming
-rule), `test/bench-gate.spec.ts` (the gate's eligibility, classification, serialization
-and accept-validation rules), `test/bench-guards.spec.ts` (the ratio-guard rules and the
-suite-side guard validation). Neither `yarn bench` nor `yarn bench:gate` is part of
-`yarn test`, so these are the only automated check on the harness itself.
+Harness tests, none run a benchmark: `test/bench-calibration.spec.ts` (timing
+policy and statistics), `test/bench-comparison.spec.ts` (cross-run rules and
+environment check), `test/bench-backends.spec.ts` (backend expansion and naming
+rule), `test/bench-gate.spec.ts` (gate's eligibility, classification, serialization
+and accept-validation rules), `test/bench-guards.spec.ts` (ratio-guard rules and
+suite-side guard validation). Neither `yarn bench` nor `yarn bench:gate` part of
+`yarn test`, so these only automated check on harness itself.
 
 See also [Architecture § Benchmark Suite](architecture.md#testing-strategy).

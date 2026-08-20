@@ -1,5 +1,5 @@
 ---
-description: The benchmarking documentation file has grown to within a few hundred words of the size limit the project enforces, so the next person who adds a section to it will have their build rejected.
+description: The benchmarking documentation file was nearly at the size limit the project enforces; compressing its prose bought it room, so the question is no longer urgent but is still open — split it, or accept that it is one topic and let it keep growing.
 files:
   - docs/benchmarking.md
   - scripts/check-docs.mjs
@@ -7,6 +7,32 @@ files:
 difficulty: medium
 tradeoffs: Splitting a doc costs every existing inbound link a redirect or an edit, and a maintainer may reasonably prefer to raise the cap or record an explicit size for this one file instead — the cap is a convention, not a correctness property.
 ---
+
+# Update 2026-08-20 — the urgency is gone, the question is not
+
+`docs/benchmarking.md` was compressed in place (prose tightened to caveman register;
+headings, code blocks and links untouched and verified byte-identical). It went from
+**11511 words to 9669** — from 489 under the 12000-word cap to **2331 under**, and
+`check-docs.mjs` no longer emits its near-cap notice.
+
+So the build is no longer one section away from going red, and this ticket is not
+pressing. It was returned to `backlog/` on that basis. What did *not* change:
+
+- The cap still has no grace band and `docs:check` is still the first step of `yarn check`.
+- Compression bought roughly one section of headroom, not a structural answer. The file
+  grew 10322 → 11511 in a single ticket (the gate wiring), so the next comparable change
+  spends most of what was just recovered.
+- The underlying question — is benchmarking one topic or several — is untouched, and
+  compressing the prose is not an argument either way.
+
+One claim below is now known to be **wrong** and should not be relied on: this ticket
+asserted that `docs/architecture.md` and comments in `packages/quereus/bench/` deep-link
+into this file by anchor (`#ratio-guards`, `#regression-gate`,
+`#noise-floor-when-a-delta-is-a-change`). A repository-wide search for `benchmarking.md#`
+finds **no such link**. `docs/architecture.md` links the file plainly, twice, and refers to
+one section by name in prose ("See *Noise floor* in the benchmarking doc"). The anchor
+constraint on a split is therefore much weaker than described — still real for a reader
+following a name, but not a link-checker failure waiting to happen.
 
 # The situation
 
