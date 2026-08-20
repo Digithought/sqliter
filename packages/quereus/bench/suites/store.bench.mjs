@@ -1633,3 +1633,58 @@ export const benchmarks = [
 	makeCatalogRehydrateBenchmark(),
 	...READ_COST_SIZES.map(makeReadCostBenchmark),
 ];
+
+/**
+ * Within-run ratio guards for the store hot paths — see the long policy comment on
+ * `ratioGuards` in `execution.bench.mjs`, which is not repeated here.
+ *
+ * WHY THESE EXIST ALONGSIDE THE COUNTER ASSERTS. Every row named below already asserts
+ * its exact storage round trips in `counters()`, and that assert is the stronger check
+ * of the two whenever a regression CHANGES the round trips. These guards cover the case
+ * it structurally cannot see: the counts stay exactly right and the work behind each
+ * round trip gets more expensive — a key list rebuilt per key, a resolution that
+ * re-decodes what it already decoded, an O(n²) merge inside one `getMany`. Counters are
+ * blind to cost per round trip by construction; a ratio is not.
+ *
+ * Every member here carries `skipUnlessStoreLoads`, so on a checkout with no built
+ * `@quereus/store` the rows skip and each guard reports `not-evaluated` — never a
+ * failure. An unbuilt store package cannot redden the gate.
+ */
+export const ratioGuards = [
+	// Ten spread-out primary keys resolved through ONE batched read, against a single
+	// point read. Both pay the same fixed per-query cost (parse, plan, execute), so the
+	// ratio is dominated by what the nine extra keys cost — near-free while resolution is
+	// genuinely batched, and growing with any per-key work that creeps into the path.
+	// MEASURED 2.00× (133.3 µs / 66.8 µs, full `yarn bench`); bound 8× — 4× headroom.
+	// These are the two fastest query-shaped rows in the suite (tens of microseconds,
+	// ~18% spread), which is exactly why the bound is loose rather than snug: at the
+	// gate's reduced calibration the same pair read 2.64× and 2.92× on two consecutive
+	// runs, with 32-53% spreads, and the full-calibration re-measure is what a run that
+	// lands even wider falls back on.
+	// NOTE: this is the widest-spread guard of the four. If it ever starts costing a
+	// full-calibration re-measure on most runs, the fix is more samples — raise
+	// `targetTotalMs` in GATE_CALIBRATION — not a higher `maxRatio`, which would only
+	// make the guard stop meaning anything.
+	{
+		name: 'multi-seek-pk-10',
+		baseline: 'point-read-pk',
+		maxRatio: 8,
+		note: 'catches per-key cost creeping into batched multi-key resolution',
+	},
+	// The index-resolve family at two widths: 4B rows resolved against B rows, where B is
+	// `ROW_RESOLUTION_BATCH`. Four times the rows must cost on the order of four times as
+	// much — the claim that resolution is LINEAR in the number of rows it resolves. A
+	// quadratic step anywhere in the path (a rescan per batch, a merge that re-walks the
+	// accumulated rows) shows up here and nowhere else in the suite: both widths keep
+	// their exact `getManyCalls`/`getManyKeys` counts either way.
+	// MEASURED 2.37× (3.10 ms / 1.31 ms, full `yarn bench`; 2.51× at the gate's reduced
+	// calibration, both sides ~15% spread — the steadiest of the four guards) — sublinear,
+	// because the fixed per-query cost is a larger share of the narrower row. Bound 8× —
+	// 3.4× headroom over the measurement and 2× the ~4× perfectly linear scaling costs.
+	{
+		name: 'index-resolve-four-batches',
+		baseline: 'index-resolve-one-batch',
+		maxRatio: 8,
+		note: 'catches index-then-fetch resolution going superlinear in row count',
+	},
+];

@@ -11,21 +11,23 @@ cd packages/quereus
 yarn bench
 ```
 
-It is **not** part of `yarn test` or `yarn check`. A full run takes roughly 150 seconds and
-is deliberately manual: a benchmark suite inside a test run either slows every test run
-down or gets its time target cut until the numbers stop meaning anything.
+`yarn bench` is **not** part of `yarn test` or `yarn check`. A full run takes roughly 160
+seconds and is deliberately manual: a benchmark suite inside a test run either slows every
+test run down or gets its time target cut until the numbers stop meaning anything. Its
+cheap sibling `yarn bench:gate` *does* run inside `yarn check`, and measures no absolute
+timing at all — see [Which check catches what](#which-check-catches-what).
 
 ## What is measured
 
-73 benchmarks across five suites — 54 entries, of which the 19 in `execution` and
-`mutation` are each measured against two storage backends (see below):
+92 benchmarks across five suites — 54 entries, of which the 19 in `execution` and
+`mutation` are each measured against three storage backends (see below):
 
 | Suite | Benchmarks | What it covers |
 | --- | --- | --- |
 | `parser` | 4 | Text to AST: a simple select, a complex select, a 50-column select, an insert with values. |
 | `planner` | 4 | AST to optimized plan, without executing it: scan, join, aggregate, subquery. |
-| `execution` | 30 (15 × 2 backends) | Whole queries over a 10 000-row table: full scan, indexed filter, group by, order by, distinct, joins, a correlated subquery and its hand-written equivalent. Seven of the fifteen are text-comparison shapes (`order by` text, unicode text, 40-character shared prefixes, text primary keys) because the `BINARY` collation comparator is the engine's hottest code. |
-| `mutation` | 8 (4 × 2 backends) | Writes: a 10 000-row bulk insert, 1 000 single-row inserts, an update and a delete over a `where` clause. |
+| `execution` | 45 (15 × 3 backends) | Whole queries over a 10 000-row table: full scan, indexed filter, group by, order by, distinct, joins, a correlated subquery and its hand-written equivalent. Seven of the fifteen are text-comparison shapes (`order by` text, unicode text, 40-character shared prefixes, text primary keys) because the `BINARY` collation comparator is the engine's hottest code. |
+| `mutation` | 12 (4 × 3 backends) | Writes: a 10 000-row bulk insert, 1 000 single-row inserts, an update and a delete over a `where` clause. |
 | `store` | 27 | The storage layer priced one path at a time, in three groups. Eleven rows call `@quereus/store` key-encoding functions directly, with no database in the picture — the value shapes where a fast path can be lost silently (plain integer, plain text, astral-plane text, JSON, a blob, a `NOCASE` key, a descending key and its ascending control, a four-column composite, a secondary-index key), plus one decode. Fourteen rows drive one storage hot path each — scan, point read, batched multi-key seeks, fetching rows found through a secondary index, commits at four sizes, an index build, a catalog rehydration — through a `Database` over the store module, and assert the exact storage round trips alongside the timing. Two rows price random reads against sequential ones on **real disk**, at the key-value layer with no database above them. See [The `store` suite](#the-store-suite-micro-benchmarks-with-no-backend-dimension). |
 
 ### The `store` suite: micro-benchmarks with no backend dimension
@@ -503,9 +505,11 @@ two gated "regressions" whose spreads were 3-6% in *both* runs. So treat a red r
 busy machine as a prompt to re-run, not as a verdict, and do not wire this exit code into an
 automatic gate until a between-run estimate exists — repeating runs and taking a median of
 medians, subtracting the common-mode shift, or requiring a regression to reproduce twice.
-This is exactly why the [regression gate](#regression-gate) (`yarn bench:gate`) times
-nothing at all and gates on work counters instead; the within-run ratio half is the
-follow-on ticket `bench-gate-ratios-and-check`.
+This is exactly why the [regression gate](#regression-gate) (`yarn bench:gate`) never
+compares an absolute millisecond figure against anything: it gates on work counters, and
+where it times something it divides two medians from the *same run* (see
+[Ratio guards](#ratio-guards)) — a quotient the displacement above moves both sides of, and
+so does not move at all.
 
 A results file written before spreads were recorded has its spread assumed to be 20%: the
 widest a run could be and still have been called stable, so the assumption can only make the
@@ -781,15 +785,23 @@ not, and no path list: there is nothing to list against a run that collected non
 
 ## Regression gate
 
-`yarn bench:gate` re-measures every counter-declaring benchmark and fails when any count
-differs from the checked-in reference set — so a change that makes the engine do more work
-is caught the day it lands, not months later when someone happens to compare two runs.
+`yarn bench:gate` is the automatic half of the suite, and the only half wired into
+`yarn check`. It runs two passes and fails if either finds a difference:
 
-**Only work counters gate; nothing about wall-clock does.** The
+1. **Work counters.** Re-measure every counter-declaring benchmark and fail when any count
+   differs from the checked-in reference set — so a change that makes the engine do more
+   work is caught the day it lands, not months later when someone happens to compare two
+   runs.
+2. **[Ratio guards](#ratio-guards).** Time only the benchmarks a suite's `ratioGuards`
+   names, and fail when one benchmark's median exceeds its declared bound against
+   another's *in the same run*.
+
+**No absolute wall-clock figure gates anything.** The
 [noise floor](#noise-floor-when-a-delta-is-a-change) is built from within-run spread and is
-blind to whole-run displacement by construction, so a timing gate on one machine cannot
-tell a regression from background load. Work counters are exact integers that do not
-depend on machine speed, so they compare for equality — no floor, no threshold, no re-run.
+blind to whole-run displacement, so a millisecond gate on one machine cannot tell a
+regression from background load. What gates instead is machine-portable: work counters,
+exact integers that compare for equality — no floor, no threshold, no re-run — and
+within-run ratios, where machine speed cancels out of the quotient.
 
 **The reference set** is one file per suite in `bench/reference/<suite>.json`, checked into
 git: the expected counter block per benchmark, plus an `accepted` block recording who
@@ -797,13 +809,45 @@ accepted it, at which commit, and why. The files are pretty-printed with sorted 
 change is a readable diff — the git history of `bench/reference/` is the log of every
 accepted change to how much work the engine does.
 
-**The pass runs every benchmark in one process,** unlike `yarn bench`, which forks a worker
-per benchmark. Forking is load-bearing for timings — the interpreter shares call sites
-across query shapes, so a benchmark's measured speed depends on what ran before it — but
-not for counts: a single-process pass produced counter blocks byte-identical to the forked
-run's for all 56 benchmarks, and saves ~22 s of forks and `dist/` imports. The whole pass
-takes about 42 s; nothing is timed, so it runs each benchmark's
-`skip`/`setup`/`counters`/`teardown` and never the timed loop.
+**The counters pass runs every benchmark in one process,** unlike `yarn bench`, which forks
+a worker per benchmark. Forking is load-bearing for timings — the interpreter shares call
+sites across query shapes, so a benchmark's measured speed depends on what ran before it —
+but not for counts: a single-process pass produced counter blocks byte-identical to the
+forked run's for all 56 benchmarks, and saves ~22 s of forks and `dist/` imports. Nothing
+is timed in it, so it runs each benchmark's `skip`/`setup`/`counters`/`teardown` and never
+the timed loop.
+
+**The guard pass forks, because it times.** It runs after the counters pass and only in
+gate mode — never under `--accept`, which records a reference and reaches no verdict. It
+times only the benchmarks some suite's `ratioGuards` names (8 of the 92 rows today), one
+per forked worker exactly as `yarn bench` isolates a timed benchmark, at the reduced
+`GATE_CALIBRATION` profile in `bench/lib/calibrate.mjs` — a third of the manual runner's
+timed work per benchmark, which is what keeps the pass to seconds. A guard that **fails**
+there is re-measured once at full `CALIBRATION`, and the re-measure decides: fail-then-pass
+does not fail the run. A busy machine therefore costs a wasted re-measure, not a false red,
+and the two measurements print as one verdict rather than two rows.
+
+**Inside `yarn check`, and what it costs.** The chain runs `docs:check → lint → build →
+typecheck → bench:gate → test:full → …`. On the machine the wall-clock figures above come
+from, the gate adds ~35 s to it: 24 s for the counters pass, 9 s for the guard pass across
+8 forks, against the ~160 s a full `yarn bench` costs. It sits **after `typecheck` and
+before `test:full`** on purpose: the chain is `&&`-chained, `test:full` is by far its
+longest step, and the gate needs nothing but a built `dist/`, which `build` two steps
+earlier produced from scratch (root `build` runs `yarn clean` first). A 35-second step
+ahead of the long one surfaces a changed work counter in about a minute instead of after
+the whole test run — do not "tidy" it to the end. A dirty tree is the normal development
+case and the gate never refuses it: it prints the dirty-tree banner and gates anyway (only
+`bench:accept` refuses, because only an accept records a provenance commit). Run on its own
+against a stale or absent `dist/`, it fails with an import error like every other bench
+entry point; build first.
+
+**`--report-only`** prints every finding and still exits 0; the env var
+`QUEREUS_BENCH_GATE_REPORT_ONLY` (any value but empty or `0`) does the same for callers that
+cannot edit the command line. It suppresses *findings*, never breakage: a bad flag, an
+unreadable reference or a suite that will not load still exits non-zero. Two situations
+justify it — a release branch pinned to a deliberately stale reference, and a machine too
+loaded to trust the guard pass on — and it is **not** a standing setting: a gate that
+reports and never fails is a gate nobody reads. It is refused outright with `--accept`.
 
 **What gates and what does not.** A benchmark gates only when its observed plan carries at
 most one join node. Join order on three or more relations is chosen under a wall-clock
@@ -848,11 +892,17 @@ run never reads half a file.
 ## Ratio guards
 
 A suite may export `ratioGuards`: a bound on one benchmark's median against another's,
-*within the same run*.
+*within the same run*. Both `yarn bench` and `yarn bench:gate` evaluate them, and the gate
+runs in `yarn check` — so a guard here is a build gate, not a report.
 
 ```js
 export const ratioGuards = [
-	{ name: 'correlated-subquery', baseline: 'hand-batched-peer-count', maxRatio: 10 },
+	{
+		name: 'correlated-subquery',
+		baseline: 'hand-batched-peer-count',
+		maxRatio: 10,
+		note: 'catches `scalar-agg-decorrelation` failing to fire',
+	},
 ];
 ```
 
@@ -861,6 +911,35 @@ This catches a plan-shape regression from a single run with no baseline file at 
 hand-written twin and the ratio spikes, whatever the absolute timings on that machine are.
 Ratios are the portable measurement, which is what makes this the strongest gate the suite
 has.
+
+**The fields.** `name` is the benchmark under test, `baseline` the one its median is
+divided by, `maxRatio` the largest acceptable quotient. `note` is optional but write one
+for every guard: a sentence saying what the guard protects, printed in brackets beside the
+verdict, so a red line says *what broke* rather than only which two rows moved apart.
+
+**`maxRatio` may be below 1.** That is the natural shape when the regression being guarded
+against is a fast path collapsing into the slow path it is normally a small fraction of:
+`filtered-scan-index-10k` sits at ~0.01× `full-scan-10k` and would land near 1× if index
+selection stopped firing, so its bound is 0.1× — an order of magnitude clear of both.
+Verdicts print ratios to two decimals for exactly this reason.
+
+**Names may cross suites.** A bare `name`/`baseline` resolves within the declaring suite; a
+name containing `/` is a full `suite/name` and is used as written, which is how a guard in
+one suite bounds a benchmark in another. A cross-suite name pointing at nothing is an
+ordinary "not found in this run" misconfiguration — nothing special-cases it.
+
+**Shape is validated when the suite loads,** in the parent process, before any benchmark
+runs: a `ratioGuards` that is not an array, an entry missing `name` or `baseline`, a `note`
+that is not a string, or a `maxRatio` that is not a finite number greater than zero all
+throw by name. That last one is two opposite bugs from one typo — `maxRatio: 0` fails every
+run unconditionally, `maxRatio: NaN` compares false against everything and passes forever —
+and neither is allowed to reach a run. The rule behind all of it: a guard that quietly
+never evaluates is a guard everyone believes is protecting them.
+
+**Bound it against what you measured.** Take the ratio from a real `yarn bench` on an
+unchanged tree, record it in a comment beside the guard, and set `maxRatio` at least 3×
+clear of it. Bounds here are order-of-magnitude by design: they trip a plan-shape collapse,
+not warm-up variance. A guard that fires on a good day trains everyone to ignore the gate.
 
 A guard naming a benchmark that was not selected is reported as *skipped* when `--filter` is
 active (narrowing a run should not make every guard fire) and as a *misconfiguration* — a
@@ -885,6 +964,24 @@ misconfiguration**, and that is the rule above made mechanical: it fails the run
 checked before the not-selected and declined cases so a `--filter` cannot hide it. A
 build-gating ratio anchored to a number that moves with the machine's disk is not a gate.
 
+## Which check catches what
+
+Three separate things in this repository measure speed. They are not redundant, and a new
+check belongs in exactly one of them.
+
+| | Runs in | Measures | Catches |
+| --- | --- | --- | --- |
+| **Performance sentinels** (`packages/quereus/test/performance-sentinels.spec.ts`) | `yarn test` | absolute milliseconds, 10-50× headroom | order-of-magnitude collapses, on any machine. The only speed check inside the test run. |
+| **The regression gate** (`yarn bench:gate`) | `yarn check` | exact work counts and within-run ratios — never wall-clock | small changes a 10× threshold cannot see: one more store round trip, one more row visited, a plan shape that stopped being chosen. |
+| **`yarn bench`** | nothing; manual | absolute timings, spreads, deltas against a saved baseline | how fast the engine actually is. The only place absolute timings are measured; its exit code is wired into nothing automatic. |
+
+**Where a new check goes:** the gate, unless it has to run inside `yarn test`.
+
+The sentinels are **not** replaced by the gate, nor being merged into it: they overlap in
+coverage and not in when they run. The two suites do reach similar workloads by different
+code, and reconciling that is its own piece of work
+(`debt-perf-sentinels-share-bench-workloads` in the backlog).
+
 ## Exit-code contract
 
 `yarn bench` exits non-zero on any of:
@@ -899,12 +996,17 @@ Unstable benchmarks, new benchmarks, missing benchmarks, sub-threshold deltas an
 the exit code. An informational benchmark that *failed* still does — an exempt number is
 not an exempt benchmark.
 
-**No part of this runs in `yarn check`.** `yarn check` invokes neither `yarn bench` nor
-`yarn bench:gate` today; wiring the [regression gate](#regression-gate) into it is the
-follow-on ticket `bench-gate-ratios-and-check`. The gate already budgets itself around the
-`memory` and `store-mem` backends only, and deletes `QUEREUS_BENCH_LEVELDB` from its own
-environment: the LevelDB rows would add roughly 75 s of disk-bound work whose numbers, by
-construction, cannot gate anything.
+**`yarn check` runs `yarn bench:gate`, and never `yarn bench`.** The gate's own exit code
+is the one the chain reads: non-zero on a differing gated counter, a failed or misconfigured
+ratio guard, a benchmark that threw, or a harness error — and zero under
+`--report-only` / `QUEREUS_BENCH_GATE_REPORT_ONLY` for everything except that last class.
+`yarn bench`'s exit code above stays wired into nothing automatic, because it can turn red
+from background load alone.
+
+Both entry points budget around the `memory` and `store-mem` backends only; the gate
+additionally deletes `QUEREUS_BENCH_LEVELDB` from its own environment, so a developer with
+it exported gets the same verdict as anyone else. The LevelDB rows would add ~75 s of
+disk-bound work whose numbers, by construction, cannot gate anything.
 
 ## `--json`
 

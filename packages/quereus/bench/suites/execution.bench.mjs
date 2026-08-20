@@ -124,19 +124,29 @@ export const benchmarks = [
 /**
  * Within-run shape-economy guards. Each guard is a ratio of one benchmark's
  * median to another's, checked inside a single run (independent of any
- * `--baseline` file). `correlated-subquery` relies on `scalar-agg-decorrelation`
- * to become the same grouped-join plan a human writes by hand
- * (`hand-batched-peer-count`); when the rule fires the two are near-identical
- * (ratio ≈ 1). If decorrelation ever breaks, the declarative side re-runs its
- * inner count(*) once per outer row (an "N+1 scan", ~26× in the original
- * post-mortem) and the ratio spikes past `maxRatio`.
+ * `--baseline` file), by both `yarn bench` and `yarn bench:gate` — and the gate
+ * runs inside `yarn check`, so a guard here is a build gate, not a report.
  *
- * `maxRatio` is deliberately LOOSE (order-of-magnitude): its job is to trip the
- * 26×-class regression, not order-of-1 warm-up variance on the in-memory vtab.
- * If the twin ever shows high variance near the bound, raise `targetTotalMs` in
- * `bench/lib/calibrate.mjs` so both sides collect more samples, rather than tightening
- * `maxRatio` — in `CALIBRATION` for `yarn bench`, and in `GATE_CALIBRATION` for the
- * reduced profile `yarn bench:gate` times guard members at.
+ * `maxRatio` is deliberately LOOSE (order-of-magnitude): its job is to trip a
+ * plan-shape collapse, not order-of-1 warm-up variance on the in-memory vtab. Every
+ * guard below records the ratio MEASURED on an unchanged tree next to it, and its
+ * bound sits at least 3× clear of that — a guard that fires on a good day teaches
+ * everyone to ignore it. If a twin shows high variance near its bound, raise
+ * `targetTotalMs` in `bench/lib/calibrate.mjs` so both sides collect more samples,
+ * rather than tightening `maxRatio` — in `CALIBRATION` for `yarn bench`, and in
+ * `GATE_CALIBRATION` for the reduced profile `yarn bench:gate` times guard members
+ * at. (A guard that fails at the reduced profile is re-measured once at full
+ * `CALIBRATION` before it may fail the run, so a busy machine costs a wasted
+ * re-measure rather than a red build.)
+ *
+ * A bound may be BELOW 1 — a "must stay this much faster than" guard, which is the
+ * natural shape when the regression being guarded against is a fast path collapsing
+ * into a slow one it is normally a small fraction of.
+ *
+ * `name` and `baseline` are bare (resolved within THIS suite) or a full
+ * `suite/name`, which is how a guard reaches across suites. The optional `note` is
+ * one sentence printed beside the verdict, so the report says what broke rather than
+ * only which two rows moved apart.
  *
  * GUARDS NAME ONE BENCHMARK EACH, AND THAT MEANS ONE BACKEND EACH. These bare names
  * are the default backend's rows. A guard that wants to bound a suffixed benchmark
@@ -147,5 +157,31 @@ export const benchmarks = [
  * docs/benchmarking.md § Ratio guards.
  */
 export const ratioGuards = [
-	{ name: 'correlated-subquery', baseline: 'hand-batched-peer-count', maxRatio: 10 },
+	// `correlated-subquery` relies on `scalar-agg-decorrelation` to become the same
+	// grouped-join plan a human writes by hand (`hand-batched-peer-count`); when the rule
+	// fires the two are near-identical. If decorrelation ever breaks, the declarative side
+	// re-runs its inner count(*) once per outer row (an "N+1 scan", ~26× in the original
+	// post-mortem) and the ratio spikes past the bound.
+	// MEASURED 1.00× (43.94 ms / 43.91 ms, full `yarn bench`); bound 10× — 10× headroom,
+	// and the regression it targets lands an order of magnitude past it.
+	{
+		name: 'correlated-subquery',
+		baseline: 'hand-batched-peer-count',
+		maxRatio: 10,
+		note: 'catches `scalar-agg-decorrelation` failing to fire',
+	},
+	// `filtered-scan-index-10k` (`where val = 42`, ten of ten thousand rows) is served by
+	// an index probe; `full-scan-10k` reads the whole table. If index selection stops
+	// firing, the filtered form degrades to a scan-plus-filter and its cost collapses onto
+	// the scan's — ratio ≈ 1, two orders of magnitude above where it sits today.
+	// MEASURED 0.010× (84.5 µs / 8.66 ms, full `yarn bench`; 0.013× at the gate's reduced
+	// calibration, where the 85 µs row is batched and its spread is wide); bound 0.1× —
+	// 10× headroom over the measured ratio, and 10× BELOW the ≈1 the collapse would
+	// produce, so the bound sits an order of magnitude clear on both sides.
+	{
+		name: 'filtered-scan-index-10k',
+		baseline: 'full-scan-10k',
+		maxRatio: 0.1,
+		note: 'catches index access selection collapsing to a full scan',
+	},
 ];
