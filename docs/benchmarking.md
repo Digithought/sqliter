@@ -17,7 +17,7 @@ down or gets its time target cut until the numbers stop meaning anything.
 
 ## What is measured
 
-71 benchmarks across five suites — 52 entries, of which the 19 in `execution` and
+73 benchmarks across five suites — 54 entries, of which the 19 in `execution` and
 `mutation` are each measured against two storage backends (see below):
 
 | Suite | Benchmarks | What it covers |
@@ -26,7 +26,7 @@ down or gets its time target cut until the numbers stop meaning anything.
 | `planner` | 4 | AST to optimized plan, without executing it: scan, join, aggregate, subquery. |
 | `execution` | 30 (15 × 2 backends) | Whole queries over a 10 000-row table: full scan, indexed filter, group by, order by, distinct, joins, a correlated subquery and its hand-written equivalent. Seven of the fifteen are text-comparison shapes (`order by` text, unicode text, 40-character shared prefixes, text primary keys) because the `BINARY` collation comparator is the engine's hottest code. |
 | `mutation` | 8 (4 × 2 backends) | Writes: a 10 000-row bulk insert, 1 000 single-row inserts, an update and a delete over a `where` clause. |
-| `store` | 25 | The storage layer priced one path at a time, in two halves. Eleven rows call `@quereus/store` key-encoding functions directly, with no database in the picture — the value shapes where a fast path can be lost silently (plain integer, plain text, astral-plane text, JSON, a blob, a `NOCASE` key, a descending key and its ascending control, a four-column composite, a secondary-index key), plus one decode. Fourteen rows drive one storage hot path each — scan, point read, batched multi-key seeks, fetching rows found through a secondary index, commits at four sizes, an index build, a catalog rehydration — through a `Database` over the store module, and assert the exact storage round trips alongside the timing. See [The `store` suite](#the-store-suite-micro-benchmarks-with-no-backend-dimension). |
+| `store` | 27 | The storage layer priced one path at a time, in three groups. Eleven rows call `@quereus/store` key-encoding functions directly, with no database in the picture — the value shapes where a fast path can be lost silently (plain integer, plain text, astral-plane text, JSON, a blob, a `NOCASE` key, a descending key and its ascending control, a four-column composite, a secondary-index key), plus one decode. Fourteen rows drive one storage hot path each — scan, point read, batched multi-key seeks, fetching rows found through a secondary index, commits at four sizes, an index build, a catalog rehydration — through a `Database` over the store module, and assert the exact storage round trips alongside the timing. Two rows price random reads against sequential ones on **real disk**, at the key-value layer with no database above them. See [The `store` suite](#the-store-suite-micro-benchmarks-with-no-backend-dimension). |
 
 ### The `store` suite: micro-benchmarks with no backend dimension
 
@@ -36,7 +36,7 @@ key decoding, iteration, row deserialization and the isolation overlay into one 
 a regression in any one of them reads as "the scan got slower" with no way to say which.
 The `store` suite exists to give the individual pieces their own numbers.
 
-It has two halves, split at `scan-10k` in the run order:
+It has three groups, in run order:
 
 - **Key encoding** (11 rows: `data-key-*`, `index-key-*`, `decode-composite-4col`) calls
   `@quereus/store`'s key functions directly — no `Database`, no plan, no storage traffic.
@@ -60,6 +60,12 @@ It has two halves, split at `scan-10k` in the run order:
   N = 10 000 was considered and deliberately dropped, because the shape is visible across
   three decades and a fourth would add hundreds of milliseconds per timed call for no
   additional claim.
+- **Read cost on real disk** (2 rows: `leveldb-read-cost-20k`, `leveldb-read-cost-200k`) —
+  the only rows in the suite that touch a provider with no `Database` above them, and the
+  only ones that touch disk. See [Read cost on real
+  disk](#read-cost-on-real-disk) below.
+
+The first two groups split at `scan-10k` in the run order; the third follows both.
 
 One thing differs from every other suite, deliberately: **its names carry no `@` suffix.**
 The suite is not in the backend dimension. The key half calls store functions directly, so
@@ -73,7 +79,9 @@ Its `skip()` is the one place in the repo that hand-writes one — a single
 `skipUnlessStoreLoads` shared by every entry — and it returns the same
 `storeLoadFailure()` reason the `@store-mem` rows use, so an unbuilt
 `packages/quereus-store/dist` skips these rows with a stated reason instead of failing all
-twenty-five with a module-resolution stack trace.
+twenty-seven with a module-resolution stack trace. The two read-cost rows compose a
+*second* reason on top of it — the LevelDB opt-in below — so an unbuilt store package still
+wins, being the more fundamental failure.
 
 Every `fn` in the **key-encoding half** builds **1 000 keys per call** (`KEYS_PER_CALL` in
 `bench/suites/store.bench.mjs`), one shared constant across every shape so the shapes stay
@@ -95,9 +103,10 @@ would cost about as much as the encode and halve the resolution of the thing bei
 measured. The one dedicated `decode-composite-4col` benchmark does assert value equality on
 every column, because there the decode *is* the subject.
 
-The suite adds roughly **50 s** to a `yarn bench` run — about 16 s of it the key-encoding
+The suite adds roughly **51 s** to a default `yarn bench` run — about 16 s of it the key-encoding
 half, the rest the hot-path rows and their per-row process forks — on the machine the
-results-file header records.
+results-file header records. The two read-cost rows contribute about 1 s of that, being a
+fork and a skip reason each; opted in they cost ~10 s instead.
 
 Two rows exist only as controls and are not interesting on their own:
 `data-key-asc-2col` (the uninverted twin of `data-key-desc-2col`, so the cost of the
@@ -114,6 +123,65 @@ decision recorded at the file itself: it is a decomposition of a no-op `apply sc
 five internal timings, and the framework measures one `fn` per benchmark. Giving the
 applied-state fast path a standing, ratio-guarded benchmark is separate work, parked as
 `feat-bench-apply-schema-fastpath-guard`.
+
+#### Read cost on real disk
+
+`leveldb-read-cost-20k` and `leveldb-read-cost-200k` answer one question the rest of the
+suite cannot: **on a real disk-backed store, how much more does a random read cost than a
+sequential one?** That ratio is exactly what a provider's *cost profile* declares to the
+planner (`packages/quereus-store/src/common/cost-profile.ts`), and LevelDB's had never been
+measured — it took the framework's parity default instead.
+
+Each row seeds N rows of 200-byte values into a fresh LevelDB temporary directory over
+integer keys, then times **three arms** per round against that one dataset:
+
+| arm | what it does | what it stands for |
+| --- | --- | --- |
+| sequential | a full `iterate()` draining every value | the 1.0 denominator — the cost-profile unit |
+| batched | 1 000 random keys through `getMany`, paged at `ROW_RESOLUTION_BATCH` | resolving index entries to rows, and the primary-key multi-seek |
+| single-seek | 1 000 *different* random keys, one `iterate({gte, lt, limit: 1})` each | the secondary-index multi-seek, one window per key |
+
+Five properties are deliberate:
+
+- **The arms measure the key-value layer, with no `Database` above them.** The unit a cost
+  profile defines is a storage-layer row, and engine overhead lands on both sides of the
+  ratio — including it would compress every ratio toward 1.0 and understate the difference
+  being measured. It also matches the sibling IndexedDB harness
+  (`packages/quereus-plugin-indexeddb/bench/README.md`), which is the only reason the two
+  backends' numbers can be read side by side. The cost is that a ratio here is *not* the
+  number to declare directly; the engine-inclusive value is smaller and was not measured.
+- **All three arms share one benchmark per dataset size, not three.** The harness forks a
+  fresh process per benchmark, so three rows would compare three medians taken with three
+  different page-cache and block-cache histories. One `fn` call runs one round of all three
+  arms in one process, and `teardown` takes the median per arm across rounds.
+- **The harness's own median for these rows is the cost of one whole round, and is not the
+  interesting number.** The interesting numbers are the per-arm milliseconds and the two
+  ratios, which `teardown` prints to stdout. The block lands immediately *above* its table
+  row, because `child.mjs` runs `teardown` and only then sends the result.
+- **The ratios are printed, not reported as counters.** Counter values are compared with no
+  tolerance and no noise floor, because they are exact machine-independent integers. A
+  wall-clock ratio is neither, so a counters block would report a "change" on every run.
+- **The two sizes do not separate page-cache-cold from page-cache-warm.** There is no
+  portable way to drop the OS page cache from Node, and a dataset big enough to exceed a
+  modern machine's page cache cannot be seeded inside a benchmark's time budget. What they
+  separate is `classic-level`'s own **8 MB block cache**: 20 000 × 200 bytes (~4 MB) fits
+  inside it, 200 000 (~40 MB) does not, so the large size's random reads go out to the
+  filesystem — which on a warm machine usually means the OS page cache, not the physical
+  disk. A claim of "cold" that is really "block-cache-miss, page-cache-hit" would be worse
+  than no claim, so it is not made.
+
+Like every disk-backed row, these two are **opt-in and [informational](#informational-rows-reported-never-gated)**:
+without `QUEREUS_BENCH_LEVELDB=1` they print the same skip reason `@store-leveldb` rows do,
+and they enter no ratio guard and no pass/fail verdict — a disk timing is not a property of
+this repository's code. Opted in they cost about 10 s for the pair, the 200k row's own
+median being ~1 s per round, well clear of the 120 s per-benchmark timeout.
+
+```bash
+QUEREUS_BENCH_LEVELDB=1 node packages/quereus/bench/run.mjs --filter store/leveldb-read-cost
+```
+
+The 2026-08-19 result is recorded in `packages/quereus-plugin-leveldb/README.md`
+§ *Measured read cost*, with the machine it was taken on and what was decided from it.
 
 ### Storage backends, and what a name means
 
@@ -251,8 +319,9 @@ node 24.2 — treat the absolute numbers as that machine's, not as a target:
 | | wall clock |
 | --- | --- |
 | the 19-row `@store-leveldb` arm, opted in | 84 s |
-| the same 19 rows skipping, on a default run | 9.2 s of a 163 s / 90-benchmark run |
+| the same 19 rows skipping, on a default run | 9.2 s of a 163 s / 90-benchmark run (92 rows, ~1 s more, since the read-cost rows landed) |
 | slowest single row (`mutation/delete-where-100@store-leveldb`) | 1.95 s median, ~14 s of wall clock |
+| the 2 [read-cost rows](#read-cost-on-real-disk), opted in | 10.3 s (they share the opt-in but carry no `@` suffix) |
 
 Nothing approaches the 120 s per-benchmark timeout. The 9.2 s a *default* run pays is the
 price of the rows printing their skip reason instead of vanishing, and it is roughly
@@ -286,7 +355,7 @@ over a database and may build as many tables as it likes), not an exception.
 | `yarn bench --baseline <file>` | Compares against a previous results file. |
 | `yarn bench --baseline latest` | Compares against the newest file in `bench/results/`, resolved *before* this run writes its own. |
 | `yarn bench --json` | Writes the result object to stdout and moves every other line — progress, table, banner, guard output — to stderr. |
-| `yarn bench:leveldb` | The same as `yarn bench` with `QUEREUS_BENCH_LEVELDB=1`, so the [disk-backed rows](#store-leveldb-real-disk-opt-in-and-advisory) run instead of printing a skip reason. Adds ~75 s and gates nothing. |
+| `yarn bench:leveldb` | The same as `yarn bench` with `QUEREUS_BENCH_LEVELDB=1`, so the [disk-backed rows](#store-leveldb-real-disk-opt-in-and-advisory) run instead of printing a skip reason. Adds ~85 s and gates nothing. Note `--filter @store-leveldb` reaches only the *backend* rows; the two [read-cost rows](#read-cost-on-real-disk) carry no `@` suffix and are filtered as `store/leveldb-read-cost`. |
 
 `bench/results/` is gitignored and never pruned. Files are named by ISO timestamp with `:`
 and `.` replaced, so they sort lexicographically in chronological order; `--baseline latest`

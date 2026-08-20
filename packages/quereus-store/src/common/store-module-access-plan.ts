@@ -756,13 +756,21 @@ function primaryKeyMultiSeekPlan(
 	// artifact (contrast the secondary arm's), and no separate `profile.pointRead` term: the
 	// point read IS the row read, with no index-entry → row indirection to charge for.
 	//
-	// NOTE: this arm is therefore slightly OVER-charged on a backend that declares an
-	// expensive profile — `profile.seekPositioning` prices "position an index window AND
-	// read the row it names", and here there is no index window (IndexedDB: ≈ 3 units of
-	// real cost, charged 5). Accepted rather than split into a third knob: a second
-	// multi-seek term would double the tuning surface to model a bias whose only effect is
-	// that a very large `where pk in (…)` prefers a scan slightly sooner than it should.
-	// Revisit only if a primary-key IN is ever measured planning wrong because of it.
+	// NOTE: this arm is therefore OVER-charged on a backend that declares an expensive
+	// profile — `profile.seekPositioning` prices "position an index window AND read the row
+	// it names", and here there is no index window (IndexedDB: ≈ 3 units of real cost,
+	// charged 5). Accepted rather than split into a third knob: a second multi-seek term
+	// would double the tuning surface to model a bias whose only effect is that a very
+	// large `where pk in (…)` prefers a scan slightly sooner than it should.
+	//
+	// That acceptance was priced on IndexedDB's 1.7x bias. LevelDB's 2026-08-19 read-cost
+	// measurement makes the same bias ~12x there (a windowed seek key costs ~15-19 scan
+	// rows, while THIS arm's batched `readEffectiveRowsByKeys` path costs ~1.3), which is
+	// why that backend declares no profile at all rather than declaring its measured seek
+	// cost and disfiguring this arm. So the tradeoff still holds for every backend that
+	// declares one today, but it is now the reason a measured backend CANNOT declare —
+	// tracked as `backlog/debt-store-seek-positioning-conflates-two-arms`, with the numbers
+	// in `packages/quereus-plugin-leveldb/README.md` § Measured read cost.
 	//
 	// `Math.max(1, …)` is LOAD-BEARING, not defensive. `rows: 0` on a plan that claims
 	// every filter makes `rule-select-access-path` replace the whole table access with an

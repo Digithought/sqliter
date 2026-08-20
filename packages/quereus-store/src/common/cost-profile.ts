@@ -57,6 +57,19 @@ export interface KVCostProfile {
 	 * solves for the key count at which a seek overtakes the plan it would displace. With
 	 * the store's multi-seek cost `k·S + 0.3·min(N, k·0.1N)` against a scan baseline of
 	 * `N` rows, the break-even lands at roughly `N/(2S)`.
+	 *
+	 * NOTE: ONE knob, TWO arms — and they do not run the same shape. The secondary-index
+	 * multi-seek opens one `iterate()` window per seek key over the index store; the
+	 * primary-key multi-seek (`primaryKeyMultiSeekPlan`) runs `scanMultiSeekPrimary`, which
+	 * BATCHES through `readEffectiveRowsByKeys` at `ROW_RESOLUTION_BATCH` and pays no
+	 * per-key iterator at all. The gap is backend-dependent and was small enough to accept
+	 * when IndexedDB was measured (≈3 real against 5 charged, recorded at the PK arm in
+	 * `store-module-access-plan.ts`). LevelDB's 2026-08-19 measurement puts the same two
+	 * shapes ~12x apart on that backend (~15-19 per windowed seek key against ~1.3 per
+	 * batched key), which is why LevelDB declares nothing rather than declaring its measured
+	 * seek cost. Splitting this into per-arm terms is
+	 * `backlog/debt-store-seek-positioning-conflates-two-arms`; the numbers are in
+	 * `packages/quereus-plugin-leveldb/README.md` § Measured read cost.
 	 */
 	readonly seekPositioning?: number;
 }

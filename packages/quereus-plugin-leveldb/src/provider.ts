@@ -99,11 +99,33 @@ export interface LevelDBProviderOptions {
  * LevelDB implementation of KVStoreProvider over a single shared root with one
  * sublevel per logical store.
  */
-// NOTE: no `costProfile` declared, deliberately. This provider therefore takes the store
-// framework's parity defaults — "a random point read costs about what a sequentially
-// scanned row costs" — which is plausible for an in-process, block-cached backend but has
-// never been measured here. An unmeasured guess would be worse than the default, since it
-// would change advertised costs for every query on this backend; measuring it is
+// NOTE: no `costProfile` declared, deliberately — and as of 2026-08-19 that is a MEASURED
+// decision, not the absence of one. This provider takes the store framework's parity
+// defaults (`pointRead: 1.0`, `seekPositioning: 0.5`). `bench/suites/store.bench.mjs`'s
+// `leveldb-read-cost-*` rows measured both knobs at the key-value layer over 200-byte
+// values; the full table, machine and caveats are in this package's README
+// (§ Measured read cost). In short:
+//
+//  - `pointRead` came back at 1.26 (20k rows) and 1.44 (200k) — near the 1.0 default, and
+//    an OVER-statement of it besides: the planner's 1.0 unit is a scanned row INCLUDING
+//    engine work, while these arms measured the key-value layer alone, and engine cost
+//    lands on both sides of the ratio and compresses it toward 1.0. The engine-inclusive
+//    value therefore sits in [1.0, 1.44], unmeasured, with the current default at its
+//    bottom. Declaring the top of that interval would pick the pessimistic end on no
+//    evidence.
+//  - `seekPositioning` came back at 18.78 and 15.55 against a 0.5 default — 31-38x — and
+//    STILL cannot be declared, because the single knob prices two arms whose runtime
+//    shapes differ by an order of magnitude here. The secondary-index multi-seek opens one
+//    `iterate()` window per seek key (the ~15-19 measurement); the primary-key multi-seek
+//    runs `scanMultiSeekPrimary`, which batches through `readEffectiveRowsByKeys` at
+//    `ROW_RESOLUTION_BATCH` and therefore costs the BATCHED number, ~1.3. Declaring ~15
+//    would over-charge the primary-key arm ~12x, and that arm's cost is what
+//    `rule-key-set-seek` reads at 2 and 1000 keys to interpolate its seek-versus-scan
+//    break-even. Splitting the knob is backlog/debt-store-seek-positioning-conflates-two-arms.
+//
+// Revisit when that split lands (each arm can then be priced from its own measurement), or
+// if a LevelDB query is ever measured planning wrong because a secondary-index multi-seek
+// is priced 30x too cheap. The decision itself stays open as
 // backlog/debt-leveldb-cost-profile-measurement.
 export class LevelDBProvider implements KVStoreProvider {
 	private basePath: string;

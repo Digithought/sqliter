@@ -190,6 +190,90 @@ try {
 }
 ```
 
+## Measured read cost (and why no cost profile is declared)
+
+A storage backend can tell the query planner what its basic reads cost, relative to
+reading one row sequentially during a full scan (1.0 by definition). The two knobs live in
+[`@quereus/store`'s `cost-profile.ts`](../quereus-store/src/common/cost-profile.ts):
+`pointRead` (resolving one secondary-index entry to its row, batched) and `seekPositioning`
+(the per-key cost of a multi-key seek). IndexedDB declares measured values; **LevelDB
+declares nothing and takes the framework's parity defaults (`pointRead: 1.0`,
+`seekPositioning: 0.5`).** That was previously an assumption. It has now been measured, and
+this section is the record so nobody has to re-ask.
+
+### The numbers
+
+Measured 2026-08-19 by `packages/quereus/bench/suites/store.bench.mjs`
+(`leveldb-read-cost-20k`, `leveldb-read-cost-200k`) on an AMD Ryzen AI 9 HX 370 (24 cores,
+31 GB, NVMe) running Windows 11 Pro 26200 under node v24.2.0. Values are 200 bytes, keys
+are `encodeCompositeKey` integers, and the arms drive the `KVStore` directly — no
+`Database`, no planner, no isolation overlay.
+
+| dataset | arm | per operation | ratio vs sequential |
+| --- | --- | --- | --- |
+| 20 000 rows (~4 MB) | sequential `iterate()`, every value | 0.002514 ms/row | 1.00 (the denominator) |
+| | 1 000 random keys via `getMany`, paged at `ROW_RESOLUTION_BATCH` | 0.003156 ms/row | **1.26** |
+| | 1 000 random single-key `iterate({gte, lt, limit: 1})` | 0.047205 ms/key | **18.78** |
+| 200 000 rows (~40 MB) | sequential `iterate()`, every value | 0.004442 ms/row | 1.00 |
+| | 1 000 random keys via `getMany`, paged | 0.006399 ms/row | **1.44** |
+| | 1 000 random single-key `iterate({gte, lt, limit: 1})` | 0.069098 ms/key | **15.55** |
+
+Medians of 13 rounds (20k) and 7 rounds (200k), first round discarded. The 20k row's own
+harness median carried a 28.5% spread and was marked `unstable`, so treat its per-arm
+figures as the noisier pair; the 200k row's spread was 5.0%.
+
+Re-run with:
+
+```bash
+QUEREUS_BENCH_LEVELDB=1 node packages/quereus/bench/run.mjs --filter store/leveldb-read-cost
+```
+
+### What the two sizes actually separate
+
+**Not** page-cache-cold versus page-cache-warm. There is no portable way to drop the OS
+page cache from Node, and a dataset big enough to exceed a modern machine's page cache
+cannot be seeded inside a benchmark's time budget. What the sizes separate is
+`classic-level`'s own **8 MB block cache**, which this provider does not override: 20 000
+rows fit inside it and are served in-process; 200 000 rows do not, so their random reads go
+out to the filesystem — which on a warm machine usually means the OS page cache, not the
+physical disk. A claim of "cold" that is really "block-cache-miss, page-cache-hit" would be
+worse than no claim, so it is not made.
+
+### What the numbers mean, and why nothing is declared
+
+**`pointRead` is near parity and stays undeclared.** 1.26 and 1.44 against a default of
+1.0. The gap is also an *over*-statement of the truth: the planner's 1.0 unit is a scanned
+row *including engine work*, while these arms measured the key-value layer alone. Engine
+overhead lands on both sides of the ratio and therefore compresses it toward 1.0, so the
+engine-inclusive value sits somewhere in `[1.0, 1.44]` — an interval that was not measured
+and whose bottom is the current default. Declaring the top of it would be picking the
+pessimistic end of a band on no evidence, so the parity default stands.
+
+**`seekPositioning` is far from parity, and cannot be fixed by declaring a number.** 15.55
+and 18.78 against a default of 0.5 — a factor of roughly 31 to 38. The cause is visible in
+the raw milliseconds: a batched read costs ~3.2 µs per key while a single-key `iterate`
+costs ~47 µs, so about 44 µs is fixed per-iterator setup and teardown (snapshot, native
+iterator, close) that `getMany` amortizes over a whole page and a one-key window cannot.
+
+The obstacle is that **one knob prices two arms whose runtime shapes differ by an order of
+magnitude on this backend**:
+
+| arm in `store-module-access-plan.ts` | what it runs (`store-table-scan.ts`) | measured per-key cost |
+| --- | --- | --- |
+| secondary-index multi-seek (`tryIndexAccessPlan`) | one `iterate()` window per distinct tuple prefix over the index store | ~15–19 (the single-seek arm) |
+| primary-key multi-seek (`primaryKeyMultiSeekPlan`) | `scanMultiSeekPrimary` → `readEffectiveRowsByKeys`, one round trip per `ROW_RESOLUTION_BATCH` keys | ~1.3–1.4 (the batched arm) |
+
+Both charge `seekKeyCount × seekPositioning`. Declaring ~15 would over-charge the
+primary-key arm by roughly 12×, and that arm's cost is exactly what `rule-key-set-seek`
+reads at 2 and 1 000 keys to interpolate a seek-versus-scan break-even — so the break-even
+for `where pk in (…)` would move about 12× in the wrong direction. Declaring 0.5 leaves the
+secondary arm 30-plus× too cheap, which is where it already is.
+
+Splitting the knob so each arm can be priced honestly is
+`backlog/debt-store-seek-positioning-conflates-two-arms`; the decision about what LevelDB
+should ultimately declare is `backlog/debt-leveldb-cost-profile-measurement`, which stays
+open on purpose.
+
 ## Related Packages
 
 - [`@quereus/store`](../quereus-store/) - Core storage module (StoreModule, StoreTable)

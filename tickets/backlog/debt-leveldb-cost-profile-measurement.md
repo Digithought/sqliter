@@ -43,6 +43,30 @@ The same harness would answer the question for the React Native LevelDB and Nati
 SQLite backends, which are in the same undeclared position, though each needs its own runtime
 to run in.
 
+## The measurement has landed — what is left is the decision
+
+As of 2026-08-19 the benchmark exists, has been run, and its numbers are written down in
+`packages/quereus-plugin-leveldb/README.md` § *Measured read cost* (table, machine, date,
+both dataset sizes, and the block-cache caveat). **Do not re-measure to get started.**
+
+The result split:
+
+- The cost of a random point read came back **near** the parity default (1.26 at 20 000
+  rows, 1.44 at 200 000, against a default of 1.0) — and is an over-statement besides,
+  since the benchmark measured the key-value layer while the unit includes engine work.
+- The cost of one seek key came back **far** from parity (18.78 and 15.55 against 0.5).
+
+Declaring the seek number was nevertheless blocked, and by something the original ticket
+did not anticipate: **one knob prices two access paths whose real costs on this backend are
+about twelve times apart** — the secondary-index multi-seek opens an iterator per key, the
+primary-key multi-seek batches. That is filed separately as
+`debt-store-seek-positioning-conflates-two-arms`. Until it lands, no value of
+`seekPositioning` is correct for LevelDB, so the provider still declares nothing and says
+so in a code comment above the class.
+
+This ticket therefore stays open as the *decision*: after the knob split, declare LevelDB's
+measured numbers.
+
 ## Cross-reference
 
 `bench-store-leveldb` (implement/) adds the opt-in LevelDB arm of the store benchmark
