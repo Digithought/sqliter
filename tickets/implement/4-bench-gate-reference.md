@@ -553,3 +553,94 @@ count is the regression-gate ticket's job") — point all three at the gate.
 - Add the `NOTE:` on the single-process choice, and the `NOTE:` on the fixture-population cost lever
 - Write `docs/benchmarking.md` section *Regression gate*: what the reference set is, what gates and what does not, the accept path, the measured ~42 s cost, and why counters and not wall-clock
 - Verify with `yarn bench:gate` on a clean tree (expect exit 0), then again after a deliberate one-line change to a plan rule (expect a named, readable difference and exit 1), then revert that change
+
+# Session 4 progress (CODE STARTED — reference.mjs landed; resume by writing gate.mjs)
+
+A fourth run began writing code and hit the soft budget. Everything below is ON DISK
+and uncommitted; nothing has been built, linted, or tested yet. Trust the prior
+sessions' facts; do not re-derive anything.
+
+## Landed this session (verify nothing, just build on it)
+
+- **`bench/lib/reference.mjs` — COMPLETE.** Implements the whole settled API from
+  sessions 2/3 with full strict JSDoc. Final exported surface (read the file for
+  signatures before writing gate.mjs, it is the source of truth):
+  `COUNTER_CHANGES_SHOWN`, `UNGATED_MULTI_JOIN_REASON`, `OUTCOME_ORDER`,
+  `referenceDir`, `referencePath(suiteName)`, `countJoinNodesPerPlan(counters)`,
+  `gateEligibility(counters)`, `classifySuite(suiteName, rows, referenceBenchmarks,
+  filter)`, `gateFails(outcomes, suitesMissingReference, orphanReferences = [])`,
+  `validateAccept({reason, filter, dirty, allowDirty})`,
+  `validateAcceptAfterPass(measured)`, `buildReferenceBenchmarks(rows)`,
+  `nextReference(previous, suite, benchmarks, accepted)`,
+  `captureAcceptance(reason, environment, by)` (`by: string|null`, omitted when null),
+  `formatChangeLines(changes, cap?)`, `parseReference(text, filePath)`,
+  `serializeReference(reference)`, `listReferenceSuites()`, `loadReference(suiteName)`
+  (null on ENOENT, throws naming file on malformed), `writeReference(suiteName,
+  reference)` (atomic temp+rename, returns path). Row shape it consumes (`GateRow`):
+  `{name, fullName, counters?, skipped?: {reason}, failure?: {phase, error:
+  {name?, message?, stack?}}}`.
+- **`runCountersPass` moved to `bench/lib/counters.mjs`** (exported), removed from
+  `child.mjs`, which now imports it. Param typed `() => unknown | Promise<unknown>`
+  (not `object`) so the null/typeof validation survives strict checkJs (TS2367).
+- **`git()` exported from `bench/lib/environment.mjs`** (was module-private).
+- **`COUNTER_CHANGES_SHOWN` moved out of `run.mjs`** into reference.mjs; `run.mjs` now
+  imports it from `./lib/reference.mjs`.
+- **`compare.mjs` stale comment updated** at the `counterChanges` return — now points
+  at `bench/gate.mjs` and `bench/reference/` (this was one of the three doc-rot fixes;
+  the two in `docs/benchmarking.md` remain).
+
+## Remaining TODO (in order)
+
+- Write `bench/gate.mjs` per the settled sessions 2/3 design. All decisions stand.
+  Additional drafted details from this session: `VALUE_FLAGS = {--filter, --reason}`,
+  `BOOLEAN_FLAGS = {--json, --accept, --allow-dirty}`; refuse `--reason`/`--allow-dirty`
+  without `--accept`; delete `process.env[LEVELDB_ENV_VAR]` at top of main() before
+  `loadSuites()`, remembering whether it was set for the header + JSON
+  (`leveldb_env_cleared`); copy run.mjs's `UsageError`/`humanStream`/`useColor`/`ansi`
+  pattern; `runOne(bench)` = child.mjs phase pattern minus `fn` (skip-phase failure
+  gets NO teardown; other failures get best-effort teardown; return
+  `{counters}|{skipped}|{failure}`); per-suite loop as settled in session 3; accept's
+  `by` = `git('git config user.name')` + `git('git config user.email')` combined
+  `Name <email>`, either alone if only one answers, null if neither; wrap
+  `loadReference` throws into UsageError so malformed refs print one line. Both
+  `NOTE:`s (single-process premise + fixture-population lever) go at the pass loop.
+- Add scripts to `packages/quereus/package.json`:
+  `"bench:gate": "node bench/gate.mjs"`, `"bench:accept": "node bench/gate.mjs --accept"`.
+- Write `test/bench-gate.spec.ts` (pure functions only, no benchmark): eligibility
+  (one join gated; `{HashJoin:1, NestedLoopJoin:1}` in ONE plan ungated; one join in
+  each of two nested plans GATED — per-plan rule, session 3 call #1, comment why; no
+  plan at all gated; bare PlanShape root counted), classifySuite outcomes (match /
+  differs / new / missing / filtered-with-excluding-filter / skipped-beats-missing /
+  failed-with-phase / ungated-recomputed-from-this-run-despite-reference-gated-true,
+  changes still carried), gateFails exit rule incl. missing-reference and orphan
+  params, validateAccept (4 cases + dirty-unknown allowed), validateAcceptAfterPass
+  (failed refuses; skipped-with-previous-entry refuses; skipped-without-entry fine),
+  nextReference unchanged-returns-previous-verbatim (test with reordered keys to prove
+  deep-equal), serializeReference (tab indent, sorted keys, top-level order, trailing
+  newline), parseReference refusals naming the file, formatChangeLines elision at 12
+  announced, buildReferenceBenchmarks (sorted, counter-rows only, ungatedReason),
+  captureAcceptance omits `by` when null. Copy bench-comparison.spec.ts style.
+- Docs (`docs/benchmarking.md`): new `## Regression gate` section (place before
+  `## Ratio guards`); update the two remaining stale spots — § Work counters closing
+  paragraph ("there is no gate on them") and § Exit-code contract's `yarn check`
+  paragraph ("the regression gate planned on top of it"); also the § Noise floor
+  closing sentence ("That work belongs to the regression-gate ticket…") — say the
+  counter half now exists as `yarn bench:gate`, ratio half is follow-on
+  `bench-gate-ratios-and-check`. Add gate.mjs + reference.mjs rows to "Where the code
+  lives" table and bench-gate.spec.ts to the harness-tests list.
+- Validation sequence exactly as session 3 listed (build → targeted spec → lint →
+  `bench:accept --allow-dirty --reason "initial reference set (bench-gate-reference
+  ticket)"` → `bench:gate` exit 0 → planner-rule sensitivity check → full test).
+- Commit `bench/reference/*.json` (the accept run generates them).
+- Then the stage transition: review/ handoff (flag the two session-3 design calls and
+  the session-4 `runCountersPass` unknown-typing), delete this ticket.
+
+## Watchpoints for the next agent
+
+- Nothing has compiled since the edits: run the targeted spec + `yarn workspace
+  @quereus/quereus lint` EARLY to shake out any strict-JSDoc nits in reference.mjs
+  before investing in gate.mjs debugging.
+- run.mjs's `USAGE` line was touched during the constant move (spacing restored) —
+  no further action, just don't be surprised by the diff.
+- reference.mjs imports only `node:fs/promises`, `node:path`, `node:url`,
+  `./compare.mjs`, `./discover.mjs` — no dist imports, safe for run.mjs to import.

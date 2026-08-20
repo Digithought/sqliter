@@ -96,6 +96,29 @@ export async function snapshotStatements(db, statements) {
 }
 
 /**
+ * Run a benchmark's `counters()` and return a JSON-safe copy of what it produced.
+ *
+ * Round-tripped through JSON here rather than at a boundary for two reasons: an
+ * unserializable value (a bigint, a cycle, a class instance) fails inside the
+ * `counters` phase with the benchmark's name attached, instead of as a bare
+ * DataCloneError from `process.send`; and what the caller keeps is then byte-identical
+ * to what lands on disk, so a snapshot cannot compare equal in memory and differ in a
+ * file. One definition shared by the per-benchmark worker (`child.mjs`) and the
+ * regression gate (`gate.mjs`), so the two produce byte-identical blocks by
+ * construction.
+ *
+ * @param {() => unknown | Promise<unknown>} counters
+ * @returns {Promise<object>}
+ */
+export async function runCountersPass(counters) {
+	const raw = await counters();
+	if (raw === null || typeof raw !== 'object') {
+		throw new Error(`counters() must return a plain JSON object, got ${raw === null ? 'null' : typeof raw}`);
+	}
+	return JSON.parse(JSON.stringify(raw));
+}
+
+/**
  * Plan-shape facts for `sql` — node count and per-`PlanNodeType` tallies — without
  * executing it. The counter available to a benchmark that only ever prepares a
  * statement, and the one that would catch a rule regression turning a hash join back

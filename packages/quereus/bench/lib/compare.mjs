@@ -404,9 +404,10 @@ export function compareRun(rows, baseline, filter = null, options = {}) {
 		comparisons,
 		counts,
 		counterCounts,
-		// Reported, never gated. Failing a run over a changed count is the regression-gate
-		// ticket's job — counters get observed for a while before anything goes red over
-		// one, so `regressions` deliberately does not include this.
+		// Reported, never gated HERE. Failing a run over a changed count is
+		// `bench/gate.mjs`'s job, against the checked-in reference set in
+		// `bench/reference/` — this baseline comparison stays advisory, so
+		// `regressions` deliberately does not include this.
 		counterChanges: counterCounts.changed,
 		regressions: comparisons.filter((c) => c.gated).length,
 		assumedSpreads,

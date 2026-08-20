@@ -32,6 +32,7 @@
  */
 
 import { loadSuite } from './lib/discover.mjs';
+import { runCountersPass } from './lib/counters.mjs';
 import { calibrate, collectSamples, pinnedPlan, runPinnedWarmup } from './lib/calibrate.mjs';
 
 /** Force-exit delay after the result is sent, so a benchmark that leaked a timer
@@ -93,27 +94,6 @@ function finishCleanly() {
 	finished = true;
 	if (process.disconnect) process.disconnect();
 	setTimeout(() => process.exit(0), LINGER_GRACE_MS).unref();
-}
-
-/**
- * Run a benchmark's `counters()` and return a JSON-safe copy of what it produced.
- *
- * Round-tripped through JSON here rather than at the IPC boundary for two reasons: an
- * unserializable value (a bigint, a cycle, a class instance) fails inside the
- * `counters` phase with the benchmark's name attached, instead of as a bare
- * DataCloneError from `process.send`; and what the parent receives is then byte-identical
- * to what lands in the results file, so a snapshot cannot compare equal in memory and
- * differ on disk.
- *
- * @param {() => object | Promise<object>} counters
- * @returns {Promise<object>}
- */
-async function runCountersPass(counters) {
-	const raw = await counters();
-	if (raw === null || typeof raw !== 'object') {
-		throw new Error(`counters() must return a plain JSON object, got ${raw === null ? 'null' : typeof raw}`);
-	}
-	return JSON.parse(JSON.stringify(raw));
 }
 
 async function main() {

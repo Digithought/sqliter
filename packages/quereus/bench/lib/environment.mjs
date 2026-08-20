@@ -69,10 +69,13 @@ const GIT_OPTIONS = { encoding: 'utf8', windowsHide: true, timeout: 5_000, cwd: 
  * Never throws: the harness must still run for someone who unpacked a tarball, and a
  * missing commit hash is a missing field, not a failed benchmark run.
  *
+ * Exported for the regression gate's provenance capture (`git config user.name` /
+ * `user.email` in `bench/gate.mjs`), so there is exactly one defensive git wrapper.
+ *
  * @param {string} command
  * @returns {string | null}
  */
-function git(command) {
+export function git(command) {
 	try {
 		return execSync(command, GIT_OPTIONS).trim();
 	} catch {

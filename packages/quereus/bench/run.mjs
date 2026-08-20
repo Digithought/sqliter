@@ -43,6 +43,7 @@ import { informationalNames, loadSuites, selectBenchmarks } from './lib/discover
 import { summarize, UNSTABLE_SPREAD, GATE_MIN_DELTA_PCT } from './lib/stats.mjs';
 import { compareRun, STATUS_ORDER } from './lib/compare.mjs';
 import { captureEnvironment, compareEnvironments, describeCheckout, describeEnvironment } from './lib/environment.mjs';
+import { COUNTER_CHANGES_SHOWN } from './lib/reference.mjs';
 import { sweepBenchTempDirs } from './lib/tempdir.mjs';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -55,14 +56,6 @@ const BENCH_TIMEOUT_MS = 120_000;
 
 /** Characters of a dead child's stderr quoted in the failure report. */
 const STDERR_TAIL_CHARS = 4000;
-
-/**
- * Counter changes printed per benchmark before the list is elided. A per-instruction
- * diff of a plan that changed shape can run to hundreds of lines, which would bury the
- * benchmarks that changed by three counts. The elision is ANNOUNCED, never silent, and
- * the full list is always in the results JSON's `comparison` block.
- */
-const COUNTER_CHANGES_SHOWN = 12;
 
 const USAGE = 'usage: node bench/run.mjs [--filter <substring>] [--baseline <file>|latest] [--json] [--no-counters]';
 
