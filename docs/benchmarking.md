@@ -503,8 +503,9 @@ two gated "regressions" whose spreads were 3-6% in *both* runs. So treat a red r
 busy machine as a prompt to re-run, not as a verdict, and do not wire this exit code into an
 automatic gate until a between-run estimate exists — repeating runs and taking a median of
 medians, subtracting the common-mode shift, or requiring a regression to reproduce twice.
-That work belongs to the regression-gate ticket, which already plans to gate on work counters
-and within-run ratios rather than on wall-clock for exactly this reason.
+This is exactly why the [regression gate](#regression-gate) (`yarn bench:gate`) times
+nothing at all and gates on work counters instead; the within-run ratio half is the
+follow-on ticket `bench-gate-ratios-and-check`.
 
 A results file written before spreads were recorded has its spread assumed to be 20%: the
 widest a run could be and still have been called stable, so the assumption can only make the
@@ -734,8 +735,10 @@ Two mechanics worth knowing:
 
 Counter portability across machines is **an assumption, not a fact**: nothing has yet
 compared counter blocks from two machines, and plan choice can in principle differ on a
-slower one. Store round trips are reported as facts about *this run*; there is no gate on
-them.
+slower one — the one known mechanism is the join-order rule's wall-clock budget, which
+engages only on plans with two or more join nodes. The [regression gate](#regression-gate)
+(`yarn bench:gate`) gates on these counters, and excludes exactly that mechanism by
+refusing to gate any benchmark whose observed plan carries two or more join nodes.
 
 ### Which suites qualify
 
@@ -775,6 +778,67 @@ Below the table, each `changed` benchmark gets a block listing every differing p
 printed output, with the full uncapped list always in the results JSON under `comparison`.
 A `dropped` benchmark gets one line saying the baseline reported counters and this run did
 not, and no path list: there is nothing to list against a run that collected none.
+
+## Regression gate
+
+`yarn bench:gate` re-measures every counter-declaring benchmark and fails when any count
+differs from the checked-in reference set — so a change that makes the engine do more work
+is caught the day it lands, not months later when someone happens to compare two runs.
+
+**Only work counters gate; nothing about wall-clock does.** The
+[noise floor](#noise-floor-when-a-delta-is-a-change) is built from within-run spread and is
+blind to whole-run displacement by construction, so a timing gate on one machine cannot
+tell a regression from background load. Work counters are exact integers that do not
+depend on machine speed, so they compare for equality — no floor, no threshold, no re-run.
+
+**The reference set** is one file per suite in `bench/reference/<suite>.json`, checked into
+git: the expected counter block per benchmark, plus an `accepted` block recording who
+accepted it, at which commit, and why. The files are pretty-printed with sorted keys so a
+change is a readable diff — the git history of `bench/reference/` is the log of every
+accepted change to how much work the engine does.
+
+**The pass runs every benchmark in one process,** unlike `yarn bench`, which forks a worker
+per benchmark. Forking is load-bearing for timings — the interpreter shares call sites
+across query shapes, so a benchmark's measured speed depends on what ran before it — but
+not for counts: a single-process pass produced counter blocks byte-identical to the forked
+run's for all 56 benchmarks, and saves ~22 s of forks and `dist/` imports. The whole pass
+takes about 42 s; nothing is timed, so it runs each benchmark's
+`skip`/`setup`/`counters`/`teardown` and never the timed loop.
+
+**What gates and what does not.** A benchmark gates only when its observed plan carries at
+most one join node. Join order on three or more relations is chosen under a wall-clock
+budget (`bug-join-order-depends-on-wall-clock` in the backlog), so those counts are not
+provably the same on another machine. The gate recomputes this eligibility from each run's
+own counters — the reference file's `gated` flag is documentation, never the authority —
+names every ungated benchmark in its report, and still records their counts so a change
+stays visible. Today nothing is excluded: no benchmark's plan has two or more join nodes.
+The LevelDB rows never gate either: `bench:gate` deletes `QUEREUS_BENCH_LEVELDB` from its
+own environment before loading suites, and says in its report when it was set.
+
+**Outcomes.** `differs` (a gated count changed), `missing` (in the reference, produced no
+result this run) and `failed` (threw during the pass) fail the run; `match`, `new` (ran,
+not yet in the reference), `ungated`, `skipped` and `filtered` do not. A suite that
+produced counter blocks but has no reference file fails, as does a reference file naming a
+suite that no longer exists — deleting `bench/reference/` cannot make the gate green. Each
+`differs` benchmark prints every changed path as `path  before -> after`, capped at 12
+lines per benchmark with the elision announced, and uncapped under `--json` (outcome object
+on stdout, human report on stderr — the same routing as `yarn bench`).
+
+**Accepting a change.** When the difference is intentional:
+
+```
+yarn bench:accept --reason "hash join now probes the build side once per batch"
+```
+
+re-runs the full pass and rewrites only the reference files whose benchmark contents
+actually changed, so an untouched suite's `accepted` provenance survives in git history.
+`--reason` is required — a reference that changes without a recorded reason is a reference
+nobody trusts. Accept refuses on a dirty working tree (the recorded provenance commit would
+be a lie) unless `--allow-dirty` is passed, refuses `--filter` (a reference is always a
+full re-measure), and refuses to write while any benchmark failed or while a
+previously-recorded benchmark skipped this run — an unbuilt `dist/` must not silently erase
+a suite's expectations. Writes are atomic (temp file, then rename), so a concurrent gate
+run never reads half a file.
 
 ## Ratio guards
 
@@ -830,11 +894,12 @@ Unstable benchmarks, new benchmarks, missing benchmarks, sub-threshold deltas an
 the exit code. An informational benchmark that *failed* still does — an exempt number is
 not an exempt benchmark.
 
-**No part of this runs in `yarn check`.** `yarn check` does not invoke `yarn bench` at all
-today, and the regression gate planned on top of it should budget its fast mode around the
-`memory` and `store-mem` backends only. It must not set `QUEREUS_BENCH_LEVELDB`: the
-LevelDB rows would add roughly 75 s of disk-bound work whose numbers, by construction,
-cannot gate anything.
+**No part of this runs in `yarn check`.** `yarn check` invokes neither `yarn bench` nor
+`yarn bench:gate` today; wiring the [regression gate](#regression-gate) into it is the
+follow-on ticket `bench-gate-ratios-and-check`. The gate already budgets itself around the
+`memory` and `store-mem` backends only, and deletes `QUEREUS_BENCH_LEVELDB` from its own
+environment: the LevelDB rows would add roughly 75 s of disk-bound work whose numbers, by
+construction, cannot gate anything.
 
 ## `--json`
 
@@ -932,6 +997,9 @@ Requirements:
 | --- | --- |
 | `bench/run.mjs` | Parent orchestrator: arguments, forking, the table, the comparison output, the exit code. Never runs benchmark work itself. |
 | `bench/child.mjs` | Worker: runs exactly one benchmark and reports raw samples over IPC. |
+| `bench/gate.mjs` | The [regression gate](#regression-gate) and accept entry point: arguments, the single-process counters pass, the report, the exit code. |
+| `bench/lib/reference.mjs` | The gate's rules — reference file read/write, gate eligibility, outcome classification, accept validation — as pure functions over plain objects. |
+| `bench/reference/*.json` | The checked-in expected counter blocks, one file per suite, rewritten only by `yarn bench:accept`. |
 | `bench/lib/calibrate.mjs` | The timing policy — warmup, batch sizing, sample count. Kept out of the worker so `test/bench-calibration.spec.ts` can drive it. |
 | `bench/lib/stats.mjs` | Median, percentiles, relative IQR, the summary record, and the noise floor. |
 | `bench/lib/compare.mjs` | The cross-run comparison rules, as pure functions over two result objects. |
@@ -947,7 +1015,8 @@ Requirements:
 Harness tests, none of which run a benchmark: `test/bench-calibration.spec.ts` (the timing
 policy and the statistics), `test/bench-comparison.spec.ts` (the cross-run rules and the
 environment check), `test/bench-backends.spec.ts` (the backend expansion and the naming
-rule). `yarn bench` is not part of `yarn test`, so these are the only automated check on
-the harness itself.
+rule), `test/bench-gate.spec.ts` (the gate's eligibility, classification, serialization
+and accept-validation rules). Neither `yarn bench` nor `yarn bench:gate` is part of
+`yarn test`, so these are the only automated check on the harness itself.
 
 See also [Architecture § Benchmark Suite](architecture.md#testing-strategy).
