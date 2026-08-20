@@ -1,36 +1,52 @@
 #!/usr/bin/env node
 
 /**
- * Work-counter regression gate.
+ * Benchmark regression gate: work counters, then within-run ratio guards.
  *
- * Re-measures every counter-declaring benchmark's work counters and fails when they no
- * longer match the checked-in reference set (`bench/reference/`, one file per suite).
- * Counters gate where wall-clock deliberately does not: they are exact
- * machine-independent integers, so any difference is a difference, with no noise floor
- * to argue about. Nothing here times anything, and nothing reads `median_ms` from
- * anywhere. See docs/benchmarking.md § Regression gate.
+ * PASS ONE re-measures every counter-declaring benchmark's work counters IN THIS
+ * PROCESS and fails when they no longer match the checked-in reference set
+ * (`bench/reference/`, one file per suite). Counters gate where wall-clock deliberately
+ * does not: they are exact machine-independent integers, so any difference is a
+ * difference, with no noise floor to argue about. Nothing in this pass times anything.
  *
- * Every rule — eligibility, outcome classification, the exit rule, accept validation,
- * reference-file shape — lives in `lib/reference.mjs` as pure functions, where the type
- * pass sees them and `test/bench-gate.spec.ts` exercises them without running a
- * benchmark. This file is the thin part: argument parsing, the pass loop, printing, and
- * the process exit code.
+ * PASS TWO (gate mode only, never `--accept`) times the benchmarks named by the suites'
+ * `ratioGuards` — one fork per benchmark, the same isolation `run.mjs` uses, at the
+ * reduced `GATE_CALIBRATION` profile — and fails when one benchmark's median exceeds its
+ * bound against another's IN THE SAME RUN. A within-run ratio cancels machine speed,
+ * which is what makes it gateable when an absolute millisecond figure is not. A guard
+ * that fails at reduced calibration is re-measured once at full `CALIBRATION` before it
+ * may fail the run, so a noisy machine costs a wasted re-measure, never a false
+ * failure. See docs/benchmarking.md § Regression gate.
+ *
+ * Every rule lives in `bench/lib/` as pure functions — `lib/reference.mjs` for the
+ * counter rules, `lib/guards.mjs` for the guard rules — where the type pass sees them
+ * and `test/bench-gate.spec.ts` / `test/bench-guards.spec.ts` exercise them without
+ * running a benchmark. This file is the thin part: argument parsing, the two pass
+ * loops, printing, and the process exit code.
  *
  * Usage:
  *   yarn bench:gate                          — re-measure and compare against the reference
  *   yarn bench:gate --filter <substring>     — gate only benchmarks whose suite/name matches
+ *   yarn bench:gate --report-only            — report findings but exit 0; env equivalent:
+ *                                              QUEREUS_BENCH_GATE_REPORT_ONLY (any value but '' / '0')
  *   yarn bench:gate --json                   — outcome object on stdout, everything else on stderr
  *   yarn bench:accept --reason "<text>"      — re-measure everything and rewrite the reference
  *   yarn bench:accept ... --allow-dirty      — accept despite uncommitted changes
  */
 
+import { fork } from 'node:child_process';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
 
 import { diffCounters } from './lib/compare.mjs';
 import { runCountersPass } from './lib/counters.mjs';
-import { loadSuites, matchesFilter } from './lib/discover.mjs';
+import { informationalNames, loadSuites, matchesFilter, selectBenchmarks } from './lib/discover.mjs';
 import { captureEnvironment, describeCheckout, describeEnvironment, git } from './lib/environment.mjs';
+import { checkRatioGuards, gateExitCode, guardMemberNames, mergeRemeasuredVerdicts, reportRatioGuards } from './lib/guards.mjs';
 import { LEVELDB_ENV_VAR } from './lib/leveldb-backend.mjs';
+import { summarize } from './lib/stats.mjs';
+import { sweepBenchTempDirs } from './lib/tempdir.mjs';
 import {
 	OUTCOME_ORDER,
 	buildReferenceBenchmarks,
@@ -49,7 +65,7 @@ import {
 } from './lib/reference.mjs';
 
 const USAGE = [
-	'usage: node bench/gate.mjs [--filter <substring>] [--json]',
+	'usage: node bench/gate.mjs [--filter <substring>] [--json] [--report-only]',
 	'       node bench/gate.mjs --accept --reason "<text>" [--allow-dirty] [--json]',
 ].join('\n');
 
@@ -78,7 +94,7 @@ const dim = ansi(2);
 
 // ── CLI args ────────────────────────────────────────────────────────────
 const VALUE_FLAGS = new Set(['--filter', '--reason']);
-const BOOLEAN_FLAGS = new Set(['--json', '--accept', '--allow-dirty']);
+const BOOLEAN_FLAGS = new Set(['--json', '--accept', '--allow-dirty', '--report-only']);
 
 function parseArgs(argv) {
 	let filter = null;
@@ -86,11 +102,13 @@ function parseArgs(argv) {
 	let json = false;
 	let accept = false;
 	let allowDirty = false;
+	let reportOnly = false;
 	for (let i = 0; i < argv.length; i++) {
 		const flag = argv[i];
 		if (BOOLEAN_FLAGS.has(flag)) {
 			if (flag === '--json') json = true;
 			else if (flag === '--accept') accept = true;
+			else if (flag === '--report-only') reportOnly = true;
 			else allowDirty = true;
 			continue;
 		}
@@ -106,7 +124,23 @@ function parseArgs(argv) {
 	// not silent acceptance — the caller believed they changed something.
 	if (!accept && reason !== null) throw new UsageError(`--reason only applies with --accept\n${USAGE}`);
 	if (!accept && allowDirty) throw new UsageError(`--allow-dirty only applies with --accept\n${USAGE}`);
-	return { filter, reason, json, accept, allowDirty };
+	// The other direction: an accept records a reference and has no verdict to suppress,
+	// so `--report-only` with it is a misunderstanding, refused rather than ignored.
+	if (accept && reportOnly) throw new UsageError(`--report-only does not apply with --accept\n${USAGE}`);
+	return { filter, reason, json, accept, allowDirty, reportOnly };
+}
+
+/**
+ * Whether `QUEREUS_BENCH_GATE_REPORT_ONLY` asks for report-only mode: any value other
+ * than unset / empty / `'0'` is on. Ignored in accept mode — unlike the flag, which is
+ * refused there: an env var is typically set for a whole CI pipeline, and it must not
+ * change what an accept records or make `--accept` start failing under it.
+ *
+ * @param {string|undefined} value
+ * @returns {boolean}
+ */
+function envReportOnly(value) {
+	return value !== undefined && value !== '' && value !== '0';
 }
 
 // ── The in-process pass ─────────────────────────────────────────────────
@@ -257,6 +291,262 @@ function countOutcomes(results) {
 	return counts;
 }
 
+// ── The timed guard pass ────────────────────────────────────────────────
+const __dirname = fileURLToPath(new URL('.', import.meta.url));
+const childPath = join(__dirname, 'child.mjs');
+
+/** Per-member ceiling, same figure as `run.mjs`'s `BENCH_TIMEOUT_MS`: a benchmark that
+ * needs more than two minutes is misconfigured, not slow. */
+const GUARD_TIMEOUT_MS = 120_000;
+
+/** Characters of a dead child's stderr quoted in the failure report. */
+const STDERR_TAIL_CHARS = 4000;
+
+/** The worker currently being timed, or null. Tracked only so an interrupted parent can
+ * take it down with it — see the signal handlers below. */
+let activeChild = null;
+
+/** PIDs of workers this parent `SIGKILL`ed, so the temp-directory sweep can treat them
+ * as dead even before the OS reaps them. See `lib/tempdir.mjs`.
+ * @type {Set<number>} */
+const killedWorkerPids = new Set();
+
+/** Remove temporary databases left by workers that are gone. Best-effort, never throws.
+ * @param {boolean} [quiet] true in a signal handler, where the run is being abandoned */
+function sweepTempDirs(quiet = false) {
+	const { removed, failed } = sweepBenchTempDirs(killedWorkerPids);
+	if (!quiet && removed.length > 0) {
+		say(yellow(`Removed ${removed.length} temporary database director${removed.length === 1 ? 'y' : 'ies'} left by killed worker(s).`));
+	}
+	for (const failure of failed) {
+		process.stderr.write(`bench:gate: could not remove leftover temporary database '${failure.dir}': ${failure.error}\n`);
+	}
+}
+
+// A fork()ed child outlives its parent. Without this, one Ctrl+C mid-guard-pass orphans
+// a worker that keeps burning CPU until it finishes on its own.
+for (const signal of ['SIGINT', 'SIGTERM']) {
+	process.on(signal, () => {
+		if (activeChild?.pid !== undefined) killedWorkerPids.add(activeChild.pid);
+		activeChild?.kill('SIGKILL');
+		sweepTempDirs(true);
+		process.exit(signal === 'SIGINT' ? 130 : 143);
+	});
+}
+
+/**
+ * Fork `child.mjs` for one guard member and await its exit.
+ *
+ * Mirrors `run.mjs`'s `forkBenchmark` — duplicated rather than imported because both
+ * entry points execute `main()` at import and can therefore never import each other;
+ * the shared LOGIC lives in `bench/lib/`, and this is process wiring, not logic. The
+ * fork is what keeps the guard medians honest: the counters pass above has already
+ * de-optimized this process's interpreter call sites, so timing in it would measure
+ * that history, not the code.
+ *
+ * @param {string} suiteFile
+ * @param {string} benchName
+ * @param {boolean} reducedCalibration `--gate-calibration` (the first pass) or full
+ *   `CALIBRATION` (the re-measure)
+ * @returns {Promise<{ result: object|null, failure: object|null, skipped: object|null, code: number|null, signal: string|null, timedOut: boolean, stderr: string }>}
+ */
+function forkGuardMember(suiteFile, benchName, reducedCalibration) {
+	return new Promise((resolve) => {
+		// Always `--no-counters`: pass one already collected counters, and the counting
+		// generators would sit inside the timed loop and corrupt the medians.
+		const args = [suiteFile, benchName, '--no-counters', ...(reducedCalibration ? ['--gate-calibration'] : [])];
+		const child = fork(childPath, args, {
+			stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+		});
+		activeChild = child;
+
+		let result = null;
+		let failure = null;
+		let skipped = null;
+		let timedOut = false;
+		let settled = false;
+		const stderrChunks = [];
+
+		child.stdout.on('data', (chunk) => humanStream.write(chunk));
+		child.stderr.on('data', (chunk) => {
+			stderrChunks.push(chunk);
+			process.stderr.write(chunk);
+		});
+
+		child.on('message', (msg) => {
+			if (msg?.type === 'result') result = msg;
+			else if (msg?.type === 'failure') failure = msg;
+			else if (msg?.type === 'skipped') skipped = msg;
+		});
+
+		const settle = (code, signal) => {
+			if (settled) return;
+			settled = true;
+			activeChild = null;
+			clearTimeout(timer);
+			clearTimeout(reapTimer);
+			const stderr = Buffer.concat(stderrChunks).toString('utf8');
+			resolve({ result, failure, skipped, code, signal, timedOut, stderr });
+		};
+
+		let reapTimer = null;
+
+		const timer = setTimeout(() => {
+			timedOut = true;
+			// Recorded before the kill, so the sweep can remove a temporary database this
+			// worker will now never get the chance to remove itself.
+			if (child.pid !== undefined) killedWorkerPids.add(child.pid);
+			child.kill('SIGKILL');
+			// A killed child normally emits 'close' within milliseconds; the backstop is for
+			// the one that does not — the pass must not hang forever on one benchmark.
+			reapTimer = setTimeout(() => settle(null, 'SIGKILL'), 5_000);
+		}, GUARD_TIMEOUT_MS);
+
+		child.on('error', (err) => {
+			failure ??= { type: 'failure', phase: 'spawn', error: { name: err.name, message: err.message, stack: err.stack ?? null } };
+			// A process that never spawned may emit 'error' without a following 'close'.
+			if (child.pid === undefined) settle(null, null);
+		});
+
+		// 'close' rather than 'exit': the stdio pipes are drained by then, so the captured
+		// stderr is complete when a dead child has to be explained.
+		child.on('close', (code, signal) => settle(code, signal));
+	});
+}
+
+/** One decimal in each unit, same rule as `run.mjs`'s table. */
+function fmtMs(ms) {
+	return ms < 1 ? `${(ms * 1000).toFixed(1)} µs` : `${ms.toFixed(2)} ms`;
+}
+
+function tail(text) {
+	if (!text) return '';
+	return text.length > STDERR_TAIL_CHARS ? `…${text.slice(-STDERR_TAIL_CHARS)}` : text;
+}
+
+function indentText(text) {
+	return text.split('\n').map((line) => `      ${line}`).join('\n');
+}
+
+/**
+ * Fork each member in turn and fold the outcomes into the shared state.
+ *
+ * STRICTLY SEQUENTIAL, deliberately — parallel children contend for CPU and would
+ * reintroduce the cross-benchmark interference the fork exists to remove.
+ *
+ * A member whose fork FAILS is recorded in `memberFailures` and its `allBenchmarks`
+ * entry is DELETED, not merely left unset: on the re-measure pass a stale
+ * reduced-calibration median must not be re-evaluated as if it were the full
+ * measurement.
+ *
+ * @param {{ suiteFile: string, name: string, fullName: string }[]} members
+ * @param {boolean} reducedCalibration
+ * @param {{ allBenchmarks: Record<string, object>, skippedNames: Map<string, string>, memberFailures: { fullName: string, detail: string }[] }} state
+ */
+async function timeGuardMembers(members, reducedCalibration, { allBenchmarks, skippedNames, memberFailures }) {
+	for (const member of members) {
+		const outcome = await forkGuardMember(member.suiteFile, member.name, reducedCalibration);
+
+		if (outcome.skipped) {
+			const reason = String(outcome.skipped.reason ?? 'no reason given');
+			skippedNames.set(member.fullName, reason);
+			say(`  ${member.fullName}... ${yellow(`skipped — ${reason}`)}`);
+			continue;
+		}
+
+		let detail = null;
+		let stderrTail = '';
+		if (outcome.timedOut) {
+			detail = `no result within ${GUARD_TIMEOUT_MS / 1000}s — child killed`;
+			stderrTail = tail(outcome.stderr);
+		} else if (outcome.failure) {
+			detail = `threw during ${outcome.failure.phase}: ${outcome.failure.error?.message ?? 'unknown error'}`;
+		} else if (!outcome.result) {
+			detail = `child exited without a result (code ${outcome.code}, signal ${outcome.signal ?? 'none'})`;
+			stderrTail = tail(outcome.stderr);
+		} else if (!Array.isArray(outcome.result.timings) || outcome.result.timings.length === 0) {
+			detail = 'child reported an empty timing set';
+		}
+		if (detail !== null) {
+			delete allBenchmarks[member.fullName];
+			memberFailures.push({ fullName: member.fullName, detail });
+			say(`  ${member.fullName}... ${red(`FAILED — ${detail}`)}`);
+			if (stderrTail) say(indentText(stderrTail.trimEnd()));
+			continue;
+		}
+
+		const summary = summarize(outcome.result.timings, {
+			batch: outcome.result.batch,
+			warmup: outcome.result.warmup,
+			pinned: outcome.result.pinned,
+		});
+		allBenchmarks[member.fullName] = summary;
+		const shape = `${summary.samples} samples${summary.batch > 1 ? ` x${summary.batch}` : ''}`;
+		say(`  ${member.fullName}... ${fmtMs(summary.median_ms)} (spread ${summary.spread_pct === null ? '?' : `${summary.spread_pct.toFixed(1)}%`}, ${shape})`);
+	}
+}
+
+/**
+ * The whole ratio-guard pass: time every selected guard member at reduced calibration,
+ * evaluate the guards, re-measure the FAILED ones at full calibration, and fold the two
+ * evaluations into one verdict list (`mergeRemeasuredVerdicts`).
+ *
+ * `selectedNames` passed to `checkRatioGuards` is the full selection — every benchmark
+ * matching the filter, counters or not — the same set `run.mjs` would run, so the
+ * skipped/misconfigured semantics survive unchanged. The TIMED set is narrower: only
+ * guard members that exist and match the filter.
+ *
+ * @param {import('./lib/discover.mjs').Suite[]} suites
+ * @param {string|null} filter
+ * @param {Set<string>} informational
+ * @returns {Promise<{ verdicts: import('./lib/guards.mjs').GuardVerdict[], memberFailures: { fullName: string, detail: string }[] }>}
+ */
+async function runGuardPass(suites, filter, informational) {
+	/** @type {{ fullName: string, detail: string }[]} */
+	const memberFailures = [];
+	if (!suites.some((s) => (s.ratioGuards ?? []).length > 0)) {
+		return { verdicts: [], memberFailures };
+	}
+
+	const selected = selectBenchmarks(suites, filter);
+	const selectedNames = new Set(selected.map((b) => b.fullName));
+	const memberNames = guardMemberNames(suites, informational);
+	const members = selected.filter((b) => memberNames.has(b.fullName));
+
+	/** @type {Record<string, object>} */
+	const allBenchmarks = {};
+	/** @type {Map<string, string>} */
+	const skippedNames = new Map();
+	const passStart = performance.now();
+
+	if (members.length > 0) {
+		say(`\nRatio guards — timing ${members.length} member benchmark(s), each in its own process (reduced calibration; a failed guard is re-measured at full calibration before it may fail the run):`);
+		await timeGuardMembers(members, true, { allBenchmarks, skippedNames, memberFailures });
+	}
+
+	let verdicts = checkRatioGuards(suites, allBenchmarks, selectedNames, Boolean(filter), skippedNames, informational);
+	let forks = members.length;
+
+	const failedVerdicts = verdicts.filter((v) => v.status === 'failed');
+	if (failedVerdicts.length > 0) {
+		const retryNames = new Set(failedVerdicts.flatMap((v) => [v.target, v.baseline]));
+		const retryMembers = members.filter((b) => retryNames.has(b.fullName));
+		say(yellow(`\n${failedVerdicts.length} guard(s) failed at reduced calibration — re-measuring ${retryMembers.length} benchmark(s) at full calibration; the re-measure decides:`));
+		await timeGuardMembers(retryMembers, false, { allBenchmarks, skippedNames, memberFailures });
+		verdicts = mergeRemeasuredVerdicts(verdicts, checkRatioGuards(suites, allBenchmarks, selectedNames, Boolean(filter), skippedNames, informational));
+		forks += retryMembers.length;
+	}
+
+	// After every worker has exited, so a temporary database a killed worker left behind
+	// is gone before the run reports. Nothing to do on the normal path.
+	sweepTempDirs();
+
+	if (forks > 0) {
+		say(`Guard pass wall-clock: ${((performance.now() - passStart) / 1000).toFixed(1)} s across ${forks} isolated process(es)`);
+	}
+	return { verdicts, memberFailures };
+}
+
 // ── The gate report ─────────────────────────────────────────────────────
 /**
  * Everything a reader needs to act without re-running: every changed count as
@@ -397,7 +687,9 @@ function finishCleanly(code) {
 }
 
 async function main() {
-	const { filter, reason, json, accept, allowDirty } = parseArgs(process.argv.slice(2));
+	const args = parseArgs(process.argv.slice(2));
+	const { filter, reason, json, accept, allowDirty } = args;
+	const reportOnly = args.reportOnly || (!accept && envReportOnly(process.env.QUEREUS_BENCH_GATE_REPORT_ONLY));
 
 	if (json) {
 		humanStream = process.stderr;
@@ -422,6 +714,9 @@ async function main() {
 	if (leveldbEnvCleared) {
 		say(yellow(`${LEVELDB_ENV_VAR} was set and has been cleared for this run — LevelDB rows are informational and never gate.`));
 	}
+	if (reportOnly) {
+		say(yellow('Report-only: findings will be reported below but will not fail this run (exit 0).'));
+	}
 
 	if (accept) {
 		const refusal = validateAccept({ reason, filter, dirty: environment.dirty, allowDirty });
@@ -431,6 +726,7 @@ async function main() {
 	const suites = await loadSuites();
 	const suiteNames = new Set(suites.map((s) => s.name));
 	const orphanReferences = (await listReferenceSuites()).filter((name) => !suiteNames.has(name));
+	const informational = informationalNames(suites);
 
 	// In accept mode an orphan refuses BEFORE the ~42 s pass: accept never deletes
 	// reference files (a human does), so running the pass first would waste it.
@@ -442,9 +738,17 @@ async function main() {
 	const selectedCount = suites.flatMap((s) => s.benchmarks.filter(
 		(b) => b.counters !== undefined && matchesFilter(`${s.name}/${b.name}`, filter))).length;
 	if (selectedCount === 0) {
-		throw new UsageError(filter
-			? `--filter '${filter}' matched no counter-declaring benchmarks (${totalSelectable} available)`
-			: 'no benchmark declares counters() — nothing to gate');
+		// In gate mode, a filter narrowed to a guard's members selects no counter-declaring
+		// benchmark and must still run the guard pass rather than refuse. Accept mode keeps
+		// the strict rule — an accept over an empty selection records nothing.
+		const guardMembersSelected = accept
+			? 0
+			: [...guardMemberNames(suites, informational)].filter((name) => matchesFilter(name, filter)).length;
+		if (guardMembersSelected === 0) {
+			throw new UsageError(filter
+				? `--filter '${filter}' matched no counter-declaring benchmarks${accept ? '' : ' and no ratio-guard members'} (${totalSelectable} available)`
+				: 'no benchmark declares counters() — nothing to gate');
+		}
 	}
 	if (filter) say(`\nFilter '${filter}' selected ${selectedCount} of ${totalSelectable} counter-declaring benchmarks`);
 
@@ -452,23 +756,55 @@ async function main() {
 	const suiteRows = await runPass(suites, filter);
 	const { results, missingReferences } = await classifyAll(suites, suiteRows, filter);
 	const counts = countOutcomes(results);
-	say(`\nTotal wall-clock: ${((performance.now() - passStart) / 1000).toFixed(1)} s in one process (counters only, nothing timed)`);
+	say(`\nCounters pass wall-clock: ${((performance.now() - passStart) / 1000).toFixed(1)} s in one process (counters only, nothing timed)`);
 
 	let failed = false;
 	let written = [];
+	/** @type {import('./lib/guards.mjs').GuardVerdict[]|null} null in accept mode: not evaluated, a different claim from "no guards" */
+	let ratioGuards = null;
+	/** @type {{ fullName: string, detail: string }[]|null} */
+	let guardMemberFailures = null;
 	if (accept) {
 		written = await runAccept(results, reason, environment);
 		say(green(`\nAccepted — reason recorded: ${reason}`));
 	} else {
 		printGateReport(results, counts, missingReferences, orphanReferences);
-		failed = gateFails(results.flatMap((r) => r.outcomes), missingReferences, orphanReferences);
+		const countersFailed = gateFails(results.flatMap((r) => r.outcomes), missingReferences, orphanReferences);
+
+		// The guard pass runs even when the counters already failed: one run should
+		// report everything it can, not stop at the first finding.
+		const guardPass = await runGuardPass(suites, filter, informational);
+		ratioGuards = guardPass.verdicts;
+		guardMemberFailures = guardPass.memberFailures;
+		if (ratioGuards.length > 0) say();
+		const guardFailures = reportRatioGuards(ratioGuards, { say, red, yellow });
+
+		// A member fork failure fails the gate — a guard that cannot be evaluated must not
+		// read as green — but it is a finding like the rest, so report-only suppresses it too.
+		failed = countersFailed || guardFailures > 0 || guardMemberFailures.length > 0;
 		if (failed) {
-			// Deliberately not "the engine does different work": `missing`, `failed` and an
-			// absent reference all land here too, and each has its own named line above.
-			say(red('\nGATE FAILED — this run does not match the checked-in reference.'));
-			say(red('If the change is intentional, record it: yarn bench:accept --reason "<why>"'));
+			say(red('\nGATE FAILED:'));
+			if (countersFailed) {
+				// Deliberately not "the engine does different work": `missing`, `failed` and an
+				// absent reference all land here too, and each has its own named line above.
+				say(red('  Work counters do not match the checked-in reference.'));
+				say(red('  If the change is intentional, record it: yarn bench:accept --reason "<why>"'));
+			}
+			if (guardFailures > 0) {
+				say(red(`  ${guardFailures} ratio guard(s) failed or are misconfigured — see the verdicts above.`));
+			}
+			if (guardMemberFailures.length > 0) {
+				say(red(`  ${guardMemberFailures.length} guard member benchmark(s) failed to run — a guard that cannot be evaluated must not read as green.`));
+			}
+			if (reportOnly) {
+				say(yellow('┌─ REPORT-ONLY ─────────────────────────────────────────────────────'));
+				say(yellow('│ The findings above would have failed this gate. --report-only (or'));
+				say(yellow('│ QUEREUS_BENCH_GATE_REPORT_ONLY) suppressed the failing exit code:'));
+				say(yellow('│ this run exits 0, with the findings recorded above and in --json.'));
+				say(yellow('└───────────────────────────────────────────────────────────────────'));
+			}
 		} else {
-			say(green('\nGate passed — every gated counter matches the reference.'));
+			say(green('\nGate passed — every gated counter matches the reference and every ratio guard holds.'));
 		}
 	}
 
@@ -487,6 +823,11 @@ async function main() {
 			missing_references: missingReferences,
 			orphan_references: orphanReferences,
 			written,
+			ratio_guards: ratioGuards,
+			guard_member_failures: guardMemberFailures,
+			report_only: reportOnly,
+			// Honest even under report-only: only the EXIT CODE is suppressed, so a script
+			// reading the JSON can still see what a gating run would have decided.
 			failed,
 		};
 		// Written last, so a crash anywhere above leaves stdout empty rather than holding
@@ -494,7 +835,7 @@ async function main() {
 		process.stdout.write(JSON.stringify(output, null, 2) + '\n');
 	}
 
-	process.exitCode = failed ? 1 : 0;
+	process.exitCode = gateExitCode(failed, reportOnly);
 	finishCleanly(process.exitCode);
 }
 
