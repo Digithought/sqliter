@@ -25,6 +25,7 @@ import {
 	gateFails,
 	nextReference,
 	parseReference,
+	referenceIsAbsent,
 	serializeReference,
 	validateAccept,
 	validateAcceptAfterPass,
@@ -158,6 +159,14 @@ describe('bench/lib/reference.mjs — classifySuite', () => {
 		expect(outcome.note).to.equal('backend unavailable');
 	});
 
+	it('classifies a row carrying no block, no skip and no failure as failed, not as a match', () => {
+		// Unreachable by construction, but the fallback must be loud: a silent match here
+		// would be the gate reporting green over a benchmark it never measured.
+		const [outcome] = classifySuite('s', [{ name: 'b', fullName: 's/b' }], { b: refEntry() }, null);
+		expect(outcome.outcome).to.equal('failed');
+		expect(outcome.note).to.contain('harness bug');
+	});
+
 	it('classifies a thrown phase as failed, naming the phase', () => {
 		const [outcome] = classifySuite('s', [failedRow('b', 'counters')], { b: refEntry() }, null);
 		expect(outcome.outcome).to.equal('failed');
@@ -175,6 +184,33 @@ describe('bench/lib/reference.mjs — classifySuite', () => {
 		expect(outcome.ungatedReason).to.equal(UNGATED_MULTI_JOIN_REASON);
 		// The changes are still carried, so the report can show what moved.
 		expect(outcome.changes.length).to.be.greaterThan(0);
+	});
+});
+
+// ── Absent expectations ─────────────────────────────────────────────────
+describe('bench/lib/reference.mjs — referenceIsAbsent', () => {
+	const file = (benchmarks: Record<string, ReturnType<typeof refEntry>>) => ({ suite: 's', benchmarks });
+
+	it('is absent when a producing suite has no reference file', () => {
+		expect(referenceIsAbsent(null, [ranRow('b')])).to.equal(true);
+	});
+
+	it('is absent when a producing suite\'s reference records ZERO benchmarks', () => {
+		// The hole this closes: an emptied file turns every benchmark into a benign `new`,
+		// so the gate would report green — deleting the file with one extra keystroke.
+		expect(referenceIsAbsent(file({}), [ranRow('b')])).to.equal(true);
+	});
+
+	it('is present when the reference has entries', () => {
+		expect(referenceIsAbsent(file({ b: refEntry() }), [ranRow('b')])).to.equal(false);
+	});
+
+	it('is not absent when the suite produced no counter blocks at all', () => {
+		// How an accept legitimately records "every counters() here was removed", and how a
+		// --filter that selects nothing from a suite stays quiet.
+		expect(referenceIsAbsent(file({}), [skippedRow('b')])).to.equal(false);
+		expect(referenceIsAbsent(null, [skippedRow('b')])).to.equal(false);
+		expect(referenceIsAbsent(file({}), [])).to.equal(false);
 	});
 });
 
@@ -324,6 +360,11 @@ describe('bench/lib/reference.mjs — serializeReference / parseReference', () =
 	it('refuses a malformed entry, naming the benchmark', () => {
 		expect(() => parseReference('{"suite":"s","benchmarks":{"b":{"gated":"yes"}}}', 's.json')).to.throw(/'b'/);
 	});
+
+	it('accepts a file a Windows editor prefixed with a byte-order mark', () => {
+		const text = '﻿' + serializeReference({ suite: 's', benchmarks: { b: refEntry() } });
+		expect(parseReference(text, 's.json').suite).to.equal('s');
+	});
 });
 
 // ── Report formatting ───────────────────────────────────────────────────
@@ -339,6 +380,20 @@ describe('bench/lib/reference.mjs — formatChangeLines', () => {
 		const lines = formatChangeLines([change('totals.a', 1, 2), change('totals.b', 3, 4)]);
 		expect(lines).to.have.length(2);
 		expect(lines[0]).to.contain('1 -> 2');
+	});
+
+	it('lets the caller say where the uncapped list lives — it is not the same file for every caller', () => {
+		const changes = Array.from({ length: COUNTER_CHANGES_SHOWN + 1 }, (_, i) => change(`totals.c${i}`, 1, 2));
+		expect(formatChangeLines(changes, { more: 'the results JSON' }).at(-1)).to.contain('the results JSON');
+	});
+
+	it('prints a one-sided path as `absent`, never as a bare null', () => {
+		const [line] = formatChangeLines([{ path: 'totals.gone', before: 5, after: null }]);
+		expect(line).to.contain('5 -> absent');
+	});
+
+	it('handles an empty change list without producing a line', () => {
+		expect(formatChangeLines([])).to.deep.equal([]);
 	});
 });
 

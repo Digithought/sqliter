@@ -22,7 +22,7 @@
  * day it does.
  */
 
-import { readFile, readdir, mkdir, rename, writeFile } from 'node:fs/promises';
+import { readFile, readdir, mkdir, rename, rm, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -134,7 +134,13 @@ function isPlainObject(value) {
 }
 
 /** Every `PlanNodeType` naming a join ends in `Join` (`Join`, `HashJoin`,
- * `NestedLoopJoin`, `MergeJoin`, `KeySetSemiJoin`, `FanOutLookupJoin`). */
+ * `NestedLoopJoin`, `MergeJoin`, `KeySetSemiJoin`, `FanOutLookupJoin`).
+ *
+ * NOTE: this is a naming convention, not something the type system enforces — a future
+ * join node called something else (`CrossProduct`, `Apply`) would be counted as zero
+ * joins here and the benchmark would keep gating on counts the join-order rule's
+ * wall-clock budget can move. If a join node ever lands without a `Join` suffix, this
+ * regex has to become an explicit list checked against `PlanNodeType`. */
 const JOIN_KEY = /Join$/;
 
 /**
@@ -284,15 +290,47 @@ export function classifySuite(suiteName, rows, referenceBenchmarks, filter) {
 }
 
 /**
+ * Whether a suite's expectations are absent while it is producing counter blocks —
+ * the condition that must fail the gate rather than read as a suite full of `new`
+ * benchmarks.
+ *
+ * Two forms of absent, deliberately treated alike: no reference file, and a file whose
+ * `benchmarks` object is EMPTY. Without the second, emptying a file — a merge resolved
+ * the wrong way, a truncated write, a "reset" by hand — turns every benchmark in that
+ * suite into a benign `new` and the gate reports green, which is the same hole as
+ * deleting the file with one extra character of effort.
+ *
+ * A suite that produced NO counter blocks is not in this condition: that is how an
+ * accept legitimately records "every `counters()` in this suite was removed" as an
+ * empty file, and how a `--filter` that selects nothing from a suite stays quiet.
+ *
+ * @param {ReferenceFile|null} reference
+ * @param {GateRow[]} rows
+ * @returns {boolean}
+ */
+export function referenceIsAbsent(reference, rows) {
+	if (!rows.some((row) => row.counters !== undefined)) return false;
+	return !reference || Object.keys(reference.benchmarks).length === 0;
+}
+
+/**
  * The gate's exit rule. `differs`, `missing` and `failed` fail; `new`, `skipped`,
- * `filtered` and `ungated` never do. A suite that produced counter blocks with NO
- * reference file fails too — otherwise deleting `bench/reference/` would make the gate
- * green forever — as does a reference file naming a suite that no longer exists, which
- * is the same hole in the other direction.
+ * `filtered` and `ungated` never do. A suite that produced counter blocks with no
+ * usable reference fails too (see `referenceIsAbsent`) — otherwise deleting or
+ * emptying `bench/reference/` would make the gate green forever — as does a reference
+ * file naming a suite that no longer exists, which is the same hole in the other
+ * direction.
+ *
+ * NOTE: the guard covers a WHOLLY absent suite, not a partial one — deleting three of
+ * a suite's four entries still reads as three `new` benchmarks and passes, because a
+ * genuinely new benchmark is indistinguishable from a deleted expectation from inside
+ * one run. The defense against a partial edit is that `bench/reference/` is checked in
+ * and its diff is reviewed; if that ever stops being true, the gate needs the suite's
+ * expected benchmark NAMES to come from somewhere the same edit cannot reach.
  *
  * @param {GateOutcome[]} outcomes every suite's outcomes, flattened
  * @param {string[]} suitesMissingReference suites that produced ≥1 counter block and
- *   have no reference file
+ *   have no usable reference file
  * @param {string[]} [orphanReferences] reference files naming no loaded suite
  * @returns {boolean}
  */
@@ -365,14 +403,14 @@ export function validateAcceptAfterPass(measured) {
 export function buildReferenceBenchmarks(rows) {
 	/** @type {Record<string, ReferenceEntry>} */
 	const benchmarks = {};
-	const names = rows.filter((row) => row.counters !== undefined).map((row) => row.name).sort();
-	for (const name of names) {
-		const row = rows.find((r) => r.name === name);
-		if (!row || row.counters === undefined) continue;
-		const eligibility = gateEligibility(row.counters);
-		benchmarks[name] = eligibility.gated
-			? { gated: true, counters: row.counters }
-			: { gated: false, ungatedReason: eligibility.ungatedReason, counters: row.counters };
+	const byName = rows.slice().sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+	for (const row of byName) {
+		const counters = row.counters;
+		if (counters === undefined) continue;
+		const eligibility = gateEligibility(counters);
+		benchmarks[row.name] = eligibility.gated
+			? { gated: true, counters }
+			: { gated: false, ungatedReason: eligibility.ungatedReason, counters };
 	}
 	return benchmarks;
 }
@@ -456,15 +494,18 @@ const fmtCounterValue = (value) => (value === null ? 'absent' : String(value));
  * never as percentages.
  *
  * @param {import('./compare.mjs').CounterChange[]} changes
- * @param {number} [cap]
+ * @param {{ cap?: number, more?: string }} [options] `more` names where the uncapped
+ *   list lives, which differs per caller — `--json` for the gate, the results file for
+ *   a `yarn bench` comparison.
  * @returns {string[]}
  */
-export function formatChangeLines(changes, cap = COUNTER_CHANGES_SHOWN) {
+export function formatChangeLines(changes, options = {}) {
+	const { cap = COUNTER_CHANGES_SHOWN, more = 'the full list is available under --json' } = options;
 	const shown = changes.slice(0, cap);
 	const pathWidth = Math.min(64, Math.max(0, ...shown.map((change) => change.path.length)));
 	const lines = shown.map((change) => `${change.path.padEnd(pathWidth)}  ${fmtCounterValue(change.before)} -> ${fmtCounterValue(change.after)}`);
 	const hidden = changes.length - shown.length;
-	if (hidden > 0) lines.push(`… and ${hidden} more — the full list is available under --json`);
+	if (hidden > 0) lines.push(`… and ${hidden} more — ${more}`);
 	return lines;
 }
 
@@ -481,7 +522,10 @@ export function parseReference(text, filePath) {
 	/** @type {unknown} */
 	let data;
 	try {
-		data = JSON.parse(text);
+		// A leading byte-order mark is not JSON and a Windows editor adds one without
+		// asking; refusing it would send a reader hunting a syntax error in a file whose
+		// visible characters are all fine.
+		data = JSON.parse(text.charCodeAt(0) === 0xFEFF ? text.slice(1) : text);
 	} catch (err) {
 		throw new Error(`reference file '${filePath}' is not valid JSON: ${/** @type {Error} */ (err).message}`);
 	}
@@ -565,7 +609,14 @@ export async function writeReference(suiteName, reference) {
 	await mkdir(referenceDir, { recursive: true });
 	const path = referencePath(suiteName);
 	const tempPath = `${path}.tmp-${process.pid}`;
-	await writeFile(tempPath, serializeReference(reference));
-	await rename(tempPath, path);
+	try {
+		await writeFile(tempPath, serializeReference(reference));
+		await rename(tempPath, path);
+	} catch (err) {
+		// `bench/reference/` is checked in, so a temp file left by a failed write shows up
+		// in `git status` as mystery litter. Removing it must never mask the write error.
+		await rm(tempPath, { force: true }).catch(() => {});
+		throw err;
+	}
 	return path;
 }

@@ -41,6 +41,7 @@ import {
 	listReferenceSuites,
 	loadReference,
 	nextReference,
+	referenceIsAbsent,
 	referencePath,
 	validateAccept,
 	validateAcceptAfterPass,
@@ -228,6 +229,10 @@ async function loadReferenceOrRefuse(suiteName) {
  * its entries (`missing`, or `filtered` under a filter), or deleting every `counters()`
  * would make the gate green.
  *
+ * Which suites have no usable expectations is `referenceIsAbsent`'s call, not this
+ * function's: it decides the exit code, so it lives in `lib/reference.mjs` where the
+ * type pass sees it and `test/bench-gate.spec.ts` drives it.
+ *
  * @returns {Promise<{results: object[], missingReferences: string[]}>}
  */
 async function classifyAll(suites, suiteRows, filter) {
@@ -237,8 +242,7 @@ async function classifyAll(suites, suiteRows, filter) {
 		const rows = suiteRows.get(suite.name) ?? [];
 		const reference = await loadReferenceOrRefuse(suite.name);
 		if (!reference && rows.length === 0) continue;
-		const produced = rows.some((r) => r.counters !== undefined);
-		if (!reference && produced) missingReferences.push(suite.name);
+		if (referenceIsAbsent(reference, rows)) missingReferences.push(suite.name);
 		const outcomes = classifySuite(suite.name, rows, reference?.benchmarks ?? {}, filter);
 		results.push({ suiteName: suite.name, reference, rows, outcomes });
 	}
@@ -296,7 +300,10 @@ function printGateReport(results, counts, missingReferences, orphanReferences) {
 	}
 
 	for (const suiteName of missingReferences) {
-		say(red(`suite '${suiteName}' produced counter blocks but '${referencePath(suiteName)}' does not exist — run yarn bench:accept to create it`));
+		const emptied = results.find((r) => r.suiteName === suiteName)?.reference !== null;
+		say(red(emptied
+			? `suite '${suiteName}' produced counter blocks but '${referencePath(suiteName)}' records no benchmarks — an emptied reference must not read as a suite of new benchmarks; restore it from git, or run yarn bench:accept to rebuild it`
+			: `suite '${suiteName}' produced counter blocks but '${referencePath(suiteName)}' does not exist — run yarn bench:accept to create it`));
 	}
 	for (const suiteName of orphanReferences) {
 		say(red(`reference file '${referencePath(suiteName)}' names no known suite — if the suite was removed, delete the file`));
@@ -332,7 +339,7 @@ function printAcceptDiff(suiteName, previous, benchmarks) {
 			const changes = diffCounters(old.counters, next.counters);
 			if (changes.length === 0 && old.gated === next.gated) continue;
 			say(`    changed  ${suiteName}/${name} — ${changes.length} count(s) differ${old.gated === next.gated ? '' : `, gated ${old.gated} -> ${next.gated}`}`);
-			for (const line of formatChangeLines(changes)) say(`      ${line}`);
+			for (const line of formatChangeLines(changes, { more: `the written reference file has every count` })) say(`      ${line}`);
 		}
 	}
 }
@@ -371,6 +378,24 @@ async function runAccept(results, reason, environment) {
 }
 
 // ── Main ────────────────────────────────────────────────────────────────
+/** Force-exit delay once the verdict is printed, mirroring `child.mjs`: a benchmark
+ * that leaked a timer, a socket or an open database keeps the event loop alive, and an
+ * unref'd timer fires only if something else is still holding it. Without this the gate
+ * hangs forever on such a benchmark — `run.mjs` bounds the same hazard by killing a
+ * child after `BENCH_TIMEOUT_MS`, which a single-process pass has no equivalent of.
+ *
+ * NOTE: this bounds the exit, not the run — nothing here can interrupt a benchmark that
+ * hangs INSIDE `setup` or `counters()`, where the forked runner would kill the child at
+ * 120 s. If a benchmark ever hangs mid-pass, the gate needs its own per-benchmark
+ * deadline (a `Promise.race` in `runOne` reports the row as failed but cannot reclaim
+ * the stuck work, so the honest fix is to run the pass in a killable child). */
+const LINGER_GRACE_MS = 250;
+
+/** @param {number} code */
+function finishCleanly(code) {
+	setTimeout(() => process.exit(code), LINGER_GRACE_MS).unref();
+}
+
 async function main() {
 	const { filter, reason, json, accept, allowDirty } = parseArgs(process.argv.slice(2));
 
@@ -438,7 +463,9 @@ async function main() {
 		printGateReport(results, counts, missingReferences, orphanReferences);
 		failed = gateFails(results.flatMap((r) => r.outcomes), missingReferences, orphanReferences);
 		if (failed) {
-			say(red('\nGATE FAILED — the engine does different work than the checked-in reference.'));
+			// Deliberately not "the engine does different work": `missing`, `failed` and an
+			// absent reference all land here too, and each has its own named line above.
+			say(red('\nGATE FAILED — this run does not match the checked-in reference.'));
 			say(red('If the change is intentional, record it: yarn bench:accept --reason "<why>"'));
 		} else {
 			say(green('\nGate passed — every gated counter matches the reference.'));
@@ -468,6 +495,7 @@ async function main() {
 	}
 
 	process.exitCode = failed ? 1 : 0;
+	finishCleanly(process.exitCode);
 }
 
 main().catch((err) => {

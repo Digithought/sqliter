@@ -43,7 +43,7 @@ import { informationalNames, loadSuites, selectBenchmarks } from './lib/discover
 import { summarize, UNSTABLE_SPREAD, GATE_MIN_DELTA_PCT } from './lib/stats.mjs';
 import { compareRun, STATUS_ORDER } from './lib/compare.mjs';
 import { captureEnvironment, compareEnvironments, describeCheckout, describeEnvironment } from './lib/environment.mjs';
-import { COUNTER_CHANGES_SHOWN } from './lib/reference.mjs';
+import { COUNTER_CHANGES_SHOWN, formatChangeLines } from './lib/reference.mjs';
 import { sweepBenchTempDirs } from './lib/tempdir.mjs';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -451,24 +451,18 @@ function printCounterChanges(comparisons) {
 	say('engine did different work, not that it might have been slower). Not gated.');
 
 	for (const comparison of changed) {
-		say(`\n  ${cyan(comparison.fullName)} — ${comparison.counters.changes.length} count(s) differ`);
-		const pathWidth = Math.min(64, Math.max(...comparison.counters.changes.slice(0, COUNTER_CHANGES_SHOWN).map((c) => c.path.length)));
-		for (const change of comparison.counters.changes.slice(0, COUNTER_CHANGES_SHOWN)) {
-			say(`    ${change.path.padEnd(pathWidth)}  ${fmtCounterValue(change.before)} -> ${fmtCounterValue(change.after)}`);
-		}
-		const hidden = comparison.counters.changes.length - COUNTER_CHANGES_SHOWN;
-		if (hidden > 0) say(dim(`    … and ${hidden} more — the full list is in this run's results JSON under comparison`));
+		const changes = comparison.counters.changes;
+		say(`\n  ${cyan(comparison.fullName)} — ${changes.length} count(s) differ`);
+		// One renderer, shared with the gate's report, so a counter difference reads the
+		// same wherever it is met. Only the pointer to the uncapped list differs.
+		const lines = formatChangeLines(changes, { more: `the full list is in this run's results JSON under comparison` });
+		const elided = changes.length > COUNTER_CHANGES_SHOWN;
+		lines.forEach((line, i) => say(`    ${elided && i === lines.length - 1 ? dim(line) : line}`));
 	}
 
 	for (const comparison of dropped) {
 		say(`\n  ${yellow(comparison.fullName)} — the baseline reported counters and this run did not`);
 	}
-}
-
-/** A counter value, or `absent` where the path exists on only one side. `null` prints
- * as a word rather than as a bare `null`, which reads like a recorded value of null. */
-function fmtCounterValue(value) {
-	return value === null ? 'absent' : String(value);
 }
 
 /** The trailing word that says what the comparison decided, for the verdicts a

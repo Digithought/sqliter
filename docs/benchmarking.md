@@ -818,8 +818,13 @@ own environment before loading suites, and says in its report when it was set.
 **Outcomes.** `differs` (a gated count changed), `missing` (in the reference, produced no
 result this run) and `failed` (threw during the pass) fail the run; `match`, `new` (ran,
 not yet in the reference), `ungated`, `skipped` and `filtered` do not. A suite that
-produced counter blocks but has no reference file fails, as does a reference file naming a
-suite that no longer exists — deleting `bench/reference/` cannot make the gate green. Each
+produced counter blocks but has no reference file fails — as does one whose reference file
+exists but records *no benchmarks*, so emptying a file cannot turn a suite into a set of
+benign `new` rows — as does a reference file naming a suite that no longer exists.
+Deleting or emptying `bench/reference/` cannot make the gate green. (Deleting *part* of a
+file still can: from inside one run a removed expectation and a genuinely new benchmark are
+the same observation, so the defense there is that `bench/reference/` is checked in and its
+diff gets reviewed.) Each
 `differs` benchmark prints every changed path as `path  before -> after`, capped at 12
 lines per benchmark with the elision announced, and uncapped under `--json` (outcome object
 on stdout, human report on stderr — the same routing as `yarn bench`).
