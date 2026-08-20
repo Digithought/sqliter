@@ -447,9 +447,104 @@ design, then hit its token budget before writing code. Nothing below needs re-ch
 - package.json: `"bench:gate": "node bench/gate.mjs"`,
   `"bench:accept": "node bench/gate.mjs --accept"`.
 
+# Session 3 learnings (investigation FINISHED — write code, run nothing exploratory)
+
+A third run re-read every file named above and hit its soft budget before writing code.
+All prior-session facts held up. Do **not** re-read `run.mjs`, `child.mjs`,
+`compare.mjs`, `discover.mjs`, `environment.mjs`, `counters.mjs`,
+`leveldb-backend.mjs`, `tsconfig.test.json`, `package.json`, `docs/benchmarking.md`,
+or `test/bench-comparison.spec.ts` beyond what an edit itself requires — start with
+`Write` on `bench/lib/reference.mjs`.
+
+## New verified facts
+
+- `bench/lib/store-counters.mjs:47` statically imports `../../dist/src/index.js` (the
+  ENGINE dist — the lazy import discipline is only about `@quereus/store`). So
+  `gate.mjs` importing `LEVELDB_ENV_VAR` from `leveldb-backend.mjs` (whose import chain
+  reaches store-counters) is fine in the parent, but the gate needs
+  `packages/quereus/dist` built — the same requirement `yarn bench` already has.
+- `tempdir.mjs` imports only node builtins. Root `.gitignore` re-confirmed: only
+  `packages/quereus/bench/results/` (line 26).
+- `counters.mjs`'s existing `dist/` references are JSDoc type-imports only — adding
+  `runCountersPass` there keeps it runtime-import-free as planned.
+
+## Two design calls made this session (adopt; flag both in the review handoff)
+
+1. **Eligibility test-bullet ambiguity resolved in favor of the per-plan rule.** The
+   test list's "two spread across different nested plans … is not" reads ambiguously;
+   the normative rule is stated twice in this ticket ("two or more in any ONE plan ⇒
+   ungated") and matches the mechanism — the quickpick budget engages only on 2+ join
+   nodes within one plan. So: two plans carrying one join node each ⇒ **gated**. Write
+   that test asserting `gated: true`, with a comment explaining why.
+2. **Accept must not destroy a reference when rows skip.** Gap in the settled design:
+   with `@quereus/store` dist unbuilt, every store-suite row SKIPS under `--accept`;
+   `buildReferenceBenchmarks` would return an empty map and `nextReference` would
+   rewrite `store.json` to empty — silently deleting all expectations. Close it with a
+   pure, tested `validateAcceptAfterPass(measured)` in `reference.mjs`, where
+   `measured = [{suiteName, rows, previous}]`: refuse when (a) any row failed (already
+   settled), or (b) any SKIPPED row's name has an entry in that suite's previous
+   reference — message names the benchmark, the skip reason, and the fix (usually
+   `yarn build`). LevelDB rows never have reference entries, so they skip freely.
+   Also: run the orphan-reference check (reference file whose name matches no loaded
+   suite) BEFORE the ~42 s pass in accept mode and refuse (a human deletes the file);
+   gate mode reports orphans at the end and fails.
+
+## Settled gate.mjs driving loop (beyond session 2)
+
+- Iterate ALL loaded suites; a suite is in scope when it has selected counter-declaring
+  rows OR a reference file exists. Per suite:
+  - no reference + ≥1 counter block produced → add to `missing_references` (fails);
+    still classify rows against `{}` so blocks read `new` and skips are named.
+  - no reference + rows all skipped/empty → classify (skips named) or skip entirely
+    when there are zero rows.
+  - reference + zero selected rows → classify with empty rows: filter active →
+    entries `filtered`; no filter → `missing` (correct signal for a benchmark whose
+    `counters()` was deleted).
+- `listReferenceFiles()` = readdir of `bench/reference/`, ENOENT → `[]` (then every
+  producing suite lands in missing_references — deleting the dir cannot go green).
+- Per-benchmark pass (`runOne`): phase tracking `skip → setup → counters → teardown`;
+  best-effort teardown on failure EXCEPT when the failure was in phase `skip` (nothing
+  built yet — `child.mjs` precedent); progress line per benchmark with per-bench ms.
+- `--json` object: `{ mode, timestamp, environment, leveldb_env_cleared, filter,
+  suites: {name: {reference: path|null, outcomes: [...]}}, counts, missing_references,
+  orphan_references, failed }`. Human lines to stderr via run.mjs's
+  `humanStream`/`useColor` pattern (copy the tiny `ansi` helpers).
+- Outcome record shape: `{name, fullName, outcome, note: string|null,
+  changes: CounterChange[], ungatedReason?}` — uniform, `changes: []` default.
+- Accept printing: per suite, union of old/new benchmark names — added / removed /
+  changed (via `diffCounters(old.counters, new.counters)` + `formatChangeLines`);
+  unchanged suite prints "unchanged — file left byte-identical".
+
+## Settled validation sequence (run in this order, foreground, no redirection)
+
+1. `yarn build` from repo root (incremental; store + engine dist must be current).
+2. Targeted spec while iterating:
+   `yarn workspace @quereus/quereus test:single packages/quereus/test/bench-gate.spec.ts`
+   (test:single cd's to repo root itself — run it from anywhere).
+3. `yarn workspace @quereus/quereus lint` — the tsc test pass is what checks
+   `reference.mjs`'s strict JSDoc.
+4. `yarn workspace @quereus/quereus bench:accept --allow-dirty --reason "initial reference set (bench-gate-reference ticket)"`
+   — the tree is necessarily dirty mid-ticket; `--allow-dirty` exists for exactly this.
+   Note in the handoff: the recorded provenance commit predates the harness edits, which
+   touch no engine code, so the counts are still that commit's counts.
+5. `yarn workspace @quereus/quereus bench:gate` → expect exit 0 (~42 s).
+6. Sensitivity check, cheap loop: one-line edit to a planner rule (e.g. make an
+   aggregate/subquery rule decline), `yarn workspace @quereus/quereus build`, then
+   `yarn bench:gate --filter planner` (planner suite is ~0 s) → expect named readable
+   diff + exit 1. Revert the edit, rebuild, run full `bench:gate` once more → exit 0.
+7. Full `yarn workspace @quereus/quereus test` once at the end.
+
+## Docs edits beyond the new section
+
+`docs/benchmarking.md` has three now-stale statements to update alongside the new
+*Regression gate* section: the counter-portability paragraph ending "there is no gate
+on them"; the `yarn check` paragraph's "the regression gate planned on top of it"; and
+`compare.mjs`'s comment at the `counterChanges` return ("Failing a run over a changed
+count is the regression-gate ticket's job") — point all three at the gate.
+
 ## TODO
 
-- Add `bench/lib/reference.mjs`: reference file read/write (sorted keys, tab-indented, atomic write), provenance capture, the join-node eligibility rule, outcome classification, and the exit rule — as pure functions over plain objects wherever the input allows
+- Add `bench/lib/reference.mjs`: reference file read/write (sorted keys, tab-indented, atomic write), provenance capture, the join-node eligibility rule, outcome classification, `validateAcceptAfterPass`, and the exit rule — as pure functions over plain objects wherever the input allows
 - Add `bench/gate.mjs`: argument parsing (`--filter`, `--json`, `--accept`, `--reason`, `--allow-dirty`), the single-process counters pass, the report, the exit code; delete `QUEREUS_BENCH_LEVELDB` from `process.env` before loading suites and say so when it was set
 - Run `teardown` even when a phase throws; record the failure and continue the pass
 - Add `bench:gate` and `bench:accept` to `packages/quereus/package.json`
