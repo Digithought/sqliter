@@ -296,6 +296,77 @@ statement of how this relates to `test/performance-sentinels.spec.ts` — all in
 follow-on ticket `bench-gate-ratios-and-check`. Introducing a continuous-integration
 service: this project deliberately has none.
 
+# Prior session learnings (investigation only — no code was written)
+
+A previous agent run hit its token budget during discovery. Everything below was read
+and verified in that session; trust it and skip straight to writing code.
+
+## Census confirmed against the suites as they stand
+
+Counter-declaring benchmarks: `execution` 15 workloads x 3 backends = 45, `mutation`
+4 x 3 = 12, `planner` 4, `store` hot-path rows 14 — 75 total, of which the 19
+`@store-leveldb` rows (15 execution + 4 mutation) always skip once the gate deletes
+`QUEREUS_BENCH_LEVELDB`. 56 run, matching the ticket's measured figures. `parser` and
+the `store` key-encoding / leveldb-read-cost rows declare no `counters()` and are out
+of scope entirely.
+
+## The pass shape is settled: skip → setup → counters → teardown, never `fn`
+
+Verified in every suite: no `counters()` depends on the timed loop having run.
+Execution memory rows snapshot against the `setup`-built database; counting backends
+(`store-mem`) build their own second database *inside* `counters()`; mutation
+`own-database` rows open their own; planner uses the `setup` database; store hot-path
+rows build a counting database inside `counters()`. So the gate runs each benchmark's
+`skip()` → `setup()` → `counters()` → `teardown()` in one process and never calls `fn`.
+Copy `child.mjs`'s phase tracking (`let phase = 'setup'` … reassigned per step) and its
+best-effort teardown-after-failure block, and its `runCountersPass` JSON round-trip
+(`JSON.parse(JSON.stringify(raw))` + plain-object validation) so gate blocks are
+byte-identical to what `yarn bench` records.
+
+## Decisions resolved during investigation (adopt unless contradicted)
+
+- **The 12-line elision constant**: `COUNTER_CHANGES_SHOWN = 12` is module-local in
+  `run.mjs`. Export it from `reference.mjs` and change `run.mjs` to import it — one
+  line, keeps the two literally one constant.
+- **skip beats missing**: a reference entry whose benchmark *skipped* this run
+  classifies `skipped`, never `missing` — same precedent as `compareRun` adding to
+  `seen` before the skip check. The report still names every skipped row and reason.
+  (Consequence: an unbuilt store package makes the store-suite rows skip and the gate
+  passes; the header's skip count is the visibility.)
+- **`--accept` refuses `--filter`** with a usage error: accept always re-measures
+  everything (~42 s), avoiding partial-reference merge logic and half-written files.
+  A rename/removal is then handled naturally by the full re-measure.
+- **Accept on `dirty === 'unknown'`** (outside a git checkout): allow — provenance
+  records `unknown`/omitted honestly. Refuse only `dirty === true` without
+  `--allow-dirty`.
+- **The reference holds only benchmarks that produced counter blocks** — skipped rows
+  are never recorded, so the LevelDB rows never appear in any reference file.
+
+## Verified environment facts
+
+- Root `.gitignore` line 26 excludes only `packages/quereus/bench/results/` —
+  `bench/reference/` needs no ignore change (confirmed, as the ticket said).
+- `tsconfig.test.json` `include` already carries `bench/lib/**/*` — `reference.mjs`
+  lands inside the type pass with no config change; `bench/gate.mjs` stays outside.
+- Test style to copy: `test/bench-comparison.spec.ts` — chai `expect`, plain-object
+  fixtures, direct `.mjs` imports, small builder helpers (`entry`, `row`,
+  `counterBlock`). Its `counterBlock` fixture shows the `WorkCounterSnapshot` shape:
+  `{ plan: { nodeCount, nodeTypes }, instructions: [...], tables: {...}, totals: {...} }`.
+
+## The ONE unresolved item — check before writing the eligibility walk
+
+The exact return shape of `Statement.getPlanShape()` (planner suite's whole counter
+block) was NOT yet confirmed. If `PlanShape` is `{ nodeCount, nodeTypes }` at the
+ROOT — i.e. `nodeTypes` NOT nested under a `plan` key — then a walk that looks only
+for `plan.nodeTypes` pairs would silently never examine planner-suite blocks (they
+would all read as "no plan ⇒ gated", which happens to be the right answer today but
+for the wrong reason, and would go quietly wrong the day a planner row gains a
+three-way join). Grep `getPlanShape`/`PlanShape` in `src/` first, then write the walk
+as: any object member whose value is an object containing a `nodeTypes`
+plain-object-of-numbers counts as ONE plan (this catches both `plan: {nodeTypes}`
+nested at any depth and a bare `PlanShape` root). Sum `/Join$/` keys per plan; two or
+more in any one plan ⇒ ungated.
+
 ## TODO
 
 - Add `bench/lib/reference.mjs`: reference file read/write (sorted keys, tab-indented, atomic write), provenance capture, the join-node eligibility rule, outcome classification, and the exit rule — as pure functions over plain objects wherever the input allows
