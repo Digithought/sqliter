@@ -1,0 +1,4664 @@
+{
+	"suite": "store",
+	"accepted": {
+		"by": "Nathan Allan <nate@digithought.com>",
+		"commit": "a8999c107",
+		"date": "2026-08-20T02:59:19.630Z",
+		"node": "v24.2.0",
+		"platform": "win32",
+		"reason": "initial reference set (bench-gate-reference ticket)"
+	},
+	"benchmarks": {
+		"catalog-rehydrate-54t": {
+			"counters": {
+				"rehydrated": {
+					"errors": 0,
+					"indexes": 9,
+					"materializedViews": 0,
+					"tables": 54,
+					"views": 14
+				},
+				"store": {
+					"__catalog__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 68,
+						"singleGets": 1
+					},
+					"__stats__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 54
+					},
+					"main.tbl_0": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_0_idx_idx_tbl_0_name": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_1": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_10": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_11": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_12": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_12_idx_idx_tbl_12_name": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_13": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_14": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_15": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_16": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_17": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_18": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_18_idx_idx_tbl_18_name": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_19": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_2": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_20": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_21": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_22": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_23": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_24": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_24_idx_idx_tbl_24_name": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_25": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_26": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_27": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_28": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_29": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_3": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_30": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_30_idx_idx_tbl_30_name": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_31": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_32": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_33": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_34": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_35": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_36": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_36_idx_idx_tbl_36_name": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_37": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_38": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_39": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_4": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_40": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_41": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_42": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_42_idx_idx_tbl_42_name": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_43": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_44": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_45": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_46": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_47": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_48": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_48_idx_idx_tbl_48_name": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_49": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_5": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_50": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_51": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_52": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_53": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_6": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_6_idx_idx_tbl_6_name": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_7": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_8": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.tbl_9": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					}
+				}
+			},
+			"gated": true
+		},
+		"commit-update-1": {
+			"counters": {
+				"engine": {
+					"begin": {
+						"instructions": [
+							{
+								"executions": 1,
+								"in": 0,
+								"key": "r#0",
+								"nodeType": "Transaction",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#1",
+								"nodeType": "Block",
+								"out": 1
+							}
+						],
+						"plan": {
+							"nodeCount": 2,
+							"nodeTypes": {
+								"Block": 1,
+								"Transaction": 1
+							}
+						},
+						"tables": {},
+						"totals": {
+							"instructionExecutions": 2,
+							"queryCalls": 0,
+							"rowsOut": 2,
+							"rowsScanned": 0,
+							"updateCalls": 0
+						}
+					},
+					"commit": {
+						"instructions": [
+							{
+								"executions": 1,
+								"in": 0,
+								"key": "r#0",
+								"nodeType": "Transaction",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#1",
+								"nodeType": "Block",
+								"out": 1
+							}
+						],
+						"plan": {
+							"nodeCount": 2,
+							"nodeTypes": {
+								"Block": 1,
+								"Transaction": 1
+							}
+						},
+						"tables": {},
+						"totals": {
+							"instructionExecutions": 2,
+							"queryCalls": 0,
+							"rowsOut": 2,
+							"rowsScanned": 0,
+							"updateCalls": 0
+						}
+					},
+					"update": {
+						"instructions": [
+							{
+								"executions": 1,
+								"in": 0,
+								"key": "r#0",
+								"nodeType": "Literal",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#1",
+								"nodeType": "IndexSeek",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 0,
+								"key": "r#2",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 2,
+								"key": "r#3",
+								"nodeType": "Update",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#4",
+								"nodeType": "ConstraintCheck",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#5",
+								"nodeType": "UpdateExecutor",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#6",
+								"nodeType": "Sink",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#7",
+								"nodeType": "Block",
+								"out": 1
+							}
+						],
+						"plan": {
+							"nodeCount": 9,
+							"nodeTypes": {
+								"Block": 1,
+								"ConstraintCheck": 1,
+								"IndexSeek": 1,
+								"Literal": 2,
+								"Sink": 1,
+								"TableReference": 1,
+								"Update": 1,
+								"UpdateExecutor": 1
+							}
+						},
+						"tables": {
+							"main.bench_t": {
+								"queryCalls": 1,
+								"rowsScanned": 1,
+								"updateCalls": 1
+							}
+						},
+						"totals": {
+							"instructionExecutions": 8,
+							"queryCalls": 1,
+							"rowsOut": 8,
+							"rowsScanned": 1,
+							"updateCalls": 1
+						}
+					}
+				},
+				"store": {
+					"__catalog__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"__stats__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_t": {
+						"batchOps": 1,
+						"batchWrites": 1,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 1,
+						"singleGets": 2
+					},
+					"main.bench_t_idx_bench_t_val": {
+						"batchOps": 2,
+						"batchWrites": 1,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					}
+				}
+			},
+			"gated": true
+		},
+		"commit-update-10": {
+			"counters": {
+				"engine": {
+					"begin": {
+						"instructions": [
+							{
+								"executions": 1,
+								"in": 0,
+								"key": "r#0",
+								"nodeType": "Transaction",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#1",
+								"nodeType": "Block",
+								"out": 1
+							}
+						],
+						"plan": {
+							"nodeCount": 2,
+							"nodeTypes": {
+								"Block": 1,
+								"Transaction": 1
+							}
+						},
+						"tables": {},
+						"totals": {
+							"instructionExecutions": 2,
+							"queryCalls": 0,
+							"rowsOut": 2,
+							"rowsScanned": 0,
+							"updateCalls": 0
+						}
+					},
+					"commit": {
+						"instructions": [
+							{
+								"executions": 1,
+								"in": 0,
+								"key": "r#0",
+								"nodeType": "Transaction",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#1",
+								"nodeType": "Block",
+								"out": 1
+							}
+						],
+						"plan": {
+							"nodeCount": 2,
+							"nodeTypes": {
+								"Block": 1,
+								"Transaction": 1
+							}
+						},
+						"tables": {},
+						"totals": {
+							"instructionExecutions": 2,
+							"queryCalls": 0,
+							"rowsOut": 2,
+							"rowsScanned": 0,
+							"updateCalls": 0
+						}
+					},
+					"update": {
+						"instructions": [
+							{
+								"executions": 1,
+								"in": 0,
+								"key": "r#0",
+								"nodeType": "Literal",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#1",
+								"nodeType": "IndexSeek",
+								"out": 10
+							},
+							{
+								"executions": 1,
+								"in": 0,
+								"key": "r#2",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 2,
+								"key": "r#3",
+								"nodeType": "Update",
+								"out": 10
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#4",
+								"nodeType": "ConstraintCheck",
+								"out": 10
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#5",
+								"nodeType": "UpdateExecutor",
+								"out": 10
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#6",
+								"nodeType": "Sink",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#7",
+								"nodeType": "Block",
+								"out": 1
+							}
+						],
+						"plan": {
+							"nodeCount": 9,
+							"nodeTypes": {
+								"Block": 1,
+								"ConstraintCheck": 1,
+								"IndexSeek": 1,
+								"Literal": 2,
+								"Sink": 1,
+								"TableReference": 1,
+								"Update": 1,
+								"UpdateExecutor": 1
+							}
+						},
+						"tables": {
+							"main.bench_t": {
+								"queryCalls": 1,
+								"rowsScanned": 10,
+								"updateCalls": 10
+							}
+						},
+						"totals": {
+							"instructionExecutions": 8,
+							"queryCalls": 1,
+							"rowsOut": 44,
+							"rowsScanned": 10,
+							"updateCalls": 10
+						}
+					}
+				},
+				"store": {
+					"__catalog__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"__stats__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_t": {
+						"batchOps": 10,
+						"batchWrites": 1,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 10,
+						"singleGets": 20
+					},
+					"main.bench_t_idx_bench_t_val": {
+						"batchOps": 20,
+						"batchWrites": 1,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					}
+				}
+			},
+			"gated": true
+		},
+		"commit-update-100": {
+			"counters": {
+				"engine": {
+					"begin": {
+						"instructions": [
+							{
+								"executions": 1,
+								"in": 0,
+								"key": "r#0",
+								"nodeType": "Transaction",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#1",
+								"nodeType": "Block",
+								"out": 1
+							}
+						],
+						"plan": {
+							"nodeCount": 2,
+							"nodeTypes": {
+								"Block": 1,
+								"Transaction": 1
+							}
+						},
+						"tables": {},
+						"totals": {
+							"instructionExecutions": 2,
+							"queryCalls": 0,
+							"rowsOut": 2,
+							"rowsScanned": 0,
+							"updateCalls": 0
+						}
+					},
+					"commit": {
+						"instructions": [
+							{
+								"executions": 1,
+								"in": 0,
+								"key": "r#0",
+								"nodeType": "Transaction",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#1",
+								"nodeType": "Block",
+								"out": 1
+							}
+						],
+						"plan": {
+							"nodeCount": 2,
+							"nodeTypes": {
+								"Block": 1,
+								"Transaction": 1
+							}
+						},
+						"tables": {},
+						"totals": {
+							"instructionExecutions": 2,
+							"queryCalls": 0,
+							"rowsOut": 2,
+							"rowsScanned": 0,
+							"updateCalls": 0
+						}
+					},
+					"update": {
+						"instructions": [
+							{
+								"executions": 1,
+								"in": 0,
+								"key": "r#0",
+								"nodeType": "Literal",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#1",
+								"nodeType": "IndexSeek",
+								"out": 100
+							},
+							{
+								"executions": 1,
+								"in": 0,
+								"key": "r#2",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 2,
+								"key": "r#3",
+								"nodeType": "Update",
+								"out": 100
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#4",
+								"nodeType": "ConstraintCheck",
+								"out": 100
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#5",
+								"nodeType": "UpdateExecutor",
+								"out": 100
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#6",
+								"nodeType": "Sink",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#7",
+								"nodeType": "Block",
+								"out": 1
+							}
+						],
+						"plan": {
+							"nodeCount": 9,
+							"nodeTypes": {
+								"Block": 1,
+								"ConstraintCheck": 1,
+								"IndexSeek": 1,
+								"Literal": 2,
+								"Sink": 1,
+								"TableReference": 1,
+								"Update": 1,
+								"UpdateExecutor": 1
+							}
+						},
+						"tables": {
+							"main.bench_t": {
+								"queryCalls": 1,
+								"rowsScanned": 100,
+								"updateCalls": 100
+							}
+						},
+						"totals": {
+							"instructionExecutions": 8,
+							"queryCalls": 1,
+							"rowsOut": 404,
+							"rowsScanned": 100,
+							"updateCalls": 100
+						}
+					}
+				},
+				"store": {
+					"__catalog__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"__stats__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_t": {
+						"batchOps": 100,
+						"batchWrites": 1,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 100,
+						"singleGets": 200
+					},
+					"main.bench_t_idx_bench_t_val": {
+						"batchOps": 200,
+						"batchWrites": 1,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					}
+				}
+			},
+			"gated": true
+		},
+		"commit-update-1000": {
+			"counters": {
+				"engine": {
+					"begin": {
+						"instructions": [
+							{
+								"executions": 1,
+								"in": 0,
+								"key": "r#0",
+								"nodeType": "Transaction",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#1",
+								"nodeType": "Block",
+								"out": 1
+							}
+						],
+						"plan": {
+							"nodeCount": 2,
+							"nodeTypes": {
+								"Block": 1,
+								"Transaction": 1
+							}
+						},
+						"tables": {},
+						"totals": {
+							"instructionExecutions": 2,
+							"queryCalls": 0,
+							"rowsOut": 2,
+							"rowsScanned": 0,
+							"updateCalls": 0
+						}
+					},
+					"commit": {
+						"instructions": [
+							{
+								"executions": 1,
+								"in": 0,
+								"key": "r#0",
+								"nodeType": "Transaction",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#1",
+								"nodeType": "Block",
+								"out": 1
+							}
+						],
+						"plan": {
+							"nodeCount": 2,
+							"nodeTypes": {
+								"Block": 1,
+								"Transaction": 1
+							}
+						},
+						"tables": {},
+						"totals": {
+							"instructionExecutions": 2,
+							"queryCalls": 0,
+							"rowsOut": 2,
+							"rowsScanned": 0,
+							"updateCalls": 0
+						}
+					},
+					"update": {
+						"instructions": [
+							{
+								"executions": 1,
+								"in": 0,
+								"key": "r#0",
+								"nodeType": "Literal",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#1",
+								"nodeType": "IndexSeek",
+								"out": 1000
+							},
+							{
+								"executions": 1,
+								"in": 0,
+								"key": "r#2",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 2,
+								"key": "r#3",
+								"nodeType": "Update",
+								"out": 1000
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#4",
+								"nodeType": "ConstraintCheck",
+								"out": 1000
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#5",
+								"nodeType": "UpdateExecutor",
+								"out": 1000
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#6",
+								"nodeType": "Sink",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#7",
+								"nodeType": "Block",
+								"out": 1
+							}
+						],
+						"plan": {
+							"nodeCount": 9,
+							"nodeTypes": {
+								"Block": 1,
+								"ConstraintCheck": 1,
+								"IndexSeek": 1,
+								"Literal": 2,
+								"Sink": 1,
+								"TableReference": 1,
+								"Update": 1,
+								"UpdateExecutor": 1
+							}
+						},
+						"tables": {
+							"main.bench_t": {
+								"queryCalls": 1,
+								"rowsScanned": 1000,
+								"updateCalls": 1000
+							}
+						},
+						"totals": {
+							"instructionExecutions": 8,
+							"queryCalls": 1,
+							"rowsOut": 4004,
+							"rowsScanned": 1000,
+							"updateCalls": 1000
+						}
+					}
+				},
+				"store": {
+					"__catalog__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"__stats__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_t": {
+						"batchOps": 1000,
+						"batchWrites": 1,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 1000,
+						"singleGets": 2000
+					},
+					"main.bench_t_idx_bench_t_val": {
+						"batchOps": 2000,
+						"batchWrites": 1,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					}
+				}
+			},
+			"gated": true
+		},
+		"index-build-5k": {
+			"counters": {
+				"store": {
+					"__catalog__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 1,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 1
+					},
+					"__stats__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_i": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 5000,
+						"singleGets": 0
+					},
+					"main.bench_i_idx_bench_i_val": {
+						"batchOps": 5000,
+						"batchWrites": 1,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					}
+				}
+			},
+			"gated": true
+		},
+		"index-resolve-four-batches": {
+			"counters": {
+				"engine": {
+					"instructions": [
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#0",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#1",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 2,
+							"key": "r#2",
+							"nodeType": "IndexSeek",
+							"out": 1024
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#3",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 2,
+							"key": "r#4",
+							"nodeType": "Project",
+							"out": 1024
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#5",
+							"nodeType": "Block",
+							"out": 1024
+						}
+					],
+					"plan": {
+						"nodeCount": 7,
+						"nodeTypes": {
+							"Block": 1,
+							"ColumnReference": 1,
+							"IndexSeek": 1,
+							"Literal": 2,
+							"Project": 1,
+							"TableReference": 1
+						}
+					},
+					"tables": {
+						"main.bench_t": {
+							"queryCalls": 1,
+							"rowsScanned": 1024,
+							"updateCalls": 0
+						}
+					},
+					"totals": {
+						"instructionExecutions": 6,
+						"queryCalls": 1,
+						"rowsOut": 3075,
+						"rowsScanned": 1024,
+						"updateCalls": 0
+					}
+				},
+				"store": {
+					"__catalog__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"__stats__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_t": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 4,
+						"getManyKeys": 1024,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_t_idx_bench_t_val": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 1024,
+						"singleGets": 0
+					}
+				}
+			},
+			"gated": true
+		},
+		"index-resolve-one-batch": {
+			"counters": {
+				"engine": {
+					"instructions": [
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#0",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#1",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 2,
+							"key": "r#2",
+							"nodeType": "IndexSeek",
+							"out": 256
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#3",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 2,
+							"key": "r#4",
+							"nodeType": "Project",
+							"out": 256
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#5",
+							"nodeType": "Block",
+							"out": 256
+						}
+					],
+					"plan": {
+						"nodeCount": 7,
+						"nodeTypes": {
+							"Block": 1,
+							"ColumnReference": 1,
+							"IndexSeek": 1,
+							"Literal": 2,
+							"Project": 1,
+							"TableReference": 1
+						}
+					},
+					"tables": {
+						"main.bench_t": {
+							"queryCalls": 1,
+							"rowsScanned": 256,
+							"updateCalls": 0
+						}
+					},
+					"totals": {
+						"instructionExecutions": 6,
+						"queryCalls": 1,
+						"rowsOut": 771,
+						"rowsScanned": 256,
+						"updateCalls": 0
+					}
+				},
+				"store": {
+					"__catalog__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"__stats__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_t": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 1,
+						"getManyKeys": 256,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_t_idx_bench_t_val": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 256,
+						"singleGets": 0
+					}
+				}
+			},
+			"gated": true
+		},
+		"index-resolve-quarter-batch": {
+			"counters": {
+				"engine": {
+					"instructions": [
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#0",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#1",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 2,
+							"key": "r#2",
+							"nodeType": "IndexSeek",
+							"out": 64
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#3",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 2,
+							"key": "r#4",
+							"nodeType": "Project",
+							"out": 64
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#5",
+							"nodeType": "Block",
+							"out": 64
+						}
+					],
+					"plan": {
+						"nodeCount": 7,
+						"nodeTypes": {
+							"Block": 1,
+							"ColumnReference": 1,
+							"IndexSeek": 1,
+							"Literal": 2,
+							"Project": 1,
+							"TableReference": 1
+						}
+					},
+					"tables": {
+						"main.bench_t": {
+							"queryCalls": 1,
+							"rowsScanned": 64,
+							"updateCalls": 0
+						}
+					},
+					"totals": {
+						"instructionExecutions": 6,
+						"queryCalls": 1,
+						"rowsOut": 195,
+						"rowsScanned": 64,
+						"updateCalls": 0
+					}
+				},
+				"store": {
+					"__catalog__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"__stats__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_t": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 1,
+						"getManyKeys": 64,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_t_idx_bench_t_val": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 64,
+						"singleGets": 0
+					}
+				}
+			},
+			"gated": true
+		},
+		"index-resolve-two-batches": {
+			"counters": {
+				"engine": {
+					"instructions": [
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#0",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#1",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 2,
+							"key": "r#2",
+							"nodeType": "IndexSeek",
+							"out": 512
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#3",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 2,
+							"key": "r#4",
+							"nodeType": "Project",
+							"out": 512
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#5",
+							"nodeType": "Block",
+							"out": 512
+						}
+					],
+					"plan": {
+						"nodeCount": 7,
+						"nodeTypes": {
+							"Block": 1,
+							"ColumnReference": 1,
+							"IndexSeek": 1,
+							"Literal": 2,
+							"Project": 1,
+							"TableReference": 1
+						}
+					},
+					"tables": {
+						"main.bench_t": {
+							"queryCalls": 1,
+							"rowsScanned": 512,
+							"updateCalls": 0
+						}
+					},
+					"totals": {
+						"instructionExecutions": 6,
+						"queryCalls": 1,
+						"rowsOut": 1539,
+						"rowsScanned": 512,
+						"updateCalls": 0
+					}
+				},
+				"store": {
+					"__catalog__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"__stats__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_t": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 2,
+						"getManyKeys": 512,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_t_idx_bench_t_val": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 512,
+						"singleGets": 0
+					}
+				}
+			},
+			"gated": true
+		},
+		"multi-seek-pk-10": {
+			"counters": {
+				"engine": {
+					"instructions": [
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#0",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#1",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#2",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#3",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#4",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#5",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#6",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#7",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#8",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#9",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 10,
+							"key": "r#10",
+							"nodeType": "IndexSeek",
+							"out": 10
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#11",
+							"nodeType": "Block",
+							"out": 10
+						}
+					],
+					"plan": {
+						"nodeCount": 13,
+						"nodeTypes": {
+							"Block": 1,
+							"IndexSeek": 1,
+							"Literal": 10,
+							"TableReference": 1
+						}
+					},
+					"tables": {
+						"main.bench_t": {
+							"queryCalls": 1,
+							"rowsScanned": 10,
+							"updateCalls": 0
+						}
+					},
+					"totals": {
+						"instructionExecutions": 12,
+						"queryCalls": 1,
+						"rowsOut": 30,
+						"rowsScanned": 10,
+						"updateCalls": 0
+					}
+				},
+				"store": {
+					"__catalog__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"__stats__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_t": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 1,
+						"getManyKeys": 10,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_t_idx_bench_t_val": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					}
+				}
+			},
+			"gated": true
+		},
+		"multi-seek-pk-over-batch": {
+			"counters": {
+				"engine": {
+					"instructions": [
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#0",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#1",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#2",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#3",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#4",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#5",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#6",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#7",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#8",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#9",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#10",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#11",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#12",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#13",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#14",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#15",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#16",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#17",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#18",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#19",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#20",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#21",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#22",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#23",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#24",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#25",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#26",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#27",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#28",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#29",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#30",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#31",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#32",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#33",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#34",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#35",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#36",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#37",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#38",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#39",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#40",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#41",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#42",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#43",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#44",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#45",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#46",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#47",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#48",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#49",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#50",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#51",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#52",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#53",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#54",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#55",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#56",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#57",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#58",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#59",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#60",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#61",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#62",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#63",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#64",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#65",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#66",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#67",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#68",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#69",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#70",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#71",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#72",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#73",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#74",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#75",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#76",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#77",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#78",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#79",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#80",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#81",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#82",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#83",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#84",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#85",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#86",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#87",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#88",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#89",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#90",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#91",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#92",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#93",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#94",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#95",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#96",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#97",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#98",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#99",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#100",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#101",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#102",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#103",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#104",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#105",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#106",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#107",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#108",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#109",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#110",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#111",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#112",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#113",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#114",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#115",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#116",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#117",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#118",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#119",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#120",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#121",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#122",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#123",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#124",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#125",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#126",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#127",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#128",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#129",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#130",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#131",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#132",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#133",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#134",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#135",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#136",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#137",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#138",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#139",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#140",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#141",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#142",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#143",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#144",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#145",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#146",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#147",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#148",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#149",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#150",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#151",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#152",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#153",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#154",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#155",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#156",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#157",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#158",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#159",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#160",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#161",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#162",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#163",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#164",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#165",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#166",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#167",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#168",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#169",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#170",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#171",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#172",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#173",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#174",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#175",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#176",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#177",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#178",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#179",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#180",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#181",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#182",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#183",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#184",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#185",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#186",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#187",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#188",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#189",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#190",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#191",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#192",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#193",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#194",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#195",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#196",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#197",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#198",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#199",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#200",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#201",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#202",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#203",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#204",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#205",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#206",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#207",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#208",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#209",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#210",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#211",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#212",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#213",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#214",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#215",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#216",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#217",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#218",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#219",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#220",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#221",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#222",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#223",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#224",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#225",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#226",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#227",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#228",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#229",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#230",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#231",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#232",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#233",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#234",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#235",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#236",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#237",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#238",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#239",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#240",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#241",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#242",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#243",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#244",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#245",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#246",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#247",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#248",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#249",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#250",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#251",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#252",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#253",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#254",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#255",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#256",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#257",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#258",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#259",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#260",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#261",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#262",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#263",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#264",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#265",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#266",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#267",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#268",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#269",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#270",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#271",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#272",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#273",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#274",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#275",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#276",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#277",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#278",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#279",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#280",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#281",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#282",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#283",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#284",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#285",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#286",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#287",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#288",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#289",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#290",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#291",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#292",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#293",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#294",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#295",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#296",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#297",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#298",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#299",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#300",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#301",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#302",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#303",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#304",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#305",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#306",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#307",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#308",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#309",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#310",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#311",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#312",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#313",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#314",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#315",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#316",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#317",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#318",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#319",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 320,
+							"key": "r#320",
+							"nodeType": "IndexSeek",
+							"out": 320
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#321",
+							"nodeType": "Block",
+							"out": 320
+						}
+					],
+					"plan": {
+						"nodeCount": 323,
+						"nodeTypes": {
+							"Block": 1,
+							"IndexSeek": 1,
+							"Literal": 320,
+							"TableReference": 1
+						}
+					},
+					"tables": {
+						"main.bench_t": {
+							"queryCalls": 1,
+							"rowsScanned": 320,
+							"updateCalls": 0
+						}
+					},
+					"totals": {
+						"instructionExecutions": 322,
+						"queryCalls": 1,
+						"rowsOut": 960,
+						"rowsScanned": 320,
+						"updateCalls": 0
+					}
+				},
+				"store": {
+					"__catalog__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"__stats__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_t": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 2,
+						"getManyKeys": 320,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_t_idx_bench_t_val": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					}
+				}
+			},
+			"gated": true
+		},
+		"point-read-pk": {
+			"counters": {
+				"engine": {
+					"instructions": [
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#0",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#1",
+							"nodeType": "IndexSeek",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#2",
+							"nodeType": "Block",
+							"out": 1
+						}
+					],
+					"plan": {
+						"nodeCount": 4,
+						"nodeTypes": {
+							"Block": 1,
+							"IndexSeek": 1,
+							"Literal": 1,
+							"TableReference": 1
+						}
+					},
+					"tables": {
+						"main.bench_t": {
+							"queryCalls": 1,
+							"rowsScanned": 1,
+							"updateCalls": 0
+						}
+					},
+					"totals": {
+						"instructionExecutions": 3,
+						"queryCalls": 1,
+						"rowsOut": 3,
+						"rowsScanned": 1,
+						"updateCalls": 0
+					}
+				},
+				"store": {
+					"__catalog__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"__stats__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_t": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 1
+					},
+					"main.bench_t_idx_bench_t_val": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					}
+				}
+			},
+			"gated": true
+		},
+		"scan-10k": {
+			"counters": {
+				"engine": {
+					"instructions": [
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#0",
+							"nodeType": "IndexScan",
+							"out": 10000
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#1",
+							"nodeType": "Block",
+							"out": 10000
+						}
+					],
+					"plan": {
+						"nodeCount": 3,
+						"nodeTypes": {
+							"Block": 1,
+							"IndexScan": 1,
+							"TableReference": 1
+						}
+					},
+					"tables": {
+						"main.bench_t": {
+							"queryCalls": 1,
+							"rowsScanned": 10000,
+							"updateCalls": 0
+						}
+					},
+					"totals": {
+						"instructionExecutions": 2,
+						"queryCalls": 1,
+						"rowsOut": 20000,
+						"rowsScanned": 10000,
+						"updateCalls": 0
+					}
+				},
+				"store": {
+					"__catalog__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"__stats__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_t": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 10000,
+						"singleGets": 0
+					},
+					"main.bench_t_idx_bench_t_val": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					}
+				}
+			},
+			"gated": true
+		}
+	}
+}

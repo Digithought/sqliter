@@ -70,6 +70,8 @@
     "typecheck": "tsc --noEmit",
     "bench": "node bench/run.mjs",
     "bench:leveldb": "QUEREUS_BENCH_LEVELDB=1 node bench/run.mjs",
+    "bench:gate": "node bench/gate.mjs",
+    "bench:accept": "node bench/gate.mjs --accept",
     "mutation:subsystem": "node mutation-subsystem.mjs"
   },
   "devDependencies": {

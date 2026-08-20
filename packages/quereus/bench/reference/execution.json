@@ -1,0 +1,2605 @@
+{
+	"suite": "execution",
+	"accepted": {
+		"by": "Nathan Allan <nate@digithought.com>",
+		"commit": "a8999c107",
+		"date": "2026-08-20T02:59:19.630Z",
+		"node": "v24.2.0",
+		"platform": "win32",
+		"reason": "initial reference set (bench-gate-reference ticket)"
+	},
+	"benchmarks": {
+		"correlated-subquery": {
+			"counters": {
+				"instructions": [
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#0",
+						"nodeType": "Literal",
+						"out": 1
+					},
+					{
+						"executions": 1,
+						"in": 1,
+						"key": "r#1",
+						"nodeType": "IndexSeek",
+						"out": 100
+					},
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#2",
+						"nodeType": "IndexScan",
+						"out": 10000
+					},
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#3",
+						"out": 1
+					},
+					{
+						"executions": 1,
+						"in": 2,
+						"key": "r#4",
+						"nodeType": "HashAggregate",
+						"out": 100
+					},
+					{
+						"executions": 1,
+						"in": 2,
+						"key": "r#5",
+						"nodeType": "HashJoin",
+						"out": 100
+					},
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#6",
+						"out": 1
+					},
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#7",
+						"out": 1
+					},
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#8",
+						"out": 1
+					},
+					{
+						"executions": 1,
+						"in": 4,
+						"key": "r#9",
+						"nodeType": "Project",
+						"out": 100
+					},
+					{
+						"executions": 1,
+						"in": 1,
+						"key": "r#10",
+						"nodeType": "Block",
+						"out": 100
+					}
+				],
+				"plan": {
+					"nodeCount": 20,
+					"nodeTypes": {
+						"Alias": 2,
+						"Block": 1,
+						"CaseExpr": 1,
+						"ColumnReference": 5,
+						"HashAggregate": 1,
+						"HashJoin": 1,
+						"IndexScan": 1,
+						"IndexSeek": 1,
+						"Literal": 2,
+						"Project": 1,
+						"ScalarFunctionCall": 1,
+						"TableReference": 2,
+						"UnaryOp": 1
+					}
+				},
+				"tables": {
+					"main.bench_t": {
+						"queryCalls": 2,
+						"rowsScanned": 10100,
+						"updateCalls": 0
+					}
+				},
+				"totals": {
+					"instructionExecutions": 11,
+					"queryCalls": 2,
+					"rowsOut": 10505,
+					"rowsScanned": 10100,
+					"updateCalls": 0
+				}
+			},
+			"gated": true
+		},
+		"correlated-subquery@store-mem": {
+			"counters": {
+				"engine": {
+					"instructions": [
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#0",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#1",
+							"nodeType": "IndexSeek",
+							"out": 100
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#2",
+							"nodeType": "IndexScan",
+							"out": 10000
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#3",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 2,
+							"key": "r#4",
+							"nodeType": "HashAggregate",
+							"out": 100
+						},
+						{
+							"executions": 1,
+							"in": 2,
+							"key": "r#5",
+							"nodeType": "HashJoin",
+							"out": 100
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#6",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#7",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#8",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 4,
+							"key": "r#9",
+							"nodeType": "Project",
+							"out": 100
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#10",
+							"nodeType": "Block",
+							"out": 100
+						}
+					],
+					"plan": {
+						"nodeCount": 20,
+						"nodeTypes": {
+							"Alias": 2,
+							"Block": 1,
+							"CaseExpr": 1,
+							"ColumnReference": 5,
+							"HashAggregate": 1,
+							"HashJoin": 1,
+							"IndexScan": 1,
+							"IndexSeek": 1,
+							"Literal": 2,
+							"Project": 1,
+							"ScalarFunctionCall": 1,
+							"TableReference": 2,
+							"UnaryOp": 1
+						}
+					},
+					"tables": {
+						"main.bench_t": {
+							"queryCalls": 2,
+							"rowsScanned": 10100,
+							"updateCalls": 0
+						}
+					},
+					"totals": {
+						"instructionExecutions": 11,
+						"queryCalls": 2,
+						"rowsOut": 10505,
+						"rowsScanned": 10100,
+						"updateCalls": 0
+					}
+				},
+				"store": {
+					"__catalog__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"__stats__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_t": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 10100,
+						"singleGets": 0
+					},
+					"main.bench_t_idx_bench_t_val": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					}
+				}
+			},
+			"gated": true
+		},
+		"distinct-text-10k": {
+			"counters": {
+				"instructions": [
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#0",
+						"nodeType": "IndexScan",
+						"out": 10000
+					},
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#1",
+						"out": 1
+					},
+					{
+						"executions": 1,
+						"in": 2,
+						"key": "r#2",
+						"nodeType": "Project",
+						"out": 10000
+					},
+					{
+						"executions": 1,
+						"in": 1,
+						"key": "r#3",
+						"nodeType": "Distinct",
+						"out": 10000
+					},
+					{
+						"executions": 1,
+						"in": 1,
+						"key": "r#4",
+						"nodeType": "Block",
+						"out": 10000
+					}
+				],
+				"plan": {
+					"nodeCount": 6,
+					"nodeTypes": {
+						"Block": 1,
+						"ColumnReference": 1,
+						"Distinct": 1,
+						"IndexScan": 1,
+						"Project": 1,
+						"TableReference": 1
+					}
+				},
+				"tables": {
+					"main.bench_text_t": {
+						"queryCalls": 1,
+						"rowsScanned": 10000,
+						"updateCalls": 0
+					}
+				},
+				"totals": {
+					"instructionExecutions": 5,
+					"queryCalls": 1,
+					"rowsOut": 40001,
+					"rowsScanned": 10000,
+					"updateCalls": 0
+				}
+			},
+			"gated": true
+		},
+		"distinct-text-10k@store-mem": {
+			"counters": {
+				"engine": {
+					"instructions": [
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#0",
+							"nodeType": "IndexScan",
+							"out": 10000
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#1",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 2,
+							"key": "r#2",
+							"nodeType": "Project",
+							"out": 10000
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#3",
+							"nodeType": "Distinct",
+							"out": 10000
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#4",
+							"nodeType": "Block",
+							"out": 10000
+						}
+					],
+					"plan": {
+						"nodeCount": 6,
+						"nodeTypes": {
+							"Block": 1,
+							"ColumnReference": 1,
+							"Distinct": 1,
+							"IndexScan": 1,
+							"Project": 1,
+							"TableReference": 1
+						}
+					},
+					"tables": {
+						"main.bench_text_t": {
+							"queryCalls": 1,
+							"rowsScanned": 10000,
+							"updateCalls": 0
+						}
+					},
+					"totals": {
+						"instructionExecutions": 5,
+						"queryCalls": 1,
+						"rowsOut": 40001,
+						"rowsScanned": 10000,
+						"updateCalls": 0
+					}
+				},
+				"store": {
+					"__catalog__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"__stats__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_text_t": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 10000,
+						"singleGets": 0
+					}
+				}
+			},
+			"gated": true
+		},
+		"filtered-scan-index-10k": {
+			"counters": {
+				"instructions": [
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#0",
+						"nodeType": "Literal",
+						"out": 1
+					},
+					{
+						"executions": 1,
+						"in": 1,
+						"key": "r#1",
+						"nodeType": "IndexSeek",
+						"out": 10
+					},
+					{
+						"executions": 1,
+						"in": 1,
+						"key": "r#2",
+						"nodeType": "Block",
+						"out": 10
+					}
+				],
+				"plan": {
+					"nodeCount": 4,
+					"nodeTypes": {
+						"Block": 1,
+						"IndexSeek": 1,
+						"Literal": 1,
+						"TableReference": 1
+					}
+				},
+				"tables": {
+					"main.bench_t": {
+						"queryCalls": 1,
+						"rowsScanned": 10,
+						"updateCalls": 0
+					}
+				},
+				"totals": {
+					"instructionExecutions": 3,
+					"queryCalls": 1,
+					"rowsOut": 21,
+					"rowsScanned": 10,
+					"updateCalls": 0
+				}
+			},
+			"gated": true
+		},
+		"filtered-scan-index-10k@store-mem": {
+			"counters": {
+				"engine": {
+					"instructions": [
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#0",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#1",
+							"nodeType": "IndexSeek",
+							"out": 10
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#2",
+							"nodeType": "Block",
+							"out": 10
+						}
+					],
+					"plan": {
+						"nodeCount": 4,
+						"nodeTypes": {
+							"Block": 1,
+							"IndexSeek": 1,
+							"Literal": 1,
+							"TableReference": 1
+						}
+					},
+					"tables": {
+						"main.bench_t": {
+							"queryCalls": 1,
+							"rowsScanned": 10,
+							"updateCalls": 0
+						}
+					},
+					"totals": {
+						"instructionExecutions": 3,
+						"queryCalls": 1,
+						"rowsOut": 21,
+						"rowsScanned": 10,
+						"updateCalls": 0
+					}
+				},
+				"store": {
+					"__catalog__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"__stats__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_t": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 1,
+						"getManyKeys": 10,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_t_idx_bench_t_val": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 10,
+						"singleGets": 0
+					}
+				}
+			},
+			"gated": true
+		},
+		"full-scan-10k": {
+			"counters": {
+				"instructions": [
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#0",
+						"nodeType": "IndexScan",
+						"out": 10000
+					},
+					{
+						"executions": 1,
+						"in": 1,
+						"key": "r#1",
+						"nodeType": "Block",
+						"out": 10000
+					}
+				],
+				"plan": {
+					"nodeCount": 3,
+					"nodeTypes": {
+						"Block": 1,
+						"IndexScan": 1,
+						"TableReference": 1
+					}
+				},
+				"tables": {
+					"main.bench_t": {
+						"queryCalls": 1,
+						"rowsScanned": 10000,
+						"updateCalls": 0
+					}
+				},
+				"totals": {
+					"instructionExecutions": 2,
+					"queryCalls": 1,
+					"rowsOut": 20000,
+					"rowsScanned": 10000,
+					"updateCalls": 0
+				}
+			},
+			"gated": true
+		},
+		"full-scan-10k@store-mem": {
+			"counters": {
+				"engine": {
+					"instructions": [
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#0",
+							"nodeType": "IndexScan",
+							"out": 10000
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#1",
+							"nodeType": "Block",
+							"out": 10000
+						}
+					],
+					"plan": {
+						"nodeCount": 3,
+						"nodeTypes": {
+							"Block": 1,
+							"IndexScan": 1,
+							"TableReference": 1
+						}
+					},
+					"tables": {
+						"main.bench_t": {
+							"queryCalls": 1,
+							"rowsScanned": 10000,
+							"updateCalls": 0
+						}
+					},
+					"totals": {
+						"instructionExecutions": 2,
+						"queryCalls": 1,
+						"rowsOut": 20000,
+						"rowsScanned": 10000,
+						"updateCalls": 0
+					}
+				},
+				"store": {
+					"__catalog__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"__stats__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_t": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 10000,
+						"singleGets": 0
+					},
+					"main.bench_t_idx_bench_t_val": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					}
+				}
+			},
+			"gated": true
+		},
+		"group-by-10k": {
+			"counters": {
+				"instructions": [
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#0",
+						"nodeType": "IndexScan",
+						"out": 10000
+					},
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#1",
+						"out": 1
+					},
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#2",
+						"out": 1
+					},
+					{
+						"executions": 1,
+						"in": 3,
+						"key": "r#3",
+						"nodeType": "HashAggregate",
+						"out": 100
+					},
+					{
+						"executions": 1,
+						"in": 1,
+						"key": "r#4",
+						"nodeType": "Block",
+						"out": 100
+					}
+				],
+				"plan": {
+					"nodeCount": 8,
+					"nodeTypes": {
+						"Block": 1,
+						"ColumnReference": 2,
+						"HashAggregate": 1,
+						"IndexScan": 1,
+						"ScalarFunctionCall": 2,
+						"TableReference": 1
+					}
+				},
+				"tables": {
+					"main.bench_t": {
+						"queryCalls": 1,
+						"rowsScanned": 10000,
+						"updateCalls": 0
+					}
+				},
+				"totals": {
+					"instructionExecutions": 5,
+					"queryCalls": 1,
+					"rowsOut": 10202,
+					"rowsScanned": 10000,
+					"updateCalls": 0
+				}
+			},
+			"gated": true
+		},
+		"group-by-10k@store-mem": {
+			"counters": {
+				"engine": {
+					"instructions": [
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#0",
+							"nodeType": "IndexScan",
+							"out": 10000
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#1",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#2",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 3,
+							"key": "r#3",
+							"nodeType": "HashAggregate",
+							"out": 100
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#4",
+							"nodeType": "Block",
+							"out": 100
+						}
+					],
+					"plan": {
+						"nodeCount": 8,
+						"nodeTypes": {
+							"Block": 1,
+							"ColumnReference": 2,
+							"HashAggregate": 1,
+							"IndexScan": 1,
+							"ScalarFunctionCall": 2,
+							"TableReference": 1
+						}
+					},
+					"tables": {
+						"main.bench_t": {
+							"queryCalls": 1,
+							"rowsScanned": 10000,
+							"updateCalls": 0
+						}
+					},
+					"totals": {
+						"instructionExecutions": 5,
+						"queryCalls": 1,
+						"rowsOut": 10202,
+						"rowsScanned": 10000,
+						"updateCalls": 0
+					}
+				},
+				"store": {
+					"__catalog__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"__stats__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_t": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 10000,
+						"singleGets": 0
+					},
+					"main.bench_t_idx_bench_t_val": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					}
+				}
+			},
+			"gated": true
+		},
+		"group-by-text-10k": {
+			"counters": {
+				"instructions": [
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#0",
+						"nodeType": "IndexScan",
+						"out": 10000
+					},
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#1",
+						"out": 1
+					},
+					{
+						"executions": 1,
+						"in": 2,
+						"key": "r#2",
+						"nodeType": "HashAggregate",
+						"out": 100
+					},
+					{
+						"executions": 1,
+						"in": 1,
+						"key": "r#3",
+						"nodeType": "Block",
+						"out": 100
+					}
+				],
+				"plan": {
+					"nodeCount": 6,
+					"nodeTypes": {
+						"Block": 1,
+						"ColumnReference": 1,
+						"HashAggregate": 1,
+						"IndexScan": 1,
+						"ScalarFunctionCall": 1,
+						"TableReference": 1
+					}
+				},
+				"tables": {
+					"main.bench_text_t": {
+						"queryCalls": 1,
+						"rowsScanned": 10000,
+						"updateCalls": 0
+					}
+				},
+				"totals": {
+					"instructionExecutions": 4,
+					"queryCalls": 1,
+					"rowsOut": 10201,
+					"rowsScanned": 10000,
+					"updateCalls": 0
+				}
+			},
+			"gated": true
+		},
+		"group-by-text-10k@store-mem": {
+			"counters": {
+				"engine": {
+					"instructions": [
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#0",
+							"nodeType": "IndexScan",
+							"out": 10000
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#1",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 2,
+							"key": "r#2",
+							"nodeType": "HashAggregate",
+							"out": 100
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#3",
+							"nodeType": "Block",
+							"out": 100
+						}
+					],
+					"plan": {
+						"nodeCount": 6,
+						"nodeTypes": {
+							"Block": 1,
+							"ColumnReference": 1,
+							"HashAggregate": 1,
+							"IndexScan": 1,
+							"ScalarFunctionCall": 1,
+							"TableReference": 1
+						}
+					},
+					"tables": {
+						"main.bench_text_t": {
+							"queryCalls": 1,
+							"rowsScanned": 10000,
+							"updateCalls": 0
+						}
+					},
+					"totals": {
+						"instructionExecutions": 4,
+						"queryCalls": 1,
+						"rowsOut": 10201,
+						"rowsScanned": 10000,
+						"updateCalls": 0
+					}
+				},
+				"store": {
+					"__catalog__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"__stats__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_text_t": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 10000,
+						"singleGets": 0
+					}
+				}
+			},
+			"gated": true
+		},
+		"hand-batched-peer-count": {
+			"counters": {
+				"instructions": [
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#0",
+						"nodeType": "Literal",
+						"out": 1
+					},
+					{
+						"executions": 1,
+						"in": 1,
+						"key": "r#1",
+						"nodeType": "IndexSeek",
+						"out": 100
+					},
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#2",
+						"nodeType": "IndexScan",
+						"out": 10000
+					},
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#3",
+						"out": 1
+					},
+					{
+						"executions": 1,
+						"in": 2,
+						"key": "r#4",
+						"nodeType": "HashAggregate",
+						"out": 100
+					},
+					{
+						"executions": 1,
+						"in": 2,
+						"key": "r#5",
+						"nodeType": "HashJoin",
+						"out": 100
+					},
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#6",
+						"out": 1
+					},
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#7",
+						"out": 1
+					},
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#8",
+						"out": 1
+					},
+					{
+						"executions": 1,
+						"in": 4,
+						"key": "r#9",
+						"nodeType": "Project",
+						"out": 100
+					},
+					{
+						"executions": 1,
+						"in": 1,
+						"key": "r#10",
+						"nodeType": "Block",
+						"out": 100
+					}
+				],
+				"plan": {
+					"nodeCount": 18,
+					"nodeTypes": {
+						"Alias": 2,
+						"Block": 1,
+						"ColumnReference": 4,
+						"HashAggregate": 1,
+						"HashJoin": 1,
+						"IndexScan": 1,
+						"IndexSeek": 1,
+						"Literal": 2,
+						"Project": 1,
+						"ScalarFunctionCall": 2,
+						"TableReference": 2
+					}
+				},
+				"tables": {
+					"main.bench_t": {
+						"queryCalls": 2,
+						"rowsScanned": 10100,
+						"updateCalls": 0
+					}
+				},
+				"totals": {
+					"instructionExecutions": 11,
+					"queryCalls": 2,
+					"rowsOut": 10505,
+					"rowsScanned": 10100,
+					"updateCalls": 0
+				}
+			},
+			"gated": true
+		},
+		"hand-batched-peer-count@store-mem": {
+			"counters": {
+				"engine": {
+					"instructions": [
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#0",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#1",
+							"nodeType": "IndexSeek",
+							"out": 100
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#2",
+							"nodeType": "IndexScan",
+							"out": 10000
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#3",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 2,
+							"key": "r#4",
+							"nodeType": "HashAggregate",
+							"out": 100
+						},
+						{
+							"executions": 1,
+							"in": 2,
+							"key": "r#5",
+							"nodeType": "HashJoin",
+							"out": 100
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#6",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#7",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#8",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 4,
+							"key": "r#9",
+							"nodeType": "Project",
+							"out": 100
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#10",
+							"nodeType": "Block",
+							"out": 100
+						}
+					],
+					"plan": {
+						"nodeCount": 18,
+						"nodeTypes": {
+							"Alias": 2,
+							"Block": 1,
+							"ColumnReference": 4,
+							"HashAggregate": 1,
+							"HashJoin": 1,
+							"IndexScan": 1,
+							"IndexSeek": 1,
+							"Literal": 2,
+							"Project": 1,
+							"ScalarFunctionCall": 2,
+							"TableReference": 2
+						}
+					},
+					"tables": {
+						"main.bench_t": {
+							"queryCalls": 2,
+							"rowsScanned": 10100,
+							"updateCalls": 0
+						}
+					},
+					"totals": {
+						"instructionExecutions": 11,
+						"queryCalls": 2,
+						"rowsOut": 10505,
+						"rowsScanned": 10100,
+						"updateCalls": 0
+					}
+				},
+				"store": {
+					"__catalog__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"__stats__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_t": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 10100,
+						"singleGets": 0
+					},
+					"main.bench_t_idx_bench_t_val": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					}
+				}
+			},
+			"gated": true
+		},
+		"join-1kx1k": {
+			"counters": {
+				"instructions": [
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#0",
+						"nodeType": "Literal",
+						"out": 1
+					},
+					{
+						"executions": 1,
+						"in": 1,
+						"key": "r#1",
+						"nodeType": "IndexSeek",
+						"out": 100
+					},
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#2",
+						"nodeType": "IndexScan",
+						"out": 1000
+					},
+					{
+						"executions": 1,
+						"in": 2,
+						"key": "r#3",
+						"nodeType": "HashJoin",
+						"out": 1000
+					},
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#4",
+						"out": 1
+					},
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#5",
+						"out": 1
+					},
+					{
+						"executions": 1,
+						"in": 3,
+						"key": "r#6",
+						"nodeType": "Project",
+						"out": 1000
+					},
+					{
+						"executions": 1,
+						"in": 1,
+						"key": "r#7",
+						"nodeType": "Block",
+						"out": 1000
+					}
+				],
+				"plan": {
+					"nodeCount": 12,
+					"nodeTypes": {
+						"Alias": 2,
+						"Block": 1,
+						"ColumnReference": 2,
+						"HashJoin": 1,
+						"IndexScan": 1,
+						"IndexSeek": 1,
+						"Literal": 1,
+						"Project": 1,
+						"TableReference": 2
+					}
+				},
+				"tables": {
+					"main.left_t": {
+						"queryCalls": 1,
+						"rowsScanned": 100,
+						"updateCalls": 0
+					},
+					"main.right_t": {
+						"queryCalls": 1,
+						"rowsScanned": 1000,
+						"updateCalls": 0
+					}
+				},
+				"totals": {
+					"instructionExecutions": 8,
+					"queryCalls": 2,
+					"rowsOut": 4103,
+					"rowsScanned": 1100,
+					"updateCalls": 0
+				}
+			},
+			"gated": true
+		},
+		"join-1kx1k@store-mem": {
+			"counters": {
+				"engine": {
+					"instructions": [
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#0",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#1",
+							"nodeType": "IndexSeek",
+							"out": 100
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#2",
+							"nodeType": "IndexScan",
+							"out": 1000
+						},
+						{
+							"executions": 1,
+							"in": 2,
+							"key": "r#3",
+							"nodeType": "HashJoin",
+							"out": 1000
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#4",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#5",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 3,
+							"key": "r#6",
+							"nodeType": "Project",
+							"out": 1000
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#7",
+							"nodeType": "Block",
+							"out": 1000
+						}
+					],
+					"plan": {
+						"nodeCount": 12,
+						"nodeTypes": {
+							"Alias": 2,
+							"Block": 1,
+							"ColumnReference": 2,
+							"HashJoin": 1,
+							"IndexScan": 1,
+							"IndexSeek": 1,
+							"Literal": 1,
+							"Project": 1,
+							"TableReference": 2
+						}
+					},
+					"tables": {
+						"main.left_t": {
+							"queryCalls": 1,
+							"rowsScanned": 100,
+							"updateCalls": 0
+						},
+						"main.right_t": {
+							"queryCalls": 1,
+							"rowsScanned": 1000,
+							"updateCalls": 0
+						}
+					},
+					"totals": {
+						"instructionExecutions": 8,
+						"queryCalls": 2,
+						"rowsOut": 4103,
+						"rowsScanned": 1100,
+						"updateCalls": 0
+					}
+				},
+				"store": {
+					"__catalog__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"__stats__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.left_t": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 100,
+						"singleGets": 0
+					},
+					"main.right_t": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 1000,
+						"singleGets": 0
+					}
+				}
+			},
+			"gated": true
+		},
+		"order-by-10k": {
+			"counters": {
+				"instructions": [
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#0",
+						"nodeType": "IndexScan",
+						"out": 10000
+					},
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#1",
+						"out": 1
+					},
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#2",
+						"out": 1
+					},
+					{
+						"executions": 1,
+						"in": 3,
+						"key": "r#3",
+						"nodeType": "Sort",
+						"out": 10000
+					},
+					{
+						"executions": 1,
+						"in": 1,
+						"key": "r#4",
+						"nodeType": "Block",
+						"out": 10000
+					}
+				],
+				"plan": {
+					"nodeCount": 6,
+					"nodeTypes": {
+						"Block": 1,
+						"ColumnReference": 2,
+						"IndexScan": 1,
+						"Sort": 1,
+						"TableReference": 1
+					}
+				},
+				"tables": {
+					"main.bench_t": {
+						"queryCalls": 1,
+						"rowsScanned": 10000,
+						"updateCalls": 0
+					}
+				},
+				"totals": {
+					"instructionExecutions": 5,
+					"queryCalls": 1,
+					"rowsOut": 30002,
+					"rowsScanned": 10000,
+					"updateCalls": 0
+				}
+			},
+			"gated": true
+		},
+		"order-by-10k@store-mem": {
+			"counters": {
+				"engine": {
+					"instructions": [
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#0",
+							"nodeType": "IndexScan",
+							"out": 10000
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#1",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#2",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 3,
+							"key": "r#3",
+							"nodeType": "Sort",
+							"out": 10000
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#4",
+							"nodeType": "Block",
+							"out": 10000
+						}
+					],
+					"plan": {
+						"nodeCount": 6,
+						"nodeTypes": {
+							"Block": 1,
+							"ColumnReference": 2,
+							"IndexScan": 1,
+							"Sort": 1,
+							"TableReference": 1
+						}
+					},
+					"tables": {
+						"main.bench_t": {
+							"queryCalls": 1,
+							"rowsScanned": 10000,
+							"updateCalls": 0
+						}
+					},
+					"totals": {
+						"instructionExecutions": 5,
+						"queryCalls": 1,
+						"rowsOut": 30002,
+						"rowsScanned": 10000,
+						"updateCalls": 0
+					}
+				},
+				"store": {
+					"__catalog__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"__stats__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_t": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 10000,
+						"singleGets": 0
+					},
+					"main.bench_t_idx_bench_t_val": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					}
+				}
+			},
+			"gated": true
+		},
+		"order-by-text-10k": {
+			"counters": {
+				"instructions": [
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#0",
+						"nodeType": "IndexScan",
+						"out": 10000
+					},
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#1",
+						"out": 1
+					},
+					{
+						"executions": 1,
+						"in": 2,
+						"key": "r#2",
+						"nodeType": "Sort",
+						"out": 10000
+					},
+					{
+						"executions": 1,
+						"in": 1,
+						"key": "r#3",
+						"nodeType": "Block",
+						"out": 10000
+					}
+				],
+				"plan": {
+					"nodeCount": 5,
+					"nodeTypes": {
+						"Block": 1,
+						"ColumnReference": 1,
+						"IndexScan": 1,
+						"Sort": 1,
+						"TableReference": 1
+					}
+				},
+				"tables": {
+					"main.bench_text_t": {
+						"queryCalls": 1,
+						"rowsScanned": 10000,
+						"updateCalls": 0
+					}
+				},
+				"totals": {
+					"instructionExecutions": 4,
+					"queryCalls": 1,
+					"rowsOut": 30001,
+					"rowsScanned": 10000,
+					"updateCalls": 0
+				}
+			},
+			"gated": true
+		},
+		"order-by-text-10k@store-mem": {
+			"counters": {
+				"engine": {
+					"instructions": [
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#0",
+							"nodeType": "IndexScan",
+							"out": 10000
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#1",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 2,
+							"key": "r#2",
+							"nodeType": "Sort",
+							"out": 10000
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#3",
+							"nodeType": "Block",
+							"out": 10000
+						}
+					],
+					"plan": {
+						"nodeCount": 5,
+						"nodeTypes": {
+							"Block": 1,
+							"ColumnReference": 1,
+							"IndexScan": 1,
+							"Sort": 1,
+							"TableReference": 1
+						}
+					},
+					"tables": {
+						"main.bench_text_t": {
+							"queryCalls": 1,
+							"rowsScanned": 10000,
+							"updateCalls": 0
+						}
+					},
+					"totals": {
+						"instructionExecutions": 4,
+						"queryCalls": 1,
+						"rowsOut": 30001,
+						"rowsScanned": 10000,
+						"updateCalls": 0
+					}
+				},
+				"store": {
+					"__catalog__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"__stats__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_text_t": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 10000,
+						"singleGets": 0
+					}
+				}
+			},
+			"gated": true
+		},
+		"order-by-text-prefix40-10k": {
+			"counters": {
+				"instructions": [
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#0",
+						"nodeType": "IndexScan",
+						"out": 10000
+					},
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#1",
+						"out": 1
+					},
+					{
+						"executions": 1,
+						"in": 2,
+						"key": "r#2",
+						"nodeType": "Sort",
+						"out": 10000
+					},
+					{
+						"executions": 1,
+						"in": 1,
+						"key": "r#3",
+						"nodeType": "Block",
+						"out": 10000
+					}
+				],
+				"plan": {
+					"nodeCount": 5,
+					"nodeTypes": {
+						"Block": 1,
+						"ColumnReference": 1,
+						"IndexScan": 1,
+						"Sort": 1,
+						"TableReference": 1
+					}
+				},
+				"tables": {
+					"main.bench_text_t": {
+						"queryCalls": 1,
+						"rowsScanned": 10000,
+						"updateCalls": 0
+					}
+				},
+				"totals": {
+					"instructionExecutions": 4,
+					"queryCalls": 1,
+					"rowsOut": 30001,
+					"rowsScanned": 10000,
+					"updateCalls": 0
+				}
+			},
+			"gated": true
+		},
+		"order-by-text-prefix40-10k@store-mem": {
+			"counters": {
+				"engine": {
+					"instructions": [
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#0",
+							"nodeType": "IndexScan",
+							"out": 10000
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#1",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 2,
+							"key": "r#2",
+							"nodeType": "Sort",
+							"out": 10000
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#3",
+							"nodeType": "Block",
+							"out": 10000
+						}
+					],
+					"plan": {
+						"nodeCount": 5,
+						"nodeTypes": {
+							"Block": 1,
+							"ColumnReference": 1,
+							"IndexScan": 1,
+							"Sort": 1,
+							"TableReference": 1
+						}
+					},
+					"tables": {
+						"main.bench_text_t": {
+							"queryCalls": 1,
+							"rowsScanned": 10000,
+							"updateCalls": 0
+						}
+					},
+					"totals": {
+						"instructionExecutions": 4,
+						"queryCalls": 1,
+						"rowsOut": 30001,
+						"rowsScanned": 10000,
+						"updateCalls": 0
+					}
+				},
+				"store": {
+					"__catalog__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"__stats__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_text_t": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 10000,
+						"singleGets": 0
+					}
+				}
+			},
+			"gated": true
+		},
+		"order-by-text-unicode-10k": {
+			"counters": {
+				"instructions": [
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#0",
+						"nodeType": "IndexScan",
+						"out": 10000
+					},
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#1",
+						"out": 1
+					},
+					{
+						"executions": 1,
+						"in": 2,
+						"key": "r#2",
+						"nodeType": "Sort",
+						"out": 10000
+					},
+					{
+						"executions": 1,
+						"in": 1,
+						"key": "r#3",
+						"nodeType": "Block",
+						"out": 10000
+					}
+				],
+				"plan": {
+					"nodeCount": 5,
+					"nodeTypes": {
+						"Block": 1,
+						"ColumnReference": 1,
+						"IndexScan": 1,
+						"Sort": 1,
+						"TableReference": 1
+					}
+				},
+				"tables": {
+					"main.bench_text_t": {
+						"queryCalls": 1,
+						"rowsScanned": 10000,
+						"updateCalls": 0
+					}
+				},
+				"totals": {
+					"instructionExecutions": 4,
+					"queryCalls": 1,
+					"rowsOut": 30001,
+					"rowsScanned": 10000,
+					"updateCalls": 0
+				}
+			},
+			"gated": true
+		},
+		"order-by-text-unicode-10k@store-mem": {
+			"counters": {
+				"engine": {
+					"instructions": [
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#0",
+							"nodeType": "IndexScan",
+							"out": 10000
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#1",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 2,
+							"key": "r#2",
+							"nodeType": "Sort",
+							"out": 10000
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#3",
+							"nodeType": "Block",
+							"out": 10000
+						}
+					],
+					"plan": {
+						"nodeCount": 5,
+						"nodeTypes": {
+							"Block": 1,
+							"ColumnReference": 1,
+							"IndexScan": 1,
+							"Sort": 1,
+							"TableReference": 1
+						}
+					},
+					"tables": {
+						"main.bench_text_t": {
+							"queryCalls": 1,
+							"rowsScanned": 10000,
+							"updateCalls": 0
+						}
+					},
+					"totals": {
+						"instructionExecutions": 4,
+						"queryCalls": 1,
+						"rowsOut": 30001,
+						"rowsScanned": 10000,
+						"updateCalls": 0
+					}
+				},
+				"store": {
+					"__catalog__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"__stats__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_text_t": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 10000,
+						"singleGets": 0
+					}
+				}
+			},
+			"gated": true
+		},
+		"temporal-arith-scan-10k": {
+			"counters": {
+				"instructions": [
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#0",
+						"nodeType": "IndexScan",
+						"out": 10000
+					},
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#1",
+						"out": 1
+					},
+					{
+						"executions": 1,
+						"in": 2,
+						"key": "r#2",
+						"nodeType": "Project",
+						"out": 10000
+					},
+					{
+						"executions": 1,
+						"in": 1,
+						"key": "r#3",
+						"nodeType": "Block",
+						"out": 10000
+					}
+				],
+				"plan": {
+					"nodeCount": 7,
+					"nodeTypes": {
+						"BinaryOp": 1,
+						"Block": 1,
+						"ColumnReference": 2,
+						"IndexScan": 1,
+						"Project": 1,
+						"TableReference": 1
+					}
+				},
+				"tables": {
+					"main.bench_temporal_t": {
+						"queryCalls": 1,
+						"rowsScanned": 10000,
+						"updateCalls": 0
+					}
+				},
+				"totals": {
+					"instructionExecutions": 4,
+					"queryCalls": 1,
+					"rowsOut": 30001,
+					"rowsScanned": 10000,
+					"updateCalls": 0
+				}
+			},
+			"gated": true
+		},
+		"temporal-arith-scan-10k@store-mem": {
+			"counters": {
+				"engine": {
+					"instructions": [
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#0",
+							"nodeType": "IndexScan",
+							"out": 10000
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#1",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 2,
+							"key": "r#2",
+							"nodeType": "Project",
+							"out": 10000
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#3",
+							"nodeType": "Block",
+							"out": 10000
+						}
+					],
+					"plan": {
+						"nodeCount": 7,
+						"nodeTypes": {
+							"BinaryOp": 1,
+							"Block": 1,
+							"ColumnReference": 2,
+							"IndexScan": 1,
+							"Project": 1,
+							"TableReference": 1
+						}
+					},
+					"tables": {
+						"main.bench_temporal_t": {
+							"queryCalls": 1,
+							"rowsScanned": 10000,
+							"updateCalls": 0
+						}
+					},
+					"totals": {
+						"instructionExecutions": 4,
+						"queryCalls": 1,
+						"rowsOut": 30001,
+						"rowsScanned": 10000,
+						"updateCalls": 0
+					}
+				},
+				"store": {
+					"__catalog__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"__stats__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_temporal_t": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 10000,
+						"singleGets": 0
+					}
+				}
+			},
+			"gated": true
+		},
+		"text-pk-point-seek-10k": {
+			"counters": {
+				"instructions": [
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#0",
+						"nodeType": "Literal",
+						"out": 1
+					},
+					{
+						"executions": 1,
+						"in": 1,
+						"key": "r#1",
+						"nodeType": "IndexSeek",
+						"out": 1
+					},
+					{
+						"executions": 1,
+						"in": 1,
+						"key": "r#2",
+						"nodeType": "Block",
+						"out": 1
+					}
+				],
+				"plan": {
+					"nodeCount": 4,
+					"nodeTypes": {
+						"Block": 1,
+						"IndexSeek": 1,
+						"Literal": 1,
+						"TableReference": 1
+					}
+				},
+				"tables": {
+					"main.bench_text_pk": {
+						"queryCalls": 1,
+						"rowsScanned": 1,
+						"updateCalls": 0
+					}
+				},
+				"totals": {
+					"instructionExecutions": 3,
+					"queryCalls": 1,
+					"rowsOut": 3,
+					"rowsScanned": 1,
+					"updateCalls": 0
+				}
+			},
+			"gated": true
+		},
+		"text-pk-point-seek-10k@store-mem": {
+			"counters": {
+				"engine": {
+					"instructions": [
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#0",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#1",
+							"nodeType": "IndexSeek",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#2",
+							"nodeType": "Block",
+							"out": 1
+						}
+					],
+					"plan": {
+						"nodeCount": 4,
+						"nodeTypes": {
+							"Block": 1,
+							"IndexSeek": 1,
+							"Literal": 1,
+							"TableReference": 1
+						}
+					},
+					"tables": {
+						"main.bench_text_pk": {
+							"queryCalls": 1,
+							"rowsScanned": 1,
+							"updateCalls": 0
+						}
+					},
+					"totals": {
+						"instructionExecutions": 3,
+						"queryCalls": 1,
+						"rowsOut": 3,
+						"rowsScanned": 1,
+						"updateCalls": 0
+					}
+				},
+				"store": {
+					"__catalog__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"__stats__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_text_pk": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 1
+					}
+				}
+			},
+			"gated": true
+		},
+		"text-pk-range-scan-10k": {
+			"counters": {
+				"instructions": [
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#0",
+						"nodeType": "Literal",
+						"out": 1
+					},
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#1",
+						"nodeType": "Literal",
+						"out": 1
+					},
+					{
+						"executions": 1,
+						"in": 2,
+						"key": "r#2",
+						"nodeType": "IndexSeek",
+						"out": 1000
+					},
+					{
+						"executions": 1,
+						"in": 1,
+						"key": "r#3",
+						"nodeType": "Block",
+						"out": 1000
+					}
+				],
+				"plan": {
+					"nodeCount": 5,
+					"nodeTypes": {
+						"Block": 1,
+						"IndexSeek": 1,
+						"Literal": 2,
+						"TableReference": 1
+					}
+				},
+				"tables": {
+					"main.bench_text_pk": {
+						"queryCalls": 1,
+						"rowsScanned": 1000,
+						"updateCalls": 0
+					}
+				},
+				"totals": {
+					"instructionExecutions": 4,
+					"queryCalls": 1,
+					"rowsOut": 2002,
+					"rowsScanned": 1000,
+					"updateCalls": 0
+				}
+			},
+			"gated": true
+		},
+		"text-pk-range-scan-10k@store-mem": {
+			"counters": {
+				"engine": {
+					"instructions": [
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#0",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#1",
+							"nodeType": "Literal",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 2,
+							"key": "r#2",
+							"nodeType": "IndexSeek",
+							"out": 1000
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#3",
+							"nodeType": "Block",
+							"out": 1000
+						}
+					],
+					"plan": {
+						"nodeCount": 5,
+						"nodeTypes": {
+							"Block": 1,
+							"IndexSeek": 1,
+							"Literal": 2,
+							"TableReference": 1
+						}
+					},
+					"tables": {
+						"main.bench_text_pk": {
+							"queryCalls": 1,
+							"rowsScanned": 1000,
+							"updateCalls": 0
+						}
+					},
+					"totals": {
+						"instructionExecutions": 4,
+						"queryCalls": 1,
+						"rowsOut": 2002,
+						"rowsScanned": 1000,
+						"updateCalls": 0
+					}
+				},
+				"store": {
+					"__catalog__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"__stats__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.bench_text_pk": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 1000,
+						"singleGets": 0
+					}
+				}
+			},
+			"gated": true
+		}
+	}
+}

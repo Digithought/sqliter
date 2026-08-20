@@ -1,0 +1,77 @@
+{
+	"suite": "planner",
+	"accepted": {
+		"by": "Nathan Allan <nate@digithought.com>",
+		"commit": "a8999c107",
+		"date": "2026-08-20T02:59:19.630Z",
+		"node": "v24.2.0",
+		"platform": "win32",
+		"reason": "initial reference set (bench-gate-reference ticket)"
+	},
+	"benchmarks": {
+		"aggregate-plan": {
+			"counters": {
+				"nodeCount": 8,
+				"nodeTypes": {
+					"Block": 1,
+					"ColumnReference": 2,
+					"HashAggregate": 1,
+					"IndexScan": 1,
+					"ScalarFunctionCall": 2,
+					"TableReference": 1
+				}
+			},
+			"gated": true
+		},
+		"join-plan": {
+			"counters": {
+				"nodeCount": 11,
+				"nodeTypes": {
+					"Alias": 2,
+					"Block": 1,
+					"ColumnReference": 2,
+					"HashJoin": 1,
+					"IndexScan": 2,
+					"Project": 1,
+					"TableReference": 2
+				}
+			},
+			"gated": true
+		},
+		"simple-scan-plan": {
+			"counters": {
+				"nodeCount": 10,
+				"nodeTypes": {
+					"BinaryOp": 1,
+					"Block": 1,
+					"ColumnReference": 3,
+					"Filter": 1,
+					"IndexScan": 1,
+					"Literal": 1,
+					"Project": 1,
+					"TableReference": 1
+				}
+			},
+			"gated": true
+		},
+		"subquery-plan": {
+			"counters": {
+				"nodeCount": 16,
+				"nodeTypes": {
+					"Alias": 2,
+					"Block": 1,
+					"ColumnReference": 4,
+					"HashAggregate": 1,
+					"HashJoin": 1,
+					"IndexScan": 1,
+					"IndexSeek": 1,
+					"Literal": 1,
+					"Project": 1,
+					"ScalarFunctionCall": 1,
+					"TableReference": 2
+				}
+			},
+			"gated": true
+		}
+	}
+}

@@ -644,3 +644,67 @@ sessions' facts; do not re-derive anything.
   no further action, just don't be surprised by the diff.
 - reference.mjs imports only `node:fs/promises`, `node:path`, `node:url`,
   `./compare.mjs`, `./discover.mjs` — no dist imports, safe for run.mjs to import.
+
+# Session 5 progress (gate WORKS end-to-end — remaining: sensitivity check, docs, full test, handoff)
+
+Everything below is on disk, verified, uncommitted. Trust it; go straight to the TODO.
+
+## Landed and verified this session
+
+- **`bench/gate.mjs` — COMPLETE and live-tested.** Implements the full settled design:
+  flag parsing (`--filter`/`--reason` value flags, `--json`/`--accept`/`--allow-dirty`
+  boolean; accept-only flags refused outside accept mode), LevelDB env var deleted
+  before `loadSuites()` with header note + `leveldb_env_cleared` in JSON, single-process
+  pass (skip → setup → counters → teardown, never `fn`; skip-phase failure gets no
+  teardown; other failures best-effort teardown; failures recorded, pass continues),
+  both `NOTE:`s at `runPass` (single-process premise + fixture-population lever),
+  per-benchmark progress lines with ms, classification via `classifySuite`, report with
+  named ungated/skipped/new/missing/failed rows and announced elision, orphan-reference
+  check (accept: refuse BEFORE pass; gate: report + fail), accept path
+  (`validateAccept` → pass → `validateAcceptAfterPass` → `captureAcceptance` with `by`
+  from git config → `nextReference` → atomic `writeReference`, unchanged suites left
+  byte-identical), `--json` object on stdout with human lines on stderr, exit code from
+  `gateFails`.
+- **`packages/quereus/package.json`**: `bench:gate` / `bench:accept` scripts added.
+- **`test/bench-gate.spec.ts`**: 38 passing
+  (`yarn workspace @quereus/quereus test:single packages/quereus/test/bench-gate.spec.ts`).
+  Covers the full session-4 list including the per-plan eligibility call (two plans one
+  join each = GATED, with the why-comment).
+- **`yarn workspace @quereus/quereus lint`** clean (includes the strict-checkJs tsc pass
+  over `reference.mjs`).
+- **`bench/reference/{execution,mutation,planner,store}.json` GENERATED** by
+  `yarn workspace @quereus/quereus bench:accept --allow-dirty --reason "initial reference set (bench-gate-reference ticket)"`
+  — 56 benchmarks recorded, 19 LevelDB rows skipped, 42.8 s. Provenance commit
+  `a8999c107` with dirty tree: the dirt is harness-only edits (no engine code), so the
+  counts are still that commit's counts — flag this in the review handoff.
+- **`yarn workspace @quereus/quereus bench:gate`** → 56 match, 0 differs, 19 skipped
+  (named), exit 0, 41.3 s. This doubles as the determinism proof: accept and gate were
+  two separate single-process runs producing identical blocks 56/56.
+
+## Remaining TODO (in order — no re-verification of anything above)
+
+- Sensitivity check. The one-line edit is already picked:
+  `src/planner/rules/aggregate/rule-aggregate-streaming.ts` line 88 — flip
+  `hashCostTotal < streamCostTotal` to `>`. Rebuild engine dist
+  (`yarn workspace @quereus/quereus build`), then
+  `yarn workspace @quereus/quereus bench:gate --filter planner` (~0 s pass) → expect a
+  named `path  before -> after` diff on `planner/aggregate-plan` and exit 1. REVERT the
+  edit, rebuild, run full `yarn workspace @quereus/quereus bench:gate` → exit 0.
+- Docs (`docs/benchmarking.md`), per the session-4 list: new `## Regression gate`
+  section placed before `## Ratio guards` (what the reference set is, what gates and
+  what does not, the accept path, the measured ~42 s cost, why counters not wall-clock);
+  update three stale spots — § Work counters closing paragraph ("there is no gate on
+  them"), § Exit-code contract's `yarn check` paragraph ("the regression gate planned on
+  top of it"), § Noise floor closing sentence ("That work belongs to the
+  regression-gate ticket…") — say the counter half now exists as `yarn bench:gate`,
+  ratio half is follow-on `bench-gate-ratios-and-check`; add `gate.mjs`,
+  `lib/reference.mjs`, `bench/reference/` rows to the "Where the code lives" table and
+  `bench-gate.spec.ts` to the harness-tests list.
+- Full `yarn workspace @quereus/quereus test` once.
+- Stage transition: write the review/ handoff, flagging (a) the per-plan eligibility
+  rule resolution (session 3 call #1 — tested), (b) `validateAcceptAfterPass` skip
+  protection (session 3 call #2 — tested), (c) `runCountersPass` `unknown` typing
+  (session 4), (d) accept skips a suite with nothing measured AND no previous file
+  (`runAccept` guard — empty-measured + existing previous still records a removal, by
+  design), (e) the reference provenance commit predates the harness edits (harness-only
+  dirt). Then delete this ticket file.

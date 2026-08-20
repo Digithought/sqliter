@@ -1,0 +1,1311 @@
+{
+	"suite": "mutation",
+	"accepted": {
+		"by": "Nathan Allan <nate@digithought.com>",
+		"commit": "a8999c107",
+		"date": "2026-08-20T02:59:19.630Z",
+		"node": "v24.2.0",
+		"platform": "win32",
+		"reason": "initial reference set (bench-gate-reference ticket)"
+	},
+	"benchmarks": {
+		"bulk-insert-10k": {
+			"counters": {
+				"firstBatch": {
+					"instructions": [
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#0",
+							"nodeType": "TableLiteral",
+							"out": 500
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#1",
+							"nodeType": "Insert",
+							"out": 500
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#2",
+							"nodeType": "ConstraintCheck",
+							"out": 500
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#3",
+							"nodeType": "UpdateExecutor",
+							"out": 500
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#4",
+							"nodeType": "Sink",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#5",
+							"nodeType": "Block",
+							"out": 1
+						}
+					],
+					"plan": {
+						"nodeCount": 6,
+						"nodeTypes": {
+							"Block": 1,
+							"ConstraintCheck": 1,
+							"Insert": 1,
+							"Sink": 1,
+							"TableLiteral": 1,
+							"UpdateExecutor": 1
+						}
+					},
+					"tables": {
+						"main.bulk_t": {
+							"queryCalls": 0,
+							"rowsScanned": 0,
+							"updateCalls": 500
+						}
+					},
+					"totals": {
+						"instructionExecutions": 6,
+						"queryCalls": 0,
+						"rowsOut": 2002,
+						"rowsScanned": 0,
+						"updateCalls": 500
+					}
+				},
+				"lastBatch": {
+					"instructions": [
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#0",
+							"nodeType": "TableLiteral",
+							"out": 500
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#1",
+							"nodeType": "Insert",
+							"out": 500
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#2",
+							"nodeType": "ConstraintCheck",
+							"out": 500
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#3",
+							"nodeType": "UpdateExecutor",
+							"out": 500
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#4",
+							"nodeType": "Sink",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#5",
+							"nodeType": "Block",
+							"out": 1
+						}
+					],
+					"plan": {
+						"nodeCount": 6,
+						"nodeTypes": {
+							"Block": 1,
+							"ConstraintCheck": 1,
+							"Insert": 1,
+							"Sink": 1,
+							"TableLiteral": 1,
+							"UpdateExecutor": 1
+						}
+					},
+					"tables": {
+						"main.bulk_t": {
+							"queryCalls": 0,
+							"rowsScanned": 0,
+							"updateCalls": 500
+						}
+					},
+					"totals": {
+						"instructionExecutions": 6,
+						"queryCalls": 0,
+						"rowsOut": 2002,
+						"rowsScanned": 0,
+						"updateCalls": 500
+					}
+				}
+			},
+			"gated": true
+		},
+		"bulk-insert-10k@store-mem": {
+			"counters": {
+				"engine": {
+					"firstBatch": {
+						"instructions": [
+							{
+								"executions": 1,
+								"in": 0,
+								"key": "r#0",
+								"nodeType": "TableLiteral",
+								"out": 500
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#1",
+								"nodeType": "Insert",
+								"out": 500
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#2",
+								"nodeType": "ConstraintCheck",
+								"out": 500
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#3",
+								"nodeType": "UpdateExecutor",
+								"out": 500
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#4",
+								"nodeType": "Sink",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#5",
+								"nodeType": "Block",
+								"out": 1
+							}
+						],
+						"plan": {
+							"nodeCount": 6,
+							"nodeTypes": {
+								"Block": 1,
+								"ConstraintCheck": 1,
+								"Insert": 1,
+								"Sink": 1,
+								"TableLiteral": 1,
+								"UpdateExecutor": 1
+							}
+						},
+						"tables": {
+							"main.bulk_t": {
+								"queryCalls": 0,
+								"rowsScanned": 0,
+								"updateCalls": 500
+							}
+						},
+						"totals": {
+							"instructionExecutions": 6,
+							"queryCalls": 0,
+							"rowsOut": 2002,
+							"rowsScanned": 0,
+							"updateCalls": 500
+						}
+					},
+					"lastBatch": {
+						"instructions": [
+							{
+								"executions": 1,
+								"in": 0,
+								"key": "r#0",
+								"nodeType": "TableLiteral",
+								"out": 500
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#1",
+								"nodeType": "Insert",
+								"out": 500
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#2",
+								"nodeType": "ConstraintCheck",
+								"out": 500
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#3",
+								"nodeType": "UpdateExecutor",
+								"out": 500
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#4",
+								"nodeType": "Sink",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#5",
+								"nodeType": "Block",
+								"out": 1
+							}
+						],
+						"plan": {
+							"nodeCount": 6,
+							"nodeTypes": {
+								"Block": 1,
+								"ConstraintCheck": 1,
+								"Insert": 1,
+								"Sink": 1,
+								"TableLiteral": 1,
+								"UpdateExecutor": 1
+							}
+						},
+						"tables": {
+							"main.bulk_t": {
+								"queryCalls": 0,
+								"rowsScanned": 0,
+								"updateCalls": 500
+							}
+						},
+						"totals": {
+							"instructionExecutions": 6,
+							"queryCalls": 0,
+							"rowsOut": 2002,
+							"rowsScanned": 0,
+							"updateCalls": 500
+						}
+					}
+				},
+				"store": {
+					"__catalog__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 1
+					},
+					"__stats__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 20,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 1
+					},
+					"main.bulk_t": {
+						"batchOps": 10000,
+						"batchWrites": 20,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 30000
+					}
+				}
+			},
+			"gated": true
+		},
+		"delete-where-100": {
+			"counters": {
+				"instructions": [
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#0",
+						"nodeType": "IndexScan",
+						"out": 10000
+					},
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#1",
+						"out": 1
+					},
+					{
+						"executions": 1,
+						"in": 2,
+						"key": "r#2",
+						"nodeType": "Filter",
+						"out": 100
+					},
+					{
+						"executions": 1,
+						"in": 1,
+						"key": "r#3",
+						"nodeType": "Delete",
+						"out": 100
+					},
+					{
+						"executions": 1,
+						"in": 1,
+						"key": "r#4",
+						"nodeType": "ConstraintCheck",
+						"out": 100
+					},
+					{
+						"executions": 1,
+						"in": 1,
+						"key": "r#5",
+						"nodeType": "UpdateExecutor",
+						"out": 100
+					},
+					{
+						"executions": 1,
+						"in": 1,
+						"key": "r#6",
+						"nodeType": "Sink",
+						"out": 1
+					},
+					{
+						"executions": 1,
+						"in": 1,
+						"key": "r#7",
+						"nodeType": "Block",
+						"out": 1
+					}
+				],
+				"plan": {
+					"nodeCount": 11,
+					"nodeTypes": {
+						"BinaryOp": 1,
+						"Block": 1,
+						"ColumnReference": 1,
+						"ConstraintCheck": 1,
+						"Delete": 1,
+						"Filter": 1,
+						"IndexScan": 1,
+						"Literal": 1,
+						"Sink": 1,
+						"TableReference": 1,
+						"UpdateExecutor": 1
+					}
+				},
+				"tables": {
+					"main.del_t": {
+						"queryCalls": 1,
+						"rowsScanned": 10000,
+						"updateCalls": 100
+					}
+				},
+				"totals": {
+					"instructionExecutions": 8,
+					"queryCalls": 1,
+					"rowsOut": 10403,
+					"rowsScanned": 10000,
+					"updateCalls": 100
+				}
+			},
+			"gated": true
+		},
+		"delete-where-100@store-mem": {
+			"counters": {
+				"engine": {
+					"instructions": [
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#0",
+							"nodeType": "IndexScan",
+							"out": 10000
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#1",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 2,
+							"key": "r#2",
+							"nodeType": "Filter",
+							"out": 100
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#3",
+							"nodeType": "Delete",
+							"out": 100
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#4",
+							"nodeType": "ConstraintCheck",
+							"out": 100
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#5",
+							"nodeType": "UpdateExecutor",
+							"out": 100
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#6",
+							"nodeType": "Sink",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#7",
+							"nodeType": "Block",
+							"out": 1
+						}
+					],
+					"plan": {
+						"nodeCount": 11,
+						"nodeTypes": {
+							"BinaryOp": 1,
+							"Block": 1,
+							"ColumnReference": 1,
+							"ConstraintCheck": 1,
+							"Delete": 1,
+							"Filter": 1,
+							"IndexScan": 1,
+							"Literal": 1,
+							"Sink": 1,
+							"TableReference": 1,
+							"UpdateExecutor": 1
+						}
+					},
+					"tables": {
+						"main.del_t": {
+							"queryCalls": 1,
+							"rowsScanned": 10000,
+							"updateCalls": 100
+						}
+					},
+					"totals": {
+						"instructionExecutions": 8,
+						"queryCalls": 1,
+						"rowsOut": 10403,
+						"rowsScanned": 10000,
+						"updateCalls": 100
+					}
+				},
+				"store": {
+					"__catalog__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"__stats__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 1,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.del_t": {
+						"batchOps": 100,
+						"batchWrites": 1,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 10000,
+						"singleGets": 100
+					}
+				}
+			},
+			"gated": true
+		},
+		"single-row-insert-1k": {
+			"counters": {
+				"firstRow": {
+					"instructions": [
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#0",
+							"nodeType": "TableLiteral",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#1",
+							"nodeType": "Insert",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#2",
+							"nodeType": "ConstraintCheck",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#3",
+							"nodeType": "UpdateExecutor",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#4",
+							"nodeType": "Sink",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#5",
+							"nodeType": "Block",
+							"out": 1
+						}
+					],
+					"plan": {
+						"nodeCount": 6,
+						"nodeTypes": {
+							"Block": 1,
+							"ConstraintCheck": 1,
+							"Insert": 1,
+							"Sink": 1,
+							"TableLiteral": 1,
+							"UpdateExecutor": 1
+						}
+					},
+					"tables": {
+						"main.single_t": {
+							"queryCalls": 0,
+							"rowsScanned": 0,
+							"updateCalls": 1
+						}
+					},
+					"totals": {
+						"instructionExecutions": 6,
+						"queryCalls": 0,
+						"rowsOut": 6,
+						"rowsScanned": 0,
+						"updateCalls": 1
+					}
+				},
+				"lastRow": {
+					"instructions": [
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#0",
+							"nodeType": "TableLiteral",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#1",
+							"nodeType": "Insert",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#2",
+							"nodeType": "ConstraintCheck",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#3",
+							"nodeType": "UpdateExecutor",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#4",
+							"nodeType": "Sink",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#5",
+							"nodeType": "Block",
+							"out": 1
+						}
+					],
+					"plan": {
+						"nodeCount": 6,
+						"nodeTypes": {
+							"Block": 1,
+							"ConstraintCheck": 1,
+							"Insert": 1,
+							"Sink": 1,
+							"TableLiteral": 1,
+							"UpdateExecutor": 1
+						}
+					},
+					"tables": {
+						"main.single_t": {
+							"queryCalls": 0,
+							"rowsScanned": 0,
+							"updateCalls": 1
+						}
+					},
+					"totals": {
+						"instructionExecutions": 6,
+						"queryCalls": 0,
+						"rowsOut": 6,
+						"rowsScanned": 0,
+						"updateCalls": 1
+					}
+				}
+			},
+			"gated": true
+		},
+		"single-row-insert-1k@store-mem": {
+			"counters": {
+				"engine": {
+					"firstRow": {
+						"instructions": [
+							{
+								"executions": 1,
+								"in": 0,
+								"key": "r#0",
+								"nodeType": "TableLiteral",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#1",
+								"nodeType": "Insert",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#2",
+								"nodeType": "ConstraintCheck",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#3",
+								"nodeType": "UpdateExecutor",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#4",
+								"nodeType": "Sink",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#5",
+								"nodeType": "Block",
+								"out": 1
+							}
+						],
+						"plan": {
+							"nodeCount": 6,
+							"nodeTypes": {
+								"Block": 1,
+								"ConstraintCheck": 1,
+								"Insert": 1,
+								"Sink": 1,
+								"TableLiteral": 1,
+								"UpdateExecutor": 1
+							}
+						},
+						"tables": {
+							"main.single_t": {
+								"queryCalls": 0,
+								"rowsScanned": 0,
+								"updateCalls": 1
+							}
+						},
+						"totals": {
+							"instructionExecutions": 6,
+							"queryCalls": 0,
+							"rowsOut": 6,
+							"rowsScanned": 0,
+							"updateCalls": 1
+						}
+					},
+					"lastRow": {
+						"instructions": [
+							{
+								"executions": 1,
+								"in": 0,
+								"key": "r#0",
+								"nodeType": "TableLiteral",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#1",
+								"nodeType": "Insert",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#2",
+								"nodeType": "ConstraintCheck",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#3",
+								"nodeType": "UpdateExecutor",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#4",
+								"nodeType": "Sink",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#5",
+								"nodeType": "Block",
+								"out": 1
+							}
+						],
+						"plan": {
+							"nodeCount": 6,
+							"nodeTypes": {
+								"Block": 1,
+								"ConstraintCheck": 1,
+								"Insert": 1,
+								"Sink": 1,
+								"TableLiteral": 1,
+								"UpdateExecutor": 1
+							}
+						},
+						"tables": {
+							"main.single_t": {
+								"queryCalls": 0,
+								"rowsScanned": 0,
+								"updateCalls": 1
+							}
+						},
+						"totals": {
+							"instructionExecutions": 6,
+							"queryCalls": 0,
+							"rowsOut": 6,
+							"rowsScanned": 0,
+							"updateCalls": 1
+						}
+					}
+				},
+				"store": {
+					"__catalog__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 1
+					},
+					"__stats__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 10,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 1
+					},
+					"main.single_t": {
+						"batchOps": 1000,
+						"batchWrites": 1000,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 3000
+					}
+				}
+			},
+			"gated": true
+		},
+		"update-where-1k": {
+			"counters": {
+				"apply": {
+					"instructions": [
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#0",
+							"nodeType": "IndexScan",
+							"out": 10000
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#1",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 2,
+							"key": "r#2",
+							"nodeType": "Filter",
+							"out": 1000
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#3",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 2,
+							"key": "r#4",
+							"nodeType": "Update",
+							"out": 1000
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#5",
+							"nodeType": "ConstraintCheck",
+							"out": 1000
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#6",
+							"nodeType": "UpdateExecutor",
+							"out": 1000
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#7",
+							"nodeType": "Sink",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#8",
+							"nodeType": "Block",
+							"out": 1
+						}
+					],
+					"plan": {
+						"nodeCount": 12,
+						"nodeTypes": {
+							"BinaryOp": 1,
+							"Block": 1,
+							"ColumnReference": 1,
+							"ConstraintCheck": 1,
+							"Filter": 1,
+							"IndexScan": 1,
+							"Literal": 2,
+							"Sink": 1,
+							"TableReference": 1,
+							"Update": 1,
+							"UpdateExecutor": 1
+						}
+					},
+					"tables": {
+						"main.upd_t": {
+							"queryCalls": 1,
+							"rowsScanned": 10000,
+							"updateCalls": 1000
+						}
+					},
+					"totals": {
+						"instructionExecutions": 9,
+						"queryCalls": 1,
+						"rowsOut": 14004,
+						"rowsScanned": 10000,
+						"updateCalls": 1000
+					}
+				},
+				"reverse": {
+					"instructions": [
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#0",
+							"nodeType": "IndexScan",
+							"out": 10000
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#1",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 2,
+							"key": "r#2",
+							"nodeType": "Filter",
+							"out": 1000
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#3",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 2,
+							"key": "r#4",
+							"nodeType": "Update",
+							"out": 1000
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#5",
+							"nodeType": "ConstraintCheck",
+							"out": 1000
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#6",
+							"nodeType": "UpdateExecutor",
+							"out": 1000
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#7",
+							"nodeType": "Sink",
+							"out": 1
+						},
+						{
+							"executions": 1,
+							"in": 1,
+							"key": "r#8",
+							"nodeType": "Block",
+							"out": 1
+						}
+					],
+					"plan": {
+						"nodeCount": 12,
+						"nodeTypes": {
+							"BinaryOp": 1,
+							"Block": 1,
+							"ColumnReference": 1,
+							"ConstraintCheck": 1,
+							"Filter": 1,
+							"IndexScan": 1,
+							"Literal": 2,
+							"Sink": 1,
+							"TableReference": 1,
+							"Update": 1,
+							"UpdateExecutor": 1
+						}
+					},
+					"tables": {
+						"main.upd_t": {
+							"queryCalls": 1,
+							"rowsScanned": 10000,
+							"updateCalls": 1000
+						}
+					},
+					"totals": {
+						"instructionExecutions": 9,
+						"queryCalls": 1,
+						"rowsOut": 14004,
+						"rowsScanned": 10000,
+						"updateCalls": 1000
+					}
+				}
+			},
+			"gated": true
+		},
+		"update-where-1k@store-mem": {
+			"counters": {
+				"engine": {
+					"apply": {
+						"instructions": [
+							{
+								"executions": 1,
+								"in": 0,
+								"key": "r#0",
+								"nodeType": "IndexScan",
+								"out": 10000
+							},
+							{
+								"executions": 1,
+								"in": 0,
+								"key": "r#1",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 2,
+								"key": "r#2",
+								"nodeType": "Filter",
+								"out": 1000
+							},
+							{
+								"executions": 1,
+								"in": 0,
+								"key": "r#3",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 2,
+								"key": "r#4",
+								"nodeType": "Update",
+								"out": 1000
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#5",
+								"nodeType": "ConstraintCheck",
+								"out": 1000
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#6",
+								"nodeType": "UpdateExecutor",
+								"out": 1000
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#7",
+								"nodeType": "Sink",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#8",
+								"nodeType": "Block",
+								"out": 1
+							}
+						],
+						"plan": {
+							"nodeCount": 12,
+							"nodeTypes": {
+								"BinaryOp": 1,
+								"Block": 1,
+								"ColumnReference": 1,
+								"ConstraintCheck": 1,
+								"Filter": 1,
+								"IndexScan": 1,
+								"Literal": 2,
+								"Sink": 1,
+								"TableReference": 1,
+								"Update": 1,
+								"UpdateExecutor": 1
+							}
+						},
+						"tables": {
+							"main.upd_t": {
+								"queryCalls": 1,
+								"rowsScanned": 10000,
+								"updateCalls": 1000
+							}
+						},
+						"totals": {
+							"instructionExecutions": 9,
+							"queryCalls": 1,
+							"rowsOut": 14004,
+							"rowsScanned": 10000,
+							"updateCalls": 1000
+						}
+					},
+					"reverse": {
+						"instructions": [
+							{
+								"executions": 1,
+								"in": 0,
+								"key": "r#0",
+								"nodeType": "IndexScan",
+								"out": 10000
+							},
+							{
+								"executions": 1,
+								"in": 0,
+								"key": "r#1",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 2,
+								"key": "r#2",
+								"nodeType": "Filter",
+								"out": 1000
+							},
+							{
+								"executions": 1,
+								"in": 0,
+								"key": "r#3",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 2,
+								"key": "r#4",
+								"nodeType": "Update",
+								"out": 1000
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#5",
+								"nodeType": "ConstraintCheck",
+								"out": 1000
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#6",
+								"nodeType": "UpdateExecutor",
+								"out": 1000
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#7",
+								"nodeType": "Sink",
+								"out": 1
+							},
+							{
+								"executions": 1,
+								"in": 1,
+								"key": "r#8",
+								"nodeType": "Block",
+								"out": 1
+							}
+						],
+						"plan": {
+							"nodeCount": 12,
+							"nodeTypes": {
+								"BinaryOp": 1,
+								"Block": 1,
+								"ColumnReference": 1,
+								"ConstraintCheck": 1,
+								"Filter": 1,
+								"IndexScan": 1,
+								"Literal": 2,
+								"Sink": 1,
+								"TableReference": 1,
+								"Update": 1,
+								"UpdateExecutor": 1
+							}
+						},
+						"tables": {
+							"main.upd_t": {
+								"queryCalls": 1,
+								"rowsScanned": 10000,
+								"updateCalls": 1000
+							}
+						},
+						"totals": {
+							"instructionExecutions": 9,
+							"queryCalls": 1,
+							"rowsOut": 14004,
+							"rowsScanned": 10000,
+							"updateCalls": 1000
+						}
+					}
+				},
+				"store": {
+					"__catalog__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"__stats__": {
+						"batchOps": 0,
+						"batchWrites": 0,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 0,
+						"singleGets": 0
+					},
+					"main.upd_t": {
+						"batchOps": 2000,
+						"batchWrites": 2,
+						"directDeletes": 0,
+						"directPuts": 0,
+						"getManyCalls": 0,
+						"getManyKeys": 0,
+						"iterateEntries": 20000,
+						"singleGets": 4000
+					}
+				}
+			},
+			"gated": true
+		}
+	}
+}
