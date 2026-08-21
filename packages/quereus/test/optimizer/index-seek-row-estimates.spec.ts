@@ -30,6 +30,13 @@ function findSeek(root: PlanNode): IndexSeekNode | undefined {
 	return found;
 }
 
+/** Every physical aggregate flavour — which one the optimizer picks is not this test's point. */
+const AGGREGATE_NODE_TYPES = new Set<PlanNodeType>([
+	PlanNodeType.Aggregate,
+	PlanNodeType.HashAggregate,
+	PlanNodeType.StreamAggregate,
+]);
+
 /** Rows the query actually returns — the number every estimate below is judged against. */
 async function actualRows(db: Database, sql: string): Promise<number> {
 	let count = 0;
@@ -146,16 +153,33 @@ describe('index seek row estimates', () => {
 		}
 	});
 
-	it('never advertises more rows than the table holds', () => {
+	it('never advertises more rows than the table holds', async () => {
 		// `min(N, inCardinality * perKey)` — a seek cannot return more rows than exist.
-		const seek = findSeek(db.getPlan('select * from big where k in (0, 1, 2, 3)'));
-		if (seek) {
-			expect(seek.physical?.estimatedRows).to.equal(2000);
-		} else {
-			// The module may prefer a scan once the seek saturates; that is a legitimate
-			// outcome of an honest estimate, not a failure of the clamp.
-			expect(findSeek(db.getPlan('select * from big where k in (0, 1, 2, 3)'))).to.be.undefined;
-		}
+		// Four seek keys at 500 matched rows each would multiply out to 2000 anyway; the
+		// clamp is what keeps `k in (0, 1, 2, 3, 0)` (a redundant key the module counts
+		// again) from advertising 2500.
+		const seek = findSeek(db.getPlan('select * from big where k in (0, 1, 2, 3, 0)'));
+		expect(seek, 'expected an IndexSeek for the saturating IN').to.not.be.undefined;
+		expect(seek!.physical?.estimatedRows).to.equal(2000);
+		expect(await actualRows(db, 'select * from big where k in (0, 1, 2, 3, 0)')).to.equal(2000);
+	});
+
+	it('propagates the corrected estimate to the node above the seek', () => {
+		// The ticket's motivating symptom is a cost decision ABOVE the seek reading the
+		// constant. `aggregateRowsFrom` divides the source count by 10 for a grouped
+		// aggregate, so the aggregate node reads 500/10 here where the flat 100 gave 10.
+		const plan = db.getPlan('select k, count(*) from big where k = 1 group by k');
+		const seek = findSeek(plan);
+		expect(seek, 'expected an IndexSeek below the aggregate').to.not.be.undefined;
+		expect(seek!.physical?.estimatedRows).to.equal(500);
+
+		let aggregateRows: number | undefined;
+		walk(plan, (n) => {
+			if (aggregateRows === undefined && AGGREGATE_NODE_TYPES.has(n.nodeType)) {
+				aggregateRows = n.physical?.estimatedRows;
+			}
+		});
+		expect(aggregateRows, 'the aggregate above the seek estimates from 500, not 100').to.equal(50);
 	});
 
 	it('leaves the unfiltered scan path untouched', () => {
@@ -170,5 +194,54 @@ describe('index seek row estimates', () => {
 			}
 		});
 		expect(scanRows, 'a full scan still reports the catalog row count').to.equal(2000);
+	});
+});
+
+describe('index seek row estimates — composite and unique indexes', () => {
+	let db: Database;
+
+	// 1200 rows; `a` holds 3 distinct values and `b` 4, under one composite non-unique
+	// index; `u` is distinct per row under a unique index.
+	before(async () => {
+		db = new Database();
+		await db.exec('create table comp (id integer primary key, a integer, b integer, u integer) using memory');
+		await db.exec('create index ix_ab on comp(a, b)');
+		await db.exec('create unique index ux_u on comp(u)');
+		const values: string[] = [];
+		for (let i = 1; i <= 1200; i++) values.push(`(${i}, ${i % 3}, ${i % 4}, ${i})`);
+		for (let i = 0; i < values.length; i += 200) {
+			await db.exec(`insert into comp values ${values.slice(i, i + 200).join(',')}`);
+		}
+		for await (const _ of db.eval('analyze comp')) { /* consume */ }
+	});
+
+	after(async () => { await db.close(); });
+
+	it('folds a composite equality prefix through the damped conjunctive combiner', async () => {
+		// The two equality columns fold through the engine's `combineConjunctive`
+		// (exponential backoff), NOT a raw product — that is the rule the module follows
+		// so its number matches what a residual Filter over the same predicate would
+		// carry. Sorted ascending the factors are 1/4 and 1/3, giving
+		// 0.25 * (1/3)^(1/2) = 0.1443, so floor(1200 * 0.1443) = 173.
+		//
+		// A raw product would give 1200/12 = 100, which is the exact answer here because
+		// `a` and `b` are independent by construction. The damping deliberately
+		// over-estimates instead: real-world conjuncts are usually correlated, and
+		// over-estimating surviving rows is the safe direction for plan choice. This test
+		// exists to make that divergence visible if anyone changes the fold.
+		const seek = findSeek(db.getPlan('select * from comp where a = 1 and b = 2'));
+		expect(seek, 'expected an IndexSeek for the composite equality prefix').to.not.be.undefined;
+		expect(seek!.physical?.estimatedRows).to.equal(173);
+		expect(await actualRows(db, 'select * from comp where a = 1 and b = 2')).to.equal(100);
+	});
+
+	it('estimates a unique SECONDARY index seek at one row per key', async () => {
+		// The primary key is recognised by name; a declared UNIQUE index is recognised by
+		// its `unique` flag. Both mean one matched row per seek key, whatever the column's
+		// distinct count says.
+		const seek = findSeek(db.getPlan('select * from comp where u = 5'));
+		expect(seek, 'expected an IndexSeek for `u = 5`').to.not.be.undefined;
+		expect(seek!.physical?.estimatedRows).to.equal(1);
+		expect(await actualRows(db, 'select * from comp where u = 5')).to.equal(1);
 	});
 });

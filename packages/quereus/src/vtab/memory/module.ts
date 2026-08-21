@@ -124,6 +124,20 @@ function equalityTupleSelectivity(tableInfo: TableSchema, eqCols: readonly numbe
  * {@link EQ_SELECTIVITY_WITHOUT_STATS} shape constant, and the row count advertised is now
  * honest either way. If a fat seek over an ANALYZEd table ever shows up as a slow plan,
  * the veto is the fix, not a smaller constant.
+ *
+ * NOTE: `inCardinality` counts the seek keys the module was OFFERED, not the ones the
+ * engine will issue — `rule-select-access-path` drops NULL-bearing tuples and collapses
+ * duplicates afterwards, so `k in (1, 1, 1)` is priced and estimated as three keys and
+ * seeks one. Over-estimating is the safe direction and the cost model has always had the
+ * same asymmetry; if a duplicate-heavy or NULL-heavy `IN` ever needs the exact count, the
+ * reduction belongs in the module rather than a second copy of it here.
+ *
+ * NOTE: without per-column statistics the shape constant saturates this estimate at ten
+ * seek keys (`10 × 0.1N` is the whole table), which is what makes the ordering comparison
+ * in {@link MemoryTableModule.adjustPlanForOrdering} prefer a plain ordered index walk
+ * over seek-then-sort from roughly nine keys up. Correct rows either way, and `ANALYZE`
+ * resolves it; if a multi-seek with an `ORDER BY` on the seek column shows up as a slow
+ * plan on an un-analyzed table, that crossover is where to look.
  */
 function estimateEqualityRows(
 	tableInfo: TableSchema,
@@ -505,7 +519,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 			&& !(request.requiredOrdering && request.requiredOrdering.length > 0)
 			&& tableInfo.primaryKeyDefinition && tableInfo.primaryKeyDefinition.length > 0
 		) {
-			const usesSecondaryIndex = bestPlan.indexName && bestPlan.indexName !== '_primary_';
+			const usesSecondaryIndex = bestPlan.indexName && bestPlan.indexName !== PRIMARY_INDEX_NAME;
 			if (!usesSecondaryIndex) {
 				const pkOrdering: OrderingSpec[] = tableInfo.primaryKeyDefinition.map(col => ({
 					columnIndex: col.index,
@@ -514,7 +528,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 				bestPlan = {
 					...bestPlan,
 					providesOrdering: pkOrdering,
-					orderingIndexName: bestPlan.orderingIndexName ?? '_primary_'
+					orderingIndexName: bestPlan.orderingIndexName ?? PRIMARY_INDEX_NAME
 				};
 			}
 		}
@@ -1049,7 +1063,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 
 		// Add pseudo-index for primary key
 		const pkIndexSchema = {
-			name: '_primary_',
+			name: PRIMARY_INDEX_NAME,
 			columns: tableInfo.primaryKeyDefinition
 		};
 		availableIndexes.push(pkIndexSchema);

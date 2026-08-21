@@ -266,6 +266,16 @@ describe('runtime-valued IN sets (feat-runtime-key-set-protocol)', () => {
 			// against one plan shape: which of the two candidate plans wins is a cost
 			// question, but a seeking plan claiming ordering is wrong at any cost.
 			const ordering = { requiredOrdering: [{ columnIndex: 1, desc: false }] };
+
+			// A key count small enough that seek-then-sort still wins, so the invariant is
+			// asserted against a plan that ACTUALLY pushes the set. Without this case the
+			// check below is vacuous — the 25-key plan does not seek at all (see the next
+			// paragraph), and no other test pins the ordering claim under a required
+			// ordering.
+			const seeking = plan('t', [runtimeSetFilter(1, 5)], ordering);
+			expect(seeking.seekColumnIndexes, 'five keys still price as a seek').to.deep.equal([1]);
+			expect(seeking.providesOrdering, 'a seeking plan must leave the Sort to the planner').to.be.undefined;
+
 			const result = plan('t', [runtimeSetFilter(1, 25)], ordering);
 			if (result.seekColumnIndexes && result.seekColumnIndexes.length > 0) {
 				expect(result.providesOrdering, 'a seeking plan must leave the Sort to the planner').to.be.undefined;
