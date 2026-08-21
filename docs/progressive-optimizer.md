@@ -45,7 +45,9 @@ The full multi-pass optimization pipeline, corresponding to the current optimize
 
 Key constraint: Tier 1 **never blocks waiting for statistics**. It uses whatever is cached at the time of optimization. When stats are missing for a particular table or predicate, the cost model falls back to heuristic defaults for that specific decision, while using available stats everywhere else. This produces a plan that is partially cost-optimized and partially heuristic — strictly better than Tier 0.
 
-Tier selection favors Tier 1 when vtab-supplied statistics are available at no I/O cost. `MemoryTable`, for instance, provides exact row counts and distinct-value estimates from BTree metadata via `getStatistics()`. For these modules, Tier 1 runs even on first execution. The tier system respects the cost of stat collection: free stats trigger Tier 1; expensive stats stay at Tier 0 until execution feedback accumulates.
+Tier selection favors Tier 1 when statistics are already cached at no I/O cost. The tier system respects the cost of stat collection: free stats trigger Tier 1; expensive stats stay at Tier 0 until execution feedback accumulates.
+
+What a module supplies today is narrower than "statistics". `getStatistics()` reports a table's **size**, and both shipped backends report only that: `MemoryTable` reads the primary BTree's node count, `StoreTable` reads its delta-tracked running count. Per-column distinct counts, null counts, min/max and histograms come from `ANALYZE`'s scan, and reach the planner through `TableSchema.statistics` — not from the module. (`MemoryTable` did once derive per-column figures from a sample of up to 1000 values, which made them wrong on any larger table; see `bug-analyze-stats-wrong-past-1000-rows`.) A module that wants a live size in a cost decision between `ANALYZE`s fills in `request.estimatedRows` from `getBestAccessPlan` instead.
 
 ### Tier 2: Feedback-Refined Plan
 
@@ -90,7 +92,7 @@ An in-memory, session-scoped cache of per-table and per-predicate observations c
 
 The overlay requires no persistence — it rebuilds naturally from query execution within a session. It is bounded (LRU eviction per table) to prevent unbounded memory growth in embedded environments with many unique queries.
 
-The overlay supplements but does not replace catalog stats. When a vtab module provides exact metadata (e.g., `MemoryTable` BTree stats), those stats are preferred. The overlay is most valuable for tables where statistics collection is expensive (DHT-backed storage, federated tables) and the only affordable source of cardinality information is the execution itself.
+The overlay supplements but does not replace catalog stats. Exact numbers are preferred where they exist — the statistics `ANALYZE` recorded on `TableSchema.statistics`, or a live row count a module reports through `getBestAccessPlan`. The overlay is most valuable for tables where statistics collection is expensive (DHT-backed storage, federated tables) and the only affordable source of cardinality information is the execution itself.
 
 ---
 
@@ -203,9 +205,11 @@ Structural passes are skipped because predicate pushdown, projection pruning, an
 
 ### vtab Stats Availability
 
-The tier selection logic queries each table's vtab module for stats availability before choosing a tier. Modules that implement `getStatistics()` with low cost (e.g., `MemoryTable` reading BTree metadata) allow Tier 1 on first execution. Modules that would require I/O for statistics (DHT-backed, federated) do not, keeping first execution at Tier 0.
+**Not yet implemented.** Nothing consults `getStatistics()` during planning today — `ANALYZE` (`runtime/emit/analyze.ts`) is its only caller in the engine, and tier selection does not ask modules what they could answer cheaply. The design below is the intended shape, recorded here so the hook's cost semantics are not lost.
 
-This distinction is important: a query joining a local `MemoryTable` with a DHT-backed table uses Tier 1 stats for the local table and Tier 0 heuristics for the remote table — the best available information for each source without unnecessary I/O.
+Tier selection should query each table's vtab module for stats availability before choosing a tier. A module that can size itself with no I/O (`MemoryTable` reading its BTree node count, `StoreTable` reading its running count) would allow Tier 1 on first execution; a module that would need I/O (DHT-backed, federated) would not, keeping first execution at Tier 0.
+
+This distinction matters: a query joining a local `MemoryTable` with a DHT-backed table would use Tier 1 stats for the local table and Tier 0 heuristics for the remote table — the best available information for each source without unnecessary I/O.
 
 ---
 

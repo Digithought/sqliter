@@ -23,8 +23,7 @@ const log = createLogger('runtime:emit:analyze');
  * The statistics `ANALYZE` records for one table.
  *
  * A module's own `getStatistics()` is preferred — it knows its storage and can be
- * both cheaper and more exact than a scan (MemoryTable reads an exact row count and
- * per-index distinct counts straight off its BTree metadata).
+ * both cheaper and more exact than a scan.
  *
  * A module may also DECLINE outright, returning `undefined` for the state it is
  * currently in — the isolation layer does that while a transaction's overlay is dirty,

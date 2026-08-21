@@ -668,7 +668,15 @@ describe('VTab-supplied statistics', () => {
 // yourself" and still scan — otherwise implementing getStatistics() would make
 // ANALYZE collect strictly LESS than it did before.
 
-/** A memory module whose tables report a row count and no column statistics. */
+/**
+ * A memory module whose tables report a row count and no column statistics.
+ *
+ * NOTE: since `bug-analyze-stats-wrong-past-1000-rows` this is what `MemoryTable` itself
+ * does, so the override below looks redundant. Keep it — this describes the size-only
+ * PROTOCOL, which any module may use, and would still have to hold if the memory backend
+ * ever learned to answer more. `analyze-stats-equivalence.spec.ts` is the test that covers
+ * the memory backend's own numbers.
+ */
 class SizeOnlyStatsModule extends MemoryTableModule {
 	/** Row count the last size-only report handed back, so a test can tell them apart. */
 	public reportedRowCount: number | undefined;

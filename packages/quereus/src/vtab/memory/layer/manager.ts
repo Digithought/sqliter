@@ -478,53 +478,21 @@ export class MemoryTableManager {
 	}
 
 	/**
-	 * Returns committed layer statistics for cost-based optimization.
-	 * Provides exact row count and per-index distinct counts without scanning.
+	 * The committed layer's exact row count, read off the primary BTree's node count
+	 * without scanning.
+	 *
+	 * This is the COMMITTED base only — a connection's uncommitted rows are in its own
+	 * pending layer and are not counted here. `MemoryTable.getStatistics`, the sole caller,
+	 * is fine with that because `ANALYZE` prefers its own scan's count.
+	 *
+	 * This used to also return a per-index distinct count (`idxTree.getCount()` over each
+	 * secondary BTree, which keys on the index key with all matching primary keys collected
+	 * into one entry — a genuine distinct count, not an estimate). Nothing reads it now that
+	 * `getStatistics` reports size only; if it is ever revived, it was correct.
 	 */
-	getBaseLayerStats(): { rowCount: number; indexDistinctCounts: Map<string, number> } {
+	getBaseLayerStats(): { rowCount: number } {
 		const tree = this._currentCommittedLayer.getModificationTree('primary');
-		const rowCount = tree?.getCount() ?? 0;
-		const indexDistinctCounts = new Map<string, number>();
-		for (const idx of this.tableSchema?.indexes ?? []) {
-			const idxTree = this._currentCommittedLayer.getSecondaryIndexTree?.(idx.name);
-			if (idxTree) {
-				indexDistinctCounts.set(idx.name, idxTree.getCount());
-			}
-		}
-		return { rowCount, indexDistinctCounts };
-	}
-
-	/**
-	 * Sample column values from the committed layer for histogram construction.
-	 * Returns sorted non-null values for the specified column index.
-	 * For tables with <= maxSample rows returns all values; otherwise systematic samples.
-	 */
-	sampleColumnValues(columnIndex: number, maxSample: number = 1000): SqlValue[] {
-		const tree = this._currentCommittedLayer.getModificationTree('primary');
-		if (!tree) return [];
-		const count = tree.getCount();
-		const values: SqlValue[] = [];
-
-		if (count === 0) return values;
-
-		const step = count <= maxSample ? 1 : Math.floor(count / maxSample);
-		let i = 0;
-		for (const path of tree.ascending(tree.first())) {
-			if (i % step === 0) {
-				const row = tree.at(path);
-				if (row) {
-					const val = row[columnIndex];
-					if (val !== null && val !== undefined) {
-						values.push(val);
-					}
-				}
-			}
-			i++;
-			if (values.length >= maxSample) break;
-		}
-
-		values.sort((a, b) => compareSqlValues(a, b));
-		return values;
+		return { rowCount: tree?.getCount() ?? 0 };
 	}
 
 	public connect(): MemoryTableConnection {

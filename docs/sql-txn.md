@@ -425,4 +425,11 @@ analyze temp.scratch;
 
 A named target (`analyze <table>` or `analyze <schema>.<table>`) is resolved the same way any other statement resolves a table name — an unqualified name follows the session search path (`pragma schema_path`) — and it must exist and must be a real table, or the statement raises an error rather than silently returning nothing. A plain view is rejected by name: it stores no rows to collect statistics from. A materialized view is a real backing table and is analyzed like any other. `ANALYZE <schema>.*` likewise errors if `<schema>` does not exist. Bare `ANALYZE` and `ANALYZE <schema>.*` on a schema with no tables still return zero rows — that is not an error, there is simply nothing to analyze. Bare `ANALYZE` covers the `main` schema only, regardless of the search path (backlog `bug-bare-analyze-only-covers-main`).
 
-If a virtual table module implements `getStatistics()`, those statistics are used directly. Otherwise, a full table scan collects per-column statistics with reservoir-sampled histograms. Collected statistics are cached on the table schema and used by the optimizer's `CatalogStatsProvider` for improved cost estimates.
+A virtual table module that implements `getStatistics()` may answer the whole question, part of it, or none of it, and `ANALYZE` scans for whatever it did not answer:
+
+- **A full answer** (a row count *and* a non-empty `columnStats`) is used directly, with no scan.
+- **A partial answer** — a row count with an *empty* `columnStats` — reads as "size answered, collect the rest yourself". Both shipped backends answer this way: they can size themselves in O(1) but keep no value distribution. `ANALYZE` scans for the per-column numbers and prefers the scan's row count, since it counted every live row while a maintained count can drift.
+- **A decline** (`undefined`) is treated exactly like an unimplemented hook, and is what a wrapper returns when its cheap answer would be wrong for the read it is serving — the isolation layer declines while a transaction's overlay is dirty.
+- **No hook at all** scans as well.
+
+The scan collects exact per-column distinct counts, null counts and min/max over every row the connection can see, plus histograms built from a sample of the values. Collected statistics are cached on the table schema and used by the optimizer's `CatalogStatsProvider` for improved cost estimates. See `docs/module-authoring.md` for the module-side contract.
