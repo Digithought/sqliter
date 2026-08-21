@@ -146,3 +146,54 @@ is why the review recorded the measurement here rather than adding one.
   producer work should not land first.
 - `docs/module-authoring.md` states the access-plan `rows` contract in prose only; a
   representation change is the chance to make it checkable.
+
+## Arm 4 (evidence) — the unknown sentinel picks the wrong join algorithm and the wrong access path
+
+Two performance reports from a user running the IndexedDB store backend both traced to this
+representation, not to the rules they appeared to be about. Recorded here as evidence for the
+representation change rather than as separate tickets.
+
+**Wrong join algorithm.** `rule-join-physical-selection` reads each side's row estimate as
+`physicalSourceRows(...) || 100`, so a never-analyzed table — which reports `0` — is costed at
+100 rows. Both sides of a join collapse to 100, and hash join wins arithmetically:
+`min(100,100)*0.8 + 100*0.4 = 120` against an index-nested-loop at `100*(1.0+0.5+0.3) = 180`.
+With real counts the same comparison is 4080 against 180 and the index-nested-loop wins.
+
+Measured, store backend, 10,000-row and 20,000-row tables, one selective filter, result is one
+row — the only variable is whether `analyze` ran:
+
+| | plan | time |
+|---|---|---|
+| no `analyze` | `HashJoin` over a full scan of the 10,000-row side | 47.3 ms |
+| `analyze` | `Join` with a correlated `IndexSeek` on the primary key | 17.8 ms |
+
+The user read the first plan as the index-nested-loop rule failing to fire and asked whether
+`feat-index-nested-loop-coverage-gaps` covered their shape. It does not — the rule is working
+from a fabricated 100.
+
+**Wrong access path.** The store's seek-versus-scan veto discriminates per query only when the
+access arm's row estimate is statistics-backed; an arm still priced by a shape constant is
+judged at the parity cost profile instead, which for the range arm never vetoes
+(reasoning at `packages/quereus-store/src/common/store-module-access-plan.ts`, top of file).
+Measured with the in-memory provider wrapped to declare the IndexedDB cost profile
+(`pointRead: 3.0`), 20,000 rows, a range matching 55% of them:
+
+| | plan | time |
+|---|---|---|
+| no `analyze` | `IndexSeek` — seeks, then resolves 11,000 scattered rows | 96.7 ms |
+| `analyze` | `IndexScan` + `Filter` — one batched scan | 43.8 ms |
+
+A 10% range correctly keeps the seek in both cases, so the machinery is right; it is starved.
+
+**Why this belongs here.** In both cases the planner is not choosing badly from real numbers —
+it is choosing from `0` spelled as a magnitude. A backend that knows its own size cannot help:
+the store maintains a live row count and uses it for its *own* access-plan sizing
+(`sizeRequestFromLiveCount`), but the engine's join costing reads
+`table.statistics?.rowCount ?? table.estimatedRows`, which `SchemaManager` pins at `0` until
+someone runs `analyze`. An "unknown" that consumers must handle explicitly would have forced
+both sites to ask the backend or to declare their fallback, instead of silently costing a
+20,000-row table as 100 rows.
+
+Related: `bug-index-seek-row-estimate-capped-at-100` (fix stage) is the neighbouring defect on
+the same cost path — an index seek reports a constant 100 rows regardless of the module's own
+answer. The two compound.
