@@ -338,6 +338,19 @@ describe('secondary-index ordering advertisement', () => {
 			expect(trailingOnly.providesOrdering).to.equal(undefined);
 		});
 
+		it('two indexes both satisfying the ordering: the narrower one is walked', async () => {
+			// Every walk candidate prices identically (the cost reads the row count, the
+			// profile and the filter count — never the index), so without the width
+			// tie-break the FIRST-DECLARED index wins and the wide one is walked for its
+			// extra encoded key columns per entry.
+			await db.exec(`create table t11 (id integer primary key, n integer, s text, u text) using store`);
+			await db.exec(`create index ix_wide on t11 (n, s, u)`);
+			await db.exec(`create index ix_narrow on t11 (n)`);
+
+			const plan = planFor('t11', [], [asc(1)]);
+			expect(plan.orderingIndexName, 'declaration order must not decide').to.equal('ix_narrow');
+		});
+
 		it('DESC index column: walks order by n desc, declines order by n', async () => {
 			await db.exec(`create table t4 (id integer primary key, n integer) using store`);
 			await db.exec(`create index ix_nd on t4 (n desc)`);
@@ -764,6 +777,36 @@ describe('secondary-index ordering advertisement', () => {
 			expect(ops, 'the selective seek must win').to.match(SEEK);
 			expect(ops, 'the walk lost, so the Sort stays').to.match(SORT);
 			expect(await column(db, q, 'b')).to.deep.equal([301 - 207, 301 - 107, 301 - 7]);
+		});
+
+		it('a mixed-storage-class column walks in the engine\'s cross-type order', async () => {
+			// The walk is the first shape that emits a WHOLE untyped column straight from
+			// index bytes with no Sort behind it, so the store's key type tags must rank
+			// storage classes exactly as `compareSqlValues` does (NULL < numeric < text <
+			// blob). Both orders are written down independently — encoding.ts's tag
+			// constants and util/comparison.ts's StorageClass enum — and nothing else
+			// compares them.
+			await db.exec(`create table t (id integer primary key, v any null) using store`);
+			await db.exec(`create index ix_v on t (v)`);
+			const values = range(120).map(i => {
+				switch (i % 4) {
+					case 0: return `'s${200 - i}'`;
+					case 1: return String(200 - i);
+					case 2: return String((200 - i) / 7);
+					default: return 'null';
+				}
+			});
+			await db.exec(`insert into t values ${values.map((v, i) => `(${i + 1}, ${v})`).join(', ')}`);
+
+			const q = `select v from t order by v`;
+			expect(await planOps(db, q)).to.match(ISCAN).and.to.not.match(SORT);
+			const walked = await column(db, q, 'v');
+			expect(walked, 'every row must survive the walk').to.have.lengthOf(120);
+
+			// Oracle: the same rows sorted by the engine itself, with the index gone.
+			await db.exec(`drop index ix_v`);
+			expect(await planOps(db, q), 'oracle must sort').to.match(SORT);
+			expect(await column(db, q, 'v')).to.deep.equal(walked);
 		});
 
 		it('empty and single-row tables answer correctly either way', async () => {

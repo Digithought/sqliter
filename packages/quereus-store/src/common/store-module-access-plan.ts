@@ -893,6 +893,7 @@ function chooseOrderingPlan(
 
 	const estimatedRows = request.estimatedRows ?? 1000;
 	let bestWalk: BestAccessPlanResult | null = null;
+	let bestWidth = 0;
 	for (const index of tableInfo.indexes ?? []) {
 		// Partial indexes are excluded from access planning outright (see
 		// {@link tryIndexAccessPlan}) — doubly so here, where the walk IS the whole
@@ -912,12 +913,29 @@ function chooseOrderingPlan(
 		if (!indexOrderingSatisfies(indexOrdering, required, NO_PINNED_COLUMNS)) continue;
 
 		const walk = buildOrderingWalkPlan(index, request, required, estimatedRows, profile);
-		// Strict '<' keeps the first qualifying index on a tie, so declaration order
-		// does not decide — matching the best-seek loop above.
-		if (!bestWalk || walk.cost < bestWalk.cost) bestWalk = walk;
+		// Cheapest first, then NARROWEST. The cost is currently identical for every
+		// candidate — {@link buildOrderingWalkPlan} reads only the row count, the profile
+		// and the filter count, never the index — so cost alone would leave declaration
+		// order deciding, and `ix_wide(n, s, u)` would be walked in preference to
+		// `ix_narrow(n)` purely for being declared first. Both walks visit the same number
+		// of entries, but the wide one's keys carry two extra encoded columns per entry,
+		// so it reads strictly more bytes for the same rows. Ties on both keep the first
+		// candidate, matching the best-seek loop above.
+		const width = index.columns.length;
+		if (!bestWalk || walk.cost < bestWalk.cost || (walk.cost === bestWalk.cost && width < bestWidth)) {
+			bestWalk = walk;
+			bestWidth = width;
+		}
 	}
 	if (!bestWalk) return filterPlan;
 
+	// NOTE: taking the walk also replaces `filterPlan.rows` with the WHOLE table — the
+	// walk pushes nothing, so that figure is honest for the leaf, but it is the number
+	// the rest of the plan is costed against, and the residual `Filter` above re-narrows
+	// it only by the engine's default selectivity. Nothing observed today depends on it
+	// (a walk wins only where its own price already beats scan-then-sort). If a join over
+	// a walked leaf is ever seen ordering itself around an inflated leaf estimate, carry
+	// `filterPlan.rows` onto the walk instead of the table count.
 	const sortCost = estimateSortCost(filterPlan.rows ?? estimatedRows);
 	return bestWalk.cost < filterPlan.cost + sortCost ? bestWalk : filterPlan;
 }

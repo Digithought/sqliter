@@ -9,7 +9,7 @@ files:
   - packages/quereus-isolation/src/isolation-module.ts       # 1,825 lines
   - scripts/check-docs.mjs                                   # 1,325 lines
   - packages/quoomb-cli/src/commands/dot-commands.ts         # 1,189 lines
-  - packages/quereus-store/src/common/store-module-access-plan.ts # 1,340 lines (`wc -l`, 2026-08-21; 1,200 before the secondary-index ordering ticket) — noticed during that review; itself the product of an earlier split of the store module file, and now past the seam again
+  - packages/quereus-store/src/common/store-module-access-plan.ts # 1,591 lines (`wc -l`, 2026-08-21; 1,340 earlier the same day, 1,200 before the secondary-index ordering ticket) — noticed during that review; itself the product of an earlier split of the store module file, and now past the seam again
   - packages/quereus-store/src/common/store-table-base.ts    # 1,120 lines (`wc -l`, 2026-08-11; 1,033 when this ticket was filed)
   - packages/quereus-store/src/common/store-table-scan.ts    # 1,401 lines (`wc -l`, 2026-08-11; 1,023 when this ticket was filed) — prefix-range seek window builders added ~230, batched row resolution another ~150
   - packages/quereus/src/vtab/memory/module.ts               # 1,230 lines (`wc -l`, 2026-08-21; 1,107 before the seek row-estimate ticket) — noticed during the index-seek row-estimate review; module lifecycle/DDL and access-path costing are two separable concerns in one file
@@ -192,10 +192,17 @@ depends on `@quereus/quereus`, so the direction works); note the two backends' *
 shape constants already disagree — memory prices a range arm at 0.25 and a prefix-range at
 0.125 against the store's 0.3 and 0.15 — so unifying them is a decision, not a rename.
 
-### `packages/quereus-store/src/common/store-module-access-plan.ts` — 1,340 lines
+### `packages/quereus-store/src/common/store-module-access-plan.ts` — 1,591 lines
 
 Measured with `wc -l` on 2026-08-21 while reviewing the secondary-index ordering ticket,
-which added ~140 lines (1,200 → 1,340). Notable because this file *is* one of the splits
+which added ~140 lines (1,200 → 1,340); the ordering-only-index-walk ticket that followed
+it the same day added ~250 more (1,340 → 1,591), so the file has grown a third in a day
+and is now the largest in its package. That growth is a **third** decision family the cut
+below has to account for: the ordering-only walk arm (`chooseOrderingPlan`,
+`buildOrderingWalkPlan`, `nullSafeOrderingPrefixLength`, `orderingAlreadySatisfied`) sits
+above both families rather than inside either — it wraps whatever the filter half returns
+and prices it against an index walk — which reads as its own file with the thin arbiter
+importing it. Notable because this file *is* one of the splits
 this ticket recommends elsewhere — it was carved out of the store module file precisely to
 keep access-path costing separate — and it has now outgrown the seam it was cut at.
 
