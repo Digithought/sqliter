@@ -155,10 +155,13 @@ export function isMultiValueEquality(f: PredicateConstraint): boolean {
  * says so outright. A row with NULL in that column therefore cannot survive the filter —
  * wherever the filter ends up being enforced.
  *
- * `OR_RANGE` is deliberately absent. It is a union of NULL-rejecting ranges and so would
- * in fact be NULL-excluding, but it already disqualifies an ordering claim on other
- * grounds in both shipped backends (concatenated windows emit in range order, not column
- * order), so including it would widen what has to be argued and buy nothing.
+ * The set is deliberately INCOMPLETE, which costs an optimization and never correctness —
+ * a missing op declines a claim that would in fact have been sound. `OR_RANGE` is a union
+ * of NULL-rejecting ranges, but it already disqualifies an ordering claim on other grounds
+ * in both shipped backends (concatenated windows emit in range order, not column order),
+ * so listing it would widen what has to be argued and buy nothing. `NOT IN`, `MATCH`,
+ * `LIKE` and `GLOB` are NULL-rejecting too and could be added on demand; none of them
+ * reaches an ordering claim today.
  */
 const NULL_EXCLUDING_OPS: ReadonlySet<ConstraintOp> = new Set<ConstraintOp>([
 	'=', 'IN', '>', '>=', '<', '<=', 'IS NOT NULL',

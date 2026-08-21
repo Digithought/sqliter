@@ -227,3 +227,56 @@ describe('DESC index — NULL placement gate', () => {
 		expect(await column(sql, 'a')).to.deep.equal([1, 2, 3, 4]);
 	});
 });
+
+/**
+ * The BARE primary-key ordering advertisement — the branch `getBestAccessPlan` takes when
+ * the request carries NO `requiredOrdering` at all, so that a merge join can pick an
+ * already-ordered leaf. It is a claim like any other and is read under the same
+ * NULLs-FIRST rule, so it needs the same gate as the request-matching path above.
+ *
+ * The claim is visible in `query_plan()` as the `ORDER BY …` suffix on the INDEXSCAN
+ * detail — an ungated advertisement over `primary key (a desc, b)` with nullable `a`
+ * prints `ORDER BY 0 DESC, 1` while the walk actually emits its NULLs last.
+ */
+describe('memory module — bare primary-key ordering advertisement', () => {
+	let db: Database;
+
+	beforeEach(() => {
+		db = new Database();
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	/** The `ORDER BY …` claim on the leaf scan of `sql`, or '' when it makes none. */
+	async function leafOrderingClaim(sql: string): Promise<string> {
+		const details: string[] = [];
+		for await (const r of db.eval("SELECT detail FROM query_plan(?) WHERE op = 'INDEXSCAN'", [sql])) {
+			details.push((r as unknown as { detail: string }).detail);
+		}
+		if (details.length === 0) return '';
+		expect(details).to.have.lengthOf(1);
+		return details[0].replace(/^.*?(?= ORDER BY |$)/, '').trim();
+	}
+
+	it('makes no claim over a nullable DESC leading PK member', async () => {
+		await db.exec("CREATE TABLE p (a INTEGER NULL, b INTEGER, PRIMARY KEY (a DESC, b)) USING memory");
+		expect(await leafOrderingClaim("SELECT a, b FROM p")).to.equal('');
+	});
+
+	it('truncates the claim before a nullable DESC trailing PK member', async () => {
+		await db.exec("CREATE TABLE pt (a INTEGER, b INTEGER NULL, PRIMARY KEY (a, b DESC)) USING memory");
+		expect(await leafOrderingClaim("SELECT a, b FROM pt")).to.equal('ORDER BY 0');
+	});
+
+	it('keeps the whole claim when the DESC member is declared NOT NULL', async () => {
+		await db.exec("CREATE TABLE pnn (a INTEGER NOT NULL, b INTEGER, PRIMARY KEY (a DESC, b)) USING memory");
+		expect(await leafOrderingClaim("SELECT a, b FROM pnn")).to.equal('ORDER BY 0 DESC, 1');
+	});
+
+	it('keeps the whole claim on an ascending nullable PK — ASC agrees with the engine', async () => {
+		await db.exec("CREATE TABLE pasc (a INTEGER NULL, b INTEGER, PRIMARY KEY (a, b)) USING memory");
+		expect(await leafOrderingClaim("SELECT a, b FROM pasc")).to.equal('ORDER BY 0, 1');
+	});
+});

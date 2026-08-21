@@ -9,10 +9,10 @@ files:
   - packages/quereus-isolation/src/isolation-module.ts       # 1,825 lines
   - scripts/check-docs.mjs                                   # 1,325 lines
   - packages/quoomb-cli/src/commands/dot-commands.ts         # 1,189 lines
-  - packages/quereus-store/src/common/store-module-access-plan.ts # 1,591 lines (`wc -l`, 2026-08-21; 1,340 earlier the same day, 1,200 before the secondary-index ordering ticket) — noticed during that review; itself the product of an earlier split of the store module file, and now past the seam again
+  - packages/quereus-store/src/common/store-module-access-plan.ts # 1,568 lines (`wc -l`, 2026-08-21; peaked at 1,591 the same day, 1,340 before that, 1,200 before the secondary-index ordering ticket) — noticed during that review; itself the product of an earlier split of the store module file, and now past the seam again
   - packages/quereus-store/src/common/store-table-base.ts    # 1,120 lines (`wc -l`, 2026-08-11; 1,033 when this ticket was filed)
   - packages/quereus-store/src/common/store-table-scan.ts    # 1,401 lines (`wc -l`, 2026-08-11; 1,023 when this ticket was filed) — prefix-range seek window builders added ~230, batched row resolution another ~150
-  - packages/quereus/src/vtab/memory/module.ts               # 1,230 lines (`wc -l`, 2026-08-21; 1,107 before the seek row-estimate ticket) — noticed during the index-seek row-estimate review; module lifecycle/DDL and access-path costing are two separable concerns in one file
+  - packages/quereus/src/vtab/memory/module.ts               # 1,284 lines (`wc -l`, 2026-08-21; 1,230 before the DESC-ordering NULL-placement ticket, 1,107 before the seek row-estimate ticket) — noticed during the index-seek row-estimate review; module lifecycle/DDL and access-path costing are two separable concerns in one file
   - packages/quereus/src/planner/analysis/constraint-extractor.ts   # 1,647 lines (`wc -l`, 2026-08-11) — noticed during the relation-key review; predicate normalization, covered-key derivation, `analyzeRowSpecific`, and `TableInfo` construction are four separable concerns in one file
   - packages/quereus/src/planner/building/select-aggregates.ts # 1,630 lines (`wc -l`, 2026-08-12, after the post-aggregate redirect choke point + finished-plan boundary check; 1,486 earlier the same day after the select-list group-key redirect; 1,451 on 2026-08-11, 1,400 before the ungrouped-aggregate ORDER BY alias change, 1,296 before the grouping-key-alias change) — noticed during the window/group-key-alias review; GROUP BY key indexing and redirection, the aggregate output scope, HAVING construction, and the final grouped projection are four separable concerns in one file, and the redirect half now has five callers routed through one entry point (select list, window phase, ORDER BY, HAVING, pre-window sort) plus a plan-walking coverage checker
   - packages/quereus/src/schema/table.ts                     # 1,751 lines (`wc -l`, 2026-08-16) — noticed during the PK-conflict DDL review; the `TableSchema`/`ColumnSchema` type surface, the AST→schema builders (`columnDefToSchema` and friends), the key resolvers (`findPKDefinition`, `resolvePkDefaultConflict`, `isSynthesizedAllColumnsKey`), and the structural mutators (`rekeySchemaPrimaryKey`, `shiftSchemaIndicesForDrop`) are four separable concerns in one file
@@ -171,11 +171,11 @@ substrate is the natural first extraction — it is the piece `decomposition.ts`
 `set-op.ts` both import, and `capture-correlation.ts` (added by that same ticket) is already
 the start of that module.
 
-### `packages/quereus/src/vtab/memory/module.ts` — 1,230 lines
+### `packages/quereus/src/vtab/memory/module.ts` — 1,284 lines
 
-Measured with `wc -l` on 2026-08-21 while reviewing the index-seek row-estimate ticket,
-which added ~123 lines of costing helpers (1,107 → 1,230) and pushed it past the seam. Not
-previously listed here.
+Measured with `wc -l` on 2026-08-21. The index-seek row-estimate ticket added ~123 lines of
+costing helpers (1,107 → 1,230) and pushed it past the seam; the DESC-ordering
+NULL-placement ticket added ~54 more (1,230 → 1,284), all of them in the costing half.
 
 `MemoryTableModule` mixes two jobs that share almost nothing: the **module lifecycle**
 (create / connect / rename / destroy, schema-change events, the table registry) and the
@@ -192,7 +192,7 @@ depends on `@quereus/quereus`, so the direction works); note the two backends' *
 shape constants already disagree — memory prices a range arm at 0.25 and a prefix-range at
 0.125 against the store's 0.3 and 0.15 — so unifying them is a decision, not a rename.
 
-### `packages/quereus-store/src/common/store-module-access-plan.ts` — 1,591 lines
+### `packages/quereus-store/src/common/store-module-access-plan.ts` — 1,568 lines
 
 Measured with `wc -l` on 2026-08-21 while reviewing the secondary-index ordering ticket,
 which added ~140 lines (1,200 → 1,340); the ordering-only-index-walk ticket that followed

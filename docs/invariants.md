@@ -564,6 +564,23 @@ the parent's key being unique, not from inclusion — so LEFT/RIGHT join elimina
 `atMostOne-left` fan-out survive the cap. Write-time FK enforcement is likewise untouched;
 the gate governs *retroactive trust*, not forward enforcement.
 
+### OPT-060 — An ordering claim over a descending key column excludes NULLs
+
+- code: `packages/quereus/src/vtab/best-access-plan.ts` — `nullSafeOrderingPrefixLength`
+- code: `packages/quereus/src/vtab/memory/module.ts` — `indexSatisfiesOrdering`
+- code: `packages/quereus-store/src/common/store-module-access-plan.ts` — `buildPkOrderingAdvertisement`
+- guard: `packages/quereus/test/optimizer/desc-index-ordering.spec.ts` — `a nullable DESC secondary index keeps its Sort and puts NULLs first`
+- doc: [Module Authoring § 2. Index-Based Access (Standard)](module-authoring.md#2-index-based-access-standard)
+
+`ORDER BY` places NULLs FIRST for both directions (`orderByNullResult`), while a key walk
+run in reverse — inverted bytes in the store, a negated comparator in the memory module —
+emits them LAST. So no advertisement may name a descending key column a NULL could reach:
+not `providesOrdering`, not the bare no-request advertisement a merge join reads, not
+`monotonicOn` (nor `supportsAsofRight`, which implies it). A descending column qualifies
+only when it is declared `NOT NULL`, pinned by the plan's own equality, or carries a
+NULL-excluding pushed filter. Every claim site truncates its prefix through
+`nullSafeOrderingPrefixLength` and drops the claim entirely at prefix zero.
+
 ## MV — Materialized views
 
 The read-side rewrite and the coverage prover are optimizer concerns, not MV ones: a view no

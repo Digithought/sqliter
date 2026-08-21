@@ -521,15 +521,26 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		) {
 			const usesSecondaryIndex = bestPlan.indexName && bestPlan.indexName !== PRIMARY_INDEX_NAME;
 			if (!usesSecondaryIndex) {
-				const pkOrdering: OrderingSpec[] = tableInfo.primaryKeyDefinition.map(col => ({
+				// This bare advertisement is a claim like any other: a consumer that trusts it
+				// (merge join) reads it under the engine's NULLs-FIRST-for-both-directions
+				// rule, while the DESC walk emits NULLs LAST. Truncate at the first member a
+				// NULL could reach — the store's `buildPkOrderingAdvertisement` gates its twin
+				// the same way. Pins are left empty: an equality on a PK member is already
+				// visible to the helper as a NULL-excluding entry in `request.filters`.
+				const pk = tableInfo.primaryKeyDefinition;
+				const claimablePrefix = nullSafeOrderingPrefixLength(
+					tableInfo, request, pk, pk.length, EMPTY_COLUMN_SET);
+				const pkOrdering: OrderingSpec[] = pk.slice(0, claimablePrefix).map(col => ({
 					columnIndex: col.index,
 					desc: !!col.desc
 				}));
-				bestPlan = {
-					...bestPlan,
-					providesOrdering: pkOrdering,
-					orderingIndexName: bestPlan.orderingIndexName ?? PRIMARY_INDEX_NAME
-				};
+				if (pkOrdering.length > 0) {
+					bestPlan = {
+						...bestPlan,
+						providesOrdering: pkOrdering,
+						orderingIndexName: bestPlan.orderingIndexName ?? PRIMARY_INDEX_NAME
+					};
+				}
 			}
 		}
 
