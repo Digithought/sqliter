@@ -427,12 +427,16 @@ The module implements `getBestAccessPlan()` to communicate capabilities:
 |----------------|------------|-------------------|
 | PK equality | O(1) | Yes (single row) |
 | PK `IN` multi-seek (`IN` covering every PK column) | O(k) point reads, k = distinct key tuples (capped at 1000) | Yes (PK order) |
-| PK range | O(k) where k = matched rows | Yes (BINARY only) |
-| Secondary index eq | O(1) + PK lookup | No |
-| Secondary index range | O(k) + PK lookups | No |
-| Full scan | O(n) | Yes (PK order, BINARY) |
+| PK range | O(k) where k = matched rows | Yes (PK order) |
+| Secondary index eq (single window) | O(1) + PK lookup | Yes (index order; equality-pinned prefix skipped) |
+| Secondary index range / prefix-range | O(k) + PK lookups | Yes (index order) |
+| Secondary index `IN` multi-seek | O(k) point seeks (capped at 1000 keys) | No (merged windows emit in seek-key order) |
+| Full scan | O(n) | Yes (PK order) |
 
-Non-BINARY collations: The module cannot provide collation-aware ordering. It reports `providesOrdering: undefined` and Quereus handles sorting above the Retrieve boundary.
+Collations and ordering: ordering is advertised under any collation whose registration asserts `orderPreserving` (the built-ins `BINARY`, `NOCASE`, and `RTRIM` do; a custom collation opts in via `db.registerCollation(name, cmp, { normalizer, orderPreserving: true })`). Two shapes never advertise:
+
+- An index column carrying its own `COLLATE` that the table column does not share — the index stores bytes in *its* collation's order, while `ORDER BY` compares under the table column's *declared* collation, so the walk's order is not the requested order (the seek itself remains available; only the Sort stays).
+- A collation registered without the `orderPreserving` assertion — its normalizer is only promised to preserve equality, not order.
 
 ## Schema Discovery
 

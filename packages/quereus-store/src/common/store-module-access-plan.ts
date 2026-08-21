@@ -38,6 +38,7 @@ import {
 } from '@quereus/quereus';
 import { PARITY_COST_PROFILE, type ResolvedCostProfile } from './cost-profile.js';
 import {
+	indexOrderPreservingPrefixLength,
 	indexPrefixSeekIsCollationExact,
 	indexRangeAtPositionIsOrderSafe,
 	pkOrderPreservingPrefixLength,
@@ -954,6 +955,13 @@ function tryIndexAccessPlan(
 	/** The arm's shape plus one per-fetched-row resolution term at the given price. */
 	const seekingArm = (pointRead: number): AccessPlanBuilder => armShape().addCost(rows * pointRead);
 	const costOnly = (why: string): IndexPlanCandidate => {
+		// NO ordering claim on a cost-only decline, ever: it names no index and no seek
+		// columns, so the engine sequentially scans the DATA store in primary-key order.
+		// An ordering claim here would make `rule-select-access-path` take its
+		// ordering-only branch and emit an IndexScanNode over a walk the store never
+		// performs — a silent wrong-order answer. (The PK-order advertisement the scan
+		// genuinely could carry is a separate matter — see the NOTE at the
+		// `costOnlyFallback` return in {@link computeBestAccessPlan}.)
 		const plan = armShape()
 			.setHandledFilters(new Array(request.filters.length).fill(false))
 			.setExplanation(`Store index scan on ${index.name} (${why})`)
@@ -1015,7 +1023,10 @@ function tryIndexAccessPlan(
 		// per-seek positioning term keeps a 500-key IN over a 10-row table from pricing
 		// below a full scan and issuing 500 seeks to read 10 rows. `isSet` false mirrors
 		// MemoryTableModule.evaluateIndexAccess's setIsSet(!isMultiSeek). No ordering is
-		// advertised — window emission order is encoded-key order, not any column order.
+		// advertised — N merged windows emit in seek-key order, not column order, so the
+		// single-window arms' `buildIndexOrderingAdvertisement` must never be attached
+		// here. `isMultiSeek` (not `seekKeyCount > 1`) is the gate deliberately: a
+		// runtime-valued set is delivered as a multi-seek even at `maxCount === 1`.
 		//
 		// **This arm pays the per-row `profile.pointRead` exactly when `statsBacked`.** It
 		// resolves every entry it matches, like the single-window arms do, so the physics
@@ -1084,12 +1095,20 @@ function tryIndexAccessPlan(
 	const armLabel = arm === 'prefixRange'
 		? `prefix-range seek(prefix=${eqCols.length})`
 		: arm === 'range' ? 'range scan' : 'seek';
-	const plan = seekingArm(profile.pointRead)
-		.setHandledFilters(handledFilters)
-		.setIndexName(index.name)
-		.setSeekColumns(seekCols)
-		.setExplanation(`Store index ${armLabel} on ${index.name}`)
-		.build();
+	// Ordering advertisement — the three single-window arms only, resolved AFTER the
+	// `prefixRange → eq` degradation above so the claim describes the arm actually
+	// advertised (like the row estimate, and unlike a degraded arm's dropped bound, the
+	// pinned set `eqCols` is the same either way). The multi-seek and cost-only returns
+	// above deliberately make no claim; the reasons are stated at each.
+	const plan = {
+		...seekingArm(profile.pointRead)
+			.setHandledFilters(handledFilters)
+			.setIndexName(index.name)
+			.setSeekColumns(seekCols)
+			.setExplanation(`Store index ${armLabel} on ${index.name}`)
+			.build(),
+		...buildIndexOrderingAdvertisement(db, tableInfo, request, index, indexKeyCollations, eqCols),
+	};
 	return {
 		plan,
 		// Statistics-backed: `rows` discriminates per query, so the backend's DECLARED price
@@ -1182,6 +1201,117 @@ function buildPkOrderingAdvertisement(
 		monotonicOn,
 		supportsAsofRight: true,
 	};
+}
+
+/**
+ * Compute the ordering advertisement for a SINGLE-WINDOW secondary-index arm (`eq` with
+ * `isMultiSeek === false`, `prefixRange`, or `range`) — the secondary-index twin of
+ * {@link buildPkOrderingAdvertisement}, with the same rigour and one deliberate
+ * difference in what it measures.
+ *
+ * **Why the claim is sound at all.** A single-window arm walks ONE contiguous byte
+ * region of the index store forward, and every layer between that walk and the caller
+ * preserves entry order: batched row resolution answers positionally and skips
+ * dead entries without shifting later ones (`resolveIndexEntries` / `resolveRowBatch`,
+ * store-table-scan.ts), and the read-your-own-writes merge interleaves pending puts /
+ * deletes by byte comparison of the same keys (`iterateEffective`, store-table-base.ts).
+ * `buildIndexKey` writes `{index columns}{PK}` with each column's DESC flag baked into
+ * the bytes by inversion, so a forward byte walk IS a walk in each index column's
+ * declared direction.
+ *
+ * **What it measures — the declared collation, not the residual's.** The consumer of an
+ * ordering claim is `ORDER BY`, which compares under the TABLE COLUMN's declared
+ * collation — not under the index column's own `COLLATE`, which is what the seek gates
+ * (`indexRangeAtPositionIsOrderSafe`) rightly judge their windows against. So the claim
+ * is truncated to {@link indexOrderPreservingPrefixLength} (which compares key bytes
+ * against the DECLARED collation via `indexOrderMatchesDeclaredCollation` — see its doc
+ * comment for the `collate nocase` counter-example) and voided at prefix 0, exactly as
+ * the PK version truncates to `pkOrderPreservingPrefixLength`.
+ *
+ * **Matching mirrors `MemoryTableModule.indexSatisfiesOrdering`,** including its
+ * equality-skip: a column pinned to one value by THIS arm's own seek (`eqCols`) is
+ * constant across the whole window and contributes no ordering, so `where a = 1 order
+ * by b` over `(a, b)` claims. The pinned set is this arm's `eqCols` — never every
+ * equality in `request.filters` — and only a non-multi-seek arm may call this at all: a
+ * multi-seek's N merged windows emit in seek-key order, not column order.
+ *
+ * When `requiredOrdering` is present, the claim is the request verbatim, and only when
+ * genuinely satisfied; declines on any explicit `nullsFirst` (no promise about NULL
+ * placement — mirrors the PK version; `trySortAbsorbViaIndexOrdering` also refuses
+ * those, but `ruleGrowRetrieve`'s Sort arm has no such guard). Never reversed: the
+ * claim is only ever the index's own declared directions — the store has no reverse
+ * secondary-index walk (`iterateEffective` accepts `reverse` but no secondary arm
+ * passes it). Absent a request, the index's own (truncated) ordering is advertised so
+ * merge-join / streaming-aggregate rules can fire opportunistically — claiming the
+ * pinned leading columns there is sound for the same reason the skip is: they are
+ * constant.
+ *
+ * `orderingIndexName` is always this very index — `validateAccessPlan` rejects a claim
+ * naming any index but the one the plan iterates.
+ */
+function buildIndexOrderingAdvertisement(
+	db: Database,
+	tableInfo: TableSchema,
+	request: BestAccessPlanRequest,
+	index: TableIndexSchema,
+	indexKeyCollations: ReadonlyArray<string | undefined>,
+	eqCols: readonly number[],
+): Pick<BestAccessPlanResult, 'providesOrdering' | 'orderingIndexName'> {
+	const orderPreservingPrefix = indexOrderPreservingPrefixLength(
+		db, tableInfo.columns, index, indexKeyCollations);
+	if (orderPreservingPrefix === 0) return {};
+
+	const indexOrdering: OrderingSpec[] = index.columns
+		.slice(0, orderPreservingPrefix)
+		.map(col => ({ columnIndex: col.index, desc: !!col.desc }));
+
+	const required = request.requiredOrdering;
+	if (required && required.length > 0) {
+		return indexOrderingSatisfies(indexOrdering, required, new Set(eqCols))
+			? { providesOrdering: required, orderingIndexName: index.name }
+			: {};
+	}
+	return { providesOrdering: indexOrdering, orderingIndexName: index.name };
+}
+
+/**
+ * True when `indexOrdering` (an index's declared column order, already truncated to its
+ * order-preserving prefix) satisfies `required` — the position-for-position match of
+ * `MemoryTableModule.indexSatisfiesOrdering`, over {@link OrderingSpec}s instead of a
+ * schema. Leading pinned columns are skipped before aligning; a pinned column
+ * encountered AFTER the matched prefix is skipped too (a constant column between two
+ * ordered ones does not break the later one's ordering). Any explicit `nullsFirst`
+ * declines — see {@link buildIndexOrderingAdvertisement}. An under-length index (fewer
+ * unpinned columns than required keys) declines rather than claiming a prefix:
+ * `orderingMatches` upstream would reject the short claim anyway, so emitting it would
+ * only mislead.
+ */
+function indexOrderingSatisfies(
+	indexOrdering: readonly OrderingSpec[],
+	required: readonly OrderingSpec[],
+	pinnedCols: ReadonlySet<number>,
+): boolean {
+	let i = 0; // pointer into indexOrdering
+	let j = 0; // pointer into required
+
+	while (i < indexOrdering.length && pinnedCols.has(indexOrdering[i].columnIndex)) i++;
+
+	while (j < required.length) {
+		if (required[j].nullsFirst !== undefined) return false;
+		if (i >= indexOrdering.length) return false;
+		if (required[j].columnIndex === indexOrdering[i].columnIndex
+			&& required[j].desc === indexOrdering[i].desc) {
+			i++;
+			j++;
+			continue;
+		}
+		if (pinnedCols.has(indexOrdering[i].columnIndex)) {
+			i++;
+			continue;
+		}
+		return false;
+	}
+	return true;
 }
 
 // --- StoreTableModule interface implementation ---

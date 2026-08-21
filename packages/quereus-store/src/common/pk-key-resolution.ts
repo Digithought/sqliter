@@ -534,6 +534,70 @@ export function indexLeadingRangeIsOrderSafe(
 }
 
 /**
+ * True when a byte walk over index column `position` emits rows in the order
+ * `ORDER BY <that column>` would produce.
+ *
+ * Strictly narrower than {@link indexRangeAtPositionIsOrderSafe}, and deliberately so:
+ * that predicate judges a byte WINDOW against the residual filter's collation (the index
+ * column's own COLLATE, else the declared one), which is what a seek needs — the residual
+ * re-compares fetched rows under exactly that collation. This one judges byte ORDER
+ * against the TABLE COLUMN'S DECLARED collation, which is what Sort uses: `ORDER BY name`
+ * compares under `name`'s declared collation regardless of what any index says. The two
+ * answers differ exactly when an index column carries an explicit `COLLATE` that its
+ * table column does not:
+ *
+ * ```sql
+ * create table t (name text primary key, v integer);   -- name declared BINARY
+ * create index ix_name on t (name collate nocase);
+ * select * from t where name > 'M' order by name;
+ * ```
+ *
+ * The index key bytes are NOCASE-normalized, so the walk emits NOCASE order — the seek
+ * window is exact ({@link indexRangeAtPositionIsOrderSafe} says safe: key NOCASE ==
+ * residual NOCASE) but the `ORDER BY` wants BINARY order, where `'Z' < 'a'` and NOCASE
+ * disagrees. Claiming ordering there would elide the Sort and silently return rows in
+ * the wrong order, so this predicate declines it.
+ */
+export function indexOrderMatchesDeclaredCollation(
+	db: Database,
+	columns: ReadonlyArray<ColumnSchema>,
+	index: TableIndexSchema,
+	keyCollations: ReadonlyArray<string | undefined>,
+	position: number,
+): boolean {
+	const spec = index.columns[position];
+	if (!spec) return false;
+	const col = columns[spec.index];
+	return keyOrderMatchesCollation(
+		db,
+		col,
+		keyCollations[position] ?? 'BINARY',
+		col?.collation ?? 'BINARY',
+	);
+}
+
+/**
+ * How many LEADING index columns satisfy {@link indexOrderMatchesDeclaredCollation} —
+ * the index twin of {@link pkOrderPreservingPrefixLength}. The ordering advertisement a
+ * secondary-index plan makes is truncated to this prefix, and voided entirely at `0`:
+ * a column past the prefix has key bytes whose memcmp order is not its `ORDER BY`
+ * order, so nothing after it may be claimed either.
+ */
+export function indexOrderPreservingPrefixLength(
+	db: Database,
+	columns: ReadonlyArray<ColumnSchema>,
+	index: TableIndexSchema,
+	keyCollations: ReadonlyArray<string | undefined>,
+): number {
+	let n = 0;
+	while (n < index.columns.length
+		&& indexOrderMatchesDeclaredCollation(db, columns, index, keyCollations, n)) {
+		n++;
+	}
+	return n;
+}
+
+/**
  * How many LEADING primary-key members have key bytes whose memcmp order matches their
  * declared collation's comparator order, per {@link keyOrderMatchesCollation}.
  *
