@@ -30,9 +30,11 @@
  *
  * Also note the scan keys its distinct sets by `String(value)`, so a column mixing the
  * integer 1 with the text '1' would count them as one value while SQL's `count(distinct)`
- * counts two. Every generated column here is single-typed; a mixed-type column is a real
- * (separate) question about what `distinctCount` should mean, not something to paper over
- * with a looser assertion.
+ * counts two — as would a blob column, whose every value stringifies alike. Every generated
+ * column here is single-typed, which is why the equivalence holds. That gap is a real
+ * pre-existing defect, tracked as backlog `bug-statistics-value-identity-uses-string-keys`;
+ * closing it means adding a mixed-type and a blob column to `COLUMNS` here, NOT loosening an
+ * assertion.
  */
 
 import { describe, it, afterEach } from 'mocha';
@@ -40,6 +42,8 @@ import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
 import type { SqlValue } from '../../src/common/types.js';
 import type { TableStatistics } from '../../src/planner/stats/catalog-stats.js';
+// The same ordering the collector used to compute min/max and sort its sample.
+import { compareSqlValues } from '../../src/util/comparison.js';
 
 /** First column of the first row, or null when the query yielded nothing. */
 async function scalar(db: Database, sql: string): Promise<SqlValue> {
@@ -203,6 +207,56 @@ describe('ANALYZE records what the data contains (memory backend)', () => {
 		expect(id.nullCount, 'a primary key column has no nulls').to.equal(0);
 
 		await expectStatisticsMatchData(db, 'big', ['id', 'g', 'v'], '5000 rows');
+	});
+
+	// Histograms are the one recorded figure that is NOT exact — they are built from a
+	// reservoir sample of up to 1000 values, so no equivalence against SQL is available and
+	// the assertions below are structural invariants instead. They matter here because the
+	// memory backend reaches the reservoir for the first time with this fix: its old sampled
+	// path built histograms from a deterministic systematic sample.
+	it('builds well-formed histograms from the sampled values', async function () {
+		this.timeout(60000);
+		db = new Database();
+		await createGeneratedTable(db, 'h', 2500);
+		await analyze(db, 'h');
+		const stats = recordedStats(db, 'h');
+
+		expect(stats.columnStats.get('allnull')!.histogram, 'a column with no values has no histogram')
+			.to.be.undefined;
+
+		for (const column of ['id', 'g', 'v', 'lo', 'hi', 'somenull']) {
+			const recorded = stats.columnStats.get(column)!;
+			const histogram = recorded.histogram;
+			expect(histogram, `${column}: histogram built`).to.not.be.undefined;
+			const { buckets, sampleSize } = histogram!;
+
+			expect(buckets.length, `${column}: at least one bucket`).to.be.greaterThan(0);
+			expect(sampleSize, `${column}: sample is capped`).to.be.at.most(1000);
+			expect(sampleSize, `${column}: never samples more than the non-null rows`)
+				.to.be.at.most(2500 - recorded.nullCount);
+			expect(buckets[buckets.length - 1].cumulativeCount, `${column}: buckets account for the whole sample`)
+				.to.equal(sampleSize);
+
+			for (let i = 0; i < buckets.length; i++) {
+				const bucket = buckets[i];
+				expect(bucket.distinctCount, `${column}: bucket ${i} holds at least one value`)
+					.to.be.greaterThan(0);
+				if (i > 0) {
+					const previous = buckets[i - 1];
+					expect(bucket.cumulativeCount, `${column}: bucket ${i} cumulative count rises`)
+						.to.be.greaterThan(previous.cumulativeCount);
+					expect(compareSqlValues(bucket.upperBound, previous.upperBound), `${column}: bucket ${i} bound rises`)
+						.to.be.at.least(0);
+				}
+			}
+
+			// Every sampled value came from the column, so the bucket bounds sit inside the
+			// column's true range — the cross-check that ties the sample back to the data.
+			expect(compareSqlValues(buckets[0].upperBound, recorded.minValue!), `${column}: first bound >= min`)
+				.to.be.at.least(0);
+			expect(compareSqlValues(buckets[buckets.length - 1].upperBound, recorded.maxValue!), `${column}: last bound <= max`)
+				.to.be.at.most(0);
+		}
 	});
 
 	// The memory backend's own report reads the COMMITTED base layer only, so inside an open

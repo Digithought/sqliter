@@ -37,6 +37,8 @@ export async function collectStatisticsFromScan(
 	const minValues: (SqlValue | undefined)[] = new Array(colCount).fill(undefined);
 	const maxValues: (SqlValue | undefined)[] = new Array(colCount).fill(undefined);
 	const sampleValues: SqlValue[][] = Array.from({ length: colCount }, () => []);
+	/** Non-null values seen per column — the reservoir's denominator, which is NOT `rowCount`. */
+	const nonNullCounts: number[] = new Array(colCount).fill(0);
 
 	let rowCount = 0;
 	const maxSample = 1000;
@@ -53,6 +55,7 @@ export async function collectStatisticsFromScan(
 				if (val === null || val === undefined) {
 					nullCounts[i]++;
 				} else {
+					nonNullCounts[i]++;
 					distinctSets[i].add(String(val));
 
 					// Track min/max
@@ -63,12 +66,15 @@ export async function collectStatisticsFromScan(
 						maxValues[i] = val;
 					}
 
-					// Collect sample values for histograms (reservoir sampling simplified)
+					// Collect sample values for histograms — Algorithm R, per column.
 					if (sampleValues[i].length < maxSample) {
 						sampleValues[i].push(val);
 					} else {
-						// Reservoir sampling: replace with decreasing probability
-						const j = Math.floor(Math.random() * rowCount);
+						// The denominator is this column's own non-null count, not `rowCount`.
+						// Drawing over `rowCount` under-weights later values in proportion to how
+						// many NULLs the column holds, biasing the histogram toward the rows the
+						// scan happened to reach first.
+						const j = Math.floor(Math.random() * nonNullCounts[i]);
 						if (j < maxSample) {
 							sampleValues[i][j] = val;
 						}

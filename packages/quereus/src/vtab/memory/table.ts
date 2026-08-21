@@ -191,6 +191,18 @@ export class MemoryTable extends VirtualTable {
 	 * counts, null counts and min/max. That also fixes the row count inside an open
 	 * transaction: `getBaseLayerStats` sees the committed base only, while the scan reads
 	 * what this connection can actually see, and the scan's count wins.
+	 *
+	 * The scan seeing uncommitted rows is a guarantee, not a coincidence, even though
+	 * `ANALYZE` connects a *fresh* `MemoryTable` rather than reusing the statement's:
+	 * `ensureConnection` below adopts the `MemoryTableConnection` already registered on the
+	 * `Database` for this qualified name, pending transaction layer and all, and `query`
+	 * starts its scan from that layer. `MemoryTableManager.disconnect` then defers while the
+	 * connection `hasOpenWork()`, so `ANALYZE`'s `disconnect()` cannot drop a live transaction.
+	 *
+	 * NOTE: `ANALYZE` on a memory table is therefore O(rows) where the old sampled path was
+	 * O(sample) — intended, since that is what `ANALYZE` means, and this method itself stays
+	 * O(1). If `ANALYZE` in a hot loop over a large memory table ever shows up in a profile,
+	 * the fix is to cache/invalidate the scan's result, not to sample it again.
 	 */
 	getStatistics(): TableStatistics {
 		return { rowCount: this.manager.getBaseLayerStats().rowCount, columnStats: new Map() };

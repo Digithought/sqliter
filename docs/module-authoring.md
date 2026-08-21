@@ -976,7 +976,7 @@ class IndexedTable extends VirtualTable {
 
 ## Statistics for Cost-Based Optimization
 
-Virtual table modules can optionally provide statistics for the optimizer's cost model. Implement `getStatistics()` on your `VirtualTable` subclass to report row counts, per-column distinct values, min/max, and histograms.
+Virtual table modules can optionally provide statistics for the optimizer's cost model. Implement `getStatistics()` on your `VirtualTable` subclass to report what your storage already knows **exactly**: the row count, plus per-column distinct values, min/max and histograms *only* where you maintain them. Report nothing else — `ANALYZE` scans for whatever you leave out, and both shipped backends leave out everything but the row count.
 
 ```typescript
 import type { TableStatistics, ColumnStatistics } from '@quereus/quereus';
@@ -985,6 +985,9 @@ class MyTable extends VirtualTable {
   getStatistics(): TableStatistics {
     return {
       rowCount: this.data.length,
+      // Both figures are exact and maintained by this module's write paths — `id` is the
+      // primary key, and `uniqueNames` is a running count. A module that would have to
+      // sample for these reports `columnStats: new Map()` instead and lets ANALYZE scan.
       columnStats: new Map([
         ['id', { distinctCount: this.data.length, nullCount: 0 }],
         ['name', { distinctCount: this.uniqueNames, nullCount: 0 }],
