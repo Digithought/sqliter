@@ -1,6 +1,6 @@
 {
   "name": "@quereus/plugin-nativescript-sqlite",
-  "version": "4.15.0",
+  "version": "4.15.1",
   "type": "module",
   "description": "NativeScript SQLite storage plugin for Quereus - mobile persistent storage",
   "keywords": [

@@ -1,6 +1,6 @@
 {
 	"name": "@quereus/isolation",
-	"version": "4.15.0",
+	"version": "4.15.1",
 	"type": "module",
 	"description": "Generic transaction isolation layer for Quereus virtual table modules",
 	"keywords": [
