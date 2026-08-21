@@ -85,6 +85,21 @@ export type AccessPath =
 	 */
 	| { readonly kind: 'unresolvedIndex'; readonly indexName: string; readonly plan: IndexPlanKind };
 
+/**
+ * The index plan an access path walks, or undefined when the path names no index
+ * (`fullScan` / `empty`) or no path was recorded at all.
+ *
+ * Answers both index kinds: a consumer asking "is this a multi-seek?" cares about the
+ * access SHAPE, which an `unresolvedIndex` describes just as faithfully as a resolved
+ * one — only the index identity is missing there.
+ */
+export function accessPathPlan(accessPath: AccessPath | undefined): IndexPlanKind | undefined {
+	if (!accessPath) return undefined;
+	return accessPath.kind === 'index' || accessPath.kind === 'unresolvedIndex'
+		? accessPath.plan
+		: undefined;
+}
+
 /** The canonical name the engine uses for a table's primary-key index in `idxStr`. */
 export const PRIMARY_INDEX_NAME = '_primary_';
 

@@ -217,10 +217,21 @@ Two rules make a module's estimate usable rather than merely present:
   opposite of the truth, and enough to disable your index arms until someone re-analyzes.
   `CatalogStatsProvider` short-circuits the same case rather than applying it.
 
+- **`rows` counts rows MATCHED, not seek keys issued.** The two coincide on a unique index
+  and diverge everywhere else: `k = 5` is one seek key against a column with four distinct
+  values over 2000 rows, and returns 500. `AccessPlanBuilder.eqMatch(n)` derives both cost
+  and `rows` from one argument, which is convenient only when they agree — cost scales with
+  the seek keys, `rows` with what they match — so pass the key count to `eqMatch` and set
+  the row count separately with `.setRows(...)`. Clamp to the table size: a seek cannot
+  return more rows than the table holds. The engine relays this number straight onto the
+  physical seek node, where it is the input to join-algorithm selection, cache admission
+  and sort costing above the seek; under-estimating it is the more dangerous direction.
+
 `@quereus/quereus` exports `TableStatistics`, `ColumnStatistics`, `EquiHeightHistogram`,
 `HistogramBucket`, `selectivityFromHistogram` and `combineConjunctive` for exactly this.
 The store module (`packages/quereus-store/src/common/store-module-access-plan.ts`) is the
-worked example.
+worked example; the memory module's equality arm (`vtab/memory/module.ts`,
+`estimateEqualityRows`) is the small one.
 
 **Claiming `handledFilters` — the positional contract**:
 

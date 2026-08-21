@@ -13,6 +13,7 @@ import type { FilterInfo } from '../../vtab/filter-info.js';
 import type { ScalarPlanNode } from './plan-node.js';
 import type { TableAccessCapable } from '../framework/characteristics.js';
 import { addSingletonFd } from '../util/fd-utils.js';
+import { accessPathPlan } from '../../vtab/index-descriptor.js';
 // Type-only: the runtime cycle `constraint-extractor → nodes/reference → …` is real,
 // so this must never become a value import.
 import type { PredicateConstraint } from '../analysis/constraint-extractor.js';
@@ -480,12 +481,21 @@ export class IndexSeekNode extends TableAccessNode {
 		}
 		const base = {
 			ordering: this.providesOrdering,
-			// NOTE: capped by a real catalog table count now (catalogRowCount), not
-			// just the static schema estimate — for an analyzed table under 100 rows
-			// this reports the whole table rather than a flat 100. If seek cardinality
-			// ever drives a bad plan, derive it from the seek key's own selectivity
-			// instead of min(tableRows, 100).
-			estimatedRows: Math.min(this.source.estimatedRows || 1000, 100),
+			// The module's own row estimate for the access plan it chose, threaded here
+			// by `rule-select-access-path.selectPhysicalNode`. It is the only number that
+			// tracks what this particular seek matches; the constant that used to sit
+			// here made every non-PK seek advertise the same cardinality whatever it
+			// returned, and every cost decision above the seek reads this.
+			//
+			// NOTE: "the module supplied no estimate" is not distinguishable at this
+			// point, by design. The rule builds this field as `accessPlan.rows || 1000`,
+			// so a missing — or zero — `rows` has already collapsed to 1000 before the
+			// node sees it. That `|| 1000` IS the no-answer fallback. Both shipped
+			// modules always set `rows`, so only a third-party module can reach it.
+			// Spelling "unknown" apart from "zero" is owned by backlog
+			// `bug-row-estimate-conflates-unknown-and-zero`; do not invent a second
+			// convention here.
+			estimatedRows: Number(this.filterInfo.indexInfoOutput.estimatedRows),
 			fds: sourcePhysical?.fds,
 			equivClasses: sourcePhysical?.equivClasses,
 			constantBindings: sourcePhysical?.constantBindings,
@@ -500,7 +510,21 @@ export class IndexSeekNode extends TableAccessNode {
 		if (this.rangeBoundedOn) base.rangeBoundedOn = this.rangeBoundedOn;
 		if (!this.isRange && this.indexName === 'primary') {
 			const pk = this.source.tableSchema.primaryKeyDefinition ?? [];
-			if (pk.length > 0 && this.seekKeys.length >= pk.length) {
+			// The singleton claim needs the seek keys to pin every primary-key column
+			// exactly ONCE. A multi-seek (`where id in (1, 2, 3)`) supplies one tuple per
+			// IN member — three seek keys against a one-column key — so a `>=` test passed
+			// for it and the node both reported one row and stamped `∅ → all columns`,
+			// which asserts the relation holds at most one row. Nothing leans on that FD
+			// today, but its consumers (uniqueness proofs, DISTINCT elision, sort elision)
+			// are exactly the rewrites that would silently drop rows if one ever did.
+			//
+			// A composite-key multi-seek that happens to reduce to a single tuple is
+			// declined here too (its `plan` is still `multiSeek`); that costs an
+			// optimization in a rare shape rather than risking a false claim.
+			// `estimatedRows` needs no override either way — the module's own estimate,
+			// read above, already says 1 for a whole-PK point seek and 3 for the IN.
+			const isMultiSeek = accessPathPlan(this.filterInfo.accessPath) === 'multiSeek';
+			if (pk.length > 0 && this.seekKeys.length === pk.length && !isMultiSeek) {
 				// Full PK equality seek — at most one row. Encode via the singleton
 				// FD `∅ → all_cols`.
 				const colCount = this.source.getType().columns.length;

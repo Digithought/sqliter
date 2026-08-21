@@ -20,6 +20,9 @@ import type { ModuleCapabilities } from '../capabilities.js';
 import type { MappingAdvertisement } from '../mapping-advertisement.js';
 import type { Schema } from '../../schema/schema.js';
 import { buildAdvertisementsFromTags } from '../../schema/mapping-advertisement-tags.js';
+import { PRIMARY_INDEX_NAME } from '../index-descriptor.js';
+import { combineConjunctive } from '../../planner/stats/selectivity-combine.js';
+import type { ColumnStatistics, TableStatistics } from '../../planner/stats/catalog-stats.js';
 
 const logger = createMemoryTableLoggers('module');
 
@@ -41,6 +44,102 @@ const SORT_COST_PER_COMPARISON = 0.1;
  * FILTER_PER_ROW constant used elsewhere in the cost model.
  */
 const RESIDUAL_FILTER_COST_PER_ROW = 0.2;
+
+/**
+ * Fraction of the table a single equality seek key is assumed to match when no
+ * per-column statistics can answer it.
+ *
+ * Deliberately the store module's `ARM_SELECTIVITY.eq`
+ * (`packages/quereus-store/src/common/store-module-access-plan.ts`) so the two backends
+ * price an un-analyzed equality identically. On the un-analyzed 1000-row default it also
+ * reproduces the flat 100 rows the physical seek node used to report unconditionally,
+ * which is why adopting a real estimate moves almost no plan on an un-analyzed schema.
+ */
+const EQ_SELECTIVITY_WITHOUT_STATS = 0.1;
+
+/** True when each seek key on this index matches at most one row. */
+function isUniqueIndex(index: IndexSchema): boolean {
+	// `gatherAvailableIndexes` builds the primary-key pseudo-index without `unique: true`,
+	// so the PK is recognised by name rather than by the flag.
+	return index.name === PRIMARY_INDEX_NAME || (index.unique ?? false);
+}
+
+/**
+ * The `ANALYZE`-collected statistics for the table column at `colIdx`, or undefined when
+ * the table has none or the column is not covered.
+ *
+ * `columnStats` is keyed by LOWERCASE COLUMN NAME while this file works in column index,
+ * so the lookup goes index → current column name → stats. That direction is what keeps a
+ * post-`ANALYZE` `ALTER TABLE` safe: a RENAMED column's current name is absent from the
+ * map, and a DROPPED column shifts later indexes onto their own current names — a miss or
+ * the right entry, never a neighbour's numbers. Mirrors the store module's `columnStatsFor`.
+ */
+function columnStatsFor(
+	tableInfo: TableSchema,
+	stats: TableStatistics,
+	colIdx: number,
+): ColumnStatistics | undefined {
+	const name = tableInfo.columns[colIdx]?.name;
+	return name === undefined ? undefined : stats.columnStats.get(name.toLowerCase());
+}
+
+/**
+ * The fraction of the table ONE equality tuple over `eqCols` is expected to match.
+ *
+ * Every formula here is the engine's `CatalogStatsProvider.estimateLeaf`: equality is
+ * `1 / max(distinctCount, 1)` and the factors combine through the engine's own
+ * `combineConjunctive` (damped independence), never a restated product. A seek's
+ * advertised row count and the estimate a residual `Filter` above it would carry describe
+ * the same row set — two different numbers have the optimizer comparing two different
+ * worlds. The store module follows the same rule, so the two backends agree.
+ */
+function equalityTupleSelectivity(tableInfo: TableSchema, eqCols: readonly number[]): number {
+	const stats = tableInfo.statistics;
+	// A snapshot taken while the table was EMPTY describes nothing — every `distinctCount`
+	// is 0 — and applying it would read `1 / max(0, 1)` as "this equality matches EVERY
+	// row". Treated as no statistics at all, as the store module and the engine's own
+	// `estimatePredicateSelectivity` both do.
+	if (!stats || stats.rowCount <= 0) return EQ_SELECTIVITY_WITHOUT_STATS;
+
+	const factors: number[] = [];
+	for (const colIdx of eqCols) {
+		const colStats = columnStatsFor(tableInfo, stats, colIdx);
+		// One uncovered equality column falls back WHOLESALE rather than mixing a measured
+		// factor with the shape constant — again the store module's rule.
+		if (!colStats) return EQ_SELECTIVITY_WITHOUT_STATS;
+		factors.push(1 / Math.max(colStats.distinctCount, 1));
+	}
+	return factors.length > 0 ? combineConjunctive(factors) : EQ_SELECTIVITY_WITHOUT_STATS;
+}
+
+/**
+ * Rows an equality seek is expected to MATCH — which is not the number of seek keys it
+ * issues. `inCardinality` counts KEYS (1 for `k = 5`, 3 for `k in (1, 2, 3)`); on a
+ * NON-unique index each key matches however many rows share it, so a column with 4
+ * distinct values over 2000 rows returns 500 rows for one key.
+ *
+ * NOTE: this module has no seek-versus-scan veto (the store's `computeBestAccessPlan` has
+ * one), so an equality seek matching a large fraction of the table still prices below a
+ * full scan — `0.5 + rows * 0.3` against `rows * 1.0`. Harmless while the estimate is the
+ * {@link EQ_SELECTIVITY_WITHOUT_STATS} shape constant, and the row count advertised is now
+ * honest either way. If a fat seek over an ANALYZEd table ever shows up as a slow plan,
+ * the veto is the fix, not a smaller constant.
+ */
+function estimateEqualityRows(
+	tableInfo: TableSchema,
+	index: IndexSchema,
+	eqCols: readonly number[],
+	inCardinality: number,
+	estimatedTableSize: number,
+): number {
+	const perKey = isUniqueIndex(index)
+		? 1
+		: Math.max(1, Math.floor(estimatedTableSize * equalityTupleSelectivity(tableInfo, eqCols)));
+	// A seek cannot return more rows than the table holds. `Math.max(1, …)` guards the
+	// `rows: 0` fold in `rule-select-access-path.selectPhysicalNode`, which replaces a
+	// fully-handled zero-row access with an `EmptyResultNode`.
+	return Math.max(1, Math.min(estimatedTableSize, inCardinality * perKey));
+}
 
 /**
  * Estimate the cost of an external O(n log n) sort over `rows` rows. Returns
@@ -379,7 +478,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 
 		// Try to find an index-based plan
 		for (const index of availableIndexes) {
-			const indexPlan = this.evaluateIndexAccess(index, request, estimatedTableSize);
+			const indexPlan = this.evaluateIndexAccess(tableInfo, index, request, estimatedTableSize);
 			if (!bestPlan || indexPlan.cost < bestPlan.cost) {
 				bestPlan = indexPlan;
 			}
@@ -395,7 +494,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 
 		// Check if we can satisfy ordering requirements
 		if (request.requiredOrdering && request.requiredOrdering.length > 0) {
-			bestPlan = this.adjustPlanForOrdering(bestPlan, request, availableIndexes, estimatedTableSize);
+			bestPlan = this.adjustPlanForOrdering(tableInfo, bestPlan, request, availableIndexes, estimatedTableSize);
 		}
 
 		// B-tree scans inherently produce rows in PK order.  Advertise this
@@ -496,8 +595,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		// the path: a unique index (PK or declared unique) where the leading column
 		// is the sole remaining unbound key. (For composite PK with a free leading
 		// column, the leading column may have duplicate values across rows.)
-		const isUnique = indexName === '_primary_' || (usedIndex.unique ?? false);
-		const strict = isUnique && trailingNonBound.length === 1;
+		const strict = isUniqueIndex(usedIndex) && trailingNonBound.length === 1;
 
 		// Direction follows the index's natural sort order, but if the planner
 		// produced an explicit providesOrdering covering this column, honor that
@@ -517,6 +615,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	 * Evaluate access via a specific index
 	 */
 	private evaluateIndexAccess(
+		tableInfo: TableSchema,
 		index: IndexSchema,
 		request: BestAccessPlanRequest,
 		estimatedTableSize: number
@@ -539,8 +638,18 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 			// small memory table prices optimistically. Harmless while every seek-key list is a
 			// literal the author typed; if runtime-valued IN sets start arriving with large
 			// ceilings, add the positioning term so the two modules stay comparable.
+			//
+			// COST stays keyed to `inCardinality` — the number of seek KEYS, which is what the
+			// work scales with — while `rows` reports what the seek MATCHES. `eqMatch` derives
+			// both from one argument, so the row count is overridden separately. Deriving the
+			// cost from the matched-row count instead was measured and rejected: it raises a
+			// pushed single-key equality seek from 1.8 to 31.5, which moves the baseline
+			// `rule-key-set-seek` reads (`filterInfo.indexInfoOutput.estimatedCost`) and stops
+			// the key-set rewrite firing at all. Pricing a fat seek honestly is a real and
+			// separate question.
 			return AccessPlanBuilder
 				.eqMatch(inCardinality)
+				.setRows(estimateEqualityRows(tableInfo, index, seekCols, inCardinality, estimatedTableSize))
 				.setHandledFilters(equalityMatches.handledFilters)
 				.setIsSet(!isMultiSeek)
 				.setIndexName(index.name)
@@ -741,6 +850,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	 * emits the plan.
 	 */
 	private adjustPlanForOrdering(
+		tableInfo: TableSchema,
 		plan: BestAccessPlanResult,
 		request: BestAccessPlanRequest,
 		availableIndexes: IndexSchema[],
@@ -793,7 +903,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		// index in its natural order (with any unpushable filters becoming
 		// residuals). Returns undefined when no such index exists.
 		const planB = this.evaluateOrderingOnlyPlans(
-			request, availableIndexes, equalityCols, estimatedTableSize
+			tableInfo, request, availableIndexes, equalityCols, estimatedTableSize
 		);
 
 		if (planB && planB.cost < planACost) {
@@ -815,6 +925,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	 * for filters left unhandled.
 	 */
 	private evaluateOrderingOnlyPlans(
+		tableInfo: TableSchema,
 		request: BestAccessPlanRequest,
 		availableIndexes: IndexSchema[],
 		equalityCols: ReadonlySet<number>,
@@ -829,7 +940,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 			}
 
 			// See whether this index can also serve as a filter seek/range.
-			const candidate = this.evaluateIndexAccess(index, request, estimatedTableSize);
+			const candidate = this.evaluateIndexAccess(tableInfo, index, request, estimatedTableSize);
 
 			// A useful filter pattern that breaks ordering (multi-IN multi-seek — literal
 			// or runtime-valued — on an ordering column, or OR_RANGE) cannot claim
