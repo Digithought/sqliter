@@ -1237,14 +1237,33 @@ function buildPkOrderingAdvertisement(
  *
  * When `requiredOrdering` is present, the claim is the request verbatim, and only when
  * genuinely satisfied; declines on any explicit `nullsFirst` (no promise about NULL
- * placement — mirrors the PK version; `trySortAbsorbViaIndexOrdering` also refuses
- * those, but `ruleGrowRetrieve`'s Sort arm has no such guard). Never reversed: the
- * claim is only ever the index's own declared directions — the store has no reverse
- * secondary-index walk (`iterateEffective` accepts `reverse` but no secondary arm
- * passes it). Absent a request, the index's own (truncated) ordering is advertised so
- * merge-join / streaming-aggregate rules can fire opportunistically — claiming the
- * pinned leading columns there is sound for the same reason the skip is: they are
- * constant.
+ * placement — mirrors the PK version). Never reversed: the claim is only ever the index's
+ * own declared directions — the store has no reverse secondary-index walk
+ * (`iterateEffective` accepts `reverse` but no secondary arm passes it). Absent a request,
+ * the index's own (truncated) ordering is advertised so merge-join / streaming-aggregate
+ * rules can fire opportunistically — claiming the pinned leading columns there is sound
+ * for the same reason the skip is: they are constant.
+ *
+ * NOTE: the `nullsFirst` decline is a belt on top of the engine's own braces, not the
+ * thing that makes `order by <nullable indexed col> nulls last` safe. Nothing populates
+ * `OrderingSpec.nullsFirst` today (the same NOTE sits on `MemoryTableModule
+ * .indexSatisfiesOrdering`): `trySortAbsorbViaIndexOrdering` refuses a sort key carrying
+ * an explicit NULLS placement outright, and `ruleGrowRetrieve`'s Sort arm goes through
+ * `extractOrderingFromSortKeys`, which drops `SortKey.nulls` — so that arm could never
+ * see the placement to forward it. Harmless while it also never absorbs such a Sort
+ * (`index-ordering.spec.ts` pins that the Sort survives). If `nullsFirst` ever starts
+ * reaching `requiredOrdering`, this decline becomes load-bearing rather than redundant —
+ * index bytes put NULLs FIRST on an ASC column and LAST on a DESC one (inversion), which
+ * is the engine's default placement and nothing else.
+ *
+ * NOTE: advertising the index's own ordering with no `requiredOrdering` can COST a
+ * pushdown. `ruleGrowRetrieve` carries an equipped `providesOrdering` into its re-probe as
+ * a `requiredOrdering` and declines the grow when the re-probe does not match it. A bare
+ * claim includes the pinned leading columns; the matched claim skips them — so
+ * `[a, b]` advertised for `where a = 1` cannot be re-satisfied on a second grow and the
+ * Filter stays above the Retrieve. Costs an optimization, never an answer (a Filter
+ * preserves row order). If a store-backed plan is ever seen refusing a filter pushdown it
+ * used to take, advertise only the unpinned suffix here.
  *
  * `orderingIndexName` is always this very index — `validateAccessPlan` rejects a claim
  * naming any index but the one the plan iterates.
@@ -1278,13 +1297,17 @@ function buildIndexOrderingAdvertisement(
  * True when `indexOrdering` (an index's declared column order, already truncated to its
  * order-preserving prefix) satisfies `required` — the position-for-position match of
  * `MemoryTableModule.indexSatisfiesOrdering`, over {@link OrderingSpec}s instead of a
- * schema. Leading pinned columns are skipped before aligning; a pinned column
- * encountered AFTER the matched prefix is skipped too (a constant column between two
- * ordered ones does not break the later one's ordering). Any explicit `nullsFirst`
+ * schema. Leading pinned columns are skipped before aligning. Any explicit `nullsFirst`
  * declines — see {@link buildIndexOrderingAdvertisement}. An under-length index (fewer
  * unpinned columns than required keys) declines rather than claiming a prefix:
  * `orderingMatches` upstream would reject the short claim anyway, so emitting it would
  * only mislead.
+ *
+ * The mid-loop skip (a pinned column encountered AFTER the matched prefix, which a
+ * constant column between two ordered ones would need) is kept for exact parity with the
+ * memory module, where the pinned set can be non-contiguous. It is unreachable from THIS
+ * caller: `pinnedCols` is `resolveEqualityPins`' `cols`, which stops at the first
+ * unpinned index column, so the leading skip above already consumes every pinned column.
  */
 function indexOrderingSatisfies(
 	indexOrdering: readonly OrderingSpec[],

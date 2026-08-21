@@ -354,6 +354,54 @@ describe('secondary-index ordering advertisement', () => {
 			expect(await column(db, q, 'name')).to.deep.equal(['B', 'Z', 'a']);
 		});
 
+		it('NULLs in the indexed column land where the engine puts them', async () => {
+			// Index bytes put NULL first on an ASC column, which is the engine's default
+			// placement — so an elided Sort must reproduce it. The oracle is the same query
+			// with the index dropped (Sort back, engine ordering).
+			await db.exec(`create table t (id integer primary key, a integer, b integer null) using store`);
+			await db.exec(`create index ix_ab on t (a, b)`);
+			await db.exec(`insert into t values (1, 1, 5), (2, 1, null), (3, 1, 2), (4, 1, null), (5, 1, 9)`);
+
+			const q = `select b from t where a = 1 order by b`;
+			expect(await planOps(db, q)).to.match(SEEK).and.to.not.match(SORT);
+			expect(await column(db, q, 'b')).to.deep.equal([null, null, 2, 5, 9]);
+
+			await db.exec(`drop index ix_ab`);
+			expect(await column(db, q, 'b'), 'index order must equal the engine\'s').to.deep.equal([null, null, 2, 5, 9]);
+		});
+
+		it('an explicit NULLS placement keeps its Sort', async () => {
+			// The advertisement promises nothing about NULL placement. Nothing populates
+			// `OrderingSpec.nullsFirst` today, so what actually protects this shape is the
+			// engine refusing to absorb a sort key carrying NULLS FIRST/LAST at all — pinned
+			// here because the module's own decline cannot be reached to do it.
+			await db.exec(`create table t (id integer primary key, a integer, b integer null) using store`);
+			await db.exec(`create index ix_ab on t (a, b)`);
+			await db.exec(`insert into t values (1, 1, 5), (2, 1, null), (3, 1, 2), (4, 1, null), (5, 1, 9)`);
+
+			const q = `select b from t where a = 1 order by b nulls last`;
+			expect(await planOps(db, q), 'NULLS LAST must not be absorbed').to.match(SORT);
+			expect(await column(db, q, 'b')).to.deep.equal([2, 5, 9, null, null]);
+		});
+
+		it('an `any` index column: byte order over mixed types is the engine\'s order', async () => {
+			// `any` keys under one collation-aware encoding across every physical type, so
+			// the cross-type byte order has to be the engine's cross-type compare order — a
+			// disagreement would reorder NULL / numeric / text / blob against each other.
+			await db.exec(`create table t (id integer primary key, v any null) using store`);
+			await db.exec(`create index ix_v on t (v)`);
+			await db.exec(
+				`insert into t values (1, 'txt'), (2, 5), (3, x'01'), (4, null), (5, -2.5), (6, 'Abc'), (7, true), (8, '')`);
+
+			const q = `select id from t where v > -1e18 order by v`;
+			expect(await planOps(db, q)).to.match(SEEK).and.to.not.match(SORT);
+			const seeked = await column(db, q, 'id');
+
+			await db.exec(`drop index ix_v`);
+			expect(await planOps(db, q), 'oracle must sort').to.match(SORT);
+			expect(seeked, 'index walk order must equal the engine\'s sort').to.deep.equal(await column(db, q, 'id'));
+		});
+
 		it('read-your-own-writes: pending rows interleave in index order', async () => {
 			// The load-bearing test for the iterateEffective merge claim: pending index
 			// puts/deletes merge by key bytes, so pending rows sorting BEFORE, BETWEEN,

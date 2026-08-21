@@ -782,9 +782,10 @@ despite comparing distinct — a distinct row could be clobbered by its neighbou
 ### Order preservation
 
 Rows are physically ordered by memcmp of their normalized key bytes, but the engine
-orders and filters them with the collation's comparator. Three store decisions equate the
-two: the primary-key range window, the secondary-index range window, and the PK-order
-advertisement (`providesOrdering` / `monotonicOn`, which lets the optimizer drop a Sort).
+orders and filters them with the collation's comparator. Four store decisions equate the
+two: the primary-key range window, the secondary-index range window, and the two ordering
+advertisements (`providesOrdering` / `monotonicOn`, which let the optimizer drop a Sort) —
+one over the primary key, one over a secondary index.
 
 `registerCollation` promises only that a normalizer partitions strings the way the
 comparator calls them **equal** — never that it preserves **order**. A collation asserts
@@ -818,6 +819,17 @@ carrying an explicit non-`BINARY` `COLLATE` (index DDL does not type-gate the wa
 DDL does). Those key hard-`BINARY` while the filter still compares under the declared
 name, so both arms decline and the query full-scans. Declining costs the seek, never a
 row.
+
+The **secondary-index ordering advertisement** asks a different pair of names than either
+seek arm, and is gated separately for that reason. `ORDER BY name` compares under the
+table column's *declared* collation whatever any index says, so the advertisement asks
+whether the key bytes reproduce **that** order — not the post-fetch filter's. The two
+questions diverge on exactly one shape: an index column carrying a `COLLATE` its table
+column does not, as in `create index ix on t (name collate nocase)` over a `BINARY`
+`name`. There the seek window is exact (key `NOCASE` equals filter `NOCASE`) but the walk
+emits `NOCASE` order while the `ORDER BY` wants `BINARY`, where `'Z' < 'a'` — so the seek
+fires and the ordering claim declines, leaving the Sort in place. The claim is truncated
+to the leading index columns that pass and voided entirely at zero.
 
 The built-ins hold their assertion for every **well-formed** string, including text outside
 the basic multilingual plane. They compare by Unicode code point (`compareCodePoints` in

@@ -79,3 +79,42 @@ the offending node, not a short result set.
 The same argument applies to `monotonicOn`, which is documented as the stronger
 claim and drives the same family of rules; whether the guard covers both or only
 `ordering` first is an open call for whoever picks this up.
+
+## Third instance: the same alignment algorithm, written twice, in two packages
+
+Found while reviewing `feat-store-index-seek-ordering`, which gave the persistent-storage
+backend's secondary-index plans the ability to say "these rows already arrive sorted".
+
+That claim is decided by a small pointer-walk that lines an index's declared column order
+up against what the query asked for, skipping columns the seek has already pinned to a
+single value. There are now **two independent copies** of that walk:
+
+- `MemoryTableModule.indexSatisfiesOrdering` (`packages/quereus/src/vtab/memory/module.ts`,
+  ~line 1023) — over an `IndexSchema`.
+- `indexOrderingSatisfies` (`packages/quereus-store/src/common/store-module-access-plan.ts`,
+  end of file) — over `OrderingSpec[]`.
+
+They agree today, deliberately and by hand: the store version's comment says it mirrors
+the memory one, and it carries a branch that is unreachable from its own caller purely to
+keep the two shapes identical. That is the whole problem — the only thing holding them in
+step is a comment. Either copy drifting produces a plan that elides a `Sort` it needed,
+which is the exact failure mode this ticket exists to catch, in the backend where it is
+hardest to notice (the store's own test suite is the only place it runs).
+
+Two ways to take it, and they compose rather than compete:
+
+- **The runtime check this ticket already proposes** covers it directly and needs no
+  refactor: run the ordering assertion over the store suite and a divergence in either
+  copy fails at the row that breaks the order, naming the plan.
+- **One shared implementation**, which retires the class rather than detecting it. The
+  store version's `OrderingSpec[]` signature is the more general of the two — it takes the
+  ordering as data instead of as a schema — so the direction is to lift it into
+  `packages/quereus` beside `OrderingSpec` in `src/vtab/best-access-plan.ts` and have the
+  memory module map its `IndexSchema` into that call. The store already depends on
+  `@quereus/quereus`, so the dependency direction works.
+
+Worth noting that the ordering claims themselves keep multiplying — the store gained
+secondary-index claims here, and `feat-store-secondary-index-monotonic-advertisement`
+queues up the stronger `monotonicOn` version over the same walks. Each new claim is
+another producer this ticket's guard would have to cover, and another chance for a
+hand-mirrored copy to drift.
