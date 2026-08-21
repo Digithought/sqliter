@@ -431,7 +431,10 @@ The module implements `getBestAccessPlan()` to communicate capabilities:
 | Secondary index eq (single window) | O(1) + PK lookup | Yes (index order; equality-pinned prefix skipped) |
 | Secondary index range / prefix-range | O(k) + PK lookups | Yes (index order) |
 | Secondary index `IN` multi-seek | O(k) point seeks (capped at 1000 keys) | No (merged windows emit in seek-key order) |
+| Ordering-only index walk (`ORDER BY` matches an index; no filter pushed) | O(n) index entries + n row resolutions (`pointRead` each) | Yes (index order) |
 | Full scan | O(n) | Yes (PK order) |
+
+The ordering-only walk is chosen only when it prices below the filter plan plus the external sort that plan would otherwise need (every pushed filter stays residual and is charged per row). The price assumes the **whole table** is wanted, because `LIMIT` is not visible to the module on this path — so a backend declaring an expensive `pointRead` (IndexedDB) prefers scan-then-sort even under `ORDER BY … LIMIT 1`.
 
 Collations and ordering: ordering is advertised under any collation whose registration asserts `orderPreserving` (the built-ins `BINARY`, `NOCASE`, and `RTRIM` do; a custom collation opts in via `db.registerCollation(name, cmp, { normalizer, orderPreserving: true })`). Two shapes never advertise:
 

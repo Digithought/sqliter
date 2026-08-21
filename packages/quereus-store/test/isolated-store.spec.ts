@@ -607,6 +607,57 @@ describe('Isolated Store Module', () => {
 		});
 	});
 
+	describe('ordering-only index walk under an open transaction', () => {
+		beforeEach(async () => {
+			const isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			await db.exec(`create table t (id integer primary key, v integer) using store`);
+			await db.exec(`create index ix_v on t (v)`);
+			// 100 committed rows at v = 2, 4, …, 200 (PK order is v order reversed), enough
+			// that the ordering-only walk prices below scan-then-sort on the parity profile.
+			const rows: string[] = [];
+			for (let i = 1; i <= 100; i++) rows.push(`(${i}, ${2 * (101 - i)})`);
+			await db.exec(`insert into t values ${rows.join(', ')}`);
+		});
+
+		it('overlay rows interleave throughout an ordering-only walk (plan=0, no filter pushed)', async () => {
+			// The first plan shape that reaches IsolatedTable.resolveScanIndex with
+			// kind 'index' / plan 'scan' from the store: the underlying stream is the whole
+			// index store in key order, and the overlay merge is keyed on (indexKey, PK).
+			// The Sort is gone (query_plan asserts it), so the merge order IS the answer.
+			const plans = await asyncIterableToArray(
+				db.eval(`select json_group_array(op) as ops from query_plan(?)`,
+					[`select v from t order by v`]),
+			);
+			expect(plans[0].ops as string).to.match(/indexscan/i).and.to.not.match(/sort/i);
+
+			await db.exec('BEGIN');
+			// Overlay rows sorting before (1), among (55, 101), and after (999) the
+			// committed range; move one committed row (v 20 → 21) and delete another (v 40).
+			await db.exec(`insert into t values (101, 1), (102, 55), (103, 101), (104, 999)`);
+			await db.exec(`update t set v = 21 where v = 20`);
+			await db.exec(`delete from t where v = 40`);
+
+			const expected: number[] = [1];
+			for (let v = 2; v <= 200; v += 2) {
+				if (v === 20 || v === 40) continue;
+				expected.push(v);
+			}
+			expected.splice(expected.indexOf(22), 0, 21);
+			expected.splice(expected.indexOf(56), 0, 55);
+			expected.splice(expected.indexOf(102), 0, 101);
+			expected.push(999);
+
+			const inTxn = await asyncIterableToArray(db.eval(`select v from t order by v`));
+			expect(inTxn.map(r => r.v)).to.deep.equal(expected);
+			await db.exec('ROLLBACK');
+
+			const committed = await asyncIterableToArray(db.eval(`select v from t order by v`));
+			expect(committed.map(r => r.v)).to.deep.equal(
+				Array.from({ length: 100 }, (_x, i) => 2 * (i + 1)));
+		});
+	});
+
 	// Note: The following tests verify the isolation layer infrastructure when wrapping
 	// the store module. Full integration requires additional work on transaction
 	// coordination between the store module and the overlay memory module.

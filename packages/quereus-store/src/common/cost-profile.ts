@@ -78,6 +78,39 @@ export interface KVCostProfile {
 /** A {@link KVCostProfile} with every field filled in — what the planner actually reads. */
 export type ResolvedCostProfile = Required<KVCostProfile>;
 
+// --- Ordering-walk cost terms -------------------------------------------------------------
+//
+// Both constants below are DELIBERATELY the memory module's numbers
+// (`MemoryTableModule`'s SORT_COST_PER_COMPARISON / RESIDUAL_FILTER_COST_PER_ROW), for the
+// same reason `ARM_SELECTIVITY.eq` in store-module-access-plan.ts is deliberately the
+// memory module's EQ_SELECTIVITY_WITHOUT_STATS: the two backends should make the same
+// ordering-vs-sort tradeoff for the same query. The engine's own `planner/cost` module is
+// not exported from `@quereus/quereus`, so they are restated here rather than imported.
+
+/**
+ * Cost per pairwise comparison of the external sort a plan avoids by emitting rows
+ * already ordered. Commensurate with `AccessPlanBuilder`'s units (full scan = rows × 1.0):
+ * sorting 1000 rows ≈ 1000 × log2(1000) × 0.1 ≈ 1000 — on the order of scanning them once.
+ */
+export const SORT_COST_PER_COMPARISON = 0.1;
+
+/**
+ * Per-row cost charged for each pushed filter an ordering-only access pattern leaves
+ * unhandled (the residual `Filter` re-checks them above the leaf). This term is what keeps
+ * an ordering-only index walk from displacing a selective seek on a filtered query.
+ */
+export const RESIDUAL_FILTER_COST_PER_ROW = 0.2;
+
+/**
+ * The estimated cost of an external O(n·log n) sort over `rows` rows — the memory
+ * module's `estimateSortCost`, at {@link SORT_COST_PER_COMPARISON}. 0 at `rows <= 1`,
+ * where no sort is needed.
+ */
+export function estimateSortCost(rows: number): number {
+	if (rows <= 1) return 0;
+	return rows * Math.log2(rows) * SORT_COST_PER_COMPARISON;
+}
+
 /**
  * The module's pre-profile constants, and the default for any backend that declares
  * nothing. `pointRead: 1.0` says a resolved row costs about what a sequentially-iterated

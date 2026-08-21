@@ -36,7 +36,12 @@ import {
 	isMultiValueEquality,
 	selectivityFromHistogram,
 } from '@quereus/quereus';
-import { PARITY_COST_PROFILE, type ResolvedCostProfile } from './cost-profile.js';
+import {
+	estimateSortCost,
+	PARITY_COST_PROFILE,
+	RESIDUAL_FILTER_COST_PER_ROW,
+	type ResolvedCostProfile,
+} from './cost-profile.js';
 import {
 	indexOrderPreservingPrefixLength,
 	indexPrefixSeekIsCollationExact,
@@ -479,6 +484,14 @@ function resolvePrimaryKeyPins(
  * The access plan this module advertises for `request`, before the caller stamps the
  * module-wide `honorsCollatedRangeBounds` flag onto it.
  *
+ * Two halves: {@link computeFilterAccessPlan} picks the best plan for the pushed
+ * PREDICATE (PK point / multi-seek / range, secondary-index seek, or full scan), and
+ * {@link chooseOrderingPlan} then asks whether walking some index purely for its
+ * EMISSION ORDER — pushing no filters at all — prices below that plan plus the external
+ * sort it would otherwise need. Wrapping the whole filter decision (rather than
+ * threading the comparison through its several return points) is what lets the early
+ * PK returns compete against an ordering walk too.
+ *
  * `tableKeyCollation` is the table's resolved key collation K, passed in rather than
  * looked up: the caller (`StoreModule.getBestAccessPlan`) owns the module's table map.
  * It is the PRIMARY-KEY arms' concern only — `resolvePkKeyCollations` still falls back to
@@ -491,6 +504,25 @@ function resolvePrimaryKeyPins(
  * reason `tableKeyCollation` is: this function reads no module state of its own.
  */
 export function computeBestAccessPlan(
+	db: Database,
+	tableInfo: TableSchema,
+	request: BestAccessPlanRequest,
+	tableKeyCollation: string,
+	costProfile: ResolvedCostProfile,
+): BestAccessPlanResult {
+	const filterPlan = computeFilterAccessPlan(db, tableInfo, request, tableKeyCollation, costProfile);
+	return chooseOrderingPlan(db, tableInfo, request, filterPlan, costProfile);
+}
+
+/**
+ * The best access plan for the pushed PREDICATE alone — {@link computeBestAccessPlan}'s
+ * former body, extracted verbatim so {@link chooseOrderingPlan} can wrap every one of its
+ * return points. Ordering is not ignored here (the seek arms still attach their
+ * advertisements, which is how a plan that already satisfies the required ordering skips
+ * the walk comparison entirely); this function just never chooses an access path FOR
+ * ordering's sake.
+ */
+function computeFilterAccessPlan(
 	db: Database,
 	tableInfo: TableSchema,
 	request: BestAccessPlanRequest,
@@ -724,6 +756,202 @@ export function computeBestAccessPlan(
 	// downstream rules (merge-join, asof-scan) can fire on store-backed
 	// tables, matching memory-mode behavior.
 	return scanPlan;
+}
+
+/**
+ * The empty pinned-column set an ordering-only walk aligns its index under. Deliberately
+ * empty even when the request carries equality filters: the walk pushes NO filters, so
+ * nothing pins a column to one value inside the walk itself. (The residual `Filter` above
+ * the leaf does make an equality column constant in the OUTPUT, which is the argument
+ * `MemoryTableModule.evaluateOrderingOnlyPlans` leans on to skip pinned columns — but that
+ * argument quietly assumes the equality's comparison collation equates only rows the walk
+ * emits adjacently. Declining the skip costs an optimization, never an answer.)
+ */
+const NO_PINNED_COLUMNS: ReadonlySet<number> = new Set();
+
+/**
+ * Pushed-filter operators that reject a NULL in the filtered column: every comparison and
+ * IN-membership is false against NULL, and the filter is enforced SOMEWHERE for every
+ * plan this module emits (the seek window, `matchesFilters`, or the residual `Filter` the
+ * engine keeps for an unhandled filter) — so a row with NULL there never reaches the
+ * consumer of an ordering claim.
+ */
+const NULL_EXCLUDING_OPS: ReadonlySet<string> = new Set([...EQ_OR_IN_OPS, ...RANGE_OPS, 'IS NOT NULL']);
+
+/**
+ * Truncate an index's order-preserving prefix at the first DESC column whose walk could
+ * misplace NULLs.
+ *
+ * The engine's ORDER BY places NULLs FIRST for BOTH directions — placement is absolute,
+ * never direction-conditioned (`orderByNullResult`, util/comparison.ts). Index key bytes
+ * agree on an ASC column (NULL's `0x00` tag sorts below every other tag) but DISAGREE on
+ * a DESC column, whose byte inversion sends NULL to the END of the walk. So a DESC
+ * ordering claim is only sound when no NULL can appear in that column's emitted rows:
+ *
+ *  - the column is declared NOT NULL;
+ *  - the column is pinned by this arm's own equality (`pinnedCols` — an equality never
+ *    matches NULL, and a pinned column contributes no ordering anyway);
+ *  - some pushed filter on the column is NULL-excluding ({@link NULL_EXCLUDING_OPS}) —
+ *    this is what keeps the parent arms' claims for `where n > 5 order by n desc`, where
+ *    the bound itself already evicts every NULL.
+ *
+ * NOTE: this gate deliberately DIVERGES from `MemoryTableModule.indexSatisfiesOrdering`,
+ * which has no NULL check and therefore shares the misplacement for a bare
+ * `order by <nullable col> desc` claim (its DESC comparator negation also sends NULLs
+ * last) — that twin, and the PK advertisement's (`buildPkOrderingAdvertisement` has the
+ * same exposure for a nullable DESC PK member), are tracked as
+ * `fix/bug-desc-index-ordering-claims-misplace-nulls`.
+ */
+function nullSafeOrderingPrefixLength(
+	tableInfo: TableSchema,
+	request: BestAccessPlanRequest,
+	index: TableIndexSchema,
+	orderPreservingPrefix: number,
+	pinnedCols: ReadonlySet<number>,
+): number {
+	for (let i = 0; i < orderPreservingPrefix; i++) {
+		const col = index.columns[i];
+		if (!col.desc) continue;
+		if (tableInfo.columns[col.index]?.notNull) continue;
+		if (pinnedCols.has(col.index)) continue;
+		if (request.filters.some(f => f.columnIndex === col.index && NULL_EXCLUDING_OPS.has(f.op))) continue;
+		return i;
+	}
+	return orderPreservingPrefix;
+}
+
+/**
+ * True when a filter plan's `providesOrdering` satisfies `required` position for
+ * position (same `columnIndex`, same `desc`; the plan may provide extra trailing
+ * ordering) — the engine's own `orderingMatches` (rule-grow-retrieve.ts). Every arm of
+ * {@link computeFilterAccessPlan} that matches a `requiredOrdering` claims it VERBATIM,
+ * so in practice this is "did some arm already claim it".
+ */
+function orderingAlreadySatisfied(
+	provided: readonly OrderingSpec[] | undefined,
+	required: readonly OrderingSpec[],
+): boolean {
+	if (!provided || provided.length < required.length) return false;
+	for (let i = 0; i < required.length; i++) {
+		if (provided[i].columnIndex !== required[i].columnIndex || provided[i].desc !== required[i].desc) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/**
+ * Consider replacing `filterPlan` with an ordering-only walk of a secondary index: a
+ * whole-index scan (`plan=0`) chosen purely for its emission order, with EVERY pushed
+ * filter left to the residual `Filter`. `... order by n` with an index on `n` and no
+ * usable predicate otherwise full-scans the data store in PK order and sorts the whole
+ * table — the walk streams the rows already ordered at the price of one index-entry read
+ * plus one row resolution per row.
+ *
+ * The Sort-absorption rule (`trySortAbsorbViaIndexOrdering`, rule-grow-retrieve.ts)
+ * deletes the Sort on the strength of `providesOrdering` alone, with no cost comparison
+ * of its own — so this function is the only place "is the walk actually cheaper than
+ * sorting?" gets asked. Mirrors `MemoryTableModule.adjustPlanForOrdering` /
+ * `evaluateOrderingOnlyPlans`, minus the memory module's seek-plus-ordering hybrid (the
+ * store's seek arms already advertise their ordering, so the hybrid case IS `filterPlan`
+ * satisfying the request).
+ *
+ * `filterPlan` is returned unchanged unless ALL of:
+ *  - a required ordering is present that `filterPlan` does not already satisfy;
+ *  - the request carries no runtime-valued set — such a request is engine-synthesized
+ *    (`rule-key-set-seek`'s probes / the key-set semi join itself) and must be answered
+ *    with the module's genuine filter plan: substituting a walk whose cost does not
+ *    scale with the key count would corrupt the probe's cost line, and the walk's
+ *    all-false `handledFilters` would push the runtime-set membership into a residual
+ *    the engine never meant to evaluate that way. Same ONE rule as the seek-vs-scan
+ *    veto exemption above.
+ *  - some non-partial index's order-preserving prefix satisfies the required ordering
+ *    with NO pinned columns (see {@link NO_PINNED_COLUMNS});
+ *  - the cheapest such walk prices STRICTLY below `filterPlan` plus the external sort
+ *    it would otherwise need. Ties keep `filterPlan` — it is the plan the store already
+ *    produces, and the sort estimate is the softer of the two numbers.
+ *
+ * NOTE: the walk is priced for the WHOLE table because `request.limit` is never
+ * populated on this path — `trySortAbsorbViaIndexOrdering` builds its request with no
+ * `limit`, and the `LimitOffset` grow arm that does populate one sits above the Sort,
+ * not above the Retrieve. So `order by n limit 1` is priced exactly like `order by n`,
+ * and a backend declaring an expensive `pointRead` (IndexedDB) prefers scan-then-sort
+ * even under a tight LIMIT, where the walk would have read one row. The enabling engine
+ * change is backlog `feat-sort-absorb-blind-to-limit`.
+ */
+function chooseOrderingPlan(
+	db: Database,
+	tableInfo: TableSchema,
+	request: BestAccessPlanRequest,
+	filterPlan: BestAccessPlanResult,
+	profile: ResolvedCostProfile,
+): BestAccessPlanResult {
+	const required = request.requiredOrdering;
+	if (!required || required.length === 0) return filterPlan;
+	if (orderingAlreadySatisfied(filterPlan.providesOrdering, required)) return filterPlan;
+	if (request.filters.some(f => f.runtimeSet !== undefined)) return filterPlan;
+
+	const estimatedRows = request.estimatedRows ?? 1000;
+	let bestWalk: BestAccessPlanResult | null = null;
+	for (const index of tableInfo.indexes ?? []) {
+		// Partial indexes are excluded from access planning outright (see
+		// {@link tryIndexAccessPlan}) — doubly so here, where the walk IS the whole
+		// row source and a partial index omits rows no residual can resurrect.
+		if (index.predicate || index.columns.length === 0) continue;
+		// Same collation gate as the seek arms' ordering advertisement: only the prefix
+		// whose key bytes provably reproduce the DECLARED collation's order may claim.
+		const indexKeyCollations = resolveIndexKeyCollations(index, tableInfo.columns);
+		const orderPreservingPrefix = indexOrderPreservingPrefixLength(
+			db, tableInfo.columns, index, indexKeyCollations);
+		const claimablePrefix = nullSafeOrderingPrefixLength(
+			tableInfo, request, index, orderPreservingPrefix, NO_PINNED_COLUMNS);
+		if (claimablePrefix === 0) continue;
+		const indexOrdering: OrderingSpec[] = index.columns
+			.slice(0, claimablePrefix)
+			.map(col => ({ columnIndex: col.index, desc: !!col.desc }));
+		if (!indexOrderingSatisfies(indexOrdering, required, NO_PINNED_COLUMNS)) continue;
+
+		const walk = buildOrderingWalkPlan(index, request, required, estimatedRows, profile);
+		// Strict '<' keeps the first qualifying index on a tie, so declaration order
+		// does not decide — matching the best-seek loop above.
+		if (!bestWalk || walk.cost < bestWalk.cost) bestWalk = walk;
+	}
+	if (!bestWalk) return filterPlan;
+
+	const sortCost = estimateSortCost(filterPlan.rows ?? estimatedRows);
+	return bestWalk.cost < filterPlan.cost + sortCost ? bestWalk : filterPlan;
+}
+
+/**
+ * The advertisement for one ordering-only walk candidate: a whole-index range scan that
+ * resolves EVERY index entry to its row (`estimatedRows × profile.pointRead`, added via
+ * `addCost` like the seek arms rather than restating the shape's formula) and re-checks
+ * every pushed filter in the residual (`estimatedRows × filters × 0.2` — the term that
+ * stops a walk from displacing a selective seek on a filtered query).
+ *
+ * `indexName` is set with NO `seekColumnIndexes`, so `rule-select-access-path`
+ * physicalizes through its legacy path's ordering branch: an `IndexScanNode` whose
+ * idxStr is `idx=<name>(0);plan=0` (`makeOrderedScanFilterInfo`) and whose FilterInfo
+ * carries no constraints. `StoreTableScan.analyzeIndexAccess` reads the `plan=0`
+ * explicitly and walks the whole index store. `orderingIndexName` equals `indexName` —
+ * `validateAccessPlan` rejects an ordering claim naming any index but the one walked.
+ */
+function buildOrderingWalkPlan(
+	index: TableIndexSchema,
+	request: BestAccessPlanRequest,
+	required: readonly OrderingSpec[],
+	estimatedRows: number,
+	profile: ResolvedCostProfile,
+): BestAccessPlanResult {
+	const plan = AccessPlanBuilder
+		.rangeScan(estimatedRows)
+		.addCost(estimatedRows * profile.pointRead)
+		.addCost(estimatedRows * request.filters.length * RESIDUAL_FILTER_COST_PER_ROW)
+		.setHandledFilters(new Array(request.filters.length).fill(false))
+		.setIndexName(index.name)
+		.setExplanation(`Store index ordering walk on ${index.name}`)
+		.build();
+	return { ...plan, providesOrdering: required, orderingIndexName: index.name };
 }
 
 /**
@@ -1278,10 +1506,15 @@ function buildIndexOrderingAdvertisement(
 ): Pick<BestAccessPlanResult, 'providesOrdering' | 'orderingIndexName'> {
 	const orderPreservingPrefix = indexOrderPreservingPrefixLength(
 		db, tableInfo.columns, index, indexKeyCollations);
-	if (orderPreservingPrefix === 0) return {};
+	// Additionally truncated at the first DESC column NULLs could reach: index bytes put
+	// them at the walk's END, the engine's ORDER BY puts them FIRST for both directions.
+	// See {@link nullSafeOrderingPrefixLength}.
+	const claimablePrefix = nullSafeOrderingPrefixLength(
+		tableInfo, request, index, orderPreservingPrefix, new Set(eqCols));
+	if (claimablePrefix === 0) return {};
 
 	const indexOrdering: OrderingSpec[] = index.columns
-		.slice(0, orderPreservingPrefix)
+		.slice(0, claimablePrefix)
 		.map(col => ({ columnIndex: col.index, desc: !!col.desc }));
 
 	const required = request.requiredOrdering;

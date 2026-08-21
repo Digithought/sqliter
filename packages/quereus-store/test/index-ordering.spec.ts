@@ -85,6 +85,7 @@ async function planOps(db: Database, query: string): Promise<string> {
 
 const SEEK = /INDEXSEEK|INDEX SEEK|IndexSeek/i;
 const SORT = /sort/i;
+const ISCAN = /indexscan/i;
 
 describe('secondary-index ordering advertisement', () => {
 	let db: Database;
@@ -108,6 +109,7 @@ describe('secondary-index ordering advertisement', () => {
 		tableName: string,
 		filters: PredicateConstraint[],
 		requiredOrdering?: OrderingSpec[],
+		estimatedRows = 1000,
 	): BestAccessPlanResult {
 		const table = db.schemaManager.getTable('main', tableName);
 		expect(table, `table ${tableName} should exist`).to.exist;
@@ -121,7 +123,7 @@ describe('secondary-index ordering advertisement', () => {
 			})),
 			filters,
 			requiredOrdering,
-			estimatedRows: 1000,
+			estimatedRows,
 		});
 	}
 
@@ -282,6 +284,139 @@ describe('secondary-index ordering advertisement', () => {
 
 			expect(planFor('t4', [gt(1, 5)], [desc(1)]).providesOrdering).to.deep.equal([desc(1)]);
 			expect(planFor('t4', [gt(1, 5)], [asc(1)]).providesOrdering).to.equal(undefined);
+		});
+	});
+
+	describe('plan level: ordering-only walk', () => {
+		beforeEach(async () => {
+			// Same shapes as the seek-arm suite: t1(id, n, s) + ix_n(n); t2(id, a, b) + ix_ab(a, b).
+			await db.exec(`create table t1 (id integer primary key, n integer, s text) using store`);
+			await db.exec(`create index ix_n on t1 (n)`);
+			await db.exec(`create table t2 (id integer primary key, a integer, b integer) using store`);
+			await db.exec(`create index ix_ab on t2 (a, b)`);
+		});
+
+		it('no filter at all: walks the ordering index instead of scan-then-sort', () => {
+			const plan = planFor('t1', [], [asc(1)]);
+			expect(plan.indexName).to.equal('ix_n');
+			expect(plan.orderingIndexName).to.equal('ix_n');
+			expect(plan.providesOrdering).to.deep.equal([asc(1)]);
+			expect(plan.seekColumnIndexes, 'a walk seeks nothing').to.equal(undefined);
+			expect(plan.handledFilters).to.deep.equal([]);
+			// rangeScan(1000) + 1000 × pointRead(parity 1.0): the whole table, resolved row by row.
+			expect(plan.cost).to.be.closeTo(1500.3, 0.01);
+		});
+
+		it('a pushed filter no index can serve stays residual and is charged per row', () => {
+			const plan = planFor('t1', [gt(2, 'x')], [asc(1)]);
+			expect(plan.indexName).to.equal('ix_n');
+			expect(plan.orderingIndexName).to.equal('ix_n');
+			expect(plan.providesOrdering).to.deep.equal([asc(1)]);
+			expect(plan.handledFilters, 'walk handles nothing').to.deep.equal([false]);
+			// … + 1000 × 1 filter × 0.2 residual.
+			expect(plan.cost).to.be.closeTo(1700.3, 0.01);
+		});
+
+		it('a selective seek on another index beats the walk (residual term decides)', async () => {
+			await db.exec(`create table t8 (id integer primary key, a integer, b integer) using store`);
+			await db.exec(`create index ix_a on t8 (a)`);
+			await db.exec(`create index ix_b on t8 (b)`);
+			// eq seek on ix_a (130.3) + sort(100 rows ≈ 66.4) undercuts the ix_b walk (1700.3).
+			const plan = planFor('t8', [eq(1, 1)], [asc(2)]);
+			expect(plan.indexName).to.equal('ix_a');
+			expect(plan.providesOrdering).to.equal(undefined);
+			expect(plan.orderingIndexName).to.equal(undefined);
+		});
+
+		it('composite index walks for its full prefix, never for a non-leading column', () => {
+			const both = planFor('t2', [], [asc(1), asc(2)]);
+			expect(both.indexName).to.equal('ix_ab');
+			expect(both.providesOrdering).to.deep.equal([asc(1), asc(2)]);
+
+			const trailingOnly = planFor('t2', [], [asc(2)]);
+			expect(trailingOnly.indexName, 'b is not a leading column of ix_ab').to.equal(undefined);
+			expect(trailingOnly.providesOrdering).to.equal(undefined);
+		});
+
+		it('DESC index column: walks order by n desc, declines order by n', async () => {
+			await db.exec(`create table t4 (id integer primary key, n integer) using store`);
+			await db.exec(`create index ix_nd on t4 (n desc)`);
+
+			const claimed = planFor('t4', [], [desc(1)]);
+			expect(claimed.orderingIndexName).to.equal('ix_nd');
+			expect(claimed.providesOrdering).to.deep.equal([desc(1)]);
+			expect(planFor('t4', [], [asc(1)]).providesOrdering, 'no reverse walk').to.equal(undefined);
+		});
+
+		it('a nullable DESC column declines the bare walk but claims under a NULL-excluding bound', async () => {
+			// The engine's ORDER BY places NULLs FIRST for both directions; a DESC byte
+			// walk emits them LAST. Only a NULL-free column may claim.
+			await db.exec(`create table t4n (id integer primary key, n integer null) using store`);
+			await db.exec(`create index ix_nnd on t4n (n desc)`);
+
+			const bare = planFor('t4n', [], [desc(1)]);
+			expect(bare.indexName).to.equal(undefined);
+			expect(bare.providesOrdering).to.equal(undefined);
+
+			// With a pushed bound the NULLs are evicted wherever the plan enforces it, so
+			// the claim is safe again — here as the parent range-seek arm.
+			const seek = planFor('t4n', [gt(1, 0)], [desc(1)]);
+			expect(seek.indexName).to.equal('ix_nnd');
+			expect(seek.providesOrdering).to.deep.equal([desc(1)]);
+		});
+
+		it('the eq arm no longer claims a nullable DESC suffix column', async () => {
+			// Pins the parent-arm side of the NULL gate: `where a = 1 order by b desc` over
+			// (a, b desc) walks the a=1 window with NULL b rows at its END, while the
+			// engine's ORDER BY wants them FIRST — the claim must decline (Sort survives).
+			await db.exec(`create table t4c (id integer primary key, a integer, b integer null) using store`);
+			await db.exec(`create index ix_abd on t4c (a, b desc)`);
+
+			const plan = planFor('t4c', [eq(1, 1)], [desc(2)]);
+			expect(plan.indexName).to.equal('ix_abd');
+			expect(plan.providesOrdering, 'NULL b rows would emit last').to.equal(undefined);
+		});
+
+		it('declines any explicit nullsFirst', () => {
+			const plan = planFor('t1', [], [{ columnIndex: 1, desc: false, nullsFirst: true }]);
+			expect(plan.indexName).to.equal(undefined);
+			expect(plan.providesOrdering).to.equal(undefined);
+		});
+
+		it('no secondary index / only a partial index: filter plan returned untouched', async () => {
+			await db.exec(`create table t9 (id integer primary key, n integer) using store`);
+			const bare = planFor('t9', [], [asc(1)]);
+			expect(bare.indexName).to.equal(undefined);
+			expect(bare.providesOrdering).to.equal(undefined);
+
+			// A partial index omits rows no residual can resurrect — never walked.
+			await db.exec(`create table t10 (id integer primary key, n integer) using store`);
+			await db.exec(`create index ixp on t10 (n) where n > 5`);
+			const partial = planFor('t10', [], [asc(1)]);
+			expect(partial.indexName).to.equal(undefined);
+			expect(partial.providesOrdering).to.equal(undefined);
+		});
+
+		it('a collation without the orderPreserving assertion is never walked', async () => {
+			db.registerCollation('SHOUT', (a: string, b: string) => {
+				const [ua, ub] = [a.toUpperCase(), b.toUpperCase()];
+				return ua < ub ? -1 : ua > ub ? 1 : 0;
+			}, (s: string) => s.toUpperCase());
+			await db.exec(`create table t5w (id integer primary key, k text collate shout) using store`);
+			await db.exec(`create index ix_kw on t5w (k)`);
+
+			const plan = planFor('t5w', [], [asc(1)]);
+			expect(plan.indexName).to.equal(undefined);
+			expect(plan.providesOrdering, 'no orderPreserving assertion ⇒ no walk').to.equal(undefined);
+		});
+
+		it('does not win on an empty or single-row table by a rounding artifact', () => {
+			// sortCost is 0 at rows <= 1, so the walk's fixed 0.3 shape cost must lose.
+			for (const estimatedRows of [0, 1]) {
+				const plan = planFor('t1', [], [asc(1)], estimatedRows);
+				expect(plan.indexName, `estimatedRows=${estimatedRows}`).to.equal(undefined);
+				expect(plan.providesOrdering, `estimatedRows=${estimatedRows}`).to.equal(undefined);
+			}
 		});
 	});
 
@@ -463,6 +598,181 @@ describe('secondary-index ordering advertisement', () => {
 			const q = `select n from t where n > 195 order by n`;
 			expect(await planOps(db, q)).to.match(SEEK).and.to.not.match(SORT);
 			expect(await column(db, q, 'n')).to.deep.equal([196, 197, 198, 199, 200]);
+		});
+	});
+
+	describe('answer + plan-shape level: ordering-only walk', () => {
+		// The walk pays one row resolution per row (parity pointRead 1.0) that the memory
+		// module does not, so on a parity profile it only undercuts scan-then-sort from
+		// about 33 rows up (0.5·N + 0.3 < 0.1·N·log2 N) — every walking shape here uses
+		// 100+ rows, and the tiny-table shapes assert the DECLINE.
+		const range = (n: number): number[] => Array.from({ length: n }, (_v, i) => i + 1);
+
+		it('order by an indexed column with no filter: IndexScan, no Sort, full ordered table', async () => {
+			await db.exec(`create table t (id integer primary key, n integer) using store`);
+			await db.exec(`create index ix_n on t (n)`);
+			// n = reversed id, so PK order is the exact opposite of n order.
+			await db.exec(`insert into t values ${range(100).map(i => `(${i}, ${101 - i})`).join(', ')}`);
+
+			const q = `select n from t order by n`;
+			const ops = await planOps(db, q);
+			expect(ops, 'the walk must be an IndexScan').to.match(ISCAN);
+			expect(ops, 'the Sort must be elided').to.not.match(SORT);
+			expect(await column(db, q, 'n')).to.deep.equal(range(100));
+
+			// Answer-level oracle: identical rows with the index gone (Sort back in the plan).
+			await db.exec(`drop index ix_n`);
+			expect(await planOps(db, q), 'oracle must sort').to.match(SORT);
+			expect(await column(db, q, 'n')).to.deep.equal(range(100));
+		});
+
+		it('NULLs appear, and appear FIRST, on an ASC walk', async () => {
+			// The completeness test: every NULL row is indexed (key tag 0x00 sorts below
+			// every other tag, matching the engine's NULLs-lowest default), so the walk
+			// must return the whole table with the NULLs leading.
+			await db.exec(`create table t (id integer primary key, n integer null) using store`);
+			await db.exec(`create index ix_n on t (n)`);
+			await db.exec(`insert into t values ${range(90).map(i => `(${i}, ${91 - i})`).join(', ')}`);
+			await db.exec(`insert into t values (91, null), (92, null), (93, null)`);
+
+			const q = `select n from t order by n`;
+			expect(await planOps(db, q)).to.match(ISCAN).and.to.not.match(SORT);
+			const walked = await column(db, q, 'n');
+			expect(walked).to.deep.equal([null, null, null, ...range(90)]);
+
+			await db.exec(`drop index ix_n`);
+			expect(await column(db, q, 'n'), 'walk order must equal the engine\'s').to.deep.equal(walked);
+		});
+
+		it('DESC index: NOT NULL column walks; nullable column keeps its Sort', async () => {
+			// NOT NULL: byte order and ORDER BY agree everywhere, so the bare walk fires.
+			await db.exec(`create table t (id integer primary key, n integer not null) using store`);
+			await db.exec(`create index ix_nd on t (n desc)`);
+			await db.exec(`insert into t values ${range(90).map(i => `(${i}, ${i})`).join(', ')}`);
+
+			const qd = `select n from t order by n desc`;
+			expect(await planOps(db, qd)).to.match(ISCAN).and.to.not.match(SORT);
+			expect(await column(db, qd, 'n')).to.deep.equal([...range(90)].reverse());
+			expect(await planOps(db, `select n from t order by n`), 'no reverse walk: Sort stays').to.match(SORT);
+
+			// NULLABLE: the engine's ORDER BY puts NULLs FIRST for BOTH directions
+			// (orderByNullResult, util/comparison.ts), but a DESC byte walk emits them
+			// LAST — the walk must decline and the Sort must survive to place them.
+			await db.exec(`create table tn (id integer primary key, n integer null) using store`);
+			await db.exec(`create index ixn_nd on tn (n desc)`);
+			await db.exec(`insert into tn values ${range(90).map(i => `(${i}, ${i})`).join(', ')}`);
+			await db.exec(`insert into tn values (91, null), (92, null)`);
+
+			const qn = `select n from tn order by n desc`;
+			expect(await planOps(db, qn), 'nullable DESC walk must decline').to.match(SORT);
+			expect(await column(db, qn, 'n')).to.deep.equal([null, null, ...[...range(90)].reverse()]);
+		});
+
+		it('a NULL-excluding filter re-enables a nullable DESC column for the walk', async () => {
+			await db.exec(`create table t (id integer primary key, a integer, b integer null) using store`);
+			await db.exec(`create index ix_abd on t (a, b desc)`);
+			// 200 rows over 4 a-groups plus two NULL-b rows the pushed bound must evict.
+			await db.exec(`insert into t values ${range(200).map(i => `(${i}, ${i % 4}, ${201 - i})`).join(', ')}, (201, 0, null), (202, 3, null)`);
+
+			// `b > 0` is pushed but unservable (b is not a leading index column), so it rides
+			// the residual above the walk — and it excludes NULLs, which is what makes the
+			// nullable DESC b column claim-safe.
+			const q = `select a, b from t where b > 0 order by a, b desc`;
+			expect(await planOps(db, q)).to.match(ISCAN).and.to.not.match(SORT);
+			const expected: Array<{ a: number; b: number }> = [];
+			for (let a = 0; a <= 3; a++) {
+				const bs = range(200).filter(i => i % 4 === a).map(i => 201 - i).sort((x, y) => y - x);
+				for (const b of bs) expected.push({ a, b });
+			}
+			expect(await asyncIterableToArray(db.eval(q))).to.deep.equal(expected);
+		});
+
+		it('read-your-own-writes: pending rows interleave before, between, and after', async () => {
+			await db.exec(`create table t (id integer primary key, n integer) using store`);
+			await db.exec(`create index ix_n on t (n)`);
+			// Committed n = 2, 4, …, 200 (even), so odd pending values land between them.
+			await db.exec(`insert into t values ${range(100).map(i => `(${i}, ${2 * i})`).join(', ')}`);
+
+			await db.exec('begin');
+			await db.exec(`insert into t values (101, 1), (102, 101), (103, 999)`);
+			await db.exec(`delete from t where n = 100`);
+			const q = `select n from t order by n`;
+			expect(await planOps(db, q)).to.match(ISCAN).and.to.not.match(SORT);
+			const expected = [1, ...range(100).map(i => 2 * i).filter(n => n !== 100)];
+			expected.splice(expected.indexOf(102), 0, 101);
+			expected.push(999);
+			expect(await column(db, q, 'n')).to.deep.equal(expected);
+			await db.exec('rollback');
+
+			expect(await column(db, q, 'n')).to.deep.equal(range(100).map(i => 2 * i));
+		});
+
+		it('stays ordered and complete across row-resolution batches (>256 rows, mid-window delete)', async () => {
+			// ROW_RESOLUTION_BATCH is 256: 300 entries force at least two batches, and the
+			// mid-transaction delete leaves a batch entry that resolves to nothing.
+			await db.exec(`create table t (id integer primary key, n integer) using store`);
+			await db.exec(`create index ix_n on t (n)`);
+			await db.exec(`insert into t values ${range(300).map(i => `(${i}, ${301 - i})`).join(', ')}`);
+
+			const q = `select n from t order by n`;
+			expect(await planOps(db, q)).to.match(ISCAN).and.to.not.match(SORT);
+
+			await db.exec('begin');
+			await db.exec(`delete from t where n = 150`);
+			const got = await column(db, q, 'n');
+			await db.exec('commit');
+			expect(got).to.deep.equal(range(300).filter(n => n !== 150));
+		});
+
+		it('a pushed filter the walk leaves unhandled is applied by the residual', async () => {
+			// The filter (a range on un-indexed s) IS pushed to the module; the walk claims
+			// nothing, so the engine keeps it as a Filter above the IndexScan — order
+			// preserved, non-matching rows gone.
+			await db.exec(`create table t (id integer primary key, n integer, s text) using store`);
+			await db.exec(`create index ix_n on t (n)`);
+			await db.exec(`insert into t values ${range(300)
+				.map(i => `(${i}, ${301 - i}, '${(301 - i) % 2 === 0 ? 'keep' : 'drop'}')`).join(', ')}`);
+
+			const q = `select n from t where s >= 'k' and s < 'l' order by n`;
+			expect(await planOps(db, q)).to.match(ISCAN).and.to.not.match(SORT);
+			expect(await column(db, q, 'n')).to.deep.equal(range(300).filter(n => n % 2 === 0));
+		});
+
+		it('a whole-PK equality keeps its point seek; the Sort stays', async () => {
+			// Pins the interaction with selectPhysicalNodeLegacy's small-table PK point arm:
+			// the point plan (rows ≤ 10) wins the cost comparison, satisfies nothing
+			// ordering-wise, and the Sort survives above it.
+			await db.exec(`create table t (id integer primary key, n integer) using store`);
+			await db.exec(`create index ix_n on t (n)`);
+			await db.exec(`insert into t values (1, 30), (2, 10), (3, 20)`);
+
+			const q = `select n from t where id = 2 order by n`;
+			expect(await planOps(db, q), 'point seek must not be displaced').to.match(SEEK);
+			expect(await column(db, q, 'n')).to.deep.equal([10]);
+		});
+
+		it('a selective analyzed seek on one index beats a walk of another', async () => {
+			await db.exec(`create table t (id integer primary key, a integer, b integer) using store`);
+			await db.exec(`create index ix_a on t (a)`);
+			await db.exec(`create index ix_b on t (b)`);
+			// 3 rows per a value; b reversed so neither PK nor a order gives b order.
+			await db.exec(`insert into t values ${range(300).map(i => `(${i}, ${i % 100}, ${301 - i})`).join(', ')}`);
+			await db.exec('analyze t');
+
+			const q = `select b from t where a = 7 order by b`;
+			const ops = await planOps(db, q);
+			expect(ops, 'the selective seek must win').to.match(SEEK);
+			expect(ops, 'the walk lost, so the Sort stays').to.match(SORT);
+			expect(await column(db, q, 'b')).to.deep.equal([301 - 207, 301 - 107, 301 - 7]);
+		});
+
+		it('empty and single-row tables answer correctly either way', async () => {
+			await db.exec(`create table t (id integer primary key, n integer) using store`);
+			await db.exec(`create index ix_n on t (n)`);
+			const q = `select n from t order by n`;
+			expect(await column(db, q, 'n')).to.deep.equal([]);
+			await db.exec(`insert into t values (1, 5)`);
+			expect(await column(db, q, 'n')).to.deep.equal([5]);
 		});
 	});
 

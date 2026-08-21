@@ -416,6 +416,23 @@ export abstract class StoreTableScan extends StoreTableBase {
 		const index = this.resolveIndexFromIdxStr(filterInfo.idxStr);
 		if (!index) return null;
 
+		// An ordering-only walk (`plan=0`): the planner chose this index for its EMISSION
+		// ORDER (`chooseOrderingPlan`, store-module-access-plan.ts) and pushed no window at
+		// all. There is nothing to derive — walk the index store end to end. Index stores
+		// are per-index, so an unbounded `buildFullScanBounds()` is exactly this index's
+		// entries and nothing else. Gated on the DECODED PLAN KIND, not on an absence of
+		// constraints: an explicit `plan=0` is the planner stating its intent (the Sort is
+		// already deleted on the strength of this walk's order), and reading it explicitly
+		// keeps a plan/scan disagreement loud — falling through to the constraint arms
+		// below would degrade to a DATA-store scan in primary-key order, a silent
+		// wrong-order answer. (A `plan=0` naming `_primary_` never reaches here:
+		// `resolveIndexFromIdxStr` returns null for it and the caller full-scans the data
+		// store, which IS the advertised primary-key order.)
+		const spec = decodeIdxStr(filterInfo.idxStr);
+		if (spec && planKindFromCode(spec.plan) === 'scan') {
+			return { index, type: 'range', bounds: buildFullScanBounds() };
+		}
+
 		const indexCols = index.columns.map(c => c.index);
 		const indexDirections = index.columns.map(c => !!c.desc);
 		const indexCollations = this.indexKeyCollations(index);
@@ -818,7 +835,9 @@ export abstract class StoreTableScan extends StoreTableBase {
 			// this today. If real persisted stores predating this format come into play,
 			// their indexes must be dropped + recreated (or the table rebuilt); the
 			// durable fix is to version-stamp the index store and rebuild on open, or to
-			// fall back to a full scan the first time an empty value is seen.
+			// fall back to a full scan the first time an empty value is seen. The
+			// ordering-only walk (`plan=0`) shares this exposure: over such a store it
+			// would return NOTHING for the whole table rather than a narrowed window's rows.
 			if (entry.value.length === 0) continue;
 			// Cross-window dedup for a multi-seek: a data key an EARLIER window already
 			// YIELDED is skipped before the data-store read, so a duplicate costs no

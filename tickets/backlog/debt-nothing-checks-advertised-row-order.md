@@ -118,3 +118,10 @@ secondary-index claims here, and `feat-store-secondary-index-monotonic-advertise
 queues up the stronger `monotonicOn` version over the same walks. Each new claim is
 another producer this ticket's guard would have to cover, and another chance for a
 hand-mirrored copy to drift.
+
+Further evidence (2026-08-21): a second reachable instance of the class was found and
+verified while implementing the store's ordering-only index walk — a DESC index over a
+nullable column emits NULLs last while the engine's ORDER BY default places them first,
+so an absorbed Sort returns them at the wrong end (`fix/bug-desc-index-ordering-claims-misplace-nulls`;
+the memory backend reproduces it in four rows). The proposed runtime assertion would have
+caught it at the first NULL row.
