@@ -106,22 +106,27 @@ export interface LevelDBProviderOptions {
 // values; the full table, machine and caveats are in this package's README
 // (§ Measured read cost). In short:
 //
-//  - `pointRead` came back at 1.26 (20k rows) and 1.44 (200k) — near the 1.0 default, and
-//    an OVER-statement of it besides: the planner's 1.0 unit is a scanned row INCLUDING
-//    engine work, while these arms measured the key-value layer alone, and engine cost
-//    lands on both sides of the ratio and compresses it toward 1.0. The engine-inclusive
-//    value therefore sits in [1.0, 1.44], unmeasured, with the current default at its
+//  - `pointRead` came back NEAR the 1.0 default (around 1.3-1.6), and an OVER-statement of
+//    it besides: the planner's 1.0 unit is a scanned row INCLUDING engine work, while these
+//    arms measured the key-value layer alone, and engine cost lands on both sides of the
+//    ratio and compresses it toward 1.0. The engine-inclusive value therefore sits strictly
+//    between 1.0 and the key-value ratio, unmeasured, with the current default at its
 //    bottom. Declaring the top of that interval would pick the pessimistic end on no
 //    evidence.
-//  - `seekPositioning` came back at 18.78 and 15.55 against a 0.5 default — 31-38x — and
-//    STILL cannot be declared, because the single knob prices two arms whose runtime
-//    shapes differ by an order of magnitude here. The secondary-index multi-seek opens one
-//    `iterate()` window per seek key (the ~15-19 measurement); the primary-key multi-seek
-//    runs `scanMultiSeekPrimary`, which batches through `readEffectiveRowsByKeys` at
-//    `ROW_RESOLUTION_BATCH` and therefore costs the BATCHED number, ~1.3. Declaring ~15
-//    would over-charge the primary-key arm ~12x, and that arm's cost is what
-//    `rule-key-set-seek` reads at 2 and 1000 keys to interpolate its seek-versus-scan
-//    break-even. Splitting the knob is backlog/debt-store-seek-positioning-conflates-two-arms.
+//  - `seekPositioning` came back FAR from its 0.5 default (around 15, i.e. ~30x) and STILL
+//    cannot be declared, because the single knob prices two arms whose runtime shapes
+//    differ by an order of magnitude here. The secondary-index multi-seek opens one
+//    `iterate()` window per seek key; the primary-key multi-seek runs `scanMultiSeekPrimary`,
+//    which batches through `readEffectiveRowsByKeys` at `ROW_RESOLUTION_BATCH` and therefore
+//    costs the BATCHED number. Declaring the windowed number would over-charge the
+//    primary-key arm about ten-fold, and that arm's cost is what `rule-key-set-seek` reads
+//    at 2 and 1000 keys to interpolate its seek-versus-scan break-even. Splitting the knob
+//    is backlog/debt-store-seek-positioning-conflates-two-arms.
+//
+// DELIBERATELY NO DECIMALS HERE. Re-running the same benchmark on the same machine and
+// commit moved three of the four ratios by 10-26% (recorded in the README), so a digit
+// quoted at this site would be a false precision that drifts from the record besides. The
+// README holds the tables; this comment holds the decision.
 //
 // Revisit when that split lands (each arm can then be priced from its own measurement), or
 // if a LevelDB query is ever measured planning wrong because a secondary-index multi-seek

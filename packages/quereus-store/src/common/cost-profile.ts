@@ -65,9 +65,10 @@ export interface KVCostProfile {
 	 * per-key iterator at all. The gap is backend-dependent and was small enough to accept
 	 * when IndexedDB was measured (≈3 real against 5 charged, recorded at the PK arm in
 	 * `store-module-access-plan.ts`). LevelDB's 2026-08-19 measurement puts the same two
-	 * shapes ~12x apart on that backend (~15-19 per windowed seek key against ~1.3 per
-	 * batched key), which is why LevelDB declares nothing rather than declaring its measured
-	 * seek cost. Splitting this into per-arm terms is
+	 * shapes roughly an ORDER OF MAGNITUDE apart on that backend — a windowed seek key costs
+	 * about fifteen sequential rows where a batched one costs about one-and-a-half — which is
+	 * why LevelDB declares nothing rather than declaring its measured seek cost. Splitting
+	 * this into per-arm terms is
 	 * `backlog/debt-store-seek-positioning-conflates-two-arms`; the numbers are in
 	 * `packages/quereus-plugin-leveldb/README.md` § Measured read cost.
 	 */

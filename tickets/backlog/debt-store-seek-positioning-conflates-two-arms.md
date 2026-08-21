@@ -35,14 +35,19 @@ LevelDB was benchmarked on 2026-08-19 (full table, machine and caveats in
 `packages/quereus-plugin-leveldb/README.md` § *Measured read cost*). Against a sequentially
 scanned row = 1.0:
 
-- one **batched** key — the shape the primary-key path runs — costs **1.26** at 20 000 rows
-  and **1.44** at 200 000;
-- one **single-key windowed** read — the shape the secondary-index path runs — costs
-  **18.78** and **15.55**.
+- one **batched** key — the shape the primary-key path runs — costs about **1.3 to 1.6**;
+- one **single-key windowed** read — the shape the secondary-index path runs — costs about
+  **15**.
 
-Roughly a factor of twelve apart, and the framework's default for both is 0.5. The cause is
-plain in the raw milliseconds: a batched read is ~3.2 µs per key while a one-key iterator
-is ~47 µs, so about 44 µs is fixed setup and teardown that batching amortizes away.
+Roughly an order of magnitude apart, and the framework's default for both is 0.5. The cause
+is plain in the raw milliseconds: a batched read is ~3.2 µs per key while a one-key iterator
+is tens of microseconds, nearly all of it fixed setup and teardown that batching amortizes
+away.
+
+Quoted as bands rather than decimals on purpose: re-running the same benchmark on the same
+machine and commit moved three of the four ratios by 10-26%. The README records both runs.
+Anyone sizing the new knob should re-measure across several runs rather than reading a digit
+out of that table.
 
 IndexedDB hit the same conflation earlier and it was accepted, because there the gap was
 about 1.7× — small enough that over-charging the primary-key path only makes a very large
@@ -53,8 +58,8 @@ recorded at the primary-key arm. LevelDB is where the gap stops being a rounding
 
 The number does not merely inflate a displayed cost. It is what the engine's key-set-seek
 rewrite reads at 2 keys and at 1 000 keys to fit a line and solve for the key count at
-which a seek beats the plan it would replace. Move the number by 12× and that break-even
-moves by about 12× — so the rewrite either fires on lists where a full scan would be
+which a seek beats the plan it would replace. Move the number ten-fold and that break-even
+moves about ten-fold — so the rewrite either fires on lists where a full scan would be
 faster, or stops firing on lists where it would have won.
 
 The immediate consequence is already visible: **LevelDB has been measured and still

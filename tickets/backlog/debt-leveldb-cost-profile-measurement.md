@@ -51,15 +51,19 @@ both dataset sizes, and the block-cache caveat). **Do not re-measure to get star
 
 The result split:
 
-- The cost of a random point read came back **near** the parity default (1.26 at 20 000
-  rows, 1.44 at 200 000, against a default of 1.0) — and is an over-statement besides,
-  since the benchmark measured the key-value layer while the unit includes engine work.
-- The cost of one seek key came back **far** from parity (18.78 and 15.55 against 0.5).
+- The cost of a random point read came back **near** the parity default (around 1.3-1.6
+  against a default of 1.0) — and is an over-statement besides, since the benchmark measured
+  the key-value layer while the unit includes engine work.
+- The cost of one seek key came back **far** from parity (around 15 against 0.5).
+
+Bands, not decimals: a second run of the same benchmark on the same machine and commit moved
+three of the four ratios by 10-26%, so re-measure across several runs before sizing anything
+off them. Both runs are tabulated in the README.
 
 Declaring the seek number was nevertheless blocked, and by something the original ticket
 did not anticipate: **one knob prices two access paths whose real costs on this backend are
-about twelve times apart** — the secondary-index multi-seek opens an iterator per key, the
-primary-key multi-seek batches. That is filed separately as
+about an order of magnitude apart** — the secondary-index multi-seek opens an iterator per
+key, the primary-key multi-seek batches. That is filed separately as
 `debt-store-seek-positioning-conflates-two-arms`. Until it lands, no value of
 `seekPositioning` is correct for LevelDB, so the provider still declares nothing and says
 so in a code comment above the class.
@@ -69,11 +73,10 @@ measured numbers.
 
 ## Cross-reference
 
-`bench-store-leveldb` (implement/) adds the opt-in LevelDB arm of the store benchmark
-suite, and its explicit job is to produce exactly the two ratios this ticket asks for, at
-both a cache-resident and a non-resident dataset size, through the batched read path the
-index resolver actually uses. Once it lands, this ticket reduces to reading those numbers
-and deciding whether to declare a profile on `LevelDBProvider` or record the parity
-finding in the plugin README. (The suite is built across `bench-backend-dimension` ->
+`bench-store-leveldb` **has landed** — it added the opt-in LevelDB arm of the store
+benchmark suite, whose explicit job was to produce exactly the two ratios this ticket asks
+for, at both a cache-resident and a non-resident dataset size, through the batched read path
+the index resolver actually uses. The numbers above came from it. (The suite was built across
+`bench-backend-dimension` ->
 `bench-store-workloads` -> `bench-store-micro` -> `bench-store-leveldb`, which together
 replace the earlier single `bench-store-suite` plan ticket.)

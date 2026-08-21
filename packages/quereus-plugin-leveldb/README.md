@@ -222,6 +222,25 @@ Medians of 13 rounds (20k) and 7 rounds (200k), first round discarded. The 20k r
 harness median carried a 28.5% spread and was marked `unstable`, so treat its per-arm
 figures as the noisier pair; the 200k row's spread was 5.0%.
 
+### These ratios do not repeat to the decimal — quote the band, not the digits
+
+Re-run 2026-08-21 on the same machine, same commit, same benchmark:
+
+| dataset | `pointRead` | `seekPositioning` |
+| --- | --- | --- |
+| 20 000 rows | 1.49 (was 1.26) | 14.91 (was 18.78) |
+| 200 000 rows | 1.57 (was 1.44) | 15.25 (was 15.55) |
+
+Only the 200k seek figure held; the other three moved by 10-26%. That is what an
+uninstrumented wall-clock ratio on a real filesystem is worth, and it is why these rows are
+`informational` and gate nothing.
+
+**So the durable claims are bands, not decimals:** `pointRead` sits somewhere around
+1.3-1.6 at the key-value layer, and one windowed seek key costs roughly 15 sequential rows
+— an order of magnitude above a batched one. Everything below is reasoned from those bands.
+A future decision that needs a specific number must re-measure across several runs; reading
+a digit out of the table above is not a measurement.
+
 Re-run with:
 
 ```bash
@@ -241,33 +260,49 @@ worse than no claim, so it is not made.
 
 ### What the numbers mean, and why nothing is declared
 
-**`pointRead` is near parity and stays undeclared.** 1.26 and 1.44 against a default of
-1.0. The gap is also an *over*-statement of the truth: the planner's 1.0 unit is a scanned
+**`pointRead` is near parity and stays undeclared.** Around 1.3-1.6 against a default of
+1.0. That gap is also an *over*-statement of the truth: the planner's 1.0 unit is a scanned
 row *including engine work*, while these arms measured the key-value layer alone. Engine
 overhead lands on both sides of the ratio and therefore compresses it toward 1.0, so the
-engine-inclusive value sits somewhere in `[1.0, 1.44]` — an interval that was not measured
-and whose bottom is the current default. Declaring the top of it would be picking the
-pessimistic end of a band on no evidence, so the parity default stands.
+engine-inclusive value sits strictly between 1.0 and whatever the key-value ratio happens
+to measure — an interval never measured directly, whose bottom is the current default and
+whose top moves run to run. Declaring the top of it would be picking the pessimistic end of
+a band on no evidence, so the parity default stands.
 
-**`seekPositioning` is far from parity, and cannot be fixed by declaring a number.** 15.55
-and 18.78 against a default of 0.5 — a factor of roughly 31 to 38. The cause is visible in
-the raw milliseconds: a batched read costs ~3.2 µs per key while a single-key `iterate`
-costs ~47 µs, so about 44 µs is fixed per-iterator setup and teardown (snapshot, native
+**`seekPositioning` is far from parity, and cannot be fixed by declaring a number.** Around
+15 against a default of 0.5 — a factor of roughly 30. The cause is visible in the raw
+milliseconds: a batched read costs ~3.2 µs per key while a single-key `iterate` costs
+~36-47 µs, so the large majority is fixed per-iterator setup and teardown (snapshot, native
 iterator, close) that `getMany` amortizes over a whole page and a one-key window cannot.
+
+That the cost is dominated by fixed setup is also why the seek arm is a fair proxy for the
+secondary-index path even though the benchmark runs it against the **data** store's
+200-byte values rather than an index store's smaller entries: what is being priced is
+opening and closing an iterator, and the payload the window returns is a few microseconds
+of it either way.
 
 The obstacle is that **one knob prices two arms whose runtime shapes differ by an order of
 magnitude on this backend**:
 
 | arm in `store-module-access-plan.ts` | what it runs (`store-table-scan.ts`) | measured per-key cost |
 | --- | --- | --- |
-| secondary-index multi-seek (`tryIndexAccessPlan`) | one `iterate()` window per distinct tuple prefix over the index store | ~15–19 (the single-seek arm) |
-| primary-key multi-seek (`primaryKeyMultiSeekPlan`) | `scanMultiSeekPrimary` → `readEffectiveRowsByKeys`, one round trip per `ROW_RESOLUTION_BATCH` keys | ~1.3–1.4 (the batched arm) |
+| secondary-index multi-seek (`tryIndexAccessPlan`) | one `iterate()` window per distinct tuple prefix over the index store, **plus** the batched row resolution those entries feed (`resolveIndexEntries`, which pages across windows) | ~15 and up (the single-seek arm, which prices the window only) |
+| primary-key multi-seek (`primaryKeyMultiSeekPlan`) | `scanMultiSeekPrimary` → `readEffectiveRowsByKeys`, one round trip per `ROW_RESOLUTION_BATCH` keys, no per-key iterator at all | ~1.3–1.6 (the batched arm) |
+
+The secondary arm's true per-key cost is therefore the single-seek figure *plus* a batched
+read, so the gap below is if anything understated — which only strengthens the conclusion.
 
 Both charge `seekKeyCount × seekPositioning`. Declaring ~15 would over-charge the
-primary-key arm by roughly 12×, and that arm's cost is exactly what `rule-key-set-seek`
-reads at 2 and 1 000 keys to interpolate a seek-versus-scan break-even — so the break-even
-for `where pk in (…)` would move about 12× in the wrong direction. Declaring 0.5 leaves the
-secondary arm 30-plus× too cheap, which is where it already is.
+primary-key arm by roughly ten-fold, and that arm's cost is exactly what `rule-key-set-seek`
+reads at 2 and 1 000 keys (`probeModuleCosts` → `interpolateBreakEven`) to interpolate a
+seek-versus-scan break-even — so the break-even for `where pk in (…)`, a shape that runs
+today, would move about ten-fold in the wrong direction. Declaring 0.5 leaves the secondary
+arm 30-odd× too cheap, which is where it already is and where no misplan has yet been
+observed. A compromise between them (the geometric middle is ~4.5) makes *both* arms about
+3.5× wrong and would need `yarn test:store` to validate, since `seekPositioning` moves plan
+selection on exactly that backend. Trading a known status quo for a new, unvalidated
+wrongness on a live query shape is not worth doing for a measurement that cannot be acted on
+until the knob splits.
 
 Splitting the knob so each arm can be priced honestly is
 `backlog/debt-store-seek-positioning-conflates-two-arms`; the decision about what LevelDB

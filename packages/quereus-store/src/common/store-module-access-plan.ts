@@ -764,10 +764,10 @@ function primaryKeyMultiSeekPlan(
 	// large `where pk in (…)` prefers a scan slightly sooner than it should.
 	//
 	// That acceptance was priced on IndexedDB's 1.7x bias. LevelDB's 2026-08-19 read-cost
-	// measurement makes the same bias ~12x there (a windowed seek key costs ~15-19 scan
-	// rows, while THIS arm's batched `readEffectiveRowsByKeys` path costs ~1.3), which is
-	// why that backend declares no profile at all rather than declaring its measured seek
-	// cost and disfiguring this arm. So the tradeoff still holds for every backend that
+	// measurement makes the same bias an order of magnitude there (a windowed seek key costs
+	// about fifteen scan rows, while THIS arm's batched `readEffectiveRowsByKeys` path costs
+	// about one-and-a-half), which is why that backend declares no profile at all rather than
+	// declaring its measured seek cost and disfiguring this arm. So the tradeoff still holds for every backend that
 	// declares one today, but it is now the reason a measured backend CANNOT declare —
 	// tracked as `backlog/debt-store-seek-positioning-conflates-two-arms`, with the numbers
 	// in `packages/quereus-plugin-leveldb/README.md` § Measured read cost.
