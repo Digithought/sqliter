@@ -34,6 +34,7 @@ import {
 	equalitySeekKeyCount,
 	hasSemanticOrdering,
 	isMultiValueEquality,
+	nullSafeOrderingPrefixLength,
 	selectivityFromHistogram,
 } from '@quereus/quereus';
 import {
@@ -770,57 +771,6 @@ function computeFilterAccessPlan(
 const NO_PINNED_COLUMNS: ReadonlySet<number> = new Set();
 
 /**
- * Pushed-filter operators that reject a NULL in the filtered column: every comparison and
- * IN-membership is false against NULL, and the filter is enforced SOMEWHERE for every
- * plan this module emits (the seek window, `matchesFilters`, or the residual `Filter` the
- * engine keeps for an unhandled filter) — so a row with NULL there never reaches the
- * consumer of an ordering claim.
- */
-const NULL_EXCLUDING_OPS: ReadonlySet<string> = new Set([...EQ_OR_IN_OPS, ...RANGE_OPS, 'IS NOT NULL']);
-
-/**
- * Truncate an index's order-preserving prefix at the first DESC column whose walk could
- * misplace NULLs.
- *
- * The engine's ORDER BY places NULLs FIRST for BOTH directions — placement is absolute,
- * never direction-conditioned (`orderByNullResult`, util/comparison.ts). Index key bytes
- * agree on an ASC column (NULL's `0x00` tag sorts below every other tag) but DISAGREE on
- * a DESC column, whose byte inversion sends NULL to the END of the walk. So a DESC
- * ordering claim is only sound when no NULL can appear in that column's emitted rows:
- *
- *  - the column is declared NOT NULL;
- *  - the column is pinned by this arm's own equality (`pinnedCols` — an equality never
- *    matches NULL, and a pinned column contributes no ordering anyway);
- *  - some pushed filter on the column is NULL-excluding ({@link NULL_EXCLUDING_OPS}) —
- *    this is what keeps the parent arms' claims for `where n > 5 order by n desc`, where
- *    the bound itself already evicts every NULL.
- *
- * NOTE: this gate deliberately DIVERGES from `MemoryTableModule.indexSatisfiesOrdering`,
- * which has no NULL check and therefore shares the misplacement for a bare
- * `order by <nullable col> desc` claim (its DESC comparator negation also sends NULLs
- * last) — that twin, and the PK advertisement's (`buildPkOrderingAdvertisement` has the
- * same exposure for a nullable DESC PK member), are tracked as
- * `fix/bug-desc-index-ordering-claims-misplace-nulls`.
- */
-function nullSafeOrderingPrefixLength(
-	tableInfo: TableSchema,
-	request: BestAccessPlanRequest,
-	index: TableIndexSchema,
-	orderPreservingPrefix: number,
-	pinnedCols: ReadonlySet<number>,
-): number {
-	for (let i = 0; i < orderPreservingPrefix; i++) {
-		const col = index.columns[i];
-		if (!col.desc) continue;
-		if (tableInfo.columns[col.index]?.notNull) continue;
-		if (pinnedCols.has(col.index)) continue;
-		if (request.filters.some(f => f.columnIndex === col.index && NULL_EXCLUDING_OPS.has(f.op))) continue;
-		return i;
-	}
-	return orderPreservingPrefix;
-}
-
-/**
  * True when a filter plan's `providesOrdering` satisfies `required` position for
  * position (same `columnIndex`, same `desc`; the plan may provide extra trailing
  * ordering) — the engine's own `orderingMatches` (rule-grow-retrieve.ts). Every arm of
@@ -905,7 +855,7 @@ function chooseOrderingPlan(
 		const orderPreservingPrefix = indexOrderPreservingPrefixLength(
 			db, tableInfo.columns, index, indexKeyCollations);
 		const claimablePrefix = nullSafeOrderingPrefixLength(
-			tableInfo, request, index, orderPreservingPrefix, NO_PINNED_COLUMNS);
+			tableInfo, request, index.columns, orderPreservingPrefix, NO_PINNED_COLUMNS);
 		if (claimablePrefix === 0) continue;
 		const indexOrdering: OrderingSpec[] = index.columns
 			.slice(0, claimablePrefix)
@@ -1389,7 +1339,18 @@ function tryIndexAccessPlan(
  * `monotonicOn` reflects the access path itself and is independent of any
  * `requiredOrdering`; it always advertises the leading PK column. Strict
  * monotonicity is claimed iff the PK is single-column — composite PKs can
- * repeat values on the leading column.
+ * repeat values on the leading column. It is NOT independent of the gating below,
+ * though: a `direction: 'desc'` claim asserts the same physical order
+ * `providesOrdering` would, and the engine has a standing conversion back the other way
+ * (`deriveOrderingFromMonotonicOn`, planner/framework/physical-utils.ts — no callers as
+ * of writing, but `rule-monotonic-limit-pushdown` already matches a Sort's direction
+ * against `monotonicOn` and would push a LIMIT past it once a module advertises
+ * `supportsOrdinalSeek`). So a member the claimable prefix rejects must void
+ * `monotonicOn` too, not merely truncate `providesOrdering` around it.
+ *
+ * `supportsAsofRight` rides on `monotonicOn` by definition ("implies `monotonicOn` is
+ * set" — see its declaration), so it needs no separate gate: both are dropped together
+ * whenever the leading member is not claimable.
  *
  * Returns an empty object when there is no PK (heap-only table) — without a
  * leading key column there is no natural emit order.
@@ -1400,6 +1361,13 @@ function tryIndexAccessPlan(
  * PK members those two orders provably agree on: the advertisement is truncated to that
  * prefix, and voided entirely when even the leading member disagrees — otherwise the
  * absorb-Sort rule would elide a Sort and hand the caller byte-ordered rows.
+ *
+ * That prefix is then truncated a second time, by {@link nullSafeOrderingPrefixLength},
+ * at the first DESC member a NULL could reach: the PK key bytes put such a NULL at the
+ * END of the walk while the engine's ORDER BY puts it FIRST. A nullable DESC PK member is
+ * reachable with no `create index` at all — `create table p (a integer null, b integer,
+ * primary key (a desc, b))` — which is why the gate belongs here and not only on the
+ * secondary-index path.
  */
 function buildPkOrderingAdvertisement(
 	tableInfo: TableSchema,
@@ -1409,6 +1377,15 @@ function buildPkOrderingAdvertisement(
 	const pk = tableInfo.primaryKeyDefinition;
 	if (pk.length === 0 || orderPreservingPrefix === 0) return {};
 
+	// The PK arms pin nothing this function can see: the pinning an equality/range arm does
+	// is already visible as a NULL-excluding entry in `request.filters`, which the helper
+	// consults itself.
+	const claimablePrefix = nullSafeOrderingPrefixLength(
+		tableInfo, request, pk, orderPreservingPrefix, NO_PINNED_COLUMNS);
+	// Prefix 0 means the LEADING member is an unclaimable DESC, so `monotonicOn` on it —
+	// and `supportsAsofRight`, which implies it — go with the ordering claim.
+	if (claimablePrefix === 0) return {};
+
 	const leading = pk[0];
 	const monotonicOn = {
 		columnIndex: leading.index,
@@ -1416,7 +1393,7 @@ function buildPkOrderingAdvertisement(
 		strict: pk.length === 1,
 	};
 
-	const pkOrdering: OrderingSpec[] = pk.slice(0, orderPreservingPrefix).map(col => ({
+	const pkOrdering: OrderingSpec[] = pk.slice(0, claimablePrefix).map(col => ({
 		columnIndex: col.index,
 		desc: !!col.desc,
 	}));
@@ -1528,7 +1505,7 @@ function buildIndexOrderingAdvertisement(
 	// them at the walk's END, the engine's ORDER BY puts them FIRST for both directions.
 	// See {@link nullSafeOrderingPrefixLength}.
 	const claimablePrefix = nullSafeOrderingPrefixLength(
-		tableInfo, request, index, orderPreservingPrefix, new Set(eqCols));
+		tableInfo, request, index.columns, orderPreservingPrefix, new Set(eqCols));
 	if (claimablePrefix === 0) return {};
 
 	const indexOrdering: OrderingSpec[] = index.columns

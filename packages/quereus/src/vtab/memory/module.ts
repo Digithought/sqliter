@@ -12,7 +12,7 @@ import { MemoryVirtualTableConnection } from './connection.js';
 import type { MemoryTableConnection } from './layer/connection.js';
 import type { MemoryTableConfig } from './types.js';
 import { createMemoryTableLoggers } from './utils/logging.js';
-import { AccessPlanBuilder, equalitySeekKeyCount, isMultiValueEquality, validateAccessPlan } from '../best-access-plan.js';
+import { AccessPlanBuilder, equalitySeekKeyCount, isMultiValueEquality, nullSafeOrderingPrefixLength, validateAccessPlan } from '../best-access-plan.js';
 import type { BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, PredicateConstraint } from '../best-access-plan.js';
 import type { VTableEventEmitter } from '../events.js';
 import { alterEventShape } from '../alter-event-shape.js';
@@ -562,7 +562,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		// per-row ordering.
 		// TODO: supportsOrdinalSeek is deferred for memory-table — the layered
 		// store's scan does not cheaply support O(log N) seek to the kth row.
-		const advertisement = this.buildMonotonicAdvertisement(bestPlan, request, availableIndexes);
+		const advertisement = this.buildMonotonicAdvertisement(tableInfo, bestPlan, request, availableIndexes);
 		if (advertisement.monotonicOn) {
 			bestPlan = { ...bestPlan, ...advertisement };
 		}
@@ -574,8 +574,15 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	 * Compute the monotonic-ordering advertisement for a chosen access plan.
 	 * Returns an empty object when the path is non-monotonic (multi-IN multi-seek,
 	 * OR_RANGE multi-range, or a single-row equality seek).
+	 *
+	 * Also empty when the leading column is a DESC key a NULL could reach: a
+	 * `direction: 'desc'` claim asserts the same physical order `providesOrdering` would,
+	 * and this module's DESC walk emits NULLs LAST while the engine's ORDER BY places them
+	 * FIRST — see {@link nullSafeOrderingPrefixLength}. `supportsAsofRight` implies
+	 * `monotonicOn`, so the two are dropped together.
 	 */
 	private buildMonotonicAdvertisement(
+		tableInfo: TableSchema,
 		bestPlan: BestAccessPlanResult,
 		request: BestAccessPlanRequest,
 		availableIndexes: IndexSchema[],
@@ -604,6 +611,13 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		if (trailingNonBound.length === 0) return {}; // single-row equality seek
 
 		const leadingCol = trailingNonBound[0];
+
+		// A nullable DESC leading column walks its NULLs to the END; the engine's ORDER BY
+		// wants them FIRST. `equalityBound` is the pinned set the helper needs (a pinned
+		// column never reached this point anyway — it was filtered out above).
+		if (nullSafeOrderingPrefixLength(tableInfo, request, [leadingCol], 1, equalityBound) === 0) {
+			return {};
+		}
 
 		// Strict iff the leading non-bound column alone determines uniqueness within
 		// the path: a unique index (PK or declared unique) where the leading column
@@ -884,7 +898,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 			? availableIndexes.find(idx => idx.name === plan.indexName)
 			: undefined;
 		const filterSatisfies = filterIndex
-			? this.indexSatisfiesOrdering(filterIndex, request.requiredOrdering!, equalityCols)
+			? this.indexSatisfiesOrdering(tableInfo, request, filterIndex, request.requiredOrdering!, equalityCols)
 			: false;
 
 		const orderingColumns = new Set(request.requiredOrdering!.map(o => o.columnIndex));
@@ -949,7 +963,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		const orderingColumns = new Set(request.requiredOrdering!.map(o => o.columnIndex));
 
 		for (const index of availableIndexes) {
-			if (!this.indexSatisfiesOrdering(index, request.requiredOrdering!, equalityCols)) {
+			if (!this.indexSatisfiesOrdering(tableInfo, request, index, request.requiredOrdering!, equalityCols)) {
 				continue;
 			}
 
@@ -1013,6 +1027,18 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	 * keys. The per-column direction comparison still applies to the remaining
 	 * (unbound) suffix.
 	 *
+	 * A match is additionally gated by {@link nullSafeOrderingPrefixLength}: this module's
+	 * DESC walk negates the ascending comparator, and NULL is the lowest value, so a DESC
+	 * column's NULLs come out LAST — while the engine's ORDER BY places them FIRST for
+	 * both directions (`orderByNullResult`, util/comparison.ts). The gate is a plain
+	 * boolean here rather than a truncation because both callers claim
+	 * `request.requiredOrdering` VERBATIM, all or nothing: one unsafe DESC column anywhere
+	 * in the matched key prefix means the whole index declines. Only the prefix actually
+	 * consumed by the match is judged — a nullable DESC column sitting BEYOND it is not
+	 * part of the claim and must not disqualify the index. The PK pseudo-index
+	 * ({@link gatherAvailableIndexes}) flows through here too, so a nullable DESC
+	 * primary-key member is covered with no `create index` involved.
+	 *
 	 * NOTE: `OrderingSpec.nullsFirst` is not compared — nothing in the planner
 	 * populates it today, so every required spec leaves it undefined. If NULLS
 	 * FIRST/LAST ever reaches requiredOrdering, this must decline the index
@@ -1021,6 +1047,8 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	 * against a different NULL placement.
 	 */
 	private indexSatisfiesOrdering(
+		tableInfo: TableSchema,
+		request: BestAccessPlanRequest,
 		index: IndexSchema,
 		requiredOrdering: readonly OrderingSpec[],
 		equalityCols: ReadonlySet<number> = EMPTY_COLUMN_SET
@@ -1055,7 +1083,8 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 			return false;
 		}
 
-		return true;
+		// `i` is now the number of leading index columns the claim consumed.
+		return nullSafeOrderingPrefixLength(tableInfo, request, index.columns, i, equalityCols) === i;
 	}
 
 	private gatherAvailableIndexes(tableInfo: TableSchema): IndexSchema[] {

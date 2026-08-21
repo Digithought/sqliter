@@ -112,6 +112,7 @@ export {
 	validateAccessPlanRequest,
 	equalitySeekKeyCount,
 	isMultiValueEquality,
+	nullSafeOrderingPrefixLength,
 } from './vtab/best-access-plan.js';
 
 // Collation and comparison functions

@@ -105,3 +105,125 @@ describe('DESC index — ordering and access path selection', () => {
 		expect(rows.map(r => r.score)).to.deep.equal([30, 20, 10]);
 	});
 });
+
+/**
+ * The engine's ORDER BY places NULLs FIRST for BOTH directions — placement is absolute,
+ * never conditioned on ASC/DESC (`orderByNullResult`, util/comparison.ts). The memory
+ * module's DESC walk negates the ascending comparator, and NULL is the lowest value, so
+ * its DESC keys emit NULLs LAST. An index whose claim would hand the planner that order
+ * must decline, or the sort-absorption rule deletes the Sort and the same query returns
+ * two different answers depending on whether the index exists.
+ *
+ * Columns are NOT NULL by default in this engine, so the gate only fires once a column is
+ * explicitly declared `null` — which is why every claim pinned above stays green.
+ *
+ * Asserted at three levels throughout, because row order alone passes whether or not the
+ * gate exists: PLAN SHAPE (`query_plan()` Sort presence), ANSWER (emitted row order), and
+ * — for the shapes that must still claim — the two together proving the optimization was
+ * not simply disabled.
+ */
+describe('DESC index — NULL placement gate', () => {
+	let db: Database;
+
+	beforeEach(() => {
+		db = new Database();
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	/** Number of SORT operators in `sql`'s physical plan. */
+	async function sortCount(sql: string): Promise<number> {
+		const rows: Array<{ c: number }> = [];
+		for await (const r of db.eval("SELECT COUNT(*) AS c FROM query_plan(?) WHERE op = 'SORT'", [sql])) {
+			rows.push(r as unknown as { c: number });
+		}
+		expect(rows).to.have.lengthOf(1);
+		return rows[0].c;
+	}
+
+	/** Every value of `name` produced by `sql`, in emission order. */
+	async function column(sql: string, name: string): Promise<Array<number | null>> {
+		const values: Array<number | null> = [];
+		for await (const r of db.eval(sql)) {
+			values.push((r as Record<string, unknown>)[name] as number | null);
+		}
+		return values;
+	}
+
+	it('a nullable DESC secondary index keeps its Sort and puts NULLs first', async () => {
+		await db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER NULL) USING memory");
+		await db.exec("INSERT INTO t VALUES (1, 3), (2, NULL), (3, 1), (4, 2)");
+
+		const sql = "SELECT n FROM t ORDER BY n DESC";
+		const unindexed = await column(sql, 'n');
+		expect(unindexed, 'engine default with no index at all').to.deep.equal([null, 3, 2, 1]);
+		expect(await sortCount(sql)).to.equal(1);
+
+		await db.exec("CREATE INDEX ix_t_n_desc ON t(n DESC)");
+
+		expect(await sortCount(sql), 'the DESC walk emits NULLs last; the Sort must survive').to.equal(1);
+		expect(await column(sql, 'n'), 'the index must not change the answer').to.deep.equal(unindexed);
+	});
+
+	it('a nullable DESC primary-key member keeps its Sort — no CREATE INDEX involved', async () => {
+		// `gatherAvailableIndexes` adds the primary key as a pseudo-index whose columns are
+		// `primaryKeyDefinition`, so it flows through the very same predicate.
+		await db.exec("CREATE TABLE p (a INTEGER NULL, b INTEGER, PRIMARY KEY (a DESC, b)) USING memory");
+		await db.exec("INSERT INTO p VALUES (3, 1), (NULL, 2), (1, 3), (2, 4)");
+
+		const sql = "SELECT a FROM p ORDER BY a DESC";
+		expect(await sortCount(sql), 'the PK pseudo-index is gated like any other').to.equal(1);
+		expect(await column(sql, 'a')).to.deep.equal([null, 3, 2, 1]);
+	});
+
+	it('an explicitly NOT NULL DESC column still elides its Sort', async () => {
+		// The gate reads `notNull` — a declared NOT NULL must keep the optimization. A gate
+		// that declined unconditionally would pass every wrong-answer test above.
+		await db.exec("CREATE TABLE nn (id INTEGER PRIMARY KEY, n INTEGER NOT NULL) USING memory");
+		await db.exec("INSERT INTO nn VALUES (1, 3), (2, 4), (3, 1), (4, 2)");
+		await db.exec("CREATE INDEX ix_nn_n_desc ON nn(n DESC)");
+
+		const sql = "SELECT n FROM nn ORDER BY n DESC";
+		expect(await sortCount(sql)).to.equal(0);
+		expect(await column(sql, 'n')).to.deep.equal([4, 3, 2, 1]);
+	});
+
+	it('a pushed NULL-excluding filter re-enables a nullable DESC column', async () => {
+		// A comparison is never true against NULL, so the bound itself evicts every NULL row
+		// — whether the module marks the filter handled (seek window) or the engine keeps it
+		// as a residual Filter. Either way the walk's NULL placement is moot.
+		await db.exec("CREATE TABLE f (id INTEGER PRIMARY KEY, n INTEGER NULL) USING memory");
+		await db.exec("INSERT INTO f VALUES (1, 3), (2, NULL), (3, 1), (4, 2), (5, 9)");
+		await db.exec("CREATE INDEX ix_f_n_desc ON f(n DESC)");
+
+		const sql = "SELECT n FROM f WHERE n > 1 ORDER BY n DESC";
+		expect(await sortCount(sql), 'the bound removes every NULL, so the claim is sound').to.equal(0);
+		expect(await column(sql, 'n')).to.deep.equal([9, 3, 2]);
+	});
+
+	it('an equality pin re-enables a nullable DESC leading column', async () => {
+		// An equality never matches NULL, and a pinned column contributes no ordering
+		// anyway — so `where a = 2 order by b` over (a DESC, b ASC) still claims.
+		await db.exec("CREATE TABLE q (id INTEGER PRIMARY KEY, a INTEGER NULL, b INTEGER) USING memory");
+		await db.exec("INSERT INTO q VALUES (1, 2, 30), (2, NULL, 99), (3, 2, 10), (4, 2, 20)");
+		await db.exec("CREATE INDEX ix_q ON q(a DESC, b ASC)");
+
+		const sql = "SELECT b FROM q WHERE a = 2 ORDER BY b";
+		expect(await sortCount(sql)).to.equal(0);
+		expect(await column(sql, 'b')).to.deep.equal([10, 20, 30]);
+	});
+
+	it('a nullable DESC column BEYOND the matched prefix does not disqualify the index', async () => {
+		// Only the key prefix the claim actually consumes is judged. `order by a` over
+		// (a ASC, b DESC) claims on `a` alone; nullable `b` is not part of the claim.
+		await db.exec("CREATE TABLE w (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER NULL) USING memory");
+		await db.exec("INSERT INTO w VALUES (1, 3, NULL), (2, 1, 5), (3, 2, NULL), (4, 4, 7)");
+		await db.exec("CREATE INDEX ix_w ON w(a ASC, b DESC)");
+
+		const sql = "SELECT a FROM w ORDER BY a";
+		expect(await sortCount(sql), 'the trailing nullable DESC column is outside the claim').to.equal(0);
+		expect(await column(sql, 'a')).to.deep.equal([1, 2, 3, 4]);
+	});
+});

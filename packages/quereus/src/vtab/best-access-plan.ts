@@ -7,6 +7,7 @@ import { quereusError } from '../common/errors.js';
 import { StatusCode, type SqlValue, type Row } from '../common/types.js';
 import type { LogicalType } from '../types/logical-type.js';
 import { validateIndexDescriptor, type IndexDescriptor } from './index-descriptor.js';
+import type { IndexColumnSchema, TableSchema } from '../schema/table.js';
 
 /**
  * Constraint operators that can be pushed down to virtual tables
@@ -146,6 +147,71 @@ export function isMultiValueEquality(f: PredicateConstraint): boolean {
 	if (f.op !== 'IN') return false;
 	if (f.runtimeSet) return equalitySeekKeyCount(f) !== null;
 	return Array.isArray(f.value) && (f.value as unknown[]).length > 1;
+}
+
+/**
+ * Pushed-filter operators that reject a NULL in the filtered column: every comparison and
+ * IN-membership evaluates to NULL (not TRUE) against a NULL operand, and `IS NOT NULL`
+ * says so outright. A row with NULL in that column therefore cannot survive the filter —
+ * wherever the filter ends up being enforced.
+ *
+ * `OR_RANGE` is deliberately absent. It is a union of NULL-rejecting ranges and so would
+ * in fact be NULL-excluding, but it already disqualifies an ordering claim on other
+ * grounds in both shipped backends (concatenated windows emit in range order, not column
+ * order), so including it would widen what has to be argued and buy nothing.
+ */
+const NULL_EXCLUDING_OPS: ReadonlySet<ConstraintOp> = new Set<ConstraintOp>([
+	'=', 'IN', '>', '>=', '<', '<=', 'IS NOT NULL',
+]);
+
+/**
+ * Truncate an ordered key's order-preserving prefix at the first DESC column whose walk
+ * could misplace NULLs. Shared by every module that turns an index (or primary-key) walk
+ * into an ordering claim.
+ *
+ * The engine's ORDER BY places NULLs FIRST for BOTH directions — placement is absolute,
+ * never direction-conditioned (`orderByNullResult`, util/comparison.ts). Both shipped
+ * backends agree on an ASC column and DISAGREE on a DESC one: the store bit-inverts the
+ * column's key bytes (NULL's low `0x00` tag ends up last) and the memory module negates
+ * the ascending comparator (NULL is the lowest value, so negation sends it last). So a
+ * DESC ordering claim is only sound when no NULL can appear in that column's emitted
+ * rows:
+ *
+ *  - the column is declared NOT NULL — columns are NOT NULL by default in this engine, so
+ *    this is the case that keeps the gate from firing on ordinary tables;
+ *  - the column is pinned by this plan's own equality (`pinnedCols`) — an equality never
+ *    matches NULL, and a pinned column contributes no ordering anyway;
+ *  - some pushed filter on the column is NULL-excluding ({@link NULL_EXCLUDING_OPS}) —
+ *    this is what keeps `where n > 5 order by n desc` fast, and it holds whether or not
+ *    the module marks the filter handled: an unhandled filter is retained by the engine
+ *    as a residual `Filter`, which removes the NULL rows and preserves order either way.
+ *
+ * `keyColumns` is `ReadonlyArray<IndexColumnSchema>` rather than a whole `IndexSchema` so
+ * that a table's `primaryKeyDefinition` can be passed directly — `PrimaryKeyColumnDefinition`
+ * is structurally identical (`{ index; desc?; collation? }`) and a nullable DESC primary-key
+ * member is exposed by exactly the same reasoning as a secondary-index one.
+ *
+ * The prefix-length form is the primitive. A caller that claims a required ordering
+ * VERBATIM (all or nothing, which is what both backends' request-matching paths do) wants
+ * the boolean `nullSafeOrderingPrefixLength(...) === matchedLength`; truncation only
+ * matters where an index's OWN ordering is advertised with no request to match.
+ */
+export function nullSafeOrderingPrefixLength(
+	tableInfo: TableSchema,
+	request: BestAccessPlanRequest,
+	keyColumns: ReadonlyArray<IndexColumnSchema>,
+	orderPreservingPrefix: number,
+	pinnedCols: ReadonlySet<number>,
+): number {
+	for (let i = 0; i < orderPreservingPrefix; i++) {
+		const col = keyColumns[i];
+		if (!col.desc) continue;
+		if (tableInfo.columns[col.index]?.notNull) continue;
+		if (pinnedCols.has(col.index)) continue;
+		if (request.filters.some(f => f.columnIndex === col.index && NULL_EXCLUDING_OPS.has(f.op))) continue;
+		return i;
+	}
+	return orderPreservingPrefix;
 }
 
 /**

@@ -819,6 +819,97 @@ describe('secondary-index ordering advertisement', () => {
 		});
 	});
 
+	/**
+	 * The primary-key ordering advertisement (`buildPkOrderingAdvertisement`) — the arm a
+	 * nullable DESC key member reaches with no `create index` at all, because
+	 * `primary key (a desc, b)` is enough.
+	 *
+	 * Same rule as the secondary-index gate above: the engine's ORDER BY places NULLs FIRST
+	 * for BOTH directions, the store's DESC key bytes are bit-inverted so NULL's low `0x00`
+	 * tag lands LAST. The PK arm additionally advertises `monotonicOn` on the leading member
+	 * and `supportsAsofRight`, both of which assert the same physical order — so an
+	 * unclaimable leading member voids all three, not just `providesOrdering`.
+	 */
+	describe('primary-key ordering advertisement: NULL placement gate', () => {
+		beforeEach(async () => {
+			// pn: nullable DESC leading PK member — the exposed shape.
+			await db.exec(`create table pn (a integer null, b integer, primary key (a desc, b)) using store`);
+			// pnn: same shape, declared NOT NULL — must keep the optimization.
+			await db.exec(`create table pnn (a integer not null, b integer, primary key (a desc, b)) using store`);
+			// pt: ASC leading member, nullable DESC TRAILING member — claim truncates, not voids.
+			await db.exec(`create table pt (a integer, b integer null, primary key (a, b desc)) using store`);
+		});
+
+		it('voids the whole advertisement for a nullable DESC leading PK member', () => {
+			const plan = planFor('pn', [], [desc(0)]);
+			expect(plan.providesOrdering, 'NULL a rows would emit last').to.equal(undefined);
+			expect(plan.orderingIndexName).to.equal(undefined);
+			expect(plan.monotonicOn, 'a desc monotonic claim asserts the same order').to.equal(undefined);
+			expect(plan.supportsAsofRight, 'implies monotonicOn, so it goes too').to.equal(undefined);
+		});
+
+		it('voids it with no requiredOrdering either — the bare advertisement is a claim too', () => {
+			const plan = planFor('pn', []);
+			expect(plan.providesOrdering).to.equal(undefined);
+			expect(plan.monotonicOn).to.equal(undefined);
+			expect(plan.supportsAsofRight).to.equal(undefined);
+		});
+
+		it('a NOT NULL DESC leading PK member still claims', () => {
+			const plan = planFor('pnn', [], [desc(0)]);
+			expect(plan.providesOrdering).to.deep.equal([desc(0)]);
+			expect(plan.orderingIndexName).to.equal('_primary_');
+			expect(plan.monotonicOn).to.deep.equal({ columnIndex: 0, direction: 'desc', strict: false });
+			expect(plan.supportsAsofRight).to.equal(true);
+		});
+
+		it('a NULL-excluding bound re-enables the nullable DESC leading member', () => {
+			const plan = planFor('pn', [gt(0, 0)], [desc(0)]);
+			expect(plan.providesOrdering, 'the bound evicts every NULL a').to.deep.equal([desc(0)]);
+			expect(plan.orderingIndexName).to.equal('_primary_');
+			expect(plan.monotonicOn).to.deep.equal({ columnIndex: 0, direction: 'desc', strict: false });
+		});
+
+		it('truncates rather than voids when only a TRAILING member is unclaimable', () => {
+			// (a asc, b desc) with nullable b: `a` is claimable, `b` is not.
+			const bare = planFor('pt', []);
+			expect(bare.providesOrdering, 'claim stops before b').to.deep.equal([asc(0)]);
+			expect(bare.monotonicOn, 'leading member a is fine').to.deep.equal(
+				{ columnIndex: 0, direction: 'asc', strict: false });
+
+			const both = planFor('pt', [], [asc(0), desc(1)]);
+			expect(both.providesOrdering, 'required runs past the claimable prefix').to.equal(undefined);
+			expect(both.monotonicOn).to.deep.equal({ columnIndex: 0, direction: 'asc', strict: false });
+
+			const leadingOnly = planFor('pt', [], [asc(0)]);
+			expect(leadingOnly.providesOrdering).to.deep.equal([asc(0)]);
+		});
+
+		it('answer and plan shape: the Sort survives and NULLs come first', async () => {
+			await db.exec(`insert into pn values (3, 1), (null, 2), (1, 3), (2, 4)`);
+
+			const q = `select a from pn order by a desc`;
+			expect(await planOps(db, q), 'the PK walk cannot reproduce NULLs-first').to.match(SORT);
+			expect(await column(db, q, 'a')).to.deep.equal([null, 3, 2, 1]);
+		});
+
+		it('answer and plan shape: a NOT NULL DESC PK member still elides its Sort', async () => {
+			await db.exec(`insert into pnn values (3, 1), (4, 2), (1, 3), (2, 4)`);
+
+			const q = `select a from pnn order by a desc`;
+			expect(await planOps(db, q), 'byte order and ORDER BY agree everywhere').to.not.match(SORT);
+			expect(await column(db, q, 'a')).to.deep.equal([4, 3, 2, 1]);
+		});
+
+		it('answer and plan shape: a NULL-excluding bound elides the Sort again', async () => {
+			await db.exec(`insert into pn values (3, 1), (null, 2), (1, 3), (2, 4)`);
+
+			const q = `select a from pn where a > 0 order by a desc`;
+			expect(await planOps(db, q), 'the bound makes the placement moot').to.not.match(SORT);
+			expect(await column(db, q, 'a')).to.deep.equal([3, 2, 1]);
+		});
+	});
+
 	describe('under the isolation layer', () => {
 		let idb: Database;
 		let iprovider: KVStoreProvider;

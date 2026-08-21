@@ -61,7 +61,15 @@ insert into d_null values (5, 'm');
 
 create index ix_d_null on d_null(val desc);
 
--- DESC sort with default NULL placement (Quereus default: NULLs last for DESC if specified that way; assert without forcing)
+-- Bare DESC sort. The engine places NULLs FIRST for BOTH directions -- placement is
+-- absolute, never conditioned on ASC/DESC. A DESC index walk emits them LAST, so the
+-- index must decline the ordering claim here and leave the Sort in place; the answer is
+-- the same with or without ix_d_null.
+select val from d_null order by val desc;
+→ [{"val":null},{"val":null},{"val":"z"},{"val":"m"},{"val":"a"}]
+
+-- A NULL-excluding filter evicts every NULL, so the DESC index may claim the ordering
+-- again -- the exception that keeps `where val is not null order by val desc` fast.
 select val from d_null where val is not null order by val desc;
 → [{"val":"z"},{"val":"m"},{"val":"a"}]
 
