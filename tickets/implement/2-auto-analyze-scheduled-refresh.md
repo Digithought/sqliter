@@ -242,6 +242,26 @@ the question does not arise.
   when it fires and abandon.
 - **Two tables tripping at once** ⇒ two independent entries, each with its own timer and
   cooldown; neither blocks the other.
+- **A hand-typed `ANALYZE` does not reset the counter.** *(Added by the part 1 review.)*
+  Part 1 ignores `table_modified` on purpose, and part 1 has no reset path at all, so a
+  user who runs `analyze t` by hand leaves `changedSinceAnalyze` exactly where it was.
+  If it was already over the threshold, this ticket's scheduler will arm and re-scan a
+  table whose statistics are seconds old — one wasted O(n) scan, then the reset in step 5
+  makes it self-correcting. Decide explicitly whether the reset path keys off *any*
+  successful `ANALYZE` of the table or only this manager's own refresh, and say which in
+  the code. The former removes the redundant scan; the latter keeps the manager decoupled
+  from the `table_modified` channel, which was part 1's stated reason for ignoring it.
+- **Materialized-view backing tables are counted, and can climb far faster than their
+  source.** *(Added by the part 1 review; pinned by `test/auto-analyze-counters.spec.ts`
+  → "counts the backing writes a materialized view makes".)* Row-time maintenance records
+  its realized backing delta through the same `_record*` calls, so an MV gets its own
+  staleness entry. For a full-rebuild MV that delta is the whole reshuffled result, not
+  the source rows touched (see the `NOTE:` above `recordMaintenanceChanges` in
+  `core/database-materialized-views.ts`) — so a small source write can push the MV past
+  the threshold repeatedly. Analyzing an MV is legitimate (it is a real backing table);
+  the question is only frequency, which the duty-cycle cooldown is meant to bound. Pin it
+  with a test: sustained small writes to a full-rebuild MV's source must not produce a
+  refresh per statement.
 - **Views.** `table_removed`/entry creation must never target a plain view — the
   `ANALYZE` emitter skips `isView` tables, but do not arm a timer for one either. A
   materialized view is a real backing table and is refreshed like any other.
@@ -296,6 +316,9 @@ New Mocha spec `packages/quereus/test/auto-analyze-refresh.spec.ts`, using
 - [ ] Add `NOTE:` comments at: the open-transaction race, the absent module-capability
       exemption, and the duty-cycle constant.
 - [ ] Document in `docs/sql-txn.md` §9.5; do not duplicate `debt-docs-analyze-guidance`.
+- [ ] Drop the "Currently inert — … nothing refreshes statistics automatically yet"
+      caveat the part 1 review added to the `auto_analyze_row_limit` row in
+      `docs/usage.md`; this ticket makes the knob live.
 - [ ] Write `test/auto-analyze-refresh.spec.ts` covering everything under *Test
       strategy*.
 - [ ] `yarn build`, `yarn lint`, `yarn test`, then `yarn test:store`. Any test that

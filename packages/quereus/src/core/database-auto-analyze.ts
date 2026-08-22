@@ -105,6 +105,13 @@ export class AutoAnalyzeManager {
 			// clean. Deliberately NOT `table_modified`: a statistics refresh fires that
 			// event itself (runtime/emit/analyze.ts), so reacting to it would couple
 			// this manager to its own future output.
+			//
+			// NOTE: `DETACH` removes a whole schema WITHOUT firing per-table events
+			// (`SchemaManager.removeSchema`), so entries for a detached schema's tables
+			// outlive it. Harmless today — each is three numbers, and
+			// `knownRowCountOrDrop` evicts one the next time it is consulted — but if a
+			// host ever attaches and detaches schemas in a loop, drop entries whose
+			// schema segment matches the detached name.
 			if (event.type === 'table_removed') {
 				const key = `${event.schemaName}.${event.objectName}`.toLowerCase();
 				this.entries.delete(key);
@@ -130,11 +137,15 @@ export class AutoAnalyzeManager {
 		}
 	}
 
-	/** Whether the named table (lowercased `schema.table`) has drifted past the threshold. */
+	/**
+	 * Whether the named table (lowercased `schema.table`) has drifted past the
+	 * threshold. Not a pure predicate: a table that has since disappeared answers
+	 * `false` and has its entry dropped — see {@link knownRowCountOrDrop}.
+	 */
 	isStale(key: string): boolean {
 		const entry = this.entries.get(key);
 		if (!entry) return false;
-		const known = this.knownRowCount(key, entry);
+		const known = this.knownRowCountOrDrop(key, entry);
 		if (known === undefined) return false;
 		return isStaleCount(entry.changedSinceAnalyze, this.minMutations(), this.ratio(), known);
 	}
@@ -159,11 +170,14 @@ export class AutoAnalyzeManager {
 
 	/**
 	 * Row count the ratio arm of the threshold applies to: what the last refresh
-	 * this process observed reported, else whatever the catalog knows. Returns
-	 * `undefined` when the table is gone (dropped between the commit and this
-	 * lookup), which also drops its entry.
+	 * this process observed reported, else whatever the catalog knows.
+	 *
+	 * Named for its side effect: a table that is gone (dropped between the commit
+	 * and this lookup, or carried in from a detached schema) answers `undefined`
+	 * AND has its entry evicted here, so every consumer of a row count doubles as
+	 * the eviction path for stale keys. That is why {@link isStale} mutates.
 	 */
-	private knownRowCount(key: string, entry: TableStalenessEntry): number | undefined {
+	private knownRowCountOrDrop(key: string, entry: TableStalenessEntry): number | undefined {
 		if (entry.analyzedRowCount !== undefined) return entry.analyzedRowCount;
 		const [schemaName, tableName] = splitBaseKey(key);
 		const table = this.ctx._findTable(tableName, schemaName);
@@ -177,7 +191,7 @@ export class AutoAnalyzeManager {
 	/** Log the first crossing of the threshold; a busy table must not flood the log. */
 	private evaluate(key: string, entry: TableStalenessEntry): void {
 		if (entry.staleLogged) return;
-		const known = this.knownRowCount(key, entry);
+		const known = this.knownRowCountOrDrop(key, entry);
 		if (known === undefined) return;
 		const threshold = stalenessThreshold(this.minMutations(), this.ratio(), known);
 		if (entry.changedSinceAnalyze < threshold) return;

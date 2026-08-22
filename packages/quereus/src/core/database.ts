@@ -465,8 +465,8 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			defaultValue: true,
 			description: 'Track how many rows each table has had changed by committed transactions since ' +
 				'statistics were last collected for it, so stale statistics can be detected and refreshed. ' +
-				'When off, no counting happens at all — turning it back on mid-session starts counting from ' +
-				'zero rather than reconstructing the mutations missed while it was off.',
+				'When off, no counting happens at all — turning it back on mid-session resumes from whatever ' +
+				'each table\'s count already was, without reconstructing the mutations missed while it was off.',
 		});
 
 		this.options.registerOption('auto_analyze_min_mutations', {

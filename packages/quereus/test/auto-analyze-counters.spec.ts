@@ -9,6 +9,7 @@
  */
 
 import assert from 'node:assert/strict';
+import type { SqlValue } from '../src/common/types.js';
 import { Database } from '../src/core/database.js';
 import { isStaleCount, stalenessThreshold } from '../src/core/database-auto-analyze.js';
 
@@ -164,6 +165,39 @@ describe('auto-analyze committed-mutation counters', () => {
 
 			assert.equal(changed(db, 'main.t'), 1);
 			assert.equal(changed(db, 'temp.t'), 2);
+		});
+	});
+
+	describe('non-DML write paths', () => {
+		it('counts the backing writes a materialized view makes', async () => {
+			await db.exec('create materialized view mv as select id, v from t');
+			await db.exec('insert into t values (1, 10), (2, 20)');
+
+			assert.equal(changed(db, 'main.t'), 2, 'the source table counts its own rows');
+			assert.equal(changed(db, 'main.mv'), 2, 'row-time maintenance counts the backing rows it wrote');
+		});
+
+		it('counts externally-ingested changes replayed through the capture seam', async () => {
+			await db.ingestExternalRowChanges([
+				{ schemaName: 'main', tableName: 't', change: { op: 'insert', newRow: [1, 10] } },
+				{ schemaName: 'main', tableName: 't', change: { op: 'insert', newRow: [2, 20] } },
+			]);
+
+			assert.equal(changed(db, 'main.t'), 2);
+		});
+	});
+
+	describe('commit isolation', () => {
+		it('never fails a committed transaction when bookkeeping throws', async () => {
+			const spied = db as unknown as { recordCommittedChangeCounts: (counts: () => Map<string, number>) => void };
+			spied.recordCommittedChangeCounts = () => { throw new Error('bookkeeping exploded'); };
+
+			await db.exec('insert into t values (1, 10)');
+
+			const rows: Array<Record<string, SqlValue>> = [];
+			for await (const row of db.eval('select v from t where id = 1')) rows.push(row);
+			assert.equal(rows.length, 1, 'the commit must survive a bookkeeping failure');
+			assert.equal(rows[0].v, 10);
 		});
 	});
 
