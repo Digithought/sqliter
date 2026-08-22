@@ -1016,6 +1016,8 @@ class MyTable extends VirtualTable {
 
 The `ANALYZE` command calls `getStatistics()` when it is implemented, and otherwise collects statistics by scanning the table. Statistics are cached on `TableSchema.statistics` and consumed by `CatalogStatsProvider` for selectivity estimation.
 
+`ANALYZE` also runs **on its own**: once a table has drifted past the `auto_analyze` threshold, the engine runs it for that table from a background timer (see `docs/sql-txn.md` §9.5). Both hooks below are therefore called without any user statement in flight, and `saveStatistics` may be called for a table nobody asked about — neither may assume it is running inside a user's `ANALYZE`.
+
 **Report a column statistic only if it is exact over every live row the connection can see. A sample is not an answer** — leave `columnStats` empty and let `ANALYZE` scan. The figures here are consumed as facts, not as estimates: a `distinctCount` derived from the first N values understates cardinality, and a `nullCount` computed as `rowCount - sampleSize` counts every un-sampled row as a NULL. The memory backend shipped exactly that for a while — a systematic sample capped at 1000 values per column, correct at or below 1000 rows and wrong above it — which is why it now reports its size and nothing else.
 
 Exact does not have to mean expensive. A count maintained by the write paths, or read off index metadata, qualifies; what does not qualify is any figure whose accuracy depends on how big the table happens to be. If the exact figure would cost a scan, do not compute it — that is `ANALYZE`'s job, and it already does it once for every column in a single pass.

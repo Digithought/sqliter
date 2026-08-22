@@ -70,6 +70,16 @@ const AUTO_ANALYZE_FAILURE_BACKOFF_MS = 5000;
 const AUTO_ANALYZE_IDLE_MAX_PASSES = 10;
 
 /**
+ * Delay for a debounce timer armed at `now` for a table not eligible until
+ * `nextEligibleAt`: the debounce, or the remaining duty-cycle cooldown when that
+ * is longer. Exported for the same reason {@link isStaleCount} is — the cooldown
+ * arithmetic is otherwise only observable through timing.
+ */
+export function armDelayMs(nextEligibleAt: number, now: number): number {
+	return Math.max(AUTO_ANALYZE_DEBOUNCE_MS, nextEligibleAt - now);
+}
+
+/**
  * Database internals the auto-analyze manager needs. Mirrors
  * `WatcherManagerContext` — keeps the manager constructible without the full
  * `Database`.
@@ -79,7 +89,12 @@ export interface AutoAnalyzeManagerContext {
 	readonly options: Database['options'];
 
 	_findTable(tableName: string, schemaName?: string): ReturnType<Database['_findTable']>;
-	/** False while an explicit `BEGIN…COMMIT` (or an in-flight implicit transaction) is open. */
+	/**
+	 * False while a transaction is open — an explicit `BEGIN…COMMIT` **and also** the
+	 * implicit single-statement transaction any statement runs inside. Since the
+	 * refresh fires from a timer, it can land mid-statement and read `false` in a
+	 * database the user considers to be in autocommit.
+	 */
 	getAutocommit(): boolean;
 	/** Runs the refresh statement. Acquires the execution mutex — see the module doc. */
 	exec(sql: string): Promise<void>;
@@ -344,10 +359,12 @@ export class AutoAnalyzeManager {
 	 */
 	private evaluate(key: string, entry: TableStalenessEntry): void {
 		// Absorbed: a pending refresh already covers whatever this commit added. The
-		// counter keeps climbing and the arming that follows the refresh picks up
-		// whatever is there by then. This is what makes N commits past the threshold
-		// cost O(1) refreshes rather than O(N) — and it is checked first so the common
-		// busy-table case does no catalog lookup at all.
+		// counter keeps climbing, and the NEXT commit after the refresh settles is what
+		// re-arms — nothing re-evaluates on the refresh's own completion. That is what
+		// makes N commits past the threshold cost O(1) refreshes rather than O(N), and
+		// it is checked first so the common busy-table case does no catalog lookup at
+		// all. Its cost: a burst that stops immediately after a refresh leaves a
+		// still-over-threshold counter with nothing scheduled until the next write.
 		if (entry.timer !== undefined || entry.running !== undefined) return;
 
 		const known = this.knownRowCountOrDrop(key, entry);
@@ -379,7 +396,7 @@ export class AutoAnalyzeManager {
 		}
 		if (table.isView) return;
 
-		const delay = Math.max(AUTO_ANALYZE_DEBOUNCE_MS, entry.nextEligibleAt - Date.now());
+		const delay = armDelayMs(entry.nextEligibleAt, Date.now());
 		const timer = setTimeout(() => {
 			entry.timer = undefined;
 			this.start(key, entry);
@@ -418,8 +435,15 @@ export class AutoAnalyzeManager {
 			// `ANALYZE` adopts the connection already registered for the table INCLUDING
 			// its pending transaction layer (see `getStatistics` in `vtab/memory/table.ts`),
 			// so refreshing mid-transaction would bake uncommitted rows into the
-			// statistics. Returning without touching the counter loses no wakeup: the next
-			// commit re-evaluates, still finds the threshold crossed, and re-arms.
+			// statistics. The counter is left untouched, so the next commit re-evaluates,
+			// still finds the threshold crossed, and re-arms.
+			//
+			// NOTE: this abandons the crossing rather than rescheduling it, and
+			// `getAutocommit()` is also false for the implicit transaction a plain
+			// statement runs inside — so a timer that happens to fire mid-statement drops
+			// its refresh even in a database nobody opened a transaction on. Self-healing
+			// under write load (every commit re-arms) but not when the writes stop right
+			// after the crossing. Tracked in tickets/fix/auto-analyze-lost-wakeup.
 			//
 			// NOTE: accepted race — a `begin` landing between this check and `exec`'s mutex
 			// acquisition lets the refresh run inside that transaction after all. Worst
@@ -482,7 +506,7 @@ export class AutoAnalyzeManager {
 		} catch (e) {
 			// The staleness is real, so the counter is left alone and the next commit
 			// re-arms — behind a backoff, so an unreadable table cannot spin.
-			log('Automatic ANALYZE of %s failed: %s', key, e);
+			warnLog('Automatic ANALYZE of %s failed: %s', key, e);
 			entry.nextEligibleAt = Date.now() + Math.max(
 				AUTO_ANALYZE_FAILURE_BACKOFF_MS,
 				(Date.now() - startedAt) * AUTO_ANALYZE_DUTY_CYCLE,

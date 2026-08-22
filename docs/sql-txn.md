@@ -467,9 +467,12 @@ What that means in practice:
   `auto_analyze_row_limit` is left to an explicit `ANALYZE`; the skip is logged once.
   A table nobody has ever analyzed reports zero known rows, so its first refresh is
   not size-gated — after that the cap applies.
-- **It is deferred while an explicit transaction is open**, because collecting
-  statistics inside your transaction would fold your uncommitted rows into them. The
-  counter is untouched, so the next commit re-arms.
+- **It is skipped while a transaction is open**, because collecting statistics inside
+  your transaction would fold your uncommitted rows into them. That covers the implicit
+  transaction an ordinary statement runs inside too, so a refresh whose timer happens to
+  fire mid-statement is skipped as well. A skip leaves the drift counter untouched and
+  schedules nothing — the next commit is what re-arms, so writes that stop right after a
+  crossing can leave that crossing unserved until the table is written again.
 - **Staleness counting restarts when the process does.** Statistics a store backend
   persisted are still there after a reopen, but the drift accumulated before the
   restart is not — a table that drifted while the process was down looks fresh until

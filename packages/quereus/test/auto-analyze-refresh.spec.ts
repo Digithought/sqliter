@@ -14,6 +14,7 @@
  */
 
 import assert from 'node:assert/strict';
+import { armDelayMs } from '../src/core/database-auto-analyze.js';
 import { Database } from '../src/core/database.js';
 import type { TableStatistics } from '../src/planner/stats/catalog-stats.js';
 
@@ -107,6 +108,25 @@ describe('auto-analyze background refresh', () => {
 			await idle;
 
 			assert.equal(changed(db, 'main.t'), 2, 'only the analyzed snapshot is subtracted');
+		});
+
+		it('refreshes from the production timer, with nobody driving the schedule', async () => {
+			// The one test that lets `arm`'s own setTimeout fire. Every other test reaches
+			// the refresh through `_whenAutoAnalyzeIdle`, which clears the timer and starts
+			// the refresh directly — so without this, a broken arming (never scheduled,
+			// scheduled with a NaN delay, callback that never calls `start`) would leave
+			// the whole suite green. Polls instead of sleeping a fixed span so the debounce
+			// constant can change without the test caring.
+			await db.exec('insert into t values (1, 10), (2, 20), (3, 30)');
+			// Polls on the STATISTICS, not on `refreshCount()`: the counter is bumped
+			// before `ANALYZE` is awaited, so waiting on it would race the collection.
+			const deadline = Date.now() + 5000;
+			while (stats(db, 't') === undefined && Date.now() < deadline) {
+				await new Promise<void>(resolve => setTimeout(resolve, 10));
+			}
+
+			assert.equal(db._autoAnalyze.refreshCount(), 1, 'the armed timer fired on its own');
+			assert.equal(stats(db, 't')?.rowCount, 3);
 		});
 
 		it('refreshes a table whose name needs quoting', async () => {
@@ -247,6 +267,35 @@ describe('auto-analyze background refresh', () => {
 		});
 	});
 
+	describe('duty cycle', () => {
+		// The cooldown is the one guard `_whenAutoAnalyzeIdle` deliberately bypasses (it
+		// zeroes `nextEligibleAt` so tests never wait one out), so nothing above can
+		// observe it. These two cover its halves separately: that a refresh records one,
+		// and that arming honours whatever was recorded.
+		it('records a cooldown proportional to the refresh it just finished', async () => {
+			const before = Date.now();
+			await db.exec('insert into t values (1, 10), (2, 20), (3, 30)');
+			await db._whenAutoAnalyzeIdle();
+
+			const eligible = db._autoAnalyze.getEntry('main.t')!.nextEligibleAt;
+			assert.ok(
+				eligible >= before,
+				`a successful refresh must set a cooldown, got ${eligible} (started ${before})`,
+			);
+		});
+
+		it('defers an arming until the cooldown expires', () => {
+			const now = 1_000_000;
+			// Read the debounce off the function rather than restating the constant, so
+			// this stays about the ARITHMETIC and not about the value 50.
+			const debounce = armDelayMs(0, now);
+			assert.ok(debounce > 0, 'no cooldown still debounces');
+			assert.equal(armDelayMs(now - 1, now), debounce, 'an expired cooldown is the plain debounce');
+			assert.equal(armDelayMs(now + debounce - 1, now), debounce, 'a shorter cooldown is absorbed');
+			assert.equal(armDelayMs(now + debounce * 20, now), debounce * 20, 'a longer cooldown pushes the timer out');
+		});
+	});
+
 	describe('self-trigger', () => {
 		it('a refresh advances no counter and settles in one further pass', async () => {
 			await db.exec('insert into t values (1, 10), (2, 20), (3, 30)');
@@ -267,6 +316,25 @@ describe('auto-analyze background refresh', () => {
 			await db._whenAutoAnalyzeIdle();
 
 			assert.equal(db._autoAnalyze.refreshCount(), 0);
+		});
+
+		it('costs one redundant rescan when a user hand-analyzes an already-stale table', async () => {
+			// The documented price of keying the counter reset off this manager's own
+			// refresh only: a manual `ANALYZE` arrives as `table_modified`, which is
+			// deliberately not listened to, so the counter stays over the threshold and the
+			// armed refresh re-scans statistics that are seconds old. Pinned because the
+			// contract is "one wasted scan, then self-corrected" — not "wasted forever".
+			await db.exec('insert into t values (1, 10), (2, 20), (3, 30)');
+			assert.ok(armed(db, 'main.t'), 'the crossing armed a refresh');
+			await db.exec('analyze t');
+			assert.equal(changed(db, 'main.t'), 3, 'a hand-typed ANALYZE does not reset the counter');
+
+			await db._whenAutoAnalyzeIdle();
+			assert.equal(db._autoAnalyze.refreshCount(), 1, 'exactly one redundant rescan');
+			assert.equal(changed(db, 'main.t'), 0, 'after which the counter is back in step');
+
+			await db._whenAutoAnalyzeIdle();
+			assert.equal(db._autoAnalyze.refreshCount(), 1, 'and it does not repeat');
 		});
 	});
 
