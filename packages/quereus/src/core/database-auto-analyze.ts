@@ -66,8 +66,49 @@ const AUTO_ANALYZE_DUTY_CYCLE = 10;
  *  table cannot spin (a fast failure has a near-zero duty-cycle cooldown). */
 const AUTO_ANALYZE_FAILURE_BACKOFF_MS = 5000;
 
+/**
+ * First delay before retrying a refresh that was deferred because a transaction
+ * was open, doubling on each further retry (250, 500, 1000, 2000 ms).
+ *
+ * NOT the debounce: the debounce exists to let a burst of commits collapse, and
+ * 50 ms is far too soon to expect a statement that was in flight a moment ago to
+ * have finished. Starting an order of magnitude higher means the common case — a
+ * timer landing inside one ordinary `UPDATE` — is served by the first retry
+ * instead of burning the whole budget on wakeups that all land inside the same
+ * statement.
+ */
+export const AUTO_ANALYZE_DEFER_RETRY_MS = 250;
+
+/**
+ * How many times one crossing may reschedule itself after being deferred. The
+ * geometric backoff above makes that about 3.75 s of total patience.
+ *
+ * Bounded on purpose: a user may park an explicit transaction open indefinitely,
+ * and an unbounded retry would then cost a wakeup per stale table forever. Once
+ * the budget is spent the crossing is dropped exactly as it was before retries
+ * existed — the counter stays over threshold and the next commit that touches the
+ * table re-arms.
+ *
+ * Must stay at or below `AUTO_ANALYZE_IDLE_MAX_PASSES - 2`: {@link
+ * AutoAnalyzeManager.whenIdle} spends one settle pass per retry plus one for the
+ * initial attempt and one to observe that nothing is left armed.
+ */
+export const AUTO_ANALYZE_MAX_DEFER_RETRIES = 4;
+
 /** Safety bound on {@link AutoAnalyzeManager.whenIdle}'s settle loop. */
 const AUTO_ANALYZE_IDLE_MAX_PASSES = 10;
+
+/**
+ * Why a scheduled refresh ended. Only `deferred` wants a retry — it is the one
+ * outcome where nothing about the table changed and the refusal was purely about
+ * *when* the timer happened to land.
+ *
+ * The union exists so that `declined` (a deliberate refusal — feature off, table
+ * oversize, table gone) and `deferred` (transient) cannot be spelled the same way.
+ * Before it, every early return in {@link AutoAnalyzeManager['refresh']} was a bare
+ * `return` and a transient refusal silently abandoned its crossing.
+ */
+export type RefreshOutcome = 'analyzed' | 'declined' | 'deferred' | 'failed';
 
 /**
  * Delay for a debounce timer armed at `now` for a table not eligible until
@@ -91,8 +132,11 @@ export interface AutoAnalyzeManagerContext {
 	_findTable(tableName: string, schemaName?: string): ReturnType<Database['_findTable']>;
 	/**
 	 * False while a transaction is open — an explicit `BEGIN…COMMIT` **and also** the
-	 * implicit single-statement transaction any statement runs inside. Since the
-	 * refresh fires from a timer, it can land mid-statement and read `false` in a
+	 * implicit transaction a *writing* statement runs inside. Only the DML and DDL
+	 * emitters call `_ensureTransaction`, so a plain `select` (and an `insert … values`
+	 * whose rows need no read) leaves this `true`, while `update`, `delete`,
+	 * `insert … select` and any DDL make it `false` for their duration. Since the
+	 * refresh fires from a timer, it can land inside one of those and read `false` in a
 	 * database the user considers to be in autocommit.
 	 */
 	getAutocommit(): boolean;
@@ -117,6 +161,13 @@ export interface TableStalenessEntry {
 	nextEligibleAt: number;
 	/** True once the oversize skip has been logged; cleared on a successful refresh. */
 	oversizeLogged: boolean;
+	/**
+	 * Retries already spent on the current crossing after being deferred by an open
+	 * transaction, capped at `AUTO_ANALYZE_MAX_DEFER_RETRIES`. Zeroed by a successful
+	 * refresh and by any commit that touches the table, so it bounds one crossing's
+	 * patience rather than the table's lifetime.
+	 */
+	deferRetries: number;
 }
 
 /**
@@ -225,10 +276,15 @@ export class AutoAnalyzeManager {
 					running: undefined,
 					nextEligibleAt: 0,
 					oversizeLogged: false,
+					deferRetries: 0,
 				};
 				this.entries.set(key, entry);
 			}
 			entry.changedSinceAnalyze += count;
+			// A commit is proof the transaction that kept deferring this table's refresh
+			// has ended, so whatever retry budget it burned is refunded. Zeroed BEFORE
+			// `evaluate`, so the crossing this commit may arm starts with a full budget.
+			entry.deferRetries = 0;
 			this.evaluate(key, entry);
 		}
 	}
@@ -268,11 +324,19 @@ export class AutoAnalyzeManager {
 	/**
 	 * @internal Resolve once no table has an armed timer or an in-flight refresh.
 	 *
-	 * Any armed timer is fired IMMEDIATELY — the debounce and the duty-cycle cooldown
-	 * are bypassed — rather than waited out, so tests never sleep.
+	 * Any armed timer is fired IMMEDIATELY — the debounce, the duty-cycle cooldown and
+	 * the deferral backoff are all bypassed — rather than waited out, so tests never
+	 * sleep.
 	 *
 	 * It deliberately does NOT bypass the open-transaction deferral: a test that wants
 	 * a refresh to happen must be in autocommit, which is what real callers face.
+	 *
+	 * A retry timer is an armed timer like any other, so driving this while a
+	 * transaction is open SPENDS the whole deferral budget in one call — fire, defer,
+	 * re-arm, fire… until `AUTO_ANALYZE_MAX_DEFER_RETRIES` is reached, then settle.
+	 * That is the intended behaviour, and it is what makes the budget observable
+	 * without sleeping. It costs one settle pass per retry, which is why the budget
+	 * must stay at or below `AUTO_ANALYZE_IDLE_MAX_PASSES - 2`.
 	 */
 	async whenIdle(): Promise<void> {
 		for (let pass = 0; pass < AUTO_ANALYZE_IDLE_MAX_PASSES; pass++) {
@@ -289,13 +353,31 @@ export class AutoAnalyzeManager {
 			if (pending.length === 0) return;
 			await Promise.all(pending);
 		}
-		// Loud rather than hanging: if a refresh ever re-arms itself, this is where a
-		// self-triggering loop shows up.
+		// Loud rather than hanging: a bounded self-re-arm (the deferral retry) is expected
+		// and fits inside the pass budget, so reaching here means an UNBOUNDED one.
 		warnLog(
 			'Auto-analyze did not settle after %d passes; still tracking: %s',
 			AUTO_ANALYZE_IDLE_MAX_PASSES,
 			[...this.entries.keys()].join(', '),
 		);
+	}
+
+	/**
+	 * @internal Fire one table's armed timer NOW, bypassing its delay, and resolve once
+	 * that SINGLE attempt has settled and its outcome has been applied. No-op when
+	 * nothing is armed for `key`.
+	 *
+	 * {@link whenIdle} cannot stand in for this: it loops until nothing is armed, so
+	 * driven while a transaction is open it spends the entire deferral budget in one
+	 * call. A test that wants to watch one deferral reschedule itself needs one attempt.
+	 */
+	async fireArmedRefresh(key: string): Promise<void> {
+		const entry = this.entries.get(key);
+		if (!entry || entry.timer === undefined) return;
+		this.clearTimer(entry);
+		entry.nextEligibleAt = 0;
+		this.start(key, entry);
+		await entry.running;
 	}
 
 	dispose(): void {
@@ -408,51 +490,120 @@ export class AutoAnalyzeManager {
 		entry.timer = timer;
 	}
 
-	/** Begin a refresh and publish its settle promise on the entry. */
+	/**
+	 * Begin a refresh, publish its settle promise on the entry, and act on how it
+	 * ended. This is the single place that turns a {@link RefreshOutcome} into a
+	 * scheduling decision — `refresh` itself only reports.
+	 */
 	private start(key: string, entry: TableStalenessEntry): void {
 		if (entry.running !== undefined) return;
 		// `refresh` has a total try/catch and therefore never rejects, so neither does
 		// `running` — no scheduled task can produce an unhandled rejection.
-		const run = this.refresh(key, entry).finally(() => {
+		const run = this.refresh(key, entry).then(outcome => {
+			// `running` must be cleared BEFORE the outcome is applied: `arm` early-returns
+			// while a refresh is in flight, so a retry armed ahead of this clear would be
+			// silently dropped. Sequenced, not raced.
 			if (entry.running === run) entry.running = undefined;
+			this.applyOutcome(key, entry, outcome);
 		});
 		entry.running = run;
 	}
 
+	/** Decide what a finished refresh means for scheduling. */
+	private applyOutcome(key: string, entry: TableStalenessEntry, outcome: RefreshOutcome): void {
+		switch (outcome) {
+			case 'analyzed':
+				// The crossing was served, so the next one starts with a full retry budget.
+				entry.deferRetries = 0;
+				break;
+			case 'deferred':
+				this.armDeferRetry(key, entry);
+				break;
+			case 'declined':
+			case 'failed':
+				// Nothing to reschedule. `declined` is a deliberate refusal that a retry would
+				// only repeat; `failed` already recorded its own backoff in `refresh`'s catch.
+				// Both wait for the next commit, as they did before retries existed.
+				break;
+		}
+	}
+
 	/**
-	 * Refresh one table's statistics. Never throws: a failed automatic refresh must not
-	 * surface as an error on an unrelated user statement, and nothing awaits this.
+	 * Reschedule a refusal that was purely about timing, on a geometric backoff and
+	 * within a fixed budget. Once the budget is spent the crossing is dropped and the
+	 * next commit that touches the table is what revives it.
 	 */
-	private async refresh(key: string, entry: TableStalenessEntry): Promise<void> {
+	private armDeferRetry(key: string, entry: TableStalenessEntry): void {
+		// The table may have been dropped, or its entry replaced, while the deferred
+		// refresh ran — do not resurrect a detached object. (`arm` re-checks the table
+		// itself; this checks the entry's identity, which `arm` cannot see.)
+		if (this.entries.get(key) !== entry) return;
+
+		if (entry.deferRetries >= AUTO_ANALYZE_MAX_DEFER_RETRIES) {
+			debugLog(
+				'Auto-analyze of %s deferred %d times by an open transaction; dropping the crossing ' +
+				'until the next commit touches the table',
+				key, entry.deferRetries,
+			);
+			// Drop the backoff with it: the spent retries must not also delay the refresh
+			// the next commit arms. `deferRetries` itself stays at the cap until a commit
+			// or a successful refresh refunds it, so the spent budget stays observable.
+			entry.nextEligibleAt = 0;
+			return;
+		}
+
+		const delay = AUTO_ANALYZE_DEFER_RETRY_MS * 2 ** entry.deferRetries;
+		entry.deferRetries++;
+		// Expressed as a cooldown rather than a second timer concept, so `arm` and
+		// `armDelayMs` remain the only places a delay is computed.
+		entry.nextEligibleAt = Date.now() + delay;
+		this.arm(key, entry);
+	}
+
+	/**
+	 * Refresh one table's statistics, reporting how it ended. Never throws: a failed
+	 * automatic refresh must not surface as an error on an unrelated user statement,
+	 * and nothing awaits this.
+	 *
+	 * It decides nothing about scheduling — every exit names a {@link RefreshOutcome}
+	 * and {@link start} decides what that means. A new early return therefore has to
+	 * say whether it is a refusal or a deferral, which is what keeps "abandoned
+	 * crossing" from being writable by accident.
+	 */
+	private async refresh(key: string, entry: TableStalenessEntry): Promise<RefreshOutcome> {
 		const startedAt = Date.now();
 		try {
-			if (this.disposed) return;
+			if (this.disposed) return 'declined';
 			// Re-read the switch at fire time: `pragma auto_analyze = false` between the
 			// arming and now must abandon the refresh, leaving the counter intact.
-			if (!this.enabled()) return;
+			if (!this.enabled()) return 'declined';
 
-			// NOTE: deferred while an explicit transaction is open. A memory table's
-			// `ANALYZE` adopts the connection already registered for the table INCLUDING
-			// its pending transaction layer (see `getStatistics` in `vtab/memory/table.ts`),
-			// so refreshing mid-transaction would bake uncommitted rows into the
-			// statistics. The counter is left untouched, so the next commit re-evaluates,
-			// still finds the threshold crossed, and re-arms.
+			// Deferred while a transaction is open. A memory table's `ANALYZE` adopts the
+			// connection already registered for the table INCLUDING its pending transaction
+			// layer (see `getStatistics` in `vtab/memory/table.ts`), so refreshing
+			// mid-transaction would bake uncommitted rows into the statistics.
 			//
-			// NOTE: this abandons the crossing rather than rescheduling it, and
-			// `getAutocommit()` is also false for the implicit transaction a plain
-			// statement runs inside — so a timer that happens to fire mid-statement drops
-			// its refresh even in a database nobody opened a transaction on. Self-healing
-			// under write load (every commit re-arms) but not when the writes stop right
-			// after the crossing. Tracked in tickets/fix/auto-analyze-lost-wakeup.
+			// The counter is left untouched and the crossing is RETRIED on a backoff —
+			// `start` → `armDeferRetry`, up to AUTO_ANALYZE_MAX_DEFER_RETRIES times. That
+			// matters because this check is not only about an explicit `BEGIN`: a writing
+			// statement (`update`, `delete`, `insert … select`, any DDL) opens an implicit
+			// transaction too, so a timer for table `t` can land inside a write to some
+			// unrelated table. Without the retry that crossing was abandoned outright, and
+			// only the next commit touching `t` itself would ever revive it.
 			//
-			// NOTE: accepted race — a `begin` landing between this check and `exec`'s mutex
-			// acquisition lets the refresh run inside that transaction after all. Worst
-			// outcome is statistics that include uncommitted rows, which is exactly what a
-			// user typing `begin; insert …; analyze;` gets today, and the store's
+			// NOTE: the retry budget is deliberately finite — see
+			// AUTO_ANALYZE_MAX_DEFER_RETRIES. A transaction held open past it drops the
+			// crossing and the pre-retry behaviour resumes: wait for the next commit.
+			//
+			// NOTE: accepted tradeoff — a `begin` landing between this check and `exec`'s
+			// mutex acquisition lets the refresh run inside that transaction after all.
+			// Worst outcome is statistics that include uncommitted rows, which is exactly
+			// what a user typing `begin; insert …; analyze;` gets today, and the store's
 			// `saveStatistics` already carries an accepted-tradeoff NOTE for the persisted
 			// half of the same situation. Closing it would mean holding the execution mutex
-			// across the check, i.e. blocking user statements on a background scan.
-			if (!this.ctx.getAutocommit()) return;
+			// across the check, i.e. blocking user statements on a background scan. Revisit
+			// only if statistics polluted by uncommitted rows show up in practice.
+			if (!this.ctx.getAutocommit()) return 'deferred';
 
 			// NOTE: a never-analyzed table reports 0 known rows (`SchemaManager` hardcodes
 			// `estimatedRows` to 0 at CREATE), so its FIRST automatic refresh is not size
@@ -475,13 +626,13 @@ export class AutoAnalyzeManager {
 						key, known, limit,
 					);
 				}
-				return;
+				return 'declined';
 			}
 
 			const table = this.findTable(key);
 			if (!table || table.isView) {
 				this.dropEntry(key);
-				return;
+				return 'declined';
 			}
 
 			// Snapshot rather than zero: mutations that commit between here and the reset
@@ -493,7 +644,7 @@ export class AutoAnalyzeManager {
 
 			// The table may have been dropped while the refresh ran, in which case
 			// `dropEntry` already discarded this object — do not resurrect it.
-			if (this.entries.get(key) !== entry) return;
+			if (this.entries.get(key) !== entry) return 'declined';
 
 			entry.changedSinceAnalyze = Math.max(0, entry.changedSinceAnalyze - snapshot);
 			const refreshed = this.findTable(key);
@@ -503,6 +654,7 @@ export class AutoAnalyzeManager {
 			const elapsed = Date.now() - startedAt;
 			entry.nextEligibleAt = Date.now() + elapsed * AUTO_ANALYZE_DUTY_CYCLE;
 			debugLog('Auto-analyzed %s in %d ms (%s rows)', key, elapsed, entry.analyzedRowCount);
+			return 'analyzed';
 		} catch (e) {
 			// The staleness is real, so the counter is left alone and the next commit
 			// re-arms — behind a backoff, so an unreadable table cannot spin.
@@ -511,6 +663,7 @@ export class AutoAnalyzeManager {
 				AUTO_ANALYZE_FAILURE_BACKOFF_MS,
 				(Date.now() - startedAt) * AUTO_ANALYZE_DUTY_CYCLE,
 			);
+			return 'failed';
 		}
 	}
 

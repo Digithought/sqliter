@@ -467,12 +467,20 @@ What that means in practice:
   `auto_analyze_row_limit` is left to an explicit `ANALYZE`; the skip is logged once.
   A table nobody has ever analyzed reports zero known rows, so its first refresh is
   not size-gated — after that the cap applies.
-- **It is skipped while a transaction is open**, because collecting statistics inside
-  your transaction would fold your uncommitted rows into them. That covers the implicit
-  transaction an ordinary statement runs inside too, so a refresh whose timer happens to
-  fire mid-statement is skipped as well. A skip leaves the drift counter untouched and
-  schedules nothing — the next commit is what re-arms, so writes that stop right after a
-  crossing can leave that crossing unserved until the table is written again.
+- **It is delayed while a transaction is open**, because collecting statistics inside
+  your transaction would fold your uncommitted rows into them. That covers more than an
+  explicit `BEGIN`: a *writing* statement (`update`, `delete`, `insert … select`, any
+  DDL) runs inside an implicit transaction for its duration, so a refresh whose timer
+  fires mid-statement is delayed too. A plain `select`, and an `insert … values` whose
+  rows need no read, open no transaction and delay nothing.
+
+  A delayed refresh reschedules itself a few times on a widening backoff (a quarter of
+  a second, then doubling, about four seconds of patience in total), so an ordinary
+  statement in flight only postpones the refresh rather than cancelling it. Once that
+  patience runs out — a transaction you have parked open, say — the refresh is dropped
+  and the next commit that touches the table is what schedules a new one. Either way the
+  drift counter is left untouched, so the staleness stays visible and nothing is
+  double-counted.
 - **Staleness counting restarts when the process does.** Statistics a store backend
   persisted are still there after a reopen, but the drift accumulated before the
   restart is not — a table that drifted while the process was down looks fresh until

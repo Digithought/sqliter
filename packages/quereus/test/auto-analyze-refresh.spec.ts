@@ -5,8 +5,13 @@
  * scheduler built on top of it does: that a crossing actually refreshes
  * statistics, that it refreshes them *off* the write path, and — mostly — that
  * it does NOT refresh in the many situations where refreshing would be wrong or
- * wasteful (rolled back, feature off, table too large, transaction open, table
- * dropped, database closed).
+ * wasteful (rolled back, feature off, table too large, table dropped, database
+ * closed).
+ *
+ * An open transaction is the one entry in that list that is a DELAY rather than a
+ * skip: the refresh is deferred and reschedules itself on a backoff, within a
+ * bounded budget, and only gives up once the budget is spent. `deferred refresh`
+ * below covers that.
  *
  * Every test drives the schedule through `db._whenAutoAnalyzeIdle()`, which
  * fires any armed debounce timer immediately and awaits the refresh. Nothing
@@ -14,7 +19,11 @@
  */
 
 import assert from 'node:assert/strict';
-import { armDelayMs } from '../src/core/database-auto-analyze.js';
+import {
+	AUTO_ANALYZE_DEFER_RETRY_MS,
+	AUTO_ANALYZE_MAX_DEFER_RETRIES,
+	armDelayMs,
+} from '../src/core/database-auto-analyze.js';
 import { Database } from '../src/core/database.js';
 import type { TableStatistics } from '../src/planner/stats/catalog-stats.js';
 
@@ -31,6 +40,11 @@ function changed(db: Database, key: string): number | undefined {
 /** True while a debounce timer is armed for the table. */
 function armed(db: Database, key: string): boolean {
 	return db._autoAnalyze.getEntry(key)?.timer !== undefined;
+}
+
+/** Retries the current crossing has spent on open-transaction deferrals. */
+function deferRetries(db: Database, key: string): number | undefined {
+	return db._autoAnalyze.getEntry(key)?.deferRetries;
 }
 
 describe('auto-analyze background refresh', () => {
@@ -228,6 +242,148 @@ describe('auto-analyze background refresh', () => {
 
 			assert.equal(db._autoAnalyze.refreshCount(), 1, 'the next commit re-arms');
 			assert.equal(stats(db, 't')?.rowCount, 4);
+		});
+	});
+
+	describe('deferred refresh', () => {
+		// A refresh deferred by an open transaction reschedules itself rather than
+		// abandoning the crossing. The distinction matters because `getAutocommit()` is
+		// false for more than an explicit BEGIN: `update`, `delete`, `insert … select`
+		// and DDL each open an implicit transaction for their duration, so a timer for
+		// table `t` can land inside a write to an entirely unrelated table. Without the
+		// retry, that crossing was lost until `t` itself was written again.
+		//
+		// These drive ONE attempt at a time through `fireArmedRefresh`.
+		// `_whenAutoAnalyzeIdle` cannot stand in: it loops until nothing is armed, so
+		// inside a transaction it spends the whole retry budget in a single call — which
+		// is what `spends a bounded budget` below asserts on purpose.
+
+		it('reschedules a wakeup that landed mid-statement, and serves it with no further writes to the table', async () => {
+			// One row only: `other` must stay under the threshold, so every refresh the
+			// assertions below count belongs to `t`.
+			await db.exec('create table other (id integer primary key, v integer)');
+			await db.exec('insert into other values (1, 1)');
+
+			// A user function referenced from an UPDATE runs on that statement's own
+			// stack, inside its implicit transaction — the production sequence exactly.
+			// (Left non-deterministic, the default, so nothing constant-folds it away.)
+			let fired: Promise<void> | undefined;
+			let sawOpenTransaction: boolean | undefined;
+			db.createScalarFunction('fire_refresh', { numArgs: 1 }, (x) => {
+				sawOpenTransaction = !db.getAutocommit();
+				fired = db._autoAnalyze.fireArmedRefresh('main.t');
+				return x;
+			});
+
+			await db.exec('insert into t values (1, 10), (2, 20), (3, 30)');
+			assert.ok(armed(db, 'main.t'), 'the crossing armed a refresh');
+
+			await db.exec('update other set v = fire_refresh(9) where id = 1');
+			await fired;
+
+			assert.equal(sawOpenTransaction, true, 'an UPDATE opens an implicit transaction');
+			assert.ok(!armed(db, 'main.other'), 'the written table itself stayed under the threshold');
+			assert.equal(db._autoAnalyze.refreshCount(), 0, 'a wakeup inside a statement cannot analyze');
+			assert.equal(changed(db, 'main.t'), 3, 'and leaves the counter untouched');
+			assert.equal(deferRetries(db, 'main.t'), 1, 'it spent one retry instead of dropping the crossing');
+			assert.ok(armed(db, 'main.t'), 'a retry timer is armed');
+
+			// `t` is never written again. Before the retry existed this crossing was gone
+			// for good — only a further commit on `t` itself could have revived it.
+			await db._whenAutoAnalyzeIdle();
+			assert.equal(db._autoAnalyze.refreshCount(), 1, 'the retry served the crossing');
+			assert.equal(stats(db, 't')?.rowCount, 3);
+			assert.equal(deferRetries(db, 'main.t'), 0, 'a served crossing refunds the budget');
+		});
+
+		it('spends a bounded budget and then gives up, leaving nothing armed', async () => {
+			await db.exec('insert into t values (1, 10), (2, 20), (3, 30)');
+			assert.ok(armed(db, 'main.t'));
+
+			await db.exec('begin');
+			// The settle loop fires → defers → re-arms → fires … until the budget is gone.
+			// It must terminate: an unbounded retry would hit `whenIdle`'s pass cap and
+			// leave a timer armed, which is what the `armed` assertion below catches.
+			await db._whenAutoAnalyzeIdle();
+
+			assert.equal(db._autoAnalyze.refreshCount(), 0, 'nothing analyzed inside the transaction');
+			assert.equal(deferRetries(db, 'main.t'), AUTO_ANALYZE_MAX_DEFER_RETRIES, 'the budget is spent, not exceeded');
+			assert.equal(armed(db, 'main.t'), false, 'and the crossing is dropped rather than retried forever');
+			assert.equal(changed(db, 'main.t'), 3, 'the counter survives every deferral');
+
+			await db.exec('rollback');
+		});
+
+		it('backs off geometrically rather than retrying on the debounce', async () => {
+			await db.exec('insert into t values (1, 10), (2, 20), (3, 30)');
+			await db.exec('begin');
+
+			const entry = db._autoAnalyze.getEntry('main.t')!;
+			const delays: number[] = [];
+			for (let retry = 0; retry < 3; retry++) {
+				const before = Date.now();
+				await db._autoAnalyze.fireArmedRefresh('main.t');
+				delays.push(entry.nextEligibleAt - before);
+			}
+
+			assert.equal(entry.deferRetries, 3, 'three attempts, three retries spent');
+			// A statement in flight now is likely still in flight in 50 ms, so the retry
+			// must not reuse the debounce. Upper bounds are loose — the delay is stamped
+			// from `Date.now()` a moment after `before` is read.
+			delays.forEach((delay, retry) => {
+				const expected = AUTO_ANALYZE_DEFER_RETRY_MS * 2 ** retry;
+				assert.ok(
+					delay >= expected && delay < expected * 2,
+					`retry ${retry} should wait about ${expected} ms, waited ${delay}`,
+				);
+			});
+
+			await db.exec('rollback');
+		});
+
+		it('absorbs a commit that arrives while a retry is armed, into one refresh', async () => {
+			await db.exec('insert into t values (1, 10), (2, 20), (3, 30)');
+			await db.exec('begin');
+			await db._autoAnalyze.fireArmedRefresh('main.t');
+			assert.equal(deferRetries(db, 'main.t'), 1, 'one deferral, one retry armed');
+			assert.ok(armed(db, 'main.t'));
+
+			await db.exec('insert into t values (4, 40)');
+			await db.exec('commit');
+
+			assert.equal(deferRetries(db, 'main.t'), 0, 'a commit refunds the retry budget');
+			assert.ok(armed(db, 'main.t'), 'the commit coalesces into the armed retry');
+
+			await db._whenAutoAnalyzeIdle();
+			assert.equal(db._autoAnalyze.refreshCount(), 1, 'one refresh covers both crossings');
+			assert.equal(stats(db, 't')?.rowCount, 4);
+			assert.equal(changed(db, 'main.t'), 0);
+		});
+
+		it('does not retry a refresh the feature switch declined', async () => {
+			// `declined` and `deferred` are different outcomes: a deliberate refusal must
+			// not reschedule, or switching the feature off would leave a timer spinning.
+			await db.exec('insert into t values (1, 10), (2, 20), (3, 30)');
+			db.setOption('auto_analyze', false);
+			await db._autoAnalyze.fireArmedRefresh('main.t');
+
+			assert.equal(deferRetries(db, 'main.t'), 0, 'a decline spends no retry');
+			assert.equal(armed(db, 'main.t'), false, 'and schedules nothing');
+			assert.equal(changed(db, 'main.t'), 3);
+		});
+
+		it('does not resurrect a table dropped while its refresh was deferred', async () => {
+			await db.exec('insert into t values (1, 10), (2, 20), (3, 30)');
+			await db.exec('begin');
+			await db._autoAnalyze.fireArmedRefresh('main.t');
+			assert.ok(armed(db, 'main.t'), 'a retry is armed for main.t');
+			await db.exec('rollback');
+
+			await db.exec('drop table t');
+
+			assert.deepEqual(db._autoAnalyze.trackedTables(), [], 'the entry and its retry timer are gone');
+			await db._whenAutoAnalyzeIdle();
+			assert.equal(db._autoAnalyze.refreshCount(), 0);
 		});
 	});
 
