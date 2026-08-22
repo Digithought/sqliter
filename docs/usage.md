@@ -633,10 +633,10 @@ pragma default_column_nullability;
 | `validate_plan` | boolean | `false` | Enable plan validation before execution. Alias: `plan_validation` |
 | `trace_plan_stack` | boolean | `false` | Enable plan stack tracing for debugging (also disables scalar fusion) |
 | `runtime_fuse_scalars` | boolean | `true` | Compile pure synchronous scalar expression subtrees into single fused closures instead of per-row sub-programs (see `docs/runtime.md` § Scalar fusion). Kill switch for bisecting a suspected fusion bug; baked into a prepared statement at emit time, so recompile to pick up a change |
-| `auto_analyze` | boolean | `true` | Track how many distinct rows each table has had changed by committed transactions since its statistics were last collected, so stale statistics can be detected. When off, no counting happens at all; turning it back on mid-session resumes from whatever each table's count already was, without reconstructing the mutations missed while it was off |
+| `auto_analyze` | boolean | `true` | Track how many distinct rows each table has had changed by committed transactions since its statistics were last collected, and refresh those statistics in the background once the drift crosses the threshold below. When off, no counting and no refreshing happens at all; turning it back on mid-session resumes from whatever each table's count already was, without reconstructing the mutations missed while it was off. See `docs/sql-txn.md` §9.5 |
 | `auto_analyze_min_mutations` | number | `500` | Absolute floor for the staleness threshold, in distinct changed rows. Positive integer. Governs on its own for a never-analyzed table, whose known row count is 0 |
 | `auto_analyze_ratio` | number | `0.2` | Fraction of the known row count that must change before statistics are stale. Finite and greater than 0. Combined with the floor as `max(min_mutations, ratio × knownRowCount)` |
-| `auto_analyze_row_limit` | number | `100000` | Largest table (in known rows) an automatic statistics refresh will scan; a larger table is left to an explicit `ANALYZE`. Set to 0 to disable the cap. Currently inert — staleness is only detected and logged; nothing refreshes statistics automatically yet |
+| `auto_analyze_row_limit` | number | `100000` | Largest table (in known rows) an automatic statistics refresh will scan; a larger table is left to an explicit `ANALYZE`, and the skip is logged once. Set to 0 to disable the cap. A table nobody has analyzed yet reports 0 known rows, so its first automatic refresh is not size-gated |
 
 ### Type-Safe Getters
 

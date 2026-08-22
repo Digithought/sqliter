@@ -2660,10 +2660,20 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		this.autoAnalyzeManager.recordCommit(counts());
 	}
 
-	/** @internal Auto-analyze staleness bookkeeping. Exposed for tests and for the
-	 *  scheduled-refresh layer that consumes the staleness signal. */
+	/** @internal Auto-analyze staleness bookkeeping and background refresh scheduler. */
 	public get _autoAnalyze(): AutoAnalyzeManager {
 		return this.autoAnalyzeManager;
+	}
+
+	/**
+	 * @internal Resolves once no automatic statistics refresh is armed or in flight.
+	 *
+	 * Determinism seam for tests: any armed debounce timer is fired immediately rather
+	 * than waited out, so a test asserts on refreshed statistics without sleeping. It
+	 * does not bypass the open-transaction deferral — see {@link AutoAnalyzeManager.whenIdle}.
+	 */
+	public _whenAutoAnalyzeIdle(): Promise<void> {
+		return this.autoAnalyzeManager.whenIdle();
 	}
 
 	/**

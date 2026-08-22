@@ -433,3 +433,51 @@ A virtual table module that implements `getStatistics()` may answer the whole qu
 - **No hook at all** scans as well.
 
 The scan collects exact per-column distinct counts, null counts and min/max over every row the connection can see, plus histograms built from a sample of the values. Collected statistics are cached on the table schema and used by the optimizer's `CatalogStatsProvider` for improved cost estimates. See `docs/module-authoring.md` for the module-side contract.
+
+#### Automatic statistics refresh
+
+Statistics also refresh on their own. Every committed transaction reports how many
+distinct rows it changed per table, and a table whose drift crosses a threshold has
+its statistics recollected in the background — by running exactly the `ANALYZE` above
+for that one table.
+
+```
+stale  ⟺  rows changed since the last refresh  >=  max(auto_analyze_min_mutations,
+                                                       auto_analyze_ratio × known rows)
+```
+
+| option | default | meaning |
+| --- | --- | --- |
+| `auto_analyze` | `true` | Master switch. Off means no counting and no refreshing |
+| `auto_analyze_min_mutations` | `500` | Absolute floor of the threshold, in changed rows |
+| `auto_analyze_ratio` | `0.2` | Fraction of the known row count that must change |
+| `auto_analyze_row_limit` | `100000` | Largest table (in known rows) a refresh will scan; `0` removes the cap |
+
+What that means in practice:
+
+- **It never runs on the write path.** A crossing arms a short debounce timer; the
+  refresh runs from that timer and acquires the same execution mutex every statement
+  uses, so it queues behind your work rather than racing it. No write and no query
+  ever waits on it.
+- **Crossings coalesce.** Commits that arrive while a refresh is armed or running are
+  absorbed into it, so a bulk load costs a handful of refreshes rather than one per
+  commit. A table is additionally limited to a small fraction of wall-clock time in
+  automatic `ANALYZE`, so a sustained write load cannot turn into a rescan treadmill.
+- **Large tables are skipped.** A table whose known row count exceeds
+  `auto_analyze_row_limit` is left to an explicit `ANALYZE`; the skip is logged once.
+  A table nobody has ever analyzed reports zero known rows, so its first refresh is
+  not size-gated — after that the cap applies.
+- **It is deferred while an explicit transaction is open**, because collecting
+  statistics inside your transaction would fold your uncommitted rows into them. The
+  counter is untouched, so the next commit re-arms.
+- **Staleness counting restarts when the process does.** Statistics a store backend
+  persisted are still there after a reopen, but the drift accumulated before the
+  restart is not — a table that drifted while the process was down looks fresh until
+  it drifts again.
+- **A hand-typed `ANALYZE` does not reset the drift counter.** Only an automatic
+  refresh does. Analyzing an already-stale table by hand can therefore cost one
+  redundant background rescan, after which the counter is back in step.
+- **Every refresh invalidates cached plans for that table**, exactly as a manual
+  `ANALYZE` does — that is the point, since the new statistics should change plans.
+
+For guidance on when to run `ANALYZE` yourself, see `docs/usage.md`.

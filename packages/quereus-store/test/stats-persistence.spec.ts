@@ -175,6 +175,35 @@ describe('ANALYZE statistics survive a reopen', () => {
 		}
 	});
 
+	it('persists statistics an AUTOMATIC refresh collected, with no manual ANALYZE', async () => {
+		// The auto-analyze scheduler runs the ordinary `ANALYZE` statement, so it reaches
+		// `saveStatistics` by the same route a typed one does — but nothing had pinned that
+		// end to end against a store-backed table, where the persisted half actually exists.
+		// A floor of 3 keeps the seed's 24 rows enough to trip the threshold.
+		db.setOption('auto_analyze_min_mutations', 3);
+		await seed(db);
+		// `_whenAutoAnalyzeIdle` is `@internal`, and `stripInternal` keeps it out of the
+		// published declarations — so from outside the engine package it has to be reached
+		// through a cast rather than by widening the public surface for a test.
+		await (db as unknown as { _whenAutoAnalyzeIdle(): Promise<void> })._whenAutoAnalyzeIdle();
+
+		const before = db.schemaManager.findTable('t');
+		expect(before?.statistics, 'the refresh happened without anyone typing ANALYZE').to.not.be.undefined;
+		expect(before!.statistics!.rowCount).to.equal(ROW_COUNT);
+		expect(columnStats(before, 'k')!.distinctCount).to.equal(DISTINCT_K);
+
+		await shutdown();
+		const { db2 } = await reopen();
+		try {
+			const after = db2.schemaManager.findTable('t');
+			expect(after?.statistics, 'the automatic refresh was persisted').to.not.be.undefined;
+			expect(after!.statistics!.rowCount).to.equal(ROW_COUNT);
+			expect(columnStats(after, 'k')!.distinctCount).to.equal(DISTINCT_K);
+		} finally {
+			await db2.close();
+		}
+	});
+
 	it('plans the reopened database exactly as it planned before the close', async () => {
 		// Equality on `k` (4 distinct values over 24 rows) is estimated from the real distinct
 		// count once statistics exist, and from a fixed-fraction guess before that. Both the
