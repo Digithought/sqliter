@@ -69,6 +69,7 @@ import { ingestExternalRowChangeBatch } from './database-external-changes.js';
 import type { ExternalRowChange, IngestExternalChangesOptions, IngestExternalChangesResult } from './database-internal.js';
 import { AssertionEvaluator, type AssertionEvaluatorContext, type AssertionViolation } from './database-assertions.js';
 import { WatcherManager, type WatcherManagerContext } from './database-watchers.js';
+import { AutoAnalyzeManager, type AutoAnalyzeManagerContext } from './database-auto-analyze.js';
 import { MaterializedViewManager, type BackingConnectionCache, type ResidualKeyBatch } from './database-materialized-views.js';
 import type { BackingRowChange } from '../vtab/backing-host.js';
 import type { ChangeScope, Subscription, WatchHandler } from '../planner/analysis/change-scope.js';
@@ -129,7 +130,7 @@ function parseSchemaPath(pathString: string): string[] | undefined {
  * Represents a connection to an Quereus database (in-memory in this port).
  * Manages schema, prepared statements, virtual tables, and functions.
  */
-export class Database implements TransactionManagerContext, AssertionEvaluatorContext, WatcherManagerContext {
+export class Database implements TransactionManagerContext, AssertionEvaluatorContext, WatcherManagerContext, AutoAnalyzeManagerContext {
 	public readonly schemaManager: SchemaManager;
 	public readonly declaredSchemaManager: DeclaredSchemaManager;
 	private isOpen = true;
@@ -177,6 +178,8 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	private readonly watcherManager: WatcherManager;
 	/** Materialized-view schema-change staleness tracking */
 	private readonly materializedViewManager: MaterializedViewManager;
+	/** Committed-mutation drift tracking that decides when statistics are stale */
+	private readonly autoAnalyzeManager: AutoAnalyzeManager;
 	/** Per-database collation registry — comparator + optional key normalizer +
 	 *  optional REPLICABLE and ORDER-PRESERVING assertions. The normalizer is required
 	 *  for index participation; comparator-only collations may still be used in ORDER BY
@@ -241,6 +244,10 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 
 		// Set up option change listeners
 		this.setupOptionListeners();
+
+		// Auto-analyze reads its thresholds from the options above, so it is
+		// constructed after they are registered.
+		this.autoAnalyzeManager = new AutoAnalyzeManager(this);
 	}
 
 	// ============================================================================
@@ -441,6 +448,79 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 					);
 				}
 				log('materialized_view_rebuild_row_threshold changed to: %s', value);
+			}
+		});
+
+		// NOTE: `auto_analyze` defaults ON deliberately. The failure mode it addresses is
+		// users who never learn `ANALYZE` exists (the majority of real "why is this query
+		// slow" reports resolve to statistics never having been collected), so an
+		// off-by-default feature would help none of them. The decline argument — a
+		// maintainer preferring default-off for zero behavior change — was weighed and
+		// rejected because the eventual background refresh is bounded by
+		// `auto_analyze_row_limit`, a duty-cycle cooldown, and deferral while a
+		// transaction is open. Revisit only if a refresh is measured interfering with
+		// foreground work despite those bounds.
+		this.options.registerOption('auto_analyze', {
+			type: 'boolean',
+			defaultValue: true,
+			description: 'Track how many rows each table has had changed by committed transactions since ' +
+				'statistics were last collected for it, so stale statistics can be detected and refreshed. ' +
+				'When off, no counting happens at all — turning it back on mid-session starts counting from ' +
+				'zero rather than reconstructing the mutations missed while it was off.',
+		});
+
+		this.options.registerOption('auto_analyze_min_mutations', {
+			type: 'number',
+			defaultValue: 500,
+			description: 'Absolute floor for the auto-analyze staleness threshold: a table is never considered ' +
+				'stale until at least this many distinct rows have changed since its last statistics refresh. ' +
+				'Governs on its own for a never-analyzed table, whose known row count is 0.',
+			onChange: (event) => {
+				// Validate at set time so a bad value fails loudly; the options framework
+				// rolls the value back when onChange throws.
+				const value = event.newValue as number;
+				if (!Number.isInteger(value) || value <= 0) {
+					throw new QuereusError(
+						`Invalid auto_analyze_min_mutations ${event.newValue}: must be a positive integer`,
+						StatusCode.ERROR,
+					);
+				}
+				log('auto_analyze_min_mutations changed to: %s', value);
+			}
+		});
+
+		this.options.registerOption('auto_analyze_ratio', {
+			type: 'number',
+			defaultValue: 0.2,
+			description: 'Fraction of the known row count of a table that must change before its statistics are ' +
+				'considered stale. Combined with auto_analyze_min_mutations as ' +
+				'max(min_mutations, ratio * knownRowCount).',
+			onChange: (event) => {
+				const value = event.newValue as number;
+				if (!Number.isFinite(value) || value <= 0) {
+					throw new QuereusError(
+						`Invalid auto_analyze_ratio ${event.newValue}: must be a finite number greater than 0`,
+						StatusCode.ERROR,
+					);
+				}
+				log('auto_analyze_ratio changed to: %s', value);
+			}
+		});
+
+		this.options.registerOption('auto_analyze_row_limit', {
+			type: 'number',
+			defaultValue: 100000,
+			description: 'Largest table (in known rows) an automatic statistics refresh will scan. A larger ' +
+				'table is left to an explicit ANALYZE. Set to 0 to disable the size cap.',
+			onChange: (event) => {
+				const value = event.newValue as number;
+				if (!Number.isFinite(value) || value < 0) {
+					throw new QuereusError(
+						`Invalid auto_analyze_row_limit ${event.newValue}: must be a non-negative number (0 disables the size cap)`,
+						StatusCode.ERROR,
+					);
+				}
+				log('auto_analyze_row_limit changed to: %s', value);
 			}
 		});
 	}
@@ -1298,6 +1378,9 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 
 		// Clean up materialized-view manager (unsubscribe schema listener)
 		this.materializedViewManager.dispose();
+
+		// Clean up auto-analyze bookkeeping (unsubscribe schema listener, clear counters)
+		this.autoAnalyzeManager.dispose();
 
 		// Clear schemas, ensuring VTabs are potentially disconnected
 		// This will also call destroy on VTabs via SchemaManager.clearAll -> schema.clearTables -> schemaManager.dropTable
@@ -2567,6 +2650,20 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 *  and before the change log is cleared. */
 	public async runPostCommitWatchers(): Promise<void> {
 		await this.watcherManager.runPostCommit();
+	}
+
+	/** @internal Invoked by the TransactionManager in the same post-commit window as
+	 *  {@link runPostCommitWatchers}. `counts` is a thunk so that with `auto_analyze`
+	 *  off no counts map is ever built. */
+	public recordCommittedChangeCounts(counts: () => Map<string, number>): void {
+		if (!this.options.getBooleanOption('auto_analyze')) return;
+		this.autoAnalyzeManager.recordCommit(counts());
+	}
+
+	/** @internal Auto-analyze staleness bookkeeping. Exposed for tests and for the
+	 *  scheduled-refresh layer that consumes the staleness signal. */
+	public get _autoAnalyze(): AutoAnalyzeManager {
+		return this.autoAnalyzeManager;
 	}
 
 	/**

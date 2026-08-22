@@ -49,6 +49,9 @@ export interface TransactionManagerContext {
 	 *  back. Invoked after all connections commit but before the change log
 	 *  is cleared. */
 	runPostCommitWatchers(): Promise<void>;
+	/** Called after a successful commit, before the change log is cleared. The callback
+	 *  materializes per-table committed row counts only if a consumer wants them. */
+	recordCommittedChangeCounts(counts: () => Map<string, number>): void;
 }
 
 /**
@@ -289,6 +292,16 @@ export class TransactionManager {
 				await this.ctx.runPostCommitWatchers();
 			} catch (err) {
 				errorLog('Post-commit watcher dispatch threw: %O', err);
+			}
+
+			// Auto-analyze staleness bookkeeping, same window: the change log is
+			// still alive. The counts map is thunked so it is never materialized
+			// when the feature is off, and the whole call is isolated — a
+			// bookkeeping error must never fail a transaction that has committed.
+			try {
+				this.ctx.recordCommittedChangeCounts(() => this.getChangedRowCounts());
+			} catch (err) {
+				errorLog('Auto-analyze commit bookkeeping threw: %O', err);
 			}
 
 			// Materialized views are NOT a post-commit consumer: each is row-time
@@ -626,6 +639,32 @@ export class TransactionManager {
 		const collect = (m: ChangeLogLayer) => {
 			for (const [t, rowMap] of m) {
 				if (rowMap.size > 0) result.add(t);
+			}
+		};
+		collect(this.changeLog);
+		for (const layer of this.changeLogLayers) collect(layer);
+		return result;
+	}
+
+	/**
+	 * Per-table count of distinct changed primary keys across the base layer and
+	 * every live savepoint layer. Cheap: one `Map.size` read per table per layer,
+	 * so the whole reading is O(tables × layers) with no scan.
+	 *
+	 * Inherits the change log's coalescing — ten updates to one row count as one,
+	 * and an insert followed by a delete of the same key leaves no entry at all.
+	 * That makes this a *distinct rows touched* measure.
+	 *
+	 * Deliberately approximate across layers: the same key changed in two live
+	 * savepoint layers is counted twice. Deduplicating would cost a scan of every
+	 * key, and the only consumer is a staleness heuristic, not an invariant.
+	 */
+	getChangedRowCounts(): Map<string, number> {
+		const result = new Map<string, number>();
+		const collect = (m: ChangeLogLayer): void => {
+			for (const [t, rowMap] of m) {
+				if (rowMap.size === 0) continue;
+				result.set(t, (result.get(t) ?? 0) + rowMap.size);
 			}
 		};
 		collect(this.changeLog);
