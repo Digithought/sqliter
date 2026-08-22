@@ -469,10 +469,10 @@ What that means in practice:
   not size-gated — after that the cap applies.
 - **It is delayed while a transaction is open**, because collecting statistics inside
   your transaction would fold your uncommitted rows into them. That covers more than an
-  explicit `BEGIN`: a *writing* statement (`update`, `delete`, `insert … select`, any
-  DDL) runs inside an implicit transaction for its duration, so a refresh whose timer
-  fires mid-statement is delayed too. A plain `select`, and an `insert … values` whose
-  rows need no read, open no transaction and delay nothing.
+  explicit `BEGIN`: every writing statement (`insert`, `update`, `delete`, and any DDL)
+  runs inside an implicit transaction for its duration, so a refresh whose timer fires
+  mid-statement is delayed too. Read-only statements open no transaction and delay
+  nothing.
 
   A delayed refresh reschedules itself a few times on a widening backoff (a quarter of
   a second, then doubling, about four seconds of patience in total), so an ordinary

@@ -13,14 +13,19 @@
  * bounded budget, and only gives up once the budget is spent. `deferred refresh`
  * below covers that.
  *
- * Every test drives the schedule through `db._whenAutoAnalyzeIdle()`, which
- * fires any armed debounce timer immediately and awaits the refresh. Nothing
- * here sleeps.
+ * Nearly every test drives the schedule through `db._whenAutoAnalyzeIdle()` (or
+ * the single-attempt `fireArmedRefresh`), both of which fire an armed timer
+ * immediately and await the refresh, so nothing sleeps. The two exceptions are
+ * deliberate: `refreshes from the production timer` and `serves the retry from
+ * its own production timer` let the real `setTimeout` fire and poll for the
+ * result, because without them a timer that is never armed would leave the rest
+ * of the suite green.
  */
 
 import assert from 'node:assert/strict';
 import {
 	AUTO_ANALYZE_DEFER_RETRY_MS,
+	AUTO_ANALYZE_IDLE_MAX_PASSES,
 	AUTO_ANALYZE_MAX_DEFER_RETRIES,
 	armDelayMs,
 } from '../src/core/database-auto-analyze.js';
@@ -248,10 +253,10 @@ describe('auto-analyze background refresh', () => {
 	describe('deferred refresh', () => {
 		// A refresh deferred by an open transaction reschedules itself rather than
 		// abandoning the crossing. The distinction matters because `getAutocommit()` is
-		// false for more than an explicit BEGIN: `update`, `delete`, `insert … select`
-		// and DDL each open an implicit transaction for their duration, so a timer for
-		// table `t` can land inside a write to an entirely unrelated table. Without the
-		// retry, that crossing was lost until `t` itself was written again.
+		// false for more than an explicit BEGIN: every `insert`, `update`, `delete` and
+		// DDL opens an implicit transaction for its duration, so a timer for table `t`
+		// can land inside a write to an entirely unrelated table. Without the retry,
+		// that crossing was lost until `t` itself was written again.
 		//
 		// These drive ONE attempt at a time through `fireArmedRefresh`.
 		// `_whenAutoAnalyzeIdle` cannot stand in: it loops until nothing is armed, so
@@ -384,6 +389,43 @@ describe('auto-analyze background refresh', () => {
 			assert.deepEqual(db._autoAnalyze.trackedTables(), [], 'the entry and its retry timer are gone');
 			await db._whenAutoAnalyzeIdle();
 			assert.equal(db._autoAnalyze.refreshCount(), 0);
+		});
+
+		it('serves the retry from its own production timer, with nobody driving the schedule', async () => {
+			// The composition every other test in this group infers: a retry armed by
+			// `armDeferRetry` must actually be a live timer that fires on the backoff and
+			// runs the refresh. `fireArmedRefresh` and `_whenAutoAnalyzeIdle` both zero
+			// `nextEligibleAt` and start the refresh directly, so a retry armed with a NaN
+			// delay, or never armed at all, would leave the rest of the group green.
+			await db.exec('insert into t values (1, 10), (2, 20), (3, 30)');
+			await db.exec('begin');
+			await db._autoAnalyze.fireArmedRefresh('main.t');
+			assert.equal(deferRetries(db, 'main.t'), 1, 'the deferral armed a retry');
+			await db.exec('rollback');
+
+			// A rollback records no commit, so nothing re-arms — only the retry timer
+			// already scheduled can serve this. Polls on the statistics for the same
+			// reason `refreshes from the production timer` does.
+			const deadline = Date.now() + 5000;
+			while (stats(db, 't') === undefined && Date.now() < deadline) {
+				await new Promise<void>(resolve => setTimeout(resolve, 10));
+			}
+
+			assert.equal(db._autoAnalyze.refreshCount(), 1, 'the retry timer fired on its own');
+			assert.equal(stats(db, 't')?.rowCount, 3);
+			assert.equal(deferRetries(db, 'main.t'), 0, 'and the served crossing refunded the budget');
+		});
+
+		it('keeps the retry budget inside what the settle loop can drain', async () => {
+			// `whenIdle` spends one pass per retry, plus one for the initial attempt and
+			// one to observe that nothing is left armed. Raising the budget past this
+			// would make `spends a bounded budget` fail with only a warning in the log to
+			// explain it, so the coupling is asserted rather than left to a doc comment.
+			assert.ok(
+				AUTO_ANALYZE_MAX_DEFER_RETRIES + 2 <= AUTO_ANALYZE_IDLE_MAX_PASSES,
+				`a budget of ${AUTO_ANALYZE_MAX_DEFER_RETRIES} needs ${AUTO_ANALYZE_MAX_DEFER_RETRIES + 2} ` +
+				`settle passes but only ${AUTO_ANALYZE_IDLE_MAX_PASSES} are allowed`,
+			);
 		});
 	});
 

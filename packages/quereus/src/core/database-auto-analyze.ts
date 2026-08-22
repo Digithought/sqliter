@@ -76,6 +76,14 @@ const AUTO_ANALYZE_FAILURE_BACKOFF_MS = 5000;
  * timer landing inside one ordinary `UPDATE` — is served by the first retry
  * instead of burning the whole budget on wakeups that all land inside the same
  * statement.
+ *
+ * NOTE: 250 ms is reasoning, not measurement — nothing has measured how long a
+ * statement actually holds its implicit transaction, and a memory-backed one
+ * frequently never yields to the timer queue at all (a 400-row `insert … values`
+ * ran to completion without a single `setTimeout(0)` firing), so this mostly
+ * governs store-backed workloads and explicit `BEGIN`s. If the debug log shows
+ * crossings routinely spending the whole budget, measure a real workload before
+ * raising the retry count — a longer first delay is likelier to be the fix.
  */
 export const AUTO_ANALYZE_DEFER_RETRY_MS = 250;
 
@@ -95,8 +103,12 @@ export const AUTO_ANALYZE_DEFER_RETRY_MS = 250;
  */
 export const AUTO_ANALYZE_MAX_DEFER_RETRIES = 4;
 
-/** Safety bound on {@link AutoAnalyzeManager.whenIdle}'s settle loop. */
-const AUTO_ANALYZE_IDLE_MAX_PASSES = 10;
+/**
+ * Safety bound on {@link AutoAnalyzeManager.whenIdle}'s settle loop. Exported so the
+ * inequality against {@link AUTO_ANALYZE_MAX_DEFER_RETRIES} is checked by a test
+ * rather than only implied by one failing if it were ever violated.
+ */
+export const AUTO_ANALYZE_IDLE_MAX_PASSES = 10;
 
 /**
  * Why a scheduled refresh ended. Only `deferred` wants a retry — it is the one
@@ -133,11 +145,11 @@ export interface AutoAnalyzeManagerContext {
 	/**
 	 * False while a transaction is open — an explicit `BEGIN…COMMIT` **and also** the
 	 * implicit transaction a *writing* statement runs inside. Only the DML and DDL
-	 * emitters call `_ensureTransaction`, so a plain `select` (and an `insert … values`
-	 * whose rows need no read) leaves this `true`, while `update`, `delete`,
-	 * `insert … select` and any DDL make it `false` for their duration. Since the
-	 * refresh fires from a timer, it can land inside one of those and read `false` in a
-	 * database the user considers to be in autocommit.
+	 * emitters call `_ensureTransaction`, so a read-only statement leaves this `true`,
+	 * while every `insert` (`values` included — `runInsert` opens the transaction before
+	 * it consumes its first row), `update`, `delete` and any DDL make it `false` for the
+	 * rest of that statement. Since the refresh fires from a timer, it can land inside
+	 * one of those and read `false` in a database the user considers to be in autocommit.
 	 */
 	getAutocommit(): boolean;
 	/** Runs the refresh statement. Acquires the execution mutex — see the module doc. */
@@ -497,14 +509,18 @@ export class AutoAnalyzeManager {
 	 */
 	private start(key: string, entry: TableStalenessEntry): void {
 		if (entry.running !== undefined) return;
-		// `refresh` has a total try/catch and therefore never rejects, so neither does
-		// `running` — no scheduled task can produce an unhandled rejection.
+		// `running` must never reject: nothing awaits it in production, so a rejection
+		// from a timer callback is a process-level crash for a background chore. `refresh`
+		// has a total try/catch, and the trailing `catch` covers the rescheduling that
+		// follows it. Logged and dropped; the next commit re-arms.
 		const run = this.refresh(key, entry).then(outcome => {
 			// `running` must be cleared BEFORE the outcome is applied: `arm` early-returns
 			// while a refresh is in flight, so a retry armed ahead of this clear would be
 			// silently dropped. Sequenced, not raced.
 			if (entry.running === run) entry.running = undefined;
 			this.applyOutcome(key, entry, outcome);
+		}).catch(e => {
+			warnLog('Auto-analyze rescheduling for %s failed: %s', key, e);
 		});
 		entry.running = run;
 	}
@@ -548,6 +564,12 @@ export class AutoAnalyzeManager {
 			// Drop the backoff with it: the spent retries must not also delay the refresh
 			// the next commit arms. `deferRetries` itself stays at the cap until a commit
 			// or a successful refresh refunds it, so the spent budget stays observable.
+			//
+			// NOTE: zeroing is safe only because every refresh reaches here through `arm`,
+			// whose timer cannot fire before `nextEligibleAt` — so the duty-cycle cooldown
+			// this discards has already elapsed. If a future path ever starts a refresh
+			// without going through `arm`, this silently drops a live cooldown; carry the
+			// pre-deferral value instead of zeroing at that point.
 			entry.nextEligibleAt = 0;
 			return;
 		}
