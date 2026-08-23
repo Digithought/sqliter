@@ -7,6 +7,10 @@
  * These helpers are intentionally syntactic — they do not interpret types,
  * collations, or coercions. Callers wanting semantic equivalence should layer
  * that on top.
+ *
+ * {@link planTimeLiteralValue} is the one plan-node-level entry point here: it
+ * lifts the same literal test to an already-unwrapped `ScalarPlanNode` for the
+ * constraint extractor and the sargable-range-rewrite rule.
  */
 
 import type * as AST from '../../parser/ast.js';

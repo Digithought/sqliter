@@ -179,27 +179,46 @@ DROP TABLE sq_in_t;
 -- as a plan-time constant by the sargable-range-rewrite rule or the
 -- constraint extractor (bug-constant-subquery-literal-crashes-predicate-rewrite).
 
-CREATE TABLE big (id INTEGER PRIMARY KEY, v INTEGER, status TEXT);
-INSERT INTO big VALUES (1, 1, 'x'), (2, 2, 'y');
+CREATE TABLE sq_const_t (id INTEGER PRIMARY KEY, v INTEGER, status TEXT);
+INSERT INTO sq_const_t VALUES (1, 1, 'x'), (2, 2, 'y');
 
 -- Equality against a folded constant scalar subquery
-SELECT id FROM big WHERE v = (SELECT 1);
+SELECT id FROM sq_const_t WHERE v = (SELECT 1);
 → [{"id":1}]
 
 -- Equality against a folded constant scalar subquery, text column
-SELECT id FROM big WHERE status = (SELECT 'x');
+SELECT id FROM sq_const_t WHERE status = (SELECT 'x');
 → [{"id":1}]
 
 -- BETWEEN with folded constant scalar subquery bounds
-SELECT id FROM big WHERE v BETWEEN (SELECT 1) AND (SELECT 2) ORDER BY id;
+SELECT id FROM sq_const_t WHERE v BETWEEN (SELECT 1) AND (SELECT 2) ORDER BY id;
 → [{"id":1},{"id":2}]
 
 -- IN list mixing a folded constant scalar subquery and an ordinary literal
-SELECT id FROM big WHERE v IN ((SELECT 1), 2) ORDER BY id;
+SELECT id FROM sq_const_t WHERE v IN ((SELECT 1), 2) ORDER BY id;
 → [{"id":1},{"id":2}]
 
--- Control: aggregate subquery is never folded to a literal, already worked
-SELECT id FROM big WHERE status = (SELECT max(status) FROM big);
+-- Range operators against folded constant scalar subquery bounds
+SELECT id FROM sq_const_t WHERE v > (SELECT 1) ORDER BY id;
 → [{"id":2}]
 
-DROP TABLE big;
+SELECT id FROM sq_const_t WHERE v >= (SELECT 1) AND v < (SELECT 2) ORDER BY id;
+→ [{"id":1}]
+
+-- Folded constant scalar subquery on the LEFT of the comparison
+SELECT id FROM sq_const_t WHERE (SELECT 2) = v;
+→ [{"id":2}]
+
+-- Against the PRIMARY KEY column, where the constraint would otherwise become a seek key
+SELECT id FROM sq_const_t WHERE id = (SELECT 2);
+→ [{"id":2}]
+
+-- NOT IN list mixing a folded constant scalar subquery and an ordinary literal
+SELECT id FROM sq_const_t WHERE v NOT IN ((SELECT 1), 99) ORDER BY id;
+→ [{"id":2}]
+
+-- Control: aggregate subquery is never folded to a literal, already worked
+SELECT id FROM sq_const_t WHERE status = (SELECT max(status) FROM sq_const_t);
+→ [{"id":2}]
+
+DROP TABLE sq_const_t;

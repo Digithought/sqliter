@@ -79,13 +79,13 @@ const rtCtx: RuntimeContext = {
   context: new RowContextMap(), tableContexts: new Map(),
   enableMetrics: false
 };
-const out  = sched.run(rtCtx);
-const val  = out instanceof Promise ? await out : out;
-const lit  = new LiteralNode(expr.scope, {type: 'literal', value: val});
+const out  = sched.run(rtCtx);   // MaybePromise — the pass is synchronous and does NOT await
+const lit  = new LiteralNode(expr.scope, {type: 'literal', value: out});
 ```
 Notes
 - There is **no special row context**.  Column references resolve because they're replaced only when their source attribute is already folded to a literal, thus no `ColumnReferenceNode` survives evaluation.
-- The scheduler may or may not be async; both paths are handled.
+- The pass runs synchronously, so when the scheduler returns a Promise the **`LiteralNode` holds a still-pending Promise as its value** (`const-pass.ts`, `replaceBorderNodes`). The emitter awaits it at runtime (`runtime/emit/literal.ts`); an uncorrelated constant scalar subquery such as `(select 1)` is the common case.
+- Consequently a `LiteralNode` is **not** automatically a plan-time constant. Any planner code reading `literalNode.expression.value` must reject a pending Promise — use `planTimeLiteralValue` (`planner/analysis/predicate-shape.ts`) rather than reading the value directly. Treating a promise-valued literal as a constant has produced both crashes and wrong results.
 - Any exception aborts folding and leaves the original node untouched.
 
 ---
@@ -132,7 +132,7 @@ Builders do not perform folding themselves; they rely on the optimizer pass.
 | Hazard                         | Mitigation                                                       |
 |--------------------------------|------------------------------------------------------------------|
 | Side-effects (`random()`, `now()`, UDF with mutations) | Those nodes have `functional=false`; never folded. |
-| Future async UDFs              | Scheduler returns Promise; folding awaits it.                    |
+| Async evaluation (async UDFs, constant scalar subqueries) | Scheduler returns a Promise; the synchronous pass stores it in the `LiteralNode` and the emitter awaits it at runtime. Plan-time readers must treat such a literal as non-constant (see §4). |
 | Column references before producer folded | Two-phase (bottom-up + top-down) ensures dependency sets resolved first. |
 
 ---

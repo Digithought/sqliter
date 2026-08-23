@@ -205,8 +205,8 @@ describe('rule-sargable-range-rewrite (unit)', () => {
 		const predicate = binOp('=', fnCall(dateBucketFn, [col]), litPromise('2024-01-15'));
 		const filter = makeFilter(1, predicate, DATETIME_TYPE);
 
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		expect(() => ruleSargableRangeRewrite(filter, {} as any)).to.not.throw();
+		// A throw (`Literal value is a promise`) fails this call outright; the
+		// null assertion pins the "declines" half of the contract.
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const result = ruleSargableRangeRewrite(filter, {} as any);
 		expect(result).to.be.null;
