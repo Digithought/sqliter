@@ -637,13 +637,13 @@ Example — declaring a renamed table and column:
 
 ```sql
 declare schema main {
-  table customer with tags (
-    "quereus.id" = 'tbl-customer',
-    "quereus.previous_name" = 'client'
-  ) {
+  table customer {
     customer_id integer primary key with tags ("quereus.previous_name" = 'client_id'),
     full_name text not null with tags ("quereus.previous_name" = 'name')
-  }
+  } with tags (
+    "quereus.id" = 'tbl-customer',
+    "quereus.previous_name" = 'client'
+  )
 }
 ```
 

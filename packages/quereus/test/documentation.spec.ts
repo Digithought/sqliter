@@ -20,6 +20,7 @@ import {
 	TEXT_RETURN,
 } from '../src/index.js';
 import type { PluginRegistrations, Row, SqlValue } from '../src/index.js';
+import { Parser } from '../src/parser/parser.js';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -288,6 +289,70 @@ describe('Documentation Validation', () => {
 			}
 
 			expect(offenders, `Stale return-type shapes in docs/plugins.md:\n${offenders.join('\n')}`).to.have.lengthOf(0);
+		});
+	});
+
+	// ========================================================================
+	// docs/sql-ddl.md § 2.6.3 Metadata Tags
+	//
+	// Each block below is transcribed verbatim from the doc. If you change one
+	// of these, change the doc — and vice versa.
+	// ========================================================================
+
+	describe('sql-ddl.md Metadata Tags examples', () => {
+		it('should parse the declare-schema renamed-table-and-column example', () => {
+			const sql = `
+declare schema main {
+  table customer {
+    customer_id integer primary key with tags ("quereus.previous_name" = 'client_id'),
+    full_name text not null with tags ("quereus.previous_name" = 'name')
+  } with tags (
+    "quereus.id" = 'tbl-customer',
+    "quereus.previous_name" = 'client'
+  )
+}`;
+			expect(() => new Parser().parseAll(sql)).to.not.throw();
+		});
+
+		it('should parse the create-table table-level tags example', () => {
+			const sql = `
+create table Orders (
+  id integer primary key,
+  name text not null
+) with tags (display_name = 'Customer Orders', audit = true);`;
+			expect(() => new Parser().parseAll(sql)).to.not.throw();
+		});
+
+		it('should parse the create-table column-level tags example', () => {
+			const sql = `
+create table Products (
+  id integer primary key with tags (display_name = 'Product ID'),
+  name text not null with tags (searchable = true)
+);`;
+			expect(() => new Parser().parseAll(sql)).to.not.throw();
+		});
+
+		it('should parse the create-table constraint-level tags example', () => {
+			const sql = `
+create table Employees (
+  id integer primary key,
+  email text not null,
+  constraint uq_email unique (email) with tags (error_message = 'Email must be unique')
+);`;
+			expect(() => new Parser().parseAll(sql)).to.not.throw();
+		});
+
+		it('should still reject a leading with-tags clause before the table body', () => {
+			// A leading `with tags (...)` before the column body was never valid syntax.
+			// If this ever starts parsing, the § 2.6.3 example above should be revisited
+			// to see whether the leading form is now preferred.
+			const sql = `
+declare schema main {
+  table customer with tags ("quereus.id" = 'tbl-customer') {
+    customer_id integer primary key
+  }
+}`;
+			expect(() => new Parser().parseAll(sql)).to.throw();
 		});
 	});
 
