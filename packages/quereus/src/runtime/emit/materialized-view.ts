@@ -235,7 +235,12 @@ export async function refreshMaintainedTable(db: Database, mv: MaintainedTableSc
 	// `stale`: if registration ever threw (the eligibility gate re-runs here), leaving
 	// the MV stale makes the next read re-validate/error rather than silently serve an
 	// unmaintained snapshot.
-	db.registerMaterializedView(live);
+	// `backingRecomputed`: the rebuild/reshape above re-derived every backing row from the
+	// body against the CURRENT function registry, so a body function that now resolves to a
+	// different registration than at the last registration is exactly what this refresh just
+	// resolved — not drift to mark stale over. (Every other re-registration path leaves the
+	// stored rows alone and so keeps the check.)
+	db.registerMaterializedView(live, { backingRecomputed: true });
 	live.derivation.stale = false;
 	sm.getChangeNotifier().notifyChange({
 		type: 'materialized_view_refreshed',

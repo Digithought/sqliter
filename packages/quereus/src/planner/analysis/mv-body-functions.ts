@@ -48,3 +48,27 @@ export function captureBodyFunctions(
 	}
 	return out;
 }
+
+/**
+ * The `(name, argument count)` keys whose resolution CHANGED between two captures — the
+ * witness that a maintained table's stored rows and a freshly built maintenance plan
+ * disagree about what one of the body's functions means.
+ *
+ * Compared by object identity over the union of both key sets, so all three ways a call
+ * site can move count: it resolves to a different registration, it resolved before and
+ * no longer does, or it resolves now and did not before. Comparing names would prove
+ * nothing — registration overwrites by `(name, argument count)`, so the name is stable
+ * across exactly the takeover this detects.
+ *
+ * Keys are returned sorted so the diagnostic reads the same run to run; empty ⇒ no drift.
+ */
+export function detectBodyFunctionDrift(
+	prior: ReadonlyMap<string, FunctionSchema>,
+	current: ReadonlyMap<string, FunctionSchema>,
+): readonly string[] {
+	const drifted: string[] = [];
+	for (const key of new Set([...prior.keys(), ...current.keys()])) {
+		if (prior.get(key) !== current.get(key)) drifted.push(key);
+	}
+	return drifted.sort();
+}

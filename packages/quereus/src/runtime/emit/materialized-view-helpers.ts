@@ -3216,8 +3216,13 @@ async function restoreMaterializedViewLive(
 	// Register the LIVE registered table (the backing-name pass may have swapped
 	// the catalog object); the shared derivation rides either way.
 	const live = schema.getTable(mv.name);
-	db.registerMaterializedView(isMaintainedTable(live) ? live : mv);
-	mv.derivation.stale = false;
+	// Body-function drift outranks this restore: registration found a body function now
+	// resolving to a different registration than the one that produced the backing's rows,
+	// and marked the MV stale. This pass restores views the RENAME did not affect — it says
+	// nothing about whether the stored rows are still a faithful derivation, and only
+	// REFRESH re-derives them. Leave the flag alone in that case.
+	const drifted = db.registerMaterializedView(isMaintainedTable(live) ? live : mv);
+	if (!drifted) mv.derivation.stale = false;
 }
 
 /**

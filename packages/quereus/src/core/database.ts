@@ -70,7 +70,7 @@ import type { ExternalRowChange, IngestExternalChangesOptions, IngestExternalCha
 import { AssertionEvaluator, type AssertionEvaluatorContext, type AssertionViolation } from './database-assertions.js';
 import { WatcherManager, type WatcherManagerContext } from './database-watchers.js';
 import { AutoAnalyzeManager, type AutoAnalyzeManagerContext } from './database-auto-analyze.js';
-import { MaterializedViewManager, type BackingConnectionCache, type ResidualKeyBatch } from './database-materialized-views.js';
+import { MaterializedViewManager, type BackingConnectionCache, type RegisterMaterializedViewOptions, type ResidualKeyBatch } from './database-materialized-views.js';
 import type { BackingRowChange } from '../vtab/backing-host.js';
 import type { ChangeScope, Subscription, WatchHandler } from '../planner/analysis/change-scope.js';
 import { tryGetEventEmitter } from '../vtab/events.js';
@@ -2794,9 +2794,12 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	}
 
 	/** @internal Compile + register an MV for row-time write-through maintenance.
-	 *  Throws on a body that is not row-time maintainable (the mandatory create-time gate). */
-	public registerMaterializedView(mv: MaintainedTableSchema): void {
-		this.materializedViewManager.registerMaterializedView(mv);
+	 *  Throws on a body that is not row-time maintainable (the mandatory create-time gate).
+	 *  Returns `true` when a body function now resolves to a different registration than the
+	 *  one that produced the backing's rows — the MV was marked stale, and a caller that
+	 *  clears `derivation.stale` afterwards must not. */
+	public registerMaterializedView(mv: MaintainedTableSchema, options?: RegisterMaterializedViewOptions): boolean {
+		return this.materializedViewManager.registerMaterializedView(mv, options);
 	}
 
 	/** @internal Detach an MV's row-time maintenance plan (DROP path). */

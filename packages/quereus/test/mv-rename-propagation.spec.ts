@@ -257,7 +257,7 @@ describe('MV rename propagation: staleness discipline', () => {
 			db.registerMaterializedView = (mv: MaintainedTableSchema) => {
 				failures++;
 				if (failures === 1) throw new Error('injected transient registration failure');
-				original(mv);
+				return original(mv);
 			};
 
 			await db.exec('alter table t rename to t2');

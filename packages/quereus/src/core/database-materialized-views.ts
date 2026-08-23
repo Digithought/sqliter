@@ -44,12 +44,13 @@ import { createLogger } from '../common/logger.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode, type SqlValue, type Row } from '../common/types.js';
 import { buildSourceUnionScope } from '../planner/analysis/change-scope.js';
-import { captureBodyFunctions } from '../planner/analysis/mv-body-functions.js';
+import { captureBodyFunctions, detectBodyFunctionDrift } from '../planner/analysis/mv-body-functions.js';
 import { isBodyIrrelevantTableChange, tryRecompileMaterializedViewLive } from '../runtime/emit/materialized-view-helpers.js';
 import { buildDerivedRowValidator, makePoisonedDerivedRowValidator } from './derived-row-validator.js';
 import type { BackingRowChange } from '../vtab/backing-host.js';
 import { compareSqlValuesFast, resolveCollationFunctions } from '../util/comparison.js';
 import type { MaintainedTableSchema } from '../schema/derivation.js';
+import type { FunctionSchema } from '../schema/function.js';
 import type { TableSchema, UniqueConstraintSchema } from '../schema/table.js';
 import { coveringMvHonorsIndexCollation, uniqueEnforcementComparators } from '../schema/unique-enforcement.js';
 import type { Database } from './database.js';
@@ -95,6 +96,20 @@ import {
 export type { BackingConnectionCache, ResidualKeyBatch } from './database-materialized-views-plans.js';
 
 const log = createLogger('core:materialized-views');
+
+/** Caller-supplied context for {@link MaterializedViewManager.registerMaterializedView}. */
+export interface RegisterMaterializedViewOptions {
+	/**
+	 * The caller re-derived the backing's rows from the body immediately before this
+	 * registration (REFRESH's rebuild/reshape). Those rows therefore ALREADY reflect the
+	 * function registrations live right now, so a body function that resolves differently
+	 * than at the previous registration is the fix, not the hazard — suppresses the
+	 * body-function drift check below. Omit (the default) for any re-registration that
+	 * leaves the stored rows as they are: ALTER … RENAME, an in-place recompile, a
+	 * rollback re-attach.
+	 */
+	readonly backingRecomputed?: boolean;
+}
 
 export class MaterializedViewManager {
 	private unsubscribeSchemaChanges: (() => void) | null = null;
@@ -305,8 +320,13 @@ export class MaterializedViewManager {
 	 * builds the maintenance plan via {@link buildMaintenancePlan}, which throws on a
 	 * body that is not row-time maintainable — the create emitter rolls the MV back on
 	 * throw, so an ineligible body errors cleanly at create time.
+	 *
+	 * Returns whether **body-function drift** was detected and the view consequently
+	 * marked stale (see {@link applyBodyFunctionDrift}). A caller that clears
+	 * `derivation.stale` after registering must honour a `true` — the backing's rows are
+	 * no longer a faithful derivation, and only REFRESH can make them one again.
 	 */
-	registerMaterializedView(mv: MaintainedTableSchema): void {
+	registerMaterializedView(mv: MaintainedTableSchema, options?: RegisterMaterializedViewOptions): boolean {
 		const key = mvKey(mv.schemaName, mv.name);
 		// Cache the source-union change-scope so a `select` from this MV projects to
 		// its sources in `analyzeChangeScope`: a `Database.watch` on this MV widens to
@@ -321,13 +341,15 @@ export class MaterializedViewManager {
 		// `db.createAggregateFunction('sum', …)` silently re-points the name; the read-side
 		// rewrite compares the live resolution against this capture by object identity and
 		// declines rather than serving the old function's stored values. Unconditional, so a
-		// re-registration refreshes it (and so a future maintenance-side drift check can
-		// compare the prior map against the freshly resolved one).
-		mv.derivation.bodyFunctions = captureBodyFunctions(
+		// re-registration refreshes it — and the prior map, kept here, is what the
+		// maintenance-side drift check at the tail compares the fresh resolution against.
+		const priorFunctions = mv.derivation.bodyFunctions;
+		const bodyFunctions = captureBodyFunctions(
 			mv.derivation.selectAst,
 			(name, argc) => this.ctx.schemaManager.findFunction(name, argc)
 				?? this.ctx.schemaManager.findFunction(name, -1),
 		);
+		mv.derivation.bodyFunctions = bodyFunctions;
 		this.releaseRowTime(key);
 		const plan = buildMaintenancePlan(this.ctx, mv); // throws on ineligible shape
 		// Compile the declared-CHECK/FK derived-row validator (undefined when the
@@ -351,6 +373,54 @@ export class MaterializedViewManager {
 			set.add(key);
 		}
 		log('Registered row-time materialized view %s.%s', mv.schemaName, mv.name);
+		// NOTE: deliberately AFTER the plan is built and installed, even though drift discards
+		// it again. The create-time eligibility gate inside `buildMaintenancePlan` must run on
+		// every registration (callers roll the MV back on its throw), and a drifted view that
+		// also has an ineligible body must still report the ineligibility — so the check
+		// cannot move ahead of the build. Drift is a rare, human-driven event (an application
+		// replacing one of its own functions), so the wasted plan build costs nothing that
+		// shows up; if a workload ever re-registers drifted views in bulk, split the gate out
+		// of `buildMaintenancePlan` and run it alone on the drift path.
+		return this.applyBodyFunctionDrift(mv, priorFunctions, bodyFunctions, options?.backingRecomputed === true);
+	}
+
+	/**
+	 * Re-registration against a CHANGED function registry. The backing's rows were produced
+	 * by the registrations the previous registration witnessed; the plan just built runs
+	 * whatever those same names resolve to NOW. Keeping the view live across that switch
+	 * would let one backing table hold two different functions' answers — the groups
+	 * maintenance touches afterwards computed the new way, every untouched group still the
+	 * old way — with nothing marking which is which.
+	 *
+	 * So mark it stale, exactly as {@link markMaterializedViewStale} does: the read-side
+	 * rewrite already declines a stale view (it recomputes from the base tables instead),
+	 * and `refresh materialized view` is the existing way to re-derive the rows under the
+	 * new meaning. Rebuilding here instead would put a full recompute inside a DDL path —
+	 * a surprising cost for a rename.
+	 *
+	 * Two ways this reports nothing, both sound:
+	 *  - `backingRecomputed` — the caller just re-derived the rows, so they already ARE the
+	 *    new functions' answers.
+	 *  - No prior capture — a first registration, and equally a fresh derivation record
+	 *    (create, catalog import on reopen). Object identity cannot cross a process
+	 *    boundary, so drift detection is inherently within-session; see
+	 *    `docs/materialized-views.md` § Function identity.
+	 */
+	private applyBodyFunctionDrift(
+		mv: MaintainedTableSchema,
+		prior: ReadonlyMap<string, FunctionSchema> | undefined,
+		current: ReadonlyMap<string, FunctionSchema>,
+		backingRecomputed: boolean,
+	): boolean {
+		if (backingRecomputed || prior === undefined) return false;
+		const drifted = detectBodyFunctionDrift(prior, current);
+		if (drifted.length === 0) return false;
+		// Loud on purpose: an application that replaced one of its own functions needs to be
+		// able to see that a view it built on the old one stopped being served.
+		log('Marking materialized view %s.%s stale: body function(s) %s no longer resolve to the registration that produced its rows; REFRESH re-derives them',
+			mv.schemaName, mv.name, drifted.join(', '));
+		this.markMaterializedViewStale(mv);
+		return true;
 	}
 
 	/** Detach an MV's row-time plan + its source-base index entry (DROP path). */

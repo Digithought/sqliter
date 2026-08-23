@@ -32,6 +32,22 @@ An *in-transaction* source schema change (e.g. `alter table … add column`, whi
 
 The emit fires per qualifying source change rather than only on the `stale` false→true transition. The unconditional firing is what re-propagates the cascade down an MV-over-MV chain; for the *single-level* compiled-while-stale case it is defensive redundancy — a plan compiled while the MV is already stale carries a **direct** dependency on the source table, so a later source change invalidates it through the ordinary dependency path even without the emit.
 
+## Body-function drift
+
+A schema change to a source is not the only way an MV's stored rows can stop being a faithful derivation of its definition. The other way is that the *definition itself* changes meaning without changing text: function registration overwrites by `(name, argument count)`, so an application calling `db.createAggregateFunction('sum', …)` re-points `sum/1` for every later compile while the backing still holds the numbers the previous registration produced.
+
+While the maintenance plan compiled at registration keeps running, that is harmless — the backing is *behind* the new meaning but internally consistent, every row produced the same way. The hazard is a **re-registration**, which recompiles the plan against whatever is registered now: `alter table … rename` on the view itself (`registerMaterializedView` under the maintenance re-key), the rename propagation's restore pass on a source rename, and the in-place recompile after a source change. Left alone, maintenance would switch implementations mid-life and the backing would end up holding two functions' answers at once — the groups a later write touches computed the new way, every untouched group still the old way, with nothing marking which is which.
+
+So `registerMaterializedView` compares the previous registration's capture (`TableDerivation.bodyFunctions`) against the freshly resolved one by **object identity** (`detectBodyFunctionDrift` in `planner/analysis/mv-body-functions.ts`). A key that resolves to a different registration, one that resolved before and no longer does, or one that resolves now and did not before is **drift**, and the view is marked stale through the same transition as any other staleness (flag + row-time plan release + cached-backing-read invalidation), with the drifted `(name, argc)` pairs logged — an application that replaced its own function needs to be able to see that a view built on the old one stopped being served. Consequences are the ordinary stale ones: the [read-side rewrite](materialized-views.md#aggregate-rollup-indexed-view-matching) declines and queries recompute from the base tables, source writes stop propagating, and `refresh materialized view` re-derives every row under the new meaning.
+
+Marking stale rather than rebuilding on the spot is deliberate: a rebuild inside `registerMaterializedView` would put a full recompute — and therefore a query — inside a DDL path that today only compiles, making a rename unexpectedly expensive. Staleness is already the engine's way of saying "the stored rows are behind their definition", and `REFRESH` is already the way to clear it.
+
+**Registration paths that re-derive the rows first** pass `backingRecomputed` and skip the check: `REFRESH`'s rebuild/reshape recomputed every row from the body against the live registry, so the differing capture there is the resolution, not the hazard. A caller that clears `derivation.stale` after registering must honour the boolean `registerMaterializedView` returns — drift outranks a restore that speaks only to whether a *rename* affected the view.
+
+**Within a session only.** Object identity cannot cross a process boundary, so a reopen attaches a fresh derivation record with no prior capture and reports no drift — the same limit the read-side gate carries. An application that replaces one of its functions before the catalog import registers its views gets no warning; the honest statement is that this detection is a within-session guarantee. A persisted, weaker witness (for example "this body function was the built-in") would be a separate design.
+
+Coverage: `mv-function-drift.spec.ts`.
+
 ## Rename propagation ("MV ≡ faster view")
 
 > **Invariant:** [MV-023](invariants.md#mv-023--a-rename-rewrites-the-stored-body-rather-than-stranding-it)
