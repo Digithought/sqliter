@@ -82,7 +82,7 @@ A table is a stored relation; a *derivation* is an optional maintenance contract
 - **`bodyHash`** — `computeBodyHash` over the canonical definition (explicit column list + body, the body string already carrying any `with defaults (...)` clause, rendered by `viewDefinitionToCanonicalString`), used by the declarative-schema differ to detect "definition changed → rebuild" — so a defaults-only edit drifts the hash without a separately-itemized field.
 - **`logicalKey`** — the body's logical key (the table's own `primaryKeyDefinition` stays the physical, order-by-seeded key); **`ordering`** — the captured body ordering; **`coarsenedKey`** — the collation-coarsened lineage key, when applicable.
 - **`sourceTables`** — qualified names of the tables the body reads.
-- **`stale`** / **`sourceScope`** — runtime maintenance state, never serialized: the staleness flag and the cached source-union change-scope a `select` from the table substitutes for `Database.watch`.
+- **`stale`** / **`sourceScope`** / **`bodyFunctions`** — runtime maintenance state, never serialized: the staleness flag; the cached source-union change-scope a `select` from the table substitutes for `Database.watch`; and the registered function schemas the body's calls resolved to when the maintenance plan was built, which the read-side rewrite compares against the live registry by object identity before trusting a stored value (object identity cannot cross a process boundary, hence never serialized — see [Materialized Views § Aggregate rollup](materialized-views.md#aggregate-rollup-indexed-view-matching)).
 - **`covers`** — the covering-structure reverse link (below).
 
 Full design: [Materialized Views](materialized-views.md).

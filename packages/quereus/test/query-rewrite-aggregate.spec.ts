@@ -653,6 +653,46 @@ describe('aggregate-rollup matcher — function identity', () => {
 		}
 	});
 
+	it('function-rebound: an avg rollup declines when a stored PARTIAL was re-registered', async () => {
+		// avg never appears in the body — it recombines the stored sum/count partials. The
+		// gate therefore has to fire on a partial, not on the composed aggregate: the
+		// `resolveMergeablePartial` arm, distinct from the direct-merge arm above.
+		const db = await freshDb(SALES);
+		try {
+			expect(matchAgg(db, 'select d, avg(amt) from sales group by d', 'byregion').match,
+				'composed from stored sum + count before the shadow').to.not.be.undefined;
+
+			registerRowCounter(db, 'sum'); // declares merge/decode, so it clears the decomposability check
+
+			const res = matchAgg(db, 'select d, avg(amt) from sales group by d', 'byregion');
+			expect(res.match).to.be.undefined;
+			expect(reason(res)).to.equal('function-rebound');
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a shadow declines only the views that store the shadowed name', async () => {
+		const db = await freshDb([
+			...IDENTITY_DDL,
+			'create materialized view mvc as select k, count(*) as c from ti group by k',
+		]);
+		try {
+			registerRowCounter(db, 'sum');
+
+			const shadowed = matchAgg(db, 'select k, sum(x) from ti group by k', 'mvi');
+			expect(shadowed.match).to.be.undefined;
+			expect(reason(shadowed)).to.equal('function-rebound');
+
+			// `mvc` stores count(*), which nothing re-registered — its rewrite is untouched.
+			const untouched = matchAgg(db, 'select k, count(*) from ti group by k', 'mvc');
+			expect(untouched.match, `matched (${reason(untouched)})`).to.not.be.undefined;
+			expect(untouched.match!.rollup!.exact).to.equal(true);
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('end-to-end: after a shadow the covered and uncovered spellings agree, and the rewrite stands down', async () => {
 		const db = await freshDb(IDENTITY_DDL);
 		try {
