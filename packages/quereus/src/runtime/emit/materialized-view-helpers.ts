@@ -1603,6 +1603,43 @@ export function detachMaintainedDerivation(db: Database, mv: MaintainedTableSche
 }
 
 /**
+ * Reject a declared mutation-context variable on a maintained table. A maintained
+ * table's rows are derived by the engine — nobody ever writes to it directly — so no
+ * statement can ever carry a `with context` clause for one, and a declared variable
+ * could never receive a value. Left unrejected, the combination fails later and
+ * confusingly: the derived-row validator that compiles the table's declared CHECK /
+ * child-side-FK constraints registers no context symbols, so a bare-name read of the
+ * variable falls through to ordinary column resolution and raises "Column not found"
+ * from {@link ../../planner/resolve.ts}.
+ *
+ * Rejects **any** declaration, not only one some constraint reads — the "declared but
+ * unread" case is harmless today, but that distinction is invisible to the author and
+ * would silently drift the moment a constraint is added; one rule is simpler to state
+ * and to document. Called from both authoring routes: {@link createMaintainedTable}
+ * (declared schema, before the table registers) and `runSetMaintained` in
+ * `alter-table.ts` (the live table, before {@link attachMaintainedDerivation}).
+ */
+export function assertNoMutationContextOnMaintainedTable(
+	table: TableSchema,
+	verb: 'create' | 'alter',
+	loc?: { line: number; column: number },
+): void {
+	const declared = table.mutationContext;
+	if (!declared || declared.length === 0) return;
+
+	const label = `${table.schemaName}.${table.name}`;
+	const names = declared.map(v => v.name).join(', ');
+	const message = verb === 'create'
+		? `cannot create maintained table '${label}': a maintained table's rows are derived `
+			+ `by the engine, so no statement can supply its mutation context variables (${names}); `
+			+ `remove the 'with context' clause`
+		: `cannot make table '${label}' maintained: it declares mutation context variables `
+			+ `(${names}) that no statement can supply, because a maintained table's rows are `
+			+ `derived by the engine`;
+	throw new QuereusError(message, StatusCode.ERROR, undefined, loc?.line, loc?.column);
+}
+
+/**
  * `create table … maintained as <body>` — the declared-shape authoring form,
  * executed all-or-nothing:
  *
@@ -1662,6 +1699,7 @@ export async function createMaintainedTable(db: Database, stmt: AST.CreateTableS
 			stmt.table.loc?.start.column,
 		);
 	}
+	assertNoMutationContextOnMaintainedTable(declared, 'create', stmt.table.loc?.start);
 
 	// `preferBacking = true`: route the create through the module's durable backing
 	// seam (`createBacking?() ?? create()`) so a durable-backing module (lamina)

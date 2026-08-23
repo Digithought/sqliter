@@ -389,3 +389,52 @@ select count(*) as n from tmt;
 insert into tsrc values (4, 7);
 select count(*) as n from tmt;
 → [{"n":2}]
+
+-- ===================================
+-- 14. mutation-context variables on a maintained table are rejected at
+-- declaration time: nobody ever writes to a maintained table directly (its
+-- rows arrive from the derivation, not a user statement), so no statement
+-- could ever supply a `with context` value for a declared variable. Left
+-- unrejected this used to fail confusingly at DDL time with "Column not
+-- found" once a CHECK tried to read the variable.
+-- ===================================
+
+create table ctxsrc (id integer primary key, v integer) using memory;
+
+-- CREATE arm: declared together with a CHECK that reads the variable
+create table ctxmt (
+	id integer primary key,
+	v integer,
+	constraint gate check (v <= cap)
+) using memory
+maintained as select id, v from ctxsrc
+with context (cap integer);
+-- error: cannot create maintained table 'main.ctxmt'
+
+-- the failed create left the name free
+create table ctxmt (id integer primary key);
+drop table ctxmt;
+
+-- CREATE arm, declared-but-never-read: no constraint reads the variable, but
+-- the declaration alone is rejected — the "unread" case gets no exemption
+create table ctxmt2 (id integer primary key, v integer) using memory
+maintained as select id, v from ctxsrc
+with context (cap integer);
+-- error: cannot create maintained table 'main.ctxmt2'
+
+-- ALTER arm: a plain context-declaring table is accepted on its own...
+create table ctxamt (id integer primary key, v integer check (v <= cap))
+	using memory with context (cap integer);
+insert into ctxamt values (1, 5) with context cap = 10;
+select * from ctxamt order by id;
+→ [{"id":1,"v":5}]
+
+-- ...but making it maintained is rejected
+alter table ctxamt set maintained as select id, v from ctxsrc;
+-- error: cannot make table 'main.ctxamt' maintained
+
+-- the failed alter left the table plain and still writable with a
+-- `with context` value
+insert into ctxamt values (2, 20) with context cap = 30;
+select * from ctxamt order by id;
+→ [{"id":1,"v":5},{"id":2,"v":20}]

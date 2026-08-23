@@ -35,6 +35,7 @@ import {
 	restoreUnaffectedMaterializedViews,
 	attachMaintainedDerivation,
 	detachMaintainedDerivation,
+	assertNoMutationContextOnMaintainedTable,
 } from './materialized-view-helpers.js';
 import {
 	propagateTableRenameToAssertions,
@@ -2107,6 +2108,7 @@ async function runSetMaintained(
 	if (!live) {
 		throw new RelationNotFoundError(`no such table: ${tableSchema.name}`);
 	}
+	assertNoMutationContextOnMaintainedTable(live, 'alter');
 	const explicit = columns !== undefined && columns.length > 0;
 	// Any omitted-insert defaults ride inside `select` (→ derivation.selectAst).
 	await attachMaintainedDerivation(

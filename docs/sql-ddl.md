@@ -513,6 +513,7 @@ The rule is per variable, and it is enforced where the variable is *read*:
 - Names are matched **case-insensitively**, like every other identifier: `with context ownerkey = …` supplies a variable declared `OwnerKey`.
 - Supplying the same name **twice** is rejected (`mutation context variable '<name>' supplied more than once`), matching the duplicate rules on an INSERT column list and an UPDATE `set` list.
 - A context value expression is evaluated to *build* the context row, so it cannot read a context variable — `with context cap = base` reports `base` as an unresolved column even when `base` is itself declared.
+- A **maintained table** may not declare mutation context variables at all — `create table … maintained as … with context (…)` and `alter table … set maintained as …` over a table that already declares one both raise a sited error naming the table and the declared variable(s). A maintained table's rows are derived by the engine, never written by a user statement, so no statement could ever supply a value; the declaration is unsatisfiable regardless of whether any DEFAULT or CHECK reads it.
 
 Because context variables shadow same-named columns, a table that declares a variable named like one of its columns resolves a *bare* reference in a DEFAULT or CHECK to the variable — including when the statement supplies no envelope, in which case an omitted NULL-marked variable reads NULL. The `new.<column>` / `old.<column>` forms always reach the column.
 
