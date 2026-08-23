@@ -6,6 +6,37 @@ import { PlanNodeCharacteristics } from '../../planner/framework/characteristics
 import { type SqlValue, type Row, MaybePromise } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 
+/** The row window this node applies, after evaluating its LIMIT / OFFSET expressions. */
+interface RowWindow {
+	limit: number;
+	offset: number;
+}
+
+/**
+ * Evaluate the LIMIT / OFFSET expressions and clamp them to a usable window.
+ *
+ * A missing LIMIT, a negative one, and a non-finite one (`null`, `NaN`) all clamp to zero
+ * rows, which is what `test/logic/94.1-limit-offset-edge-cases.sqllogic` and
+ * `104-emit-mutation-kills.sqllogic` pin today. Whether `limit null` should instead mean
+ * "no limit" is open — `backlog/bug-null-limit-returns-no-rows`.
+ */
+async function resolveWindow(
+	ctx: RuntimeContext,
+	limitFn: ((ctx: RuntimeContext) => MaybePromise<SqlValue>) | undefined,
+	offsetFn: ((ctx: RuntimeContext) => MaybePromise<SqlValue>) | undefined,
+): Promise<RowWindow> {
+	const limitValue = limitFn ? await limitFn(ctx) : null;
+	const offsetValue = offsetFn ? await offsetFn(ctx) : null;
+
+	const limit = limitValue !== null ? Number(limitValue) : Infinity;
+	const offset = offsetValue !== null ? Number(offsetValue) : 0;
+
+	return {
+		limit: limit < 0 || !Number.isFinite(limit) ? 0 : limit,
+		offset: offset < 0 || !Number.isFinite(offset) ? 0 : offset,
+	};
+}
+
 export function emitLimitOffset(plan: LimitOffsetNode, ctx: EmissionContext): Instruction {
 	// A LIMIT never truncates a writing source: a DML subtree under this node runs to
 	// completion even once the limit is reached, matching the full-drain rule the scalar
@@ -19,36 +50,18 @@ export function emitLimitOffset(plan: LimitOffsetNode, ctx: EmissionContext): In
 		sourceRows: AsyncIterable<Row>,
 		...args: Array<(ctx: RuntimeContext) => MaybePromise<SqlValue>>
 	): AsyncIterable<Row> {
-		// Determine which args we have
-		let limitFn: ((ctx: RuntimeContext) => MaybePromise<SqlValue>) | undefined;
-		let offsetFn: ((ctx: RuntimeContext) => MaybePromise<SqlValue>) | undefined;
-
+		// Args arrive in declaration order, and either may be absent.
 		let argIndex = 0;
-		if (plan.limit) {
-			limitFn = args[argIndex++];
-		}
-		if (plan.offset) {
-			offsetFn = args[argIndex++];
-		}
+		const limitFn = plan.limit ? args[argIndex++] : undefined;
+		const offsetFn = plan.offset ? args[argIndex++] : undefined;
 
-		// Evaluate limit and offset
-		const limitValue = limitFn ? await limitFn(ctx) : null;
-		const offsetValue = offsetFn ? await offsetFn(ctx) : null;
+		const { limit, offset } = await resolveWindow(ctx, limitFn, offsetFn);
 
-		// Convert to numbers, with defaults
-		let limit = limitValue !== null ? Number(limitValue) : Infinity;
-		let offset = offsetValue !== null ? Number(offsetValue) : 0;
-
-		// Validate values
-		if (limit < 0 || !Number.isFinite(limit)) {
-			limit = 0; // No rows if limit is negative or invalid
-		}
-		if (offset < 0 || !Number.isFinite(offset)) {
-			offset = 0; // No offset if negative or invalid
-		}
-
-		// A zero (or clamped-to-zero) limit over a pure source must not touch the source
-		// at all — entering the loop would pull a row the query can never emit.
+		// A zero (or clamped-to-zero) limit over a pure source must not touch the source at
+		// all, and this return is the ONLY thing that stops it: the loop below breaks only
+		// after a yield, so a zero limit that entered it would fall through to the drain
+		// branch and read the whole source. Pinned by the `LIMIT 0` case in
+		// `test/runtime/early-stop-consumption.spec.ts`.
 		if (limit <= 0 && !drainAfterLimit) {
 			return;
 		}

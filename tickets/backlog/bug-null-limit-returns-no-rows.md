@@ -82,3 +82,26 @@ larger compatibility break.
 
 Found while fixing `bug-limit-reads-one-row-too-many`, which touches the same emitter but
 deliberately leaves these cases alone.
+
+## Arm added by the review of `bug-limit-reads-one-row-too-many`
+
+That ticket landed a second rule in the same emitter: a `LIMIT` whose source subtree
+performs a write keeps consuming the source after the limit is reached, so the write runs
+to completion instead of being truncated. It interacts with this one.
+
+Measured after that change, on a table `d` fed from a 4-row source:
+
+```sql
+select k from (insert into d select k from src returning k) limit -1;
+-- returns []   and writes all 4 rows
+```
+
+Before it, the same statement wrote exactly one row. Neither answer is pinned by a test.
+So whichever semantics this ticket picks for a null / negative row count has to say what
+that statement does: under "no upper bound" it returns 4 rows and writes 4; under
+"clamp to zero" it returns nothing and writes 4 (today's answer); under "raise an error"
+it writes nothing. Decide it here rather than leaving it to fall out of the clamp.
+
+Also note the code moved: the `Infinity`-destroying guard quoted above now lives in a
+`resolveWindow` helper at the top of `runtime/emit/limit-offset.ts`, not inline in the
+generator. The bug is unchanged — only its address is.

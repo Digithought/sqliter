@@ -89,6 +89,14 @@ export function emitOrdinalSlice(plan: OrdinalSliceNode, ctx: EmissionContext): 
 			// Streaming guard: enforce the row cap above the leaf so modules that
 			// ignore the FilterInfo offset/limit directive remain correct. When
 			// the leaf does honor them, this short-circuit costs nothing extra.
+			//
+			// NOTE: unlike `limit-offset.ts`, this break carries no side-effect drain
+			// gate, because the rule that substitutes this operator peels down to a
+			// physical access leaf advertising ordinal seek — a mutation node is never
+			// one, so a write can never sit under this loop. If that ever stops holding,
+			// this needs the same `subtreeHasSideEffects` drain, and the early-stop spec
+			// (`test/runtime/early-stop-consumption.spec.ts`, which cannot reach this
+			// operator today) needs a case driving it.
 			let emitted = 0;
 			for await (const row of sourceRows) {
 				yield row;

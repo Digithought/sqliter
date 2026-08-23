@@ -59,11 +59,22 @@ the DML runs to completion — including under `LIMIT 0`, which returns nothing
 and still performs every write. This matches what a data-modifying CTE already
 does (`test/logic/13.6-cte-dml-runs-once.sqllogic`) and what PostgreSQL does for
 data-modifying CTEs. Pinned end-to-end in
-`test/logic/13.13-limit-over-dml-subquery.sqllogic`.
+`test/logic/01.9.1-limit-over-dml-subquery.sqllogic`. The gate asks whether the
+whole source *subtree* writes, not whether its immediate child does, so an outer
+`LIMIT` over an inner `LIMIT` over a DML drains through both.
 
 A `LIMIT` over a **pure** source keeps its early stop, and stops precisely: it
 pulls exactly `offset + limit` rows and never asks the source for the row past
 the last one it emits (`test/runtime/early-stop-consumption.spec.ts`).
+
+*Scope.* "Runs to completion" means *when the statement is run to completion* —
+`exec()`, or an iteration that reaches the end of the result. Abandoning the
+iteration early stops the writes with it, because the engine is lazy end to end:
+a caller that reads one row of `select … from (insert … returning …) limit 5`
+and breaks has performed one insert. That is not specific to `LIMIT` — the same
+caller breaking out of the same statement *without* a `LIMIT` gets the same one
+insert. `LIMIT 0` is the exception in the other direction: it drains on the first
+`next()`, so every write happens before the caller can abandon anything.
 
 All of these contracts are gated by `physical.readonly === false` on the inner
 subtree, so pure inners are unaffected. See `docs/runtime.md` for the

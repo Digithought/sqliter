@@ -1224,6 +1224,15 @@ an impure-path implementation that applies two contracts:
   its instruction tree across executions still resets the memo between runs,
   re-driving the inner DML once per run.
 
+`emitLimitOffset` applies the full-drain half of this rule (never the run-once
+half — a `LIMIT` is not re-evaluated per outer row) with the same
+`subtreeHasSideEffects` gate, on `plan.source`. Reaching the limit stops it
+*yielding* but not *consuming*, so a DML FROM-subquery under a `LIMIT` writes
+every row. Over a pure source it instead stops precisely, testing the limit
+after the `yield` so the source is never asked for the row past the last one
+emitted — a zero limit returns before touching the source at all, which is what
+keeps it from falling through into the drain branch.
+
 Both contracts are gated by `physical.readonly === false` on the inner — pure
 subqueries take a non-impure path. `IN` splits again: an uncorrelated +
 functional source is materialized once per execution into a probed lookup set

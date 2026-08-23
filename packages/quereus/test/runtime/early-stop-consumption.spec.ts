@@ -110,7 +110,7 @@ describe('early-stop consumption', () => {
 		// LIMIT runs to completion — same full-drain rule the scalar / IN / EXISTS paths
 		// apply to a writing inner. Pinned here next to the early-stop cases so the two
 		// rules are read together; the end-to-end row counts live in
-		// `test/logic/13.13-limit-over-dml-subquery.sqllogic`.
+		// `test/logic/01.9.1-limit-over-dml-subquery.sqllogic`.
 		await db.exec('create table dst (k integer primary key)');
 		const returned = await rows('select * from (insert into dst select k from counting returning k) limit 1');
 		expect(returned, 'the LIMIT still caps what the query returns').to.have.lengthOf(1);
