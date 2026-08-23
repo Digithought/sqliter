@@ -196,6 +196,10 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	/** Lazily-bound {@link getKeyNormalizerResolver} closure — same identity/liveness
 	 *  contract as {@link collationResolver}. */
 	private keyNormalizerResolver?: KeyNormalizerResolver;
+	/** Identities of the schemas registered by {@link registerBuiltinFunctions}, so a
+	 *  caller can ask whether a resolved schema IS the built-in rather than merely
+	 *  sharing its name. See {@link _isBuiltinFunction}. */
+	private readonly builtinFunctionSchemas = new Set<FunctionSchema>();
 	/**
 	 * Per-database latch registry — serializes commit / collapse / consolidate /
 	 * destroy / schema-change work by string key *within this database*. Scoped to
@@ -538,7 +542,9 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		// COPY so the shared exported BUILTIN_FUNCTIONS constants are never mutated.
 		BUILTIN_FUNCTIONS.forEach(funcDef => {
 			try {
-				mainSchema.addFunction({ ...funcDef, replicable: true });
+				const registered = { ...funcDef, replicable: true };
+				mainSchema.addFunction(registered);
+				this.builtinFunctionSchemas.add(registered);
 			} catch (e) {
 				errorLog(`Failed to register built-in function ${funcDef.name}/${funcDef.numArgs}: %O`, e);
 			}
@@ -2349,6 +2355,22 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	/** @internal */
 	_findFunction(funcName: string, nArg: number): FunctionSchema | undefined {
 		return this.schemaManager.findFunction(funcName, nArg);
+	}
+
+	/**
+	 * @internal True when `schema` is one of the schemas this database registered from
+	 * {@link BUILTIN_FUNCTIONS} — i.e. the real built-in, not a same-named user function.
+	 *
+	 * Name resolution cannot answer this: `addFunction` overwrites by `name/numArgs`, so
+	 * after `db.createAggregateFunction('min', …)` both the planner's resolution and
+	 * {@link _findFunction} return the SHADOW, and comparing the two only ever proves
+	 * they agree with each other. Any rule whose rewrite is sound only for the built-in's
+	 * semantics (e.g. `minmax-index-boundary` truncating a source to one ordered row)
+	 * must gate on identity here instead. Identity-based, so a user schema cannot
+	 * declare its way in.
+	 */
+	_isBuiltinFunction(schema: FunctionSchema | undefined): boolean {
+		return schema !== undefined && this.builtinFunctionSchemas.has(schema);
 	}
 
 	/**

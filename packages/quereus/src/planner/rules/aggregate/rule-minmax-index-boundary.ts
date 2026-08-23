@@ -77,6 +77,16 @@ export function ruleMinMaxIndexBoundary(node: PlanNode, context: OptContext): Pl
 	if (!sourceAcceptsTruncation(node)) return null;
 
 	const scope = node.scope;
+	// NOTE: two different sources of truth decide "can a NULL reach this column" — this
+	// line reads the column reference's own type, while `nullSafeOrderingPrefixLength`
+	// (vtab/best-access-plan.ts) reads `tableSchema.columns[i].notNull`. They agree today
+	// because a bare table column's `columnType` is built from that same schema column,
+	// and the DESC direction fails safe either way (a missing filter makes the ordering
+	// claim be refused, so the rule declines). The ASC direction does NOT fail safe: an
+	// ordering claim over a nullable ASC column is granted unconditionally, so a type that
+	// under-reports nullability would skip this filter and `min(c)` would return NULL.
+	// Revisit if a rewrite ever narrows a ColumnReferenceNode's nullability, or if a
+	// non-table relation becomes reachable through the absorb probe's chain walk.
 	const inner = colRef.getType().nullable
 		? new FilterNode(scope, node.source, buildIsNotNull(scope, colRef))
 		: node.source;
@@ -131,21 +141,25 @@ function soleUngroupedAggregateCall(node: AggregateNode): AggregateFunctionCallN
 }
 
 /**
- * Identify the call as the builtin `min`/`max` over one argument.
+ * Identify the call as the BUILTIN `min`/`max` over one argument.
  *
- * Identity-compares the resolved `functionSchema` against the registry rather than
- * matching on name, so a user-registered `min` shadowing the builtin declines — the
- * safe direction, since this rewrite is only sound for the builtin's ordering
- * semantics. `FILTER (where …)` and an aggregate-level `ORDER BY` both decline;
- * `DISTINCT` is accepted in either state because `min(distinct c) = min(c)`.
+ * The gate is `Database._isBuiltinFunction` — schema identity against the built-in
+ * registration — not a name match and not a comparison against what the name resolves
+ * to now. `addFunction` overwrites by `name/numArgs`, so after
+ * `db.createAggregateFunction('min', …)` the call and `_findFunction('min', 1)` return
+ * the SAME shadow and comparing them proves nothing; the rewrite would then truncate a
+ * user aggregate's source to one row and change its answer. `FILTER (where …)` and an
+ * aggregate-level `ORDER BY` both decline; `DISTINCT` is accepted in either state
+ * because `min(distinct c) = min(c)`.
  */
 function classifyExtremum(call: AggregateFunctionCallNode, context: OptContext): Extremum | null {
 	if (call.args.length !== 1) return null;
 	if (call.filter) return null;
 	if (call.orderBy && call.orderBy.length > 0) return null;
+	if (!context.db._isBuiltinFunction(call.functionSchema)) return null;
 
 	for (const candidate of [{ name: 'min', direction: 'asc' }, { name: 'max', direction: 'desc' }] as const) {
-		if (call.functionSchema === context.db._findFunction(candidate.name, 1)) {
+		if (call.functionSchema.name === candidate.name) {
 			return { name: candidate.name, direction: candidate.direction };
 		}
 	}

@@ -192,4 +192,13 @@ select max(c + 1) as v from mm_d;
 select max(c) as v from (select c from mm_d) x;
 → [{"v":70}]
 
+-- A primary-key range the module may prefer over the `c` ordering. Whether the
+-- boundary read or a full scan wins is a module cost decision (and differs by
+-- backend); the answer must not be.
+select max(c) as v from mm_d where k > 1;
+→ [{"v":70}]
+
+select min(c) as v from mm_d where k > 1;
+→ [{"v":20}]
+
 drop table mm_d;

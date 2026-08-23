@@ -68,7 +68,8 @@ describe('minmax-index-boundary', () => {
 	 * pulls one row past the last it emits. That is pre-existing behaviour shared with
 	 * the hand-written `select c from t order by c limit 1`, so the assertions below
 	 * pin `BOUNDARY_ROWS` (a constant, independent of table size) against a full scan
-	 * of every row, which is the distinction that matters.
+	 * of every row, which is the distinction that matters. Tracked as
+	 * `backlog/bug-limit-reads-one-row-too-many`; fixing it makes this constant 1.
 	 */
 	async function rowsScanned(sql: string): Promise<number> {
 		const snapshot = await counters(sql);
@@ -301,6 +302,39 @@ describe('minmax-index-boundary', () => {
 			await db.exec('create index t_c_desc on t(c desc)');
 
 			const sql = 'select max(c) from (select c from t) x';
+			expect(await planShape(sql)).to.deep.equal(await withRuleDisabled(() => planShape(sql)));
+			expect(await scalar(sql)).to.equal(120);
+		});
+
+		it('a user-defined aggregate that shadows the builtin min', async () => {
+			// `Schema.addFunction` overwrites by name/numArgs, so after this registration
+			// BOTH the planner's resolution and `db._findFunction('min', 1)` return the
+			// shadow — comparing the two would only prove they agree with each other. The
+			// gate is schema identity against the builtin registration
+			// (`db._isBuiltinFunction`) for exactly this reason: truncating the source to
+			// one row would change this aggregate's answer from 12 to 1.
+			await createTable();
+			await db.exec('create index t_c on t(c)');
+			db.createAggregateFunction('min', { numArgs: 1, initialState: 0 },
+				(acc: unknown) => (acc as number) + 1,
+				(acc: unknown) => acc as number);
+
+			const sql = 'select min(c) from t';
+			expect(await planOps(db, sql), 'a shadowed min must not be rewritten')
+				.to.not.include('LIMITOFFSET');
+			expect(await scalar(sql), 'the user aggregate must still see every row')
+				.to.equal(ROW_COUNT);
+		});
+
+		it('a range seek the module prefers over the boundary ordering', async () => {
+			// `where k > 1` is a primary-key range the module costs below the `c desc`
+			// walk, so the probe's access plan does not provide the requested ordering
+			// and the rule declines. The answer is correct either way — this pins that
+			// the failed probe leaves no Sort/Filter/Limit behind.
+			await createTable();
+			await db.exec('create index t_c_desc on t(c desc)');
+
+			const sql = 'select max(c) from t where k > 1';
 			expect(await planShape(sql)).to.deep.equal(await withRuleDisabled(() => planShape(sql)));
 			expect(await scalar(sql)).to.equal(120);
 		});

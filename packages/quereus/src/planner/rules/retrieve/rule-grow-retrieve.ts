@@ -426,11 +426,19 @@ function fallbackIndexSupports(
 					// NOTE: a bare `LIMIT n` lands HERE, not in the branch above — the
 					// builder materializes an absent OFFSET as `Literal(null)`, so every
 					// LIMIT without an explicit numeric OFFSET is refused and no module
-					// sees `request.limit` by this route. Inert today: this arm is
-					// unreached anyway (no shape puts a LimitOffset directly above a
-					// Retrieve, and the benefit gate below requires a requested ordering).
-					// If it becomes reachable, read a null/absent OFFSET as 0 rather than
-					// refusing.
+					// sees `request.limit` by this route.
+					//
+					// This arm IS reached: `rule-minmax-index-boundary` puts a
+					// `LimitOffset(1, Literal(null))` directly above an ordering-equipped
+					// Retrieve, and this refusal is what keeps it there. Reading a
+					// null/absent OFFSET as 0 would let the grow SWALLOW that node into
+					// `Retrieve.source`, which the index-style branch of
+					// `ruleSelectAccessPath` never executes — the boundary read's early
+					// stop would silently vanish and the scan would drain the table
+					// (answers unchanged, cost restored to a full scan). Widen this only
+					// alongside a guard for that rewrite; the "LIMITOFFSET survives
+					// directly above the access leaf" case in
+					// test/optimizer/minmax-index-boundary.spec.ts is what catches it.
 					limitVal = undefined;
 				}
 			} else {
