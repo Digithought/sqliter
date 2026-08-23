@@ -44,6 +44,7 @@ import { createLogger } from '../common/logger.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode, type SqlValue, type Row } from '../common/types.js';
 import { buildSourceUnionScope } from '../planner/analysis/change-scope.js';
+import { captureBodyFunctions } from '../planner/analysis/mv-body-functions.js';
 import { isBodyIrrelevantTableChange, tryRecompileMaterializedViewLive } from '../runtime/emit/materialized-view-helpers.js';
 import { buildDerivedRowValidator, makePoisonedDerivedRowValidator } from './derived-row-validator.js';
 import type { BackingRowChange } from '../vtab/backing-host.js';
@@ -314,6 +315,19 @@ export class MaterializedViewManager {
 		// — {@link recordMaintenanceChanges} records each realized maintenance delta —
 		// so this projection is granularity-widening, not what makes a watch fire.)
 		mv.derivation.sourceScope = buildSourceUnionScope(mv.derivation.sourceTables);
+		// Witness WHICH registered functions the body's calls resolve to right now — the
+		// functions the maintenance plan built below will use to produce every backing
+		// row. Registration overwrites by (name, arg count), so a later
+		// `db.createAggregateFunction('sum', …)` silently re-points the name; the read-side
+		// rewrite compares the live resolution against this capture by object identity and
+		// declines rather than serving the old function's stored values. Unconditional, so a
+		// re-registration refreshes it (and so a future maintenance-side drift check can
+		// compare the prior map against the freshly resolved one).
+		mv.derivation.bodyFunctions = captureBodyFunctions(
+			mv.derivation.selectAst,
+			(name, argc) => this.ctx.schemaManager.findFunction(name, argc)
+				?? this.ctx.schemaManager.findFunction(name, -1),
+		);
 		this.releaseRowTime(key);
 		const plan = buildMaintenancePlan(this.ctx, mv); // throws on ineligible shape
 		// Compile the declared-CHECK/FK derived-row validator (undefined when the

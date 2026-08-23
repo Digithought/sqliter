@@ -142,14 +142,16 @@ export function flattenDisjunction(expr: AST.Expression): AST.Expression[] {
 }
 
 /**
- * Depth-first iteration over every AST node in `expr`'s subtree. Children are
+ * Depth-first iteration over every AST node in `root`'s subtree. Children are
  * discovered reflectively (any object/array property carrying a `type` field)
  * rather than via a typed visitor table, so soundness-sensitive walkers (the
- * collation gate, the non-determinism screen) cannot silently miss node kinds
- * a visitor enumeration forgot.
+ * collation gate, the non-determinism screen, the MV body-function capture)
+ * cannot silently miss node kinds a visitor enumeration forgot. Accepts any
+ * `AstNode`, so a whole statement (e.g. a materialized view's body `QueryExpr`)
+ * walks the same way a bare expression does.
  */
-export function* walkAstNodes(expr: AST.Expression): IterableIterator<AST.AstNode> {
-	const stack: AST.AstNode[] = [expr as AST.AstNode];
+export function* walkAstNodes(root: AST.AstNode): IterableIterator<AST.AstNode> {
+	const stack: AST.AstNode[] = [root];
 	while (stack.length > 0) {
 		const node = stack.pop()!;
 		yield node;

@@ -509,3 +509,170 @@ describe('aggregate-rollup matcher — user-defined aggregate algebra', () => {
 		}
 	});
 });
+
+/* ── Function identity (`function-rebound`) ─────────────────────────────────────
+ * Function registration overwrites by (name, argument count), so an application
+ * registering its own `sum/1` re-points the name for every later query on that
+ * connection — while the MV's backing still holds the numbers the PREVIOUS
+ * registration produced. Matching on the name alone would serve those stale numbers.
+ * The matcher therefore compares the live resolution against
+ * `derivation.bodyFunctions` (captured at registration) by object identity. */
+
+/**
+ * Register a deterministic aggregate `name/numArgs` that COUNTS rows — deliberately not
+ * a sum, so serving a stored `sum(x)` in its place is visibly wrong. It declares a full
+ * merge/decode algebra (adding counts is a commutative monoid, and the stored count IS
+ * the accumulator), so it reaches the identity gate on the rollup path too instead of
+ * declining earlier as `aggregate-not-decomposable`.
+ */
+function registerRowCounter(db: Database, name: string, numArgs = 1): void {
+	db.registerFunction(createAggregateFunction(
+		{
+			name, numArgs, initialValue: 0, deterministic: true,
+			returnType: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true },
+			algebra: {
+				merge: (a: number, b: number): number => a + b,
+				decode: (stored: SqlValue): number => Number(stored ?? 0),
+				decodeExact: true,
+			},
+		},
+		(acc: number, _v: SqlValue): number => acc + 1,
+		(acc: number): number => acc,
+	));
+}
+
+/** Register a deterministic aggregate `name/1` that SUMS, carrying sum's algebra — the
+ *  "original" implementation arm B swaps out from under an already-built MV. */
+function registerUserSum(db: Database, name: string): void {
+	db.registerFunction(createAggregateFunction(
+		{
+			name, numArgs: 1, initialValue: 0, deterministic: true,
+			returnType: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true },
+			algebra: {
+				merge: (a: number, b: number): number => a + b,
+				decode: (stored: SqlValue): number => Number(stored ?? 0),
+			},
+		},
+		(acc: number, v: SqlValue): number => (v === null ? acc : acc + Number(v)),
+		(acc: number): number => acc,
+	));
+}
+
+const IDENTITY_DDL = [
+	'create table ti (id integer primary key, k integer not null, x integer not null)',
+	'create materialized view mvi as select k, sum(x) as s from ti group by k',
+];
+
+/** Rows whose per-group SUM (30 / 30) differs from their per-group ROW COUNT (2 / 1), so
+ *  a stale passthrough is distinguishable from the shadow's real answer. */
+const IDENTITY_ROWS = 'insert into ti (id, k, x) values (1, 1, 10), (2, 1, 20), (3, 2, 30)';
+
+describe('aggregate-rollup matcher — function identity', () => {
+	it('function-rebound: a shadowed built-in sum declines the exact-key passthrough', async () => {
+		const db = await freshDb(IDENTITY_DDL);
+		try {
+			// Matches before the shadow — the capture and the live registry agree.
+			expect(matchAgg(db, 'select k, sum(x) from ti group by k', 'mvi').match,
+				'matched before the shadow').to.not.be.undefined;
+
+			registerRowCounter(db, 'sum');
+
+			const res = matchAgg(db, 'select k, sum(x) from ti group by k', 'mvi');
+			expect(res.match).to.be.undefined;
+			expect(reason(res)).to.equal('function-rebound');
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('function-rebound: a shadowed built-in sum declines the rollup re-aggregation too', async () => {
+		const db = await freshDb(IDENTITY_DDL);
+		try {
+			// The global-scalar rollup (the empty query key is a strict subset of the MV's
+			// {k}) folds the stored partials back together.
+			expect(matchAgg(db, 'select sum(x) from ti', 'mvi').match,
+				'rolled up before the shadow').to.not.be.undefined;
+
+			registerRowCounter(db, 'sum');
+
+			const res = matchAgg(db, 'select sum(x) from ti', 'mvi');
+			expect(res.match).to.be.undefined;
+			// Not `aggregate-not-decomposable`: the shadow DOES declare merge/decode, so the
+			// rollup is expressible — it is the identity mismatch that declines it.
+			expect(reason(res)).to.equal('function-rebound');
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('function-rebound: one user aggregate re-registered as another declines (no built-in involved)', async () => {
+		const db = new Database();
+		registerUserSum(db, 'myagg');
+		await db.exec('create table tb (id integer primary key, k integer not null, x integer not null)');
+		await db.exec('create materialized view mvb as select k, myagg(x) as s from tb group by k');
+		try {
+			expect(matchAgg(db, 'select k, myagg(x) from tb group by k', 'mvb').match,
+				'matched while the original registration was live').to.not.be.undefined;
+
+			registerRowCounter(db, 'myagg'); // same name/arity, different meaning
+
+			const res = matchAgg(db, 'select k, myagg(x) from tb group by k', 'mvb');
+			expect(res.match).to.be.undefined;
+			expect(reason(res)).to.equal('function-rebound');
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a view over a user aggregate that is STILL the live registration keeps matching', async () => {
+		const db = new Database();
+		registerRowCounter(db, 'sum'); // taken over BEFORE the view is built — the view stores ITS output
+		for (const stmt of IDENTITY_DDL) await db.exec(stmt);
+		try {
+			const exact = matchAgg(db, 'select k, sum(x) from ti group by k', 'mvi');
+			expect(exact.match, `exact-key matched (${reason(exact)})`).to.not.be.undefined;
+			expect(exact.match!.rollup!.exact).to.equal(true);
+
+			const rollup = matchAgg(db, 'select sum(x) from ti', 'mvi');
+			expect(rollup.match, `rollup matched (${reason(rollup)})`).to.not.be.undefined;
+			expect(rollup.match!.rollup!.exact).to.equal(false);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a shadow at a different arity (sum/2) leaves sum/1 and its rewrite alone', async () => {
+		const db = await freshDb(SALES);
+		try {
+			registerRowCounter(db, 'sum', 2);
+			const res = matchAgg(db, 'select d, r, sum(amt) from sales group by d, r', 'byregion');
+			expect(res.match, `matched (${reason(res)})`).to.not.be.undefined;
+			expect(res.match!.rollup!.exact).to.equal(true);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('end-to-end: after a shadow the covered and uncovered spellings agree, and the rewrite stands down', async () => {
+		const db = await freshDb(IDENTITY_DDL);
+		try {
+			await db.exec(IDENTITY_ROWS);
+			registerRowCounter(db, 'sum');
+			db.optimizer.updateTuning(DEFAULT_TUNING);
+
+			// `sum(x)` is covered by the MV; `sum(id)` is not (id is neither stored nor the
+			// MV's aggregated column). Under the shadow both must be the per-group row count.
+			const covered = await readPositional(db, 'select k, sum(x) as v from ti group by k');
+			const uncovered = await readPositional(db, 'select k, sum(id) as v from ti group by k');
+			expect([...covered.rows].sort(), 'covered spelling must equal the uncovered one')
+				.to.deep.equal([...uncovered.rows].sort());
+			expect([...covered.rows].sort()).to.deep.equal(['[1,2]', '[2,1]']);
+
+			// And it is the base recompute answering, not the backing.
+			expect(serializePlanTree(db.getPlan('select k, sum(x) as v from ti group by k')),
+				'the rewrite must stand down').to.not.contain('"name": "mvi"');
+		} finally {
+			await db.close();
+		}
+	});
+});

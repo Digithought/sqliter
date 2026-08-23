@@ -1,6 +1,7 @@
 import type * as AST from '../parser/ast.js';
 import type { ChangeScope } from '../planner/analysis/change-scope.js';
 import type { CoarsenedKeyInfo } from './view.js';
+import type { FunctionSchema } from './function.js';
 import type { TableSchema } from './table.js';
 
 /**
@@ -16,7 +17,7 @@ import type { TableSchema } from './table.js';
  * `create materialized view` DDL is rendered on demand from the unified record
  * (`generateMaintainedTableDDL`). The derivation object is shared by reference
  * across catalog swaps of the owning table (tag updates, index appends), so its
- * runtime state (`stale`, `sourceScope`) survives those swaps.
+ * runtime state (`stale`, `sourceScope`, `bodyFunctions`) survives those swaps.
  */
 export interface TableDerivation {
 	/** The parsed body AST — any relation-producing QueryExpr (SELECT / VALUES / compound). */
@@ -65,6 +66,19 @@ export interface TableDerivation {
 	 * never serialized.
 	 */
 	sourceScope?: ChangeScope;
+	/**
+	 * The registered function schemas the body's function calls resolved to when this
+	 * derivation's maintenance plan was built — i.e. the functions that produced (and
+	 * keep producing) the backing's rows. Keyed by `getFunctionKey(name, argc)`.
+	 *
+	 * The read-side rewrite compares the LIVE resolution of a name against the schema
+	 * recorded here by object identity, so a name re-registered to a different function
+	 * declines the rewrite instead of serving the old function's stored values.
+	 *
+	 * Runtime state, never serialized — object identity cannot cross a process boundary.
+	 * Re-captured on every re-registration, exactly like `sourceScope`.
+	 */
+	bodyFunctions?: ReadonlyMap<string, FunctionSchema>;
 	/**
 	 * Back-pointer to the UNIQUE constraint this covering structure realizes,
 	 * recorded eagerly when the coverage prover recognizes coverage. The

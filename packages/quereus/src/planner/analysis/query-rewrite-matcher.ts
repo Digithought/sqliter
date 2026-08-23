@@ -64,7 +64,7 @@ import { JoinNode } from '../nodes/join-node.js';
 import { CapabilityDetectors } from '../framework/characteristics.js';
 import type { MaintainedTableSchema } from '../../schema/derivation.js';
 import type { TableSchema } from '../../schema/table.js';
-import type { AggregateFunctionSchema } from '../../schema/function.js';
+import { getFunctionKey, type AggregateFunctionSchema } from '../../schema/function.js';
 import type { SqlValue } from '../../common/types.js';
 import type * as AST from '../../parser/ast.js';
 import { recognizeConjunctiveClauses, guardClausesEntail } from './partial-unique-extraction.js';
@@ -80,6 +80,7 @@ export type RewriteFailureReason =
 	| 'aggregate-shape'        // fragment isn't a recognizable bare-key aggregate, or MV isn't a grouped MV
 	| 'group-key-mismatch'     // fragment GROUP BY key is not a subset of the MV's group key
 	| 'aggregate-not-decomposable' // a fragment aggregate has no sound recombine recipe from the MV
+	| 'function-rebound'       // a function the MV body used now resolves to a different registration
 	| 'cost-declined';         // matched, but the MV scan is not cheaper (set by the rule, not the matcher)
 
 export interface RewriteMatch {
@@ -175,6 +176,15 @@ export type AggregateRecipe = {
 );
 
 /**
+ * What a recipe builder returns: the recipe, `'rebound'` (a stored value this recipe
+ * would consume was produced by a *different* registration than the one its name
+ * resolves to now — see {@link FunctionIdentityGate}), or `undefined` (no sound recipe
+ * exists at all). The two decline kinds stay distinct so the matcher can name them
+ * apart: `'function-rebound'` vs `'aggregate-not-decomposable'`.
+ */
+type RecipeOrDecline = AggregateRecipe | 'rebound' | undefined;
+
+/**
  * A directly-mergeable re-aggregation of one stored partial column: fold the stored
  * (finalized) partials of the rolled-up subgroups through the aggregate's own
  * `merge ∘ decode`, then `finalize`. Sound for any aggregate that declares both
@@ -231,6 +241,20 @@ export type DeterminismProbe = (fnName: string, argc: number) => boolean;
  * `undefined` when `(name, argc)` names no registered aggregate.
  */
 export type AggregateResolver = (funcName: string, numArgs: number) => AggregateFunctionSchema | undefined;
+
+/**
+ * True iff `name/argc` still resolves to the **exact registration** the MV body's call
+ * resolved to when the backing's rows were computed
+ * ({@link import('../../schema/derivation.js').TableDerivation.bodyFunctions}).
+ *
+ * Function registration overwrites by `(name, argument count)`, so
+ * `db.createAggregateFunction('sum', …)` re-points `sum/1` for every subsequent query
+ * without touching the rows an MV already stores. Matching on the *name* would then hand
+ * back the old function's numbers for a query that asked for the new one. Absent capture,
+ * absent entry, or a different schema object ⇒ false ⇒ the rewrite declines and the query
+ * is computed from the base tables (correct, only slower).
+ */
+type FunctionIdentityGate = (name: string, argc: number) => boolean;
 
 function fail(reason: RewriteFailureReason): RewriteResult {
 	return { match: undefined, reason };
@@ -667,13 +691,23 @@ export function matchAggregateFragmentToMv(
 	// — exactly the columns the MV has already aggregated away.
 	const backingColOfBaseCol = new Map<number, number>(stored.groupBackingOfBaseCol);
 
+	// ---- Function identity: every stored value this match consumes must have been
+	//      produced by the registration its name resolves to NOW. Built once here so the
+	//      recipe helpers take one closure instead of a second registry-shaped parameter. ----
+	const recordedFunctions = mv.derivation.bodyFunctions;
+	const identityOk: FunctionIdentityGate = (name, argc) => {
+		const captured = recordedFunctions?.get(getFunctionKey(name, argc));
+		return captured !== undefined && captured === resolveAggregate(name, argc);
+	};
+
 	// ---- Aggregate decomposition: a recipe per fragment aggregate. ----
 	const recipes: AggregateRecipe[] = [];
 	const outputColumnMap: { attrId: number; backingCol: number }[] = [];
 	for (const qa of shape.aggregates) {
 		const recipe = exact
-			? recipeForExact(qa, stored.storedAggs)
-			: recipeForRollup(qa, stored.storedAggs, baseTable, resolveAggregate);
+			? recipeForExact(qa, stored.storedAggs, identityOk)
+			: recipeForRollup(qa, stored.storedAggs, baseTable, resolveAggregate, identityOk);
+		if (recipe === 'rebound') return fail('function-rebound');
 		if (!recipe) return fail('aggregate-not-decomposable');
 		recipes.push(recipe);
 		// Exact-key answers via `outputColumnMap`; `recipeForExact` only ever returns a
@@ -1206,10 +1240,18 @@ function sameStringSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean 
  * `passthrough` recipe naming the stored column (the rule answers exact-key via
  * `outputColumnMap`).
  */
-function recipeForExact(qa: FragmentAggregate, stored: readonly StoredAggregate[]): AggregateRecipe | undefined {
+function recipeForExact(
+	qa: FragmentAggregate,
+	stored: readonly StoredAggregate[],
+	identityOk: FunctionIdentityGate,
+): RecipeOrDecline {
 	const match = stored.find(sa =>
 		sa.funcName === qa.funcName && sa.argBaseCol === qa.argBaseCol && sa.isDistinct === qa.isDistinct);
 	if (!match) return undefined;
+	// The stored value is the answer only while the name still means the function that
+	// produced it — this path resolves no schema otherwise, so without the gate a
+	// re-registered name would be served the previous function's numbers.
+	if (!identityOk(match.funcName, aggArgc(match.argBaseCol))) return 'rebound';
 	return { outAttr: qa.outAttr, kind: 'passthrough', backingCol: match.backingCol };
 }
 
@@ -1225,13 +1267,21 @@ function recipeForExact(qa: FragmentAggregate, stored: readonly StoredAggregate[
  *    and any abelian-group UDAF) — re-aggregate the aggregate's own stored partial.
  *  - Otherwise (no algebra, or `merge` without a `decode` to reconstruct the
  *    accumulator) ⇒ decline (`total`, `group_concat`, `var_*`, …).
+ *
+ * The {@link FunctionIdentityGate} is applied to the functions whose STORED values are
+ * consumed — the aggregate's own partial on the directly-mergeable path, each sibling
+ * partial on the decompose path. Deliberately not to the composed aggregate itself: the
+ * MV body need not contain it at all (a body storing `sum(x)`/`count(x)` answers `avg(x)`
+ * without ever naming `avg`), and it is the *live* declared decomposition that is applied,
+ * matching what recomputing over the base would do.
  */
 function recipeForRollup(
 	qa: FragmentAggregate,
 	stored: readonly StoredAggregate[],
 	baseTable: TableSchema,
 	resolveAggregate: AggregateResolver,
-): AggregateRecipe | undefined {
+	identityOk: FunctionIdentityGate,
+): RecipeOrDecline {
 	if (qa.isDistinct) return undefined; // count(distinct …) and friends never compose under rollup.
 
 	const schema = resolveAggregate(qa.funcName, aggArgc(qa.argBaseCol));
@@ -1243,7 +1293,8 @@ function recipeForRollup(
 	if (algebra.decompose) {
 		const partials: MergeReagg[] = [];
 		for (const p of algebra.decompose.partials) {
-			const reagg = resolveMergeablePartial(p, qa, stored, baseTable, resolveAggregate);
+			const reagg = resolveMergeablePartial(p, qa, stored, baseTable, resolveAggregate, identityOk);
+			if (reagg === 'rebound') return 'rebound';
 			if (!reagg) return undefined; // a partial isn't stored / isn't mergeable ⇒ decline.
 			partials.push(reagg);
 		}
@@ -1257,6 +1308,9 @@ function recipeForRollup(
 	if (algebra.decode) {
 		const backingCol = findStored(stored, qa.funcName, qa.argBaseCol);
 		if (backingCol === undefined) return undefined;
+		// The stored partials were produced by whatever this name meant at registration;
+		// re-folding them with a *different* function's algebra would be wrong.
+		if (!identityOk(qa.funcName, aggArgc(qa.argBaseCol))) return 'rebound';
 		return {
 			outAttr: qa.outAttr, kind: 'merge',
 			reagg: { backingCol, schema, argCollation: argCollationOf(baseTable, qa.argBaseCol) },
@@ -1283,7 +1337,8 @@ function resolveMergeablePartial(
 	stored: readonly StoredAggregate[],
 	baseTable: TableSchema,
 	resolveAggregate: AggregateResolver,
-): MergeReagg | undefined {
+	identityOk: FunctionIdentityGate,
+): MergeReagg | 'rebound' | undefined {
 	const partialArgBaseCol = p.arg === 'star' ? undefined : qa.argBaseCol;
 	let backingCol = findStored(stored, p.func, partialArgBaseCol);
 	let storedArgc = aggArgc(partialArgBaseCol);
@@ -1300,6 +1355,9 @@ function resolveMergeablePartial(
 	// algebra; `decode` is the reconstruct the re-aggregation needs.
 	const schema = resolveAggregate(p.func, storedArgc);
 	if (!schema || !schema.algebra?.decode) return undefined;
+	// The partial's stored column was produced by the registration the body resolved to;
+	// only that registration's values may be re-merged under this name.
+	if (!identityOk(p.func, storedArgc)) return 'rebound';
 	const argBaseCol = storedArgc === 0 ? undefined : partialArgBaseCol;
 	return { backingCol, schema, argCollation: argCollationOf(baseTable, argBaseCol) };
 }
@@ -1328,6 +1386,13 @@ function findStored(stored: readonly StoredAggregate[], funcName: string, argBas
  * key; an aggregate function call (`count(*)`, or `f(col)`) is a stored aggregate;
  * a `*` or any other computed item is ignored (it answers no group key or aggregate).
  * Returns undefined only for a `table.*` naming a non-base table (defensive).
+ *
+ * NOTE: this arm reads stored *aggregate* columns by name and pairs each with the
+ * `FunctionIdentityGate` before trusting its value. The projection and join arms match
+ * only bare passthrough columns today, so a body's computed column (`upper(name)`) makes
+ * them forgo on shape and they need no such gate. If either arm ever learns to match a
+ * computed column, it must consume `derivation.bodyFunctions` the same way — otherwise a
+ * re-registered scalar function silently serves the old function's stored output.
  */
 function analyzeMvStoredColumns(
 	columns: readonly AST.ResultColumn[],
