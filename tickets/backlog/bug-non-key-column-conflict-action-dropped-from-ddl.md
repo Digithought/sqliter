@@ -1,12 +1,14 @@
 ---
-description: A column can be told what to do when a value violates its rules — roll the whole transaction back, skip the row, and so on. For columns that are not part of the table's identity, that instruction is thrown away when the database is saved, so after reopening the table quietly falls back to the default behaviour.
+description: Some things a table declares are thrown away when the database saves its definition: a column's rule-violation instruction (roll the transaction back, skip the row) and a table's per-statement parameters. After reopening, the first quietly falls back to the default behaviour and the second makes the table impossible to write to at all.
 files:
   - packages/quereus/src/schema/ddl-generator.ts (`formatColumnDef` — see the `NOTE:` just after the nullability annotation; `nullabilityAnnotation` below it)
   - packages/quereus/src/schema/table.ts (`columnDefToSchema` ~472-492 — the three constraint arms that write `ColumnSchema.defaultConflict`)
   - packages/quereus/src/schema/column.ts (~77 — `ColumnSchema.defaultConflict`)
   - packages/quereus/test/table-ddl-round-trip.spec.ts (the round-trip harness a new case belongs in)
+  - packages/quereus/src/emit/ast-stringify.ts (~1873 `contextDefinitionsToString` — the OTHER emitter, which does emit the clause; arm 2)
+  - packages/quereus/src/schema/manager.ts (~1938 — where a parsed `with context (…)` becomes `TableSchema.mutationContext`; arm 2)
 repro: static
-severity: wrong-result
+severity: wrong-result   # arm 2 is worse: the reloaded table rejects every write
 likelihood: unusual
 tradeoffs: Per-column `on conflict` clauses are rare in practice, and the fix needs a decision about forcing a nullability annotation in the session-elided output form purely so the action has a clause to attach to — a maintainer may reasonably decide the added DDL noise is not worth it until someone actually depends on the behaviour.
 ---
@@ -78,3 +80,55 @@ the re-parsed `columns[1].defaultConflict` equals the original — it should fai
 An end-to-end version would be stronger and is worth having either way: write a violating
 row against a store-backed table, close and reopen, write it again, and assert the same
 outcome (transaction rolled back) both times.
+
+---
+
+## Arm 2 — a table's mutation-context declaration is dropped the same way (added 2026-08-23)
+
+Found while reviewing `reject-mutation-context-on-maintained-table`. Same site, same
+shape as the conflict action above: the table declares something, `generateTableDDL`
+never writes it, and it is gone after a save/reopen. Filed here as a second arm rather
+than as its own ticket because one emission pass over `generateTableDDL` fixes both.
+
+A table can declare **mutation-context variables** — per-statement parameters its CHECK
+constraints and DEFAULT expressions read by name, and that each write supplies:
+
+```sql
+create table t (id integer primary key, v integer check (v <= cap))
+	with context (cap integer);
+insert into t values (1, 5) with context cap = 10;   -- works
+```
+
+`repro: verified` — run against the current tree:
+
+- `generateTableDDL` for that table emits
+  `CREATE TABLE "main"."t" ("id" INTEGER NOT NULL PRIMARY KEY, "v" INTEGER NOT NULL, constraint _check_v check on insert, update (v <= cap)) USING memory`
+  — the `with context (cap integer)` clause is simply absent (a grep for `context` in
+  `schema/ddl-generator.ts` finds no emission site at all).
+- Executing that emitted text in a fresh database **succeeds** — the CHECK still
+  mentions `cap`, but nothing declares it any more.
+- The very next `insert into t values (1, 5);` fails with `Column not found: cap`, and
+  so does every other write. The reloaded table is unwritable, and no `with context`
+  value can rescue it because the declaration is gone.
+
+That is worse than arm 1's silent fallback: the table survives the reload looking
+healthy and then rejects all writes with a message that names a column nobody wrote.
+
+**Two emitters disagree.** The declarative-schema path stringifies a declared table
+through `emit/ast-stringify.ts`, which DOES emit `with context (…)` (an `apply schema`
+of a table declaring context round-trips correctly). Only the canonical persistence
+generator drops it — the same "second emitter drifted from the canonical one" pattern
+`bug-shadow-rebuild-loses-table-definition` describes, but here the canonical one is
+the lossy side.
+
+**Expected behaviour.** `generateTableDDL` emits the `with context (…)` clause whenever
+`TableSchema.mutationContext` is non-empty, including each variable's declared
+nullability (variables are NOT NULL unless marked `null`, and the emitted text must be
+explicit — the no-`db` persistence form elides nothing). Re-parsing the emitted text in
+a fresh `Database` reproduces the same `mutationContext`, and a second emission is
+byte-identical.
+
+**Not affected by the maintained-table restriction.** A maintained table may no longer
+declare context variables at all (rejected at declaration since
+`reject-mutation-context-on-maintained-table`), so no persisted maintained-table DDL can
+carry the clause — this arm is purely about ordinary tables.

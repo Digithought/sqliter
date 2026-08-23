@@ -1217,6 +1217,9 @@ async function validateDeclaredConstraintsOverContents(
  * untouched. An expressible plan splices around the verify-by-diff reconcile —
  * see the sequencing notes inside.
  */
+// NOTE: this core does NOT re-assert {@link assertNoMutationContextOnMaintainedTable};
+// both of today's callers (createMaintainedTable, runSetMaintained) check before
+// calling. A third caller must run that guard too, or add it here.
 export async function attachMaintainedDerivation(
 	db: Database,
 	table: TableSchema,
@@ -1610,7 +1613,7 @@ export function detachMaintainedDerivation(db: Database, mv: MaintainedTableSche
  * confusingly: the derived-row validator that compiles the table's declared CHECK /
  * child-side-FK constraints registers no context symbols, so a bare-name read of the
  * variable falls through to ordinary column resolution and raises "Column not found"
- * from {@link ../../planner/resolve.ts}.
+ * from `planner/resolve.ts`.
  *
  * Rejects **any** declaration, not only one some constraint reads — the "declared but
  * unread" case is harmless today, but that distinction is invisible to the author and
