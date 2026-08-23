@@ -1,8 +1,8 @@
 /**
  * Index-nested-loop candidate construction for `rule-join-physical-selection`.
  *
- * When a join's inner (right) side bottoms out in a plain every-row walk over a
- * table whose module can answer an equality seek on the join key, the walk is
+ * When a join's inner side bottoms out in a plain every-row walk over a table
+ * whose module can answer an equality seek on the join key, the walk is
  * replaced by an `IndexSeekNode` whose seek keys are column references into the
  * OUTER row. The node above stays the logical `JoinNode`, so the existing
  * nested-loop emitter drives it: for each outer row it installs the outer row
@@ -14,9 +14,16 @@
  *     ON big.id = s.k              ──▶      ON big.id = s.k
  *   reads every row of big                 one seek per row of s
  *
+ * The function takes `outer` / `inner` explicitly rather than reading a
+ * JoinNode's `left` / `right`: the caller asks for BOTH orientations of an
+ * inner join (seek the right driven by the left, and the mirror) and elects
+ * the cheaper — see `ruleJoinPhysicalSelection`. Here "outer" always means the
+ * side that will drive, and "inner" the side whose leaf becomes the seek,
+ * whichever JoinNode slot each came from.
+ *
  * This module only CONSTRUCTS the candidate (recognize the shape, probe the
- * module, cost it); the four-way cost comparison and the join rebuild live in
- * the caller. Every gate below declines by returning null, which leaves the
+ * module, cost it); the cost comparison and the join rebuild live in the
+ * caller. Every gate below declines by returning null, which leaves the
  * nested-loop / hash / merge competition unchanged.
  *
  * NOTE: one extra pair of `getBestAccessPlan` probes runs per qualifying
@@ -29,7 +36,7 @@
 import { createLogger } from '../../../common/logger.js';
 import type { RelationalPlanNode, ScalarPlanNode } from '../../nodes/plan-node.js';
 import type { OptContext } from '../../framework/context.js';
-import { JoinNode } from '../../nodes/join-node.js';
+import type { JoinType } from '../../nodes/join-node.js';
 import type { EquiJoinPair } from '../../nodes/join-utils.js';
 import { IndexScanNode, IndexSeekNode } from '../../nodes/table-access-nodes.js';
 import { FilterNode } from '../../nodes/filter.js';
@@ -48,8 +55,12 @@ import { validateAccessPlan, type BestAccessPlanResult } from '../../../vtab/bes
 const log = createLogger('optimizer:rule:index-nested-loop');
 
 export interface IndexNestedLoopCandidate {
-	/** Rebuilt right subtree with the access leaf replaced by the correlated seek. */
-	readonly newRight: RelationalPlanNode;
+	/**
+	 * Rebuilt INNER subtree with the access leaf replaced by the correlated seek.
+	 * Which JoinNode slot it belongs in is the caller's business — it is the
+	 * `inner` argument's slot, which is the right one only in the un-mirrored case.
+	 */
+	readonly newInner: RelationalPlanNode;
 	/** Engine-currency cost, comparable with nestedLoop/hash/merge in the caller. */
 	readonly cost: number;
 }
@@ -69,10 +80,10 @@ interface ResolvedPair {
  * (backlog/feat-index-nested-loop-over-pushed-constraints). A pushed
  * limit / offset is likewise a directive the seek would not honor.
  */
-function admitLeaf(right: RelationalPlanNode): AccessLeafNode | null {
-	const leaf = peelToAccessLeaf(right);
+function admitLeaf(inner: RelationalPlanNode): AccessLeafNode | null {
+	const leaf = peelToAccessLeaf(inner);
 	if (!leaf) {
-		log('decline: right does not peel to an access leaf through Alias/Project/Filter');
+		log('decline: inner does not peel to an access leaf through Alias/Project/Filter');
 		return null;
 	}
 	const fi = leaf.filterInfo;
@@ -268,17 +279,21 @@ function probeModule(
 }
 
 /**
- * Try to build an index-nested-loop candidate for `node`: the right subtree
- * rebuilt with its access leaf replaced by a correlated `IndexSeekNode`, plus
+ * Try to build an index-nested-loop candidate: the `inner` subtree rebuilt with
+ * its access leaf replaced by an `IndexSeekNode` correlated to `outer`, plus
  * its engine-currency cost. Returns null when any gate declines; the caller's
  * nested-loop / hash / merge competition is then unchanged.
  *
- * `equiPairs` must be non-empty and oriented left=outer / right=inner (as
- * `extractEquiPairs` produces for this join). `outerRows` is the caller's
- * left-side estimate — the same input hash and merge selection use.
+ * `joinType` is the type the REBUILT join will have with `outer` on the left
+ * (so a mirrored inner join passes 'inner'). `equiPairs` must be non-empty and
+ * oriented left=outer / right=inner — the caller flips them for the mirror.
+ * `outerRows` is the outer side's row estimate, the same input hash and merge
+ * selection use for that side.
  */
 export function tryIndexNestedLoop(
-	node: JoinNode,
+	joinType: JoinType,
+	outer: RelationalPlanNode,
+	inner: RelationalPlanNode,
 	equiPairs: readonly EquiJoinPair[],
 	outerRows: number,
 	context: OptContext,
@@ -288,28 +303,27 @@ export function tryIndexNestedLoop(
 	// what makes the correlated seek keys resolve. `right` / `full` drive from
 	// the right with no left slot installed. `cross` never reaches here (no
 	// condition ⇒ no equi pairs).
-	const jt = node.joinType;
-	if (jt !== 'inner' && jt !== 'left' && jt !== 'semi' && jt !== 'anti') return null;
+	if (joinType !== 'inner' && joinType !== 'left' && joinType !== 'semi' && joinType !== 'anti') return null;
 
 	// Purity gate. Determinism is deliberately NOT gated: the nested loop
 	// already re-executes the inner side once per outer row, so replacing a scan
 	// with a seek does not change how often a non-deterministic inner runs.
 	// (rule-key-set-seek gates determinism because it drains its key source
 	// exactly once — a different execution-count contract.)
-	if (PlanNodeCharacteristics.subtreeHasSideEffects(node.right)) {
-		log('decline: right side has side effects');
+	if (PlanNodeCharacteristics.subtreeHasSideEffects(inner)) {
+		log('decline: inner side has side effects');
 		return null;
 	}
 
-	const leaf = admitLeaf(node.right);
+	const leaf = admitLeaf(inner);
 	if (!leaf) return null;
 
-	const resolved = resolvePairs(leaf, node.left, equiPairs);
+	const resolved = resolvePairs(leaf, outer, equiPairs);
 	if (!resolved || resolved.length === 0) return null;
 
 	// Synthesize `leaf.col = outer.col` and run it through the same constraint
 	// extraction a pushed user predicate gets.
-	const predicate = buildSeekPredicate(leaf, node.left, resolved);
+	const predicate = buildSeekPredicate(leaf, outer, resolved);
 	const tableSchema = leaf.tableSchema;
 	const tInfo = createTableInfoFromNode(leaf.source, `${tableSchema.schemaName}.${tableSchema.name}`);
 	const extraction = extractConstraints(predicate, [tInfo]);
@@ -350,11 +364,11 @@ export function tryIndexNestedLoop(
 		return null;
 	}
 
-	const newRight = rebuildChain(node.right, leaf, rebuiltLeaf);
-	const latencyMs = node.right.physical.expectedLatencyMs ?? 0;
+	const newInner = rebuildChain(inner, leaf, rebuiltLeaf);
+	const latencyMs = inner.physical.expectedLatencyMs ?? 0;
 	const cost = indexNestedLoopJoinCost(outerRows, seekPlan.rows!, latencyMs);
 	log('candidate: seek %s.%s via %s (%s rows/seek, cost %s for %s outer rows)',
 		tableSchema.name, seekPlan.seekColumnIndexes!.map(c => tableSchema.columns[c]?.name).join(','),
 		seekPlan.indexName, seekPlan.rows, cost, outerRows);
-	return { newRight, cost };
+	return { newInner, cost };
 }

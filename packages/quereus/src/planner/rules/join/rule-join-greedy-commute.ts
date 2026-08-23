@@ -47,6 +47,13 @@ export function ruleJoinGreedyCommute(node: PlanNode, _context: OptContext): Pla
     return null;
   }
 
+  // NOTE: this row-count arm reads the LOGICAL `estimatedRows` getter, which the
+  // physical access nodes (Alias / Retrieve / IndexScan …) do not define — so for
+  // table-backed inputs both sides read Infinity and `rightRows < leftRows` never
+  // holds; only the singleton-FD arm below fires for them. Tracked by
+  // backlog/bug-row-estimate-conflates-unknown-and-zero (fix it there, via
+  // `physicalSourceRows`). Two-table joins get their orientation decided later in
+  // rule-join-physical-selection's index-nested-loop seek-side election instead.
   const leftRows = node.getLeftSource().estimatedRows ?? Number.POSITIVE_INFINITY;
   const rightRows = node.getRightSource().estimatedRows ?? Number.POSITIVE_INFINITY;
 

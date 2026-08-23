@@ -634,7 +634,7 @@ to propagate `readonly=false`.
 | `subquery/` (decorrelation, FK-empty / FK-trivial) | aware | Decorrelation changes execution cardinality; FK-empty / -trivial drop subtrees. |
 | `predicate/` (pushdown, aggregate-pushdown, fold-empty, contradiction, inference) | aware | Pushdown moves rows under a side-effect subtree; folds drop subtrees. |
 | `cache/` (mutating-subquery-cache, nested-loop-right-cache, scalar-subquery-cache, materialization-advisory, scalar-cse) | aware | Cache injection is a run-once memoize; CSE dedups scalar expressions. |
-| `join/` (greedy-commute, physical-selection, fanout, quickpick, join-elimination, lateral-asof) | mixed | Commute / build-probe swap reorder; elimination drops; FanOut clusters concurrently. |
+| `join/` (greedy-commute, physical-selection, fanout, quickpick, join-elimination, lateral-asof) | mixed | Commute / build-probe swap / index-NL seek-side swap reorder; elimination drops; FanOut clusters concurrently. |
 | `parallel/` (async-gather union-all / zip-by-key, eager-prefetch-probe, fanout-batched) | aware | Concurrent drivers interleave per-branch writes. |
 | `retrieve/` (grow-retrieve, projection-pruning) | mixed | Grow slides into read-only Retrieve (safe); pruning drops scalar projections (aware). |
 | `access/`, `sort/`, `aggregate/`, `window/`, `distinct/` | mostly safe | Replace logical with physical nodes / annotate in place. |
@@ -789,8 +789,9 @@ See `tickets/plan/` for planned optimizer work.
 ## Join planning
 
 Join order is chosen by a randomized greedy tour search (QuickPick); a physical algorithm
-(nested loop, hash, merge, or an index-nested-loop that seeks the inner side once per
-outer row) is then selected per join by cost. Separately, a chain of
+(nested loop, hash, merge, or an index-nested-loop that seeks one side once per row of
+the other — for an inner join, whichever orientation costs less) is then selected per
+join by cost. Separately, a chain of
 per-outer-row lookups can be clustered into one concurrently-driven fan-out node, and the
 keys a join propagates to its output are derived from equi-pair coverage. See
 [Optimizer Joins](optimizer-joins.md).

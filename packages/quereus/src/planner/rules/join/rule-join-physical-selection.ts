@@ -13,8 +13,14 @@
  *   `index-nested-loop.ts`) is cheaper than the plain nested loop
  *
  * Benefits: Replaces the O(n*m) nested loop with an O(n+m) hash/merge join, or
- * with an O(n·seek) index-nested-loop when the inner side's module can answer
- * an equality seek on the join key
+ * with an O(n·seek) index-nested-loop when one side's module can answer an
+ * equality seek on the join key. For an INNER join the index-nested-loop is
+ * offered in BOTH orientations (seek the right driven by the left, and the
+ * mirror: seek the left driven by the right) and the cheaper wins — this rule
+ * is the only place a two-table join's orientation can be decided with the
+ * module's own seek-versus-scan answers in hand (`rule-join-greedy-commute`'s
+ * row-count arm never fires for table-backed inputs, and QuickPick returns
+ * immediately for fewer than three relations).
  */
 
 import { createLogger } from '../../../common/logger.js';
@@ -34,9 +40,32 @@ import {
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 import { readsColumnsOf } from '../../cache/correlation-detector.js';
 import { physicalSourceRows } from '../../util/row-estimates.js';
-import { tryIndexNestedLoop } from './index-nested-loop.js';
+import { tryIndexNestedLoop, type IndexNestedLoopCandidate } from './index-nested-loop.js';
 
 const log = createLogger('optimizer:rule:join-physical-selection');
+
+/** Flip every pair so left=old right / right=old left; spread keeps the collation flags. */
+function mirrorEquiPairs(pairs: readonly EquiJoinPair[]): EquiJoinPair[] {
+	return pairs.map(p => ({ ...p, leftAttrId: p.rightAttrId, rightAttrId: p.leftAttrId }));
+}
+
+/**
+ * Whether the index-nested-loop may also be tried with the sides exchanged
+ * (seek the LEFT input, drive from the right). Only a plain inner join
+ * commutes: `left` / `semi` / `anti` are left-driven by definition (a mirrored
+ * `left` join is a `right` join, which the emitter drives from the other
+ * side); an `exists … as` join appends its flag columns after both sides with
+ * a resolved `side` per flag, so a swap would have to flip and re-derive them
+ * — excluded rather than attempted. A write in either subtree forbids the swap
+ * because it reorders user-visible execution — the same refusal the hash
+ * build/probe swap makes below.
+ */
+function mayMirrorIndexNestedLoop(node: JoinNode): boolean {
+	return node.joinType === 'inner'
+		&& !node.hasExistenceColumns
+		&& !PlanNodeCharacteristics.subtreeHasSideEffects(node.left)
+		&& !PlanNodeCharacteristics.subtreeHasSideEffects(node.right);
+}
 
 /**
  * Create a SortNode that sorts a source on the equi-pair columns for this side.
@@ -122,17 +151,50 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 	// (the only one that derives `exists … as` flag bits) and `withChildren`
 	// threads `existence` verbatim, so existence joins CAN take this path,
 	// unlike hash/merge which drop the appended flag column.
-	const indexNL = tryIndexNestedLoop(node, extracted.equiPairs, leftRows, context);
+	const indexNL = tryIndexNestedLoop(
+		joinType, node.left, node.right, extracted.equiPairs, leftRows, context);
 
-	// Rebuild with the seek-bearing right side, KEEPING the ON condition on the
+	// Mirrored candidate: seek the LEFT input, drive from the right. Whether a
+	// table landed on the left or the right was decided long before anything
+	// knew which side had a usable index, so the un-mirrored candidate alone can
+	// read a whole table the join had a perfectly good index for. The cost
+	// formula is linear in the outer row count, so this is fed `rightRows` —
+	// the mirror is only cheap when the NEW outer is the small side.
+	const mirroredNL: IndexNestedLoopCandidate | null = mayMirrorIndexNestedLoop(node)
+		? tryIndexNestedLoop(
+			'inner', node.right, node.left, mirrorEquiPairs(extracted.equiPairs), rightRows, context)
+		: null;
+
+	// Rebuild with the seek-bearing inner side, KEEPING the ON condition on the
 	// join. It is redundant when the seek is exact, but it is the safety net
 	// when the seek over-fetches (a COARSER_SAFE collation cover, a module
 	// returning a superset) — and it costs one predicate evaluation per emitted
-	// row, not per scanned row.
+	// row, not per scanned row. `condition` is defined — equi pairs were
+	// extracted from it above.
 	const rebuildWithIndexNL = (): PlanNode => {
 		log('Selecting index-nested-loop join (cost=%.2f) for %d outer rows', indexNL!.cost, leftRows);
-		// `condition` is defined — equi pairs were extracted from it above.
-		return node.withChildren([node.left, indexNL!.newRight, node.condition!]);
+		return node.withChildren([node.left, indexNL!.newInner, node.condition!]);
+	};
+	// The mirrored rebuild is a NEW JoinNode with the children exchanged —
+	// `withChildren` re-uses the node's own slot order and cannot express the
+	// swap. The ON condition and `usingColumns` carry over verbatim: both refer
+	// to attributes by id, and `buildJoinAttributes` concatenates the two
+	// sides' Attribute objects as-is (no `preserveAttributeIds` list is passed),
+	// so the swap changes the join's attribute ORDER, never an attribute id.
+	// Order is harmless: column references resolve by id at runtime, every
+	// positional consumer derives its row descriptor from this node's own
+	// `getAttributes()` at emit time, the nested-loop emitter yields
+	// `[...leftRow, ...rightRow]` where "left" is now the old right on both
+	// sides of that equation, and `JoinNode.computePhysical` advertises no
+	// `ordering` — so no ancestor Sort was elided on the strength of the join's
+	// emission order. What DOES change is the order rows come out in for a query
+	// without ORDER BY, which is permitted (hash join already does it).
+	// `existence` is omitted: `mayMirrorIndexNestedLoop` excludes flag joins.
+	const rebuildWithMirroredNL = (): PlanNode => {
+		log('Selecting mirrored index-nested-loop join (cost=%.2f) for %d outer rows (sides exchanged)',
+			mirroredNL!.cost, rightRows);
+		return new JoinNode(node.scope, node.right, mirroredNL!.newInner, 'inner',
+			node.condition, node.usingColumns);
 	};
 
 	// A join exposing `exists … as` match flags stays the nested-loop JoinNode (the
@@ -140,6 +202,7 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 	// not carry or emit the appended flag column, so converting would drop it. Read
 	// half: existence joins forgo hash/merge selection — documented limitation.
 	// Index-NL remains available (see above): only plain NL and index-NL compete.
+	// (`mirroredNL` is null here — the mirror gate excludes existence joins.)
 	if (node.hasExistenceColumns) {
 		if (indexNL && indexNL.cost < nlCost) return rebuildWithIndexNL();
 		return null;
@@ -192,8 +255,12 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 	// plain NL `outerRows * latency` here rather than dropping it from index-NL.
 	const rightLatencyMs = node.right.physical.expectedLatencyMs ?? 0;
 
-	// Pick the cheapest physical join algorithm
-	type JoinAlgo = 'nested-loop' | 'hash' | 'merge' | 'index-nl';
+	// Pick the cheapest physical join algorithm. Every comparison is a strict
+	// `<` in this fixed order, so an exact tie keeps the earlier entry: in
+	// particular two un-analyzed sides (both at the 100-row default) cost the
+	// two index-NL orientations identically, and the un-mirrored one wins — a
+	// plan must not flip its drive side on a coin toss.
+	type JoinAlgo = 'nested-loop' | 'hash' | 'merge' | 'index-nl' | 'index-nl-mirrored';
 	let bestAlgo: JoinAlgo = 'nested-loop';
 	let bestCost = nlCost;
 
@@ -209,19 +276,27 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 		bestAlgo = 'index-nl';
 		bestCost = indexNL.cost;
 	}
+	if (mirroredNL && mirroredNL.cost < bestCost) {
+		bestAlgo = 'index-nl-mirrored';
+		bestCost = mirroredNL.cost;
+	}
+
+	const COSTS = 'nl=%.2f, hash=%.2f, merge=%.2f, index-nl=%.2f, index-nl-mirrored=%.2f';
+	const costArgs = [nlCost, hashCostValue, mergeCostValue, indexNL?.cost ?? Infinity, mirroredNL?.cost ?? Infinity];
 
 	if (bestAlgo === 'nested-loop') {
-		log('Nested loop cheapest (nl=%.2f, hash=%.2f, merge=%.2f, indexNL=%.2f) for %d x %d rows',
-			nlCost, hashCostValue, mergeCostValue, indexNL?.cost ?? Infinity, leftRows, rightRows);
+		log(`Nested loop cheapest (${COSTS}) for %d x %d rows`, ...costArgs, leftRows, rightRows);
 		return null;
 	}
 
 	if (bestAlgo === 'index-nl') {
 		return rebuildWithIndexNL();
 	}
+	if (bestAlgo === 'index-nl-mirrored') {
+		return rebuildWithMirroredNL();
+	}
 
-	log('Selecting %s join (nl=%.2f, hash=%.2f, merge=%.2f, indexNL=%.2f) for %d x %d rows',
-		bestAlgo, nlCost, hashCostValue, mergeCostValue, indexNL?.cost ?? Infinity, leftRows, rightRows);
+	log(`Selecting %s join (${COSTS}) for %d x %d rows`, bestAlgo, ...costArgs, leftRows, rightRows);
 
 	// Preserve attribute IDs from the logical JoinNode
 	const preserveAttrs = node.getAttributes().slice() as Attribute[];

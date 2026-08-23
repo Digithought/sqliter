@@ -21,7 +21,7 @@ import type { PlanNode } from '../../src/planner/nodes/plan-node.js';
 import { JoinNode } from '../../src/planner/nodes/join-node.js';
 import { BloomJoinNode } from '../../src/planner/nodes/bloom-join-node.js';
 import { MergeJoinNode } from '../../src/planner/nodes/merge-join-node.js';
-import { IndexSeekNode } from '../../src/planner/nodes/table-access-nodes.js';
+import { IndexSeekNode, TableAccessNode } from '../../src/planner/nodes/table-access-nodes.js';
 import { CacheNode } from '../../src/planner/nodes/cache-node.js';
 import { ColumnReferenceNode } from '../../src/planner/nodes/reference.js';
 import { ruleJoinPhysicalSelection } from '../../src/planner/rules/join/rule-join-physical-selection.js';
@@ -46,6 +46,7 @@ const isJoin = (n: PlanNode): n is JoinNode => n instanceof JoinNode;
 const isHashJoin = (n: PlanNode): n is BloomJoinNode => n instanceof BloomJoinNode;
 const isMergeJoin = (n: PlanNode): n is MergeJoinNode => n instanceof MergeJoinNode;
 const isIndexSeek = (n: PlanNode): n is IndexSeekNode => n instanceof IndexSeekNode;
+const isTableAccess = (n: PlanNode): n is TableAccessNode => n instanceof TableAccessNode;
 const isCache = (n: PlanNode): n is CacheNode => n instanceof CacheNode;
 const isColumnRef = (n: PlanNode): n is ColumnReferenceNode => n instanceof ColumnReferenceNode;
 
@@ -67,6 +68,25 @@ function correlatedSeekJoins(root: PlanNode): JoinNode[] {
 		return collectNodes(join.right, isIndexSeek).some(seek =>
 			seek.seekKeys.some(key => keyReferences(key, leftAttrIds)));
 	});
+}
+
+/** Names of the tables accessed anywhere under `root` (scan or seek). */
+function tablesUnder(root: PlanNode): string[] {
+	return collectNodes(root, isTableAccess).map(n => n.tableSchema.name);
+}
+
+/**
+ * The one join that fired, as (driving table, seek table): the seek-side
+ * election's observable outcome. Asserting on table NAMES rather than on
+ * `left` / `right` identity is what lets one helper describe both the
+ * un-mirrored and the mirrored outcome.
+ */
+function soleSeekOrientation(root: PlanNode): { outer: string[]; seekOn: string } {
+	const fired = correlatedSeekJoins(root);
+	expect(fired, 'exactly one join took the index-nested-loop path').to.have.lengthOf(1);
+	const seeks = collectNodes(fired[0].right, isIndexSeek);
+	expect(seeks, 'one IndexSeek on the driven side').to.have.lengthOf(1);
+	return { outer: tablesUnder(fired[0].left), seekOn: seeks[0].tableSchema.name };
 }
 
 async function drain(db: Database, sql: string): Promise<Array<Record<string, unknown>>> {
@@ -340,6 +360,210 @@ describe('index-nested-loop join plan shape', () => {
 				join big b2 on b2.w = b1.w) x on true`);
 			expect(collectNodes(plan, isHashJoin), 'the inner join is still a hash join')
 				.to.have.lengthOf(1);
+		});
+	});
+
+	describe('seek-side election (the mirrored candidate)', () => {
+		// `rule-join-physical-selection` offers the index-nested-loop in BOTH
+		// orientations of an INNER join and takes the cheaper: seek the right
+		// driven by the left (un-mirrored, the only shape before this block), or
+		// seek the LEFT driven by the right (mirrored — rebuilt as a new JoinNode
+		// with the children exchanged). Which table the user named first must
+		// not decide which table gets read in full.
+
+		/** The parent/child rollup from the ticket: filtered parent, FK-indexed child. */
+		async function createRollupTables(): Promise<void> {
+			await db.exec('create table txn (id integer primary key, entity_id integer, date text)');
+			await db.exec('create table entry (id integer primary key, txn_id integer, amount real)');
+			await db.exec('create index txn_entity on txn (entity_id, date)');
+			await db.exec('create index entry_txn on entry (txn_id)');
+			const txns: string[] = [];
+			for (let i = 1; i <= 400; i++) txns.push(`(${i}, ${i % 40}, '2024-01-${String(i % 28 + 1).padStart(2, '0')}')`);
+			await db.exec(`insert into txn values ${txns.join(', ')}`);
+			const entries: string[] = [];
+			for (let i = 1; i <= 800; i++) entries.push(`(${i}, ${(i % 400) + 1}, ${i * 1.5})`);
+			await db.exec(`insert into entry values ${entries.join(', ')}`);
+			for await (const _ of db.eval('analyze')) { /* consume */ }
+		}
+
+		const ROLLUP_FILTERED_PARENT_FIRST =
+			'select e.txn_id, sum(e.amount) as total from txn t join entry e on t.id = e.txn_id'
+			+ ' where t.entity_id = 7 group by e.txn_id';
+		const ROLLUP_CHILD_FIRST =
+			'select e.txn_id, sum(e.amount) as total from entry e join txn t on t.id = e.txn_id'
+			+ ' where t.entity_id = 7 group by e.txn_id';
+
+		it('drives from the filtered parent and seeks the child whichever table is named first', async () => {
+			// The headline regression pin. `from entry e join txn t` used to plan a
+			// hash join reading every `entry` row; the reversed spelling already got
+			// the seek shape. Both spellings must now produce it.
+			await createRollupTables();
+			for (const sql of [ROLLUP_FILTERED_PARENT_FIRST, ROLLUP_CHILD_FIRST]) {
+				const plan = db.getPlan(sql);
+				const { outer, seekOn } = soleSeekOrientation(plan);
+				expect(outer, sql).to.deep.equal(['txn']);
+				expect(seekOn, sql).to.equal('entry');
+				expect(collectNodes(plan, isHashJoin), 'no hash join').to.have.lengthOf(0);
+			}
+		});
+
+		it('returns the same rows in both spellings (mirrored drive side, same answer)', async () => {
+			await createRollupTables();
+			const a = await drain(db, ROLLUP_FILTERED_PARENT_FIRST + ' order by e.txn_id');
+			const b = await drain(db, ROLLUP_CHILD_FIRST + ' order by e.txn_id');
+			expect(a).to.have.lengthOf(10);
+			expect(b).to.deep.equal(a);
+		});
+
+		describe('both sides indexed on the join key', () => {
+			// Two candidates come back non-null; the cheaper — the one whose OUTER is
+			// the small side — must win, and the decision must follow the data, not
+			// the spelling.
+			async function createPair(smallRows: number, largeRows: number): Promise<void> {
+				await db.exec('create table pa (id integer primary key, k integer)');
+				await db.exec('create index idx_pa_k on pa(k)');
+				await db.exec('create table pb (id integer primary key, k integer)');
+				await db.exec('create index idx_pb_k on pb(k)');
+				const fill = async (t: string, n: number): Promise<void> => {
+					const rows: string[] = [];
+					for (let i = 1; i <= n; i++) rows.push(`(${i}, ${i})`);
+					await db.exec(`insert into ${t} values ${rows.join(', ')}`);
+				};
+				await fill('pa', smallRows);
+				await fill('pb', largeRows);
+				for await (const _ of db.eval('analyze')) { /* consume */ }
+			}
+
+			it('drives from the small side in either spelling', async () => {
+				await createPair(4, 200);
+				const unmirrored = soleSeekOrientation(db.getPlan('select pa.id from pa join pb on pb.k = pa.k'));
+				expect(unmirrored).to.deep.equal({ outer: ['pa'], seekOn: 'pb' });
+				const mirrored = soleSeekOrientation(db.getPlan('select pa.id from pb join pa on pb.k = pa.k'));
+				expect(mirrored, 'large-first spelling: the sides are exchanged').to.deep.equal({ outer: ['pa'], seekOn: 'pb' });
+			});
+
+			it('flips the orientation when the other side becomes the small one', async () => {
+				// Same spelling, opposite cardinalities: the loser of the first
+				// election is the winner of the second.
+				await createPair(200, 4);
+				const plan = db.getPlan('select pa.id from pa join pb on pb.k = pa.k');
+				expect(soleSeekOrientation(plan)).to.deep.equal({ outer: ['pb'], seekOn: 'pa' });
+			});
+
+			it('puts the exchanged sides in the JoinNode slots the emitter expects', async () => {
+				// A mirrored win is a NEW JoinNode (not `withChildren`, which cannot
+				// swap): its left IS the old right, its attributes are left++right in
+				// the new order with the same ids, and the rows still come out right.
+				await createPair(4, 200);
+				const sql = 'select pb.id as bid, pa.id as aid from pb join pa on pb.k = pa.k';
+				const fired = correlatedSeekJoins(db.getPlan(sql));
+				expect(fired).to.have.lengthOf(1);
+				const attrs = fired[0].getAttributes();
+				const leftAttrs = fired[0].left.getAttributes();
+				const rightAttrs = fired[0].right.getAttributes();
+				expect(attrs.map(a => a.id)).to.deep.equal([...leftAttrs, ...rightAttrs].map(a => a.id));
+				expect(fired[0].joinType).to.equal('inner');
+				expect(await drain(db, sql + ' order by aid')).to.deep.equal([
+					{ bid: 1, aid: 1 }, { bid: 2, aid: 2 }, { bid: 3, aid: 3 }, { bid: 4, aid: 4 },
+				]);
+			});
+
+			it('is idempotent for the mirrored output too', async () => {
+				// After the swap the NEW right seeks on the NEW left's columns, so the
+				// sibling-reference guard declines before the context is touched.
+				await createPair(4, 200);
+				const fired = correlatedSeekJoins(db.getPlan('select pa.id from pb join pa on pb.k = pa.k'));
+				expect(fired).to.have.lengthOf(1);
+				const noContext = null as unknown as OptContext;
+				expect(ruleJoinPhysicalSelection(fired[0], noContext)).to.equal(null);
+			});
+		});
+
+		describe('never mirrors', () => {
+			// Each shape below is one where the MIRROR would fire if it were
+			// allowed — `s.k` has no index, so the un-mirrored candidate declines,
+			// while a seek into `big.v` driven by the 4-row `s` is cheap. So the
+			// sharp assertion is "no IndexSeek into `big` anywhere": the only seek
+			// that could appear is the mirrored one. The positive control is the
+			// inner join, which does mirror. (What the non-inner shapes plan as
+			// instead — hash join, or the nested loop — is not this feature's
+			// concern; only that `big` stays the driving side.)
+			const noSeekIntoBig = (plan: PlanNode, label: string): void => {
+				expect(correlatedSeekJoins(plan), label).to.have.lengthOf(0);
+				expect(collectNodes(plan, isIndexSeek).map(n => n.tableSchema.name), `${label}: no seek into big`)
+					.to.not.include('big');
+				for (const j of [...collectNodes(plan, isJoin), ...collectNodes(plan, isHashJoin)]) {
+					expect(tablesUnder(j.left), `${label}: big stays on the left`).to.deep.equal(['big']);
+				}
+			};
+
+			it('(positive control) the inner spelling of the same join does mirror', () => {
+				const plan = db.getPlan('select b.id from big b join s on b.v = s.k');
+				expect(soleSeekOrientation(plan)).to.deep.equal({ outer: ['s'], seekOn: 'big' });
+			});
+
+			it('a LEFT join (a mirrored left join would be a right join)', () => {
+				noSeekIntoBig(db.getPlan('select b.id, s.id as sid from big b left join s on b.v = s.k'), 'left join');
+			});
+
+			it('SEMI and ANTI joins (left-driven by definition)', () => {
+				for (const not of ['', 'not ']) {
+					noSeekIntoBig(
+						db.getPlan(`select b.id from big b where ${not}exists (select 1 from s where s.k = b.v)`),
+						`${not}exists`);
+				}
+			});
+
+			it('an `exists … as` flag join (the flags are side-resolved and appended after both sides)', () => {
+				// Only outer joins carry the flag, so the type gate already excludes it;
+				// the existence gate stands behind it in case an inner flag join ever
+				// appears. The un-mirrored path must keep working for flag joins —
+				// see the `keeps exists … as flag columns` case above.
+				const plan = db.getPlan('select b.id, s_ex from big b left join s on b.v = s.k exists right as s_ex');
+				noSeekIntoBig(plan, 'exists … as');
+				expect(collectNodes(plan, isJoin), 'the flag join stays a logical JoinNode').to.have.lengthOf(1);
+			});
+
+			it('when either side carries a write (the swap would reorder user-visible execution)', async () => {
+				// A FROM-position INSERT … RETURNING is a side-effecting subtree.
+				await db.exec('create table log (id integer primary key, k integer)');
+				const writeOnLeft = db.getPlan(
+					'select b.id from big b join (insert into log (id, k) values (1, 5) returning id, k) w on b.v = w.k');
+				expect(correlatedSeekJoins(writeOnLeft), 'write on the right: no mirror (and no seek into the write)')
+					.to.have.lengthOf(0);
+				const writeOnRight = db.getPlan(
+					'select b.id from (insert into log (id, k) values (2, 7) returning id, k) w join big b on b.v = w.k');
+				// Here the UN-mirrored candidate is the one that would seek `big` driven
+				// by the write — that is allowed (the write stays the driver). What must
+				// not happen is the write moving to the driven side.
+				for (const j of collectNodes(writeOnRight, isJoin)) {
+					expect(tablesUnder(j.right), 'the write never becomes the driven side').to.not.include('log');
+				}
+			});
+		});
+
+		it('keeps the spelled orientation when neither side is analyzed (no coin toss)', async () => {
+			// Both sides at the 100-row default cost the two orientations identically
+			// (each seeks a primary key: 100 × 1.8 = 180) — and hash (120) / merge
+			// beat both, so neither fires and the join keeps its spelled orientation.
+			// An exact tie that an index-NL WINS is unreachable under the cost
+			// constants (at equal cardinality n, index-NL ≥ 1.5n while hash is
+			// 1.2n), so the tie-break itself cannot be observed end to end; the
+			// rule's election is a fixed sequence of strict `<` comparisons with the
+			// un-mirrored candidate compared first, which is what would take an
+			// exact tie if the constants ever changed.
+			await db.exec('create table ua (id integer primary key, v integer)');
+			await db.exec('create table ub (id integer primary key, v integer)');
+			await db.exec('insert into ua values (1, 1), (2, 2)');
+			await db.exec('insert into ub values (1, 1), (2, 2)');
+			const plan = db.getPlan('select ua.v from ua join ub on ub.id = ua.id');
+			expect(correlatedSeekJoins(plan)).to.have.lengthOf(0);
+			expect(collectNodes(plan, isIndexSeek), 'no seek in either direction').to.have.lengthOf(0);
+			// Both primary-key walks are ordered, so merge (60) beats hash here; either
+			// way the physical join's left is the first-named table.
+			const physical = [...collectNodes(plan, isHashJoin), ...collectNodes(plan, isMergeJoin)];
+			expect(physical, 'one physical join').to.have.lengthOf(1);
+			expect(tablesUnder(physical[0].left)).to.deep.equal(['ua']);
 		});
 	});
 
