@@ -147,7 +147,19 @@ Selected when one side of the join bottoms out in a table-access leaf whose modu
 - Nested loop: `outerRows × 1.0 + outerRows × innerRows × 0.1`
 - Index-nested-loop: `outerRows × (1.0 + 0.5 + rowsPerSeek × 0.3 + perSeekLatencyMs)` — `rowsPerSeek` is the module's estimate for the equality access plan
 
-Inner-side first-row latency (`physical.expectedLatencyMs`) is charged once to the hash and merge candidates (each drains the inner side once) and per outer row to index-nested-loop — locally inside the selection rule's comparison, not in the shared cost functions. Plain nested-loop's formula is left alone: it is the no-change fallback.
+**First-row latency.** A module may declare `expectedLatencyMs` — how long its tables take to produce the *first* row of a freshly opened iterator. Every in-tree module declares 0 (they are in-process); a network-backed one would not. `rule-join-physical-selection` charges each candidate **one open of its outer side plus however many opens of its inner side it performs**, locally inside its own comparison rather than in the shared cost functions (whose other callers stay latency-free):
+
+| candidate | outer | inner opens | latency charged |
+| --- | --- | --- | --- |
+| plain nested loop | left | one per outer row, unless the inner gets cached | `leftLatency + (cacheable ? rightLatency : leftRows × rightLatency)` |
+| hash | left | one | `leftLatency + rightLatency` |
+| merge | left | one | `leftLatency + rightLatency` |
+| index-nested-loop | left | one seek per outer row | `leftLatency` — the per-seek term is already inside `indexNestedLoopJoinCost` |
+| index-nested-loop, mirrored | right | one seek per outer row | `rightLatency` — per-seek term already inside, keyed on the **left**'s latency |
+
+"cacheable" is `canCacheNestedLoopRight`, the exported gate of `rule-nested-loop-right-cache` (which runs later in the same pass and turns N re-opens of a pure, uncorrelated, small-enough inner side into one open plus N buffer replays). The selection rule calls that predicate rather than restating its gates, and skips the call entirely when the right's latency is 0 — the predicate's size gate walks the whole right subtree, so keeping it off the zero-latency path matters. It answers one case pessimistically: an impure right side that `rule-mutating-subquery-cache` will wrap reads as "not cacheable" through the purity gate, so the plain nested loop is over-charged there. Unreachable in practice — index-nested-loop declines an impure inner outright and the hash build/probe swap refuses too, so the over-charge has no cheaper rival to hand the win to.
+
+Three consequences worth knowing. At latency 0 every term above vanishes, so local-only plans (and the golden-plan sweep) are unaffected. Hash, merge and the mirrored index-nested-loop all open the right side exactly once, so the right's latency **cancels** between them and can never decide that comparison — before this became symmetric, only hash and merge were charged it, and raising a right side's latency handed wins to the mirror it had not earned. And the plain nested loop is the only candidate whose charge scales with the outer row count, which is what lets a high-latency inner side that cannot be cached hand the win to an index-nested-loop.
 
 For a 50×1000 self-join, hash join cost = 1000×0.8 + 50×0.4 = 820 vs nested loop = 50×1.0 + 50×1000×0.1 = 5050.
 

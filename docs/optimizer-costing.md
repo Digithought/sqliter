@@ -71,6 +71,14 @@ kept the guard first. If a scalar function
 that throws on bad input ever ships, gate the reorder on a per-function
 "may raise" trait, or require CASE for guarding as PostgreSQL does.
 
+### First-row latency in cost comparisons
+
+`PhysicalProperties.expectedLatencyMs` is a subtree's **first-row** latency in milliseconds — how long an iterator opened over it takes to hand back its first row. A `VirtualTableModule` declares it (`TableReferenceNode.computePhysical` reads the module's hint) and it propagates upward as `max(children)`. Every in-tree module declares 0, so every formula below reduces to its latency-free form on local plans; a network-backed module (a sync- or IndexedDB-backed one) would declare a real number.
+
+It is **not** part of any shared formula in `cost/index.ts` except `indexNestedLoopJoinCost`'s explicit `perSeekLatencyMs` parameter — the other callers of these formulas cost latency-free subtrees, and folding a latency term into `seqScanCost` and friends would double-charge wherever a rule adds its own. Instead each rule that compares alternatives adds the latency its own candidates pay, in the same "ms-equivalent cost unit" convention `tuning.parallel.branchSetupCost` uses: one unit of `expectedLatencyMs` is one engine cost unit.
+
+The discipline that keeps such a comparison sound is that **every** candidate must be charged the opens it actually performs — charging one candidate and exempting another biases the comparison by the exempted amount, and the bias is invisible until a module reports a non-zero latency. `rule-join-physical-selection` is the worked example: see [Optimizer Joins § Physical Join Algorithm Selection](optimizer-joins.md#physical-join-algorithm-selection) for its per-candidate charge table, including the case where a later rule (`rule-nested-loop-right-cache`) changes how many opens a candidate performs, so the charge has to consult that rule's own gate.
+
 ### Self-cost-only convention
 
 > **Invariant:** [OPT-016](invariants.md#opt-016--estimatedcost-is-self-cost-only), [OPT-018](invariants.md#opt-018--the-total-cost-memo-is-invalidated-on-mutation)

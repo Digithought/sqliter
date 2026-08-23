@@ -110,15 +110,18 @@ function estimateRightRows(node: PlanNode): number | undefined {
 	return max;
 }
 
-export function ruleNestedLoopRightCache(node: PlanNode, context: OptContext): PlanNode | null {
-	// Only logical JoinNodes reach here uncached. By PostOptimization,
-	// join-physical-selection has already converted every equi-join it wanted to
-	// hash/merge (those materialize their build side), so any surviving logical
-	// JoinNode IS a nested loop — the exact structural signal we need.
-	if (!(node instanceof JoinNode)) {
-		return null;
-	}
-
+/**
+ * Would this join's right side be wrapped in a `CacheNode` by
+ * {@link ruleNestedLoopRightCache}? The single source of truth for that
+ * question: the rule below calls it and then builds the node, and
+ * `rule-join-physical-selection` calls it to decide whether a plain nested loop
+ * pays its inner side's first-row latency ONCE (cached: one open plus N buffer
+ * replays) or once per outer row (uncached: N re-opens). Neither caller may
+ * restate any of the gates.
+ *
+ * Every gate is a decline; the comments on each explain what it protects.
+ */
+export function canCacheNestedLoopRight(node: JoinNode, context: OptContext): boolean {
 	// Driver gate: only the left-driven join types re-scan the right side.
 	// `right` / `full` buffer the left side once and scan the right side once
 	// (`emitLoopJoin.driveFromRight`), so caching their right side is pure waste.
@@ -132,27 +135,27 @@ export function ruleNestedLoopRightCache(node: PlanNode, context: OptContext): P
 	// (same reopen count until the buffer fills, a win after), just data-dependent
 	// rather than the guaranteed replay inner/cross/left get.
 	if (node.joinType === 'right' || node.joinType === 'full') {
-		return null;
+		return false;
 	}
 
 	const right = node.right;
 
 	// Already cached (e.g. by cte / in-subquery / mutating-subquery cache).
 	if (CapabilityDetectors.isCached(right) && right.isCached()) {
-		return null;
+		return false;
 	}
 
 	// Purity gate: side effects are the mutating-subquery-cache rule's job.
 	// Double-wrapping a write would change nothing and only burn memory.
 	if (PlanNodeCharacteristics.subtreeHasSideEffects(right)) {
-		return null;
+		return false;
 	}
 
 	// Determinism gate: a non-deterministic right side (e.g. `random()`) must be
 	// re-evaluated per left row to preserve today's observable behavior; caching
 	// would freeze the first scan's values across every subsequent left row.
 	if (!PlanNodeCharacteristics.isDeterministic(right)) {
-		return null;
+		return false;
 	}
 
 	// Correlation gate: a right subtree that references left attributes (a
@@ -162,13 +165,13 @@ export function ruleNestedLoopRightCache(node: PlanNode, context: OptContext): P
 	// separate JoinNode.condition child, not inside the right subtree — so the
 	// bare right access has no external refs and is cacheable.
 	if (isCorrelatedSubquery(right)) {
-		return null;
+		return false;
 	}
 
 	// CTE-safety gate: eagerly materializing a CTE-backed right side breaks the
 	// join's row-context at runtime (see subtreeTouchesCte above).
 	if (subtreeTouchesCte(right)) {
-		return null;
+		return false;
 	}
 
 	// Size gate (memory safety): materializing an unbounded right side trades I/O
@@ -177,14 +180,32 @@ export function ruleNestedLoopRightCache(node: PlanNode, context: OptContext): P
 	if (estimatedRows > context.tuning.join.maxRightRowsForCaching) {
 		log('Right side too large to cache (%d rows > %d), skipping',
 			estimatedRows, context.tuning.join.maxRightRowsForCaching);
+		return false;
+	}
+
+	return true;
+}
+
+export function ruleNestedLoopRightCache(node: PlanNode, context: OptContext): PlanNode | null {
+	// Only logical JoinNodes reach here uncached. By PostOptimization,
+	// join-physical-selection has already converted every equi-join it wanted to
+	// hash/merge (those materialize their build side), so any surviving logical
+	// JoinNode IS a nested loop — the exact structural signal we need.
+	if (!(node instanceof JoinNode)) {
 		return null;
 	}
 
-	log('Caching pure nested-loop right side (%s, %d rows)', node.joinType, estimatedRows);
+	if (!canCacheNestedLoopRight(node, context)) {
+		return null;
+	}
+
+	const right = node.right;
+
+	log('Caching pure nested-loop right side (%s)', node.joinType);
 
 	// Memory strategy + a CacheNode threshold (which degrades to pass-through
 	// past its limit) mirrors the sibling mutating-subquery-cache rule. Spill is
-	// unreachable under the size gate above (maxRightRowsForCaching <
+	// unreachable under `canCacheNestedLoopRight`'s size gate (maxRightRowsForCaching <
 	// cache.spillThreshold), so 'memory' is the only live choice here.
 	const threshold = CachingAnalysis.getCacheThreshold(right);
 	const cached = new CacheNode(right.scope, right, 'memory', threshold);

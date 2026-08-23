@@ -41,6 +41,7 @@ import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 import { readsColumnsOf } from '../../cache/correlation-detector.js';
 import { physicalSourceRows } from '../../util/row-estimates.js';
 import { tryIndexNestedLoop, type IndexNestedLoopCandidate } from './index-nested-loop.js';
+import { canCacheNestedLoopRight } from '../cache/rule-nested-loop-right-cache.js';
 
 const log = createLogger('optimizer:rule:join-physical-selection');
 
@@ -65,6 +66,37 @@ function mayMirrorIndexNestedLoop(node: JoinNode): boolean {
 		&& !node.hasExistenceColumns
 		&& !PlanNodeCharacteristics.subtreeHasSideEffects(node.left)
 		&& !PlanNodeCharacteristics.subtreeHasSideEffects(node.right);
+}
+
+/**
+ * First-row latency the PLAIN nested loop pays for opening its inner (right)
+ * side: once if `rule-nested-loop-right-cache` will wrap that side in a
+ * `CacheNode` (one open, then N buffer replays), otherwise once per outer row
+ * (the emitter re-opens the inner pipeline for every left row).
+ *
+ * The cacheability question is answered by the cache rule's own exported
+ * predicate — this rule must never restate its gates.
+ *
+ * NOTE: the predicate describes a rule that has not run yet, and gets one case
+ * wrong: an impure right side that `mutating-subquery-cache` (also later in this
+ * pass) will wrap reads as "not cacheable" through the purity gate, so the plain
+ * nested loop is over-charged there. Unreachable in practice — index-nested-loop
+ * declines an impure inner outright and the hash build/probe swap refuses too,
+ * so the over-charge has no cheaper rival to hand the win to. If a candidate
+ * that tolerates an impure inner ever appears, teach the predicate about the
+ * mutating-subquery rule rather than duplicating its gates here.
+ */
+function nestedLoopInnerLatency(
+	node: JoinNode,
+	context: OptContext,
+	outerRows: number,
+	innerLatencyMs: number,
+): number {
+	// Short-circuit before `canCacheNestedLoopRight`, which walks the whole right
+	// subtree for its size gate: with no latency to charge the answer is 0 either
+	// way. Every in-tree module reports 0, so this keeps the walk off the hot path.
+	if (innerLatencyMs === 0) return 0;
+	return canCacheNestedLoopRight(node, context) ? innerLatencyMs : outerRows * innerLatencyMs;
 }
 
 /**
@@ -143,7 +175,20 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 	const leftRows = physicalSourceRows(node.left.physical, node.left) || 100;
 	const rightRows = physicalSourceRows(node.right.physical, node.right) || 100;
 
-	const nlCost = nestedLoopJoinCost(leftRows, rightRows);
+	// Latency accounting, applied uniformly to every candidate below: a candidate
+	// is charged ONE open of its outer side plus however many opens of its inner
+	// side it performs. `expectedLatencyMs` is a subtree's first-row latency
+	// (0 for every in-process module), treated as ms-equivalent engine cost.
+	// Charged locally here, not inside the shared cost functions, which other
+	// callers use latency-free.
+	const leftLatencyMs = node.left.physical.expectedLatencyMs ?? 0;
+	const rightLatencyMs = node.right.physical.expectedLatencyMs ?? 0;
+
+	// Plain nested loop: one open of the left, and one open of the right per left
+	// row unless the cache rule will collapse those to a single open.
+	const nlCost = nestedLoopJoinCost(leftRows, rightRows)
+		+ leftLatencyMs
+		+ nestedLoopInnerLatency(node, context, leftRows, rightLatencyMs);
 
 	// Index-nested-loop candidate: the logical JoinNode survives with its right
 	// leaf replaced by a per-outer-row correlated IndexSeek. Considered BEFORE
@@ -164,6 +209,14 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 		? tryIndexNestedLoop(
 			'inner', node.right, node.left, mirrorEquiPairs(extracted.equiPairs), rightRows, context)
 		: null;
+
+	// Each index-nested-loop orientation opens its outer side once; the per-seek
+	// charge for its INNER side is already inside `indexNestedLoopJoinCost`
+	// (`tryIndexNestedLoop` feeds it `inner.physical.expectedLatencyMs`, which is
+	// the RIGHT side's for the un-mirrored candidate and the LEFT side's for the
+	// mirror). Absent candidates cost Infinity so they never win a comparison.
+	const indexNLCost = indexNL ? indexNL.cost + leftLatencyMs : Infinity;
+	const mirroredNLCost = mirroredNL ? mirroredNL.cost + rightLatencyMs : Infinity;
 
 	// Rebuild with the seek-bearing inner side, KEEPING the ON condition on the
 	// join. It is redundant when the seek is exact, but it is the safety net
@@ -204,7 +257,7 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 	// Index-NL remains available (see above): only plain NL and index-NL compete.
 	// (`mirroredNL` is null here — the mirror gate excludes existence joins.)
 	if (node.hasExistenceColumns) {
-		if (indexNL && indexNL.cost < nlCost) return rebuildWithIndexNL();
+		if (indexNLCost < nlCost) return rebuildWithIndexNL();
 		return null;
 	}
 
@@ -240,29 +293,10 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 		? mergeJoinCost(leftRows, rightRows, !leftOrdered, !rightOrdered)
 		: Infinity;
 
-	// Hash and merge each scan the inner side once, so the inner subtree's
-	// first-row latency is charged ONCE to each — locally here, not in the
-	// shared cost functions (which other callers use latency-free). Index-NL's
-	// formula charges it per outer row (per seek). Plain nested-loop's formula
-	// is deliberately left alone: it is the no-change fallback, and if it wins
-	// nothing is rewritten.
-	//
-	// NOTE: that last exemption biases against index-NL once a module reports a
-	// nonzero `expectedLatencyMs` — plain NL re-opens the right side per outer
-	// row too, so it pays the same per-seek latency but is charged none, and can
-	// win a comparison against the strictly cheaper index-NL. Harmless today
-	// (both shipped modules report 0). If a high-latency module appears, charge
-	// plain NL `outerRows * latency` here rather than dropping it from index-NL.
-	//
-	// NOTE: the same exemption makes the two index-NL orientations asymmetric.
-	// Hash and merge are charged the RIGHT side's latency once; the mirrored
-	// index-NL charges the LEFT side's latency per seek (the left is its inner),
-	// and nothing charges the left's latency to hash/merge. So a high-latency
-	// left against a zero-latency right can make the mirror look cheaper than
-	// hash by dodging a charge hash never paid either. Inert today (both shipped
-	// modules report 0). If a high-latency module appears, charge each candidate
-	// its own inner side's latency here instead of hard-coding the right's.
-	const rightLatencyMs = node.right.physical.expectedLatencyMs ?? 0;
+	// Hash and merge each open both sides exactly once (build then probe / merge
+	// two streams), so each is charged one open of each side.
+	const hashTotal = hashCostValue + leftLatencyMs + rightLatencyMs;
+	const mergeTotal = mergeCostValue + leftLatencyMs + rightLatencyMs;
 
 	// Pick the cheapest physical join algorithm. Every comparison is a strict
 	// `<` in this fixed order, so an exact tie keeps the earlier entry: in
@@ -273,25 +307,25 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 	let bestAlgo: JoinAlgo = 'nested-loop';
 	let bestCost = nlCost;
 
-	if (hashCostValue + rightLatencyMs < bestCost) {
+	if (hashTotal < bestCost) {
 		bestAlgo = 'hash';
-		bestCost = hashCostValue + rightLatencyMs;
+		bestCost = hashTotal;
 	}
-	if (mergeCostValue + rightLatencyMs < bestCost) {
+	if (mergeTotal < bestCost) {
 		bestAlgo = 'merge';
-		bestCost = mergeCostValue + rightLatencyMs;
+		bestCost = mergeTotal;
 	}
-	if (indexNL && indexNL.cost < bestCost) {
+	if (indexNLCost < bestCost) {
 		bestAlgo = 'index-nl';
-		bestCost = indexNL.cost;
+		bestCost = indexNLCost;
 	}
-	if (mirroredNL && mirroredNL.cost < bestCost) {
+	if (mirroredNLCost < bestCost) {
 		bestAlgo = 'index-nl-mirrored';
-		bestCost = mirroredNL.cost;
+		bestCost = mirroredNLCost;
 	}
 
 	const COSTS = 'nl=%.2f, hash=%.2f, merge=%.2f, index-nl=%.2f, index-nl-mirrored=%.2f';
-	const costArgs = [nlCost, hashCostValue, mergeCostValue, indexNL?.cost ?? Infinity, mirroredNL?.cost ?? Infinity];
+	const costArgs = [nlCost, hashTotal, mergeTotal, indexNLCost, mirroredNLCost];
 
 	if (bestAlgo === 'nested-loop') {
 		log(`Nested loop cheapest (${COSTS}) for %d x %d rows`, ...costArgs, leftRows, rightRows);
