@@ -230,3 +230,71 @@ INSERT INTO inl_pa VALUES (1, 3), (2, 7), (3, 40), (4, NULL);
 ANALYZE;
 SELECT b.id AS bid, a.id AS aid FROM inl_big b JOIN inl_pa a ON b.v = a.k ORDER BY aid;
 → [{"bid":3,"aid":1},{"bid":7,"aid":2},{"bid":40,"aid":3}]
+
+-- ===== Join-key seek combined with a predicate the module already claimed =====
+-- `status` is indexed, so `b.status = 'x'` is pushed into the inner leaf as a seek
+-- the module enforces alone — it is nowhere else in the tree. The index-nested-loop
+-- rule re-offers that predicate together with the join key and re-applies whatever
+-- the module declines as a Filter directly above the new seek (or the module takes
+-- both on a composite index). Every outer key below matches an inner row by id, so
+-- the status predicate is what decides each row: k=5 hits id 5 (status 'y') and
+-- must be dropped — a redundant filter would prove nothing.
+CREATE TABLE inl_ps (id INTEGER PRIMARY KEY, k INTEGER NULL);
+INSERT INTO inl_ps VALUES (1, 5), (2, 8), (3, 12), (4, NULL), (5, 500);
+CREATE TABLE inl_pb (id INTEGER PRIMARY KEY, v INTEGER, status TEXT);
+CREATE INDEX inl_idx_pb_v ON inl_pb(v);
+CREATE INDEX inl_idx_pb_status ON inl_pb(status);
+INSERT INTO inl_pb VALUES
+	(1, 1, 'y'), (2, 2, 'y'), (3, 3, 'y'), (4, 4, 'x'), (5, 5, 'y'), (6, 6, 'y'), (7, 7, 'y'), (8, 8, 'x'),
+	(9, 9, 'y'), (10, 10, 'y'), (11, 11, 'y'), (12, 12, 'x'), (13, 13, 'y'), (14, 14, 'y'), (15, 15, 'y'),
+	(16, 16, 'x'), (17, 17, 'y'), (18, 18, 'y'), (19, 19, 'y'), (20, 20, 'x'), (21, 21, 'y'), (22, 22, 'y'),
+	(23, 23, 'y'), (24, 24, 'x'), (25, 25, 'y'), (26, 26, 'y'), (27, 27, 'y'), (28, 28, 'x'), (29, 29, 'y'),
+	(30, 30, 'y'), (31, 31, 'y'), (32, 32, 'x'), (33, 33, 'y'), (34, 34, 'y'), (35, 35, 'y'), (36, 36, 'x'),
+	(37, 37, 'y'), (38, 38, 'y'), (39, 39, 'y'), (40, 40, 'x');
+ANALYZE;
+
+-- INNER on the primary key: id 5 is status 'y' → dropped by the re-applied predicate
+SELECT s.id, b.id AS bid FROM inl_ps s JOIN inl_pb b ON b.id = s.k WHERE b.status = 'x' ORDER BY s.id;
+→ [{"id":2,"bid":8},{"id":3,"bid":12}]
+
+-- INNER on the secondary index: same answer through idx_v
+SELECT s.id, b.id AS bid FROM inl_ps s JOIN inl_pb b ON b.v = s.k WHERE b.status = 'x' ORDER BY s.id;
+→ [{"id":2,"bid":8},{"id":3,"bid":12}]
+
+-- LEFT with the predicate in the ON clause: the inner Filter sits inside the inner
+-- pipeline, so a row it rejects makes the seek look empty → null-pad (k=5), as do
+-- the NULL key and the unmatched key
+SELECT s.id, b.id AS bid FROM inl_ps s LEFT JOIN inl_pb b ON b.id = s.k AND b.status = 'x' ORDER BY s.id;
+→ [{"id":1,"bid":null},{"id":2,"bid":8},{"id":3,"bid":12},{"id":4,"bid":null},{"id":5,"bid":null}]
+
+-- ANTI (NOT EXISTS): a seek hit rejected by the Filter counts as "no inner row" → kept
+SELECT s.id FROM inl_ps s WHERE NOT EXISTS (SELECT 1 FROM inl_pb b WHERE b.id = s.k AND b.status = 'x') ORDER BY s.id;
+→ [{"id":1},{"id":4},{"id":5}]
+
+-- SEMI (EXISTS): the mirror of the anti answer
+SELECT s.id FROM inl_ps s WHERE EXISTS (SELECT 1 FROM inl_pb b WHERE b.id = s.k AND b.status = 'x') ORDER BY s.id;
+→ [{"id":2},{"id":3}]
+
+-- A pushed range on the join-key column itself: `b.id = s.k` wins the column as the
+-- seek and `b.id > 10` comes back as the residual (id 5 and 8 are out)
+SELECT s.id, b.id AS bid FROM inl_ps s JOIN inl_pb b ON b.id = s.k WHERE b.id > 10 ORDER BY s.id;
+→ [{"id":3,"bid":12}]
+
+-- A pushed BETWEEN re-applied as its single node: id 12 is outside the range
+SELECT s.id, b.id AS bid FROM inl_ps s JOIN inl_pb b ON b.v = s.k WHERE b.id BETWEEN 2 AND 9 ORDER BY s.id;
+→ [{"id":1,"bid":5},{"id":2,"bid":8}]
+
+-- Composite index covering both: the module takes the status equality AND the join
+-- key as one seek, so no residual is needed — rows identical to the single-index form
+CREATE TABLE inl_cb (id INTEGER PRIMARY KEY, v INTEGER, status TEXT);
+CREATE INDEX inl_idx_cb ON inl_cb(status, v);
+CREATE INDEX inl_idx_cb1 ON inl_cb(status);
+INSERT INTO inl_cb SELECT id, v, status FROM inl_pb;
+ANALYZE;
+SELECT s.id, c.id AS cid FROM inl_ps s JOIN inl_cb c ON c.v = s.k WHERE c.status = 'x' ORDER BY s.id;
+→ [{"id":2,"cid":8},{"id":3,"cid":12}]
+
+-- The module keeps its own seek (a unique primary-key equality) and refuses the join
+-- key: the plan is left alone and the rows are still right
+SELECT s.id, b.id AS bid FROM inl_ps s JOIN inl_pb b ON b.v = s.k WHERE b.id = 8 ORDER BY s.id;
+→ [{"id":2,"bid":8}]

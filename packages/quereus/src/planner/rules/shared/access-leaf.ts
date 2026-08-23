@@ -24,6 +24,15 @@ import type { TableSchema } from '../../../schema/table.js';
 export type AccessLeafNode = SeqScanNode | IndexScanNode;
 
 /**
+ * {@link AccessLeafNode} widened with a constrained seek leaf. An `IndexSeekNode`'s
+ * `FilterInfo` is the sole enforcer of the predicates recorded in its
+ * `pushedConstraints`, so a caller admitting one must either re-apply them above
+ * its rewrite (`rule-key-set-seek`) or re-offer them to the module and re-apply
+ * whatever it declines (`index-nested-loop`).
+ */
+export type SeekableAccessLeafNode = AccessLeafNode | IndexSeekNode;
+
+/**
  * A Project is "trivial" iff every projection is a bare ColumnReferenceNode —
  * it preserves row count, order, and attribute ids. Same predicate as
  * `rule-monotonic-limit-pushdown`.
@@ -38,11 +47,11 @@ export function isTrivialProject(project: ProjectNode): boolean {
  * as well as every-row walks. Returns null when anything else appears before
  * an admissible leaf.
  *
- * Callers that can honour an `IndexSeekNode`'s pushed predicates (by
- * re-applying `pushedConstraints` above their rewrite) use this directly;
- * callers that would silently drop them use {@link peelToAccessLeaf}.
+ * Every caller must be able to honour an `IndexSeekNode`'s pushed predicates
+ * (see {@link SeekableAccessLeafNode}); a caller that cannot must decline on
+ * that leaf itself.
  */
-export function peelToSeekableAccessLeaf(chainRoot: RelationalPlanNode): AccessLeafNode | IndexSeekNode | null {
+export function peelToSeekableAccessLeaf(chainRoot: RelationalPlanNode): SeekableAccessLeafNode | null {
 	let cursor: RelationalPlanNode = chainRoot;
 	let safety = 16;
 	while (safety-- > 0) {
@@ -62,18 +71,6 @@ export function peelToSeekableAccessLeaf(chainRoot: RelationalPlanNode): AccessL
 		return null;
 	}
 	return null;
-}
-
-/**
- * {@link peelToSeekableAccessLeaf} restricted to unconstrained walks. An
- * `IndexSeekNode` peels to null: its `FilterInfo` is the sole enforcer of the
- * predicates recorded in `pushedConstraints`, so a caller that replaces the
- * leaf without re-applying them (`index-nested-loop`, which would otherwise
- * re-plan a leaf that already has constraints) must decline on it.
- */
-export function peelToAccessLeaf(chainRoot: RelationalPlanNode): AccessLeafNode | null {
-	const leaf = peelToSeekableAccessLeaf(chainRoot);
-	return leaf instanceof IndexSeekNode ? null : leaf;
 }
 
 /**

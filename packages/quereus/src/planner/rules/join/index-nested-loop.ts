@@ -1,18 +1,30 @@
 /**
  * Index-nested-loop candidate construction for `rule-join-physical-selection`.
  *
- * When a join's inner side bottoms out in a plain every-row walk over a table
- * whose module can answer an equality seek on the join key, the walk is
- * replaced by an `IndexSeekNode` whose seek keys are column references into the
- * OUTER row. The node above stays the logical `JoinNode`, so the existing
- * nested-loop emitter drives it: for each outer row it installs the outer row
- * slot and re-opens the inner pipeline, and the seek-key expressions resolve
- * through the runtime context by attribute id — the same machinery correlated
+ * When a join's inner side bottoms out in a table-access leaf whose module can
+ * answer an equality seek on the join key, the leaf is replaced by an
+ * `IndexSeekNode` whose seek keys are column references into the OUTER row.
+ * The node above stays the logical `JoinNode`, so the existing nested-loop
+ * emitter drives it: for each outer row it installs the outer row slot and
+ * re-opens the inner pipeline, and the seek-key expressions resolve through
+ * the runtime context by attribute id — the same machinery correlated
  * subqueries already exercise.
  *
  *   Join(inner, s, SeqScan(big))          Join(inner, s, IndexSeek(big, keys=[s.k]))
  *     ON big.id = s.k              ──▶      ON big.id = s.k
  *   reads every row of big                 one seek per row of s
+ *
+ * Two admission arms for the inner leaf. A WALK leaf (plain full scan, or an
+ * ordering-only index walk) enforces nothing, so its `FilterInfo` may be
+ * replaced wholesale. A SEEK leaf (`IndexSeekNode`) already enforces the
+ * predicates the module claimed — `status = 'x'` below is nowhere else in the
+ * tree — so it is admitted by re-OFFERING those predicates to the module
+ * alongside the join key and re-applying whatever the module declines:
+ *
+ *   Join(inner, s, IndexSeek(big, [status='x']))
+ *     ON big.id = s.k
+ *       ──▶  Join(inner, s, Filter[status='x'](IndexSeek(big, keys=[s.k])))
+ *       or   Join(inner, s, IndexSeek(big, keys=[status='x', s.k]))   (composite index)
  *
  * The function takes `outer` / `inner` explicitly rather than reading a
  * JoinNode's `left` / `right`: the caller asks for BOTH orientations of an
@@ -27,10 +39,12 @@
  * nested-loop / hash / merge competition unchanged.
  *
  * NOTE: one extra pair of `getBestAccessPlan` probes runs per qualifying
- * equi-join, uncached (see `probeModule`). Cheap for both shipped modules;
- * memoize by (table, seek columns) only if a third-party module with an
- * expensive planner shows up in optimization profiles — mirrors the
- * rule-key-set-seek tripwire.
+ * equi-join on the walk arm, uncached (see `probeModule`); the seek arm runs
+ * ONE probe — its baseline is the displaced seek's recorded cost, a field read
+ * rather than a second probe. Cheap for both shipped modules; memoize by
+ * (table, offered constraints) only if a third-party module with an expensive
+ * planner shows up in optimization profiles — mirrors the rule-key-set-seek
+ * tripwire.
  */
 
 import { createLogger } from '../../../common/logger.js';
@@ -45,9 +59,16 @@ import { BinaryOpNode } from '../../nodes/scalar.js';
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 import { hasSemanticOrdering } from '../../../util/comparison.js';
 import { sharesSeekKeySpace } from '../../../types/builtin-types.js';
+import { hasRelationalDescendant } from '../../analysis/scalar-subqueries.js';
 import { extractConstraints, createTableInfoFromNode, type PredicateConstraint } from '../../analysis/constraint-extractor.js';
-import { selectPhysicalNode } from '../access/rule-select-access-path.js';
-import { peelToAccessLeaf, rebuildChain, buildProbeRequest, type AccessLeafNode } from '../shared/access-leaf.js';
+import { selectPhysicalNode, combineResidualExpressions } from '../access/rule-select-access-path.js';
+import {
+	peelToSeekableAccessLeaf,
+	rebuildChain,
+	buildProbeRequest,
+	type AccessLeafNode,
+	type SeekableAccessLeafNode,
+} from '../shared/access-leaf.js';
 import { combineResidual } from './equi-pair-extractor.js';
 import { indexNestedLoopJoinCost } from '../../cost/index.js';
 import { validateAccessPlan, type BestAccessPlanResult } from '../../../vtab/best-access-plan.js';
@@ -71,21 +92,60 @@ interface ResolvedPair {
 	readonly outerIdx: number;
 }
 
+/** The admitted inner leaf, plus what its `FilterInfo` is the sole enforcer of. */
+interface AdmittedLeaf {
+	readonly leaf: SeekableAccessLeafNode;
+	/**
+	 * The planner-level constraints the displaced leaf enforces —
+	 * `IndexSeekNode.pushedConstraints` for a seek leaf, empty for a walk leaf.
+	 * Re-offered to the module alongside the join key; see {@link offerConstraints}.
+	 */
+	readonly pushed: readonly PredicateConstraint[];
+}
+
 /**
- * The inner leaf, when it is an unconstrained every-row walk whose `FilterInfo`
- * may be replaced wholesale: a plain full scan, or an ordering-only index walk
- * (plan='scan'). A leaf already carrying pushed constraints had its residual
- * Filter dropped on the module's promise to enforce them; replacing its
- * FilterInfo with our seek would silently drop those predicates
- * (backlog/feat-index-nested-loop-over-pushed-constraints). A pushed
- * limit / offset is likewise a directive the seek would not honor.
+ * The constraint list offered to the module, with the boundary between its
+ * two origins: positions `< joinKeyCount` are the synthesized join-key
+ * equalities, the rest are the displaced leaf's pushed predicates. The module's
+ * `handledFilters` is positional against `combined`, so every consumer of that
+ * array reads it through this one layout.
  */
-function admitLeaf(inner: RelationalPlanNode): AccessLeafNode | null {
-	const leaf = peelToAccessLeaf(inner);
+interface OfferedConstraints {
+	readonly combined: readonly PredicateConstraint[];
+	readonly joinKeyCount: number;
+}
+
+/**
+ * Join keys FIRST. Both the module (`claimFirstPerRole` in the store,
+ * `findEqualityMatches` in memory) and `selectPhysicalNode` pick the FIRST
+ * role-filling constraint per column, so when a pushed predicate and a join key
+ * land on the same column (`where b.id = 5` joined `on b.id = s.k`) this order
+ * is what makes the correlated seek the one that wins the column — the whole
+ * point of the candidate. Either leftover is then re-applied as a Filter.
+ */
+function offerConstraints(
+	joinKeys: readonly PredicateConstraint[],
+	pushed: readonly PredicateConstraint[],
+): OfferedConstraints {
+	return { combined: [...joinKeys, ...pushed], joinKeyCount: joinKeys.length };
+}
+
+/** Dispatch on the peeled leaf's kind; each arm owns its own gates. */
+function admitLeaf(inner: RelationalPlanNode): AdmittedLeaf | null {
+	const leaf = peelToSeekableAccessLeaf(inner);
 	if (!leaf) {
 		log('decline: inner does not peel to an access leaf through Alias/Project/Filter');
 		return null;
 	}
+	return leaf instanceof IndexSeekNode ? admitSeekLeaf(leaf) : admitWalkLeaf(leaf);
+}
+
+/**
+ * WALK arm: an unconstrained every-row walk whose `FilterInfo` may be replaced
+ * wholesale — a plain full scan, or an ordering-only index walk (plan='scan').
+ * A pushed limit / offset is a directive the seek would not honor.
+ */
+function admitWalkLeaf(leaf: AccessLeafNode): AdmittedLeaf | null {
 	const fi = leaf.filterInfo;
 	const isEveryRowWalk = fi.accessPath?.kind === 'fullScan'
 		|| (fi.accessPath?.kind === 'index' && fi.accessPath.plan === 'scan');
@@ -100,7 +160,56 @@ function admitLeaf(inner: RelationalPlanNode): AccessLeafNode | null {
 		log('decline: leaf emission order is load-bearing (absorbed a Sort)');
 		return null;
 	}
-	return leaf;
+	return { leaf, pushed: [] };
+}
+
+/**
+ * SEEK arm: a leaf whose `FilterInfo` already enforces the predicates recorded
+ * in `pushedConstraints` (their residual Filter was dropped on the module's
+ * promise). Admitted when that record is complete and re-offerable; the caller
+ * re-offers it with the join key and re-applies whatever the module declines,
+ * so no recorded predicate can be lost. Same five gates as
+ * `rule-key-set-seek`'s `admitSeekLeaf`, for the same reasons.
+ */
+function admitSeekLeaf(leaf: IndexSeekNode): AdmittedLeaf | null {
+	const fi = leaf.filterInfo;
+	// Gate 1: a pushed limit / offset is a directive the re-planned seek would not
+	// honour, and unlike a predicate it cannot be re-applied by a Filter without
+	// changing which rows are dropped.
+	if (fi.limit !== undefined || fi.offset !== undefined) {
+		log('decline: seek leaf carries a pushed limit/offset');
+		return null;
+	}
+	// Gate 2: a seek whose enforced predicate we cannot describe is a seek we
+	// cannot safely re-plan.
+	if (!leaf.pushedConstraints || leaf.pushedConstraints.length === 0) {
+		log('decline: seek leaf records no pushed constraints');
+		return null;
+	}
+	// Gate 3: the seek's emission order absorbed a Sort; a re-planned seek emits
+	// in its own key order instead.
+	if (leaf.orderingLoadBearing) {
+		log('decline: seek leaf emission order is load-bearing (absorbed a Sort)');
+		return null;
+	}
+	for (const c of leaf.pushedConstraints) {
+		// Gate 4: a correlated pushed constraint means this leaf is already somebody
+		// else's per-outer-row seek (a lateral seek keyed on an enclosing scope);
+		// re-planning it would re-plan their correlation. (The caller's
+		// sibling-reference guard already blocks this rule's OWN output.)
+		if (c.correlated === true) {
+			log('decline: seek leaf carries a correlated pushed constraint');
+			return null;
+		}
+		// Gate 5: this rule runs PostOptimization, so an expression re-applied here
+		// gets no further pass — a relational subquery inside it would reach emit
+		// unphysicalized, and would re-execute per outer row besides.
+		if (hasRelationalDescendant(c.sourceExpression)) {
+			log('decline: seek leaf pushed predicate contains a relational node');
+			return null;
+		}
+	}
+	return { leaf, pushed: leaf.pushedConstraints };
 }
 
 /**
@@ -119,7 +228,7 @@ function admitLeaf(inner: RelationalPlanNode): AccessLeafNode | null {
  * per-column key identity gives composite key identity.
  */
 function resolvePairs(
-	leaf: AccessLeafNode,
+	leaf: SeekableAccessLeafNode,
 	outer: RelationalPlanNode,
 	equiPairs: readonly EquiJoinPair[],
 ): ResolvedPair[] | null {
@@ -167,7 +276,7 @@ function resolvePairs(
  * caller). Construction mirrors `createSortForEquiPairs`.
  */
 function buildSeekPredicate(
-	leaf: AccessLeafNode,
+	leaf: SeekableAccessLeafNode,
 	outer: RelationalPlanNode,
 	resolved: readonly ResolvedPair[],
 ): ScalarPlanNode {
@@ -202,12 +311,40 @@ function buildSeekPredicate(
 	return combineResidual(undefined, conjuncts)!;
 }
 
+/** Module-currency cost and row estimate of the plan the candidate would displace. */
+interface DisplacedPlan {
+	readonly cost: number;
+	readonly rows: number | undefined;
+}
+
 /**
- * Probe the module twice — once with the synthesized join constraints, once
- * with no filters — and admit the seek only when the module's OWN answers say a
- * per-row seek beats its scan (`cost` and `rows` both smaller). Comparing
- * module currency to module currency keeps the engine's cost units out of the
- * module's — the same discipline as rule-key-set-seek's break-even.
+ * What the inner leaf costs TODAY, in the module's own currency. A seek leaf
+ * already records the module's answer for its own seek — `filterInfo.
+ * indexInfoOutput.estimatedCost` / `estimatedRows` are `accessPlan.cost` /
+ * `accessPlan.rows` verbatim (`makeIndexFilterInfo` spreads a base seeded with
+ * them and never overrides either) — while an unconstrained walk has to be
+ * asked. Comparing the combined seek against a bare scan instead would let a
+ * plan WORSE than the seek already in place win. Same baseline rule as
+ * rule-key-set-seek's `probeModuleCosts`.
+ */
+function displacedPlan(
+	leaf: SeekableAccessLeafNode,
+	ask: (filters: readonly PredicateConstraint[]) => BestAccessPlanResult,
+): DisplacedPlan {
+	if (leaf instanceof IndexSeekNode) {
+		const out = leaf.filterInfo.indexInfoOutput;
+		return { cost: out.estimatedCost, rows: Number(out.estimatedRows) };
+	}
+	const scan = ask([]);
+	return { cost: scan.cost, rows: scan.rows };
+}
+
+/**
+ * Probe the module with the offered constraints and admit the seek only when
+ * the module's OWN answers say it beats the plan being displaced (`cost` no
+ * higher, `rows` strictly smaller). Comparing module currency to module
+ * currency keeps the engine's cost units out of the module's — the same
+ * discipline as rule-key-set-seek's break-even.
  *
  * These requests are the ENGINE's, not the user's: a module that answers one
  * with a plan `validateAccessPlan` rejects gets logged and declined, never
@@ -215,8 +352,8 @@ function buildSeekPredicate(
  */
 function probeModule(
 	context: OptContext,
-	leaf: AccessLeafNode,
-	constraints: readonly PredicateConstraint[],
+	leaf: SeekableAccessLeafNode,
+	offered: OfferedConstraints,
 ): BestAccessPlanResult | null {
 	const tableSchema = leaf.tableSchema;
 	const vtabModule = leaf.source.vtabModule;
@@ -233,11 +370,12 @@ function probeModule(
 		return plan;
 	};
 
+	const { combined, joinKeyCount } = offered;
 	let seekPlan: BestAccessPlanResult;
-	let scanPlan: BestAccessPlanResult;
+	let baseline: DisplacedPlan;
 	try {
-		seekPlan = ask(constraints);
-		scanPlan = ask([]);
+		seekPlan = ask(combined);
+		baseline = displacedPlan(leaf, ask);
 	} catch (e: unknown) {
 		log('decline: module %s answered a synthesized probe on %s with an invalid plan: %s',
 			tableSchema.vtabModuleName, tableSchema.name, e instanceof Error ? e.message : String(e));
@@ -248,18 +386,32 @@ function probeModule(
 		log('decline: module did not claim an index seek');
 		return null;
 	}
-	// Every seek column must be one of our equality constraints, and every
-	// constraint the seek consumes must be claimed handled — otherwise the
+	// Every seek column must be one of the offered constraints — otherwise the
 	// module answered a different question than the one we will emit.
-	const constraintCols = new Set(constraints.map(c => c.columnIndex));
-	if (!seekPlan.seekColumnIndexes.every(col => constraintCols.has(col))) {
-		log('decline: seek columns extend beyond the join constraints');
+	const offeredCols = new Set(combined.map(c => c.columnIndex));
+	if (!seekPlan.seekColumnIndexes.every(col => offeredCols.has(col))) {
+		log('decline: seek columns extend beyond the offered constraints');
 		return null;
 	}
+	// At least one seek column must come from a JOIN KEY. Without this the
+	// module can answer a seek leaf with the seek it already had: nothing is
+	// correlated, nothing is gained, and the rule would rebuild an identical
+	// leaf on every visit. (The rebuilt leaf's provenance is re-checked by
+	// identity in `tryIndexNestedLoop` — this is the cheap early exit.)
+	const joinKeyCols = new Set(combined.slice(0, joinKeyCount).map(c => c.columnIndex));
+	if (!seekPlan.seekColumnIndexes.some(col => joinKeyCols.has(col))) {
+		log('decline: the seek does not use the join key');
+		return null;
+	}
+	// Every JOIN-KEY constraint on a seek column must be claimed handled — the
+	// module must be promising to seek on the key we will emit. Pushed
+	// constraints need no such claim: a handled one is re-promised by the new
+	// seek or reattached by selectPhysicalNode, an unhandled one is re-applied
+	// by `reapplyDeclinedPushed` — either answer is honoured.
 	const seekCols = new Set(seekPlan.seekColumnIndexes);
-	for (let i = 0; i < constraints.length; i++) {
-		if (seekCols.has(constraints[i].columnIndex) && seekPlan.handledFilters[i] !== true) {
-			log('decline: module claimed a seek column without handling its filter');
+	for (let i = 0; i < joinKeyCount; i++) {
+		if (seekCols.has(combined[i].columnIndex) && seekPlan.handledFilters[i] !== true) {
+			log('decline: module claimed a join-key seek column without handling its filter');
 			return null;
 		}
 	}
@@ -268,14 +420,68 @@ function probeModule(
 		log('decline: module attached a residualFilter');
 		return null;
 	}
-	// The module's own statement that a seek beats a scan on this table.
-	if (seekPlan.rows === undefined || scanPlan.rows === undefined
-		|| !(seekPlan.cost < scanPlan.cost) || !(seekPlan.rows < scanPlan.rows)) {
-		log('decline: module costs do not favor the seek (seek %s/%s vs scan %s/%s)',
-			seekPlan.cost, seekPlan.rows, scanPlan.cost, scanPlan.rows);
+	// The module's own statement that the combined seek beats what it displaces:
+	// no dearer, and strictly fewer rows. Rows is the discriminator on purpose —
+	// the memory module prices every single-key equality seek identically (cost
+	// keyed to the seek-KEY count, not the rows matched), so a pushed
+	// `status = 'x'` seek and the join-key seek that would replace it tie on
+	// cost and differ only in rows; a strict cost test would leave the seek arm
+	// dead on that module for its headline shape.
+	if (seekPlan.rows === undefined || baseline.rows === undefined
+		|| !(seekPlan.cost <= baseline.cost) || !(seekPlan.rows < baseline.rows)) {
+		log('decline: module costs do not favor the seek (seek %s/%s vs displaced %s/%s)',
+			seekPlan.cost, seekPlan.rows, baseline.cost, baseline.rows);
 		return null;
 	}
 	return seekPlan;
+}
+
+/**
+ * Re-apply the pushed constraints the module DECLINED (`handledFilters[i]
+ * !== true`) as a Filter directly above the rebuilt leaf. `selectPhysicalNode`
+ * re-promises the handled ones it consumed (recording them on the new seek's
+ * `pushedConstraints`) and reattaches the handled-but-unconsumed ones itself,
+ * but — exactly as for a user predicate, where `rule-grow-retrieve` owns the
+ * residual — it never touches a constraint the module did not claim. This is
+ * the third place, and with it every offered pushed constraint lands in
+ * exactly one of: re-promised, reattached, or re-applied here. Join-key
+ * leftovers need nothing: the ON condition retained above the join covers them.
+ *
+ * Folded into the Filter `selectPhysicalNode` may already have wrapped the seek
+ * in (a collation residual, a reattach), so the seek carries one residual
+ * Filter rather than a stack. `combineResidualExpressions` de-duplicates by
+ * identity, so a declined BETWEEN comes back as its single `BetweenNode`.
+ */
+function reapplyDeclinedPushed(
+	rebuilt: RelationalPlanNode,
+	seekPlan: BestAccessPlanResult,
+	offered: OfferedConstraints,
+): RelationalPlanNode {
+	const { combined, joinKeyCount } = offered;
+	const declined = combined.filter((_c, i) => i >= joinKeyCount && seekPlan.handledFilters[i] !== true);
+	if (declined.length === 0) return rebuilt;
+
+	const below = rebuilt instanceof FilterNode ? rebuilt.source : rebuilt;
+	const existing = rebuilt instanceof FilterNode ? [rebuilt.predicate] : [];
+	// Non-empty input ⇒ defined result.
+	const predicate = combineResidualExpressions([...existing, ...declined.map(c => c.sourceExpression)])!;
+	log('re-applying %d module-declined pushed constraint(s) above the seek', declined.length);
+	return new FilterNode(below.scope, below, predicate);
+}
+
+/**
+ * The `IndexSeekNode` under `rebuilt`'s collation-residual Filter, or null when
+ * `selectPhysicalNode` produced something else. It degrades to a SeqScan +
+ * residual on a collation decline (MISMATCH_UNSAFE — the seek would
+ * under-fetch) and to an EmptyResultNode on an "impossible" predicate; both
+ * mean no index-nested-loop here. An EmptyResultNode in particular must NOT be
+ * adopted — it would be sound only if the join key were provably literal
+ * NULL, which a dynamic per-outer-row binding never is.
+ */
+function rebuiltSeek(rebuilt: RelationalPlanNode): IndexSeekNode | null {
+	let probe: RelationalPlanNode = rebuilt;
+	while (probe instanceof FilterNode) probe = probe.source;
+	return probe instanceof IndexSeekNode ? probe : null;
 }
 
 /**
@@ -315,8 +521,9 @@ export function tryIndexNestedLoop(
 		return null;
 	}
 
-	const leaf = admitLeaf(inner);
-	if (!leaf) return null;
+	const admitted = admitLeaf(inner);
+	if (!admitted) return null;
+	const { leaf, pushed } = admitted;
 
 	const resolved = resolvePairs(leaf, outer, equiPairs);
 	if (!resolved || resolved.length === 0) return null;
@@ -327,21 +534,22 @@ export function tryIndexNestedLoop(
 	const tableSchema = leaf.tableSchema;
 	const tInfo = createTableInfoFromNode(leaf.source, `${tableSchema.schemaName}.${tableSchema.name}`);
 	const extraction = extractConstraints(predicate, [tInfo]);
-	const constraints = extraction.constraintsByTable.get(tInfo.relationKey) ?? [];
+	const joinKeys = extraction.constraintsByTable.get(tInfo.relationKey) ?? [];
 
 	// Orientation assertion: every conjunct must have extracted as an equality
 	// on an INNER column with a correlated (per-outer-row) binding, with nothing
 	// left over. Inner-side-first construction makes this hold today; the check
 	// is here so a future extractor change declines loudly instead of seeking on
 	// the wrong column.
-	if (constraints.length !== resolved.length || extraction.residualPredicate !== undefined
-		|| !constraints.every(c => c.op === '=' && c.correlated === true
+	if (joinKeys.length !== resolved.length || extraction.residualPredicate !== undefined
+		|| !joinKeys.every(c => c.op === '=' && c.correlated === true
 			&& tInfo.columnIndexMap.has(c.attributeId))) {
 		log('decline: constraint extraction did not return %d oriented correlated equalities', resolved.length);
 		return null;
 	}
 
-	const seekPlan = probeModule(context, leaf, constraints);
+	const offered = offerConstraints(joinKeys, pushed);
+	const seekPlan = probeModule(context, leaf, offered);
 	if (!seekPlan) return null;
 
 	// Reuse the full access-path machinery: collation cover (over the real
@@ -349,26 +557,27 @@ export function tryIndexNestedLoop(
 	// comparison collation is what gets checked), composite seeks, NULL
 	// handling, and reattachUnconsumedConstraints all come from
 	// selectPhysicalNode.
-	const rebuiltLeaf = selectPhysicalNode(leaf.source, seekPlan, [...constraints]);
-
-	// Verify an IndexSeekNode actually came back. selectPhysicalNode degrades to
-	// a SeqScan + residual on a collation decline (MISMATCH_UNSAFE — the seek
-	// would under-fetch) and to an EmptyResultNode on an "impossible" predicate;
-	// both mean no index-nested-loop here. An EmptyResultNode in particular must
-	// NOT be adopted — it would be sound only if the join key were provably
-	// literal NULL, which a dynamic per-outer-row binding never is.
-	let probe: RelationalPlanNode = rebuiltLeaf;
-	while (probe instanceof FilterNode) probe = probe.source;
-	if (!(probe instanceof IndexSeekNode)) {
-		log('decline: selectPhysicalNode did not produce an IndexSeek (got %s)', probe.nodeType);
+	const rebuiltLeaf = selectPhysicalNode(leaf.source, seekPlan, [...offered.combined]);
+	const seek = rebuiltSeek(rebuiltLeaf);
+	if (!seek) {
+		log('decline: selectPhysicalNode did not produce an IndexSeek');
+		return null;
+	}
+	// The new seek must really be keyed on the join — its recorded provenance
+	// must include a join-key constraint by identity. Otherwise the module
+	// re-minted the seek it already had (a pushed equality on the seek column
+	// won the per-column pick) and nothing is correlated.
+	if (!seek.pushedConstraints?.some(c => joinKeys.includes(c))) {
+		log('decline: the rebuilt seek is not keyed on the join');
 		return null;
 	}
 
-	const newInner = rebuildChain(inner, leaf, rebuiltLeaf);
+	const newLeaf = reapplyDeclinedPushed(rebuiltLeaf, seekPlan, offered);
+	const newInner = rebuildChain(inner, leaf, newLeaf);
 	const latencyMs = inner.physical.expectedLatencyMs ?? 0;
 	const cost = indexNestedLoopJoinCost(outerRows, seekPlan.rows!, latencyMs);
-	log('candidate: seek %s.%s via %s (%s rows/seek, cost %s for %s outer rows)',
+	log('candidate: seek %s.%s via %s (%s rows/seek, cost %s for %s outer rows; %d pushed constraint(s) re-offered)',
 		tableSchema.name, seekPlan.seekColumnIndexes!.map(c => tableSchema.columns[c]?.name).join(','),
-		seekPlan.indexName, seekPlan.rows, cost, outerRows);
+		seekPlan.indexName, seekPlan.rows, cost, outerRows, pushed.length);
 	return { newInner, cost };
 }

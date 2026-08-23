@@ -23,8 +23,14 @@ import { BloomJoinNode } from '../../src/planner/nodes/bloom-join-node.js';
 import { MergeJoinNode } from '../../src/planner/nodes/merge-join-node.js';
 import { IndexSeekNode, TableAccessNode } from '../../src/planner/nodes/table-access-nodes.js';
 import { CacheNode } from '../../src/planner/nodes/cache-node.js';
+import { FilterNode } from '../../src/planner/nodes/filter.js';
 import { ColumnReferenceNode } from '../../src/planner/nodes/reference.js';
+import { BetweenNode } from '../../src/planner/nodes/scalar.js';
+import type { RelationalPlanNode } from '../../src/planner/nodes/plan-node.js';
+import type { EquiJoinPair } from '../../src/planner/nodes/join-utils.js';
+import type { PredicateConstraint } from '../../src/planner/analysis/constraint-extractor.js';
 import { ruleJoinPhysicalSelection } from '../../src/planner/rules/join/rule-join-physical-selection.js';
+import { tryIndexNestedLoop } from '../../src/planner/rules/join/index-nested-loop.js';
 import type { OptContext } from '../../src/planner/framework/context.js';
 import { indexNestedLoopJoinCost, hashJoinCost, nestedLoopJoinCost } from '../../src/planner/cost/index.js';
 import { PhysicalType } from '../../src/types/logical-type.js';
@@ -48,6 +54,7 @@ const isMergeJoin = (n: PlanNode): n is MergeJoinNode => n instanceof MergeJoinN
 const isIndexSeek = (n: PlanNode): n is IndexSeekNode => n instanceof IndexSeekNode;
 const isTableAccess = (n: PlanNode): n is TableAccessNode => n instanceof TableAccessNode;
 const isCache = (n: PlanNode): n is CacheNode => n instanceof CacheNode;
+const isFilter = (n: PlanNode): n is FilterNode => n instanceof FilterNode;
 const isColumnRef = (n: PlanNode): n is ColumnReferenceNode => n instanceof ColumnReferenceNode;
 
 /** Does this seek key expression reference any of the given attribute ids? */
@@ -185,14 +192,6 @@ describe('index-nested-loop join plan shape', () => {
 	describe('declines', () => {
 		it('when the join column has no index (module declines the seek)', () => {
 			const plan = db.getPlan('select s.id from s join big on big.w = s.k');
-			expect(correlatedSeekJoins(plan)).to.have.lengthOf(0);
-		});
-
-		it('when the leaf already carries a pushed constraint', () => {
-			// `big.id > 5` pushes into the leaf as a range seek; replacing that
-			// leaf's FilterInfo would drop the module-enforced range. The range
-			// seek's literal bound must not read as a correlated key.
-			const plan = db.getPlan('select s.id from s join big on big.v = s.k where big.id > 5');
 			expect(correlatedSeekJoins(plan)).to.have.lengthOf(0);
 		});
 
@@ -607,6 +606,230 @@ describe('index-nested-loop join plan shape', () => {
 			const physical = [...collectNodes(plan, isHashJoin), ...collectNodes(plan, isMergeJoin)];
 			expect(physical, 'one physical join').to.have.lengthOf(1);
 			expect(tablesUnder(physical[0].left)).to.deep.equal(['ua']);
+		});
+	});
+
+	describe('pushed-constraint (IndexSeek) inner leaves', () => {
+		// The inner side already seeks on a predicate the module claimed — the
+		// predicate is nowhere else in the tree, enforced only by the leaf's
+		// FilterInfo. The seek arm re-OFFERS it to the module together with the
+		// join key and re-applies whatever the module declines as a Filter
+		// directly above the new seek. `status` is indexed and takes 1 row in 4,
+		// so the re-applied predicate genuinely excludes rows the join-key seek
+		// returns (k=5 → pb.id 5 has status 'y').
+		beforeEach(async () => {
+			await db.exec('create table ps (id integer primary key, k integer null)');
+			await db.exec('insert into ps values (1, 5), (2, 8), (3, 12), (4, null)');
+			await db.exec('create table pb (id integer primary key, v integer, status text)');
+			await db.exec('create index idx_pb_v on pb(v)');
+			await db.exec('create index idx_pb_status on pb(status)');
+			const rows: string[] = [];
+			for (let i = 1; i <= 200; i++) rows.push(`(${i}, ${i}, '${i % 4 === 0 ? 'x' : 'y'}')`);
+			await db.exec(`insert into pb values ${rows.join(', ')}`);
+			for await (const _ of db.eval('analyze')) { /* consume */ }
+		});
+
+		/** The fired join's seek plus the Filter (if any) wrapping it inside the inner chain. */
+		function seekAndResidual(plan: PlanNode): { join: JoinNode; seek: IndexSeekNode; residual: FilterNode | undefined } {
+			const fired = correlatedSeekJoins(plan);
+			expect(fired, 'exactly one join took the index-nested-loop path').to.have.lengthOf(1);
+			const seeks = collectNodes(fired[0].right, isIndexSeek);
+			expect(seeks, 'one IndexSeek on the driven side').to.have.lengthOf(1);
+			const residual = collectNodes(fired[0].right, isFilter).find(f => f.source === seeks[0]);
+			return { join: fired[0], seek: seeks[0], residual };
+		}
+
+		/** Column names referenced by a predicate, for asserting what a residual Filter re-applies. */
+		const referencedColumns = (n: PlanNode): string[] =>
+			collectNodes(n, isColumnRef).map(r => r.expression.name);
+
+		it('fires on a primary-key join key, re-applying the status predicate the module declined', async () => {
+			const sql = "select s.id, b.id as bid from ps s join pb b on b.id = s.k where b.status = 'x'";
+			const plan = db.getPlan(sql);
+			const { seek, residual } = seekAndResidual(plan);
+			expect(seek.indexName).to.equal('primary');
+			// The memory module answers the combined probe with the primary-key seek
+			// alone (its per-index plans claim only their own columns), so the
+			// status equality comes back unhandled and is re-applied as a Filter
+			// directly above the seek, inside the peeled wrapper chain.
+			expect(seek.pushedConstraints, 'the new seek enforces only the join key').to.have.lengthOf(1);
+			expect(seek.pushedConstraints![0].correlated).to.equal(true);
+			expect(residual, 'a Filter re-applying the declined status predicate').to.not.equal(undefined);
+			expect(referencedColumns(residual!.predicate)).to.deep.equal(['status']);
+			expect(collectNodes(plan, isHashJoin), 'no hash join').to.have.lengthOf(0);
+			// k=5 → id 5 is status 'y' and must be dropped by the re-applied Filter.
+			expect(await drain(db, sql)).to.deep.equal([{ id: 2, bid: 8 }, { id: 3, bid: 12 }]);
+		});
+
+		it('fires on a secondary-index join key the same way', async () => {
+			const sql = "select s.id, b.id as bid from ps s join pb b on b.v = s.k where b.status = 'x'";
+			const { seek, residual } = seekAndResidual(db.getPlan(sql));
+			expect(seek.indexName).to.equal('idx_pb_v');
+			expect(referencedColumns(residual!.predicate)).to.deep.equal(['status']);
+			expect(await drain(db, sql)).to.deep.equal([{ id: 2, bid: 8 }, { id: 3, bid: 12 }]);
+		});
+
+		it('lets the module take BOTH when a composite index covers them (no residual)', async () => {
+			// `idx_cb1(status)` makes the leaf a seek on status (the memory module
+			// has no prefix-only arm, so the composite alone would leave a walk);
+			// the combined probe then finds `idx_cb(status, v)` fully pinned and
+			// consumes both — the new seek carries two constraints and no Filter is
+			// re-applied. The composite is created FIRST: the memory module prices
+			// both equality seeks identically and breaks the tie by index order, so
+			// the reverse order would keep the single-column seek and decline.
+			await db.exec('create table cb (id integer primary key, v integer, status text)');
+			await db.exec('create index idx_cb on cb(status, v)');
+			await db.exec('create index idx_cb1 on cb(status)');
+			const rows: string[] = [];
+			for (let i = 1; i <= 200; i++) rows.push(`(${i}, ${i}, '${i % 4 === 0 ? 'x' : 'y'}')`);
+			await db.exec(`insert into cb values ${rows.join(', ')}`);
+			for await (const _ of db.eval('analyze cb')) { /* consume */ }
+			const sql = "select s.id, c.id as cid from ps s join cb c on c.v = s.k where c.status = 'x'";
+			const { seek, residual } = seekAndResidual(db.getPlan(sql));
+			expect(seek.indexName).to.equal('idx_cb');
+			expect(seek.pushedConstraints, 'both the join key and the status equality are seek keys').to.have.lengthOf(2);
+			expect(seek.pushedConstraints!.map(c => c.correlated === true)).to.deep.equal([true, false]);
+			expect(residual, 'nothing left to re-apply').to.equal(undefined);
+			expect(await drain(db, sql)).to.deep.equal([{ id: 2, cid: 8 }, { id: 3, cid: 12 }]);
+		});
+
+		it('handles a pushed range on the join-key column itself (two constraints, one column)', async () => {
+			// `b.id > 10` was pushed as a primary-key range seek. Offered together with
+			// `b.id = s.k` the equality wins the column (join keys are offered first),
+			// the range is neither seeked nor claimed, and comes back as the residual.
+			const sql = 'select s.id from ps s join pb b on b.id = s.k where b.id > 10';
+			const { seek, residual } = seekAndResidual(db.getPlan(sql));
+			expect(seek.indexName).to.equal('primary');
+			expect(seek.pushedConstraints).to.have.lengthOf(1);
+			expect(residual!.predicate.toString()).to.equal('b.id > 10');
+			expect(await drain(db, sql)).to.deep.equal([{ id: 3 }]);
+		});
+
+		it('re-applies a BETWEEN as its single source node, not as two copies', async () => {
+			// Both of a BETWEEN's constraints share one `sourceExpression`;
+			// `combineResidualExpressions`' identity de-duplication must yield the
+			// one `BetweenNode`.
+			const sql = 'select s.id from ps s join pb b on b.v = s.k where b.id between 2 and 9';
+			const { residual } = seekAndResidual(db.getPlan(sql));
+			expect(residual!.predicate).to.be.instanceOf(BetweenNode);
+			// k=12 → id 12 is outside the range and must be dropped.
+			expect(await drain(db, sql)).to.deep.equal([{ id: 1 }, { id: 2 }]);
+		});
+
+		it('keeps the inner Filter inside the pipeline for LEFT and ANTI (no inner row ⇒ null-pad / keep)', async () => {
+			const leftOn = "select s.id, b.id as bid from ps s left join pb b on b.id = s.k and b.status = 'x' order by s.id";
+			const anti = "select s.id from ps s where not exists (select 1 from pb b where b.id = s.k and b.status = 'x') order by s.id";
+			const antiShape = seekAndResidual(db.getPlan(anti));
+			expect(antiShape.join.joinType).to.equal('anti');
+			expect(referencedColumns(antiShape.residual!.predicate)).to.deep.equal(['status']);
+			// k=5 matches id 5 but its status is 'y': the Filter rejects it INSIDE the
+			// inner pipeline, so the anti join keeps s.id=1 and the left join null-pads it.
+			expect(await drain(db, anti)).to.deep.equal([{ id: 1 }, { id: 4 }]);
+			expect(await drain(db, leftOn)).to.deep.equal([
+				{ id: 1, bid: null }, { id: 2, bid: 8 }, { id: 3, bid: 12 }, { id: 4, bid: null },
+			]);
+		});
+
+		it('leaves the plan alone when the module keeps its own seek and refuses the join key', () => {
+			// `b.id = 8` is a unique primary-key seek already; offered `b.v = s.k`
+			// alongside it the memory module still answers with the primary-key
+			// seek (equal cost, first index wins), which uses no join-key column —
+			// the "seek does not use the join key" gate declines and the literal
+			// seek survives untouched.
+			const plan = db.getPlan('select s.id, b.id as bid from ps s join pb b on b.v = s.k where b.id = 8');
+			expect(correlatedSeekJoins(plan)).to.have.lengthOf(0);
+			const seeks = collectNodes(plan, isIndexSeek).filter(n => n.tableSchema.name === 'pb');
+			expect(seeks, 'the displaced seek is still the literal one').to.have.lengthOf(1);
+			expect(seeks[0].indexName).to.equal('primary');
+			expect(seeks[0].pushedConstraints![0].correlated).to.not.equal(true);
+		});
+
+		it('is idempotent on its own output (the new leaf is a correlated seek)', () => {
+			const plan = db.getPlan("select s.id from ps s join pb b on b.id = s.k where b.status = 'x'");
+			const { join } = seekAndResidual(plan);
+			// The caller's sibling-reference guard declines before touching the context.
+			const noContext = null as unknown as OptContext;
+			expect(ruleJoinPhysicalSelection(join, noContext)).to.equal(null);
+			// And the candidate builder itself declines the rebuilt inner: its leaf's
+			// recorded join-key constraint is correlated (gate 4), so no re-plan is
+			// attempted even when the builder is driven directly.
+			const pairs: EquiJoinPair[] = [{
+				leftAttrId: join.left.getAttributes().find(a => a.name === 'k')!.id,
+				rightAttrId: join.right.getAttributes().find(a => a.name === 'id')!.id,
+				collationsMatch: true,
+				valueDiscriminating: true,
+			}];
+			expect(tryIndexNestedLoop('inner', join.left, join.right, pairs, 4, { db } as unknown as OptContext))
+				.to.equal(null);
+		});
+
+		describe('seek-arm gates (constructed leaves)', () => {
+			// The gates below have no SQL shape that reaches them through the full
+			// optimizer today (a subquery-valued or correlated predicate is kept
+			// above the join rather than pushed into the leaf; a Sort never absorbs
+			// into a join's inner leaf; a LIMIT cannot cross a join). Each is pinned
+			// by handing `tryIndexNestedLoop` a leaf built from a real pushed seek
+			// with the one property under test changed.
+			let outer: RelationalPlanNode;
+			let seekLeaf: IndexSeekNode;
+			let pairs: EquiJoinPair[];
+			let ctx: OptContext;
+
+			beforeEach(() => {
+				outer = collectNodes(db.getPlan('select id, k from ps'), isTableAccess)[0];
+				seekLeaf = collectNodes(db.getPlan("select id from pb where status = 'x'"), isIndexSeek)[0];
+				expect(seekLeaf.pushedConstraints).to.have.lengthOf(1);
+				pairs = [{
+					leftAttrId: outer.getAttributes().find(a => a.name === 'k')!.id,
+					rightAttrId: seekLeaf.getAttributes().find(a => a.name === 'id')!.id,
+					collationsMatch: true,
+					valueDiscriminating: true,
+				}];
+				ctx = { db } as unknown as OptContext;
+			});
+
+			const attempt = (inner: RelationalPlanNode) => tryIndexNestedLoop('inner', outer, inner, pairs, 4, ctx);
+
+			it('(positive control) the unmodified seek leaf is admitted and its predicate re-applied by identity', () => {
+				const candidate = attempt(seekLeaf);
+				expect(candidate).to.not.equal(null);
+				const residual = candidate!.newInner;
+				expect(residual).to.be.instanceOf(FilterNode);
+				expect((residual as FilterNode).predicate, 'the recorded source expression itself, not a copy')
+					.to.equal(seekLeaf.pushedConstraints![0].sourceExpression);
+				expect((residual as FilterNode).source).to.be.instanceOf(IndexSeekNode);
+			});
+
+			it('declines a seek whose emission order is load-bearing', () => {
+				expect(attempt(seekLeaf.withProvenance(seekLeaf.pushedConstraints!, true))).to.equal(null);
+			});
+
+			it('declines a seek recording no pushed constraints (cannot describe what it enforces)', () => {
+				expect(attempt(seekLeaf.withProvenance([], false))).to.equal(null);
+			});
+
+			it("declines a correlated pushed constraint (somebody else's per-outer-row seek)", () => {
+				const c: PredicateConstraint = { ...seekLeaf.pushedConstraints![0], correlated: true };
+				expect(attempt(seekLeaf.withProvenance([c], false))).to.equal(null);
+			});
+
+			it('declines a pushed predicate carrying a relational subquery', () => {
+				// A real predicate with a ScalarSubquery child, lifted off a plan.
+				const withSubquery = collectNodes(
+					db.getPlan('select id from pb where v = (select max(k) from ps)'), isFilter);
+				expect(withSubquery).to.have.lengthOf(1);
+				const c: PredicateConstraint = { ...seekLeaf.pushedConstraints![0], sourceExpression: withSubquery[0].predicate };
+				expect(attempt(seekLeaf.withProvenance([c], false))).to.equal(null);
+			});
+
+			it('declines a seek carrying a pushed limit', () => {
+				const limited = new IndexSeekNode(
+					seekLeaf.scope, seekLeaf.source, { ...seekLeaf.filterInfo, limit: 5 },
+					seekLeaf.indexName, seekLeaf.seekKeys, seekLeaf.isRange, seekLeaf.providesOrdering,
+					undefined, seekLeaf.advertisement, seekLeaf.rangeBoundedOn, seekLeaf.suppressMonotonic,
+					false, seekLeaf.pushedConstraints);
+				expect(attempt(limited)).to.equal(null);
+			});
 		});
 	});
 
