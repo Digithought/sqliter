@@ -188,13 +188,39 @@ FROM inl_entry e JOIN inl_txn t ON t.id = e.txn_id + 0
 WHERE t.entity_id = 1 GROUP BY e.txn_id ORDER BY e.txn_id;
 → [{"txn_id":1,"total":2},{"txn_id":4,"total":6.5},{"txn_id":7,"total":11},{"txn_id":10,"total":15.5},{"txn_id":13,"total":20},{"txn_id":16,"total":24.5},{"txn_id":19,"total":29},{"txn_id":22,"total":33.5}]
 
--- Non-aggregated projection through the exchanged sides: column identity is by
--- attribute id, so `select *`-style positional output still names the columns the
--- query asked for, in the order it asked for them
+-- Non-aggregated projection through the exchanged sides: values follow the
+-- attribute the projection names, not the slot it used to occupy
 SELECT t.id AS tid, t.date, e.id AS eid, e.amount
 FROM inl_entry e JOIN inl_txn t ON t.id = e.txn_id
-WHERE t.entity_id = 2 AND e.amount > 20 ORDER BY eid;
-→ [{"tid":14,"date":"2024-01-14","eid":14,"amount":21},{"tid":17,"date":"2024-01-17","eid":17,"amount":25.5},{"tid":20,"date":"2024-01-20","eid":20,"amount":30},{"tid":23,"date":"2024-01-23","eid":23,"amount":34.5},{"tid":2,"date":"2024-01-02","eid":33,"amount":100}]
+WHERE t.entity_id = 1 ORDER BY eid;
+→ [{"tid":1,"date":"2024-01-01","eid":1,"amount":1.5},{"tid":4,"date":"2024-01-04","eid":4,"amount":6},{"tid":7,"date":"2024-01-07","eid":7,"amount":10.5},{"tid":10,"date":"2024-01-10","eid":10,"amount":15},{"tid":13,"date":"2024-01-13","eid":13,"amount":19.5},{"tid":16,"date":"2024-01-16","eid":16,"amount":24},{"tid":19,"date":"2024-01-19","eid":19,"amount":28.5},{"tid":22,"date":"2024-01-22","eid":22,"amount":33},{"tid":1,"date":"2024-01-01","eid":25,"amount":0.5},{"tid":4,"date":"2024-01-04","eid":26,"amount":0.5},{"tid":7,"date":"2024-01-07","eid":27,"amount":0.5},{"tid":10,"date":"2024-01-10","eid":28,"amount":0.5},{"tid":13,"date":"2024-01-13","eid":29,"amount":0.5},{"tid":16,"date":"2024-01-16","eid":30,"amount":0.5},{"tid":19,"date":"2024-01-19","eid":31,"amount":0.5},{"tid":22,"date":"2024-01-22","eid":32,"amount":0.5}]
+
+-- `SELECT *` is the sharpest test of the swap: with no projection naming columns,
+-- the result's COLUMN ORDER is whatever the star expanded to at build time. It must
+-- stay the spelled order — entry's three columns then txn's — even though the first
+-- query below plans with the sides exchanged and the second does not.
+SELECT * FROM inl_entry e JOIN inl_txn t ON t.id = e.txn_id WHERE t.entity_id = 1 ORDER BY e.id;
+→ [{"id":1,"txn_id":1,"amount":1.5,"id:1":1,"entity_id":1,"date":"2024-01-01"},{"id":4,"txn_id":4,"amount":6,"id:1":4,"entity_id":1,"date":"2024-01-04"},{"id":7,"txn_id":7,"amount":10.5,"id:1":7,"entity_id":1,"date":"2024-01-07"},{"id":10,"txn_id":10,"amount":15,"id:1":10,"entity_id":1,"date":"2024-01-10"},{"id":13,"txn_id":13,"amount":19.5,"id:1":13,"entity_id":1,"date":"2024-01-13"},{"id":16,"txn_id":16,"amount":24,"id:1":16,"entity_id":1,"date":"2024-01-16"},{"id":19,"txn_id":19,"amount":28.5,"id:1":19,"entity_id":1,"date":"2024-01-19"},{"id":22,"txn_id":22,"amount":33,"id:1":22,"entity_id":1,"date":"2024-01-22"},{"id":25,"txn_id":1,"amount":0.5,"id:1":1,"entity_id":1,"date":"2024-01-01"},{"id":26,"txn_id":4,"amount":0.5,"id:1":4,"entity_id":1,"date":"2024-01-04"},{"id":27,"txn_id":7,"amount":0.5,"id:1":7,"entity_id":1,"date":"2024-01-07"},{"id":28,"txn_id":10,"amount":0.5,"id:1":10,"entity_id":1,"date":"2024-01-10"},{"id":29,"txn_id":13,"amount":0.5,"id:1":13,"entity_id":1,"date":"2024-01-13"},{"id":30,"txn_id":16,"amount":0.5,"id:1":16,"entity_id":1,"date":"2024-01-16"},{"id":31,"txn_id":19,"amount":0.5,"id:1":19,"entity_id":1,"date":"2024-01-19"},{"id":32,"txn_id":22,"amount":0.5,"id:1":22,"entity_id":1,"date":"2024-01-22"}]
+
+SELECT * FROM inl_txn t JOIN inl_entry e ON t.id = e.txn_id WHERE t.entity_id = 1 ORDER BY e.id;
+→ [{"id":1,"entity_id":1,"date":"2024-01-01","id:1":1,"txn_id":1,"amount":1.5},{"id":4,"entity_id":1,"date":"2024-01-04","id:1":4,"txn_id":4,"amount":6},{"id":7,"entity_id":1,"date":"2024-01-07","id:1":7,"txn_id":7,"amount":10.5},{"id":10,"entity_id":1,"date":"2024-01-10","id:1":10,"txn_id":10,"amount":15},{"id":13,"entity_id":1,"date":"2024-01-13","id:1":13,"txn_id":13,"amount":19.5},{"id":16,"entity_id":1,"date":"2024-01-16","id:1":16,"txn_id":16,"amount":24},{"id":19,"entity_id":1,"date":"2024-01-19","id:1":19,"txn_id":19,"amount":28.5},{"id":22,"entity_id":1,"date":"2024-01-22","id:1":22,"txn_id":22,"amount":33},{"id":1,"entity_id":1,"date":"2024-01-01","id:1":25,"txn_id":1,"amount":0.5},{"id":4,"entity_id":1,"date":"2024-01-04","id:1":26,"txn_id":4,"amount":0.5},{"id":7,"entity_id":1,"date":"2024-01-07","id:1":27,"txn_id":7,"amount":0.5},{"id":10,"entity_id":1,"date":"2024-01-10","id:1":28,"txn_id":10,"amount":0.5},{"id":13,"entity_id":1,"date":"2024-01-13","id:1":29,"txn_id":13,"amount":0.5},{"id":16,"entity_id":1,"date":"2024-01-16","id:1":30,"txn_id":16,"amount":0.5},{"id":19,"entity_id":1,"date":"2024-01-19","id:1":31,"txn_id":19,"amount":0.5},{"id":22,"entity_id":1,"date":"2024-01-22","id:1":32,"txn_id":22,"amount":0.5}]
+
+-- A third relation above the exchanged pair: the upper join consumes the mirrored
+-- join's attributes in their NEW order, so a stale positional mapping there would
+-- surface as swapped values rather than as an error
+CREATE TABLE inl_ent (id INTEGER PRIMARY KEY, name TEXT);
+INSERT INTO inl_ent VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma');
+ANALYZE;
+SELECT n.name, t.id AS tid, e.id AS eid
+FROM inl_entry e JOIN inl_txn t ON t.id = e.txn_id JOIN inl_ent n ON n.id = t.entity_id
+WHERE t.entity_id = 1 ORDER BY eid;
+→ [{"name":"alpha","tid":1,"eid":1},{"name":"alpha","tid":4,"eid":4},{"name":"alpha","tid":7,"eid":7},{"name":"alpha","tid":10,"eid":10},{"name":"alpha","tid":13,"eid":13},{"name":"alpha","tid":16,"eid":16},{"name":"alpha","tid":19,"eid":19},{"name":"alpha","tid":22,"eid":22},{"name":"alpha","tid":1,"eid":25},{"name":"alpha","tid":4,"eid":26},{"name":"alpha","tid":7,"eid":27},{"name":"alpha","tid":10,"eid":28},{"name":"alpha","tid":13,"eid":29},{"name":"alpha","tid":16,"eid":30},{"name":"alpha","tid":19,"eid":31},{"name":"alpha","tid":22,"eid":32}]
+
+-- Self-join that mirrors: `b` (filtered to 8 rows) drives and `a` is seeked by
+-- primary key, the reverse of how it is spelled. The two sides are distinct scan
+-- instances of one table, so the swap must not make them share a cursor.
+SELECT a.id AS aid, b.id AS bid FROM inl_big a JOIN inl_big b ON a.id = b.v WHERE b.w = 3 ORDER BY aid;
+→ [{"aid":3,"bid":3},{"aid":8,"bid":8},{"aid":13,"bid":13},{"aid":18,"bid":18},{"aid":23,"bid":23},{"aid":28,"bid":28},{"aid":33,"bid":33},{"aid":38,"bid":38}]
 
 -- Both sides indexed on the join key, large table named first: the swap drives from
 -- the small side and seeks the large one; rows are what an inner join returns

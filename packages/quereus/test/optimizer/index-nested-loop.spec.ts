@@ -415,6 +415,49 @@ describe('index-nested-loop join plan shape', () => {
 			expect(b).to.deep.equal(a);
 		});
 
+		it('feeds a physical join ABOVE the exchanged sides the right columns', async () => {
+			// A mirrored JoinNode advertises right++left. When the join above it
+			// converts to a hash join it takes a POSITIONAL snapshot of its child's
+			// attributes (`preserveAttrs`, permuted with the build/probe swap), so a
+			// snapshot taken before the exchange would surface as values landing in
+			// the wrong columns — not as an error. PostOptimization is bottom-up, so
+			// the lower join swaps first; this pins that ordering end to end.
+			await createRollupTables();
+			await db.exec('create table cat (id integer primary key, entity_id integer, label text)');
+			await db.exec("insert into cat values (1, 7, 'seven'), (2, 3, 'three')");
+			for await (const _ of db.eval('analyze')) { /* consume */ }
+			const sql = 'select c.label, t.id as tid, e.id as eid from entry e join txn t on t.id = e.txn_id'
+				+ ' join cat c on c.entity_id = t.entity_id where t.entity_id = 7 order by eid limit 3';
+			const plan = db.getPlan(sql);
+			expect(soleSeekOrientation(plan)).to.deep.equal({ outer: ['txn'], seekOn: 'entry' });
+			expect(collectNodes(plan, isHashJoin), 'a hash join sits above the exchanged pair').to.have.lengthOf(1);
+			expect(await drain(db, sql)).to.deep.equal([
+				{ label: 'seven', tid: 7, eid: 6 },
+				{ label: 'seven', tid: 47, eid: 46 },
+				{ label: 'seven', tid: 87, eid: 86 },
+			]);
+		});
+
+		it('mirrors a self-join without conflating its two scan instances', async () => {
+			// `rebuildChain` replaces the leaf by node IDENTITY, and both sides of a
+			// self-join are distinct nodes over one table — so the driving side keeps
+			// its scan while the driven side becomes the seek, even though the two
+			// carry the same `tableSchema`.
+			const sql = 'select a.id as aid, b.id as bid from big a join big b on a.id = b.v'
+				+ ' where b.w = 3 order by aid limit 4';
+			const fired = correlatedSeekJoins(db.getPlan(sql));
+			expect(fired, 'the self-join mirrors: filtered `b` drives, `a` is seeked').to.have.lengthOf(1);
+			expect(collectNodes(fired[0].left, isIndexSeek), 'the driving instance still walks').to.have.lengthOf(0);
+			const seeks = collectNodes(fired[0].right, isIndexSeek);
+			expect(seeks).to.have.lengthOf(1);
+			// Which orientation won is only visible in the index: the mirror seeks
+			// `a.id` on the primary key, the un-mirrored one would seek `b.v` on idx_v.
+			expect(seeks[0].indexName, 'seeked on a.id, so the sides were exchanged').to.equal('primary');
+			expect(await drain(db, sql)).to.deep.equal([
+				{ aid: 3, bid: 3 }, { aid: 13, bid: 13 }, { aid: 23, bid: 23 }, { aid: 33, bid: 33 },
+			]);
+		});
+
 		describe('both sides indexed on the join key', () => {
 			// Two candidates come back non-null; the cheaper — the one whose OUTER is
 			// the small side — must win, and the decision must follow the data, not

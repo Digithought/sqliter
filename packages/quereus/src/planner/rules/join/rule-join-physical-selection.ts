@@ -253,6 +253,15 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 	// win a comparison against the strictly cheaper index-NL. Harmless today
 	// (both shipped modules report 0). If a high-latency module appears, charge
 	// plain NL `outerRows * latency` here rather than dropping it from index-NL.
+	//
+	// NOTE: the same exemption makes the two index-NL orientations asymmetric.
+	// Hash and merge are charged the RIGHT side's latency once; the mirrored
+	// index-NL charges the LEFT side's latency per seek (the left is its inner),
+	// and nothing charges the left's latency to hash/merge. So a high-latency
+	// left against a zero-latency right can make the mirror look cheaper than
+	// hash by dodging a charge hash never paid either. Inert today (both shipped
+	// modules report 0). If a high-latency module appears, charge each candidate
+	// its own inner side's latency here instead of hard-coding the right's.
 	const rightLatencyMs = node.right.physical.expectedLatencyMs ?? 0;
 
 	// Pick the cheapest physical join algorithm. Every comparison is a strict
@@ -349,12 +358,7 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 		// Swap: left becomes build, right becomes probe
 		probeSource = node.right;
 		buildSource = node.left;
-		// Flip equi-pair directions; spread so the collation flags survive.
-		equiPairs = extracted.equiPairs.map(p => ({
-			...p,
-			leftAttrId: p.rightAttrId,
-			rightAttrId: p.leftAttrId
-		}));
+		equiPairs = mirrorEquiPairs(extracted.equiPairs);
 		// INVARIANT: a physical join's advertised attribute order IS its emitted
 		// row layout. `emitBloomJoin` yields `[...leftRow, ...rightRow]` — that is,
 		// probe-then-build — and `getType()`, `combineJoinKeys` and
