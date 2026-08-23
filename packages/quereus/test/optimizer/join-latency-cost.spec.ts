@@ -32,6 +32,7 @@ import { MergeJoinNode } from '../../src/planner/nodes/merge-join-node.js';
 import { IndexSeekNode } from '../../src/planner/nodes/table-access-nodes.js';
 import { CacheNode } from '../../src/planner/nodes/cache-node.js';
 import { ColumnReferenceNode } from '../../src/planner/nodes/reference.js';
+import { EagerPrefetchNode } from '../../src/planner/nodes/eager-prefetch-node.js';
 
 /** The synthetic remote-vtab stand-in used by every parallel/latency optimizer spec. */
 class HighLatencyMemoryModule extends MemoryTableModule {
@@ -54,6 +55,7 @@ const isMergeJoin = (n: PlanNode): n is MergeJoinNode => n instanceof MergeJoinN
 const isIndexSeek = (n: PlanNode): n is IndexSeekNode => n instanceof IndexSeekNode;
 const isCache = (n: PlanNode): n is CacheNode => n instanceof CacheNode;
 const isColumnRef = (n: PlanNode): n is ColumnReferenceNode => n instanceof ColumnReferenceNode;
+const isEagerPrefetch = (n: PlanNode): n is EagerPrefetchNode => n instanceof EagerPrefetchNode;
 
 /** Logical JoinNodes whose right subtree seeks on a left-side attribute (the index-NL signature). */
 function correlatedSeekJoins(root: PlanNode): JoinNode[] {
@@ -63,6 +65,23 @@ function correlatedSeekJoins(root: PlanNode): JoinNode[] {
 			seek.seekKeys.some(key =>
 				collectNodes(key, isColumnRef).some(ref => leftAttrIds.has(ref.attributeId))));
 	});
+}
+
+// `rule-eager-prefetch-probe` wraps a hash join's probe in an `EagerPrefetch`,
+// whose fork is live from `run()` for the whole statement. Executing such a plan
+// under QUEREUS_FORK_STRICT trips the documented strict-harness false positive:
+// the Sort/Project above the join calls `createRowSlot` on the parent rctx while
+// that fork is still counted active (invariant 2). The pump reads only its own
+// detached fork and `bumpParentForkCounter` is a no-op in production — see
+// docs/runtime-parallel.md § Strict-fork interaction, and the same guard in
+// `parallel-fanout.spec.ts`. Skip the row-equality assertion for prefetch-bearing
+// plans only: the non-strict run validates the rows, and every plan-shape
+// assertion in this file keeps running under strict fork.
+const strictFork = typeof process !== 'undefined' && (process.env?.QUEREUS_FORK_STRICT === '1' || process.env?.QUEREUS_FORK_STRICT === 'true');
+
+/** True when executing this plan would trip the strict-fork harness false positive. */
+function execTripsStrictFork(plan: PlanNode): boolean {
+	return strictFork && collectNodes(plan, isEagerPrefetch).length > 0;
 }
 
 async function drain(db: Database, sql: string): Promise<Array<Record<string, unknown>>> {
@@ -219,7 +238,9 @@ describe('join physical selection: first-row latency charges', () => {
 			db.registerModule('hi_lat', new HighLatencyMemoryModule());
 			await createTables(rightRows, rightModule, leftModule);
 			const plan = db.getPlan(SQL);
-			expect(await drain(db, SQL), 'rows are the same whichever wins').to.deep.equal(FIRST_THREE);
+			if (!execTripsStrictFork(plan)) {
+				expect(await drain(db, SQL), 'rows are the same whichever wins').to.deep.equal(FIRST_THREE);
+			}
 			const mirrored = correlatedSeekJoins(plan).length;
 			const hash = collectNodes(plan, isHashJoin).length;
 			const merge = collectNodes(plan, isMergeJoin).length;
