@@ -147,6 +147,73 @@ describe('DROP TABLE leaves no residue', () => {
 		await db.close();
 	});
 
+	it('a failing stats delete is logged but does not block the drop', async () => {
+		const db = new Database();
+		// Stats store whose `delete` always throws — the teardown must warn and carry on,
+		// not abort the drop and strand the table's data store on disk.
+		const failing: KVStoreProvider = {
+			...provider,
+			async getStatsStore(s: string, t: string) {
+				const store = await provider.getStatsStore(s, t);
+				// Proxy, not a spread copy: the store's methods live on its prototype, and
+				// every other stats path (prime, flush) must keep working normally — only
+				// `delete` fails.
+				return new Proxy(store, {
+					get: (target, prop, receiver) => prop === 'delete'
+						? async () => { throw new Error('stats store offline'); }
+						: Reflect.get(target, prop, receiver),
+				});
+			},
+		};
+		const mod = new StoreModule(failing);
+		db.registerModule('store', mod);
+
+		await db.exec(`create table t (id integer primary key, v integer) using store`);
+		await db.exec(`insert into t values (1, 10)`);
+
+		await db.exec(`drop table t`);
+
+		expect(provider.stores.has('main.t'), 'data store still dropped').to.equal(false);
+		await db.close();
+	});
+
+	it('deletes the stats entry BEFORE deleteTableStores', async () => {
+		// A provider with a PER-TABLE stats store: `deleteTableStores` drops that store,
+		// so the entry delete has to happen first. Reversing the two would make
+		// `getStatsStore` re-create the store it had just dropped — asserted here by call
+		// order AND by the store's absence afterwards, so a reordering fails this test.
+		const calls: string[] = [];
+		const perTable: KVStoreProvider = {
+			...provider,
+			async getStatsStore(s: string, t: string) {
+				calls.push('getStatsStore');
+				const key = `${s}.${t}.__stats__`;
+				let store = provider.stores.get(key);
+				if (!store) { store = new InMemoryKVStore(); provider.stores.set(key, store); }
+				return store;
+			},
+			async deleteTableStores(s: string, t: string, indexNames: readonly string[]) {
+				calls.push('deleteTableStores');
+				provider.stores.delete(`${s}.${t}`);
+				provider.stores.delete(`${s}.${t}.__stats__`);
+				for (const i of indexNames) provider.stores.delete(`${s}.${t}_idx_${i}`);
+			},
+		};
+		const db = new Database();
+		const mod = new StoreModule(perTable);
+		db.registerModule('store', mod);
+
+		await db.exec(`create table t (id integer primary key, v integer) using store`);
+		await db.exec(`insert into t values (1, 10)`);
+		calls.length = 0;
+
+		await db.exec(`drop table t`);
+
+		expect(calls.indexOf('getStatsStore'), 'stats entry deleted first').to.be.lessThan(calls.indexOf('deleteTableStores'));
+		expect(provider.stores.has('main.t.__stats__'), 'no empty stats store left behind').to.equal(false);
+		await db.close();
+	});
+
 	it('a table re-created under a dropped name starts with no inherited statistics', async () => {
 		const db = new Database();
 		const mod = new StoreModule(provider);

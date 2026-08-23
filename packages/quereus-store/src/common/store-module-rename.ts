@@ -296,8 +296,14 @@ export abstract class StoreModuleRename extends StoreModuleAlter {
 				await statsStore.put(buildStatsKey(schemaName, newName), statsValue);
 			}
 			await statsStore.delete(oldStatsKey);
-		} catch {
-			/* stats are advisory — a stats hiccup must never block the rename */
+		} catch (e) {
+			// Advisory — a stats hiccup must never block the rename — but never silent
+			// (AGENTS.md), and the same posture as the drop-side delete in
+			// `StoreModule.tearDownTableStorage`.
+			console.warn(
+				`[StoreModule] Failed to migrate persisted statistics for '${schemaName}.${oldName}' `
+					+ `to '${schemaName}.${newName}': ${e instanceof Error ? e.message : String(e)}`,
+			);
 		}
 
 		// Same emit-iff-`ddl` rule as `StoreModuleAlter.alterTable`: `ddl` set means this

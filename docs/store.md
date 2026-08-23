@@ -368,7 +368,9 @@ battery in every plugin's `test/conformance.spec.ts`.
 
 **Stats Keys** (in `__stats__` store):
 - Format: `{schema}.{table}` as UTF-8 string
-- Value: JSON `{rowCount: number, updatedAt: timestamp}`
+- Value: JSON `TableStats` — `rowCount` / `updatedAt` always, plus the `ANALYZE` snapshot
+  (`columnStats` keyed by lowercase column name, `analyzedRowCount`, `lastAnalyzed`) once the
+  table has been analyzed
 - Example: Key `main.users` → `{"rowCount": 1000, "updatedAt": 1704067200000}`
 
 ### Primary Key Encoding
@@ -692,6 +694,12 @@ Row counts are maintained lazily for efficient query planning:
 - **Flush on close**: Stats are persisted when a table is disconnected
 - **Load on open**: The persisted count is read back the first time a table's storage is opened, before any mutation can be tracked against it — otherwise the first write after a reopen would restart the count from zero
 - **No database upgrades**: The `__stats__` store is created at database initialization, so stats persistence never triggers schema upgrades
+- **Lifecycle with the table**: the entry is keyed by name, not owned by a per-table store, so
+  the module maintains it explicitly — `RENAME TO` re-keys it from the old name to the new one,
+  and `DROP TABLE` (plus the sync layer's detached-table reclaim) deletes it, so a table later
+  created under a freed name does not inherit the dead table's row count or column snapshot.
+  Both operations are advisory: a failure is logged and never blocks the DDL, and neither rides
+  the transaction coordinator, so statistics can be lost by a rolled-back explicit transaction
 
 ```typescript
 // Access statistics programmatically

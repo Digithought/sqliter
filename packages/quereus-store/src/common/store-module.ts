@@ -607,6 +607,13 @@ export class StoreModule extends StoreModuleRename implements VirtualTableModule
 		// delete an absent key from it). Advisory, like the rename-path re-key: a
 		// failed delete must not block the drop, but — unlike the rename arm's bare
 		// swallow — is logged (AGENTS.md: don't eat exceptions silently).
+		//
+		// NOTE: `dispose()` flushes only a delta still buffered on the instance; it does
+		// NOT await a flush already IN FLIGHT from `trackMutation`'s fire-and-forget
+		// `queueMicrotask(flushStats)` (which zeroes `mutationCount` before its awaits, so
+		// dispose sees nothing to do). On a provider whose `put` is genuinely async, that
+		// in-flight write can land after the delete below and resurrect the entry. Narrow
+		// and advisory-only; tracked as `debt-store-table-dispose-awaits-inflight-stats-flush`.
 		try {
 			const statsStore = await this.provider.getStatsStore(schemaName, tableName);
 			await statsStore.delete(buildStatsKey(schemaName, tableName));
