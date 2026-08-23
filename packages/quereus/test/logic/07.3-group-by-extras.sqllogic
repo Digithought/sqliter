@@ -407,9 +407,36 @@ from wg w order by w.b;
 select w.b, (select count(*) from wg t group by t.a having t.b = '1') as c from wg w;
 -- error: HAVING references non-grouped column 'b'
 
--- Negative, no GROUP BY: same restriction, same message.
+-- Negative, no GROUP BY: same restriction, same message — pinned in full here, so
+-- the "may only reference" tail is asserted somewhere and not just the prefix.
 select w.b, (select count(*) from wg t having t.b = '1') as c from wg w;
--- error: HAVING references non-grouped column 'b'
+-- error: HAVING references non-grouped column 'b'; HAVING may only reference GROUP BY columns or aggregate expressions
+
+-- Correlating TWO levels out of a HAVING, not just one.
+select o.b, (select count(*) from wg m where m.b = o.b
+             and (select count(*) from wg t group by t.a having t.a = o.a) > 0) as c
+from wg o order by o.b;
+→ [{"b":"1","c":1},{"b":"2","c":1},{"b":"3","c":1}]
+
+-- The ENCLOSING query is itself grouped, and the inner HAVING names its GROUPING KEY.
+select w.a, count(*) as n, (select count(*) from wg t group by t.a having t.a = w.a) as c
+from wg w group by w.a order by w.a;
+→ [{"a":"x","n":2,"c":2},{"a":"y","n":1,"c":1}]
+
+-- Same shape, but the inner HAVING names an UNGROUPED column of the enclosing grouped
+-- query. HAVING's own check cannot see it (`w.b` is not one of the INNER query's
+-- pre-grouping columns), so it is the enclosing query's finished-plan check that
+-- rejects it, with the general wording rather than HAVING's dedicated message.
+select w.a, count(*) as n, (select count(*) from wg t group by t.a having t.a = w.b) as c
+from wg w group by w.a;
+-- error: Column 'w.b' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- The `skipSubqueries` contract: an ungrouped column of THIS query reached through a
+-- subquery inside HAVING is left to the finished-plan check, so it raises the general
+-- message and not HAVING's. This is the entire reason that parameter exists.
+select a, count(*) as c from wg group by a
+having (select max(t.a) from wg t where t.a = wg.b) = 'x';
+-- error: Column 'wg.b' must appear in the GROUP BY clause or be used in an aggregate function
 
 drop table wg;
 

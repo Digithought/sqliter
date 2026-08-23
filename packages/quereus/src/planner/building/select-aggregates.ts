@@ -236,13 +236,12 @@ function handlePreAggregateSort(
  * after aggregation, plus the canonical AST strings of the GROUP BY expressions
  * themselves.
  *
- * Two flavours of attribute id are legal, and both matter depending on where the
- * expression being checked was built. An expression built against the
- * *pre-aggregate* scope (the SELECT list, before the final projection) names base
- * source attributes, so the ids of the GROUP BY key expressions cover it. A HAVING
- * predicate resolves through a hybrid scope and may name either the AggregateNode's
- * own output attributes or, via the source-column fallback, base ones — so the
- * output ids must be admitted too, passed in `groupedOutputAttributes`.
+ * Only ONE flavour of attribute id participates: the base source attributes the
+ * GROUP BY key expressions name. That is enough because the sole consumer — the
+ * SELECT-list check {@link validateAggregateProjections} — checks expressions built
+ * against the same *pre-aggregate* scope. Clauses that sit ABOVE the AggregateNode
+ * (HAVING, the window phase, ORDER BY) are checked with {@link isPreGroupingReference}
+ * instead; this coverage set cannot express what they need.
  *
  * The finished plan of a grouped query gets a second, subquery-aware check
  * ({@link assertGroupedPlanCoverage}); it needs to descend into subqueries and to
@@ -268,9 +267,7 @@ interface GroupByCoverage {
  * AggregateNode and is checked with {@link isPreGroupingReference} instead, which
  * can tell this query's own ungrouped columns from an enclosing query's.
  */
-function buildGroupByCoverage(
-	groupByExpressions: readonly ScalarPlanNode[],
-): GroupByCoverage {
+function buildGroupByCoverage(groupByExpressions: readonly ScalarPlanNode[]): GroupByCoverage {
 	const attrIds = new Set<number>();
 	const fingerprints = new Set<string>();
 	for (const expr of groupByExpressions) {
@@ -723,8 +720,8 @@ function assertPostAggregateCoverage(node: PlanNode, context: GroupedRedirectCon
 function findUngroupedPostAggregateRef(
 	node: PlanNode,
 	context: GroupedRedirectContext,
-	insideSubquery = false,
 	skipSubqueries = false,
+	insideSubquery = false,
 ): ColumnReferenceNode | null {
 	if (!insideSubquery && CapabilityDetectors.isAggregateFunction(node)) {
 		return null;
@@ -737,7 +734,7 @@ function findUngroupedPostAggregateRef(
 	for (const child of node.getChildren()) {
 		if (isCteDefinition(child)) continue;
 		if (skipSubqueries && isRelationalNode(child)) continue;
-		const found = findUngroupedPostAggregateRef(child, context, insideSubquery || isRelationalNode(child), skipSubqueries);
+		const found = findUngroupedPostAggregateRef(child, context, skipSubqueries, insideSubquery || isRelationalNode(child));
 		if (found) return found;
 	}
 	return null;
@@ -1135,7 +1132,7 @@ function buildHavingFilter(
 	// branch.
 	const coverageContext = groupedRedirectContext
 		?? buildGroupedRedirectContext([], aggregateAttributes, sourceInput);
-	const ungrouped = findUngroupedPostAggregateRef(havingExpression, coverageContext, false, true);
+	const ungrouped = findUngroupedPostAggregateRef(havingExpression, coverageContext, /* skipSubqueries */ true);
 	if (ungrouped) {
 		throw new QuereusError(
 			`HAVING references non-grouped column '${ungrouped.expression.name}'; ` +
