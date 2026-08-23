@@ -8,6 +8,8 @@ files:
   - packages/quereus/src/vtab/best-access-plan.ts                          # the `rows` field's documented meaning
   - packages/quereus/src/vtab/memory/module.ts                             # the one shipped module that makes the zero claim; also reads `request.estimatedRows || 1000`
   - packages/quereus/src/planner/nodes/set-operation-node.ts               # no estimatedRows getter at all, and computePhysical never stamps one
+  - packages/quereus/src/planner/rules/join/rule-join-greedy-commute.ts    # arm 5 — reads the logical getter; its row-count swap test never fires
+  - packages/quereus/src/planner/rules/join/rule-quickpick-enumeration.ts  # arm 5 — same read; sorts its greedy tours by a 1e9 sentinel
   - packages/quereus/src/planner/nodes/async-gather-node.ts
   - packages/quereus/src/planner/nodes/cte-node.ts
   - packages/quereus/src/planner/nodes/cte-reference-node.ts
@@ -138,6 +140,44 @@ key source is seeked per outer row), so `rule-key-set-seek` never runs and its g
 never consulted. Before `analyze` the rewrite fires with the estimate still reading 0.
 Any test that tries to exercise this gate therefore pins an unrelated plan choice — which
 is why the review recorded the measurement here rather than adding one.
+
+## Arm 5 — the two join-ordering rules read a row estimate that is never there (verified)
+
+Both rules that could reorder a join read the **logical** `estimatedRows` getter on their
+inputs. Neither `AliasNode` nor `RetrieveNode` defines that getter — both stamp a row count
+only into `computePhysical`, via `physicalSourceRows` — so for any table-backed input the
+read is `undefined`, and each rule falls back to a sentinel that makes its comparison
+meaningless.
+
+- `rule-join-greedy-commute` (`planner/rules/join/rule-join-greedy-commute.ts`) substitutes
+  `Number.POSITIVE_INFINITY`, so its swap test `rightRows < leftRows` is `Infinity <
+  Infinity` — always false. **The rule's row-count arm never fires for table-backed
+  inputs.** Its singleton-functional-dependency arm still works, so the rule is not dead,
+  just not doing the thing its own comment advertises ("prefer the smaller input on the
+  left").
+- `rule-quickpick-enumeration` (`planner/rules/join/rule-quickpick-enumeration.ts`)
+  substitutes `1e9` for every relation, so the `baseOrder` it sorts its greedy tours by is
+  arbitrary. This one runs in the Physical pass, *after* access-path selection, so the real
+  counts are sitting on `physical.estimatedRows` one node down and are simply not read.
+
+Verified in-process on the memory module: two tables of 2,000 and 4,000 rows, joined and
+then `analyze`d, written `from entry e join txn t` (4,000-row side named first). The
+commute rule leaves the order untouched, and the resulting hash join reads all 4,000 rows.
+Naming the tables in the other order produces a plan roughly 20x cheaper by the rule's own
+cost model. Nothing between the two spellings differs except the order the tables were
+written in.
+
+Same root cause as Arm 3 — a producer/consumer mismatch around `physicalSourceRows` — and
+the same one-line-per-site shape once "unknown" is spellable: `debt-join-rows-from-physical-children`
+moved the single-source operators and the join family onto `physicalSourceRows` and left
+these two join-*ordering* rules behind. Cost is performance only; both rules return correct
+rows either way.
+
+Two-table joins have a separate, narrower remedy landing independently
+(`feat-index-nested-loop-seek-side-election` elects the seek side inside
+`rule-join-physical-selection`, which does read `physicalSourceRows`), so the user-visible
+sting of the greedy-commute arm is reduced but not removed — three-way and larger joins
+still depend on QuickPick's arbitrary base order.
 
 ## Notes for whoever picks this up
 
