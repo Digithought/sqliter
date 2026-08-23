@@ -2352,7 +2352,12 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		return new Table(tableSchema, moduleName, moduleInfo.module);
 	}
 
-	/** @internal */
+	/**
+	 * @internal Resolve `funcName/nArg` to whatever is registered under that name — the
+	 * user's function when one shadows a built-in. Correct for anything that then reads
+	 * the resolved schema's own declared properties; WRONG for a caller whose rewrite is
+	 * sound only for the built-in's semantics, which must use {@link _findBuiltinFunction}.
+	 */
 	_findFunction(funcName: string, nArg: number): FunctionSchema | undefined {
 		return this.schemaManager.findFunction(funcName, nArg);
 	}

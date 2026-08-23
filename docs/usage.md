@@ -681,6 +681,12 @@ Returns a public handle to a table for inspection and per-table event subscripti
 ### `db.registerModule(...)`, `db.createScalarFunction(...)`, `db.createAggregateFunction(...)`, `db.registerCollation(...)`
 Methods for extending database functionality.
 
+#### Shadowing a built-in function
+
+Function registration overwrites by `name`/argument-count, so `db.createScalarFunction('upper', …)` or `db.createAggregateFunction('min', …)` **replaces** the built-in of that name for every query on the connection. Optimizer rewrites whose soundness depends on a built-in's own semantics detect the shadow by schema identity — not by name — and decline, so those queries stay correct and merely lose the speedup (`ruleMinMaxIndexBoundary` and `ruleGroupByFdSimplification`; see [Optimizer Rules](optimizer-rules.md)).
+
+One known exception: shadowing an aggregate that a **materialized view** already stores (e.g. registering your own `sum` when an MV holds `sum(x)`) can make a covered query answer from the view's built-in-computed values instead of your function. Tracked as `bug-mv-aggregate-rewrite-ignores-shadowed-function`. Until it lands, avoid taking over the name of an aggregate used in a materialized view.
+
 #### `db.registerCollation(name, comparator, optionsOrNormalizer?)`
 
 Registers a comparison rule for text. `NOCASE` and `RTRIM` may be overridden; `BINARY` may not. The third argument is either a bare key normalizer (legacy positional form) or an options object:

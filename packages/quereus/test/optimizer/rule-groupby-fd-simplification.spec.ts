@@ -201,56 +201,60 @@ describe('ruleGroupByFdSimplification', () => {
 		});
 	});
 
-	it('a user-defined aggregate that shadows the builtin min', async () => {
-		// `Schema.addFunction` overwrites by name/numArgs, so after this registration
+	describe('picker MIN resolution gates on builtin identity', () => {
+		// `Schema.addFunction` overwrites by name/numArgs, so after a shadow registration
 		// BOTH the planner's resolution and `db._findFunction('min', 1)` return the
 		// shadow — comparing the two would only prove they agree with each other. The
 		// gate is schema identity against the builtin registration
 		// (`db._isBuiltinFunction`, via `_findBuiltinFunction`) for exactly this reason:
 		// picking the shadow would return its row count instead of the true value.
-		await db.exec(
-			"CREATE TABLE pk (id INTEGER PRIMARY KEY, v INTEGER NOT NULL) USING memory",
-		);
-		await db.exec('INSERT INTO pk VALUES (1, 100), (2, 200)');
-		db.createAggregateFunction('min', { numArgs: 1, initialState: 0 },
-			(acc: unknown) => (acc as number) + 1,
-			(acc: unknown) => acc as number);
 
-		const rows = await planRows(db, 'SELECT id, v FROM pk GROUP BY id, v');
-		const props = aggregateProps(rows);
-		expect(props, 'expected aggregate node').to.not.equal(undefined);
-		expect(props!.groupBy, 'a shadowed min must decline the rewrite; both columns stay grouped')
-			.to.have.length(2);
-
-		const out: { id: number; v: number }[] = [];
-		for await (const r of db.eval('SELECT id, v FROM pk GROUP BY id, v ORDER BY id')) {
-			out.push(r as unknown as { id: number; v: number });
+		/** A row-counting aggregate — deliberately not an extremum, so a picker that
+		 *  resolved to it would report `1` where the column's own value is expected. */
+		function registerCountingMin(numArgs: number): void {
+			db.createAggregateFunction('min', { numArgs, initialState: 0 },
+				(acc: unknown) => (acc as number) + 1,
+				(acc: unknown) => acc as number);
 		}
-		expect(out, 'the true values must come back, not the shadow aggregate\'s row count').to.deep.equal([
-			{ id: 1, v: 100 },
-			{ id: 2, v: 200 },
-		]);
-	});
 
-	it('control: the same query still collapses GROUP BY when min is un-shadowed', async () => {
-		await db.exec(
-			"CREATE TABLE pk2 (id INTEGER PRIMARY KEY, v INTEGER NOT NULL) USING memory",
-		);
-		await db.exec('INSERT INTO pk2 VALUES (1, 100), (2, 200)');
+		/** `id` is the PK, so `v` is functionally determined and is what the rule drops.
+		 *  Asserts the surviving GROUP BY width, then that the rows carry the true values
+		 *  either way — the rewrite must be invisible in the results, only in the plan. */
+		async function expectPkGrouping(table: string, expectedGroupByWidth: number): Promise<void> {
+			await db.exec(
+				`CREATE TABLE ${table} (id INTEGER PRIMARY KEY, v INTEGER NOT NULL) USING memory`,
+			);
+			await db.exec(`INSERT INTO ${table} VALUES (1, 100), (2, 200)`);
 
-		const rows = await planRows(db, 'SELECT id, v FROM pk2 GROUP BY id, v');
-		const props = aggregateProps(rows);
-		expect(props, 'expected aggregate node').to.not.equal(undefined);
-		expect(props!.groupBy, 'GROUP BY should collapse to one column').to.have.length(1);
+			const props = aggregateProps(await planRows(db, `SELECT id, v FROM ${table} GROUP BY id, v`));
+			expect(props, 'expected aggregate node').to.not.equal(undefined);
+			expect(props!.groupBy, `expected ${expectedGroupByWidth} surviving GROUP BY column(s)`)
+				.to.have.length(expectedGroupByWidth);
 
-		const out: { id: number; v: number }[] = [];
-		for await (const r of db.eval('SELECT id, v FROM pk2 GROUP BY id, v ORDER BY id')) {
-			out.push(r as unknown as { id: number; v: number });
+			const out: { id: number; v: number }[] = [];
+			for await (const r of db.eval(`SELECT id, v FROM ${table} GROUP BY id, v ORDER BY id`)) {
+				out.push(r as unknown as { id: number; v: number });
+			}
+			expect(out, "the true values must come back, not a shadow aggregate's row count")
+				.to.deep.equal([{ id: 1, v: 100 }, { id: 2, v: 200 }]);
 		}
-		expect(out).to.deep.equal([
-			{ id: 1, v: 100 },
-			{ id: 2, v: 200 },
-		]);
+
+		it('a user-defined aggregate that shadows the builtin min declines the rewrite', async () => {
+			registerCountingMin(1);
+			await expectPkGrouping('pk', 2);
+		});
+
+		it('control: the same query still collapses GROUP BY when min is un-shadowed', async () => {
+			await expectPkGrouping('pk2', 1);
+		});
+
+		it('a shadow at a different arity leaves min/1 — and the rewrite — alone', async () => {
+			// The gate is per (name, numArgs): taking over `min/2` must not disable a
+			// rewrite that resolves `min/1`, or any app registering an unrelated
+			// multi-argument `min` would silently lose the optimization.
+			registerCountingMin(2);
+			await expectPkGrouping('pk3', 1);
+		});
 	});
 
 	it('Result rows match the un-simplified semantics under EC-driven drop', async () => {
