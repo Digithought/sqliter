@@ -599,3 +599,83 @@ select grp as k, count(*) as n from sog group by grp order by min(val) desc, k;
 → [{"k":"b","n":1},{"k":"c","n":4},{"k":"a","n":3},{"k":"e","n":5},{"k":"d","n":2}]
 
 drop table sog;
+
+-- =============================================================================
+-- DISTINCT actually collapsing rows, with a sort-only aggregate as the key. The
+-- DistinctNode sits BETWEEN the final projection and this sort, so these pin two
+-- things at once: DISTINCT dedupes before the sort (the direction of max(v) is
+-- observable in the surviving order), and the sort-only aggregate key still
+-- resolves through the DistinctNode -- it yields per source row rather than
+-- buffering, so the projection's source row context is still live.
+--
+--   g | rows | max(v)     by max(v) asc:  b(3), a(2), c(2)  -> distinct 3, 2
+--   --+------+-------     by max(v) desc: c(2), a(2), b(3)  -> distinct 2, 3
+--   a |  2   | m1
+--   b |  3   | a2
+--   c |  2   | z1
+-- Rows below are SQLite's.
+-- =============================================================================
+
+create table sod (id integer primary key, g text, v text);
+insert into sod values
+	(1,'b','a0'), (2,'b','a1'), (3,'b','a2'),
+	(4,'a','m0'), (5,'a','m1'),
+	(6,'c','z0'), (7,'c','z1');
+
+select distinct count(*) as c from sod group by g order by max(v);
+→ [{"c":3},{"c":2}]
+
+select distinct count(*) as c from sod group by g order by max(v) desc;
+→ [{"c":2},{"c":3}]
+
+-- same, with a computed alias the final projection alone publishes
+select distinct count(*) + 1 as c from sod group by g order by max(v);
+→ [{"c":4},{"c":3}]
+
+drop table sod;
+
+-- A SELECT-list alias that shadows a real column of the table, with the shadowed
+-- column inside the sort-only aggregate: `max(c)` must still read the table's c
+-- (group x has 'p','r' -> 'r'; group y has 'q'), while the bare `c` key is the
+-- alias on the final projection. One sort placement resolves both. Rows are
+-- SQLite's.
+create table sh (id integer primary key, a text, c text);
+insert into sh values (1,'x','p'), (2,'y','q'), (3,'x','r');
+
+select a, count(*) + 1 as c from sh group by a order by max(c), c;
+→ [{"a":"y","c":2},{"a":"x","c":3}]
+
+select a, count(*) + 1 as c from sh group by a order by max(c) desc, c;
+→ [{"a":"x","c":3},{"a":"y","c":2}]
+
+drop table sh;
+
+-- The same pairing where another builder wraps or re-plans the query: a CTE
+-- body, and the window path (whose ORDER BY was never routed through the
+-- retired early placement, so this pins that the two paths now agree).
+-- Rows are SQLite's.
+create table soa2 (id integer primary key, a text, b text);
+insert into soa2 values (1,'x','p'), (2,'y','q'), (3,'x','r');
+
+with w as (select a, count(*) + 1 as c from soa2 group by a order by max(b), c) select * from w;
+→ [{"a":"y","c":2},{"a":"x","c":3}]
+
+select a, count(*) over () as w, count(*) + 1 as c from soa2 group by a order by max(b), c;
+→ [{"a":"y","w":2,"c":2},{"a":"x","w":2,"c":3}]
+
+drop table soa2;
+
+-- The sort-only aggregate does NOT relax the grouped-plan boundary check for the
+-- keys beside it: `b` is neither grouped nor aggregated, and moving the sort above
+-- the final projection must still reject it at plan time with the user-facing GROUP
+-- BY message -- not ship a plan that dies at run time with "No row context found".
+-- (Deliberate divergence: SQLite accepts this and sorts by an arbitrary row of the
+-- group. See docs/runtime.md § "Corollary: a published source row reaches only the
+-- adjacent consumer".)
+create table sob (id integer primary key, a text, b text);
+insert into sob values (1,'x','p'), (2,'y','q'), (3,'x','r');
+
+select a, count(*) + 1 as c from sob group by a order by max(b), b;
+-- error: Column 'b' must appear in the GROUP BY clause or be used in an aggregate function
+
+drop table sob;

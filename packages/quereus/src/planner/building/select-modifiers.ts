@@ -95,7 +95,7 @@ export function applyDistinct(
 
 /**
  * Everything {@link applyOrderBy} needs beyond the plan/statement/context trio. An
- * options object rather than a positional tail: the three call sites (select.ts)
+ * options object rather than a positional tail: both call sites (select.ts)
  * differ only in which of these they supply, and two are bare booleans — a
  * mis-ordered or omitted positional argument was invisible at the call site and
  * type-checked.

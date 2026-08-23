@@ -488,6 +488,21 @@ sorted by an arbitrary representative row, which was a wrong-result bug. The rev
 condition and the weaker buffering-only alternative are recorded in the NOTE at the
 `assertGroupedPlanCoverage` call in `select.ts`.
 
+##### The one binding that does depend on a source-attr context
+
+An aggregate `ORDER BY` naming an aggregate the SELECT list lacks (`select a from t
+group by a order by max(b)`) sorts *above* the final `ProjectNode`, and `max(b)` is not
+one of that projection's output columns. The sort key binds to the **AggregateNode's own
+output** attribute and resolves through the projection's source-attr context, which
+`emitProject` keeps live while it yields. Unlike the accident above this is a reviewed,
+deliberate dependency, and it is sound only while every node between the final
+`ProjectNode` and the `SortNode` is *streaming* — today that is at most the `DistinctNode`
+of a `DISTINCT` query, which yields each surviving row straight through. It is **not** an
+invitation to bind this way elsewhere: it stays legal because the grouping-key redirect and
+`assertGroupedPlanCoverage` above still forbid binding a *pre-grouping* attribute here, and
+because a buffering node in that gap would break it. The NOTE at the `applyOrderBy` call in
+`select.ts` carries the remedy if one ever lands there.
+
 ### Filter conjunct early exit
 
 `emitFilter` (`runtime/emit/filter.ts`) splits a conjunctive predicate into its

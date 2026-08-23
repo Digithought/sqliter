@@ -371,14 +371,19 @@ export function buildSelectStmt(
 		// source-attr contexts and child pulls") and the SortNode evaluates its keys
 		// during that pull.
 		//
-		// NOTE: that leans on nothing sitting between the final ProjectNode and this
-		// SortNode. Nothing does today. If a builder or optimizer rule ever inserts a
-		// node there — anything that buffers, especially — the sort-only aggregate key
-		// loses its row context and the query dies with "No row context found". Remedy
-		// then: widen the final projection with one extra ColumnReferenceNode
-		// projection per sort-only aggregate, sort above that, and add a stripping
-		// projection above the sort (DISTINCT and LIMIT already sit above this sort,
-		// so they stay where they are, above the strip).
+		// NOTE: that leans on every node between the final ProjectNode and this
+		// SortNode being *streaming*. Exactly one can sit there today — the
+		// DistinctNode applyDistinct just added — and it yields each surviving row
+		// straight through, so the projection's source context is still live when the
+		// sort reads it. If a builder or optimizer rule ever inserts a *buffering*
+		// node there, the sort-only aggregate key loses its row context and the query
+		// dies with "No row context found". Remedy then: widen the final projection
+		// with one extra ColumnReferenceNode projection per sort-only aggregate, sort
+		// above that, and add a stripping projection above the sort. LIMIT already sits
+		// above this sort and would stay above the strip; DISTINCT is the awkward one —
+		// it must keep deduping on the select-list columns alone, never on the widened
+		// row, so it cannot simply ride along between the widened projection and the
+		// sort.
 		input = applyOrderBy(input, stmt, selectContext, {
 			preAggregateSort,
 			projectionScope: aggregateProjectionScope,
