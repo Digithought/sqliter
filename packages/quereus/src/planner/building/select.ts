@@ -200,6 +200,11 @@ export function buildSelectStmt(
 	// arguments — reaches the grouping-key redirect through redirectPostAggregate,
 	// and so the finished plan can be boundary-checked once at the bottom.
 	const groupedRedirectContext = aggregateResult.groupedRedirectContext;
+	// Set for every AGGREGATE query, grouped or not: what an aggregated row carries.
+	// An ungrouped aggregate query has exactly one implicit group, so the finished-plan
+	// boundary check at the bottom applies to it just as much — it just has no grouping
+	// keys, hence no redirect above.
+	const groupedCoverageContext = aggregateResult.groupedCoverageContext;
 	// The node whose output attributes ARE this SELECT's result columns, once one
 	// exists. A positional ORDER BY binds to its Nth attribute (see applyOrderBy).
 	let orderByOutputRelation: RelationalPlanNode | undefined;
@@ -395,7 +400,7 @@ export function buildSelectStmt(
 		input = applyLimitOffset(input, stmt, selectContext, aggregateProjectionScope);
 	}
 
-	// Boundary check over the finished plan of a GROUPED query: nothing above the
+	// Boundary check over the finished plan of an AGGREGATE query: nothing above the
 	// AggregateNode may still reference a pre-grouping column, which is the invariant
 	// docs/runtime.md § "Corollary: a published source row reaches only the adjacent
 	// consumer" states. A post-aggregate builder that skipped redirectPostAggregate now
@@ -403,6 +408,15 @@ export function buildSelectStmt(
 	// shipping a plan that dies at run time with an internal "No row context found"
 	// error once a buffering operator separates it from the aggregate (how both the
 	// SELECT-list and ORDER BY escapes shipped).
+	//
+	// NOTE: this covers an aggregate query with NO GROUP BY too — it has exactly one
+	// implicit group, so `having` / `order by` / `limit` / `offset` above it may still
+	// read only the aggregate results. That is why the guard is `groupedCoverageContext`
+	// (built for every aggregate query) and not `groupedRedirectContext` (grouping keys
+	// to rewrite onto, which an ungrouped query has none of). The documented Quereus
+	// extension where an ungrouped aggregate query's whole ORDER BY sorts the INPUT rows
+	// before aggregation stays legal for free: that SortNode sits BELOW the
+	// AggregateNode, and this walk stops at the aggregate.
 	//
 	// NOTE: deliberately STRICT — this also rejects a query that genuinely reads an
 	// ungrouped column above the aggregate (`select a from wg group by a order by b`,
@@ -414,8 +428,8 @@ export function buildSelectStmt(
 	// SQLite-style bare-column ORDER BY tolerance becomes a compatibility requirement;
 	// the weaker alternative is checking only above buffering operators (WindowNode),
 	// where the representative source row genuinely dies.
-	if (groupedRedirectContext && aggregateResult.aggregateNode) {
-		assertGroupedPlanCoverage(input, aggregateResult.aggregateNode, groupedRedirectContext);
+	if (groupedCoverageContext && aggregateResult.aggregateNode) {
+		assertGroupedPlanCoverage(input, aggregateResult.aggregateNode, groupedCoverageContext);
 	}
 
 	return input;

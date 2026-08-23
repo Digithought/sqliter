@@ -44,7 +44,10 @@ export function buildAggregatePhase(
 	hasHavingOnlyAggregates?: boolean;
 	hasOrderByOnlyAggregates?: boolean;
 	aggregatesContext?: PlanningContext['aggregates'];
+	/** Grouping-key rewrite target — set only for a query WITH GROUP BY. */
 	groupedRedirectContext?: GroupedRedirectContext;
+	/** What an aggregated row carries — set for EVERY aggregate query, grouped or not. */
+	groupedCoverageContext?: GroupedRedirectContext;
 } {
 	const hasGroupBy = stmt.groupBy && stmt.groupBy.length > 0;
 
@@ -127,18 +130,28 @@ export function buildAggregatePhase(
 	const aggregateNode = new AggregateNode(selectContext.scope, currentInput, groupByExpressions, aggregates);
 	currentInput = aggregateNode;
 
-	// A GROUPED query's post-aggregate expressions — HAVING below, the rebuilt SELECT
-	// list, a window phase's specifications and function arguments, the sort keys —
-	// are all built against scopes that fall through to the pre-aggregate select scope,
-	// so a legal spelling of a grouping key can bind to a base-table attribute the
-	// grouped row does not carry. Every such expression reaches the fix through ONE
-	// entry point, {@link redirectPostAggregate}, off this one context — built here,
-	// the moment the AggregateNode exists, so no post-aggregate site can run before it
-	// does. An aggregate query with no GROUP BY has no grouping keys to redirect onto
-	// and gets none.
-	const groupedRedirectContext = groupByExpressions.length > 0
-		? buildGroupedRedirectContext(groupByExpressions, aggregateNode.getAttributes(), aggregateNode.getRelations()[0])
-		: undefined;
+	// Two questions, two bindings — they used to be one value, and conflating them is
+	// what let an ungrouped aggregate query skip the coverage check entirely.
+	//
+	// "What does an aggregated row of this query carry?" — every aggregate query has an
+	// answer, GROUP BY or not: an ungrouped one has exactly one implicit group whose row
+	// carries only the aggregate results. That is what the finished-plan boundary check
+	// ({@link assertGroupedPlanCoverage}) and HAVING's own coverage check need, so this
+	// binding is built unconditionally.
+	const groupedCoverageContext = buildGroupedRedirectContext(
+		groupByExpressions, aggregateNode.getAttributes(), aggregateNode.getRelations()[0]);
+
+	// "Are there grouping keys to rewrite post-aggregate expressions onto?" — only a
+	// query WITH GROUP BY has any. A GROUPED query's post-aggregate expressions — HAVING
+	// below, the rebuilt SELECT list, a window phase's specifications and function
+	// arguments, the sort keys — are all built against scopes that fall through to the
+	// pre-aggregate select scope, so a legal spelling of a grouping key can bind to a
+	// base-table attribute the grouped row does not carry. Every such expression reaches
+	// the fix through ONE entry point, {@link redirectPostAggregate}, off this one
+	// context — built here, the moment the AggregateNode exists, so no post-aggregate
+	// site can run before it does. `undefined` here means exactly one thing: no grouping
+	// keys, so nothing to rewrite onto and the redirect takes its pass-through branch.
+	const groupedRedirectContext = groupByExpressions.length > 0 ? groupedCoverageContext : undefined;
 
 	// Create aggregate output scope
 	const aggregateOutputScope = createAggregateOutputScope(
@@ -167,7 +180,7 @@ export function buildAggregatePhase(
 	// Handle HAVING clause *after* aggregation only when we did not already push
 	// it below the AggregateNode.
 	if (stmt.having && !shouldPushHavingBelowAggregate) {
-		currentInput = buildHavingFilter(currentInput, stmt.having, selectContext, aggregateOutputScope, aggregates, groupByExpressions, groupedRedirectContext);
+		currentInput = buildHavingFilter(currentInput, stmt.having, selectContext, aggregateOutputScope, aggregates, groupByExpressions, groupedCoverageContext, groupedRedirectContext);
 	}
 
 	// Determine if final projection is needed.
@@ -201,6 +214,7 @@ export function buildAggregatePhase(
 		hasOrderByOnlyAggregates,
 		aggregatesContext,
 		groupedRedirectContext,
+		groupedCoverageContext,
 	};
 }
 
@@ -624,13 +638,21 @@ function referencesAggregateInput(node: PlanNode, context: GroupedRedirectContex
 }
 
 /**
- * Boundary check over a GROUPED query's finished plan: no node ABOVE the
+ * Boundary check over an AGGREGATE query's finished plan: no node ABOVE the
  * AggregateNode may reference an aggregate-input attribute id that is absent from
- * the aggregate's output. Called once per grouped query, from the end of
+ * the aggregate's output. Called once per aggregate query, from the end of
  * `buildSelectStmt`, walking the operator spine from the query root down to — and
  * stopping at — the AggregateNode itself (whose own input subtree legally reads
  * pre-grouping columns). Each scalar expression hanging off a spine operator gets
  * the subquery-aware per-expression check ({@link assertPostAggregateCoverage}).
+ *
+ * "Aggregate", not "grouped": a query with no GROUP BY has exactly one implicit group,
+ * whose row carries the aggregate results and nothing else, so the same rule applies to
+ * everything above it (`having`, `order by` when it is forced above the aggregate,
+ * `limit`, `offset`). `context` is therefore built for every aggregate query — see the
+ * `groupedCoverageContext` / `groupedRedirectContext` split in
+ * {@link buildAggregatePhase}. An ungrouped query's `groupKeys` maps are empty, which is
+ * correct: it has no grouping key any post-aggregate reference could be covered by.
  *
  * This is what turns "a builder forgot to call {@link redirectPostAggregate}" from a
  * runtime `No row context found for column …` internal error into the user-facing
@@ -1035,14 +1057,19 @@ function groupKeyIndexOf(node: ScalarPlanNode, groupKeys: GroupKeyIndex): number
 /**
  * Builds HAVING filter clause.
  *
- * `groupedRedirectContext` is supplied for a GROUPED query. A HAVING reference to a
- * grouping key under a spelling the hybrid scope does not hold (`having wg.a = 'x'`
- * against `group by a`, the key nested in `upper(wg.a)`, a computed key written out
- * again) falls through to a base-table attribute, which happened to read correctly
- * only because this FilterNode sits directly on the AggregateNode's yield where the
- * representative source row is still published. {@link redirectPostAggregate} lands
- * it on the aggregate's own output column instead, so the predicate stays correct
- * wherever the filter ends up relative to a buffering operator.
+ * `groupedCoverageContext` describes what an aggregated row of this query carries and
+ * is supplied for EVERY aggregate query; it drives the coverage check below.
+ *
+ * `groupedRedirectContext` is the rewrite target and is supplied only for a GROUPED
+ * query. A HAVING reference to a grouping key under a spelling the hybrid scope does
+ * not hold (`having wg.a = 'x'` against `group by a`, the key nested in `upper(wg.a)`,
+ * a computed key written out again) falls through to a base-table attribute, which
+ * happened to read correctly only because this FilterNode sits directly on the
+ * AggregateNode's yield where the representative source row is still published.
+ * {@link redirectPostAggregate} lands it on the aggregate's own output column instead,
+ * so the predicate stays correct wherever the filter ends up relative to a buffering
+ * operator. A query with no GROUP BY has no keys to land anything on and passes
+ * `undefined`, so the redirect takes its pass-through branch.
  */
 function buildHavingFilter(
 	input: RelationalPlanNode,
@@ -1051,6 +1078,7 @@ function buildHavingFilter(
 	aggregateOutputScope: RegisteredScope,
 	aggregates: { expression: ScalarPlanNode; alias: string }[],
 	groupByExpressions: ScalarPlanNode[],
+	groupedCoverageContext: GroupedRedirectContext,
 	groupedRedirectContext?: GroupedRedirectContext
 ): RelationalPlanNode {
 	const aggregateAttributes = input.getAttributes();
@@ -1122,15 +1150,10 @@ function buildHavingFilter(
 	//
 	// With GROUP BY: only GROUP BY columns/expressions and aggregates are allowed.
 	// Without GROUP BY (implicit single group, only reachable here when aggregates
-	// are present): only aggregates are allowed. That path has no
-	// `groupedRedirectContext`, so build the equivalent context locally from the same
-	// two inputs `buildAggregatePhase` would have passed. It is used for the coverage
-	// check ONLY — `redirectPostAggregate` above must keep receiving the real
-	// `groupedRedirectContext` so a non-grouped query still takes its pass-through
-	// branch.
-	const coverageContext = groupedRedirectContext
-		?? buildGroupedRedirectContext([], aggregateAttributes, sourceInput);
-	const ungrouped = findUngroupedPostAggregateRef(havingExpression, coverageContext, /* skipSubqueries */ true);
+	// are present): only aggregates are allowed. Both cases are described by
+	// `groupedCoverageContext`, which is why it is a separate parameter from the
+	// rewrite target above.
+	const ungrouped = findUngroupedPostAggregateRef(havingExpression, groupedCoverageContext, /* skipSubqueries */ true);
 	if (ungrouped) {
 		throw new QuereusError(
 			`HAVING references non-grouped column '${ungrouped.expression.name}'; ` +

@@ -438,6 +438,100 @@ select a, count(*) as c from wg group by a
 having (select max(t.a) from wg t where t.a = wg.b) = 'x';
 -- error: Column 'wg.b' must appear in the GROUP BY clause or be used in an aggregate function
 
+-- ---------------------------------------------------------------------------
+-- An aggregate query with NO GROUP BY gets the same finished-plan check
+-- (bug-no-group-by-aggregate-skips-subquery-coverage-check).
+--
+-- Such a query has exactly one implicit group, so every clause ABOVE the
+-- aggregation — HAVING, an ORDER BY forced up there, LIMIT, OFFSET — may read
+-- only the aggregate results. Reading a source column instead is the same user
+-- error the grouped form already reports, and now reports the same way.
+-- ---------------------------------------------------------------------------
+
+-- HAVING, subquery correlating back to an ungrouped column of THIS query. The
+-- `group by a` twin directly below raises the identical message; before the fix
+-- this one silently answered off an arbitrary source row (returning []).
+select count(*) as c from wg
+having (select max(t.a) from wg t where t.b = wg.b) = 'x';
+-- error: Column 'wg.b' must appear in the GROUP BY clause or be used in an aggregate function
+
+select a, count(*) as c from wg group by a
+having (select max(t.a) from wg t where t.b = wg.b) = 'x';
+-- error: Column 'wg.b' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- ORDER BY, once a select-list alias or an aggregate has forced the whole list
+-- above the aggregation. Both spellings of the forcing term are pinned.
+select count(*) as c from wg order by c, (select max(t.a) from wg t where t.b = wg.b);
+-- error: Column 'wg.b' must appear in the GROUP BY clause or be used in an aggregate function
+
+select count(*) as c from wg order by count(*), (select max(t.a) from wg t where t.b = wg.b);
+-- error: Column 'wg.b' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- LIMIT / OFFSET. These reached the runtime before the fix and died there with an
+-- engine-internal "No row context found for column b" the user could not act on;
+-- these cases pin the conversion to the plan-time message.
+select count(*) as c from wg limit b;
+-- error: Column 'b' must appear in the GROUP BY clause or be used in an aggregate function
+
+select count(*) as c from wg limit (select count(*) from wg t where t.b = wg.b);
+-- error: Column 'wg.b' must appear in the GROUP BY clause or be used in an aggregate function
+
+select count(*) as c from wg limit 1 offset (select count(*) from wg t where t.b = wg.b);
+-- error: Column 'wg.b' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- The grouped twin of the LIMIT case, which always reported at plan time.
+select a, count(*) as c from wg group by a limit b;
+-- error: Column 'b' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- Positives — the check must not over-reject. A subquery reading only its OWN
+-- columns is not a reference to this query at all.
+select count(*) as c from wg having (select max(t.a) from wg t) = 'y';
+→ [{"c":3}]
+
+select count(*) as c from wg having (select max(t.a) from wg t) = 'zz';
+→ []
+
+-- A correlated reference to an ENCLOSING query, made from an ungrouped inner
+-- aggregate and buried one subquery deeper still. `w.b` belongs to the outer
+-- query, so the inner query's check leaves it alone. max(u.a) per outer b is
+-- 'x','y','x', so only b='2' fails the comparison.
+select w.b, (select count(*) from wg t
+             having (select max(u.a) from wg u where u.b = w.b) = 'x') as c
+from wg w order by w.b;
+→ [{"b":"1","c":3},{"b":"2","c":null},{"b":"3","c":3}]
+
+select count(*) as c from wg order by count(*);
+→ [{"c":3}]
+
+select count(*) as c from wg order by (select max(t.a) from wg t);
+→ [{"c":3}]
+
+select count(*) as c from wg limit (select count(*) from wg t);
+→ [{"c":3}]
+
+-- The documented pre-aggregate-sort extension stays legal. With no GROUP BY and
+-- no term naming an alias or an aggregate, the whole ORDER BY sorts the INPUT
+-- rows before aggregation, so a correlated subquery in it is evaluated once per
+-- input row and is well defined. That sort sits BELOW the aggregate, which is
+-- where the finished-plan walk stops. Asserted in both directions so the
+-- ordering is observable rather than incidental.
+select group_concat(b) as g from wg
+order by (select max(t.b) from wg t where t.b = wg.b) desc;
+→ [{"g":"3,2,1"}]
+
+select group_concat(b) as g from wg
+order by (select max(t.b) from wg t where t.b = wg.b) asc;
+→ [{"g":"1,2,3"}]
+
+-- DISTINCT above the implicit single group is unaffected either way.
+select distinct count(*) as c from wg order by c;
+→ [{"c":3}]
+
+-- A VIEW body is planned the same way, so the mistake is caught at `create view`
+-- time rather than at first read of the view.
+create view vw_ungrouped_limit as select count(*) as c from wg limit b;
+-- error: Column 'b' must appear in the GROUP BY clause or be used in an aggregate function
+
 drop table wg;
 
 -- ---------------------------------------------------------------------------

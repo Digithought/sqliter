@@ -378,10 +378,27 @@ select count(*) as "C" from g order by c;
 → [{"C":3}]
 
 -- Composes with a second sort key and with LIMIT
-select count(*) as c from g order by c, id;
+select count(*) as c from g order by c, max(a);
 → [{"c":3}]
 
 select count(*) as c from g order by c limit 1;
+→ [{"c":3}]
+
+-- ...but the second key must itself be legal above the aggregate. ORDER BY
+-- placement is decided for the WHOLE list, not per term: naming the alias `c`
+-- moves every term above the AggregateNode, and a bare source column up there is
+-- neither a grouping key (there are none) nor an aggregate.
+select count(*) as c from g order by c, id;
+-- error: Column 'id' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- Same list, other order — the rejection is about the list, not about which term
+-- came first.
+select count(*) as c from g order by id, c;
+-- error: Column 'id' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- Control: with NO alias and no aggregate in the list, the whole list stays below
+-- the aggregate and `id` is an ordinary pre-aggregate sort key.
+select count(*) as c from g order by id;
 → [{"c":3}]
 
 -- ...and with HAVING
