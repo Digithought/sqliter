@@ -86,15 +86,13 @@ const testPattern = join('packages', 'quereus', 'test', '**', '*.spec.ts');
 
 // Use 'min' reporter by default for concise output (full failure details preserved).
 // Override with --reporter <name> on the command line.
-const hasReporterFlag = testArgs.some((a, i) => a === '--reporter' || a === '-R');
+const hasReporterFlag = testArgs.some((a) => a === '--reporter' || a === '-R');
 const reporterArgs = hasReporterFlag ? [] : ['--reporter', 'min'];
 
-// Default to a generous per-test timeout: the property-based suites (fast-check)
-// nominally run in well under 1s but can be starved past Mocha's 2s default when
-// the machine is under concurrent load (e.g. a background ticket runner). 10s
-// keeps real hangs detectable while absorbing contention. Overridable via --timeout.
-const hasTimeoutFlag = testArgs.some((a) => a === '--timeout' || a === '-t');
-const timeoutArgs = hasTimeoutFlag ? [] : ['--timeout', '10000'];
+// Per-test timeout comes from the repo-root .mocharc.cjs (Mocha's own 2s default
+// starves the property-based fast-check suites under concurrent load). We spawn
+// with cwd = projectRoot, so that config is picked up; a --timeout in testArgs
+// still overrides it.
 
 // Build command arguments
 const cmdArgs = [
@@ -103,7 +101,6 @@ const cmdArgs = [
 	testPattern,
 	'--colors',
 	'--bail',
-	...timeoutArgs,
 	...reporterArgs,
 	...testArgs
 ];
