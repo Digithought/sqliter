@@ -27,6 +27,16 @@ import * as path from 'path';
 const PKG_ROOT = path.resolve(import.meta.dirname, '..');
 const REPO_ROOT = path.resolve(PKG_ROOT, '..', '..');
 
+/** Returns the fenced `sql` blocks under a markdown `## ` heading, up to the next `## ` heading. */
+function sqlBlocksInSection(doc: string, heading: string): string[] {
+	const start = doc.indexOf(heading);
+	if (start < 0) return [];
+	const rest = doc.slice(start + heading.length);
+	const end = rest.search(/\n## /);
+	const section = end < 0 ? rest : rest.slice(0, end);
+	return [...section.matchAll(/```sql\n([\s\S]*?)```/g)].map(m => m[1]);
+}
+
 describe('Documentation Validation', () => {
 
 	describe('README Quick Start Example', () => {
@@ -295,64 +305,43 @@ describe('Documentation Validation', () => {
 	// ========================================================================
 	// docs/sql-ddl.md § 2.6.3 Metadata Tags
 	//
-	// Each block below is transcribed verbatim from the doc. If you change one
-	// of these, change the doc — and vice versa.
+	// The doc is the source of truth: every fenced sql block in the section is
+	// read out of the file and parsed as written, so a broken example fails here
+	// instead of shipping. Nothing is transcribed, so nothing can drift.
 	// ========================================================================
 
 	describe('sql-ddl.md Metadata Tags examples', () => {
-		it('should parse the declare-schema renamed-table-and-column example', () => {
-			const sql = `
-declare schema main {
-  table customer {
-    customer_id integer primary key with tags ("quereus.previous_name" = 'client_id'),
-    full_name text not null with tags ("quereus.previous_name" = 'name')
-  } with tags (
-    "quereus.id" = 'tbl-customer',
-    "quereus.previous_name" = 'client'
-  )
-}`;
-			expect(() => new Parser().parseAll(sql)).to.not.throw();
-		});
+		it('should parse every SQL example in the section', () => {
+			const doc = fs.readFileSync(path.join(REPO_ROOT, 'docs', 'sql-ddl.md'), 'utf-8');
+			const blocks = sqlBlocksInSection(doc, '## 2.6.3 Metadata Tags');
+			// A section that stops yielding blocks has been renamed or gutted, and the
+			// guard below would then pass vacuously.
+			expect(blocks, 'no sql blocks found — did the heading change?').to.have.lengthOf.at.least(2);
 
-		it('should parse the create-table table-level tags example', () => {
-			const sql = `
-create table Orders (
-  id integer primary key,
-  name text not null
-) with tags (display_name = 'Customer Orders', audit = true);`;
-			expect(() => new Parser().parseAll(sql)).to.not.throw();
-		});
+			const failures: string[] = [];
+			for (const sql of blocks) {
+				try {
+					new Parser().parseAll(sql);
+				} catch (e) {
+					failures.push(`${(e as Error).message}\n--- block ---\n${sql}`);
+				}
+			}
 
-		it('should parse the create-table column-level tags example', () => {
-			const sql = `
-create table Products (
-  id integer primary key with tags (display_name = 'Product ID'),
-  name text not null with tags (searchable = true)
-);`;
-			expect(() => new Parser().parseAll(sql)).to.not.throw();
-		});
-
-		it('should parse the create-table constraint-level tags example', () => {
-			const sql = `
-create table Employees (
-  id integer primary key,
-  email text not null,
-  constraint uq_email unique (email) with tags (error_message = 'Email must be unique')
-);`;
-			expect(() => new Parser().parseAll(sql)).to.not.throw();
+			expect(failures, `Unparsable SQL in docs/sql-ddl.md § 2.6.3:\n${failures.join('\n\n')}`).to.have.lengthOf(0);
 		});
 
 		it('should still reject a leading with-tags clause before the table body', () => {
-			// A leading `with tags (...)` before the column body was never valid syntax.
-			// If this ever starts parsing, the § 2.6.3 example above should be revisited
-			// to see whether the leading form is now preferred.
+			// A leading `with tags (...)` before the column body was never valid syntax:
+			// declareTableItem demands '(' or '{' immediately after the table name. If
+			// this ever starts parsing, revisit the § 2.6.3 example rather than letting
+			// the grammar drift under the doc.
 			const sql = `
 declare schema main {
   table customer with tags ("quereus.id" = 'tbl-customer') {
     customer_id integer primary key
   }
 }`;
-			expect(() => new Parser().parseAll(sql)).to.throw();
+			expect(() => new Parser().parseAll(sql)).to.throw(/Expected '\(' or '\{' before column definitions/);
 		});
 	});
 

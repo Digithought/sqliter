@@ -107,8 +107,20 @@ one module per check; if this check goes there it should land as its own module.
 
 ## Relationship to other work
 
-- `bug-declare-table-tags-example-does-not-parse` (in `tickets/implement/`) fixes
-  one of the 17 and adds a transcribed test for that one section. It is listed as
-  a prereq so this ticket's sweep starts from a corpus that no longer contains it.
+- `bug-declare-table-tags-example-does-not-parse` (now complete) fixes one of the
+  17 and guards that one section. It is listed as a prereq so this ticket's sweep
+  starts from a corpus that no longer contains it. Two things it leaves behind
+  that this ticket should reuse rather than reinvent:
+  - `sqlBlocksInSection(doc, heading)` in
+    `packages/quereus/test/documentation.spec.ts` — slices a `## ` section out of
+    a markdown file and returns its fenced `sql` blocks. The section-scoped
+    version of the corpus walk this ticket needs; move it somewhere shared when
+    the sweep lands.
+  - Its guard reads the doc at test time rather than transcribing the SQL, so the
+    § 2.6.3 blocks are already covered and must not be double-covered by the
+    sweep.
+  Note the review pass also added a table-level-tags example to the § 2.0
+  Declaration Syntax block, so the `sql-ddl.md` line numbers listed above have
+  shifted down by about six lines; re-measure before triaging.
 - `debt-check-docs-validate-section-markers` is a different hole in the same gate
   (prose `§ Section` pointers, not SQL blocks). Independent; either can land first.

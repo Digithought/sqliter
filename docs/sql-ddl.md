@@ -50,6 +50,12 @@ declare schema schema_name
     name text not null unique
   }
 
+  -- Table-level `with tags` trails the column body (see 2.6.3); columns and
+  -- constraints carry their own tags inline.
+  table audit_log {
+    id integer primary key with tags (display_name = 'Audit ID')
+  } with tags ("quereus.id" = 'tbl-audit-log')
+
   table user_roles (
     user_id integer not null,
     role_id integer not null,
