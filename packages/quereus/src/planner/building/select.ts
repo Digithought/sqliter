@@ -189,7 +189,6 @@ export function buildSelectStmt(
 	const aggregateResult = buildAggregatePhase(input, stmt, selectContext, aggregates, hasAggregates, projections, hasWrappedAggregates, selectListEntries, starProjectionsByColumn);
 	input = aggregateResult.output;
 	let preAggregateSort = aggregateResult.preAggregateSort;
-	let orderByAppliedEarly = false;
 	let aggregateProjectionScope: RegisteredScope | undefined;
 	// Set when the query is BOTH grouped and windowed: the grouped select-list
 	// projection list, to be projected above the window phase's WindowNode.
@@ -218,36 +217,6 @@ export function buildSelectStmt(
 			scope: aggregateResult.aggregateScope,
 			aggregates: aggregateResult.aggregatesContext,
 		};
-
-		// Applying ORDER BY here — *before* any stripping final projection — is the
-		// EXCEPTION, taken only when ORDER BY introduced aggregates the select list
-		// does not have. Those exist solely for the sort and the final projection
-		// strips them, so the sort must see the full AggregateNode output while they
-		// are still there. Every other aggregate ORDER BY falls through to the
-		// applyOrderBy at the bottom of this function, which gets the final
-		// projection's output scope — the only place an alias of a *wrapped* aggregate
-		// (`count(*) + 1 as c`, whose aggregate entry is aliased `count(*)`) is named.
-		// Also skipped when window functions are present (window output isn't
-		// available yet) or when pre-aggregate sort already handled ordering.
-		//
-		// The two scopes are mutually exclusive, so an ORDER BY that needs BOTH loses:
-		// `select count(*) + 1 as c from t order by max(a), c` takes this branch for
-		// `max(a)` and then cannot see `c`. Tracked as
-		// backlog/bug-order-by-alias-lost-when-order-by-adds-its-own-aggregate.
-		if (
-			aggregateResult.orderByNeedsPostAggregateSort &&
-			aggregateResult.hasOrderByOnlyAggregates &&
-			!preAggregateSort &&
-			!hasWindowFunctions &&
-			stmt.orderBy && stmt.orderBy.length > 0
-		) {
-			input = applyOrderBy(input, stmt, selectContext, {
-				allowAggregates: true,
-				selectList: selectListEntries,
-				groupedRedirect: groupedRedirectContext,
-			});
-			orderByAppliedEarly = true;
-		}
 
 		// Build final projections if needed. A window function in the select list also
 		// forces one: the window phase projects the select list ABOVE its WindowNode, so
@@ -384,24 +353,40 @@ export function buildSelectStmt(
 		// path already does this via finalResult.projectionScope). The window path
 		// keeps its existing scope handling.
 		input = applyDistinct(input, stmt, selectScope);
-		if (!orderByAppliedEarly) {
-			// In the aggregate path, ORDER BY may legally reference aggregates; in the
-			// window path it may reference window outputs. Both are now in selectContext.
-			// `groupedRedirect` makes a sort key naming a grouping key by a spelling the
-			// output scopes do not publish (`order by wg.a`, `order by upper(wg.a)`, a
-			// repeated computed key) land on the AggregateNode's own output column.
-			// Without it the key binds to a base-table attribute and the sort dies at run
-			// time whenever a buffering operator — a WindowNode — sits between the
-			// aggregate and this sort.
-			input = applyOrderBy(input, stmt, selectContext, {
-				preAggregateSort,
-				projectionScope: aggregateProjectionScope,
-				allowAggregates: hasAggregates,
-				selectList: selectListEntries,
-				outputRelation: orderByOutputRelation,
-				groupedRedirect: groupedRedirectContext,
-			});
-		}
+		// In the aggregate path, ORDER BY may legally reference aggregates; in the
+		// window path it may reference window outputs. Both are now in selectContext.
+		// `groupedRedirect` makes a sort key naming a grouping key by a spelling the
+		// output scopes do not publish (`order by wg.a`, `order by upper(wg.a)`, a
+		// repeated computed key) land on the AggregateNode's own output column.
+		// Without it the key binds to a base-table attribute and the sort dies at run
+		// time whenever a buffering operator — a WindowNode — sits between the
+		// aggregate and this sort.
+		//
+		// This is the ONLY placement for an aggregate query's ORDER BY, including one
+		// that named an aggregate the select list lacks (`order by max(a)` where
+		// `max(a)` is never selected). Such a sort-only aggregate IS an output column
+		// of the AggregateNode but is NOT an output column of the final ProjectNode
+		// this sort sits above; the key still resolves because emitProject keeps its
+		// source row context live while it yields (docs/runtime.md § "Invariant:
+		// source-attr contexts and child pulls") and the SortNode evaluates its keys
+		// during that pull.
+		//
+		// NOTE: that leans on nothing sitting between the final ProjectNode and this
+		// SortNode. Nothing does today. If a builder or optimizer rule ever inserts a
+		// node there — anything that buffers, especially — the sort-only aggregate key
+		// loses its row context and the query dies with "No row context found". Remedy
+		// then: widen the final projection with one extra ColumnReferenceNode
+		// projection per sort-only aggregate, sort above that, and add a stripping
+		// projection above the sort (DISTINCT and LIMIT already sit above this sort,
+		// so they stay where they are, above the strip).
+		input = applyOrderBy(input, stmt, selectContext, {
+			preAggregateSort,
+			projectionScope: aggregateProjectionScope,
+			allowAggregates: hasAggregates,
+			selectList: selectListEntries,
+			outputRelation: orderByOutputRelation,
+			groupedRedirect: groupedRedirectContext,
+		});
 		input = applyLimitOffset(input, stmt, selectContext, aggregateProjectionScope);
 	}
 

@@ -43,7 +43,6 @@ export function buildAggregatePhase(
 	groupByExpressions?: ScalarPlanNode[];
 	hasHavingOnlyAggregates?: boolean;
 	hasOrderByOnlyAggregates?: boolean;
-	orderByNeedsPostAggregateSort?: boolean;
 	aggregatesContext?: PlanningContext['aggregates'];
 	groupedRedirectContext?: GroupedRedirectContext;
 } {
@@ -200,7 +199,6 @@ export function buildAggregatePhase(
 		groupByExpressions,
 		hasHavingOnlyAggregates,
 		hasOrderByOnlyAggregates,
-		orderByNeedsPostAggregateSort: needsPostAggregateSort,
 		aggregatesContext,
 		groupedRedirectContext,
 	};

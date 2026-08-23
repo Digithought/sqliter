@@ -220,10 +220,12 @@ select jt2.*, count(*) as n from jt1 join jt2 on jt1.k = jt2.k group by jt2.k, j
 select jt2.*, count(*) as n from jt1 join jt2 on jt1.k = jt2.k group by 1, 2 order by 3 desc;
 → [{"k":1,"v":"R1","n":2},{"k":2,"v":"R2","n":1}]
 
--- ORDER BY that names an aggregate is applied BEFORE the grouped query's final
--- projection exists, so a second ordinal key in the same clause has no output
--- attributes to bind to and falls back to the select list. Position 2 is still
--- jt2.v, not jt1's same-named column.
+-- An ORDER BY that names an aggregate the select list lacks sorts in the same
+-- place as every other aggregate ORDER BY: above the grouped query's final
+-- projection. A second ordinal key in the same clause therefore binds to that
+-- projection's output attributes. Position 2 is jt2.v either way -- binding to
+-- the output attribute and falling back to the select list agree here -- so
+-- these two pin the result, not the route.
 select jt2.*, count(*) as n from jt1 join jt2 on jt1.k = jt2.k group by 1, 2 order by count(*) desc, 2;
 → [{"k":1,"v":"R1","n":2},{"k":2,"v":"R2","n":1}]
 
@@ -458,3 +460,142 @@ select a, count(*) as c from g group by a order by c + 1;
 → [{"a":"q","c":1},{"a":"p","c":2}]
 
 drop table g;
+
+-- =============================================================================
+-- ORDER BY that names BOTH an aggregate the SELECT list lacks AND a SELECT-list
+-- alias. The sort-only aggregate is computed by the AggregateNode but stripped
+-- by the final projection; the alias exists only ON that final projection. One
+-- sort placement -- above the final projection -- has to serve both names.
+-- Rows below are SQLite's.
+-- =============================================================================
+
+create table soa (id integer primary key, a text, b text);
+insert into soa values (1,'x','p'), (2,'y','q'), (3,'x','r');
+
+-- --- UNGROUPED: the whole table is one row, so only the key resolution is
+-- --- under test, not the ordering.
+
+-- bare-aggregate alias (`c` also names the AggregateNode's own output column)
+select count(*) as c from soa order by max(a), c;
+→ [{"c":3}]
+
+-- computed-aggregate alias: the aggregate entry is aliased `count(*)`, so `c`
+-- names ONLY the final projection's output column. This is the shape that used
+-- to fail with "Column not found: c".
+select count(*) + 1 as c from soa order by max(a), c;
+→ [{"c":4}]
+
+-- positional reference alongside the sort-only aggregate
+select count(*) + 1 as c from soa order by max(a), 1;
+→ [{"c":4}]
+
+-- the alias inside a larger ORDER BY expression
+select count(*) + 1 as c from soa order by max(a), c + 0;
+→ [{"c":4}]
+
+-- the sort-only aggregate need not be the same function as the selected one
+select length(max(a)) as c from soa order by min(b), c;
+→ [{"c":1}]
+
+-- (There is no ungrouped counterpart of the grouping-key-alias case: an
+-- ungrouped aggregate query has no grouping key, and Quereus rejects any
+-- non-aggregate select-list item beside an aggregate without GROUP BY --
+-- including a constant, which SQLite accepts. That divergence is independent of
+-- ORDER BY and is tracked separately as
+-- backlog/bug-ungrouped-aggregate-rejects-constant-select-item.)
+
+-- --- GROUPED: group 'x' has max(b)='r' and 2 rows, group 'y' has max(b)='q'
+-- --- and 1 row, so ordering by max(b) puts 'y' first.
+
+-- bare-aggregate alias
+select a, count(*) as c from soa group by a order by max(b), c;
+→ [{"a":"y","c":1},{"a":"x","c":2}]
+
+-- computed-aggregate alias
+select a, count(*) + 1 as c from soa group by a order by max(b), c;
+→ [{"a":"y","c":2},{"a":"x","c":3}]
+
+-- grouping-key alias
+select a as k, count(*) as c from soa group by a order by max(b), k;
+→ [{"k":"y","c":1},{"k":"x","c":2}]
+
+-- positional reference (position 2 is the computed alias)
+select a, count(*) + 1 as c from soa group by a order by max(b), 2;
+→ [{"a":"y","c":2},{"a":"x","c":3}]
+
+-- the alias inside a larger ORDER BY expression
+select a, count(*) + 1 as c from soa group by a order by max(b), c + 0;
+→ [{"a":"y","c":2},{"a":"x","c":3}]
+
+-- --- The same pairing under each surrounding modifier. DISTINCT and LIMIT sit
+-- --- above this sort, HAVING below it.
+
+select distinct count(*) + 1 as c from soa order by max(a), c;
+→ [{"c":4}]
+
+select distinct a, count(*) + 1 as c from soa group by a order by max(b), c;
+→ [{"a":"y","c":2},{"a":"x","c":3}]
+
+select a, count(*) + 1 as c from soa group by a order by max(b), c limit 1;
+→ [{"a":"y","c":2}]
+
+select a, count(*) + 1 as c from soa group by a having count(*) >= 1 order by max(b), c;
+→ [{"a":"y","c":2},{"a":"x","c":3}]
+
+-- --- Nested spellings: a derived table and a scalar subquery each wrap the
+-- --- query in another ProjectNode above the sort.
+
+select * from (select count(*) + 1 as c from soa order by max(a), c);
+→ [{"c":4}]
+
+select (select count(*) + 1 as c from soa order by max(a), c) as v;
+→ [{"v":4}]
+
+drop table soa;
+
+-- =============================================================================
+-- Ordering correctness for the same pairing. The sort-only aggregate max(val)
+-- is deliberately anti-correlated with BOTH the group name and the group size,
+-- so a plan that silently sorted by either would produce a different order:
+--
+--   grp | rows | max(val)      by max(val) asc: a, c, d, e, b
+--   ----+------+---------      by grp asc:      a, b, c, d, e
+--    a  |  3   | m1            by size asc:     b, d, a, c, e
+--    b  |  1   | m4
+--    c  |  4   | m2          Groups d and e TIE on max(val)='m3'; the computed
+--    d  |  2   | m3          alias count(*)+1 (3 vs 6) breaks the tie, so the
+--    e  |  5   | m3          second key's own direction is observable too.
+-- =============================================================================
+
+create table sog (id integer primary key, grp text, val text);
+insert into sog values
+	(1,'a','m1'), (2,'a','l0'), (3,'a','k0'),
+	(4,'b','m4'),
+	(5,'c','m2'), (6,'c','l1'), (7,'c','l2'), (8,'c','k1'),
+	(9,'d','m3'), (10,'d','a0'),
+	(11,'e','m3'), (12,'e','b0'), (13,'e','b1'), (14,'e','b2'), (15,'e','b3');
+
+-- ascending: tie d/e broken ascending by the alias
+select grp, count(*) + 1 as c from sog group by grp order by max(val), c;
+→ [{"grp":"a","c":4},{"grp":"c","c":5},{"grp":"d","c":3},{"grp":"e","c":6},{"grp":"b","c":2}]
+
+-- descending first key, ascending tiebreak: whole order reverses, d still before e
+select grp, count(*) + 1 as c from sog group by grp order by max(val) desc, c;
+→ [{"grp":"b","c":2},{"grp":"d","c":3},{"grp":"e","c":6},{"grp":"c","c":5},{"grp":"a","c":4}]
+
+-- both descending: only the tied pair swaps
+select grp, count(*) + 1 as c from sog group by grp order by max(val) desc, c desc;
+→ [{"grp":"b","c":2},{"grp":"e","c":6},{"grp":"d","c":3},{"grp":"c","c":5},{"grp":"a","c":4}]
+
+-- LIMIT cuts the sorted prefix, and the tiebreak direction decides row 3
+select grp, count(*) + 1 as c from sog group by grp order by max(val), c limit 3;
+→ [{"grp":"a","c":4},{"grp":"c","c":5},{"grp":"d","c":3}]
+
+select grp, count(*) + 1 as c from sog group by grp order by max(val), c desc limit 3;
+→ [{"grp":"a","c":4},{"grp":"c","c":5},{"grp":"e","c":6}]
+
+-- a grouping-key alias as the tiebreak, over a different sort-only aggregate
+select grp as k, count(*) as n from sog group by grp order by min(val) desc, k;
+→ [{"k":"b","n":1},{"k":"c","n":4},{"k":"a","n":3},{"k":"e","n":5},{"k":"d","n":2}]
+
+drop table sog;

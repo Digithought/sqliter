@@ -465,8 +465,7 @@ This is enforced, in two halves, both in `planner/building`:
 - **One redirect choke point.** Every post-aggregate expression of a grouped query —
   the rebuilt select list, the window phase's specifications and function arguments,
   the HAVING predicate, and every post-aggregate sort key (including the sort
-  `buildSelectStmt` places below the window phase, and the early ORDER BY placement
-  for order-by-only aggregates) — is passed through `redirectPostAggregate`
+  `buildSelectStmt` places below the window phase) — is passed through `redirectPostAggregate`
   (`select-aggregates.ts`), which rewrites any spelling of a grouping key that fell
   through to a pre-grouping attribute onto the AggregateNode's own group output
   column. It is gated on `referencesAggregateInput`, so a reference that already
