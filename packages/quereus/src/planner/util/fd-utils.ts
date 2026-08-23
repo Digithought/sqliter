@@ -12,7 +12,7 @@ import { BetweenNode, BinaryOpNode, CastNode, CollateNode, LiteralNode, UnaryOpN
 import { InNode } from '../nodes/subquery.js';
 import type { SqlValue } from '../../common/types.js';
 import { compareSqlValues, normalizeCollationName, semanticOrderingsAgree } from '../../util/comparison.js';
-import { flipComparison } from '../analysis/predicate-shape.js';
+import { flipComparison, literalValue } from '../analysis/predicate-shape.js';
 import { effectiveBetweenBoundCollation, effectiveComparisonCollation, effectiveInCollation, isValueDiscriminatingEquality, operandCollation } from '../analysis/comparison-collation.js';
 
 const log = createLogger('planner:fd');
@@ -1424,9 +1424,7 @@ function literalSqlValueOf(n: ScalarPlanNode): SqlValue | undefined {
 		cur = cur.operand;
 	}
 	if (cur instanceof LiteralNode) {
-		const v = cur.expression.value;
-		if (v instanceof Promise) return undefined;
-		return v;
+		return literalValue(cur.expression);
 	}
 	return undefined;
 }
@@ -1688,8 +1686,8 @@ function constantValueOf(n: ScalarPlanNode): ConstantValue | undefined {
 		n = n.operand;
 	}
 	if (n instanceof LiteralNode) {
-		const v = n.expression.value;
-		if (v instanceof Promise) return undefined;
+		const v = literalValue(n.expression);
+		if (v === undefined) return undefined;
 		return { kind: 'literal', value: v };
 	}
 	if (n instanceof ParameterReferenceNode) {

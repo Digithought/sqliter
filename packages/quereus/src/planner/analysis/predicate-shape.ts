@@ -8,9 +8,17 @@
  * collations, or coercions. Callers wanting semantic equivalence should layer
  * that on top.
  *
- * {@link planTimeLiteralValue} is the one plan-node-level entry point here: it
- * lifts the same literal test to an already-unwrapped `ScalarPlanNode` for the
- * constraint extractor and the sargable-range-rewrite rule.
+ * {@link literalValue} and {@link planTimeLiteralValue} are the two shared answers to
+ * "does this literal have a value I can use at plan time?" — `literalValue` for callers
+ * already holding a `LiteralNode` (or its AST expression), `planTimeLiteralValue` for a
+ * scalar plan node of unknown type. Both reject a `LiteralNode` whose value is a
+ * still-pending Promise (a folded async constant such as `(select 1)`; see
+ * `docs/optimizer-const.md` §4). Reading `expression.value` directly instead has produced
+ * both crashes and wrong results, so new code should route through these rather than
+ * open-coding another `instanceof Promise` test. Callers outside this file include the
+ * constraint extractor, the sargable-range-rewrite and monotonic-range-access rules, the
+ * expression fingerprinter, the SAT checker, functional-dependency and catalog-statistics
+ * utilities, `LimitOffsetNode`, and the LIKE emitter.
  */
 
 import type * as AST from '../../parser/ast.js';

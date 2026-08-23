@@ -15,6 +15,7 @@ import type {
 	MonotonicOnInfo,
 	PhysicalProperties,
 } from '../planner/nodes/plan-node.js';
+import { planTimeLiteralValue } from '../planner/analysis/predicate-shape.js';
 
 /**
  * Type for a scalar function implementation.
@@ -349,17 +350,18 @@ export function resolveAdvertisement<T>(
 }
 
 /**
- * Returns the literal value of a scalar operand, or `undefined` when the
- * operand is not a literal. Used by advertisement closures that want to read
- * compile-time operand values (e.g. `generate_series(1, 100)` advertising
- * `estimatedRows: 100`).
+ * Returns the plan-time constant value of a scalar operand, or `undefined` when the
+ * operand is not one. Used by advertisement closures that want to read compile-time
+ * operand values (e.g. `generate_series(1, 100)` advertising `estimatedRows: 100`).
+ *
+ * Delegates to {@link planTimeLiteralValue} rather than reading `expression.value`
+ * directly: a folded constant scalar subquery (`generate_series(1, (select 100))`) is
+ * a literal whose value is a still-pending Promise, which is not a number an
+ * advertisement can reason about. `undefined` means "not available at plan time";
+ * SQL `NULL` still comes back as `null`.
  */
 export function evaluateLiteralOperand(operand: ScalarPlanNode): SqlValue | undefined {
-	const candidate = operand as ScalarPlanNode & { readonly expression?: { type?: string; value?: SqlValue } };
-	if (candidate.expression && candidate.expression.type === 'literal') {
-		return candidate.expression.value;
-	}
-	return undefined;
+	return planTimeLiteralValue(operand);
 }
 
 /**

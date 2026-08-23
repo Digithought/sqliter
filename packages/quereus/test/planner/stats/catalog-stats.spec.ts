@@ -33,7 +33,7 @@ function mockColumnRef(name: string, attributeId = 0): ScalarPlanNode {
 function mockLiteral(value: SqlValue): ScalarPlanNode {
 	return {
 		nodeType: 'Literal',
-		expression: { value },
+		expression: { type: 'literal', value },
 		getChildren: () => [],
 		getRelations: () => [],
 	} as unknown as ScalarPlanNode;
@@ -384,8 +384,8 @@ describe('CatalogStatsProvider', () => {
 			const pred = {
 				nodeType: 'Between',
 				expression: {},
-				lower: { nodeType: 'Literal', expression: { value: Promise.resolve(10) }, getChildren: () => [], getRelations: () => [] },
-				upper: { nodeType: 'Literal', expression: { value: Promise.resolve(90) }, getChildren: () => [], getRelations: () => [] },
+				lower: { nodeType: 'Literal', expression: { type: 'literal', value: Promise.resolve(10) }, getChildren: () => [], getRelations: () => [] },
+				upper: { nodeType: 'Literal', expression: { type: 'literal', value: Promise.resolve(90) }, getChildren: () => [], getRelations: () => [] },
 				getChildren: () => [mockColumnRef('val')],
 				getRelations: () => [],
 			} as unknown as ScalarPlanNode;
@@ -704,7 +704,7 @@ describe('CatalogStatsProvider', () => {
 			const table = makeTableSchema('t', makeStats(100, { val: { distinctCount: 100, histogram: hist } }));
 			const promiseLiteral = {
 				nodeType: 'Literal',
-				expression: { value: Promise.resolve(50) },
+				expression: { type: 'literal', value: Promise.resolve(50) },
 				getChildren: () => [],
 				getRelations: () => [],
 			} as unknown as ScalarPlanNode;

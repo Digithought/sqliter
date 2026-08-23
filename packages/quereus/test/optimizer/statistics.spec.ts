@@ -203,7 +203,7 @@ describe('CatalogStatsProvider selectivity', () => {
 	function mockLiteral(value: SqlValue): ScalarPlanNode {
 		return {
 			nodeType: 'Literal',
-			expression: { value },
+			expression: { type: 'literal', value },
 			getChildren: () => [],
 			getRelations: () => [],
 		} as unknown as ScalarPlanNode;

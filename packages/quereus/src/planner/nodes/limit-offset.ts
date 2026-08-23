@@ -8,6 +8,7 @@ import { StatusCode } from '../../common/types.js';
 import type { LimitCapable } from '../framework/characteristics.js';
 import { CastNode, CollateNode, LiteralNode } from './scalar.js';
 import { addSingletonFd } from '../util/fd-utils.js';
+import { literalValue } from '../analysis/predicate-shape.js';
 import { physicalSourceRows } from '../util/row-estimates.js';
 
 /**
@@ -78,8 +79,8 @@ export class LimitOffsetNode extends PlanNode implements UnaryRelationalNode, Li
 			cur = cur.operand;
 		}
 		if (!(cur instanceof LiteralNode)) return undefined;
-		const v = cur.expression.value;
-		if (v instanceof Promise) return undefined;
+		const v = literalValue(cur.expression);
+		if (v === undefined) return undefined;
 		// Literal NULL ⇒ unbounded (emitter uses Infinity), not a ≤1-row constant.
 		if (v === null) return undefined;
 		const n = Number(v);

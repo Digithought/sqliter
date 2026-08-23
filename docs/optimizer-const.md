@@ -85,7 +85,11 @@ const lit  = new LiteralNode(expr.scope, {type: 'literal', value: out});
 Notes
 - There is **no special row context**.  Column references resolve because they're replaced only when their source attribute is already folded to a literal, thus no `ColumnReferenceNode` survives evaluation.
 - The pass runs synchronously, so when the scheduler returns a Promise the **`LiteralNode` holds a still-pending Promise as its value** (`const-pass.ts`, `replaceBorderNodes`). The emitter awaits it at runtime (`runtime/emit/literal.ts`); an uncorrelated constant scalar subquery such as `(select 1)` is the common case.
-- Consequently a `LiteralNode` is **not** automatically a plan-time constant. Any planner code reading `literalNode.expression.value` must reject a pending Promise — use `planTimeLiteralValue` (`planner/analysis/predicate-shape.ts`) rather than reading the value directly. Treating a promise-valued literal as a constant has produced both crashes and wrong results.
+- Consequently a `LiteralNode` is **not** automatically a plan-time constant. Any planner code reading `literalNode.expression.value` must reject a pending Promise. Both shared accessors live in `planner/analysis/predicate-shape.ts`; use whichever matches what you already hold, and never read `expression.value` directly:
+  - `planTimeLiteralValue(node: ScalarPlanNode)` — for a scalar plan node of unknown type; also returns `undefined` when the node is not a literal at all.
+  - `literalValue(expr: AST.LiteralExpr)` — the primitive, for callers already holding a `LiteralNode` (or its AST expression).
+  - Both return `undefined` for "not usable at plan time". SQL `NULL` comes back as `null`, so the two stay distinguishable.
+- Treating a promise-valued literal as a constant has produced both crashes (`bug-constant-subquery-literal-crashes-predicate-rewrite`) and wrong results (`bug-constant-subquery-literals-collide-in-cse`, where the expression fingerprinter canonicalized every promise-valued literal to the same string and common-subexpression elimination collapsed `(select 1)` and `(select 2)` into one computation). The fingerprinter's rule is the general one: a literal with no plan-time value gets a per-node-unique fingerprint, disabling CSE for it rather than guessing.
 - Any exception aborts folding and leaves the original node untouched.
 
 ---

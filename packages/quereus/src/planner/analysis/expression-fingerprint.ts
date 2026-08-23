@@ -14,6 +14,7 @@ import type { AggregateFunctionCallNode } from '../nodes/aggregate-function.js';
 import type { WindowFunctionCallNode } from '../nodes/window-function.js';
 import type { JSONValue } from '../../common/json-types.js';
 import { canonicalJsonString } from '../../util/json-canonical.js';
+import { literalValue } from './predicate-shape.js';
 import { createLogger } from '../../common/logger.js';
 
 const log = createLogger('planner:expression-fingerprint');
@@ -106,7 +107,29 @@ export function fingerprintExpression(node: ScalarPlanNode): string {
 }
 
 function fingerprintLiteral(node: LiteralNode): string {
-	const value = node.expression.value;
+	// `LiteralNode.expression.value` is NOT necessarily a resolved SQL value: constant
+	// folding is synchronous but the value it folds may be async, so an uncorrelated
+	// constant scalar subquery — `(select 1)` — becomes a literal holding a still-pending
+	// Promise that only the emitter awaits. `literalValue` is the shared plan-time test;
+	// it returns undefined for exactly that case, which we must not fingerprint by value —
+	// a Promise matches none of the scalar arms below and would land in the JSON-document
+	// branch, canonicalizing every one of them to the same `LI:j{}` and letting CSE collapse
+	// `(select 1)` and `(select 2)` into one shared computation.
+	const value = literalValue(node.expression);
+	if (value === undefined) {
+		// Not a plan-time value. Fall back to a per-node fingerprint so it is never
+		// deduplicated against anything — correct, but it silently disables CSE for
+		// this literal, so say so.
+		//
+		// NOTE: this also means two *textually identical* constant subqueries — `x + (select 5)`
+		// twice in one statement — no longer share one computation, so the subquery runs once per
+		// occurrence. Cheap today (the values are already materialized promises, and the
+		// pre-folding `ScalarSubquery` form was never a CSE candidate either — see `_SQ:` above).
+		// If a workload ever repeats an expensive constant subquery many times in one statement,
+		// key these on the folded subquery's identity rather than the node id.
+		log('literal has no plan-time value (pending folded constant), fingerprinting node %d uniquely', node.id);
+		return `LI:?${node.id}`;
+	}
 	if (value === null) return 'LI:null';
 	if (typeof value === 'bigint') return `LI:${value}n`;
 	if (typeof value === 'number') return `LI:${value}f`;
@@ -137,7 +160,11 @@ function fingerprintLiteral(node: LiteralNode): string {
 			return `LI:?${node.id}`;
 		}
 	}
-	return `LI:?${String(value)}`;
+	// Unreachable for a well-typed SqlValue. Stay node-unique rather than rendering the
+	// value: two literals holding the same unexpected host value would otherwise share a
+	// fingerprint and be collapsed into one computation.
+	log('literal has an unexpected value type, fingerprinting node %d uniquely', node.id);
+	return `LI:?${node.id}`;
 }
 
 /**

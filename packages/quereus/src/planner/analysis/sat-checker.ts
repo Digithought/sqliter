@@ -48,7 +48,7 @@ import {
 } from '../../util/comparison.js';
 import type { CollationFunction, CollationResolver, LogicalType } from '../../types/logical-type.js';
 import { isNoOpCast } from './scalar-invertibility.js';
-import { flipComparison } from './predicate-shape.js';
+import { flipComparison, literalValue } from './predicate-shape.js';
 import { createLogger } from '../../common/logger.js';
 
 const warnLog = createLogger('planner:analysis:sat-checker').extend('warn');
@@ -455,9 +455,7 @@ function unwrap(n: ScalarPlanNode): ScalarPlanNode {
 function literalOf(n: ScalarPlanNode): SqlValue | undefined {
 	const u = unwrap(n);
 	if (!(u instanceof LiteralNode)) return undefined;
-	const v = u.expression.value;
-	if (v instanceof Promise) return undefined;
-	return v;
+	return literalValue(u.expression);
 }
 
 function columnOf(

@@ -516,6 +516,54 @@ describe('Expression fingerprinting', () => {
 				expect(fingerprintExpression(a)).to.not.equal(fingerprintExpression(b));
 			});
 		});
+
+		// Constant folding is a synchronous pass, but the value it folds may be async, so
+		// an uncorrelated constant scalar subquery — `(select 1)` — becomes a LiteralNode
+		// whose `expression.value` is a still-pending Promise that only the emitter awaits.
+		// Fingerprinting such a literal BY VALUE dropped every one of them into the
+		// JSON-document branch, where they all canonicalized to `LI:j{}`; CSE then collapsed
+		// `x + (select 1)` and `x + (select 2)` into one computation
+		// (bug-constant-subquery-literals-collide-in-cse).
+		//
+		// The property below is the general statement of the class: a literal with no
+		// plan-time value is fingerprinted per node, so no two of them ever collide —
+		// with each other, or with any literal that DOES have a plan-time value.
+		describe('pending-Promise literals (folded async constants)', () => {
+			it('two literals holding distinct pending Promises never share a fingerprint', () => {
+				const nodes = [1, 2, 3, 'x', null, { a: 1 }].map(v => lit(Promise.resolve(v)));
+				const fps = nodes.map(fingerprintExpression);
+				expect(new Set(fps).size).to.equal(nodes.length);
+				for (const fp of fps) expect(fp).to.match(/^LI:\?/);
+			});
+
+			it('two literals holding the SAME pending Promise still fingerprint distinctly', () => {
+				// Conservative on purpose: the value is unknown at plan time, so sharing is
+				// never provable from the fingerprint alone.
+				const shared = Promise.resolve(1);
+				expect(fingerprintExpression(lit(shared)))
+					.to.not.equal(fingerprintExpression(lit(shared)));
+			});
+
+			it('a pending-Promise literal never collides with a JSON-object literal', () => {
+				const promiseFp = fingerprintExpression(lit(Promise.resolve(1)));
+				for (const doc of [{}, { a: 1 }, [] as unknown[], [1, 2]]) {
+					expect(promiseFp).to.not.equal(fingerprintExpression(lit(doc)));
+				}
+			});
+
+			it('a pending-Promise literal never collides with an ordinary scalar literal', () => {
+				const promiseFp = fingerprintExpression(lit(Promise.resolve(1)));
+				for (const v of [1, 1n, 'a', true, null, new Uint8Array([1])]) {
+					expect(promiseFp).to.not.equal(fingerprintExpression(lit(v)));
+				}
+			});
+
+			it('enclosing expressions built over distinct pending Promises stay distinct', () => {
+				const a = binOp('+', colRef(1), lit(Promise.resolve(1)));
+				const b = binOp('+', colRef(1), lit(Promise.resolve(2)));
+				expect(fingerprintExpression(a)).to.not.equal(fingerprintExpression(b));
+			});
+		});
 	});
 
 	describe('Aggregate function fingerprint (mutation-killing)', () => {

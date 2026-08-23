@@ -20,6 +20,7 @@ import { tryTemporalArithmetic, tryTemporalComparison } from "./temporal-arithme
 import { runTemporalCase, temporalOpCaseForTypes, unsupportedTemporalOp } from "../../types/temporal-ops.js";
 import { effectiveComparisonCollation } from "../../planner/analysis/comparison-collation.js";
 import { classifyBinaryOperator } from "../../planner/analysis/binary-operator-class.js";
+import { literalValue } from "../../planner/analysis/predicate-shape.js";
 import { emitScalarOp, type ScalarOpSpec } from "./scalar-op.js";
 
 /**
@@ -551,15 +552,16 @@ function emitShortCircuitLogicalOp(plan: BinaryOpNode, ctx: EmissionContext): In
 /**
  * If `node` is a literal-constant, non-NULL pattern, return the exact string the
  * per-row path would derive from it ({@link valueToText}), otherwise undefined.
- * A NULL literal, a not-yet-resolved Promise value, or any non-literal node
+ * A NULL literal, a literal with no plan-time value (a folded constant scalar
+ * subquery, whose value is a still-pending Promise), or any non-literal node
  * falls through to the dynamic (memoized) per-row path so semantics are
  * unchanged. Cast/collate-wrapped literals are intentionally NOT unwrapped —
  * emitLikeOp ignores collation, and peeling could silently diverge.
  */
 function constLikePattern(node: ScalarPlanNode): string | undefined {
 	if (!(node instanceof LiteralNode)) return undefined;
-	const value = node.expression.value;
-	if (value === null || value === undefined || value instanceof Promise) return undefined;
+	const value = literalValue(node.expression);
+	if (value === null || value === undefined) return undefined;
 	return valueToText(value);
 }
 

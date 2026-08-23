@@ -15,6 +15,7 @@ import { catalogRowCount } from './table-cardinality.js';
 import { selectivityFromHistogram } from './histogram.js';
 import { combineConjunctive, combineDisjunctive } from './selectivity-combine.js';
 import { splitConjuncts, splitDisjuncts } from '../analysis/predicate-conjuncts.js';
+import { literalValue } from '../analysis/predicate-shape.js';
 import type { BinaryOpNode, LiteralNode, BetweenNode, UnaryOpNode } from '../nodes/scalar.js';
 import type { ColumnReferenceNode } from '../nodes/reference.js';
 import type { InNode } from '../nodes/subquery.js';
@@ -570,10 +571,9 @@ function extractConstantValue(predicate: ScalarPlanNode): SqlValue | undefined {
 	const children = predicate.getChildren();
 	for (const child of children) {
 		if (child.nodeType === 'Literal') {
-			const val = (child as unknown as LiteralNode).expression.value;
-			// Predicate literals are always resolved (not promises)
-			if (val instanceof Promise) return undefined;
-			return val;
+			// A folded constant scalar subquery is a literal with no plan-time value;
+			// `literalValue` returns undefined for it, which reads as "no estimate".
+			return literalValue((child as unknown as LiteralNode).expression);
 		}
 	}
 	return undefined;
@@ -595,10 +595,8 @@ function extractBetweenBounds(predicate: ScalarPlanNode): { low: SqlValue; high:
 	const node = predicate as unknown as BetweenNode;
 	if (node.lower !== undefined && node.upper !== undefined) {
 		if (node.lower.nodeType !== 'Literal' || node.upper.nodeType !== 'Literal') return undefined;
-		const lowVal = (node.lower as unknown as LiteralNode).expression.value;
-		const highVal = (node.upper as unknown as LiteralNode).expression.value;
-		// Predicate literals are always resolved (not promises)
-		if (lowVal instanceof Promise || highVal instanceof Promise) return undefined;
+		const lowVal = literalValue((node.lower as unknown as LiteralNode).expression);
+		const highVal = literalValue((node.upper as unknown as LiteralNode).expression);
 		if (lowVal !== undefined && highVal !== undefined) {
 			return { low: lowVal, high: highVal };
 		}

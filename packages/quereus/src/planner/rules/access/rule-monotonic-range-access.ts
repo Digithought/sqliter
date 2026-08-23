@@ -31,8 +31,8 @@ import type { SqlValue } from '../../../common/types.js';
 import { IndexConstraintOp } from '../../../common/constants.js';
 import { SeqScanNode, IndexScanNode, IndexSeekNode } from '../../nodes/table-access-nodes.js';
 import { FilterNode } from '../../nodes/filter.js';
-import { LiteralNode } from '../../nodes/scalar.js';
 import { extractConstraints, createTableInfoFromNode } from '../../analysis/constraint-extractor.js';
+import { planTimeLiteralValue } from '../../analysis/predicate-shape.js';
 import type { PhysicalProperties } from '../../nodes/plan-node.js';
 import type { FilterInfo } from '../../../vtab/filter-info.js';
 import type { ScalarPlanNode } from '../../nodes/plan-node.js';
@@ -56,8 +56,8 @@ const LE_OR_LT = new Set<IndexConstraintOp>([IndexConstraintOp.LE, IndexConstrai
 /**
  * Walk the leaf's `FilterInfo.constraints` looking for handled bounds on the
  * given column index. Returns the synthesized RangeBounds (literals included
- * when the corresponding seek key is a LiteralNode); returns null when no
- * range/equality bound exists.
+ * when the corresponding seek key carries a plan-time constant); returns null when
+ * no range/equality bound exists.
  */
 function extractRangeBounds(
 	filterInfo: FilterInfo,
@@ -73,7 +73,11 @@ function extractRangeBounds(
 		const seekKey = seekKeys && entry.argvIndex >= 1 && entry.argvIndex <= seekKeys.length
 			? seekKeys[entry.argvIndex - 1]
 			: undefined;
-		const valueLiteral = seekKey instanceof LiteralNode ? seekKey.expression.value as SqlValue : undefined;
+		// `planTimeLiteralValue`, not a raw `expression.value` read: a folded constant
+		// scalar subquery is a LiteralNode whose value is a still-pending Promise, which is
+		// not a usable range bound. It returns undefined for that, so the bound stays
+		// symbolic (op only) instead of pruning against a Promise object.
+		const valueLiteral = seekKey !== undefined ? planTimeLiteralValue(seekKey) : undefined;
 
 		if (GE_OR_GT.has(c.op)) {
 			const op: '>=' | '>' = c.op === IndexConstraintOp.GE ? '>=' : '>';
