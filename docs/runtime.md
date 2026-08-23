@@ -482,12 +482,20 @@ This is enforced, in two halves, both in `planner/building`:
   instead of shipping the accident above. It runs for an aggregate query with **no**
   `group by` too — that query has one implicit group whose row carries only the
   aggregate results, so `having`, `limit`, `offset` and an `order by` forced above the
-  aggregation are all subject to the same rule. "Aggregate query" there includes one
-  whose only trigger is a `having`: a `having` with neither aggregates nor a `group by`
-  still builds an AggregateNode (empty grouping keys, empty aggregate list), so its
-  implicit group carries no columns at all and every reference above it is rejected. (The `order by` that stays *below* the
+  aggregation are all subject to the same rule. (The `order by` that stays *below* the
   aggregation — the pre-aggregate input sort of `select group_concat(b) from t order by
   a` — is outside the walk by construction.)
+
+  "Aggregate query" there includes one whose only trigger is a `having`: a `having`
+  with neither aggregates nor a `group by` still builds an AggregateNode (empty
+  grouping keys, empty aggregate list), so its implicit group carries no columns at
+  all and every reference above it is rejected. The select-list half of that rejection
+  happens earlier, in `validateAggregateProjections`, which runs the same coverage walk
+  with an empty key set for every aggregate query — grouped or not. Both halves must
+  cover the same shapes: while the ungrouped one skipped the walk,
+  `buildFinalAggregateProjections`' `select *` branch reached its
+  internal-consistency assert ("Internal: SELECT * column … is not a GROUP BY key")
+  and raised `StatusCode.INTERNAL` at the user.
 
 The check is deliberately strict — there is no escape hatch. A query that genuinely
 reads an ungrouped column above the aggregate (`select a from t group by a order by

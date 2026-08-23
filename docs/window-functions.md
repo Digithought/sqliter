@@ -59,6 +59,11 @@ window_function([arguments]) OVER (
 specification and the function's arguments are therefore subject to the same GROUP BY
 restriction as the rest of the select list.
 
+The same holds for an aggregate query with **no** `group by`, including one whose only
+trigger is a `having` (see [SELECT § 3.4](sql-select.md#34-having-clause)): it has one
+implicit group, so the window runs over that single row. `select count(*) over () from t
+having 1 = 1` is `1`, not the row count of `t`.
+
 Those expressions are built against a scope that falls through to the *pre-aggregate*
 select scope, so a grouping key spelled any way other than the one the aggregate output
 scope registered (`wg.a` against `group by a`, or a non-bare key written out again)

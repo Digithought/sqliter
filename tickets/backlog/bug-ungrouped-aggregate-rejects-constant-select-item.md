@@ -1,7 +1,8 @@
 ---
 description: A summary query that puts a fixed label next to its total — like asking for the word "total" alongside a row count — is rejected with an error instead of returning the row. Other databases accept it.
 files:
-  - packages/quereus/src/planner/building/select-aggregates.ts   # validateAggregateProjections, ~line 749-761 — the blanket throw
+  - packages/quereus/src/planner/building/select-aggregates.ts   # validateAggregateProjections — the blanket throw; also buildAggregatePhase's `needsPostAggregateSort && (hasAggregates || hasGroupBy)` gate
+  - packages/quereus/src/planner/building/select.ts               # `allowAggregates: hasAggregates` passed to applyOrderBy
   - packages/quereus/test/logic/28.2-orderby-expression-extras.sqllogic  # ~line 500 comment referencing this slug
 repro: verified
 severity: edge-case
@@ -78,3 +79,38 @@ That ticket's coverage matrix wanted an ungrouped counterpart of its
 not to plan. The matrix records the gap in a comment in
 `packages/quereus/test/logic/28.2-orderby-expression-extras.sqllogic` naming this
 slug — update that comment when this lands.
+
+## Arm: a `having`-only query cannot name an aggregate in its `order by`
+
+Found during review of `bug-having-without-aggregates-silently-dropped`, which
+made `select 1 from t having 1 = 1` an aggregate query over one implicit group.
+
+```sql
+select 1 as one from t having 1 = 1 order by count(*);
+-- Quereus: Aggregate function count not allowed in this context
+-- PostgreSQL: accepted — the query IS an aggregate query, so an aggregate in its
+--             ORDER BY is legal
+```
+
+Verified against the current build. This shape errors identically before and
+after that ticket's fix, so it is not a regression — the fix just made the shape
+reachable as a meaningful query rather than a silently-wrong one.
+
+**It resolves here, and cannot be fixed without the throw above.** Two separate
+"is this an aggregate query?" tests still read `hasAggregates || hasGroupBy`,
+which the `having`-only shape does not satisfy:
+
+- `buildAggregatePhase` guards its ORDER BY aggregate collection on it, so the
+  aggregate is never added to the AggregateNode;
+- `buildSelectStmt` passes `allowAggregates: hasAggregates` to `applyOrderBy`,
+  which is what raises the message above.
+
+Widening both to the same `isAggregateQuery` predicate the ticket's fix
+introduced would let the aggregate through — and then land straight on the
+blanket throw this ticket is about, because the select list (`1`) is a
+non-aggregate item. So the two must be fixed together, in this order: relax the
+throw to test *column-free expression* rather than *non-aggregate item*, then
+widen the two aggregate-query gates.
+
+Same-shape check to add with the fix: `select 1 as one from t having count(*) > 1`
+fails on the identical throw today.

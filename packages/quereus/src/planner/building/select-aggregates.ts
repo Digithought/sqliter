@@ -763,11 +763,16 @@ function findUngroupedPostAggregateRef(
 
 /**
  * Validates that aggregate and non-aggregate projections don't mix inappropriately.
- * With GROUP BY, every non-aggregate column reference in the SELECT list must
- * either (a) match a GROUP BY column by attribute id, or (b) appear inside a
- * subtree whose AST matches a GROUP BY expression. This is intentionally
- * stricter than full functional-dependency coverage — it matches SQL-92 and
- * the corpus assertions, without importing SQLite's permissive "bare columns" rule.
+ * Every non-aggregate column reference in the SELECT list must either (a) match a
+ * GROUP BY column by attribute id, or (b) appear inside a subtree whose AST matches
+ * a GROUP BY expression. This is intentionally stricter than full functional-dependency
+ * coverage — it matches SQL-92 and the corpus assertions, without importing SQLite's
+ * permissive "bare columns" rule.
+ *
+ * Only {@link buildAggregatePhase} calls this, and only from inside its
+ * `isAggregateQuery` guard, so "no GROUP BY" here means "one implicit group with an
+ * EMPTY set of grouping keys" — not "no grouping at all". The coverage walk therefore
+ * runs for it too, and rejects every bare select-list column.
  */
 function validateAggregateProjections(
 	projections: Projection[],
@@ -784,10 +789,13 @@ function validateAggregateProjections(
 		);
 	}
 
-	if (!hasGroupBy) return;
-
 	// The SELECT list is built against the pre-aggregate scope, so no aggregate
-	// output attributes participate.
+	// output attributes participate. With no GROUP BY the coverage set is empty, which
+	// is exactly right for the one implicit group: it carries no base-table column, so
+	// any bare column here is rejected. Skipping the walk for that shape is what let
+	// `select * from t having 1 = 1` fall through to buildFinalAggregateProjections and
+	// raise its internal-consistency assert ("Internal: SELECT * column 'id' is not a
+	// GROUP BY key", StatusCode.INTERNAL) at the user instead of this message.
 	const coverage = buildGroupByCoverage(groupByExpressions);
 	for (const proj of projections) {
 		assertGroupByCoverage(proj.node, coverage);

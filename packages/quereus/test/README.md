@@ -151,6 +151,7 @@ The full state, status legend, per-category index, and per-fixture Gaps Log live
 ## Adding new tests
 
 1. Pick the right kind: `.sqllogic` first; property test (`property.spec.ts`) only when an invariant naturally generalizes; unit test only when SQL-level coverage can't reach the surface.
+   - Fixing a clause the parser accepted but no builder ever read? The behaviour goes in a `.sqllogic`, and a row also goes in `clause-canary.spec.ts` — one query per clause whose answer must differ from the same query with the clause removed. That suite guards the *class* (a silently-dropped clause), not any one clause's correctness.
 2. For `.sqllogic`, name the file by feature/scenario (`between-with-nulls.sqllogic`), prefix it numerically per the run-order anchors above, and order scenarios inside the file mundane → exotic.
 3. Run `yarn test` to confirm the test exercises what you expect. If it's documenting a gap, leave it failing — don't paper over it.
 4. Update the relevant docs (this README, the cross-check doc, or the topic doc in `docs/`) when adding a whole new category.

@@ -131,17 +131,33 @@ insert into hn values (1, 'x', 10), (2, 'y', 20), (3, 'x', 30);
 
 create table hnempty (id integer primary key, val integer);
 
--- A bare column in HAVING is rejected: the implicit group carries no such column.
+-- A bare column above the aggregation is rejected: the implicit group carries no
+-- such column. The SELECT list is checked before HAVING is built, so when both name
+-- an ungrouped column the SELECT-list message is the one raised -- same order as a
+-- GROUP BY query, whose select list is checked at the same point.
 select grp from hn having grp = 'x';
--- error: grp
+-- error: Column 'grp' must appear in the GROUP BY clause
 
 select * from hn having grp = 'x';
--- error: grp
+-- error: Column 'id' must appear in the GROUP BY clause
 
--- ...and a bare column in the SELECT list above the aggregation is rejected too,
--- even when the HAVING predicate itself is a constant.
+-- ...including when the HAVING predicate itself is a constant, so the only ungrouped
+-- reference is in the SELECT list.
 select grp from hn having 1 = 0;
--- error: grp
+-- error: Column 'grp' must appear in the GROUP BY clause
+
+select * from hn having 1 = 1;
+-- error: Column 'id' must appear in the GROUP BY clause
+
+-- With a select list that carries no bare column, HAVING's own check is what fires,
+-- under its dedicated message.
+select 1 as one from hn having grp = 'x';
+-- error: HAVING references non-grouped column 'grp'
+
+-- A SELECT-list alias in HAVING is not a way around the rule: it denotes the same
+-- ungrouped column.
+select val as v from hn having v = 10;
+-- error: Column 'val' must appear in the GROUP BY clause
 
 -- Constant-true predicate keeps the single implicit group.
 select 1 as one from hn having 1 = 1;
@@ -159,6 +175,41 @@ select 1 as one from hnempty having 1 = 1;
 
 select 1 as one from hnempty having 1 = 0;
 → []
+
+-- A WHERE that removes every row does not remove the group either: WHERE runs below
+-- the aggregation, so the implicit group is still formed over the (now empty) input.
+select 1 as one from hn where val > 100 having 1 = 1;
+→ [{"one":1}]
+
+select 1 as one from hn where val > 15 having 1 = 1;
+→ [{"one":1}]
+
+-- A NULL predicate does not pass the filter, exactly as in WHERE.
+select 1 as one from hn having null;
+→ []
+
+-- The shape nested as a FROM-clause subquery: the outer query sees one row or none.
+select count(*) as c from (select 1 as one from hn having 1 = 1);
+→ [{"c":1}]
+
+select count(*) as c from (select 1 as one from hn having 1 = 0);
+→ [{"c":0}]
+
+-- ...and as an arm of a compound select.
+select 1 as one from hn having 1 = 0 union all select 2 as one from hn having 1 = 1;
+→ [{"one":2}]
+
+-- ...and as the source of an INSERT.
+create table hnsink (id integer primary key, v integer);
+insert into hnsink (id, v) select 1, 1 from hn having 1 = 0;
+select count(*) as c from hnsink;
+→ [{"c":0}]
+
+insert into hnsink (id, v) select 1, 1 from hn having 1 = 1;
+select count(*) as c from hnsink;
+→ [{"c":1}]
+
+drop table hnsink;
 
 -- A scalar subquery is a legal HAVING predicate here: it is not a bare column of
 -- the aggregated row.

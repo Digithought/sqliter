@@ -20,6 +20,14 @@ import type { SqlValue } from '../src/common/types.js';
  * and still compute the wrong rows and every canary here would stay green. The
  * per-clause behaviour suites (test/logic/*.sqllogic and friends) own correctness;
  * this file owns "it is connected".
+ *
+ * The `order by <ordinal> collate <name>` instance above is deliberately absent from
+ * the table: it is a KNOWN-OPEN defect, so its canary would fail today. Add it with
+ * the fix, not before — a skipped canary is indistinguishable from no canary.
+ *
+ * The table is a floor, not a ceiling. Clauses still unrepresented: the `from`-clause
+ * modifiers, `with`, set operations (`union`/`intersect`/`except`), explicit `window`
+ * definitions. Adding a row costs two queries.
  */
 
 /** The fixture every canary runs against — small, with a duplicate and an ascending key. */
@@ -103,9 +111,19 @@ const ERROR_CANARIES: readonly ErrorCanary[] = [
 	{
 		clause: 'having (no aggregate, no group by) — bare column',
 		// One implicit group, which carries no `grp`, so this must be rejected. While
-		// the clause was dropped it happily returned every row.
+		// the clause was dropped it happily returned every row. The fragment names the
+		// coverage rule, not just the column: `grp` alone appears in the SQL text and so
+		// would also match a parse error or an internal failure that echoes the query.
 		sql: `select grp from cn having grp = 'x'`,
-		errorFragment: 'grp',
+		errorFragment: `Column 'grp' must appear in the GROUP BY clause`,
+	},
+	{
+		clause: 'having (no aggregate, no group by) — bare column via star',
+		// Same rule reached through `select *`. Worth its own canary: the star select
+		// list is rebuilt by a different builder, which used to raise an internal
+		// assertion here rather than this user-facing message.
+		sql: `select * from cn having 1 = 1`,
+		errorFragment: `Column 'id' must appear in the GROUP BY clause`,
 	},
 ];
 
