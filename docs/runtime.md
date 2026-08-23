@@ -482,7 +482,10 @@ This is enforced, in two halves, both in `planner/building`:
   instead of shipping the accident above. It runs for an aggregate query with **no**
   `group by` too — that query has one implicit group whose row carries only the
   aggregate results, so `having`, `limit`, `offset` and an `order by` forced above the
-  aggregation are all subject to the same rule. (The `order by` that stays *below* the
+  aggregation are all subject to the same rule. "Aggregate query" there includes one
+  whose only trigger is a `having`: a `having` with neither aggregates nor a `group by`
+  still builds an AggregateNode (empty grouping keys, empty aggregate list), so its
+  implicit group carries no columns at all and every reference above it is rejected. (The `order by` that stays *below* the
   aggregation — the pre-aggregate input sort of `select group_concat(b) from t order by
   a` — is outside the walk by construction.)
 

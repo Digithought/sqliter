@@ -83,38 +83,38 @@ export function buildAggregatePhase(
 		}
 	}
 
-	// If there is a HAVING clause but the SELECT contains **no aggregate functions**
-	// AND **no GROUP BY**, we can safely treat the HAVING predicate as a regular filter
-	// that runs *before* the aggregation (i.e. between the source and the AggregateNode).
-	// This avoids the "missing column context" problem where the predicate refers to columns
-	// that are not available after the AggregateNode (only grouping columns and
-	// aggregate results are exposed). This behaviour is compatible with SQLite –
-	// GROUP BY with a primary-key guarantees one row per group so the semantics
-	// are unchanged.
-	const shouldPushHavingBelowAggregate = Boolean(stmt.having && !hasAggregates && !hasGroupBy);
+	// A `having` clause makes this an aggregate query on its own, exactly as SQLite and
+	// PostgreSQL define it: with no `group by` the query has ONE implicit group over all
+	// input rows, and `having` filters that single group. So a query with a `having` and
+	// neither aggregates nor `group by` still goes through the aggregate pipeline below —
+	// it builds an AggregateNode with no grouping keys and no aggregates, which yields
+	// exactly one (empty) row, and every clause above it is subject to the usual coverage
+	// rule. Returning early here instead is what silently dropped the predicate.
+	const isAggregateQuery = hasAggregates || hasGroupBy || Boolean(stmt.having);
 
-	if (!hasAggregates && !hasGroupBy) {
+	if (!isAggregateQuery) {
 		return { output: input, needsFinalProjection: false, preAggregateSort: false };
 	}
 
-	// ---------------------------------------------------------------------------
-	// Build HAVING predicate as *pre-aggregate* filter when appropriate
-	// ---------------------------------------------------------------------------
 	let currentInput: RelationalPlanNode = input;
-	if (shouldPushHavingBelowAggregate) {
-		// Build the predicate using the *pre-aggregate* scope because all columns
-		// are still available here.
-		const havingExpr = buildExpression(selectContext, stmt.having as AST.Expression, true);
-		currentInput = new FilterNode(selectContext.scope, currentInput, havingExpr);
-	}
 
-	// After (optional) early HAVING filter we continue with the existing pipeline
-	// ----------------------------------------------------------------------------
 	// Handle pre-aggregate sorting for ORDER BY without GROUP BY. Skip when the
 	// ORDER BY names an aggregate or a SELECT-list alias — neither can be evaluated
 	// against the per-input rows; they need the post-aggregate row(s).
+	// Inside the guard above, "not grouped" already means "one implicit group", so this
+	// does not test `hasAggregates`: the documented extension (an ungrouped aggregate
+	// query's ORDER BY sorts the *input* rows below the aggregation) must read the same
+	// whether or not the query happens to name an aggregate, or `select 1 from t having
+	// 1 = 1 order by a` would instead push the sort above the aggregation and be rejected
+	// by the coverage check while `select group_concat(b) from t order by a` is allowed.
+	// NOTE: for the having-only shape the aggregate list is empty, so nothing observes
+	// input order and the sort it emits cannot change the single output row — verified
+	// by dumping the program for `select 1 from hn having 1 = 1 order by val`, which
+	// carries one `sort(1 keys)` instruction. Harmless and rare; if an ungrouped
+	// aggregate query with an empty aggregate list ever shows up sorting a large input,
+	// elide the sort when `aggregates.length === 0 && groupByExpressions.length === 0`.
 	const preAggregateSort = Boolean(
-		hasAggregates && !hasGroupBy && stmt.orderBy && stmt.orderBy.length > 0 && !needsPostAggregateSort
+		!hasGroupBy && stmt.orderBy && stmt.orderBy.length > 0 && !needsPostAggregateSort
 	);
 	currentInput = handlePreAggregateSort(currentInput, stmt, selectContext, preAggregateSort, selectList);
 
@@ -177,9 +177,8 @@ export function buildAggregatePhase(
 		};
 	});
 
-	// Handle HAVING clause *after* aggregation only when we did not already push
-	// it below the AggregateNode.
-	if (stmt.having && !shouldPushHavingBelowAggregate) {
+	// Handle HAVING clause *after* aggregation.
+	if (stmt.having) {
 		currentInput = buildHavingFilter(currentInput, stmt.having, selectContext, aggregateOutputScope, aggregates, groupByExpressions, groupedCoverageContext, groupedRedirectContext);
 	}
 

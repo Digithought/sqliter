@@ -114,3 +114,114 @@ select grp from hp where val >= ? group by grp having count(*) = ? order by grp;
 → [{"grp":"a"}]
 
 drop table hp;
+
+-- =============================================================================
+-- HAVING with NO aggregate and NO GROUP BY
+--
+-- Such a query is still an aggregate query: it has one implicit group over all
+-- input rows, and HAVING filters that single group. It therefore yields at most
+-- one row, and every clause above the aggregation is subject to the usual
+-- coverage rule (only grouping columns — here, none — and aggregates).
+-- Regression: the clause used to be dropped from the plan entirely, so the
+-- query returned every input row unfiltered.
+-- =============================================================================
+
+create table hn (id integer primary key, grp text, val integer);
+insert into hn values (1, 'x', 10), (2, 'y', 20), (3, 'x', 30);
+
+create table hnempty (id integer primary key, val integer);
+
+-- A bare column in HAVING is rejected: the implicit group carries no such column.
+select grp from hn having grp = 'x';
+-- error: grp
+
+select * from hn having grp = 'x';
+-- error: grp
+
+-- ...and a bare column in the SELECT list above the aggregation is rejected too,
+-- even when the HAVING predicate itself is a constant.
+select grp from hn having 1 = 0;
+-- error: grp
+
+-- Constant-true predicate keeps the single implicit group.
+select 1 as one from hn having 1 = 1;
+→ [{"one":1}]
+
+-- Constant-false predicate filters it out. (Before the fix this returned all
+-- three rows of `hn`.)
+select 1 as one from hn having 1 = 0;
+→ []
+
+-- The implicit group exists even over an empty table — aggregation over no rows
+-- still produces exactly one group.
+select 1 as one from hnempty having 1 = 1;
+→ [{"one":1}]
+
+select 1 as one from hnempty having 1 = 0;
+→ []
+
+-- A scalar subquery is a legal HAVING predicate here: it is not a bare column of
+-- the aggregated row.
+select 1 as one from hn having (select count(*) from hn) > 2;
+→ [{"one":1}]
+
+select 1 as one from hn having (select count(*) from hn) > 5;
+→ []
+
+-- Compositions above the aggregation: LIMIT, DISTINCT, ORDER BY.
+select 1 as one from hn having 1 = 1 limit 1;
+→ [{"one":1}]
+
+select distinct 1 as one from hn having 1 = 1;
+→ [{"one":1}]
+
+-- ORDER BY over an ungrouped aggregate query sorts the *input* rows below the
+-- aggregation (a documented Quereus extension), so naming `val` here is legal
+-- and the single output row is unaffected.
+select 1 as one from hn having 1 = 1 order by val;
+→ [{"one":1}]
+
+-- The same shape as a view body.
+create view hnv as select 1 as one from hn having 1 = 1;
+select * from hnv;
+→ [{"one":1}]
+
+drop view hnv;
+
+-- A HAVING inside a subquery may reference an *enclosing* query's column, exactly
+-- as WHERE may — that is a correlated outer reference, not an ungrouped local
+-- column, and the coverage check must still tell the two apart when the subquery
+-- has no aggregates at all.
+select h.val from hn h where exists (select 1 from hn t having h.grp = 'x') order by h.val;
+→ [{"val":10},{"val":30}]
+
+-- A window function over the implicit group runs over the *aggregated* row, not the
+-- input rows: there is exactly one, so `count(*) over ()` is 1. (Before the fix this
+-- ran over all three input rows and returned 3, three times.)
+select count(*) over () as c from hn having 1 = 1;
+→ [{"c":1}]
+
+-- ORDER BY by output ordinal and by select-list alias both resolve above the single
+-- aggregated row. (Before the fix each returned three rows.)
+select 1 as one from hn having 1 = 1 order by 1;
+→ [{"one":1}]
+
+select 1 as one from hn having 1 = 1 order by one;
+→ [{"one":1}]
+
+-- Regression guards: adding an aggregate or a GROUP BY must not change any of the
+-- long-standing behaviour.
+select count(*) as c from hn having count(*) > 5;
+→ []
+
+select count(*) as c from hn having count(*) > 1;
+→ [{"c":3}]
+
+select grp, count(*) as c from hn group by grp having grp = 'x';
+→ [{"grp":"x","c":2}]
+
+select count(*) as c from hn where grp = 'x' having count(*) > 1;
+→ [{"c":2}]
+
+drop table hn;
+drop table hnempty;
