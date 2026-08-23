@@ -1,6 +1,6 @@
 import type * as AST from '../../parser/ast.js';
 import { PlanNode, type Attribute, type RelationalPlanNode, type ScalarPlanNode } from '../nodes/plan-node.js';
-import { QuereusError } from '../../common/errors.js';
+import { QuereusError, quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import type { PlanningContext } from '../planning-context.js';
 import { SingleRowNode } from '../nodes/single-row.js';
@@ -194,16 +194,15 @@ export function buildSelectStmt(
 	// projection list, to be projected above the window phase's WindowNode.
 	let windowSelectProjections: Projection[] | undefined;
 	// Set for every GROUPED query (built by buildAggregatePhase the moment the
-	// AggregateNode exists, so no post-aggregate site here can run before it): what
-	// the aggregate's rows carry, so every post-aggregate expression built below —
-	// sort keys, the rebuilt select list, the window phase's specifications and
-	// arguments — reaches the grouping-key redirect through redirectPostAggregate,
-	// and so the finished plan can be boundary-checked once at the bottom.
+	// AggregateNode exists, so no post-aggregate site here can run before it): the
+	// grouping keys every post-aggregate expression built below — sort keys, the
+	// rebuilt select list, the window phase's specifications and arguments — is
+	// redirected onto through redirectPostAggregate.
 	const groupedRedirectContext = aggregateResult.groupedRedirectContext;
-	// Set for every AGGREGATE query, grouped or not: what an aggregated row carries.
-	// An ungrouped aggregate query has exactly one implicit group, so the finished-plan
-	// boundary check at the bottom applies to it just as much — it just has no grouping
-	// keys, hence no redirect above.
+	// Set for every AGGREGATE query, grouped or not: what an aggregated row carries,
+	// which is what the finished-plan boundary check at the bottom needs. An ungrouped
+	// aggregate query has exactly one implicit group, so that check applies to it just
+	// as much — it just has no grouping keys, hence no redirect above.
 	const groupedCoverageContext = aggregateResult.groupedCoverageContext;
 	// The node whose output attributes ARE this SELECT's result columns, once one
 	// exists. A positional ORDER BY binds to its Nth attribute (see applyOrderBy).
@@ -303,6 +302,13 @@ export function buildSelectStmt(
 			}
 		}
 
+		// NOTE: the redirect context here is the GROUPED one, which is right today: a
+		// window function above an UNGROUPED aggregate is unreachable — the select list
+		// that would spell it is rejected first by "Cannot mix aggregate and non-aggregate
+		// columns in SELECT list without GROUP BY" — and an ungrouped query has no
+		// grouping keys to redirect onto anyway. If that mixing check is ever loosened,
+		// a WindowNode can land above an ungrouped aggregate and fall under the coverage
+		// walk below with no test covering it; pin that shape then.
 		input = buildWindowPhase(input, windowFunctions, selectContext, windowSelectProjections ?? projections, groupedRedirectContext);
 		// The window phase ends in a ProjectNode over the SELECT list, so that node's
 		// attributes are this query's result columns.
@@ -410,13 +416,10 @@ export function buildSelectStmt(
 	// SELECT-list and ORDER BY escapes shipped).
 	//
 	// NOTE: this covers an aggregate query with NO GROUP BY too — it has exactly one
-	// implicit group, so `having` / `order by` / `limit` / `offset` above it may still
-	// read only the aggregate results. That is why the guard is `groupedCoverageContext`
-	// (built for every aggregate query) and not `groupedRedirectContext` (grouping keys
-	// to rewrite onto, which an ungrouped query has none of). The documented Quereus
-	// extension where an ungrouped aggregate query's whole ORDER BY sorts the INPUT rows
-	// before aggregation stays legal for free: that SortNode sits BELOW the
-	// AggregateNode, and this walk stops at the aggregate.
+	// implicit group, so `having` / `order by` / `limit` / `offset` above it may read
+	// only the aggregate results. The documented Quereus extension where such a query's
+	// whole ORDER BY sorts the INPUT rows before aggregation stays legal for free: that
+	// SortNode sits BELOW the AggregateNode, and this walk stops at the aggregate.
 	//
 	// NOTE: deliberately STRICT — this also rejects a query that genuinely reads an
 	// ungrouped column above the aggregate (`select a from wg group by a order by b`,
@@ -428,7 +431,15 @@ export function buildSelectStmt(
 	// SQLite-style bare-column ORDER BY tolerance becomes a compatibility requirement;
 	// the weaker alternative is checking only above buffering operators (WindowNode),
 	// where the representative source row genuinely dies.
-	if (groupedCoverageContext && aggregateResult.aggregateNode) {
+	//
+	// The guard is the AggregateNode — the thing that decides whether the check means
+	// anything — and a missing context alongside one is an engine bug, not a query shape
+	// to pass over. Guarding on the context instead is exactly how the check came to skip
+	// every ungrouped aggregate query silently for as long as it did.
+	if (aggregateResult.aggregateNode) {
+		if (!groupedCoverageContext) {
+			quereusError('Internal: aggregate phase produced an AggregateNode with no coverage context', StatusCode.INTERNAL);
+		}
 		assertGroupedPlanCoverage(input, aggregateResult.aggregateNode, groupedCoverageContext);
 	}
 

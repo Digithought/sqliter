@@ -472,14 +472,19 @@ This is enforced, in two halves, both in `planner/building`:
   resolved through the projection, window-output or aggregate-output scope is left
   exactly as it bound.
 - **One boundary check over the finished plan.** At the end of `buildSelectStmt`,
-  `assertGroupedPlanCoverage` walks a grouped query's plan from the root down to (and
+  `assertGroupedPlanCoverage` walks an aggregate query's plan from the root down to (and
   stopping at) the AggregateNode and rejects any remaining reference to a
   pre-grouping attribute the aggregate's output does not carry, with the user-facing
   "must appear in the GROUP BY clause or be used in an aggregate function" message.
   The walk is subquery-aware: a subquery's own columns and correlated references to
   an enclosing query pass through; a correlated reference to *this* query's ungrouped
   column is rejected. A builder that forgets the redirect now fails at plan time
-  instead of shipping the accident above.
+  instead of shipping the accident above. It runs for an aggregate query with **no**
+  `group by` too — that query has one implicit group whose row carries only the
+  aggregate results, so `having`, `limit`, `offset` and an `order by` forced above the
+  aggregation are all subject to the same rule. (The `order by` that stays *below* the
+  aggregation — the pre-aggregate input sort of `select group_concat(b) from t order by
+  a` — is outside the walk by construction.)
 
 The check is deliberately strict — there is no escape hatch. A query that genuinely
 reads an ungrouped column above the aggregate (`select a from t group by a order by

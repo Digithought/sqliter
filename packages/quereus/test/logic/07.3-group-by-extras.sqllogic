@@ -532,6 +532,31 @@ select distinct count(*) as c from wg order by c;
 create view vw_ungrouped_limit as select count(*) as c from wg limit b;
 -- error: Column 'b' must appear in the GROUP BY clause or be used in an aggregate function
 
+-- Same for a MATERIALIZED VIEW body, which takes a different creation path.
+create materialized view mvw_ungrouped_limit as select count(*) as c from wg limit b;
+-- error: Column 'b' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- EXISTS is another spelling of the correlated-subquery mistake — the walk is
+-- about the reference, not about the subquery being scalar.
+select count(*) as c from wg having exists (select 1 from wg t where t.a = wg.a);
+-- error: Column 'wg.a' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- LIMIT is newly covered by the check, so the shape it must NOT reject is pinned
+-- too: an ungrouped aggregate SUBQUERY whose LIMIT correlates OUT to the
+-- enclosing query. `w.a` is the enclosing query's column, not this one's.
+select w.a, (select count(*) from wg t
+             limit (select count(*) from wg u where u.a = w.a)) as c
+from wg w order by w.a;
+→ [{"a":"x","c":3},{"a":"x","c":3},{"a":"y","c":3}]
+
+-- Compound and VALUES-fed ungrouped aggregates keep working: each arm is planned
+-- as its own aggregate query, and neither reads anything above its aggregation.
+select count(*) as c from wg union all select count(*) from wg;
+→ [{"c":3},{"c":3}]
+
+select count(*) as c from (values ('x'),('y'));
+→ [{"c":2}]
+
 drop table wg;
 
 -- ---------------------------------------------------------------------------

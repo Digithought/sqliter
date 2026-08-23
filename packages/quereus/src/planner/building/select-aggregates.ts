@@ -668,11 +668,13 @@ function referencesAggregateInput(node: PlanNode, context: GroupedRedirectContex
  * rejected with a user-facing GROUP BY error. If such a step is ever added, locate
  * the aggregate by node id instead of by reference.
  *
- * NOTE: one extra walk of the post-aggregate plan per grouped query per prepare, on
+ * NOTE: one extra walk of the post-aggregate plan per aggregate query per prepare, on
  * top of the redirect's own walk (see {@link redirectNode}). Measured end-to-end, not
  * isolated: compiling a six-column grouped query costs ~0.6-0.8 ms against ~0.5 ms for
  * a comparable ungrouped one, so this walk is bounded well below the surrounding
- * planning cost. Revisit if preparing grouped queries ever shows up as slow.
+ * planning cost. An ungrouped aggregate query now pays the same walk plus the
+ * `collectDefinedAttrIds` pass that builds its context. Revisit if preparing aggregate
+ * queries ever shows up as slow.
  */
 export function assertGroupedPlanCoverage(
 	node: PlanNode,
