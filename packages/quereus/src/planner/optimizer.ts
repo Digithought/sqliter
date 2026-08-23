@@ -48,6 +48,7 @@ import { ruleEagerPrefetchProbe } from './rules/parallel/rule-eager-prefetch-pro
 // Core optimization rules
 import { ruleAggregatePhysical } from './rules/aggregate/rule-aggregate-streaming.js';
 import { ruleGroupByFdSimplification } from './rules/aggregate/rule-groupby-fd-simplification.js';
+import { ruleMinMaxIndexBoundary } from './rules/aggregate/rule-minmax-index-boundary.js';
 import { ruleOrderByFdPruning } from './rules/sort/rule-orderby-fd-pruning.js';
 import { ruleQuickPickJoinEnumeration } from './rules/join/rule-quickpick-enumeration.js';
 import { ruleJoinPhysicalSelection } from './rules/join/rule-join-physical-selection.js';
@@ -718,6 +719,30 @@ export const RULE_MANIFEST: readonly RuleManifestEntry[] = [
 		fn: ruleJoinEliminationUnderAggregate,
 		// Drops the non-preserved side of a left/right/inner join sitting under
 		// an Aggregate — same guard as ruleJoinElimination.
+		sideEffectMode: 'aware',
+	},
+
+	// Ungrouped MIN/MAX answered from the index boundary: rewrite
+	// `Aggregate[min(c)](S)` into `Aggregate[min(c)](limit 1 (S where c is not null
+	// order by c))`, keeping the aggregate itself unchanged, and only when the
+	// access path can actually serve that ordering.
+	//
+	// Registered LAST among the Structural `PlanNodeType.Aggregate` rules —
+	// after `join-elimination-aggregate`, the final one before this — so every
+	// logical rewrite that restructures an aggregate's source sees the pristine
+	// `Aggregate` first: the materialized-view aggregate rewrite, aggregate
+	// predicate pushdown, and the existence-pruning / decorrelation /
+	// join-elimination family. In particular an aggregate answerable from a
+	// materialized view must still take the MV path, which is why
+	// `materialized-view-rewrite-aggregate` is registered first in this pass.
+	{
+		pass: PassId.Structural,
+		id: 'minmax-index-boundary',
+		nodeType: PlanNodeType.Aggregate,
+		phase: 'rewrite',
+		fn: ruleMinMaxIndexBoundary,
+		// Truncates how much of the aggregate's source is read, so a source
+		// carrying a write must decline — the rule audits it explicitly.
 		sideEffectMode: 'aware',
 	},
 

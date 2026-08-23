@@ -658,6 +658,89 @@ describe('Isolated Store Module', () => {
 		});
 	});
 
+	describe('MIN / MAX index-boundary read under an open transaction', () => {
+		// The optimizer answers an ungrouped `min(v)` / `max(v)` over an indexed column
+		// by walking the index in order and stopping after ONE row. That is the shape
+		// most likely to expose a merge-order bug in the overlay: it consumes only the
+		// first merged row, so a staged write that should sort ahead of every committed
+		// row has exactly one chance to be seen.
+		beforeEach(async () => {
+			const isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			await db.exec(`create table t (id integer primary key, v integer) using store`);
+			// Both directions, because neither backend walks an index backwards: `min`
+			// takes the ascending index and `max` the descending one.
+			await db.exec(`create index ix_v on t (v)`);
+			await db.exec(`create index ix_v_desc on t (v desc)`);
+			const rows: string[] = [];
+			for (let i = 1; i <= 100; i++) rows.push(`(${i}, ${10 * i})`);
+			await db.exec(`insert into t values ${rows.join(', ')}`);
+		});
+
+		/** The single value `sql` returns. */
+		async function scalar(sql: string): Promise<unknown> {
+			const rows = await asyncIterableToArray(db.eval(sql));
+			expect(rows, `expected one row from: ${sql}`).to.have.lengthOf(1);
+			return Object.values(rows[0] as Record<string, unknown>)[0];
+		}
+
+		it('reads the boundary through the index, not through a scan-and-sort', async () => {
+			for (const sql of ['select min(v) as x from t', 'select max(v) as x from t']) {
+				const plans = await asyncIterableToArray(
+					db.eval(`select json_group_array(op) as ops from query_plan(?)`, [sql]));
+				expect(plans[0].ops as string, sql).to.match(/indexscan/i)
+					.and.to.match(/limitoffset/i).and.to.not.match(/sort/i);
+			}
+		});
+
+		it('sees staged writes that land at either boundary', async () => {
+			expect(await scalar('select min(v) as x from t')).to.equal(10);
+			expect(await scalar('select max(v) as x from t')).to.equal(1000);
+
+			await db.exec('BEGIN');
+			// New extremes on BOTH ends, staged in the overlay only.
+			await db.exec(`insert into t values (101, 5), (102, 2000)`);
+			expect(await scalar('select min(v) as x from t')).to.equal(5);
+			expect(await scalar('select max(v) as x from t')).to.equal(2000);
+
+			// Deleting the staged extremes falls back to the committed ones.
+			await db.exec(`delete from t where id in (101, 102)`);
+			expect(await scalar('select min(v) as x from t')).to.equal(10);
+			expect(await scalar('select max(v) as x from t')).to.equal(1000);
+
+			await db.exec('ROLLBACK');
+			expect(await scalar('select min(v) as x from t')).to.equal(10);
+			expect(await scalar('select max(v) as x from t')).to.equal(1000);
+		});
+
+		it('a deleted committed extreme does not come back', async () => {
+			await db.exec('BEGIN');
+			await db.exec(`delete from t where v in (10, 1000)`);
+			expect(await scalar('select min(v) as x from t'),
+				'the deleted committed minimum must not resurface').to.equal(20);
+			expect(await scalar('select max(v) as x from t'),
+				'the deleted committed maximum must not resurface').to.equal(990);
+			await db.exec('COMMIT');
+
+			expect(await scalar('select min(v) as x from t')).to.equal(20);
+			expect(await scalar('select max(v) as x from t')).to.equal(990);
+		});
+
+		it('an updated extreme is read at its new position', async () => {
+			await db.exec('BEGIN');
+			// Move the committed minimum above three other rows, and the committed
+			// maximum below three others — both rows exist, at different key positions.
+			await db.exec(`update t set v = 35 where v = 10`);
+			await db.exec(`update t set v = 975 where v = 1000`);
+			expect(await scalar('select min(v) as x from t')).to.equal(20);
+			expect(await scalar('select max(v) as x from t')).to.equal(990);
+			await db.exec('ROLLBACK');
+
+			expect(await scalar('select min(v) as x from t')).to.equal(10);
+			expect(await scalar('select max(v) as x from t')).to.equal(1000);
+		});
+	});
+
 	// Note: The following tests verify the isolation layer infrastructure when wrapping
 	// the store module. Full integration requires additional work on transaction
 	// coordination between the store module and the overlay memory module.

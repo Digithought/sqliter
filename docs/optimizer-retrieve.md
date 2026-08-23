@@ -105,6 +105,15 @@ table instance `key`?". Both callers that place work on an access path use it:
 looks past a single `Filter`'s own predicate, which is why a bug here needs an `ORDER BY` the
 table's own key walk satisfies.
 
+`trySortAbsorbViaIndexOrdering` is **exported** and has two callers. `ruleGrowRetrieve`
+itself calls it for a `Sort` the user wrote (or an earlier rule left). `rule-minmax-index-boundary`
+(Structural, Aggregate) calls it as a *probe*: it synthesizes a throwaway `SortNode` purely
+to ask whether the access path can serve that ordering, and commits nothing when the answer
+is null. That second caller is why the helper must stay side-effect-free — it probes
+`getBestAccessPlan` and either returns a new tree or null, never mutating its input and never
+recording anything on the `OptContext`. A caller that gets null must be able to discard its
+probe input and leave the plan byte-identical.
+
 The subtree is not the same thing as the scope. A subquery body is a `RelationalPlanNode`
 hanging beneath a *scalar* expression, so `where exists (select 1 from t where t.s = a.i)`
 puts the inner `t.s = a.i` inside the outer `Filter`'s subtree. The sweep (`walkPredicatesConstraining`)

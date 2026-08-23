@@ -591,8 +591,18 @@ function orderingMatches(
  * provide the ORDER BY direction — the Sort can be elided entirely:
  * Retrieve produces rows in the requested order, and Project/Filter preserve
  * row order on the way back up.
+ *
+ * Two callers:
+ *  - `ruleGrowRetrieve` itself, for a Sort the user wrote (or an earlier rule left);
+ *  - `rules/aggregate/rule-minmax-index-boundary.ts`, which synthesizes a throwaway
+ *    Sort purely to ask this question and commits nothing when the answer is null.
+ *
+ * Because of that second caller this must stay side-effect-free: it probes
+ * `getBestAccessPlan` and either returns a NEW tree or null, never mutating the
+ * tree it was handed and never recording anything on `context`. A caller that
+ * gets null must be able to discard its probe input and leave the plan untouched.
  */
-function trySortAbsorbViaIndexOrdering(sort: SortNode, context: OptContext): PlanNode | null {
+export function trySortAbsorbViaIndexOrdering(sort: SortNode, context: OptContext): PlanNode | null {
 	// Walk down through commuting unary operators to find the RetrieveNode.
 	const chain: (ProjectNode | FilterNode)[] = [];
 	let current: PlanNode = sort.source;

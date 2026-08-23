@@ -1,0 +1,195 @@
+-- 10.5.6-minmax-index-boundary.sqllogic — answers for the ungrouped MIN/MAX rewrite.
+--
+-- requires-capability: standalone-index-ddl
+--
+-- The optimizer rewrites an ungrouped `min(c)` / `max(c)` over an indexed column into
+-- `min(c)` over `(… where c is not null order by c limit 1)`, keeping the aggregate
+-- itself on top. That is a plan-shape change only, so every answer below must be
+-- identical to what a full scan would produce — which is exactly what this file pins,
+-- on BOTH backends.
+--
+-- Plan-shape claims (which index is used, whether a LIMIT survives, work counters)
+-- are backend-dependent and live in test/optimizer/minmax-index-boundary.spec.ts.
+-- Keep them out of here.
+
+-- =====================================================
+-- 1. Empty relation — one row, NULL
+-- =====================================================
+-- The aggregate survives the rewrite, so an ungrouped aggregate over zero rows still
+-- emits exactly one row and min/max finalize an empty accumulator to NULL.
+create table mm_empty (k integer primary key, c integer);
+create index mm_empty_c on mm_empty(c);
+create index mm_empty_c_desc on mm_empty(c desc);
+
+select min(c) as v from mm_empty;
+→ [{"v":null}]
+
+select max(c) as v from mm_empty;
+→ [{"v":null}]
+
+select count(*) as n from mm_empty;
+→ [{"n":0}]
+
+drop table mm_empty;
+
+-- =====================================================
+-- 2. All-NULL column — one row, NULL
+-- =====================================================
+create table mm_null (k integer primary key, c integer null);
+create index mm_null_c on mm_null(c);
+create index mm_null_c_desc on mm_null(c desc);
+insert into mm_null values (1, null), (2, null), (3, null);
+
+select min(c) as v from mm_null;
+→ [{"v":null}]
+
+select max(c) as v from mm_null;
+→ [{"v":null}]
+
+drop table mm_null;
+
+-- =====================================================
+-- 3. NULLs at the boundary — the extreme NON-NULL value wins
+-- =====================================================
+-- ORDER BY in this engine places NULLs FIRST for both directions, so without the
+-- rewrite's `is not null` arm a `limit 1` would hand the aggregate a NULL. Both an
+-- ascending and a descending index are present so both directions take the rewrite.
+create table mm_mix (k integer primary key, c integer null);
+create index mm_mix_c on mm_mix(c);
+create index mm_mix_c_desc on mm_mix(c desc);
+insert into mm_mix values (1, 30), (2, null), (3, 10), (4, null), (5, 50), (6, 20);
+
+select min(c) as v from mm_mix;
+→ [{"v":10}]
+
+select max(c) as v from mm_mix;
+→ [{"v":50}]
+
+-- DISTINCT never changes an extremum.
+select min(distinct c) as v from mm_mix;
+→ [{"v":10}]
+
+select max(distinct c) as v from mm_mix;
+→ [{"v":50}]
+
+-- Only NULLs survive the WHERE, so the answer is NULL again.
+select max(c) as v from mm_mix where c is null;
+→ [{"v":null}]
+
+drop table mm_mix;
+
+-- =====================================================
+-- 4. WHERE clauses must not be lost
+-- =====================================================
+create table mm_w (k integer primary key, g integer, c integer);
+create index mm_w_gc on mm_w(g, c desc);
+create index mm_w_gc_asc on mm_w(g, c);
+insert into mm_w values (1, 1, 10), (2, 1, 40), (3, 2, 70), (4, 2, 20), (5, 1, 25);
+
+-- Equality-bound composite prefix: the index orders `c` within each `g`.
+select max(c) as v from mm_w where g = 1;
+→ [{"v":40}]
+
+select min(c) as v from mm_w where g = 2;
+→ [{"v":20}]
+
+-- Range predicate on the aggregated column itself.
+select max(c) as v from mm_w where c < 40;
+→ [{"v":25}]
+
+select min(c) as v from mm_w where c > 20;
+→ [{"v":25}]
+
+-- A WHERE that matches nothing still emits one NULL row.
+select max(c) as v from mm_w where g = 99;
+→ [{"v":null}]
+
+-- HAVING is a filter ABOVE the aggregate; unaffected by the rewrite.
+select max(c) as v from mm_w having max(c) > 5;
+→ [{"v":70}]
+
+select max(c) as v from mm_w having max(c) > 500;
+→ []
+
+drop table mm_w;
+
+-- =====================================================
+-- 5. Correlated MIN/MAX subquery
+-- =====================================================
+create table mm_o (g integer primary key);
+create table mm_i (k integer primary key, g integer, c integer);
+create index mm_i_gc on mm_i(g, c desc);
+insert into mm_o values (1), (2), (3);
+insert into mm_i values (1, 1, 10), (2, 1, 40), (3, 2, 70);
+
+select g, (select max(c) from mm_i where mm_i.g = mm_o.g) as m from mm_o order by g;
+→ [{"g":1,"m":40},{"g":2,"m":70},{"g":3,"m":null}]
+
+drop table mm_i;
+drop table mm_o;
+
+-- =====================================================
+-- 6. Comparator agreement — the rewrite must rank like the aggregate does
+-- =====================================================
+-- The rewrite never compares values itself: it delegates to the access plan's
+-- ordering claim, and min/max rank under the argument's semantic comparator. These
+-- two columns are where a drift between the two would show up first, because their
+-- ordering is NOT byte order.
+
+-- COLLATE NOCASE: 'A' < 'b' < 'C', not 'A' < 'C' < 'b'.
+create table mm_n (k integer primary key, n text collate nocase);
+create index mm_n_n on mm_n(n);
+create index mm_n_n_desc on mm_n(n desc);
+insert into mm_n values (1, 'b'), (2, 'A'), (3, 'C');
+
+select min(n) as v from mm_n;
+→ [{"v":"A"}]
+
+select max(n) as v from mm_n;
+→ [{"v":"C"}]
+
+drop table mm_n;
+
+-- TIMESPAN: 'PT30M' < 'PT1H' < 'P1D' by duration, not by text.
+create table mm_s (k integer primary key, s timespan);
+create index mm_s_s on mm_s(s);
+create index mm_s_s_desc on mm_s(s desc);
+insert into mm_s values (1, 'PT1H'), (2, 'PT30M'), (3, 'P1D');
+
+select min(s) as v from mm_s;
+→ [{"v":"PT30M"}]
+
+select max(s) as v from mm_s;
+→ [{"v":"P1D"}]
+
+drop table mm_s;
+
+-- =====================================================
+-- 7. Shapes the rewrite must decline — answers stay correct either way
+-- =====================================================
+create table mm_d (k integer primary key, g integer, c integer);
+create index mm_d_c on mm_d(c);
+create index mm_d_c_desc on mm_d(c desc);
+insert into mm_d values (1, 1, 10), (2, 1, 40), (3, 2, 70), (4, 2, 20);
+
+-- Both ends of the index at once.
+select min(c) as lo, max(c) as hi from mm_d;
+→ [{"lo":10,"hi":70}]
+
+-- count(*) genuinely needs every row — truncating the source would return 1.
+select max(c) as v, count(*) as n from mm_d;
+→ [{"v":70,"n":4}]
+
+-- GROUP BY present.
+select g, max(c) as v from mm_d group by g order by g;
+→ [{"g":1,"v":40},{"g":2,"v":70}]
+
+-- A non-trivial argument.
+select max(c + 1) as v from mm_d;
+→ [{"v":71}]
+
+-- A derived table between the aggregate and the base table.
+select max(c) as v from (select c from mm_d) x;
+→ [{"v":70}]
+
+drop table mm_d;

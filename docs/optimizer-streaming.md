@@ -168,6 +168,19 @@ The rule runs in the PostOptimization pass (after `join-physical-selection`, bef
 
 The rule id `monotonic-limit-pushdown` can be disabled via `tuning.disabledRules`.
 
+**Composes with `minmax-index-boundary`**: the Structural-pass
+`ruleMinMaxIndexBoundary` ([rule catalog](optimizer-rules.md#optimization-rules), under
+Aggregation) rewrites an ungrouped `min(c)` / `max(c)` over an indexed column into
+`Aggregate → LimitOffset(1) → [Filter(c is not null)] → ordered leaf`. When the leaf
+also advertises `supportsOrdinalSeek`, the nullable-free variant of that shape
+(`LimitOffset(1)` directly over the leaf) is exactly this rule's pattern, so the
+`LimitOffsetNode` may become an `OrdinalSliceNode`. Both are correct and both stop
+after one row, so tests over that shape must tolerate either operator — assert "one
+row came out of the leaf" via work counters rather than pinning the operator name. The
+nullable variant keeps its `Filter` between the two and therefore always bails here
+(the intermediate-node condition above), which is fine: the plain `LimitOffsetNode`
+already stops the walk after the first non-NULL row.
+
 ## Monotonic range-scan recognition
 
 Range predicates that bound a `MonotonicOn` access column (`WHERE id BETWEEN 2 AND 5`, `WHERE id >= 2 AND id < 8`, `WHERE id > 4`, etc.) are already lowered to a range index seek by `rule-select-access-path`, which lifts the underlying access plan's `monotonicOn` advertisement onto the physical leaf. The `monotonic-range-access` rule sits on top of that plumbing and adds two things:
