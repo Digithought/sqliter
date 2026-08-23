@@ -201,6 +201,58 @@ describe('ruleGroupByFdSimplification', () => {
 		});
 	});
 
+	it('a user-defined aggregate that shadows the builtin min', async () => {
+		// `Schema.addFunction` overwrites by name/numArgs, so after this registration
+		// BOTH the planner's resolution and `db._findFunction('min', 1)` return the
+		// shadow — comparing the two would only prove they agree with each other. The
+		// gate is schema identity against the builtin registration
+		// (`db._isBuiltinFunction`, via `_findBuiltinFunction`) for exactly this reason:
+		// picking the shadow would return its row count instead of the true value.
+		await db.exec(
+			"CREATE TABLE pk (id INTEGER PRIMARY KEY, v INTEGER NOT NULL) USING memory",
+		);
+		await db.exec('INSERT INTO pk VALUES (1, 100), (2, 200)');
+		db.createAggregateFunction('min', { numArgs: 1, initialState: 0 },
+			(acc: unknown) => (acc as number) + 1,
+			(acc: unknown) => acc as number);
+
+		const rows = await planRows(db, 'SELECT id, v FROM pk GROUP BY id, v');
+		const props = aggregateProps(rows);
+		expect(props, 'expected aggregate node').to.not.equal(undefined);
+		expect(props!.groupBy, 'a shadowed min must decline the rewrite; both columns stay grouped')
+			.to.have.length(2);
+
+		const out: { id: number; v: number }[] = [];
+		for await (const r of db.eval('SELECT id, v FROM pk GROUP BY id, v ORDER BY id')) {
+			out.push(r as unknown as { id: number; v: number });
+		}
+		expect(out, 'the true values must come back, not the shadow aggregate\'s row count').to.deep.equal([
+			{ id: 1, v: 100 },
+			{ id: 2, v: 200 },
+		]);
+	});
+
+	it('control: the same query still collapses GROUP BY when min is un-shadowed', async () => {
+		await db.exec(
+			"CREATE TABLE pk2 (id INTEGER PRIMARY KEY, v INTEGER NOT NULL) USING memory",
+		);
+		await db.exec('INSERT INTO pk2 VALUES (1, 100), (2, 200)');
+
+		const rows = await planRows(db, 'SELECT id, v FROM pk2 GROUP BY id, v');
+		const props = aggregateProps(rows);
+		expect(props, 'expected aggregate node').to.not.equal(undefined);
+		expect(props!.groupBy, 'GROUP BY should collapse to one column').to.have.length(1);
+
+		const out: { id: number; v: number }[] = [];
+		for await (const r of db.eval('SELECT id, v FROM pk2 GROUP BY id, v ORDER BY id')) {
+			out.push(r as unknown as { id: number; v: number });
+		}
+		expect(out).to.deep.equal([
+			{ id: 1, v: 100 },
+			{ id: 2, v: 200 },
+		]);
+	});
+
 	it('Result rows match the un-simplified semantics under EC-driven drop', async () => {
 		await db.exec("CREATE TABLE eq (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER) USING memory");
 		await db.exec("INSERT INTO eq VALUES (1,1,1),(2,2,2),(3,3,3),(4,1,1)");

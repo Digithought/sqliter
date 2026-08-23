@@ -5,7 +5,9 @@
  * GROUP BY columns under the aggregate-output FDs and equivalence classes.
  * Each dropped column is re-emitted as a `MIN(<original-column>)` picker
  * aggregate so the output attribute IDs (and therefore downstream binding)
- * are preserved.
+ * are preserved. The picker relies on the BUILT-IN `min`'s semantics (any
+ * value from the group, since the group is a single source row); the rule
+ * declines when `min/1` has been shadowed by a user-registered function.
  *
  * The aggregate's own `physical.fds` and `physical.equivClasses` are already
  * projected onto its output column indices by `propagateAggregateFds`, so
@@ -139,9 +141,12 @@ export function ruleGroupByFdSimplification(node: PlanNode, context: OptContext)
 	if (keptGroupBy.length === 0) return null;
 
 	// Synthesize picker MIN aggregates for each dropped column, in original order.
-	const minSchema = context.db._findFunction('min', 1);
+	// Gate on schema identity, not name: `addFunction` overwrites by name/numArgs, so
+	// a user `min/1` and `_findFunction('min', 1)` would otherwise agree with each
+	// other while disagreeing with the built-in semantics this rewrite relies on.
+	const minSchema = context.db._findBuiltinFunction('min', 1);
 	if (!minSchema || !isAggregateFunctionSchema(minSchema)) {
-		log('min/1 not registered as aggregate; skipping');
+		log('min/1 is not the built-in aggregate; skipping');
 		return null;
 	}
 

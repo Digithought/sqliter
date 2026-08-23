@@ -2358,6 +2358,18 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	}
 
 	/**
+	 * @internal Resolve `funcName/nArg` ONLY when it is the built-in registration.
+	 * Returns `undefined` when the name has been taken over by a user function, so a
+	 * caller whose rewrite is sound only for built-in semantics cannot accidentally
+	 * pick up the shadow. See {@link _isBuiltinFunction} for why a name (or a second
+	 * lookup) cannot answer this.
+	 */
+	_findBuiltinFunction(funcName: string, nArg: number): FunctionSchema | undefined {
+		const schema = this._findFunction(funcName, nArg);
+		return this._isBuiltinFunction(schema) ? schema : undefined;
+	}
+
+	/**
 	 * @internal True when `schema` is one of the schemas this database registered from
 	 * {@link BUILTIN_FUNCTIONS} — i.e. the real built-in, not a same-named user function.
 	 *
