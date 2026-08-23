@@ -7,15 +7,15 @@
  * candidate one open of its OUTER side plus however many opens of its INNER
  * side it performs:
  *
- *   plain nested loop  += leftLatency + (cacheable ? rightLatency : leftRows × rightLatency)
+ *   plain nested loop  += leftLatency + (opensOnce ? rightLatency : leftRows × rightLatency)
  *   hash / merge       += leftLatency + rightLatency
  *   index-nested-loop  += leftLatency          (per-seek right latency already in the formula)
  *   index-NL mirrored  += rightLatency         (per-seek left latency already in the formula)
  *
- * "cacheable" is `canCacheNestedLoopRight` — the exported gate of
- * `rule-nested-loop-right-cache`, which runs later in the same pass and turns
- * N re-opens of a pure, uncorrelated, small-enough inner side into one open
- * plus N buffer replays.
+ * "opensOnce" is `nestedLoopRightOpensOnce` — the right side is already
+ * materialized, or `rule-nested-loop-right-cache` (later in the same pass) is
+ * about to wrap a pure, uncorrelated, small-enough inner side in a `CacheNode`
+ * and turn N re-opens into one open plus N buffer replays.
  *
  * Every test here pairs a high-latency fixture with a zero-latency control on
  * identical data, because the whole surface is inert at latency 0 — which is
@@ -188,8 +188,12 @@ describe('join physical selection: first-row latency charges', () => {
 		//   hash   = 0.8×min(100, nR) + 0.4×max(100, nR)  (+ rightLatency)
 		//   mirror = nR × (1.0 + 0.5 + 0.3)               (+ rightLatency)
 
-		async function createTables(rightRows: number, rightModule: 'memory' | 'hi_lat'): Promise<void> {
-			await db.exec('create table lo (id integer primary key, k integer)');
+		async function createTables(
+			rightRows: number,
+			rightModule: 'memory' | 'hi_lat',
+			leftModule: 'memory' | 'hi_lat' = 'memory',
+		): Promise<void> {
+			await db.exec(`create table lo (id integer primary key, k integer) using ${leftModule}`);
 			await db.exec('create index idx_lo_k on lo(k)');
 			const left: string[] = [];
 			for (let i = 1; i <= 100; i++) left.push(`(${i}, ${i})`);
@@ -205,11 +209,15 @@ describe('join physical selection: first-row latency charges', () => {
 		const FIRST_THREE = [{ lid: 1, rid: 1 }, { lid: 2, rid: 2 }, { lid: 3, rid: 3 }];
 
 		/** Which of the live pair the rule picked, on a database freshly built for these inputs. */
-		async function chosenAlgo(rightRows: number, rightModule: 'memory' | 'hi_lat'): Promise<string> {
+		async function chosenAlgo(
+			rightRows: number,
+			rightModule: 'memory' | 'hi_lat',
+			leftModule: 'memory' | 'hi_lat' = 'memory',
+		): Promise<string> {
 			await db.close();
 			db = new Database();
 			db.registerModule('hi_lat', new HighLatencyMemoryModule());
-			await createTables(rightRows, rightModule);
+			await createTables(rightRows, rightModule, leftModule);
 			const plan = db.getPlan(SQL);
 			expect(await drain(db, SQL), 'rows are the same whichever wins').to.deep.equal(FIRST_THREE);
 			const mirrored = correlatedSeekJoins(plan).length;
@@ -233,6 +241,104 @@ describe('join physical selection: first-row latency charges', () => {
 			// 101); now both carry it and the comparison is latency-independent.
 			expect(await chosenAlgo(45, 'memory'), 'zero latency').to.equal('hash');
 			expect(await chosenAlgo(45, 'hi_lat'), 'latency 25 on the right').to.equal('hash');
+		});
+
+		it('a high-latency LEFT side sinks the mirror: its seeks are what pay that latency', async () => {
+			// The mirror's INNER is the left, so `indexNestedLoopJoinCost` charges it
+			// the left's latency once per seek — 30 × 25 on top of ~54 of work. Hash
+			// opens the left once, for 25. The 30-row shape that the mirror wins
+			// outright with a local left therefore flips to hash the moment the left
+			// is remote, and that is the direction the per-candidate table predicts:
+			// the mirror is the only candidate whose charge scales with the LEFT's
+			// latency. (Unchanged by this ticket — the per-seek term predates
+			// it — but nothing pinned the sign of it before.)
+			expect(await chosenAlgo(30, 'memory', 'hi_lat'), 'latency 25 on the left')
+				.to.equal('hash');
+			expect(await chosenAlgo(30, 'hi_lat', 'hi_lat'), 'latency 25 on both sides')
+				.to.equal('hash');
+		});
+	});
+
+	describe('the plain nested loop against hash (arm 3)', () => {
+		// Arm 1 uses an `exists … as` join, where hash and merge are excluded and
+		// only plain NL and index-NL compete. This arm is the same charge on the
+		// ordinary shape: a plain inner join where hash IS a candidate and neither
+		// index-NL orientation is (no index on either join column, so no seek), and
+		// the right side is small enough that the O(n·m) loop still beats the hash
+		// build. 2-row left × 40-row right, latency 25 on the right:
+		//   plain NL work = 2 + 2×40×0.1                       = 10
+		//   hash     work = 0.8×2 + 0.4×40                     = 17.6
+		//   plain NL, inner cacheable = 10 + 25                = 35   ← NL keeps it
+		//   plain NL, inner uncached  = 10 + 2×25              = 60
+		//   hash                      = 17.6 + 25              = 42.6 ← hash takes it
+		// Before this change the plain nested loop was charged NO latency at all
+		// while hash was charged the right's, so it won both spellings.
+		const SQL = 'select so.id as sid, bo.id as bid from so join bo on so.k = bo.k order by sid';
+		const EXPECTED = [{ sid: 1, bid: 1 }, { sid: 2, bid: 2 }];
+
+		async function createTables(rightModule: 'memory' | 'hi_lat'): Promise<void> {
+			await db.exec('create table so (id integer primary key, k integer)');
+			await db.exec('insert into so values (1, 1), (2, 2)');
+			await db.exec(`create table bo (id integer primary key, k integer) using ${rightModule}`);
+			const right: string[] = [];
+			for (let i = 1; i <= 40; i++) right.push(`(${i}, ${i})`);
+			await db.exec(`insert into bo values ${right.join(', ')}`);
+			for await (const _ of db.eval('analyze')) { /* consume */ }
+		}
+
+		/** No seek is possible on either side, so the contest is exactly NL vs hash. */
+		async function expectNestedLoop(cached: boolean): Promise<void> {
+			const plan = db.getPlan(SQL);
+			expect(collectNodes(plan, isHashJoin), 'no hash join').to.have.lengthOf(0);
+			expect(collectNodes(plan, isMergeJoin), 'no merge join').to.have.lengthOf(0);
+			const joins = collectNodes(plan, isJoin);
+			expect(joins, 'the logical JoinNode survives').to.have.lengthOf(1);
+			expect(collectNodes(joins[0].right, isCache), 'CacheNode over the inner side')
+				.to.have.lengthOf(cached ? 1 : 0);
+			expect(await drain(db, SQL)).to.deep.equal(EXPECTED);
+		}
+
+		async function expectHashJoin(): Promise<void> {
+			const plan = db.getPlan(SQL);
+			expect(collectNodes(plan, isHashJoin), 'a hash join').to.have.lengthOf(1);
+			expect(collectNodes(plan, isCache), 'nothing cached').to.have.lengthOf(0);
+			expect(await drain(db, SQL)).to.deep.equal(EXPECTED);
+		}
+
+		/** Run `body` with the cache size gate below the right side's row count. */
+		async function withCachingDisabled(body: () => Promise<void>): Promise<void> {
+			const before = db.optimizer.tuning;
+			db.optimizer.updateTuning({
+				...before,
+				join: { ...before.join, maxRightRowsForCaching: 5 },
+			});
+			try {
+				await body();
+			} finally {
+				db.optimizer.updateTuning(before);
+			}
+		}
+
+		it('keeps the nested loop when its high-latency inner will be cached', async () => {
+			// Also the regression pin for the re-visit: this rule runs again on the
+			// join AFTER the cache rule has wrapped the inner side. Asking plain
+			// cacheability there answers "no" (nothing left to wrap) and re-prices
+			// the loop at 60, so the second visit converted it to a 42.6 hash join
+			// and threw the cache away. Asking the open-count question keeps 35.
+			await createTables('hi_lat');
+			await expectNestedLoop(true);
+		});
+
+		it('hands the win to hash when that inner cannot be cached', async () => {
+			await createTables('hi_lat');
+			await withCachingDisabled(() => expectHashJoin());
+		});
+
+		it('(control) at zero latency the nested loop wins either way', async () => {
+			// 10 vs 17.6 on work alone, so the cache size gate cannot move the plan.
+			await createTables('memory');
+			await expectNestedLoop(true);
+			await withCachingDisabled(() => expectNestedLoop(false));
 		});
 	});
 });

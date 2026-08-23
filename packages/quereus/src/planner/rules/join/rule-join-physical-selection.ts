@@ -41,7 +41,7 @@ import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 import { readsColumnsOf } from '../../cache/correlation-detector.js';
 import { physicalSourceRows } from '../../util/row-estimates.js';
 import { tryIndexNestedLoop, type IndexNestedLoopCandidate } from './index-nested-loop.js';
-import { canCacheNestedLoopRight } from '../cache/rule-nested-loop-right-cache.js';
+import { nestedLoopRightOpensOnce } from '../cache/rule-nested-loop-right-cache.js';
 
 const log = createLogger('optimizer:rule:join-physical-selection');
 
@@ -70,21 +70,37 @@ function mayMirrorIndexNestedLoop(node: JoinNode): boolean {
 
 /**
  * First-row latency the PLAIN nested loop pays for opening its inner (right)
- * side: once if `rule-nested-loop-right-cache` will wrap that side in a
- * `CacheNode` (one open, then N buffer replays), otherwise once per outer row
- * (the emitter re-opens the inner pipeline for every left row).
+ * side: once if that side is opened once per join — already materialized, or
+ * about to be wrapped in a `CacheNode` by `rule-nested-loop-right-cache` — and
+ * otherwise once per outer row, because the emitter re-opens the inner pipeline
+ * for every left row.
  *
- * The cacheability question is answered by the cache rule's own exported
- * predicate — this rule must never restate its gates.
+ * That question belongs to the cache rule and is answered by its own exported
+ * predicate; this rule must never restate the gates behind it. Note it is the
+ * open-count question, NOT plain cacheability: this rule re-visits a join the
+ * cache rule has already rewritten, and on that visit the right side is cached
+ * (so it opens once) while `canCacheNestedLoopRight` reports false (so there is
+ * nothing left to wrap).
  *
- * NOTE: the predicate describes a rule that has not run yet, and gets one case
- * wrong: an impure right side that `mutating-subquery-cache` (also later in this
- * pass) will wrap reads as "not cacheable" through the purity gate, so the plain
- * nested loop is over-charged there. Unreachable in practice — index-nested-loop
- * declines an impure inner outright and the hash build/probe swap refuses too,
- * so the over-charge has no cheaper rival to hand the win to. If a candidate
- * that tolerates an impure inner ever appears, teach the predicate about the
- * mutating-subquery rule rather than duplicating its gates here.
+ * NOTE: the predicate partly describes rules that have not run yet, and answers
+ * two cases pessimistically/optimistically:
+ *  - An impure right side that `mutating-subquery-cache` (also later in this
+ *    pass) will wrap reads as "opens per row" through the purity gate, so the
+ *    plain nested loop is over-charged. Unreachable in practice —
+ *    index-nested-loop declines an impure inner outright and the hash
+ *    build/probe swap refuses too, so the over-charge has no cheaper rival to
+ *    hand the win to. If a candidate that tolerates an impure inner ever
+ *    appears, teach the predicate about the mutating-subquery rule rather than
+ *    duplicating its gates here.
+ *  - A semi/anti join breaks out of the inner scan on the first match, so its
+ *    cache buffer only lands after the first UNMATCHED outer row (see the driver
+ *    gate's own NOTE): a match-heavy semi join really can re-open the inner per
+ *    outer row while this charges it once. Optimistic by at most
+ *    (outerRows - 1) x latency, in the same direction the work term is already
+ *    pessimistic (it charges a full inner scan per outer row for a loop that
+ *    breaks early). Revisit together if a high-latency module ever makes
+ *    semi/anti plans regress; picking one side of the range is not obviously
+ *    better than the other while both terms are this coarse.
  */
 function nestedLoopInnerLatency(
 	node: JoinNode,
@@ -92,11 +108,11 @@ function nestedLoopInnerLatency(
 	outerRows: number,
 	innerLatencyMs: number,
 ): number {
-	// Short-circuit before `canCacheNestedLoopRight`, which walks the whole right
-	// subtree for its size gate: with no latency to charge the answer is 0 either
-	// way. Every in-tree module reports 0, so this keeps the walk off the hot path.
+	// Short-circuit before `nestedLoopRightOpensOnce`, whose size gate walks the
+	// whole right subtree: with no latency to charge the answer is 0 either way.
+	// Every in-tree module reports 0, so this keeps the walk off the hot path.
 	if (innerLatencyMs === 0) return 0;
-	return canCacheNestedLoopRight(node, context) ? innerLatencyMs : outerRows * innerLatencyMs;
+	return nestedLoopRightOpensOnce(node, context) ? innerLatencyMs : outerRows * innerLatencyMs;
 }
 
 /**
@@ -185,7 +201,8 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 	const rightLatencyMs = node.right.physical.expectedLatencyMs ?? 0;
 
 	// Plain nested loop: one open of the left, and one open of the right per left
-	// row unless the cache rule will collapse those to a single open.
+	// row unless the right side is already materialized or the cache rule is
+	// about to make it so.
 	const nlCost = nestedLoopJoinCost(leftRows, rightRows)
 		+ leftLatencyMs
 		+ nestedLoopInnerLatency(node, context, leftRows, rightLatencyMs);
@@ -324,7 +341,8 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 		bestCost = mirroredNLCost;
 	}
 
-	const COSTS = 'nl=%.2f, hash=%.2f, merge=%.2f, index-nl=%.2f, index-nl-mirrored=%.2f';
+	// `%d` not `%.2f`: `debug` has no precision formatter and passes the token through verbatim.
+	const COSTS = 'nl=%d, hash=%d, merge=%d, index-nl=%d, index-nl-mirrored=%d';
 	const costArgs = [nlCost, hashTotal, mergeTotal, indexNLCost, mirroredNLCost];
 
 	if (bestAlgo === 'nested-loop') {

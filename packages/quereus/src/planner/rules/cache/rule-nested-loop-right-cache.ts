@@ -186,6 +186,27 @@ export function canCacheNestedLoopRight(node: JoinNode, context: OptContext): bo
 	return true;
 }
 
+/**
+ * Is this join's right side opened ONCE per join rather than once per outer row?
+ * True two ways: it is already materialized (a `CacheNode` from this rule on an
+ * earlier visit, or from the cte / in-subquery / mutating-subquery caches — all
+ * of which scan once and replay a buffer), or {@link canCacheNestedLoopRight}
+ * says this rule is about to make it so.
+ *
+ * `rule-join-physical-selection` asks THIS question, not the cacheability one:
+ * the two differ exactly on an already-cached right side, which
+ * `canCacheNestedLoopRight` declines (nothing left to do) but which pays its
+ * first-row latency once, not per outer row. Pricing that side per outer row
+ * made the selection rule re-visit a join this rule had just improved, re-price
+ * its nested loop as if the cache were not there, and convert it to a hash join
+ * — discarding the cache and landing on the costlier plan.
+ */
+export function nestedLoopRightOpensOnce(node: JoinNode, context: OptContext): boolean {
+	const right = node.right;
+	if (CapabilityDetectors.isCached(right) && right.isCached()) return true;
+	return canCacheNestedLoopRight(node, context);
+}
+
 export function ruleNestedLoopRightCache(node: PlanNode, context: OptContext): PlanNode | null {
 	// Only logical JoinNodes reach here uncached. By PostOptimization,
 	// join-physical-selection has already converted every equi-join it wanted to
