@@ -64,20 +64,25 @@ describe('minmax-index-boundary', () => {
 	/**
 	 * Rows scanned out of `main.t` while executing `sql`.
 	 *
-	 * A `LIMIT 1` in this engine reads TWO rows off the leaf, not one — the pipeline
-	 * pulls one row past the last it emits. That is pre-existing behaviour shared with
-	 * the hand-written `select c from t order by c limit 1`, so the assertions below
-	 * pin `BOUNDARY_ROWS` (a constant, independent of table size) against a full scan
-	 * of every row, which is the distinction that matters. Tracked as
-	 * `backlog/bug-limit-reads-one-row-too-many`; fixing it makes this constant 1.
+	 * The assertions below pin `BOUNDARY_ROWS` (a constant, independent of table size)
+	 * against a full scan of every row, which is the distinction that matters: the
+	 * rewrite is only worth anything if the leaf stops at the boundary instead of
+	 * draining the table.
 	 */
 	async function rowsScanned(sql: string): Promise<number> {
 		const snapshot = await counters(sql);
 		return snapshot.tables['main.t'].rowsScanned;
 	}
 
-	/** Rows a `LIMIT 1` pulls off an access leaf: the emitted row plus one lookahead. */
-	const BOUNDARY_ROWS = 2;
+	/**
+	 * Rows a `LIMIT 1` pulls off an access leaf: exactly the one row it emits.
+	 *
+	 * `runtime/emit/limit-offset.ts` tests the limit after yielding, so a limited
+	 * pipeline never asks the source for the row past its last emitted one. Shared with
+	 * the hand-written `select c from t order by c limit 1`, which is why the "declines"
+	 * cases below can compare the two directly.
+	 */
+	const BOUNDARY_ROWS = 1;
 
 	/** The plan as `parent|op|detail` tuples — stable enough to compare two plans. */
 	async function planShape(sql: string): Promise<string[]> {

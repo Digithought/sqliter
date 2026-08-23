@@ -1,0 +1,99 @@
+-- 13.13-limit-over-dml-subquery.sqllogic - a LIMIT never truncates a writing source
+--
+-- `select ... from (insert/update/delete ... returning ...) limit n` caps what the
+-- QUERY returns, not what the STATEMENT writes: the data-modifying subquery runs to
+-- completion and the LIMIT only decides how many of its RETURNING rows come back.
+--
+-- This is the same full-drain rule the engine already applies to a writing inner in
+-- scalar / IN / EXISTS position (docs/sql-select.md § Query expressions), the same rule
+-- 13.6 pins for a data-modifying CTE under `limit 0`, and the same answer PostgreSQL
+-- gives for a data-modifying CTE. Before bug-limit-reads-one-row-too-many this case gave
+-- a third answer — it wrote exactly one row more than it returned, an artifact of the
+-- LIMIT reading one row past its last emitted one.
+--
+-- Every section asserts BOTH halves: the rows the query returned, and the rows that
+-- landed in the target table.
+
+-- ===== INSERT ... RETURNING under LIMIT 1 =====
+
+create table src13 (k integer primary key);
+insert into src13 values (1), (2), (3), (4);
+create table d1 (k integer primary key);
+-- run
+
+select k from (insert into d1 select k from src13 returning k) limit 1;
+→ [{"k":1}]
+
+-- All four rows written, not one and not two.
+select count(*) as n from d1;
+→ [{"n":4}]
+
+-- ===== INSERT ... RETURNING under LIMIT 0 =====
+-- The strongest form: the query consumes nothing at all and the write still happens.
+
+create table d2 (k integer primary key);
+-- run
+
+select k from (insert into d2 select k from src13 returning k) limit 0;
+→ []
+
+select count(*) as n from d2;
+→ [{"n":4}]
+
+-- ===== INSERT ... RETURNING under LIMIT with OFFSET =====
+
+create table d3 (k integer primary key);
+-- run
+
+select k from (insert into d3 select k from src13 returning k) limit 2 offset 1;
+→ [{"k":2},{"k":3}]
+
+select count(*) as n from d3;
+→ [{"n":4}]
+
+-- ===== UPDATE ... RETURNING under LIMIT 1 =====
+-- The silent-corruption shape: a partial update looks plausible in the output.
+
+create table u13 (k integer primary key, v integer);
+insert into u13 values (1, 0), (2, 0), (3, 0), (4, 0);
+-- run
+
+select k from (update u13 set v = v + 1 returning k, v) limit 1;
+→ [{"k":1}]
+
+-- Every row incremented, not just the one the LIMIT let through.
+select k, v from u13 order by k;
+→ [{"k":1,"v":1},{"k":2,"v":1},{"k":3,"v":1},{"k":4,"v":1}]
+
+-- ===== DELETE ... RETURNING under LIMIT 1 =====
+
+create table x13 (k integer primary key);
+insert into x13 values (1), (2), (3), (4);
+-- run
+
+select k from (delete from x13 where k >= 2 returning k) limit 1;
+→ [{"k":2}]
+
+-- All three matching rows deleted, not just the returned one.
+select k from x13 order by k;
+→ [{"k":1}]
+
+-- ===== Control: a read-only source IS truncated by the LIMIT =====
+-- The drain rule is scoped to writing sources. A pure subquery still stops early —
+-- that is the whole point of a LIMIT. (Row-level "stopped early, did not over-read"
+-- counts are pinned in test/runtime/early-stop-consumption.spec.ts.)
+
+select k from (select k from src13) order by k limit 1;
+→ [{"k":1}]
+
+select count(*) as n from src13;
+→ [{"n":4}]
+
+-- Cleanup
+drop table src13;
+drop table d1;
+drop table d2;
+drop table d3;
+drop table u13;
+drop table x13;
+-- run

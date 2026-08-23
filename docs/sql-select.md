@@ -50,7 +50,22 @@ do not apply to pure inners:
   re-evaluated (correlated subquery, per-row scan), the inner DML executes
   exactly once and subsequent evaluations replay the memoized result.
 
-Both contracts are gated by `physical.readonly === false` on the inner
+**`LIMIT` over a writing source drains too.** The same rule covers a `LIMIT`
+whose source subtree carries a write — most visibly a DML FROM-subquery,
+`select … from (insert … returning …) limit n`. The `LIMIT` caps how many rows
+the query RETURNS; it does not cap how many rows the statement WRITES. Once the
+limit is reached the emitter stops yielding but keeps consuming the source, so
+the DML runs to completion — including under `LIMIT 0`, which returns nothing
+and still performs every write. This matches what a data-modifying CTE already
+does (`test/logic/13.6-cte-dml-runs-once.sqllogic`) and what PostgreSQL does for
+data-modifying CTEs. Pinned end-to-end in
+`test/logic/13.13-limit-over-dml-subquery.sqllogic`.
+
+A `LIMIT` over a **pure** source keeps its early stop, and stops precisely: it
+pulls exactly `offset + limit` rows and never asks the source for the row past
+the last one it emits (`test/runtime/early-stop-consumption.spec.ts`).
+
+All of these contracts are gated by `physical.readonly === false` on the inner
 subtree, so pure inners are unaffected. See `docs/runtime.md` for the
 emitter-level mechanics.
 

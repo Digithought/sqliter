@@ -2,10 +2,18 @@ import type { LimitOffsetNode } from '../../planner/nodes/limit-offset.js';
 import type { Instruction, RuntimeContext } from '../types.js';
 import { asRun } from '../types.js';
 import { emitPlanNode, emitCallFromPlan } from '../emitters.js';
+import { PlanNodeCharacteristics } from '../../planner/framework/characteristics.js';
 import { type SqlValue, type Row, MaybePromise } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 
 export function emitLimitOffset(plan: LimitOffsetNode, ctx: EmissionContext): Instruction {
+	// A LIMIT never truncates a writing source: a DML subtree under this node runs to
+	// completion even once the limit is reached, matching the full-drain rule the scalar
+	// / IN / EXISTS paths already apply (`emitExists`, `emitScalarSubquery`) and matching
+	// PostgreSQL's data-modifying CTEs. Pure sources take the early-stop path instead.
+	// One subtree test at emit time, not per row, so a LIMIT over a plain scan pays nothing.
+	const drainAfterLimit = PlanNodeCharacteristics.subtreeHasSideEffects(plan.source);
+
 	async function* run(
 		ctx: RuntimeContext,
 		sourceRows: AsyncIterable<Row>,
@@ -39,7 +47,12 @@ export function emitLimitOffset(plan: LimitOffsetNode, ctx: EmissionContext): In
 			offset = 0; // No offset if negative or invalid
 		}
 
-		// Skip offset rows
+		// A zero (or clamped-to-zero) limit over a pure source must not touch the source
+		// at all — entering the loop would pull a row the query can never emit.
+		if (limit <= 0 && !drainAfterLimit) {
+			return;
+		}
+
 		let skipped = 0;
 		let emitted = 0;
 
@@ -50,11 +63,23 @@ export function emitLimitOffset(plan: LimitOffsetNode, ctx: EmissionContext): In
 			}
 
 			if (emitted >= limit) {
-				break;
+				// Only reachable while draining a side-effecting source: swallow the row so
+				// the write behind it still happens, but do not emit it.
+				// NOTE: the swallowed rows still travel the whole pipeline between the write
+				// and this node (projections, filters), so a `LIMIT 1` over a writing source
+				// pays for every row, not one. Correct and unavoidable while the write must
+				// complete; if an expensive projection over a large DML ever shows up as
+				// slow, push the drain down to the mutation node instead of draining here.
+				continue;
 			}
 
+			// Test the limit AFTER yielding, so the source is never asked for the row past
+			// the last one emitted. Testing at the top of the loop costs one extra pull on
+			// every limited query (see `ordinal-slice.ts` for the same shape).
 			yield row;
-			emitted++;
+			if (++emitted >= limit && !drainAfterLimit) {
+				break;
+			}
 		}
 	}
 
