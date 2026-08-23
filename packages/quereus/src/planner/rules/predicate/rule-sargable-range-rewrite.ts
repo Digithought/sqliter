@@ -32,6 +32,7 @@ import { FilterNode } from '../../nodes/filter.js';
 import { BinaryOpNode, CastNode, LiteralNode } from '../../nodes/scalar.js';
 import { ColumnReferenceNode, ParameterReferenceNode } from '../../nodes/reference.js';
 import { splitConjuncts, combineConjuncts } from '../../analysis/predicate-conjuncts.js';
+import { planTimeLiteralValue } from '../../analysis/predicate-shape.js';
 import { getSyncLiteral } from '../../../parser/utils.js';
 import type { SqlValue } from '../../../common/types.js';
 import type * as AST from '../../../parser/ast.js';
@@ -144,7 +145,7 @@ function unwrapCast(node: ScalarPlanNode): ScalarPlanNode {
 }
 
 function isLiteralConstant(node: ScalarPlanNode): boolean {
-	return unwrapCast(node).nodeType === PlanNodeType.Literal;
+	return planTimeLiteralValue(unwrapCast(node)) !== undefined;
 }
 
 function getLiteralValue(node: ScalarPlanNode): SqlValue {

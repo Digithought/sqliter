@@ -11,6 +11,9 @@
 
 import type * as AST from '../../parser/ast.js';
 import type { SqlValue } from '../../common/types.js';
+import type { ScalarPlanNode } from '../nodes/plan-node.js';
+import { PlanNodeType } from '../nodes/plan-node-type.js';
+import type { LiteralNode } from '../nodes/scalar.js';
 
 /**
  * Resolves an AST column/identifier expression to a base-table column index, or
@@ -64,6 +67,24 @@ export function literalValue(expr: AST.Expression): SqlValue | undefined {
 	const v = lit.value;
 	if (v instanceof Promise) return undefined;
 	return v;
+}
+
+/**
+ * The plan-time constant value of an already-unwrapped scalar node, or `undefined`
+ * when the node is not a plan-time constant — including a `LiteralNode` holding a
+ * still-pending Promise (a folded async subquery constant), whose value is unknown
+ * until runtime. `undefined` means "not a constant"; SQL `NULL` is a legitimate
+ * constant value and is returned as `null`, not `undefined`.
+ *
+ * Callers keep their own cast-unwrapping policy (see `unwrapCast` in
+ * `constraint-extractor.ts` and `rule-sargable-range-rewrite.ts`, which differ
+ * deliberately) — this decides only "is it a constant", delegating the value test
+ * to {@link literalValue} so a pending Promise is treated identically here and
+ * there.
+ */
+export function planTimeLiteralValue(node: ScalarPlanNode): SqlValue | undefined {
+	if (node.nodeType !== PlanNodeType.Literal) return undefined;
+	return literalValue((node as LiteralNode).expression);
 }
 
 /**

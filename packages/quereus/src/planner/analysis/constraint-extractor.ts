@@ -22,6 +22,7 @@ import { effectiveBetweenBoundCollation, effectiveComparisonCollation, effective
 import { collationRefines } from '../../util/comparison.js';
 import { isNoOpCast } from './scalar-invertibility.js';
 import { relationKeyHasNodeId, relationKeyOf, relationKeyOfRelation } from './relation-key.js';
+import { planTimeLiteralValue } from './predicate-shape.js';
 
 const log = createLogger('planner:analysis:constraint-extractor');
 
@@ -984,15 +985,29 @@ function getColumnReference(node: ScalarPlanNode): ColumnReferenceNode {
 
 /**
  * Check if node is a literal constant (sees through value-preserving CastNodes).
+ * A folded-but-still-pending async subquery constant (a `LiteralNode` whose value
+ * is a Promise — see `LiteralNode.getType()`) is a `LiteralNode` but not a
+ * plan-time constant; {@link planTimeLiteralValue} rejects it, so this returns
+ * false and the conjunct falls through to the residual-filter path.
  */
 function isLiteralConstant(node: ScalarPlanNode): node is LiteralNode {
-	return unwrapCast(node).nodeType === PlanNodeType.Literal;
+	return planTimeLiteralValue(unwrapCast(node)) !== undefined;
 }
 
 /**
  * True when the value side is a parameter or a column reference from any table
  * (correlation handled later). Classification only — the caller keeps the cast
  * in `valueExpr` and evaluates it at runtime, so a converting cast is fine here.
+ *
+ * NOTE: a promise-valued LiteralNode (a folded but not-yet-resolved async
+ * scalar subquery constant, e.g. `col = (select 1)`) is neither a literal
+ * constant (`isLiteralConstant` rejects it) nor recognized here, so it falls
+ * through to "no column-constant pattern" and the conjunct stays a residual
+ * filter — correct but conservative. If this shape shows up as seek-worthy,
+ * revisit routing it through `valueExpr` / `bindingKind` the way a parameter
+ * is: the value resolves before the seek runs, but a `LiteralNode` whose
+ * `getValue()` returns a Promise has not been validated through the seek
+ * binding machinery.
  */
 function isDynamicValue(node: ScalarPlanNode): boolean {
   const inner = unwrapCastForBindingKind(node);

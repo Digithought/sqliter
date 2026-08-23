@@ -41,6 +41,16 @@ function lit(value: SqlValue): LiteralNode {
 	return new LiteralNode(scope, ast);
 }
 
+/**
+ * A LiteralNode whose value is a still-pending Promise — the shape constant
+ * folding produces for an uncorrelated async scalar subquery
+ * (`planner/analysis/const-pass.ts`). Not a plan-time constant.
+ */
+function litPromise(value: SqlValue): LiteralNode {
+	const ast = { type: 'literal', value: Promise.resolve(value) } as unknown as AST.LiteralExpr;
+	return new LiteralNode(scope, ast);
+}
+
 function binOp(op: string, left: ScalarPlanNode, right: ScalarPlanNode): BinaryOpNode {
 	const ast = {
 		type: 'binary',
@@ -182,6 +192,21 @@ describe('rule-sargable-range-rewrite (unit)', () => {
 		const predicate = binOp('=', fnCall(dateBucketFn, [col]), lit(null));
 		const filter = makeFilter(1, predicate, DATETIME_TYPE);
 
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const result = ruleSargableRangeRewrite(filter, {} as any);
+		expect(result).to.be.null;
+	});
+
+	it('declines date(ts) = <promise literal> instead of throwing (bug-constant-subquery-literal-crashes-predicate-rewrite)', () => {
+		// A folded-but-still-pending async scalar subquery constant (`(select 1)`)
+		// is not a plan-time constant; the rule must decline the conjunct, not
+		// call getSyncLiteral on it.
+		const col = colRef(1, DATETIME_TYPE);
+		const predicate = binOp('=', fnCall(dateBucketFn, [col]), litPromise('2024-01-15'));
+		const filter = makeFilter(1, predicate, DATETIME_TYPE);
+
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		expect(() => ruleSargableRangeRewrite(filter, {} as any)).to.not.throw();
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const result = ruleSargableRangeRewrite(filter, {} as any);
 		expect(result).to.be.null;

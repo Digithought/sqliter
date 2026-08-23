@@ -172,3 +172,34 @@ SELECT id FROM sq_in_t WHERE val NOT IN (10, 30) ORDER BY id;
 → [{"id":2}]
 
 DROP TABLE sq_in_t;
+
+-- ===== CONSTANT SCALAR SUBQUERY AS A PREDICATE VALUE =====
+-- Constant folding replaces an uncorrelated constant scalar subquery with a
+-- LiteralNode whose value is a still-pending Promise; that must not be treated
+-- as a plan-time constant by the sargable-range-rewrite rule or the
+-- constraint extractor (bug-constant-subquery-literal-crashes-predicate-rewrite).
+
+CREATE TABLE big (id INTEGER PRIMARY KEY, v INTEGER, status TEXT);
+INSERT INTO big VALUES (1, 1, 'x'), (2, 2, 'y');
+
+-- Equality against a folded constant scalar subquery
+SELECT id FROM big WHERE v = (SELECT 1);
+→ [{"id":1}]
+
+-- Equality against a folded constant scalar subquery, text column
+SELECT id FROM big WHERE status = (SELECT 'x');
+→ [{"id":1}]
+
+-- BETWEEN with folded constant scalar subquery bounds
+SELECT id FROM big WHERE v BETWEEN (SELECT 1) AND (SELECT 2) ORDER BY id;
+→ [{"id":1},{"id":2}]
+
+-- IN list mixing a folded constant scalar subquery and an ordinary literal
+SELECT id FROM big WHERE v IN ((SELECT 1), 2) ORDER BY id;
+→ [{"id":1},{"id":2}]
+
+-- Control: aggregate subquery is never folded to a literal, already worked
+SELECT id FROM big WHERE status = (SELECT max(status) FROM big);
+→ [{"id":2}]
+
+DROP TABLE big;
