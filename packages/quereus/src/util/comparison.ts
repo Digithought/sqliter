@@ -145,6 +145,29 @@ export function normalizeCollationName(name: string): string {
 	return name.trim().toUpperCase();
 }
 
+/**
+ * True when comparing under `finer` can never conflate two values that comparing
+ * under `coarser` distinguishes — every pair `finer` calls equal, `coarser` calls
+ * equal too. Collations are opaque comparators with no lattice, so only two
+ * name-only cases are decidable: `finer` normalizes to BINARY (byte identity, and
+ * every comparator returns 0 for byte-identical inputs by reflexivity, so BINARY
+ * refines everything), or the two normalize to the same name. Anything else — a
+ * genuinely coarser `finer`, or the mutually incomparable NOCASE / RTRIM pair — is
+ * undecidable and answered false, which every caller treats as the safe side.
+ * An absent name means "no collation stated" and reads as BINARY.
+ *
+ * One spelling of a test four sites need, each in its own direction:
+ * covering-MV eligibility (`coveringMvHonorsIndexCollation`), covered-key
+ * detection over equalities and INs (`constraint-extractor`), UNIQUE-to-relation-key
+ * promotion (`planner/type-utils`), and the index-nested-loop at-most-one proof
+ * (`rules/join/index-nested-loop`). Under-claims safely: an exotic custom pair that
+ * refines semantically but matches neither test is declined.
+ */
+export function collationRefines(finer: string | undefined, coarser: string | undefined): boolean {
+	const f = normalizeCollationName(finer ?? 'BINARY');
+	return f === 'BINARY' || f === normalizeCollationName(coarser ?? 'BINARY');
+}
+
 /** Represents SQLite storage classes for comparison purposes */
 enum StorageClass {
 	NULL = 0,

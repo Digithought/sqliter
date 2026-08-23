@@ -35,22 +35,15 @@
  *    `D`, while the re-validators filter under the index per-column collation `I`.
  *    The candidate set is therefore a sound *superset* of the `I`-matches — safe
  *    to filter down — iff, per column, `D ⊒ I` (every `I`-equal pair is also
- *    `D`-equal). Two name-only tests prove `D ⊒ I` without a collation lattice
- *    (collations are opaque comparators):
- *      - `I` normalizes to BINARY — BINARY equality is byte-identity, and every
- *        comparator returns 0 for byte-identical inputs (reflexivity), so
- *        byte-identical ⊆ `D`-equal for any `D` (the finer-index case).
- *      - `D == I` (normalized names equal) — trivially `D`-equal == `I`-equal
- *        (the common case, incl. every non-derived UNIQUE where `I` falls back
- *        to `D`).
- *    Otherwise (`I` non-BINARY and ≠ `D`) the candidate set may be a *subset* and
- *    the MV must not be used as a covering structure — the per-scan / auto-index
- *    path (already index-collation-correct) enforces instead. This under-claims
- *    safely: an exotic custom pair where `D ⊒ I` holds semantically but neither
- *    test fires is declined (perf-only loss in an already-exotic shape).
+ *    `D`-equal), i.e. `I` refines `D`. That is `collationRefines(I, D)` from
+ *    `util/comparison.ts` — the shared decidable test (see its doc for why only
+ *    "`I` is BINARY" and "`I` == `D`" are provable over opaque comparators).
+ *    Otherwise the candidate set may be a *subset* and the MV must not be used as
+ *    a covering structure — the per-scan / auto-index path (already
+ *    index-collation-correct) enforces instead.
  */
 
-import { compareSqlValuesFast, createTypedComparator, hasSemanticOrdering, normalizeCollationName, resolveCollationFunctions } from '../util/comparison.js';
+import { collationRefines, compareSqlValuesFast, createTypedComparator, hasSemanticOrdering, resolveCollationFunctions } from '../util/comparison.js';
 import type { CollationFunction, CollationResolver } from '../types/logical-type.js';
 import type { SqlValue } from '../common/types.js';
 import type { ColumnSchema } from './column.js';
@@ -178,8 +171,6 @@ export function coveringMvHonorsIndexCollation(
 		: undefined;
 	return uc.columns.every((col, i) => {
 		const declared = schema.columns[col].collation;
-		const I = normalizeCollationName(index?.columns[i]?.collation ?? declared ?? 'BINARY');
-		const D = normalizeCollationName(declared ?? 'BINARY');
-		return I === 'BINARY' || I === D;
+		return collationRefines(index?.columns[i]?.collation ?? declared, declared);
 	});
 }

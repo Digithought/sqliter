@@ -19,6 +19,7 @@ import { TableReferenceNode, ColumnReferenceNode as _ColumnRef } from '../nodes/
 import { CapabilityDetectors } from '../framework/characteristics.js';
 import { computeClosure, expandEcsToFds, keysOf, type KeyRel } from '../util/fd-utils.js';
 import { effectiveBetweenBoundCollation, effectiveComparisonCollation, effectiveInCollation, operandCollation } from './comparison-collation.js';
+import { collationRefines } from '../../util/comparison.js';
 import { isNoOpCast } from './scalar-invertibility.js';
 import { relationKeyHasNodeId, relationKeyOf, relationKeyOfRelation } from './relation-key.js';
 
@@ -1147,9 +1148,9 @@ function columnSideOf(src: BinaryOpNode, attributeId: number): ScalarPlanNode | 
  * cannot conflate values the key's enforcement distinguishes — i.e. the
  * comparison's effective collation is **at least as fine** as the enforcement
  * collation (the column's declared collation: PK/UNIQUE enforcement compares
- * under it — see the memory layer manager's uniqueness checks). The two
- * decidable cases: effective collation BINARY (finest), or equal to the
- * declared collation.
+ * under it — see the memory layer manager's uniqueness checks). {@link collationRefines}
+ * is the shared two-name test; a comparison whose column side cannot be
+ * identified is admitted only when the comparison is itself BINARY.
  *
  * The shape that needs this: constant folding collapses
  * `'bob' COLLATE NOCASE` into a `LiteralNode` whose *type* keeps
@@ -1170,9 +1171,9 @@ function equalityConstraintCollationOk(c: PredicateConstraint): boolean {
 	const src = c.sourceExpression;
 	if (src instanceof BinaryOpNode) {
 		const eff = effectiveComparisonCollation(src.left, src.right);
-		if (eff === 'BINARY') return true;
 		const colSide = columnSideOf(src, c.attributeId);
-		return colSide !== undefined && operandCollation(colSide) === eff;
+		if (colSide === undefined) return eff === 'BINARY';
+		return collationRefines(eff, operandCollation(colSide));
 	}
 	// Every `op: '='` constraint today is minted by `extractBinaryConstraint`
 	// with the BinaryOpNode itself as `sourceExpression` (OR collapse emits
@@ -1188,18 +1189,16 @@ function equalityConstraintCollationOk(c: PredicateConstraint): boolean {
  * runtime membership test (`emitIn`) compares under the lattice-resolved
  * collation over the condition AND every listed value, so a wrapped element
  * like `b IN ('bob' collate nocase)` compares NOCASE over a BINARY-enforced
- * key and must not count as covering. Sound cases mirror the equality gate:
- * effective BINARY (finest), or equal to the column operand's own (declared)
- * collation. OR-collapse-minted IN constraints carry the OR BinaryOpNode as
+ * key and must not count as covering. Sound cases mirror the equality gate —
+ * the same {@link collationRefines} test against the column operand's own
+ * (declared) collation. OR-collapse-minted IN constraints carry the OR BinaryOpNode as
  * `sourceExpression` and were already vetted per-branch by
  * {@link orBranchConstraintCollationOk}.
  */
 function inConstraintCollationOk(c: PredicateConstraint): boolean {
 	const src = c.sourceExpression;
 	if (src instanceof InNode) {
-		const eff = effectiveInCollation(src);
-		if (eff === 'BINARY') return true;
-		return operandCollation(src.condition) === eff;
+		return collationRefines(effectiveInCollation(src), operandCollation(src.condition));
 	}
 	return true;
 }

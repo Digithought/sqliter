@@ -211,6 +211,37 @@ describe('batched index-nested-loop join (one-branch batched fan-out)', () => {
 		});
 	});
 
+	describe('a nullable UNIQUE inner key holding several NULL rows', () => {
+		// The proof admits a UNIQUE constraint without demanding NOT NULL, and SQL
+		// UNIQUE permits many NULLs — so uniqueness alone does NOT bound the match
+		// count here. What bounds it is `=`: `u = NULL` is UNKNOWN, so a NULL-valued
+		// seek key matches nothing and the stored NULL rows are unreachable. If that
+		// leg of the proof were wrong the branch would yield two rows and the runtime
+		// would throw CONSTRAINT — a working query turned into an error, not a wrong
+		// answer — which is exactly what the proof exists to prevent.
+		const NULL_KEY_SQL = 'select o.id, un.w from o left join un on un.u = o.k order by o.id';
+
+		beforeEach(async () => {
+			await db.exec('create table o (id integer primary key, k text null)');
+			await db.exec("insert into o values (1, 'a'), (2, null), (3, 'zz')");
+			await db.exec('create table un (pk integer primary key, u text null unique, w integer) using hi_lat');
+			const rows: string[] = ["(1, 'a', 10)", '(2, null, 20)', '(3, null, 30)', "(4, 'b', 40)"];
+			for (let i = 5; i <= 100; i++) rows.push(`(${i}, 'k${i}', ${i})`);
+			await db.exec(`insert into un values ${rows.join(', ')}`);
+			for await (const _ of db.eval('analyze')) { /* consume */ }
+		});
+
+		it('proves at-most-one from the UNIQUE constraint', async () => {
+			expect(soleBatchedFanOut(db.getPlan(NULL_KEY_SQL)).branches[0].mode).to.equal('atMostOne-left');
+		});
+
+		forkExecTest('matches no stored NULL row for a NULL key', async () => {
+			expect(await drain(db, NULL_KEY_SQL)).to.deep.equal([
+				{ id: 1, w: 10 }, { id: 2, w: null }, { id: 3, w: null },
+			]);
+		});
+	});
+
 	describe('does not form', () => {
 		it('at zero latency — the plan is the serial index-nested-loop it is today', async () => {
 			await createTables('memory');

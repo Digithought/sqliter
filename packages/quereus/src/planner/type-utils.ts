@@ -1,6 +1,6 @@
 import type { TableSchema, UniqueConstraintSchema } from '../schema/table.js';
 import type { ColumnSchema } from '../schema/column.js';
-import { normalizeCollationName } from '../util/comparison.js';
+import { collationRefines } from '../util/comparison.js';
 import type { RelationType, ColumnDef, ScalarType, ColRef } from '../common/datatype.js';
 import { StatusCode, type DeepReadonly, type SqlValue } from '../common/types.js';
 import type { AstNode } from '../parser/ast.js';
@@ -91,9 +91,8 @@ function enforcementCollationCoversDeclared(
   const index = tableSchema.indexes?.find(i => i.name === uc.derivedFromIndex);
   if (!index) return true; // no index metadata survived — declared-collation enforcement
   return index.columns.every(ic => {
-    const declared = normalizeCollationName(tableSchema.columns[ic.index]?.collation ?? 'BINARY');
-    if (declared === 'BINARY') return true;
-    return normalizeCollationName(ic.collation ?? declared) === declared;
+    const declared = tableSchema.columns[ic.index]?.collation;
+    return collationRefines(declared, ic.collation ?? declared);
   });
 }
 

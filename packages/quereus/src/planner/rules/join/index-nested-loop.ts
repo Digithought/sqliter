@@ -78,7 +78,7 @@ import { indexNestedLoopJoinCost } from '../../cost/index.js';
 import { validateAccessPlan, type BestAccessPlanResult } from '../../../vtab/best-access-plan.js';
 import type { TableSchema } from '../../../schema/table.js';
 import { uniqueEnforcementCollations } from '../../../schema/unique-enforcement.js';
-import { normalizeCollationName } from '../../../util/comparison.js';
+import { collationRefines } from '../../../util/comparison.js';
 
 const log = createLogger('optimizer:rule:index-nested-loop');
 
@@ -562,19 +562,22 @@ function enforcedKeys(tableSchema: TableSchema): EnforcedKey[] {
  * True when an equality's comparison collation is at least as fine as the
  * key's enforcement collation — every pair of rows the equality treats as
  * equal, the key treats as equal too, so uniqueness forbids a second match.
- * Two name-only tests prove it without a collation lattice (collations are
- * opaque comparators): the predicate compares BINARY — byte identity, the
- * finest relation there is, so at most one row per class under ANY coarser key
- * collation — or the two normalize to the same name (identical classes). A
- * COARSER predicate fails both: a `NOCASE` join key over a `BINARY` unique
- * column admits `'a'` and `'A'`, two distinct stored rows that both match.
- * `NOCASE` / `RTRIM` are mutually incomparable and fail too. The same two
- * tests as `coveringMvHonorsIndexCollation`, applied in the other direction.
+ * {@link collationRefines} is the shared two-name test; a COARSER predicate
+ * fails it, so a `NOCASE` join key over a `BINARY` unique column (which admits
+ * `'a'` and `'A'`, two distinct stored rows that both match) declines.
+ *
+ * The source-shape gate is load-bearing, not defensive. `effectivePredicateCollation`
+ * answers BINARY for a shape it does not recognize — a safe DECLINE for its own
+ * caller (a BINARY-read predicate over a coarser index over-fetches and keeps its
+ * residual Filter) but the STRONGEST possible claim here, where BINARY refines
+ * everything. Every `op: '='` constraint today is minted by `extractBinaryConstraint`
+ * carrying its own `BinaryOpNode` (OR collapse emits only 'IN' / 'OR_RANGE'), so
+ * requiring that shape costs nothing now and makes a future `=` producer decline
+ * rather than be proved unique on a default.
  */
 function equalityRefinesKey(constraint: PredicateConstraint, keyCollation: string | undefined): boolean {
-	const pred = normalizeCollationName(effectivePredicateCollation(constraint));
-	const key = normalizeCollationName(keyCollation ?? 'BINARY');
-	return pred === 'BINARY' || pred === key;
+	if (!(constraint.sourceExpression instanceof BinaryOpNode)) return false;
+	return collationRefines(effectivePredicateCollation(constraint), keyCollation);
 }
 
 /**
@@ -601,10 +604,14 @@ function pinsOneValue(constraint: PredicateConstraint): boolean {
  * returns 2 would turn a working query into an error.
  *
  * Premise: every constraint in `combined` is enforced somewhere inside the
- * rebuilt inner — the candidate's own correctness argument (re-promised by the
- * new seek, reattached by `selectPhysicalNode`, re-applied by
- * `reapplyDeclinedPushed`, or for a join-key leftover by the ON condition the
- * caller keeps above the seek). A Filter only removes rows, so a constraint
+ * rebuilt inner. That is total for the `=` constraints this proof reads, by
+ * construction rather than by argument — each one is either module-DECLINED, and
+ * `reapplyDeclinedPushed` re-applies every declined pushed constraint as a Filter
+ * (join-key leftovers need none: the ON condition the caller keeps above the seek
+ * covers them), or module-HANDLED, and a handled constraint is either consumed
+ * into the seek's bounds or recovered by `selectPhysicalNode`'s
+ * `reattachUnconsumedConstraints` — whose `RECLAIMABLE_OPS` set contains `'='`,
+ * so no equality can fall through it. A Filter only removes rows, so a constraint
  * enforced by a filter rather than by the index counts just the same. Then: if
  * some enforced key has EVERY column pinned by an equality whose collation
  * refines the key's ({@link equalityRefinesKey}), any two surviving rows agree
