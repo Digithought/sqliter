@@ -1,14 +1,15 @@
 ---
-description: When changing a table's identity columns forces the engine to rebuild the table behind the scenes, the rebuilt table silently loses its validation rules, its uniqueness rules and its labels — and if the new identity is "no columns", it comes back with the wrong identity entirely.
+description: Two places in the engine write out a table's definition by hand instead of using the one official writer, and both leave parts out — a table rebuilt behind the scenes loses its validation rules, its uniqueness rules and its labels (and can come back with the wrong identity), and the table listing reports a definition that would re-create a different table.
 files:
   - packages/quereus/src/runtime/emit/alter-table.ts        # buildShadowTableDdl (~1972-2016), rebuildViaShadowTable (~2121)
   - packages/quereus/src/schema/ddl-generator.ts            # generateTableDDL — the canonical emitter this path should be using
   - packages/quereus/test/runtime/shadow-ddl.spec.ts        # pins the current (wrong) empty-key behaviour at ~116
   - packages/quereus/test/no-alter-module.ts                # the stub backend that reaches this path
+  - packages/quereus/src/func/builtins/schema.ts            # schema()'s ad-hoc createSql for a plain vtab table (arm 3)
 repro: verified
 severity: wrong-result
-likelihood: unusual
-tradeoffs: Neither shipped backend (memory, store) ever reaches this path — both re-key in place — so this only bites a third-party backend, and the fix means making a second DDL emitter agree with the canonical one rather than a one-line patch.
+likelihood: normal-use
+tradeoffs: Neither shipped backend (memory, store) ever reaches arms 1-2 — both re-key in place — so those only bite a third-party backend; arm 3 is reachable by anyone but only misreports (nothing in the engine re-parses that text). Either way the fix means making hand-rolled DDL emitters defer to the canonical one rather than a one-line patch.
 ---
 
 # What is wrong
@@ -54,10 +55,43 @@ backend runs it.
 `packages/quereus/test/runtime/shadow-ddl.spec.ts:116` currently asserts the omission as if it
 were correct, so the fix has to flip that test too.
 
+## Arm 3 — `schema()` reports a definition that re-creates a different table
+
+Reported from the Lamina board (`debt-delete-synthesized-primary-key-flag`, review pass), where
+it turned up while checking that the canonical emitter names every key.
+
+`select sql from schema()` is the table listing users read to find out how a table was declared.
+For a **maintained** table it renders `generateMaintainedTableDDL` — the canonical emitter. For
+an ordinary vtab table it instead builds the text by hand from the column names and type tokens
+alone (`packages/quereus/src/func/builtins/schema.ts`, the `createSql` branch), so the key, the
+nullability markers, defaults, collations and every constraint are missing.
+
+Verified through a `using lamina` table (the omission is module-independent — it is the same
+branch for any vtab module):
+
+```
+CREATE TABLE probe_t (a INTEGER NULL, b TEXT NULL);
+
+schema().sql   →  create table "probe_t" ("a" INTEGER, "b" TEXT) using lamina()
+generateTableDDL →  CREATE TABLE "probe_t" ("a" INTEGER NULL, "b" TEXT NULL, PRIMARY KEY ("a", "b"))
+```
+
+Both omissions flip meaning rather than merely abbreviating: with `not_null` defaulting on,
+re-running the reported text gives NOT NULL columns, and the missing `PRIMARY KEY` clause means
+"key is every column" — which happens to be right here only because this table declared no key.
+Declare `primary key (a)` and the reported text still says nothing, so it re-parses to the
+all-columns key instead.
+
+Unlike arms 1-2 this does not corrupt anything in-engine — nothing re-parses `schema().sql` — so
+it is a reporting defect. It is listed here rather than as its own ticket because the fix is the
+same one this ticket already argues for: render through the canonical emitter, so a clause the
+canonical emitter learns to emit is carried everywhere. Note the two differ in identifier case
+and in `using`-clause elision, so the fix has to decide which form the listing shows.
+
 # Root cause
 
-One site: `buildShadowTableDdl` re-implements table DDL instead of rendering the table through
-the canonical emitter. Both arms are the same defect — the hand-rolled emitter renders a
+Hand-rolled table DDL instead of the canonical emitter. Two sites do it — `buildShadowTableDdl`
+(arms 1-2) and `schema()`'s `createSql` (arm 3). All three arms are the same defect — a hand-rolled emitter renders a
 *subset* of the table, and an omission in emitted DDL is never neutral (a missing `PRIMARY KEY`
 clause re-parses as a different key, a missing constraint re-parses as no constraint).
 
@@ -94,3 +128,6 @@ rebuild-path `alter primary key`:
 
 The strongest single check is a general one: emit canonical DDL before and after a rebuild that
 re-keys the table, and assert the two texts differ **only** in the `PRIMARY KEY` clause.
+
+For arm 3, the general check is that `schema().sql` for an ordinary vtab table parses back to
+the same table it describes — key, nullability, defaults, collations and constraints included.
