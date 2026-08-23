@@ -48,6 +48,24 @@ function costing(ms: number): () => void {
  * and the `maxBatch` ceiling exist for. */
 const free = () => { /* nothing */ };
 
+/** A synthetic benchmark paired with a clock that advances ONLY when it is called, so
+ * calibration measures exactly `perCallMs` per call.
+ *
+ * `costing` measures the machine as well as the function: it spins for `perCallMs`, but
+ * the elapsed the calibration loop reads also contains whatever the scheduler did in
+ * between, and that is unbounded above. A test asserting that a measurement lands UNDER
+ * a threshold — the batch grew because one call fell short of `minSampleMs` — therefore
+ * fails on a loaded machine, where a 0.125 ms call has been measured at 1.9 ms. Those
+ * tests use this instead, and assert the policy exactly rather than approximately.
+ *
+ * Tests that pin the loops against REAL elapsed time (that warmup honours a duration
+ * target, that the timed loop respects its wall-clock ceiling) keep using `costing` —
+ * reading a real clock is the behaviour under test there. */
+function virtual(perCallMs: number): { now: () => number; fn: () => void } {
+	let clock = 0;
+	return { now: () => clock, fn: () => { clock += perCallMs; } };
+}
+
 /** Counts its calls, so a test can assert how many times calibration invoked `fn`. */
 function counting(inner: () => void = free): (() => void) & { calls: number } {
 	const fn = Object.assign(() => { fn.calls++; inner(); }, { calls: 0 });
@@ -236,9 +254,15 @@ describe('bench/lib/calibrate.mjs', () => {
 
 		it('grows the batch until a sample clears the minimum', async () => {
 			const perCall = FAST.minSampleMs / 8;
-			const { batch } = await sizeBatch(costing(perCall), FAST);
+			const { now, fn } = virtual(perCall);
+			const { batch, perCallMs } = await sizeBatch(fn, FAST, now);
 			expect(batch).to.be.greaterThan(1);
 			expect(batch * perCall).to.be.greaterThanOrEqual(FAST.minSampleMs * 0.5);
+			// On an exact clock the multiplicative growth is exact too: one call falls short
+			// by 8x, so the next batch is 8 — the one step the docstring promises, not three
+			// doublings.
+			expect(batch).to.equal(8);
+			expect(perCallMs).to.be.closeTo(perCall, 1e-9);
 		});
 
 		it('terminates at maxBatch on a function too fast to ever clear the minimum', async () => {
@@ -270,8 +294,11 @@ describe('bench/lib/calibrate.mjs', () => {
 
 	describe('calibrate', () => {
 		it('produces a plan whose batch times per-call cost is a measurable sample', async () => {
-			const plan = await calibrate(costing(FAST.minSampleMs / 4), FAST);
+			const perCall = FAST.minSampleMs / 4;
+			const { now, fn } = virtual(perCall);
+			const plan = await calibrate(fn, FAST, now);
 			expect(plan.batch).to.be.greaterThan(1);
+			expect(plan.batch * perCall).to.be.greaterThanOrEqual(FAST.minSampleMs);
 			expect(plan.samples).to.be.greaterThanOrEqual(FAST.minSamples);
 			expect(plan.samples).to.be.at.most(FAST.maxSamples);
 			expect(plan.warmup).to.be.greaterThanOrEqual(FAST.minWarmup);

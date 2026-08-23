@@ -111,6 +111,23 @@ function clamp(n, lo, hi) {
 }
 
 /**
+ * The clock the calibration loops read.
+ *
+ * It is a parameter rather than a direct `performance.now()` call because a test that
+ * pins the POLICY — that the batch grows when one call falls short of `minSampleMs` —
+ * cannot express that against the real clock. Whether a measurement lands under the
+ * threshold depends on the scheduler, not on `fn`: a synthetic call costing an eighth
+ * of `minSampleMs` was measured at 1.9 ms on a loaded machine, so the loop returned a
+ * batch of 1 and the assertion failed. Passing a clock that advances only by `fn`'s
+ * nominal cost makes that test measure the policy instead of the machine.
+ *
+ * Production never passes one — `yarn bench` must read the real high-resolution clock.
+ *
+ * @type {() => number}
+ */
+const realClock = () => performance.now();
+
+/**
  * Run `fn` untimed until `warmupTargetMs` has elapsed, and report how many calls
  * that took.
  *
@@ -130,13 +147,14 @@ function clamp(n, lo, hi) {
  *
  * @param {() => unknown | Promise<unknown>} fn
  * @param {CalibrationConfig} [config]
+ * @param {() => number} [now] clock to measure elapsed with — see `realClock`
  * @returns {Promise<number>} calls made
  */
-export async function warmUp(fn, config = CALIBRATION) {
+export async function warmUp(fn, config = CALIBRATION, now = realClock) {
 	const { warmupTargetMs, minWarmup, maxWarmup } = config;
-	const start = performance.now();
+	const start = now();
 	let calls = 0;
-	while (calls < minWarmup || (calls < maxWarmup && performance.now() - start < warmupTargetMs)) {
+	while (calls < minWarmup || (calls < maxWarmup && now() - start < warmupTargetMs)) {
 		await fn();
 		calls++;
 	}
@@ -158,20 +176,21 @@ export async function warmUp(fn, config = CALIBRATION) {
  *
  * @param {() => unknown | Promise<unknown>} fn
  * @param {CalibrationConfig} [config]
+ * @param {() => number} [now] clock to measure elapsed with — see `realClock`
  * @returns {Promise<{ batch: number, perCallMs: number }>}
  */
-export async function sizeBatch(fn, config = CALIBRATION) {
+export async function sizeBatch(fn, config = CALIBRATION, now = realClock) {
 	const { minSampleMs, maxBatch, durationFloorMs } = config;
 	let batch = 1;
 	for (;;) {
-		const start = performance.now();
+		const start = now();
 		for (let i = 0; i < batch; i++) {
 			await fn();
 		}
 		// Floored before any division: `performance.now()` can return the same value
 		// twice for a trivial `fn`, and an elapsed of 0 sends both the growth factor
 		// and the sample count to Infinity.
-		const elapsed = Math.max(performance.now() - start, durationFloorMs);
+		const elapsed = Math.max(now() - start, durationFloorMs);
 		if (elapsed >= minSampleMs || batch >= maxBatch) {
 			return { batch, perCallMs: Math.max(elapsed / batch, durationFloorMs) };
 		}
@@ -199,11 +218,12 @@ export function samplesFor(batch, perCallMs, config = CALIBRATION) {
  *
  * @param {() => unknown | Promise<unknown>} fn
  * @param {CalibrationConfig} [config]
+ * @param {() => number} [now] clock to measure elapsed with — see `realClock`
  * @returns {Promise<SamplePlan>}
  */
-export async function calibrate(fn, config = CALIBRATION) {
-	const warmup = await warmUp(fn, config);
-	const { batch, perCallMs } = await sizeBatch(fn, config);
+export async function calibrate(fn, config = CALIBRATION, now = realClock) {
+	const warmup = await warmUp(fn, config, now);
+	const { batch, perCallMs } = await sizeBatch(fn, config, now);
 	return {
 		warmup,
 		batch,
