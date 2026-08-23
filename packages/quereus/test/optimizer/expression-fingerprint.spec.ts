@@ -563,6 +563,15 @@ describe('Expression fingerprinting', () => {
 				const b = binOp('+', colRef(1), lit(Promise.resolve(2)));
 				expect(fingerprintExpression(a)).to.not.equal(fingerprintExpression(b));
 			});
+
+			// The same invariant on the trailing arm: a host value matching none of the
+			// SqlValue shapes above (unreachable for a well-typed value, but one bad cast
+			// away) must stay node-unique rather than render itself into the fingerprint.
+			it('a literal holding an unrecognized host value is node-unique, not value-keyed', () => {
+				const fps = [Symbol('s'), Symbol('s'), () => 1, () => 1].map(v => fingerprintExpression(lit(v)));
+				expect(new Set(fps).size).to.equal(fps.length);
+				for (const fp of fps) expect(fp).to.match(/^LI:\?/);
+			});
 		});
 	});
 

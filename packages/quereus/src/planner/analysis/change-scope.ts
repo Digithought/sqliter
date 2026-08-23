@@ -26,6 +26,7 @@ import { FunctionFlags } from '../../common/constants.js';
 import { extractBindings, type BindingMode } from './binding-extractor.js';
 import { relationKeyOf } from './relation-key.js';
 import { extractConstraintsForTable } from './constraint-extractor.js';
+import { planTimeLiteralValue } from './predicate-shape.js';
 import { compareSqlValues } from '../../util/comparison.js';
 import { getTypeOrDefault } from '../../types/registry.js';
 
@@ -656,13 +657,13 @@ function scopeValueFromExpr(expr: ScalarPlanNode, unboundParams: Set<number | st
 		unboundParams.add(inner.nameOrIndex);
 		return { kind: 'param', index: inner.nameOrIndex, type: portableFromScalarType(inner.targetType) };
 	}
-	if (inner.nodeType === PlanNodeType.Literal) {
-		const lit = inner as unknown as { expression: { value: SqlValue } };
-		const v = lit.expression?.value;
-		if (v === undefined) return undefined;
-		return v;
-	}
-	return undefined;
+	// `planTimeLiteralValue`, not a raw `expression.value` read behind a `SqlValue` cast:
+	// a folded constant scalar subquery (`k = (select 1)`) is a LiteralNode whose value is
+	// a still-pending Promise. `stringifyScopeValue` renders any such value `j:{}`, so two
+	// distinct pinned key values would dedup to one and the watch would miss changes to the
+	// other. `undefined` degrades the caller to a full-table watch, which over-fires rather
+	// than under-fires. See `docs/optimizer-const.md` §4.
+	return planTimeLiteralValue(inner);
 }
 
 function cartesianProduct(input: readonly (readonly ScopeValue[])[]): ScopeValue[][] {

@@ -107,26 +107,20 @@ export function fingerprintExpression(node: ScalarPlanNode): string {
 }
 
 function fingerprintLiteral(node: LiteralNode): string {
-	// `LiteralNode.expression.value` is NOT necessarily a resolved SQL value: constant
-	// folding is synchronous but the value it folds may be async, so an uncorrelated
-	// constant scalar subquery — `(select 1)` — becomes a literal holding a still-pending
-	// Promise that only the emitter awaits. `literalValue` is the shared plan-time test;
-	// it returns undefined for exactly that case, which we must not fingerprint by value —
-	// a Promise matches none of the scalar arms below and would land in the JSON-document
-	// branch, canonicalizing every one of them to the same `LI:j{}` and letting CSE collapse
-	// `(select 1)` and `(select 2)` into one shared computation.
+	// Not `node.expression.value`: a folded async constant — `(select 1)` — is a literal
+	// holding a still-pending Promise (docs/optimizer-const.md §4). Fingerprinted by value
+	// it lands in the JSON-document branch below, canonicalizing every one of them to
+	// `LI:j{}` so CSE collapses `(select 1)` and `(select 2)` into one computation.
 	const value = literalValue(node.expression);
 	if (value === undefined) {
-		// Not a plan-time value. Fall back to a per-node fingerprint so it is never
-		// deduplicated against anything — correct, but it silently disables CSE for
-		// this literal, so say so.
+		// No plan-time value ⇒ node-unique, never deduplicated against anything. Correct,
+		// but it silently disables CSE for this literal, so say so.
 		//
-		// NOTE: this also means two *textually identical* constant subqueries — `x + (select 5)`
-		// twice in one statement — no longer share one computation, so the subquery runs once per
-		// occurrence. Cheap today (the values are already materialized promises, and the
-		// pre-folding `ScalarSubquery` form was never a CSE candidate either — see `_SQ:` above).
-		// If a workload ever repeats an expensive constant subquery many times in one statement,
-		// key these on the folded subquery's identity rather than the node id.
+		// NOTE: two *textually identical* constant subqueries no longer share one
+		// computation either. Cheap today — each occurrence folds separately anyway, so the
+		// subqueries already ran once each and CSE only ever saved the enclosing arithmetic.
+		// If repeating an expensive constant subquery in one statement ever matters, key
+		// these on the folded subquery's identity rather than the node id.
 		log('literal has no plan-time value (pending folded constant), fingerprinting node %d uniquely', node.id);
 		return `LI:?${node.id}`;
 	}

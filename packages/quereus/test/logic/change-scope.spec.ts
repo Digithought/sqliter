@@ -104,6 +104,26 @@ describe('Statement.getChangeScope (integration)', () => {
 		expect(scope.watches[0].scope).to.deep.equal({ kind: 'full' });
 	});
 
+	it('a key pinned by a constant scalar subquery degrades to a full watch, never a bogus row value', async () => {
+		// `k = (select 1)` const-folds to a literal holding a still-pending Promise. A
+		// row-scope built from that value would serialize as `j:{}` for every such
+		// subquery, so two distinct pinned keys would dedup to one and the watch would
+		// miss changes to the other. The analysis must bail to `{kind:'full'}` instead.
+		await db.exec('CREATE TABLE t (k INTEGER PRIMARY KEY, v INTEGER) USING memory');
+		for (const sql of [
+			'select * from t where k = (select 1)',
+			'select * from t where k in ((select 1), (select 2))',
+			'select * from t where k = cast((select 1) as integer)',
+		]) {
+			const scope = db.prepare(sql).getChangeScope();
+			expect(scope.watches, sql).to.have.length(1);
+			expect(scope.watches[0].scope, sql).to.deep.equal({ kind: 'full' });
+		}
+		// Control: an ordinary literal still pins the row.
+		const pinned = db.prepare('select * from t where k = 1').getChangeScope();
+		expect(pinned.watches[0].scope).to.deep.equal({ kind: 'rows', key: ['k'], values: [[1]] });
+	});
+
 	it('getChangeScope on an MV whose source was dropped throws cleanly (no dropped-table watch)', async () => {
 		// Dropping a source marks the MV stale; re-planning `select * from mvi` for
 		// analysis raises the same "stale; drop and recreate" error executing it does

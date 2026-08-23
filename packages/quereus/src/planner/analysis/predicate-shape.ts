@@ -15,10 +15,9 @@
  * still-pending Promise (a folded async constant such as `(select 1)`; see
  * `docs/optimizer-const.md` §4). Reading `expression.value` directly instead has produced
  * both crashes and wrong results, so new code should route through these rather than
- * open-coding another `instanceof Promise` test. Callers outside this file include the
- * constraint extractor, the sargable-range-rewrite and monotonic-range-access rules, the
- * expression fingerprinter, the SAT checker, functional-dependency and catalog-statistics
- * utilities, `LimitOffsetNode`, and the LIKE emitter.
+ * open-coding another `instanceof Promise` test or casting the value to plain `SqlValue`
+ * (`AST.LiteralExpr.value` is honestly typed `MaybePromise<SqlValue>` — the compiler
+ * catches every honest reader, so a cast is the only way to reintroduce the bug).
  */
 
 import type * as AST from '../../parser/ast.js';
