@@ -664,6 +664,8 @@ having condition
 
 The condition is applied after grouping, allowing filtering on aggregate values. References to columns are restricted: only columns that appear in `group by` and aggregate expressions are valid; bare references to ungrouped columns raise an error. The same restriction applies to the implicit single group when the query has aggregates but no `group by`.
 
+The restriction is about **this** query's own columns. A `having` written inside a subquery may name a column of an *enclosing* query, exactly as `where` may — `select w.b, (select count(*) from t group by t.a having t.a = w.a) from wg w` is legal, with and without a `group by` on the inner query. This is the same line [§3.3](#33-group-by-clause) draws for the general post-grouping restriction.
+
 **Select-list aliases are visible here.** A grouped query's output columns can be named in `having` (and in a window specification of the same query) by their select-list alias — an aggregate's alias (`select a, count(*) as c … having c > 1`) and a grouping key's alias (`select a as k … having k = 'x'`) alike. This is SQLite-style permissiveness; strict SQL admits an alias only in the statement's top-level `order by`. Two consequences worth knowing:
 
 - An alias **shadows** a same-named base-table column: under `select a as b … group by a`, a bare `b` in `having` is the grouping key `a`, not the table's own `b`.

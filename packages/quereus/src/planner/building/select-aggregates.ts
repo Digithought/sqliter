@@ -261,14 +261,15 @@ interface GroupByCoverage {
 }
 
 /**
- * Builds the coverage test for a grouped query. `groupedOutputAttributes` is the
- * AggregateNode's output attributes (group keys followed by aggregate results),
- * needed only when the expressions to be checked were built against the aggregate
- * output scope.
+ * Builds the coverage test for a grouped query, from the GROUP BY expressions as
+ * built against the PRE-aggregate scope. Its one caller is the SELECT-list check
+ * ({@link validateAggregateProjections}), whose projections are built against that
+ * same scope. HAVING deliberately does NOT use this: its predicate lives above the
+ * AggregateNode and is checked with {@link isPreGroupingReference} instead, which
+ * can tell this query's own ungrouped columns from an enclosing query's.
  */
 function buildGroupByCoverage(
 	groupByExpressions: readonly ScalarPlanNode[],
-	groupedOutputAttributes: readonly Attribute[] = []
 ): GroupByCoverage {
 	const attrIds = new Set<number>();
 	const fingerprints = new Set<string>();
@@ -277,9 +278,6 @@ function buildGroupByCoverage(
 			attrIds.add(expr.attributeId);
 		}
 		fingerprints.add(expressionToIdentityString(expr.expression));
-	}
-	for (const attr of groupedOutputAttributes) {
-		attrIds.add(attr.id);
 	}
 	return { attrIds, fingerprints };
 }
@@ -714,11 +712,19 @@ function assertPostAggregateCoverage(node: PlanNode, context: GroupedRedirectCon
  * belongs to the subquery, and its arguments may correlate back out — `over (order by
  * (select max(wg.b) from wg t))` reads an ungrouped column of this query and must say
  * so at plan time, not die at runtime with "No row context found for column b".
+ *
+ * `skipSubqueries` stops the walk at a relational child instead of descending into it,
+ * and exists for the HAVING check ({@link buildHavingFilter}). An ungrouped reference
+ * to this query's column buried inside a HAVING subquery is already rejected by the
+ * finished-plan check ({@link assertGroupedPlanCoverage}) with the general "must appear
+ * in the GROUP BY clause" wording, which is the message that shape has always raised;
+ * descending here would pre-empt it with HAVING's own dedicated message instead.
  */
 function findUngroupedPostAggregateRef(
 	node: PlanNode,
 	context: GroupedRedirectContext,
 	insideSubquery = false,
+	skipSubqueries = false,
 ): ColumnReferenceNode | null {
 	if (!insideSubquery && CapabilityDetectors.isAggregateFunction(node)) {
 		return null;
@@ -730,7 +736,8 @@ function findUngroupedPostAggregateRef(
 
 	for (const child of node.getChildren()) {
 		if (isCteDefinition(child)) continue;
-		const found = findUngroupedPostAggregateRef(child, context, insideSubquery || isRelationalNode(child));
+		if (skipSubqueries && isRelationalNode(child)) continue;
+		const found = findUngroupedPostAggregateRef(child, context, insideSubquery || isRelationalNode(child), skipSubqueries);
 		if (found) return found;
 	}
 	return null;
@@ -1108,20 +1115,27 @@ function buildHavingFilter(
 		hybridScope,
 	);
 
-	// Reject HAVING references to non-grouped, non-aggregated columns.
+	// Reject HAVING references to non-grouped, non-aggregated columns — and ONLY
+	// those. The test is {@link isPreGroupingReference}: true just for a column of
+	// THIS query's pre-grouping input that the grouped row no longer carries. A
+	// column of an ENCLOSING query (a correlated reference from a subquery's HAVING,
+	// legal in SQL exactly as it is in WHERE) belongs to neither set and passes, as
+	// does a subquery's own column. An allow-list of grouping keys is unnecessary
+	// here: `redirectPostAggregate` has already rewritten every spelling of a
+	// grouping key it handles into an AggregateNode-OUTPUT reference, which
+	// `isPreGroupingReference` returns false for.
+	//
 	// With GROUP BY: only GROUP BY columns/expressions and aggregates are allowed.
 	// Without GROUP BY (implicit single group, only reachable here when aggregates
-	// are present): only aggregates are allowed.
-	// HAVING references resolve through `hybridScope`: GROUP BY columns and
-	// aggregate aliases land on AggregateNode-output attribute IDs, while bare
-	// source columns (registered as a fallback) land on source attribute IDs.
-	// We accept both flavors of "grouped" attribute, plus any subtree whose AST
-	// fingerprint matches a GROUP BY expression.
-	const coverage = buildGroupByCoverage(
-		groupByExpressions,
-		aggregateAttributes.slice(0, groupByExpressions.length + aggregates.length),
-	);
-	const ungrouped = findUngroupedColumnRef(havingExpression, coverage);
+	// are present): only aggregates are allowed. That path has no
+	// `groupedRedirectContext`, so build the equivalent context locally from the same
+	// two inputs `buildAggregatePhase` would have passed. It is used for the coverage
+	// check ONLY — `redirectPostAggregate` above must keep receiving the real
+	// `groupedRedirectContext` so a non-grouped query still takes its pass-through
+	// branch.
+	const coverageContext = groupedRedirectContext
+		?? buildGroupedRedirectContext([], aggregateAttributes, sourceInput);
+	const ungrouped = findUngroupedPostAggregateRef(havingExpression, coverageContext, false, true);
 	if (ungrouped) {
 		throw new QuereusError(
 			`HAVING references non-grouped column '${ungrouped.expression.name}'; ` +

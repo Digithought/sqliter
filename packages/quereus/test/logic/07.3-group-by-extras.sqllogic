@@ -367,6 +367,50 @@ select k, c from vw_key_alias;
 
 drop view vw_key_alias;
 
+-- ---------------------------------------------------------------------------
+-- A subquery's HAVING may name a column of the ENCLOSING query
+-- (bug-having-rejects-correlated-outer-column).
+--
+-- The grouped-query restriction HAVING enforces is about THIS query's own
+-- ungrouped columns. A correlated reference out to the surrounding query is a
+-- different query's column and is legal in `having` exactly as it is in `where`.
+-- ---------------------------------------------------------------------------
+
+-- The inner HAVING compares a grouping key against the enclosing row's column.
+select w.b, (select count(*) from wg t group by t.a having t.a = w.a) as c
+from wg w order by w.b;
+→ [{"b":"1","c":2},{"b":"2","c":1},{"b":"3","c":2}]
+
+-- Same, with the enclosing column compared against one of the inner aggregates.
+-- Counts per group are x=2, y=1, so the group that survives differs per outer row.
+select w.b, (select count(*) from wg t group by t.a having count(*) = w.b + 0) as c
+from wg w order by w.b;
+→ [{"b":"1","c":1},{"b":"2","c":2},{"b":"3","c":null}]
+
+-- Same again, with the enclosing column on the LEFT of the comparison and a
+-- non-count aggregate on the right.
+select w.b, (select count(*) from wg t group by t.a having w.a = max(t.a)) as c
+from wg w order by w.b;
+→ [{"b":"1","c":2},{"b":"2","c":1},{"b":"3","c":2}]
+
+-- Same, in a HAVING with no GROUP BY at all (implicit single group).
+select w.b, (select count(*) from wg t having count(*) = 3 and w.b = '2') as c
+from wg w order by w.b;
+→ [{"b":"1","c":null},{"b":"2","c":3},{"b":"3","c":null}]
+
+-- Control: for comparison, the same correlation in WHERE, which always worked.
+select w.b, (select count(*) from wg t where t.a = w.a group by t.a) as c
+from wg w order by w.b;
+→ [{"b":"1","c":2},{"b":"2","c":1},{"b":"3","c":2}]
+
+-- Negative, grouped: the inner query's OWN ungrouped column keeps its rejection.
+select w.b, (select count(*) from wg t group by t.a having t.b = '1') as c from wg w;
+-- error: HAVING references non-grouped column 'b'
+
+-- Negative, no GROUP BY: same restriction, same message.
+select w.b, (select count(*) from wg t having t.b = '1') as c from wg w;
+-- error: HAVING references non-grouped column 'b'
+
 drop table wg;
 
 -- ---------------------------------------------------------------------------
