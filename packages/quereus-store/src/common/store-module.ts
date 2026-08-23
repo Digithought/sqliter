@@ -59,6 +59,7 @@ import {
 	STALE_MVS_META_NAME,
 	buildDataStoreName,
 	buildMetaCatalogKey,
+	buildStatsKey,
 } from './key-builder.js';
 import { StoreModuleRename } from './store-module-rename.js';
 import type { LensDeploymentListener, StoreModuleConfig } from './store-module-base.js';
@@ -595,6 +596,25 @@ export class StoreModule extends StoreModuleRename implements VirtualTableModule
 		// table.dispose() both flushes pending stats and runs that disposer.
 		if (table) {
 			await table.dispose();
+		}
+
+		// Delete the unified-store stats entry (buildStatsKey / STATS_STORE_NAME —
+		// see key-builder.ts). MUST run after dispose() above (which flushes a
+		// buffered delta and would otherwise resurrect the entry we are about to
+		// delete) and BEFORE deleteTableStores below (a provider that keeps a
+		// PER-TABLE stats store drops it inside deleteTableStores, so calling
+		// getStatsStore after that would silently re-create an empty store just to
+		// delete an absent key from it). Advisory, like the rename-path re-key: a
+		// failed delete must not block the drop, but — unlike the rename arm's bare
+		// swallow — is logged (AGENTS.md: don't eat exceptions silently).
+		try {
+			const statsStore = await this.provider.getStatsStore(schemaName, tableName);
+			await statsStore.delete(buildStatsKey(schemaName, tableName));
+		} catch (e) {
+			console.warn(
+				`[StoreModule] Failed to delete persisted statistics for '${schemaName}.${tableName}' `
+					+ `during teardown: ${e instanceof Error ? e.message : String(e)}`,
+			);
 		}
 
 		// Delete all stores for this table (data, indexes, stats)

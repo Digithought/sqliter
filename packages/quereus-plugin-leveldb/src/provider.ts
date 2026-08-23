@@ -294,7 +294,8 @@ export class LevelDBProvider implements KVStoreProvider {
 		await this.clearAndDropStore(buildDataStoreName(schemaName, tableName));
 
 		// Stats live in the unified __stats__ store; the individual stats entry is
-		// removed by the calling code (StoreModule), not by clearing a store.
+		// removed by the caller — see StoreModule.tearDownTableStorage — before
+		// this method runs, not by clearing a store here.
 
 		// Clear exactly the table's index stores (by name). Built via
 		// buildIndexStoreName from the authoritative schema index list — never a

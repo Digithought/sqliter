@@ -87,12 +87,16 @@ describe('StoreModule.reclaimDetachedTable', () => {
 		await db.exec(`create table t (id integer primary key, b integer) using store`);
 		await db.exec(`create index ix_b on t (b)`);
 		await db.exec(`insert into t values (1, 10), (2, 20)`);
+		for await (const _ of db.eval(`analyze t`)) { /* consume */ }
 
-		// Preconditions: the data + index stores and the catalog entry exist. (Row
-		// stats live in a unified store, not a per-table store, so they are not part
-		// of the per-table reclaim — mirroring destroy().)
+		// Preconditions: the data + index stores, the stats store and the catalog
+		// entry all exist. This provider keeps a PER-TABLE stats store (unlike the
+		// shipped providers' unified `__stats__` store), so both the reclaim's own
+		// stats-entry delete (StoreModule.tearDownTableStorage) and this provider's
+		// deleteTableStores remove it — asserted below.
 		expect(has('main.t'), 'data store').to.equal(true);
 		expect(has('main.t_idx_ix_b'), 'index store').to.equal(true);
+		expect(has('main.t.__stats__'), 'stats store').to.equal(true);
 		expect(await catalogHas('t'), 'catalog DDL').to.equal(true);
 		schemaDrops.length = 0;
 
@@ -101,6 +105,7 @@ describe('StoreModule.reclaimDetachedTable', () => {
 		// All per-table physical storage + catalog DDL reclaimed.
 		expect(has('main.t'), 'data store gone').to.equal(false);
 		expect(has('main.t_idx_ix_b'), 'index store gone').to.equal(false);
+		expect(has('main.t.__stats__'), 'stats store gone').to.equal(false);
 		expect(await catalogHas('t'), 'catalog DDL gone').to.equal(false);
 		// The engine already saw the detach — reclaim is silent.
 		expect(schemaDrops, 'no schema-change drop event emitted').to.have.lengthOf(0);

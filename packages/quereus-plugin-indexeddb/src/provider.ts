@@ -261,7 +261,8 @@ export class IndexedDBProvider implements KVStoreProvider {
 		}
 
 		// Stats are in the unified __stats__ store, so no need to delete a separate store
-		// The individual stats entry will be removed by the calling code if needed
+		// here. The individual stats entry is removed by the caller — see
+		// StoreModule.tearDownTableStorage — before this method runs.
 
 		// Delete exactly the table's index stores (by name), not every object store
 		// matching the `{table}_idx_` prefix — that prefix also matches a sibling
