@@ -1457,8 +1457,12 @@ interface CollationCoverDecision {
  * > BINARY). An IN merges the condition with every listed value / the subquery
  * column (`emitIn`); a BETWEEN bound resolves against the tested expression
  * per bound (`emitBetween`). The result is normalized.
+ *
+ * Exported for `rules/join/index-nested-loop.ts`, whose at-most-one proof
+ * compares each enforced equality's collation against the unique key's
+ * enforcement collation — the same lattice, not a restatement of it.
  */
-function effectivePredicateCollation(constraint: PlannerPredicateConstraint): string {
+export function effectivePredicateCollation(constraint: PlannerPredicateConstraint): string {
 	const src = constraint.sourceExpression;
 	if (src instanceof BinaryOpNode) {
 		return effectiveComparisonCollation(src.left, src.right);

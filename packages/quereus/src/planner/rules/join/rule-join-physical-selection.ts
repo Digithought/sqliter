@@ -21,6 +21,17 @@
  * module's own seek-versus-scan answers in hand (`rule-join-greedy-commute`'s
  * row-count arm never fires for table-backed inputs, and QuickPick returns
  * immediately for fewer than three relations).
+ *
+ * Each index-nested-loop orientation whose seek PROVABLY returns at most one
+ * row per outer row (`IndexNestedLoopCandidate.atMostOne`) is additionally
+ * offered as a one-branch `FanOutLookupJoinNode` in `batched` outer mode —
+ * the same seek, driven by the fan-out's cross-row pipelined runtime so many
+ * seeks are in flight at once and a high-latency module's round trip is
+ * amortized across them. The decision is made HERE, as a priced candidate,
+ * not by a later rewrite rule: a post-pass would only ever see index-NL joins
+ * that already won at one-seek-at-a-time prices, and under latency those
+ * mostly lose to hash join. Batching changes the price, so the price has to
+ * be in the comparison. See `tryBatchedIndexNestedLoop`.
  */
 
 import { createLogger } from '../../../common/logger.js';
@@ -30,8 +41,17 @@ import { JoinNode } from '../../nodes/join-node.js';
 import { BloomJoinNode, type EquiJoinPair } from '../../nodes/bloom-join-node.js';
 import { MergeJoinNode } from '../../nodes/merge-join-node.js';
 import { SortNode } from '../../nodes/sort.js';
+import { FilterNode } from '../../nodes/filter.js';
 import { ColumnReferenceNode } from '../../nodes/reference.js';
-import { nestedLoopJoinCost, hashJoinCost, mergeJoinCost } from '../../cost/index.js';
+import { FanOutLookupJoinNode, type FanOutBranchSpec } from '../../nodes/fanout-lookup-join-node.js';
+import type { OptimizerTuning } from '../../optimizer-tuning.js';
+import {
+	nestedLoopJoinCost,
+	hashJoinCost,
+	mergeJoinCost,
+	batchedIndexNestedLoopJoinCost,
+} from '../../cost/index.js';
+import { toBatchedOuter } from './rule-fanout-batched-outer.js';
 import {
 	extractEquiPairs,
 	isOrderedOnEquiPairs,
@@ -113,6 +133,81 @@ function nestedLoopInnerLatency(
 	// Every in-tree module reports 0, so this keeps the walk off the hot path.
 	if (innerLatencyMs === 0) return 0;
 	return nestedLoopRightOpensOnce(node, context) ? innerLatencyMs : outerRows * innerLatencyMs;
+}
+
+/** A priced one-branch batched fan-out built from an index-nested-loop candidate. */
+interface BatchedIndexNestedLoopCandidate {
+	readonly node: FanOutLookupJoinNode;
+	/** Engine-currency cost INCLUDING the outer side's one open, comparable with the other totals. */
+	readonly cost: number;
+}
+
+/**
+ * The index-nested-loop candidate re-driven as a one-branch `FanOutLookupJoinNode`
+ * in `batched` outer mode, priced — or null when this orientation has no
+ * batched candidate. Building the node and asking `toBatchedOuter`'s gates in
+ * one step is what keeps the price and the plan from ever disagreeing; a
+ * serial fan-out is never entered into the comparison (strictly worse than the
+ * join it replaces: per-row forking, no overlap).
+ *
+ * The branch is the rebuilt inner under a `Filter` carrying the join's ON
+ * condition — a fan-out branch has no residual slot, and this is the same
+ * construction `rule-fanout-lookup-join` uses for its spine branches. The
+ * condition's outer-side column references resolve through
+ * `RuntimeContext.context` exactly as the seek's own correlated keys do. A
+ * Filter cannot add rows, so it cannot break the at-most-one claim; for a LEFT
+ * join, filtering the single row away yields an empty branch, which
+ * `atMostOne-left` NULL-pads — LEFT-join semantics. `concurrencyCap` is 1: one
+ * branch; the cross-row budget is the batched driver's `outerBatchConcurrency`.
+ * `connectionKey` stays unset so the emitter falls back to the active
+ * connection, as `rule-fanout-lookup-join` does.
+ *
+ * Price: `batchedIndexNestedLoopJoinCost` with the number of seeks in flight
+ * for one branch — `min(outerBatchConcurrency, maxOuterReadAhead)`, the
+ * driver's global permit budget bounded by its read-ahead window (mirrors
+ * `deriveReadAhead` at `branchCount = 1`; see the coupling comment there) —
+ * plus one open of the outer side, the same charge the serial index-NL pays.
+ *
+ * NOTE: a `USING` join that takes this path loses its `JoinNode.usingColumns`
+ * label — the fan-out has no equivalent field, and the label only ever fed
+ * EXPLAIN's `JOIN USING(...)` rendering (`buildJoinAttributes` ignores it, so
+ * no attribute layout changes). It renders as a fan-out instead.
+ * NOTE: the row estimate changes slightly — `FanOutLookupJoinNode` reports the
+ * outer's cardinality for an at-most-one branch (an upper bound for `inner`,
+ * exact for `left`) where `JoinNode` used `estimateJoinRows`. Known, not chased.
+ */
+function tryBatchedIndexNestedLoop(
+	join: JoinNode,
+	outer: RelationalPlanNode,
+	candidate: IndexNestedLoopCandidate | null,
+	joinType: 'inner' | 'left',
+	preserveAttrs: readonly Attribute[] | undefined,
+	outerRows: number,
+	outerLatencyMs: number,
+	tuning: OptimizerTuning['parallel'],
+): BatchedIndexNestedLoopCandidate | null {
+	if (!candidate || !candidate.atMostOne) return null;
+	// Outcome-preserving short-circuit, not a restated gate: at zero latency the
+	// batched price equals the serial one (the only term batching divides is the
+	// latency), and a strict `<` after the serial entry can never pick it — so
+	// skip building nodes the comparison could not choose. Every in-tree module
+	// reports 0, which keeps node construction off the golden-sweep hot path.
+	if (candidate.perSeekLatencyMs === 0) return null;
+	const inner = candidate.newInner;
+	// `condition` is defined — the caller extracted equi pairs from it.
+	const branch: FanOutBranchSpec = {
+		child: new FilterNode(join.scope, inner, join.condition!),
+		mode: joinType === 'left' ? 'atMostOne-left' : 'atMostOne-inner',
+		outputAttrs: inner.getAttributes(),
+		concurrencySafe: inner.physical.concurrencySafe !== false,
+	};
+	const serial = new FanOutLookupJoinNode(join.scope, outer, [branch], 1, preserveAttrs, 'serial');
+	const batched = toBatchedOuter(serial, tuning);
+	if (!batched) return null;
+	const inFlight = Math.min(tuning.outerBatchConcurrency, tuning.maxOuterReadAhead);
+	const cost = batchedIndexNestedLoopJoinCost(
+		outerRows, candidate.rowsPerSeek, candidate.perSeekLatencyMs, inFlight) + outerLatencyMs;
+	return { node: batched, cost };
 }
 
 /**
@@ -278,6 +373,28 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 		return null;
 	}
 
+	// Preserve attribute IDs from the logical JoinNode. Also pins the un-mirrored
+	// batched fan-out's layout: the logical join's `[...left, ...right]` (right
+	// nullable-widened for LEFT) is exactly the fan-out's `[...outer, ...branch]`
+	// with `isLeftBranchMode` widening, so attribute identity carries verbatim.
+	const preserveAttrs = node.getAttributes().slice() as Attribute[];
+
+	// Batched index-nested-loop candidates: each proved-at-most-one orientation
+	// re-driven as a one-branch batched fan-out. Only `inner` / `left` — the
+	// fan-out node has no semi/anti mode, and existence joins returned above
+	// (no existence-flag support either). The mirrored one passes no
+	// `preserveAttrs` and lets the node derive `[...right, ...leftRebuilt]`,
+	// matching what `rebuildWithMirroredNL` produces. Absent candidates cost
+	// Infinity, as above.
+	const batchedNL = joinType === 'inner' || joinType === 'left'
+		? tryBatchedIndexNestedLoop(
+			node, node.left, indexNL, joinType, preserveAttrs, leftRows, leftLatencyMs, context.tuning.parallel)
+		: null;
+	const mirroredBatchedNL = tryBatchedIndexNestedLoop(
+		node, node.right, mirroredNL, 'inner', undefined, rightRows, rightLatencyMs, context.tuning.parallel);
+	const batchedNLCost = batchedNL ? batchedNL.cost : Infinity;
+	const mirroredBatchedNLCost = mirroredBatchedNL ? mirroredBatchedNL.cost : Infinity;
+
 	// Hash join cost: build side is the smaller input
 	const buildRows = Math.min(leftRows, rightRows);
 	const probeRows = Math.max(leftRows, rightRows);
@@ -319,8 +436,15 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 	// `<` in this fixed order, so an exact tie keeps the earlier entry: in
 	// particular two un-analyzed sides (both at the 100-row default) cost the
 	// two index-NL orientations identically, and the un-mirrored one wins — a
-	// plan must not flip its drive side on a coin toss.
-	type JoinAlgo = 'nested-loop' | 'hash' | 'merge' | 'index-nl' | 'index-nl-mirrored';
+	// plan must not flip its drive side on a coin toss. Each batched candidate
+	// sits directly after its serial counterpart, un-mirrored pair before
+	// mirrored pair: a batched candidate is at most as dear as its serial one
+	// (the latency term is divided, never grown), so it wins its own orientation
+	// whenever it exists and the in-flight count exceeds 1, and a tie between
+	// the un-mirrored batched and the mirrored serial keeps the spelled drive
+	// side.
+	type JoinAlgo = 'nested-loop' | 'hash' | 'merge'
+		| 'index-nl' | 'index-nl-batched' | 'index-nl-mirrored' | 'index-nl-mirrored-batched';
 	let bestAlgo: JoinAlgo = 'nested-loop';
 	let bestCost = nlCost;
 
@@ -336,14 +460,22 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 		bestAlgo = 'index-nl';
 		bestCost = indexNLCost;
 	}
+	if (batchedNLCost < bestCost) {
+		bestAlgo = 'index-nl-batched';
+		bestCost = batchedNLCost;
+	}
 	if (mirroredNLCost < bestCost) {
 		bestAlgo = 'index-nl-mirrored';
 		bestCost = mirroredNLCost;
 	}
+	if (mirroredBatchedNLCost < bestCost) {
+		bestAlgo = 'index-nl-mirrored-batched';
+		bestCost = mirroredBatchedNLCost;
+	}
 
 	// `%d` not `%.2f`: `debug` has no precision formatter and passes the token through verbatim.
-	const COSTS = 'nl=%d, hash=%d, merge=%d, index-nl=%d, index-nl-mirrored=%d';
-	const costArgs = [nlCost, hashTotal, mergeTotal, indexNLCost, mirroredNLCost];
+	const COSTS = 'nl=%d, hash=%d, merge=%d, index-nl=%d, index-nl-batched=%d, index-nl-mirrored=%d, index-nl-mirrored-batched=%d';
+	const costArgs = [nlCost, hashTotal, mergeTotal, indexNLCost, batchedNLCost, mirroredNLCost, mirroredBatchedNLCost];
 
 	if (bestAlgo === 'nested-loop') {
 		log(`Nested loop cheapest (${COSTS}) for %d x %d rows`, ...costArgs, leftRows, rightRows);
@@ -356,11 +488,19 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 	if (bestAlgo === 'index-nl-mirrored') {
 		return rebuildWithMirroredNL();
 	}
+	// The batched node is already built — price and plan came from the same
+	// construction — so a win returns it verbatim.
+	if (bestAlgo === 'index-nl-batched') {
+		log(`Selecting batched index-nested-loop join (${COSTS}) for %d outer rows`, ...costArgs, leftRows);
+		return batchedNL!.node;
+	}
+	if (bestAlgo === 'index-nl-mirrored-batched') {
+		log(`Selecting mirrored batched index-nested-loop join (${COSTS}) for %d outer rows (sides exchanged)`,
+			...costArgs, rightRows);
+		return mirroredBatchedNL!.node;
+	}
 
 	log(`Selecting %s join (${COSTS}) for %d x %d rows`, bestAlgo, ...costArgs, leftRows, rightRows);
-
-	// Preserve attribute IDs from the logical JoinNode
-	const preserveAttrs = node.getAttributes().slice() as Attribute[];
 
 	if (bestAlgo === 'merge') {
 		// Build merge join, inserting SortNodes if needed

@@ -1240,6 +1240,51 @@ describe('FanOutLookupJoin batched outer', () => {
 			[2, '2.0'], [2, '2.1'], [2, '2.2'],
 		]);
 	});
+
+	it('nests one batched one-branch fan-out inside another under the strict-fork contract', async () => {
+		// The shape `rule-join-physical-selection` now produces for two chained
+		// batched index-nested-loops: the outer fan-out's single branch is itself a
+		// batched one-branch fan-out over the row it was handed. Run on a STRICT
+		// context so every fork counter has to bump and unwind in order — the
+		// inner driver forks from the outer's row fork, whose own counters are
+		// live, and both must drop cleanly before the outer row slot closes. No
+		// Sort / Project sits above, so this is the strict-fork-clean way to prove
+		// what the optimizer-level nesting test cannot run under
+		// QUEREUS_FORK_STRICT.
+		const ctx = makeStrictRuntimeContext();
+		const innerLookup: FanOutLookupBranchFactory = (innerCtx) => (async function* () {
+			const k = resolveAttribute(innerCtx, 2) as number;
+			await sleep(5);
+			yield [`c${k * 2}`] as Row;
+		})();
+		const innerDescriptor: RowDescriptor = [];
+		innerDescriptor[2] = 0;
+		const outerBranch: FanOutLookupBranchFactory = (rowCtx) => (async function* () {
+			const a = resolveAttribute(rowCtx, 1) as number;
+			await sleep(15 - a * 5);
+			// The middle lookup's single row, driven as the inner fan-out's outer.
+			const middle = arrayOuter([[a * 10]]);
+			for await (const r of runFanOutLookupJoinBatched(
+				rowCtx, middle, innerDescriptor, [innerLookup],
+				[{ mode: 'atMostOne-inner', outputColCount: 1, concurrencySafe: true }], 4, 8,
+			)) {
+				yield r;
+			}
+		})();
+		const out = await collect(runFanOutLookupJoinBatched(
+			ctx, arrayOuter([[1], [2], [3]]), singleOuterDescriptor(), [outerBranch],
+			[{ mode: 'atMostOne-inner', outputColCount: 2, concurrencySafe: true }], 4, 8,
+		));
+		expect(out).to.deep.equal([
+			[1, 10, 'c20'],
+			[2, 20, 'c40'],
+			[3, 30, 'c60'],
+		]);
+		// Every counter unwound: the statement context is mutable again.
+		expect(() => {
+			ctx.tableContexts.set({} as never, () => undefined as never);
+		}).to.not.throw();
+	});
 });
 
 // ---------------------------------------------------------------------------

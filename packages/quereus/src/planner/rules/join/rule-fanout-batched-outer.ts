@@ -67,10 +67,20 @@
  *
  * **Idempotence.** After the rewrite `outerMode === 'batched'`, so a second
  * firing returns null immediately.
+ *
+ * **Two callers, one flip.** The gates, the prefetch wrap and the node rebuild
+ * live in {@link toBatchedOuter}; this rule is a thin wrapper over it, and
+ * `rule-join-physical-selection` calls it directly to turn an index-nested-loop
+ * candidate into a priced one-branch batched fan-out. One owner means the two
+ * callers cannot drift, and — because a one-branch fan-out left in serial mode
+ * is strictly worse than the join it replaces (per-row forking, no overlap) —
+ * the selection rule never enters a serial fan-out into its comparison: if
+ * this function declines, there is no batched candidate at all.
  */
 
 import { createLogger } from '../../../common/logger.js';
 import type { OptContext } from '../../framework/context.js';
+import type { OptimizerTuning } from '../../optimizer-tuning.js';
 import type { PlanNode, RelationalPlanNode } from '../../nodes/plan-node.js';
 import { PlanNodeType } from '../../nodes/plan-node-type.js';
 import { FanOutLookupJoinNode, isCrossBranchMode } from '../../nodes/fanout-lookup-join-node.js';
@@ -97,11 +107,20 @@ function outerRowEstimate(node: RelationalPlanNode): number | undefined {
 	return undefined;
 }
 
-export function ruleFanOutBatchedOuter(node: PlanNode, context: OptContext): PlanNode | null {
-	if (!(node instanceof FanOutLookupJoinNode)) return null;
+/**
+ * The serial→batched flip: every gate, the `EagerPrefetchNode` wrap and the
+ * node rebuild, in one function so no caller can obtain batched mode without
+ * the wrap (the wrap is load-bearing correctness — see the module comment's
+ * *Outer-source isolation*). Returns null when any gate declines, including on
+ * a node that is already batched (idempotence — `ruleFanOutBatchedOuter` later
+ * re-visits nodes `rule-join-physical-selection` already flipped).
+ */
+export function toBatchedOuter(
+	node: FanOutLookupJoinNode,
+	tuning: OptimizerTuning['parallel'],
+): FanOutLookupJoinNode | null {
 	if (node.outerMode === 'batched') return null; // idempotence
 
-	const tuning = context.tuning.parallel;
 	const branchCount = node.branches.length;
 
 	// Cross-branch batched outer is owned by the cross-mode ticket; only flip
@@ -159,4 +178,9 @@ export function ruleFanOutBatchedOuter(node: PlanNode, context: OptContext): Pla
 		node.preserveAttributeIds,
 		'batched',
 	);
+}
+
+export function ruleFanOutBatchedOuter(node: PlanNode, context: OptContext): PlanNode | null {
+	if (!(node instanceof FanOutLookupJoinNode)) return null;
+	return toBatchedOuter(node, context.tuning.parallel);
 }

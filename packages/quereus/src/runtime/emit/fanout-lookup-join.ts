@@ -244,7 +244,15 @@ export async function* runFanOutLookupJoin(
 	}
 }
 
-/** Clamp `R = ceil(globalCap / max(1, branchCount))` into `[1, maxOuterReadAhead]`. */
+/**
+ * Clamp `R = ceil(globalCap / max(1, branchCount))` into `[1, maxOuterReadAhead]`.
+ *
+ * Coupled to the planner: `batchedIndexNestedLoopJoinCost` (`planner/cost/
+ * index.ts`) prices a one-branch batched fan-out with `inFlight =
+ * min(outerBatchConcurrency, maxOuterReadAhead)` — this function evaluated at
+ * `branchCount = 1`, since one branch per row means rows-in-flight equals
+ * lookups-in-flight. Change the clamp here and that price goes stale.
+ */
 function deriveReadAhead(globalCap: number, branchCount: number, maxOuterReadAhead: number): number {
 	const derived = Math.ceil(globalCap / Math.max(1, branchCount));
 	return Math.min(Math.max(derived, 1), maxOuterReadAhead);

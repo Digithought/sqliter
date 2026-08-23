@@ -61,7 +61,11 @@ import { hasSemanticOrdering } from '../../../util/comparison.js';
 import { sharesSeekKeySpace } from '../../../types/builtin-types.js';
 import { hasRelationalDescendant } from '../../analysis/scalar-subqueries.js';
 import { extractConstraints, createTableInfoFromNode, type PredicateConstraint } from '../../analysis/constraint-extractor.js';
-import { selectPhysicalNode, combineResidualExpressions } from '../access/rule-select-access-path.js';
+import {
+	selectPhysicalNode,
+	combineResidualExpressions,
+	effectivePredicateCollation,
+} from '../access/rule-select-access-path.js';
 import {
 	peelToSeekableAccessLeaf,
 	rebuildChain,
@@ -72,6 +76,9 @@ import {
 import { combineResidual } from './equi-pair-extractor.js';
 import { indexNestedLoopJoinCost } from '../../cost/index.js';
 import { validateAccessPlan, type BestAccessPlanResult } from '../../../vtab/best-access-plan.js';
+import type { TableSchema } from '../../../schema/table.js';
+import { uniqueEnforcementCollations } from '../../../schema/unique-enforcement.js';
+import { normalizeCollationName } from '../../../util/comparison.js';
 
 const log = createLogger('optimizer:rule:index-nested-loop');
 
@@ -84,6 +91,21 @@ export interface IndexNestedLoopCandidate {
 	readonly newInner: RelationalPlanNode;
 	/** Engine-currency cost, comparable with nestedLoop/hash/merge in the caller. */
 	readonly cost: number;
+	/**
+	 * The two inputs `cost` was derived from, so the caller can re-price the same
+	 * seek under a different driver (`batchedIndexNestedLoopJoinCost`) without
+	 * re-probing: the module's row estimate for one seek, and the inner
+	 * subtree's first-row latency.
+	 */
+	readonly rowsPerSeek: number;
+	readonly perSeekLatencyMs: number;
+	/**
+	 * True when the rebuilt inner PROVABLY yields at most one row per outer row —
+	 * see {@link provesAtMostOne}. What lets the caller drive this candidate as a
+	 * one-branch `FanOutLookupJoinNode` (`atMostOne-*` branch), whose runtime
+	 * throws on a second row.
+	 */
+	readonly atMostOne: boolean;
 }
 
 /** One equi pair resolved to its leaf column index and outer attribute position. */
@@ -494,6 +516,123 @@ function reapplyDeclinedPushed(
 	return new FilterNode(below.scope, below, predicate);
 }
 
+/** One key the inner table enforces uniqueness on, with the collation each column is enforced under. */
+interface EnforcedKey {
+	readonly columns: readonly number[];
+	readonly collations: readonly (string | undefined)[];
+}
+
+/**
+ * Every key the table enforces uniqueness on, each with the collation its
+ * columns are enforced under: the primary key (a member's own collation, else
+ * its column's — `ddl-generator` reads it the same way), every non-partial
+ * UNIQUE constraint (`uniqueEnforcementCollations`: the backing index's
+ * per-column COLLATE for an index-derived constraint, else the column's), and
+ * every non-partial UNIQUE index (its own per-column collation, else the
+ * column's — `appendIndexToTableSchema` normally mirrors these as derived
+ * constraints already; listed so a host-authored schema carrying the index
+ * alone is not missed). A partial key (`predicate` set) only constrains the
+ * rows its WHERE admits and proves nothing about the rest.
+ */
+function enforcedKeys(tableSchema: TableSchema): EnforcedKey[] {
+	const columnCollation = (idx: number): string | undefined => tableSchema.columns[idx]?.collation;
+	const keys: EnforcedKey[] = [];
+	const pk = tableSchema.primaryKeyDefinition;
+	if (pk.length > 0) {
+		keys.push({
+			columns: pk.map(k => k.index),
+			collations: pk.map(k => k.collation ?? columnCollation(k.index)),
+		});
+	}
+	for (const uc of tableSchema.uniqueConstraints ?? []) {
+		if (uc.predicate !== undefined || uc.columns.length === 0) continue;
+		keys.push({ columns: uc.columns, collations: uniqueEnforcementCollations(tableSchema, uc) });
+	}
+	for (const ix of tableSchema.indexes ?? []) {
+		if (!ix.unique || ix.predicate !== undefined || ix.columns.length === 0) continue;
+		keys.push({
+			columns: ix.columns.map(c => c.index),
+			collations: ix.columns.map(c => c.collation ?? columnCollation(c.index)),
+		});
+	}
+	return keys;
+}
+
+/**
+ * True when an equality's comparison collation is at least as fine as the
+ * key's enforcement collation — every pair of rows the equality treats as
+ * equal, the key treats as equal too, so uniqueness forbids a second match.
+ * Two name-only tests prove it without a collation lattice (collations are
+ * opaque comparators): the predicate compares BINARY — byte identity, the
+ * finest relation there is, so at most one row per class under ANY coarser key
+ * collation — or the two normalize to the same name (identical classes). A
+ * COARSER predicate fails both: a `NOCASE` join key over a `BINARY` unique
+ * column admits `'a'` and `'A'`, two distinct stored rows that both match.
+ * `NOCASE` / `RTRIM` are mutually incomparable and fail too. The same two
+ * tests as `coveringMvHonorsIndexCollation`, applied in the other direction.
+ */
+function equalityRefinesKey(constraint: PredicateConstraint, keyCollation: string | undefined): boolean {
+	const pred = normalizeCollationName(effectivePredicateCollation(constraint));
+	const key = normalizeCollationName(keyCollation ?? 'BINARY');
+	return pred === 'BINARY' || pred === key;
+}
+
+/**
+ * An equality pins ONE value per outer row only when its value side is
+ * deterministic. A constraint re-applied as a Filter is re-evaluated per inner
+ * row, so `b.id = random()` admits a different id on every row and several can
+ * pass — nothing upstream gates non-deterministic predicates out of pushdown
+ * (`rule-select-access-path` has no such test), so the proof must. A literal
+ * has no value expression and trivially qualifies; a correlated column
+ * reference is deterministic for the duration of one outer row.
+ */
+function pinsOneValue(constraint: PredicateConstraint): boolean {
+	const value = constraint.valueExpr;
+	if (value === undefined) return true;
+	if (Array.isArray(value)) return false; // an IN list never reaches here (op !== '='); be explicit
+	return PlanNodeCharacteristics.isDeterministic(value);
+}
+
+/**
+ * PROOF — not an estimate — that the inner rebuilt from `combined` yields at
+ * most one row per outer row. `FanOutLookupJoinNode`'s `atMostOne-*` branch
+ * modes throw `QuereusError(CONSTRAINT)` at runtime on a second row, so the
+ * module's `rows: 1` estimate must not stand in: a module that estimates 1 and
+ * returns 2 would turn a working query into an error.
+ *
+ * Premise: every constraint in `combined` is enforced somewhere inside the
+ * rebuilt inner — the candidate's own correctness argument (re-promised by the
+ * new seek, reattached by `selectPhysicalNode`, re-applied by
+ * `reapplyDeclinedPushed`, or for a join-key leftover by the ON condition the
+ * caller keeps above the seek). A Filter only removes rows, so a constraint
+ * enforced by a filter rather than by the index counts just the same. Then: if
+ * some enforced key has EVERY column pinned by an equality whose collation
+ * refines the key's ({@link equalityRefinesKey}), any two surviving rows agree
+ * on the whole key and uniqueness forbids the second. Ranges, IN and OR_RANGE
+ * admit many values and never contribute. Over-fetch is harmless — a
+ * `COARSER_SAFE` seek's residual Filter re-applies the exact comparison above
+ * it — and the finer-index case (`MISMATCH_UNSAFE`) never reaches here: it
+ * degrades to a scan in `selectPhysicalNode` and `rebuiltSeek` declines the
+ * candidate first. NULL keys need no case: `col = NULL` matches nothing.
+ *
+ * Exported for direct unit coverage; it is the correctness core of the batched
+ * candidate.
+ */
+export function provesAtMostOne(tableSchema: TableSchema, combined: readonly PredicateConstraint[]): boolean {
+	const equalitiesByColumn = new Map<number, PredicateConstraint[]>();
+	for (const c of combined) {
+		if (c.op !== '=' || !pinsOneValue(c)) continue;
+		const list = equalitiesByColumn.get(c.columnIndex);
+		if (list) list.push(c); else equalitiesByColumn.set(c.columnIndex, [c]);
+	}
+	if (equalitiesByColumn.size === 0) return false;
+	// A column pinned by several equalities (a pushed `b.id = 5` beside the join
+	// key) is proved by ANY one of them: the surviving rows satisfy all of them,
+	// so they are a subset of the rows the refining one admits.
+	return enforcedKeys(tableSchema).some(key => key.columns.every((col, i) =>
+		(equalitiesByColumn.get(col) ?? []).some(eq => equalityRefinesKey(eq, key.collations[i]))));
+}
+
 /**
  * The `IndexSeekNode` under `rebuilt`'s collation-residual Filter, or null when
  * `selectPhysicalNode` produced something else. It degrades to a SeqScan +
@@ -599,10 +738,12 @@ export function tryIndexNestedLoop(
 
 	const newLeaf = reapplyDeclinedPushed(rebuiltLeaf, seekPlan, offered);
 	const newInner = rebuildChain(inner, leaf, newLeaf);
-	const latencyMs = inner.physical.expectedLatencyMs ?? 0;
-	const cost = indexNestedLoopJoinCost(outerRows, seekPlan.rows!, latencyMs);
-	log('candidate: seek %s.%s via %s (%s rows/seek, cost %s for %s outer rows; %d pushed constraint(s) re-offered)',
+	const perSeekLatencyMs = inner.physical.expectedLatencyMs ?? 0;
+	const rowsPerSeek = seekPlan.rows!;
+	const cost = indexNestedLoopJoinCost(outerRows, rowsPerSeek, perSeekLatencyMs);
+	const atMostOne = provesAtMostOne(tableSchema, offered.combined);
+	log('candidate: seek %s.%s via %s (%s rows/seek, cost %s for %s outer rows; %d pushed constraint(s) re-offered; at-most-one %s)',
 		tableSchema.name, seekPlan.seekColumnIndexes!.map(c => tableSchema.columns[c]?.name).join(','),
-		seekPlan.indexName, seekPlan.rows, cost, outerRows, pushed.length);
-	return { newInner, cost };
+		seekPlan.indexName, seekPlan.rows, cost, outerRows, pushed.length, atMostOne ? 'proved' : 'unproved');
+	return { newInner, cost, rowsPerSeek, perSeekLatencyMs, atMostOne };
 }

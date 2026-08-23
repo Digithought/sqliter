@@ -136,7 +136,9 @@ export interface OptimizerTuning {
 		 * `concurrency` (the per-row serial cap): the batched driver shares a
 		 * single semaphore over this budget so a small per-row `branchCount` can
 		 * still saturate block I/O by admitting more outer rows ahead of the
-		 * emit frontier. Default 16.
+		 * emit frontier. With `maxOuterReadAhead` it also fixes the seeks-in-flight
+		 * count `rule-join-physical-selection` prices a batched index-nested-loop
+		 * at (`min(outerBatchConcurrency, maxOuterReadAhead)`). Default 16.
 		 */
 		readonly outerBatchConcurrency: number;
 		/**
@@ -149,9 +151,11 @@ export interface OptimizerTuning {
 		 */
 		readonly maxOuterReadAhead: number;
 		/**
-		 * Minimum slowest-branch `expectedLatencyMs` for `rule-fanout-batched-outer`
-		 * to flip an already-formed `FanOutLookupJoinNode` from `serial` to
-		 * `batched` outer mode. Like `gatherThresholdMs` / `prefetchProbeThresholdMs`,
+		 * Minimum slowest-branch `expectedLatencyMs` for `toBatchedOuter` (the
+		 * `rule-fanout-batched-outer` flip, also applied by
+		 * `rule-join-physical-selection` to a proved-at-most-one index-nested-loop
+		 * candidate) to flip a `FanOutLookupJoinNode` from `serial` to `batched`
+		 * outer mode. Like `gatherThresholdMs` / `prefetchProbeThresholdMs`,
 		 * any positive value keeps the rule inert on memory-vtab plans (their leaves
 		 * declare `expectedLatencyMs = 0`), so the golden-plan sweep is unaffected.
 		 * Default 25 ms — matches the synthetic high-latency vtab fixture the other
@@ -159,8 +163,8 @@ export interface OptimizerTuning {
 		 */
 		readonly batchedOuterThresholdMs: number;
 		/**
-		 * Minimum estimated outer-row count for `rule-fanout-batched-outer` to flip
-		 * to `batched`. Cross-row pipelining only amortizes the reorder-buffer +
+		 * Minimum estimated outer-row count for `toBatchedOuter` (same two callers
+		 * as above) to flip to `batched`. Cross-row pipelining only amortizes the reorder-buffer +
 		 * per-row-fork overhead when outer rows clearly exceed the read-ahead window;
 		 * below this the serial per-row overlap is already an upper bound on
 		 * wall-clock. An unknown estimate (`undefined`) is treated as *failing* the

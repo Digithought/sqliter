@@ -173,6 +173,30 @@ export function indexNestedLoopJoinCost(
 }
 
 /**
+ * Index-nested-loop with the per-outer-row seeks pipelined (a one-branch
+ * `FanOutLookupJoinNode` in `batched` outer mode): the engine-side per-row work
+ * is unchanged — the engine is single-threaded — and only the storage latency is
+ * amortized across the `inFlight` seeks the batched driver keeps open at once.
+ * `rowsPerSeek` and `perSeekLatencyMs` mean what they do for
+ * {@link indexNestedLoopJoinCost}; at `inFlight <= 1` the two formulas agree.
+ *
+ * The caller derives `inFlight` as `min(outerBatchConcurrency,
+ * maxOuterReadAhead)` for one branch — see the coupling comment at
+ * `deriveReadAhead` in `runtime/emit/fanout-lookup-join.ts`, the driver-side
+ * half of the same number.
+ */
+export function batchedIndexNestedLoopJoinCost(
+	outerRows: number, rowsPerSeek: number, perSeekLatencyMs: number, inFlight: number,
+): number {
+	return outerRows * (
+		COST_CONSTANTS.NL_JOIN_PER_OUTER_ROW
+		+ COST_CONSTANTS.INDEX_SEEK_BASE
+		+ rowsPerSeek * COST_CONSTANTS.INDEX_SEEK_PER_ROW
+		+ perSeekLatencyMs / Math.max(1, inFlight)
+	);
+}
+
+/**
  * Calculate cost for merge join
  * Includes optional sort costs for each side
  */
