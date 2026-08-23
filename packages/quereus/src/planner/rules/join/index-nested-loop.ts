@@ -197,6 +197,14 @@ function admitSeekLeaf(leaf: IndexSeekNode): AdmittedLeaf | null {
 		// else's per-outer-row seek (a lateral seek keyed on an enclosing scope);
 		// re-planning it would re-plan their correlation. (The caller's
 		// sibling-reference guard already blocks this rule's OWN output.)
+		//
+		// NOTE: this reads the RECORDED constraint's flag, where rule-key-set-seek's
+		// equivalent gate asks whether the leaf SUBTREE is correlated. The two agree
+		// only because `stampSeekProvenance` is the sole producer of
+		// `pushedConstraints` and records every constraint the seek consumed; a
+		// future rule that mints a correlated seek without recording the correlated
+		// constraint would slip past this gate. Switch to the subtree test if one
+		// ever does.
 		if (c.correlated === true) {
 			log('decline: seek leaf carries a correlated pushed constraint');
 			return null;
@@ -326,6 +334,16 @@ interface DisplacedPlan {
  * asked. Comparing the combined seek against a bare scan instead would let a
  * plan WORSE than the seek already in place win. Same baseline rule as
  * rule-key-set-seek's `probeModuleCosts`.
+ *
+ * NOTE: `estimatedRows` is `makeFullScanFilterInfo`'s `accessPlan.rows || 1000`,
+ * so a module that answered its own seek with `rows: 0` (and did not claim every
+ * filter, which would have folded the access to an EmptyResult instead) or with
+ * no estimate at all reads back here as a 1000-row baseline the module never
+ * stated — the seek arm would then admit a candidate the cost gate should have
+ * declined. Both shipped modules always return a positive estimate for a seek,
+ * so this is unreachable today; if a third-party module reports 0 or omits
+ * `rows`, carry the module's own answer on the leaf instead of re-deriving it
+ * from the FilterInfo.
  */
 function displacedPlan(
 	leaf: SeekableAccessLeafNode,
@@ -447,10 +465,11 @@ function probeModule(
  * exactly one of: re-promised, reattached, or re-applied here. Join-key
  * leftovers need nothing: the ON condition retained above the join covers them.
  *
- * Folded into the Filter `selectPhysicalNode` may already have wrapped the seek
- * in (a collation residual, a reattach), so the seek carries one residual
- * Filter rather than a stack. `combineResidualExpressions` de-duplicates by
- * identity, so a declined BETWEEN comes back as its single `BetweenNode`.
+ * Folded into every Filter `selectPhysicalNode` may already have wrapped the
+ * seek in — it can stack two (a `COARSER_SAFE` collation residual, then a
+ * reattach above it) — so the seek carries one residual Filter rather than a
+ * stack. `combineResidualExpressions` de-duplicates by identity, so a declined
+ * BETWEEN comes back as its single `BetweenNode`.
  */
 function reapplyDeclinedPushed(
 	rebuilt: RelationalPlanNode,
@@ -461,8 +480,14 @@ function reapplyDeclinedPushed(
 	const declined = combined.filter((_c, i) => i >= joinKeyCount && seekPlan.handledFilters[i] !== true);
 	if (declined.length === 0) return rebuilt;
 
-	const below = rebuilt instanceof FilterNode ? rebuilt.source : rebuilt;
-	const existing = rebuilt instanceof FilterNode ? [rebuilt.predicate] : [];
+	// Peel the whole Filter stack, outermost predicate first, so the result is one
+	// Filter — the same peel `rebuiltSeek` uses to find the seek underneath.
+	let below: RelationalPlanNode = rebuilt;
+	const existing: ScalarPlanNode[] = [];
+	while (below instanceof FilterNode) {
+		existing.push(below.predicate);
+		below = below.source;
+	}
 	// Non-empty input ⇒ defined result.
 	const predicate = combineResidualExpressions([...existing, ...declined.map(c => c.sourceExpression)])!;
 	log('re-applying %d module-declined pushed constraint(s) above the seek', declined.length);

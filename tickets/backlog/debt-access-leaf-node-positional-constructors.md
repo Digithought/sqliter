@@ -3,6 +3,7 @@ description: Adding a field to the engine's table-access plan nodes means hand-e
 files:
   - packages/quereus/src/planner/nodes/table-access-nodes.ts
   - packages/quereus/src/planner/rules/access/rule-monotonic-range-access.ts
+  - packages/quereus/test/optimizer/index-nested-loop.spec.ts
 difficulty: medium
 tradeoffs: Nothing is broken today, and the fix is a constructor-shape change across three node classes and eight clone sites - churn landing entirely on code that currently works.
 ---
@@ -69,3 +70,17 @@ signal that it landed correctly.
 Only the physical access leaves in `table-access-nodes.ts` are in scope. Other plan nodes
 in `planner/nodes/` have their own constructor shapes; whether the same treatment helps
 them is a separate question and should not be bundled here.
+
+## Additional instance: test code now re-lists the argument list too
+
+Found during the review of `feat-index-nested-loop-over-pushed-constraints`. The
+seek-arm gate test *"declines a seek carrying a pushed limit"* in
+`packages/quereus/test/optimizer/index-nested-loop.spec.ts` builds its fixture by
+re-typing all 13 `IndexSeekNode` constructor arguments in order, purely to change one
+field (`filterInfo.limit`). It is a ninth hand-maintained argument list, and it lives in
+a test — so if a future field is added and this list is not updated, the fixture silently
+stops representing the node it is supposed to be a copy of, and the gate it pins can pass
+for the wrong reason.
+
+Whatever `withOverrides`-style shape this ticket lands should be usable from tests, and
+this call site converted along with the eight production ones.

@@ -298,3 +298,8 @@ SELECT s.id, c.id AS cid FROM inl_ps s JOIN inl_cb c ON c.v = s.k WHERE c.status
 -- key: the plan is left alone and the rows are still right
 SELECT s.id, b.id AS bid FROM inl_ps s JOIN inl_pb b ON b.v = s.k WHERE b.id = 8 ORDER BY s.id;
 → [{"id":2,"bid":8}]
+
+-- The predicate's column is not selected by the derived table: the re-applied Filter
+-- goes below the peeled Project, where `status` is still in scope
+SELECT s.id FROM inl_ps s JOIN (SELECT id, v FROM inl_pb WHERE status = 'x') t ON t.v = s.k ORDER BY s.id;
+→ [{"id":2},{"id":3}]

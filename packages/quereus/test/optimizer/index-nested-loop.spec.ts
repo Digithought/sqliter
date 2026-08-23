@@ -24,6 +24,7 @@ import { MergeJoinNode } from '../../src/planner/nodes/merge-join-node.js';
 import { IndexSeekNode, TableAccessNode } from '../../src/planner/nodes/table-access-nodes.js';
 import { CacheNode } from '../../src/planner/nodes/cache-node.js';
 import { FilterNode } from '../../src/planner/nodes/filter.js';
+import { ProjectNode } from '../../src/planner/nodes/project-node.js';
 import { ColumnReferenceNode } from '../../src/planner/nodes/reference.js';
 import { BetweenNode } from '../../src/planner/nodes/scalar.js';
 import type { RelationalPlanNode } from '../../src/planner/nodes/plan-node.js';
@@ -55,6 +56,7 @@ const isIndexSeek = (n: PlanNode): n is IndexSeekNode => n instanceof IndexSeekN
 const isTableAccess = (n: PlanNode): n is TableAccessNode => n instanceof TableAccessNode;
 const isCache = (n: PlanNode): n is CacheNode => n instanceof CacheNode;
 const isFilter = (n: PlanNode): n is FilterNode => n instanceof FilterNode;
+const isProject = (n: PlanNode): n is ProjectNode => n instanceof ProjectNode;
 const isColumnRef = (n: PlanNode): n is ColumnReferenceNode => n instanceof ColumnReferenceNode;
 
 /** Does this seek key expression reference any of the given attribute ids? */
@@ -667,6 +669,21 @@ describe('index-nested-loop join plan shape', () => {
 			expect(seek.indexName).to.equal('idx_pb_v');
 			expect(referencedColumns(residual!.predicate)).to.deep.equal(['status']);
 			expect(await drain(db, sql)).to.deep.equal([{ id: 2, bid: 8 }, { id: 3, bid: 12 }]);
+		});
+
+		it('re-applies below a peeled Project that drops the predicate\'s column', async () => {
+			// The trivial Project inside the derived table does not select `status`,
+			// so a Filter placed ABOVE it could not reference the column at all. The
+			// re-applied Filter goes directly above the seek, INSIDE the peeled
+			// wrapper chain, which is what keeps the predicate expressible.
+			const sql = "select s.id from ps s join (select id, v from pb where status = 'x') t on t.v = s.k";
+			const plan = db.getPlan(sql);
+			const { seek, residual } = seekAndResidual(plan);
+			expect(seek.indexName).to.equal('idx_pb_v');
+			expect(referencedColumns(residual!.predicate)).to.deep.equal(['status']);
+			expect(collectNodes(plan, isProject).some(p => p.source === residual),
+				'the Project sits above the re-applied Filter, not below it').to.equal(true);
+			expect(await drain(db, sql)).to.deep.equal([{ id: 2 }, { id: 3 }]);
 		});
 
 		it('lets the module take BOTH when a composite index covers them (no residual)', async () => {
