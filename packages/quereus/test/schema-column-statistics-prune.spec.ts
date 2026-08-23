@@ -121,4 +121,44 @@ describe('column statistics never outlive their columns', () => {
 			assert.deepEqual([...schema.getTable('m')!.statistics!.columnStats.keys()], ['mixed']);
 		});
 	});
+
+	describe('RENAME COLUMN carries its measurements onto the new name', () => {
+		// The engine sources these from the PRE-ALTER catalog schema rather than from the
+		// module's ALTER return value, which is what makes one implementation serve both
+		// backends. Asserted here on the DEFAULT (memory) backend specifically: the memory
+		// module returns its manager's own cached schema, which ANALYZE never stamped, so
+		// before the fix a rename dropped the measurements entirely on this backend. The
+		// store-backed half lives in `alter-column-statistics-prune.spec.ts`.
+		beforeEach(async () => {
+			for (let i = 0; i < 20; i++) await db.exec(`insert into t values (${i}, ${i % 4}, ${i})`);
+			await db.exec('analyze t');
+		});
+
+		const stats = (column: string) =>
+			db.schemaManager.findTable('t', 'main')?.statistics?.columnStats.get(column);
+
+		it('moves the entry from the old name to the new one', async () => {
+			const before = stats('k');
+			assert.equal(before?.distinctCount, 4);
+
+			await db.exec('alter table t rename column k to k2');
+
+			assert.deepEqual(stats('k2'), before);
+			assert.equal(stats('k'), undefined, 'nothing is left under the freed name');
+			assert.equal(stats('v')?.distinctCount, 20, 'an untouched column is unaffected');
+		});
+
+		it('leaves a column added under the freed name unmeasured', async () => {
+			await db.exec('alter table t rename column k to k2');
+			await db.exec('alter table t add column k integer null');
+
+			assert.equal(stats('k'), undefined);
+		});
+
+		it('is a no-op for a case-only rename, which moves the key onto itself', async () => {
+			const before = stats('k');
+			await db.exec('alter table t rename column k to "K"');
+			assert.deepEqual(stats('k'), before);
+		});
+	});
 });

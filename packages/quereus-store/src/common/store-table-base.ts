@@ -111,6 +111,10 @@ export interface StoreTableModule {
  *
  * Keys are lowercased to match `TableStats.columnStats`, which uses the same lowercase
  * keying as `TableStatistics.columnStats` and `TableSchema.columnIndexMap`.
+ *
+ * Every arm is listed rather than defaulted, so a new `SchemaChangeInfo` form fails to
+ * compile here until someone answers "does this free a column name?" — the whole point of
+ * putting the decision in one place instead of in each arm.
  */
 function columnStatisticsRemap(change: SchemaChangeInfo): { from: string; to?: string } | undefined {
 	switch (change.type) {
@@ -118,8 +122,21 @@ function columnStatisticsRemap(change: SchemaChangeInfo): { from: string; to?: s
 			return { from: change.oldName.toLowerCase(), to: change.newName.toLowerCase() };
 		case 'dropColumn':
 			return { from: change.columnName.toLowerCase() };
-		default:
+		// Frees no column name. `alterColumn` keeps the name (its own staleness — a value
+		// range describing pre-cast values — is a different concern; see the backlog ticket
+		// bug-column-type-change-keeps-old-value-range); the rest do not touch columns.
+		case 'addColumn':
+		case 'alterColumn':
+		case 'alterPrimaryKey':
+		case 'addConstraint':
+		case 'dropConstraint':
+		case 'renameConstraint':
 			return undefined;
+		default: {
+			const _exhaustive: never = change;
+			void _exhaustive;
+			return undefined;
+		}
 	}
 }
 
@@ -704,6 +721,13 @@ export abstract class StoreTableBase extends VirtualTable {
 		if (remap.to !== undefined) columnStats[remap.to] = moved;
 
 		// Immediate, not deferred: the next reopen must not read the freed name back.
+		//
+		// NOTE: accepted tradeoff — like {@link saveStatistics}, this write does not ride the
+		// transaction coordinator, so a rename inside an explicit transaction that later rolls
+		// back leaves the re-keyed record on disk. Same reasoning: statistics are advisory and
+		// the next `ANALYZE` reconciles. Revisit together with `saveStatistics` if statistics
+		// ever gain a non-advisory consumer — the two must move at once, since the record they
+		// write is the same one.
 		await this.flushStats();
 	}
 

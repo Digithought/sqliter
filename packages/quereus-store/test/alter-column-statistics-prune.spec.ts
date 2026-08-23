@@ -182,5 +182,54 @@ describe('column-level ALTER never leaves stale column statistics (store-backed)
 			expect(reopened!.minValue, 'min survives').to.equal(measured!.minValue);
 			expect(reopened!.maxValue, 'max survives').to.equal(measured!.maxValue);
 		});
+
+		it('a new column reusing a DROPPED name inherits nothing across a reopen', async () => {
+			// The drop arm frees the name the same way the rename does, but with nowhere to
+			// move the entry to — so the record must lose it outright, or the reused name
+			// picks it back up on reopen exactly as in the rename case.
+			await seed(db, 'sp_drop_reuse');
+			expect(columnStatistics(db, 'sp_drop_reuse', 'k')?.distinctCount).to.equal(7);
+
+			await db.exec('alter table sp_drop_reuse drop column k');
+			await db.exec('alter table sp_drop_reuse add column k integer null');
+			expect(columnStatistics(db, 'sp_drop_reuse', 'k'), 'the new k inherits nothing')
+				.to.be.undefined;
+
+			await mod.whenCatalogPersisted();
+			await db.close();
+
+			const { db: db2, mod: mod2 } = open();
+			expect((await mod2.rehydrateCatalog(db2)).errors).to.have.lengthOf(0);
+			await db2.exec('select count(*) from sp_drop_reuse');
+
+			expectNoStaleStatistics(db2, 'sp_drop_reuse', 'after reopen');
+			expect(columnStatistics(db2, 'sp_drop_reuse', 'k'), 'and still nothing after reopen')
+				.to.be.undefined;
+			expect(columnStatistics(db2, 'sp_drop_reuse', 'v')?.distinctCount,
+				'an untouched column keeps its own numbers').to.equal(50);
+		});
+
+		it('a case-only rename keeps the measurements, across a reopen', async () => {
+			// Both maps fold keys to lowercase, so `k` -> `K` moves the entry onto itself.
+			// The engine short-circuits it and the store re-keys `k` -> `k`; the entry must
+			// survive both rather than being deleted by a move to its own key.
+			await seed(db, 'sp_case');
+			const measured = columnStatistics(db, 'sp_case', 'k');
+
+			await db.exec('alter table sp_case rename column k to "K"');
+			expect(columnStatistics(db, 'sp_case', 'k'), 'the entry is unmoved, not lost')
+				.to.deep.equal(measured);
+
+			await mod.whenCatalogPersisted();
+			await db.close();
+
+			const { db: db2, mod: mod2 } = open();
+			expect((await mod2.rehydrateCatalog(db2)).errors).to.have.lengthOf(0);
+			await db2.exec('select count(*) from sp_case');
+
+			expectNoStaleStatistics(db2, 'sp_case', 'after reopen');
+			expect(columnStatistics(db2, 'sp_case', 'k')?.distinctCount, 'distinct count survives')
+				.to.equal(measured!.distinctCount);
+		});
 	});
 });

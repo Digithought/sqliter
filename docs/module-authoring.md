@@ -200,9 +200,10 @@ is already in scope. `tableInfo.statistics` is a `TableStatistics` — `rowCount
 optional equi-height `histogram`. It is `undefined` until statistics exist for the table —
 either because someone ran `ANALYZE` this session, or because a module that persists them
 ([Persisting statistics across a reopen](#persisting-statistics-across-a-reopen)) stamped a
-saved snapshot back onto the schema at open. A column added or renamed since those statistics
-were collected simply has no entry. Nothing else on the request carries these numbers; there
-is no separate hook to implement.
+saved snapshot back onto the schema at open. A column ADDED since those statistics were
+collected simply has no entry; a RENAMED one keeps its entry, re-keyed onto the new name by
+the engine (see [Optimizer costing § Statistics across DDL](optimizer-costing.md)). Nothing
+else on the request carries these numbers; there is no separate hook to implement.
 
 Two rules make a module's estimate usable rather than merely present:
 
@@ -215,8 +216,8 @@ Two rules make a module's estimate usable rather than merely present:
   `combineConjunctive(factors)`, rather than restating either formula.
 - **Fall back wholesale, not partially.** If any column your plan pins has no statistics,
   size the whole access from your shape constant instead of mixing a measured factor with a
-  guess. Look statistics up as index → the column's *current* name → `columnStats`: a
-  renamed column then misses cleanly, and a dropped column cannot borrow a neighbour's
+  guess. Look statistics up as index → the column's *current* name → `columnStats`: an
+  added column then misses cleanly, and a dropped column cannot borrow a neighbour's
   numbers. Treat `rowCount === 0` as no statistics at all: a snapshot taken while the table
   was empty (an `ANALYZE` that ran before the data load) has a `distinctCount` of 0 for
   every column, which `1 / max(distinctCount, 1)` reads as "matches every row" — the
@@ -1044,6 +1045,7 @@ class MyTable extends VirtualTable {
 
 - **It is advisory.** A rejection is logged and swallowed — `ANALYZE` succeeding with statistics in memory but not on disk is strictly better than `ANALYZE` failing. Do not throw to signal "I could not store these"; just return.
 - **Persisting less than you were given is fine.** `ColumnStatistics.histogram` can run to a few KB per column, so a module may drop what it cannot use and keep the scalar fields. The store module persists `distinctCount` / `nullCount` / `minValue` / `maxValue` for every column but keeps histograms only for columns it can actually seek on (a primary-key member or an index's leading column) — a dropped histogram costs a re-`ANALYZE` to recover and nothing else. Whatever you keep, keep it **keyed by column name**: a positional key silently matches a *different* column after a rename or drop.
+- **Re-key your record when an ALTER frees a column name.** A name key is safer than a positional one but is not self-correcting: `rename column k to k2` — or `drop column k` — leaves your record naming `k`, and a later `add column k` reuses that name, so on reopen the stale entry describes a brand-new column. The engine cannot catch this for you (by then `k` names a column that genuinely exists), and it drops nothing of its own — a rename's entry is re-keyed in the in-memory catalog, not on your disk. So in your `alterTable`, move a renamed column's entry onto its new name and remove a dropped column's outright, then flush. The store module does exactly this from one dispatch-level call (`StoreTableBase.remapPersistedColumnStatistics`) rather than per ALTER arm, so a newly added arm has to face the question instead of skipping it silently.
 - **Do not then report the saved snapshot from `getStatistics()`.** `ANALYZE` reads a non-empty `columnStats` as *"this module answered cheaply, skip the scan"*, so a module that echoes its own stored snapshot turns every `ANALYZE` into a no-op that re-saves numbers it never recomputed. A cached snapshot is not an answer to "analyze me". Get the loaded snapshot to the planner by stamping it onto the registered `TableSchema` at open instead (the store module does this from `primeStats`).
 
 Statistics you persist are also **per-connection on the way back in**: a second connection over the same storage keeps whatever its own schema holds until it reopens or re-analyzes. That is the same visibility model a persisted row count already has.

@@ -49,12 +49,23 @@ export class Schema {
 	}
 
 	/**
-	 * Adds or replaces a table definition in the schema
+	 * Adds or replaces a table definition in the schema.
+	 *
+	 * Registration is not always the identity: statistics naming a column `table` does not
+	 * have are pruned on the way in (see {@link pruneStaleColumnStatistics}), so what lands
+	 * in the catalog can differ from what was handed over. A caller that only registers can
+	 * ignore that; **a caller that goes on to hand the schema to anything else — a
+	 * `table_modified` notification, a persist, a module's cached copy — must pass the
+	 * RETURN value on**, or it propagates the very schema the catalog just corrected. That
+	 * is not hypothetical: DROP COLUMN notifying with its own copy is how a dropped
+	 * column's measurements reached the store's cached schema and were rebuilt into the
+	 * next ADD COLUMN's result.
 	 *
 	 * @param table The table schema object
+	 * @returns The schema actually registered — `table` itself unless it needed correcting
 	 * @throws QuereusError if a view with the same name exists
 	 */
-	addTable(table: TableSchema): void {
+	addTable(table: TableSchema): TableSchema {
 		// Ensure no view conflict (maintained tables — materialized views — live
 		// in this same map, so table-name uniqueness covers them too).
 		if (this.views.has(table.name.toLowerCase())) {
@@ -64,7 +75,9 @@ export class Schema {
 		// {@link pruneStaleColumnStatistics}. Enforced here because this is the one seam
 		// every registration passes through (CREATE TABLE, each module's ALTER result,
 		// ANALYZE's own write, the store's reopen-time stamp).
-		this.tables.set(table.name.toLowerCase(), pruneStaleColumnStatistics(table));
+		const registered = pruneStaleColumnStatistics(table);
+		this.tables.set(table.name.toLowerCase(), registered);
+		return registered;
 	}
 
 	/**

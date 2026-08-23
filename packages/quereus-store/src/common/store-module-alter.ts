@@ -114,6 +114,16 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 			}
 		}
 
+		// Keep the persisted ANALYZE snapshot's column keys in step with the column set. The
+		// engine prunes statistics naming a column the schema no longer has, but it cannot
+		// see a name that was FREED and then reused — the stale entry then names a column
+		// that genuinely exists. Correcting the record at the moment the name is freed is
+		// what makes the fix survive a reopen. Owns the per-form decision itself, so a new
+		// ALTER form has to be considered there rather than skipping this silently.
+		// Ahead of the reconcile below, whose failure window would otherwise leave a freed
+		// name in the record on an IO error the arm itself survived.
+		await table.remapPersistedColumnStatistics(change);
+
 		// Move the physical `_uc_*` index stores to match the post-ALTER constraint set:
 		// the SCHEMA entries were re-materialized by the arm's `table.updateSchema`, but a
 		// newly-added constraint's store must be BUILT and a dropped/renamed one's TORN
@@ -131,14 +141,6 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 		// reconcile that may have half-completed. Not attempted; a re-run of the statement or a
 		// reopen rebuilds the store (`reconcileImplicitUniqueIndexStores` already tolerates a
 		// partial `_uc_*` build for the same reason).
-		// Keep the persisted ANALYZE snapshot's column keys in step with the column set. The
-		// engine prunes statistics naming a column the schema no longer has, but it cannot
-		// see a name that was FREED and then reused — the stale entry then names a column
-		// that genuinely exists. Correcting the record at the moment the name is freed is
-		// what makes the fix survive a reopen. Owns the per-form decision itself, so a new
-		// ALTER form has to be considered there rather than skipping this silently.
-		await table.remapPersistedColumnStatistics(change);
-
 		await this.reconcileImplicitUniqueIndexStores(db, schemaName, tableName, table, oldSchema);
 
 		// ONE event per statement, decided here — the single gate for every arm: emit iff

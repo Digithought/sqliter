@@ -4,18 +4,18 @@ files:
   - packages/quereus/src/vtab/memory/layer/manager.ts        # 3,589 lines
   - packages/quereus/src/runtime/emit/materialized-view-helpers.ts   # 3,404 lines (`wc -l`, 2026-08-17; 3,107 earlier) — +~300 from the backing-module schema-normalization hook
   - packages/quereus/src/schema/schema-differ.ts             # 3,013 lines (`wc -l`, 2026-08-07; 2,725 when this ticket was filed) (spec: 1,186)
-  - packages/quereus/src/runtime/emit/alter-table.ts         # 2,419 lines
+  - packages/quereus/src/runtime/emit/alter-table.ts         # 2,650 lines (`wc -l`, 2026-08-23; 2,419 when this ticket was filed) — +231 since, most recently the ANALYZE-measurement carry across RENAME COLUMN
   - packages/quereus-isolation/src/isolated-table.ts         # 2,077 lines
   - packages/quereus-isolation/src/isolation-module.ts       # 1,825 lines
   - scripts/check-docs.mjs                                   # 1,325 lines
   - packages/quoomb-cli/src/commands/dot-commands.ts         # 1,189 lines
   - packages/quereus-store/src/common/store-module-access-plan.ts # 1,568 lines (`wc -l`, 2026-08-21; peaked at 1,591 the same day, 1,340 before that, 1,200 before the secondary-index ordering ticket) — noticed during that review; itself the product of an earlier split of the store module file, and now past the seam again
-  - packages/quereus-store/src/common/store-table-base.ts    # 1,120 lines (`wc -l`, 2026-08-11; 1,033 when this ticket was filed)
+  - packages/quereus-store/src/common/store-table-base.ts    # 1,327 lines (`wc -l`, 2026-08-23; 1,120 on 2026-08-11, 1,033 when this ticket was filed) — the statistics block named as its seam below has kept growing (persisted column statistics, then the ALTER re-key)
   - packages/quereus-store/src/common/store-table-scan.ts    # 1,401 lines (`wc -l`, 2026-08-11; 1,023 when this ticket was filed) — prefix-range seek window builders added ~230, batched row resolution another ~150
   - packages/quereus/src/vtab/memory/module.ts               # 1,284 lines (`wc -l`, 2026-08-21; 1,230 before the DESC-ordering NULL-placement ticket, 1,107 before the seek row-estimate ticket) — noticed during the index-seek row-estimate review; module lifecycle/DDL and access-path costing are two separable concerns in one file
   - packages/quereus/src/planner/analysis/constraint-extractor.ts   # 1,647 lines (`wc -l`, 2026-08-11) — noticed during the relation-key review; predicate normalization, covered-key derivation, `analyzeRowSpecific`, and `TableInfo` construction are four separable concerns in one file
   - packages/quereus/src/planner/building/select-aggregates.ts # 1,630 lines (`wc -l`, 2026-08-12, after the post-aggregate redirect choke point + finished-plan boundary check; 1,486 earlier the same day after the select-list group-key redirect; 1,451 on 2026-08-11, 1,400 before the ungrouped-aggregate ORDER BY alias change, 1,296 before the grouping-key-alias change) — noticed during the window/group-key-alias review; GROUP BY key indexing and redirection, the aggregate output scope, HAVING construction, and the final grouped projection are four separable concerns in one file, and the redirect half now has five callers routed through one entry point (select list, window phase, ORDER BY, HAVING, pre-window sort) plus a plan-walking coverage checker
-  - packages/quereus/src/schema/table.ts                     # 1,751 lines (`wc -l`, 2026-08-16) — noticed during the PK-conflict DDL review; the `TableSchema`/`ColumnSchema` type surface, the AST→schema builders (`columnDefToSchema` and friends), the key resolvers (`findPKDefinition`, `resolvePkDefaultConflict`, `isSynthesizedAllColumnsKey`), and the structural mutators (`rekeySchemaPrimaryKey`, `shiftSchemaIndicesForDrop`) are four separable concerns in one file
+  - packages/quereus/src/schema/table.ts                     # 1,769 lines (`wc -l`, 2026-08-23; 1,751 on 2026-08-16) — noticed during the PK-conflict DDL review; the `TableSchema`/`ColumnSchema` type surface, the AST→schema builders (`columnDefToSchema` and friends), the key resolvers (`findPKDefinition`, `resolvePkDefaultConflict`, `isSynthesizedAllColumnsKey`), and the structural mutators (`rekeySchemaPrimaryKey`, `shiftSchemaIndicesForDrop`) are four separable concerns in one file
   - packages/quereus/src/planner/mutation/multi-source.ts    # 3,541 lines (`wc -l`, 2026-08-17) — second-largest non-test source file in the repo and never listed here
   - packages/quereus/src/planner/mutation/decomposition.ts   # 2,262 lines (`wc -l`, 2026-08-17) — the sibling half of the same folder
   - packages/quereus/src/planner/mutation/set-op.ts          # 2,058 lines (`wc -l`, 2026-08-17)
@@ -233,7 +233,9 @@ These two have a **documented** threshold, not an invented one. `docs/store.md` 
 
 Both have passed it. Full chain measured with `wc -l` from `packages/quereus-store`
 (2026-08-11): 1,401 `store-table-scan.ts`, 1,120 `store-table-base.ts`,
-711 `store-table-constraints.ts`, 722 `store-table.ts`. The doc already names the seam for
+711 `store-table-constraints.ts`, 722 `store-table.ts`. Re-measured 2026-08-23:
+`store-table-base.ts` is 1,327 — the base has now moved as much as the scan layer did,
+and the growth is entirely in the statistics block already named as its seam. The doc already names the seam for
 each file, so this is mechanical.
 
 The scan layer is the one still moving, and it is now the largest file in the package —

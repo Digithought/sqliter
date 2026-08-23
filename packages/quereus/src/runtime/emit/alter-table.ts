@@ -523,12 +523,14 @@ async function runRenameColumn(
  * old min/max and histogram would describe values the column no longer holds — dropping
  * them there is correct. ADD / DROP COLUMN need nothing: the prune already makes them right.
  *
- * NOTE: in-memory only. The store's persisted `__stats__` record still names the OLD
- * column, so after close + reopen the re-keyed entry is pruned on the way back in and the
- * renamed column plans without measurements until the next `ANALYZE`. Deliberate — the
- * mis-attribution (the dangerous half) is gone durably, and re-keying the record would add
- * a second, backend-specific write path for an advisory number. Revisit if a renamed
- * column planning blind across a reopen ever shows up as a real plan regression.
+ * NOTE: this repairs the in-memory catalog only — it is half the fix. A module that
+ * PERSISTS its snapshot keyed by column name must re-key its own record when a rename
+ * frees a name, or the freed name comes back on reopen and a later `ADD COLUMN` reusing
+ * it inherits the entry (the store does this in
+ * `StoreTableBase.remapPersistedColumnStatistics`). Nothing here can do it for them: the
+ * engine holds no durable statistics of its own. Revisit if a second persisting module
+ * appears and the obligation needs a hook rather than a documented rule
+ * (`docs/module-authoring.md` § Persisting statistics across a reopen).
  */
 function carryStatisticsAcrossColumnRename(
 	previous: TableSchema,
@@ -1313,15 +1315,19 @@ async function runDropColumn(
 	// entry (the catalog is only updated below).
 	const finalSchema = withGeneratedColumnGraph(updatedTableSchema, buildColumnSourceResolver(rctx.db));
 
-	// Update the schema catalog
-	schema.addTable(finalSchema);
+	// Update the schema catalog. The REGISTERED schema is what the notify carries: the drop
+	// frees a column name, so `addTable` prunes that column's statistics entry — and a
+	// listener handed the unpruned copy caches it (the store module does exactly that), from
+	// which the next ADD COLUMN reusing the freed name builds its result and inherits the
+	// dropped column's numbers.
+	const registeredSchema = schema.addTable(finalSchema);
 
 	rctx.db.schemaManager.getChangeNotifier().notifyChange({
 		type: 'table_modified',
 		schemaName: tableSchema.schemaName,
 		objectName: tableSchema.name,
 		oldObject: tableSchema,
-		newObject: finalSchema,
+		newObject: registeredSchema,
 	});
 
 	// `drop`, not `alter` — the arm removes an object. Matches what an emitter-backed module
