@@ -69,6 +69,29 @@ function registerCountingSum(db: Database): void {
 	));
 }
 
+/** A deterministic `bump/1` adding `delta`. Registering it twice with different deltas is
+ *  the scalar takeover: same name, same arity, different meaning — and, unlike the
+ *  aggregate one above, an unchanged declared result type, so a body over it re-derives a
+ *  shape-identical backing. */
+function registerBump(db: Database, delta: number): void {
+	db.registerFunction(createScalarFunction(
+		{ name: 'bump', numArgs: 1, deterministic: true },
+		(v: SqlValue): SqlValue => Number(v) + delta,
+	));
+}
+
+/** Base table + projecting MV over `bump/1`: rows 10, 20 ⇒ 11, 21 under `+1`. */
+const SCALAR_DDL = [
+	'create table s (id integer primary key, v integer not null)',
+	'insert into s (id, v) values (1, 10), (2, 20)',
+	'create materialized view ms as select id, bump(v) as b from s',
+];
+
+async function buildScalarFixture(db: Database): Promise<void> {
+	registerBump(db, 1);
+	for (const sql of SCALAR_DDL) await db.exec(sql);
+}
+
 /** Base table + grouped MV: groups `k=1` (rows 10, 20) and `k=2` (row 30), so the built-in
  *  sum's per-group answer (30 / 30) differs from the counting takeover's (2 / 1). */
 const DDL = [
@@ -179,21 +202,12 @@ describe('MV maintenance: body-function drift', () => {
 	it('a scalar body function replaced before a rename drifts too', async () => {
 		const db = new Database();
 		try {
-			await db.exec('create table s (id integer primary key, v integer not null)');
-			db.registerFunction(createScalarFunction(
-				{ name: 'bump', numArgs: 1, deterministic: true },
-				(v: SqlValue): SqlValue => Number(v) + 1,
-			));
-			await db.exec('insert into s (id, v) values (1, 10), (2, 20)');
-			await db.exec('create materialized view ms as select id, bump(v) as b from s');
+			await buildScalarFixture(db);
 			expect(await rows(db, 'select id, b from ms order by id'))
 				.to.deep.equal([{ id: 1, b: 11 }, { id: 2, b: 21 }]);
 
 			// Same name, same arity, different meaning.
-			db.registerFunction(createScalarFunction(
-				{ name: 'bump', numArgs: 1, deterministic: true },
-				(v: SqlValue): SqlValue => Number(v) + 1000,
-			));
+			registerBump(db, 1000);
 			await db.exec('alter table ms rename to msr');
 			expect(getMv(db, 'msr').derivation.stale).to.equal(true);
 
@@ -205,6 +219,58 @@ describe('MV maintenance: body-function drift', () => {
 			await db.exec('refresh materialized view msr');
 			expect(await rows(db, 'select id, b from msr order by id'))
 				.to.deep.equal([{ id: 1, b: 1010 }, { id: 2, b: 1020 }, { id: 3, b: 1030 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('an in-place recompile after a source schema change honours drift', async () => {
+		const db = new Database();
+		try {
+			await buildScalarFixture(db);
+			registerBump(db, 1000);
+
+			// `add column` on a source is a change the body does not read and that leaves the
+			// MV's derived shape identical, so the schema-change listener normally keeps the
+			// view LIVE by recompiling its plan in place — against the new resolution, over
+			// rows the old one produced. Drift outranks that keep-live. (The aggregate fixture
+			// cannot probe this gate: replacing `sum/1` also shifts the backing's declared
+			// column type, so the recompile declines at the earlier shape gate.)
+			await db.exec('alter table s add column z integer default 0');
+			expect(getMv(db, 'ms').derivation.stale, 'recompiled against a body function that changed meaning')
+				.to.equal(true);
+
+			// Maintenance detached, so the backing stays wholly on the `+1` bump.
+			await db.exec('insert into s (id, v) values (3, 30)');
+			expect(await rows(db, 'select id, b from ms order by id'))
+				.to.deep.equal([{ id: 1, b: 11 }, { id: 2, b: 21 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('REFRESH as the FIRST re-registration after a replacement keeps the view live', async () => {
+		const db = new Database();
+		try {
+			await buildFixture(db);
+			registerCountingSum(db);
+
+			// No rename in between: this REFRESH is the registration that first sees the new
+			// resolution. It re-derived every row from the body against the live registry, so
+			// the differing capture is the fix, not the hazard (`backingRecomputed`). Were it
+			// treated as drift, registration would release the plan it just built and the
+			// `stale = false` immediately after would leave a live-flagged view with NO
+			// maintenance — writes silently no longer propagating.
+			await db.exec('refresh materialized view mv');
+			expect(getMv(db, 'mv').derivation.stale ?? false, 'the rows ARE the new function\'s answers')
+				.to.equal(false);
+			expect(await rows(db, 'select k, s from mv order by k'))
+				.to.deep.equal([{ k: 1, s: 2 }, { k: 2, s: 1 }]);
+
+			// Maintenance is live under the new meaning: k=2 gains a row.
+			await db.exec('insert into t (id, k, x) values (4, 2, 5)');
+			expect(await rows(db, 'select k, s from mv order by k'))
+				.to.deep.equal([{ k: 1, s: 2 }, { k: 2, s: 2 }]);
 		} finally {
 			await db.close();
 		}

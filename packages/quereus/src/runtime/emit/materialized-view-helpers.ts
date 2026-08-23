@@ -2268,8 +2268,18 @@ function expandGeneratedDependencyClosure(cols: Set<number>, deps: ReadonlyMap<n
  *     gating (`buildMaintenancePlan`) against the new catalog and throws on the
  *     create-time gates (non-determinism, bag/no-key floor, full-rebuild
  *     pathology against fresh ANALYZE stats — defensible: the alternative is
- *     unbounded per-write rebuild cost). Registration is event-silent, so the
- *     success path fires no nested schema-change notifications.
+ *     unbounded per-write rebuild cost).
+ *  6. Body-function drift gate, inside that same registration: a body function
+ *     now resolving to a different registration than the one that produced the
+ *     backing's rows makes the recompiled plan disagree with the stored rows, so
+ *     registration marks the MV stale itself (releasing the plan it just built)
+ *     and reports it ⇒ decline. Distinct from every gate above in that the
+ *     staleness has ALREADY been applied when this returns.
+ *
+ * Returns true iff the MV is LIVE afterwards — the caller relies on that to skip
+ * its own stale path. Every decline is idempotent with that path, so re-running it
+ * over an already-stale MV is a no-op re-assertion (gate 6's only cost is a second,
+ * identical backing-invalidation emit on a rare human-driven event).
  *
  * `oldObject`/`newObject` are the genuine event's distinct schemas. The synthetic
  * backing-invalidation event (same object as old/new) is excluded by the caller's
@@ -2348,7 +2358,10 @@ export function tryRecompileMaterializedViewLive(
 			log('Recompiling materialized view %s.%s after a value-semantics ALTER (type/collation) on column(s) the body does not read (%s)',
 				mv.schemaName, mv.name, [...valueChanged].join(', '));
 		}
-		db.registerMaterializedView(backing);
+		// Body-function drift gate: registration already marked the MV stale and released
+		// the plan it had just built, so there is nothing left to keep live. Decline, so
+		// the caller's stale path re-asserts the same state and no log claims a live view.
+		if (db.registerMaterializedView(backing)) return false;
 		log('Recompiled materialized view %s.%s in place after a genuine source change',
 			mv.schemaName, mv.name);
 		return true;

@@ -908,13 +908,17 @@ Reporting a change against a maintained table is out of contract; its contents a
 ### MV-022 — A stale view serves its snapshot and propagates nothing
 
 - code: `packages/quereus/src/core/database-materialized-views.ts` — `markMaterializedViewStale`
+- code: `packages/quereus/src/core/database-materialized-views.ts` — `applyBodyFunctionDrift`
 - code: `packages/quereus/src/runtime/emit/materialized-view-helpers.ts` — `tryRecompileMaterializedViewLive`
 - guard: `packages/quereus/test/mv-structural-alter-restore.spec.ts` — `frozen ALTER releases the plan, emits backing invalidation, and reads stale until REFRESH`
 - doc: [Materialized Views § Schema-change staleness](materialized-views.md#schema-change-staleness)
 
 A source schema change that a body provably cannot observe recompiles the view in place;
 anything else marks it **stale** and detaches its row-time plan, so it serves its last
-snapshot and source writes stop propagating. `stale` is the only read-state flag. Staleness
+snapshot and source writes stop propagating. A re-registration that resolves a body function
+to a different registration than the one that produced the stored rows stales the view too
+([body-function drift](mv-schema-change.md#body-function-drift)). `stale` is the only
+read-state flag. Staleness
 is how MV-001 stays honest under DDL: a view that can no longer be maintained refuses to
 pretend, and its next reference re-validates the body — erroring with a staleness diagnostic
 rather than serving rows against a broken definition. Only `REFRESH`, or drop-and-recreate,

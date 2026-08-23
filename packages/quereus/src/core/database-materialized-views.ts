@@ -164,8 +164,10 @@ export class MaterializedViewManager {
 					// emitBackingInvalidation fires — the backing stays maintained, so cached plans
 					// reading it remain correct (a plan reading the *source* invalidates via its own
 					// direct statement dependency on the source table). Any failure (shape mismatch,
-					// content not provably stable, ineligible re-plan) falls through to the stale
-					// path below, verbatim.
+					// content not provably stable, ineligible re-plan, body-function drift) falls
+					// through to the stale path below, verbatim — which is why that path is written
+					// to be idempotent: drift already applied the stale transition inside
+					// registration, so the fall-through re-asserts rather than initiates it.
 					if (modified !== undefined && !mv.derivation.stale
 						&& tryRecompileMaterializedViewLive(this.ctx as unknown as Database, mv, modified.oldObject, modified.newObject)) continue;
 					if (!mv.derivation.stale) {
@@ -350,6 +352,16 @@ export class MaterializedViewManager {
 				?? this.ctx.schemaManager.findFunction(name, -1),
 		);
 		mv.derivation.bodyFunctions = bodyFunctions;
+		// NOTE: advancing the capture unconditionally means that on the drift path below the
+		// capture describes the freshly resolved functions, NOT the ones that produced the
+		// stored rows — so the read-side identity gate stops independently vouching for those
+		// rows and `stale` becomes their only guard. Sound today: the only two places that
+		// clear `stale` are REFRESH (which re-derives every row first) and the rename-restore
+		// tail (which honours the drift flag). Keeping the prior capture instead would restore
+		// the second gate, at the cost of re-detecting the same drift — and re-emitting its
+		// backing invalidation down every MV-over-MV chain — on every later re-registration.
+		// Revisit if a third `stale = false` site appears, or if the read-side gate is ever
+		// asked to stand alone.
 		this.releaseRowTime(key);
 		const plan = buildMaintenancePlan(this.ctx, mv); // throws on ineligible shape
 		// Compile the declared-CHECK/FK derived-row validator (undefined when the
