@@ -618,23 +618,26 @@ describe('store per-predicate selectivity from column statistics', () => {
 		});
 
 		it('an equality column with no statistics drops the whole arm to its constant', async () => {
-			// `columnStats` is keyed by column NAME, so a column renamed after the last
-			// `ANALYZE` silently has none. The lookup goes index -> current name -> stats, so a
-			// rename MISSES rather than borrowing a neighbour's numbers — and the arm falls
-			// back wholesale rather than mixing a measured factor with a shape constant.
+			// `columnStats` is keyed by column NAME, and a column ADDED after the last
+			// `ANALYZE` has no entry under its name. The lookup goes index -> current name ->
+			// stats, so it MISSES rather than borrowing a neighbour's numbers — and the arm
+			// falls back wholesale rather than mixing a measured factor with a shape constant.
+			// (A RENAMEd column is deliberately not the case to test here: the engine re-keys
+			// its entry onto the new name, so a rename keeps its measurements — see
+			// `alter-column-statistics-prune.spec.ts`.)
 			const f = await seeded();
 			await f.analyze();
-			const eq = [{ columnIndex: 1, op: '=' as const, value: 2, usable: true }];
-			const measured = f.plan(eq, { estimatedRows: N });
-			expect(measured.rows, 'measured while the name still matches').to.equal(20);
+			const measured = f.plan([{ columnIndex: 1, op: '=', value: 2, usable: true }], { estimatedRows: N });
+			expect(measured.rows, 'measured on a column ANALYZE saw').to.equal(20);
 
-			await f.exec('alter table t rename column a to z');
-			expect([...f.table().statistics!.columnStats.keys()], 'the statistics still say "a"')
-				.to.include('a').and.to.not.include('z');
+			await f.exec('alter table t add column d integer null');
+			await f.exec('create index ix_d on t (d)');
+			expect([...f.table().statistics!.columnStats.keys()], 'the added column is unmeasured')
+				.to.include('a').and.to.not.include('d');
 
-			const degraded = f.plan(eq, { estimatedRows: N });
+			const degraded = f.plan([{ columnIndex: 4, op: '=', value: 2, usable: true }], { estimatedRows: N });
 			expect(degraded.indexName, 'the arm is still available — this changes cost only')
-				.to.equal('ix_a');
+				.to.equal('ix_d');
 			expect(degraded.rows, 'back to the 10% shape constant')
 				.to.equal(Math.floor(N * ARM_SELECTIVITY.eq));
 			expect(degraded.cost).to.be.closeTo(eqArmCost(Math.floor(N * ARM_SELECTIVITY.eq)), 1e-9);
@@ -643,11 +646,16 @@ describe('store per-predicate selectivity from column statistics', () => {
 		it('and a composite arm degrades if EITHER equality column lost its statistics', async () => {
 			const f = await seeded();
 			await f.analyze();
-			await f.exec('alter table t rename column c to zc');
+			// `ix_bc` is dropped so the composite arm under test is the only candidate for
+			// these two filters; `b` is measured, `d` (added after the ANALYZE) is not.
+			await f.exec('alter table t add column d integer null');
+			await f.exec('drop index ix_bc');
+			await f.exec('create index ix_bd on t (b, d)');
 			const plan = f.plan([
 				{ columnIndex: 2, op: '=', value: 1, usable: true },
-				{ columnIndex: 3, op: '=', value: 7, usable: true },
+				{ columnIndex: 4, op: '=', value: 7, usable: true },
 			], { estimatedRows: N });
+			expect(plan.indexName).to.equal('ix_bd');
 			expect(plan.rows, 'wholesale, not the measured b factor alone')
 				.to.equal(Math.floor(N * ARM_SELECTIVITY.eq));
 		});

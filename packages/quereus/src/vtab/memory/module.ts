@@ -1239,6 +1239,16 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 			});
 		}
 
+		// NOTE: `manager.tableSchema` is the manager's own cached copy, which ANALYZE's
+		// stamp (which lands on the REGISTERED schema) never touched — so a column-level
+		// ALTER on this backend returns a schema with no `statistics` and the engine
+		// installs that, silently discarding the last ANALYZE. The store backend instead
+		// copies its pre-ALTER statistics across (minus whatever `pruneStaleColumnStatistics`
+		// drops), so the two backends need a re-ANALYZE at different times. Fail-safe rather
+		// than wrong — the planner falls back to its default guesses — and RENAME COLUMN is
+		// already exempt (the engine re-keys the pre-ALTER measurements itself; see
+		// `carryStatisticsAcrossColumnRename`). Revisit if the difference ever shows up as a
+		// plan discrepancy between backends.
 		return manager.tableSchema;
 	}
 

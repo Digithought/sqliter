@@ -259,9 +259,16 @@ export interface TableStats {
   updatedAt: number;  // Unix timestamp
   /**
    * Per-column statistics keyed by LOWERCASE column name — the same key
-   * `TableStatistics.columnStats` uses. Name-keyed by design: a column renamed or
-   * dropped between the `ANALYZE` and the reopen is then simply never looked up (and its
-   * entry is dead weight), where a positional key would silently match a DIFFERENT column.
+   * `TableStatistics.columnStats` uses. Name-keyed by design: a positional key would
+   * silently match a DIFFERENT column after any column-set change.
+   *
+   * A name key is not self-correcting either, though: a name FREED by a rename or a drop
+   * can be taken again by a later `ADD COLUMN`, and the stale entry then matches a
+   * different column just as a positional key would — and, unlike a name that stays free,
+   * the engine's catalog-side prune cannot spot it, because the name it looks up does
+   * exist. `StoreTableBase.remapPersistedColumnStatistics` therefore moves or removes the
+   * entry at the moment the name is freed, so what is on disk names only columns the table
+   * still has.
    */
   columnStats?: Record<string, ColumnStatistics>;
   /**

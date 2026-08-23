@@ -709,6 +709,15 @@ Two routes, answering two different questions.
 
 The substituted count is floored at 1. `rows: 0` is the access-plan protocol's *"this predicate is unsatisfiable"* — `rule-select-access-path` replaces the whole table access with a static empty relation on it — and a table that is empty when the plan is built can still be read after the same statement writes into it. The rule now also requires the plan to have claimed at least one filter before folding, so the floor is belt-and-braces for the no-filter case and the real guard for a filtered one. Consequence: a genuinely empty store table is still costed as though it held one row, not zero.
 
+### Column statistics across a column-level ALTER
+
+The persisted record also carries the per-column snapshot `ANALYZE` collected, keyed by lowercase column NAME (`TableStats.columnStats`). A name key never matches the wrong column by position, but it can still match the wrong column by *reuse*: `RENAME COLUMN k TO k2` followed by `ADD COLUMN k` leaves the record naming `k`, and on reopen those measurements would be stamped onto the brand-new, entirely-empty `k`.
+
+Two corrections, at two different layers:
+
+- The engine drops any statistics entry naming a column the registered schema does not have (`pruneStaleColumnStatistics`; see [Optimizer costing § Statistics across DDL](optimizer-costing.md)). That covers the in-memory catalog, including the reopen-time stamp — but not a reused name, which names a column that genuinely exists.
+- So the store corrects the record itself, at the moment the name is freed: `StoreModuleAlter.alterTable` calls `StoreTableBase.remapPersistedColumnStatistics` after every ALTER arm, which moves a renamed column's entry onto its new name and removes a dropped column's outright, then flushes immediately. A table with no persisted snapshot, or a change that frees no name, performs no extra write.
+
 ## Configuration
 
 ```sql

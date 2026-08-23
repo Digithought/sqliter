@@ -1,4 +1,4 @@
-import type { TableSchema } from './table.js';
+import { pruneStaleColumnStatistics, type TableSchema } from './table.js';
 import type { FunctionSchema } from './function.js';
 import { getFunctionKey } from './function.js';
 import type { ViewSchema } from './view.js';
@@ -60,7 +60,11 @@ export class Schema {
 		if (this.views.has(table.name.toLowerCase())) {
 			throw new QuereusError(`Schema '${this.name}': Cannot add table '${table.name}', a view with the same name already exists.`);
 		}
-		this.tables.set(table.name.toLowerCase(), table);
+		// Statistics must never outlive the columns they describe — see
+		// {@link pruneStaleColumnStatistics}. Enforced here because this is the one seam
+		// every registration passes through (CREATE TABLE, each module's ALTER result,
+		// ANALYZE's own write, the store's reopen-time stamp).
+		this.tables.set(table.name.toLowerCase(), pruneStaleColumnStatistics(table));
 	}
 
 	/**

@@ -22,6 +22,7 @@ import {
 	type Row,
 	type SqlValue,
 	type ColumnStatistics,
+	type SchemaChangeInfo,
 	type TableStatistics,
 	type VirtualTableConnection,
 	type VirtualTableModule,
@@ -99,6 +100,27 @@ export interface StoreTableModule {
 	saveTableDDL(tableSchema: TableSchema): Promise<void>;
 	/** Write table DDL only when the persisted entry is absent or differs. */
 	persistTableCatalogEntryIfChanged(tableSchema: TableSchema): Promise<void>;
+}
+
+/**
+ * Which persisted column-statistics key a column-level ALTER frees, and where (if
+ * anywhere) it should move.
+ *
+ * `to: undefined` means the entry is dropped rather than moved. `undefined` overall means
+ * the change frees no name and the snapshot needs no correction.
+ *
+ * Keys are lowercased to match `TableStats.columnStats`, which uses the same lowercase
+ * keying as `TableStatistics.columnStats` and `TableSchema.columnIndexMap`.
+ */
+function columnStatisticsRemap(change: SchemaChangeInfo): { from: string; to?: string } | undefined {
+	switch (change.type) {
+		case 'renameColumn':
+			return { from: change.oldName.toLowerCase(), to: change.newName.toLowerCase() };
+		case 'dropColumn':
+			return { from: change.columnName.toLowerCase() };
+		default:
+			return undefined;
+	}
 }
 
 /**
@@ -642,6 +664,47 @@ export abstract class StoreTableBase extends VirtualTable {
 		const registered = schema?.getTable(this.tableName);
 		if (!schema || !registered || registered.statistics) return;
 		schema.addTable({ ...registered, statistics });
+	}
+
+	/**
+	 * Keep the persisted `ANALYZE` snapshot's column keys in step with a column-level
+	 * ALTER: move the renamed column's entry onto its new name, and drop a dropped
+	 * column's entry outright.
+	 *
+	 * The record keys column statistics by NAME (see `TableStats.columnStats`), which is
+	 * what stops a snapshot matching a DIFFERENT column by position — but a name freed by
+	 * a rename or a drop can be TAKEN AGAIN by a later `ADD COLUMN`, and then the name key
+	 * matches a different column too. The engine's catalog-side invariant cannot see this:
+	 * once the name is reused the stale entry names a column that genuinely exists, so it
+	 * reads as live. The record itself has to be corrected, at the moment the name is freed.
+	 *
+	 * Called from the ONE dispatch seam in `StoreModuleAlter.alterTable`, after the arm has
+	 * done its work, so a new ALTER form gets this decision made for it rather than
+	 * silently skipping it.
+	 *
+	 * A no-op unless the table has a persisted snapshot AND the change actually frees a
+	 * name, so an ordinary ALTER on a never-analyzed table performs no extra write.
+	 *
+	 * `ALTER COLUMN ... SET DATA TYPE` is deliberately not handled here: it frees no name.
+	 * (Its snapshot going stale in a different way — min/max describing pre-cast values —
+	 * is a separate concern, untouched by this method.)
+	 */
+	async remapPersistedColumnStatistics(change: SchemaChangeInfo): Promise<void> {
+		const remap = columnStatisticsRemap(change);
+		if (!remap) return;
+
+		await this.primeStats();
+		const columnStats = this.cachedStats?.columnStats;
+		if (!columnStats) return;
+
+		const moved = columnStats[remap.from];
+		if (moved === undefined) return;
+
+		delete columnStats[remap.from];
+		if (remap.to !== undefined) columnStats[remap.to] = moved;
+
+		// Immediate, not deferred: the next reopen must not read the freed name back.
+		await this.flushStats();
 	}
 
 	/**

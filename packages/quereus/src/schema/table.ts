@@ -11,7 +11,7 @@ import { quereusError, QuereusError } from '../common/errors.js';
 import { createLogger } from '../common/logger.js';
 import { inferType } from '../types/registry.js';
 import type { LogicalType } from '../types/logical-type.js';
-import type { TableStatistics } from '../planner/stats/catalog-stats.js';
+import type { ColumnStatistics, TableStatistics } from '../planner/stats/catalog-stats.js';
 import { collectGeneratedColumnRefs, type GeneratedColumnRef } from './generated-column-refs.js';
 import type { ResolveColumnInSource } from './rename/shared.js';
 
@@ -326,6 +326,63 @@ export function disambiguateAutoConstraintName(base: string, taken: Set<string>)
 	}
 	taken.add(candidate.toLowerCase());
 	return candidate;
+}
+
+/**
+ * Enforces the catalog invariant that a registered table schema's statistics only
+ * ever describe columns that schema actually has.
+ *
+ * Every column-level ALTER form builds its result schema in the module (six builders
+ * across the memory and store backends, plus the engine's no-module fallback) and the
+ * engine installs that return value verbatim. A builder that copies the pre-ALTER
+ * `statistics` across — as the store's does — carries a `columnStats` map still keyed
+ * by the PRE-ALTER column names. Left alone, a renamed-away or dropped name lingers
+ * in the map and a later `ADD COLUMN` reusing that name silently inherits the old
+ * column's distinct/null counts and min/max, so the planner sizes the new (empty)
+ * column from measurements of a column that no longer exists.
+ *
+ * Checked here rather than in each builder because this is the one seam every
+ * registration passes through, and the check is self-contained — it needs no
+ * comparison against the previous schema, only the schema in hand.
+ *
+ * `rowCount` is deliberately untouched: no column-level ALTER changes the row count.
+ *
+ * Returns the input object itself whenever nothing is stale (no statistics, an empty
+ * map, or every key live), so ordinary `CREATE TABLE` registration stays allocation-free
+ * and only a genuinely wrong input gets a replacement object.
+ *
+ * @param table The table schema about to be registered
+ * @returns `table`, or a copy whose `statistics.columnStats` names only live columns
+ */
+export function pruneStaleColumnStatistics(table: TableSchema): TableSchema {
+	const stats = table.statistics;
+	if (!stats || stats.columnStats.size === 0) return table;
+
+	// Both maps are keyed by lowercased column name (see buildColumnIndexMap and
+	// ANALYZE's collectTableStatistics), so membership is a direct lookup.
+	let stale = false;
+	for (const key of stats.columnStats.keys()) {
+		if (!table.columnIndexMap.has(key)) {
+			stale = true;
+			break;
+		}
+	}
+	if (!stale) return table;
+
+	const kept = new Map<string, ColumnStatistics>();
+	const dropped: string[] = [];
+	for (const [key, colStats] of stats.columnStats) {
+		if (table.columnIndexMap.has(key)) {
+			kept.set(key, colStats);
+		} else {
+			dropped.push(key);
+		}
+	}
+
+	// A silent prune makes a later "where did my statistics go?" unanswerable.
+	log('Pruning stale column statistics from %s.%s: %s', table.schemaName, table.name, dropped.join(', '));
+
+	return { ...table, statistics: { ...stats, columnStats: kept } };
 }
 
 /**

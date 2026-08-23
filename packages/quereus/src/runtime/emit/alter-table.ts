@@ -463,6 +463,11 @@ async function runRenameColumn(
 		updatedTableSchema.columns.map(c => c.name),
 	);
 
+	// Move the renamed column's ANALYZE measurements onto its new name, from the
+	// PRE-ALTER schema rather than from whatever the module returned. Must precede
+	// `addTable`, whose prune would otherwise drop the entry being moved.
+	updatedTableSchema = carryStatisticsAcrossColumnRename(tableSchema, updatedTableSchema, oldName, newName);
+
 	// Update the schema catalog
 	schema.addTable(updatedTableSchema);
 
@@ -495,6 +500,55 @@ async function runRenameColumn(
 
 	log('Renamed column %s.%s.%s to %s', tableSchema.schemaName, tableSchema.name, oldName, newName);
 	return null;
+}
+
+/**
+ * Carries a table's ANALYZE measurements across a RENAME COLUMN, re-keying the renamed
+ * column's entry from its old name to its new one and leaving every other entry alone.
+ *
+ * Sourced from the PRE-ALTER catalog schema, not from the module's return value, because
+ * neither backend's return value is usable: the store copies the pre-ALTER map across
+ * still keyed by the OLD column name (which `pruneStaleColumnStatistics` then drops at the
+ * catalog seam), and the memory module returns its manager's own cached schema, which
+ * `ANALYZE` never stamped. Reading the pre-ALTER schema repairs both at once — the store
+ * stops stranding the entry, and the memory backend stops losing it.
+ *
+ * Absent statistics stay absent; a case-only rename keeps the map as-is (the key already
+ * folds to the same string).
+ *
+ * MUST run before `schema.addTable`, or the catalog invariant prunes the very entry being
+ * moved.
+ *
+ * Only RENAME COLUMN gets this. `ALTER COLUMN ... SET DATA TYPE` rewrites values, so its
+ * old min/max and histogram would describe values the column no longer holds — dropping
+ * them there is correct. ADD / DROP COLUMN need nothing: the prune already makes them right.
+ *
+ * NOTE: in-memory only. The store's persisted `__stats__` record still names the OLD
+ * column, so after close + reopen the re-keyed entry is pruned on the way back in and the
+ * renamed column plans without measurements until the next `ANALYZE`. Deliberate — the
+ * mis-attribution (the dangerous half) is gone durably, and re-keying the record would add
+ * a second, backend-specific write path for an advisory number. Revisit if a renamed
+ * column planning blind across a reopen ever shows up as a real plan regression.
+ */
+function carryStatisticsAcrossColumnRename(
+	previous: TableSchema,
+	updated: TableSchema,
+	oldName: string,
+	newName: string,
+): TableSchema {
+	const stats = previous.statistics;
+	if (!stats) return updated;
+
+	const oldKey = oldName.toLowerCase();
+	const newKey = newName.toLowerCase();
+	if (oldKey === newKey) return { ...updated, statistics: stats };
+
+	const moved = stats.columnStats.get(oldKey);
+	const columnStats = new Map(stats.columnStats);
+	columnStats.delete(oldKey);
+	if (moved) columnStats.set(newKey, moved);
+
+	return { ...updated, statistics: { ...stats, columnStats } };
 }
 
 /**
