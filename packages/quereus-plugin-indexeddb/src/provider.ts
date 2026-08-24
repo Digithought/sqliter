@@ -122,12 +122,13 @@ export class IndexedDBProvider implements KVStoreProvider {
 	//    This backend's real latency clears none of them, so declaring it would not make
 	//    batched seeks, gathers or prefetch probes fire.
 	//  - THE ONE FORMULA IT DOES MOVE, IT MOVES BACKWARDS HERE. `expectedLatencyMs` reaches
-	//    exactly one shared cost function, `indexNestedLoopJoinCost`, which charges it per
-	//    outer row to the SEEK plan; nothing in the hash-join cost path reads it. So a
-	//    positive declaration only makes index-nested-loop look worse against hash join — and
-	//    on IndexedDB the hash join's full scan of the inner side is the catastrophic arm
-	//    (bench arm C), because a scan here is thousands of round trips that the cost model
-	//    prices as one.
+	//    exactly one shared cost function, `indexNestedLoopJoinCost`, which charges it PER
+	//    OUTER ROW to the seek plan. `rule-join-physical-selection` does charge the hash and
+	//    merge candidates too, but only ONE open per side (they each read both inputs once),
+	//    so the asymmetry stands: a positive declaration only makes index-nested-loop look
+	//    worse against hash join — and on IndexedDB the hash join's full scan of the inner
+	//    side is the catastrophic arm (bench arm C), because a scan here is thousands of
+	//    round trips that the cost model prices as one.
 	//
 	// REVISIT WHEN a scan-side per-row latency exists —
 	// `backlog/feat-per-row-latency-cost-for-remote-scans` — and re-derive both together;

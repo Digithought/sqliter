@@ -23,7 +23,7 @@
  *     `0` is a VALID latency, so only negative and non-finite values are rejected.
  *
  * The 30 ms is frankly synthetic and no in-tree backend declares anything (see the store
- * README, § Backend cost profile). It is chosen to clear the planner's latency gates, all of
+ * README, § Backend first-row latency). It is chosen to clear the planner's latency gates, all of
  * which sit at 25 ms — `tuning.parallel.batchedOuterThresholdMs` and neighbours. Fixing a
  * real backend's number is a separate question this test deliberately does not depend on.
  *
@@ -33,9 +33,9 @@
  * `test/optimizer/index-nested-loop-batched.spec.ts` uses is not available from here.
  */
 
-import { describe, it, beforeEach, afterEach } from 'mocha';
+import { describe, it, afterEach } from 'mocha';
 import { expect } from 'chai';
-import { Database, serializePlanTree } from '@quereus/quereus';
+import { Database, asyncIterableToArray, serializePlanTree } from '@quereus/quereus';
 import { StoreModule, resolveExpectedLatencyMs, type KVStoreProvider } from '../src/index.js';
 import { createInMemoryProvider } from '../src/testing/index.js';
 
@@ -114,15 +114,30 @@ describe('provider-declared first-row latency', () => {
 	});
 
 	describe('reaching the planner', () => {
+		/** Every database `planJoinOver` opened this test, closed by the hook below. */
+		const opened: Database[] = [];
+
 		/**
 		 * Outer `s` (4 rows, one NULL key, one key matching nothing) on the memory module,
 		 * joined to a `StoreModule` inner over `provider`. Mirrors the fixture in the
 		 * engine's `test/optimizer/index-nested-loop-batched.spec.ts`, including its
 		 * `batchedOuterMinRows: 0` — a four-row synthetic outer clears nothing at the 256-row
 		 * default, and the cardinality gate is not what this file is testing.
+		 *
+		 * NOTE: lowering that gate is not a shortcut around an untested claim — a fixture big
+		 * enough to satisfy it plans a HASH JOIN, not a fan-out. Measured: this same fixture
+		 * with a 300-row outer and the shipped tuning untouched plans `HashJoin` over an
+		 * `IndexScan`. That is the cost model working as documented, not the wiring failing:
+		 * under a 30 ms declaration the seek plan only overtakes hash join once the INNER
+		 * table is enormous (`docs/optimizer-joins.md` puts the break-even near 128k inner
+		 * rows at 25 ms and a 20k-row outer), and building an inner table that size is not a
+		 * unit test. So the latency-vs-no-latency contrast below is the tractable way to pin
+		 * the wiring; the shape's behavior at production cardinalities belongs to the
+		 * engine's own join specs.
 		 */
 		async function planJoinOver(provider: KVStoreProvider): Promise<Database> {
 			const db = new Database();
+			opened.push(db);
 			db.registerModule('store', new StoreModule(provider));
 			const before = db.optimizer.tuning;
 			db.optimizer.updateTuning({
@@ -141,13 +156,12 @@ describe('provider-declared first-row latency', () => {
 
 		const SQL = 'select s.id, big.w from s join big on big.id = s.k order by s.id';
 
-		let db: Database | undefined;
-
-		beforeEach(() => { db = undefined; });
-		afterEach(async () => { if (db) await db.close(); });
+		afterEach(async () => {
+			for (const db of opened.splice(0)) await db.close();
+		});
 
 		it('plans the join as a batched fan-out when the provider declares 30 ms', async () => {
-			db = await planJoinOver(providerDeclaring(HIGH_LATENCY_MS));
+			const db = await planJoinOver(providerDeclaring(HIGH_LATENCY_MS));
 			const fanouts = nodesOfType(db, SQL, 'FanOutLookupJoin');
 			expect(fanouts, 'exactly one fan-out').to.have.lengthOf(1);
 			expect(fanouts[0].properties.outerMode).to.equal('batched');
@@ -155,9 +169,25 @@ describe('provider-declared first-row latency', () => {
 		});
 
 		it('leaves the same join alone when the provider declares nothing', async () => {
-			db = await planJoinOver(providerDeclaring());
+			const db = await planJoinOver(providerDeclaring());
 			expect(nodesOfType(db, SQL, 'FanOutLookupJoin'), 'no fan-out at zero latency').to.have.lengthOf(0);
 			expect(nodesOfType(db, SQL, 'EagerPrefetch')).to.have.lengthOf(0);
+		});
+
+		/**
+		 * The plan the declaration unlocks has to RUN, not merely form. A batched fan-out over
+		 * a `StoreModule` drives concurrent seeks into an async coordinator whose module is
+		 * `concurrencyMode: 'serial'` — a combination no engine-side spec reaches, since the
+		 * engine's own batched-fan-out coverage runs against the memory module. Asserting both
+		 * plans against the same literal is what makes the latency hint a plan-CHOICE knob
+		 * rather than an answer-changing one.
+		 */
+		it('returns the same rows batched as it does serially', async () => {
+			const batched = await planJoinOver(providerDeclaring(HIGH_LATENCY_MS));
+			const serial = await planJoinOver(providerDeclaring());
+			const expected = [{ id: 1, w: 5 }, { id: 2, w: 7 }];
+			expect(await asyncIterableToArray(batched.eval(SQL)), 'batched fan-out').to.deep.equal(expected);
+			expect(await asyncIterableToArray(serial.eval(SQL)), 'serial index-nested-loop').to.deep.equal(expected);
 		});
 	});
 });

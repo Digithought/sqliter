@@ -352,8 +352,8 @@ export interface KVStoreProvider {
 	 * are literal millisecond thresholds (`tuning.parallel.batchedOuterThresholdMs` and
 	 * neighbours, all 25 ms today), so a device-relative number would not mean anything to
 	 * them. That makes an unmeasured guess worse here than the 0 default; declare only
-	 * MEASURED numbers, and see the store README (§ Backend cost profile) for why no in-tree
-	 * provider declares one.
+	 * MEASURED numbers, and see the store README (§ Backend first-row latency) for why no
+	 * in-tree provider declares one.
 	 */
 	readonly expectedLatencyMs?: number;
 

@@ -145,7 +145,9 @@ wall-clock gate. **No in-tree provider declares one** — LevelDB's has never be
 and IndexedDB's has been measured and deliberately left undeclared (its round trips are far
 below every 25 ms gate, and the one shared cost formula reading the field charges the *seek*
 plan rather than the *scan*, which is backwards on that backend). Both decisions, with their
-revisit conditions, are recorded as `NOTE:` comments at the two providers. The surface exists
+revisit conditions, are recorded as `NOTE:` comments at those two providers; the other two
+in-tree providers (React Native LevelDB, NativeScript SQLite) are unmeasured in-process
+backends and declare nothing here for the same reason LevelDB's does. The surface exists
 for the case it was built for: a key-value backend reached over a network.
 
 **`IN`-list index seeks ("multi-seek").** An `IN`-list on an indexed column

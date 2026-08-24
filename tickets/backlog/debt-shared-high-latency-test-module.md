@@ -1,5 +1,5 @@
 ---
-description: Ten optimizer test files each define their own private copy of the same fake "slow storage" table type used to test how the planner handles network delay, and the copies have already drifted apart in what they claim to do.
+description: Eleven test files each define their own private copy of the same fake "slow storage" fixture used to test how the planner handles network delay, and the copies have already drifted apart in what they claim to do.
 files:
   - packages/quereus/test/optimizer/parallel-async-gather.spec.ts
   - packages/quereus/test/optimizer/parallel-async-gather-zip-by-key.spec.ts
@@ -11,6 +11,7 @@ files:
   - packages/quereus/test/optimizer/fk-trust-gated-by-capability.spec.ts
   - packages/quereus/test/optimizer/inclusion-dependencies.spec.ts
   - packages/quereus/test/optimizer/join-latency-cost.spec.ts
+  - packages/quereus-store/test/expected-latency-plan.spec.ts       # 11th copy, different package
 tradeoffs: Each copy is three lines and keeping it next to the tests that use it makes a spec readable on its own; a maintainer may prefer that self-containment to a shared helper the reader has to go look up.
 ---
 
@@ -47,3 +48,21 @@ One shared test helper exporting the fake slow-storage table type, with the
 delay it reports stated once and its relationship to the rule thresholds
 explained in one place. The ten specs import it. Behavior of every existing test
 is unchanged — this is only about where the declaration lives.
+
+## Arm added by review of `store-module-latency-hint-wiring`
+
+There is now an eleventh copy, and it is outside `packages/quereus`:
+`packages/quereus-store/test/expected-latency-plan.spec.ts` builds its own
+slow-backend stand-in — a key-value provider that reports a 30 ms delay — to
+prove that a storage backend's declared delay reaches the planner.
+
+It differs from the ten in *what* it fakes (a slow storage backend behind the
+store module, not a fake table type), so it cannot simply import a fake table
+type. What it shares is the part this ticket is actually about: a bare number
+picked to sit just above the threshold the planner rules compare against, with
+nothing tying the two together. Whoever moves that threshold now has eleven
+places to find, in two packages.
+
+Worth considering when this is done: export the threshold-related constant
+itself alongside the shared fake, so a spec in another package can say "just
+above the threshold" rather than writing `30` and hoping.

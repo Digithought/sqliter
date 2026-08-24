@@ -1,6 +1,8 @@
 /**
  * What a storage backend's basic read operations cost, declared by the provider and
- * consumed by store access planning (`store-module-access-plan.ts`).
+ * consumed by store access planning (`store-module-access-plan.ts`) — plus the one other
+ * provider-declared planner input resolved the same way, {@link resolveExpectedLatencyMs}
+ * (first-row latency, wall-clock rather than a ratio; see its doc comment).
  *
  * The store framework already lets a provider declare things about itself that the
  * layers above must adapt to — `beginAtomicBatch`, `readCommittedSnapshot`,
