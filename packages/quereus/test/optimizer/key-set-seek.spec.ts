@@ -558,6 +558,63 @@ describe('key-set-seek plan shape', () => {
 		});
 	});
 
+	describe('compound shape: a semi join reassociated below an inner join', () => {
+		// `rule-semi-join-pushdown` moves the semi join below the inner join first,
+		// so the probe side peels to a bare access leaf again and THIS rule fires.
+		// Without that reassociation the probe side is a join, the peel declines,
+		// and `entry` is read end-to-end. The rule's own plan-shape coverage
+		// (which branch it lands on, what it refuses) is in
+		// `test/optimizer/semi-join-pushdown.spec.ts`.
+		beforeEach(async () => {
+			await db.exec('create table txn (id integer primary key, date text)');
+			await db.exec('create table entry (id integer primary key, txn_id integer, account_id integer, amount integer)');
+			await db.exec('create index idx_entry_account on entry(account_id)');
+			await db.exec('create index idx_entry_txn on entry(txn_id)');
+		});
+
+		const semiHashJoins = (plan: PlanNode): BloomJoinNode[] =>
+			collectNodes(plan, isHashJoin).filter(j => j.joinType === 'semi');
+
+		it('seeks the filtered table through its index instead of scanning it', () => {
+			const sql = `select e.id, e.amount, t.date
+				from entry e join txn t on t.id = e.txn_id
+				where e.txn_id in (select txn_id from entry where account_id = 1)`;
+			const plan = db.getPlan(sql);
+			const nodes = collectNodes(plan, isKeySetSemiJoin);
+			expect(nodes, 'exactly one KeySetSemiJoin').to.have.lengthOf(1);
+			expect(semiHashJoins(plan), 'no hash SEMI join is left').to.have.lengthOf(0);
+			expect(nodes[0].pushdown.indexName).to.equal('idx_entry_txn');
+			expect(nodes[0].pushdown.accessPath.plan).to.equal('multiSeek');
+			// The full scan of `entry` the bug produced is gone: the only IndexScan
+			// left is the seek target's own walk leaf, and `txn` is reached by seek.
+			expect(collectNodes(plan, (n): n is IndexScanNode => n instanceof IndexScanNode))
+				.to.have.lengthOf(1);
+			expect(collectNodes(plan, isIndexSeek).length, 'txn and the key source both seek')
+				.to.be.at.least(2);
+		});
+
+		it('declines when the semi condition spans BOTH join branches', () => {
+			// The semi join cannot move to one branch, so it stays above the inner
+			// join and the probe side never peels to a leaf.
+			const sql = `select e.id from entry e join txn t on t.id = e.txn_id
+				where exists (select 1 from entry m
+					where m.account_id = 1 and m.txn_id = e.txn_id and m.id = t.id)`;
+			const plan = db.getPlan(sql);
+			expect(collectNodes(plan, isKeySetSemiJoin), 'must decline').to.have.lengthOf(0);
+			expect(semiHashJoins(plan), 'the hash semi join survives').to.have.lengthOf(1);
+		});
+
+		it('declines when the probe side is a LEFT join', () => {
+			// Out of scope for the pushdown rule (see its header), so the semi join
+			// stays above the join and this rule declines as it did before.
+			const sql = `select e.id from entry e left join txn t on t.id = e.txn_id
+				where e.txn_id in (select txn_id from entry where account_id = 1)`;
+			const plan = db.getPlan(sql);
+			expect(collectNodes(plan, isKeySetSemiJoin), 'must decline').to.have.lengthOf(0);
+			expect(semiHashJoins(plan), 'the hash semi join survives').to.have.lengthOf(1);
+		});
+	});
+
 	describe('seekPreservesTargetOrder', () => {
 		// Direct predicate coverage over (leaf, pushdown) pairs: the leaves and
 		// pushdowns are real planner output, varied synthetically per clause.

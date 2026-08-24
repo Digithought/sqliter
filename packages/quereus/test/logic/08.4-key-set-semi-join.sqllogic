@@ -345,3 +345,103 @@ CREATE INDEX idx_pcr_v ON pcr(v);
 INSERT INTO pcr VALUES (1, 10), (2, 20), (3, 30), (4, 40);
 SELECT pk FROM pcr WHERE pk > 2 AND v IN (SELECT k FROM pckeys) ORDER BY pk;
 → [{"pk":3}]
+
+-- ===== Compound shape: the filtered table is ALSO joined to another table =====
+--
+-- `… from entry e join txn t on t.id = e.txn_id where e.txn_id in (select …)`
+-- puts a join on the probe side of the semi join. `rule-semi-join-pushdown`
+-- reassociates the semi join below the inner join so the probe side peels to a
+-- bare leaf and the key-set rewrite above can fire on it. These cases pin the
+-- rows only — the same answers must come back whether the semi join is pushed,
+-- and whether the runtime then seeks or scans. Plan-shape assertions live in
+-- test/optimizer/semi-join-pushdown.spec.ts and test/optimizer/key-set-seek.spec.ts.
+
+CREATE TABLE cj_txn (id INTEGER PRIMARY KEY, date TEXT NULL);
+CREATE TABLE cj_entry (id INTEGER PRIMARY KEY, txn_id INTEGER NULL, account_id INTEGER NULL, amount INTEGER NULL);
+CREATE INDEX idx_cj_entry_account ON cj_entry(account_id);
+CREATE INDEX idx_cj_entry_txn ON cj_entry(txn_id);
+CREATE TABLE cj_tag (id INTEGER PRIMARY KEY, txn_id INTEGER NULL, tag TEXT NULL);
+
+INSERT INTO cj_txn VALUES (1, 'd1'), (2, 'd2'), (3, 'd3');
+-- id 1 and 2 share txn 1 (duplicate matches on one key), id 5 has a NULL join
+-- key, id 6 names a txn that does not exist (dropped by the inner join, kept by
+-- a left join), id 4 is not in the key set at all.
+INSERT INTO cj_entry VALUES
+	(1, 1, 7, 100), (2, 1, 8, 200), (3, 2, 7, 300),
+	(4, 3, 9, 400), (5, NULL, 7, 500), (6, 99, 7, 600);
+INSERT INTO cj_tag VALUES (1, 1, 'a'), (2, 1, 'b'), (3, 2, 'c');
+
+-- The repro shape. Key set from account 7 is {1, 2, NULL, 99}; the NULL member
+-- matches nothing, and entry 6's txn 99 has no txn row so the join drops it.
+SELECT e.id, e.amount, t.date FROM cj_entry e JOIN cj_txn t ON t.id = e.txn_id
+	WHERE e.txn_id IN (SELECT txn_id FROM cj_entry WHERE account_id = 7)
+	ORDER BY e.id;
+→ [{"id":1,"amount":100,"date":"d1"},{"id":2,"amount":200,"date":"d1"},{"id":3,"amount":300,"date":"d2"}]
+
+-- A NULL target value never matches, however the semi join is placed.
+SELECT e.id FROM cj_entry e JOIN cj_txn t ON t.id = e.txn_id
+	WHERE e.txn_id IN (SELECT txn_id FROM cj_entry WHERE account_id = 7) AND e.id = 5;
+→ []
+
+-- Fan-out on the UNTOUCHED side: the semi join is pushed onto `entry`, and the
+-- tag join then multiplies the surviving rows. Pushing must not collapse or
+-- duplicate that fan-out.
+SELECT e.id, g.tag FROM cj_entry e JOIN cj_tag g ON g.txn_id = e.txn_id
+	WHERE e.txn_id IN (SELECT txn_id FROM cj_entry WHERE account_id = 7)
+	ORDER BY e.id, g.tag;
+→ [{"id":1,"tag":"a"},{"id":1,"tag":"b"},{"id":2,"tag":"a"},{"id":2,"tag":"b"},{"id":3,"tag":"c"}]
+
+-- Right-arm: the semi condition reads only the OTHER branch, so the semi join is
+-- pushed onto `txn` instead. Account 8 contributes txn 1 alone.
+SELECT e.id FROM cj_entry e JOIN cj_txn t ON t.id = e.txn_id
+	WHERE t.id IN (SELECT txn_id FROM cj_entry WHERE account_id = 8)
+	ORDER BY e.id;
+→ [{"id":1},{"id":2}]
+
+-- Correlated EXISTS reaches the same shape after decorrelation.
+SELECT e.id FROM cj_entry e JOIN cj_txn t ON t.id = e.txn_id
+	WHERE EXISTS (SELECT 1 FROM cj_entry m WHERE m.account_id = 7 AND m.txn_id = e.txn_id)
+	ORDER BY e.id;
+→ [{"id":1},{"id":2},{"id":3}]
+
+-- NOT IN over the compound shape: the pushdown declines on anti shapes, and the
+-- NULL member of the key set makes the whole predicate UNKNOWN for every row.
+SELECT e.id FROM cj_entry e JOIN cj_txn t ON t.id = e.txn_id
+	WHERE e.txn_id NOT IN (SELECT txn_id FROM cj_entry WHERE account_id = 7)
+	ORDER BY e.id;
+→ []
+
+-- NOT EXISTS (an anti join above the inner join — the pushdown declines by
+-- design) still answers: only entry 4, whose txn 3 no account-7 entry names.
+SELECT e.id FROM cj_entry e JOIN cj_txn t ON t.id = e.txn_id
+	WHERE NOT EXISTS (SELECT 1 FROM cj_entry m WHERE m.account_id = 7 AND m.txn_id = e.txn_id)
+	ORDER BY e.id;
+→ [{"id":4}]
+
+-- LEFT join on the probe side: out of scope for the pushdown, so the semi join
+-- stays above the join. Entry 6 survives with a NULL-extended txn.
+SELECT e.id, t.date FROM cj_entry e LEFT JOIN cj_txn t ON t.id = e.txn_id
+	WHERE e.txn_id IN (SELECT txn_id FROM cj_entry WHERE account_id = 7)
+	ORDER BY e.id;
+→ [{"id":1,"date":"d1"},{"id":2,"date":"d1"},{"id":3,"date":"d2"},{"id":6,"date":null}]
+
+-- The semi condition spanning BOTH branches must decline and still answer.
+SELECT e.id FROM cj_entry e JOIN cj_txn t ON t.id = e.txn_id
+	WHERE EXISTS (SELECT 1 FROM cj_entry m
+		WHERE m.account_id = 7 AND m.txn_id = e.txn_id AND m.id = t.id)
+	ORDER BY e.id;
+→ [{"id":1},{"id":2}]
+
+-- Read-your-own-writes through the compound shape: a staged row must join and
+-- filter like a committed one.
+BEGIN;
+INSERT INTO cj_entry VALUES (7, 3, 7, 700);
+SELECT e.id, t.date FROM cj_entry e JOIN cj_txn t ON t.id = e.txn_id
+	WHERE e.txn_id IN (SELECT txn_id FROM cj_entry WHERE account_id = 7)
+	ORDER BY e.id;
+→ [{"id":1,"date":"d1"},{"id":2,"date":"d1"},{"id":3,"date":"d2"},{"id":4,"date":"d3"},{"id":7,"date":"d3"}]
+ROLLBACK;
+SELECT e.id FROM cj_entry e JOIN cj_txn t ON t.id = e.txn_id
+	WHERE e.txn_id IN (SELECT txn_id FROM cj_entry WHERE account_id = 7)
+	ORDER BY e.id;
+→ [{"id":1},{"id":2},{"id":3}]

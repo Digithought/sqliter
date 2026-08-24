@@ -54,6 +54,7 @@ import { ruleQuickPickJoinEnumeration } from './rules/join/rule-quickpick-enumer
 import { ruleJoinPhysicalSelection } from './rules/join/rule-join-physical-selection.js';
 import { ruleMonotonicMergeJoin } from './rules/join/rule-monotonic-merge-join.js';
 import { ruleLateralTop1Asof } from './rules/join/rule-lateral-top1-asof.js';
+import { ruleSemiJoinPushdown } from './rules/join/rule-semi-join-pushdown.js';
 import { ruleMonotonicWindow } from './rules/window/rule-monotonic-window.js';
 // Constraint rules removed - now handled in builders for correctness
 import { ruleCteOptimization } from './rules/cache/rule-cte-optimization.js';
@@ -574,6 +575,31 @@ export const RULE_MANIFEST: readonly RuleManifestEntry[] = [
 		// Transforms EXISTS(correlated) / IN(correlated) into semi/anti
 		// joins, changing how many times the inner subquery's subtree is
 		// executed — refuses when the inner subtree carries a write.
+		sideEffectMode: 'aware',
+	},
+
+	// Semi-join pushdown: reassociate `Join(semi, Join(inner|cross, L, R), K)` to
+	// `Join(inner|cross, Join(semi, L, K), R)` (or onto R) when the semi condition
+	// reads exactly one of the two branches. Registered immediately AFTER
+	// `subquery-decorrelation`: that rule mints the semi `JoinNode` in place of a
+	// `Filter`, and `applyPassRules` runs the pass's rules to a fixpoint on the
+	// current node, so the freshly-minted Join is offered to this rule in the same
+	// node visit — no extra pass or re-entry needed. Its Join-typed peers in this
+	// pass are the IND folders `anti-join-fk-empty` / `semi-join-fk-trivial`,
+	// registered further below, so a pushed-down semi join still threads into them
+	// (pass rules fire in REGISTRATION order). The Project-typed `join-elimination`
+	// / `fanout-lookup-join` above never compete for this anchor. The point of the
+	// rewrite is downstream: with the filtered side back to a bare access leaf,
+	// PostOptimization's `key-set-seek` can fire on the compound shape.
+	{
+		pass: PassId.Structural,
+		id: 'semi-join-pushdown',
+		nodeType: PlanNodeType.Join,
+		phase: 'rewrite',
+		fn: ruleSemiJoinPushdown,
+		// Re-roots both inner-join branches and changes how many rows the semi
+		// condition is evaluated against — refuses when the key source or either
+		// branch carries a write.
 		sideEffectMode: 'aware',
 	},
 

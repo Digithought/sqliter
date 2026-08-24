@@ -718,6 +718,70 @@ describe('key-set semi join over the store backend (feat-key-set-seek-store-isol
 			});
 		});
 
+		describe('compound shape: the filtered table is also joined to another table', () => {
+			// `… from entry e join txn t on t.id = e.txn_id where e.txn_id in (select …)`
+			// puts a join on the probe side of the semi join, which `rule-key-set-seek`
+			// cannot peel. `rule-semi-join-pushdown` reassociates the semi join below the
+			// inner join first, so the probe side is a bare leaf again and the seek is
+			// won — this is the store-backed twin of the memory-backend plan-shape test
+			// in packages/quereus/test/optimizer/key-set-seek.spec.ts. Row equality for
+			// the same shapes is in test/logic/08.4-key-set-semi-join.sqllogic, which
+			// also runs against this backend under `yarn test:store`.
+
+			// entry ids i and i+100 share a txn; account 3 holds every fifth entry.
+			const KEY_TXNS = 20;
+			const expectedIds = [
+				...Array.from({ length: KEY_TXNS }, (_, k) => 3 + 5 * k),
+				...Array.from({ length: KEY_TXNS }, (_, k) => 103 + 5 * k),
+			];
+
+			beforeEach(async () => {
+				await db.exec(`create table txn (id integer primary key, date text) using store`);
+				await db.exec(`create table entry (id integer primary key, txn_id integer, account_id integer, amount integer) using store`);
+				await db.exec(`create index ix_entry_txn on entry (txn_id)`);
+				await db.exec(`create index ix_entry_account on entry (account_id)`);
+				await db.exec(`insert into txn values ${
+					Array.from({ length: 100 }, (_, i) => `(${i + 1}, 'd${i + 1}')`).join(', ')}`);
+				await db.exec(`insert into entry values ${
+					Array.from({ length: 200 }, (_, i) => {
+						const id = i + 1;
+						return `(${id}, ${(i % 100) + 1}, ${id % 5}, ${id * 10})`;
+					}).join(', ')}`);
+			});
+
+			const ids = async (q: string): Promise<number[]> =>
+				(await asyncIterableToArray(db.eval(q)))
+					.map(r => r.id as number)
+					.sort((a, b) => a - b);
+
+			it('seeks the filtered table through its index instead of scanning it', async () => {
+				const q = `select e.id from entry e join txn t on t.id = e.txn_id
+					where e.txn_id in (select txn_id from entry where account_id = 3)`;
+				expect(await planOps(q), 'the key-set rewrite fires on the compound shape')
+					.to.match(/KEYSETSEMIJOIN/);
+				mod.reset();
+				expect(await ids(q)).to.deep.equal(expectedIds);
+
+				const seen = mod.seen('entry');
+				// `entry` is opened twice: once as the key source (an `ix_entry_account`
+				// seek) and once as the pushdown target.
+				const seeks = seen.filter(s => multiSeekRe('ix_entry_txn').test(s));
+				expect(seeks, 'the target was served as a multi-seek').to.have.lengthOf(1);
+				expect(seeks[0]).to.contain(`inCount=${KEY_TXNS}`);
+				expect(seen.filter(s => SCAN_RE.test(s)), 'no full walk of entry').to.have.lengthOf(0);
+			});
+
+			it('a LEFT join on the probe side declines and still answers', async () => {
+				// Out of scope for the pushdown (see its rule header), so the semi join
+				// stays above the join and the seek is not won — the NULL-extended rows
+				// must still come back.
+				const q = `select e.id from entry e left join txn t on t.id = e.txn_id
+					where e.txn_id in (select txn_id from entry where account_id = 3)`;
+				expect(await planOps(q), 'the rewrite must decline').to.not.match(/KEYSETSEMIJOIN/);
+				expect(await ids(q)).to.deep.equal(expectedIds);
+			});
+		});
+
 		describe('the engine ceiling on seek keys', () => {
 			// OBSERVED BREAK-EVEN, recorded per the ticket: on this table the interpolated
 			// `breakEvenKeys` clamps at the engine's 1000-key ceiling — i.e. the runtime seeks
