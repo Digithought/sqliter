@@ -59,3 +59,46 @@ Making the seek path cheaper once it is chosen — that is
 `feat-index-nested-loop-batched-seeks`, which is about overlapping the lookups.
 This ticket is about the engine being able to *know* that a scan is expensive in
 the first place.
+
+## Evidence — this gap actively blocks IndexedDB from declaring any latency
+
+Added 2026-08-24 while investigating `fix/1-bug-store-module-never-declares-latency`
+(now `implement/1-store-module-latency-hint-wiring`), which set out to declare a
+measured `expectedLatencyMs` on the IndexedDB provider and concluded it must not,
+*because of this gap*. That makes the missing scan-side knob not merely a
+refinement but the thing preventing the existing knob from being used at all on
+the backend it was pointed at.
+
+The mechanism, from the measurements in
+`packages/quereus-plugin-indexeddb/bench/README.md`:
+
+- IndexedDB's real first-row latency is **0.3-2.3 ms** (arm B's smallest whole
+  round trip, 0.4 ms at 20k rows and 2.0-2.5 ms at 100k, minus the row payload at
+  the measured full-scan rate). That is 10-80x below every threshold that turns
+  the parallel machinery on — `batchedOuterThresholdMs`, `gatherThresholdMs` and
+  `prefetchProbeThresholdMs` all default to 25 ms
+  (`packages/quereus/src/planner/optimizer-tuning.ts:284`). So an honest
+  declaration cannot enable batched seeks, gathers, or prefetch on this backend.
+- The one shared formula it *does* reach is `indexNestedLoopJoinCost`
+  (`packages/quereus/src/planner/cost/index.ts:164-172`), which charges it per
+  outer row to the **seek** plan. Hash join reads the field nowhere and pays zero.
+  So the only effect of an honest declaration is to make index-nested-loop look
+  worse against hash join — and on IndexedDB the hash join's single inner scan is
+  the catastrophic arm (bench arm C: 93-1,180 ms, against 0.4-512 ms for the index
+  arms), precisely because it is thousands of round trips priced as one.
+
+So the sign is backwards: telling the planner the truth about IndexedDB's
+first-row latency, with the scan side's per-row latency still unmodeled, makes
+its plans worse. Whatever lands here should be re-derived jointly with a
+first-row number for IndexedDB, not after it.
+
+One further constraint this investigation surfaced, for whoever designs the
+second knob: `expectedLatencyMs` is already read on two incompatible scales — the
+25 ms gates treat it as literal wall-clock, while `indexNestedLoopJoinCost` adds
+it to unitless cost constants under the "one unit of `expectedLatencyMs` is one
+engine cost unit" convention (`docs/optimizer-costing.md:78`), where one unit is
+one scanned row (`SEQ_SCAN_PER_ROW = 1.0`). Those agree only when a scanned row
+costs about 1 ms; on IndexedDB it costs 0.0047-0.011 ms, a ~100x disagreement.
+The convention holds for the 25-100 ms network backends it was designed for and
+breaks for sub-millisecond ones. A second knob that inherits the same convention
+inherits the same break.
