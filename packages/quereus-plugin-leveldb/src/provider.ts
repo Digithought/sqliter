@@ -132,6 +132,13 @@ export interface LevelDBProviderOptions {
 // if a LevelDB query is ever measured planning wrong because a secondary-index multi-seek
 // is priced 30x too cheap. The decision itself stays open as
 // backlog/debt-leveldb-cost-profile-measurement.
+//
+// NOTE: no `expectedLatencyMs` either (so the module resolves to the 0 default). Unlike the
+// cost profile above, this one is UNMEASURED — nothing has ever timed this backend's
+// first-row latency — so the declare-only-measured rule applies a fortiori. A guess here
+// would be worse than a guessed cost ratio besides: the planner's gates on this field are
+// literal 25 ms wall-clock thresholds, and an in-process block-cached backend is nowhere
+// near them, so an invented number could only turn machinery on that should stay off.
 export class LevelDBProvider implements KVStoreProvider {
 	private basePath: string;
 	private createIfMissing: boolean;

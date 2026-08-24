@@ -23,6 +23,7 @@ export { defaultGetMany } from './kv-store.js';
 export {
   PARITY_COST_PROFILE,
   resolveCostProfile,
+  resolveExpectedLatencyMs,
   type KVCostProfile,
   type ResolvedCostProfile,
 } from './cost-profile.js';

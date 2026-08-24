@@ -128,6 +128,26 @@ arm-disabling rather than arm-tuning: past `pointRead` 2.83 the range arm would 
 off for every query on every table, off a guess no measurement can resolve. When real
 per-column statistics replace the guess, the comparison will use the declared cost instead.
 
+**Backend first-row latency.** Separately from the cost ratios above, a provider may declare
+`expectedLatencyMs` — how long an iterator opened over one of its stores takes to hand back
+its **first** row. `StoreModule` resolves it once at construction and surfaces it as its
+`VirtualTableModule.expectedLatencyMs`, which the planner lifts onto the table leaf and
+propagates upward as `max(children)`; it is what lets the batched-seek, gather and prefetch
+rules amortize a slow backend's per-open latency across concurrent work. Omitted (the
+default) means `0` — in-process — and a negative or non-finite declaration falls back to `0`
+with a warning. Note `0` **is** a valid declaration here, unlike a cost field, where `0` is
+unusable.
+
+Unlike the cost profile this is **wall-clock milliseconds, not a ratio**, because the rules
+gating on it compare against literal millisecond thresholds (25 ms today). That makes the
+declare-only-measured rule sharper, not softer: a device-relative guess means nothing to a
+wall-clock gate. **No in-tree provider declares one** — LevelDB's has never been measured,
+and IndexedDB's has been measured and deliberately left undeclared (its round trips are far
+below every 25 ms gate, and the one shared cost formula reading the field charges the *seek*
+plan rather than the *scan*, which is backwards on that backend). Both decisions, with their
+revisit conditions, are recorded as `NOTE:` comments at the two providers. The surface exists
+for the case it was built for: a key-value backend reached over a network.
+
 **`IN`-list index seeks ("multi-seek").** An `IN`-list on an indexed column
 (`where v in (1, 2, 3)`, including parameter-bound lists) is served from the index as one
 deduplicated, key-ordered point seek per distinct list value, instead of a full scan with

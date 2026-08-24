@@ -160,6 +160,20 @@ export function nestedLoopJoinCost(outerRows: number, innerRows: number): number
  * rule-key-set-seek's break-even). `perSeekLatencyMs` is the inner subtree's
  * `physical.expectedLatencyMs` (0 for every in-process vtab), treated as
  * ms-equivalent cost — the same convention as `tuning.parallel.branchSetupCost`.
+ *
+ * NOTE: the field's two consumers read it on incompatible scales, and this one is the
+ * ratio side. The `tuning.parallel.*ThresholdMs` gates (all 25 today) read
+ * `expectedLatencyMs` as literal wall-clock milliseconds; this formula adds it to cost
+ * constants whose unit is `SEQ_SCAN_PER_ROW = 1.0`, i.e. ONE SCANNED ROW. The two readings
+ * agree only where a scanned row costs about 1 ms — true of the network-latency backends
+ * this machinery was designed for (25-100 ms, where latency swamps engine cost and the
+ * ratio stops mattering), and off by roughly two orders of magnitude for a sub-millisecond
+ * backend, whose honest declaration is worth tens of cost units on this scale and a
+ * fraction of one on the gates' scale. Inert today: every gate sits at 25 ms and no in-tree
+ * module declares a sub-millisecond value (the IndexedDB and LevelDB providers both decline
+ * to, with their reasons recorded at their `costProfile` sites). Revisit if either changes —
+ * and do NOT resolve it by inflating a declaration to the ratio value, which would lie to
+ * the wall-clock gates.
  */
 export function indexNestedLoopJoinCost(
 	outerRows: number, rowsPerSeek: number, perSeekLatencyMs = 0,

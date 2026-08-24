@@ -144,6 +144,32 @@ export function resolveCostProfile(profile: KVCostProfile | undefined): Resolved
 	};
 }
 
+/**
+ * A provider's declared first-row latency ({@link KVStoreProvider.expectedLatencyMs}), or
+ * `0` when it declares none or declares something unusable.
+ *
+ * Lives beside the cost profile because both are provider-declared planner inputs resolved
+ * once at module construction, but it is NOT part of {@link KVCostProfile} and does not
+ * share its unit: the profile is a RATIO against one sequentially scanned row, this is
+ * wall-clock milliseconds.
+ *
+ * Same public-interface reasoning as {@link resolveCostField} — a third-party provider can
+ * declare anything, so a bad value must neither break planning (hence the fallback rather
+ * than a throw) nor pass silently (hence the warning). One difference: `0` is a perfectly
+ * valid latency, so only NEGATIVE and non-finite values are rejected here, where a cost
+ * field also rejects `0`.
+ */
+export function resolveExpectedLatencyMs(declared: number | undefined): number {
+	if (declared === undefined) return 0;
+	if (!Number.isFinite(declared) || declared < 0) {
+		console.warn(
+			`[StoreModule] provider declares an unusable expectedLatencyMs (${declared}); falling back to 0`,
+		);
+		return 0;
+	}
+	return declared;
+}
+
 /** One field's declared value, or its parity default when absent or unusable. */
 function resolveCostField(declared: number | undefined, field: keyof ResolvedCostProfile): number {
 	const parity = PARITY_COST_PROFILE[field];

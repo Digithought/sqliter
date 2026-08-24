@@ -105,6 +105,36 @@ export class IndexedDBProvider implements KVStoreProvider {
 	 */
 	readonly costProfile: KVCostProfile = { pointRead: 3.0, seekPositioning: 5.0 };
 
+	// NOTE: no `expectedLatencyMs` declared, deliberately — and like the `costProfile` above
+	// that is a MEASURED decision, not the absence of one. The provider therefore resolves to
+	// the 0 default, i.e. the planner treats this backend as in-process for latency purposes.
+	//
+	// `bench/README.md` (Chromium 151 / Windows 11, 200-byte rows, medians) has the numbers:
+	// the smallest whole round trip in the harness — arm B, 20 rows resolved in 1 request — is
+	// 0.4 ms on a 20k-row table and 2.0-2.5 ms at 100k. Subtracting the row payload at the
+	// measured full-scan rate leaves a first-row latency somewhere in the low tenths of a
+	// millisecond to low single milliseconds, depending on table size. Two reasons that
+	// number stays undeclared:
+	//
+	//  - EVERY GATE THAT TURNS THE LATENCY MACHINERY ON IS 25 ms. `batchedOuterThresholdMs`,
+	//    `gatherThresholdMs` and `prefetchProbeThresholdMs` all default to 25
+	//    (`planner/optimizer-tuning.ts`), chosen against a synthetic high-latency fixture.
+	//    This backend's real latency clears none of them, so declaring it would not make
+	//    batched seeks, gathers or prefetch probes fire.
+	//  - THE ONE FORMULA IT DOES MOVE, IT MOVES BACKWARDS HERE. `expectedLatencyMs` reaches
+	//    exactly one shared cost function, `indexNestedLoopJoinCost`, which charges it per
+	//    outer row to the SEEK plan; nothing in the hash-join cost path reads it. So a
+	//    positive declaration only makes index-nested-loop look worse against hash join — and
+	//    on IndexedDB the hash join's full scan of the inner side is the catastrophic arm
+	//    (bench arm C), because a scan here is thousands of round trips that the cost model
+	//    prices as one.
+	//
+	// REVISIT WHEN a scan-side per-row latency exists —
+	// `backlog/feat-per-row-latency-cost-for-remote-scans` — and re-derive both together;
+	// declaring first-row latency alone before then is a net-negative plan skew. As with the
+	// cost profile above, DELIBERATELY NO DECIMALS QUOTED: the bench README holds the tables,
+	// this comment holds the decision.
+
 	private databaseName: string;
 	private stores = new Map<string, KVStore>();
 	/**

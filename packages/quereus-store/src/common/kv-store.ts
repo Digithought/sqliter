@@ -336,6 +336,28 @@ export interface KVStoreProvider {
 	readonly costProfile?: KVCostProfile;
 
 	/**
+	 * First-row latency, in MILLISECONDS, of an iterator opened over one of this backend's
+	 * stores — how long the first row takes to arrive, not the per-row cost of the rest.
+	 * Omitted means 0, which is what an in-process backend should leave it at.
+	 *
+	 * Surfaced by `StoreModule` as its `VirtualTableModule.expectedLatencyMs`, which the
+	 * planner lifts onto the table leaf's physical properties and propagates upward as
+	 * `max(children)`. It is a HEURISTIC — no answer depends on it, only plan choice.
+	 *
+	 * Declared on the PROVIDER for the same reason {@link costProfile} is: latency is a
+	 * property of the BACKEND, one provider is the per-backend singleton, and
+	 * `StoreModuleBase` already holds the provider without opening anything.
+	 *
+	 * Unlike {@link costProfile} this is wall-clock, NOT a ratio — the planner's gates on it
+	 * are literal millisecond thresholds (`tuning.parallel.batchedOuterThresholdMs` and
+	 * neighbours, all 25 ms today), so a device-relative number would not mean anything to
+	 * them. That makes an unmeasured guess worse here than the 0 default; declare only
+	 * MEASURED numbers, and see the store README (§ Backend cost profile) for why no in-tree
+	 * provider declares one.
+	 */
+	readonly expectedLatencyMs?: number;
+
+	/**
 	 * Get or create a KVStore for a table's row data.
 	 * Store name: {schema}.{table}
 	 * @param schemaName - The schema name (e.g., 'main')
