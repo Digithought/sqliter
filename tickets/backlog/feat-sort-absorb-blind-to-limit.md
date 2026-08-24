@@ -67,6 +67,40 @@ a module can only stop early after `limit + offset` rows.
 - `feat-store-ordering-only-index-walk` (the store's ordering walk) carries a `NOTE:` at
   its cost comparison pointing here — it is the first module-side consumer that visibly
   loses out.
-- `feat-minmax-index-boundary` (backlog) attacks the same user-visible symptom from the
-  other end: answer `MIN` / `MAX` by reading a single index entry, without needing a limit
-  to be visible at all. If that lands first, the pressure here drops considerably.
+- `feat-minmax-index-boundary` landed since this ticket was filed — and the "pressure
+  drops considerably" prediction above did not hold. Its rewrite (`rule-minmax-index-
+  boundary.ts`) still builds the bare `SortNode` probe with no `LimitOffsetNode` — the
+  `LimitOffset(1)` is only wrapped on *after* `trySortAbsorbViaIndexOrdering` succeeds
+  (`rule-minmax-index-boundary.ts:94-121`) — so it hits exactly this blindness. Landing
+  `feat-minmax-index-boundary` removed the *shape* problem (no rule to absorb into) but not
+  the *cost-visibility* one this ticket describes.
+
+## Confirmed live on GitHub issue #31, 2026-08-24 — this is the actual blocker
+
+A user running the real `@quereus/plugin-indexeddb` (not the in-memory reference provider)
+reported `SELECT MIN(date) FROM entry WHERE entity_id = ?` over `idx_entry_entity_date
+(entity_id, date)` still full-scanning post-`feat-minmax-index-boundary`, including the
+*ascending* `MIN` case that ticket's own release comment said should already be fast.
+Investigated and confirmed mechanically, not by inference:
+
+- `IndexedDBProvider` declares a measured `costProfile.pointRead = 3.0`
+  (`packages/quereus-plugin-indexeddb/src/provider.ts:106`); the reference
+  `createInMemoryProvider()` defaults to `PARITY_COST_PROFILE.pointRead = 1.0`.
+- `tryIndexAccessPlan`'s `eq`-arm veto (`store-module-access-plan.ts:689-737`) is linear in
+  `pointRead`: the seek beats a full scan only while `selectivity ≤ 1/(0.3 + pointRead)` —
+  **≈77% at `pointRead=1.0`, ≈30% at `pointRead=3.0`**. Because the veto never sees that
+  only 1 row is needed (this ticket's exact gap), any `entity_id` with real-world
+  selectivity above ~30% — plausible for a handful of entities over many rows each —
+  makes the store module decline the composite-index arm entirely and return a plain full
+  scan, which carries no ordering advertisement on `date`. `ruleMinMaxIndexBoundary` then
+  finds nothing to absorb and returns `null`, unrewritten.
+- The in-memory reference provider's ~77% threshold is forgiving enough that this was
+  never observed in-tree — every test and every prior "confirmed working" check against
+  `createInMemoryProvider()` sits under it. It reproduces only against a backend with a
+  real, non-trivial `pointRead`, which today means only `IndexedDBProvider`.
+
+So this ticket, not a store- or IndexedDB-specific bug, is the actual reason
+`feat-minmax-index-boundary`'s ascending-`MIN` case doesn't help the one backend it was
+aimed at. Both fix routes above remain open (upward-looking sort-absorb vs. a fused
+sort-and-limit node) — that design call is still yours; this note is evidence, not a
+resolution.
