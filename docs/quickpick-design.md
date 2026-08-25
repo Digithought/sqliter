@@ -147,6 +147,15 @@ export function ruleQuickPickJoinEnumeration(
 - Walk the plan tree to find all joins and base relations
 - Identify join predicates and their referenced relations
 - Mark cross products (joins without predicates)
+- **Enumeration covers INNER/CROSS spines only.** A join of any other type
+  anywhere in the subtree abandons the whole graph and the rule declines, rather
+  than enumerating over the relations that happen to sit above it. Since
+  `rule-semi-join-pushdown` parks a semi join at the bottom of an inner spine
+  whenever an `IN (SELECT …)` filters one arm of a multi-table join, that abandon
+  now fires on ordinary queries — a 3+-relation join under such a filter gets no
+  enumeration. Admitting a non-inner join as a single opaque leaf relation would
+  restore it, but needs its own correlation guard (a LATERAL leaf must not be
+  reordered below the relation it reads).
 
 ### 2. **Tour Representation**
 - Use relation indices for efficient manipulation

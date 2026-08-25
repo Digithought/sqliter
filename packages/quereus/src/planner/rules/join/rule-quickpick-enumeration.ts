@@ -43,15 +43,34 @@ function extractJoinGraph(node: PlanNode): JoinGraph | null {
     pairToConds.get(key)!.push(cond);
   }
 
+  // Enumeration covers INNER/CROSS spines only. A non-inner join anywhere in the
+  // subtree abandons the whole graph — it must be a latched flag, NOT a sentinel
+  // written into `relations`: the recursion continues in the ancestor frames after
+  // a bail, so an emptied `relations` is refilled by the still-unvisited siblings
+  // and a PARTIAL graph then looks like a complete one. That silently reordered a
+  // join over the surviving relations and dropped the bailed subtree along with
+  // every predicate touching it (wrong rows, or "No row context found for column").
+  //
+  // NOTE: bailing is stricter than necessary — a non-inner join could instead be
+  // registered as ONE opaque leaf relation (its attributes are all this walk needs)
+  // and the surviving spine still enumerated. That matters because
+  // `rule-semi-join-pushdown` now routinely parks a semi join at the bottom of an
+  // inner spine, so `a join b join c where a.x in (select …)` loses enumeration it
+  // used to get. Revisit if a 3+-relation join under an `IN (SELECT …)` filter shows
+  // up with a bad join order; the opaque-leaf variant needs its own correlation
+  // guard first (a LATERAL leaf must not be reordered below its provider).
+  let bailed = false;
+
   function visit(n: PlanNode): void {
+    if (bailed) return;
     if (n instanceof JoinNode) {
-      // Only enumerate INNER/CROSS joins; bail if OUTER join encountered
       if (n.getJoinType() !== 'inner' && n.getJoinType() !== 'cross') {
-        relations.length = 0; // mark failure
+        bailed = true;
         return;
       }
       visit(n.getLeftSource());
       visit(n.getRightSource());
+      if (bailed) return;
 
       // Analyze equi-join predicates
       const cond = n.getJoinCondition();
@@ -84,7 +103,7 @@ function extractJoinGraph(node: PlanNode): JoinGraph | null {
   }
 
   visit(node);
-  if (relations.length === 0) return null; // failure or non-join
+  if (bailed || relations.length === 0) return null; // non-inner join encountered, or non-join
 
   // Build predicates array (AND-combine multiple per pair later during plan build)
   const predicates: JoinPredicate[] = [];

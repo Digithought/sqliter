@@ -85,6 +85,21 @@
  *   with NULLs instead of dropping it.
  *   `backlog/feat-outer-join-to-inner-on-null-rejecting-filter`, if it lands,
  *   converts some outer joins to inner ones and this rule then covers them.
+ * - NOTE: the anchor's left input must be the `JoinNode` ITSELF — no wrapper is
+ *   peeled. `select … from (select … from a join b …) x where x.k in (select …)`
+ *   and a residual `Filter` that survived predicate pushdown (one spanning both
+ *   branches, e.g. `… and e.amount > t.id`) both leave a node in between and
+ *   decline. Revisit if a wrapped compound shape shows up wanting the seek; the
+ *   peel would have to re-wrap whatever it walked through, which is why the
+ *   first pass does not attempt it.
+ *
+ * NOTE: pushing leaves a semi join as a LEAF of the enclosing inner spine, and
+ * `rule-quickpick-enumeration` abandons any join graph containing a non-inner
+ * join — so a 3+-relation join under an `IN (SELECT …)` filter now gets no join
+ * enumeration where it used to. Seek beats enumeration on the shapes this rule
+ * targets; revisit (by teaching QuickPick to admit a non-inner join as one opaque
+ * leaf) if such a query shows up with a bad join order. See the matching `NOTE:`
+ * in `rule-quickpick-enumeration.ts`.
  */
 
 import { createLogger } from '../../../common/logger.js';

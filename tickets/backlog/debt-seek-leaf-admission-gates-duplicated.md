@@ -4,6 +4,7 @@ files:
   - packages/quereus/src/planner/rules/shared/access-leaf.ts                 # where the shared gate would live, next to peelToSeekableAccessLeaf
   - packages/quereus/src/planner/rules/join/index-nested-loop.ts             # admitSeekLeaf (five gates)
   - packages/quereus/src/planner/rules/access/rule-key-set-seek.ts           # admitSeekLeaf (five gates, one of them checked differently)
+  - packages/quereus/src/planner/rules/join/rule-semi-join-pushdown.ts        # second arm: the drained-once purity trio, hand-copied again
 difficulty: medium
 tradeoffs: The two copies are not identical — one checks correlation per recorded constraint, the other per subtree — so merging them means first deciding which check is correct for both, and a maintainer may reasonably prefer two clear, separately-documented gate lists over one shared helper with two behaviour flags.
 ---
@@ -82,3 +83,25 @@ Changing what any gate decides. This is a consolidation: every plan the two rule
 or decline today must be unchanged afterwards, with the existing gate tests in
 `test/optimizer/index-nested-loop.spec.ts` and the `rule-key-set-seek` specs passing
 unmodified.
+
+## Second arm: the "may this relation be drained exactly once" checklist
+
+Found while reviewing `1-bug-key-set-seek-declines-when-probe-is-join`. The same
+copy-the-checklist pattern shows up a second time, over a different set of checks, so it
+belongs with this ticket rather than in one of its own.
+
+Before a rule may move or re-root the sub-query that supplies an `IN (SELECT …)` key set,
+it has to establish that the sub-query can be run exactly once — it must not read the row
+being tested, must return the same rows every time, and must not write anything. Three
+sites hand-write that same trio:
+
+- `rules/access/rule-key-set-seek.ts` — inside `admitJoin`.
+- `rules/join/rule-semi-join-pushdown.ts` — inline, with a comment saying it mirrors the
+  above "one-for-one".
+- the runtime set-probe / decorrelation path, which the comments at both sites cite as the
+  original.
+
+A fourth rule that forgets one of the three compiles clean and produces a wrong plan.
+Same fix shape as the arm above: one named predicate (`isDrainableOnce(relation)` or
+similar) that the sites call, keeping only their own extra gates locally. The two arms
+share a fix *style* but not a location, so they can land separately.
