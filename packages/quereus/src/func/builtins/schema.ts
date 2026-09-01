@@ -10,11 +10,10 @@ import { isWindowFunction } from "../../schema/window-function.js";
 import { Schema } from "../../schema/schema.js";
 import { exposedImplicitIndexes, isHiddenImplicitIndex, type SyntheticExposedIndex } from "../../schema/catalog.js";
 import { isMaintainedTable } from "../../schema/derivation.js";
-import { generateMaintainedTableDDL } from "../../schema/ddl-generator.js";
+import { generateMaintainedTableDDL, generateIndexDDL, generateTableDDL } from "../../schema/ddl-generator.js";
 import { INTEGER_TYPE, TEXT_TYPE } from "../../types/builtin-types.js";
-import { ColumnSchema } from "../../schema/column.js";
 import { FunctionFlags } from "../../common/constants.js";
-import { resolveReferencedColumns, RowOpFlag, type ForeignKeyConstraintSchema, type TableSchema } from "../../schema/table.js";
+import { resolveReferencedColumns, RowOpFlag, type ForeignKeyConstraintSchema, type IndexSchema, type TableSchema } from "../../schema/table.js";
 import { jsonStringify } from "../../util/serialization.js";
 import { expressionToString } from "../../emit/ast-stringify.js";
 import { createLogger } from "../../common/logger.js";
@@ -41,31 +40,29 @@ function tagsToJson(tags: Readonly<Record<string, SqlValue>> | undefined): strin
 }
 
 /**
- * Builds the `CREATE INDEX "name" ON "table" (cols)` string a `schema()` row
- * surfaces. Shared by real `IndexSchema` rows and synthetic exposed-implicit
- * descriptors (both expose `name` + `columns`). Returns `null` if a referenced
- * column index is out of range, matching the prior inline behavior.
+ * Renders the canonical `CREATE INDEX` DDL for a `schema()` row via
+ * {@link generateIndexDDL} (no `db`, so the result is fully qualified /
+ * fully annotated and re-parses to the object it describes in any session).
+ * Returns `null` on any render failure (e.g. an out-of-range column index)
+ * so the listing degrades that one row instead of failing outright.
  */
-function buildIndexCreateSql(
-	index: { name: string; columns: ReadonlyArray<{ index: number; collation?: string; desc?: boolean }> },
-	tableSchema: TableSchema,
-): string | null {
+function renderIndexCreateSql(index: IndexSchema, tableSchema: TableSchema): string | null {
 	try {
-		const indexColumns = index.columns.map(col => {
-			const column = tableSchema.columns[col.index];
-			let colStr = `"${column.name}"`;
-			if (col.collation) {
-				colStr += ` COLLATE ${col.collation}`;
-			}
-			if (col.desc) {
-				colStr += ' DESC';
-			}
-			return colStr;
-		}).join(', ');
-		return `CREATE INDEX "${index.name}" ON "${tableSchema.name}" (${indexColumns})`;
+		return generateIndexDDL(index, tableSchema);
 	} catch {
 		return null;
 	}
+}
+
+/**
+ * Lifts a {@link SyntheticExposedIndex} (the store-mode covering structure for
+ * a UNIQUE constraint that the backend did not materialize as an `IndexSchema`)
+ * into the `IndexSchema` shape {@link generateIndexDDL} expects. These are
+ * unique by construction — the descriptor carries no `unique` flag of its own
+ * (see `SyntheticExposedIndex`), so it is set explicitly here.
+ */
+function syntheticExposedIndexToIndexSchema(desc: SyntheticExposedIndex): IndexSchema {
+	return { name: desc.name, columns: desc.columns, unique: true, predicate: desc.predicate, tags: desc.tags };
 }
 
 /**
@@ -130,9 +127,13 @@ export const schemaFunc = createIntegratedTableValuedFunction(
 							// as itself, with its canonical create-materialized-view DDL.
 							createSql = generateMaintainedTableDDL(tableSchema);
 						} else {
-							const columnsStr = tableSchema.columns.map((c: ColumnSchema) => `"${c.name}" ${c.logicalType.name}`).join(', ');
-							const argsStr = Object.entries(tableSchema.vtabArgs ?? {}).map(([key, value]) => `${key}=${value}`).join(', ');
-							createSql = `create table "${tableSchema.name}" (${columnsStr}) using ${tableSchema.vtabModuleName}(${argsStr})`;
+							// No `db`: fully qualified, always-annotated DDL that re-parses
+							// to the object it describes in any session (see ddl-generator.js
+							// header). Longer / uppercase than the old hand-rolled string, but
+							// that hand-rolled form dropped the key, nullability, defaults,
+							// collations and constraints — this is a deliberate change, not a
+							// regression.
+							createSql = generateTableDDL(tableSchema);
 						}
 					} catch {
 						createSql = null;
@@ -162,7 +163,7 @@ export const schemaFunc = createIntegratedTableValuedFunction(
 								'index',
 								indexSchema.name,
 								tableSchema.name,
-								buildIndexCreateSql(indexSchema, tableSchema),
+								renderIndexCreateSql(indexSchema, tableSchema),
 								tagsToJson(indexSchema.tags)
 							] as Row;
 						}
@@ -178,7 +179,7 @@ export const schemaFunc = createIntegratedTableValuedFunction(
 							'index',
 							desc.name,
 							tableSchema.name,
-							buildIndexCreateSql(desc, tableSchema),
+							renderIndexCreateSql(syntheticExposedIndexToIndexSchema(desc), tableSchema),
 							tagsToJson(desc.tags)
 						] as Row;
 					}

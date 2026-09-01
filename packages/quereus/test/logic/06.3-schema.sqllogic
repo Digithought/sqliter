@@ -14,7 +14,7 @@ CREATE INDEX idx_name ON products(name);
 
 -- Verify indexes are returned in schema()
 SELECT type, name, tbl_name, sql FROM schema() WHERE type = 'index' ORDER BY name;
-→ [{"type":"index","name":"idx_category","tbl_name":"products","sql":"CREATE INDEX \"idx_category\" ON \"products\" (\"category\" COLLATE BINARY)"},{"type":"index","name":"idx_name","tbl_name":"products","sql":"CREATE INDEX \"idx_name\" ON \"products\" (\"name\" COLLATE BINARY)"}]
+→ [{"type":"index","name":"idx_category","tbl_name":"products","sql":"CREATE INDEX \"idx_category\" ON \"main\".\"products\" (\"category\" COLLATE BINARY)"},{"type":"index","name":"idx_name","tbl_name":"products","sql":"CREATE INDEX \"idx_name\" ON \"main\".\"products\" (\"name\" COLLATE BINARY)"}]
 
 -- Verify 'index' is in the list of schema object types
 SELECT DISTINCT type FROM schema() ORDER BY type;
@@ -30,7 +30,7 @@ CREATE TABLE orders (
 CREATE INDEX idx_customer_status ON orders(customer_id, status);
 
 SELECT name, tbl_name, sql FROM schema() WHERE type = 'index' AND tbl_name = 'orders';
-→ [{"name":"idx_customer_status","tbl_name":"orders","sql":"CREATE INDEX \"idx_customer_status\" ON \"orders\" (\"customer_id\" COLLATE BINARY, \"status\" COLLATE BINARY)"}]
+→ [{"name":"idx_customer_status","tbl_name":"orders","sql":"CREATE INDEX \"idx_customer_status\" ON \"main\".\"orders\" (\"customer_id\" COLLATE BINARY, \"status\" COLLATE BINARY)"}]
 
 -- Test with DESC index
 CREATE TABLE events (
@@ -41,7 +41,7 @@ CREATE TABLE events (
 CREATE INDEX idx_created_desc ON events(created_at DESC);
 
 SELECT sql FROM schema() WHERE type = 'index' AND name = 'idx_created_desc';
-→ [{"sql":"CREATE INDEX \"idx_created_desc\" ON \"events\" (\"created_at\" COLLATE BINARY DESC)"}]
+→ [{"sql":"CREATE INDEX \"idx_created_desc\" ON \"main\".\"events\" (\"created_at\" COLLATE BINARY DESC)"}]
 
 -- The view-shaped schema() assertions (view row, view sql preserved, 'view' in the
 -- type list) need no index and live in 06.3.6-schema-views, so a backend that skips
