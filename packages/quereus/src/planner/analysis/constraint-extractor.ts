@@ -48,7 +48,15 @@ export interface PredicateConstraint extends VtabPredicateConstraint {
 	sourceExpression: ScalarPlanNode;
 	/** Target table relation (for multi-table predicates) */
 	targetRelation?: string;
-	/** Dynamic value expression for parameterized/correlated constraints (or IN lists) */
+	/**
+	 * Dynamic value expression for parameterized/correlated constraints (or IN lists).
+	 *
+	 * Every entry — scalar or array element — is an expression evaluating to the
+	 * constrained *value*, never the branch's source comparison. Consumers
+	 * materialize these as index seek keys, which are evaluated before any row of
+	 * the constrained table is read, so an entry that mentions that table's own
+	 * columns cannot be evaluated at all.
+	 */
 	valueExpr?: ScalarPlanNode | ScalarPlanNode[];
 	/** Binding kind describing how value is supplied */
 	bindingKind?: 'literal' | 'parameter' | 'correlated' | 'expression' | 'mixed';
@@ -308,7 +316,7 @@ function findTargetRelationKey(expr: ScalarPlanNode, attributeToTableMap: Map<nu
  * function calls, casts, etc. — e.g. `outer.id + 1`, `coalesce(outer.id, 0)`,
  * `cast(outer.id + 1 as integer)`.
  */
-function collectColumnRefAttributeIds(node: ScalarPlanNode): number[] {
+export function collectColumnRefAttributeIds(node: ScalarPlanNode): number[] {
   const ids: number[] = [];
   const stack: ScalarPlanNode[] = [node];
   while (stack.length) {
@@ -749,7 +757,10 @@ function tryExtractOrBranches(
 			b.constraints[0].attributeId === firstConstraint.attributeId
 		);
 		if (sameColumn) {
-			return collapseBranchesToIn(branches, firstConstraint, expr);
+			// A null here means a branch's source shape yielded no value expression;
+			// fall through to OR_RANGE / residual rather than emitting a bad IN.
+			const inResult = collapseBranchesToIn(branches, firstConstraint, expr);
+			if (inResult) return inResult;
 		}
 	}
 
@@ -764,12 +775,22 @@ function tryExtractOrBranches(
  * Collapse OR branches (equality and/or IN) on the same column into a single IN constraint.
  * Handles mixed equality + IN branches (e.g., from nested OR normalization)
  * and both literal and non-literal (parameter, expression) values.
+ *
+ * Contract for the emitted `valueExpr` array: every element is an expression
+ * evaluating to *that member's value* — never the branch's source comparison.
+ * A consumer materializes these as index seek keys, which are evaluated before
+ * any row of the constrained table exists, so a `col = 10` node in a value slot
+ * is unevaluatable (see `valueSideOf`).
+ *
+ * Returns null when a branch's source shape cannot yield a value expression;
+ * the caller then falls through to OR_RANGE / residual — a completeness loss
+ * only, never a wrong answer.
  */
 function collapseBranchesToIn(
 	branches: { constraints: PredicateConstraint[] }[],
 	template: PredicateConstraint,
 	sourceExpr: ScalarPlanNode
-): { constraints: PredicateConstraint[] } {
+): { constraints: PredicateConstraint[] } | null {
 	const values: SqlValue[] = [];
 	const valueExprs: ScalarPlanNode[] = [];
 	let hasNonLiteral = false;
@@ -787,9 +808,13 @@ function collapseBranchesToIn(
 				}
 				hasNonLiteral = true;
 			} else {
-				// All literal IN — push placeholder source expressions
-				for (const _v of c.value as SqlValue[]) {
-					valueExprs.push(c.sourceExpression);
+				// All-literal IN branch: the members' own expressions, positionally
+				// aligned with `c.value` (`extractInConstraint` maps 1:1 over
+				// `InNode.values`).
+				const src = c.sourceExpression;
+				if (!(src instanceof InNode) || !src.values || src.values.length !== (c.value as SqlValue[]).length) return null;
+				for (const ve of src.values) {
+					valueExprs.push(ve);
 				}
 			}
 		} else {
@@ -799,7 +824,13 @@ function collapseBranchesToIn(
 				valueExprs.push(c.valueExpr as ScalarPlanNode);
 				hasNonLiteral = true;
 			} else {
-				valueExprs.push(c.sourceExpression);
+				// Literal equality branch: the value operand, never the whole
+				// comparison — a consumer materializes these as seek keys.
+				const src = c.sourceExpression;
+				if (!(src instanceof BinaryOpNode)) return null;
+				const valueSide = valueSideOf(src, c.attributeId);
+				if (!valueSide) return null;
+				valueExprs.push(valueSide);
 			}
 		}
 	}
@@ -1153,6 +1184,25 @@ function columnSideOf(src: BinaryOpNode, attributeId: number): ScalarPlanNode | 
 	if (l.nodeType === PlanNodeType.ColumnReference && (l as unknown as ColumnReferenceNode).attributeId === attributeId) return l;
 	const r = unwrapCast(src.right);
 	if (r.nodeType === PlanNodeType.ColumnReference && (r as unknown as ColumnReferenceNode).attributeId === attributeId) return r;
+	return undefined;
+}
+
+/**
+ * Locate the *value* side of a binary comparison whose other side is the
+ * (cast-unwrapped) column reference matching `attributeId` — the mirror of
+ * {@link columnSideOf}. Used by {@link collapseBranchesToIn} to record what a
+ * literal equality branch actually compares against, since the whole comparison
+ * is not evaluatable as a seek key.
+ *
+ * The cast unwrap identifies the *column* side only; the returned value side is
+ * the **raw** operand, matching {@link extractBinaryConstraint}, which keeps a
+ * converting cast in `valueExpr` on purpose.
+ */
+function valueSideOf(src: BinaryOpNode, attributeId: number): ScalarPlanNode | undefined {
+	const l = unwrapCast(src.left);
+	if (l.nodeType === PlanNodeType.ColumnReference && (l as unknown as ColumnReferenceNode).attributeId === attributeId) return src.right;
+	const r = unwrapCast(src.right);
+	if (r.nodeType === PlanNodeType.ColumnReference && (r as unknown as ColumnReferenceNode).attributeId === attributeId) return src.left;
 	return undefined;
 }
 

@@ -30,7 +30,9 @@ import { compareSqlValues, normalizeCollationName } from '../../../util/comparis
 import type { Scope } from '../../scopes/scope.js';
 import { TableReferenceNode } from '../../nodes/reference.js';
 import { FilterNode } from '../../nodes/filter.js';
-import { extractConstraintsForTable, type PredicateConstraint as PlannerPredicateConstraint, type RangeSpec, createTableInfoFromNode } from '../../analysis/constraint-extractor.js';
+import { collectColumnRefAttributeIds, extractConstraintsForTable, type PredicateConstraint as PlannerPredicateConstraint, type RangeSpec, createTableInfoFromNode } from '../../analysis/constraint-extractor.js';
+import { quereusError } from '../../../common/errors.js';
+import { StatusCode } from '../../../common/types.js';
 import { LiteralNode, BinaryOpNode, BetweenNode } from '../../nodes/scalar.js';
 import { InNode } from '../../nodes/subquery.js';
 import { effectiveBetweenBoundCollation, effectiveComparisonCollation, effectiveInCollation } from '../../analysis/comparison-collation.js';
@@ -616,8 +618,7 @@ function selectPhysicalNodeFromPlan(
 			);
 
 			log('Using index multi-seek on %s (IN with %d values)', physicalIndexName, seekKeys.length);
-			return finishSeek(new IndexSeekNode(
-				tableRef.scope,
+			return finishSeek(makeIndexSeek(
 				tableRef,
 				fi,
 				physicalIndexName,
@@ -626,6 +627,7 @@ function selectPhysicalNodeFromPlan(
 				providesOrdering,
 				accessPlan.cost,
 				advertisement,
+				'multiSeek',
 			));
 		}
 
@@ -687,8 +689,7 @@ function selectPhysicalNodeFromPlan(
 				);
 
 				log('Using composite index multi-seek on %s (cross-product of %d distinct non-null seeks, width %d)', physicalIndexName, effectiveTuples.length, seekWidth);
-				return finishSeek(new IndexSeekNode(
-					tableRef.scope,
+				return finishSeek(makeIndexSeek(
 					tableRef,
 					fi,
 					physicalIndexName,
@@ -697,6 +698,7 @@ function selectPhysicalNodeFromPlan(
 					providesOrdering,
 					accessPlan.cost,
 					advertisement,
+					'composite multiSeek',
 				));
 			}
 
@@ -729,8 +731,7 @@ function selectPhysicalNodeFromPlan(
 			);
 
 			log('Using composite index multi-seek on %s (cross-product of %d seeks, width %d)', physicalIndexName, crossProduct.length, seekWidth);
-			return finishSeek(new IndexSeekNode(
-				tableRef.scope,
+			return finishSeek(makeIndexSeek(
 				tableRef,
 				fi,
 				physicalIndexName,
@@ -739,6 +740,7 @@ function selectPhysicalNodeFromPlan(
 				providesOrdering,
 				accessPlan.cost,
 				advertisement,
+				'composite multiSeek',
 			));
 		}
 
@@ -765,8 +767,7 @@ function selectPhysicalNodeFromPlan(
 		);
 
 		log('Using index seek on %s (equality)', physicalIndexName);
-		return finishSeek(new IndexSeekNode(
-			tableRef.scope,
+		return finishSeek(makeIndexSeek(
 			tableRef,
 			fi,
 			physicalIndexName,
@@ -775,6 +776,7 @@ function selectPhysicalNodeFromPlan(
 			providesOrdering,
 			accessPlan.cost,
 			advertisement,
+			'eqSeek',
 		));
 	}
 
@@ -859,8 +861,7 @@ function selectPhysicalNodeFromPlan(
 			);
 
 			log('Using index prefix-range seek on %s (prefix=%d cols)', physicalIndexName, prefixEqCols.length);
-			return new IndexSeekNode(
-				tableRef.scope,
+			return makeIndexSeek(
 				tableRef,
 				fi,
 				physicalIndexName,
@@ -869,6 +870,7 @@ function selectPhysicalNodeFromPlan(
 				providesOrdering,
 				accessPlan.cost,
 				advertisement,
+				'prefixRangeSeek',
 			);
 		}
 	}
@@ -932,8 +934,7 @@ function selectPhysicalNodeFromPlan(
 		);
 
 		log('Using index seek (range) on %s', physicalIndexName);
-		return new IndexSeekNode(
-			tableRef.scope,
+		return makeIndexSeek(
 			tableRef,
 			fi,
 			physicalIndexName,
@@ -942,6 +943,7 @@ function selectPhysicalNodeFromPlan(
 			providesOrdering,
 			accessPlan.cost,
 			advertisement,
+			'rangeSeek',
 		);
 	}
 
@@ -1009,8 +1011,7 @@ function selectPhysicalNodeFromPlan(
 		);
 
 		log('Using index multi-range seek on %s (%d ranges)', physicalIndexName, ranges.length);
-		return new IndexSeekNode(
-			tableRef.scope,
+		return makeIndexSeek(
 			tableRef,
 			fi,
 			physicalIndexName,
@@ -1019,6 +1020,7 @@ function selectPhysicalNodeFromPlan(
 			providesOrdering,
 			accessPlan.cost,
 			advertisement,
+			'multiRangeSeek',
 		);
 	}
 
@@ -1129,8 +1131,7 @@ function selectPhysicalNodeLegacy(
 		);
 
 		log('Using index seek on primary key (legacy)');
-		const pkSeek = new IndexSeekNode(
-			tableRef.scope,
+		const pkSeek = makeIndexSeek(
 			tableRef,
 			fi,
 			'primary',
@@ -1139,6 +1140,7 @@ function selectPhysicalNodeLegacy(
 			providesOrdering,
 			accessPlan.cost,
 			advertisement,
+			'primary-key eqSeek',
 		);
 		return cover.residual ? new FilterNode(tableRef.scope, pkSeek, cover.residual) : pkSeek;
 	}
@@ -1196,8 +1198,7 @@ function selectPhysicalNodeLegacy(
 		);
 
 		log('Using index seek (range) on primary key (legacy)');
-		return new IndexSeekNode(
-			tableRef.scope,
+		return makeIndexSeek(
 			tableRef,
 			fi,
 			'primary',
@@ -1206,6 +1207,7 @@ function selectPhysicalNodeLegacy(
 			providesOrdering,
 			accessPlan.cost,
 			advertisement,
+			'primary-key rangeSeek',
 		);
 	}
 
@@ -1329,6 +1331,69 @@ function equalitySeekKey(scope: Scope, c: PlannerPredicateConstraint, columnType
 		? (c.value as unknown as SqlValue[])[0]
 		: (c.value as SqlValue);
 	return literalFromValue(scope, val, columnType);
+}
+
+/**
+ * Seek-key row-context invariant.
+ *
+ * A seek key handed to {@link IndexSeekNode} for table T is evaluated *before*
+ * any row of T is read. It may reference columns of *other* relations — that is
+ * an ordinary correlated / index-nested-loop seek — but it can never reference a
+ * column of T itself. When one does, the failure surfaces far from its cause, as
+ * "No row context found for column ..." from inside expression evaluation.
+ *
+ * Fail loudly here instead, naming the offending column. The walk covers a
+ * handful of small expressions per seek, so cost is not a concern.
+ */
+export function assertSeekKeysRowIndependent(
+	tableRef: TableReferenceNode,
+	seekKeys: readonly ScalarPlanNode[],
+	seekKind: string,
+): void {
+	const ownAttributes = new Map(tableRef.getAttributes().map(a => [a.id, a.name]));
+	for (const key of seekKeys) {
+		for (const attrId of collectColumnRefAttributeIds(key)) {
+			const name = ownAttributes.get(attrId);
+			if (name !== undefined) {
+				quereusError(
+					`Internal planner error: ${seekKind} seek key on ${tableRef.tableSchema.name} references that table's own column ` +
+					`"${name}" (attribute ${attrId}). Seek keys are evaluated before any row of the table is read, so a key may ` +
+					`reference other relations but never the table being sought. Offending key: ${key.toString()}`,
+					StatusCode.INTERNAL,
+				);
+			}
+		}
+	}
+}
+
+/**
+ * Build an {@link IndexSeekNode} for `tableRef`, checking the seek-key row-context
+ * invariant first. Every seek this rule emits goes through here so no arm can
+ * skip the check.
+ */
+function makeIndexSeek(
+	tableRef: TableReferenceNode,
+	filterInfo: FilterInfo,
+	indexName: string,
+	seekKeys: ScalarPlanNode[],
+	isRange: boolean,
+	providesOrdering: { column: number; desc: boolean }[] | undefined,
+	cost: number,
+	advertisement: AccessPathAdvertisement | undefined,
+	seekKind: string,
+): IndexSeekNode {
+	assertSeekKeysRowIndependent(tableRef, seekKeys, seekKind);
+	return new IndexSeekNode(
+		tableRef.scope,
+		tableRef,
+		filterInfo,
+		indexName,
+		seekKeys,
+		isRange,
+		providesOrdering,
+		cost,
+		advertisement,
+	);
 }
 
 /**

@@ -581,6 +581,21 @@ only when it is declared `NOT NULL`, pinned by the plan's own equality, or carri
 NULL-excluding pushed filter. Every claim site truncates its prefix through
 `nullSafeOrderingPrefixLength` and drops the claim entirely at prefix zero.
 
+### OPT-061 — A seek key never references a column of the table being sought
+
+- code: `packages/quereus/src/planner/rules/access/rule-select-access-path.ts` — `assertSeekKeysRowIndependent`
+- code: `packages/quereus/src/planner/analysis/constraint-extractor.ts` — `collapseBranchesToIn`
+- guard: `packages/quereus/test/plan/or-collapsed-in-value-exprs.spec.ts` — `rejects a seek key referencing a column of the sought table`
+- doc: [Rule Families § Predicate Analysis and Pushdown](optimizer-rule-families.md#predicate-analysis-and-pushdown)
+
+An `IndexSeekNode` key for table T is evaluated before any row of T is read. It may
+reference columns of *other* relations — that is an ordinary correlated / index-nested-loop
+seek — but never a column of T itself. The feeding contract is `PredicateConstraint.valueExpr`:
+every entry is an expression evaluating to that member's **value**, never the branch's
+source comparison. `collapseBranchesToIn` violated it for literal branches of an OR-collapsed
+`IN`, pushing `col = 10` where `10` belonged, which failed at runtime as "No row context
+found for column …". Every seek this rule emits is checked by `assertSeekKeysRowIndependent`.
+
 ## MV — Materialized views
 
 The read-side rewrite and the coverage prover are optimizer concerns, not MV ones: a view no
