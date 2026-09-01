@@ -43,6 +43,7 @@ import { emitStreamAggregate } from './emit/aggregate.js';
 import { emitHashAggregate } from './emit/hash-aggregate.js';
 import { emitCaseExpr } from './emit/case.js';
 import { emitCast } from './emit/cast.js';
+import { emitWriteCoercion } from './emit/write-coercion.js';
 import { emitCollate } from "./emit/collate.js";
 import { emitTableValuedFunctionCall } from './emit/table-valued-function.js';
 import { emitTransaction } from './emit/transaction.js';
@@ -94,6 +95,7 @@ export function registerEmitters() {
 	registerEmitter(PlanNodeType.ScalarFunctionCall, emitScalarFunctionCall as EmitterFunc);
 	registerEmitter(PlanNodeType.CaseExpr, emitCaseExpr as EmitterFunc);
 	registerEmitter(PlanNodeType.Cast, emitCast as EmitterFunc);
+	registerEmitter(PlanNodeType.WriteCoercion, emitWriteCoercion as EmitterFunc);
 	registerEmitter(PlanNodeType.Collate, emitCollate as EmitterFunc);
 	registerEmitter(PlanNodeType.Between, emitBetween as EmitterFunc);
 	registerEmitter(PlanNodeType.ScalarSubquery, emitScalarSubquery as EmitterFunc);

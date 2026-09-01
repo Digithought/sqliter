@@ -7,7 +7,7 @@ import { StatusCode, type SqlValue, type Row } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { buildRowDescriptor, composeOldNewRow } from '../../util/row-descriptor.js';
 import { createRowSlot, withAsyncRowContext } from '../context-helpers.js';
-import { buildRowCoercion } from '../../types/validation.js';
+import { buildCellCoercion, buildRowCoercion } from '../../types/validation.js';
 
 export function emitUpdate(plan: UpdateNode, ctx: EmissionContext): Instruction {
 	const tableSchema = plan.table.tableSchema;
@@ -65,14 +65,18 @@ export function emitUpdate(plan: UpdateNode, ctx: EmissionContext): Instruction 
 	const coerceRegular = buildRowCoercion(regularCellTypes, tableSchema.columns);
 
 	// After phase 1 every non-generated cell is in declared form (identity ⇒
-	// skip), so only the generated cells can still need converting.
-	const generatedCellTypes = tableSchema.columns.map(column => column.logicalType);
+	// skip), so only the generated cells can still need converting. Converted
+	// PER CELL inside the phase-2 loop — each value before the next generated
+	// column reads it — so a generated column reading another generated column
+	// derives from the stored form, matching executeUpsertUpdate's recompute
+	// order (runtime/emit/dml-executor.ts).
+	const generatedCoercions = new Map<number, (value: SqlValue) => SqlValue>();
 	for (const i of generatedIndices) {
-		generatedCellTypes[assignmentTargetIndices[i]] = plan.assignments[i].value.getType().logicalType;
+		const column = tableSchema.columns[assignmentTargetIndices[i]];
+		const coerce = buildCellCoercion(
+			plan.assignments[i].value.getType().logicalType, column.logicalType, column.name);
+		if (coerce) generatedCoercions.set(i, coerce);
 	}
-	const coerceGenerated = generatedIndices.length > 0
-		? buildRowCoercion(generatedCellTypes, tableSchema.columns)
-		: undefined;
 
 	// Distinct descriptor object carrying the same attribute IDs as `sourceRowDescriptor`,
 	// so tearing the phase-2 context down does not evict the streaming source slot (the
@@ -112,11 +116,12 @@ export function emitUpdate(plan: UpdateNode, ctx: EmissionContext): Instruction 
 				if (generatedIndices.length > 0) {
 					await withAsyncRowContext(rctx, generatedRowDescriptor!, () => updatedRow, async () => {
 						for (const i of generatedIndices) {
-							const value = await assignmentEvaluators[i](rctx) as SqlValue;
+							let value = await assignmentEvaluators[i](rctx) as SqlValue;
+							const coerce = generatedCoercions.get(i);
+							if (coerce) value = coerce(value);
 							updatedRow[assignmentTargetIndices[i]] = value;
 						}
 					});
-					if (coerceGenerated) updatedRow = coerceGenerated(updatedRow);
 				}
 
 				// Create flat row with OLD (source) and NEW (updated) values for constraint

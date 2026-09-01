@@ -670,10 +670,17 @@ than burying it in storage.
 
 Concretely:
 
+- INSERT's row-expansion projection (`building/insert.ts`) converts each
+  supplied, DEFAULT, and generated cell to declared form **in place** — a
+  planner-inserted `WriteCoercion` node with the same `buildCellCoercion`
+  semantics — so a DEFAULT reading a supplied sibling via `new.<col>` and a
+  generated expression both see the value that will be stored, matching what
+  UPDATE and the `DO UPDATE` recompute hand the same expressions.
 - `emitInsert` masks each cell by the source relation's attribute type at that
   position (the source is projected into full table-column order, so the two
-  align). `insert into b select j from a` copies JSON values untouched; a
-  VALUES literal still converts.
+  align); with the expansion projection announcing declared types, its pass
+  degrades to conformance guards there. `insert into b select j from a`
+  copies JSON values untouched; a VALUES literal converts in the projection.
 - `emitUpdate` masks an assigned column by its assignment expression's type and
   an unassigned column by the source attribute's type — for the ordinary
   target-table scan that is the declared type itself, so the carried-over

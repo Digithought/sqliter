@@ -10,6 +10,7 @@ import type {
 	CollateNode,
 	LiteralNode,
 	UnaryOpNode,
+	WriteCoercionNode,
 } from '../planner/nodes/scalar.js';
 import type { ScalarFunctionCallNode } from '../planner/nodes/function.js';
 import type { ColumnReferenceNode, ParameterReferenceNode } from '../planner/nodes/reference.js';
@@ -22,6 +23,7 @@ import { buildLiteralSpec } from './emit/literal.js';
 import { buildColumnReferenceSpec } from './emit/column-reference.js';
 import { buildParameterSpec } from './emit/parameter.js';
 import { buildCastSpec } from './emit/cast.js';
+import { buildWriteCoercionSpec } from './emit/write-coercion.js';
 import { buildUnaryOpSpec } from './emit/unary.js';
 import { buildBetweenSpec } from './emit/between.js';
 import { buildBinaryOpSpec } from './emit/binary.js';
@@ -103,6 +105,9 @@ function fuseNode(plan: PlanNode, ctx: EmissionContext, depth: number): FusedSca
 			return fuseNode((plan as CollateNode).operand, ctx, depth);
 		case PlanNodeType.Cast:
 			return fuseSpec(buildCastSpec(plan as CastNode), ctx, depth);
+		case PlanNodeType.WriteCoercion:
+			// The converter closures from buildCellCoercion are synchronous.
+			return fuseSpec(buildWriteCoercionSpec(plan as WriteCoercionNode), ctx, depth);
 		case PlanNodeType.UnaryOp:
 			return fuseSpec(buildUnaryOpSpec(plan as UnaryOpNode), ctx, depth);
 		case PlanNodeType.Between:

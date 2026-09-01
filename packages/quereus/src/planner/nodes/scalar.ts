@@ -811,6 +811,100 @@ export class CastNode extends PlanNode implements UnaryScalarNode {
 }
 
 /**
+ * Planner-inserted write-path conversion of a produced cell to its column's
+ * declared type. The INSERT row-expansion projection is the sole construction
+ * site (`building/insert.ts` `coerceToDeclared`): it wraps each supplied /
+ * DEFAULT / generated cell so DEFAULT and generated expressions evaluated
+ * later in the projection chain read the value in DECLARED form — the same
+ * form every other write path (UPDATE, upsert DO UPDATE, ALTER backfill)
+ * hands them.
+ *
+ * Semantics are the WRITE path's, from `buildCellCoercion`
+ * (`types/validation.ts`): conversion via `validateAndParse` — a failure
+ * throws MISMATCH — and an identity-matched source is guarded rather than
+ * re-converted (JSON re-parse hazard). This is NOT CAST: `lenientCast` maps a
+ * failed conversion to NULL, which would silently null a bad write.
+ */
+export class WriteCoercionNode extends PlanNode implements UnaryScalarNode {
+	readonly nodeType = PlanNodeType.WriteCoercion;
+	private cachedType: Cached<ScalarType>;
+
+	constructor(
+		public readonly scope: Scope,
+		public readonly operand: ScalarPlanNode,
+		/** The target column's declared type (carries the declared collation). */
+		public readonly targetType: ScalarType,
+		/** The target column's name, for the MISMATCH message. */
+		public readonly columnName: string,
+	) {
+		super(scope, 0.02); // Same cost shape as CastNode — one conversion per value
+		this.cachedType = new Cached(this.generateType);
+	}
+
+	/** The node adds no syntax of its own — it exposes the operand's expression. */
+	get expression(): AST.Expression {
+		return this.operand.expression;
+	}
+
+	getType(): ScalarType {
+		return this.cachedType.value;
+	}
+
+	generateType = (): ScalarType => {
+		// Conversion maps NULL→NULL and throws rather than yielding NULL, so
+		// nullability follows the operand. NOT NULL stays enforced by the
+		// constraint check, not asserted here.
+		return { ...this.targetType, nullable: this.operand.getType().nullable };
+	}
+
+	getChildren(): readonly [ScalarPlanNode] {
+		return [this.operand];
+	}
+
+	getRelations(): readonly [] {
+		return [];
+	}
+
+	withChildren(newChildren: readonly PlanNode[]): PlanNode {
+		if (newChildren.length !== 1) {
+			quereusError(`WriteCoercionNode expects 1 child, got ${newChildren.length}`, StatusCode.INTERNAL);
+		}
+
+		const [newOperand] = newChildren;
+
+		if (!('expression' in newOperand)) {
+			quereusError('WriteCoercionNode: child must be a ScalarPlanNode', StatusCode.INTERNAL);
+		}
+
+		if (newOperand === this.operand) {
+			return this;
+		}
+
+		return new WriteCoercionNode(
+			this.scope,
+			newOperand as ScalarPlanNode,
+			this.targetType,
+			this.columnName
+		);
+	}
+
+	override toString(): string {
+		return `WRITE_COERCE(${formatExpression(this.operand)} AS ${this.targetType.logicalType.name})`;
+	}
+
+	override getLogicalAttributes(): Record<string, unknown> {
+		return {
+			operand: formatExpression(this.operand),
+			targetColumn: this.columnName,
+			resultType: formatScalarType(this.getType())
+		};
+	}
+
+	// isInjectiveIn: conservative PlanNode default — a conversion collapses
+	// spellings (e.g. '1' and '1.0' both convert to 1), so no injectivity claim.
+}
+
+/**
  * `<operand> COLLATE <name>` — identity on values, overrides the collation the
  * surrounding comparison/ordering resolves.
  *
