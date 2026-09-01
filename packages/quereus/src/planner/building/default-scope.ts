@@ -27,11 +27,22 @@ export function buildRowDefaultScope(
 	targetColumns: ReadonlyArray<{ readonly name: string; readonly type?: ScalarType }>,
 	sourceAttributes: ReadonlyArray<Attribute>,
 	mutationContextVarNames?: ReadonlySet<string>,
+	/**
+	 * Position to record on each reference, parallel to `targetColumns`. Defaults to
+	 * the target-list position, which is where the column sits when the caller passes
+	 * the source relation's own attributes. A caller whose attributes come from a row
+	 * laid out differently — the INSERT row expansion, where a supplied column sits at
+	 * its *table* position — passes the positions in that row instead, so the recorded
+	 * index stays true for the planner analyses that read it (value lookup itself goes
+	 * through the attribute id, not this field).
+	 */
+	columnIndexes?: ReadonlyArray<number>,
 ): RegisteredScope {
 	const scope = new RegisteredScope(parentScope);
 	targetColumns.forEach((targetCol, index) => {
 		if (index >= sourceAttributes.length) return;
 		const sourceAttr = sourceAttributes[index];
+		const columnIndex = columnIndexes?.[index] ?? index;
 		const colNameLower = targetCol.name.toLowerCase();
 		// Resolve against the target column's *declared* type when available (it
 		// carries the declared collation), so a DEFAULT comparing a supplied sibling
@@ -40,7 +51,7 @@ export function buildRowDefaultScope(
 		// which is collation-blind.
 		const refType = targetCol.type ?? sourceAttr.type;
 		const makeRef: ReferenceCallback = (exp, s) =>
-			new ColumnReferenceNode(s, exp as AST.ColumnExpr, refType, sourceAttr.id, index);
+			new ColumnReferenceNode(s, exp as AST.ColumnExpr, refType, sourceAttr.id, columnIndex);
 		scope.registerSymbol(`new.${colNameLower}`, makeRef);
 		if (!mutationContextVarNames?.has(colNameLower)) {
 			scope.registerSymbol(colNameLower, makeRef);

@@ -21,6 +21,13 @@ export function emitInsert(plan: InsertNode, ctx: EmissionContext): Instruction 
 	// column's type (e.g. `insert into b select j from a` for a JSON column) is
 	// left alone — provided the value in hand also inhabits that type, since the
 	// source's announcement is an inference, not a guarantee. See buildRowCoercion.
+	//
+	// NOTE: on a non-fast-path insert the row-expansion projection has already converted
+	// each constrained cell, so this pass usually degrades to a second conformance probe
+	// (one storage-class check per cell). Deliberate and not skippable on the strength of
+	// the projection's announcement, for the reason above. If cell-conversion probes ever
+	// show up in a profile, the fix is a provenance flag saying a cell was converted by a
+	// WriteCoercionNode in this same plan — not dropping either pass.
 	const sourceAttrs = plan.source.getAttributes();
 	const coerceNewRow = buildRowCoercion(
 		tableSchema.columns.map((_, i) => sourceAttrs[i]?.type.logicalType),

@@ -59,6 +59,181 @@ function coerceToDeclared(ctx: PlanningContext, node: ScalarPlanNode, column: Co
 	return new WriteCoercionNode(ctx.scope, node, columnSchemaToScalarType(column), column.name);
 }
 
+/** A cell the expansion fills in at a later stage — NULL until then. */
+function nullPlaceholder(ctx: PlanningContext): ScalarPlanNode {
+	return buildExpression(ctx, { type: 'literal', value: null }) as ScalarPlanNode;
+}
+
+/** Projection that re-reads the cell a previous stage already produced at `colIdx`. */
+function passThroughCell(ctx: PlanningContext, attr: Attribute, colIdx: number, alias: string): Projection {
+	return {
+		node: new ColumnReferenceNode(
+			ctx.scope,
+			{ type: 'column', name: attr.name } satisfies AST.ColumnExpr,
+			attr.type,
+			attr.id,
+			colIdx,
+		),
+		alias,
+	};
+}
+
+/** True when the column's DEFAULT is an AST expression rather than a literal value. */
+function isExpressionDefault(dflt: ColumnSchema['defaultValue']): dflt is AST.Expression {
+	return dflt !== undefined && typeof dflt === 'object' && dflt !== null && 'type' in dflt;
+}
+
+/** True when the source already produces exactly the table's columns, in table order. */
+function sourceMatchesTableShape(targetColumns: ColumnDef[], tableSchema: TableSchema): boolean {
+	return targetColumns.length === tableSchema.columns.length
+		&& targetColumns.every((tc, i) => tc.name.toLowerCase() === tableSchema.columns[i].name.toLowerCase());
+}
+
+/** Projection A's output plus the table positions its NULL placeholders left for stage B. */
+interface BaseExpansion {
+	readonly node: RelationalPlanNode;
+	/** Table positions of omitted columns carrying an AST *expression* DEFAULT. */
+	readonly expressionDefaultCols: number[];
+}
+
+/**
+ * Projection A: expand the source to the table's column structure, converting each
+ * supplied or literal-default cell to its column's declared type in place. Expression
+ * defaults and generated columns get a NULL placeholder here; later stages replace them.
+ */
+function buildBaseExpansion(
+	ctx: PlanningContext,
+	sourceNode: RelationalPlanNode,
+	targetColumns: ColumnDef[],
+	tableSchema: TableSchema,
+): BaseExpansion {
+	const sourceAttributes = sourceNode.getAttributes();
+	const expressionDefaultCols: number[] = [];
+
+	const projections: Projection[] = tableSchema.columns.map((tableColumn, tableColIdx) => {
+		const targetColIndex = targetColumns.findIndex(tc =>
+			tc.name.toLowerCase() === tableColumn.name.toLowerCase()
+		);
+
+		if (tableColumn.generated) {
+			if (targetColIndex >= 0) {
+				throw new QuereusError(
+					`Cannot INSERT into generated column '${tableColumn.name}'`,
+					StatusCode.ERROR
+				);
+			}
+			// Replaced by the generated-column chain.
+			return { node: nullPlaceholder(ctx), alias: tableColumn.name };
+		}
+
+		if (targetColIndex >= 0) {
+			if (targetColIndex >= sourceAttributes.length) {
+				throw new QuereusError(
+					`Source has fewer columns than expected for INSERT target columns`,
+					StatusCode.ERROR
+				);
+			}
+			const sourceAttr = sourceAttributes[targetColIndex];
+			const columnRef = new ColumnReferenceNode(
+				ctx.scope,
+				{ type: 'column', name: sourceAttr.name } satisfies AST.ColumnExpr,
+				sourceAttr.type,
+				sourceAttr.id,
+				targetColIndex
+			);
+			// NOTE: wrapping a supplied cell for conversion makes it a computed projection, so
+			// ProjectNode stops carrying the source's unique keys / functional dependencies
+			// through it. Correct conservatively — a conversion collapses spellings, so
+			// distinctness is not preserved in general. If an optimizer rule ever needs the
+			// expanded source's key set, teach the coercion node an injectivity claim for the
+			// conversions that provably preserve distinctness; do not drop the wrap.
+			return { node: coerceToDeclared(ctx, columnRef, tableColumn), alias: tableColumn.name };
+		}
+
+		const dflt = tableColumn.defaultValue;
+		if (isExpressionDefault(dflt)) {
+			// Computed by projection B against this projection's CONVERTED row, so a
+			// `new.<sibling>` read sees the declared form.
+			expressionDefaultCols.push(tableColIdx);
+			return { node: nullPlaceholder(ctx), alias: tableColumn.name };
+		}
+
+		if (dflt !== undefined) {
+			// Literal default — no row scope needed; convert to declared form.
+			return {
+				node: coerceToDeclared(ctx,
+					buildExpression(ctx, { type: 'literal', value: dflt }) as ScalarPlanNode,
+					tableColumn),
+				alias: tableColumn.name
+			};
+		}
+
+		// Omitted, no default — NULL, nothing to convert.
+		return { node: nullPlaceholder(ctx), alias: tableColumn.name };
+	});
+
+	return { node: new ProjectNode(ctx.scope, sourceNode, projections), expressionDefaultCols };
+}
+
+/**
+ * Projection B: compute the omitted columns' *expression* defaults against projection
+ * A's converted row.
+ *
+ * A default can derive from a sibling the INSERT actually supplied, e.g.
+ * `slug text default (lower(new.title))`; the `new.`-qualified form is always
+ * available, and the bare form resolves too unless a same-named mutation-context
+ * variable shadows it (preserving the WITH CONTEXT precedence). Columns the INSERT
+ * omitted are intentionally NOT registered: they have no value yet in this same
+ * projection, so a default cannot depend on another column's default (which would
+ * impose an evaluation-order race).
+ */
+function buildExpressionDefaultProjection(
+	ctx: PlanningContext,
+	inputNode: RelationalPlanNode,
+	expressionDefaultCols: ReadonlyArray<number>,
+	targetColumns: ColumnDef[],
+	tableSchema: TableSchema,
+	defaultParentScope: Scope,
+): RelationalPlanNode {
+	const inputAttrs = inputNode.getAttributes();
+	// buildRowDefaultScope pairs targetColumns[i] with suppliedAttrs[i], so hand it
+	// projection A's output attributes AT THE SUPPLIED COLUMNS' TABLE POSITIONS: the
+	// supplied values now live in the expanded row (in declared form), no longer in
+	// the original source layout. Those same table positions are the ones the scope
+	// records on each reference.
+	const suppliedIndexes = targetColumns.map(tc =>
+		tableSchema.columnIndexMap.get(tc.name.toLowerCase())!);
+	const suppliedAttrs = suppliedIndexes.map(idx => inputAttrs[idx]);
+	const contextVarNames = new Set(
+		(tableSchema.mutationContext ?? []).map(v => v.name.toLowerCase())
+	);
+	const defaultScope = buildRowDefaultScope(
+		defaultParentScope,
+		targetColumns,
+		suppliedAttrs,
+		contextVarNames,
+		suppliedIndexes,
+	);
+	const defaultCtx: PlanningContext = { ...ctx, scope: defaultScope };
+	const exprDefaultSet = new Set(expressionDefaultCols);
+
+	const projections: Projection[] = tableSchema.columns.map((col, colIdx) => {
+		if (!exprDefaultSet.has(colIdx)) {
+			return passThroughCell(ctx, inputAttrs[colIdx], colIdx, col.name);
+		}
+		const defaultNode = buildExpression(defaultCtx, col.defaultValue as AST.Expression) as ScalarPlanNode;
+
+		// Validate that the default expression is deterministic — skip when the
+		// `nondeterministic_schema` option permits non-deterministic defaults.
+		if (!ctx.db.options.getBooleanOption('nondeterministic_schema')) {
+			validateDeterministicDefault(defaultNode, col.name, tableSchema.name);
+		}
+		return { node: coerceToDeclared(ctx, defaultNode, col), alias: col.name };
+	});
+
+	return new ProjectNode(ctx.scope, inputNode, projections);
+}
+
 /**
  * Creates a uniform row expansion projection that maps any relational source
  * to the target table's column structure, filling in defaults for omitted columns.
@@ -73,13 +248,13 @@ function coerceToDeclared(ctx: PlanningContext, node: ScalarPlanNode, column: Co
  * the convert-exactly-once discipline.
  *
  * The chain, each stage present only when needed:
- * 1. Projection A expands the source to table structure — supplied columns and
- *    literal defaults converted to declared form; NULL placeholders for
- *    expression defaults, generated columns, and defaultless omitted columns.
- * 2. Projection B (only when ≥1 omitted column carries an *expression* default)
- *    computes those defaults against projection A's converted row.
- * 3. The generated-column chain computes generated values, each converted
- *    before the next reads it.
+ * 1. {@link buildBaseExpansion} expands the source to table structure.
+ * 2. {@link buildExpressionDefaultProjection}, only when ≥1 omitted column carries
+ *    an *expression* default — preserving the hot-path property that the common
+ *    insert (every column supplied, or only literal/NULL defaults) allocates
+ *    nothing here.
+ * 3. {@link createGeneratedColumnProjection} computes generated values, each
+ *    converted before the next reads it.
  */
 function createRowExpansionProjection(
 	ctx: PlanningContext,
@@ -101,163 +276,24 @@ function createRowExpansionProjection(
 	const tableSchema = tableReference.tableSchema;
 	const hasGeneratedColumns = tableSchema.columns.some(col => col.generated);
 
-	// If we're inserting into all columns in table order with no generated columns, no expansion needed
-	if (!hasGeneratedColumns && targetColumns.length === tableSchema.columns.length) {
-		const allColumnsMatch = targetColumns.every((tc, i) =>
-			tc.name.toLowerCase() === tableSchema.columns[i].name.toLowerCase()
-		);
-		if (allColumnsMatch) {
-			return sourceNode; // Source already matches table structure
-		}
+	// Source already matches the table structure — no expansion needed.
+	if (!hasGeneratedColumns && sourceMatchesTableShape(targetColumns, tableSchema)) {
+		return sourceNode;
 	}
 
-	// Projection A: expand the source to table structure, converting each supplied
-	// or literal-default cell to its column's declared type in place. Expression
-	// defaults get a NULL placeholder here (their table positions recorded below)
-	// and are computed by projection B against this projection's CONVERTED row.
-	const projections: Projection[] = [];
-	const sourceAttributes = sourceNode.getAttributes();
-	const expressionDefaultCols: number[] = [];
+	const { node: expanded, expressionDefaultCols } =
+		buildBaseExpansion(ctx, sourceNode, targetColumns, tableSchema);
 
-	tableSchema.columns.forEach((tableColumn, tableColIdx) => {
-		// Find if this table column is in the target columns
-		const targetColIndex = targetColumns.findIndex(tc =>
-			tc.name.toLowerCase() === tableColumn.name.toLowerCase()
-		);
+	const withDefaults = expressionDefaultCols.length === 0
+		? expanded
+		: buildExpressionDefaultProjection(
+			ctx, expanded, expressionDefaultCols, targetColumns, tableSchema,
+			// Parented on contextScope so mutation-context variables stay resolvable.
+			contextScope ?? defaultRowContextScope ?? ctx.scope);
 
-		if (tableColumn.generated) {
-			// Generated columns cannot be explicitly provided in INSERT
-			if (targetColIndex >= 0) {
-				throw new QuereusError(
-					`Cannot INSERT into generated column '${tableColumn.name}'`,
-					StatusCode.ERROR
-				);
-			}
-			// Placeholder NULL — will be replaced by the generated-column chain
-			projections.push({
-				node: buildExpression(ctx, { type: 'literal', value: null }) as ScalarPlanNode,
-				alias: tableColumn.name
-			});
-		} else if (targetColIndex >= 0) {
-			// This column is provided by the source - reference the source column
-			if (targetColIndex < sourceAttributes.length) {
-				const sourceAttr = sourceAttributes[targetColIndex];
-				// Create a column reference to the source attribute
-				const columnRef = new ColumnReferenceNode(
-					ctx.scope,
-					{ type: 'column', name: sourceAttr.name } satisfies AST.ColumnExpr,
-					sourceAttr.type,
-					sourceAttr.id,
-					targetColIndex
-				);
-				projections.push({
-					node: coerceToDeclared(ctx, columnRef, tableColumn),
-					alias: tableColumn.name
-				});
-			} else {
-				throw new QuereusError(
-					`Source has fewer columns than expected for INSERT target columns`,
-					StatusCode.ERROR
-				);
-			}
-		} else if (tableColumn.defaultValue !== undefined
-			&& typeof tableColumn.defaultValue === 'object'
-			&& tableColumn.defaultValue !== null
-			&& 'type' in tableColumn.defaultValue) {
-			// Omitted with an AST *expression* default — NULL placeholder for now;
-			// projection B computes it against the converted row so a `new.<sibling>`
-			// read sees the declared form.
-			expressionDefaultCols.push(tableColIdx);
-			projections.push({
-				node: buildExpression(ctx, { type: 'literal', value: null }) as ScalarPlanNode,
-				alias: tableColumn.name
-			});
-		} else if (tableColumn.defaultValue !== undefined) {
-			// Literal default value — no row scope needed; convert to declared form.
-			projections.push({
-				node: coerceToDeclared(ctx,
-					buildExpression(ctx, { type: 'literal', value: tableColumn.defaultValue }) as ScalarPlanNode,
-					tableColumn),
-				alias: tableColumn.name
-			});
-		} else {
-			// No default value - use NULL (nothing to convert).
-			projections.push({
-				node: buildExpression(ctx, { type: 'literal', value: null }) as ScalarPlanNode,
-				alias: tableColumn.name
-			});
-		}
-	});
-
-	// Create first projection node that expands source to table structure
-	let resultNode: RelationalPlanNode = new ProjectNode(ctx.scope, sourceNode, projections);
-
-	// Projection B: compute expression defaults against projection A's converted
-	// row. Built only when at least one omitted column carries an *expression*
-	// default, preserving the hot-path property that the common insert (every
-	// column supplied, or only literal/NULL defaults) allocates nothing here.
-	//
-	// A default can derive from a sibling the INSERT actually supplied, e.g.
-	// `slug text default (lower(new.title))`; the `new.`-qualified form is always
-	// available, and the bare form resolves too unless a same-named mutation-context
-	// variable shadows it (preserving the WITH CONTEXT precedence). Columns the INSERT
-	// omitted are intentionally NOT registered: they have no value yet in this same
-	// projection, so a default cannot depend on another column's default (which would
-	// impose an evaluation-order race). The scope is parented on contextScope so
-	// mutation-context variables stay resolvable.
-	if (expressionDefaultCols.length > 0) {
-		const projAAttrs = resultNode.getAttributes();
-		// buildRowDefaultScope pairs targetColumns[i] with sourceAttributes[i], so hand
-		// it projection A's output attributes AT THE SUPPLIED COLUMNS' TABLE POSITIONS,
-		// parallel to targetColumns — the supplied values now live in the expanded row
-		// (in declared form), no longer in the original source layout.
-		const suppliedAttrs = targetColumns.map(tc =>
-			projAAttrs[tableSchema.columnIndexMap.get(tc.name.toLowerCase())!]);
-		const contextVarNames = new Set(
-			(tableSchema.mutationContext ?? []).map(v => v.name.toLowerCase())
-		);
-		const defaultScope = buildRowDefaultScope(
-			contextScope ?? defaultRowContextScope ?? ctx.scope,
-			targetColumns,
-			suppliedAttrs,
-			contextVarNames,
-		);
-		const defaultCtx: PlanningContext = { ...ctx, scope: defaultScope };
-		const exprDefaultSet = new Set(expressionDefaultCols);
-
-		const defaultProjections: Projection[] = tableSchema.columns.map((col, colIdx) => {
-			if (exprDefaultSet.has(colIdx)) {
-				const defaultNode = buildExpression(defaultCtx, col.defaultValue as AST.Expression) as ScalarPlanNode;
-
-				// Validate that the default expression is deterministic — skip when the
-				// `nondeterministic_schema` option permits non-deterministic defaults.
-				if (!ctx.db.options.getBooleanOption('nondeterministic_schema')) {
-					validateDeterministicDefault(defaultNode, col.name, tableSchema.name);
-				}
-				return { node: coerceToDeclared(ctx, defaultNode, col), alias: col.name };
-			}
-			// Pass-through reference to projection A's cell.
-			const attr = projAAttrs[colIdx];
-			return {
-				node: new ColumnReferenceNode(
-					ctx.scope,
-					{ type: 'column', name: attr.name } satisfies AST.ColumnExpr,
-					attr.type,
-					attr.id,
-					colIdx,
-				),
-				alias: col.name,
-			};
-		});
-		resultNode = new ProjectNode(ctx.scope, resultNode, defaultProjections);
-	}
-
-	// Final pass: compute generated column values using the expanded row
-	if (hasGeneratedColumns) {
-		resultNode = createGeneratedColumnProjection(ctx, resultNode, tableSchema);
-	}
-
-	return resultNode;
+	return hasGeneratedColumns
+		? createGeneratedColumnProjection(ctx, withDefaults, tableSchema)
+		: withDefaults;
 }
 
 /**
@@ -297,17 +333,7 @@ function createGeneratedColumnProjection(
 				// order of the upsert DO UPDATE recompute (runtime/emit/dml-executor.ts).
 				return { node: coerceToDeclared(ctx, genNode, genColumn), alias: col.name };
 			}
-			const attr = inputAttributes[colIdx];
-			return {
-				node: new ColumnReferenceNode(
-					ctx.scope,
-					{ type: 'column', name: attr.name } satisfies AST.ColumnExpr,
-					attr.type,
-					attr.id,
-					colIdx,
-				),
-				alias: col.name,
-			};
+			return passThroughCell(ctx, inputAttributes[colIdx], colIdx, col.name);
 		});
 
 		currentNode = new ProjectNode(ctx.scope, currentNode, genProjections);
