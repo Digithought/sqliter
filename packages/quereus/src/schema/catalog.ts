@@ -268,7 +268,7 @@ export function collectSchemaCatalog(db: Database, schemaName: string = 'main'):
 		// `definition` so a tag-only change stays `ALTER INDEX … SET TAGS`.
 		for (const desc of exposedImplicitIndexes(tableSchema)) {
 			// Every synthetic descriptor is exposed-implicit by construction → mark it.
-			indexes.push(indexSchemaToCatalog(desc, tableSchema, db, true));
+			indexes.push(indexSchemaToCatalog(syntheticExposedIndexToIndexSchema(desc), tableSchema, db, true));
 		}
 	}
 
@@ -861,6 +861,18 @@ export interface SyntheticExposedIndex {
 	// (ensureUniqueConstraintIndexes does not set `unique`; UNIQUE enforcement routes
 	// through uniqueConstraints), so index_info()'s `unique` column matches across
 	// backends.
+}
+
+/**
+ * Lifts a {@link SyntheticExposedIndex} into the {@link IndexSchema} shape the DDL
+ * generators (`generateIndexDDL`, `indexToCanonicalDDL`) expect. These descriptors
+ * back UNIQUE constraints, so they are unique by construction — the flag is absent
+ * from the descriptor itself (see the NOTE above) and set explicitly here. Shared by
+ * `indexSchemaToCatalog`'s exposed-implicit-index branch and the `schema()` TVF
+ * (`func/builtins/schema.ts`), so both read paths render the same `UNIQUE` keyword.
+ */
+export function syntheticExposedIndexToIndexSchema(desc: SyntheticExposedIndex): IndexSchema {
+	return { name: desc.name, columns: desc.columns, unique: true, predicate: desc.predicate, tags: desc.tags };
 }
 
 /**

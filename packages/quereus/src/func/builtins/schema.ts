@@ -8,7 +8,7 @@ import type { FunctionSchema } from "../../schema/function.js";
 import { isScalarFunctionSchema, isTableValuedFunctionSchema, isAggregateFunctionSchema } from "../../schema/function.js";
 import { isWindowFunction } from "../../schema/window-function.js";
 import { Schema } from "../../schema/schema.js";
-import { exposedImplicitIndexes, isHiddenImplicitIndex, type SyntheticExposedIndex } from "../../schema/catalog.js";
+import { exposedImplicitIndexes, isHiddenImplicitIndex, syntheticExposedIndexToIndexSchema, type SyntheticExposedIndex } from "../../schema/catalog.js";
 import { isMaintainedTable } from "../../schema/derivation.js";
 import { generateMaintainedTableDDL, generateIndexDDL, generateTableDDL } from "../../schema/ddl-generator.js";
 import { INTEGER_TYPE, TEXT_TYPE } from "../../types/builtin-types.js";
@@ -52,17 +52,6 @@ function renderIndexCreateSql(index: IndexSchema, tableSchema: TableSchema): str
 	} catch {
 		return null;
 	}
-}
-
-/**
- * Lifts a {@link SyntheticExposedIndex} (the store-mode covering structure for
- * a UNIQUE constraint that the backend did not materialize as an `IndexSchema`)
- * into the `IndexSchema` shape {@link generateIndexDDL} expects. These are
- * unique by construction — the descriptor carries no `unique` flag of its own
- * (see `SyntheticExposedIndex`), so it is set explicitly here.
- */
-function syntheticExposedIndexToIndexSchema(desc: SyntheticExposedIndex): IndexSchema {
-	return { name: desc.name, columns: desc.columns, unique: true, predicate: desc.predicate, tags: desc.tags };
 }
 
 /**
