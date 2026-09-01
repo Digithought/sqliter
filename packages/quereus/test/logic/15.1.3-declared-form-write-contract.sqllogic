@@ -421,12 +421,99 @@ insert or replace into wf_repl values (1, '2099-01-01T00:00:00.000Z', null);
 select id, d, c from wf_repl;
 → [{"id":1,"d":"2099-01-01T00:00:00","c":"<2099-01-01T00:00:00>"}]
 
--- A plain INSERT supplying the same NULL takes the same substitution and agrees.
+-- A second row, this one conflicting with nothing — the OR REPLACE resolves the
+-- NOT NULL violation, not a key collision — takes the same substitution and agrees.
 insert or replace into wf_repl values (2, '2099-01-01T00:00:00.000Z', null);
 -- run
 
 select count(distinct c) as c from wf_repl;
 → [{"c":1}]
 
+-- Without REPLACE the substitution never fires at all; NOT NULL simply rejects the
+-- row. The contract is about which form the DEFAULT reads, not about when it runs.
+insert into wf_repl values (3, '2099-01-01T00:00:00.000Z', null);
+-- error: NOT NULL constraint failed: wf_repl.c
+
 drop table wf_repl;
+-- run
+
+-- ============================================================
+-- 12. agreement — a multi-row `insert ... select` agrees with `values`
+--
+-- Sections 1-11 all write through `values`, which is the row-expansion path.
+-- A relational source reaches the same expansion, but when its static type is
+-- ALREADY the declared type the per-cell conversion is provably inert and
+-- `coerceToDeclared` skips the wrap, leaving `emitInsert`'s pass as a bare
+-- conformance probe. Both source spellings must land on the stored form.
+-- ============================================================
+
+create table wf_sel_dt (id integer primary key, d datetime null);
+-- run
+
+create table wf_sel_txt (id integer primary key, d text null);
+-- run
+
+-- Source A is already DATETIME: it holds the declared form, and the conversion on
+-- the way into wf_sel_tgt is the skipped one.
+insert into wf_sel_dt values (1, '2099-01-01T00:00:00.000Z'), (2, '2099-01-01T00:00:00.000Z');
+-- run
+
+-- Source B is TEXT holding the WRITTEN form: the conversion is live.
+insert into wf_sel_txt values (3, '2099-01-01T00:00:00.000Z');
+-- run
+
+create table wf_sel_tgt (id integer primary key, d datetime null, g text null generated always as ('<' || d || '>'), check (d = '2099-01-01T00:00:00'));
+-- run
+
+insert into wf_sel_tgt (id, d) select id, d from wf_sel_dt;
+-- run
+
+insert into wf_sel_tgt (id, d) select id, d from wf_sel_txt;
+-- run
+
+-- Row 4 through the ordinary `values` path, for comparison.
+insert into wf_sel_tgt (id, d) values (4, '2099-01-01T00:00:00.000Z');
+-- run
+
+-- Four rows, three source spellings ⇒ one computed result.
+select count(distinct g) as c from wf_sel_tgt;
+→ [{"c":1}]
+
+select id, d, g from wf_sel_tgt order by id;
+→ [{"id":1,"d":"2099-01-01T00:00:00","g":"<2099-01-01T00:00:00>"},{"id":2,"d":"2099-01-01T00:00:00","g":"<2099-01-01T00:00:00>"},{"id":3,"d":"2099-01-01T00:00:00","g":"<2099-01-01T00:00:00>"},{"id":4,"d":"2099-01-01T00:00:00","g":"<2099-01-01T00:00:00>"}]
+
+drop table wf_sel_tgt;
+-- run
+
+drop table wf_sel_txt;
+-- run
+
+drop table wf_sel_dt;
+-- run
+
+-- ============================================================
+-- 13. RETURNING hands back the same declared form the row was written in
+--
+-- RETURNING reads the written row rather than re-evaluating anything, so it is
+-- the observable end of the contract: what the caller is handed must match what a
+-- later SELECT finds, at every write site that can carry a RETURNING clause.
+-- ============================================================
+
+create table wf_ret (id integer primary key, d datetime null, g text null generated always as ('<' || d || '>'));
+-- run
+
+insert into wf_ret (id, d) values (1, '2099-01-01T00:00:00.000Z') returning d, g;
+→ [{"d":"2099-01-01T00:00:00","g":"<2099-01-01T00:00:00>"}]
+
+update wf_ret set d = '2099-01-01T00:00:00.000Z' where id = 1 returning d, g;
+→ [{"d":"2099-01-01T00:00:00","g":"<2099-01-01T00:00:00>"}]
+
+insert into wf_ret (id, d) values (1, '2099-01-01T00:00:00.000Z') on conflict (id) do update set d = excluded.d returning d, g;
+→ [{"d":"2099-01-01T00:00:00","g":"<2099-01-01T00:00:00>"}]
+
+-- A later read agrees with every RETURNING above.
+select d, g from wf_ret;
+→ [{"d":"2099-01-01T00:00:00","g":"<2099-01-01T00:00:00>"}]
+
+drop table wf_ret;
 -- run
