@@ -13,6 +13,9 @@ import type { FilterInfo } from '../../vtab/filter-info.js';
 import type { ScalarPlanNode } from './plan-node.js';
 import type { TableAccessCapable } from '../framework/characteristics.js';
 import { addSingletonFd } from '../util/fd-utils.js';
+import { collectColumnRefAttributeIds } from '../util/column-refs.js';
+import { quereusError } from '../../common/errors.js';
+import { StatusCode } from '../../common/types.js';
 import { accessPathPlan } from '../../vtab/index-descriptor.js';
 // Type-only: the runtime cycle `constraint-extractor → nodes/reference → …` is real,
 // so this must never become a value import.
@@ -373,6 +376,48 @@ export class EmptyResultNode extends TableAccessNode {
 }
 
 /**
+ * Seek-key row-context invariant (OPT-061).
+ *
+ * A seek key for table T is evaluated *before* any row of T is read. It may
+ * reference columns of *other* relations — that is an ordinary correlated /
+ * index-nested-loop seek — but never a column of T itself. When one does, the
+ * failure surfaces far from its cause, as "No row context found for column …"
+ * from inside expression evaluation.
+ *
+ * Enforced in {@link IndexSeekNode}'s constructor rather than at any one
+ * producer, so every path that mints or re-keys a seek — the access-path rule,
+ * the monotonic-range clone, `withChildren` key substitution by a later rewrite
+ * — is covered by construction.
+ *
+ * NOTE: this walks every seek key on every construction, clones included. Seek
+ * keys are almost always single literal nodes, and the uncapped composite
+ * cross-product arm of `rule-select-access-path` already costs far more to
+ * *build* its keys than to walk them. If a plan ever shows seek construction
+ * itself as hot, cache the result on the key node rather than skipping the check.
+ */
+export function assertSeekKeysRowIndependent(
+	source: TableReferenceNode,
+	seekKeys: readonly ScalarPlanNode[],
+	indexName: string,
+): void {
+	const ownAttributes = new Map(source.getAttributes().map(a => [a.id, a.name]));
+	for (const key of seekKeys) {
+		for (const attrId of collectColumnRefAttributeIds(key)) {
+			const name = ownAttributes.get(attrId);
+			if (name !== undefined) {
+				quereusError(
+					`Internal planner error: seek key on ${source.tableSchema.name} via index "${indexName}" references that ` +
+					`table's own column "${name}" (attribute ${attrId}). Seek keys are evaluated before any row of the table ` +
+					`is read, so a key may reference other relations but never the table being sought. ` +
+					`Offending key: ${key.toString()}`,
+					StatusCode.INTERNAL,
+				);
+			}
+		}
+	}
+}
+
+/**
  * Index seek - point lookup or tight range using an index
  * Very efficient for equality constraints and small ranges
  */
@@ -434,6 +479,7 @@ export class IndexSeekNode extends TableAccessNode {
 		public readonly pushedConstraints?: readonly PredicateConstraint[],
 	) {
 		super(scope, source, filterInfo, estimatedCostOverride);
+		assertSeekKeysRowIndependent(source, seekKeys, indexName);
 	}
 
 	getAccessMethod(): 'index-seek' {

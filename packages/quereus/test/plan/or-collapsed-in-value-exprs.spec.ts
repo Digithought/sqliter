@@ -3,8 +3,7 @@ import { Database } from '../../src/core/database.js';
 import type { SqlParameters, SqlValue } from '../../src/common/types.js';
 import type { PlanNode, ScalarPlanNode } from '../../src/planner/nodes/plan-node.js';
 import { PlanNodeType } from '../../src/planner/nodes/plan-node-type.js';
-import { IndexSeekNode } from '../../src/planner/nodes/table-access-nodes.js';
-import { assertSeekKeysRowIndependent } from '../../src/planner/rules/access/rule-select-access-path.js';
+import { IndexSeekNode, assertSeekKeysRowIndependent } from '../../src/planner/nodes/table-access-nodes.js';
 
 /**
  * Regression cover for `or-collapsed-in-value-exprs`.
@@ -39,7 +38,24 @@ describe('OR-collapsed IN: mixed literal/dynamic seek keys', () => {
 		await db.close();
 	});
 
+	const walk = (node: PlanNode, out: PlanNode[] = []): PlanNode[] => {
+		out.push(node);
+		for (const child of node.getChildren()) walk(child, out);
+		return out;
+	};
+
+	/**
+	 * Run `sql` and return its single output column, sorted.
+	 *
+	 * Also asserts the plan actually reached an `IndexSeek`. Without that, every
+	 * row assertion below would still pass if the collapse silently declined and
+	 * the OR fell back to a scan + residual filter — which is exactly what the
+	 * `null` returns added to `collapseBranchesToIn` can cause. The rows prove
+	 * correctness; the seek proves the fixed path is the one under test.
+	 */
 	const col = async (sql: string, params?: SqlParameters): Promise<SqlValue[]> => {
+		expect(walk(db.getPlan(sql)).some(n => n instanceof IndexSeekNode), `expected an IndexSeek for: ${sql}`)
+			.to.equal(true);
 		const out: SqlValue[] = [];
 		for await (const row of db.eval(sql, params)) {
 			out.push(Object.values(row)[0]);
@@ -71,6 +87,16 @@ describe('OR-collapsed IN: mixed literal/dynamic seek keys', () => {
 		it('all-literal IN branch OR-ed with a parameter equality', async () => {
 			expect(await col('select id from p where i in (10, 20) or i = :p', { p: 30 }))
 				.to.deep.equal([1, 2, 3]);
+		});
+
+		it('reversed operand order: literal on the left', async () => {
+			expect(await col('select id from p where 10 = i or i = :p', { p: 30 }))
+				.to.deep.equal([1, 3]);
+		});
+
+		it('no-op cast around the column side', async () => {
+			expect(await col('select id from p where cast(i as integer) = 10 or i = :p', { p: 30 }))
+				.to.deep.equal([1, 3]);
 		});
 
 		it('composite key: pinned leading column with an OR on the trailing column', async () => {
@@ -106,12 +132,6 @@ describe('OR-collapsed IN: mixed literal/dynamic seek keys', () => {
 	});
 
 	describe('seek-key row-context invariant', () => {
-		const walk = (node: PlanNode, out: PlanNode[] = []): PlanNode[] => {
-			out.push(node);
-			for (const child of node.getChildren()) walk(child, out);
-			return out;
-		};
-
 		// The guard has no SQL-level trigger left once the OR collapse is fixed, so
 		// feed it a hand-built violation: a seek whose key is a column reference to
 		// the very table being sought. Both nodes come from a real plan, so the
@@ -128,7 +148,7 @@ describe('OR-collapsed IN: mixed literal/dynamic seek keys', () => {
 			) as ScalarPlanNode | undefined;
 			expect(ownColumnRef, 'expected a column reference to table p in the plan').to.not.be.undefined;
 
-			expect(() => assertSeekKeysRowIndependent(seek!.source, [ownColumnRef!], 'eqSeek'))
+			expect(() => assertSeekKeysRowIndependent(seek!.source, [ownColumnRef!], 'primary'))
 				.to.throw(/references that table's own column/);
 		});
 
@@ -136,7 +156,7 @@ describe('OR-collapsed IN: mixed literal/dynamic seek keys', () => {
 			const nodes = walk(db.getPlan('select id from p where i = 10'));
 			const seek = nodes.find(n => n instanceof IndexSeekNode) as IndexSeekNode | undefined;
 			expect(seek).to.not.be.undefined;
-			expect(() => assertSeekKeysRowIndependent(seek!.source, seek!.seekKeys, 'eqSeek')).to.not.throw();
+			expect(() => assertSeekKeysRowIndependent(seek!.source, seek!.seekKeys, seek!.indexName)).to.not.throw();
 		});
 	});
 });

@@ -18,6 +18,7 @@ import type { ConstraintOp, PredicateConstraint as VtabPredicateConstraint, Rang
 import { TableReferenceNode, ColumnReferenceNode as _ColumnRef } from '../nodes/reference.js';
 import { CapabilityDetectors } from '../framework/characteristics.js';
 import { computeClosure, expandEcsToFds, keysOf, type KeyRel } from '../util/fd-utils.js';
+import { collectColumnRefAttributeIds } from '../util/column-refs.js';
 import { effectiveBetweenBoundCollation, effectiveComparisonCollation, effectiveInCollation, operandCollation } from './comparison-collation.js';
 import { collationRefines } from '../../util/comparison.js';
 import { isNoOpCast } from './scalar-invertibility.js';
@@ -307,28 +308,6 @@ function findTargetRelationKey(expr: ScalarPlanNode, attributeToTableMap: Map<nu
     }
   }
   return undefined;
-}
-
-/**
- * Walk a scalar subtree collecting the attributeIds of every free
- * ColumnReference within it. Walking into children (rather than only
- * unwrapping a top-level Cast) reaches references nested inside arithmetic,
- * function calls, casts, etc. — e.g. `outer.id + 1`, `coalesce(outer.id, 0)`,
- * `cast(outer.id + 1 as integer)`.
- */
-export function collectColumnRefAttributeIds(node: ScalarPlanNode): number[] {
-  const ids: number[] = [];
-  const stack: ScalarPlanNode[] = [node];
-  while (stack.length) {
-    const n = stack.pop()!;
-    if (n.nodeType === PlanNodeType.ColumnReference) {
-      ids.push((n as unknown as ColumnReferenceNode).attributeId);
-    }
-    for (const c of n.getChildren()) {
-      stack.push(c as unknown as ScalarPlanNode);
-    }
-  }
-  return ids;
 }
 
 /**
@@ -812,7 +791,10 @@ function collapseBranchesToIn(
 				// aligned with `c.value` (`extractInConstraint` maps 1:1 over
 				// `InNode.values`).
 				const src = c.sourceExpression;
-				if (!(src instanceof InNode) || !src.values || src.values.length !== (c.value as SqlValue[]).length) return null;
+				if (!(src instanceof InNode) || !src.values || src.values.length !== (c.value as SqlValue[]).length) {
+					log('OR collapse to IN declined: literal IN branch source is not a value-aligned InNode');
+					return null;
+				}
 				for (const ve of src.values) {
 					valueExprs.push(ve);
 				}
@@ -827,9 +809,11 @@ function collapseBranchesToIn(
 				// Literal equality branch: the value operand, never the whole
 				// comparison — a consumer materializes these as seek keys.
 				const src = c.sourceExpression;
-				if (!(src instanceof BinaryOpNode)) return null;
-				const valueSide = valueSideOf(src, c.attributeId);
-				if (!valueSide) return null;
+				const valueSide = src instanceof BinaryOpNode ? valueSideOf(src, c.attributeId) : undefined;
+				if (!valueSide) {
+					log('OR collapse to IN declined: literal equality branch yielded no value expression');
+					return null;
+				}
 				valueExprs.push(valueSide);
 			}
 		}
