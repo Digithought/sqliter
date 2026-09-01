@@ -1,6 +1,6 @@
 {
   "name": "@quereus/quereus-plugin-comprehensive-demo",
-  "version": "4.17.1",
+  "version": "4.18.0",
   "type": "module",
   "description": "Demonstrates vtables, functions, and collations in one plugin",
   "author": "Quereus Team",

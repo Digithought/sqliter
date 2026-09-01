@@ -2,7 +2,7 @@
 	"name": "quereus-vscode",
 	"displayName": "Quereus SQL",
 	"description": "Language support for Quereus SQL: syntax, diagnostics, completions, hovers, semantic tokens",
-	"version": "4.17.1",
+	"version": "4.18.0",
 	"icon": "images/icon.ico",
 	"publisher": "GotChoicesFoundation",
 	"files": [
