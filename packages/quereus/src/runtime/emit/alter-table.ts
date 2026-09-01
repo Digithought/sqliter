@@ -2239,8 +2239,18 @@ async function rebuildViaShadowTable(
 	await rctx.db._getEventEmitter().withPublicEventsSuppressed(async () => {
 		try {
 			await rctx.db._execWithinTransaction(createDdl);
+			// `or abort` is load-bearing, not decoration. The shadow now declares the table's
+			// own conflict actions (the whole point of rendering it through the canonical
+			// writer), so a row-set that COLLIDES under the new key — the case the in-place
+			// re-key path refuses with CONSTRAINT — would otherwise be resolved by the
+			// declared action instead of reported: `primary key (a) on conflict replace`
+			// re-keyed onto a non-unique column silently keeps the last row and reports
+			// success. The copy is engine scaffolding, not a user INSERT, so it takes the
+			// statement-level clause that outranks every declared default
+			// (see row-constraints.ts: statement OR clause > per-constraint default > ABORT)
+			// and surfaces the collision the way every other re-key path does.
 			await rctx.db._execWithinTransaction(
-				`insert into ${qualifiedShadow} (${projection}) select ${projection} from ${qualifiedTable}`
+				`insert or abort into ${qualifiedShadow} (${projection}) select ${projection} from ${qualifiedTable}`
 			);
 			// The DROP is scaffolding: the shadow's rows ARE the table's rows, moments from
 			// being renamed back over it. Two FK situations would otherwise refuse it:
@@ -2253,15 +2263,17 @@ async function rebuildViaShadowTable(
 			// Suppress the parent-side RESTRICT guard for exactly this statement; restored
 			// in the finally so a failing drop cannot latch it.
 			//
-			// NOTE: a THIRD drop-refusal shape is not handled here and is left conditional:
-			// a CHECK constraint (or partial-index predicate, or view/assertion body) whose
-			// subquery names its own table makes the shadow's copy of that expression a
-			// declared dependent of the ORIGINAL, so `assertNoExpressionDependsOn` in
-			// drop-table.ts refuses the drop. That is a different guard from the FK one this
-			// flag covers, and the shape is pre-existing (such an expression is unusual and
-			// nothing in the tree writes one). If a rebuild ever fails with an
-			// expression-dependency error naming the shadow table, this is why — the fix is
-			// to teach that guard the same suppressed scope, not to widen this flag.
+			// NOTE: two OTHER drop-refusal shapes are not handled here, and both are
+			// reachable rather than hypothetical (verified against a stub module with no
+			// `alterTable`) — see backlog `bug-rebuild-drop-refused-by-user-facing-guards`.
+			// `emitDropTable` also runs `assertNoAssertionDependsOn` and
+			// `assertNoExpressionDependsOn`, so an assertion over this table — or ANOTHER
+			// table's CHECK / DEFAULT / generated body whose subquery names it — refuses the
+			// internal DROP, and the whole ALTER fails with `cannot drop table '<name>'`,
+			// naming a drop the user never asked for. The rebuild unwinds cleanly (the shadow
+			// is dropped in the catch below, the table is untouched), so this costs a
+			// confusing refusal, not data. The fix is a scaffolding-drop scope those guards
+			// honor too, not a wider FK flag.
 			const priorSuppress = rctx.db._setFkRestrictSuppressed(true);
 			try {
 				await rctx.db._execWithinTransaction(
@@ -2290,7 +2302,13 @@ async function rebuildViaShadowTable(
 				await rctx.db._execWithinTransaction(
 					`drop table if exists ${qualifiedShadow}`
 				);
-			} catch { /* ignore */ }
+			} catch (cleanupError) {
+				// Never masks the original failure (rethrown just below), but a shadow table the
+				// engine could not clean up outlives the statement under a machine-generated name
+				// — say so rather than dropping it on the floor.
+				warnLog('failed to drop leftover shadow table %s after a failed rebuild: %s', qualifiedShadow,
+					cleanupError instanceof Error ? cleanupError.message : String(cleanupError));
+			}
 			throw e;
 		}
 	});

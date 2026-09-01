@@ -1466,11 +1466,14 @@ export class SchemaManager {
 	 */
 	private async assertNoReferencingChildrenForDrop(parentSchemaName: string, parentTableName: string): Promise<void> {
 		if (!this.db.options.getBooleanOption('foreign_keys')) return;
-		// Trust-the-origin suppression (see Database._setFkRestrictSuppressed): the
-		// external-changes apply path already had this drop enforced at its origin, and
-		// the ALTER PRIMARY KEY shadow rebuild drops a table whose rows are about to be
-		// renamed back over it — in both, re-checking referencing children here would
-		// wedge a drop whose referential outcome is already accounted for.
+		// Suppressed scope (see Database._setFkRestrictSuppressed). Its one drop-issuing
+		// caller is the ALTER PRIMARY KEY shadow rebuild, which drops a table whose rows are
+		// moments from being renamed back over it under the same name — re-checking
+		// referencing children there would wedge a drop that breaks no reference. The other
+		// caller, the external-row apply batch, issues DML only (no path from it reaches
+		// `dropTable`), so this arm is inert for it today; were that to change, its
+		// trust-the-origin posture — the origin enforced the drop at its own commit — is the
+		// same reason it skips the row-level RESTRICT pre-checks.
 		if (this.db._isFkRestrictSuppressed()) return;
 
 		const parentSchemaLower = parentSchemaName.toLowerCase();

@@ -4,7 +4,7 @@ files:
   - packages/quereus/src/vtab/memory/layer/manager.ts        # 3,589 lines
   - packages/quereus/src/runtime/emit/materialized-view-helpers.ts   # 3,442 lines (`wc -l`, 2026-08-23; 3,404 on 2026-08-17, 3,107 earlier) — +~300 from the backing-module schema-normalization hook, +38 from the maintained-table mutation-context guard
   - packages/quereus/src/schema/schema-differ.ts             # 3,013 lines (`wc -l`, 2026-08-07; 2,725 when this ticket was filed) (spec: 1,186)
-  - packages/quereus/src/runtime/emit/alter-table.ts         # 2,650 lines (`wc -l`, 2026-08-23; 2,419 when this ticket was filed) — +231 since, most recently the ANALYZE-measurement carry across RENAME COLUMN
+  - packages/quereus/src/runtime/emit/alter-table.ts         # 2,733 lines (`wc -l`, 2026-09-01; 2,650 on 2026-08-23, 2,419 when this ticket was filed) — +83 since, from the ALTER PRIMARY KEY shadow rebuild rendering through the canonical DDL writer (index re-creation, the second capability precondition, the drop-guard suppression scope and their NOTEs)
   - packages/quereus-isolation/src/isolated-table.ts         # 2,077 lines
   - packages/quereus-isolation/src/isolation-module.ts       # 1,825 lines
   - scripts/check-docs.mjs                                   # 1,325 lines

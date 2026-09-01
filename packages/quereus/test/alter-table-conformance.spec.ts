@@ -835,6 +835,24 @@ describe('ALTER PRIMARY KEY — shadow rebuild preserves the table definition', 
 		await expectConstraint(db, `insert into child values (12, 99)`, 'child FK after parent rebuild');
 	});
 
+	it('a row-set that collides under the new key is reported, never resolved by the declared conflict action', async () => {
+		// The shadow declares the table's own `on conflict` action, so the copy has to state
+		// its own: without `insert or abort` a `primary key (a) on conflict replace` re-keyed
+		// onto a non-unique column REPLACEs its way down to one row and reports success —
+		// silent row loss where the in-place re-key path raises CONSTRAINT.
+		db = openRebuildDb();
+		await db.exec(`create table t (a integer not null, b integer not null, primary key (a) on conflict replace) using noalter`);
+		await db.exec(`insert into t values (1, 10), (2, 10)`);
+
+		const err = await attemptAlter(db, `alter table t alter primary key (b)`);
+		expect(err, 'the collision is reported, not swallowed by REPLACE').to.be.instanceOf(QuereusError);
+		expect(err!.code, 'reported as a constraint violation').to.equal(StatusCode.CONSTRAINT);
+		expect(await pkColumns(db), 'PK unchanged after the refused rebuild').to.deep.equal(['a']);
+		expect(await rows(db, `select a, b from t order by a`), 'both rows survived').to.deep.equal([
+			{ a: 1, b: 10 }, { a: 2, b: 10 },
+		]);
+	});
+
 	it('the canonical DDL before and after a rebuild differs ONLY in the PRIMARY KEY clause', async () => {
 		// The general subsumer for every arm above: whatever `generateTableDDL` renders is
 		// what a store-backed catalog persists and re-parses, so if the two texts agree

@@ -54,3 +54,19 @@ A test with a stub backend that implements neither `alterTable` nor `renameTable
 the isolation module, issuing `alter table … alter primary key (…)` in autocommit: it must be
 refused with `UNSUPPORTED`, and the table must still be readable under its original key.
 `packages/quereus/test/no-alter-module.ts` already builds the unwrapped stub.
+
+# A second instance of the same blind spot (added 2026-09-01, from the shadow-rebuild review)
+
+`runAlterPrimaryKey` now carries a **second** method-presence capability probe, right next to
+the `renameTable` one: it refuses the rebuild when the table has user indexes and the module has
+no `createIndex` hook (`packages/quereus/src/runtime/emit/alter-table.ts`, ~1943 — the rebuild
+re-creates each index after the swap, and without the hook they would be lost silently).
+
+It reads `!module.createIndex`, so it has the identical wrapper hole: a wrapper that always
+defines `createIndex` and forwards only when the wrapped backend has one passes the guard, the
+rebuild runs, and the index re-creation fails **after** the original table has been dropped —
+which is exactly the half-rebuilt state the guard exists to prevent, so the failure here is worse
+than the `renameTable` arm's.
+
+Whatever replaces method-presence must cover both probes (and the `alterTable` probe that routes
+into the rebuild in the first place), not just `renameTable`.

@@ -132,3 +132,16 @@ byte-identical.
 declare context variables at all (rejected at declaration since
 `reject-mutation-context-on-maintained-table`), so no persisted maintained-table DDL can
 carry the clause — this arm is purely about ordinary tables.
+
+# A third consumer of arm 1 (added 2026-09-01, from the shadow-rebuild review)
+
+Arm 1 was filed as a *persistence* loss — the action is dropped when the table's definition is
+saved and reloaded. It now also bites **without any save/reload**. The `ALTER TABLE … ALTER
+PRIMARY KEY` fallback rebuild (for a backend that cannot re-key in place) builds its shadow table
+by running the same `generateTableDDL` over the live schema, so a column's `on conflict` action
+is dropped by the re-key itself: `x integer not null on conflict rollback` comes back as plain
+`not null` (ABORT) on the rebuilt table, in the same session, with no persistence involved.
+
+No new root cause — the fix is still `formatColumnDef` emitting the action — but it widens the
+impact from "store-backed tables after a reopen" to "any table re-keyed on the rebuild path",
+and it is a second reason the forced-nullability-annotation tradeoff is worth paying.
