@@ -104,8 +104,9 @@ select count(*) as c from schema() where type = 'index' and name = 'uq_vin';
 -- Rendered DDL exists to re-parse into the object it describes, and a plain
 -- `CREATE INDEX` does not re-parse into something that enforces uniqueness.
 -- Memory materializes the structure without a `unique` flag and the store
--- synthesizes it from the constraint, so both routes go through one display
--- helper (`indexSchemaForDisplay`) rather than each deciding for itself.
+-- synthesizes it from the constraint, so both routes go through one enumeration
+-- (`displayIndexesForTable`, which renders via `indexSchemaForDisplay`) rather
+-- than each read surface deciding for itself.
 -- Uniqueness *enforcement* stays the constraint's either way.
 select sql like 'CREATE UNIQUE INDEX%' as is_unique_ddl from schema() where type = 'index' and name = 'uq_vin';
 → [{"is_unique_ddl":true}]
@@ -134,6 +135,32 @@ select sql like 'CREATE INDEX%' as is_plain_ddl from schema() where type = 'inde
 
 select "unique" as u from index_info('iul_o') where index_name = 'ix_label';
 → [{"u":0}]
+
+-- Shapes the named single-column pin above does not reach. Each is exposed, so
+-- each must describe itself as UNIQUE on both backends.
+-- (a) An UNNAMED constraint: the structure takes the auto-name `_uc_<cols>`.
+create table iul_n (id integer primary key, code text,
+    unique (code) with tags ("quereus.expose_implicit_index" = true));
+-- run
+
+select sql like 'CREATE UNIQUE INDEX%' as is_unique_ddl from schema() where type = 'index' and name = '_uc_code';
+→ [{"is_unique_ddl":true}]
+
+select "unique" as u from index_info('iul_n') where index_name = '_uc_code';
+→ [{"u":1}]
+
+-- (b) A MULTI-COLUMN constraint under a MIXED-CASE name. The exposure map is
+-- lowercase-keyed, so an unfolded lookup would render this one without UNIQUE;
+-- and every column of the structure must carry the same answer.
+create table iul_m (id integer primary key, a integer not null, b integer not null,
+    constraint UQ_AB unique (a, b) with tags ("quereus.expose_implicit_index" = true));
+-- run
+
+select sql like 'CREATE UNIQUE INDEX%' as is_unique_ddl from schema() where type = 'index' and name = 'UQ_AB';
+→ [{"is_unique_ddl":true}]
+
+select count(*) as c from index_info('iul_m') where index_name = 'UQ_AB' and "unique" = 1;
+→ [{"c":2}]
 
 -- ============================================================
 -- 5. Mixed-case constraint name — the guards fold case like every index compare

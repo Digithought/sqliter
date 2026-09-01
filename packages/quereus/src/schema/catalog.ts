@@ -244,32 +244,12 @@ export function collectSchemaCatalog(db: Database, schemaName: string = 'main'):
 		// enforcement) are a backing detail and are omitted by default, surfaced
 		// only when the originating constraint opts in via
 		// `quereus.expose_implicit_index` — preserving the user-visible shape.
-		// One map serves both index arms below (materialized and synthetic).
-		const implicit = implicitCoveringIndexExposure(tableSchema);
-		if (tableSchema.indexes && tableSchema.indexes.length > 0) {
-			for (const indexSchema of tableSchema.indexes) {
-				// Map keys are lowercased (see `implicitCoveringIndexExposure`); without
-				// the fold a mixed-case constraint name leaks its hidden backing structure
-				// into the catalog as an ordinary index, which the declarative differ then
-				// tries to DROP.
-				const exposed = implicit.get(indexSchema.name.toLowerCase());
-				if (exposed === false) continue; // hidden implicit covering structure
-				// Mark only the *exposed* implicit covering structure (exposed === true);
-				// an ordinary index (absent from the exposure map ⇒ undefined) stays
-				// unmarked so the differ manages it normally.
-				indexes.push(indexSchemaToCatalog(indexSchema, tableSchema, db, exposed === true, implicit));
-			}
-		}
-
-		// Surface exposed implicit covering indexes the backend did NOT
-		// materialize as `IndexSchema` entries (store mode). In memory mode this
-		// returns [] (the name is already in `tableSchema.indexes` above), so the
-		// catalog shape matches across backends with no double-listing. Tags ride
-		// on the descriptor (from `uc.exposedIndexTags`), kept out of the canonical
-		// `definition` so a tag-only change stays `ALTER INDEX … SET TAGS`.
-		for (const desc of exposedImplicitIndexes(tableSchema)) {
-			// Every synthetic descriptor is exposed-implicit by construction → mark it.
-			indexes.push(indexSchemaToCatalog(syntheticExposedIndexToIndexSchema(desc), tableSchema, db, true, implicit));
+		// `displayIndexesForTable` owns that rule, and the store-mode synthetics with
+		// it: their tags ride on the descriptor (from `uc.exposedIndexTags`), kept
+		// out of the canonical `definition` so a tag-only change stays
+		// `ALTER INDEX … SET TAGS`.
+		for (const { index, implicit } of displayIndexesForTable(tableSchema)) {
+			indexes.push(indexSchemaToCatalog(index, tableSchema, db, implicit));
 		}
 	}
 
@@ -437,9 +417,9 @@ export function implicitCoveringIndexExposure(tableSchema: TableSchema): Map<str
  * constraint (`uniqueConstraints`); nothing about the returned schema changes
  * that.
  *
- * This is the single site answering "how does this index describe itself" —
- * every read surface (`indexSchemaToCatalog`, the `schema()` and `index_info()`
- * TVFs) must route through it, or the backends drift apart again.
+ * This is the single site answering "how does this index describe itself". Read
+ * surfaces reach it through {@link displayIndexesForTable}, which is the only
+ * caller that matters — call that, not this, unless you hold a lone index.
  *
  * Returns `index` unchanged unless it is an *exposed* implicit covering
  * structure lacking the flag. Hidden implicit structures never reach a read
@@ -468,6 +448,51 @@ export function indexSchemaForDisplay(
 	const map = exposure ?? implicitCoveringIndexExposure(tableSchema);
 	if (map.get(index.name.toLowerCase()) !== true) return index;
 	return { ...index, unique: true };
+}
+
+/** One index as a read surface should present it — see {@link displayIndexesForTable}. */
+export interface DisplayIndex {
+	/** Already rendered through {@link indexSchemaForDisplay}. */
+	index: IndexSchema;
+	/** True for an *exposed* implicit covering structure — see {@link CatalogIndex.implicit}. */
+	implicit: boolean;
+}
+
+/**
+ * Every index of `tableSchema` a *read* surface should list, in catalog order:
+ * the materialized indexes minus the hidden implicit covering structures, then
+ * the exposed implicit structures the backend did not materialize (the store-mode
+ * case — empty in memory mode, where the name is already materialized, so nothing
+ * double-lists).
+ *
+ * This is the single enumeration `collectSchemaCatalog`, `schema()` and
+ * `index_info()` share. Each of them used to spell the same three steps out for
+ * itself — drop the hidden structures, append the store-mode synthetics, render
+ * the result — and a surface that got one wrong drifted from the others. Add a
+ * read surface by calling this, not by repeating the recipe.
+ *
+ * Write paths and the persistence bundle must NOT use it — see the NOTE on
+ * {@link indexSchemaForDisplay}.
+ */
+export function displayIndexesForTable(tableSchema: TableSchema): DisplayIndex[] {
+	const exposure = implicitCoveringIndexExposure(tableSchema);
+	const result: DisplayIndex[] = [];
+	for (const index of tableSchema.indexes ?? []) {
+		// Map keys are lowercased (see `implicitCoveringIndexExposure`); without the
+		// fold a mixed-case constraint name leaks its hidden backing structure into
+		// the catalog as an ordinary index, which the declarative differ then drops.
+		const exposed = exposure.get(index.name.toLowerCase());
+		if (exposed === false) continue; // hidden implicit covering structure
+		// Only the *exposed* structure is marked; an ordinary index is absent from
+		// the map (⇒ undefined) and stays unmarked so the differ manages it normally.
+		result.push({ index: indexSchemaForDisplay(tableSchema, index, exposure), implicit: exposed === true });
+	}
+	for (const desc of exposedImplicitIndexes(tableSchema)) {
+		// Every synthetic descriptor is exposed-implicit by construction.
+		const lifted = syntheticExposedIndexToIndexSchema(desc);
+		result.push({ index: indexSchemaForDisplay(tableSchema, lifted, exposure), implicit: true });
+	}
+	return result;
 }
 
 /**
@@ -894,15 +919,26 @@ export function assertNoDuplicateConstraintNames(
  * helpers (`indexSchemaToCatalog`, the `schema()` / `index_info()` TVFs) can
  * consume it identically to a real index.
  *
- * Lift it with {@link syntheticExposedIndexToIndexSchema}, then render it
- * through {@link indexSchemaForDisplay} exactly as a materialized index is —
- * that is what keeps the two backends' answers identical.
+ * {@link displayIndexesForTable} lifts it with
+ * {@link syntheticExposedIndexToIndexSchema} and renders it through
+ * {@link indexSchemaForDisplay} exactly as it does a materialized index — that
+ * is what keeps the two backends' answers identical.
  */
 export interface SyntheticExposedIndex {
 	name: string;
 	/** Mirrors `ensureUniqueConstraintIndexes`: per-column index + declared collation. */
 	columns: ReadonlyArray<IndexColumnSchema>;
-	/** Partial-index predicate from `uc.predicate`, when any. */
+	/**
+	 * Partial-index predicate from `uc.predicate`, when any.
+	 *
+	 * NOTE: unreachable today, and structurally so — `uc.predicate` is only ever
+	 * set by `appendIndexToTableSchema` for a constraint synthesized from a
+	 * `CREATE UNIQUE INDEX … WHERE`, and such a constraint carries
+	 * `derivedFromIndex`, which `exposedImplicitIndexes` skips. So no exposed
+	 * implicit structure can be partial, and `index_info().partial` reads 0 for
+	 * every one of them. Kept because an inline `UNIQUE (…) WHERE …` would make it
+	 * live immediately; if that grammar lands, pin `partial = 1` here.
+	 */
 	predicate?: AST.Expression;
 	/** User tags from `uc.exposedIndexTags` (the exposure flag stays on `uc.tags`). */
 	tags?: Readonly<Record<string, SqlValue>>;
@@ -917,9 +953,9 @@ export interface SyntheticExposedIndex {
 /**
  * Lifts a {@link SyntheticExposedIndex} into the {@link IndexSchema} shape the DDL
  * generators (`generateIndexDDL`, `indexToCanonicalDDL`) expect — a plain
- * structural lift that stamps no flags of its own. Callers pass the result through
- * {@link indexSchemaForDisplay} (which supplies `unique`) before rendering, the
- * same as they do for a materialized index.
+ * structural lift that stamps no flags of its own. `unique` is supplied
+ * afterwards by {@link indexSchemaForDisplay}, the same as for a materialized
+ * index; {@link displayIndexesForTable} does both.
  */
 export function syntheticExposedIndexToIndexSchema(desc: SyntheticExposedIndex): IndexSchema {
 	return { name: desc.name, columns: desc.columns, predicate: desc.predicate, tags: desc.tags };
@@ -1010,24 +1046,24 @@ export function isImplicitCoveringIndex(tableSchema: TableSchema, indexName: str
 	return implicitCoveringIndexExposure(tableSchema).has(indexName.toLowerCase());
 }
 
+/**
+ * Renders one already-display-rendered index (see {@link displayIndexesForTable})
+ * as its catalog entry. `ddl` and `definition` come off the same schema object,
+ * so they cannot describe it differently.
+ */
 function indexSchemaToCatalog(
 	indexSchema: IndexSchema,
 	tableSchema: TableSchema,
 	db: Database,
 	/** Set true for an exposed implicit covering structure — see `CatalogIndex.implicit`. */
 	implicit = false,
-	/** Reused exposure map, see {@link indexSchemaForDisplay}. */
-	exposure?: Map<string, boolean>,
 ): CatalogIndex {
-	// Single funnel for both catalog index arms, so `ddl` and `definition` pick up
-	// the exposed-implicit UNIQUE keyword together and cannot drift apart.
-	const display = indexSchemaForDisplay(tableSchema, indexSchema, exposure);
 	const entry: CatalogIndex = {
-		name: display.name,
+		name: indexSchema.name,
 		tableName: tableSchema.name,
-		ddl: generateIndexDDL(display, tableSchema, db),
-		definition: indexToCanonicalDDL(display, tableSchema),
-		tags: display.tags,
+		ddl: generateIndexDDL(indexSchema, tableSchema, db),
+		definition: indexToCanonicalDDL(indexSchema, tableSchema),
+		tags: indexSchema.tags,
 	};
 	// Only set the field when true so an ordinary index's catalog shape is unchanged.
 	if (implicit) entry.implicit = true;

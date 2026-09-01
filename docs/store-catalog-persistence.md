@@ -36,7 +36,11 @@ never emitted as a `CREATE INDEX` (a re-import would materialize a real
 `IndexSchema`, changing the store-mode shape); only its user tags
 (`UniqueConstraintSchema.exposedIndexTags`) persist, as a whole-set
 `alter index … set tags` statement (the canonical replace form; empty tag records
-emit no line). On reopen, `rehydrateCatalog` feeds each bundle to
+emit no line). Note the deliberate asymmetry with the *read* surfaces: `schema()`,
+`index_info()` and `collectSchemaCatalog` do render that structure, as
+`CREATE UNIQUE INDEX` (see [schema.md](schema.md) § Introspection). Those
+renderings exist to be read; this bundle exists to be re-executed, and re-executing
+a `CREATE UNIQUE INDEX` here is precisely what would change the shape. On reopen, `rehydrateCatalog` feeds each bundle to
 `importCatalog`, whose `parser.parseAll` splits it by AST (never on `\n`, so a
 newline inside a `DEFAULT` / `CHECK` / partial-predicate string literal is safe)
 and imports table-before-indexes; the trailing `alter index` lines re-apply

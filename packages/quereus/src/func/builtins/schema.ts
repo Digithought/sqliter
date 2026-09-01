@@ -8,7 +8,7 @@ import type { FunctionSchema } from "../../schema/function.js";
 import { isScalarFunctionSchema, isTableValuedFunctionSchema, isAggregateFunctionSchema } from "../../schema/function.js";
 import { isWindowFunction } from "../../schema/window-function.js";
 import { Schema } from "../../schema/schema.js";
-import { exposedImplicitIndexes, implicitCoveringIndexExposure, indexSchemaForDisplay, syntheticExposedIndexToIndexSchema } from "../../schema/catalog.js";
+import { displayIndexesForTable } from "../../schema/catalog.js";
 import { isMaintainedTable } from "../../schema/derivation.js";
 import { generateMaintainedTableDDL, generateIndexDDL, generateTableDDL } from "../../schema/ddl-generator.js";
 import { INTEGER_TYPE, TEXT_TYPE } from "../../types/builtin-types.js";
@@ -137,42 +137,20 @@ export const schemaFunc = createIntegratedTableValuedFunction(
 						tagsToJson(tableSchema.tags)
 					] as Row;
 
-					// Process Indexes for this table. A hidden implicit covering structure
-					// (a plain UNIQUE's auto-built index) is a backing detail, not a
-					// user-addressable index — same rule `collectSchemaCatalog` applies.
-					// One exposure map serves both index loops below.
-					const exposure = implicitCoveringIndexExposure(tableSchema);
-					if (tableSchema.indexes) {
-						for (const indexSchema of tableSchema.indexes) {
-							if (exposure.get(indexSchema.name.toLowerCase()) === false) continue;
-							// Rendered through the display helper so an exposed implicit
-							// covering index emits `CREATE UNIQUE INDEX` here exactly as it
-							// does on the store backend and in the catalog.
-							const display = indexSchemaForDisplay(tableSchema, indexSchema, exposure);
-							yield [
-								schemaName,
-								'index',
-								display.name,
-								tableSchema.name,
-								renderIndexCreateSql(display, tableSchema),
-								tagsToJson(display.tags)
-							] as Row;
-						}
-					}
-
-					// Surface exposed implicit covering indexes the backend did NOT
-					// materialize as `IndexSchema` entries (store mode). In memory mode
-					// `exposedImplicitIndexes` returns [] (the name is already in
-					// `tableSchema.indexes` above), so this loop is a no-op there.
-					for (const desc of exposedImplicitIndexes(tableSchema)) {
-						const display = indexSchemaForDisplay(tableSchema, syntheticExposedIndexToIndexSchema(desc), exposure);
+					// Process Indexes for this table. `displayIndexesForTable` applies the
+					// same rule `collectSchemaCatalog` and `index_info()` do: a hidden
+					// implicit covering structure (a plain UNIQUE's auto-built index) is a
+					// backing detail and is skipped, the store-mode synthetics are
+					// appended, and an exposed implicit structure renders as
+					// `CREATE UNIQUE INDEX` on either backend.
+					for (const { index } of displayIndexesForTable(tableSchema)) {
 						yield [
 							schemaName,
 							'index',
-							display.name,
+							index.name,
 							tableSchema.name,
-							renderIndexCreateSql(display, tableSchema),
-							tagsToJson(display.tags)
+							renderIndexCreateSql(index, tableSchema),
+							tagsToJson(index.tags)
 						] as Row;
 					}
 				}
@@ -424,23 +402,14 @@ export const indexInfoFunc = createIntegratedTableValuedFunction(
 			throw new QuereusError(`Table '${tableName}' not found`, StatusCode.ERROR);
 		}
 
-		// Real indexes plus any exposed implicit covering index the backend did NOT
-		// materialize as an `IndexSchema` (store mode) — the synthetic descriptors
-		// lifted into that same shape, so both kinds are one list of one type. In
-		// memory mode the second list is empty (the name already lives in
-		// `table.indexes`), so the row set matches across backends. Every entry goes
-		// through `indexSchemaForDisplay`, which is what makes an exposed implicit
-		// covering index report `unique = 1` here and `CREATE UNIQUE INDEX` in
-		// `schema()` — one answer, both backends. Enforcement still routes through
-		// `uniqueConstraints`; this column describes, it does not enforce.
-		const exposure = implicitCoveringIndexExposure(table);
-		const indexes: IndexSchema[] = [
-			...(table.indexes ?? []).filter(idx => exposure.get(idx.name.toLowerCase()) !== false),
-			...exposedImplicitIndexes(table).map(syntheticExposedIndexToIndexSchema),
-		].map(idx => indexSchemaForDisplay(table, idx, exposure));
-		if (indexes.length === 0) return;
-
-		for (const idx of indexes) {
+		// The same list `schema()` and `collectSchemaCatalog` show — real indexes plus
+		// any exposed implicit covering index the backend did not materialize as an
+		// `IndexSchema` (store mode), each already display-rendered. That rendering is
+		// what makes an exposed implicit covering index report `unique = 1` here and
+		// `CREATE UNIQUE INDEX` in `schema()` — one answer, both backends. Enforcement
+		// still routes through `uniqueConstraints`; this column describes, it does not
+		// enforce.
+		for (const { index: idx } of displayIndexesForTable(table)) {
 			const tagJson = tagsToJson(idx.tags);
 			const uniqueFlag = idx.unique ? 1 : 0;
 			const partialFlag = idx.predicate ? 1 : 0;

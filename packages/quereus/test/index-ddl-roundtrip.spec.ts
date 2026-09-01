@@ -145,6 +145,68 @@ describe('CREATE INDEX DDL round-trip: generateIndexDDL emission', () => {
 	});
 });
 
+/**
+ * The exposed implicit covering index's rendered DDL, put through the same
+ * re-parse this file pins for ordinary indexes.
+ *
+ * NOT an identity round-trip, deliberately: re-importing the line materializes a
+ * REAL `IndexSchema` with no originating constraint (so no `implicit` marker),
+ * which is exactly why `quereus-store`'s persistence bundle omits it entirely
+ * (`buildCatalogEntry`; docs/store-catalog-persistence.md). What must hold is the
+ * claim the UNIQUE keyword makes on a READ surface: the text re-parses into an
+ * index that enforces uniqueness. A plain `CREATE INDEX` would not.
+ */
+describe('CREATE INDEX DDL round-trip: exposed implicit covering index', () => {
+	const EXPOSED_TABLE = 'create table t (id integer primary key, x integer not null, '
+		+ 'constraint uq unique (x) with tags ("quereus.expose_implicit_index" = true))';
+
+	/** The `ddl` the catalog renders for the exposed structure backing `uq`. */
+	async function exposedIndexDDL(): Promise<string> {
+		const db = new Database();
+		try {
+			await db.exec(EXPOSED_TABLE);
+			const entry = collectSchemaCatalog(db, 'main').indexes.find(i => i.name === 'uq');
+			expect(entry, 'exposed implicit structure surfaced in the catalog').to.exist;
+			return entry!.ddl;
+		} finally {
+			await db.close();
+		}
+	}
+
+	it('renders as CREATE UNIQUE INDEX and re-parses to a unique createIndex AST', async () => {
+		const ddl = await exposedIndexDDL();
+		expect(ddl).to.match(/^CREATE UNIQUE INDEX /);
+		const stmt = parse(ddl);
+		expect(stmt.type).to.equal('createIndex');
+		if (stmt.type === 'createIndex') {
+			expect(stmt.isUnique, 're-parsed DDL declares UNIQUE').to.equal(true);
+			expect(indexColumnName(stmt.columns[0])).to.equal('x');
+		}
+	});
+
+	it('re-executed against a plain table, builds an index that enforces uniqueness', async () => {
+		const ddl = await exposedIndexDDL();
+		const db = new Database();
+		try {
+			await db.exec('create table t (id integer primary key, x integer not null)');
+			await db.exec(ddl);
+			expect(await rows(db, `select "unique" as u from index_info('t') where index_name = 'uq'`))
+				.to.deep.equal([{ u: 1 }]);
+			await db.exec('insert into t values (1, 5)');
+			let rejected = false;
+			try {
+				await db.exec('insert into t values (2, 5)');
+			} catch (e) {
+				rejected = /unique/i.test((e as Error).message);
+			}
+			expect(rejected, 'duplicate rejected by the re-imported index').to.equal(true);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+
 describe('CREATE INDEX DDL round-trip: importCatalog reconstruction', () => {
 	it('rehydrates unique / partial / collation / desc / tags + derived constraint losslessly', async () => {
 		const { db: src, indexDDLs } = await buildSource();
