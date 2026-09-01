@@ -99,6 +99,24 @@ select (select count(*) from uac t where t.a = uac.a) as sub, count(*) as c from
 select (select count(*) from uac t where t.n > uac.n) as sub, count(*) as c from uac;
 -- error: Column 'uac.n' must appear in the GROUP BY clause or be used in an aggregate function
 
+-- --- KNOWN DIVERGENCE: a reference to an ENCLOSING query's column is constant
+-- --- with respect to this query's implicit group, so it should be accepted here
+-- --- exactly as it is in `having` (see 25.2) and in `where`. It is not: the
+-- --- select-list walk flags any column reference its coverage set lacks, with no
+-- --- notion of which query the reference belongs to, so an outer reference is
+-- --- rejected as though it were an uncovered column of this query. SQLite accepts
+-- --- both queries below (the first yields `x`, `y`). Tracked as
+-- --- backlog/bug-outer-column-rejected-in-aggregate-select-list; these pins flip
+-- --- from `-- error:` to result rows when it lands. Not a regression -- the old
+-- --- blanket mixing throw rejected the ungrouped form too, and the GROUPED form
+-- --- (second query) has always been rejected.
+
+select a from uac where exists (select uac.a, count(*) from uac t);
+-- error: Column 'uac.a' must appear in the GROUP BY clause or be used in an aggregate function
+
+select a from uac where exists (select uac.a, count(*) from uac t group by t.a);
+-- error: Column 'uac.a' must appear in the GROUP BY clause or be used in an aggregate function
+
 -- --- Accepted: the column-free item survives the clauses that sit above the
 -- --- aggregation.
 

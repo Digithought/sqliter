@@ -139,6 +139,15 @@ select grp from aob group by grp order by max(val) desc;
 select id from aob order by sum(val);
 -- error: Aggregate function sum not allowed in this context
 
+-- ...and a COLUMN-FREE select list does not change that. Such an item is legal
+-- beside an aggregate (see 25.5), but it is not itself an aggregate, so this query
+-- names no aggregate outside ORDER BY and is not an aggregate query. An aggregate
+-- written only in ORDER BY does not promote it into one -- same as SQLite, which
+-- answers "misuse of aggregate: count()". Add a HAVING (25.2) or select the
+-- aggregate to make the sort key legal.
+select 'k' from aob order by sum(val);
+-- error: Aggregate function sum not allowed in this context
+
 drop table aob;
 
 -- GROUP BY everything filtered out: no rows

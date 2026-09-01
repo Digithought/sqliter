@@ -149,14 +149,10 @@ export function buildSelectStmt(
 		projectionsByColumn,
 		aggregates,
 		windowFunctions,
-		hasAggregates: hasAggregatesInSelect,
+		hasAggregates,
 		hasWindowFunctions,
 		hasWrappedAggregates
 	} = analyzeSelectColumns(stmt.columns, selectContext, input);
-	// `hasAggregates` may grow as buildAggregatePhase collects HAVING-only or
-	// ORDER-BY-only aggregates; track it locally so the post-aggregate branch
-	// is taken when those promote a non-aggregate query into an aggregate one.
-	let hasAggregates = hasAggregatesInSelect;
 
 	// Assemble the projection list in WRITTEN select-list order, expanding each star
 	// in place. Output columns follow the order the user wrote them — a star ahead of
@@ -210,12 +206,6 @@ export function buildSelectStmt(
 
 	// Update context if we have aggregates
 	if (aggregateResult.aggregateScope) {
-		// HAVING-only or ORDER-BY-only aggregates may have promoted this into an
-		// aggregate query even if SELECT had none — reflect that locally.
-		if (aggregateResult.hasHavingOnlyAggregates || aggregateResult.hasOrderByOnlyAggregates) {
-			hasAggregates = true;
-		}
-
 		selectContext = {
 			...selectContext,
 			scope: aggregateResult.aggregateScope,

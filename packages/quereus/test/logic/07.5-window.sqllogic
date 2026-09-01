@@ -876,6 +876,12 @@ select count(*) as c, row_number() over (order by a) as rn from wg;
 select count(*) as c, sum(b) over () as s from wg;
 -- error: Column 'b' must appear in the GROUP BY clause or be used in an aggregate function
 
+-- A window function whose ARGUMENTS are column-free runs over that same single
+-- implicit-group row, so it sees exactly one row regardless of how many rows the
+-- aggregate consumed.
+select count(*) as c, sum(1) over (order by count(*)) as s from wg;
+→ [{"c":3,"s":1}]
+
 -- And the aggregate-inside-a-window-argument limitation is unchanged for the
 -- ungrouped shape (an aggregate over the aggregated row, not over the input).
 select count(*) as c, sum(count(*)) over () as s from wg;
