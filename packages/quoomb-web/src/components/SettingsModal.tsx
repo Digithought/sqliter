@@ -1,8 +1,8 @@
+import { AlertCircle, Monitor, Moon, Puzzle, Settings2, Sun, X } from 'lucide-react';
 import React, { useState } from 'react';
 import { useSettingsStore } from '../stores/settingsStore.js';
-import { X, Sun, Moon, Monitor, Eye, EyeOff, Type, Zap, Puzzle, Settings2, AlertCircle } from 'lucide-react';
-import { PluginsModal } from './PluginsModal.js';
 import { ConfigModal } from './ConfigModal.js';
+import { PluginsModal } from './PluginsModal.js';
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -353,8 +353,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
                   ) : (
                     <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
                       Format: <code className="bg-gray-100 dark:bg-gray-700 px-1 py-0.5 rounded">accountId-type#</code>
-                      {' '}where type is <code className="bg-gray-100 dark:bg-gray-700 px-1 py-0.5 rounded">s</code> (scenario), 
-                      <code className="bg-gray-100 dark:bg-gray-700 px-1 py-0.5 rounded">d</code> (dynamics), or 
+                      {' '}where type is <code className="bg-gray-100 dark:bg-gray-700 px-1 py-0.5 rounded">s</code> (scenario),
+                      <code className="bg-gray-100 dark:bg-gray-700 px-1 py-0.5 rounded">d</code> (dynamics), or
                       <code className="bg-gray-100 dark:bg-gray-700 px-1 py-0.5 rounded">acc</code> (account).
                       Default: <code className="bg-gray-100 dark:bg-gray-700 px-1 py-0.5 rounded">local-s1</code>
                     </p>

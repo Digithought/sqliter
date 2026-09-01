@@ -23,7 +23,10 @@ export const App: React.FC = () => {
   useEffect(() => {
     // Initialize settings and session on app start
     loadSettings();
-    initializeSession();
+    void initializeSession().catch((error) => {
+      console.error('Failed to initialize session:', error);
+    });
+
   }, [loadSettings, initializeSession]);
 
   useEffect(() => {

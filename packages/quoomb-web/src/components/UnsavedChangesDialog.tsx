@@ -1,5 +1,5 @@
+import { AlertTriangle, Save } from 'lucide-react';
 import React from 'react';
-import { AlertTriangle, Save, X } from 'lucide-react';
 
 interface UnsavedChangesDialogProps {
   isOpen: boolean;

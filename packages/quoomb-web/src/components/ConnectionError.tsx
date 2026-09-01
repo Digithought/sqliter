@@ -3,14 +3,31 @@ import { useSessionStore } from '../stores/sessionStore.js';
 import { AlertTriangle, RefreshCw } from 'lucide-react';
 
 interface ConnectionErrorProps {
-  error: string;
+  error: unknown;
 }
+
+const formatErrorMessage = (error: unknown): string => {
+  if (typeof error === 'string') {
+    return error;
+  }
+
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  if (error === null || error === undefined) {
+    return 'Unknown connection error';
+  }
+
+  return String(error);
+};
 
 export const ConnectionError: React.FC<ConnectionErrorProps> = ({ error }) => {
   const { initializeSession } = useSessionStore();
+  const errorMessage = formatErrorMessage(error);
 
   const handleRetry = () => {
-    initializeSession();
+    void initializeSession();
   };
 
   return (
@@ -30,7 +47,7 @@ export const ConnectionError: React.FC<ConnectionErrorProps> = ({ error }) => {
 
         <div className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg p-4 mb-6">
           <p className="text-sm text-red-700 dark:text-red-300 font-mono">
-            {error}
+            {errorMessage}
           </p>
         </div>
 

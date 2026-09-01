@@ -174,7 +174,7 @@ export const EditorPanel: React.FC = () => {
           2048 | 3, // Monaco.KeyMod.Shift | Monaco.KeyCode.Enter
         ],
         run: () => {
-          handleExecute();
+          void handleExecute();
         },
       });
     }

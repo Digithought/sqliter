@@ -1,41 +1,41 @@
 import * as Comlink from 'comlink';
-import { Database, generateTableDDL, type SqlValue, type DatabaseDataChangeEvent, type DatabaseSchemaChangeEvent } from '@quereus/quereus';
+import { Database, generateTableDDL, type SqlValue } from '@quereus/quereus';
 import { expressionToString } from '@quereus/quereus/emit';
 import type { Expression } from '@quereus/quereus/parser';
-import { dynamicLoadModule } from '@quereus/plugin-loader';
-import { IndexedDBStore, IndexedDBProvider } from '@quereus/plugin-indexeddb';
-import { StoreModule, StoreEventEmitter, type KVStore } from '@quereus/store';
+import { StoreEventEmitter, StoreModule, type KVStore } from '@quereus/store';
 import {
-  createSyncModule,
-  createStoreAdapter,
-  type SyncManager,
-  type SyncEventEmitter as SyncEventEmitterType,
-  type RemoteChangeEvent,
-  type LocalChangeEvent,
-  type ConflictEvent,
-  type SyncState,
-  type HeldChangesDrainedEvent,
-  type BasisTableEvictedEvent,
-  SYNC_MAINTENANCE_INTERVAL_MS,
-  createSyncMaintenanceTicker,
+	createStoreAdapter,
+	createSyncMaintenanceTicker,
+	createSyncModule,
+	SYNC_MAINTENANCE_INTERVAL_MS,
+	type BasisTableEvictedEvent,
+	type ConflictEvent,
+	type HeldChangesDrainedEvent,
+	type LocalChangeEvent,
+	type RemoteChangeEvent,
+	type SyncEventEmitter as SyncEventEmitterType,
+	type SyncManager,
+	type SyncState,
 } from '@quereus/sync';
+import { SyncClient, type SyncEvent as SyncClientEvent, type SyncStatus as SyncClientStatus } from '@quereus/sync-client';
+import { IndexedDBProvider, IndexedDBStore } from '@quereus/plugin-indexeddb';
+import { dynamicLoadModule } from '@quereus/plugin-loader';
 import { createLocalCreateDrainListener } from './sync-local-create-drain.js';
-import { SyncClient, type SyncStatus as SyncClientStatus, type SyncEvent as SyncClientEvent } from '@quereus/sync-client';
-import type {
-  QuereusWorkerAPI,
-  TableInfo,
-  ColumnInfo,
-  CsvPreview,
-  PlanGraph,
-  PlanGraphNode,
-  PluginManifest,
-  StorageModuleType,
-  SyncStatus,
-  SyncEvent,
-  DataChangeCallback,
-  SchemaChangeCallback,
-} from './types.js';
 import Papa from 'papaparse';
+import type {
+	ColumnInfo,
+	CsvPreview,
+	DataChangeCallback,
+	PlanGraph,
+	PlanGraphNode,
+	PluginManifest,
+	QuereusWorkerAPI,
+	SchemaChangeCallback,
+	StorageModuleType,
+	SyncEvent,
+	SyncStatus,
+	TableInfo,
+} from './types.js';
 
 // Maximum number of sync events to keep in history
 const MAX_SYNC_EVENTS = 100;

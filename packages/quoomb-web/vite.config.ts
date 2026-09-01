@@ -7,6 +7,7 @@ export default defineConfig({
 
   resolve: {
     alias: [
+      // Intra-workspace packages (@quereus/*) resolve via workspace:^ in package.json
       // @quereus/store is now abstract-only, no platform-specific aliasing needed
     ],
   },

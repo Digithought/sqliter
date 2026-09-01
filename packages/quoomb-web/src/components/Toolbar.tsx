@@ -1,13 +1,12 @@
+import { Download, File, History, Settings, Upload } from 'lucide-react';
 import React, { useState } from 'react';
 import { useSessionStore } from '../stores/sessionStore.js';
-import { useSettingsStore } from '../stores/settingsStore.js';
-import { Settings, Upload, Download, History, File } from 'lucide-react';
-import { HistoryPanel } from './HistoryPanel.js';
-import { ExportMenu } from './ExportMenu.js';
 import { CsvImportModal } from './CsvImportModal.js';
-import { SettingsModal } from './SettingsModal.js';
-import { FileMenu } from './FileMenu.js';
 import { DatabaseSelector } from './DatabaseSelector.js';
+import { ExportMenu } from './ExportMenu.js';
+import { FileMenu } from './FileMenu.js';
+import { HistoryPanel } from './HistoryPanel.js';
+import { SettingsModal } from './SettingsModal.js';
 
 export const Toolbar: React.FC = () => {
   const { queryHistory, clearHistory } = useSessionStore();

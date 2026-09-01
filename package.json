@@ -49,6 +49,7 @@
     "build:vscode": "cd packages/quereus-vscode && yarn build",
     "build:planviz": "cd packages/tools/planviz && yarn build",
     "build:sync-coordinator": "cd packages/sync-coordinator && yarn build",
+    "build:babel-fish": "cd packages/quereus-babel-fish && yarn build",
     "build:ui": "cd packages/shared-ui && yarn build",
     "preview:web": "cd packages/quoomb-web && yarn preview",
     "pub:quereus": "node scripts/publish-package.js quereus",
@@ -72,6 +73,7 @@
     "bumpp": "^11.1.0",
     "esbuild": "^0.28.1",
     "rimraf": "^6.1.3",
+    "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
   },
   "resolutions": {

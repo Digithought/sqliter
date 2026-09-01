@@ -321,7 +321,7 @@ export const useSessionStore = create<SessionState>()(
 				},
 
 				// --- Delegated action groups ---
-				...createTabActions(set, get),
+				...createTabActions(set),
 				...createExportActions(set, get),
 				...createPluginActions(set, get),
 				...createSyncActions(set, get),

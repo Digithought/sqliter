@@ -6,7 +6,6 @@ packages/sync-coordinator/.data
 .yarn/*
 !.yarn/patches
 .quereus
-.yarnrc.yml
 
 .tmp
 

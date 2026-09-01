@@ -38,7 +38,6 @@ export const QueryPlanGraph: React.FC = () => {
   const layoutTree = useCallback((root: PlanGraphNode): TreeLayout[] => {
     const layouts: TreeLayout[] = [];
     const nodeWidth = 200;
-    const nodeHeight = 80; // Reduced from 100 to eliminate wasted space
     const levelHeight = 110; // Tighter spacing
     const nodeSpacing = 40;
 

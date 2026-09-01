@@ -18,6 +18,7 @@
 		{ "path": "packages/quereus-plugin-indexeddb" },
 		{ "path": "packages/quereus-plugin-react-native-leveldb" },
 		{ "path": "packages/quereus-plugin-nativescript-sqlite" },
+		{ "path": "packages/quereus-babel-fish" },
 		{ "path": "packages/sample-plugins" },
 		{ "path": "packages/quoomb-cli" },
 		{ "path": "packages/tools/planviz" }

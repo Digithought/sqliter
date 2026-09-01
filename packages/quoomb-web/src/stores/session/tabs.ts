@@ -1,6 +1,6 @@
 import type { StoreSet, StoreGet, Tab } from './types.js';
 
-export function createTabActions(set: StoreSet, get: StoreGet) {
+export function createTabActions(set: StoreSet) {
 	return {
 		createTab: (name?: string) => {
 			const tabId = crypto.randomUUID();

@@ -81,7 +81,9 @@ while (i < args.length) {
 // Set up paths
 const projectRoot = join(__dirname, '../..');
 const registerPath = join(__dirname, 'register.mjs');
-const mochaPath = join(projectRoot, 'node_modules', 'mocha', 'bin', 'mocha.js');
+
+// Resolve mocha path using Yarn PnP
+const mochaPath = fileURLToPath(await import.meta.resolve('mocha/bin/mocha.js'));
 const testPattern = join('packages', 'quereus', 'test', '**', '*.spec.ts');
 
 // Use 'min' reporter by default for concise output (full failure details preserved).

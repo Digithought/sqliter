@@ -1,11 +1,10 @@
+import { Plus, X } from 'lucide-react';
 import React from 'react';
 import { useSessionStore } from '../stores/sessionStore.js';
-import { X, Plus, Save } from 'lucide-react';
 
 export const TabBar: React.FC = () => {
   const {
     tabs,
-    activeTabId,
     createTab,
     closeTab,
     setActiveTab

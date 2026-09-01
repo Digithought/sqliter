@@ -281,7 +281,7 @@ export const useSettingsStore = create<SettingsState>()(
 
 // Listen for system theme changes when theme is set to 'auto'
 if (typeof window !== 'undefined') {
-  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', (e) => {
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', (_) => {
     const { theme } = useSettingsStore.getState();
     if (theme === 'auto') {
       // Use the helper function for consistency

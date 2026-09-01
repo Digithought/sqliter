@@ -1,18 +1,24 @@
 {
-    "cSpell.words": [
-        "autoincrement",
-        "Backpatch",
-        "backpatched",
-        "digitree",
-        "inheritree",
-        "LPAREN",
-        "quereus",
-        "rctx",
-        "Rootward",
-        "RPAREN",
-        "SAVEPOINT",
-        "savepoints",
-        "Vdbe",
-        "vtab"
-    ]
+  "cSpell.words": [
+    "autoincrement",
+    "Backpatch",
+    "backpatched",
+    "digitree",
+    "inheritree",
+    "LPAREN",
+    "quereus",
+    "rctx",
+    "Rootward",
+    "RPAREN",
+    "SAVEPOINT",
+    "savepoints",
+    "Vdbe",
+    "vtab"
+  ],
+  "search.exclude": {
+    "**/.yarn": true,
+    "**/.pnp.*": true
+  },
+  "ts.tsdk.path": ".yarn/sdks/typescript/lib",
+  "ts.tsdk.promptToUseWorkspaceVersion": true
 }

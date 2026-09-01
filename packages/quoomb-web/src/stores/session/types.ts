@@ -1,7 +1,6 @@
-import type { SqlValue } from '@quereus/quereus';
-import type { ErrorInfo } from '@quereus/quereus';
-import type { QuereusWorkerAPI, PlanGraph, SyncStatus, SyncEvent } from '../../worker/types.js';
+import type { ErrorInfo, SqlValue } from '@quereus/quereus';
 import type * as Comlink from 'comlink';
+import type { PlanGraph, QuereusWorkerAPI, SyncEvent, SyncStatus } from '../../worker/types.js';
 
 export interface QueryResult {
 	id: string;
@@ -55,7 +54,7 @@ export interface SessionState {
 
 	// Results display
 	activeResultId: string | null;
-	selectedPanel: 'result' | 'plan' | 'graph' | 'program' | 'trace' | 'messages';
+	selectedPanel: 'result' | 'plan' | 'graph' | 'program' | 'trace' | 'messages' | 'erd';
 
 	// Plugin state
 	loadedPlugins: Set<string>;
@@ -89,7 +88,7 @@ export interface SessionState {
 	setActiveTab: (tabId: string) => void;
 	updateTabContent: (tabId: string, content: string) => void;
 	updateTabName: (tabId: string, name: string) => void;
-	setSelectedPanel: (panel: 'result' | 'plan' | 'graph' | 'program' | 'trace' | 'messages') => void;
+	setSelectedPanel: (panel: 'result' | 'plan' | 'graph' | 'program' | 'trace' | 'messages' | 'erd') => void;
 	setActiveResultId: (resultId: string | null) => void;
 	setSelectedNodeId: (nodeId: string | undefined) => void;
 	setPlanMode: (mode: 'estimated' | 'actual') => void;

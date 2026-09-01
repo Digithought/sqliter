@@ -22,12 +22,12 @@ export const ConfigModal: React.FC<ConfigModalProps> = ({ isOpen, onClose }) => 
     }
   };
 
-  const handleExport = () => {
+  const handleExport = async () => {
     const json = exportConfig();
     setImportText(json);
     setActiveTab('export');
     setMessage({ type: 'success', text: 'Config exported to clipboard' });
-    navigator.clipboard.writeText(json);
+    await navigator.clipboard.writeText(json);
     setTimeout(() => setMessage(null), 3000);
   };
 
@@ -58,7 +58,7 @@ export const ConfigModal: React.FC<ConfigModalProps> = ({ isOpen, onClose }) => 
       try {
         const content = event.target?.result as string;
         setImportText(content);
-      } catch (error) {
+      } catch {
         setMessage({
           type: 'error',
           text: 'Failed to read file'

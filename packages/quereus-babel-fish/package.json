@@ -1,0 +1,54 @@
+{
+	"name": "@quereus/babel-fish",
+	"version": "0.0.1",
+	"type": "module",
+	"description": "Transpile Quereus SQL to other formats",
+	"main": "dist/src/index.js",
+	"types": "dist/src/index.d.ts",
+	"files": [
+		"src",
+		"dist",
+		"!dist/test",
+		"!**/*.tsbuildinfo"
+	],
+	"exports": {
+		".": {
+			"types": "./dist/src/index.d.ts",
+			"import": "./dist/src/index.js"
+		}
+	},
+	"scripts": {
+		"clean": "rimraf dist",
+		"build": "tsc",
+		"typecheck": "tsc --noEmit && tsc -p tsconfig.test.json --noEmit",
+		"test": "yarn build && node test-runner.mjs",
+		"test:single": "yarn build && node test-runner.mjs --bail"
+	},
+	"homepage": "https://github.com/gotchoices/quereus",
+	"bugs": {
+		"url": "https://github.com/gotchoices/quereus/issues"
+	},
+	"keywords": [
+		"quereus",
+		"sql",
+		"translation",
+		"mermaid",
+		"typeql"
+	],
+	"publisher": "Got Choices Foundation",
+	"author": "Risav Karna",
+	"license": "MIT",
+	"devDependencies": {
+		"@quereus/quereus": "workspace:^",
+		"@types/mocha": "^10.0.10",
+		"@types/node": "^25.0.9",
+		"chai": "^6.2.2",
+		"mocha": "^11.7.5",
+		"rimraf": "^6.1.2",
+		"ts-node": "^10.9.2",
+		"typescript": "^5.9.3"
+	},
+	"peerDependencies": {
+		"@quereus/quereus": "workspace:^"
+	}
+}

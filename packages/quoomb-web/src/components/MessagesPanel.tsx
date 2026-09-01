@@ -1,6 +1,6 @@
+import { CheckCircle, Clock, Info } from 'lucide-react';
 import React from 'react';
 import { useSessionStore } from '../stores/sessionStore.js';
-import { AlertCircle, CheckCircle, Clock, Info, AlertTriangle, XCircle } from 'lucide-react';
 import { EnhancedErrorDisplay } from './EnhancedErrorDisplay.js';
 
 type MessageType = 'info' | 'success' | 'warning' | 'error';

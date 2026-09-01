@@ -1,6 +1,6 @@
-import React, { useState } from 'react';
+import { AlertCircle, CheckCircle, Play, X } from 'lucide-react';
+import React from 'react';
 import { useSessionStore } from '../stores/sessionStore.js';
-import { Clock, X, Play, AlertCircle, CheckCircle } from 'lucide-react';
 
 interface HistoryPanelProps {
   isOpen: boolean;
@@ -92,9 +92,9 @@ export const HistoryPanel: React.FC<HistoryPanelProps> = ({ isOpen, onClose }) =
                     {/* Actions */}
                     <div className="flex flex-col gap-2">
                       <button
-                        onClick={(e) => {
+                        onClick={async (e) => {
                           e.stopPropagation();
-                          handleRerunQuery(query.sql);
+                          await handleRerunQuery(query.sql);
                         }}
                         className="flex items-center gap-1 px-2 py-1 text-xs bg-blue-500 hover:bg-blue-600 text-white rounded transition-colors"
                         title="Re-run this query"

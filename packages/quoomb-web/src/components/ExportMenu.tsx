@@ -1,6 +1,6 @@
-import React, { useState, useRef, useEffect } from 'react';
+import { FileJson, FileText } from 'lucide-react';
+import React, { useEffect, useRef } from 'react';
 import { useSessionStore } from '../stores/sessionStore.js';
-import { Download, FileText, FileJson } from 'lucide-react';
 
 interface ExportMenuProps {
   isOpen: boolean;
