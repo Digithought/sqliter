@@ -104,6 +104,18 @@ Publish prereleases with a dist-tag so they don't become `latest`:
 
 All packages in the monorepo share the same version number. The `--recursive` flag in the bump script ensures this stays in sync. Do not manually edit version numbers in individual `package.json` files.
 
+### The sync wire version is not the package version
+
+`PROTOCOL_VERSION` (`packages/quereus-sync/src/sync/wire.ts`) moves independently of the version every package shares. Two peers on different releases interoperate for as long as that integer is unchanged; the moment it changes, **every deployed peer and coordinator on the previous value is refused at handshake** — with a named error, not silent corruption (see [sync-protocol.md § Protocol version](sync-protocol.md#protocol-version)).
+
+Nothing in semver signals that. So a release whose diff touches `PROTOCOL_VERSION` **must say so in the release notes**, and must say that clients and coordinator have to be upgraded together. Check it as part of curating `.release-notes.pending.md`:
+
+```bash
+git diff <last-tag>..HEAD -- packages/quereus-sync/src/sync/wire.ts | grep PROTOCOL_VERSION
+```
+
+This is a disclosure rule, not a compatibility promise — sync is Experimental and the wire version may be bumped in any release type. See [stability.md](stability.md).
+
 ## Checklist
 
 - [ ] `yarn check` passes (there is no CI — this local run is the only pre-publish safety net)
@@ -111,5 +123,6 @@ All packages in the monorepo share the same version number. The `--recursive` fl
 - [ ] `yarn test` passes
 - [ ] Clean working tree
 - [ ] `.release-notes.pending.md` curated (optional — omit for auto-generated notes)
+- [ ] If `PROTOCOL_VERSION` changed, the notes say so and say to upgrade peers together (see *The sync wire version is not the package version*)
 - [ ] `yarn release` (or `yarn bump` + `yarn pub` separately)
 - [ ] GitHub release created (`yarn gh-release`)

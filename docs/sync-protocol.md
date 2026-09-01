@@ -391,6 +391,19 @@ to a message shape or the codec, with no min/max range negotiation; `PROTOCOL_VE
 doc comment in `wire.ts` describes the range-negotiation upgrade path should
 mixed-version rolling upgrades ever be required.
 
+> **NOTE: accepted tradeoff — mixed-version skew is deliberately neither promised nor
+> tested.** A version-skew test (pin one peer at release N, the other at N-1, assert they
+> still interoperate) was proposed and declined, because it would test a guarantee the
+> project has not made: sync is Experimental, and that tier's on-the-wire row already says
+> the format may change with no upgrade path in any release. The gate above is what makes
+> that honest — a skewed peer is refused with a named error rather than left to
+> misinterpret a message. **Revisit when sync leaves Experimental**: the Beta and Stable
+> rows in [stability.md](stability.md) both promise a documented upgrade path for a stored
+> or on-the-wire format, and neither is dischargeable without this test. Note also that a
+> wire-version gate covers only the wire: on-disk sync metadata layout, semantic drift
+> under an unchanged message shape, and a peer reading its own older persisted state are
+> three separate compatibility axes it does not touch.
+
 ### Connection Lifecycle
 
 The client state machine:
