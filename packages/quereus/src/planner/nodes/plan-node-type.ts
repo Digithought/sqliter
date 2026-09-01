@@ -70,6 +70,7 @@ export enum PlanNodeType {
   BinaryOp = 'BinaryOp',
   CaseExpr = 'CaseExpr',
   Cast = 'Cast',
+  WriteCoercion = 'WriteCoercion',  // Planner-inserted write-path conversion of a produced cell to its column's declared type
   Collate = 'Collate',
   ScalarFunctionCall = 'ScalarFunctionCall',
   WindowFunctionCall = 'WindowFunctionCall',
