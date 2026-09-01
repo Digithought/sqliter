@@ -1,12 +1,16 @@
 -- adapted from SQLite test/notnull2.test
 -- IS NULL / IS NOT NULL evaluated under an aggregate over an empty NOT NULL
--- table. SQLite allows mixing aggregate and non-aggregate columns without
--- GROUP BY (using the "bare aggregate" mode where non-agg columns yield NULL
--- on empty input). Quereus rejects this by design.
+-- table. SQLite allows a bare column beside an aggregate without GROUP BY (its
+-- "bare aggregate" mode, where the non-aggregate columns yield NULL on empty
+-- input). Quereus rejects it by design: an ungrouped aggregate query has one
+-- implicit group, which carries no base-table column, so `a` here is exactly as
+-- uncovered as it would be under a GROUP BY that omits it -- and gets the same
+-- message. A select-list item that references no column at all IS accepted
+-- beside an aggregate; see 25.5. `a is null` is not one of those.
 
 create table ag_t (a integer primary key, b text);
 
 select a is null as a_is_null, a is not null as a_is_not_null, count(*) as n from ag_t;
--- error: aggregate and non-aggregate
+-- error: Column 'a' must appear in the GROUP BY clause or be used in an aggregate function
 
 drop table ag_t;

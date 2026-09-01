@@ -36,6 +36,14 @@ export function buildAggregatePhase(
 	starProjectionsByColumn: ReadonlyMap<AST.ResultColumn, readonly Projection[]> = new Map()
 ): {
 	output: RelationalPlanNode;
+	/**
+	 * Whether this SELECT is an aggregate query — it names an aggregate function
+	 * anywhere, has a GROUP BY, or has a HAVING (which makes one implicit group on its
+	 * own). False means every field below is the early-out shape and `output` is the
+	 * untouched input. Callers read this rather than re-deriving it: it is also what
+	 * decides whether an ORDER BY may name an aggregate.
+	 */
+	isAggregateQuery: boolean;
 	aggregateScope?: RegisteredScope;
 	needsFinalProjection: boolean;
 	preAggregateSort: boolean;
@@ -74,7 +82,20 @@ export function buildAggregatePhase(
 	// later — so `hasOrderByOnlyAggregates` stays false for it.
 	const needsPostAggregateSort = orderByNeedsPostAggregateSort(stmt.orderBy, selectContext, selectList);
 	let hasOrderByOnlyAggregates = false;
-	if (needsPostAggregateSort && (hasAggregates || hasGroupBy)) {
+
+	// A `having` clause makes this an aggregate query on its own, exactly as SQLite and
+	// PostgreSQL define it: with no `group by` the query has ONE implicit group over all
+	// input rows, and `having` filters that single group. So a query with a `having` and
+	// neither aggregates nor `group by` still goes through the aggregate pipeline below —
+	// it builds an AggregateNode with no grouping keys and no aggregates, which yields
+	// exactly one (empty) row, and every clause above it is subject to the usual coverage
+	// rule. Returning early instead is what silently dropped the predicate. This is
+	// computed HERE, above the ORDER BY collection, because that collection asks the same
+	// question: `select 1 from t having 1 = 1 order by count(*)` is an aggregate query,
+	// so its ORDER BY aggregate is legal and must be collected.
+	const isAggregateQuery = hasAggregates || hasGroupBy || Boolean(stmt.having);
+
+	if (needsPostAggregateSort && isAggregateQuery) {
 		const orderByAggs = collectOrderByAggregates(stmt.orderBy!, selectContext, aggregates);
 		if (orderByAggs.length > 0) {
 			aggregates.push(...orderByAggs);
@@ -83,17 +104,8 @@ export function buildAggregatePhase(
 		}
 	}
 
-	// A `having` clause makes this an aggregate query on its own, exactly as SQLite and
-	// PostgreSQL define it: with no `group by` the query has ONE implicit group over all
-	// input rows, and `having` filters that single group. So a query with a `having` and
-	// neither aggregates nor `group by` still goes through the aggregate pipeline below —
-	// it builds an AggregateNode with no grouping keys and no aggregates, which yields
-	// exactly one (empty) row, and every clause above it is subject to the usual coverage
-	// rule. Returning early here instead is what silently dropped the predicate.
-	const isAggregateQuery = hasAggregates || hasGroupBy || Boolean(stmt.having);
-
 	if (!isAggregateQuery) {
-		return { output: input, needsFinalProjection: false, preAggregateSort: false };
+		return { output: input, isAggregateQuery: false, needsFinalProjection: false, preAggregateSort: false };
 	}
 
 	let currentInput: RelationalPlanNode = input;
@@ -122,9 +134,9 @@ export function buildAggregatePhase(
 	const groupByExpressions = stmt.groupBy ?
 		stmt.groupBy.map(expr => buildOrdinalAwareExpression(selectContext, expr, selectList, 'GROUP BY', false)) : [];
 
-	// Validate aggregate/non-aggregate mixing (must run after groupByExpressions are built
+	// Validate SELECT-list coverage (must run after groupByExpressions are built
 	// so we can check column-coverage of SELECT projections against GROUP BY)
-	validateAggregateProjections(projections, hasAggregates, !!hasGroupBy, groupByExpressions);
+	validateAggregateProjections(projections, groupByExpressions);
 
 	// Create AggregateNode
 	const aggregateNode = new AggregateNode(selectContext.scope, currentInput, groupByExpressions, aggregates);
@@ -204,6 +216,7 @@ export function buildAggregatePhase(
 
 	return {
 		output: currentInput,
+		isAggregateQuery: true,
 		aggregateScope: aggregateOutputScope,
 		needsFinalProjection,
 		preAggregateSort,
@@ -762,7 +775,7 @@ function findUngroupedPostAggregateRef(
 }
 
 /**
- * Validates that aggregate and non-aggregate projections don't mix inappropriately.
+ * Validates that every SELECT-list item is covered by this query's grouping.
  * Every non-aggregate column reference in the SELECT list must either (a) match a
  * GROUP BY column by attribute id, or (b) appear inside a subtree whose AST matches
  * a GROUP BY expression. This is intentionally stricter than full functional-dependency
@@ -771,31 +784,26 @@ function findUngroupedPostAggregateRef(
  *
  * Only {@link buildAggregatePhase} calls this, and only from inside its
  * `isAggregateQuery` guard, so "no GROUP BY" here means "one implicit group with an
- * EMPTY set of grouping keys" — not "no grouping at all". The coverage walk therefore
- * runs for it too, and rejects every bare select-list column.
+ * EMPTY set of grouping keys" — not "no grouping at all". The coverage walk runs for
+ * that shape too, and the empty coverage set is exactly what makes it come out right:
+ * a bare column reference is rejected (the implicit group carries no base-table
+ * column), while an item that references no column of the query's input — a literal,
+ * a constant-folding expression, a scalar subquery, a `case` over an aggregate — has
+ * nothing for the walk to reject and is admitted. `select 'total', count(*) from t` is
+ * legal standard SQL; `select a, count(*) from t` is not, and the walk is what tells
+ * them apart.
  */
 function validateAggregateProjections(
 	projections: Projection[],
-	hasAggregates: boolean,
-	hasGroupBy: boolean,
 	groupByExpressions: ScalarPlanNode[]
 ): void {
 	if (projections.length === 0) return;
 
-	if (hasAggregates && !hasGroupBy) {
-		throw new QuereusError(
-			'Cannot mix aggregate and non-aggregate columns in SELECT list without GROUP BY',
-			StatusCode.ERROR
-		);
-	}
-
 	// The SELECT list is built against the pre-aggregate scope, so no aggregate
-	// output attributes participate. With no GROUP BY the coverage set is empty, which
-	// is exactly right for the one implicit group: it carries no base-table column, so
-	// any bare column here is rejected. Skipping the walk for that shape is what let
-	// `select * from t having 1 = 1` fall through to buildFinalAggregateProjections and
-	// raise its internal-consistency assert ("Internal: SELECT * column 'id' is not a
-	// GROUP BY key", StatusCode.INTERNAL) at the user instead of this message.
+	// output attributes participate. Skipping the walk for the ungrouped shape is what
+	// let `select * from t having 1 = 1` fall through to buildFinalAggregateProjections
+	// and raise its internal-consistency assert ("Internal: SELECT * column 'id' is not
+	// a GROUP BY key", StatusCode.INTERNAL) at the user instead of this message.
 	const coverage = buildGroupByCoverage(groupByExpressions);
 	for (const proj of projections) {
 		assertGroupByCoverage(proj.node, coverage);

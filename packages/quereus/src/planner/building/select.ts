@@ -302,13 +302,15 @@ export function buildSelectStmt(
 			}
 		}
 
-		// NOTE: the redirect context here is the GROUPED one, which is right today: a
-		// window function above an UNGROUPED aggregate is unreachable — the select list
-		// that would spell it is rejected first by "Cannot mix aggregate and non-aggregate
-		// columns in SELECT list without GROUP BY" — and an ungrouped query has no
-		// grouping keys to redirect onto anyway. If that mixing check is ever loosened,
-		// a WindowNode can land above an ungrouped aggregate and fall under the coverage
-		// walk below with no test covering it; pin that shape then.
+		// NOTE: the redirect context here is the GROUPED one, and `undefined` for an
+		// UNGROUPED aggregate query is correct rather than a gap. That shape IS reachable
+		// — `select count(*) as c, row_number() over (order by count(*)) as rn from wg`
+		// puts a WindowNode above an ungrouped aggregate — but an ungrouped query has no
+		// grouping keys, so there is nothing for redirectPostAggregate to rewrite onto
+		// and its pass-through branch is the whole answer. What keeps the shape honest is
+		// the coverage walk below: a window specification or argument naming a base-table
+		// column (`over (order by a)`, `sum(b) over ()`) is rejected there with the usual
+		// GROUP BY message. Pinned in test/logic/07.5-window.sqllogic.
 		input = buildWindowPhase(input, windowFunctions, selectContext, windowSelectProjections ?? projections, groupedRedirectContext);
 		// The window phase ends in a ProjectNode over the SELECT list, so that node's
 		// attributes are this query's result columns.
@@ -398,7 +400,11 @@ export function buildSelectStmt(
 		input = applyOrderBy(input, stmt, selectContext, {
 			preAggregateSort,
 			projectionScope: aggregateProjectionScope,
-			allowAggregates: hasAggregates,
+			// An ORDER BY may name an aggregate exactly when this is an aggregate query,
+			// which is not the same question as "does it name an aggregate somewhere" —
+			// `select 1 from t having 1 = 1 order by count(*)` is an aggregate query by
+			// virtue of its HAVING alone. buildAggregatePhase already answered it.
+			allowAggregates: aggregateResult.isAggregateQuery,
 			selectList: selectListEntries,
 			outputRelation: orderByOutputRelation,
 			groupedRedirect: groupedRedirectContext,

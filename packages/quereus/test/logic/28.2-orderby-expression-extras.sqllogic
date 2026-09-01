@@ -514,12 +514,12 @@ select count(*) + 1 as c from soa order by max(a), c + 0;
 select length(max(a)) as c from soa order by min(b), c;
 → [{"c":1}]
 
--- (There is no ungrouped counterpart of the grouping-key-alias case: an
--- ungrouped aggregate query has no grouping key, and Quereus rejects any
--- non-aggregate select-list item beside an aggregate without GROUP BY --
--- including a constant, which SQLite accepts. That divergence is independent of
--- ORDER BY and is tracked separately as
--- backlog/bug-ungrouped-aggregate-rejects-constant-select-item.)
+-- the ungrouped counterpart of the grouped grouping-key-alias case below: an
+-- ungrouped aggregate query has no grouping key, so a column-free select-list
+-- item stands in for one. Its alias has to resolve on the final projection while
+-- `max(a)` resolves on the AggregateNode below it -- the same two-name split.
+select 'all' as k, count(*) as c from soa order by max(a), k;
+→ [{"k":"all","c":3}]
 
 -- --- GROUPED: group 'x' has max(b)='r' and 2 rows, group 'y' has max(b)='q'
 -- --- and 1 row, so ordering by max(b) puts 'y' first.

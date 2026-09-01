@@ -1,0 +1,178 @@
+-- =============================================================================
+-- An ungrouped aggregate query (aggregates in the SELECT list, no GROUP BY) has
+-- exactly ONE implicit group over all input rows. That group's row carries the
+-- aggregate results and nothing else -- no base-table column.
+--
+-- So the rule the SELECT list is checked against is "does this item reference a
+-- column of the query's input?", NOT "is this item an aggregate?":
+--
+--   * a column-free item -- a literal, an expression over literals, a call whose
+--     arguments are column-free, a `case` over aggregates, a scalar subquery --
+--     references nothing the implicit group lacks, and is ACCEPTED. That is
+--     standard SQL and what SQLite and PostgreSQL do.
+--   * a bare column reference is REJECTED, with the same message and source
+--     position a GROUP BY query gets when it omits the column. Quereus
+--     deliberately does not import SQLite's permissive "bare columns" rule,
+--     which picks an arbitrary row of the group.
+--
+-- Regression: every accepted query below used to fail with "Cannot mix aggregate
+-- and non-aggregate columns in SELECT list without GROUP BY", a blanket throw
+-- that never asked whether the item named a column.
+-- =============================================================================
+
+create table uac (id integer primary key, a text, n integer);
+insert into uac values (1, 'x', 10), (2, 'y', 20);
+
+create table uacempty (id integer primary key, a text);
+
+-- --- Accepted: column-free items beside an aggregate.
+
+-- a string literal
+select 'total' as label, count(*) as c from uac;
+→ [{"label":"total","c":2}]
+
+-- an integer literal
+select 1 as one, count(*) as c from uac;
+→ [{"one":1,"c":2}]
+
+-- an expression over literals only
+select 1 + 1 as two, count(*) as c from uac;
+→ [{"two":2,"c":2}]
+
+-- a function call whose arguments are column-free
+select abs(-1) as k, count(*) as c from uac;
+→ [{"k":1,"c":2}]
+
+-- NULL is column-free too
+select null as z, count(*) as c from uac;
+→ [{"z":null,"c":2}]
+
+-- a cast over a literal
+select cast(1 as text) as k, count(*) as c from uac;
+→ [{"k":"1","c":2}]
+
+-- an IN list over literals
+select 1 in (1, 2) as k, count(*) as c from uac;
+→ [{"k":true,"c":2}]
+
+-- a COLLATE over a literal
+select 'a' collate binary as k, count(*) as c from uac;
+→ [{"k":"a","c":2}]
+
+-- more than one column-free item, and the aggregate not written first
+select count(*) as c, 'a' as x, 'b' as y from uac;
+→ [{"c":2,"x":"a","y":"b"}]
+
+-- several aggregates alongside
+select 'summary' as label, count(*) as c, sum(n) as s, max(a) as m from uac;
+→ [{"label":"summary","c":2,"s":30,"m":"y"}]
+
+-- --- Accepted: items that read the AGGREGATE results rather than input columns.
+
+-- a `case` over an aggregate
+select case when count(*) > 1 then 'many' else 'few' end as k, count(*) as c from uac;
+→ [{"k":"many","c":2}]
+
+-- an arithmetic expression over an aggregate
+select count(*) * 10 as k, count(*) as c from uac;
+→ [{"k":20,"c":2}]
+
+-- --- Accepted: a scalar subquery is a relational subtree that resolves its own
+-- --- scope, so it references no column of THIS query's input.
+
+select (select count(*) from uac) as sub, count(*) as c from uac;
+→ [{"sub":2,"c":2}]
+
+-- a correlated-looking subquery that is in fact uncorrelated
+select (select max(n) from uac) as sub, sum(n) as s from uac;
+→ [{"sub":20,"s":30}]
+
+-- ...but a GENUINELY correlated subquery, one that reads an ungrouped column of
+-- THIS query, is rejected. The select-list walk stops at every relational child,
+-- so it does not catch this; the finished-plan check (assertGroupedPlanCoverage)
+-- is the one that does, and it reports the same message. This is the seam between
+-- "the walk skipped it" and "the item is truly column-free", and the two must not
+-- be confused.
+select (select count(*) from uac t where t.a = uac.a) as sub, count(*) as c from uac;
+-- error: Column 'uac.a' must appear in the GROUP BY clause or be used in an aggregate function
+
+select (select count(*) from uac t where t.n > uac.n) as sub, count(*) as c from uac;
+-- error: Column 'uac.n' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- --- Accepted: the column-free item survives the clauses that sit above the
+-- --- aggregation.
+
+select distinct 'k' as label, count(*) as c from uac;
+→ [{"label":"k","c":2}]
+
+select 'k' as label, count(*) as c from uac limit 1;
+→ [{"label":"k","c":2}]
+
+select 'k' as label, count(*) as c from uac limit 0;
+→ []
+
+select 'k' as label, count(*) as c from uac order by count(*);
+→ [{"label":"k","c":2}]
+
+select 'k' as label, count(*) as c from uac having count(*) > 1;
+→ [{"label":"k","c":2}]
+
+select 'k' as label, count(*) as c from uac having count(*) > 5;
+→ []
+
+-- --- Accepted: over an empty table the implicit group still exists, so the
+-- --- column-free item is emitted beside a zero count.
+
+select 'total' as label, count(*) as c from uacempty;
+→ [{"label":"total","c":0}]
+
+-- --- Accepted: nested spellings, where another ProjectNode wraps the query.
+
+select * from (select 'k' as label, count(*) as c from uac);
+→ [{"label":"k","c":2}]
+
+-- ...and as an arm of a compound select.
+select 'k' as label, count(*) as c from uac union all select 'j', count(*) from uac;
+→ [{"label":"k","c":2},{"label":"j","c":2}]
+
+-- --- REJECTED: a bare column reference. This is the distinction the check makes,
+-- --- and it must keep failing -- with the GROUP BY coverage message and the
+-- --- offending column's own source position, not a generic mixing complaint.
+
+select a, count(*) as c from uac;
+-- error: Column 'a' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- the column need not be written first
+select count(*) as c, a from uac;
+-- error: Column 'a' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- a column buried inside an otherwise column-free expression is still a column
+select 'p' || a as k, count(*) as c from uac;
+-- error: Column 'a' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- ...including under a function call
+select length(a) as k, count(*) as c from uac;
+-- error: Column 'a' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- ...and inside a `case`
+select case when n > 1 then 'big' else 'small' end as k, count(*) as c from uac;
+-- error: Column 'n' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- a qualified spelling is the same column (the message echoes the spelling the
+-- user wrote, so it names `uac.a` here)
+select uac.a, count(*) as c from uac;
+-- error: Column 'uac.a' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- `select *` beside an aggregate expands to bare columns and is rejected on the
+-- first of them
+select *, count(*) as c from uac;
+-- error: Column 'id' must appear in the GROUP BY clause or be used in an aggregate function
+
+-- --- Non-regression: adding the GROUP BY that covers the column accepts it, and
+-- --- the column-free item rides along unchanged.
+
+select 'k' as label, a, count(*) as c from uac group by a order by a;
+→ [{"label":"k","a":"x","c":1},{"label":"k","a":"y","c":1}]
+
+drop table uac;
+drop table uacempty;

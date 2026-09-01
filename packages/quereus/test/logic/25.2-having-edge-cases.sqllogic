@@ -260,6 +260,46 @@ select 1 as one from hn having 1 = 1 order by 1;
 select 1 as one from hn having 1 = 1 order by one;
 → [{"one":1}]
 
+-- An ORDER BY may also name an AGGREGATE here. A HAVING makes this an aggregate
+-- query on its own, so `count(*)` is legal in its ORDER BY exactly as it is in the
+-- ORDER BY of a query that names an aggregate in its SELECT list -- the aggregate
+-- is collected into the AggregateNode for the post-aggregate sort and stripped by
+-- the final projection. (Before the fix, both the collection step and applyOrderBy
+-- asked "does this query name an aggregate?" instead of "is this an aggregate
+-- query?", so the aggregate was never collected and the sort key was rejected with
+-- "Aggregate function count not allowed in this context".)
+select 1 as one from hn having 1 = 1 order by count(*);
+→ [{"one":1}]
+
+-- ...with more than one sort-only aggregate, and one of a different function.
+select 1 as one from hn having 1 = 1 order by count(*), max(val);
+→ [{"one":1}]
+
+-- ...and mixed with the select-list alias, which resolves on the final projection
+-- while the aggregates resolve on the AggregateNode below it.
+select 1 as one from hn having 1 = 1 order by count(*), one;
+→ [{"one":1}]
+
+-- A HAVING that names an aggregate beside a column-free select list. The select
+-- list carries no base-table column, so nothing is uncovered and the query is a
+-- plain aggregate query whose single implicit group the predicate filters.
+select 1 as one from hn having count(*) > 1;
+→ [{"one":1}]
+
+select 1 as one from hn having count(*) > 5;
+→ []
+
+select 'label' as k from hn having count(*) > 1 order by count(*);
+→ [{"k":"label"}]
+
+-- ...and the same over an empty table, where the implicit group still exists but
+-- its count is 0.
+select 1 as one from hnempty having count(*) > 0;
+→ []
+
+select 1 as one from hnempty having count(*) = 0;
+→ [{"one":1}]
+
 -- Regression guards: adding an aggregate or a GROUP BY must not change any of the
 -- long-standing behaviour.
 select count(*) as c from hn having count(*) > 5;
