@@ -100,6 +100,41 @@ insert into iul_e values (2, 'VIN1');
 select count(*) as c from schema() where type = 'index' and name = 'uq_vin';
 → [{"c":1}]
 
+-- It describes itself as UNIQUE, on every backend and on every read surface.
+-- Rendered DDL exists to re-parse into the object it describes, and a plain
+-- `CREATE INDEX` does not re-parse into something that enforces uniqueness.
+-- Memory materializes the structure without a `unique` flag and the store
+-- synthesizes it from the constraint, so both routes go through one display
+-- helper (`indexSchemaForDisplay`) rather than each deciding for itself.
+-- Uniqueness *enforcement* stays the constraint's either way.
+select sql like 'CREATE UNIQUE INDEX%' as is_unique_ddl from schema() where type = 'index' and name = 'uq_vin';
+→ [{"is_unique_ddl":true}]
+
+select "unique" as u from index_info('iul_e') where index_name = 'uq_vin';
+→ [{"u":1}]
+
+-- Negative pin: the helper must not over-apply. A PLAIN (unexposed) UNIQUE
+-- constraint still surfaces no index row at all...
+create table iul_p (id integer primary key, sku text, constraint uq_sku unique (sku));
+-- run
+
+select count(*) as c from schema() where type = 'index' and name = 'uq_sku';
+→ [{"c":0}]
+
+select count(*) as c from index_info('iul_p');
+→ [{"c":0}]
+
+-- ...and an ordinary non-unique index still renders without UNIQUE and reports 0.
+create table iul_o (id integer primary key, label text);
+create index ix_label on iul_o (label);
+-- run
+
+select sql like 'CREATE INDEX%' as is_plain_ddl from schema() where type = 'index' and name = 'ix_label';
+→ [{"is_plain_ddl":true}]
+
+select "unique" as u from index_info('iul_o') where index_name = 'ix_label';
+→ [{"u":0}]
+
 -- ============================================================
 -- 5. Mixed-case constraint name — the guards fold case like every index compare
 -- ============================================================

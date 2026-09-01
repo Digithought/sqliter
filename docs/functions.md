@@ -575,7 +575,7 @@ One row per (index, indexed-column) pair, ordered by column position within the 
 | `partial` | INTEGER | 1 if the index has a `WHERE` predicate |
 | `tags` | TEXT? | Index tags as JSON object (repeated per row) |
 
-The implicit covering structure backing a plain `UNIQUE` constraint is not a user-addressable index, so neither `index_info()` nor `schema()` lists it — on any backend — unless the constraint opts in via `quereus.expose_implicit_index`. See [sql-vtab.md §6.3](sql-vtab.md#63-indexes-on-virtual-tables).
+The implicit covering structure backing a plain `UNIQUE` constraint is not a user-addressable index, so neither `index_info()` nor `schema()` lists it — on any backend — unless the constraint opts in via `quereus.expose_implicit_index`. When it *is* exposed, it reports `unique = 1` here and renders as `CREATE UNIQUE INDEX` in `schema()`, on every backend; uniqueness is still *enforced* by the constraint, not by this index. See [sql-vtab.md §6.3](sql-vtab.md#63-indexes-on-virtual-tables).
 
 ### `check_constraint_info(table_name)` columns
 

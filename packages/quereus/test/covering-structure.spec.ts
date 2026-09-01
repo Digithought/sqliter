@@ -921,6 +921,14 @@ describe('introspection hiding', () => {
 			// The surfaced entry carries the `implicit` marker so the differ excludes it
 			// from its standalone-index buckets (see the idempotency suite below).
 			expect(idx!.implicit, 'exposed implicit index marked for the differ to exclude').to.equal(true);
+			// It describes itself as UNIQUE even though the memory-materialized
+			// `IndexSchema` carries no flag (enforcement routes through the constraint).
+			// `indexSchemaForDisplay` supplies the flag on every read surface, so this
+			// matches the store backend and the sqllogic pins in
+			// test/logic/10.5.7-implicit-unique-index-lifecycle.sqllogic section 4.
+			expect(idx!.definition, 'exposed implicit index renders as UNIQUE').to.equal('unique index (x)');
+			expect(idx!.ddl, 'DDL re-parses into something that enforces uniqueness')
+				.to.match(/^create unique index /i);
 		} finally {
 			await db.close();
 		}
