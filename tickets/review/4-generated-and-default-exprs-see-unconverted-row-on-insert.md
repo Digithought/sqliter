@@ -1,110 +1,137 @@
-description: On INSERT, computed (GENERATED ALWAYS AS) and DEFAULT expressions used to see values as the caller typed them instead of converted to the column's declared type; INSERT now converts inside the row-expansion projection so those expressions read the same values every other write path hands them. Review the implementation.
+description: Continue the code-review pass of the change that makes INSERT convert values to each column's declared type before computed and DEFAULT expressions read them. Correctness was already checked by hand and holds; what remains is three small tidy-up edits, a documentation line, and the lint and test run.
 files:
-  - packages/quereus/src/planner/nodes/scalar.ts                  # WriteCoercionNode (after CastNode)
-  - packages/quereus/src/planner/nodes/plan-node-type.ts          # WriteCoercion enum entry (landed in prior run)
-  - packages/quereus/src/runtime/emit/write-coercion.ts           # new emitter (mirrors emit/cast.ts)
-  - packages/quereus/src/runtime/register.ts                      # emitter registration
-  - packages/quereus/src/runtime/scalar-fusion.ts                 # WriteCoercion fusion case
-  - packages/quereus/src/planner/building/insert.ts               # coerceToDeclared + two-projection restructure
-  - packages/quereus/src/runtime/emit/update.ts                   # phase 2: per-cell coercion inside the loop
-  - packages/quereus/src/runtime/emit/dml-executor.ts             # divergence NOTE resolved (~line 777)
-  - docs/types.md                                                 # "Concretely:" bullets updated
+  - packages/quereus/src/planner/building/insert.ts               # coerceToDeclared + the three-stage expansion chain (lines ~46-255)
+  - packages/quereus/src/planner/building/default-scope.ts        # buildRowDefaultScope — columnIndex now stale for the insert caller
+  - packages/quereus/src/planner/nodes/scalar.ts                  # WriteCoercionNode
+  - packages/quereus/src/runtime/emit/write-coercion.ts           # emitter
+  - packages/quereus/src/runtime/emit/update.ts                   # phase-2 per-cell coercion
+  - packages/quereus/src/runtime/emit/insert.ts                   # emitInsert's row coercion (now a guard for coerced cells)
+  - packages/quereus/src/planner/nodes/project-node.ts            # attribute `generated` flag / key projection
+  - docs/sql-ddl.md                                               # DEFAULT (~line 402) and GENERATED (~line 360-372) sections
 difficulty: medium
 ----
 
-# Review: INSERT DEFAULT/GENERATED expressions now see the converted row
+# Review (continuation): INSERT DEFAULT/GENERATED expressions see the converted row
 
-Implementation of the decided design from the implement-stage ticket (same slug).
-Build green, full `@quereus/quereus` suite green (10281 passing, 0 failing,
-25 pending), `yarn workspace @quereus/quereus lint` clean (eslint + test tsc).
+Continuation of the same-slug review ticket after a budget stop. **The adversarial
+correctness pass is done and is recorded below — do not redo it.** What is left is a
+short list of tidy-up edits, one documentation line, and the mandatory validation run.
 
-## What was built
+The implement-stage diff is commit `3499dccd5` (code) plus `af80df49a` (the
+`PlanNodeType.WriteCoercion` enum entry and the ticket split).
 
-- **`WriteCoercionNode`** (`planner/nodes/scalar.ts`, `PlanNodeType.WriteCoercion`):
-  unary scalar node, planner-inserted only. `expression` getter forwards the
-  operand's expression (adds no syntax). `getType()` = target declared type with
-  the operand's nullability. Write-path semantics — `buildCellCoercion`
-  (throws MISMATCH via `validateAndParse`, identity-guards against JSON
-  re-parse) — deliberately NOT CAST's lenient failure→NULL. Not injective
-  (conservative default). Cost 0.02.
-- **Emitter** `runtime/emit/write-coercion.ts`: `buildWriteCoercionSpec` computes
-  the converter once at emit time; pass-through when `buildCellCoercion` returns
-  undefined. Registered beside Cast; fused in `scalar-fusion.ts` (converters are
-  synchronous).
-- **`building/insert.ts`** restructured `createRowExpansionProjection` into:
-  - *Projection A*: supplied columns and literal defaults wrapped in
-    `coerceToDeclared` (skips wrap when the column type has no parse/validate,
-    or `buildCellCoercion` is provably inert); NULL placeholders for expression
-    defaults (positions recorded), generated columns, defaultless omissions.
-  - *Projection B* (built only when ≥1 expression default — hot-path lazy
-    property preserved): computes expression defaults against projection A's
-    CONVERTED row. `buildRowDefaultScope` reused unchanged, handed projection
-    A's output attributes at the supplied columns' table positions (parallel to
-    `targetColumns`). Same parent-scope chain (`contextScope ??
-    defaultRowContextScope ?? ctx.scope`), same mutation-context shadowing, same
-    `validateDeterministicDefault` gate. Omitted columns still unregistered
-    (defaults cannot read other defaults — unchanged rule).
-  - *Generated chain*: each computed node wrapped in `coerceToDeclared`, so a
-    generated column reading another generated column sees the converted value.
-  - Fast path (all columns supplied, no generated) still returns `sourceNode`
-    bare; `emitInsert` unchanged — its `buildRowCoercion` degrades to
-    conformance guards for cells announcing declared types.
-- **`runtime/emit/update.ts`**: phase-2 whole-row `coerceGenerated` replaced with
-  per-cell `buildCellCoercion` applied inside the loop, before the next
-  generated column reads `updatedRow` — the order `executeUpsertUpdate` already
-  used. The `dml-executor.ts` NOTE describing the divergence is rewritten: the
-  three sites (INSERT chain, UPDATE phase 2, upsert recompute) now agree.
-- `buildNotNullDefaults` / OR REPLACE substitution deliberately NOT changed.
+## Findings already established (verified this run)
 
-## Validation performed (floor, not finish line)
+Verified by reading the diff and by running ad-hoc INSERT/UPDATE/ALTER scenarios against
+the engine through `node --import ./packages/quereus/register.mjs`. Scratch script was
+deleted; nothing was committed from it.
 
-Scratch script against the built package verified every baseline from the
-implement ticket flips to declared form:
+**Correct, confirmed by running it:**
 
-- `create table G (Id text primary key, V json, Note text null, L integer generated always as (length(V)))`;
-  `insert … ('a','"Bob"','n1')` → `L=3` (was 5); after `update G set Note='n2'` → still 3.
-- ALTER backfill vs later INSERT of the same JSON value: both store `L=3`.
-- `add column k text default (new.j)`: backfill and later INSERT both store `k='Bob'` (INSERT stored `'"Bob"'` before).
-- datetime generated TEXT copy: INSERT now canonicalizes identically to UPDATE (`2024-01-02T03:04:05`, no `.000Z`).
-- Literal JSON default + generated-from-generated chain: `j='xy'`, `L=2`, `L2=3`.
-- Upsert `do update set V = excluded.V` recompute: `L=5` for `"Alice"` — still correct.
+- Expression DEFAULT reading a supplied sibling (`k text default (new.j)` over a `json`
+  column) now stores the converted value, and matches what the `ALTER TABLE ... ADD COLUMN`
+  backfill produces for the same value.
+- Generated columns, including generated-reading-generated, see converted inputs.
+- Target columns listed out of table order (`insert into t (b, a) ...`) resolve correctly —
+  this exercises the new remapping of supplied attributes into the expanded row.
+- `insert into ... select ...` (relational source), multi-row `VALUES`, `RETURNING`,
+  `on conflict ... do update` with `excluded.<col>`, and the `insert or replace` NOT NULL
+  DEFAULT substitution all produce the converted form.
+- Mutation-context (`with context`) shadowing still holds: a bare name in a DEFAULT
+  resolves to the context variable, `new.<col>` to the column.
+- No double-conversion hazard. `columnSchemaToScalarType` reuses the column's own
+  `logicalType` object, so the identity test inside `buildCellCoercion` matches and
+  `emitInsert` degrades to a conformance guard rather than re-parsing an already-parsed
+  JSON value. Checked JSON, `date`, `integer`, and literal DEFAULT values, including the
+  idempotence-sensitive ones (`json default '"5"'`); the DEFAULT path and the
+  explicitly-supplied path agree row for row.
+- Literal DEFAULT values that cannot convert are still rejected at `CREATE TABLE`, with
+  the original message — the new plan-time folding of the conversion does not degrade it.
+- Constant folding, key/functional-dependency projection, and the plan-node physical
+  property fold all treat the new node conservatively and safely (see the two accepted
+  costs below).
 
-Suite watchlist from the implement ticket (`15.1.1-json-check-coercion`,
-`06.9.1-json-coerce-once`, `41*`, `03.4-defaults` sqllogic files,
-`test/dml-write-representation.spec.ts`, `test/optimizer/dml-child-exposure.spec.ts`)
-all pass inside the full run.
+**No new defect was found in the change's behaviour.** The remaining items are hygiene,
+metadata accuracy, and documentation.
 
-## Findings to carry into review
+### Minor — fix in this pass
 
-- **Upsert arm was already correct before this change** (verified at HEAD):
-  `executeUpsertUpdate` converts user assignments per-cell and recomputes
-  generated columns against the composed converted row. Only its NOTE changed.
-- **No plan-golden churn materialized.** The implement ticket predicted
-  regeneration in `test/plan/`, but those specs assert shape programmatically
-  and none pins the INSERT expansion projection at WriteCoercion granularity —
-  the whole suite passed with zero test-file edits. Reviewer: confirm no
-  snapshot-style golden exists elsewhere that should now pin the new shape.
-- **Multi-source envelope siblings unchanged (pre-existing, out of scope):**
-  a sibling logical column reached only through `defaultRowContextScope` (the
-  multi-source view-insert envelope) still resolves to raw envelope attributes,
-  i.e. written form. Only columns of the member's own table get the converted
-  read.
-- **No new tests were added in this ticket** — Arm B (contract tests pinning
-  which value form each write shape sees) and Arm C (docs/release note) live in
-  `4.5-write-form-contract-tests-and-docs`. The scratch verification above is
-  not committed; the permanent pin is that ticket's job.
+- **`createRowExpansionProjection` is now ~170 lines covering three sequential stages**
+  (`packages/quereus/src/planner/building/insert.ts`, lines ~62-255). Repo convention is
+  small single-purpose functions and decomposed sub-functions over grouped sections.
+  Extract the base expansion and the expression-DEFAULT stage into named helpers,
+  leaving the top-level function as the three-line chain it describes.
+- **Repeated cell constructions.** The "pass through the child's cell at this position"
+  projection (a `ColumnReferenceNode` built from an input attribute) is written out
+  identically in the expression-DEFAULT stage and in the generated-column chain; the NULL
+  placeholder expression is written out three times. Both want one small shared helper.
+- **`buildRowDefaultScope` now records a stale column position for the INSERT caller.**
+  `packages/quereus/src/planner/building/default-scope.ts` builds each `new.<col>`
+  reference with `columnIndex = <position within the target column list>`. That was right
+  when the caller passed the source relation's own attributes; the INSERT caller now
+  passes attributes taken from the expanded row, where the column sits at its *table*
+  position instead. Runtime is unaffected — value lookup goes through the attribute id and
+  the producing relation's row descriptor, never this field — but the field is planner
+  metadata other analyses do read (materialized-view matching, for one), so it should not
+  be left wrong. Smallest correct fix: let the caller supply the positions (an optional
+  parallel array, defaulting to the current behaviour so the view-mutation caller, which is
+  still correct, is untouched).
+- **Documentation gap in `docs/sql-ddl.md`.** The DEFAULT section (~line 402) and the
+  generated-column section (~lines 360-372) describe exactly *how* an expression may spell
+  a sibling column, but never say *what form the value is in* when it reads one — which is
+  precisely what this change settled. Add one sentence to each saying the sibling is read
+  already converted to its declared type, cross-referencing `docs/types.md`. Keep it to
+  that: the fuller write-up of the contract, `docs/types.md` itself, `docs/invariants.md`,
+  and the release note all belong to `4.5-write-form-contract-tests-and-docs` — do not
+  duplicate them here.
 
-## Known gaps / accepted costs for reviewer judgment
+### Tripwires — record at the code site, do not file tickets
 
-- Identity-matched constrained columns get a guard-only WriteCoercion wrap in
-  the projection AND emitInsert's identity guard — a double conformance check
-  per such cell on non-fast-path inserts. Cheap (one typeof-class probe each),
-  and the fast path is unaffected; flagging rather than optimizing.
-- `expression-fingerprint.ts` has no WriteCoercion case, so it falls to the
-  unique `_UK:` fingerprint — no CSE across identical coercions. Accepted in
-  the design; confirm that is still fine.
-- A coerced supplied column is a computed projection, so `ProjectNode` marks it
-  `generated: true` in the output RelationType and source keys/FDs do not
-  project through it (WriteCoercion is not injective). Nothing downstream of the
-  INSERT expansion consumed those keys in the suite; reviewer may want to
-  confirm no optimizer rule reads the expanded source's key set.
+- **Keys and functional dependencies no longer project through a converted cell.** A
+  supplied column wrapped for conversion is a computed projection, so `ProjectNode` marks
+  it generated and does not carry the source's unique keys through it. This is the
+  conservative and correct answer (a conversion collapses spellings, so distinctness is not
+  preserved), and the whole suite passes, but it means a non-fast-path
+  `insert into t (cols) select ...` presents a keyless source to everything downstream.
+  Park a `NOTE:` at the wrap site in `insert.ts`: if an optimizer rule ever needs the
+  expanded source's key set, the fix is to teach the node an injectivity claim for the
+  cases where conversion provably preserves distinctness, not to drop the wrap.
+- **Two conformance probes per constrained supplied cell** on non-fast-path inserts — once
+  in the projection, once in `emitInsert`. Deliberate: `emitInsert`'s pass exists because a
+  source's announced type is an inference, not a guarantee, so it cannot be skipped on the
+  strength of the projection's announcement. Cheap (one storage-class probe each) and the
+  fast path is untouched. Park a `NOTE:` at `emitInsert`'s coercion.
+
+### Considered and closed — no action
+
+- **No common-subexpression sharing across conversions** (the new node has no
+  fingerprint case, so each gets a unique one). Confirmed harmless: every conversion wraps
+  a different cell of the same row, so there is no pair to share, and a unique fingerprint
+  can only miss a merge, never make a wrong one. Say so in the findings; add no code.
+- **A sibling column of another table reached through the multi-source view-insert
+  envelope still resolves to the written form.** Pre-existing, out of this change's scope,
+  and already recorded in the implement handoff.
+- **No plan-golden test churn.** Confirmed: the plan tests assert shape programmatically
+  and none pins the INSERT expansion at this granularity.
+
+### Possible arm for an existing ticket
+
+`packages/quereus/src/planner/building/insert.ts` measured 1,120 lines
+(`wc -l`, 2026-09-01), up from roughly 1,050 before this change. The backlog ticket
+`debt-oversized-source-files` collects files past that seam and does not list this one.
+Append it there as an arm with the measured count if the decomposition above does not
+bring it back under — do not file a new ticket.
+
+## TODO
+
+- Apply the four minor fixes above (decompose, DRY the repeated cells, correct the
+  recorded column position, the two `docs/sql-ddl.md` sentences).
+- Add the two tripwire `NOTE:` comments.
+- Append the `insert.ts` line count as an arm to `debt-oversized-source-files` if it is
+  still over after the decomposition.
+- Run `yarn workspace @quereus/quereus lint` and `yarn test` in the foreground, streaming
+  (no redirection), and confirm both are clean. Baseline from the implement stage: 10,281
+  passing, 0 failing, 25 pending; lint clean.
+- Write the `complete/` ticket with a `## Review findings` section built from the sections
+  above — what was checked, what was found, what was done, and the empty categories with
+  their reasons.
