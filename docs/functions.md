@@ -526,7 +526,7 @@ select name, json_extract(tags, '$.error_message') as msg
 | `name` | TEXT | Column name |
 | `type` | TEXT | Column type |
 | `notnull` | INTEGER | 1 if NOT NULL |
-| `dflt_value` | TEXT? | Default value |
+| `dflt_value` | TEXT? | Default expression, rendered as SQL text (`NULL` if the column has no default) |
 | `pk` | INTEGER | 1 if primary key |
 | `tags` | TEXT? | Column tags as JSON object (`NULL` if no tags) |
 | `collation` | TEXT | Declared collation (defaults to `'BINARY'`) |

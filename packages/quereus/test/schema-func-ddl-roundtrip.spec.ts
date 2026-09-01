@@ -24,25 +24,33 @@ async function schemaSql(db: Database, type: string, name: string): Promise<stri
 	return found[0].sql as string;
 }
 
-/** `table_info()` rows with `dflt_value` dropped — it stringifies an AST node, not the default's text (see below). */
-function withoutDefaultValue(info: Record<string, unknown>[]): Record<string, unknown>[] {
-	return info.map(({ dflt_value: _dflt_value, ...rest }) => rest);
-}
-
 describe('schema() TVF: canonical DDL round-trips through the TVF itself', () => {
-	it('a table with a key, NOT NULL, DEFAULT, COLLATE, CHECK, UNIQUE and FOREIGN KEY reconstructs identically via schema().sql', async () => {
+	it('a table with a key, NOT NULL, literal and expression DEFAULTs, COLLATE, CHECK, UNIQUE and single/composite FOREIGN KEYs reconstructs identically via schema().sql', async () => {
 		const src = new Database();
 		try {
-			await src.exec('create table parent (id integer primary key, code text unique)');
+			await src.exec(`
+				create table parent (
+					id integer primary key,
+					code text unique,
+					region text,
+					slot integer,
+					constraint uq_region_slot unique (region, slot)
+				)
+			`);
 			await src.exec(`
 				create table child (
 					id integer primary key,
 					parent_id integer not null,
+					region text,
+					slot integer,
 					name text not null collate nocase default 'anon',
 					status text default 'active',
+					score integer default (1 + 1),
 					constraint ck_status check (status in ('active', 'inactive')),
 					constraint uq_name unique (name),
-					constraint fk_parent foreign key (parent_id) references parent (id)
+					constraint fk_parent foreign key (parent_id) references parent (id),
+					constraint fk_parent_slot foreign key (region, slot) references parent (region, slot)
+						on delete cascade on update set null
 				) with tags (purpose = 'roundtrip')
 			`);
 
@@ -63,7 +71,7 @@ describe('schema() TVF: canonical DDL round-trips through the TVF itself', () =>
 				// of the executing session's current schema.
 				await dst.exec(parentDDL);
 				await dst.exec(childDDL);
-				await dst.exec("insert into parent (id, code) values (1, 'p1')");
+				await dst.exec("insert into parent (id, code, region, slot) values (1, 'p1', 'west', 7)");
 
 				const [newInfo, newChecks, newUniques, newFks, newTags] = await Promise.all([
 					rows(dst, "select * from table_info('child')"),
@@ -73,11 +81,7 @@ describe('schema() TVF: canonical DDL round-trips through the TVF itself', () =>
 					rows(dst, "select tags from schema() where type = 'table' and name = 'child'"),
 				]);
 
-				// dflt_value excluded: table_info() builds it as `defaultValue?.toString()`,
-				// but ColumnSchema.defaultValue is an AST Expression, not a raw value — that
-				// stringifies to the useless "[object Object]" on both sides (pre-existing
-				// behavior, not something this test should treat as meaningful equality).
-				expect(withoutDefaultValue(newInfo), 'columns: name/type/notnull/pk/collation round-trip').to.deep.equal(withoutDefaultValue(origInfo));
+				expect(newInfo, 'columns: name/type/notnull/default/pk/collation round-trip').to.deep.equal(origInfo);
 				expect(newChecks, 'CHECK constraint round-trips').to.deep.equal(origChecks);
 				expect(newUniques, 'UNIQUE constraint round-trips').to.deep.equal(origUniques);
 				expect(newFks, 'FOREIGN KEY round-trips').to.deep.equal(origFks);
@@ -85,9 +89,9 @@ describe('schema() TVF: canonical DDL round-trips through the TVF itself', () =>
 
 				// Behavioral proof the DEFAULT text actually survived the round-trip: insert
 				// a row omitting the defaulted columns and check what lands.
-				await dst.exec('insert into child (id, parent_id) values (1, 1)');
-				const inserted = await rows(dst, 'select name, status from child where id = 1');
-				expect(inserted).to.deep.equal([{ name: 'anon', status: 'active' }]);
+				await dst.exec("insert into child (id, parent_id, region, slot) values (1, 1, 'west', 7)");
+				const inserted = await rows(dst, 'select name, status, score from child where id = 1');
+				expect(inserted).to.deep.equal([{ name: 'anon', status: 'active', score: 2 }]);
 
 				// Re-emitting from the reconstructed schema is byte-identical to the
 				// original schema().sql text — the fixed point schema.ts must hold.
