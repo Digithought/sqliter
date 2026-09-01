@@ -117,3 +117,42 @@ does not match the spelling the comparison path expects.
 Nothing is *wrong* today in Arm B — every value stored and compared is correct — so on its own
 it is a tidiness concern. It is here because option 1 and option 2 are both answers to the
 shared blocker above, and picking one for Arm A settles Arm B with it.
+
+## Arm C (evidence) — the as-provided spelling is unobservable, and a downstream project relied on it
+
+**Added 2026-08-31 from GitHub issue [#28](https://github.com/gotchoices/quereus/issues/28).**
+Not a new defect — a second live consequence of the same unsettled blocker, recorded here so
+whoever settles the canonical-spelling question sees what depends on it.
+
+A downstream project (VoteTorrent) enforces a canonical Zulu spelling with a row-local CHECK:
+
+```sql
+Ts datetime,
+constraint TsHasZ check (isISODatetime(Ts) and like('%Z', Ts))
+```
+
+That check can never pass. Verified on `main` at `v4.17.1`: inserting
+`'2099-01-01T00:00:00.000Z'` fails with `CHECK constraint failed: TsHasZ`, because the write
+path normalizes to the UTC-naive spelling *before* the CHECK evaluates (a deliberate,
+documented rule — `docs/types.md` § "Where coercion happens (and why exactly once)"; the
+timing contract itself is tracked separately in
+`debt-nothing-pins-which-value-form-a-constraint-sees`).
+
+The point for **this** ticket is what it costs, and it cuts both ways:
+
+- **If DATETIME denotes a fixed instant** (today's behaviour: an offset input is shifted to
+  UTC and the offset dropped), then a `Z`-suffix shape check on a `datetime` column is
+  *meaningless by construction* — the column has exactly one spelling and the user should be
+  told so, loudly, rather than watching every insert fail. That is a diagnostic obligation this
+  ticket's resolution should name: a shape predicate over a temporal column is checking a
+  spelling the engine owns.
+- **If DATETIME is decided to preserve its offset**, the check becomes meaningful and this
+  arm resolves with Arm A.
+
+Either way there is currently **no way to observe the text a caller wrote** into a temporal
+column — not from a CHECK, not from a GENERATED column, not on read-back. The same project
+also content-addresses rows (`Cid = cid(Digest(…, Expiration, …))`), so the digest is taken
+over the engine's chosen spelling; the canonical form is therefore not just a display
+question but part of a persisted identity downstream. That raises the bar on Arm B's
+option 1 (changing what the variadic `datetime()` prints): a spelling change is a
+stored-identity change for anyone doing this.
