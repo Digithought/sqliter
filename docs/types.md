@@ -618,6 +618,24 @@ the top of the DML pipeline** — in the DML emitters — and everything downstr
 (constraint checking, the isolation overlay, the storage layer) sees the
 declared form.
 
+**Stated positively: every expression evaluated against a row being written sees
+that row in its columns' declared form** — CHECK (immediate and deferred alike),
+a column `DEFAULT` including one reading a sibling through `new.<column>`, and a
+`GENERATED ALWAYS AS` body — at every write site: INSERT, UPDATE,
+`ON CONFLICT … DO UPDATE`, and the `ALTER TABLE … ADD COLUMN` backfill. No
+write-path expression sees the form the statement spelled. The enumeration under
+*Concretely* below says **where** each site converts; this contract is the
+property that enumeration has to add up to, and the two drift apart easily: the
+enumeration used to omit where DEFAULT and generated evaluation sat in the order,
+and INSERT evaluated both against the *unconverted* row while UPDATE evaluated
+them against the converted one — so one value produced two different computed
+results depending on which statement wrote it. Guarded end-to-end by
+`test/logic/15.1.3-declared-form-write-contract.sqllogic` (DATETIME, where the
+two forms differ by a `Z` suffix the conversion canonicalizes away) and
+`test/logic/15.1.1-json-check-coercion.sqllogic` (JSON, raw text vs. parsed
+document). Recorded as
+[RT-001](invariants.md#rt-001--every-write-path-expression-sees-the-declared-form).
+
 Conversion cannot simply be re-run at each layer, because it is not repeatable
 for every type:
 
@@ -670,11 +688,15 @@ than burying it in storage.
 
 Concretely:
 
-- INSERT's row-expansion projection (`building/insert.ts`) converts each
-  supplied, DEFAULT, and generated cell to declared form **in place** — a
-  planner-inserted `WriteCoercion` node with the same `buildCellCoercion`
-  semantics — so a DEFAULT reading a supplied sibling via `new.<col>` and a
-  generated expression both see the value that will be stored, matching what
+- INSERT's row-expansion projection (`building/insert.ts`) is a **chain of
+  stages**, and conversion is interleaved *into* that chain rather than run after
+  it: each stage wraps the cell it produces in a planner-inserted `WriteCoercion`
+  node (`coerceToDeclared`, same `buildCellCoercion` semantics) **in place**,
+  before any later stage can read it. The order is supplied and literal-DEFAULT
+  cells, then expression DEFAULTs, then the generated columns in topological
+  order. So a DEFAULT reading a supplied sibling via `new.<col>`, a generated
+  expression reading a supplied column, and a generated expression reading an
+  earlier generated column all see the value that will be stored, matching what
   UPDATE and the `DO UPDATE` recompute hand the same expressions.
 - `emitInsert` masks each cell by the source relation's attribute type at that
   position (the source is projected into full table-column order, so the two
@@ -691,6 +713,10 @@ Concretely:
   NULL DEFAULT substitution (`runtime/row-constraints.ts`, reached both from the
   `ConstraintCheckNode` emitter and from the `ON CONFLICT … DO UPDATE` arm's own
   validation) and `ON CONFLICT … DO UPDATE` assignments (the DML executor).
+  Injecting late does not make either an exception to the contract: the row they
+  **read** — `new.<col>` in a substituted DEFAULT, `excluded.<col>` in a DO UPDATE
+  assignment — is the already-converted one; only the cell they **write** still
+  needs converting.
 - `ALTER TABLE … ADD COLUMN`'s per-row backfill (a non-foldable DEFAULT or a
   GENERATED ALWAYS AS expression) converts its one cell through the same helper
   too, so a backfilled cell is what an INSERT under the same DEFAULT would store.

@@ -1090,7 +1090,25 @@ than silently widening the write onto the collapsed or windowed-away rows. The P
 
 ## RT — Runtime
 
-Reserved.
+### RT-001 — Every write-path expression sees the declared form
+
+- code: `packages/quereus/src/types/validation.ts` — `buildCellCoercion`
+- code: `packages/quereus/src/planner/building/insert.ts` — `coerceToDeclared`
+- code: `packages/quereus/src/runtime/emit/update.ts` — `generatedCoercions`
+- code: `packages/quereus/src/runtime/row-constraints.ts` — `NotNullDefaultRuntime`
+- code: `packages/quereus/src/planner/building/alter-table.ts` — `buildCellCoercion`
+- guard: `packages/quereus/test/logic/15.1.3-declared-form-write-contract.sqllogic`
+- doc: [Type System § Where coercion happens](types.md#where-coercion-happens-and-why-exactly-once)
+
+Every expression evaluated against a row being written — a CHECK (immediate or deferred),
+a column DEFAULT including one reading `new.<column>`, and a `GENERATED ALWAYS AS` body —
+receives that row already converted to the columns' declared logical types, never the form
+the statement spelled. This holds at all four write sites: INSERT, UPDATE,
+`ON CONFLICT … DO UPDATE`, and the `ALTER TABLE … ADD COLUMN` backfill. INSERT interleaves
+`coerceToDeclared` into its row-expansion chain, so a later stage reads an earlier stage's
+converted cell; the two late single-cell injectors read that already-converted row and
+convert only the cell they inject. A site that evaluated before converting would compute a
+different value for the same written input than its siblings do.
 
 ## SCH — Schema
 

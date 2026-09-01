@@ -133,13 +133,22 @@ select a from jcc_bin;
 
 drop table jcc_bin;
 
--- === The coerced view is for CHECK only; a substituted DEFAULT stays raw ===
+-- === A substituted NOT NULL DEFAULT converts its own cell exactly once ===
 
--- A NOT NULL DEFAULT substituted under OR REPLACE is written back into the row
--- that flows on to the storage layer, which coerces it there. So `new.<col>` in
--- that DEFAULT must read the RAW value: handing it the coerced one coerces twice,
--- and `JSON_TYPE.parse` is not idempotent for a string scalar
--- (`'"Bob"'` → `Bob`, and re-parsing `Bob` throws).
+-- A NOT NULL DEFAULT substituted under OR REPLACE is injected AFTER the emitters'
+-- conversion pass, so it does two separable things.
+--
+-- What it READS is the ordinary declared form every write-path expression sees
+-- (docs/invariants.md RT-001, pinned across all four write sites by
+-- 15.1.3-declared-form-write-contract.sqllogic): `new.j` below is the parsed
+-- document `Bob`, not the raw text '"Bob"' the statement spelled.
+--
+-- What it WRITES is its own injected cell, which still needs converting — and
+-- that conversion must not re-apply `parse`, because `JSON_TYPE.parse` is not
+-- idempotent for a string scalar (`'"Bob"'` → `Bob`, and re-parsing `Bob`
+-- throws). The identity-plus-conformance guard in `buildCellCoercion` is what
+-- makes it a no-op here: `new.j` announces JSON and the value in hand inhabits
+-- JSON, so the cell is left alone.
 
 create table jcc_def_raw (id integer primary key, j json, k json not null default (new.j), check (id > 0));
 

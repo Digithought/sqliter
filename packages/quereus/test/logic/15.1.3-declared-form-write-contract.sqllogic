@@ -1,0 +1,432 @@
+-- 15.1.3-declared-form-write-contract.sqllogic
+--
+-- THE CONTRACT: every expression evaluated against a row being written sees that
+-- row in its columns' DECLARED form — the values that will be stored — never the
+-- form the statement spelled. That covers CHECK (immediate and deferred), DEFAULT
+-- (including one reading a sibling through `new.<column>`), and GENERATED ALWAYS
+-- AS, at every write site: INSERT, UPDATE, `ON CONFLICT ... DO UPDATE`, and the
+-- `ALTER TABLE ... ADD COLUMN` backfill.
+--
+-- Why it needs pinning: each of those sites converts the row at a different place
+-- in its own pipeline (docs/types.md § Where coercion happens (and why exactly
+-- once) enumerates them), and they are easy to drift apart. INSERT used to
+-- evaluate DEFAULT and GENERATED expressions against the UNCONVERTED row while
+-- UPDATE evaluated them against the converted one, so the same value produced two
+-- different computed results depending on which statement wrote it. The
+-- `-- agreement` sections below are the assertions that caught that.
+--
+-- DATETIME is the witness because the split is visible in one character:
+-- '2099-01-01T00:00:00.000Z' is accepted, canonicalized through UTC, and STORED
+-- as '2099-01-01T00:00:00'. Any expression that still sees the trailing `Z` (or
+-- the `.000` fraction) is reading the written form and is wrong.
+--
+-- Scope note: whether a DATETIME column should preserve a `Z` suffix at all is a
+-- separate question, tracked as bug-datetime-literal-with-timezone-never-matches.
+-- This file pins only that every write-path expression agrees with storage on
+-- whatever the declared form turns out to be.
+--
+-- The same contract for JSON — where the split is between raw JSON text and the
+-- parsed document — lives in 15.1.1-json-check-coercion.sqllogic, and
+-- 06.9.1-json-coerce-once.sqllogic pins that the conversion happens exactly once.
+-- Do not duplicate those here.
+--
+-- Runs under both the memory module (`yarn test`) and the store module
+-- (`yarn test:store`).
+--
+-- NOTE: the witness here is DATETIME only, and JSON's is in 15.1.1 — DATE, TIME
+-- and TIMESPAN also rewrite a value on the way in but have no contract coverage,
+-- and nothing forces a new logical type whose `parse` rewrites values to acquire
+-- any. Fine while the write sites share `buildCellCoercion`, since one witness
+-- exercises the shared path. If a type ever converts through its own route, add a
+-- section here for it rather than trusting the DATETIME case to cover it.
+
+-- ============================================================
+-- 1. Baseline: what the declared form of a DATETIME actually is
+--
+-- Everything below compares against this one value. If this section changes,
+-- every expectation in the file changes with it.
+-- ============================================================
+
+create table wf_base (id integer primary key, d datetime null);
+-- run
+
+insert into wf_base values (1, '2099-01-01T00:00:00.000Z');
+-- run
+
+-- The written form is NOT what is stored.
+select d from wf_base;
+→ [{"d":"2099-01-01T00:00:00"}]
+
+drop table wf_base;
+-- run
+
+-- ============================================================
+-- 2. An immediate CHECK sees the declared form
+--
+-- A CHECK with no subquery evaluates inline, during the writing statement.
+-- ============================================================
+
+create table wf_chk (id integer primary key, d datetime null, check (d = '2099-01-01T00:00:00'));
+-- run
+
+-- The CHECK compares against the DECLARED spelling and admits the row, even
+-- though the INSERT spelled the value differently.
+insert into wf_chk values (1, '2099-01-01T00:00:00.000Z');
+-- run
+
+select d from wf_chk;
+→ [{"d":"2099-01-01T00:00:00"}]
+
+-- The read path agrees with the CHECK that admitted the row.
+select count(*) as c from wf_chk where d = '2099-01-01T00:00:00';
+→ [{"c":1}]
+
+-- UPDATE goes through the same coerced NEW section: the CHECK is not vacuous.
+update wf_chk set d = '2098-01-01T00:00:00' where id = 1;
+-- error: CHECK
+
+select d from wf_chk;
+→ [{"d":"2099-01-01T00:00:00"}]
+
+-- An UPDATE that re-supplies the WRITTEN form still satisfies the CHECK, because
+-- the CHECK sees the converted value.
+update wf_chk set d = '2099-01-01T00:00:00.000Z' where id = 1;
+-- run
+
+select d from wf_chk;
+→ [{"d":"2099-01-01T00:00:00"}]
+
+drop table wf_chk;
+-- run
+
+-- Control: a CHECK written against the WRITTEN form matches nothing. This is the
+-- sharp end of the contract — if the CHECK saw the raw statement text this row
+-- would be admitted.
+create table wf_chk_raw (id integer primary key, d datetime null, check (d = '2099-01-01T00:00:00.000Z'));
+-- run
+
+insert into wf_chk_raw values (1, '2099-01-01T00:00:00.000Z');
+-- error: CHECK
+
+select count(*) as c from wf_chk_raw;
+→ [{"c":0}]
+
+drop table wf_chk_raw;
+-- run
+
+-- ============================================================
+-- 3. A deferred (subquery-bearing) CHECK reaches the same verdict
+--
+-- A CHECK containing a subquery auto-defers to the DeferredConstraintQueue, which
+-- is handed the same coerced row. Same comparison, same accept/reject decisions.
+-- ============================================================
+
+create table wf_def (id integer primary key, d datetime null, check ((select d = '2099-01-01T00:00:00')));
+-- run
+
+insert into wf_def values (1, '2099-01-01T00:00:00.000Z');
+-- run
+
+select d from wf_def;
+→ [{"d":"2099-01-01T00:00:00"}]
+
+drop table wf_def;
+-- run
+
+create table wf_def_raw (id integer primary key, d datetime null, check ((select d = '2099-01-01T00:00:00.000Z')));
+-- run
+
+insert into wf_def_raw values (1, '2099-01-01T00:00:00.000Z');
+-- error: CHECK
+
+select count(*) as c from wf_def_raw;
+→ [{"c":0}]
+
+drop table wf_def_raw;
+-- run
+
+-- The shape that motivated the contract: a deferred CHECK whose subquery compares
+-- `new.<column>` against a value ALREADY STORED in another table — i.e. already in
+-- declared form. If the CHECK saw the unconverted `new.d` the two would never
+-- compare equal and a perfectly valid row would be rejected.
+create table wf_seen (k integer primary key, d datetime null);
+-- run
+
+insert into wf_seen values (1, '2099-01-01T00:00:00.000Z');
+-- run
+
+create table wf_ref (id integer primary key, d datetime null, check ((select count(*) from wf_seen where wf_seen.d = new.d) = 1));
+-- run
+
+insert into wf_ref values (1, '2099-01-01T00:00:00.000Z');
+-- run
+
+select d from wf_ref;
+→ [{"d":"2099-01-01T00:00:00"}]
+
+-- UPDATE re-supplies the written form and must still match the stored row.
+update wf_ref set d = '2099-01-01T00:00:00.000Z' where id = 1;
+-- run
+
+select d from wf_ref;
+→ [{"d":"2099-01-01T00:00:00"}]
+
+-- Not vacuous: a value with no counterpart in wf_seen is rejected.
+insert into wf_ref values (2, '2050-06-15T12:00:00');
+-- error: CHECK
+
+drop table wf_ref;
+-- run
+
+drop table wf_seen;
+-- run
+
+-- ============================================================
+-- 4. A DEFAULT reading a sibling through `new.<column>` sees the declared form
+--
+-- The DEFAULT lands in a TEXT column, so whatever it read is visible verbatim.
+-- ============================================================
+
+create table wf_dflt (id integer primary key, d datetime null, c text null default ('<' || new.d || '>'));
+-- run
+
+insert into wf_dflt (id, d) values (1, '2099-01-01T00:00:00.000Z');
+-- run
+
+select d, c from wf_dflt;
+→ [{"d":"2099-01-01T00:00:00","c":"<2099-01-01T00:00:00>"}]
+
+drop table wf_dflt;
+-- run
+
+-- A DEFAULT that is itself a literal in the written form converts too, and a
+-- generated column reading that column sees the converted result.
+create table wf_dflt_lit (id integer primary key, d datetime null default ('2099-01-01T00:00:00.000Z'), g text null generated always as ('<' || d || '>'));
+-- run
+
+insert into wf_dflt_lit (id) values (1);
+-- run
+
+select d, g from wf_dflt_lit;
+→ [{"d":"2099-01-01T00:00:00","g":"<2099-01-01T00:00:00>"}]
+
+drop table wf_dflt_lit;
+-- run
+
+-- ============================================================
+-- 5. A GENERATED ALWAYS AS expression sees the declared form
+-- ============================================================
+
+create table wf_gen (id integer primary key, d datetime null, g text null generated always as ('<' || d || '>'));
+-- run
+
+insert into wf_gen (id, d) values (1, '2099-01-01T00:00:00.000Z');
+-- run
+
+select d, g from wf_gen;
+→ [{"d":"2099-01-01T00:00:00","g":"<2099-01-01T00:00:00>"}]
+
+drop table wf_gen;
+-- run
+
+-- ============================================================
+-- 6. agreement — INSERT and UPDATE compute the same value
+--
+-- This is the assertion that caught the divergence: INSERT evaluated the
+-- generated expression against the unconverted row, UPDATE against the converted
+-- one, so the same value written two ways produced two different `g` values.
+-- Stated as `count(distinct g)` so the test names the property, not the value.
+-- ============================================================
+
+create table wf_agree (id integer primary key, d datetime null, g text null generated always as ('<' || d || '>'));
+-- run
+
+-- Row 1 gets the value through INSERT.
+insert into wf_agree (id, d) values (1, '2099-01-01T00:00:00.000Z');
+-- run
+
+-- Row 2 arrives holding something else, then gets the same value through UPDATE.
+insert into wf_agree (id, d) values (2, '1970-01-01T00:00:00');
+-- run
+
+update wf_agree set d = '2099-01-01T00:00:00.000Z' where id = 2;
+-- run
+
+-- One value written two ways ⇒ one computed result.
+select count(distinct g) as c from wf_agree;
+→ [{"c":1}]
+
+select id, d, g from wf_agree order by id;
+→ [{"id":1,"d":"2099-01-01T00:00:00","g":"<2099-01-01T00:00:00>"},{"id":2,"d":"2099-01-01T00:00:00","g":"<2099-01-01T00:00:00>"}]
+
+drop table wf_agree;
+-- run
+
+-- ============================================================
+-- 7. agreement — touching an unrelated column does not move a computed column
+--
+-- UPDATE carries the untouched `d` over from storage, where it is already in
+-- declared form. Re-converting it (or evaluating against a stale written form)
+-- would show up here as `g` changing under a write that never mentioned `d`.
+-- ============================================================
+
+create table wf_touch (id integer primary key, d datetime null, other integer null, g text null generated always as ('<' || d || '>'));
+-- run
+
+insert into wf_touch (id, d, other) values (1, '2099-01-01T00:00:00.000Z', 1);
+-- run
+
+select d, other, g from wf_touch;
+→ [{"d":"2099-01-01T00:00:00","other":1,"g":"<2099-01-01T00:00:00>"}]
+
+update wf_touch set other = 2 where id = 1;
+-- run
+
+select d, other, g from wf_touch;
+→ [{"d":"2099-01-01T00:00:00","other":2,"g":"<2099-01-01T00:00:00>"}]
+
+drop table wf_touch;
+-- run
+
+-- ============================================================
+-- 8. agreement — `add column ... generated` backfill equals a later INSERT
+--
+-- The backfill evaluates the generated expression per existing row, through a
+-- different code path than INSERT. Both must land on the same value. (The
+-- backfill's own mechanics — every spelling, constant expressions, chained
+-- generated columns — are covered by 41.13-alter-add-column-generated-backfill;
+-- what is pinned here is only that it agrees with INSERT on the declared form.)
+-- ============================================================
+
+create table wf_bf_gen (id integer primary key, d datetime null);
+-- run
+
+insert into wf_bf_gen values (1, '2099-01-01T00:00:00.000Z');
+-- run
+
+alter table wf_bf_gen add column g text null generated always as ('<' || d || '>');
+-- run
+
+-- Row 2 arrives AFTER the ALTER, through the ordinary INSERT path.
+insert into wf_bf_gen (id, d) values (2, '2099-01-01T00:00:00.000Z');
+-- run
+
+select count(distinct g) as c from wf_bf_gen;
+→ [{"c":1}]
+
+select id, d, g from wf_bf_gen order by id;
+→ [{"id":1,"d":"2099-01-01T00:00:00","g":"<2099-01-01T00:00:00>"},{"id":2,"d":"2099-01-01T00:00:00","g":"<2099-01-01T00:00:00>"}]
+
+drop table wf_bf_gen;
+-- run
+
+-- ============================================================
+-- 9. agreement — `add column ... default (new.<col>)` backfill equals a later INSERT
+--
+-- This is the parity claim docs/sql-alter.md § ADD COLUMN makes: "a backfilled row
+-- and a row inserted afterwards under the same DEFAULT hold the same value".
+-- ============================================================
+
+create table wf_bf_dflt (id integer primary key, d datetime null);
+-- run
+
+insert into wf_bf_dflt values (1, '2099-01-01T00:00:00.000Z');
+-- run
+
+alter table wf_bf_dflt add column c text null default ('<' || new.d || '>');
+-- run
+
+insert into wf_bf_dflt (id, d) values (2, '2099-01-01T00:00:00.000Z');
+-- run
+
+select count(distinct c) as c from wf_bf_dflt;
+→ [{"c":1}]
+
+select id, d, c from wf_bf_dflt order by id;
+→ [{"id":1,"d":"2099-01-01T00:00:00","c":"<2099-01-01T00:00:00>"},{"id":2,"d":"2099-01-01T00:00:00","c":"<2099-01-01T00:00:00>"}]
+
+drop table wf_bf_dflt;
+-- run
+
+-- ============================================================
+-- 10. agreement — `on conflict ... do update` recompute equals a plain UPDATE
+--
+-- The DO UPDATE arm assigns its cells AFTER the emitters' conversion pass and
+-- converts each one itself (docs/types.md, the two single-cell injectors), so it
+-- is a genuinely separate path from both INSERT and UPDATE.
+-- ============================================================
+
+create table wf_upsert (id integer primary key, d datetime null, g text null generated always as ('<' || d || '>'));
+-- run
+
+insert into wf_upsert (id, d) values (1, '1970-01-01T00:00:00');
+-- run
+
+insert into wf_upsert (id, d) values (2, '1970-01-01T00:00:00');
+-- run
+
+-- Row 1: the value arrives through a DO UPDATE assignment of a written-form literal.
+insert into wf_upsert (id, d) values (1, '2000-01-01T00:00:00') on conflict (id) do update set d = '2099-01-01T00:00:00.000Z';
+-- run
+
+-- Row 2: the same value through a plain UPDATE.
+update wf_upsert set d = '2099-01-01T00:00:00.000Z' where id = 2;
+-- run
+
+select count(distinct g) as c from wf_upsert;
+→ [{"c":1}]
+
+select id, d, g from wf_upsert order by id;
+→ [{"id":1,"d":"2099-01-01T00:00:00","g":"<2099-01-01T00:00:00>"},{"id":2,"d":"2099-01-01T00:00:00","g":"<2099-01-01T00:00:00>"}]
+
+drop table wf_upsert;
+-- run
+
+-- `excluded.<col>` reaches the DO UPDATE arm already converted too, so routing the
+-- proposed value through it lands on the same computed result.
+create table wf_excluded (id integer primary key, d datetime null, g text null generated always as ('<' || d || '>'));
+-- run
+
+insert into wf_excluded (id, d) values (1, '1970-01-01T00:00:00');
+-- run
+
+insert into wf_excluded (id, d) values (1, '2099-01-01T00:00:00.000Z') on conflict (id) do update set d = excluded.d;
+-- run
+
+select id, d, g from wf_excluded;
+→ [{"id":1,"d":"2099-01-01T00:00:00","g":"<2099-01-01T00:00:00>"}]
+
+drop table wf_excluded;
+-- run
+
+-- ============================================================
+-- 11. The `OR REPLACE` NOT NULL DEFAULT substitution is not an exception
+--
+-- This is the last write-path expression, and the most out-of-band one: it fires
+-- during constraint checking, after the emitters' conversion pass, when NOT NULL
+-- catches a NULL and the column has a DEFAULT to substitute. It reads the row it
+-- is handed — which is the converted one — and converts its own injected cell
+-- separately. So it agrees with every site above.
+--
+-- (15.1.1-json-check-coercion covers why that separate conversion of its OWN cell
+-- must not double-apply for JSON. Here the point is only which form it READS.)
+-- ============================================================
+
+create table wf_repl (id integer primary key, d datetime null, c text not null default ('<' || new.d || '>'));
+-- run
+
+insert or replace into wf_repl values (1, '2099-01-01T00:00:00.000Z', null);
+-- run
+
+select id, d, c from wf_repl;
+→ [{"id":1,"d":"2099-01-01T00:00:00","c":"<2099-01-01T00:00:00>"}]
+
+-- A plain INSERT supplying the same NULL takes the same substitution and agrees.
+insert or replace into wf_repl values (2, '2099-01-01T00:00:00.000Z', null);
+-- run
+
+select count(distinct c) as c from wf_repl;
+→ [{"c":1}]
+
+drop table wf_repl;
+-- run
