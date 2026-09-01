@@ -7,7 +7,7 @@ import { createRowSlot } from '../context-helpers.js';
 import { QuereusError, RelationNotFoundError } from '../../common/errors.js';
 import { type SqlValue, type Row, type SubProgram, StatusCode } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
-import type { TableSchema, PrimaryKeyColumnDefinition } from '../../schema/table.js';
+import type { TableSchema, PrimaryKeyColumnDefinition, IndexSchema } from '../../schema/table.js';
 import { buildColumnIndexMap, withGeneratedColumnGraph, requireVtabModule, resolveNamedConstraintClass, namedConstraintExists, assertConstraintNameFree, validateCollationForType, columnDefToSchema, collectTableConstraintNames, collectDeclaredConstraintNames } from '../../schema/table.js';
 import { validateForeignKeyCollations, buildForeignKeyConstraintSchema, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, extractColumnLevelUniqueConstraints } from '../../schema/constraint-builder.js';
 import type * as AST from '../../parser/ast.js';
@@ -18,7 +18,8 @@ import type { ResolveColumnInSource, ResolveObjectRef, TableRenameTarget } from 
 import { snapshotObjectRefResolvers, tableRenameTargetsFor, type ObjectRefResolvers } from '../../schema/object-ref-resolver.js';
 import type { ColumnSchema } from '../../schema/column.js';
 import { assertCatalogObjectPersistable, assertRenameDependentsPersistable } from '../../schema/catalog-persistability.js';
-import { assertUniqueConstraintIndexNameFree, assertUniqueConstraintNotDuplicated, assertUniqueConstraintBackingNamesDistinct, uniqueConstraintColumnSetKey, type DeclaredUniqueConstraint } from '../../schema/catalog.js';
+import { assertUniqueConstraintIndexNameFree, assertUniqueConstraintNotDuplicated, assertUniqueConstraintBackingNamesDistinct, uniqueConstraintColumnSetKey, isImplicitCoveringIndex, type DeclaredUniqueConstraint } from '../../schema/catalog.js';
+import { generateTableDDL, generateIndexDDL } from '../../schema/ddl-generator.js';
 import type { Schema } from '../../schema/schema.js';
 import type { Database } from '../../core/database.js';
 import { isTruthy } from '../../util/comparison.js';
@@ -1939,6 +1940,21 @@ async function runAlterPrimaryKey(
 			StatusCode.UNSUPPORTED,
 		);
 	}
+	// Second capability check: the rebuild re-creates the table's user indexes with
+	// CREATE INDEX statements (the shadow's CREATE TABLE carries every constraint, but
+	// indexes have their own statements), and CREATE INDEX routes through
+	// `module.createIndex`. Refuse up front — failing after the original table is
+	// dropped would strand a half-rebuilt table, and silently dropping the indexes is
+	// data loss of a different kind (a UNIQUE index stops enforcing).
+	if (!module.createIndex && rebuildUserIndexes(tableSchema).length > 0) {
+		throw new QuereusError(
+			`Module '${tableSchema.vtabModuleName ?? '<unknown>'}' does not support ALTER PRIMARY KEY on table `
+				+ `'${tableSchema.name}': it cannot re-key in place, and the engine's fallback rebuild must `
+				+ `re-create the table's indexes on the rebuilt table — without 'createIndex' they would be `
+				+ `silently lost. Drop the indexes first, or use a module that can re-key or create indexes.`,
+			StatusCode.UNSUPPORTED,
+		);
+	}
 	// NOTE: refused on every `DdlTransactionality` tier, including a module declaring
 	// 'transactional'. None does today; if one appears its DROP + RENAME would roll back
 	// together with the row copy, making this refusal over-broad — exempt that tier then, the
@@ -1954,7 +1970,7 @@ async function runAlterPrimaryKey(
 		);
 	}
 
-	await rebuildTableWithNewShape(rctx, tableSchema, schema, tableSchema.columns.map(c => c.name), newPkDef);
+	await rebuildTableWithNewShape(rctx, tableSchema, schema, newPkDef);
 
 	// A DEFENSIVE NO-OP on this path today, not the working re-key the native arm above does.
 	// Nothing can be in the batch for this table by now: the rebuild's own events are
@@ -1963,8 +1979,8 @@ async function runAlterPrimaryKey(
 	// Kept anyway — it costs one walk of an empty batch, and it is the correct call the moment
 	// that transaction guard is loosened; deleting it would quietly make this arm's
 	// as-of-delivery `key` guarantee depend on the guard staying exactly as it is. Every column
-	// survives the rebuild in order (`survivingColumns` above is the full list), so the indices
-	// would still line up with the event images.
+	// survives the rebuild in order (the rebuild is whole-table by construction — see
+	// `buildShadowTableDdl`), so the indices would still line up with the event images.
 	rctx.db._getEventEmitter().rekeyBatchedDataEvents(
 		tableSchema.schemaName, tableSchema.name, oldPkIndices, newPkIndices);
 
@@ -1991,24 +2007,23 @@ async function runAlterPrimaryKey(
 }
 
 /**
- * Rebuilds a table with a new column projection and/or primary key, via the
- * shadow-table SQL approach with DROP+RENAME. This is the fallback for a module
- * whose `alterTable` throws `UNSUPPORTED` for `alterPrimaryKey` (or omits the
- * hook); the built-in memory and store modules both re-key in place and never
- * reach it. See `rebuildViaShadowTable` for the two preconditions
- * `runAlterPrimaryKey` checks before calling this.
+ * Rebuilds a table with a new primary key, via the shadow-table SQL approach
+ * with DROP+RENAME. This is the fallback for a module whose `alterTable` throws
+ * `UNSUPPORTED` for `alterPrimaryKey` (or omits the hook); the built-in memory
+ * and store modules both re-key in place and never reach it. See
+ * `rebuildViaShadowTable` for the preconditions `runAlterPrimaryKey` checks
+ * before calling this.
  */
 async function rebuildTableWithNewShape(
 	rctx: RuntimeContext,
 	tableSchema: TableSchema,
 	schema: import('../../schema/schema.js').Schema,
-	survivingColumns: string[],
 	newPkDef: PrimaryKeyColumnDefinition[],
 ): Promise<void> {
 	const tableName = tableSchema.name;
 	const schemaName = tableSchema.schemaName;
 
-	await rebuildViaShadowTable(rctx, tableSchema, schema, survivingColumns, newPkDef);
+	await rebuildViaShadowTable(rctx, tableSchema, newPkDef);
 
 	const finalSchema = schema.getTable(tableName);
 	if (finalSchema) {
@@ -2025,55 +2040,59 @@ async function rebuildTableWithNewShape(
 /**
  * Build the shadow-table CREATE TABLE DDL used by the non-memory rebuild path.
  *
- * Nullability is emitted explicitly for every column, matching the "no-db"
- * stance of `generateTableDDL` in ddl-generator.ts: safe under any session's
- * `default_column_nullability` setting. DEFAULT and COLLATE are preserved so
- * the shadow table faithfully mirrors the original schema.
+ * Rendered through the canonical emitter (`generateTableDDL`) over a copy of the
+ * REAL `TableSchema` with only the name and key substituted, so the shadow
+ * carries everything the table declares — constraints, foreign keys, tags,
+ * defaults, collations, generated columns, the key's ON CONFLICT action — not a
+ * hand-picked subset. An omission in emitted DDL is never neutral: a missing
+ * PRIMARY KEY clause re-parses as a different key (all-columns), and a missing
+ * constraint re-parses as no constraint.
+ *
+ * Called WITHOUT a `db` argument: that form fully qualifies the name, always
+ * emits USING, and annotates nullability on every column, so the text re-parses
+ * to the same shape under any session's `default_column_nullability` /
+ * `default_vtab_module` settings. An empty `newPkDef` emits `PRIMARY KEY ()` —
+ * the singleton key — rather than omitting the clause (which would re-parse as
+ * the opposite thing: keyed by every column).
+ *
+ * The copied schema's per-column `primaryKey` flags are stale (they still mirror
+ * the OLD key) — harmless: the emitter reads only `primaryKeyDefinition`, and the
+ * shadow's real schema is built by re-parsing the emitted text.
+ *
+ * Deliberately WHOLE-TABLE only (no column subset parameter): stored constraints
+ * address columns by index, so a subset copy would need every constraint and
+ * index remapped or dropped. `ALTER TABLE … DROP COLUMN` goes through
+ * `module.alterTable`, never through this rebuild; if a column-dropping rebuild
+ * is ever wanted it must come back with deliberate constraint handling.
  */
 export function buildShadowTableDdl(
 	tableSchema: TableSchema,
 	shadowName: string,
-	survivingColumns: string[],
 	newPkDef: PrimaryKeyColumnDefinition[],
 ): string {
-	const colDefs: string[] = [];
-	for (const colName of survivingColumns) {
-		const idx = tableSchema.columnIndexMap.get(colName.toLowerCase());
-		if (idx === undefined) continue;
-		const col = tableSchema.columns[idx];
-		let def = quoteIdentifier(col.name) + ' ' + col.logicalType.name;
-		def += col.notNull ? ' not null' : ' null';
-		if (col.collation && col.collation !== 'BINARY') def += ` collate ${col.collation}`;
-		if (col.defaultValue !== null && col.defaultValue !== undefined) {
-			def += ` default ${expressionToString(col.defaultValue)}`;
-		}
-		colDefs.push(def);
-	}
+	return generateTableDDL({
+		...tableSchema,
+		name: shadowName,
+		primaryKeyDefinition: newPkDef,
+	});
+}
 
-	const pkColNames: string[] = [];
-	for (const pk of newPkDef) {
-		const colName = tableSchema.columns[pk.index].name;
-		let entry = quoteIdentifier(colName);
-		if (pk.desc) entry += ' desc';
-		pkColNames.push(entry);
-	}
-
-	let createDdl = `create table ${qualifyTableName(tableSchema.schemaName, shadowName)} (${colDefs.join(', ')}`;
-	createDdl += pkColNames.length > 0
-		? `, primary key (${pkColNames.join(', ')}))`
-		: `)`;
-
-	if (tableSchema.vtabModuleName) {
-		createDdl += ` using ${tableSchema.vtabModuleName}`;
-		if (tableSchema.vtabArgs && Object.keys(tableSchema.vtabArgs).length > 0) {
-			const args = Object.entries(tableSchema.vtabArgs)
-				.map(([key, value]) => `${key} = ${JSON.stringify(value)}`)
-				.join(', ');
-			createDdl += ` (${args})`;
-		}
-	}
-
-	return createDdl;
+/**
+ * The table's user indexes — the ones the rebuild must re-create with explicit
+ * CREATE INDEX statements. Implicit covering structures (the auto-built backing
+ * of a declared UNIQUE constraint) are excluded: the shadow's CREATE TABLE
+ * carries the constraint itself, which re-materializes its backing structure.
+ * UNIQUE constraints synthesized FROM an index (`derivedFromIndex`) are the
+ * opposite case — `generateTableDDL` skips them, and the `CREATE UNIQUE INDEX`
+ * emitted for their index re-synthesizes them (see `appendIndexToTableSchema`).
+ *
+ * NOTE: an *exposed* implicit index's user tags (`exposedIndexTags` in store
+ * mode, materialized `IndexSchema.tags` in memory mode) are not carried by
+ * either channel through a rebuild; if a rebuild-path backend ever exposes
+ * implicit indexes with tags, they need explicit re-application here.
+ */
+function rebuildUserIndexes(tableSchema: TableSchema): IndexSchema[] {
+	return (tableSchema.indexes ?? []).filter(idx => !isImplicitCoveringIndex(tableSchema, idx.name));
 }
 
 /**
@@ -2156,13 +2175,16 @@ async function runDropMaintained(
  * Generic rebuild via shadow table SQL, for a module without a native
  * `alterPrimaryKey`.
  *
- * Two preconditions the caller (`runAlterPrimaryKey`) enforces, because this rebuild has no
+ * Preconditions the caller (`runAlterPrimaryKey`) enforces, because this rebuild has no
  * correct outcome without them:
  *
  *  - **The module must implement `renameTable`.** The last step renames the shadow table over
  *    the original; a module that files its rows under the table's name and never hears about
  *    the rename keeps them under the shadow name while the catalog says otherwise, and the
  *    rebuilt table cannot be connected at all.
+ *  - **The module must implement `createIndex` when the table has user indexes.** The rebuild
+ *    finishes by re-creating them on the rebuilt table; without the hook they would be
+ *    silently lost.
  *  - **No explicit transaction may be open.** The two halves have different transactional
  *    lifetimes: the schema half (DROP + RENAME) escapes ROLLBACK on every
  *    `DdlTransactionality` tier a built-in module reaches, while the row copy is staged in the
@@ -2172,14 +2194,12 @@ async function runDropMaintained(
  *    offers; making the data half survive would commit part of the user's transaction behind
  *    their back.
  *
- * The four statements are engine scaffolding, not statements the application issued, so the
+ * The statements are engine scaffolding, not statements the application issued, so the
  * whole rebuild runs with the PUBLIC event channels suppressed — see the scope inside.
  */
 async function rebuildViaShadowTable(
 	rctx: RuntimeContext,
 	tableSchema: TableSchema,
-	_schema: import('../../schema/schema.js').Schema,
-	survivingColumns: string[],
 	newPkDef: PrimaryKeyColumnDefinition[],
 ): Promise<void> {
 	const tableName = tableSchema.name;
@@ -2188,8 +2208,14 @@ async function rebuildViaShadowTable(
 	const qualifiedShadow = qualifyTableName(schemaName, shadowName);
 	const qualifiedTable = qualifyTableName(schemaName, tableName);
 
-	const createDdl = buildShadowTableDdl(tableSchema, shadowName, survivingColumns, newPkDef);
-	const projection = survivingColumns.map(c => quoteIdentifier(c)).join(', ');
+	const createDdl = buildShadowTableDdl(tableSchema, shadowName, newPkDef);
+	// Whole-table copy (see buildShadowTableDdl for why no subset is representable).
+	// Generated columns are excluded from the projection: the shadow declares the same
+	// GENERATED ALWAYS AS clauses, so it computes them itself and rejects direct writes.
+	const projection = tableSchema.columns
+		.filter(c => !c.generated)
+		.map(c => quoteIdentifier(c.name))
+		.join(', ');
 
 	// The rebuild's statements are ordinary SQL, so without this scope they would raise
 	// ordinary notifications describing the scaffolding rather than what the user asked for:
@@ -2216,12 +2242,39 @@ async function rebuildViaShadowTable(
 			await rctx.db._execWithinTransaction(
 				`insert into ${qualifiedShadow} (${projection}) select ${projection} from ${qualifiedTable}`
 			);
-			await rctx.db._execWithinTransaction(
-				`drop table ${qualifiedTable}`
-			);
+			// The DROP is scaffolding: the shadow's rows ARE the table's rows, moments from
+			// being renamed back over it. Two FK situations would otherwise refuse it:
+			//  - a SELF-referencing FK — the shadow's copy references the ORIGINAL by name
+			//    (correct for the copy: the per-row EXISTS checks run against the intact
+			//    original), so the drop guard sees the shadow as a referencing child;
+			//  - another table's FK into this one with rows present — the referencing rows
+			//    stay satisfied because the rename restores the name with identical rows,
+			//    matching the in-place re-key path (which never breaks such children).
+			// Suppress the parent-side RESTRICT guard for exactly this statement; restored
+			// in the finally so a failing drop cannot latch it.
+			const priorSuppress = rctx.db._setFkRestrictSuppressed(true);
+			try {
+				await rctx.db._execWithinTransaction(
+					`drop table ${qualifiedTable}`
+				);
+			} finally {
+				rctx.db._setFkRestrictSuppressed(priorSuppress);
+			}
+			// The rename's propagate pass rewrites the shadow's dangling references to the
+			// dropped original (e.g. a self-referencing FK) onto the restored name.
 			await rctx.db._execWithinTransaction(
 				`alter table ${qualifiedShadow} rename to ${quoteIdentifier(tableName)}`
 			);
+			// Re-create the table's user indexes on the rebuilt table (see
+			// rebuildUserIndexes for what is included and why). AFTER the rename so the
+			// index names — unique per schema — never coexist with the original's, and
+			// rendered from the ORIGINAL schema, whose name/schema/column order the rebuilt
+			// table shares. `runAlterPrimaryKey` refused up front if the module cannot
+			// createIndex, so a failure here is exceptional; it propagates rather than
+			// silently dropping the index.
+			for (const idx of rebuildUserIndexes(tableSchema)) {
+				await rctx.db._execWithinTransaction(generateIndexDDL(idx, tableSchema));
+			}
 		} catch (e) {
 			try {
 				await rctx.db._execWithinTransaction(

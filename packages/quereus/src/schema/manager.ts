@@ -1466,6 +1466,12 @@ export class SchemaManager {
 	 */
 	private async assertNoReferencingChildrenForDrop(parentSchemaName: string, parentTableName: string): Promise<void> {
 		if (!this.db.options.getBooleanOption('foreign_keys')) return;
+		// Trust-the-origin suppression (see Database._setFkRestrictSuppressed): the
+		// external-changes apply path already had this drop enforced at its origin, and
+		// the ALTER PRIMARY KEY shadow rebuild drops a table whose rows are about to be
+		// renamed back over it — in both, re-checking referencing children here would
+		// wedge a drop whose referential outcome is already accounted for.
+		if (this.db._isFkRestrictSuppressed()) return;
 
 		const parentSchemaLower = parentSchemaName.toLowerCase();
 		const parentTableLower = parentTableName.toLowerCase();

@@ -16,7 +16,7 @@
 import { MemoryTableModule } from '../src/vtab/memory/module.js';
 import type { AnyVirtualTableModule } from '../src/vtab/module.js';
 
-export function makeNoAlterModule(opts: { withRenameTable?: boolean } = {}): AnyVirtualTableModule {
+export function makeNoAlterModule(opts: { withRenameTable?: boolean; withCreateIndex?: boolean } = {}): AnyVirtualTableModule {
 	const inner = new MemoryTableModule();
 	return {
 		concurrencyMode: inner.concurrencyMode,
@@ -27,5 +27,11 @@ export function makeNoAlterModule(opts: { withRenameTable?: boolean } = {}): Any
 		getBestAccessPlan: inner.getBestAccessPlan.bind(inner),
 		// alterTable intentionally omitted; `renameTable` too unless opted back in.
 		...(opts.withRenameTable ? { renameTable: inner.renameTable.bind(inner) } : {}),
+		// `createIndex`/`dropIndex` opt-in: the rebuild fallback refuses up front when a
+		// table has user indexes and the module cannot re-create them, so the index-survival
+		// arm of the rebuild is only reachable with these forwarded.
+		...(opts.withCreateIndex
+			? { createIndex: inner.createIndex.bind(inner), dropIndex: inner.dropIndex.bind(inner) }
+			: {}),
 	};
 }
