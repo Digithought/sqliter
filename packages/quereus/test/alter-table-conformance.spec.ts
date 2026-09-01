@@ -31,6 +31,7 @@ import { expect } from 'chai';
 import { Database } from '../src/index.js';
 import { QuereusError } from '../src/common/errors.js';
 import { StatusCode, type SqlValue } from '../src/common/types.js';
+import { generateTableDDL } from '../src/schema/ddl-generator.js';
 import { makeNoAlterModule } from './no-alter-module.js';
 
 // ── Outcome contract ────────────────────────────────────────────────────────
@@ -635,5 +636,243 @@ describe('ALTER conformance matrix — module without alterTable (sited UNSUPPOR
 		expect(names, 'old name gone').to.not.include('name');
 		const r = await rows(db, `select title from t where id = 1`);
 		expect(r[0].title, 'data preserved under the renamed column').to.equal('a');
+	});
+});
+
+// ── ALTER PRIMARY KEY via the engine-side shadow rebuild ─────────────────────
+//
+// For a module with no native `alterPrimaryKey`, the engine falls back to a
+// shadow rebuild (runtime/emit/alter-table.ts): CREATE a shadow table, copy the
+// rows into it, DROP the original, RENAME the shadow over it, re-create the user
+// indexes. The shadow's CREATE TABLE is rendered by `generateTableDDL` over the
+// real `TableSchema` with only the name and key substituted, so everything the
+// table declares has to survive that round trip. Anything the shadow DDL fails
+// to render does not merely look different — it stops being enforced, which is
+// the silent divergence this file exists to forbid.
+//
+// These arms assert survival BEHAVIORALLY (the constraint still rejects a
+// violating write) rather than by reading DDL text; the closing arm is the
+// general subsumer that compares the canonical DDL before and after.
+
+describe('ALTER PRIMARY KEY — shadow rebuild preserves the table definition', () => {
+	let db: Database;
+
+	afterEach(async () => {
+		if (db) await db.close();
+	});
+
+	/**
+	 * A database whose 'noalter' module omits `alterTable` (so ALTER PRIMARY KEY must
+	 * take the rebuild fallback) but keeps `renameTable` (which the rebuild's closing
+	 * RENAME requires), and optionally `createIndex`/`dropIndex`.
+	 */
+	function openRebuildDb(opts: { withCreateIndex?: boolean } = {}): Database {
+		const fresh = new Database();
+		fresh.registerModule('noalter', makeNoAlterModule({ withRenameTable: true, ...opts }));
+		return fresh;
+	}
+
+	it('a table-level CHECK still rejects a violating insert after the rebuild', async () => {
+		db = openRebuildDb();
+		await db.exec(`create table t (id integer primary key, code integer not null, v integer not null, constraint pos check (v > 0)) using noalter`);
+		await db.exec(`insert into t values (1, 100, 5)`);
+		await db.exec(`alter table t alter primary key (code)`);
+
+		expect(await pkColumns(db), 'PK re-keyed by the rebuild').to.deep.equal(['code']);
+		await expectConstraint(db, `insert into t values (2, 200, -1)`, 'CHECK after rebuild');
+		// The satisfying insert still works — the CHECK survived as a CHECK, not as a wall.
+		await db.exec(`insert into t values (2, 200, 1)`);
+	});
+
+	it('a UNIQUE constraint still rejects a duplicate after the rebuild', async () => {
+		db = openRebuildDb();
+		await db.exec(`create table t (id integer primary key, code integer not null, email text not null, constraint u_email unique (email)) using noalter`);
+		await db.exec(`insert into t values (1, 100, 'a@x')`);
+		await db.exec(`alter table t alter primary key (code)`);
+
+		await expectConstraint(db, `insert into t values (2, 200, 'a@x')`, 'UNIQUE after rebuild');
+		await db.exec(`insert into t values (2, 200, 'b@x')`);
+	});
+
+	it('a declared FOREIGN KEY is still enforced after the rebuild', async () => {
+		db = openRebuildDb();
+		await db.exec(`pragma foreign_keys = true`);
+		await db.exec(`create table parent (pid integer primary key) using noalter`);
+		await db.exec(`insert into parent values (1), (2)`);
+		await db.exec(`create table t (id integer primary key, code integer not null, pa integer not null, constraint fk_pa foreign key (pa) references parent(pid)) using noalter`);
+		await db.exec(`insert into t values (1, 100, 1)`);
+		await db.exec(`alter table t alter primary key (code)`);
+
+		const schema = db.schemaManager.findTable('t')!;
+		expect((schema.foreignKeys ?? []).length, 'FK survives in the rebuilt schema').to.equal(1);
+		await expectConstraint(db, `insert into t values (2, 200, 99)`, 'FK after rebuild');
+		await db.exec(`insert into t values (2, 200, 2)`);
+	});
+
+	it('table tags survive the rebuild', async () => {
+		db = openRebuildDb();
+		await db.exec(`create table t (id integer primary key, code integer not null) using noalter with tags (owner = 'ops')`);
+		await db.exec(`insert into t values (1, 100)`);
+		await db.exec(`alter table t alter primary key (code)`);
+
+		const schema = db.schemaManager.findTable('t')!;
+		expect(schema.tags?.owner, 'table tag survives the rebuild').to.equal('ops');
+	});
+
+	it('the key ON CONFLICT REPLACE action survives the rebuild (behaviorally)', async () => {
+		db = openRebuildDb();
+		await db.exec(`create table t (a integer not null, b integer not null, v text, primary key (a) on conflict replace) using noalter`);
+		await db.exec(`insert into t values (1, 10, 'x')`);
+		await db.exec(`alter table t alter primary key (b)`);
+
+		expect(await pkColumns(db), 'PK re-keyed to b').to.deep.equal(['b']);
+		// Same b as the existing row: REPLACE means the insert takes over, not an error.
+		await db.exec(`insert into t values (2, 10, 'y')`);
+		const r = await rows(db, `select a, b, v from t`);
+		expect(r, 'duplicate key replaced rather than erroring').to.deep.equal([{ a: 2, b: 10, v: 'y' }]);
+	});
+
+	it('user indexes survive the rebuild and a UNIQUE index still enforces', async () => {
+		db = openRebuildDb({ withCreateIndex: true });
+		await db.exec(`create table t (id integer primary key, code integer not null, name text not null, tag text not null) using noalter`);
+		await db.exec(`create index idx_name on t (name)`);
+		await db.exec(`create unique index u_tag on t (tag)`);
+		await db.exec(`insert into t values (1, 100, 'a', 'x')`);
+		await db.exec(`alter table t alter primary key (code)`);
+
+		const names = (db.schemaManager.findTable('t')!.indexes ?? []).map(i => i.name.toLowerCase());
+		expect(names, 'plain index re-created on the rebuilt table').to.include('idx_name');
+		expect(names, 'unique index re-created on the rebuilt table').to.include('u_tag');
+		await expectConstraint(db, `insert into t values (2, 200, 'b', 'x')`, 'UNIQUE INDEX after rebuild');
+		await db.exec(`insert into t values (2, 200, 'b', 'y')`);
+	});
+
+	it('refuses up front — leaving the table untouched — when the module cannot re-create the indexes', async () => {
+		// A module that cannot `createIndex` also cannot have had an index created on it
+		// through SQL (SchemaManager.createIndex refuses first), so the shape this guard
+		// exists for is reached the other way round: a table arriving with indexes already
+		// attached (a store-backed catalog rehydrate). Simulated here by dropping the hook
+		// after setup — what the engine sees at ALTER time is identical.
+		const mod = makeNoAlterModule({ withRenameTable: true, withCreateIndex: true });
+		db = new Database();
+		db.registerModule('noalter', mod);
+		await db.exec(`create table t (id integer primary key, code integer not null, name text not null) using noalter`);
+		await db.exec(`create index idx_name on t (name)`);
+		await db.exec(`insert into t values (1, 100, 'a')`);
+
+		delete (mod as { createIndex?: unknown }).createIndex;
+
+		const err = await attemptAlter(db, `alter table t alter primary key (code)`);
+		expect(err, 'refused rather than silently dropping the index').to.be.instanceOf(QuereusError);
+		expect(err!.code, 'refusal code').to.equal(StatusCode.UNSUPPORTED);
+		expect(err!.message, 'refusal names the missing capability').to.match(/createIndex/);
+		expect(err!.message, 'refusal is sited on the table').to.match(/'t'/);
+
+		// Untouched: same key, same index, same rows.
+		expect(await pkColumns(db), 'PK unchanged after the refusal').to.deep.equal(['id']);
+		expect((db.schemaManager.findTable('t')!.indexes ?? []).map(i => i.name.toLowerCase()), 'index unchanged').to.include('idx_name');
+		expect(await rows(db, `select id, code, name from t`), 'rows unchanged').to.deep.equal([{ id: 1, code: 100, name: 'a' }]);
+	});
+
+	it('alter primary key () yields the empty singleton key on a one-row table', async () => {
+		db = openRebuildDb();
+		await db.exec(`create table t (id integer primary key, code integer not null) using noalter`);
+		await db.exec(`insert into t values (1, 100)`);
+		await db.exec(`alter table t alter primary key ()`);
+
+		expect(db.schemaManager.findTable('t')!.primaryKeyDefinition, 'singleton key').to.deep.equal([]);
+		expect(await pkColumns(db), 'no column reported as key member').to.deep.equal([]);
+		expectKeyFlagsAgreeWithDefinition(db);
+		expect(await rows(db, `select id, code from t`), 'the row survived').to.deep.equal([{ id: 1, code: 100 }]);
+	});
+
+	it('alter primary key () rejects when existing rows would collide under the singleton key', async () => {
+		db = openRebuildDb();
+		await db.exec(`create table t (id integer primary key, code integer not null) using noalter`);
+		await db.exec(`insert into t values (1, 100), (2, 200)`);
+
+		const err = await attemptAlter(db, `alter table t alter primary key ()`);
+		expect(err, 'two rows cannot share the singleton key').to.be.instanceOf(QuereusError);
+		expect(err!.message, 'rejection cites the collision').to.match(/unique|collide/i);
+		expect(await pkColumns(db), 'PK unchanged after the failed rebuild').to.deep.equal(['id']);
+		expect(await rows(db, `select id from t order by id`), 'rows unchanged').to.deep.equal([{ id: 1 }, { id: 2 }]);
+	});
+
+	it('a self-referencing FOREIGN KEY survives the rebuild and is still enforced', async () => {
+		db = openRebuildDb();
+		await db.exec(`pragma foreign_keys = true`);
+		await db.exec(`create table t (code integer primary key, parent_code integer null, constraint fk_self foreign key (parent_code) references t(code)) using noalter`);
+		await db.exec(`insert into t values (1, null), (2, 1)`);
+		// Genuine re-key that keeps `code` as the (still unique) FK target: flip to descending.
+		await db.exec(`alter table t alter primary key (code desc)`);
+
+		const schema = db.schemaManager.findTable('t')!;
+		expect(schema.primaryKeyDefinition.map(pk => pk.desc), 'key is now descending').to.deep.equal([true]);
+		const fk = (schema.foreignKeys ?? [])[0];
+		expect(fk, 'the self-FK survived').to.not.be.undefined;
+		expect(fk?.referencedTable.toLowerCase(), 'self-FK still points at the table itself').to.equal('t');
+		expect(await rows(db, `select code from t order by code`), 'rows survived').to.deep.equal([{ code: 1 }, { code: 2 }]);
+
+		await db.exec(`insert into t values (3, 2)`);
+		await expectConstraint(db, `insert into t values (4, 999)`, 'self-FK after rebuild');
+	});
+
+	it('another table FOREIGN KEY into the rebuilt table survives, referencing rows and all', async () => {
+		db = openRebuildDb();
+		await db.exec(`pragma foreign_keys = true`);
+		await db.exec(`create table parent (id integer primary key, label text) using noalter`);
+		await db.exec(`insert into parent values (1, 'a'), (2, 'b')`);
+		await db.exec(`create table child (cid integer primary key, pid integer not null, constraint fk_p foreign key (pid) references parent(id)) using noalter`);
+		await db.exec(`insert into child values (10, 1)`);
+		// The rebuild internally DROPs `parent` while `child` still references it; the drop
+		// guard is suppressed for exactly that statement, matching the in-place re-key path
+		// (which never breaks such children). The re-key keeps `id` as the FK target.
+		await db.exec(`alter table parent alter primary key (id desc)`);
+
+		expect(await rows(db, `select id from parent order by id`), 'parent rows survived').to.deep.equal([{ id: 1 }, { id: 2 }]);
+		expect(await rows(db, `select cid, pid from child`), 'child rows untouched').to.deep.equal([{ cid: 10, pid: 1 }]);
+		await db.exec(`insert into child values (11, 2)`);
+		await expectConstraint(db, `insert into child values (12, 99)`, 'child FK after parent rebuild');
+	});
+
+	it('the canonical DDL before and after a rebuild differs ONLY in the PRIMARY KEY clause', async () => {
+		// The general subsumer for every arm above: whatever `generateTableDDL` renders is
+		// what a store-backed catalog persists and re-parses, so if the two texts agree
+		// outside the key clause, nothing the table declares was dropped by the rebuild.
+		db = openRebuildDb();
+		await db.exec(`create table t (
+			id integer primary key,
+			code integer not null,
+			name text not null collate nocase default 'x',
+			v integer not null default 7,
+			dbl integer null generated always as (v * 2) stored,
+			constraint pos check (v > 0),
+			constraint u_name unique (name)
+		) using noalter with tags (owner = 'ops')`);
+		await db.exec(`insert into t (id, code, name, v) values (1, 100, 'a', 5)`);
+
+		const before = generateTableDDL(db.schemaManager.findTable('t')!);
+		await db.exec(`alter table t alter primary key (code)`);
+		const after = generateTableDDL(db.schemaManager.findTable('t')!);
+
+		expect(before, 'sanity: the pre-rebuild DDL names the old key').to.match(/"id"[^,]*PRIMARY KEY/);
+		expect(after, 'sanity: the post-rebuild DDL names the new key').to.match(/"code"[^,]*PRIMARY KEY/);
+		expect(after, 'the two texts are not trivially identical').to.not.equal(before);
+		// Non-vacuity: the comparison below is only worth anything if the captured text
+		// actually carries every feature the rebuild could drop.
+		for (const feature of [/CHECK/i, /UNIQUE/i, /COLLATE/i, /DEFAULT/i, /GENERATED ALWAYS AS/i, /TAGS/i, /USING/i]) {
+			expect(before, `sanity: captured DDL carries ${feature}`).to.match(feature);
+		}
+
+		// Strip every PRIMARY KEY clause (inline and table-level) plus the comma it leaves
+		// behind, then the remainders must be byte-identical.
+		const withoutKey = (ddl: string) => ddl
+			.replace(/\s*PRIMARY KEY(\s*\([^)]*\))?(\s+ON CONFLICT\s+\w+)?/g, '')
+			.replace(/,\s*,/g, ',')
+			.replace(/\(\s*,/g, '(');
+		expect(withoutKey(after), 'rebuild changed nothing but the key').to.equal(withoutKey(before));
+
+		// And the generated column still computes on the rebuilt table.
+		expect(await rows(db, `select dbl from t`), 'generated column recomputes').to.deep.equal([{ dbl: 10 }]);
 	});
 });

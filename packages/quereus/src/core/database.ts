@@ -2607,25 +2607,33 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		this.transactionManager.setPendingCommitAssertionSink(sink);
 	}
 
-	/** @internal Apply-mode RESTRICT suppression flag — see {@link _setFkRestrictSuppressed}. */
+	/** @internal Parent-side RESTRICT suppression flag — see {@link _setFkRestrictSuppressed}. */
 	private _fkRestrictSuppressed = false;
 
-	/** @internal Apply-mode RESTRICT suppression. While set, the parent-side FK
+	/** @internal Parent-side RESTRICT suppression. While set, the parent-side FK
 	 *  RESTRICT pre-checks ({@link assertTransitiveRestrictsForParentMutation} and its
-	 *  callees) early-return — the trust-the-origin external-row apply path: the origin
-	 *  already enforced RESTRICT at its own commit, so re-enforcing it on the receiver
-	 *  would wedge the sync stream. Cascade / set-null / set-default propagation is
-	 *  unaffected. Set for the duration of an apply batch (mutex held, so no concurrent
-	 *  statement observes it) and honored by every nested cascade DML and MV-maintenance
-	 *  FK pass. Returns the prior value so the caller restores it in a `finally`
-	 *  (supports nesting). */
+	 *  callees) early-return, as does the DROP TABLE referencing-children guard
+	 *  (`SchemaManager.assertNoReferencingChildrenForDrop`). Cascade / set-null /
+	 *  set-default propagation is unaffected. Returns the prior value so the caller
+	 *  restores it in a `finally` (supports nesting).
+	 *
+	 *  Two callers, both "the referential outcome is already accounted for elsewhere":
+	 *   - the trust-the-origin external-row apply path — the origin already enforced
+	 *     RESTRICT at its own commit, so re-enforcing it on the receiver would wedge the
+	 *     sync stream. Set for the duration of an apply batch (mutex held, so no
+	 *     concurrent statement observes it) and honored by every nested cascade DML and
+	 *     MV-maintenance FK pass;
+	 *   - the ALTER PRIMARY KEY shadow rebuild (runtime/emit/alter-table.ts), around its
+	 *     own internal `DROP TABLE` only — that table's rows are moments from being
+	 *     renamed back over it with the same name and contents, so a child's references
+	 *     are never actually broken. */
 	public _setFkRestrictSuppressed(value: boolean): boolean {
 		const prior = this._fkRestrictSuppressed;
 		this._fkRestrictSuppressed = value;
 		return prior;
 	}
 
-	/** @internal Whether apply-mode RESTRICT suppression is active — see
+	/** @internal Whether parent-side RESTRICT suppression is active — see
 	 *  {@link _setFkRestrictSuppressed}. */
 	public _isFkRestrictSuppressed(): boolean {
 		return this._fkRestrictSuppressed;

@@ -2252,6 +2252,16 @@ async function rebuildViaShadowTable(
 			//    matching the in-place re-key path (which never breaks such children).
 			// Suppress the parent-side RESTRICT guard for exactly this statement; restored
 			// in the finally so a failing drop cannot latch it.
+			//
+			// NOTE: a THIRD drop-refusal shape is not handled here and is left conditional:
+			// a CHECK constraint (or partial-index predicate, or view/assertion body) whose
+			// subquery names its own table makes the shadow's copy of that expression a
+			// declared dependent of the ORIGINAL, so `assertNoExpressionDependsOn` in
+			// drop-table.ts refuses the drop. That is a different guard from the FK one this
+			// flag covers, and the shape is pre-existing (such an expression is unusual and
+			// nothing in the tree writes one). If a rebuild ever fails with an
+			// expression-dependency error naming the shadow table, this is why — the fix is
+			// to teach that guard the same suppressed scope, not to widen this flag.
 			const priorSuppress = rctx.db._setFkRestrictSuppressed(true);
 			try {
 				await rctx.db._execWithinTransaction(

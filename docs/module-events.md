@@ -268,7 +268,7 @@ The `ALTER TABLE` arms are the exception to the auto path's usual silence about 
 
 A few statements the engine issues on its own behalf are not statements the application made, and are deliberately invisible on both channels. The engine runs them inside a suppression scope (`DatabaseEventEmitter.withPublicEventsSuppressed`): while it is open, no auto event is generated, and an event forwarded from a module's own emitter is discarded (with a debug log line) instead of delivered or batched.
 
-Today there is exactly one such scope: the shadow-table rebuild behind `ALTER TABLE … ALTER PRIMARY KEY` on a module that cannot re-key in place. It creates a shadow table with the new key, copies every row into it, drops the original, and renames the shadow over it — none of which is a change the application asked for, so a subscriber hears nothing about any of it. (The `ALTER PRIMARY KEY` statement's own `alter`/`table` event is raised *outside* the scope, so the re-key itself still reports.) See [sql-alter.md § ALTER PRIMARY KEY](sql-alter.md) for the user-facing consequence.
+Today there is exactly one such scope: the shadow-table rebuild behind `ALTER TABLE … ALTER PRIMARY KEY` on a module that cannot re-key in place. It creates a shadow table with the new key, copies every row into it, drops the original, renames the shadow over it, and re-creates the table's user indexes — none of which is a change the application asked for, so a subscriber hears nothing about any of it. (The `ALTER PRIMARY KEY` statement's own `alter`/`table` event is raised *outside* the scope, so the re-key itself still reports.) See [sql-alter.md § ALTER PRIMARY KEY](sql-alter.md) for the user-facing consequence.
 
 What this means for a module with a native emitter:
 
