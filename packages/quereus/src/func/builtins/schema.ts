@@ -266,6 +266,10 @@ export const tableInfoFunc = createIntegratedTableValuedFunction(
 				column.name,                         // name
 				column.logicalType.name,             // type
 				column.notNull ? 1 : 0,             // notnull
+				// NOTE: defaultValue is an AST Expression, not a raw value — .toString()
+				// degrades to "[object Object]" for any non-primitive default. Not a real
+				// default-value comparison today; use expressionToString(column.defaultValue)
+				// if this ever needs to be meaningful.
 				column.defaultValue?.toString() || null, // dflt_value
 				isPrimaryKey ? 1 : 0,               // pk
 				tagsToJson(column.tags),            // tags
