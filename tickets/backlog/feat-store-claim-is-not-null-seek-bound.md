@@ -1,4 +1,4 @@
-description: Finding the smallest or largest value in a column that allows blanks is still slow on storage backends where reading a row is expensive, because the "skip the blanks" test the engine adds cannot be handled by the storage layer. Columns allow blanks by default, so this is the common case.
+description: Finding the smallest or largest value in a column that allows blanks is still slow on storage backends where reading a row is expensive, because the "skip the blanks" test the engine adds cannot be handled by the storage layer. Reaches only columns explicitly declared to allow blanks, since this engine forbids them by default.
 files:
   - packages/quereus-store/src/common/store-module-access-plan.ts   # seek-role vocabulary: EQ_OR_IN_OPS / LOWER_BOUND_OPS / UPPER_BOUND_OPS, claimFirstPerRole
   - packages/quereus/src/planner/rules/aggregate/rule-minmax-index-boundary.ts   # buildIsNotNull — the filter that is added and never claimed
@@ -19,14 +19,22 @@ create index ix_bc on t (b, c);
 select min(c) from t where b = 1;     -- reads one row
 ```
 
-and this — the same query, with `c` merely declared nullable — reads the whole table:
+and this — the same query, with `c` explicitly declared nullable — reads the whole table:
 
 ```sql
 create table t (id integer primary key, b integer not null, c integer null);
 ```
 
-Nullable is what a column is unless you say otherwise, so the fast path is the
-exception rather than the rule today.
+**Correction to this ticket's original framing.** It was filed saying nullable is what a
+column is unless you say otherwise, which would make the fast path the exception. That is
+true of standard SQL and NOT true here: `default_column_nullability` defaults to
+`'not_null'` (`core/database.ts`, and `createDefaultColumnSchema`'s `defaultNotNull = true`
+— Third Manifesto). A column in this engine is NOT NULL unless it is declared `null` or
+the session sets the pragma to `'nullable'`.
+
+So the common case is the fast one, and this ticket covers the explicitly-nullable
+minority. That lowers its priority rather than raising it — worth stating plainly, because
+the original wording would have ranked it as a headline regression.
 
 ## Why
 

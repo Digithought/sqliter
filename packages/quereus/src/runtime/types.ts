@@ -228,6 +228,11 @@ export interface InstructionRuntimeStats {
 
 /** * Trace event for instruction execution. */
 export interface InstructionTraceEvent {
+	/**
+	 * Global address of the traced instruction — `Scheduler.addressOf`, unique
+	 * across the whole program tree (main program and every nested sub-program),
+	 * not an index within whichever scheduler happened to be running.
+	 */
 	instructionIndex: number;
 	note?: string;
 	type: 'input' | 'output' | 'row' | 'error';
@@ -245,12 +250,23 @@ export interface InstructionTraceEvent {
 
 /** Information about a sub-program for tracing purposes */
 export interface SubProgramInfo {
+	/**
+	 * Base address of the sub-program: the global address of its first instruction
+	 * (`Scheduler.baseAddress`). Names a row that `scheduler_program()` actually
+	 * lists, so trace output can be followed into the sub-program.
+	 */
 	programIndex: number;
 	instructionCount: number;
 	rootNote?: string;
 }
 
-/** * Interface for tracing instruction execution. */
+/**
+ * Interface for tracing instruction execution.
+ *
+ * Every `instructionIndex` here is a *global* address (`Scheduler.addressOf`),
+ * unique across the main program and every nested sub-program — not an index
+ * within the scheduler that is currently running.
+ */
 export interface InstructionTracer {
 	/** Called before an instruction executes */
 	traceInput(instructionIndex: number, instruction: Instruction, args: RuntimeValue[]): void;
@@ -262,7 +278,7 @@ export interface InstructionTracer {
 	traceRow(instructionIndex: number, instruction: Instruction, rowIndex: number, row: Row): void;
 	/** Gets collected trace events (if supported by the tracer) */
 	getTraceEvents?(): InstructionTraceEvent[];
-	/** Gets information about all sub-programs encountered during tracing */
+	/** Gets information about all sub-programs encountered during tracing, keyed by base address */
 	getSubPrograms?(): Map<number, { scheduler: Scheduler; parentInstructionIndex: number }>;
 }
 
@@ -270,7 +286,6 @@ export interface InstructionTracer {
 export class CollectingInstructionTracer implements InstructionTracer {
 	private events: InstructionTraceEvent[] = [];
 	private subPrograms = new Map<number, { scheduler: Scheduler; parentInstructionIndex: number }>();
-	private nextSubProgramId = 0;
 
 	traceInput(instructionIndex: number, instruction: Instruction, args: RuntimeValue[]): void {
 		const subPrograms = this.collectSubProgramInfo(instructionIndex, instruction);
@@ -327,7 +342,6 @@ export class CollectingInstructionTracer implements InstructionTracer {
 	clear(): void {
 		this.events = [];
 		this.subPrograms.clear();
-		this.nextSubProgramId = 0;
 	}
 
 	private collectSubProgramInfo(instructionIndex: number, instruction: Instruction): SubProgramInfo[] | undefined {
@@ -335,12 +349,16 @@ export class CollectingInstructionTracer implements InstructionTracer {
 			return undefined;
 		}
 
+		// Key sub-programs by their base address rather than an invented counter, so
+		// the ids reported here name rows that scheduler_program() also lists. The
+		// root scheduler has already assigned addresses by the time any instruction
+		// traces (see Scheduler.ensureAddressesAssigned).
 		return instruction.programs.map(scheduler => {
-			const programId = this.nextSubProgramId++;
-			this.subPrograms.set(programId, { scheduler, parentInstructionIndex: instructionIndex });
+			const baseAddress = scheduler.baseAddress;
+			this.subPrograms.set(baseAddress, { scheduler, parentInstructionIndex: instructionIndex });
 
 			return {
-				programIndex: programId,
+				programIndex: baseAddress,
 				instructionCount: scheduler.instructions.length,
 				rootNote: scheduler.instructions[scheduler.instructions.length - 1]?.note
 			};

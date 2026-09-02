@@ -203,7 +203,12 @@ export const queryPlanFunc = createIntegratedTableValuedFunction(
 	}
 );
 
-/** One row of the compiled instruction listing produced by {@link collectSchedulerProgram}. */
+/**
+ * One row of the compiled instruction listing produced by
+ * {@link collectSchedulerProgram}. Every address here is a global instruction
+ * address (`Scheduler.addressOf`) — unique across the main program and every
+ * nested sub-program — which is what makes it joinable against trace events.
+ */
 interface SchedulerProgramEntry {
 	addr: number;
 	dependencies: number[];
@@ -221,7 +226,7 @@ interface SchedulerProgramEntry {
 //
 // Shared by scheduler_program() and execution_trace(), which must report the
 // same (full, sub-program) instruction listing — execution_trace() joins its
-// trace events against these addresses by index. Throws rather than
+// trace events against these addresses. Throws rather than
 // returning an error row; callers keep their own error handling.
 function collectSchedulerProgram(db: Database, sql: string): SchedulerProgramEntry[] {
 	const entries: SchedulerProgramEntry[] = [];
@@ -231,60 +236,50 @@ function collectSchedulerProgram(db: Database, sql: string): SchedulerProgramEnt
 
 	// Emit the plan to get the instruction tree. Unfused: this listing exists to
 	// show the instruction graph, and execution_trace() joins against it by
-	// instruction index — both must report the same (full, sub-program) form.
+	// instruction address — both must report the same (full, sub-program) form.
 	// Scalar fusion would dissolve scalar sub-programs into single fused(...)
 	// instructions.
 	const emissionContext = new EmissionContext(db, { fuseScalars: false });
 	const rootInstruction = emitPlanNode(plan, emissionContext);
 
-	// Create a scheduler to get the instruction sequence
+	// Create a scheduler to get the instruction sequence. The scheduler owns
+	// addressing; nothing here encodes or decodes an address.
 	const scheduler = new Scheduler(rootInstruction);
-	const indexByInstruction = new Map<Instruction, number>();
-	for (let i = 0; i < scheduler.instructions.length; i++) {
-		indexByInstruction.set(scheduler.instructions[i], i);
-	}
+	scheduler.ensureAddressesAssigned();
+	appendSchedulerEntries(scheduler, null, entries);
 
+	return entries;
+}
+
+/**
+ * Appends one entry per instruction in `scheduler`, then recurses into each
+ * instruction's nested programs so a program nested two deep (e.g. a correlated
+ * scalar subquery inside a filter predicate) is listed too. Sub-program rows
+ * follow the instruction that owns them, which is also their `parentAddr`.
+ */
+function appendSchedulerEntries(
+	scheduler: Scheduler,
+	parentAddr: number | null,
+	entries: SchedulerProgramEntry[]
+): void {
 	for (let i = 0; i < scheduler.instructions.length; i++) {
 		const instruction = scheduler.instructions[i];
-		const dependencies = instruction.params
-			.map(inst => indexByInstruction.get(inst))
-			.filter((idx): idx is number => idx !== undefined);
+		const addr = scheduler.addressOf(i);
 
 		entries.push({
-			addr: i,
-			dependencies,
-			description: instruction.note || `INSTRUCTION_${i}`,
-			isSubprogram: false,
-			parentAddr: null,
+			addr,
+			dependencies: scheduler.dependencyAddressesOf(i),
+			description: instruction.note || `INSTRUCTION_${addr}`,
+			isSubprogram: parentAddr !== null,
+			parentAddr,
 		});
 
-		// If this instruction has sub-programs, collect those too
 		if (instruction.programs) {
-			for (let progIdx = 0; progIdx < instruction.programs.length; progIdx++) {
-				const subProgram = instruction.programs[progIdx];
-				const subIndexByInstruction = new Map<Instruction, number>();
-				for (let subI = 0; subI < subProgram.instructions.length; subI++) {
-					subIndexByInstruction.set(subProgram.instructions[subI], subI);
-				}
-				for (let subI = 0; subI < subProgram.instructions.length; subI++) {
-					const subInstruction = subProgram.instructions[subI];
-					const subDependencies = subInstruction.params
-						.map(inst => subIndexByInstruction.get(inst))
-						.filter((idx): idx is number => idx !== undefined);
-
-					entries.push({
-						addr: scheduler.instructions.length + progIdx * 1000 + subI, // offset for sub-programs
-						dependencies: subDependencies,
-						description: subInstruction.note || `SUB_INSTRUCTION_${progIdx}_${subI}`,
-						isSubprogram: true,
-						parentAddr: i,
-					});
-				}
+			for (const subProgram of instruction.programs) {
+				appendSchedulerEntries(subProgram, addr, entries);
 			}
 		}
 	}
-
-	return entries;
 }
 
 // Scheduler program explanation function (table-valued function)
@@ -565,12 +560,17 @@ export const executionTraceFunc = createIntegratedTableValuedFunction(
 						};
 
 						if (subProgramDetail) {
-							// Add instruction details from the sub-program
-							const instructions = subProgramDetail.scheduler.instructions.map((instr: Instruction, idx: number) => ({
-								index: idx,
-								operation: instr.note || `instruction_${idx}`,
-								dependencies: instr.params.map((_, paramIdx) => paramIdx).filter((paramIdx) => paramIdx < idx)
-							}));
+							// Add instruction details from the sub-program, addressed the same
+							// way as every other row so they can be looked up in the listing.
+							const subScheduler = subProgramDetail.scheduler;
+							const instructions = subScheduler.instructions.map((instr: Instruction, idx: number) => {
+								const address = subScheduler.addressOf(idx);
+								return {
+									index: address,
+									operation: instr.note || `instruction_${address}`,
+									dependencies: subScheduler.dependencyAddressesOf(idx)
+								};
+							});
 							return { ...baseInfo, instructions };
 						}
 

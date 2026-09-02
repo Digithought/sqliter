@@ -20,7 +20,7 @@ const TRACED_ITERABLE_SYMBOL = Symbol('tracedIterable');
 function wrapIterableForTracing<T>(
 	src: AsyncIterable<T>,
 	ctx: RuntimeContext,
-	instructionIndex: number,
+	address: number,
 	instruction: Instruction
 ): AsyncIterable<T> {
 	// Prevent double-wrapping
@@ -34,7 +34,7 @@ function wrapIterableForTracing<T>(
 		for await (const row of src) {
 			// Only emit row trace events for valid rows (non-empty arrays)
 			if (Array.isArray(row) && row.length > 0) {
-				tracer.traceRow(instructionIndex, instruction, rowIndex++, row as Row);
+				tracer.traceRow(address, instruction, rowIndex++, row as Row);
 			}
 			yield row;
 		}
@@ -89,14 +89,29 @@ export class Scheduler {
 	readonly instructions: Instruction[] = [];
 	/** Index of the instruction that consumes the output of each instruction. */
 	readonly destinations: ResultDestination[];
+	/** Local indices of the instructions producing each instruction's arguments, in param order. */
+	private readonly argIndexes: number[][] = [];
+
+	/**
+	 * Instruction count of this scheduler plus every program nested under it.
+	 * Computable in the constructor because emission is bottom-up: `emitCall` has
+	 * already built (and attached, via `instruction.programs`) every nested
+	 * scheduler by the time this one is constructed.
+	 */
+	readonly totalInstructionCount: number;
+
+	/**
+	 * First global address occupied by this scheduler; meaningful only once
+	 * {@link ensureAddressesAssigned} has run on the root of the program tree.
+	 */
+	private base = 0;
+	private addressesAssigned = false;
 
 	constructor(root: Instruction) {
-		const argIndexes: number[][] = [];
-
 		const buildPlan = (inst: Instruction): number => {
 			const instArgIndexes = inst.params.map(p => buildPlan(p));
 			const currentIndex = this.instructions.push(inst) - 1;
-			argIndexes[currentIndex] = instArgIndexes;
+			this.argIndexes[currentIndex] = instArgIndexes;
 			return currentIndex;
 		};
 
@@ -104,14 +119,87 @@ export class Scheduler {
 
 		this.destinations = new Array<ResultDestination>(this.instructions.length).fill(null);
 
+		let total = this.instructions.length;
 		for (let instIndex = 0; instIndex < this.instructions.length; ++instIndex) {
-			const instArgIndexes = argIndexes[instIndex];
+			const instArgIndexes = this.argIndexes[instIndex];
 			if (instArgIndexes) {
 				for (let argIndex = 0; argIndex < instArgIndexes.length; ++argIndex) {
 					this.destinations[instArgIndexes[argIndex]] = instIndex;
 				}
 			}
+			const programs = this.instructions[instIndex].programs;
+			if (programs) {
+				for (const program of programs) {
+					total += program.totalInstructionCount;
+				}
+			}
 		}
+		this.totalInstructionCount = total;
+	}
+
+	// --- Instruction addressing -------------------------------------------------
+	//
+	// A query's instructions live in a *tree* of schedulers: the root program plus
+	// one nested `Scheduler` per `emitCall` (the only place `instruction.programs`
+	// is set, so every nested scheduler has exactly one owner). Each scheduler
+	// numbers its own instructions from 0, which is all the dispatch loops need —
+	// but two different schedulers then both have an instruction "1", and any
+	// consumer that joins on that number (`execution_trace()` joining trace events
+	// against the `scheduler_program()` listing) conflates them.
+	//
+	// So the tree gets one flat address space, depth-first and deterministic from
+	// the instruction tree alone:
+	//
+	//   a scheduler with base B and N own instructions occupies
+	//     B .. B+N-1                 its own instructions, in scheduler order
+	//     then, in order of (owning instruction index, program index),
+	//     each nested program takes the next block of its own totalInstructionCount
+	//
+	// Addresses are assigned lazily and only on the tracing path: normal execution
+	// (the optimized and metrics dispatch loops) never needs them and must not pay
+	// for them.
+
+	/** Global address of local instruction `index` within the whole program tree. */
+	addressOf(index: number): number {
+		return this.base + index;
+	}
+
+	/** First global address of this scheduler's own instructions. */
+	get baseAddress(): number {
+		return this.base;
+	}
+
+	/** Global addresses of the instructions producing local instruction `index`'s arguments. */
+	dependencyAddressesOf(index: number): number[] {
+		return (this.argIndexes[index] ?? []).map(argIndex => this.addressOf(argIndex));
+	}
+
+	/**
+	 * Assigns global addresses across this scheduler and everything nested under
+	 * it, treating this scheduler as the root of the address space. Idempotent, and
+	 * memoized so a cached scheduler pays it once.
+	 *
+	 * A nested scheduler never has to assign for itself: its root always runs
+	 * first and stamps it on the way through, so the no-op guard below is what its
+	 * own tracing-path call hits.
+	 */
+	ensureAddressesAssigned(): void {
+		if (this.addressesAssigned) return;
+		this.assignAddresses(0);
+	}
+
+	/** Stamps `base` on this scheduler and its nested programs; returns the next free address. */
+	private assignAddresses(base: number): number {
+		this.base = base;
+		this.addressesAssigned = true;
+		let next = base + this.instructions.length;
+		for (const instruction of this.instructions) {
+			if (!instruction.programs) continue;
+			for (const program of instruction.programs) {
+				next = program.assignAddresses(next);
+			}
+		}
+		return next;
 	}
 
 	run(ctx: RuntimeContext): OutputValue {
@@ -127,6 +215,9 @@ export class Scheduler {
 		} else if (!ctx.tracer) {
 			result = this.runSyncLoop(ctx, this.optimizedHooks());
 		} else {
+			// Tracing is the only mode whose events are joined against an instruction
+			// listing, so it is the only mode that pays for global addressing.
+			this.ensureAddressesAssigned();
 			result = this.runSyncLoop(ctx, this.tracingHooks(ctx));
 		}
 
@@ -358,33 +449,40 @@ export class Scheduler {
 	 * iterables via {@link wrapIterableForTracing}. For a resolved-scalar promise
 	 * the async hook parks the ORIGINAL promise (deferring the await to the
 	 * destination), exactly as before the collapse.
+	 *
+	 * Every event is reported under the instruction's *global* address
+	 * ({@link addressOf}), not its scheduler-local index, so events from a nested
+	 * sub-program cannot land on a main-program instruction that happens to share
+	 * a local index.
 	 */
 	private tracingHooks(ctx: RuntimeContext): RunHooks {
 		const tracer = ctx.tracer!;
 		return {
-			onInput: (i, instruction, args) => tracer.traceInput(i, instruction, args),
+			onInput: (i, instruction, args) => tracer.traceInput(this.addressOf(i), instruction, args),
 			runInstruction: (_index, instruction, rctx, args) => instruction.run(rctx, ...args),
 			onSyncOutput: (i, instruction, output) => {
+				const address = this.addressOf(i);
 				let traced = output;
 				if (isAsyncIterable(traced)) {
-					traced = wrapIterableForTracing(traced, ctx, i, instruction);
+					traced = wrapIterableForTracing(traced, ctx, address, instruction);
 				}
-				tracer.traceOutput(i, instruction, traced);
+				tracer.traceOutput(address, instruction, traced);
 				return traced;
 			},
 			onAsyncOutput: async (i, instruction, output) => {
+				const address = this.addressOf(i);
 				let resolved = output instanceof Promise ? await output : output;
 				// Default: keep the original output for flow control (re-defers a
 				// resolved-scalar promise to its destination).
 				let parkValue: OutputValue = output;
 				if (isAsyncIterable(resolved)) {
-					resolved = wrapIterableForTracing(resolved, ctx, i, instruction);
+					resolved = wrapIterableForTracing(resolved, ctx, address, instruction);
 					parkValue = resolved;
 				}
-				tracer.traceOutput(i, instruction, resolved);
+				tracer.traceOutput(address, instruction, resolved);
 				return parkValue;
 			},
-			onError: (i, instruction, error) => tracer.traceError(i, instruction, error as Error),
+			onError: (i, instruction, error) => tracer.traceError(this.addressOf(i), instruction, error as Error),
 		};
 	}
 
