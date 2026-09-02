@@ -68,3 +68,15 @@ Whether the *engine* should hold table-definition changes and concurrent reads
 apart with a lock is a separate, already-filed question
 (`backlog/debt-concurrent-reads-schema-gate`). This ticket is only about what the
 conformance check exercises.
+
+## Arm 3 — the "snapshot must advance" step never uses a committed read (being closed separately)
+
+Found while working `fix/2-bug-committed-read-opt-in-also-forfeits-refresh`, and
+closed by `implement/2-committed-read-freshness-bound` rather than here, because
+it is an active bug that already broke a downstream deployment.
+
+Recorded so it is not re-discovered: step 6 (`assertAdvancesAfterCommit`) proves
+the snapshot advances using an **ordinary** read, never a committed one, so a
+backend that pins only its committed connections passes the whole harness. That
+implement ticket adds the committed leg plus a stub for it. Arms 1 and 2 above
+are untouched by it and still stand.
