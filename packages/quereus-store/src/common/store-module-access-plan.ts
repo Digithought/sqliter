@@ -658,13 +658,19 @@ function computeFilterAccessPlan(
 	// the module rejects it here. Built once and re-explained on the way out rather than
 	// re-deriving `AccessPlanBuilder.fullScan`'s cost formula for the comparison — the
 	// drift {@link AccessPlanBuilder.addCost} exists to prevent.
+	// The ordering advertisement is resolved BEFORE the cost, because under a plan-time
+	// LIMIT the price depends on it: a scan whose PK order already satisfies the request
+	// stops at the bound, one that gets a Sort above it does not. Pricing the seek arms
+	// against the bound without doing the same here would bias the veto below.
+	const scanOrdering = buildPkOrderingAdvertisement(tableInfo, request, pkOrderPreservingPrefix);
+	const scanHandledFilters: boolean[] = new Array(request.filters.length).fill(false);
 	const scanPlan: BestAccessPlanResult = {
 		...AccessPlanBuilder
-			.fullScan(estimatedRows)
-			.setHandledFilters(new Array(request.filters.length).fill(false))
+			.fullScan(rowsToProduce(request, estimatedRows, scanOrdering.providesOrdering, scanHandledFilters))
+			.setHandledFilters(scanHandledFilters)
 			.setExplanation('Store full table scan')
 			.build(),
-		...buildPkOrderingAdvertisement(tableInfo, request, pkOrderPreservingPrefix),
+		...scanOrdering,
 	};
 
 	const indexes = tableInfo.indexes || [];
@@ -791,6 +797,43 @@ function orderingAlreadySatisfied(
 }
 
 /**
+ * How many rows a candidate plan actually has to produce, given a plan-time LIMIT.
+ *
+ * `request.limit` is a licence to stop early, not a hint: the engine populates it only
+ * when nothing between this module's scan and the LIMIT can discard a row (see
+ * {@link BestAccessPlanRequest.limit}). Two conditions still have to hold *per candidate*,
+ * because the licence is about the request while stopping early is about the plan:
+ *
+ *  - **The plan must provide the requested ordering.** A plan that does not gets a Sort
+ *    above it, and a Sort drains its input before emitting anything - the limit buys it
+ *    nothing. This is the gate that keeps the veto comparison honest: pricing only the
+ *    seek arms against the bound, and not the full scan that also satisfies the ordering,
+ *    would be a thumb on the scale rather than a correction.
+ *  - **The plan must claim every filter.** An unclaimed filter becomes a residual
+ *    `Filter` above this access, which can reject rows the scan produced - so the scan
+ *    has to keep going past the bound. This mirrors the engine's own truncation-safety
+ *    rule (`truncationIsSafe`, rule-grow-retrieve.ts), so the two agree by construction:
+ *    a plan this function prices against the bound is exactly a plan the engine will
+ *    accept the bound for.
+ *
+ * `limit + offset` is the bound, never `limit` alone - the engine's `LimitOffsetNode`
+ * still discards `offset` rows above whatever is emitted.
+ */
+function rowsToProduce(
+	request: BestAccessPlanRequest,
+	rows: number,
+	providesOrdering: readonly OrderingSpec[] | undefined,
+	handledFilters: readonly boolean[],
+): number {
+	const limit = request.limit;
+	if (limit === undefined || limit === null) return rows;
+	const required = request.requiredOrdering;
+	if (required && required.length > 0 && !orderingAlreadySatisfied(providesOrdering, required)) return rows;
+	if (handledFilters.some(handled => !handled)) return rows;
+	return Math.max(1, Math.min(rows, limit + (request.offset ?? 0)));
+}
+
+/**
  * Consider replacing `filterPlan` with an ordering-only walk of a secondary index: a
  * whole-index scan (`plan=0`) chosen purely for its emission order, with EVERY pushed
  * filter left to the residual `Filter`. `... order by n` with an index on `n` and no
@@ -821,13 +864,18 @@ function orderingAlreadySatisfied(
  *    it would otherwise need. Ties keep `filterPlan` — it is the plan the store already
  *    produces, and the sort estimate is the softer of the two numbers.
  *
- * NOTE: the walk is priced for the WHOLE table because `request.limit` is never
- * populated on this path — `trySortAbsorbViaIndexOrdering` builds its request with no
- * `limit`, and the `LimitOffset` grow arm that does populate one sits above the Sort,
- * not above the Retrieve. So `order by n limit 1` is priced exactly like `order by n`,
- * and a backend declaring an expensive `pointRead` (IndexedDB) prefers scan-then-sort
- * even under a tight LIMIT, where the walk would have read one row. The enabling engine
- * change is backlog `feat-sort-absorb-blind-to-limit`.
+ * The walk is priced against `request.limit` when one is present — see
+ * {@link rowsToProduce}, which a walk always qualifies for on the ordering test and
+ * qualifies for on the residual test only when there are no filters to leave behind.
+ *
+ * NOTE: only an engine-synthesized limit reaches here today. `ruleMinMaxIndexBoundary`
+ * passes the `LimitOffset(1)` it is about to wrap on, so `min(c)` / `max(c)` are priced
+ * as the one row they read. A limit the USER wrote still is not: it sits above the Sort,
+ * and `trySortAbsorbViaIndexOrdering` walks only downward from the Sort, so it has
+ * nothing to pass. `order by n limit 10` is therefore still priced exactly like
+ * `order by n`, and a backend declaring an expensive `pointRead` still prefers
+ * scan-then-sort under it. The remaining engine change is backlog
+ * `feat-sort-absorb-blind-to-limit-general`.
  */
 function chooseOrderingPlan(
 	db: Database,
@@ -911,11 +959,16 @@ function buildOrderingWalkPlan(
 	estimatedRows: number,
 	profile: ResolvedCostProfile,
 ): BestAccessPlanResult {
+	// A walk provides the required ordering by construction, so a plan-time LIMIT reaches
+	// it - but only when there is nothing to leave in the residual, since the walk claims
+	// no filters at all and a residual `Filter` above it would drain past the bound.
+	const handledFilters: boolean[] = new Array(request.filters.length).fill(false);
+	const walkRows = rowsToProduce(request, estimatedRows, required, handledFilters);
 	const plan = AccessPlanBuilder
-		.rangeScan(estimatedRows)
-		.addCost(estimatedRows * profile.pointRead)
-		.addCost(estimatedRows * request.filters.length * RESIDUAL_FILTER_COST_PER_ROW)
-		.setHandledFilters(new Array(request.filters.length).fill(false))
+		.rangeScan(walkRows)
+		.addCost(walkRows * profile.pointRead)
+		.addCost(walkRows * request.filters.length * RESIDUAL_FILTER_COST_PER_ROW)
+		.setHandledFilters(handledFilters)
 		.setIndexName(index.name)
 		.setExplanation(`Store index ordering walk on ${index.name}`)
 		.build();
@@ -1146,10 +1199,16 @@ function tryIndexAccessPlan(
 	);
 	const rows = Math.max(1, Math.floor(estimatedRows * selectivity));
 	/** The arm's shape — `AccessPlanBuilder`'s per-row index-entry term, no resolution. */
-	const armShape = (): AccessPlanBuilder =>
-		isRange ? AccessPlanBuilder.rangeScan(rows, 0.2) : AccessPlanBuilder.eqMatch(rows, 0.3);
-	/** The arm's shape plus one per-fetched-row resolution term at the given price. */
-	const seekingArm = (pointRead: number): AccessPlanBuilder => armShape().addCost(rows * pointRead);
+	const armShape = (n: number = rows): AccessPlanBuilder =>
+		isRange ? AccessPlanBuilder.rangeScan(n, 0.2) : AccessPlanBuilder.eqMatch(n, 0.3);
+	/**
+	 * The arm's shape plus one per-fetched-row resolution term at the given price.
+	 * `n` defaults to the arm's full row estimate; a single-window arm that provides the
+	 * requested ordering under a plan-time LIMIT passes the smaller bound instead — it
+	 * traverses and resolves only the entries it emits. See {@link rowsToProduce}.
+	 */
+	const seekingArm = (pointRead: number, n: number = rows): AccessPlanBuilder =>
+		armShape(n).addCost(n * pointRead);
 	const costOnly = (why: string): IndexPlanCandidate => {
 		// NO ordering claim on a cost-only decline, ever: it names no index and no seek
 		// columns, so the engine sequentially scans the DATA store in primary-key order.
@@ -1296,14 +1355,20 @@ function tryIndexAccessPlan(
 	// advertised (like the row estimate, and unlike a degraded arm's dropped bound, the
 	// pinned set `eqCols` is the same either way). The multi-seek and cost-only returns
 	// above deliberately make no claim; the reasons are stated at each.
+	const ordering = buildIndexOrderingAdvertisement(db, tableInfo, request, index, indexKeyCollations, eqCols);
+	// Resolved before the cost: an arm that satisfies the ordering under a plan-time LIMIT
+	// reads only `limit + offset` entries, and that is the whole point of the request
+	// carrying one. An arm that does not satisfy it, or that leaves a filter in the
+	// residual, is priced for every row it matches.
+	const producedRows = rowsToProduce(request, rows, ordering.providesOrdering, handledFilters);
 	const plan = {
-		...seekingArm(profile.pointRead)
+		...seekingArm(profile.pointRead, producedRows)
 			.setHandledFilters(handledFilters)
 			.setIndexName(index.name)
 			.setSeekColumns(seekCols)
 			.setExplanation(`Store index ${armLabel} on ${index.name}`)
 			.build(),
-		...buildIndexOrderingAdvertisement(db, tableInfo, request, index, indexKeyCollations, eqCols),
+		...ordering,
 	};
 	return {
 		plan,
@@ -1314,7 +1379,7 @@ function tryIndexAccessPlan(
 		// price is re-derived from `armShape()` rather than adjusted off `plan.cost`, so it is
 		// the exact number the pre-profile module produced rather than a float round trip
 		// through the declared one.
-		vetoCost: statsBacked ? plan.cost : seekingArm(PARITY_COST_PROFILE.pointRead).build().cost,
+		vetoCost: statsBacked ? plan.cost : seekingArm(PARITY_COST_PROFILE.pointRead, producedRows).build().cost,
 		isMultiSeek: false,
 		statsBacked,
 	};

@@ -591,6 +591,58 @@ function orderingMatches(
 	return true;
 }
 
+/** A row bound a caller already knows, to be handed to the module as LIMIT/OFFSET. */
+export interface RowsWanted {
+	/** Rows the caller can consume. */
+	limit: number;
+	/** Rows discarded before those — a module may only stop after `limit + offset`. */
+	offset: number;
+}
+
+/**
+ * Whether a module may stop producing after `limit + offset` rows.
+ *
+ * `BestAccessPlanRequest.limit` is a truncation contract, not a pricing hint — its
+ * sibling `offset` explicitly invites a module to stamp `scan-side limit = limit +
+ * offset` — so it may only be sent when nothing between the module's scan and the
+ * LimitOffset can discard a row. Filtering above a truncated scan UNDERPRODUCES:
+ * `min(c)` over a scan stopped at one row whose `c` is then filtered out returns NULL
+ * rather than the minimum.
+ *
+ * A row survives to the limit when every Filter it passes through is one the access
+ * plan already claimed — a claimed constraint cannot reject a row the module produced
+ * under it. So every conjunct of every Filter below the Sort must match, by node
+ * identity, the `sourceExpression` of a constraint the plan reported handled.
+ *
+ * Deliberately conservative in three ways, because the failure mode is a wrong answer
+ * and the cost of declining is only the pricing this ticket set out to improve:
+ *  - a conjunct that never became a constraint at all is invisible to the residual
+ *    assembly, so this tests the Filters themselves rather than `residualPredicate`;
+ *  - identity matching means a constraint synthesized from something other than the
+ *    conjunct it came from (an OR_RANGE union, say) simply fails to cover it;
+ *  - the walk descends into every child, so a Filter inside a subquery — which is not
+ *    between the scan and the limit at all — declines rather than being reasoned about.
+ */
+function truncationIsSafe(
+	source: PlanNode,
+	constraints: readonly PredicateConstraint[],
+	handledFilters: readonly boolean[],
+): boolean {
+	const claimed = new Set<ScalarPlanNode>();
+	constraints.forEach((c, i) => {
+		if (handledFilters[i]) claimed.add(c.sourceExpression);
+	});
+
+	const survivesEveryFilter = (node: PlanNode): boolean => {
+		if (node instanceof FilterNode
+			&& !splitConjuncts(node.predicate).every(conjunct => claimed.has(conjunct))) {
+			return false;
+		}
+		return node.getChildren().every(survivesEveryFilter);
+	};
+	return survivesEveryFilter(source);
+}
+
 /**
  * Attempt to absorb a Sort whose Retrieve is reachable through a chain of
  * commuting unary operators (Project, Filter). When the table's access plan
@@ -609,8 +661,18 @@ function orderingMatches(
  * `getBestAccessPlan` and either returns a NEW tree or null, never mutating the
  * tree it was handed and never recording anything on `context`. A caller that
  * gets null must be able to discard its probe input and leave the plan untouched.
+ *
+ * `rowsWanted` is how a caller that already knows the LIMIT tells the module about
+ * it. Only `rule-minmax-index-boundary` can: it synthesizes its own
+ * `LimitOffset(1)` right after this probe, so it knows the bound before it asks.
+ * A LIMIT the user wrote sits ABOVE the Sort, and this rule walks only downward —
+ * that case is backlog `feat-sort-absorb-blind-to-limit-general`.
  */
-export function trySortAbsorbViaIndexOrdering(sort: SortNode, context: OptContext): PlanNode | null {
+export function trySortAbsorbViaIndexOrdering(
+	sort: SortNode,
+	context: OptContext,
+	rowsWanted?: RowsWanted,
+): PlanNode | null {
 	// Walk down through commuting unary operators to find the RetrieveNode.
 	const chain: (ProjectNode | FilterNode)[] = [];
 	let current: PlanNode = sort.source;
@@ -678,7 +740,29 @@ export function trySortAbsorbViaIndexOrdering(sort: SortNode, context: OptContex
 		estimatedRows: tableRef.estimatedRows || context.stats.tableRows(tableSchema) || 1000,
 	};
 
-	const accessPlan = vtabModule.getBestAccessPlan(context.db, tableSchema, request) as BestAccessPlanResult;
+	// Probe WITH the limit first, then validate what comes back. Probing limit-free
+	// first cannot work: a module that vetoes its ordered arm on whole-table pricing
+	// answers with an unordered plan, `orderingMatches` fails, and this returns null
+	// before a second phase could run — which is precisely the case `rowsWanted` exists
+	// to fix. Validating afterwards costs at most one extra probe, and none at all when
+	// no caller passed a bound. `getBestAccessPlan` is pure at plan time, so a discarded
+	// probe leaves nothing behind.
+	const probe = (bound: RowsWanted | undefined): BestAccessPlanResult =>
+		vtabModule.getBestAccessPlan!(
+			context.db,
+			tableSchema,
+			bound ? { ...request, limit: bound.limit, offset: bound.offset } : request,
+		) as BestAccessPlanResult;
+
+	let accessPlan = probe(rowsWanted);
+	if (rowsWanted && !truncationIsSafe(sort.source, constraints, accessPlan.handledFilters)) {
+		// The module was told it may stop after `limit + offset` rows and something above
+		// its scan can still discard one, so the plan it returned may be priced — or
+		// truncated — against a bound the engine cannot honour. Discard it and ask again
+		// without the bound.
+		log('Limit is not truncation-safe for this subtree; re-probing without it');
+		accessPlan = probe(undefined);
+	}
 
 	// Only proceed if the plan actually satisfies the ordering — every requested
 	// position must be provided by the SAME column and direction, not merely

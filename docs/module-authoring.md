@@ -150,10 +150,31 @@ interface BestAccessPlanRequest {
   columns: readonly ColumnMeta[];
   filters: readonly PredicateConstraint[];
   requiredOrdering?: OrderingSpec;
-  limit?: number | null;
+  limit?: number | null;   // present ONLY when stopping early is provably safe — see below
+  offset?: number | null;  // travels with `limit`; the bound is `limit + offset`
   estimatedRows?: number;
 }
+```
 
+**`limit` is a licence, not a hint.** When it is present the engine has already proven
+that nothing between your scan and the `LIMIT` can discard a row, so you may both price
+against it and truncate to it. When it cannot prove that, the field is *absent* rather
+than advisory — there is no "limit you should ignore". Two rules follow:
+
+- The bound is `limit + offset`, never `limit` alone. The engine's `LimitOffsetNode` still
+  discards `offset` rows above whatever you emit, so stopping at `limit` underproduces.
+- Apply it only to a candidate that **provides the requested ordering**, and only when
+  that candidate **claims every filter**. A plan that provides no ordering gets a Sort
+  above it, which drains its input before emitting anything; a plan that leaves a filter
+  in the residual gets a `Filter` above it, which can reject rows you already produced. If
+  you price *some* candidates against the bound and not others, you have not made your
+  cost model more accurate — you have put a thumb on the scale between them.
+
+`StoreModule` does exactly this in `rowsToProduce`
+(`packages/quereus-store/src/common/store-module-access-plan.ts`), applied uniformly to
+its seek arms, its ordering walk, and its full scan.
+
+```typescript
 interface BestAccessPlanResult {
   handledFilters: readonly boolean[];  // Which filters the module handles
   cost: number;                        // Cost estimate

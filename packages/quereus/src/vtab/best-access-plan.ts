@@ -239,7 +239,21 @@ export interface BestAccessPlanRequest {
 	filters: readonly PredicateConstraint[];
 	/** Required ordering that ancestor nodes need (ORDER BY) */
 	requiredOrdering?: readonly OrderingSpec[];
-	/** LIMIT value known at plan time */
+	/**
+	 * LIMIT value known at plan time, and a licence to stop early.
+	 *
+	 * The engine populates this ONLY when it can prove that nothing between this
+	 * module's scan and the LIMIT can discard a row — so a module may both price
+	 * against it and truncate to it. When the engine cannot prove that, the field is
+	 * absent rather than advisory: a module that stopped early under a filter it did
+	 * not claim would underproduce, and `min(c)` over a scan stopped at one row that
+	 * is then filtered out would answer NULL instead of the minimum.
+	 *
+	 * A module pricing against this must still charge the full row count for any plan
+	 * that does NOT provide the requested ordering — a Sort above it drains every row
+	 * regardless of the limit. Applying the bound to only some candidate plans biases
+	 * the comparison between them.
+	 */
 	limit?: number | null;
 	/**
 	 * OFFSET value known at plan time. Modules pushing LIMIT into the scan

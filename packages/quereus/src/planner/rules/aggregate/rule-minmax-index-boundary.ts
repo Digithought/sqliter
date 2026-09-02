@@ -97,7 +97,13 @@ export function ruleMinMaxIndexBoundary(node: PlanNode, context: OptContext): Pl
 	const probe = new SortNode(scope, inner, [
 		{ expression: colRef, direction: extremum.direction, nulls: undefined },
 	]);
-	const absorbed = trySortAbsorbViaIndexOrdering(probe, context);
+	// The `LimitOffset(1)` wrapped on below is synthesized HERE, so unlike a limit the
+	// user wrote — which sits above the Sort, where this rule's downward walk cannot see
+	// it — the bound is known before the probe. Telling the module lets it price a
+	// boundary read as the one row it is, instead of as an ordered read of the whole
+	// table; the absorb declines the bound on its own if anything below the Sort could
+	// still filter a row out. See `feat-sort-absorb-blind-to-limit`.
+	const absorbed = trySortAbsorbViaIndexOrdering(probe, context, { limit: 1, offset: 0 });
 	if (!absorbed) {
 		log('access path cannot serve %s ordering for %s; leaving the aggregate alone',
 			extremum.direction, colRef.toString());
