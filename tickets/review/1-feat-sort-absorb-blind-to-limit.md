@@ -94,8 +94,8 @@ boundary row is NULL still answering with the minimum rather than NULL.
 
 ## Known gaps — treat these as starting points, not as the finish line
 
-- **`yarn test:store` was not run before this handoff.** The change is in the store's
-  access planner, so that is a real gap; run it.
+- ~~`yarn test:store` was not run.~~ Run after the handoff was drafted: **10276 passing,
+  exit 0**, against the LevelDB store module. Closed, not outstanding.
 - **No engine-side unit test for `truncationIsSafe` in isolation.** It is exercised only
   through the store spec's end-to-end cases. A direct test over a Filter whose conjunct is
   unclaimed would be worth having, and would pin the identity assumption above.
