@@ -53,6 +53,49 @@ can. The engine therefore withholds the row bound, the module prices the ordered
 the entire table, decides scanning-and-sorting is cheaper, and the one-row read is priced
 out — exactly the symptom the original report described, for the nullable case only.
 
+## Narrowed by measurement, 2026-09-02 — the engine side is already done
+
+Probed directly rather than reasoned about, at `pointRead = 3.0` and at parity, over
+`select max(date) from entry where entity_id = 1` with a `(entity_id, date desc)` index:
+
+| `date` declared | backend | boundary read? |
+|---|---|---|
+| `not null` | `pointRead = 3.0` | **yes** |
+| `not null` | parity | yes |
+| `null` | `pointRead = 3.0` | no |
+| `null` | **parity** | **yes** |
+
+The nullable case working at parity is the finding. It means **the ordering claim is
+already granted for a nullable column** — `IS NOT NULL` is in `NULL_EXCLUDING_OPS`
+(`vtab/best-access-plan.ts`), so `nullSafeOrderingPrefixLength` does not truncate the DESC
+claim when the rewrite's own `is not null` filter is in `request.filters`. Nothing on the
+engine side is missing.
+
+The only thing separating the two rows is **price**: the filter is unclaimed, so
+`truncationIsSafe` withholds the bound, the arm is costed for every matching row, and the
+seek-vs-scan veto drops it — at parity it survives the veto anyway, which is exactly why
+this is invisible without a cost profile.
+
+So the whole ticket reduces to `claimFirstPerRole` claiming `IS NOT NULL`.
+
+### The part that is not a one-liner
+
+Claiming a filter asserts the scan will not emit rows violating it, and that is
+**direction-dependent** — which the original "NULLs are a contiguous run at the front, so
+it is a lower bound" framing gets right for only one of the two walks:
+
+- **ASC walk**: NULLs are emitted FIRST. Claiming `IS NOT NULL` requires genuinely seeking
+  past the NULL run — a real lower bound the key encoder has to express as "just above the
+  NULL tag". This is the case `min()` needs.
+- **DESC walk**: the store bit-inverts the key bytes, so NULLs land LAST. A bounded read
+  never reaches them, but an unbounded walk does — so claiming the filter outright would be
+  wrong for a full walk while being harmless under a limit. This is the case `max()` needs,
+  and it is the one the measurement above exercises.
+
+Do not add `'IS NOT NULL'` to a shared ops list and stop there. The claim has to be
+conditioned on the walk direction, and on the ASC side it needs the seek bound to actually
+exist.
+
 ## What is wanted
 
 The storage module should be able to serve `IS NOT NULL` on a seek column. On an
