@@ -3,7 +3,7 @@ import { Database } from '../../src/core/database.js';
 import { MemoryTableModule } from '../../src/vtab/memory/module.js';
 import { runCommittedReadConformance } from '../../src/vtab/test-support/committed-read-conformance.js';
 import { installCommitStall, type CommitStall } from '../../src/vtab/test-support/commit-stall.js';
-import { NoSeekMemoryModule, StaleSnapshotModule, TornPublishModule } from '../vtab/_conformance-stub-modules.js';
+import { NoSeekMemoryModule, StaleCommittedSnapshotModule, StaleSnapshotModule, TornPublishModule } from '../vtab/_conformance-stub-modules.js';
 
 /**
  * `runCommittedReadConformance` is the runnable form of the obligation a module
@@ -177,6 +177,34 @@ describe('committed-read conformance harness', () => {
 
 		expect(error).to.contain('still held their pre-write value');
 		expect(error).to.contain('crc-seed-1');
+	});
+
+	it('fails a module that pins only its committed reads, while ordinary reads refresh', async () => {
+		// The freshness bound has a lower half as well as an upper one: a committed
+		// read may be no staler than an ordinary read taken at the same instant.
+		// This module honours the upper half and violates the lower — mid-commit it
+		// is coherent, and its ORDINARY reads advance, so every check except the
+		// committed-path one in step 6 goes green.
+		db.registerModule('stale_committed', new StaleCommittedSnapshotModule());
+		await db.exec('create table conf (id integer primary key, v text) using stale_committed');
+
+		const error = await captureError(runCommittedReadConformance({
+			db,
+			table: 'conf',
+			keyColumn: 'id',
+			valueColumn: 'v',
+			rowCount: 20,
+			stallCommit: () => stall.asStallCommit(),
+		}));
+
+		// The message must name the committed-read path specifically — a future
+		// refactor must not be able to satisfy this case with the ordinary read's
+		// coarser "serving a stale snapshot to ordinary reads" error.
+		expect(error, 'names the committed path').to.contain("readConcurrency: 'committed'");
+		expect(error, 'names the connect option the module pinned on').to.contain('_readCommitted');
+		expect(error, 'the stale value is shown per row').to.contain('crc-seed-1');
+		expect(error, 'the ordinary-read checks passed, so their message must not be what fired')
+			.to.not.contain('still held their pre-write value');
 	});
 
 	it('rejects a rowCount it cannot seed a meaningful snapshot from', async () => {

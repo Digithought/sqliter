@@ -180,6 +180,58 @@ export class StaleSnapshotModule extends MemoryTableModule {
 }
 
 /**
+ * A DELIBERATELY non-conformant module of the subtlest kind: it pins served rows
+ * ONLY on `_readCommitted` connections and leaves every ordinary connection
+ * refreshing normally. Mid-commit it is perfectly coherent, and an ordinary read
+ * taken after the writer lands sees the new state — so the only thing that can
+ * catch it is asking the COMMITTED path whether it advanced too.
+ *
+ * This is the real-world shape: a module that fetches state from its peers on an
+ * ordinary read while its committed handle is a cached pre-transaction object it
+ * never re-fetches. Distinct from {@link StaleSnapshotModule}, which pins every
+ * connection; both failures are worth catching.
+ */
+export class StaleCommittedSnapshotModule extends MemoryTableModule {
+	/** First row ever served through a committed connection, per table: table → key → row. */
+	private readonly pinned = new Map<string, Map<string, Row>>();
+
+	private pinFirstSeenForCommittedReads(table: MemoryTable): MemoryTable {
+		const key = table.tableName.toLowerCase();
+		let rows = this.pinned.get(key);
+		if (!rows) {
+			rows = new Map();
+			this.pinned.set(key, rows);
+		}
+		const byKey = rows;
+		return interceptQuery(table, (source, _filterInfo, pkIndex) => (async function* () {
+			for await (const row of source) {
+				const rowKey = keyToString(row[pkIndex]);
+				const first = byKey.get(rowKey);
+				if (first) {
+					yield first;
+				} else {
+					byKey.set(rowKey, row);
+					yield row;
+				}
+			}
+		})());
+	}
+
+	override async connect(
+		db: Database,
+		pAux: unknown,
+		moduleName: string,
+		schemaName: string,
+		tableName: string,
+		options: MemoryTableConfig,
+		tableSchema?: TableSchema,
+	): Promise<MemoryTable> {
+		const table = await super.connect(db, pAux, moduleName, schemaName, tableName, options, tableSchema);
+		return options?._readCommitted === true ? this.pinFirstSeenForCommittedReads(table) : table;
+	}
+}
+
+/**
  * Snapshot-safe like the memory vtab, but never offers a seek: every filter comes
  * back unhandled, so a range predicate plans as a scan plus a residual filter.
  * Exercises the harness's explicit "index-driven leg skipped" reporting, which

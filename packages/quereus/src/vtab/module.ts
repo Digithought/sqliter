@@ -177,6 +177,13 @@ export interface VirtualTableModule<
 	 * index-driven access paths (an index-driven plan and a full scan of the same
 	 * connection must agree).
 	 *
+	 * **The pinned state must be re-taken per scan.** "At or before the read began"
+	 * is an upper bound only; the matching lower bound is that a committed read
+	 * beginning after a commit has landed must observe it, so a committed read is
+	 * never staler than an ordinary read taken at the same instant. A connection
+	 * that captures one state and serves it across statements does NOT meet this
+	 * declaration, however coherent each individual scan looks.
+	 *
 	 * Omit (default `false`) to decline the engine's concurrent committed-read
 	 * path; reads against this module then keep taking today's serialized path.
 	 * Declining is not a defect — `_readCommitted` on its own still means only

@@ -240,8 +240,11 @@ function withStallTimeout<T>(work: Promise<T>, ms: number, what: string): Promis
  *     Without a provable park the bar drops to "each read equals ONE whole state,
  *     pre- or post-write" — a mix is still a failure, but a writer that landed
  *     before the read is not;
- *  6. release, await the writer, and assert a fresh read now sees the post-write
- *     state (so a module that serves permanently stale data fails too).
+ *  6. release, await the writer, and assert that a fresh read now sees the
+ *     post-write state — checked on BOTH an ordinary read and a
+ *     `readConcurrency: 'committed'` read, so neither a module that serves
+ *     permanently stale data nor one that pins only its `_readCommitted`
+ *     connections across statements can pass.
  *
  * @throws Error with the specific divergence on any failure.
  */
@@ -512,7 +515,12 @@ function assertLegsAgree(fullScan: readonly SnapshotRow[], indexDriven: readonly
 
 /**
  * Step 6: a module that pins a snapshot but never advances it would pass every
- * check above. After the writer lands, a fresh read must see the new state.
+ * check above. After the writer lands, a fresh read must see the new state — on
+ * the ordinary path AND on the committed path, since a module can pin only its
+ * `_readCommitted` connections and refresh on every other one.
+ *
+ * The ordinary checks run first on purpose: they catch the coarser "everything is
+ * stale" module and say so in plainer terms than a cross-path comparison could.
  */
 async function assertAdvancesAfterCommit(db: Database, plan: RunPlan): Promise<void> {
 	const after = await collectSnapshot(db, plan.projection);
@@ -528,6 +536,33 @@ async function assertAdvancesAfterCommit(db: Database, plan: RunPlan): Promise<v
 			`committed-read conformance: after the writer committed, ${stale.length} of ${after.length} rows still held their pre-write value ` +
 			`(first: key ${stale[0].key} = ${JSON.stringify(stale[0].value)}). A pinned snapshot must advance once the commit lands ` +
 			`— seeding was ${plan.rowCount} rows.`,
+		);
+	}
+
+	// The checks above only ever asked the ORDINARY path. A module whose
+	// `_readCommitted` connections pin one state and never re-pin — while every
+	// other path refreshes normally — passes all of them, and that is exactly the
+	// shape a module fetching state from elsewhere has when its committed handle
+	// is a cached pre-transaction object it never re-fetches.
+	//
+	// NOTE: `readConcurrency: 'committed'` falls back to the serialized path
+	// silently when a statement is ineligible, and the engine exposes no signal
+	// for which path a read actually took. This check is meaningful only because a
+	// read-only autocommit query over a declaring module is eligible today; if the
+	// eligibility rules ever narrow, this comparison degrades into an ordinary read
+	// against an ordinary read and passes vacuously. The mid-commit legs (steps
+	// 4–5) would catch that regression via their stall timeout — they are the
+	// canary — but if eligibility is ever reworked, re-verify this step against
+	// `StaleCommittedSnapshotModule` in test/vtab/_conformance-stub-modules.ts.
+	const afterCommitted = await collectSnapshot(db, plan.projection, { readCommitted: true });
+	if (!matches(afterCommitted, after)) {
+		throw new Error(
+			`committed-read conformance: after the writer committed, a read with readConcurrency: 'committed' returned ${afterCommitted.length} rows ` +
+			`that disagree with an ordinary read of the same committed state (${after.length} rows). ` +
+			`Divergences — ${describeDivergences(after, afterCommitted)}. ` +
+			`The module's _readCommitted connection appears to pin its state ACROSS statements. Pinning is required only for the life of a ` +
+			`single scan: every new committed read must re-pin to the state committed as of the moment that read begins, so a committed read ` +
+			`may never be staler than an ordinary read taken at the same instant.`,
 		);
 	}
 }

@@ -29,6 +29,21 @@ interface VirtualTableModule {
 > connection's commit landing mid-iteration, including across concurrent DDL on
 > that table, and including across index-driven access paths (an index-driven plan
 > and a full scan of the same connection must agree).
+>
+> **And it may be no *older* than that boundary.** The state is pinned for the life
+> of **one scan**, not for the life of a connection, a table, or a process: a
+> committed read that *begins* after a commit has landed must observe that commit.
+> Equivalently — a `_readCommitted` read may never be staler than an ordinary read
+> of the same module taken at the same instant. Holding one state across a scan is
+> the obligation; holding it across scans is a defect.
+
+The freshness bound is the half that is easy to miss, because "at or before the
+moment the read began" is an upper bound only, and a module that captures one
+snapshot and serves it unchanged forever satisfies that clause literally. It is
+also the half a module is most likely to break by accident, since the natural way
+to implement the upper bound — capture a handle, serve from it — becomes a
+violation the moment that handle is cached beyond the scan that opened it. Both
+halves are checked by the conformance harness below.
 
 Why the bar is that high: once reads overlap commits, *"read the committed store
 directly"* and *"read a consistent committed state"* stop being the same
@@ -121,7 +136,9 @@ this is the rule to copy: open a **separate** underlying handle for a
 `_readCommitted` connect rather than re-serving the writer's, or you silently
 degrade a snapshot-safe underlying to a tearing one. Do not cache that handle for
 the table's lifetime either — an underlying that pins its snapshot at first pull
-would then serve the same, ever-staler state forever.
+would then serve the same, ever-staler state forever, which is the freshness bound
+in [the obligation](#the-declaration-and-its-obligation) broken by caching rather
+than by tearing.
 
 ## Proving it: the conformance harness
 
@@ -175,8 +192,13 @@ What it does, in order:
    before the read began is not — and the two legs are not compared, since they
    may legitimately straddle the commit.
 6. Releases the stall, awaits the writer, and asserts a fresh read now sees the
-   post-write state — so a module that pins a snapshot and never advances it fails
-   too. Finally it deletes the rows it wrote.
+   post-write state — the freshness bound. Both paths are checked: an ordinary
+   read (which catches a module that is stale on *every* path) and then a
+   `readConcurrency: 'committed'` read compared against it (which catches the
+   subtler module that pins only its `_readCommitted` connections while ordinary
+   reads refresh normally — the shape a module takes when its committed handle is
+   a cached pre-transaction object it never re-fetches). Finally it deletes the
+   rows it wrote.
 
 **Read `observedCommitOverlap` before believing a pass.** It is `true` only when a
 `stallCommit` was supplied *and* the writer stayed parked for the whole of both
