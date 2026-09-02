@@ -450,6 +450,9 @@ function fallbackIndexSupports(
 			log('No usable constant LIMIT (or non-literal OFFSET present)');
 			return undefined;
 		}
+		// Reached by an explicit numeric OFFSET only (`limit 5 offset 0` gets here;
+		// a bare `limit 5` is refused above). The probe below sends this through
+		// `probeAccessPlan`, which strips it again unless truncation is provably safe.
 		request.limit = limitVal;
 		request.offset = offsetVal;
 		log('Extracted limit=%d offset=%d', limitVal, offsetVal);
@@ -477,8 +480,17 @@ function fallbackIndexSupports(
 		request.requiredOrdering ? 'yes' : 'no',
 		request.limit ?? 'none');
 
-	// Get access plan from module
-	const accessPlan = vtabModule.getBestAccessPlan!(context.db, tableSchema, request);
+	// Get access plan from module. The LimitOffset arm above is the other site that can
+	// populate `request.limit`, so it goes through the same funnel: the region that could
+	// still discard a row is everything below `node` (the swallowed LimitOffset's own
+	// source pipeline, Retrieve included). The Filter and Sort arms carry no limit, so
+	// this is a plain single probe for them.
+	const accessPlan = probeAccessPlan(
+		req => vtabModule.getBestAccessPlan!(context.db, tableSchema, req) as BestAccessPlanResult,
+		request,
+		plannerConstraints,
+		node,
+	);
 
 	// No-clobber guard: never replace an equipped ordering plan with one that does
 	// not provide the same ordering (same column indexes + directions). Declining
@@ -622,25 +634,73 @@ export interface RowsWanted {
  *    conjunct it came from (an OR_RANGE union, say) simply fails to cover it;
  *  - the walk descends into every child, so a Filter inside a subquery — which is not
  *    between the scan and the limit at all — declines rather than being reasoned about.
+ *
+ * Only `FilterNode` discards rows in the region this walks: the chain between the Sort
+ * and the Retrieve admits Project and Filter alone, and a module pipeline under
+ * `Retrieve.source` is built from the same two. A row-discarding node type reaching that
+ * region would need adding here.
  */
 function truncationIsSafe(
 	source: PlanNode,
 	constraints: readonly PredicateConstraint[],
 	handledFilters: readonly boolean[],
 ): boolean {
+	// One expression can yield SEVERAL constraints — a BETWEEN yields its `>=` and its
+	// `<=` from the same node — and they can be claimed independently: `where b > 0 and b
+	// between 1 and 5` lets the module take the earlier `b > 0` as its lower bound and
+	// only the BETWEEN's upper half. `assembleResidual` then puts the whole BETWEEN back
+	// in the residual Filter, so covering it off the claimed half alone would license a
+	// truncation the residual can still underproduce. An expression covers a conjunct only
+	// when EVERY constraint it produced was claimed.
 	const claimed = new Set<ScalarPlanNode>();
+	const unclaimed = new Set<ScalarPlanNode>();
 	constraints.forEach((c, i) => {
-		if (handledFilters[i]) claimed.add(c.sourceExpression);
+		(handledFilters[i] ? claimed : unclaimed).add(c.sourceExpression);
 	});
+	const covers = (conjunct: ScalarPlanNode): boolean =>
+		claimed.has(conjunct) && !unclaimed.has(conjunct);
 
 	const survivesEveryFilter = (node: PlanNode): boolean => {
-		if (node instanceof FilterNode
-			&& !splitConjuncts(node.predicate).every(conjunct => claimed.has(conjunct))) {
+		if (node instanceof FilterNode && !splitConjuncts(node.predicate).every(covers)) {
 			return false;
 		}
 		return node.getChildren().every(survivesEveryFilter);
 	};
 	return survivesEveryFilter(source);
+}
+
+/**
+ * Probe `getBestAccessPlan`, honouring the truncation contract on `request.limit`.
+ *
+ * EVERY site that populates `request.limit` goes through here — that single funnel is
+ * what keeps the field's documented "licence, not a hint" contract true. A request
+ * carrying a limit is probed WITH it, and the plan that comes back is kept only when
+ * {@link truncationIsSafe} holds for the constraints that plan actually claimed;
+ * otherwise the limit is stripped and the module is asked again.
+ *
+ * Probing limit-free first cannot work: a module that vetoes its ordered arm on
+ * whole-table pricing answers with an unordered plan, the caller's ordering check fails,
+ * and it gives up before a second phase could run — which is precisely the case the
+ * bound exists to fix. Validating afterwards costs at most one extra probe, and none at
+ * all when the request carries no limit. `getBestAccessPlan` is pure at plan time, so a
+ * discarded probe leaves nothing behind.
+ *
+ * `subtree` is the region between the module's scan and the LIMIT — everything that
+ * could still discard a row the module produced. `constraints` is `request.filters` in
+ * its planner-side form: `handledFilters` is positional against it, and only that form
+ * carries the `sourceExpression` the safety check matches on.
+ */
+function probeAccessPlan(
+	ask: (request: BestAccessPlanRequest) => BestAccessPlanResult,
+	request: BestAccessPlanRequest,
+	constraints: readonly PredicateConstraint[],
+	subtree: PlanNode,
+): BestAccessPlanResult {
+	const plan = ask(request);
+	if (request.limit === undefined || request.limit === null) return plan;
+	if (truncationIsSafe(subtree, constraints, plan.handledFilters)) return plan;
+	log('Limit is not truncation-safe for this subtree; re-probing without it');
+	return ask({ ...request, limit: undefined, offset: undefined });
 }
 
 /**
@@ -740,29 +800,16 @@ export function trySortAbsorbViaIndexOrdering(
 		estimatedRows: tableRef.estimatedRows || context.stats.tableRows(tableSchema) || 1000,
 	};
 
-	// Probe WITH the limit first, then validate what comes back. Probing limit-free
-	// first cannot work: a module that vetoes its ordered arm on whole-table pricing
-	// answers with an unordered plan, `orderingMatches` fails, and this returns null
-	// before a second phase could run — which is precisely the case `rowsWanted` exists
-	// to fix. Validating afterwards costs at most one extra probe, and none at all when
-	// no caller passed a bound. `getBestAccessPlan` is pure at plan time, so a discarded
-	// probe leaves nothing behind.
-	const probe = (bound: RowsWanted | undefined): BestAccessPlanResult =>
-		vtabModule.getBestAccessPlan!(
-			context.db,
-			tableSchema,
-			bound ? { ...request, limit: bound.limit, offset: bound.offset } : request,
-		) as BestAccessPlanResult;
-
-	let accessPlan = probe(rowsWanted);
-	if (rowsWanted && !truncationIsSafe(sort.source, constraints, accessPlan.handledFilters)) {
-		// The module was told it may stop after `limit + offset` rows and something above
-		// its scan can still discard one, so the plan it returned may be priced — or
-		// truncated — against a bound the engine cannot honour. Discard it and ask again
-		// without the bound.
-		log('Limit is not truncation-safe for this subtree; re-probing without it');
-		accessPlan = probe(undefined);
-	}
+	// `probeAccessPlan` sends the bound and re-asks without it if the plan that comes back
+	// is not truncation-safe; the region it validates is everything below the Sort, which
+	// is exactly what sits between the module's scan and the LimitOffset this caller is
+	// about to wrap on.
+	const accessPlan = probeAccessPlan(
+		req => vtabModule.getBestAccessPlan!(context.db, tableSchema, req) as BestAccessPlanResult,
+		rowsWanted ? { ...request, limit: rowsWanted.limit, offset: rowsWanted.offset } : request,
+		constraints,
+		sort.source,
+	);
 
 	// Only proceed if the plan actually satisfies the ordering — every requested
 	// position must be provided by the SAME column and direction, not merely

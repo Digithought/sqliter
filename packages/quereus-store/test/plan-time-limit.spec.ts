@@ -92,6 +92,12 @@ const INDEXEDDB_PROFILE: KVCostProfile = { pointRead: INDEXEDDB_POINT_READ };
 const eqArmCost = (rows: number, pointRead: number): number =>
 	EQ_ARM_FIXED + rows * (EQ_ARM_PER_ROW + pointRead);
 
+/** The range mirror: `rangeScan(rows, 0.2)` is `0.2 + rows * 0.5`, plus the same resolution term. */
+const RANGE_ARM_FIXED = 0.2;
+const RANGE_ARM_PER_ROW = 0.5;
+const rangeArmCost = (rows: number, pointRead: number): number =>
+	RANGE_ARM_FIXED + rows * (RANGE_ARM_PER_ROW + pointRead);
+
 /** The row count the pricing block prices against. Every expected cost derives from it. */
 const N = 1000;
 /** `AccessPlanBuilder.fullScan(N)` — what the seek-vs-scan veto compares against. */
@@ -113,7 +119,14 @@ const ORDER_BY_C: BestAccessPlanRequest['requiredOrdering'] = [{ columnIndex: CO
 /** `order by id` — served by the primary key, and by no secondary index here. */
 const ORDER_BY_ID: BestAccessPlanRequest['requiredOrdering'] = [{ columnIndex: COL.id, desc: false }];
 
+/** `order by b` — served by `ix_bc`'s leading column, which a range on `b` also seeks on. */
+const ORDER_BY_B: BestAccessPlanRequest['requiredOrdering'] = [{ columnIndex: COL.b, desc: false }];
+/** `order by c desc` — served by `ix_bc` only when the fixture declares `c` descending. */
+const ORDER_BY_C_DESC: BestAccessPlanRequest['requiredOrdering'] = [{ columnIndex: COL.c, desc: true }];
+
 const eqB: PredicateConstraint = { columnIndex: COL.b, op: '=', value: 1, usable: true };
+/** A range on the INDEXED leading column — the `range` mirror of {@link eqB}. */
+const rangeB: PredicateConstraint = { columnIndex: COL.b, op: '>=', value: 0, usable: true };
 /** A predicate on an unindexed column — nothing can claim it, so a residual always survives. */
 const rangeU: PredicateConstraint = { columnIndex: COL.u, op: '>', value: 2, usable: true };
 
@@ -139,6 +152,12 @@ async function createFixture(options: {
 	costProfile?: KVCostProfile;
 	rowCount?: number;
 	nullableC?: boolean;
+	/**
+	 * Declare `ix_bc`'s trailing column DESCENDING. `max(c)` needs it: neither shipped
+	 * backend walks an index backwards, so the boundary read is only reachable when the
+	 * index already emits `c` in the direction the extremum wants.
+	 */
+	descC?: boolean;
 	/** `c` values, when the default `id * 10` ramp is not what the case needs. */
 	cValue?: (id: number) => string;
 } = {}): Promise<Fixture> {
@@ -149,7 +168,7 @@ async function createFixture(options: {
 
 	const cDecl = options.nullableC ? 'c integer null' : 'c integer not null';
 	await db.exec(`create table t (id integer primary key, b integer not null, ${cDecl}, u integer null) using store`);
-	await db.exec('create index ix_bc on t (b, c)');
+	await db.exec(`create index ix_bc on t (b, c${options.descC ? ' desc' : ''})`);
 
 	const rowCount = options.rowCount ?? 40;
 	const cValue = options.cValue ?? ((id: number) => `${id * 10}`);
@@ -221,6 +240,21 @@ describe('plan-time LIMIT reaching the store module (feat-sort-absorb-blind-to-l
 			expect(plan.rows).to.equal(1);
 			expect(plan.providesOrdering).to.deep.equal(ORDER_BY_C);
 			expect(plan.orderingIndexName).to.equal('ix_bc');
+		});
+
+		it('the range arm is repriced the same way as the equality arm', async () => {
+			// `seekingArm` serves `eq`, `range` and `prefixRange` alike, so the bound has to
+			// reach a range seek too — otherwise the reprice silently favours equalities.
+			const f = await track({ costProfile: INDEXEDDB_PROFILE });
+			const unlimited = f.plan([rangeB], { requiredOrdering: ORDER_BY_B });
+			const limited = f.plan([rangeB], { requiredOrdering: ORDER_BY_B, limit: 1, offset: 0 });
+
+			expect(unlimited.indexName, 'priced whole-table, the range seek loses the veto')
+				.to.be.undefined;
+			expect(limited.indexName).to.equal('ix_bc');
+			expect(limited.rows).to.equal(1);
+			expect(limited.cost).to.be.closeTo(rangeArmCost(1, INDEXEDDB_POINT_READ), 1e-9);
+			expect(limited.providesOrdering).to.deep.equal(ORDER_BY_B);
 		});
 
 		it('the bound is limit + offset, not limit alone', async () => {
@@ -341,6 +375,48 @@ describe('plan-time LIMIT reaching the store module (feat-sort-absorb-blind-to-l
 
 			const rows = await f.rows('select min(c) from t where b = 1');
 			expect(Object.values(rows[0])[0]).to.equal(30);
+		});
+
+		it('max over a descending index answers from the boundary too', async () => {
+			const f = await track({ costProfile: INDEXEDDB_PROFILE, descC: true });
+
+			const rows = await f.rows('select max(c) from t where b = 1');
+			// ids 1, 3, 5 … 39 carry b = 1, and c is id * 10.
+			expect(Object.values(rows[0])[0]).to.equal(390);
+
+			const ops = await f.rows("select op, detail from query_plan('select max(c) from t where b = 1')");
+			const rendered = ops.map(r => JSON.stringify(r)).join('\n');
+			expect(rendered, 'the plan should carry a LIMIT over an ix_bc access').to.match(/ix_bc/i);
+			expect(rendered).to.match(/LIMIT/i);
+			expect(f.plan([eqB], { requiredOrdering: ORDER_BY_C_DESC, limit: 1, offset: 0 }).rows)
+				.to.equal(1);
+		});
+
+		/**
+		 * KNOWN LIMITATION, pinned so it is visible rather than folklore. `min(c)` over a
+		 * NULLABLE `c` gets a synthesized `c is not null` filter (without it the boundary row
+		 * would be a NULL and the aggregate would answer NULL). No store arm claims
+		 * `IS NOT NULL`, so a residual Filter survives, the engine correctly refuses to send
+		 * the bound, and this query is still priced whole-table — exactly the GitHub #31
+		 * symptom, on the column nullability SQL gives you by default.
+		 *
+		 * The answer is right either way; only the plan is. Tracked as backlog
+		 * `feat-store-claim-is-not-null-seek-bound`. When that lands, this case should start
+		 * reading like the not-null one above — update it rather than deleting it.
+		 */
+		it('declines the bound when a filter is left unclaimed (nullable min column)', async () => {
+			const f = await track({
+				costProfile: INDEXEDDB_PROFILE,
+				nullableC: true,
+				cValue: (id) => (id === 1 ? 'null' : `${id * 10}`),
+			});
+
+			expect(Object.values((await f.rows('select min(c) from t where b = 1'))[0])).to.deep.equal([30]);
+
+			const ops = await f.rows("select op, detail from query_plan('select min(c) from t where b = 1')");
+			const rendered = ops.map(r => JSON.stringify(r)).join('\n');
+			expect(rendered, 'no bound reaches the module, so the boundary read is still priced out')
+				.to.not.match(/ix_bc/i);
 		});
 
 		it('the ordinary aggregate answers agree with a hand-written order by', async () => {

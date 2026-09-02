@@ -209,6 +209,13 @@ function sourceAcceptsTruncation(node: AggregateNode): boolean {
  * count, so at worst an index entry plus a row per NULL (roughly twice a plain scan on
  * an all-NULL column, free on a column with few NULLs). Worth acting on only if a
  * mostly-NULL indexed column shows up slower than before this rewrite existed.
+ *
+ * It costs more than that on a backend with expensive random reads. An unclaimed filter
+ * makes `truncationIsSafe` (rule-grow-retrieve.ts) withhold the plan-time LIMIT, so the
+ * module prices the ordered read for the WHOLE table and vetoes it — the rewrite does
+ * not fire at all, and a nullable column is the SQL default. Tracked as backlog
+ * `feat-store-claim-is-not-null-seek-bound`; pinned by the "declines the bound when a
+ * filter is left unclaimed" case in quereus-store's `plan-time-limit.spec.ts`.
  */
 function buildIsNotNull(scope: Scope, colRef: ColumnReferenceNode): ScalarPlanNode {
 	const ast: AST.UnaryExpr = {

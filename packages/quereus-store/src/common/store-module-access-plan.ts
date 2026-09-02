@@ -818,6 +818,14 @@ function orderingAlreadySatisfied(
  *
  * `limit + offset` is the bound, never `limit` alone - the engine's `LimitOffsetNode`
  * still discards `offset` rows above whatever is emitted.
+ *
+ * NOTE: shrinking `rows` to 1 also flips `AccessPlanBuilder.eqMatch`'s `isSet`
+ * (`matchedRows <= 1`) on a seek that matches many rows. Inert today - nothing in the
+ * engine reads `BestAccessPlanResult.isSet` - and defensible either way, since the leaf
+ * under a truncation-safe `limit 1` really does emit at most one row. But it is a
+ * uniqueness claim derived from a row CAP rather than from a key, so if the engine ever
+ * lifts `isSet` into `RelationType.isSet`, gate that lift on the limit being absent or
+ * set `isSet` explicitly here.
  */
 function rowsToProduce(
 	request: BestAccessPlanRequest,

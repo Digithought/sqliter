@@ -655,7 +655,7 @@ interface FilterInfo {
 
 The module receives individual constraints and returns matching rows.
 
-**Pushdown directives**: `FilterInfo.limit` is a soft row cap — modules may stop emitting once `limit` rows have been yielded. `FilterInfo.offset` is a seek-to-kth-row directive and is only set when the access plan advertised `supportsOrdinalSeek` for this query — modules without ordinal-seek support can ignore both fields safely (a streaming guard above the leaf still enforces correctness).
+**Pushdown directives**: `FilterInfo.limit` is a *runtime* row cap and — unlike the plan-time `BestAccessPlanRequest.limit` above — genuinely soft: a streaming guard above the leaf enforces the count either way, so ignoring it costs work, never answers. Modules may stop emitting once `limit` rows have been yielded. `FilterInfo.offset` is a seek-to-kth-row directive and is only set when the access plan advertised `supportsOrdinalSeek` for this query — modules without ordinal-seek support can ignore both fields safely (a streaming guard above the leaf still enforces correctness).
 
 ## Optimization Integration Points
 

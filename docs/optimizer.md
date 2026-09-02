@@ -399,7 +399,8 @@ interface BestAccessPlanRequest {
   columns: readonly ColumnMeta[];
   filters: readonly PredicateConstraint[];
   requiredOrdering?: OrderingSpec;
-  limit?: number | null;
+  limit?: number | null;   // a licence to stop early, not a hint — see module-authoring.md
+  offset?: number | null;  // travels with `limit`; the bound is `limit + offset`
   estimatedRows?: number;
 }
 
