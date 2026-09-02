@@ -266,6 +266,11 @@ export function getInstructionDebugInfo(
 
 /**
  * Generates a comprehensive trace report that includes sub-program execution details.
+ *
+ * NOTE: an event's `instructionIndex` is a tree-global address (`Scheduler.addressOf`),
+ * while {@link generateInstructionProgram} above numbers each scheduler from 0 and
+ * lists sub-programs separately. The two listings are NOT joinable by number — use
+ * `scheduler_program()`, which reports addresses, if you need that join.
  */
 export function generateTraceReport(
   tracer: InstructionTracer

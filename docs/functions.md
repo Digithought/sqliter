@@ -647,6 +647,10 @@ select id, op, detail from query_plan('select * from users where age > 25');
 select addr, description from scheduler_program('select 1 + 1');
 ```
 
+`scheduler_program().addr` and the `instruction_index` of `execution_trace()` and
+`row_trace()` are the same instruction address — unique across the main program and
+every nested sub-program — so the three join on it.
+
 ### `explain_assertion(name)` columns
 
 | Column | Type | Description |

@@ -93,14 +93,6 @@ export class Scheduler {
 	private readonly argIndexes: number[][] = [];
 
 	/**
-	 * Instruction count of this scheduler plus every program nested under it.
-	 * Computable in the constructor because emission is bottom-up: `emitCall` has
-	 * already built (and attached, via `instruction.programs`) every nested
-	 * scheduler by the time this one is constructed.
-	 */
-	readonly totalInstructionCount: number;
-
-	/**
 	 * First global address occupied by this scheduler; meaningful only once
 	 * {@link ensureAddressesAssigned} has run on the root of the program tree.
 	 */
@@ -119,7 +111,6 @@ export class Scheduler {
 
 		this.destinations = new Array<ResultDestination>(this.instructions.length).fill(null);
 
-		let total = this.instructions.length;
 		for (let instIndex = 0; instIndex < this.instructions.length; ++instIndex) {
 			const instArgIndexes = this.argIndexes[instIndex];
 			if (instArgIndexes) {
@@ -127,14 +118,7 @@ export class Scheduler {
 					this.destinations[instArgIndexes[argIndex]] = instIndex;
 				}
 			}
-			const programs = this.instructions[instIndex].programs;
-			if (programs) {
-				for (const program of programs) {
-					total += program.totalInstructionCount;
-				}
-			}
 		}
-		this.totalInstructionCount = total;
 	}
 
 	// --- Instruction addressing -------------------------------------------------
@@ -153,7 +137,7 @@ export class Scheduler {
 	//   a scheduler with base B and N own instructions occupies
 	//     B .. B+N-1                 its own instructions, in scheduler order
 	//     then, in order of (owning instruction index, program index),
-	//     each nested program takes the next block of its own totalInstructionCount
+	//     each nested program takes the next block, sized by its own subtree
 	//
 	// Addresses are assigned lazily and only on the tracing path: normal execution
 	// (the optimized and metrics dispatch loops) never needs them and must not pay
@@ -182,13 +166,29 @@ export class Scheduler {
 	 * A nested scheduler never has to assign for itself: its root always runs
 	 * first and stamps it on the way through, so the no-op guard below is what its
 	 * own tracing-path call hits.
+	 *
+	 * NOTE: the space is per scheduler *tree*, always based at 0, so two
+	 * independently-rooted trees traced by ONE tracer would collide. Fine today:
+	 * only a statement's own root scheduler ever sees a `RuntimeContext` carrying a
+	 * tracer — every other `Scheduler.run` site (materialized-view maintenance,
+	 * assertions, the derived-row validator, the const evaluator) builds a fresh
+	 * tracer-free context. If a site ever runs a second root on a traced context,
+	 * bases must come from the tracer instead of from 0.
 	 */
 	ensureAddressesAssigned(): void {
 		if (this.addressesAssigned) return;
 		this.assignAddresses(0);
 	}
 
-	/** Stamps `base` on this scheduler and its nested programs; returns the next free address. */
+	/**
+	 * Stamps `base` on this scheduler and its nested programs; returns the next free address.
+	 *
+	 * NOTE: assumes the program graph is a TREE — `emitCall` allocates a fresh
+	 * `Scheduler` per call site, so no scheduler is reachable twice today. A shared
+	 * (or cyclic) sub-program would be stamped twice here, silently handing two
+	 * instructions the same address; `WorkCounterCollector.walk` guards the same
+	 * assumption defensively, and this would need the same guard.
+	 */
 	private assignAddresses(base: number): number {
 		this.base = base;
 		this.addressesAssigned = true;

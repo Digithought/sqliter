@@ -566,7 +566,7 @@ export const executionTraceFunc = createIntegratedTableValuedFunction(
 							const instructions = subScheduler.instructions.map((instr: Instruction, idx: number) => {
 								const address = subScheduler.addressOf(idx);
 								return {
-									index: address,
+									address,
 									operation: instr.note || `instruction_${address}`,
 									dependencies: subScheduler.dependencyAddressesOf(idx)
 								};
@@ -661,6 +661,10 @@ export const rowTraceFunc = createIntegratedTableValuedFunction(
 			let stmt: ReturnType<Database['prepare']> | undefined;
 			try {
 				stmt = db.prepare(sql);
+				// Trace the UNFUSED graph, like execution_trace() and scheduler_program():
+				// instruction_index means the same global address in all three, so a row
+				// trace can be joined against the listing.
+				stmt._emitUnfused = true;
 
 				// Execute the query with tracing to collect row-level events
 				const results: Row[] = [];

@@ -626,8 +626,8 @@ false — the explicit kill switch for bisecting a suspected fusion bug. Both ar
 into a prepared statement's cached emission context at emit time; recompile to pick up
 a toggle. **Debug introspection reports the unfused graph**: `scheduler_program()`,
 `execution_trace()` (which joins its trace events against that same instruction
-listing by *address* — both build it from one shared in-process helper) and
-`Statement.getDebugProgram()` all emit with fusion disabled — the faithful description
+listing by *address* — both build it from one shared in-process helper), `row_trace()`
+and `Statement.getDebugProgram()` all emit with fusion disabled — the faithful description
 of what the query computes — while a normal execution runs the fused form.
 
 An **instruction address** (`Scheduler.addressOf`) is unique across the whole program
@@ -636,6 +636,12 @@ index into whichever scheduler happens to be running — those repeat, so a trac
 from a scalar sub-program would otherwise land on the main-program instruction sharing
 its local index. Addresses are assigned lazily, on the tracing path only, so an ordinary
 execution pays nothing for them.
+
+`scheduler_program()`'s `addr`, `parent_addr` and `dependencies` and the
+`instruction_index` of `execution_trace()` and `row_trace()` are all addresses in this
+one space, so the three can be joined on it. `Statement.getDebugProgram()` is the
+exception: it prints each scheduler's own local numbering with sub-programs in separate
+sections, and is not joinable against the other three.
 
 ### Work counters: machine-independent execution counts
 

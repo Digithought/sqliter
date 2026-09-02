@@ -179,4 +179,58 @@ describe('instruction addressing (scheduler_program / execution_trace join)', fu
 			expect(tracedSubProgram.length, `${shape.sql}: no sub-program instruction appears in the trace`).to.be.greaterThan(0);
 		});
 	}
+
+	/**
+	 * The checks above read the tracer directly. These go through the two TVFs a
+	 * user actually calls, so the addresses they *publish* — not just the ones the
+	 * scheduler computes — have to resolve against the same listing.
+	 */
+	for (const shape of QUERY_SHAPES) {
+		it(`publishes resolvable addresses through the TVFs: ${shape.label}`, async function () {
+			this.timeout(10_000);
+
+			const listed = new Set((await readListing(shape.sql)).map(row => row.addr));
+			let tracedRows = 0;
+			let subProgramInstructions = 0;
+
+			for await (const row of db.eval(`select * from execution_trace(?)`, [shape.sql])) {
+				tracedRows++;
+				const addr = row.instruction_index as number;
+				expect(row.operation, `${shape.sql}: execution_trace() captured no events`).to.not.equal('NO_TRACE_DATA');
+				expect(listed.has(addr), `${shape.sql}: execution_trace() addr ${addr} (${row.operation}) is absent from the listing`).to.equal(true);
+
+				// Every dependency, and every sub-program address the row advertises,
+				// must name a listed row too — that blob is the path into the nested
+				// program, so a dangling address there is the original defect.
+				for (const dep of JSON.parse((row.dependencies as string) ?? '[]') as number[]) {
+					expect(listed.has(dep), `${shape.sql}: addr ${addr} depends on unlisted addr ${dep}`).to.equal(true);
+				}
+				const subPrograms = JSON.parse((row.sub_programs as string) ?? 'null') as
+					Array<{ programIndex: number; instructions?: Array<{ address: number; dependencies: number[] }> }> | null;
+				for (const sub of subPrograms ?? []) {
+					expect(listed.has(sub.programIndex), `${shape.sql}: sub-program base ${sub.programIndex} is absent from the listing`).to.equal(true);
+					for (const instr of sub.instructions ?? []) {
+						subProgramInstructions++;
+						expect(listed.has(instr.address), `${shape.sql}: sub-program instruction ${instr.address} is absent from the listing`).to.equal(true);
+						for (const dep of instr.dependencies) {
+							expect(listed.has(dep), `${shape.sql}: sub-program instruction ${instr.address} depends on unlisted addr ${dep}`).to.equal(true);
+						}
+					}
+				}
+			}
+
+			expect(tracedRows, `${shape.sql}: execution_trace() produced no rows`).to.be.greaterThan(0);
+			expect(subProgramInstructions, `${shape.sql}: execution_trace() advertised no sub-program instructions`).to.be.greaterThan(0);
+
+			// row_trace() reports the same addresses (it traces the unfused graph too).
+			let sawRow = false;
+			for await (const row of db.eval(`select * from row_trace(?)`, [shape.sql])) {
+				expect(row.operation, `${shape.sql}: row_trace() failed or captured nothing`).to.not.be.oneOf(['NO_ROW_DATA', 'ROW_TRACE_SETUP']);
+				sawRow = true;
+				const addr = row.instruction_index as number;
+				expect(listed.has(addr), `${shape.sql}: row_trace() addr ${addr} (${row.operation}) is absent from the listing`).to.equal(true);
+			}
+			expect(sawRow, `${shape.sql}: row_trace() produced no row events`).to.equal(true);
+		});
+	}
 });
