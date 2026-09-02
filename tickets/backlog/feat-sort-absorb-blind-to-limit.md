@@ -104,3 +104,34 @@ So this ticket, not a store- or IndexedDB-specific bug, is the actual reason
 aimed at. Both fix routes above remain open (upward-looking sort-absorb vs. a fused
 sort-and-limit node) — that design call is still yours; this note is evidence, not a
 resolution.
+
+## Re-confirmed on GitHub issue #31, 2026-09-01 — still live on 4.18.0, mechanism agreed independently
+
+The same reporter read the published 4.18.0 sources and reached this ticket's diagnosis without
+being pointed at it, which is worth recording because it was reached from the opposite direction:
+they were looking for the backward-index-walk gap and found this instead.
+
+Their trace, re-checked and correct: `rule-minmax-index-boundary.ts` builds a bare `SortNode`
+probe, hands it to `trySortAbsorbViaIndexOrdering`, and only **afterwards** wraps the result in a
+`LimitOffsetNode(limit=1)` (the `probe` at ~line 97, `absorbed` at ~line 100, `limited` at
+~line 116). So at the moment the store is asked whether it can serve the ordering, the request
+carries no limit and the walk is priced for the whole table — exactly what the `NOTE:` on
+`chooseOrderingPlan` (`packages/quereus-store/src/common/store-module-access-plan.ts`, ~825-830)
+already predicted, naming this ticket as the enabling change.
+
+They also confirmed the equality-seek-with-ordering arm does not rescue it:
+`buildIndexOrderingAdvertisement` correctly advertises `date`-ordering off an `entity_id = ?` pin,
+but that seek is likewise priced to resolve **every** matching row, so at `pointRead = 3.0` it
+loses to the batched full scan. Same root cause, second path.
+
+Still reproducing on 4.18.0: `select min(date) from entry where entity_id = ?` plans as
+`StreamAggregate | Filter | IndexScan _primary_`, ~480 ms, no boundary read.
+
+**Test-coverage consequence worth acting on whenever this is picked up.** This is invisible in
+every in-tree test by construction: at the memory backend's cheap `pointRead` the ordered plan
+wins *even when priced for the whole table*, so no memory-backend test can fail on it. Only a
+high-`pointRead` cost profile flips the comparison. Whatever fix lands should come with a
+cost-profile-parameterized case, or it will regress silently the same way.
+
+Both fix routes named above remain open (upward-looking sort-absorb vs. a fused sort-and-limit
+node); this changes the evidence, not the decision.

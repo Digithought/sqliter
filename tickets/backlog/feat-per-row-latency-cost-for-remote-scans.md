@@ -8,7 +8,7 @@ files:
   - packages/quereus/src/planner/rules/join/rule-join-physical-selection.ts  # where scan-once and seek-per-row plans are compared
   - docs/optimizer-costing.md
   - docs/module-authoring.md
-tradeoffs: A second latency knob is one more thing every module author has to reason about and every cost formula has to thread, and the only plans it changes are ones no in-tree module can produce — so a maintainer may reasonably want a real remote plugin declaring it before adding the surface.
+tradeoffs: A second latency knob is one more thing every module author has to reason about and every cost formula has to thread. The original second half of this line — "the only plans it changes are ones no in-tree module can produce, so a maintainer may reasonably want a real remote plugin declaring it before adding the surface" — is DISCHARGED as of 2026-09-01: an external consumer on the IndexedDB store has measured the mispricing, traced it to these exact cost functions, and named this ticket as their blocker (see § Confirmed live on GitHub issue #30). What remains is genuinely a sequencing call, not a "wait for a user" call.
 ---
 
 # A storage module cannot say that reading each row costs a round trip
@@ -102,3 +102,41 @@ costs about 1 ms; on IndexedDB it costs 0.0047-0.011 ms, a ~100x disagreement.
 The convention holds for the 25-100 ms network backends it was designed for and
 breaks for sub-millisecond ones. A second knob that inherits the same convention
 inherits the same break.
+
+## Confirmed live on GitHub issue #30, 2026-09-01 — independently re-derived from the source
+
+An external consumer (`kjeib`, running the IndexedDB store backend) read the published 4.18.0
+sources and arrived at this ticket unprompted, with the arithmetic worked out. Every figure in
+their comment was re-checked against `planner/cost/index.ts` and reproduces exactly. At
+entry ≈ 20k rows, txn ≈ 10k rows, all declared latencies 0:
+
+| plan | cost | formula |
+|---|---|---|
+| index-nested-loop | **36000** | `20000 * (NL_JOIN_PER_OUTER_ROW 1.0 + INDEX_SEEK_BASE 0.5 + 1 * INDEX_SEEK_PER_ROW 0.3 + 0)` |
+| hash join | **16000** | `10000 * HASH_JOIN_BUILD_PER_ROW 0.8 + 20000 * HASH_JOIN_PROBE_PER_ROW 0.4` |
+
+Hash wins by better than 2x. The asymmetry is structural and visible in the two signatures:
+`indexNestedLoopJoinCost(outerRows, rowsPerSeek, perSeekLatencyMs)` charges latency **per outer
+row**; `hashJoinCost(buildRows, probeRows)` takes no latency argument **at all**, so its full
+scan of the inner side is free of latency no matter what the module declares. On storage where a
+scanned row is a round trip, that ordering is backwards — which is what this ticket exists to fix.
+
+The store side is not the problem: `computeBestAccessPlan` correctly returns a single-row point
+lookup for the PK equality (`AccessPlanBuilder.eqMatch(1, 0.1)`), so the INL candidate IS built
+with `rowsPerSeek = 1`. It is then priced out. The capability is present and unreachable.
+
+Measured impact on their workload: the outer join stays `INNER HASH JOIN` and full-scans the
+inner side, leaving ~150 ms where the hand-written equivalent is ~25 ms.
+
+### One arm of their report that this ticket does NOT close
+
+They also expect that, once scans pay per-row cost, an honest `expectedLatencyMs` declaration
+would re-enable the **batched** fan-out path for a large driving set. It would not, on its own.
+`rule-fanout-batched-outer.ts:142` gates on `maxLatency < tuning.batchedOuterThresholdMs`, which
+is `25` (`optimizer-tuning.ts:284`), and IndexedDB's measured first-row latency is 0.3-2.3 ms. An
+honest declaration clears no gate. That arm additionally needs the wall-clock-vs-cost-unit
+mismatch settled — the one the `NOTE:` on `indexNestedLoopJoinCost` describes, where the
+`*ThresholdMs` gates read `expectedLatencyMs` as literal milliseconds while the cost formula adds
+it to constants whose unit is one scanned row. That is a **separate decision**, and it should not
+be folded into this ticket silently; whoever picks this up should say which of the two they are
+doing.
