@@ -28,6 +28,38 @@ function interceptQuery(
 	return table;
 }
 
+/** Get-or-create the per-table row map inside a `table name → key → row` index. */
+function rowsFor(index: Map<string, Map<string, Row>>, tableName: string): Map<string, Row> {
+	const key = tableName.toLowerCase();
+	let rows = index.get(key);
+	if (!rows) {
+		rows = new Map();
+		index.set(key, rows);
+	}
+	return rows;
+}
+
+/**
+ * Pin the first row ever served for each key on `table`, replaying it forever
+ * after. Shared by the two stale-snapshot stubs below, which differ only in WHICH
+ * connections they apply it to.
+ */
+function pinFirstSeenRows(pinned: Map<string, Map<string, Row>>, table: MemoryTable): MemoryTable {
+	const byKey = rowsFor(pinned, table.tableName);
+	return interceptQuery(table, (source, _filterInfo, pkIndex) => (async function* () {
+		for await (const row of source) {
+			const rowKey = keyToString(row[pkIndex]);
+			const first = byKey.get(rowKey);
+			if (first) {
+				yield first;
+			} else {
+				byKey.set(rowKey, row);
+				yield row;
+			}
+		}
+	})());
+}
+
 /**
  * Which committed-read access paths the {@link TornPublishModule} tears on.
  *
@@ -57,19 +89,9 @@ export class TornPublishModule extends MemoryTableModule {
 		super();
 	}
 
-	private stagedFor(tableName: string): Map<string, Row> {
-		const key = tableName.toLowerCase();
-		let rows = this.staged.get(key);
-		if (!rows) {
-			rows = new Map();
-			this.staged.set(key, rows);
-		}
-		return rows;
-	}
-
 	/** Records what a writer stages, and leaks half of it into committed reads. */
 	private instrument(table: MemoryTable, readCommitted: boolean): MemoryTable {
-		const staged = this.stagedFor(table.tableName);
+		const staged = rowsFor(this.staged, table.tableName);
 		const pkIndex = table.tableSchema?.primaryKeyDefinition?.[0]?.index ?? 0;
 
 		if (readCommitted) {
@@ -138,30 +160,8 @@ export class StaleSnapshotModule extends MemoryTableModule {
 	/** First row ever served for a key, per table: table → key → row. */
 	private readonly pinned = new Map<string, Map<string, Row>>();
 
-	private pinFirstSeen(table: MemoryTable): MemoryTable {
-		const key = table.tableName.toLowerCase();
-		let rows = this.pinned.get(key);
-		if (!rows) {
-			rows = new Map();
-			this.pinned.set(key, rows);
-		}
-		const byKey = rows;
-		return interceptQuery(table, (source, _filterInfo, pkIndex) => (async function* () {
-			for await (const row of source) {
-				const rowKey = keyToString(row[pkIndex]);
-				const first = byKey.get(rowKey);
-				if (first) {
-					yield first;
-				} else {
-					byKey.set(rowKey, row);
-					yield row;
-				}
-			}
-		})());
-	}
-
 	override async create(db: Database, tableSchema: TableSchema): Promise<MemoryTable> {
-		return this.pinFirstSeen(await super.create(db, tableSchema));
+		return pinFirstSeenRows(this.pinned, await super.create(db, tableSchema));
 	}
 
 	override async connect(
@@ -173,7 +173,8 @@ export class StaleSnapshotModule extends MemoryTableModule {
 		options: MemoryTableConfig,
 		tableSchema?: TableSchema,
 	): Promise<MemoryTable> {
-		return this.pinFirstSeen(
+		return pinFirstSeenRows(
+			this.pinned,
 			await super.connect(db, pAux, moduleName, schemaName, tableName, options, tableSchema),
 		);
 	}
@@ -195,28 +196,6 @@ export class StaleCommittedSnapshotModule extends MemoryTableModule {
 	/** First row ever served through a committed connection, per table: table → key → row. */
 	private readonly pinned = new Map<string, Map<string, Row>>();
 
-	private pinFirstSeenForCommittedReads(table: MemoryTable): MemoryTable {
-		const key = table.tableName.toLowerCase();
-		let rows = this.pinned.get(key);
-		if (!rows) {
-			rows = new Map();
-			this.pinned.set(key, rows);
-		}
-		const byKey = rows;
-		return interceptQuery(table, (source, _filterInfo, pkIndex) => (async function* () {
-			for await (const row of source) {
-				const rowKey = keyToString(row[pkIndex]);
-				const first = byKey.get(rowKey);
-				if (first) {
-					yield first;
-				} else {
-					byKey.set(rowKey, row);
-					yield row;
-				}
-			}
-		})());
-	}
-
 	override async connect(
 		db: Database,
 		pAux: unknown,
@@ -227,7 +206,7 @@ export class StaleCommittedSnapshotModule extends MemoryTableModule {
 		tableSchema?: TableSchema,
 	): Promise<MemoryTable> {
 		const table = await super.connect(db, pAux, moduleName, schemaName, tableName, options, tableSchema);
-		return options?._readCommitted === true ? this.pinFirstSeenForCommittedReads(table) : table;
+		return options?._readCommitted === true ? pinFirstSeenRows(this.pinned, table) : table;
 	}
 }
 

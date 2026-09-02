@@ -78,20 +78,22 @@ export interface StatementOptions {
 	 * Honored by the row-returning entry points (`Database.get`, `Database.eval`,
 	 * `Statement.get/all/iterateRows/run`); `Database.exec` ignores it.
 	 *
-	 * The consequential loss, for a module that fetches its state from somewhere
-	 * else (peers, a server, another process): a committed read is pinned at read
-	 * start, so a write arriving from elsewhere WHILE the read runs cannot appear
-	 * in it. A caller that polls for such a write — "wait until the other machine
-	 * publishes its row" — will therefore never converge if it routes those polls
-	 * through `'committed'`. Broad, unconditional opt-in is not a safe default for
-	 * that reason. Narrowing it to the window where a writer is actually parked —
-	 * ask for `'committed'` only while a local transaction is open, and read
-	 * normally otherwise — is a reasonable caller policy; how much staleness a read
-	 * tolerates is the caller's call, not the engine's.
+	 * A second, subtler loss for a module that fetches its state from somewhere
+	 * else (peers, a server, another process): the state a committed read serves is
+	 * pinned when that read starts, so a write arriving from elsewhere WHILE it
+	 * runs cannot appear in its rows. The NEXT committed read picks that write up —
+	 * a conformant module re-pins per read, which is what makes a poll converge
+	 * (see `VirtualTableModule.readCommittedSnapshot` for the obligation). A module
+	 * that instead pins one state per connection or per process and never re-pins
+	 * is NOT conformant, and a caller polling through `'committed'` against it
+	 * would never converge at all.
 	 *
-	 * Before trusting a module on this path, run `runCommittedReadConformance`
+	 * So before trusting a module on this path, run `runCommittedReadConformance`
 	 * against it: it checks both that a committed read stays coherent across
 	 * another connection's commit and that it advances once that commit lands.
+	 * How much staleness a read tolerates stays the caller's call, not the
+	 * engine's — reading normally except where the latency actually hurts is a
+	 * perfectly reasonable policy.
 	 */
 	readConcurrency?: 'serialized' | 'committed';
 }

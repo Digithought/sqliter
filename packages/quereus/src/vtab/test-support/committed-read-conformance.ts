@@ -149,13 +149,17 @@ function assertModuleDeclaresSnapshot(db: Database, table: string): void {
 	}
 }
 
-async function collectSnapshot(
-	db: Database,
-	sql: string,
-	options?: { readCommitted?: boolean },
-): Promise<SnapshotRow[]> {
+/**
+ * Which read path a snapshot is collected on. Required rather than defaulted:
+ * whether a check interrogates the committed path or the ordinary one IS the
+ * check in several places below, and a default is exactly how an assertion meant
+ * for one path ends up silently running on the other.
+ */
+type ReadPath = 'ordinary' | 'committed';
+
+async function collectSnapshot(db: Database, sql: string, path: ReadPath): Promise<SnapshotRow[]> {
 	const rows: SnapshotRow[] = [];
-	const iter = options?.readCommitted
+	const iter = path === 'committed'
 		? db.eval(sql, undefined, { readConcurrency: 'committed' })
 		: db.eval(sql);
 	for await (const row of iter) {
@@ -319,7 +323,7 @@ function buildRunPlan(table: string, keyColumn: string, valueColumn: string, row
 
 /** The harness owns the table's contents for the run, so it refuses to share it. */
 async function assertTableEmpty(db: Database, table: string, projection: string): Promise<void> {
-	const existing = await collectSnapshot(db, projection);
+	const existing = await collectSnapshot(db, projection, 'ordinary');
 	if (existing.length > 0) {
 		throw new Error(
 			`committed-read conformance: '${table}' must be empty on entry (found ${existing.length} rows). ` +
@@ -447,9 +451,9 @@ async function observeConcurrentReads(args: ObserveArgs): Promise<ReadOutcome> {
 	const guard = <T>(work: Promise<T>, what: string): Promise<T> =>
 		parked ? withStallTimeout(work, stallTimeoutMs, what) : work;
 
-	const fullScan = await guard(collectSnapshot(db, plan.projection, { readCommitted: true }), 'the full-scan read');
+	const fullScan = await guard(collectSnapshot(db, plan.projection, 'committed'), 'the full-scan read');
 	const indexDriven = seekPlanned
-		? await guard(collectSnapshot(db, plan.indexDrivenSql, { readCommitted: true }), 'the index-driven read')
+		? await guard(collectSnapshot(db, plan.indexDrivenSql, 'committed'), 'the index-driven read')
 		: [];
 	if (parked && writer.settled()) {
 		// The writer landed while we were reading, so neither read is evidence of
@@ -519,11 +523,21 @@ function assertLegsAgree(fullScan: readonly SnapshotRow[], indexDriven: readonly
  * the ordinary path AND on the committed path, since a module can pin only its
  * `_readCommitted` connections and refresh on every other one.
  *
- * The ordinary checks run first on purpose: they catch the coarser "everything is
- * stale" module and say so in plainer terms than a cross-path comparison could.
+ * The ordinary check runs first on purpose: it catches the coarser "stale on
+ * every path" module and says so in plainer terms than a cross-path comparison
+ * could.
  */
 async function assertAdvancesAfterCommit(db: Database, plan: RunPlan): Promise<void> {
-	const after = await collectSnapshot(db, plan.projection);
+	const after = await assertOrdinaryReadAdvanced(db, plan);
+	await assertCommittedReadAdvanced(db, plan, after);
+}
+
+/**
+ * The ordinary path must show the whole post-write state once the writer lands.
+ * Returns that state, which the committed-path check below compares against.
+ */
+async function assertOrdinaryReadAdvanced(db: Database, plan: RunPlan): Promise<SnapshotRow[]> {
+	const after = await collectSnapshot(db, plan.projection, 'ordinary');
 	if (after.length !== plan.highKey) {
 		throw new Error(
 			`committed-read conformance: after the writer committed, a fresh read returned ${after.length} rows, expected ${plan.highKey}. ` +
@@ -538,33 +552,41 @@ async function assertAdvancesAfterCommit(db: Database, plan: RunPlan): Promise<v
 			`— seeding was ${plan.rowCount} rows.`,
 		);
 	}
+	return after;
+}
 
-	// The checks above only ever asked the ORDINARY path. A module whose
-	// `_readCommitted` connections pin one state and never re-pin — while every
-	// other path refreshes normally — passes all of them, and that is exactly the
-	// shape a module fetching state from elsewhere has when its committed handle
-	// is a cached pre-transaction object it never re-fetches.
-	//
-	// NOTE: `readConcurrency: 'committed'` falls back to the serialized path
-	// silently when a statement is ineligible, and the engine exposes no signal
-	// for which path a read actually took. This check is meaningful only because a
-	// read-only autocommit query over a declaring module is eligible today; if the
-	// eligibility rules ever narrow, this comparison degrades into an ordinary read
-	// against an ordinary read and passes vacuously. The mid-commit legs (steps
-	// 4–5) would catch that regression via their stall timeout — they are the
-	// canary — but if eligibility is ever reworked, re-verify this step against
-	// `StaleCommittedSnapshotModule` in test/vtab/_conformance-stub-modules.ts.
-	const afterCommitted = await collectSnapshot(db, plan.projection, { readCommitted: true });
-	if (!matches(afterCommitted, after)) {
-		throw new Error(
-			`committed-read conformance: after the writer committed, a read with readConcurrency: 'committed' returned ${afterCommitted.length} rows ` +
-			`that disagree with an ordinary read of the same committed state (${after.length} rows). ` +
-			`Divergences — ${describeDivergences(after, afterCommitted)}. ` +
-			`The module's _readCommitted connection appears to pin its state ACROSS statements. Pinning is required only for the life of a ` +
-			`single scan: every new committed read must re-pin to the state committed as of the moment that read begins, so a committed read ` +
-			`may never be staler than an ordinary read taken at the same instant.`,
-		);
-	}
+/**
+ * The freshness bound's lower half, which the ordinary check above cannot reach:
+ * a module whose `_readCommitted` connections pin one state and never re-pin —
+ * while every other path refreshes normally — passes every check before this one.
+ * That is exactly the shape a module fetching its state from elsewhere has when
+ * its committed handle is a cached pre-transaction object it never re-fetches.
+ *
+ * NOTE: `readConcurrency: 'committed'` falls back to the serialized path silently
+ * when a statement is ineligible, and the engine exposes no signal for which path
+ * a read actually took. This check is meaningful only because a read-only
+ * autocommit query over a declaring module is eligible today; if the eligibility
+ * rules ever narrow, this comparison degrades into an ordinary read against an
+ * ordinary read and passes vacuously. The mid-commit legs (steps 4–5) would catch
+ * that regression via their stall timeout — they are the canary — but if
+ * eligibility is ever reworked, re-verify this step against
+ * `StaleCommittedSnapshotModule` in test/vtab/_conformance-stub-modules.ts.
+ */
+async function assertCommittedReadAdvanced(
+	db: Database,
+	plan: RunPlan,
+	after: readonly SnapshotRow[],
+): Promise<void> {
+	const afterCommitted = await collectSnapshot(db, plan.projection, 'committed');
+	if (matches(afterCommitted, after)) return;
+	throw new Error(
+		`committed-read conformance: after the writer committed, a read with readConcurrency: 'committed' returned ${afterCommitted.length} rows ` +
+		`that disagree with an ordinary read of the same committed state (${after.length} rows). ` +
+		`Divergences — ${describeDivergences(after, afterCommitted)}. ` +
+		`The module's _readCommitted connection appears to pin its state ACROSS statements. Pinning is required only for the life of a ` +
+		`single scan: every new committed read must re-pin to the state committed as of the moment that read begins, so a committed read ` +
+		`may never be staler than an ordinary read taken at the same instant.`,
+	);
 }
 
 /**
