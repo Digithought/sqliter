@@ -28,7 +28,7 @@ import { expect } from 'chai';
 import { Database, generateIndexDDL, generateTableDDL } from '@quereus/quereus';
 import { StoreModule, StoreEventEmitter, type KVStoreProvider, type SchemaChangeEvent } from '@quereus/store';
 import { createStoreAdapter } from '../../src/sync/store-adapter.js';
-import type { ApplyToStoreCallback, SchemaChangeToApply } from '../../src/sync/protocol.js';
+import type { ApplyToStoreCallback, SchemaChangeToApply, SnapshotChunk } from '../../src/sync/protocol.js';
 import {
 	DEFAULT_ORDERS_DDL,
 	closePeer,
@@ -37,6 +37,7 @@ import {
 	localWrite,
 	makePeer,
 	relayAll,
+	toStream,
 	type Peer,
 } from './_peer-harness.js';
 
@@ -51,6 +52,13 @@ const DIVERGENT_ORDERS_DDL =
  * makes the failure direction deterministic: relaying b → a admits b's migration
  * at a peer that already has the table (a → b is HLC-dominated and skipped).
  */
+/** Drain a peer's streamed snapshot into the array `toStream` replays. */
+async function chunksOf(peer: Peer): Promise<SnapshotChunk[]> {
+	const chunks: SnapshotChunk[] = [];
+	for await (const c of peer.manager.getSnapshotStream()) chunks.push(c);
+	return chunks;
+}
+
 async function makeDivergedPair(bDdl: string = DEFAULT_ORDERS_DDL): Promise<[Peer, Peer]> {
 	const a = await makePeer('a');
 	const b = await makePeer('b');
@@ -222,6 +230,93 @@ describe('schema replication idempotency', () => {
 			} finally {
 				await closePeer(a);
 				await closePeer(b);
+			}
+		});
+	});
+
+	describe('duplicate create judged after the local table moved on (snapshot ingress)', () => {
+		let a: Peer;
+		let b: Peer;
+
+		beforeEach(async () => {
+			[a, b] = await makeDivergedPair();
+			// Same setup as the delta case above, bootstrapped instead of relayed: both
+			// snapshot consumers must look their own recorded create up BEFORE they
+			// record the incoming one over it, or the comparison is vacuous.
+			await localWrite(a, 'alter table orders add column sku text null');
+		});
+
+		afterEach(async () => {
+			await closePeer(a);
+			await closePeer(b);
+		});
+
+		const localColumns = (peer: Peer): string[] =>
+			peer.db.schemaManager.getTable('main', 'orders')!.columns.map(c => c.name.toLowerCase());
+
+		it('a whole snapshot converges the duplicate create and keeps the local alteration', async () => {
+			await a.manager.applySnapshot(await b.manager.getSnapshot());
+
+			expect(localColumns(a)).to.deep.equal(['id', 'note', 'sku']);
+		});
+
+		it('a streamed snapshot converges the duplicate create and keeps the local alteration', async () => {
+			await a.manager.applySnapshotStream(toStream(await chunksOf(b)));
+
+			expect(localColumns(a)).to.deep.equal(['id', 'note', 'sku']);
+		});
+
+		it('a streamed snapshot re-applied after success still converges', async () => {
+			await a.manager.applySnapshotStream(toStream(await chunksOf(b)));
+			await a.manager.applySnapshotStream(toStream(await chunksOf(b)));
+
+			expect(localColumns(a)).to.deep.equal(['id', 'note', 'sku']);
+		});
+
+		it('a streamed snapshot RETRIED after a divergent create still conflicts', async () => {
+			// The streaming consumer files each migration record only after the flush
+			// that applied it. Filing it at chunk time instead would leave the incoming
+			// ddl recorded under this device's own key after the failed first attempt,
+			// so the retry would compare the incoming create against ITSELF and
+			// silently converge a divergence the first attempt correctly rejected.
+			const [c, d] = await makeDivergedPair(DIVERGENT_ORDERS_DDL);
+			try {
+				const attempt = async (): Promise<string | undefined> => {
+					try {
+						await c.manager.applySnapshotStream(toStream(await chunksOf(d)));
+						return undefined;
+					} catch (e) {
+						return (e as Error).message;
+					}
+				};
+
+				expect(await attempt(), 'first attempt').to.include('Schema conflict');
+				expect(await attempt(), 'retry').to.include('Schema conflict');
+			} finally {
+				await closePeer(c);
+				await closePeer(d);
+			}
+		});
+
+		it('a whole snapshot still surfaces a DIVERGENT create, create against create', async () => {
+			const [c, d] = await makeDivergedPair(DIVERGENT_ORDERS_DDL);
+			try {
+				await localWrite(c, 'alter table orders add column sku text null');
+
+				let caught: Error | undefined;
+				try {
+					await c.manager.applySnapshot(await d.manager.getSnapshot());
+				} catch (e) {
+					caught = e as Error;
+				}
+
+				expect(caught, 'expected the divergent create to be surfaced').to.be.instanceOf(Error);
+				expect(caught!.message).to.include('main.orders');
+				expect(caught!.message).to.include('"extra"');
+				expect(caught!.message.toLowerCase(), 'altered shape not printed').to.not.include('sku');
+			} finally {
+				await closePeer(c);
+				await closePeer(d);
 			}
 		});
 	});

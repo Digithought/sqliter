@@ -482,9 +482,19 @@ function decideSchemaChange(db: Database, change: SchemaChangeToApply): SchemaCh
         return 'already-applied';
       }
 
-      // No same-version record (a table created before sync was attached, or a
-      // version that does not line up because the table was dropped and
-      // re-created): compare the current shape, as this always did.
+      // No same-version, same-TYPE record — a table created before sync was
+      // attached, or a version whose record is some other migration type: compare
+      // the current shape, as this always did.
+      //
+      // NOTE: a local drop + re-create does NOT land here. Migration records are
+      // never deleted, so the original `create_table` still sits at version 1 while
+      // the live table is the re-created one at a later version; an incoming create
+      // matching that ORIGINAL record converges silently against a table that no
+      // longer has its shape. Benign today — the peer's create is genuinely stale
+      // and the drop/re-create replicates behind it — and strictly better than the
+      // permanent block the current-shape comparison gave. If drop/re-create of a
+      // replicated table becomes common, key the lookup on the CURRENT version's
+      // create rather than the incoming migration's version.
       // Both sides render through `generateTableDDL` with no `db` argument, so
       // the strings are fully qualified and session-independent — directly
       // comparable against the DDL the origin put on the wire.

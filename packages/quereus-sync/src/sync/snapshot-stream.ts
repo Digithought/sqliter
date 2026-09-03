@@ -12,6 +12,7 @@ import { assertWithinDrift } from '../clock/hlc.js';
 import type { SiteId } from '../clock/site.js';
 import { deserializeColumnVersion } from '../metadata/column-version.js';
 import { deserializeTombstone } from '../metadata/tombstones.js';
+import type { StoredMigration } from '../metadata/schema-migration.js';
 import {
 	buildAllColumnVersionsScanBounds,
 	buildAllTombstonesScanBounds,
@@ -39,6 +40,7 @@ import {
 	type ColumnVersionEntry,
 	type DataChangeToApply,
 	type SchemaChangeToApply,
+	type SchemaObjectKind,
 	migrationObjectKind,
 	sortMigrationsByHLC,
 	toSchemaChangeWithLocalRecord,
@@ -63,6 +65,22 @@ const DEFAULT_SNAPSHOT_CHUNK_SIZE = 1000;
  * derive their row counts from it rather than restating the literal.
  */
 export const DATA_FLUSH_SIZE = 100;
+
+/**
+ * One replicated migration held between the chunk that carried it and the flush
+ * that applies it: the change the store adapter replays, plus the metadata record
+ * to file once that apply has committed (never before — see `flushDataToStore`).
+ */
+interface PendingSchemaChange {
+	readonly hlc: HLC;
+	readonly change: SchemaChangeToApply;
+	readonly record: {
+		readonly schema: string;
+		readonly kind: SchemaObjectKind;
+		readonly object: string;
+		readonly stored: StoredMigration;
+	};
+}
 
 // ============================================================================
 // Snapshot Generation
@@ -392,10 +410,11 @@ export async function applySnapshotStream(
 	let pendingDataChanges: DataChangeToApply[] = [];
 	// Kept HLC-stamped so the flush can re-order them causally instead of trusting the
 	// sender's chunk order — DDL replays in list order and `create index` needs its
-	// table's `create table` to have run. The `SchemaChangeToApply` itself is built at
-	// CHUNK time, not here: it carries what this device's own migration at that version
-	// recorded, and the chunk handler's `recordMigration` overwrites that record.
-	let pendingSchemaChanges: Array<{ readonly hlc: HLC; readonly change: SchemaChangeToApply }> = [];
+	// table's `create table` to have run. The `SchemaChangeToApply` is built at CHUNK
+	// time (it carries what THIS device's own migration at that version recorded, which
+	// the record write below overwrites), and the record write is carried alongside it
+	// so the flush can order the two: apply first, record second.
+	let pendingSchemaChanges: PendingSchemaChange[] = [];
 
 	const flushDataToStore = async (): Promise<void> => {
 		// A streamed snapshot is a known-complete wholesale load: each flush is a
@@ -406,8 +425,16 @@ export async function applySnapshotStream(
 		// storage failure emits `status:'error'` and aborts the stream mid-flight,
 		// before the footer emits `status:'synced'` / clears the checkpoint — so the
 		// checkpoint stays in place and the transfer resumes/retries.
-		const schemaChanges = sortMigrationsByHLC(pendingSchemaChanges).map(p => p.change);
-		await applyDataToStore(ctx, pendingDataChanges, schemaChanges, { remote: true, bootstrap: true });
+		const ordered = sortMigrationsByHLC(pendingSchemaChanges);
+		await applyDataToStore(ctx, pendingDataChanges, ordered.map(p => p.change), { remote: true, bootstrap: true });
+		// Record each migration only AFTER the apply that admitted it committed. A
+		// record written ahead of its apply survives a FAILED attempt, and the next
+		// attempt's own `toSchemaChangeWithLocalRecord` lookup then returns the
+		// INCOMING ddl — a vacuous comparison that silently converges the very
+		// divergence the first attempt correctly rejected.
+		for (const { record } of ordered) {
+			await ctx.schemaMigrations.recordMigration(record.schema, record.kind, record.object, record.stored);
+		}
 		pendingDataChanges = [];
 		pendingSchemaChanges = [];
 		completedTables.push(...stagedCompletedTables);
@@ -700,26 +727,34 @@ export async function applySnapshotStream(
 
 			case 'schema-migration': {
 				const migration = chunk.migration;
-				// Resolve what THIS device's own migration at the same version said BEFORE
-				// the `recordMigration` below overwrites that record with the incoming one —
-				// the store adapter judges a replicated create against it rather than against
-				// the table's current shape, which a local alteration has moved on from.
+				const kind = migrationObjectKind(migration.type);
+				// NOTE: the `??` fallback reads storage the flush has not written yet, so two
+				// migrations of ONE object that BOTH omit `schemaVersion` would collapse onto
+				// one `sm:` key. Unreachable — `SchemaMigration.schemaVersion` is required on
+				// the wire; same stance as `applyChanges`' Phase 1a.
+				const schemaVersion = migration.schemaVersion ??
+					(await ctx.schemaMigrations.getCurrentVersion(migration.schema, kind, migration.table)) + 1;
+				// Resolve what THIS device's own migration at the same version said BEFORE the
+				// deferred record write overwrites it — the store adapter judges a replicated
+				// create against it rather than against the table's current shape, which a
+				// local alteration has moved on from.
 				pendingSchemaChanges.push({
 					hlc: migration.hlc,
 					change: await toSchemaChangeWithLocalRecord(ctx.schemaMigrations, migration),
-				});
-
-				const kind = migrationObjectKind(migration.type);
-				const schemaVersion = migration.schemaVersion ??
-					(await ctx.schemaMigrations.getCurrentVersion(migration.schema, kind, migration.table)) + 1;
-				await ctx.schemaMigrations.recordMigration(migration.schema, kind, migration.table, {
-					type: migration.type,
-					// Keep the rename's old name, or this replica's own re-relay/snapshot
-					// would ship the rename without it — undecidable downstream.
-					...(migration.fromTable !== undefined ? { fromTable: migration.fromTable } : {}),
-					ddl: migration.ddl,
-					hlc: migration.hlc,
-					schemaVersion,
+					record: {
+						schema: migration.schema,
+						kind,
+						object: migration.table,
+						stored: {
+							type: migration.type,
+							// Keep the rename's old name, or this replica's own re-relay/snapshot
+							// would ship the rename without it — undecidable downstream.
+							...(migration.fromTable !== undefined ? { fromTable: migration.fromTable } : {}),
+							ddl: migration.ddl,
+							hlc: migration.hlc,
+							schemaVersion,
+						},
+					},
 				});
 				break;
 			}

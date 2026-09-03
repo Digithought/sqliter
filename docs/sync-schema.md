@@ -143,7 +143,11 @@ For a `create_table`, "definition matches" is decided against **this device's ow
 recorded migration at the same schema version** — not against the table's current shape.
 Every ingress path (`change-applicator.ts` for a delta batch, both snapshot consumers)
 looks that record up before recording the incoming migration over it, and carries it on
-`SchemaChangeToApply.localDDLAtVersion`:
+`SchemaChangeToApply.localDDLAtVersion`. All three obey one ordering rule: **an incoming
+migration is recorded only after the apply that admitted it has committed.** A record
+filed ahead of its apply survives a *failed* attempt, and the next attempt's own lookup
+then returns the incoming DDL — a vacuous comparison that silently converges the very
+divergence the first attempt rejected.
 
 | incoming create | local record at the same version | verdict |
 |---|---|---|
@@ -163,8 +167,8 @@ sync was attached records its first *alteration* at version 1, and comparing a c
 against that `ALTER TABLE` text would manufacture a conflict out of nothing.
 
 The **fallback**, used when there is no such record (a table created before sync was
-attached, or a version that does not line up because the table was dropped and
-re-created), and the comparison every other object type uses, regenerates the canonical
+attached, or a version whose record is some other migration type), and the comparison
+every other object type uses, regenerates the canonical
 DDL from the local `TableSchema` / `IndexSchema` (`generateTableDDL` / `generateIndexDDL`
 with no `db` argument — exactly how the origin produced the DDL it put on the wire). It
 keeps the pre-record limitation: a table altered locally since a create that was never

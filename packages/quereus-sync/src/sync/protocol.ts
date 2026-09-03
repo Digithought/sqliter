@@ -506,9 +506,9 @@ export interface SchemaChangeToApply {
    * peer alters the table afterwards.
    *
    * Absent when this device has no same-type record at that version (a table
-   * created before sync was attached, or a version that does not line up because
-   * the table was dropped and re-created) — the decision then falls back to the
-   * current-shape comparison.
+   * created before sync was attached, or a version whose record is some other
+   * migration type) — the decision then falls back to the current-shape
+   * comparison.
    */
   readonly localDDLAtVersion?: string;
 }
