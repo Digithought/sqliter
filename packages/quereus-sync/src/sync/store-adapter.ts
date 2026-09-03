@@ -9,13 +9,19 @@
  * maintenance, opt-in parent-side FK actions).
  *
  * Per `applyToStore(dataChanges, schemaChanges, options)` invocation:
- *   1. Schema changes execute first via `db.exec` (DDL before DML), with the
- *      resulting module schema events pre-marked remote. Replicated DDL is
- *      applied IDEMPOTENTLY: an object already in the migration's wanted state
- *      with a matching definition is counted applied without re-exec'ing, so two
- *      peers that independently created the same table converge instead of the
- *      receiver failing "already exists" on every sync (see
- *      {@link decideSchemaChange}).
+ *   1. Schema changes execute via `db.exec`, with the resulting module schema
+ *      events pre-marked remote. Replicated DDL is applied IDEMPOTENTLY: an
+ *      object already in the migration's wanted state with a matching definition
+ *      is counted applied without re-exec'ing, so two peers that independently
+ *      created the same table converge instead of the receiver failing "already
+ *      exists" on every sync (see {@link decideSchemaChange}).
+ *
+ *      Most DDL runs BEFORE the data (the batch's rows need the new shape to land
+ *      in), but a migration that VALIDATES the rows the table already holds — `set
+ *      not null`, `add constraint`, a UNIQUE index create — is legal only against a
+ *      row set this batch may still be delivering, so it runs AFTER the row writes
+ *      instead. {@link partitionSchemaChanges} splits the batch into those two
+ *      phases; {@link validatesExistingRows} is the classifier.
  *   2. Data changes are grouped per table, then per row; each row group
  *      collapses to ONE `ExternalRowOp` — the group's NET effect in list
  *      order, which the caller delivers HLC-ordered (a delete resets the row to
@@ -179,18 +185,26 @@ export function createStoreAdapter(options: SyncStoreAdapterOptions): ApplyToSto
       errors: [],
     };
 
-    // Apply schema changes first (DDL before DML)
-    for (const schemaChange of schemaChanges) {
-      try {
-        await applySchemaChange(db, events, schemaChange, applyOptions);
-        result.schemaChangesApplied++;
-      } catch (error) {
-        result.errors.push({
-          change: schemaChange,
-          error: toError(error),
-        });
+    // Both phases share one accounting path, so a validating alteration's failure
+    // reaches `result.errors` exactly as a pre-data one always did.
+    const applySchemaPhase = async (phase: readonly SchemaChangeToApply[]): Promise<void> => {
+      for (const schemaChange of phase) {
+        try {
+          await applySchemaChange(db, events, schemaChange, applyOptions);
+          result.schemaChangesApplied++;
+        } catch (error) {
+          result.errors.push({
+            change: schemaChange,
+            error: toError(error),
+          });
+        }
       }
-    }
+    };
+
+    // DDL the batch's rows may depend on runs first; DDL that validates existing
+    // rows runs after them (see partitionSchemaChanges).
+    const { beforeData, afterData } = partitionSchemaChanges(schemaChanges);
+    await applySchemaPhase(beforeData);
 
     // Effective changes accumulated across all tables, in apply order,
     // for the single end-of-invocation seam call. The order here is
@@ -246,6 +260,11 @@ export function createStoreAdapter(options: SyncStoreAdapterOptions): ApplyToSto
         }
       }
     }
+
+    // Row-validating DDL runs here, against the rows this batch just landed —
+    // the whole point of the split. It precedes the seam call so the seam
+    // observes the batch's FINAL schema.
+    await applySchemaPhase(afterData);
 
     // One seam call per invocation, after all storage writes. Driven in
     // assertion REPORT mode: a commit-time global-assertion violation over the
@@ -613,6 +632,158 @@ type AlterTableStmt = Extract<ReturnType<Parser['parse']>, { type: 'alterTable' 
 type ColumnDef = Extract<AlterTableStmt['action'], { type: 'addColumn' }>['column'];
 
 /**
+ * Parse one replicated migration's DDL with the engine's own parser, returning
+ * either the statement or the parse failure — never throwing, and never deciding
+ * what a failure means: each caller does that for itself ({@link decideAlterTable}
+ * logs it and executes the text as-is; {@link validatesExistingRows} treats an
+ * unparseable migration as non-validating). Shared so the idempotency decision and
+ * the apply-phase classifier read one migration the same way.
+ */
+function parseMigrationDDL(ddl: string): {
+  stmt?: ReturnType<Parser['parse']>;
+  parseError?: Error;
+} {
+  try {
+    return { stmt: new Parser().parse(ddl) };
+  } catch (e) {
+    return { parseError: toError(e) };
+  }
+}
+
+/**
+ * Does this migration VALIDATE the rows the receiver already holds — i.e. is it
+ * legal only against a row set the same batch may still be delivering?
+ *
+ * A tightening alteration is recorded by the origin AFTER the rows that make it
+ * hold, so replaying it ahead of those rows fails on the batch that carries them
+ * (fill a column's NULLs, then `set not null`, in one relay). Everything answered
+ * true here is therefore applied AFTER the batch's row writes; everything else
+ * keeps its pre-data position, because the batch's rows may need the new shape to
+ * land in. See {@link partitionSchemaChanges} for how the answer is used.
+ *
+ * The validating set is deliberately narrow — only alterations that INSPECT
+ * existing rows without changing how those rows are stored or addressed:
+ *
+ * - `alter column … set not null` (`drop not null` loosens, so it stays early)
+ * - `add constraint` — the `unique`, `check` and foreign-key forms all validate
+ * - a UNIQUE `add_index` — verified to throw `UNIQUE constraint failed` against
+ *   pre-existing duplicates, the same failure mode as `set not null`. A NON-unique
+ *   index create inspects nothing, so it stays early.
+ *
+ * Two alterations look like they belong here and deliberately do NOT:
+ *
+ * - `alter primary key` — re-keying is not merely validating. The batch's row
+ *   changes carry primary-key values and the key definition in force decides how
+ *   those rows are ADDRESSED, so applying it after the rows would file them under
+ *   the old key. It stays early, and its own tightening failure mode (duplicate
+ *   values under the new key, arriving with the rows that resolve them) therefore
+ *   remains.
+ * - `alter column … set data type` — a type change rewrites stored values, so
+ *   rows applied before it would be stored under the OLD type and then converted,
+ *   which is not the same history the origin has. Stays early, same tradeoff.
+ *
+ * A migration whose DDL does not parse classifies non-validating: it keeps
+ * today's position, and {@link decideAlterTable} logs the parse failure when it
+ * reaches the same text.
+ */
+function validatesExistingRows(change: SchemaChangeToApply): boolean {
+  // Only these two migration types can carry a validating statement; skip the
+  // parse for every other one.
+  if (change.type !== 'add_index' && change.type !== 'alter_column') return false;
+
+  const { stmt } = parseMigrationDDL(change.ddl);
+  if (change.type === 'add_index') {
+    // A partial (`where`-carrying) unique index still validates the rows inside
+    // its predicate, so it belongs here too.
+    return stmt?.type === 'createIndex' && stmt.isUnique === true;
+  }
+  if (stmt?.type !== 'alterTable') return false;
+  const action = stmt.action;
+  if (action.type === 'addConstraint') return true;
+  if (action.type === 'alterColumn') return action.setNotNull === true;
+  return false;
+}
+
+/**
+ * The `(schema, object)` key a migration is ordered under within one batch.
+ *
+ * For a table migration that is the table; for an index migration `change.table`
+ * holds the INDEX name (see `mapSchemaMigrationType`), so a create/drop pair for
+ * one index keys together while an index and its owner table key apart. Keying an
+ * index by its owner instead would need the owner resolved before the create has
+ * run, and the only cost of the split is the ordering caveat in
+ * {@link partitionSchemaChanges}.
+ */
+function migrationOrderKey(change: SchemaChangeToApply): string {
+  return `${change.schema}.${change.table}`;
+}
+
+/**
+ * Split one batch's schema changes into the phase that runs BEFORE the row writes
+ * and the phase that runs AFTER them, preserving each phase's relative order.
+ *
+ * A change moves to the after-data phase only when BOTH hold:
+ *
+ * - it validates existing rows ({@link validatesExistingRows}), and
+ * - every LATER change on the same object in this batch also moves.
+ *
+ * The second condition is what keeps the split from reordering DDL against DDL.
+ * A batch is a whole resolved `ChangeSet[]` — many source transactions — so it can
+ * legitimately carry `add constraint u1` and, from a later transaction, `drop
+ * constraint u1`. Deferring only the add would run the drop first (against a
+ * constraint that does not exist yet, which converges silently) and then install
+ * the constraint the origin no longer has. Holding a validating change in place
+ * as soon as anything later on the same object stays put means per-object DDL
+ * order is never rearranged: the batch simply keeps today's behaviour for that
+ * object, which is the pre-existing spurious-error case and not a new divergence.
+ *
+ * Consequences worth knowing:
+ *
+ * - A tightening followed by another ALTERATION of the same table in one batch
+ *   (`set not null`, then `add column`) keeps today's pre-data position and
+ *   today's outcome. Only the trailing run of validating changes per object moves,
+ *   where a trailing `drop_table` does not count as a blocker (see below).
+ * - NOTE: an index migration keys by index name, not by its owner table, so a
+ *   unique index create followed in the same batch by an alteration of its OWNER
+ *   (e.g. dropping the indexed column) is not held back by that alteration and the
+ *   two can be reordered. Both statements would have to arrive in one batch AND
+ *   touch the same column; if that combination ever shows up, resolve the create's
+ *   owner from its parsed DDL in {@link migrationOrderKey}.
+ */
+function partitionSchemaChanges(changes: readonly SchemaChangeToApply[]): {
+  beforeData: SchemaChangeToApply[];
+  afterData: SchemaChangeToApply[];
+} {
+  // Walk backwards so "is everything later on this object also deferred?" is a
+  // single set membership: an object lands in `pinned` the first time (from the
+  // end) a change on it stays put, and every earlier change on it then stays too.
+  const pinned = new Set<string>();
+  const deferred = new Set<number>();
+  for (let i = changes.length - 1; i >= 0; i--) {
+    const change = changes[i];
+    // A `drop_table` discards the object, so nothing earlier on that table can be
+    // reordered INTO a wrong end state by moving past it — the table is gone
+    // either way. Letting it pin would hold an earlier tightening in the pre-data
+    // phase, where it fails against rows the batch has not delivered yet and
+    // aborts a batch whose own last word is "this table is gone". Deferred
+    // instead, it meets an absent table and converges with a warning
+    // ({@link decideAlterTable}'s absent-table arm).
+    if (change.type === 'drop_table') continue;
+    const key = migrationOrderKey(change);
+    if (!pinned.has(key) && validatesExistingRows(change)) {
+      deferred.add(i);
+    } else {
+      pinned.add(key);
+    }
+  }
+
+  const beforeData: SchemaChangeToApply[] = [];
+  const afterData: SchemaChangeToApply[] = [];
+  changes.forEach((change, i) => (deferred.has(i) ? afterData : beforeData).push(change));
+  return { beforeData, afterData };
+}
+
+/**
  * Idempotency decision for a replicated `alter_column` migration. The migration
  * carries only the statement text, so parse it with the engine's own parser and
  * compare the parsed alteration against the local {@link TableSchema}.
@@ -624,20 +795,17 @@ type ColumnDef = Extract<AlterTableStmt['action'], { type: 'addColumn' }>['colum
  * loop `create_table` idempotency exists to prevent.
  */
 function decideAlterTable(db: Database, change: SchemaChangeToApply): SchemaChangeAction {
-  let stmt: AlterTableStmt;
-  try {
-    const parsed = new Parser().parse(change.ddl);
-    if (parsed.type !== 'alterTable') return 'execute';
-    stmt = parsed;
-  } catch (e) {
+  const { stmt, parseError } = parseMigrationDDL(change.ddl);
+  if (parseError) {
     // A parse failure must not be swallowed into a skip: execute the DDL so the
     // underlying engine error is what the operator sees, not a parser message.
     console.error(
       `[Sync] Could not parse replicated ${change.type} DDL for ${change.schema}.${change.table} — executing as-is:`,
-      e,
+      parseError,
     );
     return 'execute';
   }
+  if (stmt?.type !== 'alterTable') return 'execute';
   // NOTE: the decision reads the migration's `(schema, table)` envelope, never
   // `stmt.table` — the origin filed the envelope from the same event that carried
   // this text, so the two agree for anything the pipeline produces. A hand-crafted
@@ -730,11 +898,11 @@ function decideAlterTable(db: Database, change: SchemaChangeToApply): SchemaChan
         return inferType(action.setDataType).name === col.logicalType.name ? 'already-applied' : 'execute';
       }
       if (action.setNotNull !== undefined) {
-        // A `set not null` executes against the rows this peer currently holds, and
-        // schema changes are applied ahead of the same batch's data facts — so the
-        // very batch that fills the NULLs fails its own DDL and only succeeds on the
-        // next sync round. Whole class (tightening DDL vs. the data that satisfies
-        // it); tracked as `bug-sync-tightening-ddl-applied-before-its-data`.
+        // A `set not null` executes against the rows this peer currently holds, so
+        // it is applied AFTER the batch's row writes rather than ahead of them —
+        // the batch that fills the NULLs satisfies its own DDL on the first round.
+        // `drop not null` loosens and keeps its pre-data position. See
+        // {@link validatesExistingRows}.
         return col.notNull === action.setNotNull ? 'already-applied' : 'execute';
       }
       if (action.setDefault !== undefined) {

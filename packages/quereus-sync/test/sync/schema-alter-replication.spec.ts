@@ -630,6 +630,151 @@ describe('alter table replication', () => {
 		});
 	});
 
+	describe('a tightening alteration applies after the batch\'s rows', () => {
+		/**
+		 * `note` is spelled `null` explicitly: a bare `note text` is NOT NULL under
+		 * the session default, and every case here needs a column that can hold the
+		 * NULL the alteration later forbids.
+		 */
+		const NULLABLE_ORDERS_DDL =
+			'create table orders (id integer primary key, note text null) using store';
+
+		let a: Peer;
+		let b: Peer;
+
+		beforeEach(async () => {
+			[a, b] = await makeSyncedPair(NULLABLE_ORDERS_DDL);
+		});
+
+		afterEach(async () => {
+			await closePeer(a);
+			await closePeer(b);
+		});
+
+		/** Give both peers row 1 with a NULL `note` — the row the tightening later forbids. */
+		const seedNullRow = async (): Promise<void> => {
+			await localWrite(a, 'insert into orders (id, note) values (1, null)');
+			await relayAll(a, b);
+			expect(await collect(b.db, 'select id, note from orders'), 'seeded NULL row on b')
+				.to.deep.equal([{ id: 1, note: null }]);
+		};
+
+		it('fill-then-tighten in one relay succeeds on the FIRST round', async () => {
+			await seedNullRow();
+
+			await localWrite(a, "update orders set note = 'filled' where id = 1");
+			await localWrite(a, 'alter table orders alter column note set not null');
+
+			// One relay, no retry: the row write lands before the alteration that
+			// validates it, so the batch does not report an apply error at all.
+			await relayAll(a, b);
+
+			expect(await collect(b.db, 'select id, note from orders')).to.deep.equal([{ id: 1, note: 'filled' }]);
+			expect(b.db.schemaManager.getTable('main', 'orders')!
+				.columns.find(c => c.name.toLowerCase() === 'note')!.notNull).to.equal(true);
+			expectConverged(a, b);
+		});
+
+		it('a tightening the batch does NOT satisfy still fails', async () => {
+			await seedNullRow();
+
+			// b holds a second NULL row of its own that a never sees, so a's local
+			// `set not null` succeeds while b's rows still violate it.
+			await localWrite(b, 'insert into orders (id, note) values (2, null)');
+			await localWrite(a, "update orders set note = 'filled' where id = 1");
+			await localWrite(a, 'alter table orders alter column note set not null');
+
+			let caught: Error | undefined;
+			try {
+				await relayAll(a, b);
+			} catch (e) {
+				caught = e as Error;
+			}
+
+			expect(caught, 'expected the unsatisfiable tightening to be surfaced').to.be.instanceOf(Error);
+			expect(caught!.message).to.include('note');
+			expect(b.db.schemaManager.getTable('main', 'orders')!
+				.columns.find(c => c.name.toLowerCase() === 'note')!.notNull).to.equal(false);
+		});
+
+		it('an extending and a tightening alteration keep their order around the data', async () => {
+			// The row must already exist on b, so the new column is NULL there until
+			// the batch's own update fills it: `add column` has to land BEFORE that
+			// update and `set not null` AFTER it — both in one batch, one relay.
+			await localWrite(a, "insert into orders (id, note) values (1, 'n')");
+			await relayAll(a, b);
+
+			await localWrite(a, 'alter table orders add column sku text null');
+			await localWrite(a, "update orders set sku = 'S-1' where id = 1");
+			await localWrite(a, 'alter table orders alter column sku set not null');
+
+			await relayAll(a, b);
+
+			expect(await collect(b.db, 'select id, sku from orders')).to.deep.equal([{ id: 1, sku: 'S-1' }]);
+			expect(b.db.schemaManager.getTable('main', 'orders')!
+				.columns.find(c => c.name.toLowerCase() === 'sku')!.notNull).to.equal(true);
+			expectConverged(a, b);
+		});
+
+		it('an add constraint the batch satisfies applies on the FIRST round', async () => {
+			await localWrite(a, "insert into orders (id, note) values (1, 'dup')");
+			await localWrite(a, "insert into orders (id, note) values (2, 'dup')");
+			await relayAll(a, b);
+
+			await localWrite(a, "update orders set note = 'other' where id = 2");
+			await localWrite(a, 'alter table orders add constraint u_note unique (note)');
+
+			await relayAll(a, b);
+
+			expect(await collect(b.db, 'select id, note from orders order by id'))
+				.to.deep.equal([{ id: 1, note: 'dup' }, { id: 2, note: 'other' }]);
+			expectConverged(a, b);
+		});
+
+		it('a unique index the batch satisfies applies on the FIRST round', async () => {
+			await localWrite(a, "insert into orders (id, note) values (1, 'dup')");
+			await localWrite(a, "insert into orders (id, note) values (2, 'dup')");
+			await relayAll(a, b);
+
+			await localWrite(a, "update orders set note = 'other' where id = 2");
+			await localWrite(a, 'create unique index idx_note on orders (note)');
+
+			await relayAll(a, b);
+
+			expect(b.db.schemaManager.findIndexOwner('main', 'idx_note'), 'unique index on b').to.not.equal(undefined);
+			expect(await collect(b.db, 'select id, note from orders order by id'))
+				.to.deep.equal([{ id: 1, note: 'dup' }, { id: 2, note: 'other' }]);
+		});
+
+		it('add constraint then drop constraint in ONE batch leaves the constraint gone', async () => {
+			// The split must never reorder DDL against DDL on the same object: deferring
+			// only the (validating) add would run the drop first against a constraint
+			// that does not exist yet — converging silently — and then install the
+			// constraint the origin no longer has.
+			await localWrite(a, 'alter table orders add constraint u_note unique (note)');
+			await localWrite(a, 'alter table orders drop constraint u_note');
+
+			await relayAll(a, b);
+
+			expectConverged(a, b);
+			expect(tableDDL(b).toLowerCase(), 'dropped constraint absent on b').to.not.include('u_note');
+		});
+
+		it('a tightening of a table the same batch drops converges instead of failing', async () => {
+			await seedNullRow();
+
+			// The tightening is unsatisfiable against b's rows, but the batch's last
+			// word on `orders` is that it is gone — so it must not wedge the batch.
+			await localWrite(a, "update orders set note = 'filled' where id = 1");
+			await localWrite(a, 'alter table orders alter column note set not null');
+			await localWrite(a, 'drop table orders');
+
+			await relayAll(a, b);
+
+			expect(b.db.schemaManager.getTable('main', 'orders'), 'orders dropped on b').to.equal(undefined);
+		});
+	});
+
 	describe('declarative apply schema', () => {
 		it('an apply that adds and drops a column in one round replicates both alterations', async () => {
 			const [a, b] = await makeSyncedPair(

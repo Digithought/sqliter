@@ -246,13 +246,52 @@ automatically would require last-writer-wins over schema *definitions* (apply th
 higher-HLC shape as a migration, rewriting the local table) — substantially more
 machinery.
 
-A different failure survives all of this: an alteration that **tightens** a rule
-(`set not null`, `add constraint unique`, a narrowing `set data type`, `alter primary
-key`) is legal only against rows the receiver may not hold yet, and schema changes are
-applied ahead of the same batch's data facts. The DDL therefore fails on the batch that
-carries the very rows satisfying it, and succeeds on the next sync round — self-healing,
-but one spurious error and one wasted round trip. Tracked as
-`bug-sync-tightening-ddl-applied-before-its-data`.
+### Apply order: most DDL before the rows, row-validating DDL after them
+
+An alteration that **tightens** a rule is legal only against rows the receiver may not
+hold yet — the origin recorded it *after* the rows that make it hold, and those rows are
+queued behind it in the same batch. So `applyToStore` splits each batch's schema changes
+into two phases (`partitionSchemaChanges` in `store-adapter.ts`):
+
+```
+non-validating DDL  →  row writes  →  row-validating DDL  →  engine ingestion seam
+```
+
+**Row-validating** — deliberately narrow: only alterations that *inspect* existing rows
+without changing how those rows are stored or addressed.
+
+| migration | why it validates |
+|---|---|
+| `alter column … set not null` | rejects if any existing row is NULL (`drop not null` loosens, so it stays early) |
+| `add constraint` | the `unique`, `check` and foreign-key forms all check existing rows |
+| a **unique** `create index` | rejects on pre-existing duplicates, exactly like `set not null` (a non-unique index inspects nothing, so it stays early) |
+
+Everything else runs **before** the rows, because the batch's rows may need the new shape
+to land in: creates, drops, renames, `add column`, `drop constraint`, `set default`,
+`set collation`, `drop not null`, non-unique index creates, index drops, tag and
+maintenance changes.
+
+Two alterations look like they belong in the validating set and deliberately **do not**:
+
+- **`alter primary key`** — re-keying is not merely validating. The batch's row changes
+  carry primary-key values, and the key definition in force decides how those rows are
+  *addressed*; applying the re-key after the rows would file them under the old key. It
+  stays early, so its own tightening failure (duplicate values under the new key,
+  arriving with the rows that resolve them) still costs a retry.
+- **`alter column … set data type`** — a type change rewrites stored values, so rows
+  applied before it would be stored under the old type and then converted, which is not
+  the history the origin has. Stays early, same tradeoff.
+
+The split never rearranges DDL against DDL on the same object. A validating change moves
+to the after-data phase only when every *later* change on the same object in the batch
+also moves — otherwise it keeps its early position and its old behaviour. A batch is a
+whole resolved `ChangeSet[]` (many source transactions), so it can legitimately carry
+`add constraint u1` and, from a later transaction, `drop constraint u1`; deferring only
+the add would leave the receiver enforcing a constraint the origin no longer has. The one
+exception is a trailing `drop_table`: the table is discarded either way, so it does not
+hold an earlier tightening back — deferred past the data, that tightening meets an absent
+table and converges with a warning rather than aborting a batch whose last word on the
+table is that it is gone.
 
 ### What replicates
 
