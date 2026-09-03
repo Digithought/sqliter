@@ -8,6 +8,7 @@ import type { RelationType } from '../../common/datatype.js';
 import { formatExpression } from '../../util/plan-formatter.js';
 import { buildAttributesFromFlatDescriptor } from '../../util/row-descriptor.js';
 import type { PhysicalProperties } from './plan-node.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 
 export interface UpdateAssignment {
   targetColumn: AST.ColumnExpr; // Could be resolved ColumnReferenceNode or just index
@@ -114,12 +115,19 @@ export class UpdateNode extends PlanNode implements RelationalPlanNode {
     );
   }
 
-  computePhysical(): Partial<PhysicalProperties> {
+  computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
     return {
       readonly: false,  // UPDATE has side effects
+      estimatedRows: physicalSourceRows(childrenPhysical?.[0], this.source),
     };
   }
 
+  /**
+   * Rows this node EMITS — one per source row (the emitter expands each source
+   * row into a flat OLD/NEW row). See "Data-modifying nodes" in
+   * `planner/util/row-estimates.ts` for why the whole write family counts emitted
+   * rows and where the statement's user-visible count lives instead.
+   */
   get estimatedRows(): number | undefined {
     return this.source.estimatedRows;
   }

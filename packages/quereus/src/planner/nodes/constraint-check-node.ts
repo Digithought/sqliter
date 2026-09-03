@@ -1,5 +1,7 @@
 import type { Scope } from '../scopes/scope.js';
 import { PlanNode, type RelationalPlanNode, type Attribute, type RowDescriptor, type ScalarPlanNode, isRelationalNode, asScalarNodes } from './plan-node.js';
+import type { PhysicalProperties } from './plan-node.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 import { PlanNodeType } from './plan-node-type.js';
 import type { TableReferenceNode } from './reference.js';
 import type { RelationType } from '../../common/datatype.js';
@@ -170,8 +172,19 @@ export class ConstraintCheckNode extends PlanNode implements RelationalPlanNode 
     );
   }
 
+  /**
+   * Validating a row does not remove it: the emitter yields exactly one row per
+   * source row (or throws / resolves the conflict). Rows EMITTED, per
+   * "Data-modifying nodes" in `planner/util/row-estimates.ts`.
+   */
   get estimatedRows(): number | undefined {
     return this.source.estimatedRows;
+  }
+
+  computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
+    // Without this stamp the write family's relay stops here: the prep node below
+    // has a real count, and the executor above reads `undefined` through this node.
+    return { estimatedRows: physicalSourceRows(childrenPhysical?.[0], this.source) };
   }
 
   override toString(): string {

@@ -720,6 +720,14 @@ computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalPropert
 }
 ```
 
+A multi-branch node composes its branches instead of relaying one source, and keeps that
+composition in a shared helper so its logical `estimatedRows` getter and its
+`computePhysical` cannot drift: `setOperationRowsFrom` for `SetOperationNode`,
+`gatherRowsFrom` for `AsyncGatherNode`, `aggregateRowsFrom` for the aggregate family (all in
+`planner/util/row-estimates.ts`). Which nodes relay, which compose, and the two that report
+something else on purpose (`SinkNode`, `RecursiveCTENode`) are listed in
+[Costing § The number the selectivity multiplies](optimizer-costing.md).
+
 ### Cache Injection
 ```typescript
 if (shouldCache(node, context)) {

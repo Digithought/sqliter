@@ -1,9 +1,10 @@
-import { PlanNode, type RelationalPlanNode, type Attribute } from './plan-node.js';
+import { PlanNode, type RelationalPlanNode, type Attribute, type PhysicalProperties } from './plan-node.js';
 import type { RelationType } from '../../common/datatype.js';
 import { PlanNodeType } from './plan-node-type.js';
 import type { Scope } from '../scopes/scope.js';
 import type { CTEPlanNode } from './cte-node.js';
 import { Cached } from '../../util/cached.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 
 /**
  * Plan node for referencing a CTE in a FROM clause.
@@ -81,6 +82,20 @@ export class CTEReferenceNode extends PlanNode implements RelationalPlanNode {
 
 	getRelations(): readonly [RelationalPlanNode] {
 		return [this.source];
+	}
+
+	/**
+	 * Each reference re-reads the whole CTE body, so it produces the body's row
+	 * count. A CTE referenced twice yields that many rows at EACH reference — the
+	 * two references share one `CTENode`, and both report its count; the shared
+	 * body is not double-counted because each reference is its own plan site.
+	 */
+	get estimatedRows(): number | undefined {
+		return this.source.estimatedRows;
+	}
+
+	computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
+		return { estimatedRows: physicalSourceRows(childrenPhysical?.[0], this.source) };
 	}
 
 	withChildren(newChildren: readonly PlanNode[]): PlanNode {

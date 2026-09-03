@@ -13,6 +13,7 @@ import { EXISTENCE_FLAG_TYPE } from './join-utils.js';
 import { superkeyToFd } from '../util/fd-utils.js';
 import { resolveSetOpColumnCollation, collationConflictError } from '../analysis/comparison-collation.js';
 import { mergeSetOpColumnType, mergeSetOpAdvertisedType } from '../analysis/set-op-type-merge.js';
+import { physicalSourceRows, setOperationRowsFrom } from '../util/row-estimates.js';
 import { ProjectNode, type Projection } from './project-node.js';
 import { ColumnReferenceNode } from './reference.js';
 import { CastNode } from './scalar.js';
@@ -301,7 +302,30 @@ export class SetOperationNode extends PlanNode implements BinaryRelationalNode {
     return [this.left, this.right];
   }
 
-  computePhysical(_childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
+  /**
+   * Pre-optimization branch composition ({@link setOperationRowsFrom}). Membership
+   * flags are appended COLUMNS, so they never change the row count — both the
+   * flagged and unflagged shapes report the same number.
+   */
+  get estimatedRows(): number | undefined {
+    return setOperationRowsFrom(this.op, this.left.estimatedRows, this.right.estimatedRows);
+  }
+
+  /**
+   * The same composition over the PHYSICAL branch counts. By this pass both
+   * operands are usually physical access nodes (or wrappers over them), which
+   * declare no `estimatedRows` getter — reading the logical side there would blank
+   * the count for every node above the set operation (see `physicalSourceRows`).
+   */
+  private physicalRows(childrenPhysical: PhysicalProperties[]): number | undefined {
+    return setOperationRowsFrom(
+      this.op,
+      physicalSourceRows(childrenPhysical?.[0], this.left),
+      physicalSourceRows(childrenPhysical?.[1], this.right),
+    );
+  }
+
+  computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
     // All set operations drop monotonicOn in this pass.
     // TODO: UNION ALL with disjoint X-ranges on both sides could preserve
     // MonotonicOn(X); see ticket 1-monotonic-on-characteristic for the deferred
@@ -320,6 +344,7 @@ export class SetOperationNode extends PlanNode implements BinaryRelationalNode {
     //     differing constants is no longer constant).
     if (!this.hasMembershipColumns) {
       return {
+        estimatedRows: this.physicalRows(childrenPhysical),
         monotonicOn: undefined,
         fds: undefined,
         equivClasses: undefined,
@@ -331,6 +356,8 @@ export class SetOperationNode extends PlanNode implements BinaryRelationalNode {
     }
 
     return {
+      // Flags are appended columns, not extra rows — same count as the plain branch.
+      estimatedRows: this.physicalRows(childrenPhysical),
       monotonicOn: undefined,
       // Invariant 1: `key → flag` for the keyed distinct case (no claim for union all).
       fds: this.membershipFds(),

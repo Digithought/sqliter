@@ -1,5 +1,6 @@
 import type { Scope } from '../scopes/scope.js';
 import { PlanNode, type RelationalPlanNode, type ScalarPlanNode, type Attribute, type RowDescriptor, type PhysicalProperties, isRelationalNode } from './plan-node.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 import { PlanNodeType } from './plan-node-type.js';
 import type { TableReferenceNode } from './reference.js';
 import type { RelationType } from '../../common/datatype.js';
@@ -81,13 +82,22 @@ export class DeleteNode extends PlanNode implements RelationalPlanNode {
     );
   }
 
-  computePhysical(): Partial<PhysicalProperties> {
+  computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
     return {
       readonly: false,  // DELETE has side effects
-      estimatedRows: this.source.estimatedRows
+      // PHYSICAL source count, not the logical getter: by this pass the source is
+      // an access node (or a wrapper over one) that declares no getter, so reading
+      // `this.source.estimatedRows` here silently blanked the count.
+      estimatedRows: physicalSourceRows(childrenPhysical?.[0], this.source),
     };
   }
 
+  /**
+   * Rows this node EMITS — one per source row (the emitter expands each source
+   * row into a flat OLD/NEW row). See "Data-modifying nodes" in
+   * `planner/util/row-estimates.ts` for why the whole write family counts emitted
+   * rows and where the statement's user-visible count lives instead.
+   */
   get estimatedRows(): number | undefined {
     return this.source.estimatedRows;
   }

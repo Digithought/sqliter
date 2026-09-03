@@ -1,5 +1,5 @@
 import { PlanNodeType } from './plan-node-type.js';
-import { PlanNode, type RelationalPlanNode } from './plan-node.js';
+import { PlanNode, type RelationalPlanNode, type PhysicalProperties } from './plan-node.js';
 import type { ScalarType } from '../../common/datatype.js';
 import type { Scope } from '../scopes/scope.js';
 import { INTEGER_TYPE } from '../../types/builtin-types.js';
@@ -50,8 +50,21 @@ export class SinkNode extends PlanNode {
 		return [this.source];
 	}
 
+	/**
+	 * The statement boundary: a Sink drains the write stream for its side effects
+	 * and reports the single changes-count row, whatever the pipeline below it
+	 * processed. See "Data-modifying nodes" in `planner/util/row-estimates.ts` —
+	 * the DML nodes below count rows EMITTED into the write pipeline; this is where
+	 * that becomes the statement's one user-visible row.
+	 */
 	get estimatedRows(): number {
 		return 1;
+	}
+
+	computePhysical(): Partial<PhysicalProperties> {
+		// Not a function of the source: however many rows the write processed, the
+		// Sink emits exactly one.
+		return { estimatedRows: 1 };
 	}
 
 	override toString(): string {

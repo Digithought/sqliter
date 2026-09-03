@@ -1,5 +1,6 @@
 import type { Scope } from '../scopes/scope.js';
 import { PlanNode, type RelationalPlanNode, type Attribute, isRelationalNode, type PhysicalProperties } from './plan-node.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 import { PlanNodeType } from './plan-node-type.js';
 import type { ScalarPlanNode } from './plan-node.js';
 import type { RelationType } from '../../common/datatype.js';
@@ -189,6 +190,10 @@ export class ReturningNode extends PlanNode implements RelationalPlanNode {
     );
   }
 
+  /**
+   * RETURNING projects the executor's stream 1:1 — one returned row per written
+   * row. See "Data-modifying nodes" in `planner/util/row-estimates.ts`.
+   */
   get estimatedRows(): number | undefined {
     return this.executor.estimatedRows;
   }
@@ -260,7 +265,9 @@ export class ReturningNode extends PlanNode implements RelationalPlanNode {
     const projectedInds = projectInds(sourcePhysical?.inds ?? [], map);
 
     return {
-      estimatedRows: this.estimatedRows,
+      // PHYSICAL executor count, not `this.estimatedRows` (which reads the logical
+      // executor getter and blanks once the write's source became an access node).
+      estimatedRows: physicalSourceRows(sourcePhysical, this.executor),
       ordering: projectOrdering(sourcePhysical?.ordering, map),
       fds: fds.length > 0 ? fds : undefined,
       equivClasses: projectedEquiv.length > 0 ? projectedEquiv : undefined,

@@ -1,8 +1,9 @@
-import { PlanNode, type UnaryRelationalNode, type RelationalPlanNode, type Attribute, type TableDescriptor, isRelationalNode } from './plan-node.js';
+import { PlanNode, type UnaryRelationalNode, type RelationalPlanNode, type Attribute, type TableDescriptor, type PhysicalProperties, isRelationalNode } from './plan-node.js';
 import type { RelationType } from '../../common/datatype.js';
 import { PlanNodeType } from './plan-node-type.js';
 import type { Scope } from '../scopes/scope.js';
 import { Cached } from '../../util/cached.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 
 /**
  * Narrow contract that any node must satisfy to be placed in the CTE lookup map
@@ -116,6 +117,21 @@ export class CTENode extends PlanNode implements CTEPlanNode, CTEScopeNode {
 
 	getRelations(): readonly [RelationalPlanNode] {
 		return [this.source];
+	}
+
+	/**
+	 * A CTE emits exactly the rows its body produces — naming and (optionally)
+	 * buffering a relation changes neither its cardinality nor its rows.
+	 */
+	get estimatedRows(): number | undefined {
+		return this.source.estimatedRows;
+	}
+
+	computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
+		// The PHYSICAL body count, not the logical getter: by this pass the body
+		// usually bottoms out in physical access nodes, which declare no getter
+		// (see `physicalSourceRows`).
+		return { estimatedRows: physicalSourceRows(childrenPhysical?.[0], this.source) };
 	}
 
 	withChildren(newChildren: readonly PlanNode[]): PlanNode {

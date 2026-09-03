@@ -1,10 +1,11 @@
 import type { RelationType } from '../../common/datatype.js';
-import { PlanNode, type RelationalPlanNode, type Attribute, type UnaryRelationalNode } from './plan-node.js';
+import { PlanNode, type RelationalPlanNode, type Attribute, type UnaryRelationalNode, type PhysicalProperties } from './plan-node.js';
 import { PlanNodeType } from './plan-node-type.js';
 import type { Scope } from '../scopes/scope.js';
 import type { TableReferenceNode } from './reference.js';
 import type { AnyVirtualTableModule } from '../../vtab/module.js';
 import { Cached } from '../../util/cached.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 
 /**
  * RemoteQueryNode represents a physical node for executing a pushed-down
@@ -52,6 +53,18 @@ export class RemoteQueryNode extends PlanNode implements UnaryRelationalNode {
 
 	getRelations(): readonly [RelationalPlanNode] {
 		return [this.source];
+	}
+
+	/**
+	 * Executing the pipeline remotely re-shapes latency, not cardinality — the
+	 * same rows come back, so the source's count passes through unchanged.
+	 */
+	get estimatedRows(): number | undefined {
+		return this.source.estimatedRows;
+	}
+
+	computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
+		return { estimatedRows: physicalSourceRows(childrenPhysical?.[0], this.source) };
 	}
 
 	/** Get the virtual table module for this remote query node */

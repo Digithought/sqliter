@@ -1,5 +1,6 @@
 import type { Scope } from '../scopes/scope.js';
 import { PlanNode, type RelationalPlanNode, type Attribute, type PhysicalProperties, type ScalarPlanNode, type RowDescriptor, isRelationalNode, asScalarNodes } from './plan-node.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 import { PlanNodeType } from './plan-node-type.js';
 import type { TableReferenceNode } from './reference.js';
 import type { RelationType } from '../../common/datatype.js';
@@ -250,6 +251,7 @@ export class DmlExecutorNode extends PlanNode implements RelationalPlanNode {
     );
   }
 
+  /** Upper bound: rows emitted, which is the source count minus any skipped rows. */
   get estimatedRows(): number | undefined {
     return this.source.estimatedRows;
   }
@@ -297,9 +299,14 @@ export class DmlExecutorNode extends PlanNode implements RelationalPlanNode {
     return props;
   }
 
-  computePhysical(): Partial<PhysicalProperties> {
+  computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
     return {
       readonly: false, // DML executor has side effects
+      // At most one output row per source row — a row the executor skipped (`insert
+      // or ignore` onto an existing key, `on conflict do nothing`) yields nothing,
+      // so this is an upper bound. See "Data-modifying nodes" in
+      // `planner/util/row-estimates.ts`; read from the PHYSICAL child.
+      estimatedRows: physicalSourceRows(childrenPhysical?.[0], this.source),
       idempotent: false, // DML operations are generally not idempotent
       // Non-deterministic via the side-effect axis: a write changes
       // database state, so the executor cannot be folded by determinism-

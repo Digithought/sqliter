@@ -124,6 +124,14 @@ export class RecursiveCTENode extends PlanNode implements CTEPlanNode, CTEScopeN
 		return [this.baseCaseQuery];
 	}
 
+	// NOTE: deliberately no `estimatedRows` / `computePhysical` row stamp. A
+	// recursive CTE's cardinality is the fixpoint of iterating the recursive case
+	// over the working table; the number of iterations is not derivable from the
+	// base and recursive branch counts, so any composition of them would be an
+	// invented multiplier. `undefined` — "nobody knows" — is the honest answer, and
+	// consumers apply their own default to it. `CTENode` (the non-recursive path)
+	// does relay its body's count.
+
 	withChildren(newChildren: readonly PlanNode[]): PlanNode {
 		const expectedLength = 2 + (this.limitExpr ? 1 : 0) + (this.offsetExpr ? 1 : 0);
 		if (newChildren.length !== expectedLength) {

@@ -26,6 +26,7 @@ import {
 	shiftFds,
 } from '../util/fd-utils.js';
 import { mergeSetOpAdvertisedType } from '../analysis/set-op-type-merge.js';
+import { gatherRowsFrom, physicalSourceRows } from '../util/row-estimates.js';
 
 /**
  * How {@link AsyncGatherNode} combines rows from its N independent child relations.
@@ -533,6 +534,7 @@ export class AsyncGatherNode extends PlanNode implements RelationalPlanNode {
 			// conditional non-key FDs (branch-i FDs hold only when the branch-i
 			// row exists) are future work, not implemented here.
 			return {
+				estimatedRows: this.physicalRows(childrenPhysical),
 				ordering: undefined,
 				monotonicOn: undefined,
 				fds: undefined,
@@ -598,6 +600,7 @@ export class AsyncGatherNode extends PlanNode implements RelationalPlanNode {
 		}
 
 		return {
+			estimatedRows: this.physicalRows(childrenPhysical),
 			ordering: undefined,
 			monotonicOn: undefined,
 			fds: fds.length > 0 ? fds : undefined,
@@ -648,33 +651,27 @@ export class AsyncGatherNode extends PlanNode implements RelationalPlanNode {
 		);
 	}
 
+	/**
+	 * Pre-optimization branch composition. The per-combinator arms live in
+	 * {@link gatherRowsFrom} so this getter and {@link computePhysical} cannot
+	 * drift — the same discipline `aggregateRowsFrom` applies to the aggregates.
+	 */
 	get estimatedRows(): number | undefined {
-		if (this.combinator.kind === 'unionAll') {
-			let total = 0;
-			for (const c of this.children) {
-				if (c.estimatedRows === undefined) return undefined;
-				total += c.estimatedRows;
-			}
-			return total;
-		}
-		if (this.combinator.kind === 'zipByKey') {
-			// Distinct keys across branches is bounded by max(children) <= result
-			// <= sum(children). Use max — heavily overlapping keys is the join's
-			// normal case. Reviewer may tune toward sum for low-overlap workloads.
-			let max = 0;
-			for (const c of this.children) {
-				if (c.estimatedRows === undefined) return undefined;
-				max = Math.max(max, c.estimatedRows);
-			}
-			return max;
-		}
-		// crossProduct
-		let product = 1;
-		for (const c of this.children) {
-			if (c.estimatedRows === undefined) return undefined;
-			product *= c.estimatedRows;
-		}
-		return product;
+		return gatherRowsFrom(this.combinator.kind, this.children.map(c => c.estimatedRows));
+	}
+
+	/**
+	 * The same composition over the PHYSICAL branch counts. `rule-parallel-gather`
+	 * substitutes this node for a `union all` on high-latency plans, so without this
+	 * stamp the branch meant to PRESERVE the estimate would be the one that loses it
+	 * — the children are physical access nodes by then and declare no logical getter
+	 * (see `physicalSourceRows`).
+	 */
+	private physicalRows(childrenPhysical: PhysicalProperties[]): number | undefined {
+		return gatherRowsFrom(
+			this.combinator.kind,
+			this.children.map((child, i) => physicalSourceRows(childrenPhysical?.[i], child)),
+		);
 	}
 
 	override toString(): string {
