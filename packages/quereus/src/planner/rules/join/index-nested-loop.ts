@@ -402,7 +402,9 @@ function probeModule(
 		log('decline: module has no getBestAccessPlan');
 		return null;
 	}
-	const tableRows = leaf.source.estimatedRows || undefined;
+	// `??`, not `||`: a measured empty table is `0` and must reach the module as `0`.
+	// Only `undefined` (never analyzed) means unknown.
+	const tableRows = leaf.source.estimatedRows ?? undefined;
 	const ask = (filters: readonly PredicateConstraint[]): BestAccessPlanResult => {
 		const request = buildProbeRequest(tableSchema, tableRows, filters);
 		const plan = getBestAccessPlan.call(vtabModule, context.db, tableSchema, request) as BestAccessPlanResult;

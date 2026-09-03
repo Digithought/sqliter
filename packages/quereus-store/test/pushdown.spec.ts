@@ -863,6 +863,12 @@ describe('StoreModule predicate pushdown', () => {
 		it('index over an ANY column with a declared COLLATE seeks and stays correct', async () => {
 			await db.exec(`create table t (id integer primary key, x ANY collate nocase) using store (collation = binary)`);
 			await db.exec(`insert into t values (1, 'Bob')`);
+			// Enough rows for the seek to be the cheaper plan: since
+			// `ask-the-backend-before-guessing-its-size` the module prices against the table's
+			// real size, and on a one-row table reading the row beats seeking for it. The
+			// subject here is whether the seek stays NOCASE-correct, not whether it is chosen.
+			await db.exec(`insert into t values ${
+				Array.from({ length: 19 }, (_, i) => `(${i + 2}, 'other${i}')`).join(', ')}`);
 
 			const q = `select id from t where x = 'BOB' order by id`;
 			// Pin the no-index answer first: it is the oracle the indexed plan must match.

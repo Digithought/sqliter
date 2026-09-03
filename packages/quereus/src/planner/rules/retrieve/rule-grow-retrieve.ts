@@ -43,6 +43,26 @@ import { type IndexStyleContext, isIndexStyleContext } from '../shared/index-sty
 
 const log = createLogger('optimizer:rule:grow-retrieve');
 
+/**
+ * The row count for a `BestAccessPlanRequest`: the catalog's measured count, or
+ * `undefined` when nothing has measured it. Never a fabricated number.
+ *
+ * `TableReferenceNode.estimatedRows` is `catalogRowCount(tableSchema)` — populated only
+ * by `ANALYZE` (or a module reporting statistics), where a real `0` means "measured,
+ * empty" and `undefined` means "nobody knows".
+ *
+ * `context.stats.tableRows()` is deliberately NOT consulted here. `CatalogStatsProvider`
+ * reads that same `catalogRowCount` and, finding nothing, falls back to
+ * `NaiveStatsProvider`'s fixed 1000 — so routing through it would hand the module a
+ * made-up size indistinguishable from a real 1000-row `ANALYZE` result, and lock out
+ * every module that can size itself better (`quereus-store` keeps a live row count).
+ * A module with no way to size itself applies its own default instead; that default is
+ * now the sole fallback.
+ */
+function measuredRows(tableRef: TableReferenceNode): number | undefined {
+	return tableRef.estimatedRows;
+}
+
 export function ruleGrowRetrieve(node: PlanNode, context: OptContext): PlanNode | null {
 	// This rule runs in a TOP-DOWN pass, looking for any relational operation
 	// above a RetrieveNode that can be pushed into the module's execution boundary
@@ -366,7 +386,7 @@ function fallbackIndexSupports(
 		filters: [],
 		requiredOrdering: undefined,
 		limit: undefined,
-		estimatedRows: tableRef.estimatedRows || context.stats.tableRows(tableSchema) || 1000
+		estimatedRows: measuredRows(tableRef)
 	};
 
 	// Extract information based on node type
@@ -797,7 +817,7 @@ export function trySortAbsorbViaIndexOrdering(
 		})),
 		filters: constraints,
 		requiredOrdering,
-		estimatedRows: tableRef.estimatedRows || context.stats.tableRows(tableSchema) || 1000,
+		estimatedRows: measuredRows(tableRef),
 	};
 
 	// `probeAccessPlan` sends the bound and re-asks without it if the plan that comes back

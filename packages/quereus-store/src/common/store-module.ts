@@ -76,7 +76,18 @@ import { reconcilePkCollations } from './store-module-schema-rewrite.js';
  * whatever the table actually holds. This module maintains a running row count as it
  * writes ({@link StoreTable.getKnownRowCount}), so it can answer for itself.
  *
- * A supplied hint WINS: it is the number the rest of the plan was costed with (join
+ * ONE exception, and only one: a hint of `0` that this module's own count contradicts.
+ * `0` normally means "analyzed, and empty" and is honored like any other measurement — but
+ * an `ANALYZE` run before the data load leaves that 0 in the catalog while the table fills
+ * up behind it, and the module can see the contradiction directly. Honoring the 0 there is
+ * not conservative, it is degenerate: every cost derives from the size, so a 2000-row table
+ * prices every arm and every scan at zero and the seek-versus-scan comparison decides on
+ * rounding. `resolveArmEstimate` already refuses a `rowCount <= 0` snapshot for the same
+ * reason (see its comment, which names this exact bootstrap-script case); the size path now
+ * refuses it consistently. A hint of 0 that the live count AGREES with is a genuinely empty
+ * table and stays 0.
+ *
+ * Otherwise a supplied hint WINS: it is the number the rest of the plan was costed with (join
  * ordering, cache thresholds and sort costs all read the same catalog statistics), and
  * a module quietly pricing against a different figure would make the access path
  * disagree with the plan around it. A stale post-`ANALYZE` count therefore stays stale
@@ -101,14 +112,25 @@ import { reconcilePkCollations } from './store-module-schema-rewrite.js';
  * answer — the scan claims no filters, so the residual keeps the predicate. If a prepared
  * statement is ever seen picking a plan wrong for the table's current size, the fix belongs
  * at the statement's recompile trigger, not here.
+ *
+ * The trigger exists and covers growth, but only indirectly — checked while making this
+ * function actually fire (`ask-the-backend-before-guessing-its-size`). `core/statement.ts`
+ * subscribes each compiled plan to the schema-change notifier and drops the plan when an
+ * event touches a table it depends on. Plain INSERTs fire no such event, so growth alone
+ * never recompiles; what does is the `table_modified` that `ANALYZE` emits
+ * (`runtime/emit/analyze.ts`), and `auto_analyze` — on by default — re-analyzes a table
+ * once its mutation counters cross `auto_analyze_min_mutations` / `auto_analyze_ratio`.
+ * So the staleness window is bounded by those thresholds rather than closed outright.
+ * Closing it properly would need a row-count signal the notifier does not carry today.
  */
 function sizeRequestFromLiveCount(
 	request: BestAccessPlanRequest,
 	table: StoreTable | undefined,
 ): BestAccessPlanRequest {
-	if (request.estimatedRows !== undefined) return request;
 	const liveRows = table?.getKnownRowCount();
 	if (liveRows === undefined) return request;
+	const staleEmptySnapshot = request.estimatedRows === 0 && liveRows > 0;
+	if (request.estimatedRows !== undefined && !staleEmptySnapshot) return request;
 	return { ...request, estimatedRows: Math.max(1, liveRows) };
 }
 

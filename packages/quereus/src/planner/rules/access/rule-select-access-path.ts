@@ -260,7 +260,10 @@ function createIndexBasedAccess(retrieveNode: RetrieveNode, context: OptContext)
 				isUnique: col.primaryKey || false // For now, assume only PK columns are unique
 			} as ColumnMeta)),
 			filters: constraints,
-			estimatedRows: retrieveNode.tableRef.estimatedRows || undefined
+			// `??`, not `||`: a measured empty table is `0` and must reach the module as
+			// `0`. Only `undefined` (never analyzed) means unknown, which is the module's
+			// cue to substitute a size of its own.
+			estimatedRows: retrieveNode.tableRef.estimatedRows ?? undefined
 		};
 
 		// Use the vtab module's getBestAccessPlan method to get an optimized access plan

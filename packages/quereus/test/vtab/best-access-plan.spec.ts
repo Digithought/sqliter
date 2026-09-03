@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import { AccessPlanBuilder, validateAccessPlan } from '../../src/vtab/best-access-plan.js';
+import { AccessPlanBuilder, validateAccessPlan, validateAccessPlanRequest } from '../../src/vtab/best-access-plan.js';
 import type { BestAccessPlanRequest, BestAccessPlanResult, ColumnMeta } from '../../src/vtab/best-access-plan.js';
 import { INTEGER_TYPE, TEXT_TYPE } from '../../src/types/index.js';
 
@@ -428,6 +428,40 @@ describe('AccessPlanBuilder', () => {
 				supportsAsofRight: true,
 			};
 			expect(() => validateAccessPlan(request, result)).not.to.throw();
+		});
+	});
+	describe('validateAccessPlanRequest — estimatedRows', () => {
+		/**
+		 * Three spellings, all distinct and all legal on the way in: `undefined` (nobody
+		 * measured the table — what every planner site now sends for a never-analyzed one),
+		 * `0` (measured, and empty — a module is entitled to price against it), and a
+		 * positive integer (measured). Anything else is a caller bug.
+		 */
+		const requestWith = (estimatedRows?: number): BestAccessPlanRequest => ({
+			columns: testColumns,
+			filters: [],
+			estimatedRows,
+		});
+
+		it('accepts undefined — the spelling for "nobody measured this table"', () => {
+			expect(() => validateAccessPlanRequest(requestWith(undefined))).not.to.throw();
+		});
+
+		it('accepts a measured 0, which is not the same thing as unknown', () => {
+			expect(() => validateAccessPlanRequest(requestWith(0))).not.to.throw();
+		});
+
+		it('accepts a measured positive count', () => {
+			expect(() => validateAccessPlanRequest(requestWith(1_000_000))).not.to.throw();
+		});
+
+		it('rejects a negative count', () => {
+			expect(() => validateAccessPlanRequest(requestWith(-1))).to.throw(/estimatedRows/);
+		});
+
+		it('rejects a non-integer count', () => {
+			expect(() => validateAccessPlanRequest(requestWith(12.5))).to.throw(/estimatedRows/);
+			expect(() => validateAccessPlanRequest(requestWith(Number.NaN))).to.throw(/estimatedRows/);
 		});
 	});
 });

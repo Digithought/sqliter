@@ -6,6 +6,7 @@ files:
   - packages/quereus/src/planner/nodes/sequencing-node.ts          # hole: getter relays, no computePhysical at all
   - packages/quereus/src/planner/nodes/sequence-node.ts            # hole: computePhysical() takes no args, cannot relay
   - packages/quereus/src/planner/nodes/block.ts                    # hole: getter sums relations, no computePhysical
+  - packages/quereus/src/planner/nodes/table-access-nodes.ts       # arm: IndexScanNode/SeqScanNode relay the CATALOG count, not the module's answer
   - packages/quereus/test/optimizer/set-op-row-estimates.spec.ts   # where a guard would naturally live
 difficulty: medium
 tradeoffs: A maintainer could reasonably say the remaining three nodes are rare enough in real plans that the hand-patching has already bought most of the value, and that a guard test which enumerates node classes is itself maintenance.
@@ -66,3 +67,40 @@ so.
 Fixing the three nodes without the guard is the smaller version of this ticket and
 is worth doing on its own — but it is the fourth round of hand-patching, and the
 fifth will follow.
+
+## Arm: a table-access node relays the wrong one of two available numbers
+
+Added while landing `ask-the-backend-before-guessing-its-size`, which made a storage
+backend able to answer "how many rows does this table hold?" for a table nobody has run
+`ANALYZE` on.
+
+The three physical table-access nodes in
+`packages/quereus/src/planner/nodes/table-access-nodes.ts` each have **two** row counts in
+scope, and they do not agree on which to publish upward:
+
+| node | what its `computePhysical` publishes |
+|---|---|
+| `IndexSeekNode` (~545) | `this.filterInfo.indexInfoOutput.estimatedRows` — **the module's own answer** |
+| `IndexScanNode` (~277) | `this.source.estimatedRows` — the catalog count |
+| `SeqScanNode` (~177) | `this.source.estimatedRows` — the catalog count |
+
+The catalog count comes only from `ANALYZE`, so on a never-analyzed table it is
+`undefined`. The module's answer is a real number whenever the backend can size itself.
+So a scan over an un-analyzed store table receives a live row count, prices its plan with
+it, and then throws it away at the physical boundary — while a *seek* over the same table
+publishes it. This is the relay bug of the parent ticket in a slightly different dress:
+the number is not missing, it is available and the wrong one is chosen.
+
+**Measured consequence.** `rule-key-set-seek` (~618) declines its rewrite when the key
+source's physical row estimate exceeds the number of keys the runtime would seek with.
+Against a 3000-row key source and a 200-row target advertising `breakEvenKeys: 343` — an
+estimate nearly 9× over the threshold — the gate still proceeds, because what it reads
+through the key source's `IndexScan` is `undefined`. The gate has never once declined on
+either shipped backend. Pinned as *observed* behavior (not as desired behavior) by
+`packages/quereus-store/test/live-row-count-plans.spec.ts`, which is the test that will
+report the change when this is fixed.
+
+Whether the fix is "publish `filterInfo.indexInfoOutput.estimatedRows` from the scan nodes
+too" or "prefer the catalog count and fall back to the module's" is the design question,
+not settled here — but the two sibling nodes disagreeing is not defensible either way, and
+the guard test this ticket proposes would have caught the disagreement.

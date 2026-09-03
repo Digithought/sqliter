@@ -741,14 +741,25 @@ describe('secondary-index ordering advertisement', () => {
 			// The filter (a range on un-indexed s) IS pushed to the module; the walk claims
 			// nothing, so the engine keeps it as a Filter above the IndexScan — order
 			// preserved, non-matching rows gone.
+			//
+			// 1200 rows, not the 300 its neighbours use. Since
+			// `ask-the-backend-before-guessing-its-size` the module prices against the table's
+			// real size instead of a fixed 1000-row placeholder, and the ordering walk only
+			// beats scan-then-sort above ~512 rows once two pushed filters have to be
+			// re-checked per row (walk ≈ 1.9N against N + 0.1·N·log₂N). At 300 rows
+			// scan-then-sort is now genuinely cheaper and there is no walk to test; the
+			// unfiltered neighbours above keep winning at 300 because they pay no residual
+			// term. The subject here is the residual over a walk, so the fixture is sized to
+			// where a walk is the right plan.
+			const N = 1200;
 			await db.exec(`create table t (id integer primary key, n integer, s text) using store`);
 			await db.exec(`create index ix_n on t (n)`);
-			await db.exec(`insert into t values ${range(300)
-				.map(i => `(${i}, ${301 - i}, '${(301 - i) % 2 === 0 ? 'keep' : 'drop'}')`).join(', ')}`);
+			await db.exec(`insert into t values ${range(N)
+				.map(i => `(${i}, ${N + 1 - i}, '${(N + 1 - i) % 2 === 0 ? 'keep' : 'drop'}')`).join(', ')}`);
 
 			const q = `select n from t where s >= 'k' and s < 'l' order by n`;
 			expect(await planOps(db, q)).to.match(ISCAN).and.to.not.match(SORT);
-			expect(await column(db, q, 'n')).to.deep.equal(range(300).filter(n => n % 2 === 0));
+			expect(await column(db, q, 'n')).to.deep.equal(range(N).filter(n => n % 2 === 0));
 		});
 
 		it('a whole-PK equality keeps its point seek; the Sort stays', async () => {

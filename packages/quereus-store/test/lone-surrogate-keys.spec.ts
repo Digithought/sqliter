@@ -297,6 +297,12 @@ describe('Lone surrogates are refused by the store and accepted in memory', () =
 			await db.exec(`create table js (id integer primary key, k json) using store`);
 			await db.exec(`create index ix_jk on js (k)`);
 			await db.exec(`insert into js values (1, '["a"]')`);
+			// Enough rows for the index seek to be the cheaper plan. Since
+			// `ask-the-backend-before-guessing-its-size` the store prices against the table's
+			// real size, and on a one-row table a scan wins — so no equality probe would be
+			// built and there would be nothing for the encoder to refuse.
+			await db.exec(`insert into js values ${
+				Array.from({ length: 19 }, (_, i) => `(${i + 2}, '["v${i}"]')`).join(', ')}`);
 			await rejects(db, `select id from js where k = json('["\\ud800"]')`);
 		});
 	});

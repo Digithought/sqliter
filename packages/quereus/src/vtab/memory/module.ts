@@ -452,6 +452,13 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		// arrives as `undefined` ("nobody knows"); fall back to a reasonable
 		// default to avoid degenerate costs. (`||` also catches an analyzed empty
 		// table — a plan over 0 rows is cheap under any default, so that is fine.)
+		//
+		// NOTE: this default is now the SOLE fallback for an un-analyzed table. Every
+		// planner site that builds a `BestAccessPlanRequest` sends `undefined` rather
+		// than substituting 1000 of its own, precisely so a module that can size itself
+		// gets the chance. This module keeps no live row count, so it cannot — the
+		// constant stays. If the in-memory table ever exposes its own size, read it here
+		// instead of the constant.
 		const estimatedTableSize = request.estimatedRows || 1000;
 
 		// Find the best access strategy

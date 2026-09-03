@@ -530,6 +530,11 @@ function computeFilterAccessPlan(
 	tableKeyCollation: string,
 	costProfile: ResolvedCostProfile,
 ): BestAccessPlanResult {
+	// NOTE: last-resort default only. Every planner site now sends `undefined` for an
+	// un-analyzed table rather than substituting 1000 of its own, and `StoreModule`
+	// fills that gap from the table's live row count before this function runs
+	// (`sizeRequestFromLiveCount`). Reaching this constant means neither the catalog nor
+	// the live count could answer — a table this module has no handle for.
 	const estimatedRows = request.estimatedRows ?? 1000;
 
 	// Whether ANY pushed filter is a runtime-valued set. Detected once, on the REQUEST:
@@ -897,6 +902,7 @@ function chooseOrderingPlan(
 	if (orderingAlreadySatisfied(filterPlan.providesOrdering, required)) return filterPlan;
 	if (request.filters.some(f => f.runtimeSet !== undefined)) return filterPlan;
 
+	// NOTE: same last-resort default as `computeFilterAccessPlan` — see the note there.
 	const estimatedRows = request.estimatedRows ?? 1000;
 	let bestWalk: BestAccessPlanResult | null = null;
 	let bestWidth = 0;

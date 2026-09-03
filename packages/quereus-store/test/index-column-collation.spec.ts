@@ -246,7 +246,16 @@ describe('secondary-index key bytes encode under the index column collation, not
 		it('an index-backed lookup succeeds for a value matching only under the new collation', async () => {
 			await db.exec(`create table t (id integer primary key, name text) using store`);
 			await db.exec(`create index ix on t (name)`);
+			// Twenty rows, not one: since `ask-the-backend-before-guessing-its-size` the module
+			// prices against the table's REAL size, and on a one-row table an index seek
+			// (0.3 + 1.3 per row) genuinely costs more than reading the single row, so the
+			// seek-versus-scan comparison drops the arm and there is no seek left to test.
+			// That matches what an ANALYZEd one-row table has always done. The subject here is
+			// the re-encoded index KEY, not the cost model, so the fixture carries enough rows
+			// for the seek to be the cheaper plan.
 			await db.exec(`insert into t values (1, 'Ann')`);
+			await db.exec(`insert into t values ${
+				Array.from({ length: 19 }, (_, i) => `(${i + 2}, 'filler${i}')`).join(', ')}`);
 
 			await db.exec(`alter table t alter column name set collate nocase`);
 			// C = NOCASE = K now, so the planner takes the index seek and drops the

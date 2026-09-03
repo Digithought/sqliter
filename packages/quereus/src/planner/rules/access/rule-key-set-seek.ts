@@ -406,7 +406,9 @@ function probeModuleCosts(
 		return null;
 	}
 
-	const tableRows = leaf.source.estimatedRows || undefined;
+	// `??`, not `||`: a measured empty table is `0` and must reach the module as `0`.
+	// Only `undefined` (never analyzed) means unknown.
+	const tableRows = leaf.source.estimatedRows ?? undefined;
 	// Advisory count estimate, clamped into the ceiling `validateAccessPlanRequest` demands.
 	const runtimeSetFilter = (maxCount: number): PredicateConstraint => ({
 		columnIndex: seekCol,
@@ -615,6 +617,18 @@ export function ruleKeySetSeek(node: PlanNode, context: OptContext): PlanNode | 
 		// and the gate always proceeds. That is the unknown-spelled-as-zero
 		// conflation `bug-row-estimate-conflates-unknown-and-zero` tracks, seen from
 		// this site; the gate exists for modules that report real cardinality.
+		//
+		// STILL inert after `unknown-row-count-stops-pretending-to-be-zero` (which made that
+		// estimate read `undefined` instead of `0`) and after
+		// `ask-the-backend-before-guessing-its-size` (which lets a self-sizing module answer
+		// with its live row count). Measured on the store: a 3000-row key source against a
+		// 200-row target advertising `breakEvenKeys: 343` — nearly 9× over — still proceeds.
+		// The live count reaches the module and is discarded one level up:
+		// `IndexScanNode.computePhysical` relays `this.source.estimatedRows` (the CATALOG
+		// count, `undefined` un-analyzed) where its sibling `IndexSeekNode` relays the
+		// module's own `filterInfo.indexInfoOutput.estimatedRows`. Tracked as an arm on
+		// `debt-row-estimate-relay-has-no-guard`; pinned as observed behavior by
+		// `packages/quereus-store/test/live-row-count-plans.spec.ts`.
 		const keyRows = node.right.physical.estimatedRows;
 		if (keyRows !== undefined && keyRows > Math.min(pushdown.maxKeys, pushdown.breakEvenKeys)) {
 			log('decline: key source estimate %d exceeds the seek threshold min(%d, %d)',

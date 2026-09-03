@@ -267,7 +267,22 @@ export interface BestAccessPlanRequest {
 	 * starting at the `offset`-th monotonic position.
 	 */
 	offset?: number | null;
-	/** Estimated rows hint from planner (may be unknown) */
+	/**
+	 * The planner's row-count hint, populated ONLY from `ANALYZE`-collected statistics.
+	 *
+	 * Three distinct spellings, and the difference is load-bearing:
+	 * - `undefined` — nobody has measured this table. Every planner site that builds a
+	 *   request sends this rather than substituting a constant, so a module that can size
+	 *   itself (a live row count, a stored cardinality) may fill it in; one that cannot
+	 *   applies its own default.
+	 * - `0` — measured, and empty. Not "unknown": price against it.
+	 * - `n > 0` — measured. A module must DEFER to it rather than substituting its own
+	 *   count, since the rest of the plan (join ordering, cache thresholds, sort costs)
+	 *   was costed from the same catalog statistics; a module quietly pricing against a
+	 *   different figure makes the access path disagree with the plan around it.
+	 *
+	 * A snapshot from the last `ANALYZE` — rows written afterwards are invisible to it.
+	 */
 	estimatedRows?: number;
 }
 
@@ -590,6 +605,17 @@ export class AccessPlanBuilder {
  * never to deliver, so it is an engine bug rather than a pessimistic guess.
  */
 export function validateAccessPlanRequest(request: BestAccessPlanRequest): void {
+	// `undefined` is the legal spelling of "unknown" and every planner site sends it for a
+	// never-analyzed table, so only a PRESENT value is checked. A measured `0` (analyzed,
+	// empty) is valid and must survive — the module is entitled to price against it.
+	if (request.estimatedRows !== undefined
+		&& (!Number.isInteger(request.estimatedRows) || request.estimatedRows < 0)) {
+		quereusError(
+			`estimatedRows must be a non-negative integer or undefined, got ${request.estimatedRows}`,
+			StatusCode.FORMAT
+		);
+	}
+
 	for (const filter of request.filters) {
 		if (!filter.runtimeSet) continue;
 
