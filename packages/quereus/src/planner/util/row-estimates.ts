@@ -73,20 +73,20 @@ export function aggregateRowsFrom(
  * Every estimate in this file counts the rows a node puts on its own output
  * stream. For the write family (`InsertNode`, `UpdateNode`, `DeleteNode`,
  * `ConstraintCheckNode`, `DmlExecutorNode`, `ReturningNode`) that stream tracks
- * the source one-for-one — the prep nodes yield one flat OLD/NEW row per source
- * row, the constraint check passes each row through or throws, and
- * `ReturningNode` projects one row per written row — so "rows emitted" and "rows
- * processed" coincide and every member passes its source count through
- * unchanged.
+ * the source at most one-for-one — the prep nodes yield one flat OLD/NEW row per
+ * source row and `ReturningNode` projects one row per written row — so every
+ * member relays its source count unchanged.
  *
- * The one place the two can part is `DmlExecutorNode`, which yields NOTHING for a
- * row it did not write (`insert or ignore` onto an existing key, `on conflict do
- * nothing`, an update whose row is no longer there). That makes the family's
- * relay an upper bound rather than an exact count for those statements. It is
- * deliberately not modelled: the skip rate is a property of the data, not of the
- * plan, and inventing a discount would be less honest than the bound. Consumers
- * of a write's estimate size buffers and pick strategies, which an upper bound
- * serves correctly.
+ * That relay is an UPPER BOUND, not an exact count, because two members can drop
+ * a row silently. `ConstraintCheckNode` skips a row whose NOT NULL / CHECK
+ * violation resolves to `IGNORE` (`runtime/row-constraints.ts` returns
+ * `{ skip: true }` and the emitter `continue`s), and `DmlExecutorNode` yields
+ * nothing for a row it did not write (`insert or ignore` onto an existing key,
+ * `on conflict do nothing`, an update whose row is no longer there). Neither skip
+ * rate is modelled: both are properties of the data, not of the plan, and
+ * inventing a discount would be less honest than the bound. Consumers of a
+ * write's estimate size buffers and pick strategies, which an upper bound serves
+ * correctly.
  *
  * The two readings only diverge at the statement boundary, and that boundary is
  * a different node: a statement with no `returning` is topped by a `SinkNode`,
@@ -130,8 +130,9 @@ export type SetOperationKind = 'union' | 'unionAll' | 'intersect' | 'except';
  * - `unionAll` — the sum; no rows are removed.
  * - `union` — the true count lies in `max(branches) … sum(branches)` and the
  *   deduplication factor is unknown, so report the **sum**: the honest upper
- *   bound. Narrowing it is the job of whatever proves duplicates exist; a
- *   `Distinct` above the union is what states the tighter claim.
+ *   bound. The deduplication happens inside the node's own emitter
+ *   (`runtime/emit/set-operation.ts`), not in a `Distinct` above it, so nothing
+ *   downstream narrows this claim — it stays an upper bound for the whole plan.
  * - `intersect` — the min; the result is a subset of both branches.
  * - `except` — the left branch's count. The right branch can only remove rows,
  *   so the left count is an upper bound and the result can never go negative.
@@ -168,6 +169,10 @@ export type GatherCombinatorKind = 'unionAll' | 'zipByKey' | 'crossProduct';
  *   shapes must not report different counts for the same rows.
  * - `zipByKey` — the max. Distinct keys across branches bound the result at
  *   `max(branches) … sum(branches)`; heavily overlapping keys is the normal case.
+ *   NOTE: this is the only arm that picks the LOW end of its range — every other
+ *   arm reports the upper bound. Now that the number is also stamped physically,
+ *   a low-key-overlap workload can under-size a buffer above the gather; if that
+ *   ever shows up, move this arm to the sum like the others.
  * - `crossProduct` — the product, saturated by {@link clampRowEstimate} so three
  *   large branches cannot emit `Infinity`.
  *

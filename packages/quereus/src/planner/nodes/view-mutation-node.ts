@@ -6,6 +6,7 @@ import type { ConflictResolution } from '../../common/constants.js';
 import { INTEGER_TYPE } from '../../types/builtin-types.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 
 /** When a separate {@link ViewMutationNode.returning} relation is captured. */
 export type ReturningTiming = 'pre' | 'post';
@@ -385,15 +386,38 @@ export class ViewMutationNode extends PlanNode {
 		return new ViewMutationNode(this.scope, newBaseOps, newReturning, newEnvelope, this.returningTiming, newCapture, newNestedCaptures);
 	}
 
+	/**
+	 * A RETURNING-through-view yields its result relation's rows; a void view
+	 * mutation is a statement boundary like {@link SinkNode} and reports the one
+	 * affected-row count. Rows EMITTED, per "Data-modifying nodes" in
+	 * `planner/util/row-estimates.ts`.
+	 */
 	get estimatedRows(): number | undefined {
 		return this.resultRelation()?.estimatedRows ?? 1;
 	}
 
-	computePhysical(): Partial<PhysicalProperties> {
+	/**
+	 * Index of {@link resultRelation} within {@link getChildren}, or -1 when the
+	 * mutation is void. The separate RETURNING re-query sits directly after the
+	 * base ops; otherwise the result is the first relational base op.
+	 */
+	private resultChildIndex(): number {
+		if (this.returning) return this.baseOps.length;
+		return this.baseOps.findIndex(isRelationalNode);
+	}
+
+	computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
+		const result = this.resultRelation();
 		return {
 			readonly: false, // drives base-table writes
 			idempotent: false,
 			deterministic: false,
+			// The PHYSICAL result-relation count, not the logical getter: by this pass
+			// the re-query bottoms out in access nodes that declare no getter (see
+			// `physicalSourceRows`). A void mutation emits its single count row.
+			estimatedRows: result
+				? physicalSourceRows(childrenPhysical[this.resultChildIndex()], result)
+				: 1,
 		};
 	}
 

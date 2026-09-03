@@ -306,7 +306,7 @@ export class DmlExecutorNode extends PlanNode implements RelationalPlanNode {
       // or ignore` onto an existing key, `on conflict do nothing`) yields nothing,
       // so this is an upper bound. See "Data-modifying nodes" in
       // `planner/util/row-estimates.ts`; read from the PHYSICAL child.
-      estimatedRows: physicalSourceRows(childrenPhysical?.[0], this.source),
+      estimatedRows: physicalSourceRows(childrenPhysical[0], this.source),
       idempotent: false, // DML operations are generally not idempotent
       // Non-deterministic via the side-effect axis: a write changes
       // database state, so the executor cannot be folded by determinism-

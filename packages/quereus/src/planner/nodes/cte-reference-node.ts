@@ -95,7 +95,7 @@ export class CTEReferenceNode extends PlanNode implements RelationalPlanNode {
 	}
 
 	computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
-		return { estimatedRows: physicalSourceRows(childrenPhysical?.[0], this.source) };
+		return { estimatedRows: physicalSourceRows(childrenPhysical[0], this.source) };
 	}
 
 	withChildren(newChildren: readonly PlanNode[]): PlanNode {

@@ -670,7 +670,7 @@ export class AsyncGatherNode extends PlanNode implements RelationalPlanNode {
 	private physicalRows(childrenPhysical: PhysicalProperties[]): number | undefined {
 		return gatherRowsFrom(
 			this.combinator.kind,
-			this.children.map((child, i) => physicalSourceRows(childrenPhysical?.[i], child)),
+			this.children.map((child, i) => physicalSourceRows(childrenPhysical[i], child)),
 		);
 	}
 

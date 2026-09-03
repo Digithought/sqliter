@@ -131,7 +131,7 @@ export class CTENode extends PlanNode implements CTEPlanNode, CTEScopeNode {
 		// The PHYSICAL body count, not the logical getter: by this pass the body
 		// usually bottoms out in physical access nodes, which declare no getter
 		// (see `physicalSourceRows`).
-		return { estimatedRows: physicalSourceRows(childrenPhysical?.[0], this.source) };
+		return { estimatedRows: physicalSourceRows(childrenPhysical[0], this.source) };
 	}
 
 	withChildren(newChildren: readonly PlanNode[]): PlanNode {

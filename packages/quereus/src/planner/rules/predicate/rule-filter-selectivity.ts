@@ -176,9 +176,10 @@ function singleTableSelectivity(
  * NOTE: the stamped number does move `estimatedRows` above a join — the join family
  * derives its physical cardinality from its children's PHYSICAL counts
  * (`physicalSourceRows` / `joinPhysicalRows`), so a Filter over a join has a real
- * number to multiply. It still has nothing to multiply above a `union`/`union all`,
- * where `SetOperationNode` stamps no count at all (backlog
- * `debt-row-estimates-die-at-set-operations`).
+ * number to multiply. The same now holds above a `union`/`union all`, an async
+ * gather, a CTE reference and the write pipeline, which compose or relay their
+ * branch counts (`setOperationRowsFrom` / `gatherRowsFrom` in
+ * `planner/util/row-estimates.ts`).
  */
 function multiRelationSelectivity(
 	filter: FilterNode,

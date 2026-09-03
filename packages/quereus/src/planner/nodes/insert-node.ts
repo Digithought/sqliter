@@ -123,7 +123,7 @@ export class InsertNode extends PlanNode implements RelationalPlanNode {
   computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
     return {
       readonly: false,  // INSERT has side effects
-      estimatedRows: physicalSourceRows(childrenPhysical?.[0], this.source),
+      estimatedRows: physicalSourceRows(childrenPhysical[0], this.source),
     };
   }
 

@@ -173,9 +173,11 @@ export class ConstraintCheckNode extends PlanNode implements RelationalPlanNode 
   }
 
   /**
-   * Validating a row does not remove it: the emitter yields exactly one row per
-   * source row (or throws / resolves the conflict). Rows EMITTED, per
-   * "Data-modifying nodes" in `planner/util/row-estimates.ts`.
+   * Upper bound: the emitter yields at most one row per source row. It normally
+   * yields exactly one (or throws), but a violation whose conflict action is
+   * IGNORE makes `evaluateRowConstraints` return `{ skip: true }` and the row is
+   * dropped. Rows EMITTED, per "Data-modifying nodes" in
+   * `planner/util/row-estimates.ts`.
    */
   get estimatedRows(): number | undefined {
     return this.source.estimatedRows;
@@ -184,7 +186,7 @@ export class ConstraintCheckNode extends PlanNode implements RelationalPlanNode 
   computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
     // Without this stamp the write family's relay stops here: the prep node below
     // has a real count, and the executor above reads `undefined` through this node.
-    return { estimatedRows: physicalSourceRows(childrenPhysical?.[0], this.source) };
+    return { estimatedRows: physicalSourceRows(childrenPhysical[0], this.source) };
   }
 
   override toString(): string {

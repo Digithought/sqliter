@@ -72,10 +72,12 @@ function subtreeTouchesCte(node: PlanNode): boolean {
  *
  * We can't just read `right.physical.estimatedRows`. Two gaps make the top of
  * the subtree read too low:
- *  - Not every node propagates the physical estimate. The single-source relays and
- *    the join family do (`physicalSourceRows`), but a set operation, an async
- *    gather, or a CTE reference in between still stamps nothing, so the subtree top
- *    can be `undefined` while the leaf underneath has a count.
+ *  - Not every node propagates the physical estimate. The single-source relays, the
+ *    join family, the set operations, the async gathers, the CTE nodes and the write
+ *    pipeline all do (`physicalSourceRows` / `setOperationRowsFrom` /
+ *    `gatherRowsFrom`), but a node outside that set — a recursive CTE, a
+ *    `SequencingNode`, a `BlockNode` — still stamps nothing, so the subtree top can
+ *    be `undefined` while the leaf underneath has a count.
  *  - An access leaf's `physical.estimatedRows` is the *table* row count, but the
  *    module's own access-plan estimate (getBestAccessPlan `rows`, the true "how
  *    many rows will this scan hand back" — e.g. a high-latency vtab reporting

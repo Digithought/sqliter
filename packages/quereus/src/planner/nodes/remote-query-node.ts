@@ -64,7 +64,7 @@ export class RemoteQueryNode extends PlanNode implements UnaryRelationalNode {
 	}
 
 	computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
-		return { estimatedRows: physicalSourceRows(childrenPhysical?.[0], this.source) };
+		return { estimatedRows: physicalSourceRows(childrenPhysical[0], this.source) };
 	}
 
 	/** Get the virtual table module for this remote query node */

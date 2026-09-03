@@ -88,7 +88,7 @@ export class DeleteNode extends PlanNode implements RelationalPlanNode {
       // PHYSICAL source count, not the logical getter: by this pass the source is
       // an access node (or a wrapper over one) that declares no getter, so reading
       // `this.source.estimatedRows` here silently blanked the count.
-      estimatedRows: physicalSourceRows(childrenPhysical?.[0], this.source),
+      estimatedRows: physicalSourceRows(childrenPhysical[0], this.source),
     };
   }
 

@@ -320,8 +320,8 @@ export class SetOperationNode extends PlanNode implements BinaryRelationalNode {
   private physicalRows(childrenPhysical: PhysicalProperties[]): number | undefined {
     return setOperationRowsFrom(
       this.op,
-      physicalSourceRows(childrenPhysical?.[0], this.left),
-      physicalSourceRows(childrenPhysical?.[1], this.right),
+      physicalSourceRows(childrenPhysical[0], this.left),
+      physicalSourceRows(childrenPhysical[1], this.right),
     );
   }
 

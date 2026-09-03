@@ -242,8 +242,7 @@ describe('row estimates survive set operations and writes', () => {
 	it('relays a CTE body count through the CTE and its reference', () => {
 		const plan = db.getPlan('with c as (select id, v from big) select * from c');
 		expect(rowsAt(plan, PlanNodeType.CTEReference)).to.equal(BIG_ROWS);
-		const cte = findNodeOfType(plan, PlanNodeType.CTE);
-		if (cte) expect(cte.physical?.estimatedRows).to.equal(BIG_ROWS);
+		expect(rowsAt(plan, PlanNodeType.CTE)).to.equal(BIG_ROWS);
 	});
 
 	it('reports each reference of a twice-referenced CTE as the body count', () => {
@@ -289,6 +288,40 @@ describe('row estimates survive set operations and writes', () => {
 		const plan = db.getPlan('delete from big returning id');
 		expect(rowsAt(plan, PlanNodeType.Delete)).to.equal(BIG_ROWS);
 		expect(rowsAt(plan, PlanNodeType.Returning)).to.equal(BIG_ROWS);
+	});
+
+	it('reports at least the rows an insert or ignore actually writes', async () => {
+		// The write family's relay is an UPPER bound: a row the constraint check or
+		// the executor skips is counted by the estimate but never written. Pin the
+		// direction of the inequality rather than an exact count.
+		await db.exec('create table ignore_t (id integer primary key, v integer not null) using memory');
+		await db.exec('insert into ignore_t values (1, 1)');
+		const estimate = rowsAt(
+			db.getPlan('insert or ignore into ignore_t select id, v from big'),
+			PlanNodeType.UpdateExecutor,
+		);
+		expect(estimate, 'the executor should carry a numeric estimate').to.be.a('number');
+
+		await db.exec('insert or ignore into ignore_t select id, v from big');
+		let written = 0;
+		for await (const row of db.eval('select count(*) as n from ignore_t')) {
+			written = Number((row as { n: number }).n) - 1; // minus the pre-existing row
+		}
+		expect(written, 'the skipped row makes the estimate an over-count, never an under-count')
+			.to.be.at.most(estimate!);
+		expect(written).to.be.lessThan(BIG_ROWS);
+	});
+
+	it('relays the RETURNING relation count through a view mutation', async () => {
+		await db.exec('create view big_v as select id, v from big');
+		const plan = db.getPlan('delete from big_v returning id');
+		expect(rowsAt(plan, PlanNodeType.ViewMutation)).to.equal(BIG_ROWS);
+	});
+
+	it('reports one changes-count row for a void view mutation', async () => {
+		await db.exec('create view sink_v as select id, v from sink_t');
+		const plan = db.getPlan('insert into sink_v select id, v from big');
+		expect(rowsAt(plan, PlanNodeType.ViewMutation)).to.equal(1);
 	});
 
 	it('relays the filtered source count through an update', () => {
