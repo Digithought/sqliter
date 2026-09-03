@@ -136,6 +136,16 @@ export class JoinNode extends PlanNode implements BinaryRelationalNode, JoinCapa
 	) {
 		// Self-cost only: the children (left, right, condition) flow in via
 		// getTotalCost(); self is the nested-loop join cost heuristic.
+		//
+		// NOTE: both reads are the LOGICAL getter, which a table-backed side never
+		// defines (it stamps its count into `computePhysical` only — see
+		// `physicalSourceRows`), so this is `100 * 100` for every join over tables.
+		// Not fixable here: physical properties do not exist when a node is
+		// constructed and `estimatedCost` is a constructor value. The whole class of
+		// twelve such constructors is tracked by
+		// `backlog/debt-node-self-cost-reads-the-blank-estimate`; the consumer it
+		// blunts is `rule-quickpick-enumeration`, which scores candidate join orders
+		// with `getTotalCost()`.
 		const leftRows = left.estimatedRows ?? 100;
 		const rightRows = right.estimatedRows ?? 100;
 		const joinCost = leftRows * rightRows;

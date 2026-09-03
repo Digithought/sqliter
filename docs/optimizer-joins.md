@@ -49,8 +49,8 @@ Quereus uses the **QuickPick** algorithm (Neumann & Kemper, VLDB 2020) for join 
    remaining relation whose resulting left-deep plan costs least, penalizing a candidate
    with no predicate connecting it to the already-chosen set by 10× so cross products lose
    to any connected alternative. Tours run until `maxTours` or `timeLimitMs` is exhausted,
-   varying only the start relation (alternating between the two smallest by
-   `estimatedRows`). One greedy **bushy** plan — repeatedly merge the cheapest pair of
+   varying only the start relation (alternating between the two smallest in
+   `quickPickBaseOrder`). One greedy **bushy** plan — repeatedly merge the cheapest pair of
    components — is built per invocation and compared against the best tour.
 4. **Adopt only on a real win.** The best plan replaces the original only if it costs less
    than 90% of the baseline; otherwise the rule declines. Either way, tour count and best
@@ -58,20 +58,37 @@ Quereus uses the **QuickPick** algorithm (Neumann & Kemper, VLDB 2020) for join 
 
 Cost throughout is `PlanNode.getTotalCost()` on the candidate plan — the accumulated
 subtree cost, which already reflects the `estimatedRows` reduction a key-covered join
-earns from `computePhysical`.
+earns from `computePhysical`. One caveat on how sharp that signal is: a `JoinNode`'s own
+self-cost is fixed at construction, before any physical property exists, so it falls back
+to 100 × 100 for every table-backed join. Ordering decisions therefore separate mostly on
+the leaves' costs; see `bug-join-self-cost-cannot-see-its-inputs` in `tickets/backlog/`.
 
-### Two-table joins are not reordered here
+### Where the base order comes from
 
-QuickPick declines on fewer than three relations, and the Structural-pass
-`rule-join-greedy-commute` — meant to put the smaller input of an inner join on the left —
-has a row-count arm that reads the **logical** `estimatedRows` getter, which the physical
-access nodes (`Alias` / `Retrieve` / `IndexScan` …) do not define, so for table-backed
-inputs both sides read as unknown and the comparison never fires (its singleton-FD arm
-still works; tracked by `backlog/bug-row-estimate-conflates-unknown-and-zero`). A
-two-table join therefore reaches physical selection in the order the query spelled it.
-The one place its orientation *is* decided with real numbers is
-[index-nested-loop selection](#index-nested-loop-join), which tries the seek in both
-orientations and keeps the cheaper.
+`quickPickBaseOrder(relations)` sorts relation indices by **physical** row count
+(`physicalSourceRows` — the child's `physical.estimatedRows`, or its logical
+`estimatedRows` getter when it has only that). This must be the physical read: QuickPick
+runs after access-path selection, so a table-backed relation is an `Alias` / `Retrieve` /
+`IndexScan`, none of which define the logical getter. Reading the logical getter made every
+relation look identically unknown and left the base order equal to the order the tables
+were written in the SQL.
+
+A relation whose size nobody knows (a never-`ANALYZE`d table) sorts **last** — it may be
+enormous, and starting a tour from it is the expensive guess. The sentinel for that is
+`MAX_ROW_ESTIMATE`, the ceiling `clampRowEstimate` saturates at, deliberately finite:
+`Infinity - Infinity` is `NaN`, which would make the comparator's behaviour
+implementation-defined for two unknown relations. Ties break on relation index, so the
+result depends only on the join graph.
+
+### Two-table joins
+
+QuickPick declines on fewer than three relations. The Structural-pass
+`rule-join-greedy-commute` puts the smaller input of an inner join on the left, reading the
+same physical row counts; when either side's size is unknown it declines the swap rather
+than reorder on a fabricated number, and equal counts never swap (the comparison is strict,
+so a re-run cannot oscillate). Orientation is decided again, with real numbers and a real
+cost comparison, in [index-nested-loop selection](#index-nested-loop-join), which tries the
+seek in both orientations and keeps the cheaper.
 
 ### Integration Points
 

@@ -425,7 +425,16 @@ describe('index-nested-loop join plan shape', () => {
 			// the lower join swaps first; this pins that ordering end to end.
 			await createRollupTables();
 			await db.exec('create table cat (id integer primary key, entity_id integer, label text)');
-			await db.exec("insert into cat values (1, 7, 'seven'), (2, 3, 'three')");
+			// Only row 1 matches `entity_id = 7`, so the expected rows below are the
+			// same three either way; the other 39 rows exist purely to keep `cat`
+			// large enough that a HASH join wins above the exchanged pair. With a
+			// two-row `cat` the greedy-commute rule (which reads real row counts
+			// since 5.4-join-ordering-reads-the-estimate-that-exists) puts the
+			// one-row side on the left and a nested loop wins there — a fine plan,
+			// but one that never takes the positional snapshot this test is about.
+			const cats: string[] = ["(1, 7, 'seven')"];
+			for (let i = 2; i <= 40; i++) cats.push(`(${i}, 3, 'three-${i}')`);
+			await db.exec(`insert into cat values ${cats.join(', ')}`);
 			for await (const _ of db.eval('analyze')) { /* consume */ }
 			const sql = 'select c.label, t.id as tid, e.id as eid from entry e join txn t on t.id = e.txn_id'
 				+ ' join cat c on c.entity_id = t.entity_id where t.entity_id = 7 order by eid limit 3';

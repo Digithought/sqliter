@@ -797,7 +797,11 @@ See `tickets/plan/` for planned optimizer work.
 
 ## Join planning
 
-Join order is chosen by a randomized greedy tour search (QuickPick); a physical algorithm
+Join order is chosen by a randomized greedy tour search (QuickPick), whose tours start
+from the relations with the smallest **physical** row estimate (a relation nobody has
+measured sorts last); a two-table inner join is instead commuted by
+`rule-join-greedy-commute` to put the smaller side on the left, which declines when either
+side's size is unknown. A physical algorithm
 (nested loop, hash, merge, or an index-nested-loop that seeks one side once per row of
 the other — for an inner join, whichever orientation costs less) is then selected per
 join by cost. Separately, a chain of

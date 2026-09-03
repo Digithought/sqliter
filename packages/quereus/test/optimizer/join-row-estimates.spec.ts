@@ -19,6 +19,7 @@ import { Database } from '../../src/core/database.js';
 import { PlanNode } from '../../src/planner/nodes/plan-node.js';
 import { PlanNodeType } from '../../src/planner/nodes/plan-node-type.js';
 import { FilterNode } from '../../src/planner/nodes/filter.js';
+import { TableReferenceNode } from '../../src/planner/nodes/reference.js';
 import { joinPhysicalRows, estimateJoinRows } from '../../src/planner/nodes/join-utils.js';
 import { physicalSourceRows } from '../../src/planner/util/row-estimates.js';
 import type { PhysicalProperties, RelationalPlanNode } from '../../src/planner/nodes/plan-node.js';
@@ -42,15 +43,29 @@ function findJoin(root: PlanNode): PlanNode | undefined {
 	return found;
 }
 
-function findFilter(root: PlanNode): FilterNode | undefined {
-	let found: FilterNode | undefined;
-	walk(root, (n) => { if (!found && n instanceof FilterNode) found = n; });
-	return found;
-}
-
 function findNodeOfType(root: PlanNode, type: PlanNodeType): PlanNode | undefined {
 	let found: PlanNode | undefined;
 	walk(root, (n) => { if (!found && n.nodeType === type) found = n; });
+	return found;
+}
+
+/** True when `root`'s subtree reads the named base table. */
+function scansTable(root: PlanNode, table: string): boolean {
+	let found = false;
+	walk(root, (n) => { if (n instanceof TableReferenceNode && n.tableSchema.name === table) found = true; });
+	return found;
+}
+
+/**
+ * The first node of `type` whose subtree reads `table`.
+ *
+ * Pre-order position alone cannot name a branch: `rule-join-greedy-commute` puts
+ * the smaller input on the left, so which branch the walk reaches first depends
+ * on the row counts, not on the order the tables were written.
+ */
+function findNodeOverTable(root: PlanNode, type: PlanNodeType, table: string): PlanNode | undefined {
+	let found: PlanNode | undefined;
+	walk(root, (n) => { if (!found && n.nodeType === type && scansTable(n, table)) found = n; });
 	return found;
 }
 
@@ -165,8 +180,10 @@ describe('join row estimates survive the physical pass', () => {
 
 	it('multiplies the stamped filter selectivity by the scanned row count', () => {
 		const plan = db.getPlan(JOIN_SQL);
-		// Pre-order walk: the `o` branch's pushed Filter is the first one in the plan.
-		const filter = findFilter(plan);
+		// Located by the table it reads, not by pre-order position — the greedy
+		// commute puts the 3-row regions branch on the left, so the first Filter in
+		// the walk is the regions one.
+		const filter = findNodeOverTable(plan, PlanNodeType.Filter, 'orders') as FilterNode | undefined;
 		expect(filter, 'expected the pushed Filter on the orders branch').to.not.be.undefined;
 		expect(filter!.selectivity, 'filter selectivity should be stamped').to.be.a('number');
 
@@ -183,10 +200,10 @@ describe('join row estimates survive the physical pass', () => {
 		const plan = db.getPlan(JOIN_SQL);
 		// Aliases sit between each access node and the join; without their physical
 		// relay the join sees `undefined` on both sides no matter what it reads.
-		const alias = findNodeOfType(plan, PlanNodeType.Alias);
+		const alias = findNodeOverTable(plan, PlanNodeType.Alias, 'orders');
 		expect(alias, 'expected an Alias between each access node and the join').to.not.be.undefined;
-		// The `o` alias is found first (pre-order walk) — it relays the orders scan
-		// through the Filter that `predicate-pushdown` slid underneath it.
+		// The `o` alias relays the orders scan through the Filter that
+		// `predicate-pushdown` slid underneath it.
 		expect(alias!.physical?.estimatedRows, 'alias physical estimatedRows').to.equal(ORDERS_BRANCH_ROWS);
 
 		const project = findNodeOfType(plan, PlanNodeType.Project);

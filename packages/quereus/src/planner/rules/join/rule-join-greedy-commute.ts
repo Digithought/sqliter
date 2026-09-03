@@ -5,6 +5,7 @@ import { JoinNode } from '../../nodes/join-node.js';
 import { hasSingletonFd } from '../../util/fd-utils.js';
 import { isCorrelatedSubquery } from '../../cache/correlation-detector.js';
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
+import { physicalSourceRows } from '../../util/row-estimates.js';
 
 const log = createLogger('optimizer:rule:join-greedy-commute');
 
@@ -19,7 +20,8 @@ function isSingleton(node: RelationalPlanNode): boolean {
  * Rule: Join Greedy Commute
  *
  * Simple heuristic: for INNER joins, prefer the smaller input on the left to drive nested-loop-like cost.
- * This uses children estimatedRows (influenced by pushdown/growth) and swaps left/right when beneficial.
+ * This uses the children's PHYSICAL row estimates (influenced by pushdown/growth)
+ * and swaps left/right when beneficial.
  *
  * Safety:
  * - INNER joins are commutative; ColumnReferenceNode uses attribute IDs, so swapping sides preserves semantics.
@@ -47,22 +49,32 @@ export function ruleJoinGreedyCommute(node: PlanNode, _context: OptContext): Pla
     return null;
   }
 
-  // NOTE: this row-count arm reads the LOGICAL `estimatedRows` getter, which the
-  // physical access nodes (Alias / Retrieve / IndexScan …) do not define — so for
-  // table-backed inputs both sides read Infinity and `rightRows < leftRows` never
-  // holds; only the singleton-FD arm below fires for them. Tracked by
-  // backlog/bug-row-estimate-conflates-unknown-and-zero (fix it there, via
-  // `physicalSourceRows`). Two-table joins get their orientation decided later in
-  // rule-join-physical-selection's index-nested-loop seek-side election instead.
-  const leftRows = node.getLeftSource().estimatedRows ?? Number.POSITIVE_INFINITY;
-  const rightRows = node.getRightSource().estimatedRows ?? Number.POSITIVE_INFINITY;
+  // Row counts come from the PHYSICAL property first. Table-backed inputs
+  // (Alias / Retrieve / SeqScan / IndexScan …) declare no logical `estimatedRows`
+  // getter — they stamp their catalog-derived count into `computePhysical` only —
+  // so reading the logical getter here yields `undefined` for exactly the inputs
+  // this arm exists to compare. `physicalSourceRows` reads the physical count and
+  // falls back to the logical getter for nodes that only have that one.
+  const left = node.getLeftSource();
+  const right = node.getRightSource();
+  const leftRows = physicalSourceRows(left.physical, left);
+  const rightRows = physicalSourceRows(right.physical, right);
 
-  // Prefer known finite estimatedRows; also detect <=1 row driver on either side
-  const leftIsSingleton = isSingleton(node.getLeftSource());
-  const rightIsSingleton = isSingleton(node.getRightSource());
+  // Detect a <=1 row driver on either side
+  const leftIsSingleton = isSingleton(left);
+  const rightIsSingleton = isSingleton(right);
+
+  // An unknown estimate on either side must NOT trigger a swap: `undefined` means
+  // nobody knows how big that side is (a never-analyzed table), and commuting on a
+  // fabricated default row count is worse than leaving the written order alone.
+  // Only the singleton-FD arm applies then.
+  //
+  // Strict `<`: equal estimates never swap, so a pass that re-runs this rule over
+  // its own output cannot oscillate between the two orders.
+  const rightIsSmaller = leftRows !== undefined && rightRows !== undefined && rightRows < leftRows;
 
   // If right is strictly better driver (smaller or singleton), swap
-  const shouldSwap = (rightIsSingleton && !leftIsSingleton) || (!rightIsSingleton && !leftIsSingleton && rightRows < leftRows);
+  const shouldSwap = (rightIsSingleton && !leftIsSingleton) || (!rightIsSingleton && !leftIsSingleton && rightIsSmaller);
   if (!shouldSwap) return null;
 
   log('Commuting join children to place smaller input on the left (leftRows=%s, rightRows=%s)', String(leftRows), String(rightRows));
@@ -70,8 +82,8 @@ export function ruleJoinGreedyCommute(node: PlanNode, _context: OptContext): Pla
   // Swap children; condition stays the same (attribute IDs are stable)
   const swapped = new JoinNode(
     node.scope,
-    node.getRightSource() as RelationalPlanNode,
-    node.getLeftSource() as RelationalPlanNode,
+    right,
+    left,
     node.getJoinType(),
     node.getJoinCondition(),
     node.getUsingColumns()

@@ -7,8 +7,22 @@ import { normalizePredicate } from '../../analysis/predicate-normalizer.js';
 import { BinaryOpNode } from '../../nodes/scalar.js';
 import { ColumnReferenceNode } from '../../nodes/reference.js';
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
+import { MAX_ROW_ESTIMATE, physicalSourceRows } from '../../util/row-estimates.js';
 
 const log = createLogger('optimizer:rule:quickpick');
+
+/**
+ * Row count assumed for a relation whose size nobody knows, chosen so unknown
+ * relations sort LAST in the base order: an unmeasured table may be enormous,
+ * and starting a greedy tour from it is the expensive guess.
+ *
+ * `MAX_ROW_ESTIMATE` is the ceiling every real estimate is clamped to
+ * (`clampRowEstimate`), so no known count can sort after an unknown one. It is
+ * deliberately not `Infinity`: the base-order comparator subtracts two sizes,
+ * and `Infinity - Infinity` is `NaN`, which makes `Array.prototype.sort`
+ * behaviour implementation-defined for two unknown relations.
+ */
+const UNKNOWN_RELATION_ROWS = MAX_ROW_ESTIMATE;
 
 interface JoinPredicate {
   leftIndex: number;
@@ -123,6 +137,28 @@ function extractJoinGraph(node: PlanNode): JoinGraph | null {
     predicates.push({ leftIndex: a, rightIndex: b, condition: combined });
   }
   return { relations, predicates };
+}
+
+/**
+ * The order the greedy tours start from: relation indices by ascending row
+ * count, unknown sizes last, ties broken by relation index.
+ *
+ * Sizes come from the PHYSICAL property. This rule runs in the Physical pass,
+ * *after* access-path selection, so a table-backed relation is an Alias /
+ * Retrieve / IndexScan that stamps its row count into `computePhysical` and
+ * declares no logical `estimatedRows` getter. Reading the logical getter here
+ * made every relation look identically unknown, leaving the base order equal to
+ * whatever order the relations happened to be flattened in — i.e. the order the
+ * tables were written in the SQL.
+ *
+ * The `|| (a - b)` tie-break is what makes the result depend only on the graph:
+ * `Array.prototype.sort` is stable in modern engines, but pinning the tie
+ * explicitly keeps equal (and equally unknown) relations in a fixed order
+ * regardless of engine, and keeps the comparator away from `NaN`.
+ */
+export function quickPickBaseOrder(relations: readonly RelationalPlanNode[]): number[] {
+  const sizes = relations.map(r => physicalSourceRows(r.physical, r) ?? UNKNOWN_RELATION_ROWS);
+  return [...relations.keys()].sort((a, b) => (sizes[a] - sizes[b]) || (a - b));
 }
 
 function estimatePlanCost(plan: RelationalPlanNode): number {
@@ -253,9 +289,8 @@ export function ruleQuickPickJoinEnumeration(node: PlanNode, context: OptContext
   let bestPlan: RelationalPlanNode | null = null;
   let bestCost = Number.POSITIVE_INFINITY;
 
-  // Try multiple strategies: left-deep greedy from small bases and bushy greedy
-  const sizes = graph.relations.map(r => r.estimatedRows ?? 1e9);
-  const baseOrder = [...graph.relations.keys()].sort((a, b) => (sizes[a] - sizes[b]));
+  // Try multiple strategies: left-deep greedy from small bases and bushy greedy.
+  const baseOrder = quickPickBaseOrder(graph.relations);
 
   const start = Date.now();
   let tours = 0;
