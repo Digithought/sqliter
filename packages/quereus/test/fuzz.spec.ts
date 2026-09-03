@@ -1155,7 +1155,7 @@ describe('Optimizer Equivalence', function () {
 	const PREDICATE_RULES = ['predicate-pushdown', 'filter-merge', 'filter-conjunct-ordering'];
 	const JOIN_REWRITE_RULES = ['join-greedy-commute', 'join-key-inference'];
 	const SUBQUERY_RULES = ['subquery-decorrelation'];
-	const CACHE_RULES = ['cte-optimization', 'mutating-subquery-cache', 'scalar-cse'];
+	const CACHE_RULES = ['mutating-subquery-cache', 'scalar-cse'];
 	const DISTINCT_RULES = ['distinct-elimination'];
 
 	// All rewrite rules combined for the catch-all test

@@ -320,12 +320,7 @@ const SIDE_EFFECT_SIGNALS = [
 ] as const;
 
 /** `'aware'` rules that legitimately consult no signal, with the reason each is sound. */
-const NO_SIGNAL_ALLOWLIST: ReadonlyMap<string, string> = new Map([
-	[
-		'cte-optimization',
-		'wraps the CTE body in a run-once CacheNode rather than refusing, so a write inside the body still executes exactly once — there is no signal to consult',
-	],
-]);
+const NO_SIGNAL_ALLOWLIST: ReadonlyMap<string, string> = new Map([]);
 
 interface Unguarded {
 	/**
@@ -363,8 +358,8 @@ function auditAwareRules(
 }
 
 /** An `'aware'` rule is excused only when it is allowlisted *and* the audit actually ran on it. */
-function isExcused(u: Unguarded): boolean {
-	return u.kind === 'no-signal' && NO_SIGNAL_ALLOWLIST.has(u.id);
+function isExcused(u: Unguarded, allowlist: ReadonlyMap<string, string> = NO_SIGNAL_ALLOWLIST): boolean {
+	return u.kind === 'no-signal' && allowlist.has(u.id);
 }
 
 describe("OPT-003 static guard: every 'aware' rule consults a side-effect signal", () => {
@@ -484,7 +479,11 @@ describe("OPT-003 static guard: every 'aware' rule consults a side-effect signal
 	});
 
 	it('does not let the allowlist excuse a rule the audit could not read', () => {
-		const allowlisted = [...NO_SIGNAL_ALLOWLIST.keys()][0];
+		// Fixture allowlist, independent of the production NO_SIGNAL_ALLOWLIST (which
+		// may legitimately be empty) — this test only needs SOME id that is allowlisted
+		// but whose rule function cannot be resolved to source.
+		const allowlisted = 'ghost-rule';
+		const fixtureAllowlist = new Map([[allowlisted, 'fixture reason']]);
 		const optimizer = stripComments(`
 			const RULE_MANIFEST = [
 				{
@@ -496,7 +495,7 @@ describe("OPT-003 static guard: every 'aware' rule consults a side-effect signal
 			];
 		`);
 		const { unguarded } = auditAwareRules(optimizer, () => undefined);
-		expect(unguarded.filter(u => !isExcused(u)).map(u => u.id)).to.deep.equal([allowlisted]);
+		expect(unguarded.filter(u => !isExcused(u, fixtureAllowlist)).map(u => u.id)).to.deep.equal([allowlisted]);
 	});
 
 	it('rejects a registration that omits sideEffectMode rather than skipping it', () => {

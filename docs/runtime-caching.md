@@ -50,8 +50,8 @@ registers a `VirtualTableConnection`, so this is independent of the
 
 `emitCache` (`src/runtime/emit/cache.ts`) materializes its source's rows on
 first iteration and replays them on later re-iterations within the same
-execution — used for CTE materialization (`rule-cte-optimization`),
-mutating-subquery caching (`rule-mutating-subquery-cache`), uncorrelated scalar
+execution — used for the materialization advisory's multi-parent sharing
+recommendations, mutating-subquery caching (`rule-mutating-subquery-cache`), uncorrelated scalar
 subqueries (`rule-scalar-subquery-cache`), and the nested-loop right side
 (`rule-nested-loop-right-cache`). Uncorrelated `IN (subquery)` no longer uses a
 row cache — `emitIn` materializes a probed value set directly (see § IN-subquery

@@ -116,6 +116,15 @@ describe('Plan shape: CTE materialization', () => {
 			expect((refs[0].source as CTENode).materialize, 'MATERIALIZED hint forces the mark').to.equal(true);
 		});
 
+		it('a MATERIALIZED single-reference CTE is buffered once, not double-wrapped in a CACHE node', async () => {
+			// CTE materialization is owned solely by the `materialize` mark (emitCTE's
+			// own per-execution buffer) — a CTE never also takes a CacheNode wrap.
+			const q = 'WITH cte AS MATERIALIZED (SELECT id, val FROM items) SELECT * FROM cte';
+			const ops = await planOps(db, q);
+			expect(ops).to.not.include('CACHE',
+				'materialize mark buffers via emitCTE, not a separate CacheNode wrap');
+		});
+
 		it('honors NOT MATERIALIZED on a 2-reference CTE', () => {
 			const plan = db.getPlan(`
 				WITH cte AS NOT MATERIALIZED (SELECT id, val FROM items)

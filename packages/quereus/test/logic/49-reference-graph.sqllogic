@@ -77,7 +77,8 @@ INSERT INTO t3 VALUES (1), (2), (3);
 SELECT COUNT(*) AS cache_count FROM query_plan('SELECT (SELECT id FROM t3 ORDER BY random() LIMIT 1) AS x FROM t3') WHERE op = 'CACHE'
 → [{"cache_count": 0}]
 
--- Test 9: CTE with MATERIALIZED hint should trigger caching
--- This CTE has an explicit materialization hint, so it should inject a cache node
+-- Test 9: CTE with MATERIALIZED hint buffers via the `materialize` mark, not a CACHE node
+-- This CTE has an explicit materialization hint; emitCTE buffers it once per execution
+-- (CTENode.materialize), so no separate CacheNode wrap is injected.
 SELECT COUNT(*) AS cache_count FROM query_plan('WITH high_values AS MATERIALIZED (SELECT * FROM t1 WHERE value >= 20) SELECT COUNT(*) FROM high_values') WHERE op = 'CACHE'
-→ [{"cache_count": 1}]
+→ [{"cache_count": 0}]

@@ -40,13 +40,13 @@ export interface OptimizerTuning {
 		readonly maxCacheThreshold: number;
 	};
 
-	/** CTE optimization */
+	/**
+	 * Shared by `rule-scalar-subquery-cache` for its cache threshold. Named `cte`
+	 * for historical reasons (it also fed the now-removed CTE-source cache wrap);
+	 * kept rather than renamed to avoid rippling into unrelated test overrides.
+	 */
 	readonly cte: {
-		/** Maximum CTE size to consider for caching */
-		readonly maxSizeForCaching: number;
-		/** Cache threshold multiplier for CTEs */
-		readonly cacheThresholdMultiplier: number;
-		/** Maximum cache threshold for CTEs */
+		/** Maximum cache threshold */
 		readonly maxCacheThreshold: number;
 	};
 
@@ -238,8 +238,6 @@ export const DEFAULT_TUNING: OptimizerTuning = {
 		maxCacheThreshold: 10000
 	},
 	cte: {
-		maxSizeForCaching: 50000,
-		cacheThresholdMultiplier: 2,
 		maxCacheThreshold: 20000
 	},
 	recursiveCte: {

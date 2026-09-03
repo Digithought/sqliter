@@ -57,7 +57,6 @@ import { ruleLateralTop1Asof } from './rules/join/rule-lateral-top1-asof.js';
 import { ruleSemiJoinPushdown } from './rules/join/rule-semi-join-pushdown.js';
 import { ruleMonotonicWindow } from './rules/window/rule-monotonic-window.js';
 // Constraint rules removed - now handled in builders for correctness
-import { ruleCteOptimization } from './rules/cache/rule-cte-optimization.js';
 import { ruleMutatingSubqueryCache } from './rules/cache/rule-mutating-subquery-cache.js';
 import { ruleNestedLoopRightCache } from './rules/cache/rule-nested-loop-right-cache.js';
 import { ruleScalarSubqueryCache } from './rules/cache/rule-scalar-subquery-cache.js';
@@ -1207,9 +1206,9 @@ export const RULE_MANIFEST: readonly RuleManifestEntry[] = [
 	// on memory-vtab leaves — so the rule is inert on local-only plans (the
 	// golden-plan sweep is unaffected). Runs after `mutating-subquery-cache` and
 	// `asof-strategy-select` — by which point leaf physical properties incl.
-	// `expectedLatencyMs` are finalized — and before `cte-optimization` and
-	// `materialization-advisory`, so the advisory sees the prefetch-wrapped tree and
-	// does not re-wrap the probe in a Cache.
+	// `expectedLatencyMs` are finalized — and before `materialization-advisory`,
+	// so the advisory sees the prefetch-wrapped tree and does not re-wrap the
+	// probe in a Cache.
 	{
 		pass: PassId.PostOptimization,
 		id: 'eager-prefetch-probe',
@@ -1239,20 +1238,6 @@ export const RULE_MANIFEST: readonly RuleManifestEntry[] = [
 		fn: ruleFanOutBatchedOuter,
 		// Flips fan-out outer pump to batched (concurrent) — interleaves
 		// outer iteration with branch lookups. Refuses on side-effect outer.
-		sideEffectMode: 'aware',
-	},
-
-	{
-		pass: PassId.PostOptimization,
-		id: 'cte-optimization',
-		nodeType: PlanNodeType.CTE,
-		phase: 'rewrite',
-		fn: ruleCteOptimization,
-		// Wraps a CTE source in CacheNode. CacheNode materializes on first
-		// read and replays on subsequent reads — a run-once fence over the
-		// source, so a side-effect-bearing CTE that was previously rerun
-		// per reference would now run once. That is sound but order-changing,
-		// so the rule is aware of side effects.
 		sideEffectMode: 'aware',
 	},
 
@@ -1298,9 +1283,10 @@ export const RULE_MANIFEST: readonly RuleManifestEntry[] = [
 	// NOTE: The materialization advisory no longer registers per-node-type rules.
 	// It runs once over the whole plan as a dedicated custom-execute pass
 	// (`PassId.Materialization`, order 35 — after PostOptimization so it observes
-	// the CacheNodes injected by `cte-optimization`). See
-	// `createMaterializationPass` in framework/pass.ts for the single-walk rationale
-	// and the side-effect-soundness argument.
+	// the CacheNodes injected by earlier PostOptimization rules, e.g.
+	// `rule-nested-loop-right-cache`). See `createMaterializationPass` in
+	// framework/pass.ts for the single-walk rationale and the
+	// side-effect-soundness argument.
 
 	// ── Final-estimates pass (bottom-up, order 37) ──────────────────────────
 

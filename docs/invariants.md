@@ -56,9 +56,7 @@ declares `'aware'` and consults a purity signal, refusing or weakening when a pa
 subtree carries a write. Usually that signal is `PlanNodeCharacteristics.hasSideEffects` /
 `subtreeHasSideEffects`; `scalar-subquery-cache` instead refuses on `isFunctional`
 (`physical.readonly` **and** deterministic), which is strictly stronger. `'safe'` is the
-counter-claim that the transform's structural shape preserves side effects by itself. One
-`'aware'` rule, `cte-optimization`, consults nothing: it wraps the subtree in a run-once
-`CacheNode`, which preserves the write.
+counter-claim that the transform's structural shape preserves side effects by itself.
 
 ### OPT-003 — A static guard checks every `'aware'` rule's source for a purity signal
 
@@ -69,9 +67,9 @@ counter-claim that the transform's structural shape preserves side effects by it
 OPT-002's behavioural guard covers the fold rules only; this static guard closes the rest.
 It reads `optimizer.ts`, resolves every `'aware'` rule's `fn:` to its source file, and fails
 if that file names none of `hasSideEffects`, `subtreeHasSideEffects`, `isConcurrencySafe`,
-`isFunctional`, `physical.readonly`. `cte-optimization` is allowlisted there with its
-reason. The check is textual: it proves a rule *mentions* a signal, not that it acts on it
-correctly.
+`isFunctional`, `physical.readonly`. A rule that legitimately consults no signal can be
+recorded in `NO_SIGNAL_ALLOWLIST` (currently empty) with its reason. The check is textual:
+it proves a rule *mentions* a signal, not that it acts on it correctly.
 
 ### OPT-004 — A custom-`execute` pass argues its own soundness
 

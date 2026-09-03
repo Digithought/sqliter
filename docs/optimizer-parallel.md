@@ -74,7 +74,7 @@ builds as `Project[ coalesce(a.k,b.k,c.k) as k, a.av, b.bv, c.cv ]` over a left-
 
 **Skip predicates.** The wrap is suppressed when the probe is already pump-driven or pre-materialized: `left` is an `EagerPrefetchNode` (idempotence), a `Cache` (pre-materialized — a prefetch over a cache buys nothing), or an `AsyncGather` (already drives its branches concurrently). Pure-`nodeType` checks; no capability detector.
 
-**Pass placement.** Runs in PostOptimization — after `mutating-subquery-cache` and `asof-strategy-select` (finalizes leaf physical properties incl. `expectedLatencyMs`), and before `cte-optimization` and `materialization-advisory` (so the advisory sees the prefetch-wrapped tree and does not re-wrap the probe in a Cache).
+**Pass placement.** Runs in PostOptimization — after `mutating-subquery-cache` and `asof-strategy-select` (finalizes leaf physical properties incl. `expectedLatencyMs`), and before `materialization-advisory` (so the advisory sees the prefetch-wrapped tree and does not re-wrap the probe in a Cache).
 
 **Tuning knobs** (`OptimizerTuning.parallel`): `prefetchProbeThresholdMs` (default 25 — shares the synthetic high-latency vtab fixture value) and `prefetchBufferSize` (default 64 — mirrors the `EagerPrefetchNode` constructor default).
 
