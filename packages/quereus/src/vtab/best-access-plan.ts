@@ -281,8 +281,29 @@ export interface BestAccessPlanResult {
 	residualFilter?: (row: Row) => boolean;
 	/** Estimated cost in arbitrary virtual CPU units */
 	cost: number;
-	/** Estimated number of rows this plan will return */
+	/**
+	 * Estimated number of rows this plan will return. An ESTIMATE — never a proof, and
+	 * nothing in the engine reads a particular value out of it as one. A module that
+	 * knows its predicate matches nothing says so with {@link provablyEmpty}.
+	 */
 	rows: number | undefined;
+	/**
+	 * Set only when the module has PROVEN that no row can satisfy the filters it
+	 * claimed in `handledFilters` (e.g. `IS NULL` on a NOT NULL column). The planner
+	 * replaces the entire table access with a static empty relation, so this must
+	 * never be set merely because the table is empty at plan time — planning precedes
+	 * execution, and a statement can write rows into a table before reading them back.
+	 * Defaults to false/absent; declining is always safe.
+	 *
+	 * Two shapes are module bugs and {@link validateAccessPlan} REJECTS them rather
+	 * than reconciling them, because silent normalization hides the bug:
+	 *   - `provablyEmpty` with no filter claimed handled — a module cannot prove a
+	 *     predicate unsatisfiable without claiming the predicate;
+	 *   - `provablyEmpty` with `rows` anything other than 0.
+	 * {@link AccessPlanBuilder.empty} builds the whole answer so neither can happen
+	 * by accident.
+	 */
+	provablyEmpty?: boolean;
 	/** Ordering guaranteed by this access plan */
 	providesOrdering?: readonly OrderingSpec[];
 	/** Name of the index that provides the ordering (if any) */
@@ -408,6 +429,31 @@ export class AccessPlanBuilder {
 	}
 
 	/**
+	 * Create the whole "nothing can match" answer: cost 0, rows 0, the given filter
+	 * claims, and {@link BestAccessPlanResult.provablyEmpty} set. The planner deletes
+	 * the table access outright on this, so build it only from a PROOF that the claimed
+	 * filters are unsatisfiable — never from a table that happens to be empty right now.
+	 *
+	 * `handledFilters` must claim at least one filter (that is the filter being proven
+	 * unsatisfiable); a claim-nothing proof is a module bug and throws here rather than
+	 * waiting for {@link validateAccessPlan}, which not every module calls.
+	 */
+	static empty(handledFilters: readonly boolean[]): AccessPlanBuilder {
+		if (!handledFilters.some(h => h)) {
+			quereusError(
+				'AccessPlanBuilder.empty requires at least one handled filter: a module cannot prove a predicate unsatisfiable without claiming the predicate',
+				StatusCode.INTERNAL
+			);
+		}
+		return new AccessPlanBuilder()
+			.setCost(0)
+			.setRows(0)
+			.setHandledFilters(handledFilters)
+			.setProvablyEmpty(true)
+			.setExplanation('Empty result (predicate proven unsatisfiable)');
+	}
+
+	/**
 	 * Set the estimated cost of this access plan
 	 */
 	setCost(cost: number): this {
@@ -437,6 +483,17 @@ export class AccessPlanBuilder {
 	 */
 	setRows(rows: number | undefined): this {
 		this.result.rows = rows;
+		return this;
+	}
+
+	/**
+	 * Declare that no row can satisfy the filters this plan claims — see
+	 * {@link BestAccessPlanResult.provablyEmpty}. Prefer {@link AccessPlanBuilder.empty},
+	 * which sets the whole shape (cost, rows and the flag together); this setter is for a
+	 * module that already built its plan another way.
+	 */
+	setProvablyEmpty(provablyEmpty: boolean): this {
+		this.result.provablyEmpty = provablyEmpty;
 		return this;
 	}
 
@@ -567,12 +624,18 @@ export function validateAccessPlanRequest(request: BestAccessPlanRequest): void 
 /**
  * Validation function for access plan results
  * Throws if the plan violates basic contracts
+ *
+ * `moduleName` is optional and only sharpens the error messages — pass
+ * `tableInfo.vtabModuleName` where it is in scope.
  */
 export function validateAccessPlan(
 	request: BestAccessPlanRequest,
-	result: BestAccessPlanResult
+	result: BestAccessPlanResult,
+	moduleName?: string
 ): void {
 	validateAccessPlanRequest(request);
+
+	const by = moduleName ? ` (module '${moduleName}')` : '';
 
 	// Validate handledFilters array length
 	if (result.handledFilters.length !== request.filters.length) {
@@ -590,6 +653,25 @@ export function validateAccessPlan(
 	// Validate rows is non-negative if specified
 	if (result.rows !== undefined && result.rows < 0) {
 		quereusError(`Access plan rows cannot be negative: ${result.rows}`, StatusCode.INTERNAL);
+	}
+
+	// `provablyEmpty` deletes the whole table access, so the two shapes that would make it
+	// a lie are module bugs, not something to reconcile: a proof that claims no predicate,
+	// and a proof that also reports rows it would return. Rejecting keeps the bug at the
+	// boundary where the module can still be fixed; normalizing would bury it.
+	if (result.provablyEmpty) {
+		if (!result.handledFilters.some(h => h)) {
+			quereusError(
+				`Access plan${by} sets provablyEmpty but claims no filter as handled; a module cannot prove a predicate unsatisfiable without claiming the predicate`,
+				StatusCode.INTERNAL
+			);
+		}
+		if (result.rows !== 0) {
+			quereusError(
+				`Access plan${by} sets provablyEmpty but reports rows: ${result.rows}; a proven-empty plan returns 0 rows`,
+				StatusCode.INTERNAL
+			);
+		}
 	}
 
 	// Validate ordering column indexes

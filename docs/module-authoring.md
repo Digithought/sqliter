@@ -178,7 +178,8 @@ its seek arms, its ordering walk, and its full scan.
 interface BestAccessPlanResult {
   handledFilters: readonly boolean[];  // Which filters the module handles
   cost: number;                        // Cost estimate
-  rows: number | undefined;            // Cardinality estimate
+  rows: number | undefined;            // Cardinality ESTIMATE, never a proof
+  provablyEmpty?: boolean;             // Proof that nothing can match the claimed filters
   providesOrdering?: readonly OrderingSpec[]; // If module provides ordering
   indexName?: string;                  // Name of the chosen index ('_primary_' or a secondary)
   indexDescriptor?: IndexDescriptor;   // Structured identity of that index (see below)
@@ -208,9 +209,18 @@ interface BestAccessPlanResult {
 - `supportsOrdinalSeek` enables the `monotonic-limit-pushdown` rule: when advertised, the runtime may stamp `FilterInfo.offset`/`FilterInfo.limit` and the module must seek directly to the kth monotonic row (see `query()` contract above). Modules that advertise `supportsOrdinalSeek` but ignore the directives at runtime degrade to a streaming `LIMIT` (the rule's slice operator enforces the cap above the leaf).
 - `supportsAsofRight` enables the `lateral-top1-asof` rule: forward-only repositioning per left row.
 
-**Row counts — one of the two is a claim, not an estimate**:
+**Row counts — `rows` is an estimate, with no exception**:
 
-`request.estimatedRows` is the planner's hint, populated only from `ANALYZE`-collected statistics; `undefined` means unknown, and a module that can size itself may substitute its own count there — but must defer to a supplied hint, or the access path is costed against a different figure than the plan around it. `rows` in the result is an estimate, with one exception: **`rows: 0` on a plan claiming at least one filter handled asserts the predicate is unsatisfiable**, and `rule-select-access-path` replaces the entire table access with a static empty relation. Never report 0 as an estimate there, nor merely because the table is empty right now — planning precedes execution, and a statement can write rows into a table before reading it. Report at least 1.
+`request.estimatedRows` is the planner's hint, populated only from `ANALYZE`-collected statistics; `undefined` means unknown, and a module that can size itself may substitute its own count there — but must defer to a supplied hint, or the access path is costed against a different figure than the plan around it. `rows` in the result is an estimate the engine costs with and nothing more — `rows: 0` is a very selective estimate, not an assertion about the result set, and the engine will still read your table and enforce the filters.
+
+**`provablyEmpty` is the proof channel.** Set it only when your module has *proven* that no row can satisfy the filters it claimed in `handledFilters` — `IS NULL` on a NOT NULL column is the canonical case. The planner then replaces the entire table access with a static empty relation and your table is never read. Two consequences:
+
+- **Never set it because the table is empty right now.** Planning precedes execution, and a statement can write rows into a table before reading them back (a view update materializing its missing non-preserved-side row does exactly that). "Empty at plan time" is a row count, not a proof.
+- **Declining is always safe.** Leaving it absent costs one optimization and can never produce a wrong answer.
+
+Build the answer with `AccessPlanBuilder.empty(handledFilters)`, which sets cost 0, `rows: 0`, your filter claims and the flag together. `validateAccessPlan` rejects the two half-expressed shapes as module bugs: `provablyEmpty` with no filter claimed handled (you cannot prove a predicate unsatisfiable without claiming the predicate), and `provablyEmpty` with `rows` other than 0.
+
+> **Contract change.** `rows: 0` on a plan claiming every filter used to mean "unsatisfiable" and folded the table access away. It no longer does: such a plan is now READ and its filters enforced normally. A third-party module that relied on the old overload must set `provablyEmpty` (or call `AccessPlanBuilder.empty`) to keep the fold; one that reported an honest 0 gets the correct answer where it previously got none.
 
 **Sizing `rows` per predicate: read `tableInfo.statistics`.**
 

@@ -358,14 +358,14 @@ interface DisplacedPlan {
  * rule-key-set-seek's `probeModuleCosts`.
  *
  * NOTE: `estimatedRows` is `makeFullScanFilterInfo`'s `accessPlan.rows || 1000`,
- * so a module that answered its own seek with `rows: 0` (and did not claim every
- * filter, which would have folded the access to an EmptyResult instead) or with
- * no estimate at all reads back here as a 1000-row baseline the module never
- * stated — the seek arm would then admit a candidate the cost gate should have
- * declined. Both shipped modules always return a positive estimate for a seek,
- * so this is unreachable today; if a third-party module reports 0 or omits
- * `rows`, carry the module's own answer on the leaf instead of re-deriving it
- * from the FilterInfo.
+ * so a module that answered its own seek with `rows: 0` or with no estimate at
+ * all reads back here as a 1000-row baseline the module never stated — the seek
+ * arm would then admit a candidate the cost gate should have declined. A zero is
+ * an ordinary estimate now (the EmptyResult fold reads `provablyEmpty`, not
+ * `rows`), so nothing upstream intercepts it. Both shipped modules always return
+ * a positive estimate for a seek, so this is unreachable today; if a third-party
+ * module reports 0 or omits `rows`, carry the module's own answer on the leaf
+ * instead of re-deriving it from the FilterInfo.
  */
 function displacedPlan(
 	leaf: SeekableAccessLeafNode,
@@ -406,7 +406,7 @@ function probeModule(
 	const ask = (filters: readonly PredicateConstraint[]): BestAccessPlanResult => {
 		const request = buildProbeRequest(tableSchema, tableRows, filters);
 		const plan = getBestAccessPlan.call(vtabModule, context.db, tableSchema, request) as BestAccessPlanResult;
-		validateAccessPlan(request, plan);
+		validateAccessPlan(request, plan, tableSchema.vtabModuleName);
 		return plan;
 	};
 

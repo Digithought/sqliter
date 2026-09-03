@@ -768,7 +768,11 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		request: BestAccessPlanRequest
 	): BestAccessPlanResult {
 		if (!this.underlying.getBestAccessPlan) {
-			// Return a default full scan plan if underlying doesn't implement getBestAccessPlan
+			// Return a default full scan plan if underlying doesn't implement getBestAccessPlan.
+			// This is the only place the layer BUILDS a plan rather than passing the
+			// underlying module's through: it claims no filter and never sets
+			// `provablyEmpty`, which is the safe answer — a fabricated proof would delete a
+			// read that must happen.
 			const rows = request.estimatedRows ?? 1000;
 			return {
 				handledFilters: request.filters.map(() => false),

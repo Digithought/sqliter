@@ -82,12 +82,15 @@ import { reconcilePkCollations } from './store-module-schema-rewrite.js';
  * disagree with the plan around it. A stale post-`ANALYZE` count therefore stays stale
  * here — engine-wide snapshot semantics, not a separate rule.
  *
- * Floored at 1: `rows: 0` is not "this table is empty" in the access-plan protocol, it
- * is a module PROVING its predicate unsatisfiable, and `rule-select-access-path` acts
- * on it by replacing the whole table access with a static empty relation. A live count
- * is a snapshot taken at PLAN time, so an empty table can still be read after rows are
- * written into it by the very same statement — a view update materializing its missing
- * non-preserved-side row does exactly that.
+ * NOTE: floored at 1, conservatively rather than load-bearingly. `rows: 0` used to be read
+ * by `rule-select-access-path` as "this module proved its predicate unsatisfiable", which
+ * replaced the whole table access with a static empty relation; a live count is a snapshot
+ * taken at PLAN time, so an empty table read after the same statement writes into it — a
+ * view update materializing its missing non-preserved-side row — returned nothing. That
+ * fold reads the explicit `provablyEmpty` flag now (which this module never sets), so a
+ * zero here would be read as the estimate it is. The floor stays because a 0-row estimate
+ * still distorts every downstream cost (join ordering, cache admission, sort costing);
+ * revisit if a genuine zero estimate ever needs to reach the cost model.
  *
  * NOTE: a prepared `Statement` holds its compiled plan and recompiles only on a schema
  * change, so a long-lived prepared statement keeps the costs derived from the size the

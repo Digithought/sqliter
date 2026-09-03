@@ -149,9 +149,15 @@ function estimateEqualityRows(
 	const perKey = isUniqueIndex(index)
 		? 1
 		: Math.max(1, Math.floor(estimatedTableSize * equalityTupleSelectivity(tableInfo, eqCols)));
-	// A seek cannot return more rows than the table holds. `Math.max(1, …)` guards the
-	// `rows: 0` fold in `rule-select-access-path.selectPhysicalNode`, which replaces a
-	// fully-handled zero-row access with an `EmptyResultNode`.
+	// A seek cannot return more rows than the table holds.
+	//
+	// NOTE: the `Math.max(1, …)` floor is now conservative rather than load-bearing. It
+	// once guarded the `rows: 0` fold in `rule-select-access-path.selectPhysicalNode`,
+	// which folded any fully-handled zero-row access to an `EmptyResultNode`; that fold
+	// reads `provablyEmpty` now, so a zero estimate is only an estimate. Kept because
+	// dropping it changes what the cost model sees (a 0-row seek prices below every rival
+	// and wins plans it should not); revisit if a genuine zero estimate ever needs to
+	// reach the cost model.
 	return Math.max(1, Math.min(estimatedTableSize, inCardinality * perKey));
 }
 
@@ -451,7 +457,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		const bestPlan = this.findBestAccessPlan(tableInfo, request, estimatedTableSize);
 
 		// Validate the plan before returning
-		validateAccessPlan(request, bestPlan);
+		validateAccessPlan(request, bestPlan, tableInfo.vtabModuleName);
 
 		logger.debugLog(`[getBestAccessPlan] Selected plan: ${bestPlan.explains} (cost: ${bestPlan.cost}, rows: ${bestPlan.rows})`);
 
@@ -476,11 +482,11 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 			if (filter.op === 'IS NULL') {
 				const col = tableInfo.columns[filter.columnIndex];
 				if (col?.notNull) {
+					// A PROOF, not an estimate: no value satisfies `IS NULL` on a NOT NULL
+					// column, whatever the table holds now or after this statement writes to
+					// it. `empty()` sets cost/rows/`provablyEmpty` together.
 					return AccessPlanBuilder
-						.fullScan(0)
-						.setCost(0)
-						.setRows(0)
-						.setHandledFilters(new Array(request.filters.length).fill(true))
+						.empty(new Array(request.filters.length).fill(true))
 						.setExplanation('Empty result (IS NULL on NOT NULL column)')
 						.build();
 				}

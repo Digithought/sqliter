@@ -743,11 +743,11 @@ describe('store per-predicate selectivity from column statistics', () => {
 
 	describe('degenerate table sizes', () => {
 		it('an analyzed empty table advertises no zero-row plan', async () => {
-			// `rows: 0` on a plan that claims every filter makes `rule-select-access-path` fold
-			// the whole table access to an `EmptyResultNode`, so a table empty at PLAN time
-			// would return nothing for rows the same statement writes. Every arm's
-			// `Math.max(1, ...)` is what prevents that, and `ANALYZE` on an empty table is the
-			// shortest path to it: `rowCount` 0 and every `distinctCount` 0.
+			// A zero row estimate is no longer read as a proof — `rule-select-access-path` folds
+			// on the explicit `provablyEmpty` flag, which this module never sets — but every
+			// arm's `Math.max(1, ...)` still keeps a 0 out of the cost model, where it would
+			// price below every rival plan. `ANALYZE` on an empty table is the shortest path
+			// to one: `rowCount` 0 and every `distinctCount` 0.
 			const f = await track({ ddl: STANDARD_DDL });
 			await f.analyze();
 			expect(f.table().statistics!.rowCount).to.equal(0);

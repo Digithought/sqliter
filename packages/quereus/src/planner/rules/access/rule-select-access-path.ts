@@ -397,20 +397,22 @@ export function selectPhysicalNode(
 
 	// Empty result optimization (e.g., IS NULL on NOT NULL column).
 	//
-	// `rows === 0` folds the whole table access away, so it is only sound when the module
-	// was PROVING a predicate unsatisfiable. `handledFilters.every(...)` alone does not say
-	// that — it is vacuously true for a plan with no filters at all, so a module reporting
-	// `rows: 0` on a plain full scan (a plausible reading of a field the interface calls a
-	// "cardinality estimate", for a table that is empty at plan time) would have its read
-	// deleted, and a statement that writes rows into that table before reading them back
-	// would return nothing. Requiring at least one claimed filter keeps the fold to the case
-	// it was written for. It cannot fire vacuously today — the memory module emits `rows: 0`
-	// only for `IS NULL` on a NOT NULL column, which always carries that filter.
+	// Folding deletes the table read entirely, so the only signal that licenses it is the
+	// module's explicit PROOF that nothing can satisfy the filters it claimed
+	// (`BestAccessPlanResult.provablyEmpty`). `rows` is deliberately NOT consulted: it is an
+	// estimate, and reading `rows === 0` as a proof deleted the read of a module that rounded
+	// a very selective estimate down, or that honestly reported a table empty at PLAN time —
+	// after which a statement writing rows into that table and reading them back returns
+	// nothing.
 	//
-	// NOTE: with filters present the fold still trusts a number the interface documents as an
-	// estimate; an explicit "predicate is unsatisfiable" signal is tracked in
-	// backlog/debt-empty-access-plan-fold-trusts-estimate.
-	if (accessPlan.rows === 0 && accessPlan.handledFilters.length > 0 && accessPlan.handledFilters.every(h => h)) {
+	// The `handledFilters` conjunct is a runtime backstop, not part of the signal.
+	// `validateAccessPlan` rejects a `provablyEmpty` plan that claims nothing, but not every
+	// module validates its own plan (the store module does not), so an unclaimed proof
+	// declines here instead of folding. `every(...)` is stricter than soundness requires — a
+	// proof over a claimed filter holds whatever the engine does with the unclaimed ones, all
+	// of which can only remove more rows — but the strict form costs at most an optimization
+	// and keeps the vacuous no-filter case (`every` over an empty list is true) out.
+	if (accessPlan.provablyEmpty && accessPlan.handledFilters.length > 0 && accessPlan.handledFilters.every(h => h)) {
 		log('Using empty result (impossible predicate detected)');
 		return createEmptyResultNode(tableRef);
 	}

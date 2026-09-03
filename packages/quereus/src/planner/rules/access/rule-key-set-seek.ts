@@ -422,7 +422,7 @@ function probeModuleCosts(
 	const ask = (filters: readonly PredicateConstraint[]): BestAccessPlanResult => {
 		const request = buildProbeRequest(tableSchema, tableRows, filters);
 		const plan = getBestAccessPlan.call(vtabModule, context.db, tableSchema, request) as BestAccessPlanResult;
-		validateAccessPlan(request, plan);
+		validateAccessPlan(request, plan, tableSchema.vtabModuleName);
 		return plan;
 	};
 

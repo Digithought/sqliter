@@ -150,12 +150,13 @@ describe('store row count reaches the planner', () => {
 		});
 
 		it('never advertises zero rows for an empty table', async () => {
-			// `rows: 0` is the access-plan protocol's "this predicate is unsatisfiable",
-			// and the engine acts on it by replacing the table access with a static empty
-			// relation. A table that is empty when the plan is BUILT can still be read
-			// after the same statement writes into it (a view update materializing its
-			// missing non-preserved-side row), so an honest 0 folds away a read that must
-			// happen. Regression for 93.4-view-mutation.sqllogic under the store backend.
+			// `rows: 0` was once the access-plan protocol's "this predicate is unsatisfiable",
+			// and the engine acted on it by replacing the table access with a static empty
+			// relation — so an honest 0 for a table that is empty when the plan is BUILT
+			// folded away a read the same statement then needed (a view update materializing
+			// its missing non-preserved-side row). The fold reads `provablyEmpty` now, but the
+			// floor stays: a 0 estimate distorts every cost derived from it. Regression for
+			// 93.4-view-mutation.sqllogic under the store backend.
 			await db.exec(`create table e (id integer primary key, v text) using store`);
 			const schema = db.schemaManager.findTable('e')!;
 			// Nothing has opened this table's storage yet, so there is no count to give —

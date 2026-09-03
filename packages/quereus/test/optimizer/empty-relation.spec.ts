@@ -264,14 +264,12 @@ describe('Empty-relation folding', () => {
 	});
 });
 
-// ── `rows: 0` from a module is only a proof when it claimed a filter ─────────
-// `selectPhysicalNode` replaces a table access with an EmptyRelation on
-// `accessPlan.rows === 0`. That is sound only for the case it was written for: the
-// module was handed a filter it can prove nothing matches. The guard that is meant to
-// say so, `handledFilters.every(...)`, is vacuously true when there are NO filters, so
-// a module reporting a live count of zero on a plain full scan would have its read
-// deleted — and planning precedes execution, so "empty now" is not "empty when this
-// runs". Requiring at least one claimed filter keeps the fold to the proof case.
+// ── `rows: 0` is an estimate; `provablyEmpty` is the proof ──────────────────
+// `selectPhysicalNode` replaces a table access with an EmptyResult only on the module's
+// explicit `provablyEmpty` flag. It used to fold on `accessPlan.rows === 0` instead —
+// reading a documented estimate as a proof — so a module reporting a live count of zero,
+// or rounding a very selective estimate down, had its read deleted; planning precedes
+// execution, so "empty now" is not "empty when this runs".
 
 /** A module that reports its live size on a no-filter scan, honestly — zero included. */
 class LiveCountModule extends MemoryTableModule {
@@ -290,6 +288,92 @@ class LiveCountModule extends MemoryTableModule {
 		return super.getBestAccessPlan(db, tableInfo, request);
 	}
 }
+
+/**
+ * Answers every filtered request with the underlying plan, then stamps `rows: 0` on it —
+ * the shape the old fold read as a proof (every filter claimed, zero rows) with no
+ * `provablyEmpty` flag. The filters are genuinely claimed and genuinely enforced by the
+ * memory module's own seek, so the correct answer is the row, not nothing.
+ */
+class ZeroEstimateModule extends MemoryTableModule {
+	override getBestAccessPlan(
+		db: Database,
+		tableInfo: TableSchema,
+		request: BestAccessPlanRequest,
+	): BestAccessPlanResult {
+		const plan = super.getBestAccessPlan(db, tableInfo, request);
+		return request.filters.length > 0 ? { ...plan, rows: 0 } : plan;
+	}
+}
+
+/** Answers any filtered request with a PROOF that nothing matches. */
+class ProvenEmptyModule extends MemoryTableModule {
+	override getBestAccessPlan(
+		db: Database,
+		tableInfo: TableSchema,
+		request: BestAccessPlanRequest,
+	): BestAccessPlanResult {
+		if (request.filters.length === 0) return super.getBestAccessPlan(db, tableInfo, request);
+		return AccessPlanBuilder
+			.empty(new Array(request.filters.length).fill(true))
+			.setExplanation('Module says nothing can match')
+			.build();
+	}
+}
+
+describe('A module `rows: 0` is an estimate, not a proof', () => {
+	let db: Database;
+
+	beforeEach(() => {
+		db = new Database();
+		db.registerModule('zero_estimate', new ZeroEstimateModule());
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	it('reads the table and enforces the filter when every filter is claimed', async () => {
+		await db.exec('create table z (id integer primary key, v text) using zero_estimate');
+		await db.exec("insert into z values (1, 'a'), (2, 'b')");
+
+		const q = 'select id, v from z where id = 1';
+		const plan = await planRows(db, q);
+		expect(hasOp(plan, 'EMPTYRESULT'), `plan ops=${plan.map(r => r.op).join(',')}`).to.equal(false);
+		expect(await results(db, q)).to.deep.equal([{ id: 1, v: 'a' }]);
+	});
+});
+
+describe('`provablyEmpty` is the fold signal', () => {
+	let db: Database;
+
+	beforeEach(() => {
+		db = new Database();
+		db.registerModule('proven_empty', new ProvenEmptyModule());
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	it('folds the whole table access away', async () => {
+		await db.exec('create table p (id integer primary key, v text) using proven_empty');
+		await db.exec("insert into p values (1, 'a')");
+
+		const q = 'select id from p where id = 1';
+		const plan = await planRows(db, q);
+		expect(hasOp(plan, 'EMPTYRESULT'), `plan ops=${plan.map(r => r.op).join(',')}`).to.equal(true);
+		expect(await results(db, q)).to.have.lengthOf(0);
+	});
+
+	it('leaves an unfiltered read alone', async () => {
+		await db.exec('create table p2 (id integer primary key, v text) using proven_empty');
+		await db.exec("insert into p2 values (1, 'a')");
+
+		const q = 'select id from p2 order by id';
+		expect(await results(db, q)).to.deep.equal([{ id: 1 }]);
+	});
+});
 
 describe('A no-filter `rows: 0` is an estimate, not a proof', () => {
 	let db: Database;

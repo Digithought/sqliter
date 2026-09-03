@@ -1030,11 +1030,14 @@ function primaryKeyMultiSeekPlan(
 	// tracked as `backlog/debt-store-seek-positioning-conflates-two-arms`, with the numbers
 	// in `packages/quereus-plugin-leveldb/README.md` § Measured read cost.
 	//
-	// `Math.max(1, …)` is LOAD-BEARING, not defensive. `rows: 0` on a plan that claims
-	// every filter makes `rule-select-access-path` replace the whole table access with an
-	// `EmptyResultNode` (its "the module proved the predicate unsatisfiable" fold), so a
-	// table that is empty at PLAN time would return nothing for rows written by the same
-	// statement.
+	// NOTE: `Math.max(1, …)` is conservative, no longer load-bearing. It once kept `rows: 0`
+	// away from `rule-select-access-path`'s fold, which replaced the whole table access with
+	// an `EmptyResultNode` for any fully-claimed zero-row plan — so a table empty at PLAN
+	// time returned nothing for rows written by the same statement. That fold reads the
+	// explicit `provablyEmpty` proof now (which this module never sets), so a zero here is
+	// read as the estimate it is. Kept because a 0-row seek prices below every rival and
+	// would win plans on an arithmetic artifact; revisit if a genuine zero estimate ever
+	// needs to reach the cost model.
 	const rows = Math.max(1, Math.min(estimatedRows, pins.seekKeyCount));
 	const plan = AccessPlanBuilder
 		// `setIsSet(false)` is likewise load-bearing: `eqMatch` defaults `isSet` to

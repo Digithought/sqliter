@@ -51,6 +51,20 @@ describe('AccessPlanBuilder', () => {
 			expect(plan.explains).to.equal('Index range scan');
 		});
 
+		it('empty() builds the whole proven-empty answer', () => {
+			const plan = AccessPlanBuilder.empty([true, false]).build();
+			expect(plan.cost).to.equal(0);
+			expect(plan.rows).to.equal(0);
+			expect(plan.provablyEmpty).to.be.true;
+			expect(plan.handledFilters).to.deep.equal([true, false]);
+		});
+
+		it('empty() refuses a proof that claims no filter', () => {
+			// A module cannot prove a predicate unsatisfiable without claiming the predicate.
+			expect(() => AccessPlanBuilder.empty([false, false])).to.throw(/at least one handled filter/i);
+			expect(() => AccessPlanBuilder.empty([])).to.throw(/at least one handled filter/i);
+		});
+
 		it('should create a range scan with custom index cost', () => {
 			const plan = AccessPlanBuilder.rangeScan(20, 1.5).build();
 			expect(plan.cost).to.equal(1.5 + 20 * 0.5);
@@ -328,6 +342,57 @@ describe('AccessPlanBuilder', () => {
 				monotonicOn: { columnIndex: -1, direction: 'asc', strict: false },
 			};
 			expect(() => validateAccessPlan(request, result)).to.throw(/monotonicOn column index/i);
+		});
+
+		it('accepts a well-formed provablyEmpty plan', () => {
+			const request = makeRequest(2);
+			const result: BestAccessPlanResult = {
+				handledFilters: [true, false],
+				cost: 0,
+				rows: 0,
+				provablyEmpty: true,
+			};
+			expect(() => validateAccessPlan(request, result)).not.to.throw();
+		});
+
+		it('should throw when provablyEmpty claims no filter', () => {
+			const request = makeRequest(2);
+			const result: BestAccessPlanResult = {
+				handledFilters: [false, false],
+				cost: 0,
+				rows: 0,
+				provablyEmpty: true,
+			};
+			expect(() => validateAccessPlan(request, result, 'testmod')).to.throw(/provablyEmpty but claims no filter/i);
+			// The message names the offending module when the caller supplied its name.
+			expect(() => validateAccessPlan(request, result, 'testmod')).to.throw(/testmod/);
+		});
+
+		it('should throw when provablyEmpty accompanies a non-zero row count', () => {
+			const request = makeRequest(1);
+			const nonZero: BestAccessPlanResult = {
+				handledFilters: [true],
+				cost: 0,
+				rows: 5,
+				provablyEmpty: true,
+			};
+			expect(() => validateAccessPlan(request, nonZero)).to.throw(/provablyEmpty but reports rows: 5/i);
+
+			// `undefined` is "no estimate", which contradicts a proof just as much.
+			const unknown: BestAccessPlanResult = { ...nonZero, rows: undefined };
+			expect(() => validateAccessPlan(request, unknown)).to.throw(/provablyEmpty but reports rows/i);
+		});
+
+		it('leaves a plain rows: 0 estimate alone', () => {
+			// The old overload: every filter claimed, zero rows, no proof. Legal now, and the
+			// planner reads it as an estimate.
+			const request = makeRequest(1);
+			const result: BestAccessPlanResult = {
+				handledFilters: [true],
+				cost: 0,
+				rows: 0,
+			};
+			expect(() => validateAccessPlan(request, result)).not.to.throw();
 		});
 
 		it('should throw when supportsOrdinalSeek is set without monotonicOn', () => {
