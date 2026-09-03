@@ -228,8 +228,11 @@ describe('a store table is planned against its live row count', () => {
 		 * The seek-versus-scan veto in `computeBestAccessPlan` compares the seek arm against a
 		 * sequential scan. While the arm's estimate is an `ARM_SELECTIVITY` shape CONSTANT —
 		 * which is what "un-analyzed" means — both sides of that comparison are the same linear
-		 * function of `estimatedRows`, so the verdict is invariant under the table's size:
-		 * `0.5 + 0.3·N·1.5` stays below `N` for every N ≥ 1. All that changes is the price.
+		 * function of `estimatedRows`, so the verdict is invariant under the table's size. The
+		 * flip points are already spelled out at the top of `store-module-access-plan.ts`: the
+		 * `range` arm costs `0.3·N·(0.5 + R)` against a scan's `N`, so with the veto judged at
+		 * parity (`R = 1.0`, which is what an un-backed estimate means) it is `0.45·N < N` for
+		 * every N — a seek, always. Only the price moves with the size.
 		 *
 		 * The discrimination the parent ticket measured (a range matching 55% of the rows
 		 * flipping to a scan) needs `ANALYZE`: only a statistics-backed estimate is per-query,

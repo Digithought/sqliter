@@ -19,12 +19,14 @@
  * exactly what this change exists to stop. The module's own default is the sole fallback now.
  *
  * Three spellings must stay distinct all the way to the module: `undefined` (nobody
- * measured), `0` (measured, and empty), and `n > 0` (measured). The `||` spellings at the
- * remaining sites collapsed `0` into the next fallback and are now `??`.
+ * measured), `0` (measured, and empty), and `n > 0` (measured). The `|| undefined`
+ * spellings at the remaining sites collapsed a measured `0` into "unknown" and are now
+ * plain relays.
  *
- * The memory backend keeps no live row count, so nothing here may change what it plans —
- * `two un-analyzed tables of very different sizes` pins that directly, and the full suite
- * pins it broadly.
+ * The memory backend keeps its own flat 1000 default and does not (yet) answer from the
+ * O(1) size it could read — see `feat-memory-backend-sizes-itself` — so nothing here may
+ * change what it plans. `prices two un-analyzed tables of very different sizes identically`
+ * pins that directly, and the full suite pins it broadly.
  */
 
 import { expect } from 'chai';
@@ -33,10 +35,13 @@ import { MemoryTableModule } from '../../src/vtab/memory/module.js';
 import type { TableSchema } from '../../src/schema/table.js';
 import type { BestAccessPlanRequest, BestAccessPlanResult } from '../../src/vtab/best-access-plan.js';
 
-/** Every `estimatedRows` the planner sent, with the table it was about. */
+/** One `getBestAccessPlan` exchange: what the planner sent, and what the module answered. */
 interface Ask {
 	readonly table: string;
+	/** `request.estimatedRows` — `undefined` is "nobody measured this table". */
 	readonly estimatedRows: number | undefined;
+	/** `result.rows` — the arm the module picked, sized from whatever it decided to use. */
+	readonly answered: number | undefined;
 }
 
 /** A memory module that records what the planner asks it, then answers normally. */
@@ -48,13 +53,23 @@ class RecordingMemoryModule extends MemoryTableModule {
 		tableInfo: TableSchema,
 		request: BestAccessPlanRequest,
 	): BestAccessPlanResult {
-		this.asks.push({ table: tableInfo.name.toLowerCase(), estimatedRows: request.estimatedRows });
-		return super.getBestAccessPlan(db, tableInfo, request);
+		const result = super.getBestAccessPlan(db, tableInfo, request);
+		this.asks.push({
+			table: tableInfo.name.toLowerCase(),
+			estimatedRows: request.estimatedRows,
+			answered: result.rows,
+		});
+		return result;
 	}
 
 	/** What was asked about `table` since the last `reset()`, in order. */
 	forTable(table: string): Array<number | undefined> {
 		return this.asks.filter(a => a.table === table).map(a => a.estimatedRows);
+	}
+
+	/** What the module answered about `table` since the last `reset()`, in order. */
+	answersFor(table: string): Array<number | undefined> {
+		return this.asks.filter(a => a.table === table).map(a => a.answered);
 	}
 
 	reset(): void {
@@ -127,13 +142,23 @@ describe('BestAccessPlanRequest.estimatedRows', () => {
 			});
 		}
 
-		it('leaves the module free to answer with a size of its own', async () => {
-			// The memory backend has no live count, so its own `?? 1000` default answers —
-			// unchanged behavior, and the whole point of leaving module-side defaults alone.
+		it('leaves the module to answer from its own default, and that default is what shows', async () => {
+			// The gap the planner no longer fills is filled by the MODULE. This backend
+			// substitutes a flat 1000 (`vtab/memory/module.ts`), so its arms are fractions of
+			// 1000 and not of the 137 rows the table holds — the module's number, not the
+			// planner's. `feat-memory-backend-sizes-itself` is what would change that; the
+			// mirror of the store backend's assertion, where no arm may exceed the table.
 			await seed(137);
 			mod.reset();
 			await planRows(db, 'select id from t where v > 100');
-			expect(mod.forTable('t').every(e => e === undefined)).to.equal(true);
+
+			const asked = mod.forTable('t');
+			expect(asked, 'the planner asked about t').to.not.be.empty;
+			expect(asked, 'and asked with no number at all').to.deep.equal(asked.map(() => undefined));
+
+			const answered = mod.answersFor('t').map(a => a ?? 0);
+			expect(Math.max(...answered), 'an arm claims more rows than the table holds, so it was sized from 1000')
+				.to.be.greaterThan(137);
 		});
 	});
 

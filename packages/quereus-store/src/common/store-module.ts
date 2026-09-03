@@ -131,6 +131,12 @@ function sizeRequestFromLiveCount(
 	if (liveRows === undefined) return request;
 	const staleEmptySnapshot = request.estimatedRows === 0 && liveRows > 0;
 	if (request.estimatedRows !== undefined && !staleEmptySnapshot) return request;
+	// NOTE: floored at 1, so an un-analyzed table this module knows is empty is substituted
+	// as 1 rather than 0 — every arm and the scan would otherwise price at 0 and the
+	// seek-versus-scan comparison would decide on rounding. Deliberately NOT the same case
+	// as a supplied hint of 0, which is a measurement the module honors verbatim (above).
+	// If an empty table's plan ever needs to be distinguishable from a one-row table's, this
+	// floor is what to remove, and the zero-cost comparison is what to fix first.
 	return { ...request, estimatedRows: Math.max(1, liveRows) };
 }
 

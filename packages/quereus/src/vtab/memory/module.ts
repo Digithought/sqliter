@@ -453,12 +453,14 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		// default to avoid degenerate costs. (`||` also catches an analyzed empty
 		// table — a plan over 0 rows is cheap under any default, so that is fine.)
 		//
-		// NOTE: this default is now the SOLE fallback for an un-analyzed table. Every
-		// planner site that builds a `BestAccessPlanRequest` sends `undefined` rather
-		// than substituting 1000 of its own, precisely so a module that can size itself
-		// gets the chance. This module keeps no live row count, so it cannot — the
-		// constant stays. If the in-memory table ever exposes its own size, read it here
-		// instead of the constant.
+		// NOTE: this constant is now the SOLE fallback for an un-analyzed table. Every
+		// planner site that builds a `BestAccessPlanRequest` sends `undefined` rather than
+		// substituting 1000 of its own, precisely so a module that can size itself gets the
+		// chance. This module COULD take it — `MemoryTableManager.getBaseLayerStats()` is
+		// the committed BTree's node count in O(1), reachable from `this.tables` — and
+		// deliberately does not yet, because switching every un-analyzed memory table from
+		// a flat 1000 to its real size re-prices the default backend under the entire test
+		// suite. Tracked as `feat-memory-backend-sizes-itself`; do not "fix" it in passing.
 		const estimatedTableSize = request.estimatedRows || 1000;
 
 		// Find the best access strategy

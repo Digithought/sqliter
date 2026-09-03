@@ -260,10 +260,10 @@ function createIndexBasedAccess(retrieveNode: RetrieveNode, context: OptContext)
 				isUnique: col.primaryKey || false // For now, assume only PK columns are unique
 			} as ColumnMeta)),
 			filters: constraints,
-			// `??`, not `||`: a measured empty table is `0` and must reach the module as
-			// `0`. Only `undefined` (never analyzed) means unknown, which is the module's
-			// cue to substitute a size of its own.
-			estimatedRows: retrieveNode.tableRef.estimatedRows ?? undefined
+			// Relayed as-is: a measured empty table is `0` and must reach the module as
+			// `0`, and only `undefined` (never analyzed) means unknown — the module's cue
+			// to substitute a size of its own. (Was `|| undefined`, which spelt 0 unknown.)
+			estimatedRows: retrieveNode.tableRef.estimatedRows
 		};
 
 		// Use the vtab module's getBestAccessPlan method to get an optimized access plan
@@ -1232,6 +1232,11 @@ function selectPhysicalNodeLegacy(
  * Create a sequential scan node
  */
 function createSeqScan(tableRef: TableReferenceNode, filterInfo?: FilterInfo, cost?: number): SeqScanNode {
+	// NOTE: `||`, so an ANALYZEd-empty table (a measured `0`) is costed here as 1000. Unlike
+	// the request-building sites above, this number feeds the engine's own cost model rather
+	// than a module, and `seqScanCost(0)` raises a separate question — what an empty table's
+	// scan should cost — so it was left alone. Tracked as
+	// `bug-measured-empty-table-costed-as-thousand-rows`; don't re-file it.
 	const tableRows = tableRef.estimatedRows || 1000;
 	const scanCost = cost ?? seqScanCost(tableRows);
 

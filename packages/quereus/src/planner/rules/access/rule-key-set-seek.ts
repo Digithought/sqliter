@@ -406,9 +406,10 @@ function probeModuleCosts(
 		return null;
 	}
 
-	// `??`, not `||`: a measured empty table is `0` and must reach the module as `0`.
-	// Only `undefined` (never analyzed) means unknown.
-	const tableRows = leaf.source.estimatedRows ?? undefined;
+	// Relayed as-is: a measured empty table is `0` and must reach the module as `0`, and
+	// only `undefined` (never analyzed) means unknown. (Was `|| undefined`, which spelt
+	// a measured 0 as unknown.)
+	const tableRows = leaf.source.estimatedRows;
 	// Advisory count estimate, clamped into the ceiling `validateAccessPlanRequest` demands.
 	const runtimeSetFilter = (maxCount: number): PredicateConstraint => ({
 		columnIndex: seekCol,
@@ -609,26 +610,20 @@ export function ruleKeySetSeek(node: PlanNode, context: OptContext): PlanNode | 
 		// optimization, never a row. Absent estimate ⇒ proceed, the same posture
 		// the rest of the rule takes toward advisory numbers. The PHYSICAL
 		// estimate is read because the logical `estimatedRows` getter reads
-		// `undefined` through a physical access node. NOTE: inert on BOTH shipped
-		// backends today — a freshly-populated table's physical row estimate reads 0
-		// on the memory backend and (measured while covering the store's primary-key
-		// arm, feat-store-pk-key-set-seek-coverage: 7 committed rows, physical
-		// estimate 0) on the persistent store too — so `0 > threshold` is never true
-		// and the gate always proceeds. That is the unknown-spelled-as-zero
-		// conflation `bug-row-estimate-conflates-unknown-and-zero` tracks, seen from
-		// this site; the gate exists for modules that report real cardinality.
+		// `undefined` through a physical access node.
 		//
-		// STILL inert after `unknown-row-count-stops-pretending-to-be-zero` (which made that
-		// estimate read `undefined` instead of `0`) and after
-		// `ask-the-backend-before-guessing-its-size` (which lets a self-sizing module answer
-		// with its live row count). Measured on the store: a 3000-row key source against a
-		// 200-row target advertising `breakEvenKeys: 343` — nearly 9× over — still proceeds.
-		// The live count reaches the module and is discarded one level up:
-		// `IndexScanNode.computePhysical` relays `this.source.estimatedRows` (the CATALOG
-		// count, `undefined` un-analyzed) where its sibling `IndexSeekNode` relays the
-		// module's own `filterInfo.indexInfoOutput.estimatedRows`. Tracked as an arm on
-		// `debt-row-estimate-relay-has-no-guard`; pinned as observed behavior by
-		// `packages/quereus-store/test/live-row-count-plans.spec.ts`.
+		// NOTE: this gate has never declined on either shipped backend, and still does not.
+		// The key source is reached through an `IndexScan`/`SeqScan`, and those relay
+		// `this.source.estimatedRows` — the CATALOG count, `undefined` until `ANALYZE` —
+		// where their sibling `IndexSeekNode` relays the module's own
+		// `filterInfo.indexInfoOutput.estimatedRows`. So a store table's live row count
+		// prices the module's plan and is then discarded one level up, and `undefined`
+		// arrives here. Measured: a 3000-row key source against a 200-row target
+		// advertising `breakEvenKeys: 343` — nearly 9× over — still proceeds. Tracked as an
+		// arm on `debt-row-estimate-relay-has-no-guard`; pinned as OBSERVED (not desired)
+		// behavior by `packages/quereus-store/test/live-row-count-plans.spec.ts`, which is
+		// what will report the change when that relay is fixed. The gate itself is correct
+		// and exists for modules that report real cardinality.
 		const keyRows = node.right.physical.estimatedRows;
 		if (keyRows !== undefined && keyRows > Math.min(pushdown.maxKeys, pushdown.breakEvenKeys)) {
 			log('decline: key source estimate %d exceeds the seek threshold min(%d, %d)',
