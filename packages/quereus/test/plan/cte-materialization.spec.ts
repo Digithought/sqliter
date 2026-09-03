@@ -66,6 +66,8 @@ describe('Plan shape: CTE materialization', () => {
 
 			const cteRefCount = ops.filter(op => op === 'CTEREFERENCE').length;
 			expect(cteRefCount).to.equal(2, 'Should have two CTE reference nodes');
+			expect(ops).to.not.include('CACHE',
+				'a multi-reference CTE buffers via the materialize mark, never a CacheNode wrap');
 			expect(ops.some(op => op.includes('JOIN')),
 				'Multi-use CTE with self-join should contain a JOIN'
 			).to.equal(true);
@@ -123,6 +125,12 @@ describe('Plan shape: CTE materialization', () => {
 			const ops = await planOps(db, q);
 			expect(ops).to.not.include('CACHE',
 				'materialize mark buffers via emitCTE, not a separate CacheNode wrap');
+		});
+
+		it('a MATERIALIZED CTE still returns its rows once buffered', async () => {
+			const rows = await allRows<{ id: number; val: number }>(db,
+				'WITH cte AS MATERIALIZED (SELECT id, val FROM items WHERE val >= 30) SELECT * FROM cte ORDER BY id');
+			expect(rows).to.deep.equal([{ id: 3, val: 30 }, { id: 4, val: 40 }]);
 		});
 
 		it('honors NOT MATERIALIZED on a 2-reference CTE', () => {

@@ -23,7 +23,6 @@ import { SortNode } from '../../src/planner/nodes/sort.js';
 import { LimitOffsetNode } from '../../src/planner/nodes/limit-offset.js';
 import { ProjectNode } from '../../src/planner/nodes/project-node.js';
 import { CacheNode } from '../../src/planner/nodes/cache-node.js';
-import { CTENode } from '../../src/planner/nodes/cte-node.js';
 import { TableReferenceNode, ColumnReferenceNode } from '../../src/planner/nodes/reference.js';
 import { SeqScanNode } from '../../src/planner/nodes/table-access-nodes.js';
 import { WindowFunctionCallNode } from '../../src/planner/nodes/window-function.js';
@@ -204,7 +203,6 @@ describe('CapabilityDetectors — brand behavior preservation', () => {
 	const limit = new LimitOffsetNode(mockScope, src, undefined, undefined);
 	const project = new ProjectNode(mockScope, src, []);
 	const cache = new CacheNode(mockScope, src);
-	const cte = new CTENode(mockScope, 'c', undefined, src, undefined);
 	const tableRef = new TableReferenceNode(mockScope, {} as any, {} as any);
 	const seqScan = new SeqScanNode(mockScope, tableRef, { indexInfoOutput: { estimatedCost: 1 } } as any);
 	const colRef = new ColumnReferenceNode(mockScope, { type: 'column', name: 'x' } as any, {} as any, 1, 0);
@@ -227,7 +225,6 @@ describe('CapabilityDetectors — brand behavior preservation', () => {
 		expect(CapabilityDetectors.isLimit(limit)).to.equal(true);
 		expect(CapabilityDetectors.canProject(project)).to.equal(true);
 		expect(CapabilityDetectors.isCached(cache)).to.equal(true);
-		expect(CapabilityDetectors.isCTE(cte)).to.equal(true);
 		expect(CapabilityDetectors.isTableAccess(tableRef)).to.equal(true);
 		expect(CapabilityDetectors.isColumnBindingProvider(tableRef)).to.equal(true);
 		expect(CapabilityDetectors.isTableAccess(seqScan)).to.equal(true); // brand inherited from TableAccessNode base

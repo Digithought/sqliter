@@ -3,7 +3,6 @@ import type { RelationType } from '../../common/datatype.js';
 import { PlanNodeType } from './plan-node-type.js';
 import type { Scope } from '../scopes/scope.js';
 import { Cached } from '../../util/cached.js';
-import type { CTECapable } from '../framework/characteristics.js';
 
 /**
  * Narrow contract that any node must satisfy to be placed in the CTE lookup map
@@ -36,9 +35,8 @@ export interface CTEPlanNode extends UnaryRelationalNode {
  * Plan node for Common Table Expressions (CTEs).
  * This represents a single CTE definition within a WITH clause.
  */
-export class CTENode extends PlanNode implements CTEPlanNode, CTEScopeNode, CTECapable {
+export class CTENode extends PlanNode implements CTEPlanNode, CTEScopeNode {
 	readonly nodeType = PlanNodeType.CTE;
-	readonly isCTECapable = true as const;
 	/**
 	 * Stable identity object for this CTE, minted once when the CTE is built and
 	 * threaded through every optimizer rebuild. Two `CTENode` instances that
@@ -150,10 +148,6 @@ export class CTENode extends PlanNode implements CTEPlanNode, CTEScopeNode, CTEC
 			this.materialize,
 			this.tableDescriptor
 		);
-	}
-
-	getCTESource(): RelationalPlanNode {
-		return this.source;
 	}
 
 	override toString(): string {

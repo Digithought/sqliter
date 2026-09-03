@@ -308,28 +308,6 @@ export interface CacheCapable extends PlanNode {
 }
 
 /**
- * Interface for Common Table Expression operations
- */
-export interface CTECapable extends RelationalPlanNode {
-	/** Capability brand — see {@link PredicateCapable.isPredicateCapable}. */
-	readonly isCTECapable: true;
-	readonly cteName: string;
-	readonly columns: string[] | undefined;
-	readonly materializationHint: 'materialized' | 'not_materialized' | undefined;
-	readonly isRecursive: boolean;
-	/** Stable identity for this CTE, preserved across optimizer rebuilds. */
-	readonly tableDescriptor: TableDescriptor;
-	/**
-	 * Resolved buffer-once-per-execution decision. On the capability (not just on
-	 * `CTENode`) so a rule rebuilding a CTE carries it over without an `instanceof`
-	 * — dropping it would re-execute the body, which for a data-modifying CTE means
-	 * a second write.
-	 */
-	readonly materialize: boolean;
-	getCTESource(): RelationalPlanNode;
-}
-
-/**
  * Interface for column reference nodes
  */
 export interface ColumnReferenceCapable extends ScalarPlanNode {
@@ -433,10 +411,6 @@ export class CapabilityDetectors {
 
 	static isCached(node: PlanNode): node is CacheCapable {
 		return (node as Partial<Pick<CacheCapable, 'isCacheCapable'>>).isCacheCapable === true;
-	}
-
-	static isCTE(node: PlanNode): node is CTECapable {
-		return (node as Partial<Pick<CTECapable, 'isCTECapable'>>).isCTECapable === true;
 	}
 
 	static isColumnReference(node: PlanNode): node is ColumnReferenceCapable {

@@ -41,7 +41,7 @@ src/
 │   ├── rules/                # Optimizer rules, by category:
 │   │   ├── access/           #   access-path selection
 │   │   ├── aggregate/        #   streaming aggregation
-│   │   ├── cache/            #   CTE, scalar-subquery, materialization
+│   │   ├── cache/            #   scalar-subquery, nested-loop right, CSE, MV rewrite
 │   │   ├── distinct/         #   distinct elimination
 │   │   ├── join/             #   join commutation, physical selection
 │   │   ├── predicate/        #   predicate pushdown

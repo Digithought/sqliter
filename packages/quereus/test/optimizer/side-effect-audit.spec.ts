@@ -320,7 +320,7 @@ const SIDE_EFFECT_SIGNALS = [
 ] as const;
 
 /** `'aware'` rules that legitimately consult no signal, with the reason each is sound. */
-const NO_SIGNAL_ALLOWLIST: ReadonlyMap<string, string> = new Map([]);
+const NO_SIGNAL_ALLOWLIST: ReadonlyMap<string, string> = new Map();
 
 interface Unguarded {
 	/**
