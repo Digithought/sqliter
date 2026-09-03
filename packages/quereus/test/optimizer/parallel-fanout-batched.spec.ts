@@ -219,8 +219,8 @@ describe('ruleFanOutBatchedOuter', () => {
 	it('does NOT flip when outer cardinality is below batchedOuterMinRows', async () => {
 		await setup3Branches('hi_lat_memory');
 		const before = db.optimizer.tuning;
-		// Restore a positive minimum; the synthetic memory outer resolves
-		// estimatedRows to 0, which is below it.
+		// Restore a positive minimum; the analyzed synthetic outer measures 3 rows,
+		// which is below it.
 		db.optimizer.updateTuning({
 			...before,
 			parallel: { ...before.parallel, batchedOuterMinRows: 256 },

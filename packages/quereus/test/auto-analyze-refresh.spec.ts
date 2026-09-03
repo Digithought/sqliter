@@ -200,7 +200,8 @@ describe('auto-analyze background refresh', () => {
 
 		it('a table larger than auto_analyze_row_limit', async () => {
 			// The gate reads the *known* row count, so the table has to have been sized
-			// once already — a never-analyzed table reports 0 known rows by construction.
+			// once already — a never-analyzed table has none, and the gate collapses that
+			// unknown to 0.
 			await db.exec('insert into t values (1, 10), (2, 20), (3, 30), (4, 40)');
 			await db.exec('analyze t');
 			const before = stats(db, 't')!;

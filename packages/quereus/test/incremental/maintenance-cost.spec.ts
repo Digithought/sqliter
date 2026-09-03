@@ -49,6 +49,28 @@ describe('maintenanceCost — per-arm formulas', () => {
 		expect(maintenanceCost('residual-recompute', 3, withStats)).to.equal(expected);
 	});
 
+	it("'residual-recompute' prefers the compiled residual's own plan cost when an arm builder stamped it", () => {
+		// `residualExecutionCost` is what ONE residual run actually does (a key seek when
+		// the binding key is indexed, a whole-source scan when it is not), so it replaces
+		// the rows-per-group heuristic outright — on the with-stats path…
+		expect(maintenanceCost('residual-recompute', 3, { ...withStats, residualExecutionCost: 42 }))
+			.to.equal(3 * 42);
+		// …and on the no-stats path, where the fallback ratio would otherwise apply.
+		const noStats: MaintenanceSourceStats =
+			{ tableRows: 1000, forwardBodyCost: 100, fallbackRatio: 0.5, residualExecutionCost: 7 };
+		expect(maintenanceCost('residual-recompute', 2, noStats)).to.equal(2 * 7);
+	});
+
+	it("'delta-aggregate' caps against the stamped residual cost, not the heuristic", () => {
+		// deltaPerGroup = min(INVERSE_PER_ROW, residualPerGroup x 0.5). A residual cheap
+		// enough that half of it undercuts the seek+project constant drives the cap arm.
+		const cheapResidual: MaintenanceSourceStats = { ...withStats, residualExecutionCost: 0.2 };
+		expect(maintenanceCost('delta-aggregate', 5, cheapResidual)).to.be.closeTo(5 * 0.1, 1e-9);
+		// An expensive residual leaves the constant arm in charge (unchanged behaviour).
+		const dearResidual: MaintenanceSourceStats = { ...withStats, residualExecutionCost: 1000 };
+		expect(maintenanceCost('delta-aggregate', 5, dearResidual)).to.be.closeTo(5 * INVERSE_PER_ROW, 1e-9);
+	});
+
 	it("'residual-recompute' with NO stats reproduces the deltaPerRowFallbackRatio heuristic", () => {
 		const noStats: MaintenanceSourceStats = { tableRows: 1000, forwardBodyCost: 100, fallbackRatio: 0.5 };
 		// Parity: cc × forwardBodyCost × ratio — the legacy ratio behaviour, byte-for-byte.
@@ -120,6 +142,18 @@ describe('shouldDegradeToRebuild — per-write runtime demotion (stateless)', ()
 	it('degrades when a bulk statement crosses the crossover', () => {
 		expect(shouldDegradeToRebuild(3, stats)).to.equal(true);
 		expect(shouldDegradeToRebuild(1000, stats)).to.equal(true);
+	});
+
+	it('never demotes below the distinct-key floor, even when one residual outprices a rebuild', () => {
+		// A stamped residual that alone costs more than the whole-body rebuild: the raw
+		// crossover would demote at every cardinality. The floor holds 1- and 2-key
+		// statements on the targeted residual, because a `'replace-all'` rebuild also
+		// rewrites every backing row — write amplification the cost model does not carry.
+		const expensiveResidual: MaintenanceSourceStats =
+			{ tableRows: 1000, forwardBodyCost: 100, residualExecutionCost: 1000 };
+		expect(shouldDegradeToRebuild(1, expensiveResidual)).to.equal(false);
+		expect(shouldDegradeToRebuild(2, expensiveResidual)).to.equal(false);
+		expect(shouldDegradeToRebuild(3, expensiveResidual)).to.equal(true);
 	});
 
 	it('reverts on a subsequent low-cardinality statement (no retained state)', () => {

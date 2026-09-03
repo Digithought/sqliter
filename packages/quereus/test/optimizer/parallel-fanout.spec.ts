@@ -881,7 +881,10 @@ describe('ruleFanOutLookupJoin', () => {
 		 *   p=3 → no matches in either        (inner-drop, both branches empty)
 		 *   p=4 → b0∈{400},     b1∈{}         (inner-drop, ONE branch empty)
 		 */
-		async function setupCross(child: 'memory' | 'hi_lat_memory'): Promise<void> {
+		async function setupCross(
+			child: 'memory' | 'hi_lat_memory',
+			{ analyze = true }: { analyze?: boolean } = {},
+		): Promise<void> {
 			await db.exec(`create table p (id integer primary key, label text) using memory`);
 			await db.exec(`create table b0 (id integer primary key, pid integer, v integer) using ${child}`);
 			await db.exec(`create table b1 (id integer primary key, pid integer, w integer) using ${child}`);
@@ -889,7 +892,7 @@ describe('ruleFanOutLookupJoin', () => {
 			await db.exec('insert into b0 values (10, 1, 100), (11, 1, 101), (12, 2, 200), (13, 4, 400)');
 			await db.exec('insert into b1 values (20, 1, 5), (21, 2, 6), (22, 2, 7)');
 			// `crossGuardsPass` refuses on unknown estimates — measure the fixture.
-			for (const t of ['p', 'b0', 'b1']) await db.exec(`analyze ${t}`);
+			if (analyze) for (const t of ['p', 'b0', 'b1']) await db.exec(`analyze ${t}`);
 		}
 
 		const crossSQL =
@@ -912,6 +915,16 @@ describe('ruleFanOutLookupJoin', () => {
 			expect(hasFanOut(plan), `ops=${plan.map(r => r.op).join(',')}`).to.equal(true);
 			expect(fanOutBranchModes(plan)).to.deep.equal(['cross', 'cross']);
 			expect(joinCount(plan), `ops=${plan.map(r => r.op).join(',')}`).to.equal(0);
+		});
+
+		it('does NOT cluster when the fixture is un-analyzed (unknown row estimates)', async () => {
+			// The product guard treats an unknown estimate as exceeding the cap, so a
+			// never-analyzed source can never authorize an unbounded Cartesian product.
+			// Same fixture and latency as the clustering case above — only the missing
+			// statistics differ.
+			await setupCross('hi_lat_memory', { analyze: false });
+			const plan = await planRows(db, crossSQL);
+			expect(hasFanOut(plan), `ops=${plan.map(r => r.op).join(',')}`).to.equal(false);
 		});
 
 		it('does NOT cluster on local-only (memory) 1:n chains', async () => {

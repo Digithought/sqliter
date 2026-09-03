@@ -136,7 +136,7 @@ export class CatalogStatsProvider implements StatsProvider {
 	tableRows(table: TableSchema): number | undefined {
 		const rows = catalogRowCount(table);
 		if (rows === undefined) return this.fallback.tableRows(table);
-		log('Table %s: rowCount=%d (source: %s)', table.name, rows, table.statistics ? 'catalog' : 'schema');
+		log('Table %s: rowCount=%d (source: catalog)', table.name, rows);
 		return rows;
 	}
 

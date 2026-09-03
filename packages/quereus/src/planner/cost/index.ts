@@ -402,6 +402,12 @@ export function maintenanceCost(
 		case 'residual-recompute':
 			return changeCardinality * residualCostPerGroup(stats);
 		case 'full-rebuild':
+			// NOTE: asymmetric inputs — the residual arm can be priced from a REAL optimized
+			// plan cost (`residualExecutionCost`) while this arm stays the synthetic
+			// `seqScan+filter+project` formula `estimateMaintenanceStats` builds. Both are in
+			// COST_CONSTANTS units so the crossover is meaningful today; if the two ever
+			// disagree in practice, stamp `buildFullRebuildPlan`'s optimized `getTotalCost()`
+			// here the same way the arm builders stamp the residual's.
 			return stats.forwardBodyCost;
 		default: {
 			// A new strategy must extend this switch; never-assignment makes that a
@@ -474,23 +480,29 @@ export function isFullRebuildPathological(stats: MaintenanceSourceStats, thresho
 }
 
 /**
- * Per-write demotion test for the `'residual-recompute'` arm: at the DML boundary the
- * actual `changeCardinality` of the current statement may spike above the
- * residual ↔ rebuild crossover, at which point a single `'full-rebuild'` for that
- * statement is cheaper. Returns true when the driver should set `degradeToRebuild` for
- * this statement only (the stored strategy is retained for later, lower-cardinality writes).
- * Stateless by design, so a subsequent low-cardinality statement naturally reverts.
- */
-/**
  * Distinct-key floor below which the residual arm is NEVER demoted to a rebuild.
  * With an un-indexed binding key one residual run and one rebuild both scan the whole
  * source, so their modeled costs sit within noise of each other — but the rebuild's
  * `'replace-all'` diff also rewrites/verifies EVERY backing row (write amplification
  * the cost model does not carry), so a statement touching only a key or two is always
  * better served by the targeted residual. Wide statements still cross over.
+ *
+ * NOTE: a judgment constant standing in for a cost term the model cannot express.
+ * The principled replacement is charging `'full-rebuild'` its per-backing-row write
+ * cost, which needs a backing-size statistic that does not exist yet; revisit if the
+ * floor ever has to move, or once the backing carries its own row count.
  */
 const MIN_DEGRADE_DISTINCT_KEYS = 3;
 
+/**
+ * Per-write demotion test for the `'residual-recompute'` arm: at the DML boundary the
+ * actual `changeCardinality` of the current statement may spike above the
+ * residual ↔ rebuild crossover, at which point a single `'full-rebuild'` for that
+ * statement is cheaper. Returns true when the driver should set `degradeToRebuild` for
+ * this statement only (the stored strategy is retained for later, lower-cardinality writes).
+ * Stateless by design, so a subsequent low-cardinality statement naturally reverts.
+ * Statements below {@link MIN_DEGRADE_DISTINCT_KEYS} distinct keys never demote.
+ */
 export function shouldDegradeToRebuild(
 	changeCardinality: number,
 	stats: MaintenanceSourceStats,

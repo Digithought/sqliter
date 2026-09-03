@@ -189,9 +189,9 @@ export interface TableStalenessEntry {
  * stale  ⟺  changedSinceAnalyze >= max(minMutations, ratio × knownRowCount)
  * ```
  *
- * `knownRowCount` is 0 for a never-analyzed table (`SchemaManager` hardcodes
- * `estimatedRows` to 0 at create), so the absolute floor governs exactly the
- * case that matters most: bulk-loading rows into a fresh table trips
+ * A never-analyzed table has no catalog row count at all, and the caller
+ * collapses that unknown to `knownRowCount = 0`, so the absolute floor governs
+ * exactly the case that matters most: bulk-loading rows into a fresh table trips
  * `minMutations` long before any percentage of zero could.
  *
  * Precedent for the defaults: SQL Server's auto-update-stats uses 500 + 20% of

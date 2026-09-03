@@ -168,9 +168,9 @@ export interface OptimizerTuning {
 		 * per-row-fork overhead when outer rows clearly exceed the read-ahead window;
 		 * below this the serial per-row overlap is already an upper bound on
 		 * wall-clock. An unknown estimate (`undefined`) is treated as *failing* the
-		 * gate (conservative — never flip on a missing statistic). Synthetic
-		 * memory-vtab fixtures resolve `estimatedRows` to 0, so the default also keeps
-		 * the rule inert there independent of the latency gate. Default 256
+		 * gate (conservative — never flip on a missing statistic). A never-analyzed
+		 * fixture reports exactly that, so the rule stays inert on unmeasured tables
+		 * independent of the latency gate. Default 256
 		 * (≈ 4× `maxOuterReadAhead`).
 		 */
 		readonly batchedOuterMinRows: number;

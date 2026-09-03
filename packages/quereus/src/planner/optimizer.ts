@@ -1229,7 +1229,8 @@ export const RULE_MANIFEST: readonly RuleManifestEntry[] = [
 	// / estimatedRows / concurrencySafe are final) and before `materialization-
 	// advisory` so the EagerPrefetch the rule wraps the outer in is already in place
 	// when the advisory walks the tree. Inert on memory-vtab plans (expectedLatencyMs
-	// = 0 AND estimatedRows = 0), so the golden-plan sweep is unaffected.
+	// = 0, and an un-analyzed leaf's unknown estimate fails the cardinality gate), so
+	// the golden-plan sweep is unaffected.
 	{
 		pass: PassId.PostOptimization,
 		id: 'fanout-batched-outer',
