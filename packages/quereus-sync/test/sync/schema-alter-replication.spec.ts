@@ -187,14 +187,6 @@ describe('alter table replication', () => {
 
 		beforeEach(async () => {
 			[a, b] = await makeSyncedPair();
-			// Reconcile the two independent `create table orders` migrations FIRST, so
-			// later relays carry only the alterations under test. Without this, a's
-			// table drifts from its original CREATE via the alteration, and b's
-			// still-unreconciled create_table migration then conflicts against the
-			// drifted definition — a pre-existing property of the create_table
-			// comparison, not the alteration path.
-			await relayAll(a, b);
-			await relayAll(b, a);
 		});
 
 		afterEach(async () => {
@@ -295,10 +287,11 @@ describe('alter table replication', () => {
 
 		beforeEach(async () => {
 			[a, b] = await makeSyncedPair();
-			// Reconcile the two independent `create table orders` migrations first —
-			// same reason as the convergence describe, plus one rename-specific twist:
-			// after a renames `orders` away, an unreconciled create_table for `orders`
-			// arriving later from b would find the name free and re-create it.
+			// Reconcile the two independent `create table orders` migrations first: after
+			// a renames `orders` away, an unreconciled create_table for `orders` arriving
+			// later from b would find the name free and re-create it. (Not the
+			// duplicate-create conflict this used to also dodge — a create is now judged
+			// against the recorded migration at the same version, not the altered shape.)
 			await relayAll(a, b);
 			await relayAll(b, a);
 		});

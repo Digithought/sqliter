@@ -154,6 +154,78 @@ describe('schema replication idempotency', () => {
 		});
 	});
 
+	describe('duplicate create judged after the local table moved on (end-to-end)', () => {
+		let a: Peer;
+		let b: Peer;
+
+		beforeEach(async () => {
+			[a, b] = await makeDivergedPair();
+			// The alteration is what used to break the comparison: `a`'s table no longer
+			// renders as the CREATE that made it, so b's identical create_table read as a
+			// divergence against the altered shape.
+			await localWrite(a, 'alter table orders add column sku text null');
+		});
+
+		afterEach(async () => {
+			await closePeer(a);
+			await closePeer(b);
+		});
+
+		it('admits the peer\'s identical create and keeps the local alteration', async () => {
+			await relayAll(b, a);
+
+			expect(a.db.schemaManager.getTable('main', 'orders')!.columns.map(c => c.name.toLowerCase()))
+				.to.deep.equal(['id', 'note', 'sku']);
+			expect(b.db.schemaManager.getTable('main', 'orders')!.columns.map(c => c.name.toLowerCase()))
+				.to.deep.equal(['id', 'note']);
+		});
+
+		it('stays admitted on a second relay (the permanence half)', async () => {
+			// The conflict aborted the admission unit BEFORE its metadata committed, so
+			// the watermark never advanced and the same batch re-failed on every sync.
+			await relayAll(b, a);
+			const second = await relayAll(b, a);
+
+			expect(second.applied, 'b → a round 2 applied').to.equal(0);
+			expect(a.db.schemaManager.getTable('main', 'orders')!.columns.map(c => c.name.toLowerCase()))
+				.to.deep.equal(['id', 'note', 'sku']);
+		});
+
+		it('lets the local alteration replicate onward afterwards', async () => {
+			await relayAll(b, a);
+			await relayAll(a, b);
+
+			expect(b.db.schemaManager.getTable('main', 'orders')!.columns.map(c => c.name.toLowerCase()))
+				.to.deep.equal(['id', 'note', 'sku']);
+		});
+	});
+
+	describe('divergent create judged after the local table moved on (end-to-end)', () => {
+		it('still conflicts, naming both original creates rather than the altered shape', async () => {
+			const [a, b] = await makeDivergedPair(DIVERGENT_ORDERS_DDL);
+			try {
+				await localWrite(a, 'alter table orders add column sku text null');
+
+				let caught: Error | undefined;
+				try {
+					await relayAll(b, a);
+				} catch (e) {
+					caught = e as Error;
+				}
+
+				expect(caught, 'expected the divergent create to be surfaced').to.be.instanceOf(Error);
+				expect(caught!.message).to.include('main.orders');
+				expect(caught!.message).to.include('"extra"');
+				// The recorded create is what `local:` names, so the operator sees create
+				// against create — the local alteration is not part of the disagreement.
+				expect(caught!.message.toLowerCase(), 'altered shape not printed').to.not.include('sku');
+			} finally {
+				await closePeer(a);
+				await closePeer(b);
+			}
+		});
+	});
+
 	describe('adapter-level, synthetic schema changes', () => {
 		let db: Database;
 		let provider: KVStoreProvider;

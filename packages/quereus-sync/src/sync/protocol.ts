@@ -135,8 +135,13 @@ export interface SchemaMigration {
  * outright if its table's `create table` has not run. Neither the `sm:` key order
  * (schema, then object kind, then name — every index before every table) nor
  * changeset arrival order is causal, so both snapshot and delta paths sort here.
+ *
+ * Generic over anything HLC-stamped so a consumer that has to carry something
+ * alongside each migration (the streaming snapshot pairs each with the
+ * `SchemaChangeToApply` it built at chunk time) orders the pairs directly rather
+ * than re-deriving this comparator.
  */
-export function sortMigrationsByHLC(migrations: readonly SchemaMigration[]): SchemaMigration[] {
+export function sortMigrationsByHLC<T extends { readonly hlc: HLC }>(migrations: readonly T[]): T[] {
 	return [...migrations].sort((a, b) => compareHLC(a.hlc, b.hlc));
 }
 
@@ -489,10 +494,37 @@ export interface SchemaChangeToApply {
   readonly fromTable?: string;
   /** The DDL statement to execute. */
   readonly ddl: string;
+  /**
+   * The DDL this device's OWN migration of the same type, at the same
+   * `(object kind, object name, schema version)`, recorded — when it has one.
+   *
+   * The decision compares against this: the state the incoming migration was
+   * meant to produce, rather than the object's CURRENT shape, which the
+   * receiver's own later migrations have moved on from. Two peers that each ran
+   * the identical `create table orders` both record the identical canonical DDL
+   * at version 1, so the duplicate create stays decidable however much either
+   * peer alters the table afterwards.
+   *
+   * Absent when this device has no same-type record at that version (a table
+   * created before sync was attached, or a version that does not line up because
+   * the table was dropped and re-created) — the decision then falls back to the
+   * current-shape comparison.
+   */
+  readonly localDDLAtVersion?: string;
 }
 
-/** Narrow a migration to the fields the store adapter replays. */
-export function toSchemaChange(migration: SchemaMigration): SchemaChangeToApply {
+/**
+ * Narrow a migration to the fields the store adapter replays.
+ *
+ * `localDDLAtVersion` is what this device's OWN migration at the same version
+ * recorded — see {@link SchemaChangeToApply.localDDLAtVersion}. Every ingress
+ * path resolves it with {@link sameVersionLocalDDL} so one rule decides what
+ * counts as "the same version".
+ */
+export function toSchemaChange(
+	migration: SchemaMigration,
+	localDDLAtVersion?: string,
+): SchemaChangeToApply {
 	return {
 		type: migration.type,
 		schema: migration.schema,
@@ -500,7 +532,65 @@ export function toSchemaChange(migration: SchemaMigration): SchemaChangeToApply 
 		// Present-only, so a non-rename migration carries no phantom key.
 		...(migration.fromTable !== undefined ? { fromTable: migration.fromTable } : {}),
 		ddl: migration.ddl,
+		...(localDDLAtVersion !== undefined ? { localDDLAtVersion } : {}),
 	};
+}
+
+/**
+ * The local record's DDL, but only when it answers the question the decision
+ * asks: what did THIS device's migration of the SAME type at that version say?
+ *
+ * A same-version record of a different type is a different question — a table
+ * created before sync was attached records its first alteration at version 1, and
+ * comparing an incoming `create_table` against that `ALTER TABLE` text would
+ * manufacture a conflict out of nothing.
+ */
+export function sameVersionLocalDDL(
+	local: { readonly type: SchemaMigrationType; readonly ddl: string } | undefined,
+	migration: SchemaMigration,
+): string | undefined {
+	return local !== undefined && local.type === migration.type ? local.ddl : undefined;
+}
+
+/**
+ * The migration-record read {@link toSchemaChangeWithLocalRecord} needs, stated
+ * structurally so this module does not have to import the metadata store (which
+ * imports this one). `SchemaMigrationStore` satisfies it.
+ */
+export interface MigrationVersionLookup {
+	getMigration(
+		schemaName: string,
+		kind: SchemaObjectKind,
+		objectName: string,
+		version: number,
+	): Promise<{ readonly type: SchemaMigrationType; readonly ddl: string } | undefined>;
+}
+
+/**
+ * {@link toSchemaChange} for an ingress path that has NOT already fetched the
+ * local record at the migration's version (the two snapshot consumers).
+ *
+ * Must run BEFORE the caller records the incoming migration at that key —
+ * afterwards the lookup returns the incoming DDL itself and the comparison is
+ * vacuous.
+ *
+ * NOTE: reads `migration.schemaVersion` directly rather than repeating the
+ * `?? getCurrentVersion() + 1` fallback its callers apply when RECORDING. The
+ * field is required on the wire, so the two agree; a peer that somehow omitted it
+ * would look up a version that resolves to no record and fall back to the
+ * current-shape comparison — the pre-existing behaviour, not a new failure.
+ */
+export async function toSchemaChangeWithLocalRecord(
+	lookup: MigrationVersionLookup,
+	migration: SchemaMigration,
+): Promise<SchemaChangeToApply> {
+	const local = await lookup.getMigration(
+		migration.schema,
+		migrationObjectKind(migration.type),
+		migration.table,
+		migration.schemaVersion,
+	);
+	return toSchemaChange(migration, sameVersionLocalDDL(local, migration));
 }
 
 /**

@@ -139,11 +139,39 @@ the migration's wanted state:
 | Object already in the wanted state, definition matches | **Converge silently** — nothing is executed, the change still counts as applied and its migration metadata commits |
 | Object already exists with a **different** definition | Error naming the object and printing both definitions |
 
-"Definition matches" is decided by regenerating the canonical DDL from the local
-`TableSchema` / `IndexSchema` (`generateTableDDL` / `generateIndexDDL` with no `db`
-argument — exactly how the origin produced the DDL it put on the wire) and comparing it
-against the received DDL after a small normalization: trim, drop a trailing `;`, collapse
-whitespace runs, compare case-insensitively.
+For a `create_table`, "definition matches" is decided against **this device's own
+recorded migration at the same schema version** — not against the table's current shape.
+Every ingress path (`change-applicator.ts` for a delta batch, both snapshot consumers)
+looks that record up before recording the incoming migration over it, and carries it on
+`SchemaChangeToApply.localDDLAtVersion`:
+
+| incoming create | local record at the same version | verdict |
+|---|---|---|
+| — | absent | fall back to the current-shape comparison below |
+| matches | present | already applied — converge silently |
+| differs | present | divergence — error, printing create against create |
+
+The record is the comparison that stays decidable. A table that has been altered since
+its own create no longer renders as the create that made it, so comparing an incoming
+duplicate create against the current shape reports a divergence as soon as the receiver
+alters its own table — and, because the error aborts the batch before its metadata
+commits, reports it on every sync from then on. Two peers that each ran the identical
+`create table` both record the identical canonical DDL at version 1, so the record
+answers the question however much either peer alters the table afterwards. Only a
+record of the **same migration type at the same version** counts: a table created before
+sync was attached records its first *alteration* at version 1, and comparing a create
+against that `ALTER TABLE` text would manufacture a conflict out of nothing.
+
+The **fallback**, used when there is no such record (a table created before sync was
+attached, or a version that does not line up because the table was dropped and
+re-created), and the comparison every other object type uses, regenerates the canonical
+DDL from the local `TableSchema` / `IndexSchema` (`generateTableDDL` / `generateIndexDDL`
+with no `db` argument — exactly how the origin produced the DDL it put on the wire). It
+keeps the pre-record limitation: a table altered locally since a create that was never
+recorded still reads as a divergence.
+
+Either way the two strings are compared after a small normalization: trim, drop a
+trailing `;`, collapse whitespace runs, compare case-insensitively.
 
 An `alter_column` migration (the coarse "table definition changed" migration every
 ALTER TABLE records) is decided per alteration arm: the adapter parses the statement with

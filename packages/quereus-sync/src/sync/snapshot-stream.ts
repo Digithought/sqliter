@@ -38,10 +38,10 @@ import {
 	type SnapshotFooterChunk,
 	type ColumnVersionEntry,
 	type DataChangeToApply,
-	type SchemaMigration,
+	type SchemaChangeToApply,
 	migrationObjectKind,
 	sortMigrationsByHLC,
-	toSchemaChange,
+	toSchemaChangeWithLocalRecord,
 } from './protocol.js';
 import type { SyncContext } from './sync-context.js';
 import { persistHLCState, toError } from './sync-context.js';
@@ -390,10 +390,12 @@ export async function applySnapshotStream(
 
 	// Pending data to apply to store (batched for efficiency)
 	let pendingDataChanges: DataChangeToApply[] = [];
-	// Held as full migrations, not `SchemaChangeToApply`, so the flush can re-order
-	// them causally instead of trusting the sender's chunk order — DDL replays in
-	// list order and `create index` needs its table's `create table` to have run.
-	let pendingSchemaMigrations: SchemaMigration[] = [];
+	// Kept HLC-stamped so the flush can re-order them causally instead of trusting the
+	// sender's chunk order — DDL replays in list order and `create index` needs its
+	// table's `create table` to have run. The `SchemaChangeToApply` itself is built at
+	// CHUNK time, not here: it carries what this device's own migration at that version
+	// recorded, and the chunk handler's `recordMigration` overwrites that record.
+	let pendingSchemaChanges: Array<{ readonly hlc: HLC; readonly change: SchemaChangeToApply }> = [];
 
 	const flushDataToStore = async (): Promise<void> => {
 		// A streamed snapshot is a known-complete wholesale load: each flush is a
@@ -404,10 +406,10 @@ export async function applySnapshotStream(
 		// storage failure emits `status:'error'` and aborts the stream mid-flight,
 		// before the footer emits `status:'synced'` / clears the checkpoint — so the
 		// checkpoint stays in place and the transfer resumes/retries.
-		const schemaChanges = sortMigrationsByHLC(pendingSchemaMigrations).map(toSchemaChange);
+		const schemaChanges = sortMigrationsByHLC(pendingSchemaChanges).map(p => p.change);
 		await applyDataToStore(ctx, pendingDataChanges, schemaChanges, { remote: true, bootstrap: true });
 		pendingDataChanges = [];
-		pendingSchemaMigrations = [];
+		pendingSchemaChanges = [];
 		completedTables.push(...stagedCompletedTables);
 		stagedCompletedTables = [];
 	};
@@ -698,7 +700,14 @@ export async function applySnapshotStream(
 
 			case 'schema-migration': {
 				const migration = chunk.migration;
-				pendingSchemaMigrations.push(migration);
+				// Resolve what THIS device's own migration at the same version said BEFORE
+				// the `recordMigration` below overwrites that record with the incoming one —
+				// the store adapter judges a replicated create against it rather than against
+				// the table's current shape, which a local alteration has moved on from.
+				pendingSchemaChanges.push({
+					hlc: migration.hlc,
+					change: await toSchemaChangeWithLocalRecord(ctx.schemaMigrations, migration),
+				});
 
 				const kind = migrationObjectKind(migration.type);
 				const schemaVersion = migration.schemaVersion ??

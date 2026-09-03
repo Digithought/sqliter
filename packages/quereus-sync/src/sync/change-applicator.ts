@@ -23,7 +23,7 @@ import type {
 	SchemaChangeToApply,
 	SchemaMigration,
 } from './protocol.js';
-import { migrationObjectKind, sortMigrationsByHLC, toSchemaChange } from './protocol.js';
+import { migrationObjectKind, sameVersionLocalDDL, sortMigrationsByHLC, toSchemaChange } from './protocol.js';
 import type { SyncContext } from './sync-context.js';
 import { toError, deleteRowVersionsAndLogEntries } from './sync-context.js';
 import { admitGroup } from './admission.js';
@@ -302,7 +302,11 @@ export async function applyChanges(
 			}
 		}
 
-		schemaChangesToApply.push(toSchemaChange(migration));
+		// The record fetched above is exactly what the store adapter needs to judge
+		// this migration against — what THIS device's own migration at the same
+		// version said, not what the object looks like now (a table altered since its
+		// create no longer renders as the create that made it). No extra store read.
+		schemaChangesToApply.push(toSchemaChange(migration, sameVersionLocalDDL(existingMigration, migration)));
 		pendingSchemaMigrations.push({ migration, schemaVersion });
 		applied++;
 	}

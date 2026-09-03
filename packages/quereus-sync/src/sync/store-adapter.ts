@@ -390,8 +390,14 @@ function normalizeDDL(ddl: string): string {
 
 /**
  * The object named by the migration already exists locally: converge silently if
- * its definition matches the replicated one, otherwise throw a conflict naming
- * both definitions.
+ * `localDDL` matches the replicated definition, otherwise throw a conflict naming
+ * both.
+ *
+ * `localDDL` is what the CALLER decided this migration should be judged against —
+ * for a `create_table` with a same-version local migration record, that record's
+ * own CREATE; otherwise the object's current shape regenerated from the catalog
+ * (see {@link decideSchemaChange}). `localOrigin` names which one, so an operator
+ * reading the conflict is not left guessing what `local:` is.
  *
  * NOTE: a genuinely DIVERGENT concurrent `create_table` (same name, different
  * shape on two peers) has no automatic convergence path — this throw aborts the
@@ -404,6 +410,8 @@ function normalizeDDL(ddl: string): string {
 function assertDefinitionMatches(
   change: SchemaChangeToApply,
   localDDL: string,
+  /** What `localDDL` is, named in the conflict message; omitted for the current shape. */
+  localOrigin?: string,
 ): void {
   if (normalizeDDL(localDDL) === normalizeDDL(change.ddl)) return;
 
@@ -411,7 +419,8 @@ function assertDefinitionMatches(
     `Schema conflict applying remote ${change.type} for ${change.schema}.${change.table}: ` +
     `a different definition already exists locally.\n` +
     `  local:  ${localDDL}\n` +
-    `  remote: ${change.ddl}`
+    `  remote: ${change.ddl}` +
+    (localOrigin ? `\n  (local is ${localOrigin})` : '')
   );
 }
 
@@ -431,6 +440,14 @@ function assertDefinitionMatches(
  * local shape and committing the metadata would record "converged" for a
  * divergence that is not converged (see {@link assertDefinitionMatches}).
  *
+ * The invariant the `create_table` arm holds: a replicated migration is judged
+ * against the state it was MEANT to produce — `change.localDDLAtVersion`, what
+ * this device's own migration at the same schema version recorded — never against
+ * whatever the local object happens to look like now. The other arms read the
+ * catalog because their question is about presence (does the object exist?) or
+ * about one alteration's effect, neither of which a later local migration
+ * invalidates.
+ *
  * NOTE: presence is read from the in-memory catalog (`db.schemaManager`), which
  * is assumed to reflect what is persisted — true once a database has finished
  * `rehydrateCatalog`. If a peer ever drives sync against a half-rehydrated
@@ -442,6 +459,32 @@ function decideSchemaChange(db: Database, change: SchemaChangeToApply): SchemaCh
     case 'create_table': {
       const local = db.schemaManager.getTable(change.schema, change.table);
       if (!local) return 'execute';
+
+      // | incoming create | local record at the same version | verdict |
+      // |---|---|---|
+      // | —                | absent  | fall back to the current-shape comparison |
+      // | matches          | present | already applied — converge |
+      // | differs          | present | genuine divergence — throw, create vs create |
+      //
+      // The record is the RIGHT comparison: a table that has been altered since its
+      // own create no longer renders as the create that made it, so comparing the
+      // incoming create against the current shape reports a divergence the moment
+      // the receiver alters its own table — permanently, since the throw aborts the
+      // batch before its metadata commits. Both peers' duplicate creates are
+      // version 1 and record byte-identical canonical DDL, so the record keeps the
+      // question decidable however much either table is altered afterwards.
+      if (change.localDDLAtVersion !== undefined) {
+        assertDefinitionMatches(
+          change,
+          change.localDDLAtVersion,
+          `this device's own ${change.type} recorded at the same schema version, not the table's current shape`,
+        );
+        return 'already-applied';
+      }
+
+      // No same-version record (a table created before sync was attached, or a
+      // version that does not line up because the table was dropped and
+      // re-created): compare the current shape, as this always did.
       // Both sides render through `generateTableDDL` with no `db` argument, so
       // the strings are fully qualified and session-independent — directly
       // comparable against the DDL the origin put on the wire.
@@ -450,6 +493,10 @@ function decideSchemaChange(db: Database, change: SchemaChangeToApply): SchemaCh
       // rendering the same table some other way would be reported as a conflict
       // rather than converging; the comparison would then need to be over parsed
       // schemas, not rendered strings.
+      // NOTE: this fallback keeps the pre-record failure mode — a table altered
+      // locally since a create that was never recorded still reads as a divergence.
+      // Only reachable for the two cases above; if either becomes common, record a
+      // migration for the pre-sync create rather than widening the comparison.
       assertDefinitionMatches(change, generateTableDDL(local));
       return 'already-applied';
     }
@@ -465,6 +512,12 @@ function decideSchemaChange(db: Database, change: SchemaChangeToApply): SchemaCh
       // here can never disagree with what the replicated DDL would then resolve to.
       const owner = db.schemaManager.findIndexOwner(change.schema, change.table);
       if (!owner) return 'execute';
+      // NOTE: still compares the index's CURRENT shape, which is safe only because
+      // no ALTER form modifies an index in place — a live index always renders as
+      // the create that made it. If in-place index alteration ever lands, this arm
+      // acquires the same stale-comparison bug the create_table arm above fixed;
+      // give it `localDDLAtVersion` too (the field is already populated for every
+      // migration type, index migrations included).
       assertDefinitionMatches(change, generateIndexDDL(owner.index, owner.table));
       return 'already-applied';
     }

@@ -26,7 +26,7 @@ import {
 	type SchemaChangeToApply,
 	migrationObjectKind,
 	sortMigrationsByHLC,
-	toSchemaChange,
+	toSchemaChangeWithLocalRecord,
 } from './protocol.js';
 import type { SyncContext } from './sync-context.js';
 import { toError } from './sync-context.js';
@@ -161,7 +161,11 @@ export async function applySnapshot(
 	const orderedMigrations = sortMigrationsByHLC(snapshot.schemaMigrations);
 
 	for (const migration of orderedMigrations) {
-		schemaChangesToApply.push(toSchemaChange(migration));
+		// Resolve what THIS device's own migration at the same version said BEFORE
+		// PHASE 3 below overwrites that record with the incoming one — the store
+		// adapter judges a replicated create against it rather than against the
+		// table's current shape (which a local alteration has moved on from).
+		schemaChangesToApply.push(await toSchemaChangeWithLocalRecord(ctx.schemaMigrations, migration));
 	}
 
 	for (const tableSnapshot of snapshot.tables) {
