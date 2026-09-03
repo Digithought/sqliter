@@ -335,8 +335,12 @@ RetrieveNode(source: Filter(condition, TableRef))
   deterministic and reproducible
 - Cost-aware for the index-style fallback — `fallbackIndexSupports` (used for a module that
   only implements `getBestAccessPlan`) declines a plan whose seek costs no less than a plain
-  whole-table read, because pushing a predicate down that does not pay for itself only moves
-  work around. Both numbers in that comparison are quoted by the same module: the baseline is
+  whole-table read. Note that declining does **not** currently produce that whole-table read:
+  with no index-style context committed, `rule-predicate-pushdown` absorbs the predicate into
+  `Retrieve.source` and access-path selection rebuilds the same seek with the absorbed Filter
+  re-stacked above it, so a decline costs strictly more than the push-down it refused — see
+  `bug-declined-push-down-is-rebuilt-as-seek-plus-duplicate-filter`. Both numbers in that
+  comparison are quoted by the same module: the baseline is
   a second, filter-free/ordering-free/limit-free probe of `getBestAccessPlan`, not the
   engine's own `seqScanCost` over the catalog's row count. Pricing the two sides against
   different table sizes is what made a self-sizing backend's honest seek lose to a fabricated

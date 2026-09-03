@@ -156,6 +156,17 @@ interface BestAccessPlanRequest {
 }
 ```
 
+**It is called more than once per statement, so keep it pure and cheap.** Planning probes the
+same table several times with different requests and keeps only the answer it wants: the
+retrieve-growth rule asks once for the plan it is considering, re-asks without `limit` when the
+limit turns out not to be truncation-safe, and asks a third time with `filters`, `requiredOrdering`,
+`limit` and `offset` all stripped to get the whole-table baseline it compares that plan against
+(`baselineScanCost`, see [Optimizer costing § Where a module's own size fits](optimizer-costing.md)).
+A discarded probe must leave nothing behind — no cursor opened, no cache mutated, no counter
+advanced — and asking about a filter-free request must be as cheap as asking about a filtered one.
+A module that cannot answer cheaply should memoize its own answer; the engine does not memoize for
+you.
+
 **`limit` is a licence, not a hint.** When it is present the engine has already proven
 that nothing between your scan and the `LIMIT` can discard a row, so you may both price
 against it and truncate to it. When it cannot prove that, the field is *absent* rather

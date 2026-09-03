@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-09-03T13:09:11.812Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\1-seek-vs-scan-baseline-quoted-by-the-module.review.2026-09-03T13-09-11-812Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: The query planner used to compare an index seek's price against a whole-table read priced from a different guess at the table's size, so on tables nobody had measured the index lost and the same condition got checked twice on every row; both prices now come from the storage backend itself.
 files:
   - packages/quereus/src/planner/rules/retrieve/rule-grow-retrieve.ts        # the fix: new `baselineScanCost` (~733) + the reworked veto (~559)

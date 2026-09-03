@@ -276,11 +276,17 @@ function createIndexBasedAccess(retrieveNode: RetrieveNode, context: OptContext)
 	// If the Retrieve source contained a pipeline (e.g., Filter/Sort/Project), rebuild it above the physical leaf.
 	//
 	// NOTE: on this path (no index-style moduleCtx) an absorbed `Filter` in `source` is
-	// preserved verbatim, so a constraint that `reattachUnconsumedConstraints` recovers is
-	// already applied above — the reattached `Filter` is then redundant, not wrong. Only
-	// reachable for a module exposing BOTH `supports()` (declining here) and
-	// `getBestAccessPlan()`. If that ever shows up as a duplicated predicate in EXPLAIN,
-	// pass the consumed set out and skip the reattach when `source !== tableRef`.
+	// preserved verbatim, so a constraint the seek below already consumed is applied a
+	// second time above it — redundant, not wrong. This is NOT confined to a module
+	// exposing both `supports()` and `getBestAccessPlan()`, as this note previously said:
+	// `rule-grow-retrieve`'s seek-versus-scan veto leaves any index-style module in exactly
+	// this state, `rule-predicate-pushdown` then absorbs the predicate into `source`, and
+	// the shipped memory backend reproduces it (`id in (<60 keys>)` over a 10-row ANALYZEd
+	// table plans as FILTER over INDEXSEEK). Tracked, together with the veto whose decline
+	// is what routes here, as
+	// `bug-declined-push-down-is-rebuilt-as-seek-plus-duplicate-filter`; the local half of
+	// the fix is to pass the consumed set out and skip rebuilding a `Filter` whose
+	// constraints the leaf already claimed.
 	let rebuiltPipeline: RelationalPlanNode = physicalLeaf;
 	if (retrieveNode.source !== retrieveNode.tableRef) {
 		log('Rebuilding Retrieve pipeline above physical access node');

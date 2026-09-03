@@ -55,6 +55,13 @@ class SelfSizingMemoryModule extends MemoryTableModule {
 	/** `request.estimatedRows` as it arrived, per call, in order. */
 	readonly asked: Array<number | undefined> = [];
 
+	/**
+	 * Multiplier applied to the cost of a plan that claimed a filter, so the module prices
+	 * its own seek above its own filter-free baseline. `1` leaves the module honest; a
+	 * large value is how the veto's decline path is reached.
+	 */
+	seekCostMultiplier = 1;
+
 	override getBestAccessPlan(
 		db: Database,
 		tableInfo: TableSchema,
@@ -64,7 +71,9 @@ class SelfSizingMemoryModule extends MemoryTableModule {
 		const catalogIsWrong = request.estimatedRows === undefined
 			|| (this.overrideStaleZero && request.estimatedRows === 0);
 		const sized = catalogIsWrong ? { ...request, estimatedRows: this.liveRows } : request;
-		return super.getBestAccessPlan(db, tableInfo, sized);
+		const plan = super.getBestAccessPlan(db, tableInfo, sized);
+		if (this.seekCostMultiplier === 1 || !plan.handledFilters.some(Boolean)) return plan;
+		return { ...plan, cost: plan.cost * this.seekCostMultiplier };
 	}
 }
 
@@ -144,12 +153,36 @@ describe('seek-versus-scan baseline is quoted by the module', () => {
 			await planOps(db, 'select * from e where id < 500');
 
 			expect(mod.asked, 'the planner asked about the analyzed-empty table').to.not.be.empty;
-			expect(mod.asked, 'a measured 0 must arrive as 0, not as unknown')
-				.to.deep.equal(mod.asked.map(() => 0));
+			for (const seen of mod.asked) {
+				expect(seen, 'a measured 0 must arrive as 0, not as unknown').to.equal(0);
+			}
 		});
 	});
 
-	describe('the veto still fires when the seek is genuinely worse', () => {
+	describe('the veto still fires', () => {
+		it('declines the push-down when the module prices its seek above its own scan', async () => {
+			// The decline path of `accessPlan.cost >= seqCost`, which the arms above only ever
+			// drive to `accept`. The module answers the filtered probe with a cost it cannot
+			// justify against the filter-free baseline IT quoted, so quoting the baseline
+			// through the module must not have turned the comparison into a rubber stamp.
+			mod.liveRows = 10000;
+			mod.seekCostMultiplier = 1000;
+			await createTable();
+
+			const ops = await planOps(db, 'select * from t where id < 500');
+			expect(ops, `expected the grow to decline, got ${ops.join(' | ')}`).to.include('FILTER');
+
+			// KNOWN WRONG, pinned deliberately. Declining here does NOT produce the sequential
+			// scan the veto believes it is choosing: `rule-predicate-pushdown` then pushes the
+			// same predicate into the now-context-free Retrieve and `ruleSelectAccessPath`
+			// rebuilds the very same seek, with the absorbed Filter re-stacked on top — so the
+			// veto's decline is strictly worse than the push-down it refused. Tracked as
+			// `bug-declined-push-down-is-rebuilt-as-seek-plus-duplicate-filter`; when that
+			// lands, this expectation flips to `.to.not.include('INDEXSEEK')`.
+			expect(ops, 'pins the pathological decline shape until the tracked bug is fixed')
+				.to.include('INDEXSEEK');
+		});
+
 		it('leaves a non-sargable predicate above the access node', async () => {
 			// Nothing to push down: no constraint is extractable from the predicate, so the
 			// grow declines for want of a benefit and the Filter belongs where it is. Pins

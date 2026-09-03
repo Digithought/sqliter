@@ -505,12 +505,13 @@ function fallbackIndexSupports(
 	// still discard a row is everything below `node` (the swallowed LimitOffset's own
 	// source pipeline, Retrieve included). The Filter and Sort arms carry no limit, so
 	// this is a plain single probe for them.
-	const accessPlan = probeAccessPlan(
-		req => vtabModule.getBestAccessPlan!(context.db, tableSchema, req) as BestAccessPlanResult,
-		request,
-		plannerConstraints,
-		node,
-	);
+	// One binding of "ask THIS module about THIS table", shared by the plan probe and the
+	// baseline probe below. Both sides of the seek-versus-scan comparison being answered by
+	// the same module is the whole point of `baselineScanCost`, so they read one `ask`.
+	const ask = (req: BestAccessPlanRequest): BestAccessPlanResult =>
+		vtabModule.getBestAccessPlan!(context.db, tableSchema, req) as BestAccessPlanResult;
+
+	const accessPlan = probeAccessPlan(ask, request, plannerConstraints, node);
 
 	// No-clobber guard: never replace an equipped ordering plan with one that does
 	// not provide the same ordering (same column indexes + directions). Declining
@@ -560,11 +561,17 @@ function fallbackIndexSupports(
 	// both numbers are priced against one table size — see `baselineScanCost`. Only this
 	// branch reads it: when the plan provides the requested ordering that is the benefit
 	// being bought, and no baseline probe is paid for.
+	//
+	// NOTE: declining below does NOT yield the sequential scan this comparison assumes.
+	// With no index-style context on the Retrieve, `rule-predicate-pushdown` pushes the
+	// same predicate into `Retrieve.source` and `ruleSelectAccessPath`'s no-context branch
+	// rebuilds the identical seek, with the absorbed Filter re-stacked above it — so a
+	// decline costs the seek AND a second evaluation of the predicate per surviving row.
+	// Verified with the shipped memory backend: `id in (<60 keys>)` over a 10-row ANALYZEd
+	// table plans as FILTER over INDEXSEEK. Tracked as
+	// `bug-declined-push-down-is-rebuilt-as-seek-plus-duplicate-filter`; do not re-file.
 	if (!providesOrdering) {
-		const seqCost = baselineScanCost(
-			req => vtabModule.getBestAccessPlan!(context.db, tableSchema, req) as BestAccessPlanResult,
-			request,
-		);
+		const seqCost = baselineScanCost(ask, request);
 		if (accessPlan.cost >= seqCost) {
 			log('Access plan cost (%d) not better than sequential scan (%d)', accessPlan.cost, seqCost);
 			return undefined;
