@@ -104,6 +104,42 @@ describe('join ordering reads physical row estimates', () => {
 		});
 	});
 
+	describe('two-table commute, end to end', () => {
+		// The commute tests further down call the rule directly on a hand-built
+		// node. These pin the same behaviour through a real compile — that the rule
+		// is reached, that its inputs carry real counts by the Structural pass, and
+		// that commuting changes only the plan, never the result.
+		beforeEach(async () => {
+			await db.exec('create table big (id integer primary key, v integer) using memory');
+			await db.exec('create table little (id integer primary key, w integer) using memory');
+			const rows = (n: number): string =>
+				Array.from({ length: n }, (_, k) => `(${k + 1}, ${k + 1})`).join(', ');
+			await db.exec(`insert into big values ${rows(400)}`);
+			await db.exec(`insert into little values ${rows(4)}`);
+			for await (const _ of db.eval('analyze')) { /* consume */ }
+		});
+
+		it('reads the small table first however the query names the two tables', () => {
+			const bigFirst = tableOrder(db.getPlan('select b.v, s.w from big b join little s on s.id = b.id'));
+			const littleFirst = tableOrder(db.getPlan('select b.v, s.w from little s join big b on s.id = b.id'));
+			expect(bigFirst, 'small side drives even when written second').to.deep.equal(['little', 'big']);
+			expect(littleFirst).to.deep.equal(bigFirst);
+		});
+
+		it('leaves SELECT * column order and values untouched when it commutes', async () => {
+			// `usingColumns` must survive the rebuild, and the star expanded to
+			// explicit projections at build time — long before the commute — so the
+			// columns stay in the order the query wrote the tables.
+			const plan = tableOrder(db.getPlan('select * from big join little using (id)'));
+			expect(plan, 'the plan really did commute').to.deep.equal(['little', 'big']);
+			const rows = await drain(db, 'select * from big join little using (id) order by id');
+			expect(rows.map(r => Object.keys(r))[0], 'big columns before little columns')
+				.to.deep.equal(['id', 'v', 'id:1', 'w']);
+			expect(rows).to.have.lengthOf(4);
+			expect(rows[0]).to.deep.equal({ id: 1, v: 1, 'id:1': 1, w: 1 });
+		});
+	});
+
 	describe('quickPickBaseOrder (unit)', () => {
 		// The base order decides which relations the greedy tours start from, so a
 		// blank read used to leave it equal to the flattening order.

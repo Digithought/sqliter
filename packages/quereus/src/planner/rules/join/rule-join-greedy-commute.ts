@@ -31,6 +31,12 @@ export function ruleJoinGreedyCommute(node: PlanNode, _context: OptContext): Pla
   if (!(node instanceof JoinNode)) return null;
   if (node.joinType !== 'inner' && node.joinType !== 'cross') return null;
 
+  // An existence flag names the side whose match it reifies (`spec.side`), so a
+  // commute would have to flip every spec. The parser rejects `exists … as` on
+  // INNER/CROSS (no side null-extends), so this is unreachable today — it is a
+  // guard, not a code path, and swapping is only safe because of it.
+  if (node.hasExistenceColumns) return null;
+
   // A correlated input (LATERAL referencing the other side) imposes an
   // evaluation order: the correlated side must be the driven (right) side so the
   // relation defining its outer references is in scope. Commuting would move it
@@ -77,19 +83,21 @@ export function ruleJoinGreedyCommute(node: PlanNode, _context: OptContext): Pla
   const shouldSwap = (rightIsSingleton && !leftIsSingleton) || (!rightIsSingleton && !leftIsSingleton && rightIsSmaller);
   if (!shouldSwap) return null;
 
+  // NOTE: this Structural-pass heuristic fixes the orientation the Physical-pass
+  // `rule-join-physical-selection` then costs, so it can pre-empt a cost
+  // comparison (a tiny left side makes a nested loop beat a hash join). That is
+  // benign today: hash cost builds on `min(leftRows, rightRows)` either way, and
+  // index-nested-loop elects its seek side in both orientations. Revisit if a
+  // physical algorithm is added whose cost is asymmetric in the sides and NOT
+  // re-elected — it would only ever see the orientation this rule chose.
+
   log('Commuting join children to place smaller input on the left (leftRows=%s, rightRows=%s)', String(leftRows), String(rightRows));
 
-  // Swap children; condition stays the same (attribute IDs are stable)
-  const swapped = new JoinNode(
-    node.scope,
-    right,
-    left,
-    node.getJoinType(),
-    node.getJoinCondition(),
-    node.getUsingColumns()
-  );
-
-  return swapped;
+  // Swap children. The condition is carried verbatim (attribute ids are stable),
+  // so `withChildren` — not `new JoinNode(...)` — threads `usingColumns` through
+  // instead of silently dropping it, the same discipline
+  // rule-join-predicate-pushdown and rule-semi-join-pushdown apply. (`existence`
+  // threads through too, but the guard above means there is never any.)
+  const condition = node.getJoinCondition();
+  return node.withChildren(condition ? [right, left, condition] : [right, left]);
 }
-
-

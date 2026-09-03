@@ -67,3 +67,31 @@ Worth settling as part of the same change: whether a search that hits the safety
 should be allowed to serve a plan at all, or whether the planner should instead fall back to
 a fixed, deterministic ordering heuristic so that "the plan was chosen under time pressure"
 never silently becomes "the plan is whatever the clock allowed".
+
+## Review arm (from `5.4-join-ordering-reads-the-estimate-that-exists`): the 100 candidates are only 2 distinct candidates
+
+The body above says "candidate number 7 is always the same candidate". True, but
+sharper than intended: **candidate 7 is the same candidate as candidate 1.**
+
+The loop varies exactly one thing between iterations — the relation each tour
+starts from — and it picks that with `baseOrder[Math.min(tours % 2, …)]`, so only
+two start relations are ever used. Everything after the start is a deterministic
+greedy walk with no randomness anywhere (despite the comment reading "random among
+top-2 smallest"). Iterations 2..99 therefore reproduce iterations 0 and 1 exactly,
+and the observed `{"tours":100}` in the diagnostics is 100 evaluations of 2 plans.
+
+Two consequences for whoever picks this up:
+
+- **The reproducibility risk is smaller than the body implies.** Once two
+  iterations have completed, the answer is final; the clock can only change the
+  outcome by cutting the loop off after iteration 0, which needs the budget to
+  expire inside a single tour. That is a much narrower window than "stopped at 60
+  of 100".
+- **98% of the loop is wasted work, on every compile of every 3+-relation join.**
+  Each iteration rebuilds O(N^2) candidate plans through `buildLeftDeepPlan`.
+  Whatever budget unit replaces the wall clock, the first fix is to stop repeating
+  identical tours — either make the tours actually varied (the randomization the
+  comment already claims) or run exactly as many as there are distinct starts.
+
+Both arms resolve at the same site (`rule-quickpick-enumeration.ts`, the tour
+loop), which is why this is an arm here rather than a separate ticket.

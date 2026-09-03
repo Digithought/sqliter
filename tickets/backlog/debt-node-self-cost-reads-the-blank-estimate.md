@@ -104,3 +104,36 @@ reintroduce it.
 - `rule-join-physical-selection` computes its candidates' costs from its own
   formulas over `physicalSourceRows`, not from `getTotalCost()`, so its decisions
   are not affected.
+
+## Review arm (from `5.4-join-ordering-reads-the-estimate-that-exists`): QuickPick cannot adopt *any* plan today
+
+The section above says the enumeration "still works — leaf costs and any physical
+join nodes below do vary — but the join-shaped part of its signal is inert". That
+understates it, and the sharper statement changes how this ticket should be
+prioritized: **`rule-quickpick-enumeration` can never replace a plan at all.**
+
+Why. The rule scores each candidate ordering with `getTotalCost()` and adopts one
+only when `bestCost < baselineCost * 0.9`. A candidate ordering is built from the
+*same set* of already-optimized leaf subtrees as every other candidate and as the
+baseline — `buildLeftDeepPlan` reuses `graph.relations[i]` verbatim — so the leaf
+costs contribute an identical constant to all of them. The only other contributors
+are the N-1 `JoinNode` self-costs, which this ticket's defect pins at a flat 10000
+each, and the join-condition scalar nodes, which differ by at most a fraction.
+Every candidate therefore scores within a rounding error of the baseline, and a
+10% win is unreachable.
+
+Measured (memory backend, three-table chain `dimc` 500 / `fact` 3000 / `dimb` 50,
+all `ANALYZE`d): the rule reported `{"tours":100,"bestCost":23553.05}`, which is
+exactly `3000 + 500 + 50` of leaves plus `2 x 10000` of join constants plus 3.05
+of condition nodes — i.e. the baseline it had to beat by 10%. Independently, a
+four-table star join (3000-row fact, 5/50/500-row dimensions) planned in the order
+the tables were *written* under both spellings, with the 5-row dimension never
+promoted to the front: no adoption in either.
+
+Consequence for triage: `5.4-join-ordering-reads-the-estimate-that-exists` made
+`quickPickBaseOrder` read real row counts, but that base order is unobservable in
+any plan until this ticket lands. The general test this ticket already asks for
+(a node's self-cost responds to its children's physical row counts) is the right
+guard; worth adding a second one alongside it — **that QuickPick adopts a
+different order for a join graph where one ordering is genuinely cheaper** — since
+that is the property the whole rule exists to provide and nothing pins it today.

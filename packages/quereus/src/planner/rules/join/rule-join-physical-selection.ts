@@ -340,9 +340,11 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 		log('Selecting index-nested-loop join (cost=%.2f) for %d outer rows', indexNL!.cost, leftRows);
 		return node.withChildren([node.left, indexNL!.newInner, node.condition!]);
 	};
-	// The mirrored rebuild is a NEW JoinNode with the children exchanged —
-	// `withChildren` re-uses the node's own slot order and cannot express the
-	// swap. The ON condition and `usingColumns` carry over verbatim: both refer
+	// The mirrored rebuild is a NEW JoinNode with the children exchanged.
+	// `withChildren([right, left, cond])` would express the swap (that is how
+	// rule-join-greedy-commute rebuilds), but the mirror also forces the join
+	// type to `inner` and deliberately drops `existence`, neither of which
+	// `withChildren` can do. The ON condition and `usingColumns` carry over verbatim: both refer
 	// to attributes by id, and `buildJoinAttributes` concatenates the two
 	// sides' Attribute objects as-is (no `preserveAttributeIds` list is passed),
 	// so the swap changes the join's attribute ORDER, never an attribute id.
