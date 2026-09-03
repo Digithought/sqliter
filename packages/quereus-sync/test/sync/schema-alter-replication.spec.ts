@@ -731,6 +731,26 @@ describe('alter table replication', () => {
 			expectConverged(a, b);
 		});
 
+		it('a foreign key the batch satisfies applies on the FIRST round', async () => {
+			// The second row-validating `addConstraint` arm: the receiver's row is an
+			// orphan until the batch's own update re-points it. (The `check` arm is
+			// classified alongside these two but the engine does not scan existing rows
+			// for it today — see `bug-add-check-constraint-skips-existing-rows`.)
+			await localWrite(a, 'create table parent (pid integer primary key) using store');
+			await localWrite(a, 'alter table orders add column pid integer null');
+			await localWrite(a, 'insert into parent (pid) values (1)');
+			await localWrite(a, "insert into orders (id, note, pid) values (1, 'n', 99)");
+			await relayAll(a, b);
+
+			await localWrite(a, 'update orders set pid = 1 where id = 1');
+			await localWrite(a, 'alter table orders add constraint fk_p foreign key (pid) references parent (pid)');
+
+			await relayAll(a, b);
+
+			expect(await collect(b.db, 'select id, pid from orders')).to.deep.equal([{ id: 1, pid: 1 }]);
+			expectConverged(a, b);
+		});
+
 		it('a unique index the batch satisfies applies on the FIRST round', async () => {
 			await localWrite(a, "insert into orders (id, note) values (1, 'dup')");
 			await localWrite(a, "insert into orders (id, note) values (2, 'dup')");
@@ -763,8 +783,9 @@ describe('alter table replication', () => {
 		it('a tightening of a table the same batch drops converges instead of failing', async () => {
 			await seedNullRow();
 
-			// The tightening is unsatisfiable against b's rows, but the batch's last
-			// word on `orders` is that it is gone — so it must not wedge the batch.
+			// b's row still violates the tightening at the moment the pre-data phase
+			// would run it, but the batch's last word on `orders` is that it is gone —
+			// so the tightening must defer past the drop rather than wedge the batch.
 			await localWrite(a, "update orders set note = 'filled' where id = 1");
 			await localWrite(a, 'alter table orders alter column note set not null');
 			await localWrite(a, 'drop table orders');
@@ -772,6 +793,44 @@ describe('alter table replication', () => {
 			await relayAll(a, b);
 
 			expect(b.db.schemaManager.getTable('main', 'orders'), 'orders dropped on b').to.equal(undefined);
+		});
+
+		it('a unique index created and its owner table dropped in ONE batch converges', async () => {
+			// The create is deferred (it validates rows) while the drop is not, so the
+			// create meets an absent table. That must converge, not throw `no such
+			// table` — the create can never succeed afterwards, so a throw would wedge
+			// the batch on every retry instead of self-healing.
+			await localWrite(a, "insert into orders (id, note) values (1, 'x')");
+			await relayAll(a, b);
+
+			await localWrite(a, 'create unique index idx_note on orders (note)');
+			await localWrite(a, 'drop table orders');
+
+			await relayAll(a, b);
+
+			expect(b.db.schemaManager.getTable('main', 'orders'), 'orders dropped on b').to.equal(undefined);
+			expect(b.db.schemaManager.findIndexOwner('main', 'idx_note'), 'index gone with its table')
+				.to.equal(undefined);
+		});
+
+		it('a unique index create is held before the data by a later drop of the indexed column', async () => {
+			// An index migration is filed under the INDEX name, so only the owner key
+			// from `migrationOrderKeys` stops the (non-validating) `drop column` from
+			// being reordered ahead of the create — which would run it against a column
+			// that is gone.
+			await localWrite(a, "insert into orders (id, note) values (1, 'x')");
+			await relayAll(a, b);
+
+			await localWrite(a, 'create unique index idx_note on orders (note)');
+			await localWrite(a, 'alter table orders drop column note');
+
+			await relayAll(a, b);
+
+			expectConverged(a, b);
+			expect(b.db.schemaManager.getTable('main', 'orders')!.columns.map(c => c.name.toLowerCase()))
+				.to.not.include('note');
+			expect(b.db.schemaManager.findIndexOwner('main', 'idx_note'), 'index gone with its column')
+				.to.equal(undefined);
 		});
 	});
 

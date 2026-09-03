@@ -540,7 +540,7 @@ function decideSchemaChange(db: Database, change: SchemaChangeToApply): SchemaCh
       // `DROP INDEX` uses, at the same default scope — so the receiver's verdict
       // here can never disagree with what the replicated DDL would then resolve to.
       const owner = db.schemaManager.findIndexOwner(change.schema, change.table);
-      if (!owner) return 'execute';
+      if (!owner) return decideAbsentIndexCreate(db, change);
       // NOTE: still compares the index's CURRENT shape, which is safe only because
       // no ALTER form modifies an index in place — a live index always renders as
       // the create that made it. If in-place index alteration ever lands, this arm
@@ -566,6 +566,32 @@ function decideSchemaChange(db: Database, change: SchemaChangeToApply): SchemaCh
       // them as before.
       return 'execute';
   }
+}
+
+/**
+ * Decision for a replicated `add_index` whose index is NOT present locally.
+ *
+ * Normally that means "run it". The exception is an index whose OWNER table is
+ * absent here: the create can only throw `no such table` / `column not found`, and
+ * repeating it every round wedges the admission unit permanently rather than
+ * self-healing. An absent owner also means the wanted end state has already
+ * arrived — the table (or the indexed column) is gone, and an index cannot outlive
+ * what it indexes — so converge with a warning, the same posture `drop_index` and
+ * {@link decideAlterTable} take for an object this peer does not have.
+ *
+ * This is what lets {@link partitionSchemaChanges} defer a unique index create
+ * past a `drop_table` in the same batch (see its `drop_table` note). An
+ * unparseable DDL leaves the owner unknown: execute, so the engine's own error is
+ * what the operator sees.
+ */
+function decideAbsentIndexCreate(db: Database, change: SchemaChangeToApply): SchemaChangeAction {
+  const ownerName = createIndexOwner(change);
+  if (ownerName === undefined || db.schemaManager.getTable(change.schema, ownerName)) return 'execute';
+  console.warn(
+    `[Sync] Remote ${change.type} ${change.schema}.${change.table} indexes ${change.schema}.${ownerName}, `
+      + `a table this peer does not have — converging without applying: ${change.ddl}`,
+  );
+  return 'already-applied';
 }
 
 /**
@@ -665,7 +691,12 @@ function parseMigrationDDL(ddl: string): {
  * existing rows without changing how those rows are stored or addressed:
  *
  * - `alter column … set not null` (`drop not null` loosens, so it stays early)
- * - `add constraint` — the `unique`, `check` and foreign-key forms all validate
+ * - `add constraint` — the `unique` and foreign-key forms scan existing rows and
+ *   throw on a violation. The `check` form is classified with them even though the
+ *   engine does not scan for it today (both backends append the constraint
+ *   schema-only — see `bug-add-check-constraint-skips-existing-rows`): deferring a
+ *   statement that inspects nothing is harmless, and it is the right position for
+ *   the arm the moment that gap is closed.
  * - a UNIQUE `add_index` — verified to throw `UNIQUE constraint failed` against
  *   pre-existing duplicates, the same failure mode as `set not null`. A NON-unique
  *   index create inspects nothing, so it stays early.
@@ -705,17 +736,37 @@ function validatesExistingRows(change: SchemaChangeToApply): boolean {
 }
 
 /**
- * The `(schema, object)` key a migration is ordered under within one batch.
+ * The `(schema, object)` keys a migration is ordered under within one batch — the
+ * objects whose later migrations must hold it in place (see
+ * {@link partitionSchemaChanges}).
  *
- * For a table migration that is the table; for an index migration `change.table`
- * holds the INDEX name (see `mapSchemaMigrationType`), so a create/drop pair for
- * one index keys together while an index and its owner table key apart. Keying an
- * index by its owner instead would need the owner resolved before the create has
- * run, and the only cost of the split is the ordering caveat in
- * {@link partitionSchemaChanges}.
+ * For a table migration that is the table. For an index migration `change.table`
+ * holds the INDEX name (see `mapSchemaMigrationType`), which is what pairs a create
+ * with its drop; an index CREATE also depends on the table it indexes, so it keys
+ * under its owner as well — a later alteration of that owner (dropping the indexed
+ * column, dropping the table) must not be reordered ahead of it.
  */
-function migrationOrderKey(change: SchemaChangeToApply): string {
-  return `${change.schema}.${change.table}`;
+function migrationOrderKeys(change: SchemaChangeToApply): string[] {
+  const own = `${change.schema}.${change.table}`;
+  if (change.type !== 'add_index') return [own];
+  const owner = createIndexOwner(change);
+  return owner === undefined ? [own] : [own, `${change.schema}.${owner}`];
+}
+
+/**
+ * The table a replicated `add_index` migration indexes, read from its own DDL —
+ * the migration envelope carries only the index name. `undefined` when the DDL
+ * does not parse as a `CREATE INDEX`; callers treat that as "owner unknown" and
+ * fall back to the conservative behaviour.
+ *
+ * The schema qualifier is deliberately ignored in favour of the migration's
+ * envelope, for the same reason {@link decideAlterTable} reads the envelope over
+ * `stmt.table`: the origin filed both from one event, so they agree for anything
+ * the pipeline produces.
+ */
+function createIndexOwner(change: SchemaChangeToApply): string | undefined {
+  const { stmt } = parseMigrationDDL(change.ddl);
+  return stmt?.type === 'createIndex' ? stmt.table.name : undefined;
 }
 
 /**
@@ -743,12 +794,10 @@ function migrationOrderKey(change: SchemaChangeToApply): string {
  *   (`set not null`, then `add column`) keeps today's pre-data position and
  *   today's outcome. Only the trailing run of validating changes per object moves,
  *   where a trailing `drop_table` does not count as a blocker (see below).
- * - NOTE: an index migration keys by index name, not by its owner table, so a
- *   unique index create followed in the same batch by an alteration of its OWNER
- *   (e.g. dropping the indexed column) is not held back by that alteration and the
- *   two can be reordered. Both statements would have to arrive in one batch AND
- *   touch the same column; if that combination ever shows up, resolve the create's
- *   owner from its parsed DDL in {@link migrationOrderKey}.
+ * - A unique index create is held by a later migration of EITHER its own name or
+ *   its owner table — {@link migrationOrderKeys} gives it both keys, so neither a
+ *   `drop index` of the same name nor a `drop column` of the indexed column can be
+ *   reordered ahead of it.
  */
 function partitionSchemaChanges(changes: readonly SchemaChangeToApply[]): {
   beforeData: SchemaChangeToApply[];
@@ -766,14 +815,16 @@ function partitionSchemaChanges(changes: readonly SchemaChangeToApply[]): {
     // either way. Letting it pin would hold an earlier tightening in the pre-data
     // phase, where it fails against rows the batch has not delivered yet and
     // aborts a batch whose own last word is "this table is gone". Deferred
-    // instead, it meets an absent table and converges with a warning
-    // ({@link decideAlterTable}'s absent-table arm).
+    // instead, it meets an absent table and converges with a warning — both
+    // {@link decideAlterTable} and the `add_index` arm of
+    // {@link decideSchemaChange} take that posture, which is what makes the
+    // exception safe for every migration type this classifier can defer.
     if (change.type === 'drop_table') continue;
-    const key = migrationOrderKey(change);
-    if (!pinned.has(key) && validatesExistingRows(change)) {
+    const keys = migrationOrderKeys(change);
+    if (validatesExistingRows(change) && !keys.some(key => pinned.has(key))) {
       deferred.add(i);
     } else {
-      pinned.add(key);
+      for (const key of keys) pinned.add(key);
     }
   }
 

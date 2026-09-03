@@ -185,6 +185,13 @@ engine's own diagnostic is what surfaces. If the named **table** does not exist 
 the migration converges with a warning (the local drop was the more destructive change) —
 consistent with `drop_index`'s absent-owner arm.
 
+An `add_index` whose index is absent locally takes the same posture one level up: if the
+**table it indexes** is absent too, the create can only ever throw (`no such table`, or
+`column not found` when the indexed column is gone), and retrying it every round wedges
+the batch instead of self-healing. An index cannot outlive what it indexes, so the wanted
+end state has already arrived — the migration converges with a warning
+(`decideAbsentIndexCreate`).
+
 | Alteration | `already-applied` when | otherwise |
 |---|---|---|
 | `add column` | column present with the same **logical type** | absent → execute; different type → **conflict** naming the column and both types |
@@ -263,7 +270,7 @@ without changing how those rows are stored or addressed.
 | migration | why it validates |
 |---|---|
 | `alter column … set not null` | rejects if any existing row is NULL (`drop not null` loosens, so it stays early) |
-| `add constraint` | the `unique`, `check` and foreign-key forms all check existing rows |
+| `add constraint` | the `unique` and foreign-key forms scan existing rows and reject a violation. The `check` form is classified with them although the engine appends it schema-only today (`bug-add-check-constraint-skips-existing-rows`) — deferring a statement that inspects nothing is harmless and is the right position once that gap closes |
 | a **unique** `create index` | rejects on pre-existing duplicates, exactly like `set not null` (a non-unique index inspects nothing, so it stays early) |
 
 Everything else runs **before** the rows, because the batch's rows may need the new shape
@@ -287,11 +294,20 @@ to the after-data phase only when every *later* change on the same object in the
 also moves — otherwise it keeps its early position and its old behaviour. A batch is a
 whole resolved `ChangeSet[]` (many source transactions), so it can legitimately carry
 `add constraint u1` and, from a later transaction, `drop constraint u1`; deferring only
-the add would leave the receiver enforcing a constraint the origin no longer has. The one
-exception is a trailing `drop_table`: the table is discarded either way, so it does not
-hold an earlier tightening back — deferred past the data, that tightening meets an absent
-table and converges with a warning rather than aborting a batch whose last word on the
-table is that it is gone.
+the add would leave the receiver enforcing a constraint the origin no longer has.
+
+"The same object" is two objects for a unique index create: it is held in place by a later
+migration of its own name *or* of the table it indexes (`migrationOrderKeys` gives it both
+keys, reading the owner out of the create's own DDL). Without the owner key, a batch that
+creates a unique index and then drops the indexed column would run the drop first and the
+create against a column that is gone.
+
+The one exception is a trailing `drop_table`: the table is discarded either way, so it does
+not hold an earlier change back — deferred past the data, that change meets an absent table
+and converges with a warning rather than aborting a batch whose last word on the table is
+that it is gone. That exception is safe only because *every* migration this classifier can
+defer converges against an absent table — `alter_column` through `decideAlterTable`, a
+unique index create through `decideAbsentIndexCreate`.
 
 ### What replicates
 
