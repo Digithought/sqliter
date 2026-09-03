@@ -1982,7 +1982,6 @@ export class SchemaManager {
 			vtabArgs: effectiveModuleArgs,
 			vtabModule: moduleInfo.module,
 			vtabAuxData: moduleInfo.auxData,
-			estimatedRows: 0,
 			mutationContext: mutationContextSchemas ? Object.freeze(mutationContextSchemas) : undefined,
 			generatedColumnDependencies,
 			generatedColumnTopoOrder: genTopoOrder ? Object.freeze(genTopoOrder) : undefined,
@@ -2041,7 +2040,6 @@ export class SchemaManager {
 			// Logical tables carry no module — they are a design, not storage.
 			vtabModule: undefined,
 			vtabModuleName: '',
-			estimatedRows: 0,
 			tags: stmt.tags && Object.keys(stmt.tags).length > 0 ? Object.freeze({ ...stmt.tags }) : undefined,
 		};
 	}
@@ -2470,7 +2468,6 @@ export class SchemaManager {
 			vtabArgs: effectiveModuleArgs,
 			vtabModule: moduleInfo.module,
 			vtabAuxData: moduleInfo.auxData,
-			estimatedRows: correctedSchema.estimatedRows ?? 0,
 		};
 	}
 

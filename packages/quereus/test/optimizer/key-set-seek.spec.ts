@@ -486,8 +486,8 @@ describe('key-set-seek plan shape', () => {
 		// into a Set first. When the key source's row estimate already exceeds
 		// min(maxKeys, breakEvenKeys) the seek provably cannot fire, so the rule
 		// must keep the merge join. The stats are planted via `TableSchema.statistics`
-		// (what `catalogRowCount` → `physical.estimatedRows` reads); the memory
-		// module itself reports 0 for a fresh table, which is why this needs a
+		// (what `catalogRowCount` → `physical.estimatedRows` reads); a fresh,
+		// never-analyzed table has no row count at all, which is why this needs a
 		// doctored module — the gate is inert on undoctored memory tables.
 		class StatsModule extends MemoryTableModule {
 			constructor(private readonly stats: Record<string, number>) {
@@ -570,6 +570,13 @@ describe('key-set-seek plan shape', () => {
 			await db.exec('create table entry (id integer primary key, txn_id integer, account_id integer, amount integer)');
 			await db.exec('create index idx_entry_account on entry(account_id)');
 			await db.exec('create index idx_entry_txn on entry(txn_id)');
+			// These tests pin plan SHAPE, and a never-analyzed table's row count is
+			// unknown (`undefined`) — under the unknown-default (1000 rows a side)
+			// physical join selection prefers a scan-based join over the
+			// index-nested-loop these shapes assert. Measure the (empty) tables so
+			// the cost model works from real numbers.
+			await db.exec('analyze txn');
+			await db.exec('analyze entry');
 		});
 
 		const semiHashJoins = (plan: PlanNode): BloomJoinNode[] =>

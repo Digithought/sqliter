@@ -212,8 +212,7 @@ const jsonTableModule: VirtualTableModule<JsonTable> = {
 			isTemporary: false,
 			isView: false,
 			vtabModuleName: 'json_table',
-			vtabArgs: options ?? {},
-			estimatedRows: 0
+			vtabArgs: options ?? {}
 		} as unknown as TableSchema;
 		const effectiveOptions = (options ?? schema.vtabArgs ?? {}) as Record<string, SqlValue>;
 		return new JsonTable(db, jsonTableModule, schemaName, tableName, schema, effectiveOptions);

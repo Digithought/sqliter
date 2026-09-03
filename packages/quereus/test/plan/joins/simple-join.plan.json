@@ -20,9 +20,7 @@
                               "age",
                               "dept_id"
                             ],
-                            "estimates": {
-                              "rows": 0
-                            },
+                            "estimates": {},
                             "schema": "main",
                             "table": "users"
                           },
@@ -114,7 +112,6 @@
                         },
                         "concurrencySafe": true,
                         "deterministic": true,
-                        "estimatedRows": 0,
                         "expectedLatencyMs": 0,
                         "fds": [
                           {
@@ -246,7 +243,6 @@
                   "physical": {
                     "concurrencySafe": true,
                     "deterministic": true,
-                    "estimatedRows": 0,
                     "expectedLatencyMs": 0,
                     "fds": [
                       {
@@ -325,7 +321,6 @@
               "physical": {
                 "concurrencySafe": true,
                 "deterministic": true,
-                "estimatedRows": 0,
                 "expectedLatencyMs": 0,
                 "fds": [
                   {
@@ -407,9 +402,7 @@
                           "name",
                           "budget"
                         ],
-                        "estimates": {
-                          "rows": 0
-                        },
+                        "estimates": {},
                         "schema": "main",
                         "table": "departments"
                       },
@@ -492,7 +485,6 @@
                     },
                     "concurrencySafe": true,
                     "deterministic": true,
-                    "estimatedRows": 0,
                     "expectedLatencyMs": 0,
                     "fds": [
                       {
@@ -562,7 +554,6 @@
               "physical": {
                 "concurrencySafe": true,
                 "deterministic": true,
-                "estimatedRows": 0,
                 "expectedLatencyMs": 0,
                 "fds": [
                   {
@@ -646,7 +637,6 @@
                 4
               ]
             ],
-            "estimatedRows": 0,
             "expectedLatencyMs": 0,
             "fds": [
               {
@@ -750,7 +740,6 @@
       "physical": {
         "concurrencySafe": true,
         "deterministic": true,
-        "estimatedRows": 0,
         "expectedLatencyMs": 0,
         "idempotent": true,
         "readonly": true,

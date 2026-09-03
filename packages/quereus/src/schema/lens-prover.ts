@@ -22,6 +22,7 @@ import type { AcknowledgedAdvisory } from './lens-ack.js';
 import { createLogger } from '../common/logger.js';
 import { ConflictResolution, FunctionFlags } from '../common/constants.js';
 import { compareSqlValues } from '../util/comparison.js';
+import { catalogRowCount } from '../planner/stats/table-cardinality.js';
 import type { SqlValue } from '../common/types.js';
 
 const log = createLogger('schema:lens-prover');
@@ -2461,7 +2462,7 @@ function buildFingerprint(ctx: ProveContext, columnNames: readonly string[], has
 	return {
 		constraintColumns: [...columnNames].sort((a, b) => a.localeCompare(b)),
 		hasCoveringStructure,
-		cardinalityBand: cardinalityBand(basis?.estimatedRows),
+		cardinalityBand: cardinalityBand(basis ? catalogRowCount(basis) : undefined),
 		basisRelation: basis ? `${basis.schemaName.toLowerCase()}.${basis.name.toLowerCase()}` : undefined,
 	};
 }

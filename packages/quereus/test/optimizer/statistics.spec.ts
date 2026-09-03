@@ -782,41 +782,35 @@ describe('base-table cardinality from catalog statistics', () => {
 	// ── catalogRowCount unit cases ──────────────────────────────────────────
 
 	describe('catalogRowCount', () => {
-		function makeTableSchema(stats?: TableStatistics, estimatedRows?: number): TableSchema {
-			return { name: 't', statistics: stats, estimatedRows, columns: [] } as unknown as TableSchema;
+		function makeTableSchema(stats?: TableStatistics): TableSchema {
+			return { name: 't', statistics: stats, columns: [] } as unknown as TableSchema;
 		}
 
-		it('statistics present: returns rowCount, ignoring the static estimate', () => {
+		it('statistics present: returns rowCount', () => {
 			const stats = { rowCount: 100, columnStats: new Map() } as TableStatistics;
-			expect(catalogRowCount(makeTableSchema(stats, 0))).to.equal(100);
+			expect(catalogRowCount(makeTableSchema(stats))).to.equal(100);
 		});
 
-		it('statistics absent, static estimatedRows present: returns the static estimate', () => {
-			expect(catalogRowCount(makeTableSchema(undefined, 0))).to.equal(0);
-			expect(catalogRowCount(makeTableSchema(undefined, 42))).to.equal(42);
+		it('never analyzed: returns undefined, not 0', () => {
+			expect(catalogRowCount(makeTableSchema(undefined))).to.be.undefined;
 		});
 
-		it('both absent: returns undefined', () => {
-			expect(catalogRowCount(makeTableSchema(undefined, undefined))).to.be.undefined;
-		});
-
-		it('rowCount: 0 is honoured, not treated as "unknown" (?? vs ||)', () => {
-			// If this used `||` instead of `??`, a 0-row analyzed table would fall
-			// through to the static estimate below and silently misreport.
+		it('rowCount: 0 is honoured — analyzed-and-empty is a measurement, not "unknown"', () => {
 			const stats = { rowCount: 0, columnStats: new Map() } as TableStatistics;
-			expect(catalogRowCount(makeTableSchema(stats, 500))).to.equal(0);
+			expect(catalogRowCount(makeTableSchema(stats))).to.equal(0);
 		});
 
 		// CatalogStatsProvider.tableRows is the other caller of the helper; it must agree
-		// with the node getter and still hand the fully-unknown case to NaiveStatsProvider.
+		// with the node getter and hand only the never-analyzed case to NaiveStatsProvider.
 		it('CatalogStatsProvider.tableRows agrees with the helper, defaulting only when nothing is known', () => {
 			const provider = new CatalogStatsProvider();
 			const stats = { rowCount: 100, columnStats: new Map() } as TableStatistics;
-			expect(provider.tableRows(makeTableSchema(stats, 0))).to.equal(100);
-			expect(provider.tableRows(makeTableSchema(undefined, 0))).to.equal(0);
-			expect(provider.tableRows(makeTableSchema(undefined, 42))).to.equal(42);
-			// Neither source knows: NaiveStatsProvider's 1000 default, not 0 and not undefined.
-			expect(provider.tableRows(makeTableSchema(undefined, undefined))).to.equal(1000);
+			expect(provider.tableRows(makeTableSchema(stats))).to.equal(100);
+			// Analyzed and empty: a real 0, not the fallback.
+			const empty = { rowCount: 0, columnStats: new Map() } as TableStatistics;
+			expect(provider.tableRows(makeTableSchema(empty))).to.equal(0);
+			// Never analyzed: NaiveStatsProvider's 1000 default, not 0 and not undefined.
+			expect(provider.tableRows(makeTableSchema(undefined))).to.equal(1000);
 		});
 	});
 
@@ -859,17 +853,21 @@ describe('base-table cardinality from catalog statistics', () => {
 			expect(estimates.rows).to.equal(100);
 		});
 
-		it('a populated but never-analyzed table keeps the static (0) estimate — the change is inert without ANALYZE', async () => {
+		it('a populated but never-analyzed table reports unknown, not 0', async () => {
 			await seed(100);
 			// No ANALYZE.
 			const schema = db.schemaManager.findTable('m');
 			expect(schema?.statistics, 'no ANALYZE means no statistics').to.be.undefined;
-			expect(schema?.estimatedRows, 'SchemaManager stamps a static 0 at CREATE TABLE').to.equal(0);
 
+			// The catalog has no third spelling: unknown is `undefined` at every layer.
+			expect(catalogRowCount(schema!)).to.be.undefined;
 			const plan = db.getPlan('select * from m where a = 1');
+			const tableRef = findTableRef(plan);
+			expect(tableRef!.estimatedRows, 'logical getter reports unknown').to.be.undefined;
 			const scan = findScanNode(plan);
 			expect(scan, 'expected a physical access node').to.not.be.undefined;
-			expect(scan!.physical?.estimatedRows).to.equal(0);
+			expect(scan!.physical?.estimatedRows, 'physical estimate stays unknown, never a fake 0')
+				.to.be.undefined;
 		});
 
 		it('ANALYZE on an empty table: scan and filter both report 0', async () => {

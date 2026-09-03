@@ -439,6 +439,11 @@ export class AutoAnalyzeManager {
 			this.dropEntry(key);
 			return undefined;
 		}
+		// NOTE: never-analyzed (`undefined`) deliberately collapses to 0 alongside
+		// analyzed-empty here: both make the ratio arm contribute nothing, so the
+		// table goes stale after `auto_analyze_min_mutations` changes alone. That is
+		// the right urgency for both — a table with no statistics wants its first
+		// ANALYZE promptly, and an empty one that starts filling wants a fresh count.
 		return catalogRowCount(table) ?? 0;
 	}
 
@@ -627,14 +632,15 @@ export class AutoAnalyzeManager {
 			// only if statistics polluted by uncommitted rows show up in practice.
 			if (!this.ctx.getAutocommit()) return 'deferred';
 
-			// NOTE: a never-analyzed table reports 0 known rows (`SchemaManager` hardcodes
-			// `estimatedRows` to 0 at CREATE), so its FIRST automatic refresh is not size
-			// gated — a table bulk-loaded to 10M rows in a single transaction gets one
-			// unbounded scan before `analyzedRowCount` starts gating the rest. Deliberate:
-			// the obvious tightening — treating `changedSinceAnalyze` as a size proxy —
-			// deadlocks, because a table skipped as oversize never resets its counter and
-			// would therefore be skipped forever. If that first scan ever matters, give the
-			// gate a real size source (a module-reported row count) rather than a proxy.
+			// NOTE: a never-analyzed table has no catalog row count (`catalogRowCount`
+			// reports `undefined`, collapsed to 0 here), so its FIRST automatic refresh is
+			// not size gated — a table bulk-loaded to 10M rows in a single transaction gets
+			// one unbounded scan before `analyzedRowCount` starts gating the rest.
+			// Deliberate: the obvious tightening — treating `changedSinceAnalyze` as a size
+			// proxy — deadlocks, because a table skipped as oversize never resets its
+			// counter and would therefore be skipped forever. If that first scan ever
+			// matters, give the gate a real size source (a module-reported row count)
+			// rather than a proxy.
 			const known = entry.analyzedRowCount ?? this.catalogRowCount(key) ?? 0;
 			const limit = this.rowLimit();
 			// 0 disables the cap (documented with the option), hence `limit > 0 &&` rather

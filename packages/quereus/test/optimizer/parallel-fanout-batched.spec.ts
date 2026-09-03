@@ -6,9 +6,10 @@
  * Two cost surfaces drive the rule (both inert on memory-vtab plans):
  *   - `physical.expectedLatencyMs` on the slowest branch (non-zero only via the
  *     synthetic `HighLatencyMemoryModule`), and
- *   - `physical.estimatedRows` on the outer (0 for memory fixtures), gated by
- *     `tuning.parallel.batchedOuterMinRows` — overridden to 0 in the firing
- *     tests so the synthetic fixture clears it.
+ *   - `physical.estimatedRows` on the outer (unknown until ANALYZE runs — the
+ *     gate refuses on a missing statistic, so the fixture analyzes its tables),
+ *     gated by `tuning.parallel.batchedOuterMinRows` — overridden to 0 in the
+ *     firing tests so the small synthetic fixture clears it.
  *
  * The fan-out must *form* first (its own Structural cost gate), so these tests
  * reuse the same `concurrency`-lowering trick as `parallel-fanout.spec.ts`.
@@ -94,8 +95,8 @@ describe('ruleFanOutBatchedOuter', () => {
 		db = new Database();
 		db.registerModule('hi_lat_memory', new HighLatencyMemoryModule());
 		// Lower the per-row cap so a 3-branch chain surfaces a positive *formation*
-		// cost gate, and drop batchedOuterMinRows to 0 so the synthetic memory
-		// outer (estimatedRows = 0) clears the cardinality gate. Both are restored
+		// cost gate, and drop batchedOuterMinRows to 0 so the small synthetic
+		// outer (3 analyzed rows) clears the cardinality gate. Both are restored
 		// per-test where a gate is being exercised.
 		const before = db.optimizer.tuning;
 		db.optimizer.updateTuning({
@@ -131,6 +132,11 @@ describe('ruleFanOutBatchedOuter', () => {
 			(1, 1, 10, 100, 99.0),
 			(2, 2, 20, 200, 49.5),
 			(3, 1, 20, 100, 12.0)`);
+		// The batched flip's cardinality gate refuses on an unknown outer estimate
+		// (a never-analyzed table has no row count), so measure the fixture.
+		for (const t of ['orders', 'cust', 'prod', 'region']) {
+			await db.exec(`analyze ${t}`);
+		}
 	}
 
 	const fanout3SQL =
@@ -294,6 +300,9 @@ describe('ruleFanOutBatchedOuter', () => {
 			await db.exec("insert into p values (1, 'one'), (2, 'two')");
 			await db.exec('insert into b0 values (10, 1, 100), (11, 1, 101), (12, 2, 200)');
 			await db.exec('insert into b1 values (20, 1, 5), (21, 2, 6)');
+			// The cross-branch formation guard (`crossGuardsPass`) refuses to
+			// cluster on unknown row estimates — measure the fixture first.
+			for (const t of ['p', 'b0', 'b1']) await db.exec(`analyze ${t}`);
 		}
 
 		const crossSQL =

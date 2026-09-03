@@ -105,11 +105,9 @@ export class NaiveStatsProvider implements StatsProvider {
 	}
 
 	tableRows(table: TableSchema): number | undefined {
-		// Use table's estimated rows if available, otherwise use default
-		const estimate = table.estimatedRows ?? this.defaultTableRows;
-		log('Table %s estimated rows: %d (source: %s)',
-			table.name, estimate, table.estimatedRows ? 'schema' : 'default');
-		return estimate;
+		// Naive by definition: no catalog knowledge, always the configured default.
+		log('Table %s estimated rows: %d (source: default)', table.name, this.defaultTableRows);
+		return this.defaultTableRows;
 	}
 
 	selectivity(table: TableSchema, predicate: ScalarPlanNode): number | undefined {

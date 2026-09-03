@@ -29,6 +29,7 @@ import type {
 import type { Database } from './database.js';
 import type { SchemaChangeEvent } from '../schema/change-events.js';
 import { splitBaseKey } from '../util/qualified-name.js';
+import { catalogRowCount } from '../planner/stats/table-cardinality.js';
 
 const log = createLogger('core:watchers');
 const warnLog = log.extend('warn');
@@ -81,7 +82,7 @@ export class WatcherManager {
 			getRowCount: (base) => {
 				const [schemaName, tableName] = splitBaseKey(base);
 				const table = ctx._findTable(tableName, schemaName);
-				return table?.estimatedRows;
+				return table ? catalogRowCount(table) : undefined;
 			},
 			deltaPerRowFallbackRatio: ctx.optimizer.tuning.deltaPerRowFallbackRatio,
 		};

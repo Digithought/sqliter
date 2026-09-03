@@ -538,9 +538,10 @@ export class IndexSeekNode extends TableAccessNode {
 			// so a missing — or zero — `rows` has already collapsed to 1000 before the
 			// node sees it. That `|| 1000` IS the no-answer fallback. Both shipped
 			// modules always set `rows`, so only a third-party module can reach it.
-			// Spelling "unknown" apart from "zero" is owned by backlog
-			// `bug-row-estimate-conflates-unknown-and-zero`; do not invent a second
-			// convention here.
+			// The catalog layer spells unknown as `undefined` (see
+			// `planner/stats/table-cardinality.ts`); if a module's declined estimate
+			// ever needs the same treatment, switch the rule's `||` to `??` there —
+			// do not invent a second convention here.
 			estimatedRows: Number(this.filterInfo.indexInfoOutput.estimatedRows),
 			fds: sourcePhysical?.fds,
 			equivClasses: sourcePhysical?.equivClasses,

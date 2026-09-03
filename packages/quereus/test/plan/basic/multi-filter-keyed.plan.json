@@ -16,9 +16,7 @@
                       "age",
                       "dept_id"
                     ],
-                    "estimates": {
-                      "rows": 0
-                    },
+                    "estimates": {},
                     "schema": "main",
                     "table": "users"
                   },

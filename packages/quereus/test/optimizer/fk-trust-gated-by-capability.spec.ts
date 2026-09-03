@@ -397,10 +397,19 @@ describe('FK trust gated by permitsOrphanedForeignKeyRows', () => {
 			// The gated lookupCoveringFK fails the at-most-one existence proof, but
 			// recognizeBranch falls through to the sound `cross` mode instead of
 			// bailing the entire cluster.
+			//
+			// Cross branches (unlike atMostOne ones) pass through crossGuardsPass,
+			// which refuses to cluster on UNKNOWN row estimates — a never-analyzed
+			// table must not authorize an unbounded Cartesian product. Run ANALYZE
+			// so the guard sees measured (empty ⇒ 0-row) estimates and the cluster
+			// this test exists to observe can actually form.
 			db.registerModule('hi_lat_orphan', new HighLatencyOrphanMemoryModule());
 			const restore = tightenConcurrency();
 			try {
 				await setup3InnerBranches('hi_lat_orphan');
+				for (const t of ['orders', 'cust', 'prod', 'region']) {
+					await db.exec(`analyze ${t}`);
+				}
 				const plan = await planRows(fanout3InnerSQL);
 				expect(fanOutBranchModes(plan), `ops=${plan.map(r => r.op).join(',')}`)
 					.to.deep.equal(['cross', 'cross', 'cross']);

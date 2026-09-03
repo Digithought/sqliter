@@ -608,8 +608,8 @@ export function buildAggregateResidualPlan(
 	// Compile + cache the group-keyed residual once (the body with `g1 = :gk0 AND …`
 	// injected on T). Re-run per affected group key against the live transaction.
 	const relKey = relationKeyOf(tableRef);
-	const residualScheduler = compileResidual(ctx, analyzed, relKey, groupColumns, 'gk');
-	if (!residualScheduler) return null; // could not parameterize the residual → floor
+	const residual = compileResidual(ctx, analyzed, relKey, groupColumns, 'gk');
+	if (!residual) return null; // could not parameterize the residual → floor
 
 	// Delta-aggregate fast path: build the descriptor when EVERY stored aggregate
 	// column is delta-maintainable by its declared algebra (see the builder below).
@@ -632,6 +632,7 @@ export function buildAggregateResidualPlan(
 		: ['residual-recompute'];
 	const hasPredicate = mv.derivation.selectAst.type === 'select' && mv.derivation.selectAst.where !== undefined;
 	const sourceStats = estimateMaintenanceStats(ctx, tableRef.tableSchema, backing.columns.length, hasPredicate);
+	sourceStats.residualExecutionCost = residual.cost;
 	// A tighten-only (min/max) column re-derives a retracted group from the residual, so the
 	// delta arm's cost is no longer pure arithmetic — feed the create-time expected-rescan
 	// fraction into the `'delta-aggregate'` cost blend (maintenanceCost). A tighten body then
@@ -656,7 +657,7 @@ export function buildAggregateResidualPlan(
 		chosenStrategy,
 		sourceStats,
 		binding: { kind: 'group', groupColumns: [...groupColumns] },
-		residualScheduler,
+		residualScheduler: residual.scheduler,
 		bindParamPrefix: 'gk',
 		bindColumns: groupColumns,
 		backingPkDefinition,
@@ -1114,6 +1115,8 @@ export function buildJoinResidualPlan(
 	const tRelKey = relationKeyOf(tRef);
 	const forwardResidual = compileResidual(ctx, analyzed, tRelKey, tPkCols, 'pk');
 	if (!forwardResidual) return null;
+	// The forward (T-keyed) residual is the per-key unit the degrade crossover trades
+	// against a rebuild, so its compiled cost is the one stamped into sourceStats below.
 
 	// Reverse (`P`) **in-scope** residual: the body — WHERE retained — with `P.pk = :pk0 AND …`
 	// injected on `P`. Drives lookup-side maintenance — finds every currently in-scope joined
@@ -1141,12 +1144,13 @@ export function buildJoinResidualPlan(
 	if (whereReferencesLookup) {
 		const membership = compileLookupMembershipResidual(ctx, mv, lookupBase, pPkCols);
 		if (!membership) return null; // could not strip + re-key the membership residual → floor
-		lookupMembershipResidual = membership;
+		lookupMembershipResidual = membership.scheduler;
 	}
 
 	// ── Cost gate (parity with the other residual arms) ──
 	const soundStrategies: MaintenanceStrategy[] = ['residual-recompute'];
 	const sourceStats = estimateMaintenanceStats(ctx, tSchema, backing.columns.length, hasWhere);
+	sourceStats.residualExecutionCost = forwardResidual.cost;
 	const estimatedChangeCardinality = Math.max(1, sourceStats.tableRows * 0.01);
 	const chosenStrategy = selectMaintenanceStrategy(soundStrategies, estimatedChangeCardinality, sourceStats);
 	if (chosenStrategy !== 'residual-recompute') {
@@ -1165,13 +1169,13 @@ export function buildJoinResidualPlan(
 		chosenStrategy,
 		sourceStats,
 		binding: { kind: 'row', keyColumns: [...tPkCols] },
-		residualScheduler: forwardResidual,
+		residualScheduler: forwardResidual.scheduler,
 		bindParamPrefix: 'pk',
 		bindColumns: tPkCols,
 		backingPkDefinition,
 		backingPkSourceCols,
 		lookupBase,
-		lookupResidualScheduler: reverseResidual,
+		lookupResidualScheduler: reverseResidual.scheduler,
 		lookupMembershipResidualScheduler: lookupMembershipResidual,
 		lookupBindColumns: pPkCols,
 		lookupBindParamPrefix: 'pk',
@@ -1199,7 +1203,7 @@ export function compileLookupMembershipResidual(
 	mv: MaintainedTableSchema,
 	lookupBase: string,
 	pPkCols: readonly number[],
-): Scheduler | null {
+): CompiledResidual | null {
 	const db = ctx as unknown as Database;
 	const strippedAst = { ...(mv.derivation.selectAst as AST.SelectStmt), where: undefined };
 	const stripped = db.schemaManager.withSuppressedMaterializedViewRewrite(() => {
@@ -1354,6 +1358,16 @@ export function buildFullRebuildPlan(ctx: MaterializedViewManagerContext, mv: Ma
 	};
 }
 
+/** A compiled key-filtered residual plus what one execution of it costs. */
+export interface CompiledResidual {
+	scheduler: Scheduler;
+	/** `getTotalCost()` of the optimized residual plan — feeds
+	 *  {@link MaintenanceSourceStats.residualExecutionCost} so the residual↔rebuild
+	 *  crossover is judged against what a residual run actually does (a seek when the
+	 *  binding key is indexed, a whole-source scan when it is not). */
+	cost: number;
+}
+
 /**
  * Compile the key-filtered residual for a binding into a reusable {@link Scheduler}:
  * the analyzed body with a key-equality filter injected on `T`'s `TableReferenceNode`
@@ -1368,7 +1382,7 @@ export function compileResidual(
 	relKey: string,
 	bindColumns: readonly number[],
 	paramPrefix: 'gk' | 'pk',
-): Scheduler | null {
+): CompiledResidual | null {
 	const db = ctx as unknown as Database;
 	const rewritten = injectKeyFilter(analyzed, relKey, bindColumns, paramPrefix);
 	if (rewritten === analyzed) return null; // could not parameterize the residual → floor
@@ -1378,7 +1392,7 @@ export function compileResidual(
 		() => ctx.optimizer.optimize(rewritten, db) as BlockNode,
 	);
 	const instruction = emitPlanNode(optimized, new EmissionContext(db));
-	return new Scheduler(instruction);
+	return { scheduler: new Scheduler(instruction), cost: optimized.getTotalCost() };
 }
 
 /**
@@ -1537,8 +1551,8 @@ export function buildLateralTvfPrefixDeletePlan(
 	// injected on T). Re-run per affected base key against the live transaction; it
 	// re-runs the lateral join + TVF for that single base row, fanning out to N rows.
 	const relKey = relationKeyOf(tableRef);
-	const residualScheduler = compileResidual(ctx, analyzed, relKey, sourcePkCols, 'pk');
-	if (!residualScheduler) return null; // could not parameterize the residual → floor
+	const residual = compileResidual(ctx, analyzed, relKey, sourcePkCols, 'pk');
+	if (!residual) return null; // could not parameterize the residual → floor
 
 	// ── Cost gate ──
 	// The fan-out residual shares the residual-recompute cost shape (a key-filtered
@@ -1550,6 +1564,7 @@ export function buildLateralTvfPrefixDeletePlan(
 	const soundStrategies: MaintenanceStrategy[] = ['residual-recompute'];
 	const hasPredicate = mv.derivation.selectAst.type === 'select' && mv.derivation.selectAst.where !== undefined;
 	const sourceStats = estimateMaintenanceStats(ctx, sourceSchema, backing.columns.length, hasPredicate);
+	sourceStats.residualExecutionCost = residual.cost;
 	const estimatedChangeCardinality = Math.max(1, sourceStats.tableRows * 0.01);
 	const chosenStrategy = selectMaintenanceStrategy(soundStrategies, estimatedChangeCardinality, sourceStats);
 	if (chosenStrategy !== 'residual-recompute') {
@@ -1568,7 +1583,7 @@ export function buildLateralTvfPrefixDeletePlan(
 		chosenStrategy,
 		sourceStats,
 		binding: { kind: 'row', keyColumns: [...sourcePkCols] },
-		residualScheduler,
+		residualScheduler: residual.scheduler,
 		bindParamPrefix: 'pk',
 		bindColumns: sourcePkCols,
 		backingPkDefinition,

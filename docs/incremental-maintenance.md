@@ -448,12 +448,19 @@ violating content does not trip an assertion at that commit.
 `DeltaExecutor` iterates registered subscriptions, computes the per-relation binding
 tuples via `getChangedTuples(base, columnIndices, pkIndices)`, and calls each
 subscription's `apply`. **Cost fallback (detection kernel only):** if the number of
-distinct binding tuples exceeds `tuning.deltaPerRowFallbackRatio × estimatedRows(base)`,
-the kernel demotes that relation to global re-evaluation (always correct — it just
-recomputes more than the minimum). This ratio governs the **detection kernel**
-(assertions and watchers) only; row-time materialized-view maintenance instead uses the
-backward `maintenanceCost(...)` surface (`planner/cost/index.ts`), reusing this value as
-the stats-absent fallback multiplier in its `'residual-recompute'` formula.
+distinct binding tuples exceeds `tuning.deltaPerRowFallbackRatio × rowCount(base)`
+(the catalog row count from the last `ANALYZE`; a never-analyzed table has no count and
+is never demoted), the kernel demotes that relation to global re-evaluation (always
+correct — it just recomputes more than the minimum). This ratio governs the
+**detection kernel** (assertions and watchers) only; row-time materialized-view
+maintenance instead uses the backward `maintenanceCost(...)` surface
+(`planner/cost/index.ts`): the arm builders stamp the compiled key-filtered residual's
+own plan cost (`MaintenanceSourceStats.residualExecutionCost`) so the per-statement
+residual↔rebuild crossover is judged against what a residual run actually does (a
+seek when the binding key is indexed, a whole-source scan otherwise), with this ratio
+kept only as the stats-absent fallback multiplier. Statements touching fewer than
+three distinct keys never demote — a `'replace-all'` rebuild rewrites the whole
+backing, write amplification the cost formulas do not carry.
 
 The kernel runs only at top-level COMMIT — savepoints are seen indirectly via the
 merged change log. How an `apply` exception is handled is the **consumer's** choice,

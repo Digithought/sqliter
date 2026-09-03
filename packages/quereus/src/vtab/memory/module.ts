@@ -448,9 +448,10 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	): BestAccessPlanResult {
 		logger.debugLog(`[getBestAccessPlan] Planning access for ${tableInfo.name} with ${request.filters.length} filters`);
 
-		// Get table size estimate for cost calculations.
-		// The schema defaults estimatedRows to 0 at creation time, so treat 0 as
-		// "unknown" and fall back to a reasonable default to avoid degenerate costs.
+		// Get table size estimate for cost calculations. An un-analyzed table
+		// arrives as `undefined` ("nobody knows"); fall back to a reasonable
+		// default to avoid degenerate costs. (`||` also catches an analyzed empty
+		// table — a plan over 0 rows is cheap under any default, so that is fine.)
 		const estimatedTableSize = request.estimatedRows || 1000;
 
 		// Find the best access strategy

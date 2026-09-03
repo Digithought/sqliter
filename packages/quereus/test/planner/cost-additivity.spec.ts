@@ -33,6 +33,9 @@ describe('Cost model: self-cost-only additivity (planner-cost-model-double-count
 		db = new Database();
 		await db.exec('create table t (id integer primary key, v text) using memory');
 		await db.exec("insert into t values (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')");
+		// `firstRelationalBase` keys on a numeric logical `estimatedRows`, and a
+		// never-analyzed table reports unknown (`undefined`) — measure it.
+		await db.exec('analyze t');
 	});
 
 	afterEach(async () => {

@@ -5,10 +5,9 @@ import type { ScalarPlanNode } from '../../../src/planner/nodes/plan-node.js';
 
 // ── Mock factories ──────────────────────────────────────────────────────
 
-function makeTable(name: string, estimatedRows?: number): TableSchema {
+function makeTable(name: string): TableSchema {
 	return {
 		name,
-		estimatedRows,
 		columns: [],
 	} as unknown as TableSchema;
 }
@@ -27,13 +26,7 @@ function mockPredicate(nodeType: string): ScalarPlanNode {
 describe('NaiveStatsProvider', () => {
 
 	describe('tableRows', () => {
-		it('uses schema estimatedRows when available', () => {
-			const provider = new NaiveStatsProvider();
-			const table = makeTable('t', 42);
-			expect(provider.tableRows(table)).to.equal(42);
-		});
-
-		it('falls back to defaultTableRows', () => {
+		it('always answers the configured default — naive has no catalog knowledge', () => {
 			const provider = new NaiveStatsProvider();
 			const table = makeTable('t');
 			expect(provider.tableRows(table)).to.equal(1000);
@@ -97,26 +90,25 @@ describe('NaiveStatsProvider', () => {
 	});
 
 	describe('joinSelectivity', () => {
-		it('computes heuristic join selectivity', () => {
+		it('computes heuristic join selectivity from the default row counts', () => {
 			const provider = new NaiveStatsProvider();
-			const left = makeTable('a', 100);
-			const right = makeTable('b', 200);
+			const left = makeTable('a');
+			const right = makeTable('b');
+			// 1/max(1000,1000,10) = 0.001
 			const sel = provider.joinSelectivity(left, right, mockPredicate('BinaryOp'));
-			expect(sel).to.be.a('number');
-			expect(sel!).to.be.greaterThan(0);
-			expect(sel!).to.be.at.most(0.5);
+			expect(sel!).to.be.closeTo(0.001, 0.0005);
 		});
 
 		it('is capped at 0.5', () => {
-			const provider = new NaiveStatsProvider();
-			const left = makeTable('a', 1);
-			const right = makeTable('b', 1);
+			const provider = new NaiveStatsProvider(1);
+			const left = makeTable('a');
+			const right = makeTable('b');
 			// 1/max(1,1,10) = 1/10 = 0.1
 			const sel = provider.joinSelectivity(left, right, mockPredicate('BinaryOp'));
 			expect(sel!).to.be.at.most(0.5);
 		});
 
-		it('uses default row count when schema has none', () => {
+		it('uses a custom default row count', () => {
 			const provider = new NaiveStatsProvider(500);
 			const left = makeTable('a');
 			const right = makeTable('b');
@@ -128,21 +120,20 @@ describe('NaiveStatsProvider', () => {
 
 	describe('distinctValues', () => {
 		it('returns 50% of total rows', () => {
-			const provider = new NaiveStatsProvider();
-			const table = makeTable('t', 100);
+			const provider = new NaiveStatsProvider(100);
+			const table = makeTable('t');
 			expect(provider.distinctValues(table, 'col')).to.equal(50);
 		});
 
 		it('floors at 1', () => {
-			const provider = new NaiveStatsProvider();
-			const table = makeTable('t', 1);
+			const provider = new NaiveStatsProvider(1);
+			const table = makeTable('t');
 			expect(provider.distinctValues(table, 'col')).to.equal(1);
 		});
 
-		it('returns undefined when totalRows is undefined/falsy', () => {
-			const provider = new NaiveStatsProvider();
-			// tableRows returns 0 when estimatedRows is 0
-			const table = makeTable('t', 0);
+		it('returns undefined when totalRows is falsy', () => {
+			const provider = new NaiveStatsProvider(0);
+			const table = makeTable('t');
 			// tableRows returns 0, which is falsy → undefined
 			const result = provider.distinctValues(table, 'col');
 			expect(result).to.be.undefined;

@@ -26,16 +26,11 @@ import type { PhysicalProperties, RelationalPlanNode } from '../nodes/plan-node.
  * there the logical getter is the only number available, and it is still the
  * pre-optimization truth.
  */
-// NOTE: `SchemaManager` hardcodes `TableSchema.estimatedRows` to 0 at CREATE TABLE,
-// so a never-analyzed table's scan reports 0 — a value that means "unknown", not
-// "empty" (see the NOTE in `planner/stats/table-cardinality.ts`). That 0 now travels
-// much further than it used to: before this relay it died at the first operator that
-// read a logical getter, and consumers fell back to their own defaults instead. Any
-// consumer that reads a row estimate as a *magnitude* must therefore spell 0 as
-// unknown; threshold consumers that floor (the cache threshold's min of 1000) or
-// use a `>` test are unaffected. The real fix is distinguishing unknown from empty
-// at the source — not clamping here, which would erase a genuinely empty analyzed
-// table.
+// Invariant: a row estimate has exactly two spellings — `undefined` means "nobody
+// knows" and a number (including a real 0, from an analyzed empty table) means
+// "measured or derived" (see `planner/stats/table-cardinality.ts`). A never-analyzed
+// table's scan reports `undefined`, not 0, so this relay may propagate any number it
+// sees as a genuine magnitude; consumers apply their own default only on `undefined`.
 export function physicalSourceRows(
 	childPhysical: PhysicalProperties | undefined,
 	source: RelationalPlanNode,
@@ -64,13 +59,9 @@ export function aggregateRowsFrom(
 	// (including the unknown sentinel — the count is not a function of the source).
 	if (!grouped) return 1;
 
-	// 0 must pass through unchanged. It is both the genuinely-empty count (0 rows
-	// in ⇒ 0 groups out) and the never-analyzed "unknown" sentinel (see the NOTE
-	// on `physicalSourceRows`), and flooring it to 1 conflates them: unknown would
-	// leave here as a confident single row, which reads as a real magnitude and
-	// silently defeats every downstream `|| default` unknown-guard —
-	// `rule-join-physical-selection` costed a 1x1 join and kept the nested loop
-	// where both sides were un-analyzed grouped aggregates.
+	// 0 passes through unchanged: it now only ever means a genuinely empty source
+	// (never-analyzed is `undefined`, handled above), and 0 rows in ⇒ 0 groups
+	// out. Flooring it to 1 would claim a row an empty table cannot produce.
 	if (sourceRows === 0) return 0;
 
 	return Math.max(1, Math.floor(sourceRows / groupDivisor));

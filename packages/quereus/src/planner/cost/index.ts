@@ -335,6 +335,14 @@ export interface MaintenanceSourceStats {
 	 *  join-semilattice UDAF — `merge`, no `negate`); blended into the delta cost by
 	 *  {@link maintenanceCost}. Absent/0 ⇒ pure-group body, delta cost unchanged. */
 	deltaTightenFallbackRatio?: number;
+	/** Optimizer cost of ONE execution of the compiled key-filtered residual plan
+	 *  (`PlanNode.getTotalCost()` of the optimized residual, stamped by the arm builders).
+	 *  This is what a residual run ACTUALLY costs: with no index on the binding key the
+	 *  injected filter cannot seek and each run scans the whole source, which the
+	 *  rows-per-group heuristic below wildly underestimates — the estimate-driven
+	 *  degrade-to-rebuild crossover then never fires and a wide statement pays k full
+	 *  scans instead of one rebuild. When present it replaces the heuristic outright. */
+	residualExecutionCost?: number;
 }
 
 /**
@@ -413,6 +421,10 @@ export function maintenanceCost(
  * is byte-for-byte the previous behaviour.
  */
 function residualCostPerGroup(stats: MaintenanceSourceStats): number {
+	// The compiled residual plan's own cost is the ground truth for one residual run —
+	// it reflects whether the injected key filter actually seeks or the run scans the
+	// whole source. Prefer it whenever an arm builder stamped it.
+	if (stats.residualExecutionCost !== undefined) return stats.residualExecutionCost;
 	const haveStats =
 		stats.distinctGroupsEstimate !== undefined &&
 		stats.distinctGroupsEstimate > 0 &&
@@ -469,10 +481,21 @@ export function isFullRebuildPathological(stats: MaintenanceSourceStats, thresho
  * this statement only (the stored strategy is retained for later, lower-cardinality writes).
  * Stateless by design, so a subsequent low-cardinality statement naturally reverts.
  */
+/**
+ * Distinct-key floor below which the residual arm is NEVER demoted to a rebuild.
+ * With an un-indexed binding key one residual run and one rebuild both scan the whole
+ * source, so their modeled costs sit within noise of each other — but the rebuild's
+ * `'replace-all'` diff also rewrites/verifies EVERY backing row (write amplification
+ * the cost model does not carry), so a statement touching only a key or two is always
+ * better served by the targeted residual. Wide statements still cross over.
+ */
+const MIN_DEGRADE_DISTINCT_KEYS = 3;
+
 export function shouldDegradeToRebuild(
 	changeCardinality: number,
 	stats: MaintenanceSourceStats,
 ): boolean {
+	if (changeCardinality < MIN_DEGRADE_DISTINCT_KEYS) return false;
 	return maintenanceCost('residual-recompute', changeCardinality, stats) >
 		maintenanceCost('full-rebuild', changeCardinality, stats);
 }

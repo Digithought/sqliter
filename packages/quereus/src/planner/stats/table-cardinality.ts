@@ -1,12 +1,12 @@
 /**
  * Shared base-table row-count helper.
  *
- * Statistics-first: prefer the `ANALYZE`-collected `rowCount` over the static
- * `TableSchema.estimatedRows` field (which `SchemaManager` hardcodes to 0 at
- * CREATE TABLE and never updates). `undefined` means "nobody knows" and must
- * stay `undefined` — callers apply their own fallback (e.g. NaiveStatsProvider's
- * default of 1000); folding that default in here would change every
- * un-analyzed table's cardinality.
+ * The catalog knows a table's row count only through `TableSchema.statistics`
+ * (populated by `ANALYZE` or VTab reporting). There are exactly two spellings:
+ * `undefined` means "nobody knows" and a number — including a real 0 — means
+ * "measured". `undefined` must stay `undefined` here: callers apply their own
+ * fallback (e.g. NaiveStatsProvider's default of 1000), and folding a default
+ * in would change every un-analyzed table's cardinality.
  *
  * `TableReferenceNode.estimatedRows` and `CatalogStatsProvider.tableRows` both
  * call this so the logical/physical estimate and the stats-provider estimate
@@ -27,5 +27,5 @@
 import type { TableSchema } from '../../schema/table.js';
 
 export function catalogRowCount(table: TableSchema): number | undefined {
-	return table.statistics?.rowCount ?? table.estimatedRows;
+	return table.statistics?.rowCount;
 }

@@ -360,7 +360,6 @@ export function buildBackingTableSchema(
 		vtabArgs: moduleArgs ? { ...moduleArgs } : {},
 		vtabAuxData: moduleInfo.auxData,
 		isView: false,
-		estimatedRows: 0,
 		tags: tags && Object.keys(tags).length > 0 ? tags : undefined,
 	};
 }
@@ -444,7 +443,6 @@ function normalizeBackingShape(
 		vtabModuleName: resolvedModuleName,
 		vtabArgs: moduleArgs ? { ...moduleArgs } : {},
 		isView: false,
-		estimatedRows: 0,
 	};
 
 	const normalized = module.normalizeCreateSchema(probe);
@@ -780,7 +778,9 @@ export async function adoptMaterializedView(
 
 	assertNoSelfReference(def, shape);
 	const stamped = buildBackingTableSchema(db, def.schemaName, def.viewName, shape, def.backingModuleName, def.backingModuleArgs, def.tags);
-	schema.addTable({ ...stamped, estimatedRows: preExisting.estimatedRows ?? 0 });
+	// Carry the adopted table's measured statistics forward — the pre-existing
+	// backing's rows are being kept, so its row count is still the truth.
+	schema.addTable(preExisting.statistics ? { ...stamped, statistics: preExisting.statistics } : stamped);
 
 	const maintained = sm.attachDerivation(def.schemaName, def.viewName, buildTableDerivation(def, shape));
 	linkCoveredUniqueConstraints(db, maintained, def.bodySql);

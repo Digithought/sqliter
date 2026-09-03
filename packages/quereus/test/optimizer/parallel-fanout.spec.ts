@@ -133,6 +133,12 @@ describe('ruleFanOutLookupJoin', () => {
 			(1, 1, 10, 100, 99.0),
 			(2, 2, 20, 200, 49.5),
 			(3, 1, 20, 100, 12.0)`);
+		// Cross-mode clustering is guarded by `crossGuardsPass`, which refuses on
+		// unknown row estimates (a never-analyzed table has no row count) —
+		// measure the fixture so estimate-gated shapes are reachable.
+		for (const t of ['orders', 'cust', 'prod', 'region']) {
+			await db.exec(`analyze ${t}`);
+		}
 	}
 
 	const fanout3SQL =
@@ -243,6 +249,11 @@ describe('ruleFanOutLookupJoin', () => {
 			region_id integer null references region(id),
 			total real
 		) using memory`);
+		// The nullable-FK branch degrades to `cross`, which is estimate-gated
+		// (`crossGuardsPass` refuses on unknown) — measure the (empty) tables.
+		for (const t of ['orders', 'cust', 'prod', 'region']) {
+			await db.exec(`analyze ${t}`);
+		}
 		const q = `select o.order_id, c.name, p.sku, r.label
 		           from orders o
 		           inner join cust c on o.customer_id = c.id
@@ -355,6 +366,11 @@ describe('ruleFanOutLookupJoin', () => {
 			// order 1 joins on value 1 (matches both lookup rows per branch);
 			// order 2 joins on value 2 (matches none — exercises the NULL pad).
 			await db.exec('insert into orders values (1, 1, 1, 1), (2, 2, 2, 2)');
+			// Non-FK derived branches degrade to `cross-left`, which is
+			// estimate-gated (`crossGuardsPass` refuses on unknown) — measure.
+			for (const t of ['orders', 'cust', 'prod', 'region']) {
+				await db.exec(`analyze ${t}`);
+			}
 		}
 
 		// `c.other` is output position 0 of the sub-select but column 1 of `cust`;
@@ -872,6 +888,8 @@ describe('ruleFanOutLookupJoin', () => {
 			await db.exec("insert into p values (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four')");
 			await db.exec('insert into b0 values (10, 1, 100), (11, 1, 101), (12, 2, 200), (13, 4, 400)');
 			await db.exec('insert into b1 values (20, 1, 5), (21, 2, 6), (22, 2, 7)');
+			// `crossGuardsPass` refuses on unknown estimates — measure the fixture.
+			for (const t of ['p', 'b0', 'b1']) await db.exec(`analyze ${t}`);
 		}
 
 		const crossSQL =
@@ -950,11 +968,10 @@ describe('ruleFanOutLookupJoin', () => {
 		});
 
 		// The fan-out forms with default tuning (verified above); the guard-trip
-		// cases below tighten a cap so the same chain stays nested-loop. NOTE: the
-		// synthetic memory-vtab fixtures resolve `estimatedRows` to 0 (no row-count
-		// reaches the access plan), so the deterministic way to exercise the gate
-		// is a sub-zero cap (0 > -1). In production the same comparison rejects a
-		// real positive estimate that exceeds a positive cap.
+		// cases below tighten a cap so the same chain stays nested-loop. The
+		// fixture is analyzed (small positive estimates), so a negative cap is
+		// the deterministic way to sit below every estimate; in production the
+		// same comparison rejects a real estimate exceeding a positive cap.
 		it('guard trips: product cap below the cross product leaves a nested-loop chain', async () => {
 			await setupCross('hi_lat_memory');
 			const before = db.optimizer.tuning;
@@ -1002,6 +1019,8 @@ describe('ruleFanOutLookupJoin', () => {
 			await db.exec("insert into lk values (1, 'Acme'), (2, 'Beta')");
 			await db.exec('insert into m values (1, 1), (2, 2)');
 			await db.exec('insert into c values (10, 1, 100), (11, 1, 101), (12, 2, 200)');
+			// The cross branch is estimate-gated — measure the fixture.
+			for (const t of ['lk', 'm', 'c']) await db.exec(`analyze ${t}`);
 			return `select m.id, lk.name, c.v
 				 from m
 				 left join lk on m.lk_id = lk.id
@@ -1084,6 +1103,8 @@ describe('ruleFanOutLookupJoin', () => {
 			await db.exec("insert into p values (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four')");
 			await db.exec('insert into b0 values (10, 1, 100), (11, 1, 101), (12, 2, 200), (13, 4, 400)');
 			await db.exec('insert into b1 values (20, 1, 5), (21, 2, 6), (22, 2, 7)');
+			// `crossGuardsPass` refuses on unknown estimates — measure the fixture.
+			for (const t of ['p', 'b0', 'b1']) await db.exec(`analyze ${t}`);
 		}
 
 		const crossLeftSQL =
@@ -1190,6 +1211,8 @@ describe('ruleFanOutLookupJoin', () => {
 			await db.exec('insert into m values (1, 1), (2, 2)');
 			await db.exec('insert into c values (10, 1, 100), (11, 1, 101), (12, 2, 200)');
 			await db.exec('insert into d values (20, 1, 7)'); // no row for m=2
+			// The cross/cross-left branches are estimate-gated — measure the fixture.
+			for (const t of ['lk', 'm', 'c', 'd']) await db.exec(`analyze ${t}`);
 			return `select m.id, lk.name, c.v, d.w
 				 from m
 				 left join lk on m.lk_id = lk.id

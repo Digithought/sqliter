@@ -32,6 +32,7 @@ import { DeltaExecutor, type DeltaApplyInput, type DeltaExecutorContext, type De
 import type { Database } from './database.js';
 import type { SchemaChangeEvent } from '../schema/change-events.js';
 import { splitBaseKey } from '../util/qualified-name.js';
+import { catalogRowCount } from '../planner/stats/table-cardinality.js';
 
 const log = createLogger('core:assertions');
 
@@ -173,7 +174,7 @@ export class AssertionEvaluator {
 			getRowCount: (base) => {
 				const [schemaName, tableName] = splitBaseKey(base);
 				const table = ctx._findTable(tableName, schemaName);
-				return table?.estimatedRows;
+				return table ? catalogRowCount(table) : undefined;
 			},
 			deltaPerRowFallbackRatio: ctx.optimizer.tuning.deltaPerRowFallbackRatio,
 		};

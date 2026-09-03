@@ -466,7 +466,6 @@ export class StoreModule extends StoreModuleRename implements VirtualTableModule
 					vtabModuleName: 'store',
 					vtabArgs,
 					vtabModule: this,
-					estimatedRows: 0,
 				};
 			}
 		}
