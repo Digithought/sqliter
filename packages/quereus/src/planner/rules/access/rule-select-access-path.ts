@@ -19,7 +19,7 @@ import { RetrieveNode } from '../../nodes/retrieve-node.js';
 import { RemoteQueryNode } from '../../nodes/remote-query-node.js';
 import { SeqScanNode, IndexScanNode, IndexSeekNode, EmptyResultNode, type AccessPathAdvertisement } from '../../nodes/table-access-nodes.js';
 import { seqScanCost } from '../../cost/index.js';
-import type { ColumnMeta, BestAccessPlanRequest, BestAccessPlanResult } from '../../../vtab/best-access-plan.js';
+import { provesEmpty, type ColumnMeta, type BestAccessPlanRequest, type BestAccessPlanResult } from '../../../vtab/best-access-plan.js';
 import { makeEmptyFilterInfo, makeFullScanFilterInfo, type FilterInfo } from '../../../vtab/filter-info.js';
 import { PRIMARY_INDEX_NAME, PRIMARY_PHYSICAL_INDEX_NAME, resolveIndexDescriptor, type AccessPath, type IndexPlanKind } from '../../../vtab/index-descriptor.js';
 import { encodeIdxStr, makeIdxStrSpec } from '../../../vtab/idx-str.js';
@@ -405,14 +405,12 @@ export function selectPhysicalNode(
 	// after which a statement writing rows into that table and reading them back returns
 	// nothing.
 	//
-	// The `handledFilters` conjunct is a runtime backstop, not part of the signal.
-	// `validateAccessPlan` rejects a `provablyEmpty` plan that claims nothing, but not every
-	// module validates its own plan (the store module does not), so an unclaimed proof
-	// declines here instead of folding. `every(...)` is stricter than soundness requires — a
-	// proof over a claimed filter holds whatever the engine does with the unclaimed ones, all
-	// of which can only remove more rows — but the strict form costs at most an optimization
-	// and keeps the vacuous no-filter case (`every` over an empty list is true) out.
-	if (accessPlan.provablyEmpty && accessPlan.handledFilters.length > 0 && accessPlan.handledFilters.every(h => h)) {
+	// `provesEmpty` is the same well-formedness test `validateAccessPlan` enforces, kept in
+	// one place so the fold and the validation cannot drift. It runs here as well as there
+	// because not every module validates its own plan (the store module does not), so a
+	// half-expressed proof — no filter claimed, or a non-zero `rows` — declines instead of
+	// deleting a read.
+	if (provesEmpty(accessPlan)) {
 		log('Using empty result (impossible predicate detected)');
 		return createEmptyResultNode(tableRef);
 	}

@@ -659,6 +659,9 @@ export function validateAccessPlan(
 	// a lie are module bugs, not something to reconcile: a proof that claims no predicate,
 	// and a proof that also reports rows it would return. Rejecting keeps the bug at the
 	// boundary where the module can still be fixed; normalizing would bury it.
+	//
+	// The same two conditions are what {@link provesEmpty} tests; the checks are spelled out
+	// separately here only to name which one failed. Change one, change the other.
 	if (result.provablyEmpty) {
 		if (!result.handledFilters.some(h => h)) {
 			quereusError(
@@ -760,3 +763,22 @@ export function validateAccessPlan(
 }
 
 
+
+/**
+ * True when a plan carries a well-formed PROOF that nothing can match — the exact shape
+ * {@link validateAccessPlan} enforces for {@link BestAccessPlanResult.provablyEmpty}:
+ * the flag set, `rows: 0`, and at least one filter claimed as handled.
+ *
+ * The planner deletes a table access outright on this, so the test lives beside the
+ * validation it mirrors rather than being restated in a rule: a module that never
+ * validates its own plan (the store module does not) still cannot fold an access away
+ * with a half-expressed proof.
+ *
+ * One claimed filter is enough — the proof is about that filter, and it holds whatever
+ * the engine does with the unclaimed ones, all of which can only remove more rows.
+ */
+export function provesEmpty(result: BestAccessPlanResult): boolean {
+	return result.provablyEmpty === true
+		&& result.rows === 0
+		&& result.handledFilters.some(h => h);
+}

@@ -411,3 +411,112 @@ describe('A no-filter `rows: 0` is an estimate, not a proof', () => {
 		expect(await results(db, q)).to.have.lengthOf(0);
 	});
 });
+
+/**
+ * Proves the filter it claims and leaves the rest to the engine — the shape
+ * `AccessPlanBuilder.empty` and `validateAccessPlan` both accept. Claiming one filter is
+ * enough for the fold: the unclaimed ones survive as residuals above an access that is
+ * already known to produce nothing.
+ */
+class PartialProofModule extends MemoryTableModule {
+	override getBestAccessPlan(
+		db: Database,
+		tableInfo: TableSchema,
+		request: BestAccessPlanRequest,
+	): BestAccessPlanResult {
+		if (request.filters.length < 2) return super.getBestAccessPlan(db, tableInfo, request);
+		const handled = request.filters.map((_, i) => i === 0);
+		return AccessPlanBuilder
+			.empty(handled)
+			.setExplanation('Module proved the first filter unsatisfiable')
+			.build();
+	}
+}
+
+/**
+ * Sets `provablyEmpty` on shapes `validateAccessPlan` rejects, without calling it — a
+ * module that skips validation, as the store module does. The planner's own well-formedness
+ * test (`provesEmpty`) must decline both rather than deleting the read.
+ */
+class MalformedProofModule extends MemoryTableModule {
+	constructor(private readonly flavor: 'no-claim' | 'nonzero-rows') {
+		super();
+	}
+
+	override getBestAccessPlan(
+		db: Database,
+		tableInfo: TableSchema,
+		request: BestAccessPlanRequest,
+	): BestAccessPlanResult {
+		if (request.filters.length === 0) return super.getBestAccessPlan(db, tableInfo, request);
+		if (this.flavor === 'no-claim') {
+			// A plain scan that claims nothing, then stamps the flag on anyway.
+			return {
+				...AccessPlanBuilder.fullScan(0).setHandledFilters(request.filters.map(() => false)).build(),
+				rows: 0,
+				provablyEmpty: true,
+			};
+		}
+		// Every filter claimed and genuinely enforced by the memory module's own seek, but
+		// the plan reports rows it would return — the flag contradicts itself.
+		const plan = super.getBestAccessPlan(db, tableInfo, request);
+		return { ...plan, rows: 7, provablyEmpty: true };
+	}
+}
+
+describe('a proof over one claimed filter still folds', () => {
+	let db: Database;
+
+	beforeEach(() => {
+		db = new Database();
+		db.registerModule('partial_proof', new PartialProofModule());
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	it('folds with the unclaimed filter left to the engine', async () => {
+		await db.exec('create table pp (id integer primary key, v text) using partial_proof');
+		await db.exec("insert into pp values (1, 'a')");
+
+		const q = "select id from pp where id = 1 and v = 'a'";
+		const plan = await planRows(db, q);
+		expect(hasOp(plan, 'EMPTYRESULT'), `plan ops=${plan.map(r => r.op).join(',')}`).to.equal(true);
+		expect(await results(db, q)).to.have.lengthOf(0);
+	});
+});
+
+describe('a half-expressed proof does not fold', () => {
+	let db: Database;
+
+	beforeEach(() => {
+		db = new Database();
+		db.registerModule('no_claim_proof', new MalformedProofModule('no-claim'));
+		db.registerModule('nonzero_proof', new MalformedProofModule('nonzero-rows'));
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	it('declines a proof that claims no filter', async () => {
+		await db.exec('create table nc (id integer primary key, v text) using no_claim_proof');
+		await db.exec("insert into nc values (1, 'a'), (2, 'b')");
+
+		const q = 'select id, v from nc where id = 1';
+		const plan = await planRows(db, q);
+		expect(hasOp(plan, 'EMPTYRESULT'), `plan ops=${plan.map(r => r.op).join(',')}`).to.equal(false);
+		expect(await results(db, q)).to.deep.equal([{ id: 1, v: 'a' }]);
+	});
+
+	it('declines a proof that reports rows it would return', async () => {
+		await db.exec('create table nz (id integer primary key, v text) using nonzero_proof');
+		await db.exec("insert into nz values (1, 'a'), (2, 'b')");
+
+		const q = 'select id, v from nz where id = 1';
+		const plan = await planRows(db, q);
+		expect(hasOp(plan, 'EMPTYRESULT'), `plan ops=${plan.map(r => r.op).join(',')}`).to.equal(false);
+		expect(await results(db, q)).to.deep.equal([{ id: 1, v: 'a' }]);
+	});
+});
