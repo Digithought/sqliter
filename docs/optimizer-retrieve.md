@@ -330,8 +330,19 @@ RetrieveNode(source: Filter(condition, TableRef))
 ```
 
 **Key properties**:
-- Purely structural — no cost modeling during growth, so the segment boundary is
+- Structural for a module with `supports()` — that module either commits to the expanded
+  pipeline or does not, and no cost enters the decision, so the segment boundary is
   deterministic and reproducible
+- Cost-aware for the index-style fallback — `fallbackIndexSupports` (used for a module that
+  only implements `getBestAccessPlan`) declines a plan whose seek costs no less than a plain
+  whole-table read, because pushing a predicate down that does not pay for itself only moves
+  work around. Both numbers in that comparison are quoted by the same module: the baseline is
+  a second, filter-free/ordering-free/limit-free probe of `getBestAccessPlan`, not the
+  engine's own `seqScanCost` over the catalog's row count. Pricing the two sides against
+  different table sizes is what made a self-sizing backend's honest seek lose to a fabricated
+  scan — see [Costing § Where a module's own size fits](optimizer-costing.md). The probe is
+  paid only on the branch that reads it; when the plan supplies the ordering that was
+  requested, that ordering is the benefit and no baseline is fetched
 - Module-bounded — a module evaluates exactly the operations it commits to handle
 - Runs before physical selection, so access-path choice sees the final segment
 - Establishes the "query segment" baseline every later push-down rule builds on

@@ -539,10 +539,6 @@ function fallbackIndexSupports(
 		? orderingMatches(accessPlan.providesOrdering, request.requiredOrdering)
 		: false;
 
-	// Calculate baseline cost
-	const estimatedRows = request.estimatedRows ?? 1000;
-	const seqCost = seqScanCost(estimatedRows);
-
 	// Accept the plan if it handles filters OR provides required ordering
 	if (!handlesAnyFilter && !providesOrdering) {
 		log('Access plan provides no benefit');
@@ -560,12 +556,23 @@ function fallbackIndexSupports(
 		return undefined;
 	}
 
-	if (accessPlan.cost >= seqCost && !providesOrdering) {
-		log('Access plan cost (%d) not better than sequential scan (%d)', accessPlan.cost, seqCost);
-		return undefined;
+	// Seek-versus-scan. The baseline is quoted by the SAME module that quoted the seek, so
+	// both numbers are priced against one table size — see `baselineScanCost`. Only this
+	// branch reads it: when the plan provides the requested ordering that is the benefit
+	// being bought, and no baseline probe is paid for.
+	if (!providesOrdering) {
+		const seqCost = baselineScanCost(
+			req => vtabModule.getBestAccessPlan!(context.db, tableSchema, req) as BestAccessPlanResult,
+			request,
+		);
+		if (accessPlan.cost >= seqCost) {
+			log('Access plan cost (%d) not better than sequential scan (%d)', accessPlan.cost, seqCost);
+			return undefined;
+		}
+		log('Index-style fallback beneficial: cost %d vs %d seq scan', accessPlan.cost, seqCost);
+	} else {
+		log('Index-style fallback beneficial: plan provides the required ordering');
 	}
-
-	log('Index-style fallback beneficial: cost %d vs %d seq scan', accessPlan.cost, seqCost);
 
 	residualPredicate = assembleResidual(
 		residualPredicate, plannerConstraints, accessPlan.handledFilters, committedResidual);
@@ -721,6 +728,59 @@ function probeAccessPlan(
 	if (truncationIsSafe(subtree, constraints, plan.handledFilters)) return plan;
 	log('Limit is not truncation-safe for this subtree; re-probing without it');
 	return ask({ ...request, limit: undefined, offset: undefined });
+}
+
+/**
+ * What a plain whole-table read of this table costs, quoted by the SAME module that
+ * quoted the seek being compared against it.
+ *
+ * The seek-versus-scan veto in `fallbackIndexSupports` (`accessPlan.cost >= seqCost`)
+ * compares two numbers, and they have to be priced against one table size. Deriving the baseline from
+ * `seqScanCost(request.estimatedRows ?? 1000)` did not: `estimatedRows` is the catalog's
+ * measurement — `undefined` when nobody ran `ANALYZE`, and a stale `0` when `ANALYZE` ran
+ * before the table was filled — while a module that keeps a live row count (e.g.
+ * `quereus-store`) prices its seek arm against the real size. On any table where the two
+ * disagree the honest seek lost to a made-up scan, the grow was declined, and the
+ * predicate was re-enforced in a `Filter` above the seek that had already bounded the rows.
+ *
+ * Asking the module instead is symmetric by construction: whatever size it used to price
+ * the seek, it used the same one here. No new module interface, and no re-fabricated 1000
+ * on the request — that would reinstate the bug `ask-the-backend-before-guessing-its-size`
+ * removed and blind every self-sizing module again.
+ *
+ * The probe strips filters, ordering, limit and offset. Ordering too, not just filters:
+ * the veto only fires when `!providesOrdering` (ordering is scored as a benefit
+ * separately), so the baseline must be the plain scan the seek is actually competing with.
+ *
+ * `seqScanCost` stays as the non-finite fallback. `BestAccessPlanResult.cost` is a
+ * required `number`, so the branch should be unreachable; keeping it means a module
+ * answering `NaN` degrades to exactly the old behavior instead of vetoing on a comparison
+ * with `NaN`.
+ *
+ * `getBestAccessPlan` is pure at plan time, so the discarded probe leaves nothing behind —
+ * the same property `probeAccessPlan` above already relies on.
+ *
+ * NOTE: this costs one extra `getBestAccessPlan` call per grow attempt that reaches the
+ * seek-versus-scan veto (an index-style module whose plan does not provide the requested
+ * ordering). Measured as free — no gated bench counter moved and all four ratio guards
+ * held — but a module with an expensive `getBestAccessPlan` pays it twice per such
+ * attempt; if that ever shows up in a profile, memoize the filter-free answer per table
+ * per optimizer pass.
+ */
+function baselineScanCost(
+	ask: (request: BestAccessPlanRequest) => BestAccessPlanResult,
+	request: BestAccessPlanRequest,
+): number {
+	const baseline = ask({
+		...request,
+		filters: [],
+		requiredOrdering: undefined,
+		limit: undefined,
+		offset: undefined,
+	});
+	if (Number.isFinite(baseline.cost)) return baseline.cost;
+	log('Module quoted a non-finite baseline cost; falling back to the engine model');
+	return seqScanCost(request.estimatedRows ?? 1000);
 }
 
 /**
