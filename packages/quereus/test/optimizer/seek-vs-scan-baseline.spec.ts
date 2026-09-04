@@ -52,8 +52,13 @@ class SelfSizingMemoryModule extends MemoryTableModule {
 	 */
 	overrideStaleZero = false;
 
+	/** Every request this module was handed, in order. */
+	readonly requests: BestAccessPlanRequest[] = [];
+
 	/** `request.estimatedRows` as it arrived, per call, in order. */
-	readonly asked: Array<number | undefined> = [];
+	get asked(): Array<number | undefined> {
+		return this.requests.map(r => r.estimatedRows);
+	}
 
 	/**
 	 * Multiplier applied to the cost of a plan that claimed a filter, so the module prices
@@ -67,7 +72,7 @@ class SelfSizingMemoryModule extends MemoryTableModule {
 		tableInfo: TableSchema,
 		request: BestAccessPlanRequest,
 	): BestAccessPlanResult {
-		this.asked.push(request.estimatedRows);
+		this.requests.push(request);
 		const catalogIsWrong = request.estimatedRows === undefined
 			|| (this.overrideStaleZero && request.estimatedRows === 0);
 		const sized = catalogIsWrong ? { ...request, estimatedRows: this.liveRows } : request;
@@ -148,7 +153,7 @@ describe('seek-versus-scan baseline is quoted by the module', () => {
 			mod.overrideStaleZero = false;
 			await createTable('e');
 			await db.exec('analyze e');
-			mod.asked.length = 0;
+			mod.requests.length = 0;
 
 			await planOps(db, 'select * from e where id < 500');
 
@@ -156,6 +161,45 @@ describe('seek-versus-scan baseline is quoted by the module', () => {
 			for (const seen of mod.asked) {
 				expect(seen, 'a measured 0 must arrive as 0, not as unknown').to.equal(0);
 			}
+		});
+	});
+
+	describe('the baseline is a second probe of the same module', () => {
+		// The cost-outcome tests above prove the veto now reaches the right verdict; these
+		// pin HOW, so a refactor that left `filters` or `requiredOrdering` on the baseline
+		// probe — or fetched one where it is never read — fails here rather than silently.
+		const isBaselineProbe = (r: BestAccessPlanRequest): boolean =>
+			r.filters.length === 0 && r.requiredOrdering === undefined
+			&& r.limit === undefined && r.offset === undefined;
+
+		it('asks the module for a filter-free whole-table price, sized like the seek', async () => {
+			await createTable();
+			mod.requests.length = 0;
+
+			expectBareSeek(await planOps(db, 'select * from t where id < 500'), 'baseline probe');
+
+			const seek = mod.requests.filter(r => r.filters.length > 0);
+			const baseline = mod.requests.filter(isBaselineProbe);
+			expect(seek, 'the seek probe carries the pushed-down constraint').to.have.lengthOf(1);
+			expect(baseline, 'the baseline is quoted by the module, not modelled by the engine')
+				.to.have.lengthOf(1);
+			expect(baseline[0].estimatedRows, 'both sides of the comparison are sized identically')
+				.to.equal(seek[0].estimatedRows);
+		});
+
+		it('does not pay for a baseline when the plan provides the required ordering', async () => {
+			// The veto only fires on `!providesOrdering`, so the probe lives inside that
+			// branch. If a future change ever makes the veto apply to an ordering-providing
+			// plan too, the probe has to move back out — and this test is what says so.
+			await createTable();
+			mod.requests.length = 0;
+
+			const ops = await planOps(db, 'select * from t order by id');
+			expect(ops, `expected the ordering to be absorbed, got ${ops.join(' | ')}`)
+				.to.not.include('SORT');
+			expect(mod.requests.filter(isBaselineProbe),
+				'an ordering-providing plan reads no baseline, so none should be fetched')
+				.to.be.empty;
 		});
 	});
 

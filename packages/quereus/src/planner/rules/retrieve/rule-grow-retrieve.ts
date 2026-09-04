@@ -500,17 +500,17 @@ function fallbackIndexSupports(
 		request.requiredOrdering ? 'yes' : 'no',
 		request.limit ?? 'none');
 
-	// Get access plan from module. The LimitOffset arm above is the other site that can
-	// populate `request.limit`, so it goes through the same funnel: the region that could
-	// still discard a row is everything below `node` (the swallowed LimitOffset's own
-	// source pipeline, Retrieve included). The Filter and Sort arms carry no limit, so
-	// this is a plain single probe for them.
 	// One binding of "ask THIS module about THIS table", shared by the plan probe and the
 	// baseline probe below. Both sides of the seek-versus-scan comparison being answered by
 	// the same module is the whole point of `baselineScanCost`, so they read one `ask`.
 	const ask = (req: BestAccessPlanRequest): BestAccessPlanResult =>
 		vtabModule.getBestAccessPlan!(context.db, tableSchema, req) as BestAccessPlanResult;
 
+	// Get access plan from module. The LimitOffset arm above is the other site that can
+	// populate `request.limit`, so it goes through the same funnel: the region that could
+	// still discard a row is everything below `node` (the swallowed LimitOffset's own
+	// source pipeline, Retrieve included). The Filter and Sort arms carry no limit, so
+	// this is a plain single probe for them.
 	const accessPlan = probeAccessPlan(ask, request, plannerConstraints, node);
 
 	// No-clobber guard: never replace an equipped ordering plan with one that does

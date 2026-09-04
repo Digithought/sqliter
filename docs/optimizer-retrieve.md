@@ -340,9 +340,9 @@ RetrieveNode(source: Filter(condition, TableRef))
   `Retrieve.source` and access-path selection rebuilds the same seek with the absorbed Filter
   re-stacked above it, so a decline costs strictly more than the push-down it refused — see
   `bug-declined-push-down-is-rebuilt-as-seek-plus-duplicate-filter`. Both numbers in that
-  comparison are quoted by the same module: the baseline is
-  a second, filter-free/ordering-free/limit-free probe of `getBestAccessPlan`, not the
-  engine's own `seqScanCost` over the catalog's row count. Pricing the two sides against
+  comparison are quoted by the same module: the baseline is a second,
+  filter-free/ordering-free/limit-free probe of `getBestAccessPlan`, not the engine's own
+  `seqScanCost` over the catalog's row count. Pricing the two sides against
   different table sizes is what made a self-sizing backend's honest seek lose to a fabricated
   scan — see [Costing § Where a module's own size fits](optimizer-costing.md). The probe is
   paid only on the branch that reads it; when the plan supplies the ordering that was
